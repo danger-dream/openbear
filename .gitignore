@@ -1,0 +1,55 @@
+# ─── 配置与密钥（绝对不能提交）────────────────────────────────
+openbear.json
+openbear.json.bak*
+openbear.json.tmp
+.openbear-install.json
+.env
+.env.*
+!.env.example
+
+# ─── 运行时数据 ──────────────────────────────────────────────
+data/
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+state.db
+
+# ─── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ─── 工作区与本地分析 ────────────────────────────────────────
+workspace/
+.serena/
+.cloakbrowser/
+.DS_Store
+
+# ─── Web 前端构建产物 ────────────────────────────────────────
+web/node_modules/
+web/dist/
+web/data/
+web/logs/
+
+# ─── 运行时 skills / MCP（仓库只保留示例）────────────────────
+skills/*/
+!skills/example-skill/
+!skills/example-skill/**
+mcp-servers/
+
+# ─── 编辑器 / 备份 ──────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+bak/
+backups/

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "patches": {
+    "xai/grok-4.5": {
+      "reason": "models.dev 缺少 xAI Priority Processing，且长上下文 cache_read 费率与 xAI 官方价格不一致",
+      "checkedAt": "2026-07-28",
+      "sources": [
+        "https://docs.x.ai/developers/advanced-api-usage/priority-processing",
+        "https://docs.x.ai/developers/pricing"
+      ],
+      "merge": {
+        "cost": {
+          "input": 2,
+          "output": 6,
+          "cache_read": 0.3,
+          "tiers": [
+            {
+              "tier": {
+                "type": "context",
+                "size": 200000
+              },
+              "input": 4,
+              "output": 12,
+              "cache_read": 0.6
+            }
+          ],
+          "context_over_200k": {
+            "input": 4,
+            "output": 12,
+            "cache_read": 0.6
+          }
+        },
+        "experimental": {
+          "modes": {
+            "fast": {
+              "provider": {
+                "body": {
+                  "service_tier": "priority"
+                }
+              },
+              "cost": {
+                "input": 4,
+                "output": 12,
+                "cache_read": 0.6,
+                "tiers": [
+                  {
+                    "tier": {
+                      "type": "context",
+                      "size": 200000
+                    },
+                    "input": 8,
+                    "output": 24,
+                    "cache_read": 1.2
+                  }
+                ],
+                "context_over_200k": {
+                  "input": 8,
+                  "output": 24,
+                  "cache_read": 1.2
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

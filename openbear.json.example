@@ -1,0 +1,153 @@
+{
+  "telegram": {
+    "botToken": "123456:ABC-your-bot-token",
+    "mode": "polling",
+    "webhookHost": "",
+    "webhookSecret": "",
+    "webhookPort": 18960,
+    "whitelistIds": [
+      123456789
+    ]
+  },
+  "models": {
+    "providers": {
+      "default": {
+        "baseUrl": "https://api.example.com/v1",
+        "apiKey": "replace-me",
+        "protocol": "responses",
+        "enabled": true,
+        "models": [
+          {
+            "id": "your-model",
+            "name": "your-model",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "contextWindow": 200000,
+            "maxTokens": 16384
+          }
+        ]
+      }
+    },
+    "primary": "default/your-model",
+    "compressionModels": []
+  },
+  "memory": {
+    "provider": "builtin",
+    "identity": "openbear",
+    "baseUrl": "",
+    "accessKey": "",
+    "timeoutS": 8
+  },
+  "agent": {
+    "maxRunWallSeconds": 0,
+    "noProgressRounds": 8,
+    "compactRatio": 0.7,
+    "keepRecentMessages": 100,
+    "compactPrompt": "You are compacting an ongoing engineering conversation for future continuation. After compaction, the next model will only see this summary plus the most recent uncompressed messages, so the summary must be sufficient to continue the work without re-reading the compacted transcript.\n\nOutput in English only, even if the conversation history is in another language. Be dense, specific, and continuity-focused. Prefer concrete facts over generic prose. The latest user request, latest user corrections, and latest unfinished/current work have highest priority; do not let older context drown them out.\n\nBefore writing the final summary, carefully review the compacted history chronologically. For each meaningful conversation section, identify:\n- the user's explicit request and intent;\n- what the assistant did or decided;\n- files, paths, functions, commands, configs, APIs, schemas, IDs, errors, and test results that matter;\n- user feedback/corrections that changed direction or constraints;\n- unresolved blockers, pending work, and the exact current stopping point.\n\nStrictly use the following Markdown headings in this exact order. Do not omit any heading; write \"None\" if a section truly has no content.\n\n## Primary Request and Intent\nCapture the user's explicit requests and intent in detail. Emphasize the newest request and any changes in requirements, priorities, permissions, or constraints. If the user corrected the assistant, preserve the correction and its effect.\n\n## Key Technical Concepts\nList important technologies, protocols, architecture, models, APIs, data structures, context-window behavior, compaction behavior, deployment/runtime facts, and constraints discussed. Include only concepts needed to continue work.\n\n## Files and Code Sections\nEnumerate files, paths, functions/classes, config keys, database tables/fields, commands, scripts, tests, generated artifacts, and code sections that were read, edited, created, or are important. For each item, say why it matters and what changed or was learned. Include exact snippets, diffs, commands, or error excerpts when needed to continue safely.\n\n## Errors and Fixes\nRecord every important error, failed attempt, diagnostic result, root cause, fix, retry state, and final status. Preserve exact error strings when useful. Distinguish resolved issues from still-open issues.\n\n## Problem Solving\nDescribe the reasoning path and decisions already made. Include investigated alternatives when they affect future choices, why a chosen path was selected, and any assumptions or uncertainty that remain. Do not turn this into vague narrative; keep it actionable.\n\n## All User Messages\nList all user messages represented in the compacted history when feasible. If there are too many, at minimum preserve every message that changed the task, constraints, priorities, permissions, or next step, plus the most recent user messages verbatim or near-verbatim. User wording matters; do not paraphrase away intent-changing details.\n\n## Pending Tasks\nList unfinished tasks in execution order. Distinguish confirmed tasks from optional follow-ups. Include required confirmations, safety boundaries, and tasks that must not be done unless the user asks.\n\n## Current Work\nDescribe exactly what was being worked on immediately before compaction: current file/command/test/result, latest known state, what has already been completed, what is mid-flight, and where execution paused. This section must let the next model resume without asking the user to repeat context.\n\n## Optional Next Step\nGive the single next step that directly follows from the latest user request and Current Work. Include the exact command/file/action when known. If the latest task was complete, say it is complete and only include a next step if the user explicitly asked for one. Do not revive old tasks or drift to unrelated work.\n\n## Critical Identifiers\nPreserve exact identifiers verbatim: project names, file paths, function names, class names, config keys, commands, URLs, IPs, ports, request IDs, task/session IDs, timestamps, model names, database/table/field names, error strings, hashes, versions, service names, and environment names. Never translate, normalize, or “clean up” identifiers.\n\nAdditional rules:\n- Do not invent details not supported by the history. State uncertainty explicitly.\n- Do not preserve meta-instructions that only applied to producing this summary.\n- Mention tool calls and tool results only at the level needed to continue work; do not dump large raw outputs unless they are necessary.\n- Preserve security/safety constraints, user preferences, approvals, and explicit “do not” instructions that affect future actions.\n- Preserve exact command outputs or code snippets only when they are necessary for continuation; otherwise summarize them with enough detail to avoid re-running work.\n- If there is an existing summary, merge it with the new history without losing the latest current-work details.\n- The final answer must be the summary only. Do not include apologies, prefaces, or commentary about doing the compaction.\n\nExisting summary/context, if any:\n{existing}\n\nConversation history to compact. Each line is prefixed by role:\n{history}",
+    "manualCompactMinPercent": 50,
+    "memoryReminderPercent": 80,
+    "compactMaxTokens": 32768,
+    "compactMaxRetries": 1,
+    "compactTimeoutS": 1800,
+    "maxRetries": 10,
+    "retryBackoffS": 0.5,
+    "retryMaxDelayS": 32,
+    "retryJitterRatio": 0.25,
+    "emptyResponseRetryLimit": 1,
+    "reasoningOnlyRetryLimit": 2,
+    "llmConnectTimeoutS": 10,
+    "llmFirstByteTimeoutS": 90,
+    "llmIdleTimeoutS": 120,
+    "llmTotalTimeoutS": 0
+  },
+  "tools": {
+    "bashTimeoutS": 120,
+    "bashMaxTimeoutS": 600,
+    "bashOutputLimit": 200000,
+    "bashSpoolMaxBytes": 67108864,
+    "fileReadLimitLines": 2000,
+    "fileReadOutputBytes": 100000,
+    "fileReadMaxLineBytes": 64000,
+    "fileStateMaxEntries": 512,
+    "fileDiffMaxChars": 12000,
+    "toolResultMaxChars": 32000,
+    "skillsDir": "./skills",
+    "disabledSkills": []
+  },
+  "storage": {
+    "dbPath": "./data/openbear.db"
+  },
+  "mcp": {
+    "enabled": false,
+    "installDir": "./mcp-servers",
+    "startupTimeoutS": 30,
+    "toolCallTimeoutS": 120,
+    "outputMaxChars": 20000,
+    "inlineMaxChars": 8000,
+    "defaultApproval": "ask",
+    "toolNamePrefix": "mcp",
+    "allowTools": [
+      "*"
+    ],
+    "denyTools": [],
+    "servers": {}
+  },
+  "rath": {
+    "enabled": true,
+    "statusUpdateIntervalS": 3,
+    "maxConcurrentTasks": 5,
+    "agentModelCallLimit": 200,
+    "agentToolCallLimit": 500,
+    "planControlCallLimit": 200,
+    "agentPlanEnabled": true,
+    "planMaxRevisionRounds": 5,
+    "planMaxSteps": 30,
+    "planMaxCriteriaPerStep": 10,
+    "planMaxFinalOutputs": 20,
+    "planDraftPrompt": "",
+    "planRevisionPrompt": "",
+    "planReviewPrompt": "",
+    "planExecutionPrompt": "",
+    "planContextRestorePrompt": "",
+    "agentToolForegroundWaitS": 0
+  },
+  "web": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 18961,
+    "customUrl": "",
+    "sessionDays": 30,
+    "loginRequestTtlSeconds": 300,
+    "failedLoginCooldownMinutes": 10,
+    "taskNotifications": {
+      "enabled": true,
+      "includeResult": true,
+      "thresholdMinutes": 5,
+      "events": [
+        "task_started",
+        "agent_started",
+        "agent_finished",
+        "retrying",
+        "task_completed",
+        "task_failed",
+        "task_interrupted"
+      ]
+    }
+  },
+  "ui": {
+    "showTurnStats": true
+  },
+  "media": {
+    "downloadDir": "data/media/inbound",
+    "maxImageMb": 20,
+    "maxAudioMb": 25,
+    "maxVideoMb": 50,
+    "maxFileMb": 200,
+    "maxMediaPerMessage": 10,
+    "mediaGroupFlushMs": 1000
+  },
+  "logLevel": "INFO"
+}

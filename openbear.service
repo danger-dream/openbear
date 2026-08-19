@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenBear — 单人自用 Agent Web 控制台
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__OPENBEAR_DIR__
+ExecStart=__OPENBEAR_DIR__/.venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=3
+Environment=OPENBEAR_CONFIG=__OPENBEAR_DIR__/openbear.json
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# OpenBear pre-commit：阻止敏感文件 / 凭证被误提交。
+#
+# 安装：git config core.hooksPath .githooks
+
+set -euo pipefail
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+RESET=$'\033[0m'
+
+fail() {
+    echo "${RED}[pre-commit] 拒绝提交：$*${RESET}" >&2
+    exit 1
+}
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$staged_files" ]; then
+    exit 0
+fi
+
+SENSITIVE_FILES=(
+    "openbear.json"
+    "openbear.json.tmp"
+    ".env"
+    "state.db"
+    "state.db-wal"
+    "state.db-shm"
+)
+
+for sf in "${SENSITIVE_FILES[@]}"; do
+    if echo "$staged_files" | grep -qxF "$sf"; then
+        fail "$sf 是敏感运行时文件，不能提交（样板请用 openbear.json.example）"
+    fi
+done
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        openbear.json.bak*|*.env|*.env.*|.env.*|*.db|*.db-wal|*.db-shm)
+            fail "$f 匹配敏感文件通配规则"
+            ;;
+        data/*|logs/*|workspace/*|skills/*|mcp-servers/*|web/dist/*|web/node_modules/*|.venv/*|venv/*)
+            fail "$f 属于本应 ignore 的运行时目录"
+            ;;
+    esac
+done <<< "$staged_files"
+
+patterns=(
+    'sk-ant-api0[A-Za-z0-9_-]{20,}'
+    'sk-ant-oat01-[A-Za-z0-9_-]{20,}'
+    'sk-ant-ort01-[A-Za-z0-9_-]{20,}'
+    'sk-proj-[A-Za-z0-9_-]{20,}'
+    'sk-svcacct-[A-Za-z0-9_-]{20,}'
+    'ccp-[0-9a-f]{32,}'
+    'ghp_[A-Za-z0-9]{30,}'
+    'gho_[A-Za-z0-9]{30,}'
+    'github_pat_[A-Za-z0-9_]{30,}'
+    'AIza[0-9A-Za-z_-]{30,}'
+    '[0-9]{8,12}:AA[A-Za-z0-9_-]{30,}'
+    '-----BEGIN OPENSSH PRIVATE KEY-----'
+    '-----BEGIN RSA PRIVATE KEY-----'
+    'eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+)
+
+hits=0
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        openbear.json.example|.githooks/pre-commit)
+            continue
+            ;;
+    esac
+    if ! git show ":$f" >/dev/null 2>&1; then
+        continue
+    fi
+    if git show ":$f" | grep -q $'\0'; then
+        continue
+    fi
+    content=$(git show ":$f" 2>/dev/null || true)
+    [ -z "$content" ] && continue
+    for pat in "${patterns[@]}"; do
+        if echo "$content" | grep -E -e "$pat" -q; then
+            matched=$(echo "$content" | grep -E -e "$pat" -o | head -3)
+            echo "${RED}[pre-commit] 在 $f 中命中敏感模式：${RESET}" >&2
+            echo "$matched" | sed 's/\(.\{12\}\).*\(.\{4\}\)$/  \1…\2/' >&2
+            hits=$((hits + 1))
+        fi
+    done
+done <<< "$staged_files"
+
+if [ "$hits" -gt 0 ]; then
+    fail "共命中 $hits 处潜在凭证。确认是误报才可用 git commit --no-verify。"
+fi
+
+echo "${GREEN}[pre-commit] ✓ 未发现敏感文件/凭证${RESET}" >&2
+exit 0

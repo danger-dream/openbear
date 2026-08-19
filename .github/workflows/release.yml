@@ -1,0 +1,207 @@
+name: Release
+
+# 推送 v* tag 后：校验版本、全量测试、构建前端、打包 zip，全部通过才创建 Release。
+# 测试失败 = 没有这个发行版。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v0.2.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ -z "$TAG" || "$TAG" != v* ]]; then
+            echo "❌ 无效 tag: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" =~ -(rc|alpha|beta|pre|dev) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify version files
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/bump_version.py --check --expect "${TAG#v}"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Python
+        run: uv python install 3.12
+
+      - name: Install Python deps
+        run: uv sync --frozen --extra dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - name: Classify against previous stable tag
+        id: meta
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          PREV="$(git tag -l 'v*' --sort=-v:refname | grep -Ev -- '-(rc|alpha|beta|pre|dev)' | grep -vx "$TAG" | head -n1 || true)"
+          mkdir -p dist
+          if [[ -n "$PREV" ]]; then
+            git diff --name-only "$PREV" "$TAG" > dist/changed.txt
+            python3 scripts/updater.py classify-names \
+              --files dist/changed.txt \
+              --version "$VERSION" \
+              --compared-with "${PREV#v}" \
+              --write-meta dist/release-meta.json
+            echo "compared_with=${PREV#v}" >> "$GITHUB_OUTPUT"
+          else
+            python3 - <<PY
+          from pathlib import Path
+          import json
+          Path("dist/release-meta.json").write_text(json.dumps({
+              "schema": 1,
+              "version": "$VERSION",
+              "requiresRestart": True,
+              "effect": "restart",
+              "comparedWith": "",
+              "changedCount": 0,
+          }, indent=2) + "\n", encoding="utf-8")
+          PY
+            echo "compared_with=" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          meta = json.load(open("dist/release-meta.json", encoding="utf-8"))
+          print(f"requires_restart={str(bool(meta.get('requiresRestart', True))).lower()}")
+          PY
+
+      - name: Package zip
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/pkg"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/web"
+          cp -a app prompts scripts pyproject.toml uv.lock openbear.service openbear.json.example "$STAGE/"
+          if [[ -f README.md ]]; then cp -a README.md "$STAGE/"; fi
+          cp -a web/dist "$STAGE/web/dist"
+          cp dist/release-meta.json "$STAGE/release-meta.json"
+          # 禁止把运行时私货打进包
+          rm -rf "$STAGE/app/__pycache__" "$STAGE/scripts/__pycache__"
+          find "$STAGE" -name '*.pyc' -delete
+          (
+            cd "$STAGE"
+            zip -r "../openbear-${VERSION}.zip" .
+          )
+          (
+            cd dist
+            sha256sum "openbear-${VERSION}.zip" > SHA256SUMS
+          )
+
+      - name: Build release notes
+        id: notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REQUIRES: ${{ steps.meta.outputs.requires_restart }}
+          COMPARED: ${{ steps.meta.outputs.compared_with }}
+        run: |
+          set -euo pipefail
+          MSG="$(git tag -l --format='%(contents)' "$TAG" || true)"
+          if [[ -z "$(echo "$MSG" | tr -d '[:space:]')" ]]; then
+            MSG="$(git log -1 --pretty=%B "$TAG")"
+          fi
+          if [[ "$REQUIRES" == "true" ]]; then
+            EFFECT="生效方式预告：需要重启后端（相对 ${COMPARED:-无上一版}；现场以本机文件对比为准）"
+          else
+            EFFECT="生效方式预告：刷新页面即可（相对 ${COMPARED:-无上一版}；现场以本机文件对比为准）"
+          fi
+          {
+            echo "body<<__END_OF_BODY__"
+            echo "$EFFECT"
+            echo
+            echo "$MSG"
+            echo "__END_OF_BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check existing release
+        id: exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Release $TAG 已存在，跳过创建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        if: steps.exist.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          BODY: ${{ steps.notes.outputs.body }}
+          PRE: ${{ steps.tag.outputs.prerelease }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          if [[ "$PRE" == "true" ]]; then
+            EXTRA+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "$BODY" \
+            "${EXTRA[@]}" \
+            "dist/openbear-${VERSION}.zip" \
+            "dist/SHA256SUMS" \
+            "dist/release-meta.json" \
+            "scripts/install.sh"
