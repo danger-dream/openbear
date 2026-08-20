@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from app import __version__, installed_version
+from app import installed_version
 from app.logging import get_logger
 from app.telegram_ui import send_rich
 from app.update.loader import load_updater, updater_script_path
@@ -91,7 +91,7 @@ class UpdateService:
             log.info("版本检查未启动", 原因="测试或已禁用")
             return
         self._task = asyncio.create_task(self._loop(), name="openbear-update-check")
-        log.info("版本检查已启动", 仓库=GITHUB_REPO, 当前版本=__version__)
+        log.info("版本检查已启动", 仓库=GITHUB_REPO, 当前版本=installed_version())
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -301,7 +301,8 @@ class UpdateService:
         )
         updater = load_updater()
         latest = str(available.get("version") or "")
-        if latest and updater.is_newer(latest, __version__) and notified_version != latest:
+        current = installed_version()
+        if latest and updater.is_newer(latest, current) and notified_version != latest:
             await self._notify_admins(self._new_version_text(available))
             available["notifiedVersion"] = latest
             self._merge_state(available=available)

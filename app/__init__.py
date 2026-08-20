@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 _VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
 

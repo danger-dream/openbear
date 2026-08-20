@@ -333,3 +333,58 @@ async def test_release_assets_follow_github_redirects():
     assert available["sha256"] == "deadbeef"
     assert available["requiresRestart"] is False
     assert available["comparedWith"] == "0.0.1"
+
+
+async def test_update_notification_compares_latest_with_disk_version(tmp_path: Path, monkeypatch):
+    import httpx
+
+    import app.update.service as service_module
+    from app.update.service import UpdateService
+
+    svc = type(
+        "S",
+        (),
+        {
+            "config": type("C", (), {"storage": type("St", (), {"db_path": str(tmp_path / "data" / "openbear.db")})()})(),
+            "bot": None,
+        },
+    )()
+    us = UpdateService(svc)
+    latest = {"version": "0.1.1"}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        version = latest["version"]
+        return httpx.Response(200, headers={"ETag": f'"{version}"'}, json={
+            "tag_name": f"v{version}",
+            "name": f"v{version}",
+            "body": "notes",
+            "published_at": "2026-01-01T00:00:00Z",
+            "html_url": f"https://github.com/danger-dream/openbear/releases/tag/v{version}",
+            "draft": False,
+            "prerelease": False,
+            "assets": [],
+        })
+
+    notices: list[str] = []
+
+    async def fake_notify(text: str) -> None:
+        notices.append(text)
+
+    monkeypatch.setattr(service_module, "installed_version", lambda: "0.1.1")
+    monkeypatch.setattr(service_module, "__version__", "0.1.0", raising=False)
+    monkeypatch.setattr(us, "_notify_admins", fake_notify)
+    us._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await us._check_github()
+        assert notices == []
+        assert read_json(us.state_path)["available"]["version"] == "0.1.1"
+
+        latest["version"] = "0.1.2"
+        await us._check_github()
+    finally:
+        await us._http.aclose()
+
+    assert len(notices) == 1
+    assert "当前：<code>v0.1.1</code>" in notices[0]
+    assert "最新：<code>v0.1.2</code>" in notices[0]
+    assert read_json(us.state_path)["available"]["notifiedVersion"] == "0.1.2"
