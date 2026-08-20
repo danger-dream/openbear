@@ -281,6 +281,12 @@ export function agentCompactionActivityView(event = {}) {
 }
 
 export function isActiveAgentEvent(event = {}, state = {}) {
+  const operation = object(event?.operation);
+  const operationStatus = text(operation.status || object(operation.payload).status);
+  if (
+    text(operation.lifecycle) === "terminal"
+    || ["completed", "partial", "failed", "cancelled", "interrupted"].includes(operationStatus)
+  ) return false;
   const rows = array(state?.rows);
   if (rows.some((row) => ACTIVE_AGENT_STATUSES.has(text(row?.status)))) return true;
   return Boolean(event?.live && text(state?.summary?.cls) === "running");

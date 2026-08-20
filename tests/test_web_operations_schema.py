@@ -77,6 +77,25 @@ def test_agent_stop_result_is_control_and_only_patches_existing_agent_task():
     assert control_spec["payload"]["task"]["status"] == "cancelled"
 
 
+def test_agent_launch_failure_without_task_uuid_is_terminal_immediately():
+    specs = tool_event_operation_specs(
+        "tool_result",
+        turn_uuid="turn-1",
+        tool_call_id="failed-launch",
+        name="Agent",
+        arguments='{"workerType":"missing-preset","description":"审查代码"}',
+        result='{"ok":false,"error":"agent_preset_not_found","status":"failed"}',
+    )
+
+    agent_spec = [spec for spec in specs if spec["op_type"] == "agent"][-1]
+    assert agent_spec["op_id"] == "agent:failed-launch"
+    assert agent_spec["action"] == "error"
+    assert agent_spec["status"] == "failed"
+    assert agent_spec["lifecycle"] == "terminal"
+    assert agent_spec["payload"]["status"] == "failed"
+    assert agent_spec["payload"]["taskUuid"] == ""
+
+
 def test_root_retry_wait_maps_each_attempt_to_stable_model_retry_operation():
     event = {
         "type": "retry_wait",

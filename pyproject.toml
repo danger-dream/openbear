@@ -1,6 +1,6 @@
 [project]
 name = "openbear"
-version = "0.1.0"
+version = "0.1.1"
 description = "单人自用 Agent Web 控制台：多协议接入 Parrot（anthropic/chat/responses）+ 工具 + skills + Web 记忆系统"
 requires-python = ">=3.11"
 dependencies = [

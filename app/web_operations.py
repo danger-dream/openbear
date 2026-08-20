@@ -653,6 +653,12 @@ def tool_event_operation_specs(
                 })
             action = "patch"
             status = ""
+            if is_agent and not agent_task_uuid:
+                parsed_result = json_loads_dict(str(result or ""))
+                if parsed_result.get("ok") is False or parsed_result.get("error"):
+                    status = "failed"
+                    next_payload["status"] = status
+                    action = "error"
             if tool_name == "AgentStop":
                 parsed_result = json_loads_dict(str(result or ""))
                 task_result = parsed_result.get("task") if isinstance(parsed_result.get("task"), dict) else None

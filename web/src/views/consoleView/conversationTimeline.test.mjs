@@ -5,6 +5,7 @@ import {readFileSync} from "node:fs";
 import {conversationTimelineEntries, isConversationTimelineEvent, shouldRenderAssistantDivider} from "./conversationTimeline.js";
 
 const turnListSource = readFileSync(new URL("./TurnList.vue", import.meta.url), "utf8");
+const workDetailPanelSource = readFileSync(new URL("./TurnWorkDetailPanel.vue", import.meta.url), "utf8");
 const agentToolNames = new Set(["Agent", "AgentMessage", "AgentStop"]);
 const isAgentFixture = (event) => agentToolNames.has(event?.toolName);
 const canonicalCompaction = {
@@ -56,6 +57,22 @@ test("Agent events keep their source positions while ordinary tools remain filte
 		"answer-before", "agent-live", "compaction", "agent-start", "retry", "agent-message", "agent-stop", "answer-after",
 	]);
 	assert.match(turnListSource, /conversationTimelineEntries\(displayEvents\(turn\), eventPrimaryToolName, isAgentEvent\)/);
+});
+
+test("failed Agent stays out of the main conversation but remains available to work detail", () => {
+	const events = [
+		{kind: "tool", id: "running", toolName: "Agent", operation: {status: "running", lifecycle: "active", payload: {status: "running"}}},
+		{kind: "tool", id: "failed-task", toolName: "Agent", operation: {status: "failed", lifecycle: "terminal", payload: {task: {status: "failed"}}}},
+		{kind: "tool", id: "failed-launch", toolName: "Agent", operation: {status: "failed", lifecycle: "terminal", payload: {status: "failed", taskUuid: ""}}},
+		{kind: "tool", id: "completed", toolName: "Agent", operation: {status: "completed", lifecycle: "terminal", payload: {task: {status: "completed"}}}},
+		{kind: "tool", id: "partial", toolName: "Agent", operation: {status: "partial", lifecycle: "terminal", payload: {status: "partial"}}},
+		{kind: "tool", id: "cancelled", toolName: "Agent", operation: {status: "cancelled", lifecycle: "terminal", payload: {status: "cancelled"}}},
+	];
+	const entries = conversationTimelineEntries(events, (event) => event.toolName || "", isAgentFixture);
+
+	assert.deepEqual(entries.map(({event}) => event.id), ["running", "completed", "partial", "cancelled"]);
+	assert.equal(events.length, 6, "main timeline filtering must not delete source work events");
+	assert.match(workDetailPanelSource, /sourceEvents = computed\(\(\) => Array\.isArray\(props\.turn\?\.events\) \? props\.turn\.events : \[\]\)/);
 });
 
 test("typed and legacy UserInteraction remain in the main timeline while ordinary tools stay filtered", () => {

@@ -45,3 +45,37 @@ test("Agent activity uses Read description before path metadata", () => {
 	});
 	assert.equal(message, "调用工具 Read · 核对 Read 工具的 schema");
 });
+
+
+test("Agent launch failure without taskUuid does not keep a queued fallback row", () => {
+	const resultText = JSON.stringify({ok: false, error: "agent_preset_not_found", status: "failed"});
+	const event = {
+		kind: "tool",
+		live: false,
+		toolName: "Agent",
+		calls: [{
+			id: "failed-launch",
+			name: "Agent",
+			arguments: JSON.stringify({workerType: "missing-preset", description: "审查代码"}),
+		}],
+		result: {content: resultText},
+		livePayload: {
+			toolName: "Agent",
+			status: "failed",
+			taskUuid: "",
+			resultText,
+		},
+		operation: {
+			status: "failed",
+			lifecycle: "terminal",
+			payload: {status: "failed"},
+		},
+	};
+
+	const state = display.agentDisplayState(event);
+	assert.equal(state.summary.cls, "error");
+	assert.equal(state.summary.label, "执行失败");
+	assert.equal(state.rows.length, 1);
+	assert.equal(state.rows[0].status, "failed");
+	assert.equal(state.rows[0].current, "启动失败");
+});

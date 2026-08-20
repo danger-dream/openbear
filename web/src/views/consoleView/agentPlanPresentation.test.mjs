@@ -231,6 +231,23 @@ test("persisted tool-kind Agent cards remain active for WS-driven updates", () =
   assert.equal(isActiveAgentEvent({...event, live: false}, {...state, rows: [{status: "completed"}], summary: {cls: "success"}}), false);
 });
 
+test("terminal Agent operation overrides a stale queued fallback row", () => {
+  const event = {
+    kind: "tool",
+    live: false,
+    operation: {
+      status: "failed",
+      lifecycle: "terminal",
+      payload: {status: "failed"},
+    },
+  };
+  const state = {
+    summary: {cls: "error"},
+    rows: [{status: "queued"}],
+  };
+  assert.equal(isActiveAgentEvent(event, state), false);
+});
+
 function completedSnapshot() {
   return {
     task: {

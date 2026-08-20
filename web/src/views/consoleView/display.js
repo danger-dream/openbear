@@ -753,7 +753,17 @@ export function agentRows(event) {
 		}];
 	} else {
 		const items = Array.isArray(args.items) ? args.items : Object.keys(args).length ? [args] : [];
-		value = items.map(agentItemFromArgs);
+		const status = agentOverallStatus(event);
+		value = items.map((item) => ({
+			...agentItemFromArgs(item),
+			status,
+			current: status === "completed" ? "任务完成"
+				: status === "failed" ? "启动失败"
+					: status === "cancelled" ? "已取消"
+						: status === "interrupted" ? "已中断"
+							: status === "queued" ? "等待调度"
+								: status,
+		}));
 	}
 	if (event && typeof event === "object") {
 		agentRowsMemo.set(event, {
