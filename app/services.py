@@ -23,6 +23,7 @@ from app.llm.client import HTTPClient
 from app.llm.factory import BackendFactory
 from app.logging import get_logger
 from app.mcp.manager import MCPManager
+from app.mcp.oauth import MCPAuthManager
 from app.memory.builtin import BuiltinMemoryClient
 from app.memory.client import MemoryClient
 from app.models.selection import ModelSelection
@@ -68,6 +69,9 @@ class Services:
             total_timeout_s=config.agent.llm_total_timeout_s,
         )
         self.db = DB(config.storage.db_path)
+        # OAuth credentials are encrypted by this manager and never enter the
+        # JSON config, MCP tool metadata, or model context.
+        self.mcp_oauth = MCPAuthManager(self.db)
         self.messages = MessageDAO(self.db)
         self.summaries = SummaryDAO(self.db)
         self.operation_locks = ChatOperationLocks()
@@ -89,6 +93,7 @@ class Services:
             db=self.db,
             approval_updater=self._update_mcp_server_approval,
             tools_changed_callback=self._on_mcp_tools_changed,
+            oauth_manager=self.mcp_oauth,
         )
         self._mcp_reload_lock = asyncio.Lock()
         self._mcp_reload_generation = 0

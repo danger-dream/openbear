@@ -16,6 +16,7 @@ class MCPServerState(BaseModel):
     last_connected_at: float | None = None
     last_failed_at: float | None = None
     approval: str = "ask"
+    oauth_authorized: bool = False
 
 
 class MCPManagerState(BaseModel):

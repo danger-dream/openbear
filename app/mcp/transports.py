@@ -12,6 +12,7 @@ import contextlib
 import inspect
 import json
 import os
+import re
 import signal
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -22,7 +23,13 @@ import httpx
 
 from app.config import MCPServerConfig
 from app.logging import get_logger
-from app.mcp.errors import MCPConnectionError, MCPServerExited, MCPTimeoutError, MCPToolCallError
+from app.mcp.errors import (
+    MCPAuthRequired,
+    MCPConnectionError,
+    MCPServerExited,
+    MCPTimeoutError,
+    MCPToolCallError,
+)
 from app.mcp.output import expand_header_env, redact_headers, redact_text_secrets
 from app.tools import processes
 
@@ -290,12 +297,23 @@ class StdioJSONRPCTransport(MCPTransport):
 
 
 class StreamableHTTPTransport(MCPTransport):
-    def __init__(self, server_key: str, config: MCPServerConfig) -> None:
+    def __init__(
+        self,
+        server_key: str,
+        config: MCPServerConfig,
+        token_provider: Callable[[bool], Awaitable[str]] | None = None,
+    ) -> None:
         self.server_key = server_key
         self.config = config
         self._client: httpx.AsyncClient | None = None
         self._next_id = 0
+        self._token_provider = token_provider
         self._base_headers = expand_header_env(config.headers)
+        if config.oauth and config.oauth.enabled:
+            self._base_headers = {
+                key: value for key, value in self._base_headers.items()
+                if key.lower() != "authorization"
+            }
         self._session_id = ""
         self._protocol_version = ""
 
@@ -316,12 +334,14 @@ class StreamableHTTPTransport(MCPTransport):
         self._next_id += 1
         request_id = self._next_id
         payload = {"jsonrpc": _JSONRPC_VERSION, "id": request_id, "method": method, "params": params or {}}
+        request_timeout = float(timeout_s or self.config.tool_call_timeout_s or 120)
+        headers = await self._request_headers()
         try:
             resp = await self._client.post(
                 self.config.url,
                 json=payload,
-                headers=self._request_headers(),
-                timeout=float(timeout_s or self.config.tool_call_timeout_s or 120),
+                headers=headers,
+                timeout=request_timeout,
             )
         except TimeoutError as exc:
             raise MCPTimeoutError(f"MCP {self.server_key} {method} timeout after {timeout_s}s") from exc
@@ -330,6 +350,32 @@ class StreamableHTTPTransport(MCPTransport):
         except httpx.HTTPError as exc:
             raise MCPConnectionError(f"MCP {self.server_key} HTTP error: {type(exc).__name__}: {exc}") from exc
         self._capture_session_headers(resp)
+        if resp.status_code == 401 and self._oauth_enabled():
+            try:
+                refreshed_headers = await self._request_headers(force_refresh=True)
+            except Exception as exc:
+                log.warning("mcp.oauth.refresh_failed", server=self.server_key, error=type(exc).__name__)
+                refreshed_headers = headers
+            if refreshed_headers.get("Authorization") and refreshed_headers.get("Authorization") != headers.get("Authorization"):
+                try:
+                    resp = await self._client.post(
+                        self.config.url,
+                        json=payload,
+                        headers=refreshed_headers,
+                        timeout=request_timeout,
+                    )
+                except TimeoutError as exc:
+                    raise MCPTimeoutError(f"MCP {self.server_key} {method} timeout after {timeout_s}s") from exc
+                except httpx.TimeoutException as exc:
+                    raise MCPTimeoutError(f"MCP {self.server_key} {method} timeout after {timeout_s}s") from exc
+                except httpx.HTTPError as exc:
+                    raise MCPConnectionError(f"MCP {self.server_key} HTTP error: {type(exc).__name__}: {exc}") from exc
+                self._capture_session_headers(resp)
+            if resp.status_code == 401:
+                raise MCPAuthRequired(
+                    f"MCP server {self.server_key} OAuth authorization required",
+                    resource_metadata_url=self._resource_metadata_url(resp),
+                )
         if resp.status_code >= 400:
             detail = redact_text_secrets(resp.text[:500])
             raise MCPConnectionError(f"MCP {self.server_key} HTTP {resp.status_code}: {detail}")
@@ -347,7 +393,7 @@ class StreamableHTTPTransport(MCPTransport):
             return
         payload = {"jsonrpc": _JSONRPC_VERSION, "method": method, "params": params or {}}
         with contextlib.suppress(Exception):
-            resp = await self._client.post(self.config.url, json=payload, headers=self._request_headers(), timeout=5.0)
+            resp = await self._client.post(self.config.url, json=payload, headers=await self._request_headers(), timeout=5.0)
             self._capture_session_headers(resp)
 
     async def close(self) -> None:
@@ -356,16 +402,31 @@ class StreamableHTTPTransport(MCPTransport):
         if client is not None:
             await client.aclose()
 
-    def _request_headers(self) -> dict[str, str]:
-        headers = {
+    async def _request_headers(self, *, force_refresh: bool = False) -> dict[str, str]:
+        headers = dict(self._base_headers)
+        headers.update({
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
-        }
+        })
+        if self._oauth_enabled() and self._token_provider is not None:
+            token = await self._token_provider(force_refresh)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
         if self._session_id:
             headers[_SESSION_HEADER] = self._session_id
         if self._protocol_version:
             headers[_PROTOCOL_HEADER] = self._protocol_version
         return headers
+
+    def _oauth_enabled(self) -> bool:
+        return bool(self.config.oauth and self.config.oauth.enabled and self._token_provider is not None)
+
+    def _resource_metadata_url(self, resp: httpx.Response) -> str:
+        challenge = resp.headers.get("www-authenticate", "")
+        match = re.search(r'resource_metadata="([^"]+)"', challenge, flags=re.I)
+        if match:
+            return match.group(1)
+        return str(getattr(self.config.oauth, "resource_metadata_url", "") or "")
 
     def _capture_session_headers(self, resp: httpx.Response) -> None:
         session_id = resp.headers.get(_SESSION_HEADER) or resp.headers.get(_SESSION_HEADER.lower())
@@ -467,10 +528,14 @@ def _rpc_error_text(error: Any) -> str:
     return str(error or "JSON-RPC error")
 
 
-def make_transport(server_key: str, config: MCPServerConfig) -> MCPTransport:
+def make_transport(
+    server_key: str,
+    config: MCPServerConfig,
+    token_provider: Callable[[bool], Awaitable[str]] | None = None,
+) -> MCPTransport:
     transport = str(config.transport or "stdio").strip().lower()
     if transport == "stdio":
         return StdioJSONRPCTransport(server_key, config)
     if transport == "streamable_http":
-        return StreamableHTTPTransport(server_key, config)
+        return StreamableHTTPTransport(server_key, config, token_provider=token_provider)
     raise MCPConnectionError(f"unsupported MCP transport: {transport}")

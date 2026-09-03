@@ -116,6 +116,7 @@ class WebAdminServer(
         self.rath = rath or RathTaskManager(RathDAO(db))
         self.rath_dao = self.rath.dao
         self.mcp = None
+        self.mcp_oauth = None
         self.tools = tools
         self.messages = messages
         self.config_store = config_store

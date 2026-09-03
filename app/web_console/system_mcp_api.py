@@ -1,12 +1,236 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+import html
+import json
+from urllib.parse import urlparse
+
+from aiohttp import web
+
+from app.config import MCPServerConfig
 from app.config_store import ConfigConflictError
+from app.mcp.oauth import MCPOAuthError
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
 
 class WebAdminSystemMcpMixin:
+    @staticmethod
+    def _mcp_oauth_error_code(exc: Exception) -> str:
+        """Map internal OAuth failures to a small, non-sensitive API vocabulary."""
+        raw = str(exc or "").split(":", 1)[0].strip()
+        allowed = {
+            "oauth_not_configured",
+            "oauth_client_id_missing",
+            "oauth_endpoints_not_discovered",
+            "oauth_redirect_uri_invalid",
+            "oauth_redirect_uri_must_use_https",
+            "oauth_state_invalid_or_expired",
+            "oauth_authorization_denied",
+            "oauth_code_missing",
+            "oauth_storage_unavailable",
+            "oauth_storage_key_unavailable",
+            "oauth_storage_key_invalid",
+            "oauth_token_exchange_failed",
+            "oauth_token_exchange_rejected",
+        }
+        return raw if raw in allowed else "oauth_operation_failed"
+
+    @staticmethod
+    def _mcp_oauth_callback_page(*, server: str, ok: bool, error: str = "") -> web.Response:
+        """Finish OAuth in a tiny popup page without exposing any credential."""
+        message = json.dumps(
+            {"type": "openbear:mcp-oauth", "ok": bool(ok), "server": server, "error": error},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+        title = html.escape("GitHub 授权完成" if ok else "MCP 授权未完成")
+        body = html.escape("已完成授权，可以关闭此窗口。" if ok else "授权未完成，请返回 OpenBear 查看提示后重试。")
+        html_text = f"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>body{{font:15px system-ui,sans-serif;margin:3rem;color:#27272a}}p{{color:#71717a}}</style>
+<h1>{title}</h1>
+<p>{body}</p>
+<script>
+(() => {{
+  const message = {message};
+  try {{ if (window.opener) window.opener.postMessage(message, window.location.origin); }} catch (_) {{}}
+  setTimeout(() => {{ try {{ window.close(); }} catch (_) {{}} }}, 120);
+}})();
+</script>
+"""
+        return web.Response(
+            text=html_text,
+            content_type="text/html",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
+
+    def _mcp_external_base_url(self, request: web.Request) -> str:
+        """Resolve the public Web origin used for a default OAuth callback."""
+        config = getattr(self, "config", None)
+        web_config = getattr(config, "web", None)
+        configured = str(getattr(web_config, "custom_url", "") or "").strip()
+        if configured:
+            parsed = urlparse(configured)
+            if parsed.scheme in {"http", "https"} and parsed.netloc and not parsed.username and not parsed.password:
+                return configured.rstrip("/")
+        host = (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "").split(",", 1)[0].strip()
+        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",", 1)[0].strip().lower()
+        parsed = urlparse(f"{proto}://{host}")
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    def _mcp_oauth_context(self, server: str) -> tuple[Any, MCPServerConfig, Any] | None:
+        manager = getattr(self, "mcp", None)
+        oauth_manager = getattr(manager, "oauth_manager", None) if manager is not None else None
+        configured_servers = getattr(getattr(manager, "mcp_config", None), "servers", {}) if manager is not None else {}
+        config = configured_servers.get(server) if isinstance(configured_servers, dict) else None
+        if manager is None or oauth_manager is None or not isinstance(config, MCPServerConfig):
+            return None
+        return manager, config, oauth_manager
+
+    async def handle_api_mcp_oauth_status(self, request: web.Request) -> web.Response:
+        server = str(request.match_info.get("server") or "").strip()
+        if not server:
+            return web.json_response({"ok": False, "error": "server_required"}, status=400)
+        context = self._mcp_oauth_context(server)
+        if context is None:
+            return web.json_response({"ok": False, "error": "mcp_oauth_unavailable", "server": server}, status=503)
+        _manager, config, oauth_manager = context
+        try:
+            oauth_status = await oauth_manager.status(server, config)
+        except Exception as exc:
+            log.warning("Web MCP OAuth status failed", 错误类型=type(exc).__name__, server=server)
+            return web.json_response({"ok": False, "error": "oauth_status_unavailable", "server": server}, status=500)
+        return web.json_response({
+            "ok": True,
+            "server": server,
+            "oauth": oauth_status,
+            "sensitiveConfigHidden": True,
+        })
+
+    async def handle_api_mcp_oauth_authorize(self, request: web.Request) -> web.Response:
+        server = str(request.match_info.get("server") or "").strip()
+        if not server:
+            return web.json_response({"ok": False, "error": "server_required"}, status=400)
+        context = self._mcp_oauth_context(server)
+        if context is None:
+            return web.json_response({"ok": False, "error": "mcp_oauth_unavailable", "server": server}, status=503)
+        _manager, config, oauth_manager = context
+        try:
+            result = await oauth_manager.begin_authorization(
+                server,
+                config,
+                external_base_url=self._mcp_external_base_url(request),
+            )
+        except Exception as exc:
+            code = self._mcp_oauth_error_code(exc)
+            log.warning("Web MCP OAuth authorization start failed", 错误类型=type(exc).__name__, server=server, error=code)
+            return web.json_response({"ok": False, "error": code, "server": server}, status=400)
+        session: WebSession = request[_WEB_SESSION_KEY]
+        await self.audit(
+            "web.mcp.oauth.authorize.started",
+            actor="web",
+            chat_id=session.chat_id,
+            ip=request.remote or "",
+            detail={
+                "server": server,
+                "authorizationServer": str(result.get("authorizationServer") or "")[:200],
+                "scopes": [str(item)[:120] for item in result.get("scopes", [])[:50]],
+            },
+        )
+        return web.json_response({"ok": True, "server": server, **result, "sensitiveConfigHidden": True})
+
+    async def handle_api_mcp_oauth_revoke(self, request: web.Request) -> web.Response:
+        server = str(request.match_info.get("server") or "").strip()
+        if not server:
+            return web.json_response({"ok": False, "error": "server_required"}, status=400)
+        context = self._mcp_oauth_context(server)
+        if context is None:
+            return web.json_response({"ok": False, "error": "mcp_oauth_unavailable", "server": server}, status=503)
+        _manager, _config, oauth_manager = context
+        session: WebSession = request[_WEB_SESSION_KEY]
+        try:
+            revoked = bool(await oauth_manager.revoke(server))
+        except Exception as exc:
+            log.warning("Web MCP OAuth revoke failed", 错误类型=type(exc).__name__, server=server)
+            return web.json_response({"ok": False, "error": "oauth_revoke_failed", "server": server}, status=500)
+
+        reloaded = False
+        reload_error = ""
+        if self._mcp_reload_hook is not None:
+            try:
+                reload_result = await self._mcp_reload_hook()
+                reloaded = bool(reload_result.get("ok"))
+                if not reloaded:
+                    reload_error = "mcp_reload_failed"
+            except Exception as exc:
+                reload_error = "mcp_reload_failed"
+                log.warning("Web MCP OAuth revoke reload failed", 错误类型=type(exc).__name__, server=server)
+        await self.audit(
+            "web.mcp.oauth.revoked",
+            actor="web",
+            chat_id=session.chat_id,
+            ip=request.remote or "",
+            detail={"server": server, "revoked": revoked, "reloaded": reloaded, "reloadError": reload_error},
+        )
+        return web.json_response({
+            "ok": True,
+            "server": server,
+            "revoked": revoked,
+            "reloaded": reloaded,
+            "reloadError": reload_error,
+            "sensitiveConfigHidden": True,
+        })
+
+    async def handle_api_mcp_oauth_callback(self, request: web.Request) -> web.Response:
+        """Exchange the one-time authorization code; this route is intentionally public."""
+        server = str(request.match_info.get("server") or "").strip()
+        context = self._mcp_oauth_context(server) if server else None
+        if context is None:
+            return self._mcp_oauth_callback_page(server=server, ok=False, error="mcp_oauth_unavailable")
+        _manager, config, oauth_manager = context
+        params = {key: value for key, value in request.query.items() if key in {"state", "code", "error"}}
+        try:
+            result = await oauth_manager.complete_authorization(server, config, params)
+        except Exception as exc:
+            code = self._mcp_oauth_error_code(exc)
+            log.warning("MCP OAuth callback failed", 错误类型=type(exc).__name__, server=server, error=code)
+            await self.audit(
+                "web.mcp.oauth.callback",
+                actor="web_oauth",
+                ip=request.remote or "",
+                detail={"server": server, "ok": False, "error": code},
+            )
+            return self._mcp_oauth_callback_page(server=server, ok=False, error=code)
+
+        reloaded = False
+        if self._mcp_reload_hook is not None:
+            try:
+                reload_result = await self._mcp_reload_hook()
+                reloaded = bool(reload_result.get("ok"))
+            except Exception as exc:
+                log.warning("MCP OAuth callback reload failed", 错误类型=type(exc).__name__, server=server)
+        await self.audit(
+            "web.mcp.oauth.callback",
+            actor="web_oauth",
+            ip=request.remote or "",
+            detail={
+                "server": server,
+                "ok": True,
+                "reloaded": reloaded,
+                "scopes": [str(item)[:120] for item in result.get("scopes", [])[:50]],
+            },
+        )
+        return self._mcp_oauth_callback_page(server=server, ok=True)
+
     async def _running_operations_json(self, *, limit: int = 8) -> list[dict[str, Any]]:
         try:
             cur = await self.db.conn.execute(
@@ -262,10 +486,24 @@ class WebAdminSystemMcpMixin:
             approval_counts[meta.approval] = int(approval_counts.get(meta.approval, 0)) + 1
 
         configured_servers = getattr(getattr(manager, "mcp_config", None), "servers", {}) or {}
+        oauth_manager = getattr(manager, "oauth_manager", None)
         servers = []
         for server in snapshot.servers:
             cfg = configured_servers.get(server.key)
             counts = tools_by_server.get(server.key, {"total": 0, "visible": 0, "filtered": 0, "riskCounts": {}, "approvalCounts": {}})
+            oauth_status = {
+                "enabled": bool(getattr(getattr(cfg, "oauth", None), "enabled", False)),
+                "configured": False,
+                "authorized": False,
+                "expiresAt": 0,
+                "scopes": [],
+                "hasRefreshToken": False,
+            }
+            if oauth_manager is not None:
+                try:
+                    oauth_status = await oauth_manager.status(server.key, cfg)
+                except Exception:
+                    oauth_status["error"] = "oauth_status_unavailable"
             servers.append({
                 "key": server.key,
                 "name": server.key,
@@ -289,6 +527,7 @@ class WebAdminSystemMcpMixin:
                 "lastFailed": server.last_failed_at,
                 "errorPresent": bool(server.error),
                 "errorHidden": bool(server.error),
+                "oauth": oauth_status,
             })
 
         tools = [
@@ -327,6 +566,7 @@ class WebAdminSystemMcpMixin:
             "failedCount": int(status_counts.get("failed", 0)),
             "disabledCount": int(status_counts.get("disabled", 0)),
             "pendingCount": int(status_counts.get("pending", 0)),
+            "authRequiredCount": int(status_counts.get("auth_required", 0)),
             "totalTools": len(all_tool_meta),
             "visibleTools": len(visible_tools),
             "filteredTools": len(filtered_tools),
