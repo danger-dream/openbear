@@ -88,5 +88,6 @@ curl -fsS http://127.0.0.1:18961/health
 
 - 真实配置在 `openbear.json`，包含 Bot Token 和模型密钥，不要提交或外传
 - 仓库里只有 `openbear.json.example`
+- MCP 远程 OAuth（例如 GitHub MCP）只写 Client ID / Secret 引用；access/refresh token 加密落 SQLite，加密钥在 `.mcp-oauth.key`，都不进 git、不进 Web API、不进模型上下文
 - 数据库、工作区、skills、MCP 安装目录都不会进入 git
 - 一台机器默认只跑一份 `openbear.service`；同一个 Bot 也不要同时被两套实例 polling

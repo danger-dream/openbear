@@ -8,6 +8,7 @@ openbear.json.tmp
 !.env.example
 
 # ─── 运行时数据 ──────────────────────────────────────────────
+.mcp-oauth.key
 data/
 logs/
 *.log

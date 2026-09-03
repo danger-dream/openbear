@@ -91,6 +91,9 @@ export const Api = {
   ackSystemUpdate: (data = {}) => api.post("/system/update/ack", data).then(unwrap),
 
   mcpStatus: () => api.get("/mcp/status").then(unwrap),
+  mcpOAuthStatus: (serverKey) => api.get(`/mcp/oauth/status/${encodeURIComponent(serverKey)}`).then(unwrap),
+  mcpOAuthAuthorize: (serverKey) => api.post(`/mcp/oauth/authorize/${encodeURIComponent(serverKey)}`, {}, { timeout: 30000 }).then(unwrap),
+  mcpOAuthRevoke: (serverKey) => api.post(`/mcp/oauth/revoke/${encodeURIComponent(serverKey)}`, {}).then(unwrap),
   setMcpEnabled: (enabled) => api.patch("/mcp/enabled", { enabled }).then(unwrap),
   setMcpServerEnabled: (serverKey, enabled) => api.patch(`/mcp/servers/${encodeURIComponent(serverKey)}/enabled`, { enabled }).then(unwrap),
   setMcpServerApproval: (serverKey, approval) => api.patch(`/mcp/servers/${encodeURIComponent(serverKey)}/approval`, { approval }).then(unwrap),

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 
@@ -9,6 +9,7 @@ const loading = ref(false);
 const reloading = ref(false);
 const mcpToggling = ref(false);
 const serverTogglingKeys = ref(new Set());
+const oauthBusyKeys = ref(new Set());
 const status = ref({ ok: true, enabled: false, summary: {}, servers: [], tools: [], prompts: [], note: "" });
 const query = ref("");
 const drawerOpen = ref(false);
@@ -23,6 +24,7 @@ const STATUS_TEXT = {
   failed: "连接失败",
   disabled: "已停用",
   pending: "连接中",
+  auth_required: "待授权",
   stopped: "已停止",
   unknown: "未知状态",
 };
@@ -98,6 +100,35 @@ function filterReasonText(value) {
 function enabledText(value) {
   return value ? "已启用" : "已禁用";
 }
+function oauthFor(row) {
+  const oauth = row?.oauth;
+  return oauth && typeof oauth === "object" ? oauth : {
+    enabled: false,
+    configured: false,
+    authorized: false,
+    expiresAt: 0,
+    scopes: [],
+  };
+}
+function oauthStatusText(row) {
+  const oauth = oauthFor(row);
+  if (!oauth.enabled) return "未启用";
+  if (!oauth.configured) return "待配置";
+  return oauth.authorized ? "已授权" : "待授权";
+}
+function oauthStatusType(row) {
+  const oauth = oauthFor(row);
+  if (!oauth.enabled || !oauth.configured) return "info";
+  return oauth.authorized ? "success" : "warning";
+}
+function oauthExpiryText(row) {
+  const oauth = oauthFor(row);
+  if (!oauth.authorized) return "—";
+  return oauth.expiresAt ? formatTime(oauth.expiresAt) : "长期有效";
+}
+function oauthScopeText(row) {
+  return asArray(oauthFor(row).scopes).slice(0, 12).join("、") || "由授权服务器返回";
+}
 function boolText(value) {
   return value ? "是" : "否";
 }
@@ -146,7 +177,7 @@ function statusType(value) {
   const statusValue = String(value || "");
   if (statusValue === "connected") return "success";
   if (statusValue === "failed") return "danger";
-  if (statusValue === "pending") return "warning";
+  if (statusValue === "pending" || statusValue === "auth_required") return "warning";
   if (statusValue === "disabled" || statusValue === "stopped") return "info";
   return "info";
 }
@@ -525,6 +556,76 @@ function setServerApprovalLocal(key, approval) {
     drawerItem.value = { ...drawerItem.value, approval };
   }
 }
+function isOauthBusy(row) {
+  return oauthBusyKeys.value.has(serverKey(row));
+}
+function setOauthBusy(key, value) {
+  const next = new Set(oauthBusyKeys.value);
+  if (value) next.add(key);
+  else next.delete(key);
+  oauthBusyKeys.value = next;
+}
+async function authorizeMcp(row) {
+  const key = serverKey(row);
+  if (!key || isOauthBusy(row)) return;
+  setOauthBusy(key, true);
+  let popup = null;
+  try {
+    popup = window.open("about:blank", `openbear-mcp-oauth-${encodeURIComponent(key)}`, "popup=yes,width=620,height=760,resizable=yes,scrollbars=yes");
+    const data = okOrThrow(await Api.mcpOAuthAuthorize(key));
+    const url = String(data?.authorizationUrl || "").trim();
+    if (!url) throw new Error("授权地址为空");
+    if (!popup || popup.closed) {
+      if (popup && popup.closed) popup.close();
+      throw new Error("浏览器阻止了授权窗口，请允许此站点打开弹窗后重试");
+    }
+    popup.location.href = url;
+    ElMessage.info("已打开 GitHub 授权窗口，完成后本页会自动刷新状态");
+  } catch (error) {
+    if (popup && !popup.closed) popup.close();
+    ElMessage.error(apiError(error));
+  } finally {
+    setOauthBusy(key, false);
+  }
+}
+async function revokeMcp(row) {
+  const key = serverKey(row);
+  if (!key || isOauthBusy(row)) return;
+  try {
+    await ElMessageBox.confirm(
+      `撤回「${serverName(row)}」的 GitHub OAuth 授权？OpenBear 会删除本地加密凭据并断开此 MCP；之后仍可重新授权。`,
+      "撤回 GitHub 授权",
+      { type: "warning", confirmButtonText: "撤回授权", cancelButtonText: "取消" },
+    );
+  } catch {
+    return;
+  }
+  setOauthBusy(key, true);
+  try {
+    const result = okOrThrow(await Api.mcpOAuthRevoke(key));
+    ElMessage.success(result.revoked ? "GitHub OAuth 授权已撤回" : "本地 OAuth 凭据已清理");
+    await load({ silent: true });
+  } catch (error) {
+    ElMessage.error(apiError(error));
+    await load({ silent: true });
+  } finally {
+    setOauthBusy(key, false);
+  }
+}
+function handleMcpOAuthMessage(event) {
+  if (event.origin !== window.location.origin) return;
+  const data = event.data;
+  if (!data || typeof data !== "object" || data.type !== "openbear:mcp-oauth") return;
+  const key = String(data.server || "").trim();
+  if (!key) return;
+  if (data.ok) {
+    ElMessage.success(`MCP「${key}」GitHub OAuth 授权完成`);
+  } else {
+    ElMessage.error(`MCP「${key}」OAuth 未完成：${String(data.error || "授权失败")}`);
+  }
+  setOauthBusy(key, false);
+  void load({ silent: true });
+}
 function syncDrawerItem() {
   if (!drawerOpen.value || !drawerItem.value) return;
   if (drawerKind.value === "server") {
@@ -702,7 +803,13 @@ async function reloadMcp() {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  window.addEventListener("message", handleMcpOAuthMessage);
+  void load();
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("message", handleMcpOAuthMessage);
+});
 </script>
 
 <template>
@@ -848,6 +955,25 @@ onMounted(load);
             最近存在连接错误，错误明文已隐藏
           </div>
 
+          <section v-if="oauthFor(card).enabled" class="mcp-oauth-panel" :class="oauthFor(card).authorized ? 'is-authorized' : 'is-pending'">
+            <div class="flex items-center justify-between gap-3">
+              <div class="flex min-w-0 items-center gap-2">
+                <span class="text-xs font-semibold text-zinc-800">GitHub OAuth</span>
+                <el-tag size="small" round :type="oauthStatusType(card)">{{ oauthStatusText(card) }}</el-tag>
+              </div>
+              <span v-if="oauthFor(card).authorized" class="text-[11px] text-macsub">{{ oauthExpiryText(card) }}</span>
+            </div>
+            <p v-if="!oauthFor(card).configured" class="mt-2 text-xs leading-5 text-amber-800">请先在 MCP 配置中填写 OAuth Client ID；凭据不会写入配置文件。</p>
+            <p v-else-if="oauthFor(card).authorized" class="mt-2 text-xs leading-5 text-zinc-600">访问令牌仅在服务器端加密保存，页面不会读取或展示令牌。</p>
+            <p v-else class="mt-2 text-xs leading-5 text-zinc-600">需要在 GitHub 完成一次授权。授权范围：{{ oauthScopeText(card) }}</p>
+            <div class="mt-3 flex flex-wrap items-center gap-2">
+              <el-button v-if="!oauthFor(card).authorized" size="small" type="primary" plain round :loading="isOauthBusy(card)" :disabled="!oauthFor(card).configured" @click="authorizeMcp(card)">授权 GitHub</el-button>
+              <el-button v-else size="small" type="danger" plain round :loading="isOauthBusy(card)" @click="revokeMcp(card)">撤回授权</el-button>
+              <a v-if="!oauthFor(card).configured && settingsEntryAvailable" href="/settings" class="text-xs text-macblue hover:underline">去配置</a>
+            </div>
+            <div v-if="oauthFor(card).authorized && oauthFor(card).scopes?.length" class="mt-2 text-[11px] leading-5 text-macsub">已授权范围：{{ oauthScopeText(card) }}</div>
+          </section>
+
           <p class="mcp-intro" :title="compactServerIntro(card)">{{ compactServerIntro(card) }}</p>
 
           <div class="mcp-tool-preview">
@@ -919,6 +1045,24 @@ onMounted(load);
             <el-descriptions-item label="最近失败">{{ formatTime(drawerItem.lastFailedAt) }}</el-descriptions-item>
             <el-descriptions-item label="错误明文">{{ drawerItem.errorPresent ? '已隐藏' : '无' }}</el-descriptions-item>
           </el-descriptions>
+
+          <section v-if="oauthFor(drawerItem).enabled" class="mcp-oauth-panel" :class="oauthFor(drawerItem).authorized ? 'is-authorized' : 'is-pending'">
+            <div class="flex items-center justify-between gap-3">
+              <div class="flex min-w-0 items-center gap-2">
+                <span class="text-sm font-semibold text-zinc-800">GitHub OAuth</span>
+                <el-tag size="small" round :type="oauthStatusType(drawerItem)">{{ oauthStatusText(drawerItem) }}</el-tag>
+              </div>
+              <span v-if="oauthFor(drawerItem).authorized" class="text-xs text-macsub">{{ oauthExpiryText(drawerItem) }}</span>
+            </div>
+            <p class="mt-2 text-xs leading-5 text-zinc-600">令牌只在 OpenBear 服务器端加密保存，Web 页面不会接触令牌明文。</p>
+            <p v-if="oauthFor(drawerItem).authorized" class="mt-1 text-xs leading-5 text-macsub">已授权范围：{{ oauthScopeText(drawerItem) }}</p>
+            <p v-else-if="!oauthFor(drawerItem).configured" class="mt-1 text-xs leading-5 text-amber-800">请先配置 OAuth Client ID。</p>
+            <p v-else class="mt-1 text-xs leading-5 text-macsub">授权范围：{{ oauthScopeText(drawerItem) }}</p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <el-button v-if="!oauthFor(drawerItem).authorized" size="small" type="primary" plain round :loading="isOauthBusy(drawerItem)" :disabled="!oauthFor(drawerItem).configured" @click="authorizeMcp(drawerItem)">授权 GitHub</el-button>
+              <el-button v-else size="small" type="danger" plain round :loading="isOauthBusy(drawerItem)" @click="revokeMcp(drawerItem)">撤回授权</el-button>
+            </div>
+          </section>
 
           <div class="rounded-2xl border border-macborder bg-white p-4">
             <h3 class="mb-2 text-sm font-semibold">简介</h3>
@@ -1126,6 +1270,21 @@ onMounted(load);
   padding: 6px 9px;
   color: #991b1b;
   font-size: 11px;
+}
+.mcp-oauth-panel {
+  margin-top: 12px;
+  border: 1px solid rgba(0, 122, 255, 0.16);
+  border-radius: 14px;
+  background: rgba(239, 246, 255, 0.72);
+  padding: 11px 12px;
+}
+.mcp-oauth-panel.is-authorized {
+  border-color: rgba(16, 185, 129, 0.2);
+  background: rgba(236, 253, 245, 0.72);
+}
+.mcp-oauth-panel.is-pending {
+  border-color: rgba(245, 158, 11, 0.24);
+  background: rgba(255, 251, 235, 0.78);
 }
 .mcp-intro {
   display: -webkit-box;

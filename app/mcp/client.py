@@ -1,10 +1,11 @@
 """MCP client protocol wrapper."""
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.config import MCPServerConfig
-from app.mcp.errors import MCPInitializeError, MCPToolCallError, MCPToolListError
+from app.mcp.errors import MCPAuthRequired, MCPInitializeError, MCPToolCallError, MCPToolListError
 from app.mcp.transports import MCPTransport, NotificationHandler, make_transport
 from app.mcp.types import MCPRawResult, MCPRawTool
 
@@ -13,10 +14,16 @@ _CLIENT_INFO = {"name": "openbear", "version": "0.1.0"}
 
 
 class MCPClient:
-    def __init__(self, server_key: str, config: MCPServerConfig, transport: MCPTransport | None = None) -> None:
+    def __init__(
+        self,
+        server_key: str,
+        config: MCPServerConfig,
+        transport: MCPTransport | None = None,
+        token_provider: Callable[[bool], Awaitable[str]] | None = None,
+    ) -> None:
         self.server_key = server_key
         self.config = config
-        self.transport = transport or make_transport(server_key, config)
+        self.transport = transport or make_transport(server_key, config, token_provider=token_provider)
         self.initialized = False
         self.instructions = ""
 
@@ -39,12 +46,16 @@ class MCPClient:
                 self.instructions = str(result.get("instructions") or "").strip()
             await self.transport.notify("notifications/initialized", {})
             self.initialized = True
+        except MCPAuthRequired:
+            raise
         except Exception as exc:
             raise MCPInitializeError(f"MCP server {self.server_key} initialize failed: {type(exc).__name__}: {exc}") from exc
 
     async def list_tools(self) -> list[MCPRawTool]:
         try:
             raw_tools = await self._list_paginated("tools/list", "tools")
+        except MCPAuthRequired:
+            raise
         except Exception as exc:
             raise MCPToolListError(f"MCP server {self.server_key} tools/list failed: {type(exc).__name__}: {exc}") from exc
         tools: list[MCPRawTool] = []
@@ -96,6 +107,8 @@ class MCPClient:
                 {"name": name, "arguments": arguments or {}},
                 timeout_s=float(self.config.tool_call_timeout_s or 120),
             )
+        except MCPAuthRequired:
+            raise
         except Exception as exc:
             raise MCPToolCallError(f"MCP server {self.server_key} tool {name} failed: {type(exc).__name__}: {exc}") from exc
         if isinstance(result, dict):

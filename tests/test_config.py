@@ -113,6 +113,31 @@ def test_mcp_server_config_aliases_and_validation():
     assert server.connect_timeout_s == 3
     assert server.tool_call_timeout_s == 5
     assert server.tools.allow == ["read*"]
+    oauth = MCPServerConfig.model_validate({
+        "transport": "streamable_http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "oauth": {
+            "enabled": True,
+            "clientId": " abc ",
+            "clientSecretEnv": "OPENBEAR_GITHUB_OAUTH_CLIENT_SECRET",
+            "scopes": "repo, read:user gist",
+        },
+    }).oauth
+    assert oauth is not None
+    assert oauth.client_id == "abc"
+    assert oauth.scopes == ["repo", "read:user", "gist"]
+    dumped = MCPServerConfig.model_validate({
+        "transport": "streamable_http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "oauth": {
+            "enabled": True,
+            "clientId": "abc",
+            "clientSecretFile": "/run/secrets/github-oauth",
+        },
+    }).model_dump(mode="json", by_alias=True)
+    assert dumped["oauth"]["clientSecretEnv"] == ""
+    assert dumped["oauth"]["clientSecretFile"] == "/run/secrets/github-oauth"
+    assert "accessToken" not in dumped["oauth"]
     with pytest.raises(Exception):
         MCPServerConfig.model_validate({"transport": "sse"})
     with pytest.raises(Exception):

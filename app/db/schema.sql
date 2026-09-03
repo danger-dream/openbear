@@ -481,6 +481,20 @@ CREATE TABLE IF NOT EXISTS app_state (
   updated_at  INTEGER DEFAULT 0
 );
 
+-- MCP OAuth tokens are encrypted application credentials. The encryption key is
+-- kept in a separate mode-0600 file next to the database; plaintext tokens never
+-- enter openbear.json, audit logs, model context, or Web API responses.
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+  server_key   TEXT PRIMARY KEY,
+  ciphertext   TEXT NOT NULL,
+  scopes       TEXT DEFAULT '',
+  expires_at   INTEGER DEFAULT 0,
+  created_at   INTEGER DEFAULT 0,
+  updated_at   INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_expiry
+  ON mcp_oauth_tokens(expires_at);
+
 CREATE TABLE IF NOT EXISTS web_login_requests (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   request_uuid    TEXT NOT NULL UNIQUE,

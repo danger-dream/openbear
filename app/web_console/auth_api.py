@@ -15,6 +15,7 @@ class WebAdminAuthMixin:
             or path.startswith("/assets/")
             or path.startswith("/api/auth/login/status/")
             or path.startswith("/api/auth/login/consume/")
+            or path.startswith("/api/mcp/oauth/callback/")
         ):
             return await handler(request)
         session = await self.session_from_request(request)

@@ -93,7 +93,25 @@
       "*"
     ],
     "denyTools": [],
-    "servers": {}
+    "servers": {
+      "github": {
+        "enabled": true,
+        "transport": "streamable_http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "oauth": {
+          "enabled": true,
+          "clientId": "replace-with-github-oauth-app-client-id",
+          "clientSecretEnv": "OPENBEAR_GITHUB_OAUTH_CLIENT_SECRET",
+          "scopes": [
+            "repo",
+            "read:org",
+            "read:user",
+            "user:email"
+          ]
+        },
+        "approval": "ask"
+      }
+    }
   },
   "rath": {
     "enabled": true,

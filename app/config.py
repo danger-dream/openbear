@@ -448,6 +448,46 @@ class MCPToolFilterConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
+class MCPOAuthConfig(BaseModel):
+    """OAuth settings for a remote MCP resource.
+
+    Tokens never belong in ``openbear.json``.  Secret env/file fields are
+    references to operator-owned credentials, not credential values.
+    """
+
+    enabled: bool = False
+    client_id: str = Field(default="", alias="clientId")
+    client_secret_env: str = Field(default="", alias="clientSecretEnv")
+    client_secret_file: str = Field(default="", alias="clientSecretFile")
+    scopes: list[str] = Field(default_factory=list)
+    authorization_server: str = Field(default="", alias="authorizationServer")
+    authorization_endpoint: str = Field(default="", alias="authorizationEndpoint")
+    token_endpoint: str = Field(default="", alias="tokenEndpoint")
+    resource_metadata_url: str = Field(default="", alias="resourceMetadataUrl")
+    redirect_uri: str = Field(default="", alias="redirectUri")
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    @field_validator(
+        "client_id", "client_secret_env", "client_secret_file", "authorization_server",
+        "authorization_endpoint", "token_endpoint", "resource_metadata_url", "redirect_uri",
+    )
+    @classmethod
+    def _trim_text(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            value = value.replace(",", " ").split()
+        if not isinstance(value, list):
+            raise ValueError("mcp.oauth.scopes 必须是数组或空格/逗号分隔文本")
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))[:50]
+
+
 class MCPServerConfig(BaseModel):
     enabled: bool = True
     transport: Literal["stdio", "streamable_http"] = "stdio"
@@ -464,6 +504,7 @@ class MCPServerConfig(BaseModel):
     # streamable_http
     url: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
+    oauth: MCPOAuthConfig | None = None
 
     required: bool = False
     # None means inherit from mcp.startupTimeoutS / mcp.toolCallTimeoutS.

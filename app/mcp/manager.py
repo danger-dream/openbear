@@ -11,6 +11,7 @@ from app.config import Config, MCPServerConfig
 from app.logging import get_logger
 from app.mcp.audit import record_audit
 from app.mcp.client import MCPClient
+from app.mcp.errors import MCPAuthRequired
 from app.mcp.output import format_mcp_result, redact_text_secrets
 from app.mcp.permissions import build_tool_meta, can_call_without_prompt, summarize_arguments
 from app.mcp.types import MCPManagerState, MCPServerState, MCPToolMeta
@@ -28,6 +29,7 @@ class MCPManager:
         db: Any = None,
         approval_updater: Callable[[str, str], Awaitable[Any]] | None = None,
         tools_changed_callback: Callable[[], Awaitable[Any]] | None = None,
+        oauth_manager: Any = None,
     ) -> None:
         self.config = config
         self.mcp_config = config.mcp
@@ -35,6 +37,7 @@ class MCPManager:
         self.db = db
         self.approval_updater = approval_updater
         self.tools_changed_callback = tools_changed_callback
+        self.oauth_manager = oauth_manager
         self._clients: dict[str, MCPClient] = {}
         self._states: dict[str, MCPServerState] = {}
         self._tools: dict[str, MCPToolMeta] = {}
@@ -91,7 +94,11 @@ class MCPManager:
             approval=_server_approval(self.mcp_config, server_config),
         )
         log.info("mcp.server.starting", server=server_key, transport=server_config.transport, required=server_config.required)
-        client = MCPClient(server_key, server_config)
+        token_provider = None
+        if self.oauth_manager is not None and server_config.oauth and server_config.oauth.enabled:
+            async def token_provider(force: bool = False, *, key: str = server_key, cfg: MCPServerConfig = server_config) -> str:
+                return await self.oauth_manager.provider_token(key, cfg, force)
+        client = MCPClient(server_key, server_config, token_provider=token_provider)
         client.set_notification_handler(
             lambda method, params, key=server_key: self._handle_server_notification(key, method, params)
         )
@@ -145,6 +152,19 @@ class MCPManager:
             if raw_prompts:
                 log.info("mcp.prompts.discovered", server=server_key, total=len(raw_prompts))
             await record_audit(self.db, "mcp.server.started", detail={"server": server_key, "transport": server_config.transport, "tools": visible, "prompts": len(raw_prompts)})
+        except MCPAuthRequired:
+            await client.close()
+            self._states[server_key] = MCPServerState(
+                key=server_key,
+                transport=server_config.transport,
+                status="auth_required",
+                required=server_config.required,
+                error="",
+                last_failed_at=time.time(),
+                approval=_server_approval(self.mcp_config, server_config),
+            )
+            log.info("mcp.server.oauth_required", server=server_key, transport=server_config.transport)
+            await record_audit(self.db, "mcp.server.oauth_required", detail={"server": server_key, "transport": server_config.transport})
         except Exception as exc:
             await client.close()
             err = _short_error(exc)
@@ -305,6 +325,7 @@ class MCPManager:
             interactions=self.interactions,
             db=self.db,
             approval_updater=self.approval_updater,
+            oauth_manager=self.oauth_manager,
         )
         try:
             await fresh.start()
@@ -434,11 +455,23 @@ class MCPManager:
             return _json({"status": "error", "error": "mcp_tool_not_found", "tool": public_tool_name})
         client = self._clients.get(meta.server_key)
         if client is None:
+            state = self._states.get(meta.server_key)
+            if state is not None and state.status == "auth_required":
+                return _json({"status": "error", "error": "mcp_oauth_authorization_required", "server": meta.server_key})
             return _json({"status": "error", "error": "mcp_server_not_connected", "server": meta.server_key})
         if not await self._begin_server_call(meta.server_key):
             return _json({"status": "error", "error": "mcp_server_draining", "server": meta.server_key})
         try:
-            return await self._call_tool_reserved(meta, client, arguments, context)
+            try:
+                return await self._call_tool_reserved(meta, client, arguments, context)
+            except MCPAuthRequired:
+                state = self._states.get(meta.server_key)
+                if state is not None:
+                    state.status = "auth_required"
+                    state.error = ""
+                    state.last_failed_at = time.time()
+                await record_audit(self.db, "mcp.server.oauth_required", detail={"server": meta.server_key, "source": "tool_call"})
+                return _json({"status": "error", "error": "mcp_oauth_authorization_required", "server": meta.server_key})
         finally:
             await self._end_server_call(meta.server_key)
 

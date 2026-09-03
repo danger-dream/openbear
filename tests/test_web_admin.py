@@ -250,6 +250,10 @@ async def test_web_admin_public_exports_and_route_baseline(web_env):
     assert ("GET", "/api/conversations/{conversation_uuid}/artifacts") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/artifacts/{artifact_uuid}/content") in routes
     assert ("GET", "/api/mcp/status") in routes
+    assert ("GET", "/api/mcp/oauth/status/{server}") in routes
+    assert ("POST", "/api/mcp/oauth/authorize/{server}") in routes
+    assert ("POST", "/api/mcp/oauth/revoke/{server}") in routes
+    assert ("GET", "/api/mcp/oauth/callback/{server}") in routes
     assert ("PATCH", "/api/mcp/servers/{server}/approval") in routes
     assert ("POST", "/api/mcp/servers/{server}/uninstall") in routes
     assert ("GET", "/api/rath/tasks") not in routes
