@@ -8,119 +8,8 @@ from app.web_console.core import *
 from app.web_console.live_stream import *
 
 
-def _web_option_label_value(option: Any) -> dict[str, str]:
-    if isinstance(option, dict):
-        label = str(option.get("label") or option.get("text") or option.get("value") or "")
-        value = str(option.get("value") if option.get("value") is not None else label)
-    else:
-        label = str(option or "")
-        value = label
-    return {"label": label, "value": value}
-
-
-def _web_select_defaults(item: dict[str, Any]) -> list[tuple[int, dict[str, str]]]:
-    options = [_web_option_label_value(opt) for opt in item.get("options") or []]
-    default_indexes = {int(x) for x in item.get("defaultIndexes") or [] if isinstance(x, int | float) or str(x).isdigit()}
-    default_values = {str(x) for x in item.get("defaultValues") or []}
-    selected: list[tuple[int, dict[str, str]]] = []
-    for idx, opt in enumerate(options):
-        if idx in default_indexes or opt["value"] in default_values or opt["label"] in default_values:
-            selected.append((idx, opt))
-    if not item.get("multiple") and selected:
-        return selected[:1]
-    return selected
-
-
-def _normalize_web_questionnaire(raw_questions: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    errors: list[dict[str, str]] = []
-    if not isinstance(raw_questions, list) or not raw_questions:
-        return [], [{"path": "questions", "message": "questions must be a non-empty array"}]
-    normalized: list[dict[str, Any]] = []
-    seen_question_ids: set[str] = set()
-    for question_index, raw_question in enumerate(raw_questions):
-        path = f"questions[{question_index}]"
-        if not isinstance(raw_question, dict):
-            errors.append({"path": path, "message": "question must be an object"})
-            continue
-        question_id = str(raw_question.get("id") or "").strip()
-        question_type = str(raw_question.get("type") or "").strip().lower()
-        question_text = raw_question.get("question")
-        if not question_id:
-            errors.append({"path": f"{path}.id", "message": "question id must be a non-empty string"})
-        elif question_id in seen_question_ids:
-            errors.append({"path": f"{path}.id", "message": f"duplicate question id: {question_id}"})
-        else:
-            seen_question_ids.add(question_id)
-        if question_type not in {"choice", "open"}:
-            errors.append({"path": f"{path}.type", "message": "question type must be choice or open"})
-        if not isinstance(question_text, str) or not question_text.strip():
-            errors.append({"path": f"{path}.question", "message": "question must be a non-empty string"})
-        if "description" in raw_question and not isinstance(raw_question.get("description"), str):
-            errors.append({"path": f"{path}.description", "message": "description must be a string"})
-        if "required" in raw_question and not isinstance(raw_question.get("required"), bool):
-            errors.append({"path": f"{path}.required", "message": "required must be a boolean"})
-        normalized_question: dict[str, Any] = {
-            "id": question_id,
-            "type": question_type,
-            "question": question_text if isinstance(question_text, str) else "",
-            "required": raw_question.get("required", True) if isinstance(raw_question.get("required", True), bool) else True,
-        }
-        if "description" in raw_question and isinstance(raw_question.get("description"), str):
-            normalized_question["description"] = raw_question["description"]
-        if question_type == "choice":
-            if "multiple" in raw_question and not isinstance(raw_question.get("multiple"), bool):
-                errors.append({"path": f"{path}.multiple", "message": "multiple must be a boolean"})
-            normalized_question["multiple"] = raw_question.get("multiple", False) if isinstance(raw_question.get("multiple", False), bool) else False
-            raw_options = raw_question.get("options")
-            normalized_options: list[dict[str, str]] = []
-            seen_values: set[str] = set()
-            if not isinstance(raw_options, list) or not raw_options:
-                errors.append({"path": f"{path}.options", "message": "choice options must be a non-empty array"})
-            else:
-                for option_index, raw_option in enumerate(raw_options):
-                    option_path = f"{path}.options[{option_index}]"
-                    if not isinstance(raw_option, dict):
-                        errors.append({"path": option_path, "message": "option must be an object"})
-                        continue
-                    label = raw_option.get("label")
-                    value = raw_option.get("value")
-                    if not isinstance(label, str) or not label.strip():
-                        errors.append({"path": f"{option_path}.label", "message": "option label must be a non-empty string"})
-                    if not isinstance(value, str) or not value.strip():
-                        errors.append({"path": f"{option_path}.value", "message": "option value must be a non-empty string"})
-                    elif value in seen_values:
-                        errors.append({"path": f"{option_path}.value", "message": f"duplicate option value: {value}"})
-                    else:
-                        seen_values.add(value)
-                    if "description" in raw_option and not isinstance(raw_option.get("description"), str):
-                        errors.append({"path": f"{option_path}.description", "message": "option description must be a string"})
-                    normalized_option = {
-                        "label": label if isinstance(label, str) else "",
-                        "value": value if isinstance(value, str) else "",
-                    }
-                    if "description" in raw_option and isinstance(raw_option.get("description"), str):
-                        normalized_option["description"] = raw_option["description"]
-                    normalized_options.append(normalized_option)
-            normalized_question["options"] = normalized_options
-            if "recommendation" in raw_question:
-                recommendation = raw_question.get("recommendation")
-                if not isinstance(recommendation, dict):
-                    errors.append({"path": f"{path}.recommendation", "message": "recommendation must be an object"})
-                else:
-                    values = recommendation.get("values")
-                    reason = recommendation.get("reason")
-                    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
-                        errors.append({"path": f"{path}.recommendation.values", "message": "recommendation values must be an array of strings"})
-                        values = []
-                    for value in values:
-                        if value not in seen_values:
-                            errors.append({"path": f"{path}.recommendation.values", "message": f"unknown recommended option value: {value}"})
-                    if not isinstance(reason, str):
-                        errors.append({"path": f"{path}.recommendation.reason", "message": "recommendation reason must be a string"})
-                        reason = ""
-                    normalized_question["recommendation"] = {"values": list(values), "reason": reason}
-        normalized.append(normalized_question)
-    return normalized, errors
+from app.tools.base import current_tool_context
+from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 
 
 class WebAdminChatStateMixin:
@@ -475,134 +364,39 @@ class WebAdminChatStateMixin:
         return self._model_default_thinking_level(model_label)
 
     def _pending_web_confirmations(self, conversation_uuid: str) -> list[dict[str, Any]]:
-        ids = list(self._web_confirm_by_conversation.get(str(conversation_uuid or ""), set()))
-        out: list[dict[str, Any]] = []
-        now_mono = time.monotonic()
-        for cid in ids:
-            item = self._web_confirmations.get(cid)
-            if not item:
-                continue
-            if now_mono >= float(item.get("expiresAtMono") or 0):
-                continue
-            out.append({
-                "confirmationId": cid,
-                "interactionId": cid,
-                "action": item.get("action") or "confirm",
-                "title": item.get("title") or "请确认",
-                "body": item.get("body") or "",
-                "type": item.get("type") or "warning",
-                "confirmText": item.get("confirmText") or "确认",
-                "cancelText": item.get("cancelText") or "取消",
-                "options": item.get("options") if isinstance(item.get("options"), list) else [],
-                "multiple": bool(item.get("multiple")),
-                "defaultValues": item.get("defaultValues") if isinstance(item.get("defaultValues"), list) else [],
-                "defaultIndexes": item.get("defaultIndexes") if isinstance(item.get("defaultIndexes"), list) else [],
-                "defaultValue": item.get("defaultValue") or "",
-                "sensitive": bool(item.get("sensitive")),
-                **({"questions": item.get("questions") if isinstance(item.get("questions"), list) else []}
-                   if item.get("action") == "questionnaire" else {}),
-                "expiresAtMs": int(item.get("expiresAtMs") or 0),
-            })
-        return sorted(out, key=lambda x: int(x.get("expiresAtMs") or 0))
+        return self.interactions.pending_for(str(conversation_uuid or ""))
+
+    async def _interaction_changed(self, event: str, item: dict[str, Any]) -> None:
+        conv_uuid = str(item.get("conversationUuid") or "")
+        live = self._web_live_streams.get(conv_uuid)
+        if live is not None:
+            # Pending forms are transient authenticated state, not historical
+            # operation payloads. The ledger and tool result persist lifecycle.
+            await live.publish({
+                "type": "web_confirmation", "action": "created" if event == "created" else "resolved",
+                "confirmation": self._pending_web_confirmations(conv_uuid),
+                "confirmationId": item.get("interactionId"),
+            }, persist=False)
 
     async def _web_confirm(self, conversation_uuid: str, payload: dict[str, Any]) -> dict[str, Any]:
         conv_uuid = str(conversation_uuid or "").strip()
         if not conv_uuid:
             return {"status": "error", "confirmed": False, "error": "missing_conversation_uuid"}
-        timeout_s = max(1.0, float(payload.get("timeoutSeconds") or payload.get("timeout") or 600))
-        cid = secrets.token_urlsafe(10).replace("-", "_")
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        now_ms_value = int(time.time() * 1000)
-        action = str(payload.get("action") or "confirm").strip().lower()
-        if action not in {"confirm", "select", "prompt", "questionnaire"}:
-            action = "confirm"
-        questions: list[dict[str, Any]] = []
-        if action == "questionnaire":
-            questions, errors = _normalize_web_questionnaire(payload.get("questions"))
-            if errors:
-                return {
-                    "status": "error",
-                    "error": "invalid_questionnaire",
-                    "message": "Questionnaire validation failed",
-                    "details": errors,
-                }
-        item = {
-            "confirmationId": cid,
-            "conversationUuid": conv_uuid,
-            "action": action,
-            "title": str(payload.get("title") or "请确认"),
-            "body": str(payload.get("body") or payload.get("message") or ""),
-            "type": str(payload.get("type") or payload.get("tone") or "warning"),
-            "confirmText": str(payload.get("confirmText") or ("确认" if action != "confirm" else "确认")),
-            "cancelText": str(payload.get("cancelText") or "取消"),
-            "default": bool(payload.get("default") or payload.get("defaultConfirmed")),
-            "options": payload.get("options") if isinstance(payload.get("options"), list) else [],
-            "multiple": bool(payload.get("multiple") or payload.get("multi")),
-            "defaultValues": payload.get("defaultValues") if isinstance(payload.get("defaultValues"), list) else [],
-            "defaultIndexes": payload.get("defaultIndexes") if isinstance(payload.get("defaultIndexes"), list) else [],
-            "defaultValue": str(payload.get("defaultValue") or payload.get("default") or "") if action == "prompt" else "",
-            "sensitive": bool(payload.get("sensitive") or payload.get("secret")),
-            "questions": questions,
-            "expiresAtMono": time.monotonic() + timeout_s,
-            "expiresAtMs": now_ms_value + int(timeout_s * 1000),
-            "future": future,
-        }
-        self._web_confirmations[cid] = item
-        self._web_confirm_by_conversation.setdefault(conv_uuid, set()).add(cid)
-        live = self._web_live_streams.get(conv_uuid)
-        if live is not None:
-            await live.publish({"type": "web_confirmation", "action": "created", "confirmation": self._pending_web_confirmations(conv_uuid), "confirmationId": cid})
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
-        except TimeoutError:
-            if action == "questionnaire":
-                result = {
-                    "status": "timeout",
-                    "cancelled": True,
-                    "answers": [],
-                    "interactionId": cid,
-                }
-            elif action == "select":
-                selected = _web_select_defaults(item)
-                result = {
-                    "status": "timeout",
-                    "cancelled": False,
-                    "multiple": bool(item.get("multiple")),
-                    "selectedIndexes": [idx for idx, _opt in selected],
-                    "selectedValues": [str(opt.get("value") if opt.get("value") is not None else opt.get("label") or "") for _idx, opt in selected],
-                    "selectedLabels": [str(opt.get("label") or opt.get("value") or "") for _idx, opt in selected],
-                    "interactionId": cid,
-                }
-            elif action == "prompt":
-                result = {
-                    "status": "timeout",
-                    "cancelled": True,
-                    "value": str(item.get("defaultValue") or ""),
-                    "interactionId": cid,
-                }
-            else:
-                result = {
-                    "status": "timeout",
-                    "confirmed": bool(item.get("default")),
-                    "choice": "confirm" if item.get("default") else "cancel",
-                    "label": item.get("confirmText") if item.get("default") else item.get("cancelText"),
-                    "interactionId": cid,
-                }
-            if not future.done():
-                future.set_result(result)
-            return result
-        finally:
-            self._web_confirmations.pop(cid, None)
-            ids = self._web_confirm_by_conversation.get(conv_uuid)
-            if ids is not None:
-                ids.discard(cid)
-                if not ids:
-                    self._web_confirm_by_conversation.pop(conv_uuid, None)
-            live = self._web_live_streams.get(conv_uuid)
-            if live is not None:
-                with contextlib.suppress(Exception):
-                    await live.publish({"type": "web_confirmation", "action": "resolved", "confirmation": self._pending_web_confirmations(conv_uuid), "confirmationId": cid})
+        cur = await self.db.conn.execute(
+            "SELECT owner_chat_id,title FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return {"status": "error", "confirmed": False, "error": "conversation_not_found"}
+        ctx = current_tool_context()
+        result = await self.interactions.request(
+            payload, owner_chat_id=int(row["owner_chat_id"]), conversation_uuid=conv_uuid,
+            conversation_title=str(row["title"] or ""),
+            turn_uuid=str(ctx.turn_uuid or ctx.run_root_turn_uuid or ""), tool_call_id=str(ctx.tool_call_id or ""),
+        )
+        if str(result.get("text") or "").strip():
+            ctx.preserve_user_answer = True
+        return result
 
     async def _project_context_compaction_operations(
         self,

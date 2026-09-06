@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.config import Config, MCPServerConfig
+from app.interaction_data import explicit_authorization
 from app.logging import get_logger
 from app.mcp.audit import record_audit
 from app.mcp.client import MCPClient
@@ -461,14 +462,15 @@ class MCPManager:
             allowed, reason = True, "allowed_by_conversation_grant"
         if not allowed:
             if reason == "confirmation_required":
-                decision = await self._confirm_call(meta, arguments, context)
+                confirmation: dict[str, Any] = {}
+                decision = await self._confirm_call(meta, arguments, context, feedback=confirmation)
                 if decision in {"conversation", "always"}:
                     self._grant_conversation(meta, context)
                 persist_trust = decision == "always"
                 if decision not in {"once", "conversation", "always"}:
                     log.info("mcp.tool.confirm_denied", server=meta.server_key, tool=meta.original_tool_name)
                     await record_audit(self.db, "mcp.tool.denied", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "reason": "user_denied"})
-                    return _json({"status": "denied", "error": "mcp_tool_call_denied", "server": meta.server_key, "tool": meta.original_tool_name})
+                    return _json({"status": "denied", "error": "mcp_tool_call_denied", "server": meta.server_key, "tool": meta.original_tool_name, "confirmation": confirmation, "message": "原操作未执行；如用户提交了文字意见，请先按原文调整，不要把选项单独当成授权。"})
             elif reason == "needs_openbear_control":
                 return _json({
                     "status": "needs_openbear_control",
@@ -516,7 +518,7 @@ class MCPManager:
             await record_audit(self.db, "mcp.tool.failed", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "error": err})
             return _json({"status": "error", "error": "mcp_tool_failed", "server": meta.server_key, "tool": meta.original_tool_name, "detail": err})
 
-    async def _confirm_call(self, meta: MCPToolMeta, arguments: dict[str, Any], context: ToolRuntimeContext) -> str:
+    async def _confirm_call(self, meta: MCPToolMeta, arguments: dict[str, Any], context: ToolRuntimeContext, *, feedback: dict[str, Any] | None = None) -> str:
         if not (context.source == "web" and context.web_confirm is not None):
             return "deny"
         log.info("mcp.tool.confirm_requested", server=meta.server_key, tool=meta.original_tool_name, risk=meta.risk, source=context.source)
@@ -529,6 +531,11 @@ class MCPManager:
         )
         payload = {
             "action": "select",
+            "_sourceTool": "MCP",
+            "_requiresAuthorization": True,
+            # The argument summary can contain private user data. Do not mirror
+            # MCP permission prompts to Telegram, even when answers are simple.
+            "sensitive": True,
             "title": "确认执行 MCP 工具",
             "body": body,
             "type": "warning",
@@ -543,16 +550,22 @@ class MCPManager:
             "timeoutSeconds": 600,
         }
         result = await context.web_confirm(payload)
+        if feedback is not None:
+            feedback.update(result)
         decision = "deny"
-        if not bool(result.get("cancelled")):
+        if (result.get("status", "answered") == "answered"
+                and not bool(result.get("cancelled"))
+                and not str(result.get("text") or "").strip()
+                and result.get("decision") != "feedback"
+                and result.get("authorizationGranted") is not False):
             values = result.get("selectedValues")
-            if isinstance(values, list) and values:
+            if isinstance(values, list) and len(values) == 1:
                 candidate = str(values[0] or "").strip().lower()
                 if candidate in {"once", "conversation", "always"}:
                     decision = candidate
             # Compatibility with older/binary confirmation callbacks used by
             # integrations and tests while the Web UI moves to select mode.
-            elif bool(result.get("confirmed")):
+            elif explicit_authorization(result):
                 decision = "once"
         if decision != "deny":
             log.info("mcp.tool.confirm_approved", server=meta.server_key, tool=meta.original_tool_name, scope=decision)

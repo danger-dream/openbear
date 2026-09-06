@@ -926,6 +926,10 @@ class AgentPlanCoordinator:
                         "grantedTools is valid only for action=approve",
                     )
                 if action == "approve":
+                    ceiling = set(sanitize_tool_allowlist(task_input.get("presetToolCeiling") or []))
+                    outside_ceiling = [name for name in granted_tools if ceiling and name not in ceiling]
+                    if outside_ceiling:
+                        raise PlanError("agent_tool_not_allowed_by_preset", "Tool grants exceed this instance's preset ceiling", tools=outside_ceiling)
                     if active_version:
                         # A Replan replaces only the remaining execution method.
                         # It never repeats or renegotiates the initial tool grant;

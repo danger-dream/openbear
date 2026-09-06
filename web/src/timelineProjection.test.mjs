@@ -857,6 +857,69 @@ test("agent operation display name is not polluted by nested tool payload name",
   assert.equal(agentCard.calls[0].id, "agent:task-1");
 });
 
+test("AgentContinue projects as an Agent execution payload while AgentInfo stays an ordinary read-only tool", () => {
+  const operations = [
+    {opId: "msg:start", opType: "user_message", runId: "run-1", displaySeq: 10, revision: 1, lifecycle: "terminal", status: "completed", payload: {text: "继续处理并读取实例"}, createdAtMs: 1000, updatedAtMs: 1000},
+    {
+      opId: "tool:continue", opType: "tool", runId: "run-1", displaySeq: 20, revision: 1,
+      lifecycle: "active", status: "running", taskUuid: "task-2",
+      payload: {
+        name: "AgentContinue", status: "running", arguments: JSON.stringify({to: "agent-a", prompt: "继续修复"}),
+        task: {taskUuid: "task-2", agentId: "agent-a", sessionKind: "independent", sessionTurn: 2, status: "running"},
+        agentSession: {agentId: "agent-a", sessionKind: "independent", activeTaskUuid: "task-2"},
+      }, createdAtMs: 1001, updatedAtMs: 1001,
+    },
+    {
+      opId: "tool:info", opType: "tool", runId: "run-1", displaySeq: 30, revision: 1,
+      lifecycle: "terminal", status: "completed",
+      payload: {name: "AgentInfo", arguments: JSON.stringify({to: "agent-a"}), result: {ok: true, agentSession: {agentId: "agent-a"}}},
+      createdAtMs: 1002, updatedAtMs: 1002,
+    },
+  ];
+
+  const assistant = projectOperationMessages(operations).find((item) => item.role === "assistant");
+  const cards = assistant.localTimeline.filter((item) => item.kind === "tool");
+  assert.deepEqual(cards.map((item) => item.toolName), ["AgentContinue", "AgentInfo"]);
+  assert.equal(cards[0].livePayload.task.taskUuid, "task-2");
+  assert.equal(cards[0].livePayload.task.sessionTurn, 2);
+  assert.equal(cards[1].livePayload, null, "AgentInfo does not masquerade as running Agent state");
+  const runState = deriveOperationRunState(operations);
+  assert.equal(runState.backgroundRunning, true);
+  assert.equal(runState.foregroundRunning, false);
+});
+
+test("a late T1 completion notice cannot overwrite the running T2 state of the same instance", () => {
+  const operations = [
+    {opId: "msg:start", opType: "user_message", runId: "run-1", runRootTurnId: "root-1", displaySeq: 10, revision: 1, lifecycle: "terminal", status: "completed", payload: {text: "继续 Agent"}, createdAtMs: 1000, updatedAtMs: 1000},
+    {
+      opId: "agent:t1", opType: "agent", runId: "run-1", runRootTurnId: "root-1", taskUuid: "task-1", displaySeq: 20, revision: 3, lifecycle: "terminal", status: "completed",
+      payload: {rootToolName: "Agent", status: "completed", task: {taskUuid: "task-1", agentId: "agent-a", sessionKind: "independent", sessionTurn: 1, status: "completed", title: "调查"}, agentSession: {agentId: "agent-a", activeTaskUuid: "task-2", lastTaskUuid: "task-2", canContinue: false}},
+      createdAtMs: 1001, updatedAtMs: 1003,
+    },
+    {
+      opId: "agent:t2", opType: "agent", runId: "run-1", runRootTurnId: "root-1", taskUuid: "task-2", displaySeq: 30, revision: 2, lifecycle: "active", status: "running",
+      payload: {rootToolName: "AgentContinue", status: "running", task: {taskUuid: "task-2", agentId: "agent-a", sessionKind: "independent", sessionTurn: 2, status: "running", title: "修复"}, agentSession: {agentId: "agent-a", activeTaskUuid: "task-2", lastTaskUuid: "task-2", canContinue: false}},
+      createdAtMs: 1004, updatedAtMs: 1005,
+    },
+    {
+      opId: "notice:t1-late", opType: "notice", runId: "run-1", runRootTurnId: "root-1", displaySeq: 40, revision: 1, lifecycle: "informational", status: "completed",
+      payload: {taskUuid: "task-1", status: "completed", title: "调查", text: "T1 结果迟到回传"}, createdAtMs: 1006, updatedAtMs: 1006,
+    },
+  ];
+
+  const projected = projectOperationMessages(operations);
+  const cards = projected.flatMap((item) => item.localTimeline || []).filter((item) => item.kind === "tool");
+  assert.equal(cards.length, 2);
+  assert.equal(cards[0].livePayload.task.taskUuid, "task-1");
+  assert.equal(cards[0].livePayload.task.status, "completed");
+  assert.equal(cards[1].livePayload.task.taskUuid, "task-2");
+  assert.equal(cards[1].livePayload.task.status, "running");
+  assert.equal(deriveOperationRunState(operations).backgroundRunning, true);
+  const lateNotice = projected.flatMap((item) => item.localTimeline || []).find((item) => item.taskUuid === "task-1" && item.kind === "live_status");
+  assert.match(lateNotice.status, /完成/);
+});
+
+
 test("agent projection recovers original launch arguments from merged placeholder", () => {
   const originalArguments = JSON.stringify({ prompt: "最初的 Agent 任务", tools: ["Read"] });
   const operations = [

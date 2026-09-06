@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS conversation_task_memories (
   id                     INTEGER PRIMARY KEY AUTOINCREMENT,
   memory_uuid            TEXT NOT NULL UNIQUE,
   conversation_uuid      TEXT NOT NULL,
-  scope_type             TEXT NOT NULL CHECK(scope_type IN ('conversation','agent_task')),
+  scope_type             TEXT NOT NULL CHECK(scope_type IN ('conversation','agent_task','agent_session')),
   task_uuid              TEXT NOT NULL DEFAULT '',
   name                   TEXT NOT NULL,
   description            TEXT NOT NULL DEFAULT '',
@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS conversation_task_memories (
   idempotency_key        TEXT NOT NULL DEFAULT '',
   CHECK(
     (scope_type='conversation' AND task_uuid='') OR
-    (scope_type='agent_task' AND task_uuid<>'')
+    (scope_type IN ('agent_task','agent_session') AND task_uuid<>'')
   )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_conversation_task_memories_active_name
@@ -673,6 +673,12 @@ CREATE INDEX IF NOT EXISTS idx_rath_agents_sort
 CREATE TABLE IF NOT EXISTS rath_agent_sessions (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
   session_uuid             TEXT NOT NULL UNIQUE,
+  session_kind             TEXT NOT NULL DEFAULT 'legacy',
+  active_task_uuid         TEXT NOT NULL DEFAULT '',
+  context_task_uuid        TEXT NOT NULL DEFAULT '',
+  context_revision         INTEGER NOT NULL DEFAULT 0,
+  revision                 INTEGER NOT NULL DEFAULT 0,
+  turn_count               INTEGER NOT NULL DEFAULT 0,
   openbear_session_uuid    TEXT DEFAULT '',
   chat_id                  INTEGER DEFAULT 0,
   workflow_uuid            TEXT DEFAULT '',
@@ -690,7 +696,7 @@ CREATE INDEX IF NOT EXISTS idx_rath_agent_sessions_openbear_agent
   ON rath_agent_sessions(openbear_session_uuid, workflow_uuid, agent_key, status, updated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rath_agent_sessions_active_openbear_agent
   ON rath_agent_sessions(openbear_session_uuid, workflow_uuid, agent_key)
-  WHERE status='active';
+  WHERE status='active' AND session_kind='legacy';
 CREATE INDEX IF NOT EXISTS idx_rath_agent_sessions_chat_time
   ON rath_agent_sessions(chat_id, updated_at DESC, id DESC);
 

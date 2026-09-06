@@ -17,6 +17,27 @@ function block(view, label) {
 	return view.blocks.find((item) => item.label === label);
 }
 
+test("AgentContinue and AgentInfo expose instance intent without inventing permissions or execution", () => {
+	const continued = buildToolArgumentsView("AgentContinue", {
+		to: "agent-aaaaaaaa",
+		prompt: "继续修复并运行定向测试",
+		tools: ["Read", "Edit"],
+		planMode: "direct",
+	});
+	assert.equal(isStructuredToolArguments("AgentContinue"), true);
+	assert.equal(tag(continued, "实例"), "agent-aaaaaaaa");
+	assert.equal(tag(continued, "本轮能力"), "Read · Edit");
+	assert.equal(tag(continued, "本轮能力").includes("EditBatch"), false);
+	assert.equal(block(continued, "本轮指派").content, "继续修复并运行定向测试");
+
+	const info = buildToolArgumentsView("AgentInfo", {to: "agent-aaaaaaaa", fields: ["tasks", "context"]});
+	assert.equal(isStructuredToolArguments("AgentInfo"), true);
+	assert.equal(tag(info, "用途"), "只读信息");
+	assert.equal(tag(info, "读取内容"), "tasks · context");
+	assert.match(info.summary, /只读查询/);
+});
+
+
 test("Bash renders highlighted command and translated compatibility metadata", () => {
 	const view = buildToolArgumentsView("Bash", JSON.stringify({
 		command: "uv run pytest -q",

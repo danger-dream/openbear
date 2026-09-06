@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -427,8 +428,27 @@ def parse_sha256sums(text: str, filename: str) -> str:
                 continue
             digest, name = parts[0], parts[-1]
         if Path(name.strip().lstrip("*")).name == want:
-            return digest.strip().lower()
+            digest = digest.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"SHA256SUMS 中 {want} 的摘要无效")
+            return digest
     raise ValueError(f"SHA256SUMS 中没有 {want}")
+
+
+def _load_release_validation(install_root: Path | None = None):
+    candidates = [Path(__file__).resolve().with_name("release_validation.py")]
+    if install_root is not None:
+        candidates.append(Path(install_root).resolve() / "scripts" / "release_validation.py")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("openbear_release_validation", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise UpdateError("缺少 scripts/release_validation.py，无法验证发行包")
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +477,7 @@ class Updater:
         self.result_path = self.data_dir / "update-result.json"
         self.stopped = False
         self.backup_path: Path | None = None
+        self.database_backup_path: Path | None = None
         self.did_swap = False
         self.classification: dict[str, Any] = {}
 
@@ -497,6 +518,13 @@ class Updater:
             "logPath": str(self.log_path.relative_to(self.install_root)) if self.log_path.is_relative_to(self.install_root) else str(self.log_path),
             "acked": False,
         }
+        if self.database_backup_path is not None:
+            db_backup = self.database_backup_path
+            payload["databaseBackupPath"] = (
+                str(db_backup.relative_to(self.install_root))
+                if db_backup.is_relative_to(self.install_root)
+                else str(db_backup)
+            )
         payload.update(extra)
         atomic_write_json(self.result_path, payload)
         self.write_state("done", lastResultStatus=status)
@@ -546,13 +574,33 @@ class Updater:
         if self.classification.get("error"):
             self.log(f"分类出错，按重启处理: {self.classification['error']}")
         requires_restart = bool(self.classification.get("requiresRestart"))
+        validation = _load_release_validation(self.install_root)
+        retention = validation.retain_previous_assets(
+            staging / "web" / "dist",
+            self.install_root / "web" / "dist",
+        )
+        self.log(
+            f"前端资源代际: active={retention.get('active', 0)} retained={retention.get('retained', 0)}"
+        )
         self.write_state("applying", requiresRestart=requires_restart, effect=self.classification.get("effect"))
         self.backup_path = self._backup()
         if requires_restart:
             self._stop_service()
+            try:
+                self._backup_database()
+            except Exception as exc:
+                try:
+                    self._start_service()
+                except Exception as restart_exc:
+                    raise UpdateError(
+                        f"{exc}；旧服务恢复失败: {restart_exc}"
+                    ) from exc
+                raise UpdateError(f"{exc}；未切换文件，旧服务已恢复") from exc
+        # 停服成功后、首次文件切换前标记恢复责任。_swap 会逐目录替换，
+        # 不能等它完整返回后才标记，否则中途失败会留下两代文件。
+        self.did_swap = True
         try:
             self._swap(staging)
-            self.did_swap = True
             self._sync_deps()
             if requires_restart:
                 self._install_unit()
@@ -591,17 +639,33 @@ class Updater:
         if not expected and sums_url:
             sums_path = work / "SHA256SUMS"
             _download(sums_url, sums_path)
-            expected = parse_sha256sums(sums_path.read_text(encoding="utf-8"), zip_name)
-        actual = sha256_file(zip_path)
-        if expected and actual != expected:
-            raise UpdateError(f"SHA256 不匹配：期望 {expected}，实际 {actual}")
+            try:
+                expected = parse_sha256sums(sums_path.read_text(encoding="utf-8"), zip_name)
+            except (OSError, ValueError) as exc:
+                raise UpdateError(f"SHA256SUMS 无效: {exc}") from exc
         if not expected:
-            self.log("警告: 没有提供 SHA256，仅记录实际值 " + actual)
+            raise UpdateError("发行包缺少 SHA256 校验和，拒绝更新")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise UpdateError("发行包 SHA256 格式无效")
+        actual = sha256_file(zip_path)
+        if actual != expected:
+            raise UpdateError(f"SHA256 不匹配：期望 {expected}，实际 {actual}")
         extract_to = work / "extract"
         safe_extract_zip(zip_path, extract_to)
         staging = unwrap_staging(extract_to)
-        if not (staging / "app").is_dir() and not (staging / "web" / "dist").is_dir():
-            raise UpdateError("发行包结构无效：缺少 app/ 或 web/dist/")
+        try:
+            validation = _load_release_validation(self.install_root)
+            report = validation.validate_release_tree(staging, self.to_version)
+        except Exception as exc:
+            if isinstance(exc, UpdateError):
+                raise
+            raise UpdateError(f"发行包校验失败: {exc}") from exc
+        self.log(
+            "发行包校验通过: version={version} resources={resources}".format(
+                version=report.get("version"),
+                resources=(report.get("frontend") or {}).get("checkedResources", 0),
+            )
+        )
         return staging
 
     def _backup(self) -> Path:
@@ -619,6 +683,27 @@ class Updater:
         for stale in existing[BACKUP_KEEP:]:
             stale.unlink(missing_ok=True)
         return path
+
+    def _backup_database(self) -> None:
+        self.write_state("backing_up_database")
+        validation = _load_release_validation(self.install_root)
+        try:
+            result = validation.create_sqlite_backup(
+                self.install_root,
+                self.install_root / "data" / "backups",
+                label=f"v{self.from_version or 'unknown'}-to-v{self.to_version or 'unknown'}",
+            )
+        except Exception as exc:
+            raise UpdateError(f"升级前数据库一致性备份失败: {exc}") from exc
+        if not result.get("created"):
+            self.log(f"旧数据库不存在，跳过备份: {result.get('databasePath') or '?'}")
+            return
+        self.database_backup_path = Path(str(result["backupPath"])).resolve()
+        self.write_state(
+            "backing_up_database",
+            databaseBackupPath=str(self.database_backup_path),
+        )
+        self.log(f"数据库一致性备份已保留: {self.database_backup_path}")
 
     def _swap(self, staging: Path) -> None:
         self.log("替换代码文件")
@@ -678,7 +763,10 @@ class Updater:
 
     def _stop_service(self) -> None:
         self.log(f"停止 {self.service_name}")
-        self._systemctl("stop", self.service_name, check=False)
+        try:
+            self._systemctl("stop", self.service_name)
+        except Exception as exc:
+            raise UpdateError(f"无法停止 {self.service_name}，未开始文件切换: {exc}") from exc
         self.stopped = True
 
     def _start_service(self) -> None:
@@ -691,23 +779,48 @@ class Updater:
         deadline = time.time() + HEALTH_WAIT_S
         last = ""
         while time.time() < deadline:
-            ok, last = _probe_health(self.health_url, self.to_version)
+            ok, last = _probe_deployment(
+                self.health_url,
+                self.to_version,
+                install_root=self.install_root,
+            )
             if ok:
-                self.log(f"健康检查通过: {last}")
+                self.log(f"健康检查与 Web 资源检查通过: {last}")
                 return
             time.sleep(HEALTH_INTERVAL_S)
         raise UpdateError(
-            f"新版本 /health 在 {HEALTH_WAIT_S}s 内未返回 ok=true 且 version={self.to_version}（最后: {last}）"
+            f"新版本在 {HEALTH_WAIT_S}s 内未通过 /health、/login 与入口资源检查"
+            f"（期望 version={self.to_version}，最后: {last}）"
         )
 
     def _rollback(self, reason: str) -> None:
         self.log(f"开始回滚: {reason}")
         self.write_state("rolling_back")
         # 新版本可能已经 start 成功但 health 失败；此时 stopped=False，
-        # 只 start 不会换进程。回滚前必须先停掉正在跑的新进程。
-        self._systemctl("stop", self.service_name, check=False)
+        # 只 start 不会换进程。回滚前必须确认停掉正在跑的新进程；失败时
+        # 不能删除任何当前代码，唯一备份继续保留。
+        try:
+            self._systemctl("stop", self.service_name)
+        except Exception as exc:
+            backup = str(self.backup_path) if self.backup_path else "未知"
+            raise UpdateError(
+                f"回滚前无法停止 {self.service_name}；未删除当前文件，备份保留在 {backup}: {exc}"
+            ) from exc
         self.stopped = True
         if self.backup_path and self.backup_path.is_file():
+            # 精确恢复托管代码树；先删除新版本独有文件，避免回滚后混用两代代码/资源。
+            for rel in REPLACE_DIRS:
+                target = self.install_root / rel
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+            for rel in REPLACE_FILES:
+                target = self.install_root / rel
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                elif target.exists():
+                    shutil.rmtree(target)
             with tarfile.open(self.backup_path, "r:gz") as tar:
                 try:
                     tar.extractall(self.install_root, filter="data")
@@ -725,7 +838,11 @@ class Updater:
             ok, last = False, ""
             deadline = time.time() + HEALTH_WAIT_S
             while time.time() < deadline:
-                ok, last = _probe_health(self.health_url, self.from_version or None)
+                ok, last = _probe_deployment(
+                    self.health_url,
+                    self.from_version or None,
+                    install_root=self.install_root,
+                )
                 if ok:
                     break
                 time.sleep(HEALTH_INTERVAL_S)
@@ -735,6 +852,11 @@ class Updater:
         except Exception as exc:
             self.write_result("failed", f"{reason}；回滚启动失败: {exc}")
             return
+        if self.database_backup_path is not None:
+            self.log(
+                f"数据库未自动回退；升级前备份保留在 {self.database_backup_path}。"
+                "人工恢复该快照会丢失快照后的新数据。"
+            )
         self.write_result("rolled_back", f"更新失败已回滚到 v{self.from_version or '?'}。原因: {reason}")
         self.log("回滚完成")
 
@@ -803,6 +925,20 @@ def _probe_health(url: str, expected_version: str | None) -> tuple[bool, str]:
     if expected_version and _strip_v(version) != _strip_v(expected_version):
         return False, f"ok 但 version={version!r} 期望 {expected_version!r}"
     return True, raw[:200]
+
+
+def _probe_deployment(
+    health_url: str,
+    expected_version: str | None,
+    *,
+    install_root: Path | None = None,
+) -> tuple[bool, str]:
+    try:
+        validation = _load_release_validation(install_root)
+        report = validation.probe_deployment(health_url, expected_version or "")
+    except Exception as exc:
+        return False, f"Web 检查失败: {type(exc).__name__}: {exc}"
+    return True, json.dumps(report, ensure_ascii=False)[:500]
 
 
 def inspect_dirty(root: Path) -> bool:

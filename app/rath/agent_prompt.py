@@ -8,7 +8,7 @@ from typing import Any
 
 from app.db.engine import DB
 from app.memory.builtin import BuiltinMemoryClient
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist
+from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist, expand_agent_tool_names
 from app.tools.base import ToolRegistry
 
 
@@ -18,8 +18,8 @@ def allowed_agent_tool_names(registry: ToolRegistry | None, tool_allowlist: list
     requested = set(sanitize_tool_allowlist(tool_allowlist or [])) & set(AGENT_DELEGATION_TOOL_NAMES)
     if not requested:
         return []
-    available = set(registry.names(scope="agent")) & set(AGENT_DELEGATION_TOOL_NAMES)
-    return [name for name in registry.names(scope="agent") if name in requested and name in available]
+    requested = expand_agent_tool_names(requested)
+    return [name for name in registry.names(scope="agent") if name in requested]
 
 
 def agent_system_prompt_params(

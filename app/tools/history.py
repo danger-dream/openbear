@@ -274,9 +274,13 @@ def _render_turns(
     total_turns: int,
     max_chars: int,
     excluded_current_turn: bool = False,
+    offset_turns: int = 0,
+    offset_from: str = "",
 ) -> str:
     lines = _render_conversation_header(info, action="read")
     lines.append(f"returnedTurns: {len(turns)} / {total_turns}")
+    if offset_turns > 0:
+        lines.append(f"offsetTurns: {offset_turns} (from {offset_from or 'end'})")
     if excluded_current_turn:
         lines.append("currentTurnExcluded: true")
     lines.append("included: user_message, assistant_message")
@@ -330,11 +334,22 @@ def history_read(
         direction = str(args.get("from") or args.get("position") or "end").strip().lower()
         turn_count = _int_arg(args, "turns", "lastTurns", "last_turns", "limitTurns", "limit_turns", default=5)
         turn_count = max(1, min(turn_count, 50))
-        if direction in {"start", "first", "begin", "beginning"}:
-            selected = turns[:turn_count]
+        offset = max(0, _int_arg(args, "offset", default=0))
+        from_start = direction in {"start", "first", "begin", "beginning"}
+        if from_start:
+            selected = turns[offset:offset + turn_count]
         else:
-            selected = turns[-turn_count:]
-        return _render_turns(info, selected, total_turns=total_turns, max_chars=_max_chars(args), excluded_current_turn=excluded)
+            end_index = max(0, len(turns) - offset)
+            selected = turns[max(0, end_index - turn_count):end_index]
+        return _render_turns(
+            info,
+            selected,
+            total_turns=total_turns,
+            max_chars=_max_chars(args),
+            excluded_current_turn=excluded,
+            offset_turns=offset,
+            offset_from="start" if from_start else "end",
+        )
 
 
 def _split_terms(query: str) -> list[str]:
@@ -376,10 +391,30 @@ def history_search(
     include_archived = _bool_arg(args, "includeArchived", False) or _bool_arg(args, "include_archived", False)
     with _connect_ro(db_path) as con:
         owner = _resolve_owner(con, current_conversation_uuid)
+        conv_filter = str(
+            args.get("conversationUuid")
+            or args.get("conversation_uuid")
+            or args.get("convUuid")
+            or args.get("conv_uuid")
+            or ""
+        ).strip()
+        scope = str(args.get("scope") or "").strip().lower()
+        if not conv_filter and scope == "current":
+            conv_filter = current_conversation_uuid
+        if conv_filter:
+            conv_info = _resolve_conversation(con, conv_filter)
+            if conv_info is None:
+                return f"error: conversation not found: {conv_filter}"
+            if owner and conv_info.owner_chat_id and owner != conv_info.owner_chat_id:
+                return "error: conversation belongs to a different owner"
         first = f"%{terms[0]}%"
         params: list[Any] = [first, first]
+        conv_sql = ""
         owner_sql = ""
         archived_sql = ""
+        if conv_filter:
+            conv_sql = " AND o.conversation_uuid=?"
+            params.append(conv_filter)
         if owner:
             owner_sql = " AND c.owner_chat_id=?"
             params.append(owner)
@@ -394,6 +429,7 @@ def history_search(
             WHERE o.op_type IN ('user_message','assistant_message')
               AND COALESCE(o.internal,0)=0
               AND (LOWER(c.title) LIKE ? OR LOWER(o.payload_json) LIKE ?)
+              {conv_sql}
               {owner_sql}
               {archived_sql}
             ORDER BY c.updated_at DESC, o.display_seq ASC, o.id ASC
@@ -414,7 +450,11 @@ def history_search(
                 matches.append((row, role, text))
                 if len(matches) >= limit:
                     break
-    lines = ["# History search results", "", f"Query: {query}", f"Returned: {len(matches)}", ""]
+    lines = ["# History search results", "", f"Query: {query}"]
+    if conv_filter:
+        lines.append(f"Conversation filter: {conv_filter}")
+    lines.append(f"Returned: {len(matches)}")
+    lines.append("")
     for index, (row, role, text) in enumerate(matches, 1):
         lines.append(f"## {index}. {row['title'] or '(untitled)'}")
         lines.append(f"conversationUuid: {row['conversation_uuid']}")
@@ -564,18 +604,19 @@ def register_history_tools(reg: ToolRegistry, db: Any) -> None:
 
     reg.add(
         "History",
-        "Read/search OpenBear Web conversation history as visible transcript. Use when the user asks 看之前/上一轮/上次/接着之前/还有工作没做完/查看某会话结论. Read-only; defaults to user+assistant visible text from web_operations and excludes tools, reasoning, stats, raw events.",
+        "Read/search OpenBear Web conversation history as visible transcript. Use when the user asks 看之前/上一轮/上次/接着之前/还有工作没做完/查看某会话结论, and after context compaction to re-read this conversation's earlier visible dialogue (read/search with scope=current) instead of asking the user to repeat it. Read-only; defaults to user+assistant visible text from web_operations and excludes tools, reasoning, stats, raw events.",
         {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["read", "search", "list", "read_turn"], "description": "History action"},
-                "scope": {"type": "string", "description": "current or explicit conversation"},
-                "conversationUuid": {"type": "string", "description": "Web conversation UUID; optional for scope=current"},
+                "scope": {"type": "string", "description": "current or explicit conversation; for search, scope=current restricts matches to this conversation"},
+                "conversationUuid": {"type": "string", "description": "Web conversation UUID; optional for scope=current; for search, restricts matches to that conversation"},
                 "turnUuid": {"type": "string", "description": "Turn UUID for read_turn"},
                 "query": {"type": "string", "description": "Search query for action=search"},
                 "from": {"type": "string", "description": "read position: start or end"},
                 "turns": {"type": "integer", "description": "Number of turns to read"},
                 "lastTurns": {"type": "integer", "description": "Alias for turns when reading from end"},
+                "offset": {"type": "integer", "description": "read: skip N turns from the chosen end before returning, to page into the middle of a long conversation"},
                 "before": {"type": "integer", "description": "Turns before target for read_turn"},
                 "after": {"type": "integer", "description": "Turns after target for read_turn"},
                 "limit": {"type": "integer", "description": "Result limit for list/search"},

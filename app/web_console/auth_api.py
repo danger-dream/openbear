@@ -10,6 +10,18 @@ class WebAdminAuthMixin:
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
         path = request.path
+        if path == "/login" or path.startswith("/api/auth/login/"):
+            login_url = self._https_login_url(request)
+            if login_url:
+                if path == "/login" and request.method in {"GET", "HEAD"}:
+                    raise web.HTTPFound(login_url, headers={"Cache-Control": "no-store"})
+                # Never replay the Secret Key POST to another origin. Reject before
+                # reading it or creating a request/Telegram notification.
+                return web.json_response(
+                    {"ok": False, "error": "https_required", "loginUrl": login_url},
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
         if (
             path in {"/health", "/login", "/api/auth/login/start"}
             or path.startswith("/assets/")
@@ -177,6 +189,7 @@ class WebAdminAuthMixin:
         resp = web.json_response({
             "ok": True,
             "requestUuid": req_uuid,
+            "expiresIn": self.config.web.login_request_ttl_seconds,
             "statusUrl": f"/api/auth/login/status/{req_uuid}",
             "consumeUrl": f"/api/auth/login/consume/{req_uuid}",
         })
@@ -192,7 +205,10 @@ class WebAdminAuthMixin:
 
     async def handle_api_auth_status(self, request: web.Request) -> web.Response:
         req_uuid = request.match_info.get("request_uuid", "")
-        return web.json_response({"ok": True, "requestUuid": req_uuid, "status": await self.login_request_status(req_uuid)})
+        return web.json_response(
+            {"ok": True, "requestUuid": req_uuid, "status": await self.login_request_status(req_uuid)},
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def handle_api_auth_consume(self, request: web.Request) -> web.Response:
         req_uuid = request.match_info.get("request_uuid", "")
@@ -215,7 +231,10 @@ class WebAdminAuthMixin:
 
     async def handle_api_auth_session(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
-        return web.json_response({"ok": True, "chatId": session.chat_id, "expiresAt": session.expires_at})
+        return web.json_response(
+            {"ok": True, "chatId": session.chat_id, "expiresAt": session.expires_at},
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _audit_query(self, request: web.Request, *, export: bool = False) -> tuple[str, list[Any], int, int]:
         page = max(1, int(request.query.get("page", "1") or 1))

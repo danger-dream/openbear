@@ -2087,8 +2087,8 @@ def test_agent_snapshot_contains_runtime_config(env):
     assert snap["toolAllowlist"] == ["Read"]
 
 
-async def test_single_agent_session_reuses_own_summary_and_artifacts(tmp_path):
-    """同一 Rath Agent Session 后续 Task 会续接自身摘要/产物；不同 session 仍隔离。"""
+async def test_single_agent_tasks_are_self_contained_without_history_injection(tmp_path):
+    """同一 Agent Session 的后续 Task 不再注入历史摘要/产物标题；prompt 如实声明自包含。"""
     from app.db.engine import DB
     from app.llm.base import AgentResult
     from app.rath.dao import RathDAO
@@ -2176,12 +2176,15 @@ async def test_single_agent_session_reuses_own_summary_and_artifacts(tmp_path):
     assert len(backend.calls) == 2
     second_prompt = backend.calls[1]["messages"][0]["content"]
     assert "再说模块 B 的细节" in second_prompt
-    assert "当前 Agent Session 历史" in second_prompt
-    assert "模块 A 结论" in second_prompt
+    # Tasks are self-contained: no session history or artifact-title blocks are
+    # injected, and the prompt says so instead of promising continuity.
+    assert "当前 Agent Session 历史" not in second_prompt
+    assert "近期产物摘要" not in second_prompt
+    assert "模块 A 结论" not in second_prompt
+    assert "本 task 自包含" in second_prompt
     first_session_id = safe_agent_llm_session_id(agent_session.session_uuid, first_uuid, "reader")
     second_session_id = safe_agent_llm_session_id(agent_session.session_uuid, second_uuid, "reader")
-    # Durable Agent history is carried explicitly in the second prompt.  Hidden
-    # upstream reasoning/cache state must remain isolated per task.
+    # Hidden upstream reasoning/cache state must remain isolated per task.
     assert backend.calls[0]["session_id"] == first_session_id
     assert backend.calls[1]["session_id"] == second_session_id
     assert backend.calls[0]["session_id"] != backend.calls[1]["session_id"]
@@ -2393,9 +2396,10 @@ async def test_single_agent_budget_pause_can_continue_same_task(env):
     assert any(e.kind == "agent_task_continued" for e in events)
 
 
-async def test_single_agent_user_prompt_uses_evidence_based_convergence_without_budget_salience(
+async def test_single_agent_user_prompt_carries_runtime_facts_only(
     env,
 ):
+    """The wrapper adds runtime facts; method and handoff shape stay with the brief and base prompt."""
     dao, task_uuid, agent = env
     agent.tool_allowlist = []
 
@@ -2426,18 +2430,77 @@ async def test_single_agent_user_prompt_uses_evidence_based_convergence_without_
 
     await runner.run()
 
-    assert "Rath Agent Session" in backend.first_user
+    assert backend.first_user.startswith("用户任务：")
+    assert "本 task 自包含" in backend.first_user
+    assert f"本轮任务身份：{task_uuid}" in backend.first_user
+    assert "本轮开始时间：" in backend.first_user
+    assert "以实际提供的 schema 为准" in backend.first_user
+    assert "未指定时跟随任务的主要语言" in backend.first_user
+    # Budget numbers, controller-only tool names, and Plan vocabulary never leak
+    # into a direct task's first message.
+    assert "会继续带入" not in backend.first_user
     assert "最多 3 次" not in backend.first_user
     assert "最多 5 次" not in backend.first_user
     assert "AgentMessage" not in backend.first_user
-    assert "输出中文 Markdown" not in backend.first_user
-    assert "输出语言以 task brief 明确要求为准" in backend.first_user
-    assert "未指定时跟随任务的主要语言" in backend.first_user
-    assert "批量搜索、批量读取相关片段" in backend.first_user
-    assert "读一个文件 → 重新推理 → 再读一个文件" in backend.first_user
-    assert "仍未满足的 Plan criterion" in backend.first_user
-    assert "立即冻结证据并成稿" in backend.first_user
-    assert "任务方向、真实阻塞、风险边界" in backend.first_user
+    assert "Plan criterion" not in backend.first_user
+    assert "已批准 Plan" not in backend.first_user
+    # The wrapper no longer imposes a generic workflow or report format; those
+    # belong to the task brief and the Agent base system prompt.
+    for forced in (
+        "收敛规则",
+        "调查/审查执行规则",
+        "最低交付要求",
+        "完整子报告",
+        "下一步建议",
+        "风险、未覆盖项",
+        "批量搜索、批量读取",
+        "立即冻结证据并成稿",
+        "TASK_CONTRACT_INCOMPLETE",
+        "TOOL_GAP",
+    ):
+        assert forced not in backend.first_user, forced
+
+
+async def test_direct_agent_exposes_control_ack_only_when_intervention_pending(env):
+    """direct 模式收到干预时必须能看到 AgentControlAck，否则回执门禁会死锁任务。"""
+    dao, task_uuid, agent = env
+    agent.tool_allowlist = ["Read"]
+    reg = ToolRegistry()
+
+    async def read(_args):
+        return "read"
+
+    async def ack(_args):
+        return "{}"
+
+    reg.add("Read", "读取文件", {"type": "object", "properties": {}}, read, visibility={"agent"})
+    reg.add("AgentControlAck", "回执", {"type": "object", "properties": {}}, ack, visibility={"agent"})
+    runner = SingleAgentWorkflowRunner(
+        dao,
+        task_uuid,
+        agent=agent,
+        backend=object(),
+        model="gpt",
+        max_tokens=1024,
+        tools=reg,
+        plan_protocol_enabled=False,
+    )
+
+    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    assert names == {"Read"}
+
+    runner.steers.append({"controlUuid": "c-1", "message": "补一个缺口"})
+    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    assert names == {"Read", "AgentControlAck"}
+
+    runner.steers.clear()
+    runner._pending_control_acks.add("c-1")
+    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    assert names == {"Read", "AgentControlAck"}
+
+    runner._pending_control_acks.clear()
+    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    assert names == {"Read"}
 
 
 async def test_tool_budget_pause_persists_only_paired_tool_calls(env):

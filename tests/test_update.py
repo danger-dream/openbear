@@ -140,8 +140,11 @@ def test_classify_trees_lock_dependency_change_is_restart(tmp_path: Path):
 
 
 def test_parse_sha256sums():
-    text = "abc123  openbear-0.2.0.zip\n"
-    assert updater().parse_sha256sums(text, "openbear-0.2.0.zip") == "abc123"
+    digest = "a" * 64
+    text = f"{digest}  openbear-0.2.0.zip\n"
+    assert updater().parse_sha256sums(text, "openbear-0.2.0.zip") == digest
+    with pytest.raises(ValueError, match="摘要无效"):
+        updater().parse_sha256sums("abc123  openbear-0.2.0.zip\n", "openbear-0.2.0.zip")
 
 
 def test_update_result_roundtrip(tmp_path: Path):
@@ -203,11 +206,163 @@ def test_rollback_stops_running_new_process(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(u.tarfile, "open", lambda *_args, **_kwargs: FakeTar())
     monkeypatch.setattr(worker, "_sync_deps", lambda: None)
     monkeypatch.setattr(worker, "_install_unit", lambda: None)
-    monkeypatch.setattr(u, "_probe_health", lambda *_a, **_k: (True, '{"ok": true, "version": "0.1.0"}'))
+    monkeypatch.setattr(u, "_probe_deployment", lambda *_a, **_k: (True, '{"ok": true, "version": "0.1.0"}'))
 
     worker._rollback("health failed")
     assert calls[0] == ("stop", "openbear.service")
     assert any(item[:1] == ("start",) for item in calls)
+    result = json.loads((data / "update-result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "rolled_back"
+
+
+def test_run_stop_failure_does_not_switch_or_enter_destructive_rollback(tmp_path: Path, monkeypatch):
+    u = updater()
+    install = tmp_path / "install"
+    staging = tmp_path / "staging"
+    data = tmp_path / "data"
+    for root in (install, staging):
+        (root / "app").mkdir(parents=True)
+        (root / "web" / "dist").mkdir(parents=True)
+    data.mkdir()
+    (install / "app" / "main.py").write_text("old backend\n", encoding="utf-8")
+    (install / "web" / "dist" / "index.html").write_text("old frontend\n", encoding="utf-8")
+    (staging / "app" / "main.py").write_text("new backend\n", encoding="utf-8")
+    (staging / "web" / "dist" / "index.html").write_text("new frontend\n", encoding="utf-8")
+    worker = u.Updater({
+        "installRoot": str(install),
+        "dataDir": str(data),
+        "fromVersion": "1.0.0",
+        "toVersion": "2.0.0",
+        "serviceName": "openbear.service",
+    })
+    swap_called = {"value": False}
+    stop_calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def failed_stop(*args, check=True):
+        stop_calls.append((args, check))
+        raise u.UpdateError("simulated stop failure")
+
+    def forbidden_swap(_incoming: Path):
+        swap_called["value"] = True
+        raise AssertionError("swap must not run after stop failure")
+
+    monkeypatch.setattr(worker, "_download_and_verify", lambda: staging)
+    monkeypatch.setattr(worker, "_systemctl", failed_stop)
+    monkeypatch.setattr(worker, "_swap", forbidden_swap)
+
+    assert worker.run() == 1
+    assert stop_calls == [(('stop', 'openbear.service'), True)]
+    assert swap_called["value"] is False
+    assert worker.did_swap is False
+    assert worker.stopped is False
+    assert worker.backup_path is not None and worker.backup_path.is_file()
+    assert (install / "app" / "main.py").read_text(encoding="utf-8") == "old backend\n"
+    assert (install / "web" / "dist" / "index.html").read_text(encoding="utf-8") == "old frontend\n"
+    result = json.loads((data / "update-result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert "未开始文件切换" in result["message"]
+
+
+def test_rollback_stop_failure_keeps_current_files_and_backup(tmp_path: Path, monkeypatch):
+    u = updater()
+    install = tmp_path / "install"
+    data = tmp_path / "data"
+    (install / "app").mkdir(parents=True)
+    (install / "web" / "dist").mkdir(parents=True)
+    data.mkdir()
+    (install / "app" / "main.py").write_text("current backend\n", encoding="utf-8")
+    (install / "web" / "dist" / "index.html").write_text("current frontend\n", encoding="utf-8")
+    backup = data / "only-backup.tgz"
+    backup.write_bytes(b"only recovery material")
+    worker = u.Updater({
+        "installRoot": str(install),
+        "dataDir": str(data),
+        "fromVersion": "1.0.0",
+        "toVersion": "2.0.0",
+        "serviceName": "openbear.service",
+    })
+    worker.backup_path = backup
+
+    def failed_stop(*_args, **_kwargs):
+        raise u.UpdateError("simulated rollback stop failure")
+
+    monkeypatch.setattr(worker, "_systemctl", failed_stop)
+    with pytest.raises(u.UpdateError, match="未删除当前文件，备份保留"):
+        worker._rollback("health failed")
+
+    assert worker.stopped is False
+    assert (install / "app" / "main.py").read_text(encoding="utf-8") == "current backend\n"
+    assert (install / "web" / "dist" / "index.html").read_text(encoding="utf-8") == "current frontend\n"
+    assert backup.read_bytes() == b"only recovery material"
+
+
+@pytest.mark.parametrize("failure_point", ["before_swap", "partial_swap"])
+def test_run_recovers_when_swap_fails_before_or_between_directories(
+    tmp_path: Path, monkeypatch, failure_point: str
+):
+    u = updater()
+    install = tmp_path / "install"
+    staging = tmp_path / "staging"
+    data = tmp_path / "data"
+    for root in (install, staging):
+        (root / "app").mkdir(parents=True)
+        (root / "web" / "dist").mkdir(parents=True)
+    data.mkdir()
+    (install / "app" / "main.py").write_text('VERSION = "old"\n', encoding="utf-8")
+    (install / "app" / "old_only.py").write_text("old\n", encoding="utf-8")
+    (install / "web" / "dist" / "index.html").write_text("old frontend\n", encoding="utf-8")
+    (install / "openbear.json").write_text("{}\n", encoding="utf-8")
+    (staging / "app" / "main.py").write_text('VERSION = "new"\n', encoding="utf-8")
+    (staging / "app" / "new_only.py").write_text("new\n", encoding="utf-8")
+    (staging / "web" / "dist" / "index.html").write_text("new frontend\n", encoding="utf-8")
+
+    worker = u.Updater({
+        "installRoot": str(install),
+        "dataDir": str(data),
+        "fromVersion": "1.0.0",
+        "toVersion": "2.0.0",
+        "serviceName": "openbear.service",
+        "healthUrl": "http://127.0.0.1:18961/health",
+    })
+    active = {"value": True}
+    systemctl_calls: list[tuple[str, ...]] = []
+
+    def fake_systemctl(*args, check=True):
+        systemctl_calls.append(args)
+        if args[0] == "stop":
+            active["value"] = False
+        elif args[0] == "start":
+            active["value"] = True
+
+    def failing_swap(incoming: Path) -> None:
+        if failure_point == "partial_swap":
+            u._replace_dir(incoming / "app", install / "app")
+            assert (install / "app" / "new_only.py").is_file()
+        raise RuntimeError(failure_point)
+
+    def restored_probe(*_args, **_kwargs):
+        restored = (
+            (install / "app" / "main.py").read_text(encoding="utf-8") == 'VERSION = "old"\n'
+            and (install / "web" / "dist" / "index.html").read_text(encoding="utf-8")
+            == "old frontend\n"
+        )
+        return restored, "restored" if restored else "mixed trees"
+
+    monkeypatch.setattr(worker, "_download_and_verify", lambda: staging)
+    monkeypatch.setattr(worker, "_systemctl", fake_systemctl)
+    monkeypatch.setattr(worker, "_swap", failing_swap)
+    monkeypatch.setattr(worker, "_sync_deps", lambda: None)
+    monkeypatch.setattr(worker, "_install_unit", lambda: None)
+    monkeypatch.setattr(u, "_probe_deployment", restored_probe)
+
+    assert worker.run() == 1
+    assert worker.did_swap is True
+    assert active["value"] is True
+    assert systemctl_calls[0] == ("stop", "openbear.service")
+    assert systemctl_calls[-1] == ("start", "openbear.service")
+    assert (install / "app" / "old_only.py").is_file()
+    assert not (install / "app" / "new_only.py").exists()
+    assert (install / "web" / "dist" / "index.html").read_text(encoding="utf-8") == "old frontend\n"
     result = json.loads((data / "update-result.json").read_text(encoding="utf-8"))
     assert result["status"] == "rolled_back"
 
@@ -297,7 +452,7 @@ async def test_release_assets_follow_github_redirects():
         if url == "https://github.com/danger-dream/openbear/releases/download/v0.1.0/SHA256SUMS":
             return httpx.Response(302, headers={"Location": "https://objects.test/SHA256SUMS"})
         if url == "https://objects.test/SHA256SUMS":
-            return httpx.Response(200, text="deadbeef  openbear-0.1.0.zip\n")
+            return httpx.Response(200, text=f"{'d' * 64}  openbear-0.1.0.zip\n")
         if url == "https://github.com/danger-dream/openbear/releases/download/v0.1.0/release-meta.json":
             return httpx.Response(302, headers={"Location": "https://objects.test/release-meta.json"})
         if url == "https://objects.test/release-meta.json":
@@ -330,7 +485,7 @@ async def test_release_assets_follow_github_redirects():
     finally:
         await us._http.aclose()
 
-    assert available["sha256"] == "deadbeef"
+    assert available["sha256"] == "d" * 64
     assert available["requiresRestart"] is False
     assert available["comparedWith"] == "0.0.1"
 

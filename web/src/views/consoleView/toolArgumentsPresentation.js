@@ -519,6 +519,31 @@ function interactionView(toolName, data) {
 	return view.finish(title || actionLabel(action));
 }
 
+function agentContinueView(toolName, data) {
+	const view = new ViewBuilder(toolName, data);
+	const target = view.takeFirst(["to", "agentId", "agent_id"]);
+	const prompt = view.takeFirst(["prompt", "instruction", "task"]);
+	const tools = view.takeFirst(["tools", "grantedTools", "granted_tools"]);
+	const planMode = view.takeFirst(["planMode", "plan_mode"]);
+	view.addTag("实例", target, {mono: true, wide: true, primary: true});
+	view.addTag("执行模式", planMode);
+	if (Array.isArray(tools)) view.addTag("本轮能力", tools.join(" · ") || "无");
+	else view.addTag("本轮能力", tools);
+	view.addBlock("本轮指派", prompt, "markdown", {allowEmpty: true});
+	return view.finish([target, firstLine(prompt)].filter(Boolean).join(" · "));
+}
+
+function agentInfoView(toolName, data) {
+	const view = new ViewBuilder(toolName, data);
+	const target = view.takeFirst(["to", "agentId", "agent_id", "taskUuid", "task_uuid"]);
+	const query = view.takeFirst(["query", "include", "fields"]);
+	view.addTag("查询实例 / 任务", target, {mono: true, wide: true, primary: true});
+	if (Array.isArray(query)) view.addTag("读取内容", query.join(" · "));
+	else view.addTag("读取内容", query);
+	view.addTag("用途", "只读信息");
+	return view.finish([target, "只读查询"].filter(Boolean).join(" · "));
+}
+
 function agentWaitView(toolName, data) {
 	const view = new ViewBuilder(toolName, data);
 	for (const [key, label, suffix] of [
@@ -583,6 +608,8 @@ function planProgressView(toolName, data) {
 }
 
 const PRESENTERS = {
+	AgentContinue: agentContinueView,
+	AgentInfo: agentInfoView,
 	AgentPlanProgress: planProgressView,
 	AgentPlanSubmit: planSubmitView,
 	AgentWait: agentWaitView,

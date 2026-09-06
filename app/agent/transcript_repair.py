@@ -41,6 +41,13 @@ VISIBLE_HISTORY_INTRO = (
     "以下是压缩后保留的最近可见对话文本；仅包含用户消息和助手最终可见回复，"
     "工具结果、Agent 内部状态、Plan/通知 JSON、调试信息和 reasoning 均已排除。"
 )
+# 压缩注入块末尾的自救提示：告诉模型「更早的原文还能自己取回」，
+# 恰好出现在模型看到压缩上下文的那一刻，比系统提示词里的通用引导有效。
+POST_COMPACTION_RECOVERY_HINT = (
+    "更早的完整可见对话未包含在此处：需要压缩前的原文时，用 History(action=read/search, "
+    "scope=current) 按需回读本会话历史，不要让用户重复已说过的内容。工具结果与内部执行"
+    "过程不在 History 中，关键结论与工作状态请依赖 TaskMemory。"
+)
 
 
 def _row_value(row: Any, key: str, default: Any = "") -> Any:
@@ -134,6 +141,7 @@ def build_summary_prefixed_visible_history(
         blocks.append(f"{VISIBLE_HISTORY_INTRO}\n{xml}")
     if not blocks:
         return []
+    blocks.append(POST_COMPACTION_RECOVERY_HINT)
     return [
         {"role": "user", "content": "\n\n".join(blocks)},
         {"role": "assistant", "content": SUMMARY_ACK_TEXT},

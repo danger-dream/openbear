@@ -27,7 +27,7 @@ const TOOL_RESULT_PREVIEW_CHARS = 8000;
 const AGENT_OUTPUT_PREVIEW_CHARS = 24000;
 const TOOL_META_RE = /<tool-meta>[\s\S]*?<\/tool-meta>/gi;
 const PREVIEW_KEYS = ["description", "command", "pattern", "query", "title", "body", "name", "ref", "path", "old_string", "content", "action", "text", "instruction", "task"];
-const LONG_AGENT_TOOLS = new Set(["Agent", "AgentMessage", "AgentStop"]);
+const LONG_AGENT_TOOLS = new Set(["Agent", "AgentContinue", "AgentMessage", "AgentStop"]);
 const AGENT_ACTIVE_STATUSES = new Set(["running", "resuming", "queued", "pausing", "stopping"]);
 const AGENT_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted", "needs_openbear_control"]);
 const AGENT_RECENT_LINE_LIMIT = 8;
@@ -52,6 +52,8 @@ const TOOL_ICON = {
 	Edit: EditPen,
 	Bash: Monitor,
 	Agent: User,
+	AgentContinue: Refresh,
+	AgentInfo: DataAnalysis,
 	AgentMessage: Finished,
 	AgentStop: Close,
 	ContextCompaction: ContextCompactionIcon,
@@ -538,10 +540,13 @@ export function humanizeAgentArguments(args = {}) {
 	}
 	const lines = [];
 	if (args.workerType || args.subagent_type || args.agent || args.agentName || args.agentKey) lines.push(`Agent：${args.workerType || args.subagent_type || args.agent || args.agentName || args.agentKey}`);
+	if (args.to || args.agentId || args.agent_id) lines.push(`实例：${args.to || args.agentId || args.agent_id}`);
 	if (args.taskUuid || args.task_uuid) lines.push(`任务：${args.taskUuid || args.task_uuid}`);
 	if (args.description || args.title) lines.push(`标题：${args.description || args.title}`);
 	if (args.prompt || args.instruction || args.task) lines.push(`任务：${args.prompt || args.instruction || args.task}`);
 	if (args.message || args.guidance) lines.push(`消息：${args.message || args.guidance}`);
+	if (Array.isArray(args.tools)) lines.push(`能力：${args.tools.join("、") || "无"}`);
+	if (args.planMode || args.plan_mode) lines.push(`执行模式：${args.planMode || args.plan_mode}`);
 	if (args.maxParallel) lines.push(`最大并行：${args.maxParallel}`);
 	return lines.join("\n");
 }
@@ -584,7 +589,10 @@ export function agentPayload(event) {
 }
 
 export function agentStatusMeta(status, toolName = "Agent") {
-	const base = toolName === "AgentMessage" ? "续跑" : toolName === "AgentStop" ? "停止" : "执行";
+	const base = toolName === "AgentContinue" ? "指派"
+		: toolName === "AgentMessage" ? "续跑"
+			: toolName === "AgentStop" ? "停止"
+				: "执行";
 	const map = {
 		completed: {icon: CircleCheck, label: `${base}完成`, cls: "ok"},
 		partial: {icon: CircleCheck, label: "部分完成", cls: "ok"},
@@ -694,6 +702,15 @@ export function agentRows(event) {
 			const argItem = argItems[idx] || null;
 			return {
 				taskUuid: String(task.taskUuid || item.taskUuid || item?.result?.taskUuid || ""),
+				agentId: String(task.agentId || task.agentSessionUuid || session.agentId || session.sessionUuid || ""),
+				sessionKind: String(task.sessionKind || session.sessionKind || "legacy"),
+				sessionTurn: Number(task.sessionTurn || 0),
+				continuedFromTaskUuid: String(task.continuedFromTaskUuid || ""),
+				grantedTools: Array.isArray(task.grantedTools) ? task.grantedTools.slice() : [],
+				contextSource: task.contextSource && typeof task.contextSource === "object" ? task.contextSource : {},
+				task,
+				agentSession: session,
+				recentEvents: Array.isArray(item?.recentEvents) ? item.recentEvents : [],
 				status,
 				name: taskDisplayName(session.title || session.agentKey || task.currentAgent || item.agent || "Agent", task.taskUuid || item.taskUuid || item?.result?.taskUuid, task.displayName || item.displayName || item?.result?.displayName),
 				title: task.title || item.title || "",
@@ -728,6 +745,15 @@ export function agentRows(event) {
 		const outputFallback = payload?.error || "";
 		value = [{
 			taskUuid: String(task.taskUuid || payload.taskUuid || payload?.result?.taskUuid || ""),
+			agentId: String(task.agentId || task.agentSessionUuid || session.agentId || session.sessionUuid || ""),
+			sessionKind: String(task.sessionKind || session.sessionKind || "legacy"),
+			sessionTurn: Number(task.sessionTurn || 0),
+			continuedFromTaskUuid: String(task.continuedFromTaskUuid || ""),
+			grantedTools: Array.isArray(task.grantedTools) ? task.grantedTools.slice() : [],
+			contextSource: task.contextSource && typeof task.contextSource === "object" ? task.contextSource : {},
+			task,
+			agentSession: session,
+			recentEvents: Array.isArray(payload?.recentEvents) ? payload.recentEvents : [],
 			status,
 			name: taskDisplayName(session.title || session.agentKey || task.currentAgent || "Agent", task.taskUuid || payload.taskUuid || payload?.result?.taskUuid, task.displayName || payload.displayName || payload?.result?.displayName),
 			title: task.title || "",

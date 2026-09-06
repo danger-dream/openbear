@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 
 import pytest
 
@@ -10,6 +12,7 @@ from app.llm.events import ToolCall, Usage
 from app.rath.builtin_workflows import ensure_builtin_workflows
 from app.rath.dao import RathDAO
 from app.rath.manager import RathTaskManager
+from app.rath.plan import AgentPlanCoordinator, register_agent_plan_tools
 from app.rath.runner import RathTaskCancelled, RathWorkflowRunner
 from app.rath.schemas import RathAgentDef
 from app.rath.single_agent import SingleAgentWorkflowRunner
@@ -73,6 +76,11 @@ class _CapturingSingleAgentBackend:
 
     async def complete(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
         self.calls.append(messages)
+        if len(self.calls) == 1:
+            control_id = re.search(r'<agent-control id="([^"]+)"', str(messages)).group(1)
+            return AgentResult(tool_calls=[ToolCall(id="ack", name="AgentControlAck", arguments=json.dumps({
+                "controlUuid": control_id, "status": "accepted",
+            }))])
         return AgentResult(text="已按追加指导处理。", usage=Usage(input_tokens=10, output_tokens=5))
 
 
@@ -102,6 +110,8 @@ async def test_single_agent_steer_is_injected_into_model_messages(env):
         enabled=True,
     )
     backend = _CapturingSingleAgentBackend()
+    registry = ToolRegistry()
+    register_agent_plan_tools(registry, AgentPlanCoordinator(dao, RathTaskManager(dao)))
     runner = SingleAgentWorkflowRunner(
         dao,
         task_uuid,
@@ -109,7 +119,8 @@ async def test_single_agent_steer_is_injected_into_model_messages(env):
         backend=backend,
         model="gpt",
         max_tokens=1024,
-        tools=ToolRegistry(),
+        tools=registry,
+        plan_protocol_enabled=False,
     )
 
     output = await runner.run()

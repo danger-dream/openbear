@@ -98,6 +98,7 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 				<strong>{{ view.title }}</strong>
 			</span>
 			<span class="interaction-intro">{{ view.intro }}</span>
+			<span v-if="view.sourceLabel" class="source-chip">{{ view.sourceLabel }}</span>
 			<span class="status-chip">{{ view.statusLabel }}</span>
 			<span class="disclosure-icon" aria-hidden="true"><ArrowRight/></span>
 		</summary>
@@ -108,16 +109,20 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 			<div class="readonly-card" :class="{'questionnaire-card': view.action === 'questionnaire'}">
 				<header class="readonly-title">
 					<span class="readonly-title-icon" aria-hidden="true"><component :is="actionIcon"/></span>
-					<div><strong>{{ view.title }}</strong><span>{{ view.actionName }} · {{ view.statusLabel }}</span></div>
+					<div><strong>{{ view.title }}</strong><span>{{ view.actionName }} · {{ view.statusLabel }}<template v-if="view.sourceLabel"> · {{ view.sourceLabel }}处理</template></span></div>
 				</header>
 				<p v-if="view.body" class="readonly-body">{{ view.body }}</p>
 
 				<div v-if="view.sensitive" class="redacted-answer">{{ view.redactedText }}</div>
 
 				<template v-else-if="view.action === 'confirm'">
-					<div class="confirm-outcome" :class="{'is-confirmed': view.confirmed}">
-						<span class="faux-indicator" aria-hidden="true">{{ view.confirmed ? '✓' : '×' }}</span>
-						<span>{{ view.statusLabel }}</span>
+					<div class="confirm-outcome" :class="{'is-confirmed': view.confirmed, 'is-feedback': view.statusKey === 'feedback'}">
+						<span class="faux-indicator" aria-hidden="true">{{ view.confirmed ? '✓' : (view.statusKey === 'feedback' ? '…' : '×') }}</span>
+						<span>{{ view.statusLabel }}<small v-if="view.statusKey === 'feedback'">原操作未获授权</small></span>
+					</div>
+					<div v-if="view.confirmText" class="readonly-text-answer">
+						<span>反馈内容<small v-if="view.selectedDecisionLabel"> · 原选择：{{ view.selectedDecisionLabel }}</small></span>
+						<div>{{ view.confirmText }}</div>
 					</div>
 				</template>
 
@@ -127,6 +132,10 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 						<span class="option-copy"><strong>{{ option.label }}</strong><small v-if="option.description">{{ option.description }}</small></span>
 					</div>
 					<p v-if="!view.options.length" class="empty-answer">没有可展示的选项</p>
+					<div v-if="view.selectText" class="readonly-text-answer">
+						<span>{{ view.options.some((option) => option.selected) ? '补充、限制或修正' : '文字回答' }}</span>
+						<div>{{ view.selectText }}</div>
+					</div>
 				</div>
 
 				<div v-else-if="view.action === 'prompt'" class="readonly-text-answer">
@@ -166,6 +175,8 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 </template>
 
 <style scoped>
+@import "./userInteractionTokens.css";
+
 .interaction-event { container-type: inline-size; margin: .16rem 0; border: 0; color: #334155; }
 .interaction-event > summary { display: flex; align-items: center; gap: .34rem; max-width: 100%; min-width: 0; min-height: 1.45rem; padding: .04rem 0; list-style: none; cursor: pointer; }
 .interaction-event > summary::-webkit-details-marker { display: none; }
@@ -175,11 +186,13 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 .interaction-name { flex: 0 0 auto; font-size: .72rem; font-weight: 750; color: #526f91; }
 .interaction-heading strong { min-width: 0; overflow: hidden; font-size: .78rem; color: #334155; text-overflow: ellipsis; white-space: nowrap; }
 .interaction-intro { min-width: 0; flex: 1 1 auto; overflow: hidden; font-size: .72rem; color: #7c8592; text-overflow: ellipsis; white-space: nowrap; }
-.status-chip { display: inline-flex; height: 1.15rem; max-height: 1.15rem; flex: 0 0 auto; align-items: center; justify-content: center; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 999px; padding: 0 .38rem; background: #f8fafc; font-size: .64rem; font-weight: 700; line-height: 1; color: #64748b; white-space: nowrap; }
+.status-chip, .source-chip { display: inline-flex; height: 1.15rem; max-height: 1.15rem; flex: 0 0 auto; align-items: center; justify-content: center; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 999px; padding: 0 .38rem; background: #f8fafc; font-size: .64rem; font-weight: 700; line-height: 1; color: #64748b; white-space: nowrap; }
+.source-chip { border-color: var(--ob-interaction-border); background: var(--ob-interaction-accent-soft); color: var(--ob-interaction-accent-strong); }
 .interaction-event.compact .interaction-intro { display: none; }
 .interaction-event.compact .interaction-heading { flex: 1 1 auto; }
 .tone-success .status-chip { border-color: #bbdbc8; background: #f0f8f3; color: #35704d; }
-.tone-warning .status-chip, .tone-waiting .status-chip { border-color: #ead2a6; background: #fff9ed; color: #8b6524; }
+.tone-info .status-chip, .tone-waiting .status-chip { border-color: var(--ob-interaction-border-strong); background: var(--ob-interaction-accent-soft); color: var(--ob-interaction-accent-strong); }
+.tone-warning .status-chip { border-color: #ead2a6; background: #fff9ed; color: #8b6524; }
 .tone-danger .status-chip { border-color: #efc3c3; background: #fff5f5; color: #a33f3f; }
 .disclosure-icon { display: grid; width: 1rem; height: 1rem; flex: 0 0 auto; place-items: center; color: #94a3b8; }
 .disclosure-icon svg { width: .72rem; transition: transform .14s ease; }
@@ -187,7 +200,7 @@ details[open] > summary .disclosure-icon svg { transform: rotate(90deg); }
 .interaction-detail { margin: .25rem 0 .7rem 1.7rem; }
 .detail-notice { margin: 0 0 .45rem; font-size: .72rem; color: #64748b; }
 .detail-notice.is-error { color: #b91c1c; }
-.readonly-card { border: 1px solid #dbe4ee; border-radius: .9rem; background: rgba(248,250,252,.96); padding: .85rem; box-shadow: 0 10px 28px rgba(15,23,42,.07); }
+.readonly-card { border: 1px solid var(--ob-interaction-border); border-radius: .9rem; background: var(--ob-interaction-surface); padding: .85rem; box-shadow: 0 10px 28px rgba(15,23,42,.07); }
 .readonly-title { display: flex; align-items: flex-start; gap: .52rem; color: #1e3a5f; }
 .readonly-title-icon { display: grid; width: 1.15rem; height: 1.15rem; flex: 0 0 auto; place-items: center; margin-top: .05rem; }
 .readonly-title > div { display: grid; gap: .12rem; }
@@ -197,8 +210,12 @@ details[open] > summary .disclosure-icon svg { transform: rotate(90deg); }
 .redacted-answer, .empty-answer { margin: .7rem 0 0; border: 1px dashed #cbd5e1; border-radius: .7rem; background: #fff; padding: .65rem; font-size: .75rem; color: #64748b; }
 .confirm-outcome { display: flex; align-items: center; gap: .5rem; margin-top: .7rem; border: 1px solid #d8e0e9; border-radius: .72rem; background: #fff; padding: .6rem; font-size: .78rem; font-weight: 700; }
 .confirm-outcome.is-confirmed { border-color: #bed8c8; background: #f4faf6; color: #35704d; }
+.confirm-outcome.is-feedback { border-color: var(--ob-interaction-border-strong); background: var(--ob-interaction-accent-soft); color: var(--ob-interaction-accent-strong); }
+.confirm-outcome > span:last-child { display: grid; gap: .08rem; }
+.confirm-outcome small { font-size: .66rem; font-weight: 500; color: var(--ob-interaction-muted); }
 .faux-indicator { display: grid; width: 1.25rem; height: 1.25rem; place-items: center; border-radius: 50%; background: #e9eef4; color: #64748b; }
 .is-confirmed .faux-indicator { background: #dcefe3; color: #2f6d48; }
+.is-feedback .faux-indicator { background: #dbe7f3; color: var(--ob-interaction-accent-strong); }
 .readonly-options, .question-choice-list { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: .45rem; margin-top: .7rem; }
 .readonly-option, .question-choice-option { display: flex; min-width: 0; align-items: flex-start; gap: .5rem; border: 1px solid #dbe4ee; border-radius: .72rem; background: #fff; padding: .55rem .62rem; }
 .readonly-option.is-selected, .question-choice-option.is-selected { border-color: #7896bd; background: #f2f6fb; }

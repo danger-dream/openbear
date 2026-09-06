@@ -791,3 +791,33 @@ async def test_services_apply_config_hot_reloads_mcp_tools(tmp_path, monkeypatch
 def json_loads(raw: bytes) -> dict:
     data = json.loads(raw.decode("utf-8"))
     return data if isinstance(data, dict) else {}
+
+
+@pytest.mark.parametrize("status,text", [("answered", "  先别执行，也不要永久信任\n  "), ("timeout", "")])
+async def test_mcp_shared_interaction_feedback_and_timeout_do_not_grant_or_execute(status, text):
+    events = []
+
+    class Client:
+        async def call_tool(self, name, arguments):
+            events.append("executed")
+            return MCPRawResult(content=[{"type": "text", "text": "unexpected"}])
+
+    async def trust_update(*_args):
+        events.append("trusted")
+
+    manager = MCPManager(_cfg(), approval_updater=trust_update)
+    meta = MCPToolMeta(public_name="mcp__s__delete", server_key="s", original_tool_name="delete", normalized_tool_name="delete", description="", approval="ask", risk="destructive")
+    manager._tools[meta.public_name] = meta
+    manager._clients["s"] = Client()
+
+    async def web_confirm(payload):
+        assert payload["_requiresAuthorization"] is True
+        assert payload["sensitive"] is True
+        return {"status": status, "selectedValues": ["always"], "text": text, "sensitive": True}
+
+    context = ToolRuntimeContext(chat_id=-1, source="web", conversation_uuid="c", web_confirm=web_confirm)
+    result = json.loads(await manager.call_tool(meta.public_name, {}, context))
+    assert result["status"] == "denied"
+    assert result["confirmation"]["text"] == text
+    assert events == []
+    assert not manager._has_conversation_grant(meta, context)

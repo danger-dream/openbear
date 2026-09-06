@@ -549,9 +549,16 @@ class WebAdminConversationsMixin:
 
         try:
             old_task_uuids = list((await self._uuid_map_for_rows("rath_tasks", "task_uuid", "chat_id=?", (old_internal,))).keys())
+            retained_heads = await self.db.conn.execute(
+                "SELECT context_task_uuid FROM rath_agent_sessions WHERE chat_id=? AND session_kind='independent' AND context_task_uuid<>''",
+                (old_internal,),
+            )
+            old_task_uuids = list(dict.fromkeys(old_task_uuids + [str(row[0]) for row in await retained_heads.fetchall()]))
             task_map = {old: str(uuid.uuid4()) for old in old_task_uuids}
             artifact_map = await self._uuid_map_for_rows("web_artifacts", "artifact_uuid", "conversation_uuid=?", (old_uuid,))
             agent_session_map = await self._uuid_map_for_rows("rath_agent_sessions", "session_uuid", "chat_id=?", (old_internal,))
+            old_memories = await self._uuid_map_for_rows("conversation_task_memories", "memory_uuid", "conversation_uuid=?", (old_uuid,))
+            memory_uuid_map = {old: f"mem_{uuid.uuid4().hex}" for old in old_memories}
             rath_artifact_map: dict[str, str] = {}
             control_map: dict[str, str] = {}
             if old_task_uuids:
@@ -563,6 +570,7 @@ class WebAdminConversationsMixin:
                 artifact_map,
                 task_map,
                 agent_session_map,
+                memory_uuid_map,
                 rath_artifact_map,
                 control_map,
                 extra=[(old_uuid, new_uuid), (old_session_uuid, new_session_uuid)],
@@ -698,7 +706,10 @@ class WebAdminConversationsMixin:
                     "session_uuid": agent_session_map.get(str(row.get("session_uuid") or ""), str(uuid.uuid4())),
                     "openbear_session_uuid": new_session_uuid,
                     "chat_id": new_internal,
-                    "last_task_uuid": task_map.get(str(row.get("last_task_uuid") or ""), str(row.get("last_task_uuid") or "")),
+                    "last_task_uuid": task_map.get(str(row.get("last_task_uuid") or ""), ""),
+                    "active_task_uuid": "",
+                    "context_task_uuid": task_map.get(str(row.get("context_task_uuid") or ""), ""),
+                    "context_revision": int(row.get("context_revision") or 0) if str(row.get("context_task_uuid") or "") in task_map else 0,
                     "metadata_json": self._rewrite_duplicate_json_text(
                         row.get("metadata_json"),
                         pairs,
@@ -736,6 +747,8 @@ class WebAdminConversationsMixin:
                 old_uuid,
                 new_uuid,
                 task_map,
+                agent_session_map=agent_session_map,
+                memory_uuid_map=memory_uuid_map,
                 conn=self.db.conn,
             )
             await self._suppress_duplicate_task_notifications(
@@ -745,6 +758,18 @@ class WebAdminConversationsMixin:
             )
             if old_task_uuids:
                 placeholders = ",".join("?" for _ in old_task_uuids)
+                def duplicate_agent_context(row):
+                    state = json.loads(self._rewrite_duplicate_json_text(
+                        row.get("state_json"), pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal,
+                    ) or "{}")
+                    for message in state.get("messages") or []:
+                        message.pop("native_output_items", None)
+                    state["sessionId"] = ""
+                    state["providerPromptSnapshot"] = {}
+                    return {"task_uuid": task_map[str(row["task_uuid"])], "session_id": "", "state_json": json.dumps(state, ensure_ascii=False)}
+                await self._copy_table_rows_for_duplicate(
+                    "rath_task_model_contexts", f"task_uuid IN ({placeholders})", tuple(old_task_uuids), duplicate_agent_context,
+                )
                 await self._copy_table_rows_for_duplicate(
                     "rath_task_events",
                     f"task_uuid IN ({placeholders})",
@@ -927,11 +952,17 @@ class WebAdminConversationsMixin:
         if task_uuids & active_task_uuids:
             return ""
         terminal_statuses: list[str] = []
+        all_tasks_missing = bool(task_uuids) and self.rath_dao is not None
         for task_uuid in task_uuids:
             task = None
             if self.rath_dao is not None:
-                with contextlib.suppress(Exception):
+                try:
                     task = await self.rath_dao.get_task(task_uuid)
+                except Exception:
+                    # A failed lookup is not evidence that the task is gone.
+                    return ""
+            if task is not None:
+                all_tasks_missing = False
             status = str(getattr(task, "status", "") or "").strip()
             if status in {"completed", "partial", "failed", "cancelled", "interrupted"}:
                 terminal_statuses.append(status)
@@ -950,9 +981,57 @@ class WebAdminConversationsMixin:
         direct = str(payload.get("status") or "").strip()
         if direct in {"completed", "partial", "failed", "cancelled", "interrupted"}:
             return direct
+        if all_tasks_missing and not active_task_uuids:
+            return "interrupted"
         if not task_uuids and not active_task_uuids:
             return "failed" if direct in {"", "queued", "running", "resuming", "pausing", "stopping"} else "interrupted"
         return ""
+
+    async def _reconcile_agent_continue_placeholder(
+        self, row: dict[str, Any], op_row: Any, payload: dict[str, Any], *, source: str,
+    ) -> dict[str, Any] | None:
+        """Repair the old args.to-as-task-id bug without rewriting a real task."""
+        if str(payload.get("rootToolName") or payload.get("toolName") or payload.get("name") or "") != "AgentContinue":
+            return None
+        args = operation_json_loads_dict(str(payload.get("rootArguments") or payload.get("arguments") or payload.get("args") or "{}"))
+        result = operation_json_loads_dict(str(payload.get("resultText") or "{}"))
+        result_task = result.get("task") if isinstance(result.get("task"), dict) else {}
+        target_uuid = str(result.get("taskUuid") or result_task.get("taskUuid") or "")
+        source_uuid = str(payload.get("taskUuid") or "")
+        call_id = str(payload.get("rootToolCallId") or payload.get("toolCallId") or "")
+        if (
+            result.get("ok") is not True or not target_uuid or target_uuid == source_uuid
+            or not source_uuid or source_uuid != str(args.get("to") or "")
+            or str(op_row["op_id"]) != f"agent:{source_uuid}" or not call_id
+            or self.rath_dao is None
+        ):
+            return None
+        conv_uuid = str(row.get("conversation_uuid") or "")
+        chat_id = int(row.get("internal_chat_id") or 0)
+        try:
+            if await self.rath_dao.get_task(source_uuid) is not None:
+                return None
+            task = await self.rath_dao.get_task(target_uuid)
+        except Exception:
+            return None
+        if task is None or task.chat_id != chat_id or task.parent_session_uuid != conv_uuid:
+            return None
+        cur = await self.db.conn.execute(
+            "SELECT payload_json FROM web_operations WHERE conversation_uuid=? AND op_id=? AND op_type='agent' AND task_uuid=?",
+            (conv_uuid, f"agent:{target_uuid}", target_uuid),
+        )
+        target = await cur.fetchone()
+        target_payload = operation_json_loads_dict(str(target["payload_json"] or "{}")) if target else {}
+        if str(target_payload.get("rootToolCallId") or target_payload.get("toolCallId") or "") != call_id:
+            return None
+        return await self._publish_operation(
+            conv_uuid, internal_chat_id=chat_id, op_id=str(op_row["op_id"]),
+            op_type="agent", action="cancel", turn_uuid=str(op_row["turn_uuid"] or ""),
+            payload={"status": "completed", "merged": True, "mergedTo": f"agent:{target_uuid}",
+                     "mergeRedirect": True, "reconciled": True},
+            status="completed", lifecycle="terminal",
+            debug={"source": source, "reason": "agent_continue_identity_reconcile"},
+        )
 
     async def _reconcile_inactive_web_conversation_operations(self, row: dict[str, Any], *, source: str) -> list[dict[str, Any]]:
         conv_uuid = str(row.get("conversation_uuid") or "").strip()
@@ -987,6 +1066,10 @@ class WebAdminConversationsMixin:
         frames: list[dict[str, Any]] = []
         for op_row in await cur.fetchall():
             old_payload = operation_json_loads_dict(str(op_row["payload_json"] or "{}"))
+            redirect = await self._reconcile_agent_continue_placeholder(row, op_row, old_payload, source=source)
+            if redirect:
+                frames.append(redirect)
+                continue
             status = await self._terminal_status_for_agent_operation(old_payload, active_task_uuids)
             if not status:
                 continue
@@ -1057,7 +1140,7 @@ class WebAdminConversationsMixin:
         )
         rows = await cur.fetchall()
         if not rows:
-            return []
+            return agent_frames
         run_statuses: dict[str, str] = {}
         run_ids = sorted({str(r["run_id"] or r["target_id"] or r["turn_uuid"] or "") for r in rows if str(r["run_id"] or r["target_id"] or r["turn_uuid"] or "")})
         if run_ids:
@@ -1876,16 +1959,19 @@ class WebAdminConversationsMixin:
             return "", set()
         token = str(uuid.uuid4())
         ts = now_ts()
-        await self.db.conn.execute(
-            f"UPDATE web_task_notifications SET state='processing', claim_token=?, claimed_at=?, attempts=attempts+1, updated_at=? WHERE notification_uuid IN ({','.join('?' for _ in ids)}) AND state='pending'",
-            (token, ts, ts, *sorted(ids)),
-        )
-        await self.db.conn.commit()
-        cur = await self.db.conn.execute(
-            f"SELECT notification_uuid FROM web_task_notifications WHERE notification_uuid IN ({','.join('?' for _ in ids)}) AND state='processing' AND claim_token=?",
-            (*sorted(ids), token),
-        )
-        claimed = {str(row["notification_uuid"] or "") for row in await cur.fetchall()}
+        # Read the claimed IDs on the same writer transaction. After commit the
+        # router uses the shared reader, which may still hold an older snapshot
+        # and incorrectly report no rows even though the lease was acquired.
+        async with self.db.write_transaction(label="claim-web-task-notifications") as conn:
+            await conn.execute(
+                f"UPDATE web_task_notifications SET state='processing', claim_token=?, claimed_at=?, attempts=attempts+1, updated_at=? WHERE notification_uuid IN ({','.join('?' for _ in ids)}) AND state='pending'",
+                (token, ts, ts, *sorted(ids)),
+            )
+            cur = await conn.execute(
+                f"SELECT notification_uuid FROM web_task_notifications WHERE notification_uuid IN ({','.join('?' for _ in ids)}) AND state='processing' AND claim_token=?",
+                (*sorted(ids), token),
+            )
+            claimed = {str(row["notification_uuid"] or "") for row in await cur.fetchall()}
         return token, claimed
 
     async def _requeue_web_task_notifications(self, notification_uuids: set[str], error: str) -> None:

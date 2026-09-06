@@ -14,7 +14,7 @@ from typing import Any
 
 from app.tools.base import redact_tool_arguments_for_audit, redact_tool_result_for_audit
 
-AGENT_TASK_TOOL_NAMES = {"Agent"}
+AGENT_TASK_TOOL_NAMES = {"Agent", "AgentContinue"}
 AGENT_CONTROL_TOOL_NAMES = {"AgentMessage", "AgentStop"}
 AGENT_TOOL_NAMES = AGENT_TASK_TOOL_NAMES | AGENT_CONTROL_TOOL_NAMES
 ACTIVE_STATUSES = {"queued", "running", "pausing", "resuming", "stopping"}
@@ -118,6 +118,7 @@ _USER_INTERACTION_STATUS_MAP = {
     "answered": ("completed", "end"),
     "cancelled": ("cancelled", "cancel"),
     "timeout": ("completed", "end"),
+    "interrupted": ("interrupted", "cancel"),
     "error": ("failed", "error"),
 }
 
@@ -494,7 +495,7 @@ def tool_event_operation_specs(
     name = str(name or "Tool")
     arguments = str(arguments or "")
     raw_payload = payload if isinstance(payload, dict) else {}
-    # Only Agent creates a task card. AgentMessage/AgentStop are control
+    # Agent/AgentContinue create task cards. AgentMessage/AgentStop are control
     # operations attached to a target task; treating them as Agent tasks creates
     # fake queued cards (especially when the model uses an 8-char task id).
     tool_name = str(raw_payload.get("toolName") or name)
@@ -531,20 +532,17 @@ def tool_event_operation_specs(
     if is_agent or is_agent_control:
         task_obj = raw_payload.get("task") if isinstance(raw_payload.get("task"), dict) else None
         agent_task_uuid = str((task_obj or {}).get("taskUuid") or raw_payload.get("taskUuid") or "")
-        if not agent_task_uuid:
-            try:
-                parsed_args = json.loads(str(arguments or "{}"))
-                if isinstance(parsed_args, dict):
-                    agent_task_uuid = str(parsed_args.get("taskUuid") or parsed_args.get("task_uuid") or parsed_args.get("to") or "")
-            except Exception:
-                pass
         if not agent_task_uuid and typ == "tool_result":
-            try:
-                parsed = json.loads(str(result or ""))
-                if isinstance(parsed, dict):
-                    agent_task_uuid = str(parsed.get("taskUuid") or "")
-            except Exception:
-                pass
+            parsed_result = json_loads_dict(str(result or ""))
+            result_task = parsed_result.get("task") if isinstance(parsed_result.get("task"), dict) else {}
+            if not is_agent or (parsed_result.get("ok") is not False and not parsed_result.get("error")):
+                agent_task_uuid = str(parsed_result.get("taskUuid") or result_task.get("taskUuid") or "")
+        if not agent_task_uuid and is_agent_control:
+            parsed_args = json_loads_dict(arguments)
+            agent_task_uuid = str(parsed_args.get("taskUuid") or parsed_args.get("task_uuid") or parsed_args.get("to") or "")
+        # Creation/continuation arguments identify the source instance (or an old
+        # task), never the newly assigned task. Keep a call-id placeholder until
+        # authoritative progress/result supplies that new task's identity.
     if is_agent and agent_task_uuid and f"agent:{agent_task_uuid}" != f"{op_type}:{tool_call_id}":
         op_id = f"agent:{agent_task_uuid}"
     elif is_compaction or is_user_interaction:
@@ -653,12 +651,16 @@ def tool_event_operation_specs(
                 })
             action = "patch"
             status = ""
-            if is_agent and not agent_task_uuid:
+            if is_agent:
                 parsed_result = json_loads_dict(str(result or ""))
-                if parsed_result.get("ok") is False or parsed_result.get("error"):
+                if not agent_task_uuid and (parsed_result.get("ok") is False or parsed_result.get("error")):
                     status = "failed"
-                    next_payload["status"] = status
                     action = "error"
+                elif agent_task_uuid:
+                    status = _agent_status(parsed_result)
+                    action = _agent_operation_action(status)
+                if status:
+                    next_payload["status"] = status
             if tool_name == "AgentStop":
                 parsed_result = json_loads_dict(str(result or ""))
                 task_result = parsed_result.get("task") if isinstance(parsed_result.get("task"), dict) else None
@@ -1301,9 +1303,14 @@ def _user_interaction_summary_payload(payload: dict[str, Any], status: str) -> d
         "interactionStatus": str(sanitized.get("interactionStatus") or "pending"),
         "sensitive": bool(arguments.get("sensitive") or arguments.get("secret")),
     }
+    raw_result = sanitized.get("resultText") if "resultText" in sanitized else sanitized.get("result")
+    result_data = _summary_json_object(raw_result)
+    if str(result_data.get("source") or "") in {"web", "telegram"}:
+        summary["source"] = result_data["source"]
+    if str(result_data.get("decision") or "") in {"confirm", "reject", "feedback", "cancel"}:
+        summary["decision"] = result_data["decision"]
     if action == "confirm":
-        raw_result = sanitized.get("resultText") if "resultText" in sanitized else sanitized.get("result")
-        confirmed = _user_interaction_confirmed_flag(_summary_json_object(raw_result))
+        confirmed = _user_interaction_confirmed_flag(result_data)
         if confirmed is not None:
             summary["confirmed"] = confirmed
     for key in ("durationMs", "startedAtMs", "updatedAtMs", "terminalAtMs"):

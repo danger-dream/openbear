@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.interaction_data import explicit_authorization
 from app.logging import get_logger
 from app.models.thinking import (
     available_think_levels,
@@ -78,6 +79,8 @@ async def _confirm_if_needed(
     if ctx.web_confirm is None:
         return {"status": "error", "confirmed": False, "error": "web_confirmation_not_available"}
     result = await ctx.web_confirm({
+        "_sourceTool": "OpenBearControl",
+        "_requiresAuthorization": True,
         "title": f"确认执行：{action}",
         "body": body + (f"\n\n原因：{reason}" if reason else ""),
         "type": "warning" if action in {"restart", "new", "stop"} else "info",
@@ -253,7 +256,7 @@ async def _action_mcp_reload(svc: Any, reason: str) -> str:
         ),
         confirm_text="确认重载 MCP",
     )
-    if not confirm.get("confirmed"):
+    if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "mcp_reload", "confirmation": confirm})
     reload_fn = getattr(svc, "reload_mcp_from_disk", None)
     if not callable(reload_fn):
@@ -319,7 +322,7 @@ async def _action_restart(svc: Any, chat_id: int, args: dict[str, Any], reason: 
         ),
         confirm_text="确认重启",
     )
-    if not confirm.get("confirmed"):
+    if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "restart", "confirmation": confirm})
     svc.control_actions.enqueue_after_turn(
         chat_id,
@@ -339,7 +342,7 @@ async def _action_new(svc: Any, chat_id: int, reason: str) -> str:
         body="这会在当前回复完成后清空当前会话；下一条消息会进入新会话。",
         confirm_text="确认新建会话",
     )
-    if not confirm.get("confirmed"):
+    if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "new", "confirmation": confirm})
     svc.control_actions.enqueue_after_turn(
         chat_id,
@@ -368,7 +371,7 @@ async def _action_stop(svc: Any, chat_id: int, args: dict[str, Any], reason: str
         body=f"这会停止目标：{target}。当前回复会尽量优雅收尾。",
         confirm_text="确认停止",
     )
-    if not confirm.get("confirmed"):
+    if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "stop", "target": target, "confirmation": confirm})
     stopped_run = False
     if target in {"current_run", "all"}:
@@ -430,7 +433,7 @@ def register_openbear_control_tool(reg: ToolRegistry, svc: Any) -> None:
         (
             "OpenBear control plane: status/models/mcp_status/skills_status/skills_reload/mcp_reload/think/restart/new/foreground-run stop. "
             "Do not use this tool for Rath/Agent task cancellation; use AgentStop. "
-            "Risky actions ask channel confirmation when supported and run safely after the reply; "
+            "Risky actions ask channel confirmation when supported and run safely after the reply. User text is feedback, not authorization: read confirmation.text and revise the action before asking again; "
             "do not restart/stop openbear.service via Bash."
         ),
         {
@@ -452,4 +455,5 @@ def register_openbear_control_tool(reg: ToolRegistry, svc: Any) -> None:
         },
         lambda tool_args: make_openbear_control_tool(svc, tool_args),
         visibility={"main"},
+        preserve_result=True,
     )

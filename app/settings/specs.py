@@ -706,6 +706,18 @@ SPECS: dict[str, SettingSpec] = {
         max_value=1440,
         unit="分钟",
     ),
+    "web.interactionNotifications.enabled": _s(
+        "web.interactionNotifications.enabled",
+        "Telegram 交互待办提醒",
+        "确认、选择、输入或问卷等待回答时立即提醒，不受长任务时长阈值限制；敏感内容只提醒前往 Web。",
+        "bool", "web_notifications", "立即生效",
+    ),
+    "web.interactionNotifications.allowReply": _s(
+        "web.interactionNotifications.allowReply",
+        "允许在 Telegram 作答",
+        "通过交互消息的按钮和指定回复处理非敏感待办；Web 与 Telegram 共用一次提交结果。",
+        "bool", "web_notifications", "立即生效",
+    ),
     "web.taskNotifications.enabled": _s(
         "web.taskNotifications.enabled",
         "Telegram 长任务通知",
@@ -884,8 +896,10 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         ],
     ),
     "web_notifications": (
-        "Telegram 长任务通知",
+        "Telegram 通知",
         [
+        "web.interactionNotifications.enabled",
+        "web.interactionNotifications.allowReply",
         "web.taskNotifications.enabled",
         "web.taskNotifications.includeResult",
         "web.taskNotifications.thresholdMinutes",

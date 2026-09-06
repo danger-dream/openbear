@@ -1,69 +1,20 @@
 <script setup>
-import { onBeforeUnmount, ref } from "vue";
+import { onBeforeUnmount, reactive, toRefs } from "vue";
 import { ElMessage } from "element-plus";
-import { Api, apiError } from "../api";
+import { Api } from "../api";
+import { createLoginFlow } from "./loginFlow.js";
 
-const secret = ref("");
-const loading = ref(false);
-const requestUuid = ref("");
-const status = ref("");
-const retryAfter = ref(0);
-let timer = 0;
-
-function clearPoll() {
-  if (timer) {
-    window.clearTimeout(timer);
-    timer = 0;
-  }
-}
-
-async function pollStatus() {
-  if (!requestUuid.value) return;
-  try {
-    const result = await Api.loginStatus(requestUuid.value);
-    status.value = result.status;
-    if (result.status === "approved") {
-      await Api.consumeLogin(requestUuid.value);
-      window.location.href = "/";
-      return;
-    }
-    if (result.status === "rejected" || result.status === "denied") {
-      ElMessage.error("Telegram 已拒绝本次登录");
-      loading.value = false;
-      return;
-    }
-    if (result.status === "expired") {
-      ElMessage.error("登录请求已过期，请重新输入 Secret Key");
-      loading.value = false;
-      return;
-    }
-    timer = window.setTimeout(pollStatus, 1800);
-  } catch (error) {
-    ElMessage.error(apiError(error));
-    loading.value = false;
-  }
-}
-
-async function submit() {
-  clearPoll();
-  retryAfter.value = 0;
-  requestUuid.value = "";
-  status.value = "";
-  loading.value = true;
-  try {
-    const result = await Api.loginStart(secret.value);
-    requestUuid.value = result.requestUuid;
-    status.value = "pending";
-    ElMessage.success("Secret Key 已通过，请在 Telegram 中确认登录");
-    timer = window.setTimeout(pollStatus, 800);
-  } catch (error) {
-    retryAfter.value = Number(error?.response?.data?.retryAfter || 0);
-    ElMessage.error(apiError(error));
-    loading.value = false;
-  }
-}
-
-onBeforeUnmount(clearPoll);
+const state = reactive({secret: "", loading: false, requestUuid: "", status: "", retryAfter: 0});
+const { secret, loading, requestUuid, status, retryAfter } = toRefs(state);
+const flow = createLoginFlow({
+  state,
+  api: Api,
+  success: (message) => ElMessage.success(message),
+  error: (message) => ElMessage.error(message),
+  authenticated: () => window.location.replace("/"),
+});
+const submit = () => flow.submit();
+onBeforeUnmount(() => flow.dispose());
 </script>
 
 <template>
@@ -83,10 +34,9 @@ onBeforeUnmount(clearPoll);
           placeholder="Web Secret Key"
           size="large"
           show-password
-          :disabled="loading && status === 'pending'"
-          @keyup.enter="submit"
+          :disabled="loading"
         />
-        <el-button type="primary" size="large" class="w-full" :loading="loading" :disabled="!secret" @click="submit">
+        <el-button type="primary" size="large" class="w-full" :loading="loading" :disabled="loading || !secret" native-type="submit">
           {{ status === 'pending' ? '等待 Telegram 确认…' : '继续' }}
         </el-button>
       </el-form>

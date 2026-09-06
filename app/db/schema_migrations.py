@@ -211,11 +211,11 @@ async def dedupe_active_rath_agent_sessions(conn: aiosqlite.Connection) -> int:
     cur = await conn.execute(
         """
         SELECT id, metadata_json FROM rath_agent_sessions
-        WHERE status='active'
+        WHERE status='active' AND session_kind='legacy'
           AND id NOT IN (
             SELECT MAX(id)
             FROM rath_agent_sessions
-            WHERE status='active'
+            WHERE status='active' AND session_kind='legacy'
             GROUP BY openbear_session_uuid, workflow_uuid, agent_key
           )
         """

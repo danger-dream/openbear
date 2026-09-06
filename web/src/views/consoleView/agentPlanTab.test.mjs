@@ -58,9 +58,11 @@ try {
 
 const originalPlanRequest = Api.rathTaskPlan;
 const originalEventsRequest = Api.rathTaskEvents;
+const originalInstanceRequest = Api.rathAgentInstance;
 after(() => {
   Api.rathTaskPlan = originalPlanRequest;
   Api.rathTaskEvents = originalEventsRequest;
+  Api.rathAgentInstance = originalInstanceRequest;
 });
 
 function deferred() {
@@ -73,8 +75,8 @@ function deferred() {
   return {promise, resolve, reject};
 }
 
-function taskEvent(task) {
-  return {livePayload: {task}, calls: [], result: {}};
+function taskEvent(task, agentSession = null) {
+  return {livePayload: {task, ...(agentSession ? {agentSession} : {})}, calls: [], result: {}};
 }
 
 function plannedSnapshot(version = 1) {
@@ -133,9 +135,9 @@ function installApi(planRequest) {
   return {planCalls, eventCalls};
 }
 
-function createCard(task, {previewOnly = false, open = true} = {}) {
+function createCard(task, {previewOnly = false, open = true, agentSession = null} = {}) {
   const props = reactive({
-    event: taskEvent(task),
+    event: taskEvent(task, agentSession),
     conversationUuid: "conversation-1",
     turnId: "turn-1",
     index: 0,
@@ -168,10 +170,10 @@ test("single Agent summary uses its task title for running and completed states"
   t.after(completed.stop);
 
   assert.equal(running.bindings.summaryTitle.value, "Agent");
-  assert.equal(running.bindings.summarySubtitle.value, "· 分析会话首屏加载链路 · 运行中");
+  assert.equal(running.bindings.summarySubtitle.value, "· 分析会话首屏加载链路 · 本轮执行中");
   assert.equal(running.bindings.panelTitle.value, "Agent 运行中", "expanded panel heading remains unchanged");
   assert.equal(completed.bindings.summaryTitle.value, "Agent");
-  assert.equal(completed.bindings.summarySubtitle.value, "· 分析会话首屏加载链路 · 执行完成");
+  assert.equal(completed.bindings.summarySubtitle.value, "· 分析会话首屏加载链路 · 本轮已结束");
 });
 
 test("planMode=direct hides the Plan tab on first open without blocking workspace loading", async (t) => {
@@ -317,4 +319,165 @@ test("preview-only Agent cards do not enter workspace or event request paths", a
   assert.equal(requests.planCalls.length, 0);
   assert.equal(requests.eventCalls.length, 0);
   assert.equal(card.bindings.isOpen.value, false);
+});
+
+test("instance history is requested only when its tab opens and keeps all turns of one agent", async (t) => {
+  installApi(async () => noPlanSnapshot());
+  const instanceCalls = [];
+  const session = {
+    agentId: "agent-a", sessionKind: "independent", status: "active", activeTaskUuid: "",
+    lastTaskUuid: "task-2", contextRevision: 5, turnCount: 2, canContinue: true,
+  };
+  Api.rathAgentInstance = async (...args) => {
+    instanceCalls.push(args);
+    return {
+      ok: true,
+      agentSession: session,
+      legacy: false,
+      tasks: [
+        {taskUuid: "task-1", agentId: "agent-a", sessionKind: "independent", sessionTurn: 1, title: "调查", status: "completed", grantedTools: ["Read"], contextSource: {state: "fresh", revision: 1}},
+        {taskUuid: "task-2", agentId: "agent-a", sessionKind: "independent", sessionTurn: 2, title: "修复", status: "completed", grantedTools: ["Read", "Edit"], continuedFromTaskUuid: "task-1", contextSource: {state: "restored", taskUuid: "task-1", revision: 4}},
+      ],
+    };
+  };
+  const card = createCard({taskUuid: "task-2", agentId: "agent-a", sessionKind: "independent", sessionTurn: 2, title: "修复", status: "completed"}, {agentSession: session});
+  t.after(card.stop);
+  await flushAsync();
+
+  assert.equal(instanceCalls.length, 0, "opening the Agent panel does not eagerly request instance history");
+  card.bindings.selectTab("instance");
+  await flushAsync();
+  assert.equal(instanceCalls.length, 1);
+  assert.deepEqual(card.bindings.visibleInstanceData.value.tasks.map((task) => task.taskUuid), ["task-1", "task-2"]);
+  assert.equal(card.bindings.visibleInstanceData.value.tasks[1].statusView.label, "本轮已结束，可继续指派");
+  assert.equal(card.bindings.instanceView.value.turnLabel, "第 2 次指派");
+});
+
+test("late instance response for an old task cannot replace the new task state", async (t) => {
+  installApi(async () => noPlanSnapshot());
+  const oldRequest = deferred();
+  const instanceCalls = [];
+  Api.rathAgentInstance = async (_conversationUuid, requestedTaskUuid) => {
+    instanceCalls.push(requestedTaskUuid);
+    if (requestedTaskUuid === "task-old") return oldRequest.promise;
+    return {
+      ok: true,
+      legacy: false,
+      agentSession: {agentId: "agent-new", sessionKind: "independent", activeTaskUuid: "task-new", lastTaskUuid: "task-new", turnCount: 1, canContinue: false},
+      tasks: [{taskUuid: "task-new", agentId: "agent-new", sessionKind: "independent", sessionTurn: 1, title: "新轮", status: "running", grantedTools: ["Read"], contextSource: {state: "fresh", revision: 1}}],
+    };
+  };
+  const card = createCard({taskUuid: "task-old", agentId: "agent-old", sessionKind: "independent", sessionTurn: 1, title: "旧轮", status: "completed"}, {
+    agentSession: {agentId: "agent-old", sessionKind: "independent", lastTaskUuid: "task-old", canContinue: true},
+  });
+  t.after(card.stop);
+  card.bindings.selectTab("instance");
+  await Promise.resolve();
+
+  card.props.event = taskEvent(
+    {taskUuid: "task-new", agentId: "agent-new", sessionKind: "independent", sessionTurn: 1, title: "新轮", status: "running"},
+    {agentId: "agent-new", sessionKind: "independent", activeTaskUuid: "task-new", lastTaskUuid: "task-new", canContinue: false},
+  );
+  await nextTick();
+  oldRequest.resolve({
+    ok: true,
+    legacy: false,
+    agentSession: {agentId: "agent-old", sessionKind: "independent", lastTaskUuid: "task-old", canContinue: true},
+    tasks: [{taskUuid: "task-old", agentId: "agent-old", sessionKind: "independent", sessionTurn: 1, title: "旧轮", status: "completed"}],
+  });
+  await flushAsync();
+  await flushAsync();
+
+  assert.deepEqual(instanceCalls, ["task-old", "task-new"]);
+  assert.equal(card.bindings.instanceTaskUuid.value, "task-new");
+  assert.deepEqual(card.bindings.visibleInstanceData.value.tasks.map((task) => task.taskUuid), ["task-new"]);
+  assert.equal(card.bindings.instanceView.value.statusView.label, "本轮执行中");
+});
+
+test("unsupported instance endpoint falls back to the current task without losing the panel", async (t) => {
+  installApi(async () => noPlanSnapshot());
+  Api.rathAgentInstance = async () => {
+    const error = new Error("Request failed with status code 404");
+    error.response = {status: 404, data: {error: "not_found"}};
+    throw error;
+  };
+  const card = createCard({taskUuid: "legacy-task", title: "历史任务", status: "completed"});
+  t.after(card.stop);
+  card.bindings.selectTab("instance");
+  await flushAsync();
+
+  assert.match(card.bindings.instanceError.value, /not_found/);
+  assert.equal(card.bindings.visibleInstanceData.value.legacy, true);
+  assert.deepEqual(card.bindings.visibleInstanceData.value.tasks.map((task) => task.taskUuid), ["legacy-task"]);
+});
+
+
+test("reopening a collapsed panel backfills activity missed while pushes were dropped", async (t) => {
+  // Pushes are discarded while the details element is closed; once the task is
+  // terminal no further push can trigger gap recovery, so reopening must fetch
+  // the newer tail over HTTP (paginating past a single page) instead of leaving
+  // the process log frozen at the moment the panel was collapsed.
+  const eventCalls = [];
+  Api.rathTaskPlan = async () => noPlanSnapshot();
+  Api.rathTaskEvents = async (conversationUuid, taskUuid, opts = {}) => {
+    eventCalls.push(opts);
+    const afterSeq = Number(opts.afterSeq || 0);
+    if (afterSeq >= 4) return {ok: true, events: [], total: 5, monitorTotal: 0, hasMore: false, nextBeforeSeq: 0};
+    if (afterSeq === 3) {
+      return {
+        ok: true,
+        events: [
+          {seq: 4, ts: 4, kind: "model_call_finished", summary: "模型调用完成", detail: {}},
+          {seq: 5, ts: 5, kind: "task_completed", summary: "任务完成", detail: {}},
+        ],
+        total: 5, monitorTotal: 0, hasMore: false, nextBeforeSeq: 0,
+      };
+    }
+    if (afterSeq === 2) {
+      return {
+        ok: true,
+        events: [{seq: 3, ts: 3, kind: "model_stream_progress", summary: "模型流式输出中", detail: {}}],
+        total: 5, monitorTotal: 0, hasMore: true, nextBeforeSeq: 0,
+      };
+    }
+    return {
+      ok: true,
+      events: [
+        {seq: 1, ts: 1, kind: "task_started", summary: "任务开始", detail: {}},
+        {seq: 2, ts: 2, kind: "model_call_started", summary: "模型调用开始", detail: {}},
+      ],
+      total: 2, monitorTotal: 0, hasMore: false, nextBeforeSeq: 0,
+    };
+  };
+  const openState = reactive({open: true});
+  const props = reactive({
+    event: taskEvent({taskUuid: "task-reopen", status: "running", planMode: "direct"}),
+    conversationUuid: "conversation-1",
+    turnId: "turn-1",
+    index: 0,
+    detailKey: () => "legacy-agent-detail",
+    isDetailOpen: () => openState.open,
+    onDetailsToggle: () => {},
+    previewOnly: false,
+  });
+  const scope = effectScope();
+  const bindings = scope.run(() => AgentEventCard.setup(props, {expose: () => {}}));
+  t.after(() => scope.stop());
+  await flushAsync();
+  await flushAsync();
+  assert.deepEqual(bindings.activityLines.value.map((item) => item.seq), [1, 2]);
+
+  openState.open = false;
+  await flushAsync();
+  // Tail events 3-5 happen while the panel is collapsed; the task completes.
+  props.event.livePayload.task.status = "completed";
+  await flushAsync();
+  assert.deepEqual(bindings.activityLines.value.map((item) => item.seq), [1, 2]);
+
+  openState.open = true;
+  await flushAsync();
+  await flushAsync();
+  assert.deepEqual(bindings.activityLines.value.map((item) => item.seq), [1, 2, 3, 4, 5]);
+  const afterSeqs = eventCalls.map((opts) => Number(opts?.afterSeq || 0)).filter(Boolean);
+  assert.deepEqual(afterSeqs, [2, 3]);
 });

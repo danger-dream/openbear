@@ -77,6 +77,11 @@ import {
 	taskMemoryChangedTransportEvent,
 } from "./taskMemoryUiState.js";
 import {
+	interactionErrorCode,
+	interactionRevision,
+	isTerminalInteractionError,
+} from "./userInteractionState.js";
+import {
 	capturePrependAnchor,
 	findTurnIndexByIdentity,
 	mergeOperationSnapshots,
@@ -831,43 +836,38 @@ function updatePendingConfirmations(list = []) {
 async function answerPendingConfirmation(item, answer = {}) {
 	const confirmationId = item?.confirmationId;
 	const conversationUuid = activeConversationUuid.value;
-	if (!confirmationId || !conversationUuid) return;
-	const questionnaire = String(item?.action || "") === "questionnaire";
-	if (questionnaire && confirmationSubmitting.value[confirmationId]) return;
-	if (questionnaire) {
-		confirmationSubmitting.value = {...confirmationSubmitting.value, [confirmationId]: true};
-		const nextErrors = {...confirmationErrors.value};
-		delete nextErrors[confirmationId];
-		confirmationErrors.value = nextErrors;
-	}
+	if (!confirmationId || !conversationUuid || confirmationSubmitting.value[confirmationId]) return;
+	confirmationSubmitting.value = {...confirmationSubmitting.value, [confirmationId]: true};
+	const nextErrors = {...confirmationErrors.value};
+	delete nextErrors[confirmationId];
+	confirmationErrors.value = nextErrors;
 	try {
-		await Api.answerConversationConfirmation(conversationUuid, confirmationId, answer);
+		await Api.answerConversationConfirmation(conversationUuid, confirmationId, {
+			...answer,
+			revision: interactionRevision(item),
+		});
 		pendingConfirmations.value = pendingConfirmations.value.filter((x) => x.confirmationId !== confirmationId);
 	} catch (error) {
 		const statusCode = Number(error?.response?.status || 0);
-		const errorCode = String(error?.response?.data?.error || error?.response?.data?.code || error?.response?.data?.message || "");
-		if (questionnaire && statusCode === 404 && errorCode === "confirmation_not_found") {
+		const errorCode = interactionErrorCode(error);
+		if (isTerminalInteractionError(error)) {
 			pendingConfirmations.value = pendingConfirmations.value.filter((x) => x.confirmationId !== confirmationId);
 			await load({conversationUuid, scrollMode: "preserve", manageLoading: false});
 			return;
 		}
 		const message = apiError(error);
-		if (questionnaire) {
-			confirmationErrors.value = {
-				...confirmationErrors.value,
-				[confirmationId]: statusCode === 400
-					? `回答未能提交：${message || "请检查必填项后重试。"}`
-					: `提交失败：${message || "请稍后重试。"}`,
-			};
-		} else {
-			ElMessage.error(message);
-		}
+		confirmationErrors.value = {
+			...confirmationErrors.value,
+			[confirmationId]: statusCode === 400
+				? `回答未能提交：${message || "请检查输入后重试。"}`
+				: (statusCode === 409 && errorCode
+					? `提交冲突：${message || errorCode}`
+					: `提交失败：${message || "请稍后重试。"}`),
+		};
 	} finally {
-		if (questionnaire) {
-			const nextSubmitting = {...confirmationSubmitting.value};
-			delete nextSubmitting[confirmationId];
-			confirmationSubmitting.value = nextSubmitting;
-		}
+		const nextSubmitting = {...confirmationSubmitting.value};
+		delete nextSubmitting[confirmationId];
+		confirmationSubmitting.value = nextSubmitting;
 	}
 }
 
@@ -2512,7 +2512,7 @@ function handleWsMessage(raw, source = {}) {
 	}
 	if (data.type === "event") return;
 	if (data.type === "web_confirmation") {
-		updatePendingConfirmations(data.confirmations || []);
+		updatePendingConfirmations(data.confirmations || data.confirmation || []);
 		return;
 	}
 	if (data.type === "pending_steering") {

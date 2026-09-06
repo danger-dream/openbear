@@ -1,5 +1,6 @@
 const AGENT_PANEL_PREFIX = "agent-panel:";
 const AGENT_PANEL_INTENTS = new Set(["auto", "open", "closed"]);
+const AGENT_EXECUTION_TOOLS = new Set(["Agent", "AgentContinue", "AgentMessage", "AgentStop"]);
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -11,8 +12,17 @@ function text(value) {
 
 function taskUuidFrom(value = {}) {
   const item = object(value);
-  const task = object(item.task);
-  return text(item.taskUuid || item.task_uuid || task.taskUuid || task.task_uuid);
+  const result = object(item.result);
+  const task = Object.keys(object(item.task)).length ? object(item.task) : object(result.task);
+  return text(item.taskUuid || item.task_uuid || result.taskUuid || result.task_uuid || task.taskUuid || task.task_uuid);
+}
+
+function isAgentExecutionOperation(value = {}) {
+  const operation = object(value);
+  if (text(operation.opType) === "agent") return true;
+  if (text(operation.opType) !== "tool") return false;
+  const payload = object(operation.payload);
+  return AGENT_EXECUTION_TOOLS.has(text(payload.rootToolName || payload.name || payload.toolName));
 }
 
 export function agentOperationIdentity(operation = {}) {
@@ -70,7 +80,7 @@ export function selectLatestActiveAgentOperation(operations = [], runState = {})
   if (!activeIds.size) return null;
   const active = (Array.isArray(operations) ? operations : [])
     .filter((operation) => (
-      text(operation?.opType) === "agent"
+      isAgentExecutionOperation(operation)
       && object(operation?.payload).merged !== true
       && activeIds.has(text(operation?.opId))
     ));

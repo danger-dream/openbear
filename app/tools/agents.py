@@ -8,15 +8,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import re
+import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
+from uuid import uuid4
 
 from app.agent.compaction import CompressionCandidate
 from app.config import Config
 from app.db.dao import MessageDAO
 from app.llm.events import Usage
 from app.llm.factory import BackendFactory
+from app.memory.client import MemoryClient
 from app.models.agent_runtime import resolve_agent_runtime_config
 from app.models.selection import ModelSelection
 from app.rath.agent_prompt import render_agent_base_system_prompt
@@ -40,7 +46,9 @@ from app.rath.single_agent import (
 from app.stream.tool_progress import (
     format_agent_task_progress_card,
 )
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist
+from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist, expand_agent_tool_names
+from app.tools.agent_continuation import AgentContinuationTools, register_continuation_tools
+from app.rath.continuity import agent_session_public
 from app.tools.base import (
     ToolRegistry,
     ToolRuntimeContext,
@@ -52,6 +60,14 @@ from app.utils import estimate_tokens
 _AGENT_PLAN_MODE_DIRECT = "direct"
 _AGENT_PLAN_MODE_MANAGED = "managed"
 _AGENT_PLAN_MODES = frozenset({_AGENT_PLAN_MODE_DIRECT, _AGENT_PLAN_MODE_MANAGED})
+
+_ATTACHMENT_MAX_ITEMS = 12
+_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _attachment_slug(value: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", str(value or "").strip()).strip("-.")
+    return slug[:80] or "attachment"
 
 
 def _normalize_agent_plan_mode(value: Any, *, default: str = _AGENT_PLAN_MODE_DIRECT) -> str:
@@ -112,6 +128,13 @@ def _task_public(
     include_runtime_output = isinstance(retry_state, dict)
     return {
         "taskUuid": task.task_uuid,
+        "taskId": task.task_uuid,
+        "agentId": task.agent_session_uuid,
+        "sessionKind": str(task.input.get("sessionKind") or "legacy"),
+        "sessionTurn": int(task.input.get("sessionTurn") or 0),
+        "continuedFromTaskUuid": str((task.input.get("contextSource") or {}).get("taskUuid") or ""),
+        "contextSource": task.input.get("contextSource") or {"state": "fresh", "taskUuid": "", "revision": 0},
+        "grantedTools": sorted(expand_agent_tool_names((snapshot or {}).get("toolAllowlist") or [])),
         "taskShortId": task_short_id,
         "displayName": f"{display_base}-{task_short_id}" if task_short_id else display_base,
         "title": task.title,
@@ -284,7 +307,7 @@ _NOTIFIABLE_AGENT_STATUSES = set(TERMINAL_TASK_STATUSES) | {"needs_openbear_cont
 _DETACHED_PROGRESS_POLL_INTERVAL_S = 10.0
 
 
-class AgentTools:
+class AgentTools(AgentContinuationTools):
     def __init__(
         self,
         *,
@@ -296,6 +319,7 @@ class AgentTools:
         registry: ToolRegistry,
         messages: MessageDAO | None = None,
         workspace_dir: str = "",
+        memory: MemoryClient | None = None,
     ) -> None:
         self.config = config
         self.dao = dao
@@ -305,6 +329,7 @@ class AgentTools:
         self.registry = registry
         self.messages = messages or MessageDAO(dao.db)
         self.workspace_dir = str(workspace_dir or "").strip()
+        self.memory = memory
         coordinator = manager.plan_coordinator
         if coordinator is None:
             rath_config = config.rath
@@ -572,6 +597,158 @@ class AgentTools:
                 }
         return {"tools": requested, "availableTools": available}
 
+    async def _resolve_attachments(
+        self, raw: Any
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Fetch the complete body behind each attachment reference.
+
+        Attachments exist so the controller hands full source material to the
+        child instead of a title or summary. Any unresolvable reference fails
+        the launch: silently launching without promised material would recreate
+        the context-loss failure this feature removes.
+        """
+        if raw is None:
+            return [], None
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            return [], {
+                "error": "agent_attachments_invalid",
+                "message": (
+                    "attachments must be an array of strings: @doc/<name>, @mem/<ref>, "
+                    "or an existing local file path."
+                ),
+            }
+        refs = [item.strip() for item in raw if item.strip()]
+        if len(refs) > _ATTACHMENT_MAX_ITEMS:
+            return [], {
+                "error": "agent_attachments_too_many",
+                "message": f"attachments supports at most {_ATTACHMENT_MAX_ITEMS} items per launch.",
+            }
+        resolved: list[dict[str, Any]] = []
+        for ref in refs:
+            if ref.startswith("@secret/"):
+                return [], {
+                    "error": "agent_attachment_forbidden",
+                    "ref": ref,
+                    "message": (
+                        "Secrets are never materialized into attachment files. "
+                        "Reference the credential through the granted tools instead."
+                    ),
+                }
+            if ref.startswith("@doc/") or ref.startswith("@mem/"):
+                if self.memory is None:
+                    return [], {
+                        "error": "agent_attachment_unavailable",
+                        "ref": ref,
+                        "message": "Memory-backed attachments are unavailable in this runtime.",
+                    }
+                is_doc = ref.startswith("@doc/")
+                key = ref[len("@doc/"):] if is_doc else ref[len("@mem/"):]
+                try:
+                    if is_doc:
+                        data = await self.memory.tool_call("doc", {"action": "get", "name": key})
+                    else:
+                        data = await self.memory.tool_call("entry", {"action": "get", "ref": key})
+                except Exception as exc:
+                    return [], {
+                        "error": "agent_attachment_fetch_failed",
+                        "ref": ref,
+                        "message": f"Memory fetch failed: {type(exc).__name__}",
+                    }
+                item = data.get("item") if isinstance(data, dict) else None
+                if not (isinstance(data, dict) and data.get("ok") and isinstance(item, dict)):
+                    detail = str((data or {}).get("error") or "not found") if isinstance(data, dict) else "not found"
+                    return [], {
+                        "error": "agent_attachment_not_found",
+                        "ref": ref,
+                        "message": f"Memory item could not be fetched: {detail}",
+                    }
+                if is_doc:
+                    text = str(item.get("content") or "")
+                else:
+                    parts = [f"# @mem/{key} — {str(item.get('title') or key)}"]
+                    fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+                    if fields:
+                        parts.append(json.dumps(fields, ensure_ascii=False, indent=2))
+                    body = str(item.get("body") or "")
+                    if body.strip():
+                        parts.append(body)
+                    text = "\n\n".join(parts)
+                if not text.strip():
+                    return [], {
+                        "error": "agent_attachment_empty",
+                        "ref": ref,
+                        "message": "The referenced memory item has no body to attach.",
+                    }
+                resolved.append({
+                    "ref": ref,
+                    "kind": "doc" if is_doc else "entry",
+                    "filename": f"{'doc' if is_doc else 'mem'}-{_attachment_slug(key)}.md",
+                    "text": text,
+                    "chars": len(text),
+                })
+                continue
+            path = os.path.abspath(os.path.expanduser(ref))
+            if not os.path.isfile(path):
+                return [], {
+                    "error": "agent_attachment_not_found",
+                    "ref": ref,
+                    "message": "Attachment file does not exist or is not a regular file.",
+                }
+            size = os.path.getsize(path)
+            if size > _ATTACHMENT_MAX_BYTES:
+                return [], {
+                    "error": "agent_attachment_too_large",
+                    "ref": ref,
+                    "sizeBytes": size,
+                    "message": f"Attachment files are capped at {_ATTACHMENT_MAX_BYTES} bytes.",
+                }
+            chars: int | None = None
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    chars = len(fh.read())
+            except (UnicodeDecodeError, OSError):
+                chars = None
+            resolved.append({
+                "ref": ref,
+                "kind": "file",
+                "filename": _attachment_slug(os.path.basename(path)),
+                "sourcePath": path,
+                "chars": chars,
+                "bytes": size,
+            })
+        return resolved, None
+
+    def _materialize_attachments(self, prompt: str, items: list[dict[str, Any]]) -> str:
+        """Write attachment bodies to task-local files and append a real manifest."""
+        base = self.workspace_dir or tempfile.gettempdir()
+        directory = os.path.join(base, ".agent-attachments", uuid4().hex[:12])
+        os.makedirs(directory, exist_ok=True)
+        lines: list[str] = []
+        used_names: set[str] = set()
+        for item in items:
+            filename = str(item["filename"])
+            stem, ext = os.path.splitext(filename)
+            counter = 1
+            while filename in used_names:
+                counter += 1
+                filename = f"{stem}-{counter}{ext}"
+            used_names.add(filename)
+            target = os.path.join(directory, filename)
+            if item["kind"] == "file":
+                shutil.copyfile(str(item["sourcePath"]), target)
+            else:
+                with open(target, "w", encoding="utf-8") as fh:
+                    fh.write(str(item["text"]))
+            chars = item.get("chars")
+            size_desc = f"{chars} 字符" if isinstance(chars, int) else f"{item.get('bytes', 0)} 字节（非 UTF-8 文本）"
+            lines.append(f"- {item['ref']} → {target}（{size_desc}）")
+        manifest = (
+            "\n\n【任务材料】\n"
+            "以下材料已随本任务完整落盘为本地文件。先用 Read（或 Bash）读取需要的全文再开展工作；"
+            "不要只凭本清单、文件名或任何转述下结论：\n" + "\n".join(lines)
+        )
+        return prompt + manifest
+
     async def agent(self, args: dict[str, Any]) -> str:
         """Claude-Code-style subagent entrypoint exposed to the main model."""
         ctx = current_tool_context()
@@ -613,15 +790,27 @@ class AgentTools:
             })
         inherited_context: dict[str, Any] = {}
         if inherit_ref:
+            if plan_mode == _AGENT_PLAN_MODE_DIRECT:
+                # A direct task has no Plan runtime, so inherited Plan facts would be
+                # recorded in the DB but never reach the model. Refuse instead of lying.
+                return _json({
+                    "ok": False,
+                    "error": "inherit_requires_managed_plan",
+                    "message": (
+                        "inheritFromTaskUuid only injects durable Plan facts into a planMode=managed task; "
+                        "a direct task never receives that context, so inheriting here would silently drop it. "
+                        "Write the completed facts, evidence, and remaining work directly into the prompt "
+                        "(or share them via TaskMemory), then relaunch without inheritFromTaskUuid."
+                    ),
+                })
             inherited_context, inherit_error = await self._inherit_plan_context(inherit_ref)
             if inherit_error:
                 return _json({"ok": False, **inherit_error})
-            if plan_mode == _AGENT_PLAN_MODE_DIRECT:
-                inherited_context = dict(inherited_context)
-                inherited_context["instruction"] = (
-                    "Treat these as durable facts and references only. Do not resume the old coroutine or transcript. "
-                    "Continue only the remaining requested work directly, without repeating completed work."
-                )
+        attachments, attachment_error = await self._resolve_attachments(
+            args.get("attachments") if "attachments" in args else args.get("attachment")
+        )
+        if attachment_error:
+            return _json({"ok": False, **attachment_error})
         worker_type = str(
             args.get("workerType")
             or args.get("subagent_type")
@@ -643,9 +832,19 @@ class AgentTools:
         tool_resolution = self._resolve_requested_agent_tools(args, agent)
         if tool_resolution.get("error"):
             return _json({"ok": False, **tool_resolution})
-        agent = replace(agent, tool_allowlist=tool_resolution["tools"])
+        granted_tools = list(tool_resolution["tools"])
+        if attachments and "Read" not in granted_tools:
+            # Attached material is delivered as files; a child that cannot read
+            # them would be handed a manifest of unreachable paths.
+            granted_tools.append("Read")
+        preset_ceiling = list(agent.tool_allowlist)
+        if attachments and preset_ceiling and "Read" not in preset_ceiling:
+            return _json({"ok": False, "error": "agent_attachment_tool_denied", "message": "Attached material requires Read within the preset ceiling."})
+        agent = replace(agent, tool_allowlist=granted_tools)
         description = str(args.get("description") or args.get("title") or "").strip()
         title = (description or f"{agent.name}: {prompt[:80]}").strip()[:120]
+        if attachments:
+            prompt = self._materialize_attachments(prompt, attachments)
         output = await self._run_one(
             agent,
             instruction=prompt,
@@ -655,6 +854,9 @@ class AgentTools:
             inherit_from_task_uuid=inherit_ref,
             inherited_plan_context=inherited_context,
             plan_mode=plan_mode,
+            preset_ceiling=preset_ceiling,
+            attachment_refs=[str(item["ref"]) for item in attachments],
+            original_prompt=str(args.get("prompt") or args.get("instruction") or args.get("task") or ""),
         )
         return _json(output)
 
@@ -698,8 +900,8 @@ class AgentTools:
             })
         if task.status in TERMINAL_TASK_STATUSES:
             # A delayed controller message must not resurrect completed work as
-            # a hidden follow-up task. Starting more work requires a fresh,
-            # explicit Agent call with a complete prompt and tool allowlist.
+            # a hidden follow-up task. Explicit AgentContinue starts a new
+            # round on the same instance with a new instruction and tool grant.
             return _json({
                 "ok": True,
                 "status": task.status,
@@ -707,7 +909,7 @@ class AgentTools:
                 "alreadyTerminal": True,
                 "taskUuid": task.task_uuid,
                 "task": _task_public(task, include_output=True),
-                "message": "目标 Agent 已终止；未创建 follow-up。需要追加任务时请显式调用 Agent。",
+                "message": "目标任务本轮已结束；未自动创建后续任务。向同一实例追加指派请显式调用 AgentContinue，并提供本轮指令和完整工具授权。",
             })
         try:
             queued = await self.plan.queue_intervention(
@@ -934,6 +1136,11 @@ class AgentTools:
             workspace_dir=self.workspace_dir,
         )
 
+        resumed_session = await self.dao.agent_session(task.agent_session_uuid) if task.agent_session_uuid else None
+        if resumed_session and "baseSystemPrompt" in resumed_session.metadata:
+            agent_base_system_prompt = str(resumed_session.metadata["baseSystemPrompt"])
+        resumed_model_session = str((resumed_session.metadata if resumed_session else {}).get("llmSessionId") or safe_agent_llm_session_id(task.agent_session_uuid, task_uuid, agent.agent_key))
+
         async def _on_agent_model_call(detail: dict[str, Any]) -> None:
             nonlocal latest_ledger_usage
             latest_ledger_usage = await self._persist_agent_model_call(
@@ -957,7 +1164,7 @@ class AgentTools:
             think_level=think_level,
             service_tier=service_tier,
             fast_request=fast_request,
-            session_id=safe_agent_llm_session_id(task.agent_session_uuid, task_uuid, agent.agent_key),
+            session_id=resumed_model_session,
             openbear_session_uuid=task.parent_session_uuid,
             agent_session_uuid=task.agent_session_uuid,
             caller_agent_session_uuid=task.caller_agent_session_uuid,
@@ -1268,13 +1475,9 @@ class AgentTools:
                 "testing, and other focused delegated tasks."
             ),
             system_prompt=(
-                "You are a focused general-purpose subagent running under OpenBear's main controller.\n"
-                "Work only on the task in the user message. Use the available tools to gather evidence, "
-                "make necessary edits when the task explicitly calls for implementation, and stop when "
-                "you have enough information for the delegated objective.\n\n"
-                "Return a concise handoff for OpenBear, including: conclusion, actions taken, evidence "
-                "(files, commands, tests, sources), remaining risks, and any recommended next step. "
-                "Do not address the end user directly unless the task asks for user-facing wording."
+                "You are the general-purpose Agent preset. It adds no specialization: the task message "
+                "defines what to do, and your base system prompt defines how you work and hand off. "
+                "Use the granted tools to complete exactly the assigned result, then return it to OpenBear."
             ),
             model="",
             think_level="",
@@ -1533,7 +1736,7 @@ class AgentTools:
     ) -> RathAgentSession:
         workflow_uuid = agent.workflow_uuid or await self._default_workflow_uuid()
         session_key = openbear_session_uuid or f"chat:{chat_id}"
-        return await self.dao.get_or_create_agent_session(
+        return await self.dao.create_agent_instance(
             openbear_session_uuid=session_key,
             chat_id=chat_id,
             workflow_uuid=workflow_uuid,
@@ -1711,6 +1914,12 @@ class AgentTools:
         inherit_from_task_uuid: str = "",
         inherited_plan_context: dict[str, Any] | None = None,
         plan_mode: str = _AGENT_PLAN_MODE_DIRECT,
+        instance: RathAgentSession | None = None,
+        context_source: dict[str, Any] | None = None,
+        preset_ceiling: list[str] | None = None,
+        continuation_request_id: str = "",
+        attachment_refs: list[str] | None = None,
+        original_prompt: str = "",
     ) -> dict[str, Any]:
         ctx = current_tool_context()
         resolved_chat_id = ctx.chat_id if chat_id is None else int(chat_id or 0)
@@ -1732,12 +1941,21 @@ class AgentTools:
             or lineage_turn_uuid
         )
         workflow_uuid = agent.workflow_uuid or await self._default_workflow_uuid()
-        agent_session = await self._agent_session_for(
+        agent_session = instance or await self._agent_session_for(
             agent,
             chat_id=resolved_chat_id,
             openbear_session_uuid=resolved_openbear_session_uuid,
         )
-        runtime = await self._resolve_agent_runtime(agent, chat_id=resolved_chat_id)
+        runtime = await self._resolve_agent_runtime(
+            agent, chat_id=resolved_chat_id,
+            frozen=(agent_session.metadata or {}).get("agentSnapshot") if instance else None,
+        )
+        await self.dao.freeze_agent_instance(
+            agent_session.session_uuid, agentSnapshot=agent_to_snapshot(agent, runtime=runtime),
+            presetToolCeiling=list(preset_ceiling or []),
+            llmSessionId=safe_agent_llm_session_id(agent_session.session_uuid, agent_session.session_uuid, agent.agent_key),
+        )
+        agent_session = await self.dao.agent_session(agent_session.session_uuid)
         model_name = str(runtime.get("model") or self.model_selection.current or self.config.models.primary)
         think_level = str(runtime.get("thinkLevel") or "off")
         service_tier = str(runtime.get("serviceTier") or "")
@@ -1764,6 +1982,12 @@ class AgentTools:
                 "inheritFromTaskUuid": str(inherit_from_task_uuid or ""),
                 "inheritedPlanContext": dict(inherited_plan_context or {}),
                 "planMode": plan_mode,
+                "contextSource": dict(context_source or {"state": "fresh"}),
+                "continueRequestId": continuation_request_id,
+                "requestedTools": list(agent.tool_allowlist),
+                "presetToolCeiling": list(preset_ceiling or []),
+                "attachmentRefs": list(attachment_refs or []),
+                "originalPrompt": original_prompt or instruction,
             },
             parent_session_uuid=resolved_openbear_session_uuid,
             agent_session_uuid=agent_session.session_uuid,
@@ -1890,6 +2114,10 @@ class AgentTools:
                 model_name=model_name,
                 workspace_dir=self.workspace_dir,
             )
+            if "baseSystemPrompt" in agent_session.metadata:
+                agent_base_system_prompt = str(agent_session.metadata["baseSystemPrompt"])
+            else:
+                await self.dao.freeze_agent_instance(agent_session.session_uuid, baseSystemPrompt=agent_base_system_prompt)
             async def _on_agent_model_call(detail: dict[str, Any]) -> None:
                 nonlocal latest_ledger_usage
                 latest_ledger_usage = await self._persist_agent_model_call(
@@ -1913,7 +2141,7 @@ class AgentTools:
                 think_level=think_level,
                 service_tier=service_tier,
                 fast_request=fast_request,
-                session_id=safe_agent_llm_session_id(agent_session.session_uuid, task_uuid, agent.agent_key),
+                session_id=str(agent_session.metadata.get("llmSessionId") or safe_agent_llm_session_id(agent_session.session_uuid, task_uuid, agent.agent_key)),
                 openbear_session_uuid=resolved_openbear_session_uuid,
                 agent_session_uuid=agent_session.session_uuid,
                 caller_agent_session_uuid=caller_agent_session_uuid,
@@ -2053,20 +2281,11 @@ class AgentTools:
             "recentEvents": await _recent_events(),
         }
         if terminal_status in TERMINAL_TASK_STATUSES:
-            payload["next"] = "Agent result is terminal; summarize for the user now. Do not call Read/Bash/search to redo this delegated work."
-            payload["finalOnly"] = True
+            payload["next"] = "This Agent round has ended. Review and integrate its result without redoing the package; continue controller-owned work if the root objective is not yet complete. Use AgentContinue for a new authorized assignment to this same instance."
         return payload
 
     def _agent_session_public(self, session: RathAgentSession) -> dict[str, Any]:
-        return {
-            "sessionUuid": session.session_uuid,
-            "openbearSessionUuid": session.openbear_session_uuid,
-            "agentKey": session.agent_key,
-            "status": session.status,
-            "title": session.title,
-            "summary": session.summary,
-            "lastTaskUuid": session.last_task_uuid,
-        }
+        return agent_session_public(session)
 
 
     async def _prepare_agent_result(self, output: dict[str, Any], *, task: RathTask | None) -> dict[str, Any]:
@@ -2090,6 +2309,7 @@ def register_agent_tools(
     model_selection: ModelSelection,
     messages: MessageDAO | None = None,
     workspace_dir: str = "",
+    memory: MemoryClient | None = None,
 ) -> None:
     tools = AgentTools(
         config=config,
@@ -2100,12 +2320,14 @@ def register_agent_tools(
         registry=reg,
         messages=messages,
         workspace_dir=workspace_dir,
+        memory=memory,
     )
+    register_continuation_tools(reg, tools)
     reg.add(
         "Agent",
-        "Launch a focused background Agent task. New tasks run directly by default without the Agent Plan protocol. Use planMode=managed only for explicitly Plan-governed work. Always provide a concise task prompt and an explicit minimal tools array. Empty tools means the child Agent receives no tools. In Web mode this usually returns running/detached; do not poll or redo delegated work.",
+        "Create a NEW independent Agent instance and its first task. For another instruction to an existing instance use AgentContinue, which retains its context. The child receives only the supplied prompt, attachments, explicitly shared TaskMemory, and the granted tools; it cannot see this conversation. New tasks run directly by default without the Agent Plan protocol; use planMode=managed only for explicitly Plan-governed work. Empty tools means the child Agent receives no tools. In Web mode this usually returns running/detached; do not poll or redo delegated work.",
         {"type": "object", "properties": {
-            "prompt": {"type": "string", "description": "Complete task brief for the Agent, including context, constraints, scope, and output requirements."},
+            "prompt": {"type": "string", "description": "Self-contained brief written from the child's point of view in plain language: the question to answer or change to make, the specific locations involved, the facts and evidence already established that must not be redone, the constraints, and what makes the work finished. Reference attachments by purpose."},
             "tools": {
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)},
@@ -2116,6 +2338,17 @@ def register_agent_tools(
             },
             "description": {"type": "string", "description": "Short task label for progress display."},
             "workerType": {"type": "string", "description": "Optional Agent preset key/name from Web Agent presets. Defaults to general-purpose."},
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Source material the child must work from, passed in full: each item is @doc/<name>, "
+                    "@mem/<ref>, or an existing local file path. Every item's complete body is written to a "
+                    "task-local file, Read is auto-granted, and a manifest of real paths and sizes is appended "
+                    "to the prompt. Use this whenever the package depends on a document, report, or file; "
+                    "never substitute a summary or title in the prompt. @secret/ references are rejected."
+                ),
+            },
             "planMode": {
                 "type": "string",
                 "enum": [_AGENT_PLAN_MODE_DIRECT, _AGENT_PLAN_MODE_MANAGED],
@@ -2128,7 +2361,7 @@ def register_agent_tools(
                     "tool count alone never require managed mode."
                 ),
             },
-            "inheritFromTaskUuid": {"type": "string", "description": "Optional interrupted/terminal Agent task UUID from this same conversation. Inherits only durable Plan facts, completed steps, and evidence references; the new task still uses its own planMode, which defaults to direct."},
+            "inheritFromTaskUuid": {"type": "string", "description": "Optional interrupted/terminal Agent task UUID from this same conversation, valid only with planMode=managed: it injects the source task's durable Plan facts, completed steps, and evidence references into the new managed task. Direct tasks reject it; write the needed facts directly into the prompt instead."},
         }, "required": ["prompt", "tools"]},
         tools.agent,
         visibility={"main", "runtime"},
@@ -2136,7 +2369,7 @@ def register_agent_tools(
     )
     reg.add(
         "AgentMessage",
-        "Send a narrow, evidence-based intervention to an active Agent task. Intervene only for a new user instruction, safety risk, scope drift, a real blocker, repeated lack of progress, sufficient evidence, a criterion gap, or Plan inconsistency. Do not steer based on usage metrics. The Agent must explicitly accept, reject, appeal, or request clarification before continuing. If the instruction materially changes an approved Plan's objective, scope, constraints, evidence requirements, or execution method, first call AgentPlanDecision(action=request_replan) against the active version.",
+        "Send a narrow intervention to an active Agent task: a new user instruction, safety risk, scope drift, a real blocker, repeated lack of progress, evidence already sufficient to conclude, a criterion gap, or Plan inconsistency. State the concrete basis and, when narrowing, the specific remaining question. The Agent must explicitly accept, reject, appeal, or request clarification before continuing. If the instruction materially changes an approved Plan's objective, scope, constraints, evidence requirements, or execution method, first call AgentPlanDecision(action=request_replan) against the active version.",
         {"type": "object", "properties": {
             "to": {"type": "string", "description": "Agent task id, short id, title, or preset key. Omit only when exactly one scoped Agent task is active."},
             "message": {"type": "string", "description": "Correction or narrow continuation guidance for the Agent."},

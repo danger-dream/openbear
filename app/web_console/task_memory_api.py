@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.task_memory import (
     SCOPE_AGENT_TASK,
+    SCOPE_AGENT_SESSION,
     SCOPE_CONVERSATION,
     TASK_MEMORY_ACTIVE_MAX,
     TASK_MEMORY_RUNTIME_MAX_TOKENS,
@@ -48,8 +49,16 @@ class WebAdminTaskMemoryMixin:
         scope_type = str(source.get("scopeType") or SCOPE_CONVERSATION).strip()
         if scope_type == SCOPE_CONVERSATION:
             return SCOPE_CONVERSATION, ""
-        if scope_type != SCOPE_AGENT_TASK:
+        if scope_type not in {SCOPE_AGENT_TASK, SCOPE_AGENT_SESSION}:
             raise web.HTTPBadRequest(text="invalid_scope_type")
+        if scope_type == SCOPE_AGENT_SESSION:
+            owner = str(source.get("agentSessionUuid") or source.get("taskUuid") or "").strip()
+            instance = await self.rath_dao.agent_session(owner)
+            if (instance is None or instance.session_kind != "independent"
+                    or instance.chat_id != int(row.get("internal_chat_id") or 0)
+                    or instance.openbear_session_uuid != str(row.get("conversation_uuid") or "")):
+                raise web.HTTPNotFound(text="task_memory_not_found")
+            return SCOPE_AGENT_SESSION, owner
         task_uuid = str(source.get("taskUuid") or "").strip()
         if not task_uuid:
             raise web.HTTPNotFound(text="task_memory_not_found")
@@ -60,7 +69,7 @@ class WebAdminTaskMemoryMixin:
             or str(task.parent_session_uuid or "") != str(row.get("conversation_uuid") or "")
         ):
             raise web.HTTPNotFound(text="task_memory_not_found")
-        return SCOPE_AGENT_TASK, task_uuid
+        return await TaskMemoryDAO(self.db).agent_scope(str(row.get("conversation_uuid") or ""), task_uuid)
 
     @staticmethod
     def _task_memory_error(exc: Exception) -> web.Response:
@@ -210,7 +219,8 @@ class WebAdminTaskMemoryMixin:
             TaskMemoryDAO(self.db),
             conversation_uuid=conversation_uuid,
             task_uuid=task_uuid,
-            for_agent=scope_type == SCOPE_AGENT_TASK,
+            for_agent=scope_type != SCOPE_CONVERSATION,
+            private_scope=(scope_type, task_uuid) if scope_type != SCOPE_CONVERSATION else None,
         )
         runtime_block = render_task_memory_runtime_block(catalog_xml)
         return web.json_response({

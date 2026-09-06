@@ -235,6 +235,52 @@ async def test_questionnaire_result_enters_next_model_call_with_free_text_intact
     assert result["answers"][0]["selectedLabels"] == ["方案 A"]
 
 
+async def test_unified_user_interaction_free_text_reaches_next_model_call(tmp_path):
+    from app.db.engine import DB
+    from app.user_interactions import InteractionService
+
+    db = DB(str(tmp_path / "interaction-loop.sqlite"))
+    await db.connect()
+    service = InteractionService(db)
+    text = "  选项只作参考，以我的原文为准。\n先不要部署  "
+
+    async def answer(event, item):
+        if event == "created":
+            body = {"selectedValues": ["a"], "text": text} if item["action"] == "select" else {"confirmed": True, "text": text}
+            assert (await service.submit(item["interactionId"], 123, body, source="telegram"))["ok"]
+
+    service.add_listener(answer)
+
+    async def web_confirm(payload):
+        return await service.request(payload, owner_chat_id=123, conversation_uuid="conv")
+
+    registry = ToolRegistry()
+    register_user_interaction_tools(registry, UserInteractionManager())
+    try:
+        for action in ("select", "confirm"):
+            args = {"action": action, "title": "决定", "body": "回答", "options": [{"label": "A", "value": "a"}]}
+            backend = FakeBackend([
+                [StreamEvent(kind="tool_call", tool_calls=[ToolCall(id="ui", name="UserInteraction", arguments=json.dumps(args))]), StreamEvent(kind="finish", finish_reason="tool_calls")],
+                [StreamEvent(kind="content", text="done"), StreamEvent(kind="finish", finish_reason="stop")],
+            ])
+            await Agent(backend, registry).run(
+                [{"role": "user", "content": "clarify"}], RecordRenderer(), model="m",
+                tool_context=ToolRuntimeContext(web_confirm=web_confirm, source="web"),
+            )
+            message = next(value for value in backend.seen_convos[1] if value["role"] == "tool")
+            result = json.loads(message["content"])
+            assert result["text"] == text
+            assert result["source"] == "telegram"
+            if action == "select":
+                assert result["selectedValues"] == ["a"]
+                assert result["selectedLabels"] == ["A"]
+            else:
+                assert result["confirmed"] is False and result["decision"] == "feedback"
+    finally:
+        await service.stop()
+        await db.close()
+
+
 async def test_main_loop_exposes_and_dispatches_real_edit_batch(tmp_path):
     class CapturingBackend(FakeBackend):
         def __init__(self, scripts):

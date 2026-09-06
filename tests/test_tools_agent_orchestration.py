@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import re
 
 import pytest
 
@@ -249,18 +251,16 @@ def test_agent_operation_payload_preserves_root_invocation_identity():
     assert "resultText" not in merged
 
 
-def test_default_rath_agent_prompt_has_actionable_structure():
+def test_default_rath_agent_prompt_only_adds_specialization():
+    """A preset supplements the base prompt; it must not restate workflow or report format."""
     prompt = WebAdminServer.__new__(WebAdminServer)._default_rath_agent_prompt()
 
-    assert "## 核心职责" in prompt
-    assert "## 工作流程" in prompt
-    assert "## 工具使用规则" in prompt
-    assert "## 输出格式" in prompt
-    assert "## 质量标准" in prompt
-    assert "只有实际调用工具后" in prompt
-    assert "Agent / AgentMessage / AgentStop" in prompt
-    assert "Web Agent 配置只是你的可复用 system prompt" in prompt
-    assert "本次任务 prompt" in prompt
+    assert "预设只补充这个角色的专业能力" in prompt
+    assert "基础 system prompt 统一规定" in prompt
+    assert "真实任务目标始终来自每次指派的任务消息" in prompt
+    assert "不套用固定的工作流程或报告栏目" in prompt
+    for duplicated in ("## 工作流程", "## 输出格式", "## 质量标准", "建议下一步", "风险 / 未覆盖项", "收敛优先"):
+        assert duplicated not in prompt, duplicated
 
 
 def test_agent_new_and_continue_callbacks_emit_progress_after_persisting_ledger_usage():
@@ -453,6 +453,8 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
 
     assert set(reg.names(scope="main")) == {
         "Agent",
+        "AgentContinue",
+        "AgentInfo",
         "AgentMessage",
         "AgentStop",
         "AgentWait",
@@ -460,6 +462,8 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     }
     assert set(reg.names()) == {
         "Agent",
+        "AgentContinue",
+        "AgentInfo",
         "AgentMessage",
         "AgentStop",
         "AgentWait",
@@ -481,11 +485,16 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     }
     main_schemas = {item["name"]: item for item in reg.schemas(scope="main")}
     agent_schemas = {item["name"]: item for item in reg.schemas(scope="agent")}
-    assert main_schemas["Agent"]["parameters"]["properties"]["tools"]["items"]["enum"] == canonical_tools
-    plan_mode_schema = main_schemas["Agent"]["parameters"]["properties"]["planMode"]
+    agent_schema = main_schemas["Agent"]
+    # Structural contract only. Wording of descriptions is validated by the
+    # behavioral delegation evals (evals/agent_delegation), not by keyword
+    # assertions that pass regardless of actual model behavior.
+    assert agent_schema["parameters"]["required"] == ["prompt", "tools"]
+    assert agent_schema["parameters"]["properties"]["tools"]["items"]["enum"] == canonical_tools
+    assert agent_schema["parameters"]["properties"]["attachments"]["items"]["type"] == "string"
+    plan_mode_schema = agent_schema["parameters"]["properties"]["planMode"]
     assert plan_mode_schema["enum"] == ["direct", "managed"]
     assert plan_mode_schema["default"] == "direct"
-    assert "tool count alone never require managed" in plan_mode_schema["description"]
 
     plan_schema = agent_schemas["AgentPlanSubmit"]["parameters"]["properties"]["plan"]
     assert plan_schema["required"] == ["title", "objective", "steps", "finalOutputs"]
@@ -507,7 +516,6 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
         "title",
         "description",
     ]
-    assert "never replaces" in plan_schema["description"]
 
     tool_request_schema = plan_schema["properties"]["toolRequests"]
     assert tool_request_schema["items"]["properties"]["name"]["enum"] == canonical_tools
@@ -520,7 +528,6 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     message_schema = main_schemas["AgentMessage"]
     expected_schema = message_schema["parameters"]["properties"]["expectedPlanVersion"]
     assert expected_schema["minimum"] == 0
-    assert "Optimistic CAS" in expected_schema["description"]
     assert "expectedPlanVersion" not in message_schema["parameters"]["required"]
 
 
@@ -1410,6 +1417,112 @@ async def test_agent_launches_general_worker_with_dynamic_prompt(agent_tool_env)
     assert task.input["agentSnapshot"]["toolAllowlist"] == []
 
 
+class _FakeMemoryClient:
+    async def tool_call(self, endpoint, payload):
+        if endpoint == "doc" and payload.get("name") == "runtime-notes":
+            return {"ok": True, "item": {"name": "runtime-notes", "title": "runtime-notes", "content": "完整文档正文 " * 100}}
+        if endpoint == "entry" and payload.get("ref") == "openbear":
+            return {"ok": True, "item": {"ref": "openbear", "title": "openbear", "fields": {"path": "/opt"}, "body": "条目正文"}}
+        return {"ok": False, "error": "not found"}
+
+
+async def test_agent_attachments_materialize_full_bodies_and_grant_read(agent_tool_env, tmp_path):
+    dao = agent_tool_env
+    backend = _RecordingBackend()
+    reg = ToolRegistry()
+
+    async def read(_args):
+        return "read"
+
+    reg.add("Read", "读取文件", {"type": "object", "properties": {}}, read, visibility={"agent"})
+    workspace_dir = str(tmp_path / "ws")
+    register_agent_tools(
+        reg,
+        config=_FakeConfig(),
+        dao=dao,
+        manager=RathTaskManager(dao),
+        llm_factory=_FakeFactory(backend),
+        model_selection=_FakeSelection(),
+        workspace_dir=workspace_dir,
+        memory=_FakeMemoryClient(),
+    )
+    source = tmp_path / "audit-report.md"
+    source.write_text("# 审计报告\n" + "正文行\n" * 50, encoding="utf-8")
+
+    raw = await reg.dispatch(
+        "Agent",
+        json.dumps({
+            "description": "对照分析",
+            "prompt": "对照 runtime 文档与审计报告，输出差异清单",
+            "tools": [],
+            "attachments": ["@doc/runtime-notes", "@mem/openbear", str(source)],
+        }, ensure_ascii=False),
+        context=ToolRuntimeContext(chat_id=123, session_uuid="openbear-session-1", source="chat"),
+    )
+    data = json.loads(raw)
+    assert data["ok"] is True
+    task = await dao.get_task(data["task"]["taskUuid"])
+    assert task is not None
+    instruction = task.input["instruction"]
+    assert "【任务材料】" in instruction
+    # Read is auto-granted because attached material arrives as files.
+    assert task.input["agentSnapshot"]["toolAllowlist"] == ["Read"]
+
+    manifest_lines = [line for line in instruction.splitlines() if line.startswith("- @") or line.startswith("- /")]
+    assert len(manifest_lines) == 3
+    for line in manifest_lines:
+        path = line.split(" → ")[1].split("（")[0]
+        assert os.path.isfile(path)
+    doc_line = next(line for line in manifest_lines if line.startswith("- @doc/runtime-notes"))
+    doc_path = doc_line.split(" → ")[1].split("（")[0]
+    doc_body = "完整文档正文 " * 100
+    with open(doc_path, encoding="utf-8") as fh:
+        assert fh.read() == doc_body
+    assert f"（{len(doc_body)} 字符）" in doc_line
+    entry_line = next(line for line in manifest_lines if line.startswith("- @mem/openbear"))
+    entry_path = entry_line.split(" → ")[1].split("（")[0]
+    with open(entry_path, encoding="utf-8") as fh:
+        entry_text = fh.read()
+    assert "条目正文" in entry_text and '"path": "/opt"' in entry_text
+    file_line = next(line for line in manifest_lines if str(source) in line)
+    file_path = file_line.split(" → ")[1].split("（")[0]
+    with open(file_path, encoding="utf-8") as fh:
+        assert fh.read() == source.read_text(encoding="utf-8")
+
+
+async def test_agent_attachments_reject_secrets_and_missing_material(agent_tool_env, tmp_path):
+    dao = agent_tool_env
+    reg = ToolRegistry()
+    register_agent_tools(
+        reg,
+        config=_FakeConfig(),
+        dao=dao,
+        manager=RathTaskManager(dao),
+        llm_factory=_FakeFactory(),
+        model_selection=_FakeSelection(),
+        workspace_dir=str(tmp_path / "ws"),
+        memory=_FakeMemoryClient(),
+    )
+    ctx = ToolRuntimeContext(chat_id=123, session_uuid="openbear-session-1", source="chat")
+
+    for attachments, expected_error in [
+        (["@secret/ssh-key"], "agent_attachment_forbidden"),
+        ([str(tmp_path / "missing.md")], "agent_attachment_not_found"),
+        (["@doc/no-such-doc"], "agent_attachment_not_found"),
+        ("not-a-list", "agent_attachments_invalid"),
+    ]:
+        raw = await reg.dispatch(
+            "Agent",
+            json.dumps({"prompt": "分析材料", "tools": [], "attachments": attachments}, ensure_ascii=False),
+            context=ctx,
+        )
+        data = json.loads(raw)
+        assert data["ok"] is False
+        assert data["error"] == expected_error
+    # No task may be created for a launch whose promised material cannot be delivered.
+    assert await dao.list_tasks(chat_id=123, limit=10) == []
+
+
 async def test_agent_launch_prepends_active_agent_prompt_template(agent_tool_env, tmp_path):
     dao = agent_tool_env
     await dao.db.conn.execute(
@@ -1447,7 +1560,7 @@ async def test_agent_launch_prepends_active_agent_prompt_template(agent_tool_env
     assert system.startswith("Agent base prompt")
     assert f"Workspace: {workspace_dir}" in system
     assert "- Read: 读取文件" in system
-    assert "You are a focused general-purpose subagent" in system
+    assert "You are the general-purpose Agent preset" in system
 
 
 async def test_agent_child_inherits_parent_task_root_turn_lineage(agent_tool_env):
@@ -1778,6 +1891,18 @@ async def test_concurrent_agent_messages_only_one_claims_continuation(agent_tool
             self.calls.append({"messages": messages})
             self.entered.set()
             await self.release.wait()
+            # A control arriving while the first model request is in flight
+            # must be acknowledged before the runner can finish.
+            if len(self.calls) == 2:
+                control_ids = re.findall(r'<agent-control id="([^"]+)"', str(messages))
+                assert len(control_ids) == 2
+                return AgentResult(tool_calls=[ToolCall(
+                    id=f"ack-{control_id}", name="AgentControlAck",
+                    arguments=json.dumps({
+                        "controlUuid": control_id, "status": "accepted",
+                        "reason": "继续原任务，不启动第二个执行器",
+                    }),
+                ) for control_id in control_ids])
             return AgentResult(text="续跑完成")
 
     backend = BlockingBackend()
@@ -1823,9 +1948,10 @@ async def test_concurrent_agent_messages_only_one_claims_continuation(agent_tool
 
     backend.release.set()
     first_result = json.loads(await asyncio.wait_for(first, timeout=1))
-    assert first_result["ok"] is True
-    # The steer request causes another model round in the same runner.
-    assert len(backend.calls) == 2
+    assert first_result["ok"] is True, json.dumps(first_result, ensure_ascii=False, indent=2)
+    # Steer delivery, acknowledgement, and final output stay in the same runner.
+    assert len(backend.calls) == 3
+    assert (await dao.control(second["controlUuid"])).responded_at > 0
     assert (await dao.get_task(task_uuid)).status == "completed"
     assert manager.task(task_uuid) is None
 
@@ -2184,6 +2310,9 @@ async def test_agent_inheritance_uses_durable_plan_facts_and_enforces_scope(agen
         {"type": "object", "properties": {}},
         tools.agent,
     )
+    # Direct tasks have no Plan runtime to receive inherited facts, so the
+    # launch must be rejected instead of recording a fake inheritance event.
+    task_count_before = len(await dao.list_tasks(chat_id=300, limit=50))
     launched_raw = await registry.dispatch(
         "RunInheritedAgent",
         json.dumps({
@@ -2195,13 +2324,10 @@ async def test_agent_inheritance_uses_durable_plan_facts_and_enforces_scope(agen
         context=ToolRuntimeContext(chat_id=300, session_uuid="inherit-session", source="chat"),
     )
     launched = json.loads(launched_raw)
-    assert launched["ok"] is True
-    new_task = await dao.get_task(launched["task"]["taskUuid"])
-    assert new_task is not None
-    assert new_task.input["inheritFromTaskUuid"] == source_uuid
-    assert new_task.input["inheritedPlanContext"]["evidence"][0]["evidenceUuid"]
-    events = await dao.events(new_task.task_uuid)
-    assert any(event.kind == "agent_plan_inherited" for event in events)
+    assert launched["ok"] is False
+    assert launched["error"] == "inherit_requires_managed_plan"
+    assert "directly into the prompt" in launched["message"]
+    assert len(await dao.list_tasks(chat_id=300, limit=50)) == task_count_before
 
     await registry.dispatch(
         "ProbeInheritance",

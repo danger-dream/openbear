@@ -70,45 +70,17 @@ class WebAdminRathMixin:
         )
 
     def _default_rath_agent_prompt(self) -> str:
+        """Default system prompt for a Web-registered Agent preset.
+
+        A preset only adds specialization. Working method, boundaries,
+        authorization, task memory, and handoff rules come from the Agent base
+        system prompt and must not be duplicated here, otherwise the two layers
+        drift apart and the model receives conflicting instructions.
+        """
         return """
-你是 OpenBear 的后台执行 Agent。你只负责 OpenBear 在本次任务 prompt 中分配给你的子任务，不负责最终对用户发言。Web Agent 配置只是你的可复用 system prompt；真实任务目标始终来自每次 Agent 调用的 prompt。
+你是 OpenBear 主控注册的 Agent 预设。预设只补充这个角色的专业能力与领域内的注意事项；工作方式、范围边界、授权、工作记忆和交接方式由你的基础 system prompt 统一规定，这里不再重复。
 
-## 执行边界
-- 你不是一次性 skill，而是当前 OpenBear 会话中的可持续 Agent Session；Task 完成不代表 Session 结束，后续同一 Agent 可能复用你的历史摘要和产物。
-- `Agent` / `AgentMessage` / `AgentStop` 只属于 OpenBear 主控；你不能调用，也不要要求用户选择 Agent。
-- 收敛优先：你不是全量审计器。达到“足够回答本次子任务”的证据量后，应停止扩展搜索/读取并输出综合结论；接近预算上限时必须基于已有证据收口，不要把总结工作留给 OpenBear 重做。
-
-## 核心职责
-1. 严格完成本次 instruction 指定的子任务。
-2. 基于可用上下文和工具给出可追踪结论。
-3. 把已验证事实、合理推断、未覆盖项分开，方便 OpenBear 汇总。
-
-## 工作流程
-1. 先阅读本次 instruction，确认目标、上下文、边界和输出契约。
-2. 判断可用工具；只在必要时调用工具。
-3. 收集证据：文件路径、符号名、命令结果、URL、日志或文本片段。
-4. 完成分析/执行/验证后，先给结论，再给依据。
-5. 如果信息不足或工具不可用，说明缺口，不要编造。
-
-## 工具使用规则
-- 只有实际调用工具后，才能说“已读取/已搜索/已执行/已验证”。
-- 不要调用 Agent / AgentMessage / AgentStop；这些只属于 OpenBear 主控。
-- 不要要求用户选择 Agent。
-- 不执行删除、重启、发布、改权限、外部发送、破坏性数据库操作，除非 instruction 明确授权。
-- 如果 instruction 与安全边界冲突，停止并报告冲突。
-
-## 输出格式
-- 结论
-- 已执行动作 / 使用工具
-- 关键依据
-- 风险 / 未覆盖项
-- 建议下一步
-
-## 质量标准
-- 结论明确，不绕圈。
-- 证据可追踪。
-- 建议具体可执行。
-- 不把推断写成事实。
+真实任务目标始终来自每次指派的任务消息，不来自本预设。按任务要求的深度完成指定的结果并交回 OpenBear，不套用固定的工作流程或报告栏目。本预设未定义额外专长时，按通用能力处理任务。
 """.strip()
 
     def _normalize_agent_payload(self, body: dict[str, Any], *, partial: bool = False) -> dict[str, Any]:
@@ -185,6 +157,25 @@ class WebAdminRathMixin:
             ),
             "changedFields": changed_fields,
         }
+
+    async def handle_api_rath_task_instance(self, request: web.Request) -> web.Response:
+        from app.rath.continuity import agent_session_public
+        from app.tools.agents import _task_public
+        conversation_uuid = str(request.match_info.get("conversation_uuid") or "")
+        task_uuid = str(request.match_info.get("task_uuid") or "")
+        task = await self._scoped_rath_task(request, task_uuid)
+        if task is None or task.parent_session_uuid != conversation_uuid:
+            return web.json_response({"ok": False, "error": "rath_task_not_found"}, status=404)
+        session = await self.rath_dao.agent_session(task.agent_session_uuid)
+        independent = bool(session and session.session_kind == "independent")
+        tasks = await self.rath_dao.agent_instance_tasks(session.session_uuid) if independent else [task]
+        total = len(tasks)
+        if independent:
+            cur = await self.db.conn.execute("SELECT COUNT(*) FROM rath_tasks WHERE agent_session_uuid=?", (session.session_uuid,))
+            total = int((await cur.fetchone())[0])
+        return web.json_response({"ok": True, "agentSession": agent_session_public(session) if session else {},
+                                  "legacy": not independent, "total": total,
+                                  "tasks": [_task_public(item, include_output=True) for item in tasks]})
 
     async def handle_api_rath_task_plan(self, request: web.Request) -> web.Response:
         conversation_uuid = str(request.match_info.get("conversation_uuid") or "").strip()

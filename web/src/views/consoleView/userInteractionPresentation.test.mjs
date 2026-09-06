@@ -62,12 +62,13 @@ test("typed lazy summary preserves root questionnaire presentation after refresh
 
 test("confirm/select/prompt terminal status matrix has stable labels and answer-free intro", () => {
 	const statuses = {
-		pending: "等待回答", cancelled: "已取消", timeout: "已超时", error: "出错",
+		pending: "等待回答", cancelled: "已取消", interrupted: "已中断", timeout: "已超时", error: "出错",
 	};
 	const names = {confirm: "确认", select: "选择", prompt: "输入"};
 	const intros = {
 		pending: (name) => `正在等待用户完成${name}`,
 		cancelled: (name) => `用户未继续本次${name}`,
+		interrupted: (name) => `本次${name}因运行中断未完成`,
 		timeout: (name) => `本次${name}未在限定时间内完成`,
 		error: (name) => `本次${name}未能完成`,
 	};
@@ -85,6 +86,16 @@ test("confirm/select/prompt terminal status matrix has stable labels and answer-
 	assert.equal(view("confirm", "answered").statusLabel, "已回答");
 	assert.equal(view("confirm", "answered").intro, "用户已完成本次确认");
 	assert.equal(view("prompt", "answered", {}, {value: "逐字回答"}).promptValue, "逐字回答");
+});
+
+test("operation interrupted fallback remains interrupted instead of becoming answered or cancelled", () => {
+	const model = buildUserInteractionView({
+		operation: {status: "interrupted", payload: {interaction: {action: "prompt", title: "等待输入"}}},
+	});
+	assert.equal(model.status, "interrupted");
+	assert.equal(model.statusKey, "interrupted");
+	assert.equal(model.statusLabel, "已中断");
+	assert.equal(model.intro, "本次输入因运行中断未完成");
 });
 
 test("loading interaction detail body does not rewrite the collapsed intro", () => {
@@ -168,6 +179,76 @@ test("lazy confirm summary uses confirmed polarity and does not treat a missing 
 	assert.equal(unknown.intro, "用户已完成本次确认");
 });
 
+test("summary-only confirm reads feedback decision, selected decision, and Telegram source", () => {
+	const model = buildUserInteractionView(userInteractionEventInput({operation: {
+		opType: "user_interaction",
+		status: "completed",
+		payload: {
+			action: "confirm",
+			title: "确认发布",
+			interactionStatus: "answered",
+			decision: "feedback",
+			selectedDecision: "confirm",
+			source: "telegram",
+		},
+	}}));
+	assert.equal(model.status, "answered");
+	assert.equal(model.statusKey, "feedback");
+	assert.equal(model.statusLabel, "已反馈");
+	assert.equal(model.confirmed, false);
+	assert.equal(model.selectedDecisionLabel, "确认执行");
+	assert.equal(model.source, "telegram");
+	assert.equal(model.sourceLabel, "Telegram");
+	assert.equal(model.intro, "用户已提交意见，未授权执行原操作");
+});
+
+test("select history preserves options plus text, text-only answers, answer mode, and source", () => {
+	const withOptions = view("select", "answered", {options: [
+		{label: "方案 A", value: "a"}, {label: "方案 B", value: "b"},
+	]}, {
+		selectedValues: ["a"],
+		selectedIndexes: [0],
+		text: "  不要立即部署\n保留原文  ",
+		answerMode: "options_with_text",
+		source: "telegram",
+	});
+	assert.equal(withOptions.options[0].selected, true);
+	assert.equal(withOptions.options[1].selected, false);
+	assert.equal(withOptions.selectText, "  不要立即部署\n保留原文  ");
+	assert.equal(withOptions.answerMode, "options_with_text");
+	assert.equal(withOptions.sourceLabel, "Telegram");
+
+	const textOnly = view("select", "answered", {options: [{label: "方案 A", value: "a"}]}, {
+		selectedValues: [], text: "改用 C", answerMode: "text_only", source: "web",
+	});
+	assert.equal(textOnly.options[0].selected, false);
+	assert.equal(textOnly.selectText, "改用 C");
+	assert.equal(textOnly.sourceLabel, "网页");
+});
+
+test("confirm feedback is never presented as rejection or authorization", () => {
+	const model = view("confirm", "answered", {}, {
+		confirmed: false,
+		choice: "feedback",
+		decision: "feedback",
+		selectedDecision: "confirm",
+		text: "先备份，不要立刻重启",
+		source: "telegram",
+	});
+	assert.equal(model.statusKey, "feedback");
+	assert.equal(model.statusLabel, "已反馈");
+	assert.equal(model.statusTone, "info");
+	assert.equal(model.confirmed, false);
+	assert.equal(model.confirmText, "先备份，不要立刻重启");
+	assert.equal(model.selectedDecisionLabel, "确认执行");
+	assert.equal(model.intro, "用户已提交意见，未授权执行原操作");
+	assert.equal(model.sourceLabel, "Telegram");
+
+	const inconsistent = view("confirm", "answered", {}, {confirmed: true, decision: "confirm", text: "有文字就不能授权"});
+	assert.equal(inconsistent.statusKey, "feedback");
+	assert.equal(inconsistent.confirmed, false);
+});
+
 test("questionnaire preserves question order, selected plus text, and never treats recommendation as an answer", () => {
 	const model = view("questionnaire", "answered", {questions: [
 		{id: "q1", type: "choice", question: "第一题", required: true, multiple: true,
@@ -199,6 +280,8 @@ test("sensitive and redacted payloads are fail-closed in presentation", () => {
 		const model = buildUserInteractionView({arguments: JSON.stringify(args), result: JSON.stringify({status: "answered", value: secret})});
 		assert.equal(model.sensitive, true);
 		assert.equal(model.promptValue, "");
+		assert.equal(model.body, "");
+		assert.deepEqual(model.questions, []);
 		assert.equal(JSON.stringify(model).includes(secret), false);
 		assert.equal(model.redactedText, "[敏感内容已隐藏]");
 	}
@@ -209,6 +292,9 @@ test("component contract is read-only and retains collapsed and questionnaire st
 	assert.match(componentSource, /interaction-name/);
 	assert.match(componentSource, /interaction-intro/);
 	assert.match(componentSource, /status-chip/);
+	assert.match(componentSource, /source-chip/);
+	assert.match(componentSource, /view\.selectText/);
+	assert.match(componentSource, /view\.confirmText/);
 	assert.match(componentSource, /\.interaction-event > summary \{ display: flex;/);
 	assert.doesNotMatch(componentSource, /\.interaction-event > summary \{[^}]*grid-template-columns/);
 	assert.match(componentSource, /white-space:\s*nowrap/);

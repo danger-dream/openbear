@@ -1,6 +1,7 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.memory.builtin import bundled_prompt_template
 from app.rath.prompting import available_agent_prompt_items
 from app.web_console.core import *
 from app.web_console.live_stream import *
@@ -55,12 +56,12 @@ class WebAdminMemoryMixin:
         return out
 
     def _prompt_template_params(self, *, available_agents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        tool_summaries = self.tools.summaries() if self.tools is not None else {}
-        tool_names = self.tools.names() if self.tools is not None else list(tool_summaries.keys())
-        builtin_tool_names = self.tools.names(source="builtin") if self.tools is not None else tool_names
-        builtin_tool_summaries = self.tools.summaries(source="builtin") if self.tools is not None else tool_summaries
-        mcp_tool_names = self.tools.names(source="mcp") if self.tools is not None else []
-        mcp_tool_summaries = self.tools.summaries(source="mcp") if self.tools is not None else {}
+        tool_summaries = self.tools.summaries(scope="main") if self.tools is not None else {}
+        tool_names = self.tools.names(scope="main") if self.tools is not None else list(tool_summaries.keys())
+        builtin_tool_names = self.tools.names(source="builtin", scope="main") if self.tools is not None else tool_names
+        builtin_tool_summaries = self.tools.summaries(source="builtin", scope="main") if self.tools is not None else tool_summaries
+        mcp_tool_names = self.tools.names(source="mcp", scope="main") if self.tools is not None else []
+        mcp_tool_summaries = self.tools.summaries(source="mcp", scope="main") if self.tools is not None else {}
         mcp_server_instructions = []
         if getattr(self, "mcp", None) is not None and hasattr(self.mcp, "server_instructions_snapshot"):
             mcp_server_instructions = self.mcp.server_instructions_snapshot()
@@ -473,6 +474,123 @@ class WebAdminMemoryMixin:
         item_id = int(cur.lastrowid or 0)
         await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "contentLength": len(content)})
         return web.json_response({"ok": True, "id": item_id})
+
+    async def handle_api_memory_template_import_builtin(self, request: web.Request) -> web.Response:
+        async with self._memory_operation_lock:
+            await self._require_memory_write_allowed()
+            data = await self._json_body(request)
+            unexpected = sorted(set(data) - {"kinds"})
+            if unexpected:
+                return web.json_response({
+                    "ok": False,
+                    "error": "unexpected_fields",
+                    "fields": unexpected,
+                }, status=400)
+            raw_kinds = data.get("kinds")
+            if not isinstance(raw_kinds, list) or not raw_kinds:
+                return web.json_response({"ok": False, "error": "builtin_template_kinds_required"}, status=400)
+
+            kinds: list[str] = []
+            for raw_kind in raw_kinds:
+                if not isinstance(raw_kind, str) or raw_kind not in {"main", "agent"}:
+                    return web.json_response({
+                        "ok": False,
+                        "error": "unsupported_builtin_template_kind",
+                        "kind": raw_kind if isinstance(raw_kind, str) else None,
+                    }, status=400)
+                if raw_kind not in kinds:
+                    kinds.append(raw_kind)
+
+            specs: list[tuple[str, str, str]] = []
+            for kind in kinds:
+                try:
+                    name, content = bundled_prompt_template(kind)
+                except (OSError, UnicodeError, ValueError) as exc:
+                    log.error("读取随版本模板失败", 类型=kind, 错误=type(exc).__name__)
+                    return web.json_response({
+                        "ok": False,
+                        "error": "bundled_template_unavailable",
+                        "kind": kind,
+                    }, status=500)
+                validation_error = await self._validate_memory_template(
+                    content,
+                    name,
+                    agent_active=kind == "agent",
+                )
+                if validation_error:
+                    return web.json_response({
+                        "ok": False,
+                        "error": "bundled_template_validation_failed",
+                        "kind": kind,
+                        "detail": validation_error,
+                    }, status=400)
+                specs.append((kind, name, content))
+
+            items: list[dict[str, Any]] = []
+            created_items: list[dict[str, Any]] = []
+            for kind, name, content in specs:
+                cur = await self.db.conn.execute(
+                    """
+                    SELECT id, is_active, is_agent_active
+                    FROM memory_templates
+                    WHERE name=? AND content=?
+                    ORDER BY id LIMIT 1
+                    """,
+                    (name, content),
+                )
+                existing = await cur.fetchone()
+                if existing is not None:
+                    items.append({
+                        "kind": kind,
+                        "id": int(existing["id"]),
+                        "name": name,
+                        "status": "existing",
+                        "isActive": bool(existing["is_active"]),
+                        "isAgentActive": bool(existing["is_agent_active"]),
+                    })
+                    continue
+                cur = await self.db.conn.execute(
+                    """
+                    INSERT INTO memory_templates
+                        (name, content, is_active, is_agent_active, updated_at)
+                    VALUES (?,?,0,0,?)
+                    """,
+                    (name, content, now_ts()),
+                )
+                item = {
+                    "kind": kind,
+                    "id": int(cur.lastrowid or 0),
+                    "name": name,
+                    "status": "created",
+                    "isActive": False,
+                    "isAgentActive": False,
+                }
+                items.append(item)
+                created_items.append({**item, "contentLength": len(content)})
+            await self.db.conn.commit()
+
+            for item in created_items:
+                await self._audit_memory(request, "memory_template.save", {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "isActive": False,
+                    "isAgentActive": False,
+                    "contentLength": item["contentLength"],
+                    "source": "builtin_import",
+                    "kind": item["kind"],
+                })
+            await self._audit_memory(request, "memory_template.import_builtin", {
+                "requestedKinds": kinds,
+                "created": len(created_items),
+                "reused": len(items) - len(created_items),
+                "items": [{"kind": item["kind"], "id": item["id"], "name": item["name"], "status": item["status"]} for item in items],
+            })
+            return web.json_response({
+                "ok": True,
+                "items": items,
+                "created": len(created_items),
+                "reused": len(items) - len(created_items),
+            })
 
     async def handle_api_memory_template_update(self, request: web.Request) -> web.Response:
         await self._require_memory_write_allowed()

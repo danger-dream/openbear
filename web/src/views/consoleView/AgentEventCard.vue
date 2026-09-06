@@ -32,6 +32,12 @@ import {
 	mergeAgentEventLines,
 } from "./agentPlanPresentation.js";
 import {toolArgumentsSummary} from "./toolArgumentsPresentation.js";
+import {
+	currentAgentInstanceView,
+	localAgentInstanceEnvelope,
+	normalizeAgentInstanceEnvelope,
+	shortAgentId,
+} from "./agentInstancePresentation.js";
 
 const props = defineProps({
 	event: {type: Object, required: true},
@@ -49,6 +55,10 @@ const workspaceError = ref("");
 const workspaceData = ref(null);
 const workspaceTaskUuid = ref("");
 const workspaceDirty = ref(false);
+const instanceData = ref(null);
+const instanceTaskUuid = ref("");
+const instanceLoading = ref(false);
+const instanceError = ref("");
 const panelTab = ref("plan");
 const activityScroller = ref(null);
 const activityLines = ref([]);
@@ -69,6 +79,8 @@ let eventCountsPromise = null;
 let planRecentActivityPromise = null;
 let workspaceReloadQueued = false;
 let workspaceLoadingTaskUuid = "";
+let instanceLoadPromise = null;
+let activityRequestGeneration = 0;
 
 const legacyDetailId = computed(() => props.detailKey(props.turnId, "agent", props.index));
 const detailId = computed(() => agentPanelDetailKey(props.conversationUuid, agentEventIdentity(props.event)) || legacyDetailId.value);
@@ -95,17 +107,42 @@ const agentState = computed(() => {
 const isActiveLiveAgent = computed(() => isActiveAgentEvent(props.event, agentState.value));
 const isSingleAgentSummary = computed(() => (
 	agentState.value.rows.length === 1
-	&& agentState.value.summary.toolName === "Agent"
+	&& ["Agent", "AgentContinue"].includes(agentState.value.summary.toolName)
 ));
+const immediateTask = computed(() => {
+	const row = agentState.value.rows.find((item) => item?.task && typeof item.task === "object")
+		|| agentState.value.rows[0];
+	if (row?.task) return row.task;
+	return agentTasks(props.event)[0] || row || {};
+});
+const immediateAgentSession = computed(() => {
+	const row = agentState.value.rows.find((item) => item?.agentSession && typeof item.agentSession === "object");
+	if (row?.agentSession) return row.agentSession;
+	const payload = props.event?.livePayload || {};
+	return payload.agentSession || payload.result?.agentSession || {};
+});
+const loadedCurrentTask = computed(() => instanceData.value?.tasks?.find((item) => item.taskUuid === taskUuid.value)?.raw || null);
+const effectiveAgentSession = computed(() => (
+	instanceTaskUuid.value === taskUuid.value && instanceData.value?.session
+		? instanceData.value.session
+		: immediateAgentSession.value
+));
+const instanceView = computed(() => currentAgentInstanceView({
+	currentTask: loadedCurrentTask.value || immediateTask.value,
+	currentSession: effectiveAgentSession.value,
+}));
+const assignmentStatusLabel = computed(() => isActiveLiveAgent.value
+	? "本轮执行中"
+	: instanceView.value.statusView.label || agentState.value.summary.label);
 const panelTitle = computed(() => isActiveLiveAgent.value ? "Agent 运行中" : agentState.value.summary.title);
 const panelSubtitle = computed(() => isActiveLiveAgent.value
 	? "正在等待子 Agent 返回结果"
-	: `${agentState.value.subtitle} · ${agentState.value.summary.label}`);
-const summaryTitle = computed(() => isSingleAgentSummary.value ? "Agent" : panelTitle.value);
+	: `${agentState.value.subtitle} · ${assignmentStatusLabel.value}`);
+const summaryTitle = computed(() => isSingleAgentSummary.value ? agentState.value.summary.toolName : panelTitle.value);
 const summarySubtitle = computed(() => isSingleAgentSummary.value
-	? `· ${agentState.value.subtitle} · ${isActiveLiveAgent.value ? "运行中" : agentState.value.summary.label}`
+	? `· ${agentState.value.subtitle} · ${assignmentStatusLabel.value}`
 	: panelSubtitle.value);
-const panelStatusLabel = computed(() => isActiveLiveAgent.value ? "执行中" : agentState.value.summary.label);
+const panelStatusLabel = computed(() => assignmentStatusLabel.value);
 const panelStatusClass = computed(() => isActiveLiveAgent.value ? "running" : agentState.value.summary.cls);
 
 function rowOutputAvailable(row) {
@@ -232,8 +269,23 @@ const monitorCount = computed(() => monitorDisplayLines.value.length);
 const monitorDisplayTotal = computed(() => Math.max(monitorTotal.value, monitorCount.value));
 const loadedEventCount = computed(() => activityLoaded.value ? activityLines.value.length : activityCount.value);
 const activityLatestSeq = computed(() => Math.max(0, ...activityLines.value.map((item) => Number(item.seq || 0))));
+const localInstanceData = computed(() => localAgentInstanceEnvelope({
+	currentTask: immediateTask.value,
+	currentSession: immediateAgentSession.value,
+}));
+const visibleInstanceData = computed(() => (
+	instanceTaskUuid.value === taskUuid.value && instanceData.value
+		? instanceData.value
+		: localInstanceData.value
+));
+const instanceAssignmentCount = computed(() => Math.max(
+	Number(visibleInstanceData.value.total || 0),
+	Number(visibleInstanceData.value.session.turnCount || 0),
+	visibleInstanceData.value.tasks.length,
+));
 const panelTabs = computed(() => [
 	{id: "plan", label: "执行进度", show: showPlanTab.value},
+	{id: "instance", label: "实例指派", show: Boolean(taskUuid.value), count: instanceAssignmentCount.value},
 	{id: "activity", label: "过程记录", show: true, count: canLoadPlan.value ? (eventCountsReady.value ? activityTotal.value : 0) : activityCount.value},
 	{id: "monitor", label: "监控事件", show: true, count: canLoadPlan.value ? (eventCountsReady.value ? monitorTotal.value : 0) : monitorCount.value},
 	{id: "launch", label: "启动信息", show: Boolean(canLoadPlan.value || fallbackArguments.value)},
@@ -376,6 +428,8 @@ async function loadActivity({older = false, newer = false, force = false, limit 
 	if (older && (!activityLoaded.value || !activityHasMore.value)) return;
 	if (newer && !activityLoaded.value) newer = false;
 	if (!older && !newer && !force && activityLoaded.value) return;
+	const requestedTaskUuid = taskUuid.value;
+	const requestGeneration = ++activityRequestGeneration;
 	const visibleTab = eventTab();
 	const visibleState = visibleTab ? eventScrollState[visibleTab] : null;
 	const previousScroller = activityScroller.value;
@@ -384,17 +438,19 @@ async function loadActivity({older = false, newer = false, force = false, limit 
 	const stickToLatest = !visibleState?.interacted
 		|| !previousScroller
 		|| previousScroller.scrollHeight - previousScroller.clientHeight - previousTop <= 36;
+	let continueNewer = false;
 	let finishLoad;
 	activityLoadPromise = new Promise((resolve) => { finishLoad = resolve; });
 	activityLoading.value = true;
 	activityError.value = "";
 	try {
-		const data = await Api.rathTaskEvents(props.conversationUuid, taskUuid.value, {
+		const data = await Api.rathTaskEvents(props.conversationUuid, requestedTaskUuid, {
 			beforeSeq: older ? activityBeforeSeq.value : 0,
 			afterSeq: newer ? activityLatestSeq.value : 0,
 			limit: newer ? 100 : limit,
 		});
 		if (data?.ok === false) throw new Error(data.error || "过程记录读取失败");
+		if (taskUuid.value !== requestedTaskUuid || requestGeneration !== activityRequestGeneration) return;
 		const incoming = (Array.isArray(data?.events) ? data.events : []).map(activityEventLine);
 		const existing = new Set(activityLines.value.map((item) => item.key));
 		const novel = incoming.filter((item) => !existing.has(item.key));
@@ -418,6 +474,9 @@ async function loadActivity({older = false, newer = false, force = false, limit 
 		if (!newer) {
 			activityHasMore.value = Boolean(data?.hasMore);
 			activityBeforeSeq.value = Math.max(0, Number(data?.nextBeforeSeq || 0));
+		} else {
+			// 面板收起期间漏掉的推送可能超过一页，逐页续拉直到追平最新事件。
+			continueNewer = Boolean(data?.hasMore);
 		}
 		await nextTick();
 		const scroller = eventTab() === visibleTab ? activityScroller.value : null;
@@ -427,12 +486,17 @@ async function loadActivity({older = false, newer = false, force = false, limit 
 			if (visibleState) visibleState.top = scroller.scrollTop;
 		}
 	} catch (error) {
-		activityError.value = apiError(error);
+		if (taskUuid.value === requestedTaskUuid && requestGeneration === activityRequestGeneration) {
+			activityError.value = apiError(error);
+		}
 	} finally {
-		activityLoading.value = false;
 		finishLoad?.();
-		activityLoadPromise = null;
+		if (requestGeneration === activityRequestGeneration) {
+			activityLoading.value = false;
+			activityLoadPromise = null;
+		}
 	}
+	if (continueNewer && taskUuid.value === requestedTaskUuid) await loadActivity({newer: true});
 }
 
 async function ensurePlanRecentActivity() {
@@ -562,6 +626,42 @@ async function loadWorkspace(force = false) {
 	}
 }
 
+async function loadAgentInstance(force = false) {
+	const requestedTaskUuid = taskUuid.value;
+	if (!canLoadPlan.value || !requestedTaskUuid) return;
+	if (!force && instanceTaskUuid.value === requestedTaskUuid && instanceData.value) return;
+	if (instanceLoadPromise) {
+		await instanceLoadPromise;
+		if (taskUuid.value === requestedTaskUuid && (force || instanceTaskUuid.value !== requestedTaskUuid)) {
+			await loadAgentInstance(force);
+		}
+		return;
+	}
+	const currentTask = immediateTask.value;
+	const currentSession = immediateAgentSession.value;
+	instanceLoading.value = true;
+	instanceError.value = "";
+	instanceLoadPromise = (async () => {
+		try {
+			const data = await Api.rathAgentInstance(props.conversationUuid, requestedTaskUuid);
+			if (data?.ok === false) throw new Error(data.error || "实例指派读取失败");
+			if (taskUuid.value !== requestedTaskUuid) return;
+			instanceData.value = normalizeAgentInstanceEnvelope(data, {currentTask, currentSession});
+			instanceTaskUuid.value = requestedTaskUuid;
+		} catch (error) {
+			if (taskUuid.value !== requestedTaskUuid) return;
+			instanceData.value = localAgentInstanceEnvelope({currentTask, currentSession});
+			instanceTaskUuid.value = requestedTaskUuid;
+			instanceError.value = apiError(error);
+		} finally {
+			if (taskUuid.value === requestedTaskUuid) instanceLoading.value = false;
+		}
+	})().finally(() => {
+		instanceLoadPromise = null;
+	});
+	await instanceLoadPromise;
+}
+
 function ensureDefaultTab() {
 	const available = panelTabs.value.map((item) => item.id);
 	if (!available.includes(panelTab.value)) panelTab.value = showPlanTab.value && available.includes("plan") ? "plan" : "activity";
@@ -573,6 +673,9 @@ function prepareOpenPanel({resetTab = false} = {}) {
 	if (canLoadPlan.value) {
 		void loadWorkspace();
 		void loadEventCounts();
+		// 收起期间 agentPushKey 推送按 isOpen 被丢弃，任务终止后不会再有推送触发
+		// 缺口恢复；重新展开时必须增量补拉，否则过程记录永久停在收起那一刻。
+		if (activityLoaded.value) void loadActivity({newer: true});
 		if (showPlanTab.value) void ensurePlanRecentActivity();
 		else void prepareEventTab("activity");
 	} else {
@@ -595,6 +698,7 @@ function selectTab(tab) {
 	panelTab.value = tab;
 	if (["plan", "launch"].includes(tab)) void loadWorkspace();
 	if (tab === "plan") void ensurePlanRecentActivity();
+	if (tab === "instance") void loadAgentInstance();
 	if (["activity", "monitor"].includes(tab)) void prepareEventTab(tab);
 }
 
@@ -618,6 +722,11 @@ watch(taskUuid, () => {
 	workspaceTaskUuid.value = "";
 	workspaceError.value = "";
 	workspaceDirty.value = false;
+	instanceData.value = null;
+	instanceTaskUuid.value = "";
+	instanceLoading.value = false;
+	instanceError.value = "";
+	activityRequestGeneration += 1;
 	activityLines.value = [];
 	activityLoaded.value = false;
 	activityLoading.value = false;
@@ -636,6 +745,7 @@ watch(taskUuid, () => {
 	if (isOpen.value && canLoadPlan.value) {
 		void loadWorkspace();
 		void loadEventCounts();
+		if (panelTab.value === "instance") void loadAgentInstance();
 		if (showPlanTab.value) void ensurePlanRecentActivity();
 		else void prepareEventTab("activity");
 	}
@@ -711,6 +821,14 @@ watch(agentPushKey, (value, oldValue) => {
 					</div>
 				</header>
 
+				<div v-if="taskUuid" class="agent-continuity-strip" aria-label="Agent 实例与本轮指派">
+					<span><b>{{ instanceView.legacy ? '记录' : '实例' }}</b><code :title="instanceView.task.agentId || instanceView.session.agentId || taskUuid">{{ instanceView.instanceLabel }}</code></span>
+					<span><b>轮次</b>{{ instanceView.turnLabel }}</span>
+					<span v-if="!instanceView.legacy"><b>上一轮</b><code :title="instanceView.task.continuedFromTaskUuid">{{ instanceView.previousLabel }}</code></span>
+					<span v-if="instanceView.task.contextSource.label"><b>上下文</b>{{ instanceView.task.contextSource.label }}</span>
+					<span><b>本轮能力</b>{{ instanceView.task.grantedTools.length ? instanceView.task.grantedTools.join(' · ') : '未记录' }}</span>
+				</div>
+
 				<nav class="agent-tabs" role="tablist" aria-label="Agent 详情">
 					<button v-for="tab in panelTabs" :key="tab.id" type="button" role="tab" :aria-selected="panelTab === tab.id" :class="{active: panelTab === tab.id}" @click="selectTab(tab.id)">
 						{{ tab.label }}<span v-if="Number(tab.count || 0)">{{ tab.count }}</span>
@@ -728,6 +846,40 @@ watch(agentPushKey, (value, oldValue) => {
 						:activity-error="activityError"
 						@refresh="loadWorkspace(true); ensurePlanRecentActivity()"
 					/>
+
+					<div v-else-if="panelTab === 'instance'" class="instance-panel">
+						<div class="tab-intro">
+							<div><strong>{{ visibleInstanceData.legacy ? '旧任务记录' : '实例指派记录' }}</strong><span>{{ visibleInstanceData.legacy ? '旧数据只按当前任务展示，不推断同角色上下文连续' : '同一实例的每次指派独立保留状态、能力和上下文来源' }}</span></div>
+							<em>{{ visibleInstanceData.tasks.length }} / {{ instanceAssignmentCount }} 轮</em>
+						</div>
+						<div v-if="instanceLoading" class="instance-loading"><Loading/><span>正在读取实例指派…</span></div>
+						<div v-if="instanceError" class="instance-fallback-notice" role="status">
+							<span>实例历史暂不可用，已保留当前任务的单次展示：{{ instanceError }}</span>
+							<button type="button" @click="loadAgentInstance(true)">重试</button>
+						</div>
+						<div v-if="visibleInstanceData.session.agentId || visibleInstanceData.legacy" class="instance-session-summary">
+							<span><b>{{ visibleInstanceData.legacy ? '兼容方式' : '实例标识' }}</b><code :title="visibleInstanceData.session.agentId">{{ visibleInstanceData.legacy ? 'legacy · 单任务' : visibleInstanceData.session.agentId }}</code></span>
+							<span v-if="!visibleInstanceData.legacy"><b>实例状态</b>{{ visibleInstanceData.session.activeTaskUuid ? `当前任务 ${shortAgentId(visibleInstanceData.session.activeTaskUuid)}` : (visibleInstanceData.session.canContinue ? '空闲，可继续指派' : '空闲') }}</span>
+							<span v-if="visibleInstanceData.session.contextRevision"><b>上下文版本</b>r{{ visibleInstanceData.session.contextRevision }}</span>
+							<span v-if="visibleInstanceData.session.continuationBlocker"><b>续接限制</b>{{ visibleInstanceData.session.continuationBlocker }}</span>
+						</div>
+						<div v-if="visibleInstanceData.tasks.length" class="instance-assignment-list">
+							<article v-for="assignment in visibleInstanceData.tasks" :key="assignment.taskUuid" class="instance-assignment" :class="[`tone-${assignment.statusView.tone}`, {'is-current': assignment.isCurrent}]">
+								<header>
+									<div><span>{{ assignment.sessionTurn ? `第 ${assignment.sessionTurn} 次指派` : '单次记录' }}</span><strong>{{ assignment.title }}</strong></div>
+									<em :class="assignment.statusView.tone">{{ assignment.statusView.label }}</em>
+								</header>
+								<div class="instance-assignment-facts">
+									<span><b>任务</b><code :title="assignment.taskUuid">{{ shortAgentId(assignment.taskUuid) }}</code></span>
+									<span><b>来源</b><code :title="assignment.continuedFromTaskUuid">{{ assignment.continuedFromTaskUuid ? shortAgentId(assignment.continuedFromTaskUuid) : '无' }}</code></span>
+									<span><b>上下文</b>{{ assignment.contextSource.label }}</span>
+									<span v-if="assignment.planMode"><b>模式</b>{{ assignment.planMode }}</span>
+								</div>
+								<div class="instance-assignment-tools"><b>本轮能力</b><span v-if="!assignment.grantedTools.length">未记录</span><span v-for="tool in assignment.grantedTools" :key="tool">{{ tool }}</span></div>
+							</article>
+						</div>
+						<div v-else-if="!instanceLoading" class="tab-empty">没有可展示的指派记录。</div>
+					</div>
 
 					<div v-else-if="panelTab === 'activity'" class="activity-panel">
 						<div class="tab-intro"><div><strong>过程记录</strong><span>实时追加业务执行事件；向上滚动加载更早记录</span></div><em>已载入 {{ loadedEventCount }} / {{ activityTotal }} 条事件</em></div>
@@ -877,7 +1029,11 @@ details[open] .disclosure-icon svg { transform: rotate(90deg); }
 .agent-metrics-row { display: flex; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .agent-metrics-row span { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #e4e4e7; border-radius: 8px; background: rgba(255,255,255,.82); padding: 5px 8px; color: #71717a; font-size: 11px; font-weight: 600; }
 .tiny-icon { width: 11px; height: 11px; color: #98a2b3; }
-.agent-tabs { display: flex; gap: 3px; overflow-x: auto; margin: 11px 0 12px; border: 1px solid rgba(228,228,231,.72); border-radius: 11px; background: rgba(228,228,231,.5); padding: 3px; scrollbar-width: none; }
+.agent-continuity-strip { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 9px; color: #52525b; }
+.agent-continuity-strip > span { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 4px; overflow: hidden; border: 1px solid #e4e4e7; border-radius: 999px; background: rgba(255,255,255,.76); padding: 2px 7px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-continuity-strip b { color: #a1a1aa; font-size: 9px; font-weight: 650; }
+.agent-continuity-strip code, .instance-panel code { overflow: hidden; color: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: inherit; text-overflow: ellipsis; white-space: nowrap; }
+.agent-tabs { display: flex; gap: 3px; overflow-x: auto; margin: 9px 0 12px; border: 1px solid rgba(228,228,231,.72); border-radius: 11px; background: rgba(228,228,231,.5); padding: 3px; scrollbar-width: none; }
 .agent-tabs::-webkit-scrollbar { display: none; }
 .agent-tabs button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; border: 0; border-radius: 8px; background: transparent; padding: 7px 11px; color: #71717a; font-size: 12px; font-weight: 620; cursor: pointer; transition: background .15s ease, color .15s ease, box-shadow .15s ease; }
 .agent-tabs button:hover { color: #27272a; }
@@ -885,8 +1041,35 @@ details[open] .disclosure-icon svg { transform: rotate(90deg); }
 .agent-tabs button span { border-radius: 999px; background: #e4e4e7; padding: 1px 5px; color: #71717a; font-size: 10px; }
 .agent-tab-panel { height: 450px; min-width: 0; min-height: 0; overflow: hidden; }
 .agent-tab-panel :deep(.plan-workspace) { width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; }
-.activity-panel, .launch-panel, .output-panel { box-sizing: border-box; display: flex; width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.activity-panel > .tab-intro, .launch-panel > .tab-intro, .output-panel > .tab-intro { flex: 0 0 auto; }
+.activity-panel, .launch-panel, .output-panel, .instance-panel { box-sizing: border-box; display: flex; width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+.activity-panel > .tab-intro, .launch-panel > .tab-intro, .output-panel > .tab-intro, .instance-panel > .tab-intro { flex: 0 0 auto; }
+.instance-loading { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; color: #71717a; font-size: 11px; }
+.instance-loading svg { width: 12px; animation: agentOrbit 1s linear infinite; }
+.instance-fallback-notice { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; border: 1px solid #fde7c2; border-radius: 8px; background: #fffbeb; padding: 7px 9px; color: #92400e; font-size: 10.5px; }
+.instance-fallback-notice button { flex: 0 0 auto; border: 0; background: transparent; color: #92400e; font-size: 10.5px; font-weight: 650; cursor: pointer; }
+.instance-session-summary { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+.instance-session-summary > span { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 5px; overflow: hidden; border: 1px solid #e4e4e7; border-radius: 8px; background: #fafafa; padding: 5px 7px; color: #52525b; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.instance-session-summary b, .instance-assignment-facts b, .instance-assignment-tools > b { color: #a1a1aa; font-size: 9px; font-weight: 650; }
+.instance-assignment-list { display: grid; min-height: 0; flex: 1 1 auto; align-content: start; gap: 7px; overflow-x: hidden; overflow-y: auto; padding-right: 4px; scrollbar-color: #c7c7cc transparent; scrollbar-width: thin; }
+.instance-assignment { --assignment-accent: #d4d4d8; overflow: hidden; border: 1px solid #e4e4e7; border-left: 3px solid var(--assignment-accent); border-radius: 0 10px 10px 0; background: rgba(255,255,255,.88); padding: 9px 10px; }
+.instance-assignment.is-current { box-shadow: inset 0 0 0 1px rgba(59,130,246,.1); }
+.instance-assignment.tone-running { --assignment-accent: #3b82f6; }
+.instance-assignment.tone-ok { --assignment-accent: #22c55e; }
+.instance-assignment.tone-error { --assignment-accent: #ef4444; }
+.instance-assignment.tone-pending, .instance-assignment.tone-partial { --assignment-accent: #f59e0b; }
+.instance-assignment > header { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.instance-assignment > header > div { display: grid; min-width: 0; gap: 2px; }
+.instance-assignment > header span { color: #a1a1aa; font-size: 9.5px; }
+.instance-assignment > header strong { overflow: hidden; color: #27272a; font-size: 11.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.instance-assignment > header em { flex: 0 0 auto; border-radius: 999px; background: #f4f4f5; padding: 2px 6px; color: #71717a; font-size: 9.5px; font-style: normal; }
+.instance-assignment > header em.running { background: #eff6ff; color: #1d4ed8; }
+.instance-assignment > header em.ok { background: #f0fdf8; color: #0f766e; }
+.instance-assignment > header em.error { background: #fff1f2; color: #b91c1c; }
+.instance-assignment > header em.pending, .instance-assignment > header em.partial { background: #fffbeb; color: #b45309; }
+.instance-assignment-facts { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px 10px; margin-top: 7px; color: #71717a; font-size: 10px; }
+.instance-assignment-facts > span { display: inline-flex; min-width: 0; align-items: center; gap: 4px; }
+.instance-assignment-tools { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 7px; color: #a1a1aa; font-size: 10px; }
+.instance-assignment-tools > span { border: 1px solid #e4e4e7; border-radius: 999px; background: #f7f7f8; padding: 1px 6px; color: #52525b; }
 .activity-scroll { min-height: 0; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; padding-right: 4px; scrollbar-color: #c7c7cc transparent; scrollbar-width: thin; }
 .tab-intro { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .tab-intro > div { display: grid; min-width: 0; gap: 3px; }

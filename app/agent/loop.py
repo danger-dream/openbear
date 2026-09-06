@@ -44,7 +44,7 @@ from app.tools.base import (
 log = get_logger("agent.loop")
 
 _AGENT_USAGE_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted", "partial", "needs_openbear_control"}
-_AGENT_START_TOOLS = {"Agent"}
+_AGENT_START_TOOLS = {"Agent", "AgentContinue"}
 _AGENT_LONG_TOOLS = _AGENT_START_TOOLS | {"AgentMessage"}
 
 
@@ -57,7 +57,7 @@ def _json_obj(value: str) -> dict:
 
 
 def _agent_tool_tasks(tool_name: str, payload: dict) -> list[dict]:
-    if tool_name in {"Agent", "AgentMessage"}:
+    if tool_name in {"Agent", "AgentContinue", "AgentMessage"}:
         task = payload.get("task")
         return [task] if isinstance(task, dict) else []
     return []
@@ -123,6 +123,7 @@ def _detached_agent_tool_payload(tool_name: str, tool_result: str) -> dict:
 
 _AGENT_ORCHESTRATION_TOOLS = {
     "Agent",
+    "AgentContinue",
     "AgentMessage",
     "AgentStop",
     "AgentWait",
@@ -174,10 +175,10 @@ def _agent_result_delivery_budget(tool_name: str, tool_result: str) -> tuple[int
     authoritative. Direct Agent/AgentMessage results have one terminal payload and
     may fall back to the task's final-call usage for compatibility.
     """
-    if tool_name not in {"Agent", "AgentMessage", "AgentWait"}:
+    if tool_name not in {"Agent", "AgentContinue", "AgentMessage", "AgentWait"}:
         return 0, 0
     payload = _json_obj(tool_result)
-    if not payload or bool(payload.get("skipped")) or bool(payload.get("alreadyTerminal")):
+    if not payload or bool(payload.get("skipped")) or bool(payload.get("alreadyTerminal")) or bool(payload.get("replayed")):
         return 0, 0
     try:
         explicit_tokens = max(0, int(payload.get("resultOutputTokens") or 0))

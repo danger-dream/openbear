@@ -46,6 +46,7 @@ from app.agent.transcript_repair import (
     repair_tool_pairing,
 )
 from app.config import Config, fast_request_mode
+from app.interaction_data import redact_interaction_log
 from app.context.builder import build_system_prompt_params
 from app.control_actions import (
     schedule_openbear_restart,
@@ -183,6 +184,7 @@ def _log_web_frontend_event(record: dict[str, Any]) -> None:
     if not _WEB_DEBUG_FILE_LOGS_ENABLED:
         return
     try:
+        record = redact_interaction_log(record)
         ts_ms = int(time.time() * 1000)
         payload = {
             "tsMs": ts_ms,
@@ -210,6 +212,7 @@ def _log_web_ws_audit(record: dict[str, Any]) -> None:
     if not _WEB_DEBUG_FILE_LOGS_ENABLED:
         return
     try:
+        record = redact_interaction_log(record)
         ts_ms = int(time.time() * 1000)
         day = time.strftime("%Y-%m-%d", time.gmtime(ts_ms / 1000))
         payload = {

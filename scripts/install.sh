@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # OpenBear 一键安装 / 升级（Debian / Ubuntu 及同系，systemd 源码部署）
 #
-# 远程一键（优先拉最新 GitHub Release）：
-#   bash <(curl -Ls https://github.com/danger-dream/openbear/releases/latest/download/install.sh)
+# 远程安装（先完整下载并校验 HTTP 成功，再执行）：
+#   bash -c '
+#     installer="$(mktemp)" || exit 1
+#     trap "rm -f \"$installer\"" EXIT
+#     curl -fSL --retry 3 -o "$installer" \
+#       https://github.com/danger-dream/openbear/releases/latest/download/install.sh || exit $?
+#     bash "$installer"
+#   '
 #
 # 开发机也可以用 main 上的脚本；若还没有正式发行版，会回退到 git clone。
 #
@@ -24,10 +30,18 @@ REPO_SLUG="${OPENBEAR_REPO:-danger-dream/openbear}"
 REPO_URL="${OPENBEAR_REPO_URL:-https://github.com/${REPO_SLUG}.git}"
 REPO_REF="${OPENBEAR_REF:-main}"
 SERVICE_NAME="${OPENBEAR_SERVICE:-openbear.service}"
+SYSTEMD_UNIT_DIR="${OPENBEAR_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 DEFAULT_DIR="/opt/openbear"
 DEFAULT_PORT="18961"
 DEFAULT_NAME="老大"
 NODE_VERSION="${OPENBEAR_NODE_VERSION:-v20.19.4}"
+RELEASE_UPGRADE_PENDING=0
+RELEASE_TXN=""
+RELEASE_SERVICE_WAS_ACTIVE=0
+RELEASE_SERVICE_WAS_ENABLED=0
+RELEASE_REQUIRES_DB_BACKUP=1
+RELEASE_DB_BACKUP_PATH=""
+APT_UPDATED=0
 
 if [[ -t 1 ]]; then
     C_RESET='\033[0m'; C_BOLD='\033[1m'
@@ -489,10 +503,43 @@ node_major() {
     node -p 'parseInt(process.versions.node.split(".")[0], 10)' 2>/dev/null || echo 0
 }
 
+apt_update_once() {
+    if [[ "$APT_UPDATED" -eq 0 ]]; then
+        if ! apt-get update -y; then
+            return 1
+        fi
+        APT_UPDATED=1
+    fi
+}
+
+ensure_bootstrap_packages() {
+    section "准备安装引导"
+    export DEBIAN_FRONTEND=noninteractive
+    local -a packages=()
+    curl --version >/dev/null 2>&1 || packages+=(curl)
+    python3 -c 'import json, urllib.request' >/dev/null 2>&1 || packages+=(python3)
+    [[ -r /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+        info "补齐安装引导依赖: ${packages[*]}"
+        if ! apt_update_once; then
+            die "更新 apt 索引失败，尚未开始渠道探测"
+        fi
+        if ! apt-get install -y --no-install-recommends "${packages[@]}"; then
+            die "安装引导依赖失败（需要 curl、CA 证书和 python3），尚未开始渠道探测"
+        fi
+    fi
+    curl --version >/dev/null 2>&1 || die "安装引导缺少 curl，尚未开始渠道探测"
+    python3 -c 'import json, urllib.request' >/dev/null 2>&1 \
+        || die "安装引导缺少可用的 python3，尚未开始渠道探测"
+    [[ -r /etc/ssl/certs/ca-certificates.crt ]] \
+        || die "安装引导缺少 CA 证书，尚未开始渠道探测"
+    ok "安装引导已就绪: curl / CA / $(python3 -V 2>&1)"
+}
+
 ensure_apt_packages() {
     section "安装系统依赖"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
+    apt_update_once || die "更新 apt 索引失败"
     apt-get install -y --no-install-recommends \
         ca-certificates curl git tar xz-utils \
         python3 python3-venv python3-pip python3-dev \
@@ -694,21 +741,272 @@ PY
     return "$rc"
 }
 
+validate_release_package() {
+    local pkg="$1" output
+    if [[ ! -f "$pkg/scripts/release_validation.py" ]]; then
+        err "发行包缺少 scripts/release_validation.py"
+        return 1
+    fi
+    if ! output="$(python3 "$pkg/scripts/release_validation.py" validate-tree --root "$pkg" --version "$RELEASE_VERSION")"; then
+        err "发行包校验失败: $output"
+        return 1
+    fi
+    info "发行包校验: $output"
+}
+
+copy_release_tree() {
+    local pkg="$1" f
+    mkdir -p "$INSTALL_DIR/web"
+    rm -rf "$INSTALL_DIR/app" "$INSTALL_DIR/web/dist" "$INSTALL_DIR/prompts" "$INSTALL_DIR/scripts"
+    cp -a "$pkg/app" "$INSTALL_DIR/app" || return 1
+    cp -a "$pkg/web/dist" "$INSTALL_DIR/web/dist" || return 1
+    cp -a "$pkg/prompts" "$INSTALL_DIR/prompts" || return 1
+    cp -a "$pkg/scripts" "$INSTALL_DIR/scripts" || return 1
+    for f in pyproject.toml uv.lock openbear.service openbear.json.example release-meta.json; do
+        cp -a "$pkg/$f" "$INSTALL_DIR/$f" || return 1
+    done
+    for f in README.md README; do
+        if [[ -e "$pkg/$f" ]]; then
+            cp -a "$pkg/$f" "$INSTALL_DIR/$f" || return 1
+        else
+            rm -f "$INSTALL_DIR/$f"
+        fi
+    done
+}
+
 apply_release_tree() {
     local pkg="$1"
     mkdir -p "$INSTALL_DIR"
-    if [[ ! -d "$pkg/app" && ! -d "$pkg/web/dist" ]]; then
-        die "发行包结构无效"
+    validate_release_package "$pkg" || return 1
+    copy_release_tree "$pkg"
+}
+
+prepare_release_dependencies() {
+    local stage="$1" py="3.12"
+    section "准备新版本 Python 依赖"
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+        py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     fi
-    rm -rf "$INSTALL_DIR/app" "$INSTALL_DIR/web/dist" "$INSTALL_DIR/prompts" "$INSTALL_DIR/scripts"
-    mkdir -p "$INSTALL_DIR/web"
-    [[ -d "$pkg/app" ]] && cp -a "$pkg/app" "$INSTALL_DIR/app"
-    [[ -d "$pkg/web/dist" ]] && cp -a "$pkg/web/dist" "$INSTALL_DIR/web/dist"
-    [[ -d "$pkg/prompts" ]] && cp -a "$pkg/prompts" "$INSTALL_DIR/prompts"
-    [[ -d "$pkg/scripts" ]] && cp -a "$pkg/scripts" "$INSTALL_DIR/scripts"
-    for f in pyproject.toml uv.lock openbear.service openbear.json.example README.md README release-meta.json; do
-        [[ -e "$pkg/$f" ]] && cp -a "$pkg/$f" "$INSTALL_DIR/$f"
+    rm -rf "$stage/.venv"
+    # 非 editable 安装避免 .venv 搬到正式目录后仍引用 staging 源路径。
+    UV_PROJECT_ENVIRONMENT="$stage/.venv" uv sync \
+        --frozen --no-editable --python "$py" --directory "$stage" || return 1
+    [[ -x "$stage/.venv/bin/python" ]] || { err "新版本依赖环境未生成"; return 1; }
+    (
+        cd "$stage"
+        PYTHONPATH="$stage" "$stage/.venv/bin/python" -c \
+            'import aiogram, aiohttp, aiosqlite, httpx, pydantic, yaml'
+    ) || return 1
+    # venv 会整体搬到正式 .venv；修正 console script/activate 中的绝对 staging 路径。
+    _OB_STAGE_VENV="$stage/.venv" _OB_FINAL_VENV="$INSTALL_DIR/.venv" python3 - <<'PY' || return 1
+import os
+from pathlib import Path
+root = Path(os.environ["_OB_STAGE_VENV"])
+if not root.is_symlink():
+    old = str(root).encode()
+    new = os.environ["_OB_FINAL_VENV"].encode()
+    for path in (root / "bin").iterdir():
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 1024 * 1024:
+            continue
+        data = path.read_bytes()
+        if b"\0" not in data and old in data:
+            path.write_bytes(data.replace(old, new))
+PY
+    ok "新版本依赖已在 staging 准备完成"
+}
+
+classify_release_database_backup_need() {
+    local pkg="$1" classification
+    RELEASE_REQUIRES_DB_BACKUP=1
+    if classification="$(python3 "$pkg/scripts/updater.py" classify \
+        --current "$INSTALL_DIR" --incoming "$pkg" 2>/dev/null)"; then
+        RELEASE_REQUIRES_DB_BACKUP="$(python3 -c \
+            'import json,sys; print(1 if json.loads(sys.argv[1]).get("requiresRestart") else 0)' \
+            "$classification" 2>/dev/null || echo 1)"
+    else
+        warn "无法分类本机与发行包差异，按后端重启升级准备数据库备份"
+    fi
+}
+
+prepare_release_upgrade() {
+    local pkg="$1" txn="$INSTALL_DIR/.openbear-install-transaction" rel unit
+    local -a existing=()
+    if [[ -e "$txn" || -L "$txn" ]]; then
+        err "检测到未完成的升级事务，拒绝覆盖恢复材料: $txn"
+        return 1
+    fi
+    classify_release_database_backup_need "$pkg"
+    if [[ "$RELEASE_REQUIRES_DB_BACKUP" -eq 1 ]]; then
+        info "检测到后端重启升级；停服后、切换前将创建 SQLite 一致性备份"
+    else
+        info "实际文件差异仅需前端刷新/无需重启；不创建数据库备份"
+    fi
+    mkdir -p "$txn/new"
+    cp -a "$pkg/." "$txn/new/" || { rm -rf "$txn"; return 1; }
+    if ! python3 "$txn/new/scripts/release_validation.py" retain-assets \
+        --incoming "$txn/new/web/dist" --current "$INSTALL_DIR/web/dist"; then
+        rm -rf "$txn"
+        return 1
+    fi
+    if ! prepare_release_dependencies "$txn/new"; then
+        rm -rf "$txn"
+        return 1
+    fi
+
+    for rel in app web/dist prompts scripts pyproject.toml uv.lock openbear.service \
+        openbear.json.example README.md README release-meta.json .venv; do
+        [[ -e "$INSTALL_DIR/$rel" ]] && existing+=("$rel")
     done
+    if [[ "${#existing[@]}" -gt 0 ]]; then
+        tar -czf "$txn/old-code.tgz" -C "$INSTALL_DIR" -- "${existing[@]}" || {
+            rm -rf "$txn"
+            return 1
+        }
+    else
+        tar -czf "$txn/old-code.tgz" --files-from /dev/null || {
+            rm -rf "$txn"
+            return 1
+        }
+    fi
+    unit="$SYSTEMD_UNIT_DIR/$SERVICE_NAME"
+    if [[ -e "$unit" ]]; then
+        cp -a "$unit" "$txn/old-unit" || { rm -rf "$txn"; return 1; }
+    fi
+    if systemctl is-active --quiet "$SERVICE_NAME"; then RELEASE_SERVICE_WAS_ACTIVE=1; else RELEASE_SERVICE_WAS_ACTIVE=0; fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME"; then RELEASE_SERVICE_WAS_ENABLED=1; else RELEASE_SERVICE_WAS_ENABLED=0; fi
+    RELEASE_TXN="$txn"
+    ok "代码、前端、依赖和回滚备份均已准备；尚未停止服务或切换文件"
+}
+
+restore_release_upgrade() {
+    local txn="$1" reason="$2" rel unit="$SYSTEMD_UNIT_DIR/$SERVICE_NAME"
+    warn "升级失败，恢复旧版本: $reason"
+    if ! systemctl stop "$SERVICE_NAME" >/dev/null 2>&1; then
+        err "恢复前无法停止 $SERVICE_NAME；未删除任何当前文件，备份保留在 $txn"
+        return 1
+    fi
+    for rel in app web/dist prompts scripts pyproject.toml uv.lock openbear.service \
+        openbear.json.example README.md README release-meta.json .venv; do
+        if ! rm -rf "$INSTALL_DIR/$rel"; then
+            err "清理新版本 $rel 失败；备份保留在 $txn"
+            return 1
+        fi
+    done
+    if [[ ! -f "$txn/old-code.tgz" ]]; then
+        err "缺少旧代码/依赖备份；事务目录保留在 $txn"
+        return 1
+    fi
+    if ! tar -xzf "$txn/old-code.tgz" -C "$INSTALL_DIR"; then
+        err "旧代码/依赖恢复失败；唯一备份保留在 $txn，请人工恢复"
+        return 1
+    fi
+    if [[ -f "$txn/old-unit" ]]; then
+        if ! mkdir -p "$SYSTEMD_UNIT_DIR" || ! cp -a "$txn/old-unit" "$unit"; then
+            err "旧 systemd unit 恢复失败；事务目录保留在 $txn"
+            return 1
+        fi
+    elif ! rm -f "$unit"; then
+        err "移除新 systemd unit 失败；事务目录保留在 $txn"
+        return 1
+    fi
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        err "systemd daemon-reload 失败；事务目录保留在 $txn"
+        return 1
+    fi
+    if [[ "$RELEASE_SERVICE_WAS_ENABLED" -eq 1 ]]; then
+        if ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+            err "恢复服务 enable 状态失败；事务目录保留在 $txn"
+            return 1
+        fi
+    elif ! systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
+        err "恢复服务 disable 状态失败；事务目录保留在 $txn"
+        return 1
+    fi
+    if [[ "$RELEASE_SERVICE_WAS_ACTIVE" -eq 1 ]] && ! systemctl start "$SERVICE_NAME" >/dev/null 2>&1; then
+        err "旧服务恢复启动失败；事务目录保留在 $txn"
+        return 1
+    fi
+    if ! rm -rf "$txn"; then
+        err "旧版本已恢复，但事务目录清理失败: $txn"
+        return 1
+    fi
+    RELEASE_TXN=""
+    ok "旧版本代码、依赖、unit 和服务状态已恢复"
+    if [[ -n "${RELEASE_DB_BACKUP_PATH:-}" ]]; then
+        warn "数据库未自动回退；升级前备份保留在 $RELEASE_DB_BACKUP_PATH。人工恢复会丢失备份后的新数据"
+    fi
+    return 0
+}
+
+backup_release_database() {
+    local stage="$1" output py
+    py="$stage/.venv/bin/python"
+    RELEASE_DB_BACKUP_PATH=""
+    [[ "$RELEASE_REQUIRES_DB_BACKUP" -eq 1 ]] || return 0
+    [[ -x "$py" ]] || { err "staging Python 不存在，无法创建数据库备份: $py"; return 1; }
+    if ! output="$("$py" "$stage/scripts/release_validation.py" backup-database \
+        --root "$INSTALL_DIR" \
+        --backup-dir "$INSTALL_DIR/data/backups" \
+        --label "v${RELEASE_VERSION:-unknown}")"; then
+        err "升级前数据库一致性备份失败: ${output:-无详情}"
+        return 1
+    fi
+    RELEASE_DB_BACKUP_PATH="$("$py" -c \
+        'import json,sys; print((json.loads(sys.argv[1]) or {}).get("backupPath") or "")' \
+        "$output")" || return 1
+    if [[ -n "$RELEASE_DB_BACKUP_PATH" ]]; then
+        ok "数据库一致性备份已保留: $RELEASE_DB_BACKUP_PATH"
+    else
+        info "未发现旧数据库，无需创建升级前备份"
+    fi
+}
+
+commit_release_upgrade() {
+    local txn="$1" reason=""
+    section "停止服务并切换已准备的新版本"
+    if ! systemctl stop "$SERVICE_NAME"; then
+        err "无法停止 $SERVICE_NAME，未切换任何文件；staging 与备份保留在 $txn"
+        if [[ "$RELEASE_SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
+    if ! backup_release_database "$txn/new"; then
+        err "数据库备份失败，未切换任何文件"
+        if [[ "$RELEASE_SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+            if ! systemctl start "$SERVICE_NAME"; then
+                err "旧服务恢复启动失败；staging 与代码备份保留在 $txn"
+                return 2
+            fi
+        fi
+        return 1
+    fi
+    if ! copy_release_tree "$txn/new"; then
+        reason="切换代码失败"
+    elif [[ ! -x "$txn/new/.venv/bin/python" ]]; then
+        reason="staging 依赖环境缺失"
+    else
+        rm -rf "$INSTALL_DIR/.venv"
+        if ! mv "$txn/new/.venv" "$INSTALL_DIR/.venv"; then
+            reason="切换依赖环境失败"
+        elif ! write_service; then
+            reason="安装 systemd unit 失败"
+        elif ! systemctl start "$SERVICE_NAME"; then
+            reason="启动新版本服务失败"
+        elif ! verify_web_ready "$RELEASE_VERSION"; then
+            reason="新版本 Web 健康检查失败"
+        fi
+    fi
+    if [[ -n "$reason" ]]; then
+        if ! restore_release_upgrade "$txn" "$reason"; then
+            err "自动恢复未完成；不要删除事务目录，恢复材料保留在 $txn"
+            return 2
+        fi
+        return 1
+    fi
+    rm -rf "$txn"
+    RELEASE_TXN=""
+    ok "发行版事务切换完成"
 }
 
 sync_code_release() {
@@ -717,11 +1015,11 @@ sync_code_release() {
     zip_path="$tmp/openbear-${RELEASE_VERSION}.zip"
     info "下载发行包 $RELEASE_TAG"
     curl -fL --retry 3 -A "OpenBear-Install" -o "$zip_path" "$RELEASE_ZIP_URL" || die "下载发行包失败"
-    if [[ -n "${RELEASE_SUMS_URL:-}" ]]; then
-        sums_path="$tmp/SHA256SUMS"
-        curl -fL --retry 3 -A "OpenBear-Install" -o "$sums_path" "$RELEASE_SUMS_URL" || die "下载 SHA256SUMS 失败"
-        python3 - "$zip_path" "$sums_path" <<'PY'
-import hashlib, sys
+    [[ -n "${RELEASE_SUMS_URL:-}" ]] || die "发行版缺少 SHA256SUMS，拒绝安装或升级"
+    sums_path="$tmp/SHA256SUMS"
+    curl -fL --retry 3 -A "OpenBear-Install" -o "$sums_path" "$RELEASE_SUMS_URL" || die "下载 SHA256SUMS 失败"
+    python3 - "$zip_path" "$sums_path" <<'PY'
+import hashlib, re, sys
 from pathlib import Path
 zip_path, sums_path = Path(sys.argv[1]), Path(sys.argv[2])
 want = zip_path.name
@@ -734,17 +1032,14 @@ for line in sums_path.read_text(encoding="utf-8").splitlines():
     if len(parts) >= 2 and Path(parts[-1]).name == want:
         expected = parts[0].lower()
         break
-if not expected:
-    raise SystemExit(f"SHA256SUMS 中没有 {want}")
+if not re.fullmatch(r"[0-9a-f]{64}", expected):
+    raise SystemExit(f"SHA256SUMS 中 {want} 的摘要缺失或无效")
 digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
 if digest != expected:
     raise SystemExit(f"SHA256 不匹配: {digest} != {expected}")
 print(digest)
 PY
-        ok "SHA256 校验通过"
-    else
-        warn "发行版没有 SHA256SUMS，跳过校验"
-    fi
+    ok "SHA256 校验通过"
     extract="$tmp/extract"
     mkdir -p "$extract"
     python3 - "$zip_path" "$extract" <<'PY'
@@ -778,7 +1073,16 @@ PY
         git -C "$INSTALL_DIR" status --porcelain | sed 's/^/    /'
         die "安装目录有未提交改动，已拒绝升级以免覆盖本地修改"
     fi
-    apply_release_tree "$pkg"
+    validate_release_package "$pkg" || die "发行包不完整，未切换任何文件"
+    if [[ "$MODE" == "upgrade" ]]; then
+        prepare_release_upgrade "$pkg" || die "新版本 staging 或依赖准备失败，旧服务和文件未改变"
+        RELEASE_UPGRADE_PENDING=1
+        rm -rf "$tmp"
+        return 0
+    fi
+    python3 "$pkg/scripts/release_validation.py" retain-assets \
+        --incoming "$pkg/web/dist" || die "无法写入前端资源代际信息"
+    copy_release_tree "$pkg" || die "复制发行版失败"
     INSTALL_DIR="$INSTALL_DIR" REPO_REF="$REPO_REF" write_install_source release "$RELEASE_VERSION" "$RELEASE_TAG"
     rm -rf "$tmp"
     ok "已安装发行版 $RELEASE_TAG"
@@ -839,6 +1143,9 @@ sync_code() {
         return
     fi
     rm -f "$meta"
+    if [[ "$MODE" == "upgrade" ]]; then
+        die "无法取得可校验的 GitHub 稳定发行版；升级未改动文件，也不会自动切换到 git"
+    fi
     warn "没有可用的 GitHub 稳定发行版，回退到 git $REPO_REF"
     sync_code_git
 }
@@ -865,10 +1172,11 @@ sync_python() {
 build_web() {
     if [[ -f "$INSTALL_DIR/web/dist/index.html" && "${OPENBEAR_FORCE_BUILD_WEB:-}" != "1" ]]; then
         section "Web 前端"
-        info "发行包已包含 web/dist，跳过构建"
+        info "发行包已包含 web/dist，跳过 Node 检查与前端构建"
         return 0
     fi
     section "构建 Web 前端"
+    ensure_node
     cd "$INSTALL_DIR/web"
     if [[ -f package-lock.json ]]; then
         npm ci
@@ -952,11 +1260,12 @@ PY
 
 write_service() {
     section "安装 systemd 服务"
-    local unit="/etc/systemd/system/${SERVICE_NAME}"
-    sed "s|__OPENBEAR_DIR__|${INSTALL_DIR}|g" "$INSTALL_DIR/openbear.service" > "$unit"
-    chmod 644 "$unit"
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
+    local unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}"
+    mkdir -p "$SYSTEMD_UNIT_DIR" || return 1
+    sed "s|__OPENBEAR_DIR__|${INSTALL_DIR}|g" "$INSTALL_DIR/openbear.service" > "$unit" || return 1
+    chmod 644 "$unit" || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable "$SERVICE_NAME" || return 1
     ok "已安装 $unit"
 }
 
@@ -993,25 +1302,31 @@ ensure_firewall() {
     info "未检测到活动的 ufw/firewalld。若云厂商安全组未放行 ${port}，请自行打开"
 }
 
-start_and_verify() {
-    section "启动并验证"
-    systemctl restart "$SERVICE_NAME"
-    local i health
+verify_web_ready() {
+    local expected_version="$1" i output
+    local health_url="http://127.0.0.1:${WEB_PORT:-$DEFAULT_PORT}/health"
     for i in $(seq 1 30); do
-        if curl -fsS "http://127.0.0.1:${WEB_PORT:-$DEFAULT_PORT}/health" >/dev/null 2>&1; then
-            health=$(curl -fsS "http://127.0.0.1:${WEB_PORT:-$DEFAULT_PORT}/health" || true)
-            ok "/health: $health"
+        if output="$("$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/release_validation.py" \
+            probe-web --health-url "$health_url" --version "$expected_version" --timeout 4 2>&1)"; then
             if systemctl is-active --quiet "$SERVICE_NAME"; then
-                ok "$SERVICE_NAME 运行中"
+                ok "健康检查、/login 与入口资源检查通过: $output"
+                return 0
             fi
-            print_done
-            return 0
+            output="服务未处于 active"
         fi
         sleep 2
     done
-    err "60s 内 /health 未通过"
+    err "60s 内 Web 验收未通过: ${output:-无响应}"
     journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
-    exit 1
+    return 1
+}
+
+start_and_verify() {
+    local expected_version="${1:-}"
+    section "启动并验证"
+    systemctl restart "$SERVICE_NAME" || die "重启 $SERVICE_NAME 失败"
+    verify_web_ready "$expected_version" || die "新版本 Web 验收失败"
+    print_done
 }
 
 print_done() {
@@ -1046,7 +1361,7 @@ ${C_GREEN}${C_BOLD}╔═══════════════════�
   内网地址 : ${INTERNAL_URL}
   外网地址 : ${external_line}
   访问密钥 : ${secret_line}
-
+$(if [[ -n "${RELEASE_DB_BACKUP_PATH:-}" ]]; then printf '  数据库备份 : %s\n' "$RELEASE_DB_BACKUP_PATH"; fi)
 第一次登录：
   1. 用上面的 Telegram Admin 账号给 Bot 发一次 /start
   2. 浏览器打开内网或外网地址
@@ -1069,11 +1384,23 @@ main() {
     print_banner
     need_root
     need_linux
+    ensure_bootstrap_packages
     collect_config
     ensure_apt_packages
     ensure_uv
-    ensure_node
     sync_code
+    if [[ "$RELEASE_UPGRADE_PENDING" -eq 1 ]]; then
+        # 事务升级的依赖已在 staging 中准备；先完成所有无需停服的本机工作。
+        if [[ -z "${WEB_PORT:-}" ]]; then
+            WEB_PORT="$("$INSTALL_DIR/.venv/bin/python" -c 'import json; print(json.load(open("openbear.json"))["web"]["port"])')"
+        fi
+        ensure_firewall
+        commit_release_upgrade "$RELEASE_TXN" || die "发行版升级失败，已尝试恢复旧版本"
+        INSTALL_DIR="$INSTALL_DIR" REPO_REF="$REPO_REF" write_install_source release "$RELEASE_VERSION" "$RELEASE_TAG"
+        ok "已升级到发行版 $RELEASE_TAG"
+        print_done
+        return 0
+    fi
     sync_python
     build_web
     write_runtime
@@ -1083,7 +1410,7 @@ main() {
         WEB_PORT="$("$INSTALL_DIR/.venv/bin/python" -c 'import json; print(json.load(open("openbear.json"))["web"]["port"])')"
     fi
     ensure_firewall
-    start_and_verify
+    start_and_verify "${RELEASE_VERSION:-}"
 }
 
 main "$@"

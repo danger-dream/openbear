@@ -12,6 +12,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from app.interaction_data import redact_result
 from app.logging import get_logger
 from app.tools.json_repair import extract_balanced_json
 from app.tools.truncate import truncate_tool_result
@@ -65,14 +66,31 @@ def redact_tool_arguments_for_audit(name: str, arguments: str) -> str:
             "defaultValue": _SENSITIVE_REDACTION,
             "sensitiveRedacted": True,
         }, ensure_ascii=False, separators=(",", ":"))
-    if "defaultValue" in payload:
-        payload["defaultValue"] = _SENSITIVE_REDACTION
+    for key in ("title", "body", "description", "defaultValue", "text"):
+        if key in payload:
+            payload[key] = _SENSITIVE_REDACTION
+    for key in ("options", "questions", "defaultValues", "defaultIndexes"):
+        if key in payload:
+            payload[key] = []
+    payload["sensitiveRedacted"] = True
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def redact_tool_result_for_audit(name: str, result: str, arguments: str = "") -> str:
     """Redact sensitive UserInteraction prompt values without changing raw results."""
-    if str(name or "") != "UserInteraction" or not _user_interaction_sensitive(arguments):
+    if str(name or "") != "UserInteraction":
+        # Shared approval consumers can return a user's sensitive feedback inside
+        # their result. Keep raw text for the model, but not for audit surfaces.
+        try:
+            outer = json.loads(result)
+            confirmation = outer.get("confirmation") if isinstance(outer, dict) else None
+            if isinstance(confirmation, dict) and confirmation.get("sensitive"):
+                outer["confirmation"] = redact_result(confirmation)
+                return json.dumps(outer, ensure_ascii=False, separators=(",", ":"))
+        except (ValueError, TypeError):
+            pass
+        return result
+    if not _user_interaction_sensitive(arguments):
         return result
     try:
         payload = json.loads(result or "{}")
@@ -88,10 +106,7 @@ def redact_tool_result_for_audit(name: str, result: str, arguments: str = "") ->
             "value": _SENSITIVE_REDACTION,
             "sensitiveRedacted": True,
         }, ensure_ascii=False, separators=(",", ":"))
-    if "value" in payload:
-        payload["value"] = _SENSITIVE_REDACTION
-    payload["sensitiveRedacted"] = True
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(redact_result(payload), ensure_ascii=False, separators=(",", ":"))
 
 # 工具处理函数：(arguments_dict) -> 结果字符串
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
@@ -123,6 +138,9 @@ class ToolRuntimeContext:
     turn_uuid: str = ""
     run_root_turn_uuid: str = ""
     tool_call_id: str = ""
+    # Set only by the trusted interaction callback when a user submitted text.
+    # A denied shared approval must not truncate that text with ordinary output.
+    preserve_user_answer: bool = False
     # Optional renderer callback for long-running tools to update their inline
     # progress block while the tool is still executing.
     progress_update: Callable[[str], Awaitable[None]] | None = None
@@ -242,7 +260,9 @@ class ToolRegistry:
                 args = repaired
         if not isinstance(args, dict):
             return "error: 工具参数必须是 JSON 对象"
-        token = _TOOL_CONTEXT.set(context or ToolRuntimeContext())
+        execution_context = context or ToolRuntimeContext()
+        execution_context.preserve_user_answer = False
+        token = _TOOL_CONTEXT.set(execution_context)
         try:
             try:
                 result = await tool.handler(args)
@@ -251,7 +271,7 @@ class ToolRegistry:
                 return f"error: 工具 {name} 执行失败: {type(e).__name__}: {e}"
         finally:
             _TOOL_CONTEXT.reset(token)
-        if isinstance(result, str) and len(result) > max_chars and not tool.preserve_result:
+        if isinstance(result, str) and len(result) > max_chars and not tool.preserve_result and not execution_context.preserve_user_answer:
             log.info("工具结果智能截断", 工具=name, 原长=len(result), 上限=max_chars)
             return truncate_tool_result(result, max_chars)
         return result

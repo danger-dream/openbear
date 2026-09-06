@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from app.llm.events import ToolCall
 
-_LONG_AGENT_TOOLS = {"Agent", "AgentMessage"}
+_LONG_AGENT_TOOLS = {"Agent", "AgentContinue", "AgentMessage"}
 
 
 def normalize_tool_calls(calls: list[ToolCall]) -> list[ToolCall]:

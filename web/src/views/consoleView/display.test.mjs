@@ -47,6 +47,32 @@ test("Agent activity uses Read description before path metadata", () => {
 });
 
 
+test("AgentContinue is an Agent execution card while AgentInfo remains a read-only tool card", () => {
+	const continued = {
+		kind: "tool",
+		toolName: "AgentContinue",
+		calls: [{name: "AgentContinue", arguments: JSON.stringify({to: "agent-a", prompt: "继续修复", tools: ["Read", "Edit"]})}],
+		result: {},
+		livePayload: {
+			task: {taskUuid: "task-2", agentId: "agent-a", sessionKind: "independent", sessionTurn: 2, status: "running"},
+			agentSession: {agentId: "agent-a", sessionKind: "independent", activeTaskUuid: "task-2"},
+		},
+	};
+	const info = {
+		kind: "tool",
+		toolName: "AgentInfo",
+		calls: [{name: "AgentInfo", arguments: JSON.stringify({to: "agent-a"})}],
+		result: {name: "AgentInfo", content: JSON.stringify({ok: true})},
+	};
+
+	assert.equal(display.isAgentEvent(continued), true);
+	assert.equal(display.eventPrimaryToolName(continued), "AgentContinue");
+	assert.equal(display.agentDisplayState(continued).rows[0].sessionTurn, 2);
+	assert.equal(display.isAgentEvent(info), false);
+	assert.equal(display.toolSummaryTitle(info), "AgentInfo");
+});
+
+
 test("Agent launch failure without taskUuid does not keep a queued fallback row", () => {
 	const resultText = JSON.stringify({ok: false, error: "agent_preset_not_found", status: "failed"});
 	const event = {

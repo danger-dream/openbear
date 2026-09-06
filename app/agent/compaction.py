@@ -82,7 +82,7 @@ ContextCompactionCallback = Callable[[CompactionOutcome], Awaitable[None]]
 
 DEFAULT_SUMMARY_PROMPT = """You are compacting an ongoing engineering conversation for future continuation. After compaction, the next model will only see this summary plus the most recent uncompressed messages, so the summary must be sufficient to continue the work without re-reading the compacted transcript.
 
-Output in English only, even if the conversation history is in another language. Be dense, specific, and continuity-focused. Prefer concrete facts over generic prose. The latest user request, latest user corrections, and latest unfinished/current work have highest priority; do not let older context drown them out.
+Output in English, even if the conversation history is in another language, with one exemption: quoted user messages and exact identifiers must stay verbatim in their original language; never translate them. Be dense, specific, and continuity-focused. Prefer concrete facts over generic prose. The latest user request, latest user corrections, and latest unfinished/current work have highest priority; do not let older context drown them out.
 
 Before writing the final summary, carefully review the compacted history chronologically. For each meaningful conversation section, identify:
 - the user's explicit request and intent;
@@ -109,7 +109,7 @@ Record every important error, failed attempt, diagnostic result, root cause, fix
 Describe the reasoning path and decisions already made. Include investigated alternatives when they affect future choices, why a chosen path was selected, and any assumptions or uncertainty that remain. Do not turn this into vague narrative; keep it actionable.
 
 ## All User Messages
-List all user messages represented in the compacted history when feasible. If there are too many, at minimum preserve every message that changed the task, constraints, priorities, permissions, or next step, plus the most recent user messages verbatim or near-verbatim. User wording matters; do not paraphrase away intent-changing details.
+List all user messages represented in the compacted history when feasible. If there are too many, at minimum preserve every message that changed the task, constraints, priorities, permissions, or next step, plus the most recent user messages verbatim or near-verbatim in their original language. User wording matters; do not translate it or paraphrase away intent-changing details.
 
 ## Pending Tasks
 List unfinished tasks in execution order. Distinguish confirmed tasks from optional follow-ups. Include required confirmations, safety boundaries, and tasks that must not be done unless the user asks.

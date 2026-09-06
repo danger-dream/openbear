@@ -146,6 +146,7 @@ class Services:
             model_selection=self.selection,
             messages=self.messages,
             workspace_dir=self.workspace_dir,
+            memory=self.mem,
         )
         self.web_admin.tools = self.tools
 
@@ -641,6 +642,7 @@ class Services:
             model_selection=self.selection,
             messages=self.messages,
             workspace_dir=self.workspace_dir,
+            memory=self.mem,
         )
         if include_mcp:
             register_mcp_tools(self.tools, self.mcp)

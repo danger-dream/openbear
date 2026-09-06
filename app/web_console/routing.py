@@ -38,11 +38,20 @@ class WebAdminAppMixin:
             return True
         return candidate in self._allowed_origins(request)
 
-    def _cookie_secure(self, request: web.Request) -> bool:
+    def _request_is_https(self, request: web.Request) -> bool:
+        # Keep the same reverse-proxy scheme convention used by origin checks.
         proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",", 1)[0].strip().lower()
-        if proto == "https" or request.secure:
-            return True
-        return _origin_key(self.config.web.custom_url).startswith("https://")
+        return proto == "https" or request.secure
+
+    def _https_login_url(self, request: web.Request) -> str:
+        configured = _origin_key(self.config.web.custom_url)
+        if configured.startswith("https://") and not self._request_is_https(request):
+            # Only configuration can select the redirect host, never request headers.
+            return configured + "/login"
+        return ""
+
+    def _cookie_secure(self, request: web.Request) -> bool:
+        return self._request_is_https(request) or _origin_key(self.config.web.custom_url).startswith("https://")
 
     def make_app(self) -> web.Application:
         app = web.Application(middlewares=[self._auth_middleware])
@@ -159,12 +168,14 @@ class WebAdminAppMixin:
             web.delete("/api/memory/docs/{item_id}", self.handle_api_memory_doc_delete),
             web.get("/api/memory/templates", self.handle_api_memory_templates),
             web.post("/api/memory/templates", self.handle_api_memory_template_create),
+            web.post("/api/memory/templates/import-builtin", self.handle_api_memory_template_import_builtin),
             web.put("/api/memory/templates/{item_id}", self.handle_api_memory_template_update),
             web.delete("/api/memory/templates/{item_id}", self.handle_api_memory_template_delete),
             web.post("/api/memory/reorder", self.handle_api_memory_reorder),
             web.post("/api/memory/preview", self.handle_api_memory_preview),
             web.get("/api/memory/render-logs", self.handle_api_memory_render_logs),
             web.get("/api/memory/render-logs/{log_id:\\d+}", self.handle_api_memory_render_log_detail),
+            web.get("/api/conversations/{conversation_uuid}/agents/{task_uuid}/instance", self.handle_api_rath_task_instance),
             web.get("/api/conversations/{conversation_uuid}/agents/{task_uuid}/plan", self.handle_api_rath_task_plan),
             web.get("/api/conversations/{conversation_uuid}/agents/{task_uuid}/events", self.handle_api_rath_task_events),
             web.get("/api/rath/options", self.handle_api_rath_options),

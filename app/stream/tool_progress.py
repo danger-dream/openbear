@@ -16,6 +16,8 @@ _TOOL_EMOJI = {
     "EditBatch": "✏️",
     "Bash": "💻",
     "Agent": "🧑‍💻",
+    "AgentContinue": "🧑‍💻",
+    "AgentInfo": "📋",
     "AgentMessage": "▶️",
     "AgentStop": "🛑",
     "Memory": "🧠",
@@ -122,8 +124,8 @@ def _agent_card(lines: list[str], *, expandable: bool = False) -> str:
 
 def _agent_tool_start_line(tool_name: str, arguments: str) -> str | None:
     items = _agent_items(arguments)
-    if tool_name == "Agent" and items:
-        return _agent_card(["🧑‍💻 Agent", f"🚧 {_agent_item_preview(items[0], limit=90)}"])
+    if tool_name in {"Agent", "AgentContinue"} and items:
+        return _agent_card([f"🧑‍💻 {tool_name}", f"🚧 {_agent_item_preview(items[0], limit=90)}"])
     if tool_name == "AgentMessage" and items:
         target = _short_text(str(items[0].get("to") or items[0].get("taskUuid") or items[0].get("task_uuid") or "Agent task"), 16)
         message = _short_text(str(items[0].get("message") or items[0].get("prompt") or items[0].get("guidance") or ""), 80)
@@ -134,7 +136,7 @@ def _agent_tool_start_line(tool_name: str, arguments: str) -> str | None:
 def format_tool_running_status_line(tool_name: str, arguments: str) -> str | None:
     """Return a dynamic status label while a long-running Agent tool is executing."""
     items = _agent_items(arguments)
-    if tool_name == "Agent" and items:
+    if tool_name in {"Agent", "AgentContinue"} and items:
         agent = str(items[0].get("workerType") or items[0].get("subagent_type") or "general-purpose")
         task = _short_text(str(items[0].get("description") or items[0].get("title") or items[0].get("prompt") or ""), 60)
         return f"Agent 执行中：{agent}" + (f" · {task}" if task else "")
@@ -443,14 +445,14 @@ def _payload_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def format_tool_result_line(tool_name: str, arguments: str, result: str, duration_ms: int) -> str:
     """Human-friendly completion line for long Agent tools; empty for ordinary tools."""
-    if tool_name not in {"Agent", "AgentMessage", "AgentStop"}:
+    if tool_name not in {"Agent", "AgentContinue", "AgentMessage", "AgentStop"}:
         return ""
     payload = _load_json_obj(result)
     elapsed = _duration_text(duration_ms)
     if not payload:
         return f"✅ {tool_name} 完成 · {elapsed}"
 
-    if tool_name in {"Agent", "AgentMessage", "AgentStop"}:
+    if tool_name in {"Agent", "AgentContinue", "AgentMessage", "AgentStop"}:
         agent = payload.get("agentSession") if isinstance(payload.get("agentSession"), dict) else {}
         task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
         name = agent.get("title") or agent.get("agentKey") or "Agent"
@@ -517,6 +519,8 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
     data = _load_json_obj(result)
     status = str(data.get("status") or "")
     action = str(args.get("action") or "confirm") if tool_name == "UserInteraction" else ""
+    if status == "interrupted":
+        return "⏹️ 运行已中断，本次交互失效，未采用任何默认答案。"
     if action == "questionnaire":
         if status == "error":
             return "❌ 需求问卷创建失败。"
@@ -528,12 +532,14 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
         answer_count = len(answers) if isinstance(answers, list) else 0
         return f"✅ 用户已提交需求问卷（{answer_count} 题）。"
     if status == "timeout":
-        return "⌛ 用户未响应，已按默认值继续。"
+        return "⌛ 用户未响应，本次交互已超时；未采用默认答案或授权。"
     if data.get("cancelled") is True:
         return "🚫 用户已取消。"
 
     if tool_name == "UserInteraction":
         if action == "select":
+            if str(data.get("text") or "").strip():
+                return "✍️ 用户已提交选择与原文，请以文字中的补充或修正为准。" if data.get("selectedValues") else "✍️ 用户已提交自己的文字答案。"
             labels = data.get("selectedLabels")
             if isinstance(labels, list) and labels:
                 rendered = "、".join(_short_text(str(x), 40) for x in labels)
@@ -545,6 +551,8 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
             if sensitive:
                 return "✍️ 用户已输入文本（已隐藏）。"
             return f"✍️ 用户输入：{_short_text(value)}" if value else "✍️ 用户已输入文本。"
+        if data.get("decision") == "feedback" or str(data.get("text") or "").strip():
+            return "✍️ 用户已提交意见，未确认执行原操作。"
         label = _short_text(str(data.get("label") or data.get("choice") or ""), 60)
         if data.get("confirmed") is True:
             return f"✅ 用户已确认：{label}" if label else "✅ 用户已确认。"
@@ -556,6 +564,9 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
         if status == "scheduled":
             return f"✅ 控制动作已安排：{action}"
         if status == "cancelled":
+            confirmation = data.get("confirmation") or {}
+            if isinstance(confirmation, dict) and str(confirmation.get("text") or "").strip():
+                return f"✍️ 用户已提交意见，原控制动作未执行：{action}"
             return f"🚫 控制动作已取消：{action}"
         if status == "ok":
             return f"✅ 控制动作完成：{action}"

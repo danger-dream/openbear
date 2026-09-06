@@ -51,6 +51,7 @@ from app.task_memory import (
 from app.tools.allowlist import (
     AGENT_DELEGATION_TOOL_NAMES,
     agent_tool_capability,
+    agent_phase_tool_names,
     expand_agent_tool_names,
     sanitize_tool_allowlist,
 )
@@ -61,7 +62,7 @@ from app.tools.base import (
     redact_tool_result_for_audit,
 )
 from app.tools.file_state import clear_read_file_state
-from app.utils import estimate_tokens
+from app.utils import estimate_tokens, now_cn
 
 _CONTEXT_COMPACT_DEFAULT_KEEP_RECENT = 6
 _CONTEXT_COMPACT_DEFAULT_SUMMARY_CHARS = 12_000
@@ -433,6 +434,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             raise RuntimeError(f"Rath task not found: {self.task_uuid}")
         instruction = str(task.input.get("instruction") or task.input.get("question") or task.title or "").strip()
         self._task_instruction = instruction
+        self._round_input = dict(task.input or {})
         inherited = task.input.get("inheritedPlanContext") if isinstance(task.input, dict) else {}
         self._inherited_plan_context = inherited if isinstance(inherited, dict) else {}
         self.chat_id = int(task.chat_id or 0)
@@ -594,6 +596,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         round_no: int,
         stage: str,
         last_text: str = "",
+        extra_state: dict[str, Any] | None = None,
     ) -> int:
         """Persist the private model context without exposing it to UI/summary."""
         protocol = str(getattr(self.backend, "protocol", "") or "").lower()
@@ -603,6 +606,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             "stage": str(stage or "checkpoint"),
             "roundNo": max(0, int(round_no or 0)),
             "lastText": str(last_text or ""),
+            "pendingControlUuids": sorted(self._pending_control_acks),
             "providerPromptSnapshot": self._provider_prompt_snapshot_state(),
             "messages": self._serialize_messages(safe_messages),
             "droppedDanglingToolCallsOrOutputs": int(dropped or 0),
@@ -613,6 +617,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             "agentSessionUuid": self.agent_session_uuid,
             "openbearSessionUuid": self.openbear_session_uuid,
         }
+        state.update(extra_state or {})
         return await self.dao.save_task_model_context(
             self.task_uuid,
             protocol=protocol,
@@ -629,6 +634,25 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         return sanitize_paired_messages(messages)
 
     async def _latest_continuation_state(self) -> dict[str, Any] | None:
+        checkpoint = await self.dao.task_model_context(self.task_uuid)
+        if checkpoint and isinstance(checkpoint.get("state"), dict):
+            state = dict(checkpoint["state"])
+            if state.get("kind") or not str(state.get("stage") or "").startswith(("budget_boundary:", "control_boundary:")):
+                return state
+            # Old boundaries kept pending calls only in an artifact. Merge its
+            # metadata only at the same boundary, never over a newer checkpoint.
+            for artifact in reversed(await self.dao.artifacts(self.task_uuid)):
+                if artifact.kind == "agent_continuation_state":
+                    try:
+                        old = json.loads(artifact.content or "{}")
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(old, dict) and old.get("roundNo") == state.get("roundNo"):
+                        for key in ("kind", "pendingToolCalls", "used", "limit"):
+                            if key in old:
+                                state[key] = old[key]
+                        break
+            return state
         artifacts = await self.dao.artifacts(self.task_uuid)
         for artifact in reversed(artifacts):
             if artifact.kind != "agent_continuation_state":
@@ -639,9 +663,6 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 continue
             if isinstance(state, dict):
                 return state
-        checkpoint = await self.dao.task_model_context(self.task_uuid)
-        if checkpoint and isinstance(checkpoint.get("state"), dict):
-            return dict(checkpoint["state"])
         return None
 
     async def _budget_control_payload(
@@ -663,12 +684,6 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             limit = self.tool_call_limit
             used = self._work_tool_calls_made
         safe_messages, dropped_pairs = self._sanitize_paired_messages(messages)
-        await self._checkpoint_model_context(
-            safe_messages,
-            round_no=round_no,
-            stage=f"budget_boundary:{kind}",
-            last_text=last_text,
-        )
         pending = [
             {"id": self._tool_call_id(call, i), "name": call.name, "arguments": call.arguments}
             for i, call in enumerate(pending_tool_calls or [])
@@ -692,6 +707,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             "agentSessionUuid": self.agent_session_uuid,
             "openbearSessionUuid": self.openbear_session_uuid,
         }
+        state["checkpointRevision"] = await self._checkpoint_model_context(
+            safe_messages, round_no=round_no, stage=f"budget_boundary:{kind}",
+            last_text=last_text, extra_state=state,
+        )
         state_uuid = await self.dao.create_artifact(
             self.task_uuid,
             kind="agent_continuation_state",
@@ -758,14 +777,74 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         ))
 
     async def _run_agent(self, instruction: str) -> str:
-        session_context = await self._agent_session_context_block()
-        messages: list[Message] = [{"role": "user", "content": self._user_prompt(instruction, session_context)}]
+        messages = await self._round_context_messages()
+        messages.append({"role": "user", "content": self._user_prompt(instruction)})
         tools = await self._allowed_tool_schemas()
         await self._append_plan_runtime_update(messages)
         await self._reconcile_task_memory_context(messages)
         if self._budget_exhausted("model"):
             await self._raise_budget_control("model", messages=messages, round_no=0, last_text="")
         return await self._run_agent_loop(messages, tools, round_no=0, last_text="")
+
+    async def _round_context_messages(self) -> list[Message]:
+        source = getattr(self, "_round_input", {}).get("contextSource") or {}
+        if not source.get("taskUuid"):
+            return []
+        checkpoint = await self.dao.task_model_context(str(source["taskUuid"]))
+        if not checkpoint or int(checkpoint["revision"]) != int(source.get("revision") or 0):
+            raise RuntimeError("The requested Agent context checkpoint is missing or changed")
+        state = checkpoint["state"]
+        messages = self._deserialize_messages(list(state.get("messages") or []))
+        compatible = (
+            state.get("protocol") == str(getattr(self.backend, "protocol", "") or "").lower()
+            and state.get("model") == self.model and state.get("sessionId") == self.session_id
+        )
+        if not compatible:
+            for message in messages:
+                message.pop("native_output_items", None)
+            await self.emit("agent_native_context_reset", agent_key=self.agent.agent_key,
+                            summary="续接保留业务消息，不兼容的原生模型状态已移除")
+        else:
+            self._restore_provider_prompt_snapshot(state.get("providerPromptSnapshot"))
+        messages = [
+            message for message in without_task_memory_runtime_messages(messages)
+            if not _is_agent_plan_runtime_message(message)
+            and (message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") not in {"agent_capabilities", "agent_completion_gate"}
+        ]
+        for message in messages:
+            if message.get("role") == "user" and "<agent-control " in str(message.get("content") or ""):
+                historical = str(message["content"]).split("\n这些是 OpenBear 主控制器", 1)[0]
+                message["content"] = (
+                    "上轮历史指导（保留事实和约束，不继承回执要求或执行授权）：\n"
+                    + historical.replace("<agent-control ", "<historical-agent-control ").replace("</agent-control>", "</historical-agent-control>")
+                )
+                message.pop(_AGENT_RUNTIME_METADATA_KEY, None)
+        messages, _ = self._sanitize_paired_messages(messages)
+        self._task_memory_epoch = task_memory_runtime_epoch(messages)
+        if state.get("inflightTool") or source.get("state") == "partial":
+            messages.append({"role": "user", "content": (
+                "上一轮非正常结束，恢复的是最后可靠检查点。部分工具副作用可能已经发生但未确认；"
+                "不要自动重放。仅按本轮指令核实相关实际对象，并说明不能确定的结果。"
+            )})
+        await self.emit("agent_context_continued", agent_key=self.agent.agent_key,
+                        summary="新一轮已接入原 Agent 实例上下文", detail={
+                            "sourceTaskUuid": source["taskUuid"], "sourceRevision": source["revision"],
+                            "nativeCompatible": compatible, "messageCount": len(messages),
+                        })
+        return messages
+
+    def _append_capability_state(self, messages: list[Message], tools: list[dict[str, Any]]) -> None:
+        names = sorted(str(tool.get("name") or "") for tool in tools)
+        payload = {"agentId": self.agent_session_uuid, "taskId": self.task_uuid,
+                   "effectiveTools": names, "planMode": "managed" if self.plan_protocol_enabled else "direct"}
+        signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if any((message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("capabilitySignature") == signature for message in messages):
+            return
+        messages.append({"role": "user", "content": (
+            "当前 Agent 运行事实（替代旧轮次和启动模板中的工具清单；不扩大用户授权）：\n" + signature +
+            "\n旧轮次的指令、Plan和回执是历史依据，不是本轮授权；以本轮指令及实际schema为准。"
+            "私有TaskMemory由运行时绑定当前独立实例；父会话历史不会自动提供。"
+        ), _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_capabilities", "capabilitySignature": signature}})
 
     def _append_pending_steers(self, messages: list[Message]) -> bool:
         if not self.steers:
@@ -797,6 +876,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 + "\n这些是 OpenBear 主控制器的结构化干预。先对每个 id 调用 AgentControlAck，"
                 "明确 accepted、rejected、appeal 或 needs_clarification；全部回执完成前不得调用其他工具。"
             ),
+            _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_control"},
         })
         return True
 
@@ -817,6 +897,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             if self._budget_exhausted("model"):
                 await self._raise_budget_control("model", messages=messages, round_no=round_no, last_text=last_text)
             tools = await self._allowed_tool_schemas()
+            self._append_capability_state(messages, tools)
             await self._append_plan_runtime_update(messages)
             await self._reconcile_task_memory_context(messages)
             await self._checkpoint_model_context(
@@ -855,6 +936,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                     )
                 messages.append(_assistant_result_message(result, calls_to_run))
                 for call in calls_to_run:
+                    await self._checkpoint_model_context(
+                        messages, round_no=round_no, stage="before_tool_call", last_text=last_text,
+                        extra_state={"inflightTool": {"id": call.id, "name": call.name}},
+                    )
                     tool_result = await self._dispatch_tool(
                         call.name,
                         call.arguments,
@@ -867,6 +952,9 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                         "name": call.name,
                         "content": tool_result,
                     })
+                    await self._checkpoint_model_context(
+                        messages, round_no=round_no, stage="after_tool_result", last_text=last_text,
+                    )
                     await self._raise_if_needs_openbear_control(
                         tool_result,
                         messages=messages,
@@ -893,6 +981,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                     await self._raise_budget_control("model", messages=messages, round_no=round_no, last_text=last_text)
                 await self._checkpoint_and_append_steers("before_model", messages)
                 tools = await self._allowed_tool_schemas()
+                self._append_capability_state(messages, tools)
                 await self._append_plan_runtime_update(messages)
                 await self._reconcile_task_memory_context(messages)
                 await self._checkpoint_model_context(
@@ -907,7 +996,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
 
             await self.checkpoint("after_model", agent_key=self.agent.agent_key)
             if not self.steers:
-                correction = await self._plan_completion_correction()
+                correction = (
+                    "先对所有待回执控制调用 AgentControlAck；尚未完成回执，不能结束本轮。"
+                    if self._pending_control_acks else await self._plan_completion_correction()
+                )
                 if not correction:
                     final_messages = messages + [_assistant_result_message(result)]
                     await self._checkpoint_model_context(
@@ -918,7 +1010,8 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                     )
                     return (result.text or result.reasoning or "").strip()
                 messages.append(_assistant_result_message(result))
-                messages.append({"role": "user", "content": correction})
+                messages.append({"role": "user", "content": correction,
+                                 _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_completion_gate"}})
                 await self._checkpoint_model_context(
                     messages,
                     round_no=round_no,
@@ -952,6 +1045,8 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         if task is None:
             raise RuntimeError(f"Rath task not found: {self.task_uuid}")
         self.chat_id = int(task.chat_id or 0)
+        self._round_input = dict(task.input or {})
+        self._task_instruction = str(task.input.get("instruction") or task.title or "")
         self.openbear_session_uuid = self.openbear_session_uuid or task.parent_session_uuid
         self.agent_session_uuid = self.agent_session_uuid or task.agent_session_uuid
         self.caller_agent_session_uuid = self.caller_agent_session_uuid or task.caller_agent_session_uuid
@@ -966,6 +1061,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         if not state:
             raise RuntimeError("agent continuation state not found")
         messages = self._deserialize_messages(list(state.get("messages") or []))
+        for control_uuid in state.get("pendingControlUuids") or []:
+            control = await self.dao.control(str(control_uuid))
+            if control and control.status == "applied" and not control.responded_at:
+                self._pending_control_acks.add(str(control_uuid))
         has_native_items = any(bool(message.get("native_output_items")) for message in messages)
         expected_protocol = str(getattr(self.backend, "protocol", "") or "").lower()
         context_identity_matches = (
@@ -1061,6 +1160,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 if calls_to_run:
                     messages.append({"role": "assistant", "content": None, "tool_calls": calls_to_run})
                     for call in calls_to_run:
+                        await self._checkpoint_model_context(
+                            messages, round_no=round_no, stage="before_tool_call", last_text=last_text,
+                            extra_state={"inflightTool": {"id": call.id, "name": call.name}},
+                        )
                         tool_result = await self._dispatch_tool(
                             call.name,
                             call.arguments,
@@ -1073,6 +1176,9 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                             "name": call.name,
                             "content": tool_result,
                         })
+                        await self._checkpoint_model_context(
+                            messages, round_no=round_no, stage="after_tool_result", last_text=last_text,
+                        )
                         await self._raise_if_needs_openbear_control(
                             tool_result,
                             messages=messages,
@@ -1135,65 +1241,32 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         await self.complete(output)
         return output
 
-    def _user_prompt(self, instruction: str, session_context: str = "") -> str:
-        history_block = session_context or "【当前 Agent Session 历史】\n暂无历史；这是该 Agent Session 的首轮任务。"
+    def _user_prompt(self, instruction: str) -> str:
+        """Wrap the controller's brief with runtime facts only.
+
+        Working method, investigation depth, and handoff shape are governed by
+        the task brief and the Agent base system prompt. This wrapper must not
+        impose a generic workflow or report format on every delegated task.
+        """
+        has_source = bool((getattr(self, "_round_input", {}).get("contextSource") or {}).get("taskUuid"))
+        context_note = (
+            "本轮接续本实例前面轮次的实际检查点上下文（不是其他 Agent 或父会话的历史）。"
+            "复用已保留的理解，只补会改变本轮行动的未知信息；上面的新指令替代的阶段约束按新指令执行，其余保留约束继续有效。"
+            if has_source
+            else "本 task 自包含：从独立上下文开始，不自动注入父会话或同角色其他任务的历史。"
+        )
         return f"""
 用户任务：
 {instruction}
 
-你是 Web 控制台注册的 Agent：{self.agent.name}（{self.agent.agent_key}）。
-描述：{self.agent.description or '（无）'}
+运行事实：
+- 你是 Agent「{self.agent.name}」（{self.agent.agent_key}）。描述：{self.agent.description or '（无）'}
+- 本轮任务身份：{self.task_uuid}；Agent 实例：{self.agent_session_uuid or 'legacy-task'}；本轮开始时间：{now_cn()}。
+- {context_note}
+- 本轮工具授权以实际提供的 schema 为准；历史工具权限、旧 Plan 完成态和旧控制回执不是本轮授权。
 
-你不是一次性普通 skill，而是 OpenBear 当前会话中的一个 Rath Agent Session。Task 完成不代表你的 Agent Session 结束；后续同一 OpenBear 会话再次派给你任务时，会继续带入你的 session 摘要和近期产物。
-
-收敛规则：你不是全网审计器，目标是“足够回答本次子任务”。资料调研类任务先用高价值搜索定位来源，再深读最相关的代表性来源；一旦 durable evidence 已覆盖全部必需 Plan criterion 且没有阻断冲突，就停止扩展搜索并输出综合结论。不要为了凑来源继续追每一条论坛、社媒或博客线索；收口依据是任务方向、正确性、安全边界和证据充分度。
-
-调查/审查执行规则：
-- 先做一次有边界的目录、符号、生产调用链或权威来源定位，再读取真正影响结论的片段；不要把字符串命中数或文件数量当成完成度。
-- 对互相独立的文件或页面，优先批量搜索、批量读取相关片段，或在同一模型轮次发出多个工具调用；避免“读一个文件 → 重新推理 → 再读一个文件”的线性扫描。
-- 每次追加探索调用都必须能解决一个仍未满足的 Plan criterion 或明确的阻断冲突。全部必需 criterion 已有直接证据且没有阻断冲突时，立即冻结证据并成稿；除非用户明确要求穷尽性审计，不再为边角覆盖继续扩张。
-- 监督与收口只依据任务方向、真实阻塞、风险边界和 Plan criterion 的 durable evidence；健康执行中的已批准 Plan 应继续推进。
-
-{history_block}
-
-请按你的 system prompt 和工具权限完成任务。输出语言以 task brief 明确要求为准；未指定时跟随任务的主要语言。使用 Markdown。
-你的输出读者是 OpenBear，不是最终用户；但它必须是一份 OpenBear 可以直接汇总的完整子报告，不能只写过程笔记、工具调用列表或一句“建议继续检查”。
-
-最低交付要求：
-1. 先给明确结论。
-2. 写清实际执行/读取/验证了什么；没有实际做过的不要声称已做。
-3. 给出具体依据（文件路径、命令结果、URL、文本片段或日志要点）。
-4. 标注风险、未覆盖项和不确定性。
-5. 给 OpenBear 一个可执行的下一步建议。
-6. 如果工具轮次或信息不足，仍要基于已掌握证据做最终综合，并明确缺口；不要把综合工作留给 OpenBear 重做。
+按上面的任务和你的 system prompt 完成工作，结果交给 OpenBear 主控。任务明确要求的输出语言优先；未指定时跟随任务的主要语言。使用 Markdown。
 """.strip()
-
-    async def _agent_session_context_block(self) -> str:
-        if not self.agent_session_uuid:
-            return ""
-        session = await self.dao.agent_session(self.agent_session_uuid)
-        if session is None:
-            return ""
-        lines: list[str] = [
-            "【当前 Agent Session 历史】",
-            f"sessionUuid: {session.session_uuid}",
-            f"状态: {session.status}",
-        ]
-        if session.summary.strip():
-            lines.append("\n历史摘要：")
-            lines.append(session.summary.strip())
-        recent_tasks = await self.dao.list_tasks(chat_id=self.chat_id, limit=20)
-        related = [t for t in recent_tasks if t.agent_session_uuid == self.agent_session_uuid and t.task_uuid != self.task_uuid]
-        if related:
-            lines.append("\n近期产物摘要：")
-            for task in related[:5]:
-                artifacts = await self.dao.artifacts(task.task_uuid)
-                for artifact in artifacts[:2]:
-                    lines.append(
-                        f"- task {task.task_uuid[:8]} / artifact {artifact.artifact_uuid[:8]} / {artifact.name}: "
-                        f"{artifact.summary or artifact.content[:160]}"
-                    )
-        return "\n".join(lines).strip()
 
     async def _raise_if_needs_openbear_control(
         self,
@@ -1216,6 +1289,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             round_no=round_no + 1,
             stage=f"control_boundary:{reason}",
             last_text=last_text,
+            extra_state={"kind": reason, "pendingToolCalls": []},
         )
         state = {
             "kind": reason,
@@ -1441,6 +1515,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             message
             for message in without_task_memory_runtime_messages(messages)
             if not _is_agent_plan_runtime_message(message)
+            and (message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") != "agent_capabilities"
         ]
 
     def _build_agent_history_xml(
@@ -2837,45 +2912,25 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         if self.tools is None:
             self._plan_runtime = {"phase": "drafting"}
             return []
-        initial_tools = set(sanitize_tool_allowlist(self.agent.tool_allowlist or [])) & set(
-            AGENT_DELEGATION_TOOL_NAMES
+        runtime = await self._refresh_plan_runtime() if self.plan_protocol_enabled else {}
+        phase = str(runtime.get("phase") or "drafting")
+        approved = tuple(sorted(set(sanitize_tool_allowlist(runtime.get("approvedTools") or [])) & AGENT_DELEGATION_TOOL_NAMES))
+        if self.plan_protocol_enabled and phase in {"executing", "finalizing"}:
+            if self._frozen_execution_tools is None:
+                self._frozen_execution_tools = approved
+            elif approved != self._frozen_execution_tools:
+                raise RuntimeError(f"approved Agent tool set changed after execution started: {self._frozen_execution_tools!r} -> {approved!r}")
+        allowed = agent_phase_tool_names(
+            self.agent.tool_allowlist or [], managed=self.plan_protocol_enabled, phase=phase,
+            approved=approved, pending_control=bool(self.steers or self._pending_control_acks),
+            ceiling=getattr(self, "_round_input", {}).get("presetToolCeiling") or [],
         )
-        if not self.plan_protocol_enabled:
-            allowed = initial_tools
-        else:
-            runtime = await self._refresh_plan_runtime()
-            phase = str(runtime.get("phase") or "drafting")
-            plan_allowed: set[str]
-            ordinary: set[str] = set()
-            if phase in {"drafting", "revising"}:
-                plan_allowed = {"AgentPlanSubmit"}
-            elif phase in {"executing", "finalizing"}:
-                approved = tuple(sorted(
-                    set(sanitize_tool_allowlist(runtime.get("approvedTools") or []))
-                    & set(AGENT_DELEGATION_TOOL_NAMES)
-                ))
-                if self._frozen_execution_tools is None:
-                    self._frozen_execution_tools = approved
-                elif approved != self._frozen_execution_tools:
-                    raise RuntimeError(
-                        "approved Agent tool set changed after execution started: "
-                        f"{self._frozen_execution_tools!r} -> {approved!r}"
-                    )
-                ordinary = set(self._frozen_execution_tools)
-                plan_allowed = {"AgentPlanProgress", "AgentPlanReplan"}
-            elif phase == "replan_required":
-                plan_allowed = {"AgentPlanReplan"}
-            else:
-                plan_allowed = set()
-            plan_allowed &= PLAN_TOOL_NAMES
-            allowed = ordinary | plan_allowed | {"AgentControlAck"}
-        allowed = expand_agent_tool_names(allowed)
         schemas = [
             schema
             for schema in self.tools.schemas(scope="agent")
             if str(schema.get("name") or "") in allowed
         ]
-        if self.plan_protocol_enabled and str(self._plan_runtime.get("phase") or "") in {"executing", "finalizing"}:
+        if self.plan_protocol_enabled and phase in {"executing", "finalizing"}:
             if self._frozen_execution_tool_schemas is None:
                 self._frozen_execution_tool_schemas = json.loads(json.dumps(schemas, ensure_ascii=False))
             return json.loads(json.dumps(self._frozen_execution_tool_schemas, ensure_ascii=False))

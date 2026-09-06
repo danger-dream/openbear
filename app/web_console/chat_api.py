@@ -6,25 +6,14 @@ from app.web_console.core import *
 from app.web_console.live_stream import *
 
 
-def _web_option_label_value(option: Any) -> dict[str, str]:
-    if isinstance(option, dict):
-        label = str(option.get("label") or option.get("text") or option.get("value") or "")
-        value = str(option.get("value") if option.get("value") is not None else label)
-    else:
-        label = str(option or "")
-        value = label
-    return {"label": label, "value": value}
+from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers, redact_result
 
 
 def _confirmation_answer_audit_result(
     action: str, item: dict[str, Any], result: dict[str, Any],
 ) -> dict[str, Any]:
-    if action == "prompt" and bool(item.get("sensitive") or item.get("secret")):
-        audit_result = dict(result)
-        if "value" in audit_result:
-            audit_result["value"] = "[敏感内容已隐藏]"
-        audit_result["sensitiveRedacted"] = True
-        return audit_result
+    if bool(item.get("sensitive") or item.get("secret")):
+        return redact_result(result)
     if action == "questionnaire":
         answers = result.get("answers") if isinstance(result.get("answers"), list) else []
         return {
@@ -42,86 +31,6 @@ def _confirmation_answer_audit_result(
             ],
         }
     return result
-
-
-def _canonical_questionnaire_answers(
-    questions: list[dict[str, Any]], raw_answers: Any,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    if not isinstance(raw_answers, list):
-        return [], [{"path": "answers", "message": "answers must be an array"}]
-    errors: list[dict[str, str]] = []
-    questions_by_id = {str(question.get("id") or ""): question for question in questions}
-    submitted: dict[str, tuple[list[str], str]] = {}
-    for answer_index, raw_answer in enumerate(raw_answers):
-        path = f"answers[{answer_index}]"
-        if not isinstance(raw_answer, dict):
-            errors.append({"path": path, "message": "answer must be an object"})
-            continue
-        raw_question_id = raw_answer.get("questionId")
-        if not isinstance(raw_question_id, str) or not raw_question_id.strip():
-            errors.append({"path": f"{path}.questionId", "message": "questionId must be a non-empty string"})
-            continue
-        question_id = raw_question_id.strip()
-        if question_id in submitted:
-            errors.append({"path": f"{path}.questionId", "message": f"duplicate questionId: {question_id}"})
-            continue
-        question = questions_by_id.get(question_id)
-        if question is None:
-            errors.append({"path": f"{path}.questionId", "message": f"unknown questionId: {question_id}"})
-            continue
-        raw_selected_values = raw_answer.get("selectedValues", [])
-        if not isinstance(raw_selected_values, list) or any(not isinstance(value, str) for value in raw_selected_values):
-            errors.append({"path": f"{path}.selectedValues", "message": "selectedValues must be an array of strings"})
-            selected_values: list[str] = []
-        else:
-            selected_values = list(raw_selected_values)
-        if len(set(selected_values)) != len(selected_values):
-            errors.append({"path": f"{path}.selectedValues", "message": "selectedValues must not contain duplicates"})
-        raw_text = raw_answer.get("text", "")
-        if not isinstance(raw_text, str):
-            errors.append({"path": f"{path}.text", "message": "text must be a string"})
-            raw_text = ""
-        text = raw_text if raw_text.strip() else ""
-        if question.get("type") == "choice":
-            option_values = {str(option.get("value")): option for option in question.get("options") or []}
-            for value in selected_values:
-                if value not in option_values:
-                    errors.append({"path": f"{path}.selectedValues", "message": f"unknown option value for {question_id}: {value}"})
-            if not question.get("multiple") and len(selected_values) > 1:
-                errors.append({"path": f"{path}.selectedValues", "message": f"question {question_id} allows only one selected value"})
-        elif selected_values:
-            errors.append({"path": f"{path}.selectedValues", "message": f"open question {question_id} does not accept option values"})
-        submitted[question_id] = (selected_values, text)
-
-    canonical: list[dict[str, Any]] = []
-    for question in questions:
-        question_id = str(question.get("id") or "")
-        selected_values, text = submitted.get(question_id, ([], ""))
-        if question.get("required") and not selected_values and not text:
-            errors.append({"path": f"answers.{question_id}", "message": f"required question is unanswered: {question_id}"})
-        options_by_value = {
-            str(option.get("value")): option for option in question.get("options") or []
-        }
-        selected_labels = [str(options_by_value[value].get("label") or "") for value in selected_values if value in options_by_value]
-        if selected_values and text:
-            answer_mode = "options_with_text"
-        elif selected_values:
-            answer_mode = "options"
-        elif text:
-            answer_mode = "text"
-        else:
-            answer_mode = "unanswered"
-        canonical.append({
-            "questionId": question_id,
-            "type": question.get("type") or "open",
-            "question": question.get("question") or "",
-            "required": bool(question.get("required")),
-            "answerMode": answer_mode,
-            "selectedValues": selected_values,
-            "selectedLabels": selected_labels,
-            "text": text,
-        })
-    return canonical, errors
 
 
 class WebAdminChatHandlersMixin:
@@ -645,8 +554,19 @@ class WebAdminChatHandlersMixin:
                 "stoppedTasks": stopped_tasks,
                 "stoppedProcesses": killed_processes,
             }
+        # A durable card may outlive every actual runner. Stopping must still
+        # close those operations, but a genuinely empty idle stop stays a no-op.
+        active_operations = False
+        if conv_uuid:
+            cur = await self.db.conn.execute(
+                "SELECT 1 FROM web_operations WHERE conversation_uuid=? "
+                "AND op_type IN ('run','tool','user_interaction','agent','agent_supervision','assistant_message','reasoning','status') "
+                "AND COALESCE(lifecycle,'') IN ('active','paused','waiting_control') LIMIT 1",
+                (conv_uuid,),
+            )
+            active_operations = await cur.fetchone() is not None
         published_stop = False
-        if stopped_run or stopped_tasks or live.status == "running":
+        if stopped_run or stopped_tasks or killed_processes or live.status == "running" or active_operations:
             await live.publish({"type": "stopped", "reason": message, "stopAtMs": stop_at_ms})
             published_stop = True
         if conv_uuid:
@@ -793,80 +713,18 @@ class WebAdminChatHandlersMixin:
         conv_uuid = str(row.get("conversation_uuid") or "")
         confirmation_id = str(request.match_info.get("confirmation_id") or "").strip()
         body = await self._json_body(request)
-        item = self._web_confirmations.get(confirmation_id)
-        if not item or str(item.get("conversationUuid") or "") != conv_uuid:
+        item = await self.interactions.get(confirmation_id, owner_chat_id=session.chat_id)
+        if not item or item.get("conversationUuid") != conv_uuid:
             return web.json_response({"ok": False, "error": "confirmation_not_found"}, status=404)
-        action = str(item.get("action") or "confirm")
-        cancelled = bool(body.get("cancelled"))
-        if action == "questionnaire":
-            if cancelled:
-                result = {
-                    "status": "cancelled",
-                    "cancelled": True,
-                    "answers": [],
-                    "interactionId": confirmation_id,
-                }
-            else:
-                answers, errors = _canonical_questionnaire_answers(
-                    item.get("questions") if isinstance(item.get("questions"), list) else [],
-                    body.get("answers"),
-                )
-                if errors:
-                    return web.json_response({
-                        "ok": False,
-                        "error": "invalid_questionnaire_answer",
-                        "message": "Questionnaire answer validation failed",
-                        "details": errors,
-                    }, status=400)
-                result = {
-                    "status": "answered",
-                    "cancelled": False,
-                    "answers": answers,
-                    "interactionId": confirmation_id,
-                }
-        elif action == "select":
-            options = [_web_option_label_value(opt) for opt in item.get("options") or []]
-            raw_indexes = body.get("selectedIndexes") if isinstance(body.get("selectedIndexes"), list) else []
-            raw_values = body.get("selectedValues") if isinstance(body.get("selectedValues"), list) else []
-            selected_indexes = {int(x) for x in raw_indexes if isinstance(x, int | float) or str(x).isdigit()}
-            selected_values = {str(x) for x in raw_values}
-            selected: list[tuple[int, dict[str, str]]] = []
-            for idx, opt in enumerate(options):
-                if idx in selected_indexes or opt["value"] in selected_values or opt["label"] in selected_values:
-                    selected.append((idx, opt))
-            if not item.get("multiple") and selected:
-                selected = selected[:1]
-            result = {
-                "status": "cancelled" if cancelled else "answered",
-                "cancelled": cancelled,
-                "multiple": bool(item.get("multiple")),
-                "selectedIndexes": [] if cancelled else [idx for idx, _opt in selected],
-                "selectedValues": [] if cancelled else [opt["value"] for _idx, opt in selected],
-                "selectedLabels": [] if cancelled else [opt["label"] for _idx, opt in selected],
-                "interactionId": confirmation_id,
-            }
-        elif action == "prompt":
-            result = {
-                "status": "cancelled" if cancelled else "answered",
-                "cancelled": cancelled,
-                "value": "" if cancelled else str(body.get("value") or ""),
-                "interactionId": confirmation_id,
-            }
-        else:
-            confirmed = bool(body.get("confirmed")) and not cancelled
-            result = {
-                "status": "cancelled" if cancelled else "answered",
-                "confirmed": confirmed,
-                "choice": "confirm" if confirmed else "cancel",
-                "label": item.get("confirmText") if confirmed else item.get("cancelText"),
-                "interactionId": confirmation_id,
-            }
-        future = item.get("future")
-        if future is not None and not future.done():
-            future.set_result(result)
-        audit_result = _confirmation_answer_audit_result(action, item, result)
-        await self.audit("web.confirmation.answer", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": conv_uuid, "confirmationId": confirmation_id, "action": action, "result": audit_result})
-        return web.json_response({"ok": True, "confirmationId": confirmation_id, "action": action, "result": result})
+        response = await self.interactions.submit(confirmation_id, session.chat_id, body, source="web")
+        status_code = int(response.pop("statusCode", 200))
+        if response.get("ok") and not response.get("replayed"):
+            await self.audit(
+                "web.confirmation.answer", actor="web", chat_id=session.chat_id, ip=request.remote or "",
+                detail={"conversationUuid": conv_uuid, "confirmationId": confirmation_id,
+                        "action": item["action"], "result": _confirmation_answer_audit_result(item["action"], item, response["result"])},
+            )
+        return web.json_response({"confirmationId": confirmation_id, "action": item["action"], **response}, status=status_code)
 
     async def handle_api_conversation_patch(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1264,19 +1122,7 @@ class WebAdminChatHandlersMixin:
                     )
 
         self._web_task_notification_deferred.pop(conv_uuid, None)
-        for confirmation_id in list(self._web_confirm_by_conversation.pop(conv_uuid, set())):
-            item = self._web_confirmations.pop(confirmation_id, None)
-            future = item.get("future") if isinstance(item, dict) else None
-            if future is not None and not future.done():
-                if item.get("action") == "questionnaire":
-                    future.set_result({
-                        "status": "cancelled",
-                        "cancelled": True,
-                        "answers": [],
-                        "interactionId": confirmation_id,
-                    })
-                else:
-                    future.set_result({"status": "cancelled", "confirmed": False, "choice": "cancel"})
+        await self.interactions.cancel_conversation(conv_uuid)
         live = self._web_live_streams.get(conv_uuid)
         if live is not None:
             live.status = "idle"
@@ -1419,8 +1265,7 @@ class WebAdminChatHandlersMixin:
         self._web_stop_markers.pop(conv_uuid, None)
         self._web_stopped_task_uuids.pop(conv_uuid, None)
         self._web_task_notification_deferred.pop(conv_uuid, None)
-        for confirmation_id in list(self._web_confirm_by_conversation.pop(conv_uuid, set())):
-            self._web_confirmations.pop(confirmation_id, None)
+        await self.interactions.cancel_conversation(conv_uuid)
         await self.audit(
             "web.conversation.delete",
             actor="web",
@@ -1721,11 +1566,19 @@ class WebAdminChatHandlersMixin:
             task_row for task_row in active_background_tasks
             if not conv_uuid or str(getattr(task_row, "parent_session_uuid", "") or "") == conv_uuid
         ]
+        # Do not queue a new user message behind a stale operation whose runner
+        # has already ended. A known unfinished task may still be registering its
+        # runner; preserve its existing same-root interruption path.
+        if not active_background_tasks:
+            await self._reconcile_inactive_web_conversation_operations(row, source="conversation_send_reconcile")
         active_round = await self._web_active_round_info(conv_uuid, internal_chat_id)
+        # A stranded steering queue alone cannot consume another interruption.
+        # Start a controller below and leave the old messages queued for it.
+        pending_only = set(active_round.get("activeReasons") or []) == {"steering"}
         # A detached Agent does not create a new visible turn. The main
         # controller stays alive in an event-driven wait inside the original root
         # turn, so interruptions use the normal steering queue and wake it now.
-        if active_round.get("active"):
+        if active_round.get("active") and not pending_only:
             if media:
                 return {"ok": False, "error": "attachments_while_running_not_supported"}
             root_turn_uuid = str(active_round.get("rootTurnUuid") or "").strip() or await self._latest_visible_root_turn_uuid(conv_uuid) or turn_uuid

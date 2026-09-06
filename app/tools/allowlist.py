@@ -44,6 +44,29 @@ def agent_tool_capability(name: object) -> str:
     return _AGENT_TOOL_CAPABILITIES.get(tool_name, tool_name)
 
 
+def agent_phase_tool_names(
+    initial: Iterable[object], *, managed: bool = False,
+    phase: str = "", approved: Iterable[object] = (),
+    pending_control: bool = False, ceiling: Iterable[object] = (),
+) -> set[str]:
+    """Canonical phase capabilities for runner schemas and inspection surfaces."""
+    ordinary = set(sanitize_tool_allowlist(approved if managed else initial)) & AGENT_DELEGATION_TOOL_NAMES
+    cap = set(sanitize_tool_allowlist(ceiling))
+    if cap:
+        ordinary &= cap
+    if not managed:
+        return expand_agent_tool_names(ordinary | ({"AgentControlAck"} if pending_control else set()))
+    protocol = {
+        "drafting": {"AgentPlanSubmit"}, "revising": {"AgentPlanSubmit"},
+        "executing": {"AgentPlanProgress", "AgentPlanReplan"},
+        # Keep the approved schema prefix stable through final output. The
+        # dispatcher still rejects non-ack calls once finalization has passed.
+        "finalizing": {"AgentPlanProgress", "AgentPlanReplan"},
+        "replan_required": {"AgentPlanReplan"},
+    }.get(phase or "drafting", set())
+    return expand_agent_tool_names((ordinary if phase in {"executing", "finalizing"} else set()) | protocol | {"AgentControlAck"})
+
+
 def sanitize_tool_allowlist(tools: Iterable[object] | None) -> list[str]:
     """Return a stable tool allowlist without removed/empty/duplicate entries."""
     out: list[str] = []

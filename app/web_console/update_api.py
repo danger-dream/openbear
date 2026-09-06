@@ -5,6 +5,18 @@ from app.web_console.core import *
 
 
 class WebAdminUpdateMixin:
+    def _frontend_build_info(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads((self._web_dist_dir() / "build-info.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None  # Legacy releases have no build marker.
+        if not isinstance(data, dict) or data.get("schema") != 1:
+            return None
+        build_id = str(data.get("buildId") or "")
+        if not re.fullmatch(r"[a-f0-9]{16}", build_id):
+            return None
+        return {"schema": 1, "version": str(data.get("version") or ""), "buildId": build_id}
+
     async def handle_api_system_version(self, request: web.Request) -> web.Response:
         update = getattr(self, "update_service", None)
         running = await self._restart_running_json()
@@ -14,14 +26,17 @@ class WebAdminUpdateMixin:
             return web.json_response({
                 "ok": True,
                 "version": installed_version(),
+                "frontend": self._frontend_build_info(),
                 "latest": None,
                 "updateAvailable": False,
                 "phase": "idle",
                 "dirtyWorktree": False,
                 "lastResult": None,
                 "running": running,
-            })
-        return web.json_response(update.snapshot(running=running))
+            }, headers={"Cache-Control": "no-store"})
+        data = update.snapshot(running=running)
+        data["frontend"] = self._frontend_build_info()
+        return web.json_response(data, headers={"Cache-Control": "no-store"})
 
     async def handle_api_system_update(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]

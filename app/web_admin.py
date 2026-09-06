@@ -14,9 +14,11 @@ from aiohttp import web
 from app.config import Config
 from app.control_actions import schedule_openbear_restart
 from app.db.engine import DB
+from app.interaction_telegram import InteractionTelegram
 from app.operation_locks import ChatOperationLocks
 from app.rath.dao import RathDAO
 from app.rath.manager import RathTaskManager
+from app.user_interactions import InteractionService
 from app.web_console.artifacts_api import WebAdminArtifactsMixin
 from app.web_console.auth_api import WebAdminAuthMixin
 from app.web_console.chat_api import WebAdminChatHandlersMixin
@@ -152,10 +154,15 @@ class WebAdminServer(
         self._web_controller_notifications: dict[str, list[dict[str, Any]]] = {}
         self._web_stop_markers: dict[str, int] = {}
         self._web_stopped_task_uuids: dict[str, set[str]] = {}
-        self._web_confirmations: dict[str, dict[str, Any]] = {}
-        self._web_confirm_by_conversation: dict[str, set[str]] = {}
+        self.interactions = InteractionService(db)
+        self.interactions.add_listener(self._interaction_changed)
+        # Compatibility aliases; all mutations go through the shared service.
+        self._web_confirmations = self.interactions.pending
+        self._web_confirm_by_conversation = self.interactions.by_conversation
         self._channel_test_jobs: dict[str, _ChannelTestJob] = {}
         self.web_task_telegram = WebTaskTelegramNotifier(config, db, bot)
+        self.interaction_telegram = InteractionTelegram(config, db, bot, self.interactions)
+        self.interactions.add_listener(self.interaction_telegram.on_interaction)
         self.update_service = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -168,11 +175,15 @@ class WebAdminServer(
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.config.web.host, self.config.web.port)
+        await self.interactions.start()
+        await self.interaction_telegram.start()
         await self.web_task_telegram.start()
         try:
             await self._site.start()
         except Exception:
+            await self.interaction_telegram.stop()
             await self.web_task_telegram.stop()
+            await self.interactions.stop()
             raise
         await self._recover_web_task_notifications(reset_processing=True)
 
@@ -194,6 +205,7 @@ class WebAdminServer(
         async def _frame_retention_loop() -> None:
             while True:
                 try:
+                    await self.interactions.prune()
                     deleted = await self._prune_web_event_frames()
                     notification_deleted = await self._prune_web_task_notification_history()
                     tg_runs_deleted, tg_deliveries_deleted = await self.web_task_telegram.prune()
@@ -241,6 +253,8 @@ class WebAdminServer(
             self._site = None
         if self.runs is not None:
             await self.runs.cancel_all_and_wait()
+        await self.interactions.stop()
+        await self.interaction_telegram.stop()
         await self.web_task_telegram.stop()
         workers = [
             task for task in asyncio.all_tasks()
@@ -260,6 +274,7 @@ class WebAdminServer(
         new_web = (config.web.enabled, config.web.host, config.web.port)
         self.config = config
         self.web_task_telegram.apply_config(config)
+        self.interaction_telegram.apply_config(config)
         self.llm_factory = llm_factory
         self.model_selection = model_selection
         if tools is not None:

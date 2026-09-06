@@ -8,6 +8,7 @@ import {toolArgumentsRawPayload} from "./toolArgumentsPresentation.js";
 import {toolDisplayState, toolResultText} from "./display.js";
 import {highlightCodeHtml} from "./markdown.js";
 import {useToolDetailCache} from "./toolDetailCache.js";
+import {agentInfoResultView, shortAgentId} from "./agentInstancePresentation.js";
 
 const props = defineProps({
 	event: {type: Object, required: true},
@@ -170,6 +171,7 @@ const resultSource = computed(() => isContextCompaction.value
 	: (toolState.value.activeResult ? toolResultText(displayEvent.value, toolState.value.activeResult) : ""));
 const resultPayload = computed(() => formatPayload(resultSource.value));
 const resultHtml = computed(() => highlightCodeHtml(resultPayload.value.content, resultPayload.value.language));
+const agentInfo = computed(() => agentInfoResultView(toolState.value.activeToolName, resultSource.value));
 const toolDetailNotice = computed(() => {
 	if (isContextCompaction.value) return "";
 	if (toolDetailLoading.value) return "正在读取完整工具详情…";
@@ -336,6 +338,25 @@ function selectCallTab(index) {
 			</div>
 
 			<p v-if="toolDetailNotice" class="tool-detail-notice" :class="{'is-error': toolDetailNoticeIsError}">{{ toolDetailNotice }}</p>
+
+			<section v-if="agentInfo.isAgentInfo && agentInfo.hasData" class="agent-info-readonly" aria-label="Agent 只读实例信息">
+				<header><div><strong>实例信息</strong><span>AgentInfo 返回的只读快照</span></div><em>只读</em></header>
+				<div class="agent-info-session">
+					<span><b>{{ agentInfo.legacy ? '兼容记录' : '实例' }}</b><code :title="agentInfo.session.agentId">{{ agentInfo.instanceLabel }}</code></span>
+					<span><b>状态</b>{{ agentInfo.availabilityLabel }}</span>
+					<span v-if="agentInfo.session.turnCount"><b>指派</b>{{ agentInfo.session.turnCount }} 轮</span>
+					<span v-if="agentInfo.session.contextRevision"><b>上下文</b>r{{ agentInfo.session.contextRevision }}</span>
+					<span v-if="agentInfo.session.continuationBlocker"><b>续接限制</b>{{ agentInfo.session.continuationBlocker }}</span>
+				</div>
+				<div v-if="agentInfo.tasks.length" class="agent-info-tasks">
+					<div v-for="task in agentInfo.tasks" :key="task.taskUuid">
+						<span>{{ task.sessionTurn ? `第 ${task.sessionTurn} 次指派` : '单次记录' }}</span>
+						<strong>{{ task.title }}</strong>
+						<em :class="task.statusView.tone">{{ task.statusView.label }}</em>
+						<small><code :title="task.taskUuid">{{ shortAgentId(task.taskUuid) }}</code> · {{ task.grantedTools.length ? task.grantedTools.join(' · ') : '能力未记录' }} · {{ task.contextSource.label }}</small>
+					</div>
+				</div>
+			</section>
 
 			<section class="tool-payload-section" aria-label="调用参数">
 				<header class="tool-payload-heading">
@@ -672,6 +693,26 @@ details[open] > summary > .disclosure-icon {
 .tool-payload-empty.is-error {
 	color: #b42318;
 }
+
+.agent-info-readonly { display: grid; min-width: 0; gap: 7px; border: 1px solid #e4e4e7; border-radius: 9px; background: #fafafa; padding: 8px 9px; }
+.agent-info-readonly > header { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-info-readonly > header > div { display: flex; min-width: 0; align-items: baseline; gap: 6px; }
+.agent-info-readonly > header strong { color: #3f3f46; font-size: 11px; }
+.agent-info-readonly > header span { overflow: hidden; color: #a1a1aa; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-info-readonly > header em { flex: 0 0 auto; border: 1px solid #d4d4d8; border-radius: 999px; background: #fff; padding: 1px 6px; color: #71717a; font-size: 9px; font-style: normal; }
+.agent-info-session { display: flex; min-width: 0; flex-wrap: wrap; gap: 4px; }
+.agent-info-session > span { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 4px; border-radius: 6px; background: #fff; padding: 3px 6px; color: #52525b; font-size: 9.5px; }
+.agent-info-session b { color: #a1a1aa; font-size: 8.5px; font-weight: 650; }
+.agent-info-session code, .agent-info-tasks code { overflow: hidden; color: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: inherit; text-overflow: ellipsis; white-space: nowrap; }
+.agent-info-tasks { display: grid; min-width: 0; max-height: min(220px, 28vh); gap: 4px; overflow-x: hidden; overflow-y: auto; padding-right: 3px; scrollbar-color: #c7c7cc transparent; scrollbar-width: thin; }
+.agent-info-tasks > div { display: grid; min-width: 0; grid-template-columns: max-content minmax(0, 1fr) max-content; align-items: center; gap: 5px; border-top: 1px solid #eceef2; padding-top: 5px; }
+.agent-info-tasks span, .agent-info-tasks small { color: #a1a1aa; font-size: 9px; }
+.agent-info-tasks strong { overflow: hidden; color: #52525b; font-size: 10px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.agent-info-tasks em { border-radius: 999px; background: #f4f4f5; padding: 1px 5px; color: #71717a; font-size: 8.5px; font-style: normal; }
+.agent-info-tasks em.ok { background: #f0fdf8; color: #0f766e; }
+.agent-info-tasks em.error { background: #fff1f2; color: #b91c1c; }
+.agent-info-tasks em.running { background: #eff6ff; color: #1d4ed8; }
+.agent-info-tasks small { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .tool-payload-section {
 	display: grid;

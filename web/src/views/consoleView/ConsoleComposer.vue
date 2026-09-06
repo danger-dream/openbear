@@ -35,6 +35,17 @@ import {
 	toggleQuestionChoice,
 	validateQuestionnaire,
 } from "./questionnaireState.js";
+import {
+	buildInteractionAnswer,
+	clearInteractionSelection,
+	createInteractionDraft,
+	interactionExpiryLabel,
+	interactionPrimaryActionLabel,
+	interactionRejectActionLabel,
+	isInteractionExpired,
+	toggleInteractionOption,
+	validateInteractionDraft,
+} from "./userInteractionState.js";
 
 const props = defineProps({
 	draft: {type: String, default: ""},
@@ -102,8 +113,11 @@ const composerShell = ref(null);
 const composerTextarea = ref(null);
 let composerResizeObserver = null;
 const interactionDrafts = ref({});
+const interactionErrors = ref({});
 const questionnaireDrafts = ref({});
 const questionnaireErrors = ref({});
+const interactionNowMs = ref(Date.now());
+let interactionClockTimer = null;
 const runConfigTab = ref("main"); // main | agent
 const DEFAULT_COMPACT_RATIO = 0.7;
 const runConfigPopoverVisible = computed({
@@ -293,7 +307,7 @@ function clearDraft() {
 }
 
 function interactionAction(item) {
-	return String(item?.action || "confirm");
+	return String(item?.action || "confirm").trim().toLowerCase();
 }
 
 function optionLabel(option) {
@@ -301,28 +315,10 @@ function optionLabel(option) {
 	return String(option || "");
 }
 
-function optionValue(option) {
-	if (option && typeof option === "object") return String(option.value ?? option.label ?? option.text ?? "");
-	return String(option || "");
-}
-
 function ensureInteractionDraft(item) {
 	const id = item?.confirmationId;
-	if (!id) return {selectedIndexes: [], value: ""};
-	if (!interactionDrafts.value[id]) {
-		const defaults = Array.isArray(item.defaultIndexes) ? item.defaultIndexes.map((x) => Number(x)).filter(Number.isFinite) : [];
-		const defaultValues = new Set(Array.isArray(item.defaultValues) ? item.defaultValues.map((x) => String(x)) : []);
-		const selectedIndexes = defaults.length ? defaults : [];
-		if (!selectedIndexes.length && defaultValues.size && Array.isArray(item.options)) {
-			item.options.forEach((option, idx) => {
-				if (defaultValues.has(optionValue(option)) || defaultValues.has(optionLabel(option))) selectedIndexes.push(idx);
-			});
-		}
-		interactionDrafts.value[id] = {
-			selectedIndexes: item.multiple ? selectedIndexes : selectedIndexes.slice(0, 1),
-			value: String(item.defaultValue || ""),
-		};
-	}
+	if (!id) return createInteractionDraft(item);
+	if (!interactionDrafts.value[id]) interactionDrafts.value[id] = createInteractionDraft(item);
 	return interactionDrafts.value[id];
 }
 
@@ -330,19 +326,68 @@ function optionChecked(item, idx) {
 	return ensureInteractionDraft(item).selectedIndexes.includes(idx);
 }
 
+function clearInteractionError(item) {
+	const id = item?.confirmationId;
+	if (id && interactionErrors.value[id]) delete interactionErrors.value[id];
+}
+
 function toggleOption(item, idx) {
-	const draft = ensureInteractionDraft(item);
-	if (item.multiple) {
-		draft.selectedIndexes = draft.selectedIndexes.includes(idx)
-			? draft.selectedIndexes.filter((x) => x !== idx)
-			: [...draft.selectedIndexes, idx];
-	} else {
-		draft.selectedIndexes = [idx];
-	}
+	toggleInteractionOption(item, ensureInteractionDraft(item), idx);
+	clearInteractionError(item);
+}
+
+function clearSelectChoice(item) {
+	clearInteractionSelection(ensureInteractionDraft(item));
+	clearInteractionError(item);
 }
 
 function setPromptValue(item, value) {
 	ensureInteractionDraft(item).value = value;
+	clearInteractionError(item);
+}
+
+function setInteractionText(item, value) {
+	ensureInteractionDraft(item).text = value;
+	if (String(value || "").trim() || ensureInteractionDraft(item).selectedIndexes.length) clearInteractionError(item);
+}
+
+function interactionExpired(item) {
+	return isInteractionExpired(item, interactionNowMs.value);
+}
+
+function interactionDisabled(item) {
+	return Boolean(props.confirmationSubmitting[item?.confirmationId] || interactionExpired(item));
+}
+
+function interactionExpiry(item) {
+	return interactionExpiryLabel(item, interactionNowMs.value);
+}
+
+function interactionError(item) {
+	return interactionErrors.value[item?.confirmationId] || props.confirmationErrors[item?.confirmationId] || "";
+}
+
+function interactionActionName(item) {
+	return {confirm: "确认", select: "选择", prompt: "输入", questionnaire: "问卷"}[interactionAction(item)] || "确认";
+}
+
+function interactionRiskLabel(item) {
+	const type = String(item?.type || item?.tone || "").toLowerCase();
+	if (type === "danger") return "高风险操作";
+	if (type === "warning") return "请谨慎确认";
+	return "";
+}
+
+function primaryActionLabel(item) {
+	return interactionPrimaryActionLabel(
+		item,
+		ensureInteractionDraft(item),
+		Boolean(props.confirmationSubmitting[item?.confirmationId]),
+	);
+}
+
+function confirmRejectLabel(item) {
+	return interactionRejectActionLabel(ensureInteractionDraft(item));
 }
 
 function questionnaireQuestions(item) {
@@ -429,7 +474,7 @@ function focusFirstQuestionnaireError(item) {
 }
 
 function submitQuestionnaire(item) {
-	if (props.confirmationSubmitting[item?.confirmationId]) return;
+	if (interactionDisabled(item)) return;
 	const questions = questionnaireQuestions(item);
 	const draft = ensureQuestionnaireDraft(item);
 	const errors = validateQuestionnaire(questions, draft);
@@ -442,31 +487,22 @@ function submitQuestionnaire(item) {
 }
 
 function cancelQuestionnaire(item) {
-	if (props.confirmationSubmitting[item?.confirmationId]) return;
+	if (interactionDisabled(item)) return;
 	emit("answer-confirmation", item, buildQuestionnaireAnswer(questionnaireQuestions(item), ensureQuestionnaireDraft(item), true));
 }
 
 function answerInteraction(item, intent) {
-	const action = interactionAction(item);
-	if (action === "select") {
-		const draft = ensureInteractionDraft(item);
-		const indexes = intent === "cancel" ? [] : draft.selectedIndexes;
-		emit("answer-confirmation", item, {
-			cancelled: intent === "cancel",
-			selectedIndexes: indexes,
-			selectedValues: indexes.map((idx) => optionValue(item.options?.[idx])),
-		});
-		return;
+	if (interactionDisabled(item)) return;
+	const draft = ensureInteractionDraft(item);
+	if (intent !== "cancel") {
+		const error = validateInteractionDraft(item, draft);
+		if (error) {
+			interactionErrors.value[item.confirmationId] = error;
+			return;
+		}
 	}
-	if (action === "prompt") {
-		const draft = ensureInteractionDraft(item);
-		emit("answer-confirmation", item, {
-			cancelled: intent === "cancel",
-			value: intent === "cancel" ? "" : draft.value,
-		});
-		return;
-	}
-	emit("answer-confirmation", item, {confirmed: intent === "confirm", cancelled: intent === "cancel"});
+	clearInteractionError(item);
+	emit("answer-confirmation", item, buildInteractionAnswer(item, draft, intent));
 }
 
 function handleKeydown(event) {
@@ -478,6 +514,10 @@ function handleKeydown(event) {
 }
 
 onMounted(() => {
+	interactionNowMs.value = Date.now();
+	interactionClockTimer = window.setInterval(() => {
+		interactionNowMs.value = Date.now();
+	}, 1000);
 	const el = composerShell.value;
 	if (!el) return;
 	const notifyHeight = () => emit("height-change", Math.ceil(el.getBoundingClientRect().height));
@@ -489,6 +529,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+	if (interactionClockTimer) window.clearInterval(interactionClockTimer);
+	interactionClockTimer = null;
 	composerResizeObserver?.disconnect();
 	composerResizeObserver = null;
 });
@@ -512,16 +554,23 @@ defineExpose({focus, adjustHeight, openFilePicker});
 
 			<div v-if="props.pendingConfirmations.length" class="web-confirm-stack">
 				<div v-for="item in props.pendingConfirmations" :key="item.confirmationId" class="web-confirm-card"
-				     :class="{'questionnaire-card': interactionAction(item) === 'questionnaire'}"
+				     :class="{'questionnaire-card': interactionAction(item) === 'questionnaire', 'is-expired': interactionExpired(item)}"
 				     :data-questionnaire-id="interactionAction(item) === 'questionnaire' ? item.confirmationId : undefined">
-					<template v-if="interactionAction(item) === 'questionnaire'">
-						<div class="web-confirm-title questionnaire-title">
-							<Warning/>
-							<div>
-								<strong>{{ item.title || '需要你补充一些信息' }}</strong>
-								<span>请按实际情况回答；选择题也可以直接填写自己的答案。</span>
-							</div>
+					<div class="web-confirm-title" :class="{'questionnaire-title': interactionAction(item) === 'questionnaire'}">
+						<Warning/>
+						<div>
+							<strong>{{ item.title || (interactionAction(item) === 'questionnaire' ? '需要你补充一些信息' : '请确认') }}</strong>
+							<span v-if="interactionAction(item) === 'questionnaire'" class="interaction-title-description">请按实际情况回答；选择题也可以直接填写自己的答案。</span>
+							<span class="interaction-card-meta">
+								<span>{{ interactionActionName(item) }}</span>
+								<span v-if="interactionExpiry(item)" class="interaction-expiry" :class="{'is-expired': interactionExpired(item)}">{{ interactionExpiry(item) }}</span>
+								<span v-if="interactionRiskLabel(item)" class="interaction-risk" :class="String(item.type || item.tone || '').toLowerCase()">{{ interactionRiskLabel(item) }}</span>
+							</span>
 						</div>
+					</div>
+					<div v-if="interactionExpired(item)" class="interaction-expired-notice" role="status">此交互已过期，等待同步最新状态。</div>
+
+					<template v-if="interactionAction(item) === 'questionnaire'">
 						<p v-if="item.body" class="questionnaire-intro">{{ item.body }}</p>
 						<div class="questionnaire-questions">
 							<fieldset v-for="(question, questionIndex) in questionnaireQuestions(item)"
@@ -546,7 +595,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 											<input :type="question.multiple ? 'checkbox' : 'radio'"
 											       :name="`question-${item.confirmationId}-${questionnaireQuestionId(question)}`"
 											       :checked="questionnaireChoiceSelected(item, question, option)"
-											       :disabled="props.confirmationSubmitting[item.confirmationId]"
+											       :disabled="interactionDisabled(item)"
 											       @change="toggleQuestionnaireChoice(item, question, option)"/>
 											<span class="question-choice-copy">
 												<span class="question-choice-label">
@@ -562,13 +611,13 @@ defineExpose({focus, adjustHeight, openFilePicker});
 									</div>
 									<button v-if="!question.multiple && questionnaireAnswer(item, question).selectedValues.length"
 									        type="button" class="clear-question-choice"
-									        :disabled="props.confirmationSubmitting[item.confirmationId]"
+									        :disabled="interactionDisabled(item)"
 									        @click="clearQuestionnaireSelection(item, question)">清除选择</button>
 									<label class="question-free-text" :for="`${questionnaireFieldId(item, question, questionIndex)}-text`">
 										<span>{{ questionnaireAnswer(item, question).selectedValues.length ? '补充、限制或修正以上选择' : '也可以不选，直接填写自己的答案' }}</span>
 										<textarea :id="`${questionnaireFieldId(item, question, questionIndex)}-text`"
 										          :value="questionnaireAnswer(item, question).text" rows="2"
-										          :disabled="props.confirmationSubmitting[item.confirmationId]"
+										          :disabled="interactionDisabled(item)"
 										          placeholder="写下更符合你需要的答案"
 										          @input="setQuestionnaireText(item, question, $event.target.value)"></textarea>
 									</label>
@@ -577,7 +626,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 									<span>你的回答</span>
 									<textarea :id="`${questionnaireFieldId(item, question, questionIndex)}-text`"
 									          :value="questionnaireAnswer(item, question).text" rows="3"
-									          :disabled="props.confirmationSubmitting[item.confirmationId]"
+									          :disabled="interactionDisabled(item)"
 									          placeholder="请输入你的回答"
 									          @input="setQuestionnaireText(item, question, $event.target.value)"></textarea>
 								</label>
@@ -589,40 +638,58 @@ defineExpose({focus, adjustHeight, openFilePicker});
 								</div>
 							</fieldset>
 						</div>
-						<div v-if="props.confirmationErrors[item.confirmationId]" class="questionnaire-submit-error" role="alert">
-							{{ props.confirmationErrors[item.confirmationId] }}
-						</div>
+						<div v-if="interactionError(item)" class="interaction-submit-error" role="alert">{{ interactionError(item) }}</div>
 						<div class="web-confirm-actions questionnaire-actions">
-							<button type="button" class="web-confirm-btn cancel"
-							        :disabled="props.confirmationSubmitting[item.confirmationId]"
-							        @click="cancelQuestionnaire(item)">暂不回答</button>
-							<button type="button" class="web-confirm-btn confirm"
-							        :disabled="props.confirmationSubmitting[item.confirmationId]"
+							<button type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)" @click="cancelQuestionnaire(item)">暂不回答</button>
+							<button type="button" class="web-confirm-btn confirm" :disabled="interactionDisabled(item)"
 							        :aria-busy="props.confirmationSubmitting[item.confirmationId] ? 'true' : 'false'"
 							        @click="submitQuestionnaire(item)">{{ props.confirmationSubmitting[item.confirmationId] ? '提交中…' : '提交回答' }}</button>
 						</div>
 					</template>
+
 					<template v-else>
-						<div class="web-confirm-title">
-							<Warning/>
-							{{ item.title || '请确认' }}
-						</div>
-						<pre class="web-confirm-body">{{ item.body }}</pre>
-						<div v-if="interactionAction(item) === 'select'" class="web-interaction-options">
-							<label v-for="(option, idx) in item.options || []" :key="`${item.confirmationId}-${idx}`" class="web-interaction-option">
-								<input :type="item.multiple ? 'checkbox' : 'radio'" :name="`interaction-${item.confirmationId}`"
-								       :checked="optionChecked(item, idx)" @change="toggleOption(item, idx)"/>
-								<span>{{ optionLabel(option) }}</span>
+						<pre v-if="item.body" class="web-confirm-body">{{ item.body }}</pre>
+						<template v-if="interactionAction(item) === 'select'">
+							<div class="web-interaction-options">
+								<label v-for="(option, idx) in item.options || []" :key="`${item.confirmationId}-${idx}`"
+								       class="web-interaction-option" :class="{'is-selected': optionChecked(item, idx)}">
+									<input :type="item.multiple ? 'checkbox' : 'radio'" :name="`interaction-${item.confirmationId}`"
+									       :checked="optionChecked(item, idx)" :disabled="interactionDisabled(item)" @change="toggleOption(item, idx)"/>
+									<span class="web-interaction-option-copy"><strong>{{ optionLabel(option) }}</strong><small v-if="option?.description">{{ option.description }}</small></span>
+								</label>
+							</div>
+							<button v-if="!item.multiple && ensureInteractionDraft(item).selectedIndexes.length" type="button"
+							        class="clear-question-choice" :disabled="interactionDisabled(item)" @click="clearSelectChoice(item)">清除选择</button>
+							<label class="web-interaction-input">
+								<span>{{ ensureInteractionDraft(item).selectedIndexes.length ? '补充、限制或修正以上选择' : '也可以不选，直接填写自己的答案' }}</span>
+								<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
+								          placeholder="写下更符合你需要的答案" @input="setInteractionText(item, $event.target.value)"></textarea>
+								<small v-if="item.requiresAuthorization">有文字时只提交意见，不执行原操作。</small>
 							</label>
-						</div>
-						<div v-else-if="interactionAction(item) === 'prompt'" class="web-interaction-prompt">
+						</template>
+						<label v-else-if="interactionAction(item) === 'prompt'" class="web-interaction-input">
+							<span>你的回答</span>
 							<textarea :value="ensureInteractionDraft(item).value" :placeholder="item.sensitive ? '输入内容' : '请输入内容'"
-							          rows="3" @input="setPromptValue(item, $event.target.value)"></textarea>
-							<div v-if="item.sensitive" class="web-interaction-hint">此输入会原样提交给当前任务。</div>
-						</div>
+							          rows="3" :disabled="interactionDisabled(item)" @input="setPromptValue(item, $event.target.value)"></textarea>
+							<small v-if="item.sensitive">此输入会原样提交给当前任务，不会显示在公开历史中。</small>
+						</label>
+						<label v-else class="web-interaction-input confirm-feedback-input">
+							<span>补充意见（可选）</span>
+							<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
+							          placeholder="如需调整原操作，请在这里说明" @input="setInteractionText(item, $event.target.value)"></textarea>
+							<small>填写任何意见后都不会执行原操作；意见将原样提交。</small>
+						</label>
+						<div v-if="interactionError(item)" class="interaction-submit-error" role="alert">{{ interactionError(item) }}</div>
 						<div class="web-confirm-actions">
-							<button type="button" class="web-confirm-btn cancel" @click="answerInteraction(item, 'cancel')">{{ item.cancelText || '取消' }}</button>
-							<button type="button" class="web-confirm-btn confirm" @click="answerInteraction(item, 'confirm')">{{ item.confirmText || (interactionAction(item) === 'select' ? '确认选择' : '确认') }}</button>
+							<button type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)"
+							        @click="answerInteraction(item, 'cancel')">{{ item.cancelText || '暂不回答' }}</button>
+							<button v-if="interactionAction(item) === 'confirm'" type="button" class="web-confirm-btn reject"
+							        :disabled="interactionDisabled(item)" @click="answerInteraction(item, 'reject')">{{ confirmRejectLabel(item) }}</button>
+							<button type="button" class="web-confirm-btn confirm" :disabled="interactionDisabled(item)"
+							        :aria-busy="props.confirmationSubmitting[item.confirmationId] ? 'true' : 'false'"
+							        @click="answerInteraction(item, 'confirm')">
+								{{ primaryActionLabel(item) }}
+							</button>
 						</div>
 					</template>
 				</div>
@@ -917,6 +984,8 @@ defineExpose({focus, adjustHeight, openFilePicker});
 </template>
 
 <style scoped>
+@import "./userInteractionTokens.css";
+
 .composer-shell {
 	pointer-events: none;
 	padding-right: var(--console-content-gutter, 1rem);
@@ -987,25 +1056,97 @@ defineExpose({focus, adjustHeight, openFilePicker});
 .web-confirm-card {
 	position: relative;
 	z-index: 45;
-	border: 1px solid rgba(245, 158, 11, 0.38);
-	background: rgba(255, 251, 235, 0.98);
-	box-shadow: 0 14px 42px rgba(120, 53, 15, 0.12);
+	border: 1px solid var(--ob-interaction-border);
 	border-radius: 1rem;
+	background: var(--ob-interaction-surface);
+	box-shadow: var(--ob-interaction-shadow);
 	padding: 0.85rem;
+	color: var(--ob-interaction-ink);
+}
+
+.web-confirm-card.is-expired {
+	box-shadow: none;
+	opacity: 0.82;
 }
 
 .web-confirm-title {
 	display: flex;
-	align-items: center;
-	gap: 0.45rem;
+	align-items: flex-start;
+	gap: 0.52rem;
 	font-size: 0.82rem;
 	font-weight: 700;
-	color: #92400e;
+	color: var(--ob-interaction-accent-strong);
 }
 
-.web-confirm-title svg {
-	width: 1rem;
-	height: 1rem;
+.web-confirm-title > svg {
+	width: 1.05rem;
+	height: 1.05rem;
+	flex: 0 0 auto;
+	margin-top: 0.08rem;
+}
+
+.web-confirm-title > div {
+	display: grid;
+	min-width: 0;
+	gap: 0.16rem;
+}
+
+.web-confirm-title strong {
+	font-size: 0.9rem;
+	line-height: 1.4;
+}
+
+.interaction-title-description {
+	font-size: 0.75rem;
+	font-weight: 400;
+	line-height: 1.5;
+	color: var(--ob-interaction-muted);
+}
+
+.interaction-card-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.35rem;
+	font-size: 0.67rem;
+	font-weight: 650;
+	line-height: 1.35;
+	color: var(--ob-interaction-muted);
+}
+
+.interaction-card-meta > span + span::before {
+	margin-right: 0.35rem;
+	color: #b5c0cd;
+	content: "·";
+}
+
+.interaction-expiry.is-expired {
+	font-weight: 750;
+	color: #a33f3f;
+}
+
+.interaction-risk {
+	font-weight: 750;
+}
+
+.interaction-risk.warning {
+	color: #8b6524;
+}
+
+.interaction-risk.danger {
+	color: #a33f3f;
+}
+
+.interaction-expired-notice,
+.interaction-submit-error {
+	margin-top: 0.65rem;
+	border: 1px solid #fecaca;
+	border-radius: 0.7rem;
+	background: #fef2f2;
+	padding: 0.55rem 0.65rem;
+	font-size: 0.74rem;
+	line-height: 1.45;
+	color: #991b1b;
 }
 
 .web-confirm-body {
@@ -1013,90 +1154,132 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	max-height: 12rem;
 	overflow: auto;
 	white-space: pre-wrap;
-	font-size: 0.76rem;
-	line-height: 1.45;
-	color: #3f3f46;
 	font-family: inherit;
+	font-size: 0.76rem;
+	line-height: 1.5;
+	color: var(--ob-interaction-muted);
 }
 
 .web-interaction-options {
 	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
 	gap: 0.45rem;
 	margin-top: 0.7rem;
 }
 
 .web-interaction-option {
 	display: flex;
-	align-items: center;
+	min-width: 0;
+	align-items: flex-start;
 	gap: 0.5rem;
-	border: 1px solid rgba(217, 119, 6, 0.18);
-	border-radius: 0.75rem;
-	background: rgba(255, 255, 255, 0.72);
-	padding: 0.5rem 0.65rem;
-	font-size: 0.8rem;
-	color: #3f3f46;
+	border: 1px solid var(--ob-interaction-border);
+	border-radius: 0.72rem;
+	background: var(--ob-interaction-surface-strong);
+	padding: 0.55rem 0.62rem;
+	font-size: 0.78rem;
+	color: var(--ob-interaction-ink);
 	cursor: pointer;
 }
 
+.web-interaction-option.is-selected {
+	border-color: var(--ob-interaction-border-strong);
+	background: var(--ob-interaction-surface-selected);
+}
+
 .web-interaction-option input {
-	accent-color: #d97706;
+	flex: 0 0 auto;
+	margin-top: 0.17rem;
+	accent-color: var(--ob-interaction-accent);
 }
 
-.web-interaction-prompt {
-	margin-top: 0.7rem;
+.web-interaction-option-copy {
+	display: grid;
+	min-width: 0;
+	gap: 0.15rem;
+	line-height: 1.4;
 }
 
-.web-interaction-prompt textarea {
+.web-interaction-option-copy small {
+	font-size: 0.7rem;
+	font-weight: 400;
+	color: var(--ob-interaction-muted);
+}
+
+.web-interaction-input {
+	display: grid;
+	gap: 0.32rem;
+	margin-top: 0.62rem;
+	font-size: 0.72rem;
+	font-weight: 650;
+	color: #475569;
+}
+
+.web-interaction-input textarea {
 	width: 100%;
 	resize: vertical;
-	border: 1px solid rgba(217, 119, 6, 0.24);
-	border-radius: 0.75rem;
-	background: rgba(255, 255, 255, 0.78);
-	padding: 0.6rem 0.7rem;
-	font-size: 0.82rem;
-	line-height: 1.45;
-	color: #27272a;
+	border: 1px solid #ced9e5;
+	border-radius: 0.68rem;
+	background: var(--ob-interaction-surface-strong);
+	padding: 0.58rem 0.65rem;
+	font: inherit;
+	font-size: 0.78rem;
+	font-weight: 400;
+	line-height: 1.5;
+	color: var(--ob-interaction-ink);
 	outline: none;
 }
 
-.web-interaction-prompt textarea:focus {
-	border-color: rgba(217, 119, 6, 0.55);
-	box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12);
+.web-interaction-input textarea:focus {
+	border-color: var(--ob-interaction-border-strong);
+	box-shadow: 0 0 0 3px var(--ob-interaction-focus);
 }
 
-.web-interaction-hint {
-	margin-top: 0.35rem;
-	font-size: 0.72rem;
-	color: #92400e;
+.web-interaction-input small {
+	font-size: 0.69rem;
+	font-weight: 400;
+	line-height: 1.45;
+	color: var(--ob-interaction-muted);
 }
 
 .web-confirm-actions {
 	display: flex;
+	flex-wrap: wrap;
 	justify-content: flex-end;
 	gap: 0.5rem;
 	margin-top: 0.7rem;
 }
 
 .web-confirm-btn {
-	border: 0;
+	min-height: 2rem;
+	border: 1px solid transparent;
 	border-radius: 999px;
 	padding: 0.42rem 0.8rem;
-	font-size: 0.78rem;
+	font-size: 0.76rem;
 	font-weight: 700;
+	line-height: 1.25;
 	cursor: pointer;
 }
 
 .web-confirm-btn.cancel {
-	background: #f4f4f5;
-	color: #52525b;
+	border-color: var(--ob-interaction-border);
+	background: var(--ob-interaction-surface-strong);
+	color: var(--ob-interaction-muted);
+}
+
+.web-confirm-btn.reject {
+	border-color: #c8d2de;
+	background: #eef2f6;
+	color: #475569;
 }
 
 .web-confirm-btn.confirm {
-	background: #d97706;
-	color: white;
+	background: var(--ob-interaction-accent);
+	color: #fff;
 }
 
-.web-confirm-btn:disabled {
+.web-confirm-btn:disabled,
+.web-interaction-option:has(input:disabled),
+.clear-question-choice:disabled {
 	opacity: 0.58;
 	cursor: not-allowed;
 }
@@ -1104,32 +1287,14 @@ defineExpose({focus, adjustHeight, openFilePicker});
 .questionnaire-card {
 	max-height: min(70vh, 46rem);
 	overflow: auto;
-	border-color: rgba(37, 99, 235, 0.28);
-	background: rgba(248, 250, 252, 0.98);
-	box-shadow: 0 18px 48px rgba(15, 23, 42, 0.14);
 }
 
-.questionnaire-title {
-	align-items: flex-start;
-	color: #1e3a5f;
-}
-
-.questionnaire-title > div {
-	display: grid;
-	gap: 0.18rem;
-}
-
-.questionnaire-title strong {
-	font-size: 0.9rem;
-}
-
-.questionnaire-title span,
 .questionnaire-intro,
 .question-description {
 	font-size: 0.75rem;
 	font-weight: 400;
 	line-height: 1.5;
-	color: #64748b;
+	color: var(--ob-interaction-muted);
 	white-space: pre-wrap;
 }
 
@@ -1339,17 +1504,6 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	display: none;
 }
 
-.questionnaire-submit-error {
-	margin-top: 0.65rem;
-	border: 1px solid #fecaca;
-	border-radius: 0.7rem;
-	background: #fef2f2;
-	padding: 0.55rem 0.65rem;
-	font-size: 0.74rem;
-	line-height: 1.45;
-	color: #991b1b;
-}
-
 .questionnaire-actions {
 	position: sticky;
 	bottom: -0.85rem;
@@ -1359,16 +1513,13 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	padding: 0.65rem 0.85rem;
 }
 
-.questionnaire-actions .confirm {
-	background: #46678f;
-}
-
 @media (max-width: 640px) {
 	.questionnaire-card {
 		max-height: 62vh;
 	}
 
-	.question-choice-list {
+	.question-choice-list,
+	.web-interaction-options {
 		grid-template-columns: minmax(0, 1fr);
 	}
 

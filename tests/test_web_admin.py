@@ -2590,6 +2590,52 @@ async def test_rath_terminal_trigger_survives_missing_python_notification_callba
     assert "final user-facing answer only when the root objective is complete" in calls[0]["text"]
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_web_task_notification_claim_reads_its_write_with_pinned_reader_snapshot(web_env, concurrent):
+    row = await web_env.server._create_web_conversation(123, title="notification claim snapshot")
+    queued = []
+    for index in range(2):
+        item = await web_env.server._persist_web_task_notification(row, {
+            "taskUuid": f"task-claim-snapshot-{index}",
+            "status": "completed",
+            "summary": f"result {index}",
+        })
+        assert item is not None
+        queued.append(item)
+    expected = {item["_notificationUuid"] for item in queued}
+
+    # A concurrent recovery/list query can hold the shared read connection on a
+    # snapshot from before the claim's writer transaction. Leave one row unread
+    # to make that production interleaving deterministic instead of sleeping.
+    cursor = await web_env.db.conn.execute(
+        "SELECT notification_uuid FROM web_task_notifications ORDER BY id",
+    )
+    assert await cursor.fetchone() is not None
+    try:
+        if concurrent:
+            results = await asyncio.gather(
+                web_env.server._claim_web_task_notifications(queued),
+                web_env.server._claim_web_task_notifications(queued),
+            )
+        else:
+            results = [await web_env.server._claim_web_task_notifications(queued)]
+    finally:
+        await cursor.close()
+
+    assert set().union(*(claimed for _token, claimed in results)) == expected
+    assert sum(len(claimed) for _token, claimed in results) == len(expected)
+    stored = await web_env.db.conn.execute(
+        "SELECT notification_uuid, state, claim_token FROM web_task_notifications ORDER BY id",
+    )
+    records = {str(item["notification_uuid"]): dict(item) for item in await stored.fetchall()}
+    for token, claimed in results:
+        for notification_uuid in claimed:
+            assert records[notification_uuid]["state"] == "processing"
+            assert records[notification_uuid]["claim_token"] == token
+    _token, retried = await web_env.server._claim_web_task_notifications(queued)
+    assert retried == set(), "A second claim must not steal a processing lease"
+
+
 async def test_web_task_notification_recovery_reclaims_only_expired_processing_leases(web_env):
     row = await web_env.server._create_web_conversation(123, title="notification lease recovery")
     expired = await web_env.server._persist_web_task_notification(row, {
@@ -3342,6 +3388,16 @@ async def test_task_notification_summary_run_keeps_conversation_running(web_env,
     assert state["running"] is False
 
 
+async def _wait_pending_interaction(server, conversation_uuid):
+    # Interaction creation now commits its durable record before exposing forms.
+    for _ in range(200):
+        pending = server._pending_web_confirmations(conversation_uuid)
+        if pending:
+            return pending
+        await asyncio.sleep(0.005)
+    raise AssertionError("interaction did not enter pending")
+
+
 async def test_web_confirm_payload_supports_select_and_prompt_metadata(web_env):
     row = await web_env.server._create_web_conversation(123, title="interactions")
     conv_uuid = row["conversation_uuid"]
@@ -3354,19 +3410,12 @@ async def test_web_confirm_payload_supports_select_and_prompt_metadata(web_env):
         "multiple": False,
         "defaultValues": ["skip"],
     }))
-    await asyncio.sleep(0)
-    pending = web_env.server._pending_web_confirmations(conv_uuid)
+    pending = await _wait_pending_interaction(web_env.server, conv_uuid)
     assert pending[0]["action"] == "select"
     assert pending[0]["options"][0]["label"] == "修复"
     assert pending[0]["defaultValues"] == ["skip"]
     cid = pending[0]["confirmationId"]
-    web_env.server._web_confirmations[cid]["future"].set_result({
-        "status": "answered",
-        "cancelled": False,
-        "selectedIndexes": [1],
-        "selectedValues": ["skip"],
-        "selectedLabels": ["跳过"],
-    })
+    await web_env.server.interactions.submit(cid, 123, {"selectedValues": ["skip"]})
     assert (await select_task)["selectedValues"] == ["skip"]
 
     prompt_task = asyncio.create_task(web_env.server._web_confirm(conv_uuid, {
@@ -3376,17 +3425,12 @@ async def test_web_confirm_payload_supports_select_and_prompt_metadata(web_env):
         "defaultValue": "默认",
         "sensitive": True,
     }))
-    await asyncio.sleep(0)
-    pending = web_env.server._pending_web_confirmations(conv_uuid)
+    pending = await _wait_pending_interaction(web_env.server, conv_uuid)
     assert pending[0]["action"] == "prompt"
     assert pending[0]["defaultValue"] == "默认"
     assert pending[0]["sensitive"] is True
     cid = pending[0]["confirmationId"]
-    web_env.server._web_confirmations[cid]["future"].set_result({
-        "status": "answered",
-        "cancelled": False,
-        "value": "用户输入",
-    })
+    await web_env.server.interactions.submit(cid, 123, {"value": "用户输入"})
     assert (await prompt_task)["value"] == "用户输入"
 
 
@@ -8370,8 +8414,8 @@ async def test_web_memory_reminder_is_xml_user_overlay_runtime_only_and_deduplic
     injected_text = str(real_users[-1]["content"])
     assert '<openbear-memory-checkpoint version="1" runtime-only="true"' in injected_text
     assert 'latest_controller_prompt_tokens="72000"' in injected_text
-    assert "Use Memory for stable" in injected_text
-    assert "Use TaskMemory for independently useful working state" in injected_text
+    assert "Perform this audit before continuing" in injected_text
+    assert "Compare that list against the injected TaskMemory catalog" in injected_text
     runtime_units = [message for message in first_request if is_task_memory_runtime_message(message)]
     assert len(runtime_units) == 1
     assert "openbear-memory-checkpoint" not in str(runtime_units[0]["content"])
@@ -8729,8 +8773,7 @@ async def test_questionnaire_pending_http_answer_is_canonical_and_text_faithful(
     task = asyncio.create_task(web_env.server._web_confirm(conv_uuid, {
         "action": "questionnaire", "title": "澄清", "body": "回答", "questions": questions,
     }))
-    await asyncio.sleep(0)
-    pending = web_env.server._pending_web_confirmations(conv_uuid)
+    pending = await _wait_pending_interaction(web_env.server, conv_uuid)
     assert len(pending) == 1
     assert pending[0]["questions"] == questions
     state = await web_env.server._chat_payload(int(row["internal_chat_id"]), row)
@@ -8775,8 +8818,7 @@ async def test_questionnaire_http_rejects_invalid_answers_and_keeps_pending(web_
             {"id": "open", "type": "open", "question": "必答开放题", "required": True},
         ],
     }))
-    await asyncio.sleep(0)
-    cid = web_env.server._pending_web_confirmations(conv_uuid)[0]["confirmationId"]
+    cid = (await _wait_pending_interaction(web_env.server, conv_uuid))[0]["confirmationId"]
     response = await web_env.client.post(
         f"/api/conversations/{conv_uuid}/confirmations/{cid}/answer",
         json={"cancelled": False, "answers": bad_answer}, cookies={"openbear_web_session": cookie},
@@ -8784,9 +8826,7 @@ async def test_questionnaire_http_rejects_invalid_answers_and_keeps_pending(web_
     assert response.status == 400
     assert (await response.json())["error"] == "invalid_questionnaire_answer"
     assert web_env.server._pending_web_confirmations(conv_uuid)[0]["confirmationId"] == cid
-    web_env.server._web_confirmations[cid]["future"].set_result({
-        "status": "cancelled", "cancelled": True, "answers": [], "interactionId": cid,
-    })
+    await web_env.server.interactions.submit(cid, 123, {"cancelled": True})
     assert (await task)["answers"] == []
 
 
@@ -8801,8 +8841,7 @@ async def test_questionnaire_text_only_cancel_and_timeout_never_use_recommendati
     }]}
 
     text_task = asyncio.create_task(web_env.server._web_confirm(conv_uuid, payload))
-    await asyncio.sleep(0)
-    cid = web_env.server._pending_web_confirmations(conv_uuid)[0]["confirmationId"]
+    cid = (await _wait_pending_interaction(web_env.server, conv_uuid))[0]["confirmationId"]
     response = await web_env.client.post(
         f"/api/conversations/{conv_uuid}/confirmations/{cid}/answer",
         json={"cancelled": False, "answers": [{"questionId": "required-choice", "selectedValues": [], "text": "只填文字"}]},
@@ -8814,8 +8853,7 @@ async def test_questionnaire_text_only_cancel_and_timeout_never_use_recommendati
     assert text_result["answers"][0]["selectedValues"] == []
 
     cancel_task = asyncio.create_task(web_env.server._web_confirm(conv_uuid, payload))
-    await asyncio.sleep(0)
-    cid = web_env.server._pending_web_confirmations(conv_uuid)[0]["confirmationId"]
+    cid = (await _wait_pending_interaction(web_env.server, conv_uuid))[0]["confirmationId"]
     response = await web_env.client.post(
         f"/api/conversations/{conv_uuid}/confirmations/{cid}/answer",
         json={"cancelled": True}, cookies={"openbear_web_session": cookie},
@@ -8940,3 +8978,58 @@ async def test_sensitive_prompt_answer_audit_and_all_public_operation_surfaces_h
     persisted_frames = json.dumps([dict(item) for item in await cur.fetchall()], ensure_ascii=False)
     assert secret not in persisted_frames
     assert "[敏感内容已隐藏]" in persisted_frames
+
+
+@pytest.mark.parametrize("action,answer", [
+    ("select", {"selectedValues": [], "text": "  我有自己的答案\n保留原文  "}),
+    ("select", {"selectedValues": ["a"], "text": "  参考 A，但不部署\n  "}),
+    ("confirm", {"confirmed": True, "text": "  先别执行\n请修改方案  "}),
+])
+async def test_interaction_http_free_text_and_real_tg_outbox_wiring(web_env, action, answer):
+    cookie = await _login_cookie(web_env)
+    row = await web_env.server._create_web_conversation(123, title="跨端回答")
+    conv = row["conversation_uuid"]
+    payload = {"action": action, "title": "决定", "body": "请回答", "options": [{"label": "A", "value": "a"}]}
+    task = asyncio.create_task(web_env.server._web_confirm(conv, payload))
+    item = (await _wait_pending_interaction(web_env.server, conv))[0]
+    cid = item["interactionId"]
+    response = await web_env.client.post(
+        f"/api/conversations/{conv}/confirmations/{cid}/answer",
+        json={**answer, "revision": item["revision"]}, cookies={"openbear_web_session": cookie},
+    )
+    assert response.status == 200
+    result = (await response.json())["result"]
+    assert result == await task
+    assert result["text"] == answer["text"]
+    assert result["source"] == "web"
+    if action == "confirm":
+        assert result["decision"] == "feedback" and result["confirmed"] is False
+    else:
+        assert result["selectedValues"] == answer["selectedValues"]
+    # The WebServer's registered TG listener was invoked without running a Bot
+    # worker or making a network call. Short interactions still enter the outbox.
+    cur = await web_env.db.conn.execute("SELECT event_type FROM interaction_tg_outbox WHERE interaction_id=?", (cid,))
+    assert "created" in [r["event_type"] for r in await cur.fetchall()]
+
+    later = await web_env.client.post(
+        f"/api/conversations/{conv}/confirmations/{cid}/answer",
+        json={"text": "另一份迟到答案"}, cookies={"openbear_web_session": cookie},
+    )
+    assert later.status == 409
+    assert (await later.json())["error"] == "confirmation_already_resolved"
+
+
+async def test_interaction_sensitive_pending_does_not_enter_debug_logs(web_env, tmp_path, monkeypatch):
+    from app.web_console import core
+    secret = "SENSITIVE-PENDING-DO-NOT-LOG"
+    record = {"payload": {"pendingConfirmations": [{"interactionId": "p", "sensitive": True, "body": secret, "defaultValue": secret}]}}
+    record["frameText"] = json.dumps(record["payload"])
+    monkeypatch.setattr(core, "_WEB_DEBUG_FILE_LOGS_ENABLED", True)
+    monkeypatch.setattr(core, "_WEB_FRONTEND_EVENT_LOG_DIR", tmp_path / "frontend")
+    monkeypatch.setattr(core, "_WEB_WS_AUDIT_LOG_DIR", tmp_path / "ws")
+    core._log_web_frontend_event(record)
+    core._log_web_ws_audit(record)
+    logs = list(tmp_path.rglob("*.jsonl"))
+    assert logs
+    assert all(secret not in path.read_text() for path in logs)
+    assert secret in json.dumps(record)  # Redaction does not mutate Web delivery.

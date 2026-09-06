@@ -1,4 +1,4 @@
-"""Human-in-the-loop tools backed by the Web conversation UI."""
+"""Human-in-the-loop tools with one Web/TG interaction lifecycle."""
 from __future__ import annotations
 
 import json
@@ -30,7 +30,9 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
                     "error": "user_interaction_not_available_in_this_context",
                 }, ensure_ascii=False, indent=2)
             payload = dict(args)
-            payload.setdefault("type", payload.get("tone") or "warning")
+            payload["_sourceTool"] = "UserInteraction"
+            payload["_requiresAuthorization"] = False
+            payload.setdefault("type", payload.get("tone") or "info")
             result = await ctx.web_confirm(payload)
             return json.dumps(result, ensure_ascii=False, indent=2)
         return json.dumps({"status": "error", "error": f"unknown_action:{action}"}, ensure_ascii=False, indent=2)
@@ -67,26 +69,27 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
     }
     reg.add(
         "UserInteraction",
-        "Ask the Web user for an interaction. Supports action=confirm, action=select, action=prompt, and action=questionnaire in the Web conversation UI.",
+        "Ask the user via a shared Web/TG interaction. Supports confirm, select, prompt, questionnaire. Choices always permit text-only or options plus original text; user text takes precedence over conflicting selections. Confirmation feedback does not authorize the original action. Telegram delivery/reply follows user settings; sensitive answers are Web-only.",
         {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["confirm", "select", "prompt", "questionnaire"], "description": "Interaction action"},
             "title": {"type": "string", "description": "标题"},
             "body": {"type": "string", "description": "正文说明"},
             "type": {"type": "string", "enum": ["none", "success", "info", "warning", "danger"], "description": "提示类型"},
             "tone": {"type": "string", "enum": ["none", "success", "info", "warning", "danger"], "description": "type 的别名"},
-            "default": {"type": "boolean", "description": "confirm 超时时默认是否确认，默认 false"},
+            "default": {"type": "boolean", "description": "兼容字段；超时始终不确认，不代替用户作答"},
             "confirmText": {"type": "string", "description": "确认按钮文案，默认 确认"},
             "cancelText": {"type": "string", "description": "取消按钮文案，默认 取消"},
             "timeoutSeconds": {"type": "number", "description": "等待秒数，默认 600"},
             "options": {"type": "array", "items": {"oneOf": [
                 {"type": "string"},
                 {"type": "object", "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label"]},
-            ]}, "description": "select 的选项列表"},
+            ]}, "description": "select 的选项列表；用户始终可以只写文字或选择后补充，原文和选择一起回传"},
             "multiple": {"type": "boolean", "description": "select 是否允许多选；questionnaire 请在每个 choice 问题中设置"},
-            "sensitive": {"type": "boolean", "description": "prompt 输入是否按敏感文本处理"},
-            "defaultValue": {"type": "string", "description": "prompt 超时时返回的默认输入值"},
+            "sensitive": {"type": "boolean", "description": "整条交互是否敏感；敏感内容不发往 TG，答案原文只提交给当前任务，公开日志脱敏"},
+            "defaultValue": {"type": "string", "description": "prompt 的输入初始值；只有用户实际提交才算回答，超时不采用"},
             "questions": {"type": "array", "items": question_schema, "description": "questionnaire 的问题列表；choice 固有支持选项之外的自由文字补充"},
         }, "required": ["action", "title", "body"]},
         _user_interaction,
         visibility={"main"},
+        preserve_result=True,
     )

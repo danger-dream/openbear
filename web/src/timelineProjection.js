@@ -108,6 +108,7 @@ function finishActiveReasoning(turn) {
 const OP_ACTIVE_LIFECYCLES = new Set(["active", "paused"]);
 const OP_ACTIVE_STATUSES = new Set(["queued", "running", "pausing", "paused", "resuming", "stopping"]);
 const OP_TERMINAL_STATUSES = new Set(["completed", "partial", "failed", "cancelled", "interrupted", "needs_openbear_control"]);
+const AGENT_EXECUTION_TOOL_NAMES = new Set(["Agent", "AgentContinue", "AgentMessage", "AgentStop"]);
 
 export function normalizeOperations(operations = []) {
   return [...(operations || [])]
@@ -348,6 +349,15 @@ export function convergeStoppedAcknowledgement(options = {}) {
   return true;
 }
 
+function operationToolName(op = {}) {
+  const payload = isPlainObject(op?.payload) ? op.payload : {};
+  return String(payload.rootToolName || payload.name || payload.toolName || "").trim();
+}
+
+function isAgentExecutionOperation(op = {}) {
+  return String(op?.opType || "") === "agent" || AGENT_EXECUTION_TOOL_NAMES.has(operationToolName(op));
+}
+
 function operationTaskUuid(op = {}) {
   const payload = isPlainObject(op?.payload) ? op.payload : {};
   const task = isPlainObject(payload.task) ? payload.task : {};
@@ -363,8 +373,8 @@ export function deriveOperationRunState(operations = []) {
   });
   const waitingControl = ops.filter((op) => op.opType !== "notice" && (String(op.lifecycle || "") === "waiting_control" || String(op.status || op.payload?.status || "") === "needs_openbear_control"));
   const activeRootRuns = active.filter((op) => op.opType === "run" && !operationTaskUuid(op));
-  const activeAgents = active.filter((op) => op.opType === "agent");
-  const activeTools = active.filter((op) => op.opType === "tool");
+  const activeAgents = active.filter((op) => isAgentExecutionOperation(op));
+  const activeTools = active.filter((op) => op.opType === "tool" && !isAgentExecutionOperation(op));
   const activeSupervision = active.filter((op) => op.opType === "agent_supervision");
   const supervisionWaiting = activeSupervision.length > 0;
   const rootTurnRunning = activeRootRuns.length > 0;
@@ -784,10 +794,14 @@ function attachAgentControlToTask(turns, op, payload, taskInfoByUuid) {
 function agentTaskInfoMap(ops = []) {
   const out = new Map();
   for (const op of ops) {
-    if (!op || op.opType !== "agent") continue;
+    if (!op) continue;
     const payload = op.payload && typeof op.payload === "object" ? op.payload : {};
-    const task = payload.task && typeof payload.task === "object" ? payload.task : {};
-    const taskUuid = String(op.taskUuid || payload.taskUuid || task.taskUuid || task.task_uuid || "").trim();
+    if (!isAgentExecutionOperation(op)) continue;
+    const result = payload.result && typeof payload.result === "object" ? payload.result : {};
+    const task = payload.task && typeof payload.task === "object"
+      ? payload.task
+      : (result.task && typeof result.task === "object" ? result.task : {});
+    const taskUuid = String(op.taskUuid || payload.taskUuid || result.taskUuid || task.taskUuid || task.task_uuid || "").trim();
     if (!taskUuid) continue;
     out.set(taskUuid, {
       title: String(task.title || task.displayName || payload.title || payload.displayName || "").trim(),
@@ -1044,7 +1058,7 @@ export function projectOperationMessages(operations = [], options = {}) {
         result,
         results: result ? [result] : [],
         live,
-        livePayload: opType === "agent" ? payload : (payload.progress || null),
+        livePayload: opType === "agent" || AGENT_EXECUTION_TOOL_NAMES.has(call.name) ? payload : (payload.progress || null),
         livePreview: payload.preview || helpers.agentSummary({ livePayload: payload }).preview || "",
         operation: projectedOp,
       });

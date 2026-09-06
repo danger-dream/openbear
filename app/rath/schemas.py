@@ -77,6 +77,12 @@ class RathAgentDef:
 @dataclass(slots=True)
 class RathAgentSession:
     session_uuid: str
+    session_kind: str = "legacy"
+    active_task_uuid: str = ""
+    context_task_uuid: str = ""
+    context_revision: int = 0
+    revision: int = 0
+    turn_count: int = 0
     openbear_session_uuid: str = ""
     chat_id: int = 0
     workflow_uuid: str = ""

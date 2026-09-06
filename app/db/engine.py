@@ -9,6 +9,7 @@ from pathlib import Path
 import aiosqlite
 
 from app.db.connection_router import SQLiteConnectionRouter
+from app.db.agent_continuity_migration import migrate_agent_continuity
 from app.db.schema_migrations import (
     backfill_web_operation_terminal_times,
     dedupe_active_rath_agent_sessions,
@@ -19,7 +20,10 @@ from app.logging import get_logger
 
 log = get_logger("db.engine")
 
-_SCHEMA = (Path(__file__).parent / "schema.sql").read_text(encoding="utf-8")
+_SCHEMA = "\n".join(
+    (Path(__file__).parent / name).read_text(encoding="utf-8")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql")
+)
 
 
 class DB:
@@ -43,6 +47,7 @@ class DB:
         await self._pre_migrate_existing_rath_schema()
         await self._pre_migrate_existing_model_call_schema()
         await self._pre_migrate_memory_assets_schema()
+        await migrate_agent_continuity(self._conn)
         await self._conn.executescript(_SCHEMA)
         await self._remove_structural_memory_categories()
         backfilled_terminal_times = await backfill_web_operation_terminal_times(self._conn)
@@ -350,7 +355,7 @@ class DB:
             log.info("已清理 Agent 工具白名单中的废弃工具", 数量=removed_tool_rows)
         await dedupe_active_rath_agent_sessions(self._conn)
         await self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_rath_agent_sessions_active_openbear_agent ON rath_agent_sessions(openbear_session_uuid, workflow_uuid, agent_key) WHERE status='active'"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_rath_agent_sessions_active_openbear_agent ON rath_agent_sessions(openbear_session_uuid, workflow_uuid, agent_key) WHERE status='active' AND session_kind='legacy'"
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rath_tasks_agent_session ON rath_tasks(agent_session_uuid, updated_at DESC)"

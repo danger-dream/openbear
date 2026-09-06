@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app import installed_version
 from app.db.engine import DB, now_ts
 
 _REMOVED_STRUCTURAL_CATEGORIES = frozenset({"identity", "persona", "rule"})
@@ -25,10 +26,39 @@ _DEFAULT_CATEGORIES = [
     ("memory", "记忆", "🧠", 80),
 ]
 
-MAIN_TEMPLATE_NAME = "OpenBear-v3.2"
-AGENT_TEMPLATE_NAME = "Agent基础提示词-v8"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _INSTALL_META = Path("data/install-meta.json")
+_BUNDLED_PROMPT_FILES = {
+    "main": "openbear-system.tpl",
+    "agent": "openbear-agent.tpl",
+}
+
+
+def builtin_template_name(kind: str) -> str:
+    """Return the stable display label for this installed release."""
+    version = installed_version()
+    if kind == "main":
+        return f"内置主控模板 · OpenBear {version}"
+    if kind == "agent":
+        return f"内置 Agent 模板 · OpenBear {version}"
+    raise ValueError(f"unsupported builtin template kind: {kind}")
+
+
+def bundled_prompt_template(kind: str) -> tuple[str, str]:
+    """Read one prompt shipped with this installation from a fixed location."""
+    filename = _BUNDLED_PROMPT_FILES.get(kind)
+    if filename is None:
+        raise ValueError(f"unsupported builtin template kind: {kind}")
+    path = _REPO_ROOT / "prompts" / filename
+    content = path.read_text(encoding="utf-8")
+    if not content.strip():
+        raise ValueError(f"bundled prompt is empty: {filename}")
+    return builtin_template_name(kind), content
+
+
+# Compatibility exports for callers/tests that referenced the former constants.
+MAIN_TEMPLATE_NAME = builtin_template_name("main")
+AGENT_TEMPLATE_NAME = builtin_template_name("agent")
 
 _FALLBACK_TEMPLATE = """You are OpenBear, a capable AI assistant operating inside a private Web console. Speak Chinese by default.
 
@@ -300,13 +330,13 @@ class BuiltinMemoryClient:
         if not row or int(row["n"] or 0) == 0:
             await self._db.conn.execute(
                 "INSERT INTO memory_templates (name, content, is_active, is_agent_active, updated_at) VALUES (?,?,1,0,?)",
-                (MAIN_TEMPLATE_NAME, self._default_template(), now_ts()),
+                (builtin_template_name("main"), self._default_template(), now_ts()),
             )
             agent_content = self._default_agent_template()
             if agent_content.strip():
                 await self._db.conn.execute(
                     "INSERT INTO memory_templates (name, content, is_active, is_agent_active, updated_at) VALUES (?,?,0,1,?)",
-                    (AGENT_TEMPLATE_NAME, agent_content, now_ts()),
+                    (builtin_template_name("agent"), agent_content, now_ts()),
                 )
         await self._db.conn.commit()
         self._bootstrapped = True

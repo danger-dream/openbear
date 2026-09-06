@@ -5,7 +5,7 @@ import {encode} from "gpt-tokenizer";
 import MarkdownIt from "markdown-it";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
-import {Api} from "../api";
+import {Api, apiError} from "../api";
 import MdEditor from "../components/MdEditor.vue";
 
 const templates = ref([]);
@@ -14,6 +14,9 @@ const editing = ref(null);
 const original = ref("");
 const showHelp = ref(false);
 const showParams = ref(false);
+const showBuiltinImport = ref(false);
+const builtinImportKinds = ref(["main", "agent"]);
+const builtinImportLoading = ref(false);
 
 const sampleParams = ref(JSON.stringify({}, null, 2));
 const runtimePromptParams = ref(null);
@@ -110,13 +113,14 @@ const renderedPreview = computed(() => markdown.render(previewResult.value || ""
 const activeTemplateName = computed(() => templates.value.find((t) => t.is_active)?.name || "未设置");
 const agentActiveTemplateName = computed(() => templates.value.find((t) => t.is_agent_active)?.name || "未设置");
 
-async function load(keepId = activeId.value) {
+async function load(keepId = activeId.value, {preserveDirty = false} = {}) {
 	const data = await Api.templates();
 	templates.value = data.items || [];
 	if (data.promptParams) {
 		runtimePromptParams.value = data.promptParams;
 		if (!sampleParams.value || sampleParams.value === "{}" || sampleParamsNeedRuntimeRefresh()) resetParamsFromRuntime();
 	}
+	if (preserveDirty && dirty()) return;
 	if (keepId) {
 		const t = templates.value.find((x) => x.id === keepId);
 		if (t) {
@@ -185,6 +189,49 @@ async function newTpl() {
 	const r = await Api.createTemplate({name: "新模板", content: SAMPLE, is_active: 0, is_agent_active: 0});
 	if (r?.ok === false) throw new Error(r.error || "创建失败");
 	await load(r.id);
+}
+
+function openBuiltinImport() {
+	builtinImportKinds.value = ["main", "agent"];
+	showBuiltinImport.value = true;
+}
+
+async function importBuiltinTemplates() {
+	if (!builtinImportKinds.value.length || builtinImportLoading.value) return;
+	builtinImportLoading.value = true;
+	let result;
+	try {
+		result = await Api.importBuiltinTemplates([...builtinImportKinds.value]);
+		if (result?.ok === false) throw new Error(result.error || "导入失败");
+	} catch (error) {
+		const code = apiError(error);
+		const messages = {
+			builtin_template_kinds_required: "请至少选择一种模板",
+			unsupported_builtin_template_kind: "所选模板类型不受支持",
+			bundled_template_unavailable: "当前安装中的提示词文件不可用",
+			bundled_template_validation_failed: "随版本模板未通过校验",
+		};
+		ElMessage.error(`导入失败：${messages[code] || code}`);
+		return;
+	} finally {
+		builtinImportLoading.value = false;
+	}
+
+	showBuiltinImport.value = false;
+	try {
+		await load(activeId.value, {preserveDirty: true});
+	} catch (error) {
+		ElMessage.warning(`模板已导入，但列表刷新失败：${apiError(error)}`);
+		return;
+	}
+	const created = Number(result?.created || 0);
+	const reused = Number(result?.reused || 0);
+	if (created) {
+		const reusedText = reused ? `，另有 ${reused} 个已存在` : "";
+		ElMessage.success(`已导入 ${created} 个未激活模板${reusedText}。导入不会自动激活，也不改变已有会话提示词。`);
+	} else {
+		ElMessage.info("所选随版本模板已存在，未新增重复副本。导入不会自动激活，也不改变已有会话提示词。");
+	}
 }
 
 async function removeCurrent() {
@@ -263,6 +310,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 			<div class="flex gap-2 shrink-0">
 				<el-button :icon="'QuestionFilled'" @click="showHelp = true" round>语法说明</el-button>
+				<el-button :icon="'Download'" @click="openBuiltinImport" round>导入随版本模板</el-button>
 				<el-button :icon="'Plus'" @click="newTpl" round>新建</el-button>
 				<el-button @click="save" round :disabled="!dirty()">保存</el-button>
 				<el-button type="primary" @click="activate" round :disabled="editing?.is_active">设为激活</el-button>
@@ -370,6 +418,40 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			<div v-else class="flex-1 flex items-center justify-center text-macsub text-sm">选择或新建一个模板</div>
 		</div>
 		
+		<el-dialog
+			v-model="showBuiltinImport"
+			title="导入随版本模板"
+			width="520px"
+			:close-on-click-modal="!builtinImportLoading"
+			:close-on-press-escape="!builtinImportLoading"
+		>
+			<div class="text-sm leading-relaxed text-mactext">
+				<p class="mb-3 text-macsub">从当前 OpenBear 安装包读取提示词，并保存为可自行检查、编辑和激活的模板副本。</p>
+				<el-checkbox-group v-model="builtinImportKinds" class="flex flex-col gap-2">
+					<el-checkbox value="main" border class="builtin-template-option">
+						<span class="block font-medium text-mactext">主控提示词</span>
+						<span class="mt-0.5 block text-xs font-normal text-macsub">当前版本附带的 OpenBear 主控模板</span>
+					</el-checkbox>
+					<el-checkbox value="agent" border class="builtin-template-option">
+						<span class="block font-medium text-mactext">Agent 提示词</span>
+						<span class="mt-0.5 block text-xs font-normal text-macsub">当前版本附带的 Agent 基础模板</span>
+					</el-checkbox>
+				</el-checkbox-group>
+				<div class="mt-4 rounded-xl border border-[#d8e1ec] bg-[#f3f6fa] px-3 py-2.5 text-xs text-[#526579]">
+					导入不会自动激活，也不改变已有会话提示词。相同版本内容已存在时不会重复创建。
+				</div>
+			</div>
+			<template #footer>
+				<el-button @click="showBuiltinImport = false" :disabled="builtinImportLoading">取消</el-button>
+				<el-button
+					type="primary"
+					:loading="builtinImportLoading"
+					:disabled="!builtinImportKinds.length"
+					@click="importBuiltinTemplates"
+				>导入所选模板</el-button>
+			</template>
+		</el-dialog>
+
 		<el-dialog v-model="showParams" title="预览样例运行时参数" width="760px">
 			<div class="text-xs text-macsub mb-2">默认来自后端当前运行时 params；改完会自动刷新预览。</div>
 			<el-input v-model="sampleParams" type="textarea" resize="none" class="template-param-input"/>
@@ -425,6 +507,23 @@ memory.docNames         文档名称索引</pre>
 </template>
 
 <style>
+.builtin-template-option.el-checkbox.is-bordered {
+	width: 100%;
+	height: auto;
+	margin: 0;
+	padding: 11px 14px;
+	align-items: flex-start;
+	border-radius: 12px;
+}
+
+.builtin-template-option .el-checkbox__input {
+	margin-top: 2px;
+}
+
+.builtin-template-option .el-checkbox__label {
+	line-height: 1.35;
+}
+
 .template-param-input .el-textarea__inner {
 	height: 420px !important;
 	font-family: "SF Mono", Menlo, Consolas, monospace;

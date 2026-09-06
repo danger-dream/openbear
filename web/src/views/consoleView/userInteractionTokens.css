@@ -1,0 +1,15 @@
+.web-confirm-stack,
+.interaction-event {
+	--ob-interaction-surface: rgba(248, 250, 252, 0.98);
+	--ob-interaction-surface-strong: #ffffff;
+	--ob-interaction-surface-selected: #f2f6fb;
+	--ob-interaction-border: #dbe4ee;
+	--ob-interaction-border-strong: #7896bd;
+	--ob-interaction-ink: #1e293b;
+	--ob-interaction-muted: #64748b;
+	--ob-interaction-accent: #46678f;
+	--ob-interaction-accent-strong: #345477;
+	--ob-interaction-accent-soft: #edf3fa;
+	--ob-interaction-focus: rgba(70, 103, 143, 0.12);
+	--ob-interaction-shadow: 0 14px 42px rgba(15, 23, 42, 0.11);
+}

@@ -17,26 +17,41 @@
 
 - Debian、Ubuntu 或同系发行版
 - root + systemd
-- Python 3.11+（安装脚本可用 uv 自动准备）
+- `curl`（用于首次下载安装器）
+- Python 3.11+（目标机没有合适版本时，安装器会通过 uv 自动准备）
 - 一个 Telegram Bot，以及你自己的 Telegram 数字用户 ID
 - 至少一个可用的模型渠道（Base URL + API Key）
 
-发行包已包含前端构建产物，目标机不必再装 Node。
+发行包已包含前端构建产物，目标机不必再装 Node。只有强制走 git/源码且缺少构建产物时，安装器才会准备 Node。
 
 ## 安装
 
+先完整下载最新安装器，下载成功后再执行；临时文件会自动清理：
+
 ```bash
-bash <(curl -Ls https://github.com/danger-dream/openbear/releases/latest/download/install.sh)
+bash -c '
+  installer="$(mktemp)" || exit 1
+  trap "rm -f \"$installer\"" EXIT
+  curl -fSL --retry 3 -o "$installer" \
+    https://github.com/danger-dream/openbear/releases/latest/download/install.sh || exit $?
+  bash "$installer"
+'
 ```
 
-脚本会询问部署目录、Bot Token、Admin 的 Telegram 用户 ID、显示名，以及模型渠道。渠道会先探测并做一次对话测试，不通就不会继续装。
+脚本会先补齐 CA 证书和 Python 等最小安装引导，再询问部署目录、Bot Token、Admin 的 Telegram 用户 ID、显示名，以及模型渠道。渠道会先探测并做一次对话测试，不通就不会继续装。
 
 默认目录是 `/opt/openbear`，工作目录是其下的 `workspace`。装完后会生成 `openbear.json`（权限 `600`）、空数据库，并启动 `openbear.service`。
 
-本机若开着 `ufw` / `firewalld`，脚本会放行 Web 端口。云厂商安全组需要自己开。不想改防火墙：
+本机若开着 `ufw` / `firewalld`，脚本会放行 Web 端口。云厂商安全组需要自己开。不想改防火墙，可把环境变量传给同一下载命令：
 
 ```bash
-OPENBEAR_SKIP_FIREWALL=1 bash <(curl -Ls https://github.com/danger-dream/openbear/releases/latest/download/install.sh)
+OPENBEAR_SKIP_FIREWALL=1 bash -c '
+  installer="$(mktemp)" || exit 1
+  trap "rm -f \"$installer\"" EXIT
+  curl -fSL --retry 3 -o "$installer" \
+    https://github.com/danger-dream/openbear/releases/latest/download/install.sh || exit $?
+  bash "$installer"
+'
 ```
 
 ## 第一次登录
@@ -52,13 +67,35 @@ Telegram 用户 ID 不是 Bot Token，也不是 `@用户名`。可在 Telegram �
 
 ## 更新
 
-控制台左上角的版本号可以点开。有新发行版时会提示，确认后自动下载、校验并替换文件。配置、数据库、工作区和 skills 不会被覆盖。
+### 公开 v0.1.2 用户首次升级到 v0.2.0
 
-也可以再跑一次安装脚本，效果相同：
+等待 GitHub 的 `latest` 已显示 `v0.2.0` 后，按以下顺序做一次桥接升级：
+
+1. 先结束正在运行的主控/Agent 任务和待回答交互；这些进程内工作不能跨后端重启继续执行。
+2. **不要**先点 v0.1.2 控制台里的更新，也不要运行本地旧版 `/opt/openbear/scripts/install.sh`。第一次升级仍会执行机器上已有的旧更新逻辑，下载包里的修复不能反向保护已经启动的旧 updater。
+3. 重新完整下载 `latest` 的新 installer 并执行：
 
 ```bash
-bash /opt/openbear/scripts/install.sh
+bash -c '
+  installer="$(mktemp)" || exit 1
+  trap "rm -f \"$installer\"" EXIT
+  curl -fSL --retry 3 -o "$installer" \
+    https://github.com/danger-dream/openbear/releases/latest/download/install.sh || exit $?
+  bash "$installer"
+'
 ```
+
+4. 升级完成后手动刷新原来的 Web 页面。完成这次桥接后，后续版本可正常使用网页更新。
+
+新 installer 会保留 `openbear.json`、`data`、`workspace`、`skills` 和 MCP 安装目录。后端重启型升级会在旧服务停止后、切换新代码前，对配置中实际 `storage.dbPath` 创建 SQLite 一致性备份；路径会打印并保留在 `data/backups`。只有前端变化或旧数据库不存在时不会凭空创建备份。
+
+代码/依赖自动回滚**不会**自动用旧快照覆盖数据库，以免抹掉新版本已经写入的数据。如需人工恢复数据库备份，必须先停服务，并接受备份时间点之后的数据会丢失；使用过新版功能后也不能承诺旧代码理解所有新状态，降级前应先确认边界。
+
+升级不会覆盖已有的激活模板或用户自定义模板。希望采用新版模板时，请升级后在 Web 模板页显式导入/合并和激活，并在新会话中验证。v0.2.0 新增的 Telegram 待答交互通知默认开启，可在 Web 设置中关闭通知或 TG 回复能力。
+
+### 后续更新
+
+完成上述 v0.1.2 桥接后，控制台左上角的版本号会提示新发行版。确认后会自动下载、校验并替换文件；后端重启升级前会创建上述数据库备份。更新前仍应先结束运行中的任务和待回答交互，更新后刷新页面。
 
 安装目录里如果有未提交的源码改动，升级会拒绝执行。
 

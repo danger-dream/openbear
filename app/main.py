@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
-from app.bot import admin
+from app.bot import admin, interactions
 from app.bot.menu import setup_menu
 from app.bot.whitelist import WhitelistMiddleware
 from app.config import get_config
@@ -25,7 +25,9 @@ def build_dispatcher(svc: Services) -> Dispatcher:
     wl = WhitelistMiddleware(svc.config.telegram.whitelist_ids)
     dp.message.middleware(wl)
     dp.callback_query.middleware(wl)
-    # 只注册轻量管理 router。旧对话、媒体、渠道/设置/会话/工具面板不再接入 Dispatcher。
+    # Exact interaction replies must precede the admin settings text handler.
+    # This is not a general Telegram chat/Agent input route.
+    dp.include_router(interactions.router)
     dp.include_router(admin.router)
     return dp
 

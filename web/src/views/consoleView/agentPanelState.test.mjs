@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  agentEventIdentity,
   agentPanelDetailKey,
   decideAgentAutoOpen,
   normalizeAgentPanelIntents,
@@ -23,6 +24,22 @@ test("latest active Agent selection is stable by displaySeq then createdAt", () 
   assert.equal(selected.opId, "agent:newest");
   assert.equal(agentPanelDetailKey("conversation-1", "task-newest"), "agent-panel:conversation-1:task-newest");
 });
+
+test("AgentContinue tool operations participate in Agent auto-open with their new task identity", () => {
+  const continued = {
+    opId: "tool:continue", opType: "tool", displaySeq: 50, createdAtMs: 7000,
+    payload: {name: "AgentContinue", result: {task: {taskUuid: "task-continued"}}},
+  };
+  const decision = decideAgentAutoOpen({
+    conversationUuid: "conversation-1",
+    operations: [...operations, continued],
+    runState: {activeAgentOperationIds: ["tool:continue"]},
+    intents: {},
+  });
+  assert.equal(decision.action, "open");
+  assert.equal(decision.key, agentPanelDetailKey("conversation-1", "task-continued"));
+});
+
 
 test("auto-open uses stable task identity and respects an explicit closed latest task", () => {
   const latestKey = agentPanelDetailKey("conversation-1", "task-newest");
@@ -50,6 +67,18 @@ test("a new Agent task does not inherit an older task closed intent", () => {
   assert.equal(decision.intent, "auto");
   assert.equal(decision.key, agentPanelDetailKey("conversation-1", "task-newest"));
 });
+
+test("two turns of one instance still keep independent task panel identities", () => {
+  const first = {livePayload: {task: {taskUuid: "task-turn-1", agentId: "agent-a", sessionTurn: 1}}};
+  const second = {livePayload: {task: {taskUuid: "task-turn-2", agentId: "agent-a", sessionTurn: 2}}};
+  assert.equal(agentEventIdentity(first), "task-turn-1");
+  assert.equal(agentEventIdentity(second), "task-turn-2");
+  assert.notEqual(
+    agentPanelDetailKey("conversation-1", agentEventIdentity(first)),
+    agentPanelDetailKey("conversation-1", agentEventIdentity(second)),
+  );
+});
+
 
 test("missing active Agent requests one pending hydration consumption", () => {
   const decision = decideAgentAutoOpen({

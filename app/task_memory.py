@@ -21,7 +21,8 @@ from app.utils import estimate_tokens, now_cn
 
 SCOPE_CONVERSATION = "conversation"
 SCOPE_AGENT_TASK = "agent_task"
-TASK_MEMORY_SCOPES = frozenset({SCOPE_CONVERSATION, SCOPE_AGENT_TASK})
+SCOPE_AGENT_SESSION = "agent_session"
+TASK_MEMORY_SCOPES = frozenset({SCOPE_CONVERSATION, SCOPE_AGENT_TASK, SCOPE_AGENT_SESSION})
 
 TASK_MEMORY_NAME_MAX_CHARS = 80
 TASK_MEMORY_DESCRIPTION_MAX_CHARS = 200
@@ -253,10 +254,10 @@ def _validate_scope(scope_type: str, task_uuid: str) -> tuple[str, str]:
     scope = _text(scope_type).strip()
     task = _text(task_uuid).strip()
     if scope not in TASK_MEMORY_SCOPES:
-        raise TaskMemoryValidationError("invalid_scope_type", "scope_type must be conversation or agent_task")
+        raise TaskMemoryValidationError("invalid_scope_type", "scope_type must be conversation, agent_task or agent_session")
     if scope == SCOPE_CONVERSATION and task:
         raise TaskMemoryValidationError("invalid_task_scope", "conversation memory cannot bind a task")
-    if scope == SCOPE_AGENT_TASK and not task:
+    if scope in {SCOPE_AGENT_TASK, SCOPE_AGENT_SESSION} and not task:
         raise TaskMemoryValidationError("task_uuid_required", "agent_task memory requires the current task")
     return scope, task
 
@@ -285,7 +286,9 @@ def _row_dict(row: Any, *, include_body: bool) -> dict[str, Any]:
         "memoryUuid": _text(data.get("memory_uuid")),
         "conversationUuid": _text(data.get("conversation_uuid")),
         "scopeType": _text(data.get("scope_type")),
-        "taskUuid": _text(data.get("task_uuid")),
+        "taskUuid": _text(data.get("task_uuid")) if data.get("scope_type") != SCOPE_AGENT_SESSION else "",
+        "agentSessionUuid": _text(data.get("task_uuid")) if data.get("scope_type") == SCOPE_AGENT_SESSION else "",
+        "sourceTaskUuid": _text(data.get("source_run_uuid")) if data.get("scope_type") == SCOPE_AGENT_SESSION else "",
         "name": _text(data.get("name")),
         "description": _text(data.get("description")),
         "autoReinjectCatalog": bool(data.get("auto_reinject_catalog")),
@@ -308,6 +311,22 @@ class TaskMemoryDAO:
     def __init__(self, db: DB) -> None:
         self.db = db
 
+    async def agent_scope(self, conversation_uuid: str, task_uuid: str) -> tuple[str, str]:
+        """Resolve the private owner from runtime task identity, never model input.
+
+        The historical task_uuid storage column is a scope owner key; for the
+        new agent_session scope it stores the instance UUID. Source task remains
+        in source_run_uuid and public output names the owner unambiguously.
+        """
+        cur = await self.db.conn.execute(
+            """SELECT s.session_uuid FROM rath_tasks t JOIN rath_agent_sessions s
+               ON t.agent_session_uuid=s.session_uuid WHERE t.task_uuid=?
+               AND t.parent_session_uuid=? AND s.openbear_session_uuid=? AND s.session_kind='independent'""",
+            (task_uuid, conversation_uuid, conversation_uuid),
+        )
+        row = await cur.fetchone()
+        return (SCOPE_AGENT_SESSION, str(row[0])) if row else (SCOPE_AGENT_TASK, task_uuid)
+
     async def _scope_usage(self, conn: Any, conversation_uuid: str, scope_type: str, task_uuid: str) -> tuple[int, int]:
         cur = await conn.execute(
             """
@@ -326,7 +345,7 @@ class TaskMemoryDAO:
             """
             SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0) AS body_bytes
             FROM conversation_task_memories
-            WHERE conversation_uuid=? AND scope_type='agent_task' AND deleted_at=0
+            WHERE conversation_uuid=? AND scope_type IN ('agent_task','agent_session') AND deleted_at=0
             """,
             (conversation_uuid,),
         )
@@ -353,7 +372,7 @@ class TaskMemoryDAO:
                 "task_memory_scope_body_quota",
                 f"scope body total exceeds {TASK_MEMORY_SCOPE_BODY_MAX_BYTES} bytes",
             )
-        if scope_type == SCOPE_AGENT_TASK:
+        if scope_type in {SCOPE_AGENT_TASK, SCOPE_AGENT_SESSION}:
             agent_bytes = await self._agent_conversation_bytes(conn, conversation_uuid)
             next_agent_bytes = agent_bytes - replacing_body_bytes + body_bytes
             if next_agent_bytes > TASK_MEMORY_AGENT_CONVERSATION_BODY_MAX_BYTES:
@@ -736,7 +755,7 @@ class TaskMemoryDAO:
             SELECT {_TASK_MEMORY_LIST_COLUMNS}
             FROM conversation_task_memories
             WHERE {' AND '.join(clauses)}
-            ORDER BY revision DESC, updated_at DESC, memory_uuid ASC
+            ORDER BY updated_at DESC, memory_uuid ASC
             LIMIT ?
             """,
             (*params, max(1, min(int(limit or TASK_MEMORY_CATALOG_MAX_ITEMS), TASK_MEMORY_CATALOG_MAX_ITEMS))),
@@ -778,6 +797,8 @@ class TaskMemoryDAO:
         new_conversation_uuid: str,
         task_uuid_map: dict[str, str],
         *,
+        agent_session_map: dict[str, str] | None = None,
+        memory_uuid_map: dict[str, str] | None = None,
         conn: Any | None = None,
     ) -> int:
         target = conn or self.db.conn
@@ -790,8 +811,9 @@ class TaskMemoryDAO:
         for raw in await cur.fetchall():
             row = dict(raw)
             old_task = _text(row.get("task_uuid"))
-            if row.get("scope_type") == SCOPE_AGENT_TASK:
-                new_task = _text(task_uuid_map.get(old_task)).strip()
+            if row.get("scope_type") in {SCOPE_AGENT_TASK, SCOPE_AGENT_SESSION}:
+                owners = (agent_session_map or {}) if row.get("scope_type") == SCOPE_AGENT_SESSION else task_uuid_map
+                new_task = _text(owners.get(old_task)).strip()
                 if not new_task:
                     continue
             else:
@@ -807,7 +829,7 @@ class TaskMemoryDAO:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    f"mem_{uuid.uuid4().hex}", _text(new_conversation_uuid).strip(),
+                    (memory_uuid_map or {}).get(str(row.get("memory_uuid"))) or f"mem_{uuid.uuid4().hex}", _text(new_conversation_uuid).strip(),
                     row.get("scope_type"), new_task, row.get("name"), row.get("description"), row.get("body"),
                     row.get("auto_reinject_catalog"), row.get("visible_to_agents"), row.get("revision"),
                     "duplicate", row.get("source_turn_uuid"),
@@ -971,6 +993,7 @@ async def task_memory_catalog_snapshot(
     conversation_uuid: str,
     task_uuid: str = "",
     for_agent: bool = False,
+    private_scope: tuple[str, str] | None = None,
 ) -> TaskMemoryCatalogSnapshot:
     """Build a deterministic effective catalog without loading memory bodies."""
     conversation = _text(conversation_uuid).strip()
@@ -982,11 +1005,12 @@ async def task_memory_catalog_snapshot(
             scope_type=SCOPE_CONVERSATION,
             visible_to_agents_only=for_agent,
         )
-        if for_agent and _text(task_uuid).strip():
+        if for_agent and (_text(task_uuid).strip() or private_scope):
+            resolved_scope, private_owner = private_scope or await dao.agent_scope(conversation, _text(task_uuid).strip())
             own = await dao.catalog_rows(
                 conversation_uuid=conversation,
-                scope_type=SCOPE_AGENT_TASK,
-                task_uuid=_text(task_uuid).strip(),
+                scope_type=resolved_scope,
+                task_uuid=private_owner,
             )
     all_items = sorted(
         [
@@ -1061,12 +1085,14 @@ async def task_memory_catalog_xml(
     conversation_uuid: str,
     task_uuid: str = "",
     for_agent: bool = False,
+    private_scope: tuple[str, str] | None = None,
 ) -> str:
     snapshot = await task_memory_catalog_snapshot(
         dao,
         conversation_uuid=conversation_uuid,
         task_uuid=task_uuid,
         for_agent=for_agent,
+        private_scope=private_scope,
     )
     return snapshot.catalog_xml
 

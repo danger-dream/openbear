@@ -5,8 +5,8 @@ const api = axios.create({ baseURL: "/api", timeout: 30000 });
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error?.response?.status === 401) {
-      window.location.href = "/login";
+    if (error?.response?.status === 401 && window.location.pathname !== "/login") {
+      window.location.replace("/login");
       return Promise.reject(error);
     }
     return Promise.reject(error);
@@ -18,6 +18,7 @@ function unwrap(response) {
 }
 
 export const Api = {
+  authSession: () => api.get("/auth/session").then(unwrap),
   loginStart: (secret) => api.post("/auth/login/start", { secret }).then(unwrap),
   loginStatus: (requestUuid) => api.get(`/auth/login/status/${requestUuid}`).then(unwrap),
   consumeLogin: (requestUuid) => api.post(`/auth/login/consume/${requestUuid}`).then(unwrap),
@@ -77,6 +78,7 @@ export const Api = {
 
   templates: () => api.get("/memory/templates").then(unwrap),
   createTemplate: (data) => api.post("/memory/templates", data).then(unwrap),
+  importBuiltinTemplates: (kinds) => api.post("/memory/templates/import-builtin", { kinds }).then(unwrap),
   updateTemplate: (id, data) => api.put(`/memory/templates/${id}`, data).then(unwrap),
   deleteTemplate: (id) => api.delete(`/memory/templates/${id}`).then(unwrap),
   reorder: (kind, items) => api.post("/memory/reorder", { kind, items }).then(unwrap),
@@ -143,6 +145,7 @@ export const Api = {
   trialRathAgent: (id, instruction) => api.post(`/rath/agents/${id}/trial`, { instruction }, { timeout: 60000 }).then(unwrap),
   deleteRathAgent: (id) => api.delete(`/rath/agents/${id}`).then(unwrap),
   rathTaskPlan: (conversationUuid, taskUuid) => api.get(`/conversations/${encodeURIComponent(conversationUuid)}/agents/${encodeURIComponent(taskUuid)}/plan`).then(unwrap),
+  rathAgentInstance: (conversationUuid, taskUuid) => api.get(`/conversations/${encodeURIComponent(conversationUuid)}/agents/${encodeURIComponent(taskUuid)}/instance`).then(unwrap),
   rathTaskEvents: (conversationUuid, taskUuid, { beforeSeq = 0, afterSeq = 0, limit = 20 } = {}) => api.get(
     `/conversations/${encodeURIComponent(conversationUuid)}/agents/${encodeURIComponent(taskUuid)}/events`,
     { params: { beforeSeq, afterSeq, limit } },

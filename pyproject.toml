@@ -1,6 +1,6 @@
 [project]
 name = "openbear"
-version = "0.1.2"
+version = "0.2.0"
 description = "单人自用 Agent Web 控制台：多协议接入 Parrot（anthropic/chat/responses）+ 工具 + skills + Web 记忆系统"
 requires-python = ">=3.11"
 dependencies = [
@@ -50,3 +50,4 @@ packages = { find = { include = ["app*"] } }
 
 [tool.setuptools.package-data]
 app = ["models_dev_overrides.json"]
+"app.db" = ["*.sql"]

@@ -9,6 +9,7 @@ from typing import Any
 import aiosqlite
 
 from app.db.engine import DB, now_ts
+from app.rath.continuity import AgentContinuityDAO
 from app.rath.schemas import (
     ACTIVE_TASK_STATUSES,
     CONTROLLABLE_TASK_STATUSES,
@@ -45,7 +46,7 @@ def _row_dict(row: aiosqlite.Row | None) -> dict[str, Any] | None:
     return {k: row[k] for k in row.keys()} if row is not None else None
 
 
-class RathDAO:
+class RathDAO(AgentContinuityDAO):
     def __init__(self, db: DB) -> None:
         self._db = db
 
@@ -282,7 +283,7 @@ class RathDAO:
         cur = await self._db.conn.execute(
             """
             SELECT * FROM rath_agent_sessions
-            WHERE openbear_session_uuid=? AND workflow_uuid=? AND agent_key=? AND status='active'
+            WHERE openbear_session_uuid=? AND workflow_uuid=? AND agent_key=? AND status='active' AND session_kind='legacy'
             ORDER BY updated_at DESC, id DESC
             LIMIT 1
             """,
@@ -325,7 +326,7 @@ class RathDAO:
             cur = await self._db.conn.execute(
                 """
                 SELECT * FROM rath_agent_sessions
-                WHERE openbear_session_uuid=? AND workflow_uuid=? AND agent_key=? AND status='active'
+                WHERE openbear_session_uuid=? AND workflow_uuid=? AND agent_key=? AND status='active' AND session_kind='legacy'
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 1
                 """,
@@ -385,6 +386,8 @@ class RathDAO:
         session = await self.agent_session(session_uuid)
         if session is None:
             return
+        if session.session_kind == "independent" and session.active_task_uuid != task_uuid:
+            return
         ts = now_ts()
         next_summary = session.summary
         if summary_delta.strip():
@@ -400,9 +403,9 @@ class RathDAO:
             """
             UPDATE rath_agent_sessions
             SET summary=?, last_task_uuid=?, metadata_json=?, updated_at=?
-            WHERE session_uuid=?
+            WHERE session_uuid=? AND (session_kind='legacy' OR active_task_uuid=?)
             """,
-            (next_summary, task_uuid, _json_dumps(merged_meta), ts, session_uuid),
+            (next_summary, task_uuid, _json_dumps(merged_meta), ts, session_uuid, task_uuid),
         )
         await self._db.conn.commit()
 
@@ -451,6 +454,12 @@ class RathDAO:
         return RathAgentSession(
             id=int(d["id"]),
             session_uuid=d["session_uuid"],
+            session_kind=d.get("session_kind") or "legacy",
+            active_task_uuid=d.get("active_task_uuid") or "",
+            context_task_uuid=d.get("context_task_uuid") or "",
+            context_revision=int(d.get("context_revision") or 0),
+            revision=int(d.get("revision") or 0),
+            turn_count=int(d.get("turn_count") or 0),
             openbear_session_uuid=d["openbear_session_uuid"] or "",
             chat_id=int(d["chat_id"] or 0),
             workflow_uuid=d["workflow_uuid"] or "",
@@ -487,6 +496,17 @@ class RathDAO:
         tid = task_uuid or _new_uuid()
         turn = str(turn_uuid or "").strip()
         root_turn = str(run_root_turn_uuid or turn or "").strip()
+        session = await self.agent_session(agent_session_uuid) if agent_session_uuid else None
+        if session and session.session_kind == "independent":
+            return await self._create_instance_task(
+                task_uuid=tid, session_uuid=agent_session_uuid,
+                values={"chat_id": chat_id, "parent_session_uuid": parent_session_uuid,
+                        "caller_agent_session_uuid": caller_agent_session_uuid,
+                        "parent_task_uuid": str(parent_task_uuid or ""), "workflow_uuid": workflow_uuid,
+                        "title": title, "status": status, "input": input_data or {},
+                        "turn_uuid": turn, "parent_turn_uuid": str(parent_turn_uuid or ""),
+                        "run_root_turn_uuid": root_turn},
+            )
         await self._db.conn.execute(
             """
             INSERT INTO rath_tasks (
@@ -516,38 +536,43 @@ class RathDAO:
         session_id: str,
         state: dict[str, Any],
     ) -> int:
-        """Durably checkpoint one task's private provider continuation state."""
+        """Commit a private checkpoint and its instance head as one write unit."""
         ts = now_ts()
-        await self._db.conn.execute(
-            """
-            INSERT INTO rath_task_model_contexts (
-              task_uuid, protocol, model, session_id, state_json, revision, created_at, updated_at
-            ) VALUES (?,?,?,?,?,1,?,?)
-            ON CONFLICT(task_uuid) DO UPDATE SET
-              protocol=excluded.protocol,
-              model=excluded.model,
-              session_id=excluded.session_id,
-              state_json=excluded.state_json,
-              revision=rath_task_model_contexts.revision+1,
-              updated_at=excluded.updated_at
-            """,
-            (
-                str(task_uuid or ""),
-                str(protocol or ""),
-                str(model or ""),
-                str(session_id or ""),
-                _json_dumps(state),
-                ts,
-                ts,
-            ),
-        )
-        await self._db.conn.commit()
-        cur = await self._db.conn.execute(
-            "SELECT revision FROM rath_task_model_contexts WHERE task_uuid=?",
-            (task_uuid,),
-        )
-        row = await cur.fetchone()
-        return int(row["revision"] or 0) if row else 0
+        async with self._db.write_transaction(label="agent_context_checkpoint") as conn:
+            cur = await conn.execute(
+                "SELECT s.* FROM rath_agent_sessions s JOIN rath_tasks t ON t.agent_session_uuid=s.session_uuid WHERE t.task_uuid=?",
+                (task_uuid,),
+            )
+            session = await cur.fetchone()
+            if session and session["session_kind"] == "independent" and session["active_task_uuid"] != task_uuid:
+                raise RuntimeError("A stale runner cannot overwrite this Agent instance context")
+            await conn.execute(
+                """INSERT INTO rath_task_model_contexts
+                   (task_uuid,protocol,model,session_id,state_json,revision,created_at,updated_at)
+                   VALUES (?,?,?,?,?,1,?,?)
+                   ON CONFLICT(task_uuid) DO UPDATE SET protocol=excluded.protocol,model=excluded.model,
+                   session_id=excluded.session_id,state_json=excluded.state_json,
+                   revision=rath_task_model_contexts.revision+1,updated_at=excluded.updated_at""",
+                (task_uuid, protocol, model, session_id, _json_dumps(state), ts, ts),
+            )
+            cur = await conn.execute("SELECT revision FROM rath_task_model_contexts WHERE task_uuid=?", (task_uuid,))
+            row = await cur.fetchone()
+            revision = int(row[0])
+            # A task-history cleanup can leave the current head intentionally
+            # retained. Once a newer reliable head exists, retire that orphan.
+            if session and session["session_kind"] == "independent":
+                previous = str(session["context_task_uuid"] or "")
+                if previous and previous != task_uuid:
+                    await conn.execute(
+                        "DELETE FROM rath_task_model_contexts WHERE task_uuid=? AND NOT EXISTS (SELECT 1 FROM rath_tasks WHERE task_uuid=?)",
+                        (previous, previous),
+                    )
+            await conn.execute(
+                """UPDATE rath_agent_sessions SET context_task_uuid=?,context_revision=?,
+                   revision=revision+1,updated_at=? WHERE session_kind='independent' AND active_task_uuid=?""",
+                (task_uuid, revision, ts, task_uuid),
+            )
+        return revision
 
     async def task_model_context(self, task_uuid: str) -> dict[str, Any] | None:
         cur = await self._db.conn.execute(
@@ -646,7 +671,10 @@ class RathDAO:
             ("events", "rath_task_events"),
         ):
             cur = await self._db.conn.execute(
-                f"DELETE FROM {table} WHERE task_uuid IN ({placeholders})",
+                f"DELETE FROM {table} WHERE task_uuid IN ({placeholders})" + (
+                    " AND task_uuid NOT IN (SELECT context_task_uuid FROM rath_agent_sessions WHERE status='active' AND session_kind='independent')"
+                    if table == "rath_task_model_contexts" else ""
+                ),
                 params,
             )
             deleted[key] = int(cur.rowcount or 0)
@@ -658,8 +686,19 @@ class RathDAO:
         return {**empty, **deleted}
 
     async def delete_task_records_for_chat(self, chat_id: int) -> dict[str, int]:
-        """Delete Rath tasks and all task-owned child rows for a chat."""
-        return await self.delete_task_records(await self.task_uuids_for_chat(chat_id))
+        """Whole-conversation deletion also removes instance-owned retained data."""
+        contexts = await self._db.conn.execute(
+            "DELETE FROM rath_task_model_contexts WHERE task_uuid IN (SELECT context_task_uuid FROM rath_agent_sessions WHERE chat_id=?)",
+            (chat_id,),
+        )
+        memories = await self._db.conn.execute(
+            "DELETE FROM conversation_task_memories WHERE scope_type='agent_session' AND task_uuid IN (SELECT session_uuid FROM rath_agent_sessions WHERE chat_id=?)",
+            (chat_id,),
+        )
+        result = await self.delete_task_records(await self.task_uuids_for_chat(chat_id))
+        result["modelContexts"] += max(0, int(contexts.rowcount or 0))
+        result["taskMemories"] += max(0, int(memories.rowcount or 0))
+        return result
 
     async def task_usage_totals(
         self,
@@ -857,13 +896,15 @@ class RathDAO:
             where += f" AND status NOT IN ({','.join('?' for _ in terminal)})"
             params.extend(terminal)
         sql = f"UPDATE rath_tasks SET {', '.join(fields)} WHERE {where}"
-        if str(status or "") in {"failed", "cancelled", "interrupted"}:
+        if str(status or "") in TERMINAL_TASK_STATUSES:
+            # Task termination and instance ownership release are one commit unit.
             # The task CAS and its Plan terminal projection are one commit unit.
             # Every manager/runner/Agent path already funnels through update_task,
             # so centralizing here also covers stale cleanup and stop controls.
             async with self._db.plan_transaction() as conn:
                 cur = await conn.execute(sql, tuple(params))
                 if cur.rowcount:
+                    await self.release_agent_task(conn, task_uuid, ts)
                     await self.finalize_task_plan_terminal(
                         conn,
                         task_uuid,
@@ -899,6 +940,7 @@ class RathDAO:
                 """
             )
             for row in await terminal_rows.fetchall():
+                await self.release_agent_task(conn, str(row["task_uuid"] or ""), ts)
                 await self.finalize_task_plan_terminal(
                     conn,
                     str(row["task_uuid"] or ""),

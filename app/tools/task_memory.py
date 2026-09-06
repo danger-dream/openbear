@@ -90,10 +90,11 @@ class TaskMemoryTool:
         ctx, conversation_uuid, _ = self._context()
         if not conversation_uuid or not str(ctx.task_uuid or "").strip():
             raise TaskMemoryNotFound()
+        private_scope, private_owner = await self.dao.agent_scope(conversation_uuid, str(ctx.task_uuid).strip())
         own = await self.dao.list(
             conversation_uuid=conversation_uuid,
-            scope_type=SCOPE_AGENT_TASK,
-            task_uuid=str(ctx.task_uuid).strip(),
+            scope_type=private_scope,
+            task_uuid=private_owner,
             query=query,
             include_deleted=bool(args.get("includeDeleted")),
             offset=int(args.get("offset") or 0),
@@ -109,20 +110,21 @@ class TaskMemoryTool:
                 offset=int(args.get("offset") or 0),
                 limit=int(args.get("limit") or 50),
             )
-        return {"ok": True, "scope": "current_agent_task", "own": own, "sharedConversation": shared}
+        return {"ok": True, "scope": f"current_{private_scope}", "own": own, "sharedConversation": shared}
 
     async def _get_agent(self, memory_uuid: str) -> dict[str, Any]:
         ctx, conversation_uuid, _ = self._context()
         if not conversation_uuid or not str(ctx.task_uuid or "").strip():
             raise TaskMemoryNotFound()
+        private_scope, private_owner = await self.dao.agent_scope(conversation_uuid, str(ctx.task_uuid).strip())
         try:
             item = await self.dao.get(
                 memory_uuid,
                 conversation_uuid=conversation_uuid,
-                scope_type=SCOPE_AGENT_TASK,
-                task_uuid=str(ctx.task_uuid).strip(),
+                scope_type=private_scope,
+                task_uuid=private_owner,
             )
-            return {"ok": True, "scope": "current_agent_task", "memory": item}
+            return {"ok": True, "scope": f"current_{private_scope}", "memory": item}
         except TaskMemoryNotFound:
             item = await self.dao.get(
                 memory_uuid,
@@ -137,6 +139,8 @@ class TaskMemoryTool:
         ctx, conversation_uuid, is_agent = self._context()
         scope_type = SCOPE_AGENT_TASK if is_agent else SCOPE_CONVERSATION
         task_uuid = str(ctx.task_uuid or "").strip() if is_agent else ""
+        if is_agent and task_uuid and conversation_uuid:
+            scope_type, task_uuid = await self.dao.agent_scope(conversation_uuid, task_uuid)
         actor = f"agent:{ctx.agent_key}" if is_agent else "main-controller"
         memory_uuid = str(args.get("memoryUuid") or "").strip()
         mutation = action in {"create", "update", "delete", "restore"}
@@ -330,9 +334,12 @@ def register_task_memory_tool(registry: ToolRegistry, dao: TaskMemoryDAO) -> Non
     registry.add(
         "TaskMemory",
         (
-            "Manage memory scoped to the current conversation or current Agent task. Identity is runtime-derived: "
-            "main controllers manage only the current conversation; child Agents manage only their current task and "
-            "may read explicitly shared conversation memory. list/search omit body; use get for body."
+            "Working memory preserved across context compaction. Main controllers own current-conversation memory; "
+            "child Agents own their independent instance memory across successive task rounds, or task-local memory "
+            "for legacy tasks. Identity is runtime-derived, never supplied by the model. Agents may also read "
+            "explicitly shared conversation memory, but cannot modify it or access another instance's private memory. "
+            "list/search return body-free locators; use get for content. Preserve key decisions and execution state "
+            "when it supports reliable continuity; do not copy routine logs or entire transcripts."
         ),
         {
             "type": "object",

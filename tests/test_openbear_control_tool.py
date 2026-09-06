@@ -421,3 +421,22 @@ async def test_openbear_control_mcp_reload_allowed_from_web_after_confirmation_b
     assert result["action"] == "mcp_reload"
     assert result["sensitiveConfigHidden"] is True
     assert svc.mcp_reload_called == 1
+
+
+@pytest.mark.parametrize("action", ["restart", "new", "stop", "mcp_reload"])
+async def test_openbear_control_feedback_never_executes_even_legacy_confirmed_true(action):
+    svc = FakeSvc()
+    text = "先别执行；保留我的完整意见。\n" * 40
+
+    async def web_confirm(payload):
+        assert payload["_requiresAuthorization"] is True
+        return {"status": "answered", "confirmed": True, "text": text}
+
+    result = json.loads(await _reg(svc).dispatch(
+        "OpenBearControl", json.dumps({"action": action}), max_chars=64,
+        context=ToolRuntimeContext(chat_id=-1, source="web", web_confirm=web_confirm),
+    ))
+    assert result["status"] == "cancelled"
+    assert result["confirmation"]["text"] == text
+    assert svc.control_actions.pending_count(-1) == 0
+    assert svc.mcp_reload_called == 0

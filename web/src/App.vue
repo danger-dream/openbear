@@ -21,6 +21,7 @@ import {
 } from "./conversationOrdering.js";
 import { dragAutoScrollOptions } from "./utils/dragScroll";
 import {documentTitle as browserDocumentTitle} from "./pageTitle.js";
+import { frontendMismatch } from "./versionSync.js";
 
 const nav = [
   { key: "memory", label: "记忆管理", icon: "Collection", component: MemoryView },
@@ -61,6 +62,10 @@ const versionUpdating = ref(false);
 const isLoginPath = window.location.pathname === "/login";
 const VERSION_POLL_MS = 30000;
 let versionPollTimer = null;
+let versionRequestInFlight = false;
+let refreshPromptOpen = false;
+let lastPromptedFrontend = "";
+const frontendRefreshRequired = ref(false);
 const releaseNotes = computed(() => {
   const raw = String(versionInfo.value?.latest?.body || "");
   return raw.replace(/^生效方式预告：[^\n]*\n*/u, "").trim();
@@ -584,11 +589,51 @@ function resultBanner(result) {
   return "";
 }
 
+async function requestFrontendRefresh() {
+  if (isLoginPath || refreshPromptOpen) return;
+  refreshPromptOpen = true;
+  try {
+    await ElMessageBox.confirm(
+      "服务已更新，请刷新以载入配套前端。聊天文字草稿沿用浏览器本地保存；未提交的附件、交互答案和设置请先保存或复制。不会自动刷新当前页面。",
+      "前端版本已变化",
+      { confirmButtonText: "已处理未提交内容，刷新", cancelButtonText: "保留当前编辑", type: "info", closeOnClickModal: false },
+    );
+    await nextTick(); // Flush the existing console draft watcher before navigation.
+    window.location.reload();
+  } catch { /* Keep mounted views and their unsubmitted input intact. */ }
+  finally { refreshPromptOpen = false; }
+}
+
+function observeFrontendVersion(data) {
+  const mismatch = frontendMismatch(data);
+  if (mismatch === null) return;
+  frontendRefreshRequired.value = Boolean(mismatch);
+  if (!mismatch) lastPromptedFrontend = "";
+  else if (mismatch !== lastPromptedFrontend) {
+    lastPromptedFrontend = mismatch;
+    void requestFrontendRefresh();
+  }
+}
+
+function checkVersionOnResume() {
+  if (!isLoginPath && document.visibilityState === "visible") void loadVersionInfo();
+}
+
+function handlePreloadError(event) {
+  if (isLoginPath) return;
+  event.preventDefault();
+  frontendRefreshRequired.value = true;
+  void requestFrontendRefresh();
+}
+
 async function loadVersionInfo() {
+  if (isLoginPath || versionRequestInFlight) return;
+  versionRequestInFlight = true;
   try {
     const data = await Api.systemVersion();
     versionInfo.value = data;
     appVersion.value = data.version || "";
+    observeFrontendVersion(data);
     const banner = resultBanner(data.lastResult);
     if (banner && !versionUpdating.value) {
       const status = data.lastResult?.status;
@@ -602,19 +647,10 @@ async function loadVersionInfo() {
     }
     if (versionUpdating.value) {
       const phase = data.phase || "idle";
-      if (data.version && data.latest?.version && data.version === data.latest.version && !data.updateAvailable) {
+      if (["idle", "done"].includes(phase) && data.lastResult?.status === "success"
+        && data.lastResult.toVersion === data.version) {
         versionUpdating.value = false;
-        ElMessage.success(data.lastResult?.message || `已更新到 v${data.version}`);
-        if (data.lastResult?.status === "success" && data.lastResult?.requiresRestart === false) {
-          try {
-            await ElMessageBox.confirm("前端已更新，刷新页面即可生效。", "刷新页面", {
-              confirmButtonText: "刷新",
-              cancelButtonText: "稍后",
-              type: "success",
-            });
-            window.location.reload();
-          } catch { /* later */ }
-        }
+        ElMessage.success(data.lastResult.message || `已更新到 v${data.version}`);
       } else if (["idle", "done"].includes(phase) && data.lastResult && ["rolled_back", "failed"].includes(data.lastResult.status)) {
         versionUpdating.value = false;
         ElMessage.error(data.lastResult.message || "更新失败");
@@ -622,10 +658,13 @@ async function loadVersionInfo() {
     }
   } catch {
     if (!appVersion.value) appVersion.value = "";
+  } finally {
+    versionRequestInFlight = false;
   }
 }
 
 function scheduleVersionPoll() {
+  if (isLoginPath) return;
   if (versionPollTimer) window.clearTimeout(versionPollTimer);
   const delay = versionUpdating.value ? 2000 : VERSION_POLL_MS;
   versionPollTimer = window.setTimeout(() => {
@@ -708,9 +747,15 @@ onMounted(() => {
   window.addEventListener("scroll", closeConversationMenu, true);
   window.addEventListener("resize", closeConversationMenu);
   window.addEventListener("keydown", handleConversationMenuKeydown);
-  void loadConversations();
-  scheduleConversationsRefresh(CONVERSATION_REFRESH_IDLE_MS);
-  void loadVersionInfo().finally(scheduleVersionPoll);
+  if (!isLoginPath) {
+    void loadConversations();
+    scheduleConversationsRefresh(CONVERSATION_REFRESH_IDLE_MS);
+    void loadVersionInfo().finally(scheduleVersionPoll);
+    window.addEventListener("focus", checkVersionOnResume);
+    window.addEventListener("pageshow", checkVersionOnResume);
+    document.addEventListener("visibilitychange", checkVersionOnResume);
+    window.addEventListener("vite:preloadError", handlePreloadError);
+  }
 });
 onBeforeUnmount(() => {
   window.removeEventListener("popstate", applyRouteFromLocation);
@@ -721,6 +766,10 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", handleConversationMenuKeydown);
   if (conversationsRefreshTimer) window.clearTimeout(conversationsRefreshTimer);
   if (versionPollTimer) window.clearTimeout(versionPollTimer);
+  window.removeEventListener("focus", checkVersionOnResume);
+  window.removeEventListener("pageshow", checkVersionOnResume);
+  document.removeEventListener("visibilitychange", checkVersionOnResume);
+  window.removeEventListener("vite:preloadError", handlePreloadError);
 });
 </script>
 
@@ -943,6 +992,12 @@ onBeforeUnmount(() => {
     </Teleport>
 
     <main class="app-main flex-1 min-w-0 flex flex-col bg-macbg text-mactext">
+      <el-alert v-if="frontendRefreshRequired" type="info" :closable="false" show-icon class="shrink-0" data-testid="frontend-refresh-required">
+        <template #title>
+          页面版本已过期，请先处理未提交内容，再刷新以免接口不兼容。
+          <el-button link type="primary" @click="requestFrontendRefresh">刷新页面</el-button>
+        </template>
+      </el-alert>
       <ConsoleView
         v-if="active === 'console'"
         :conversation-uuid="activeConversationUuid"

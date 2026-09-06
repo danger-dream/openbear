@@ -56,14 +56,15 @@ function normalizeAction(...values) {
 
 function normalizeInteractionStatus(summary, result, operationStatus) {
 	const raw = text(summary.interactionStatus || summary.status || result.interactionStatus || result.status).trim().toLowerCase();
-	if (["answered", "cancelled", "timeout", "error", "pending"].includes(raw)) return raw;
+	if (["answered", "cancelled", "interrupted", "timeout", "error", "pending"].includes(raw)) return raw;
 	if (raw === "canceled") return "cancelled";
 	if (["timed_out", "timedout", "expired"].includes(raw)) return "timeout";
 	if (["failed", "errored"].includes(raw)) return "error";
 	if (result.cancelled === true) return "cancelled";
 	if (Object.keys(result).length) return result.error ? "error" : "answered";
 	const op = text(operationStatus).trim().toLowerCase();
-	if (["cancelled", "canceled", "interrupted"].includes(op)) return "cancelled";
+	if (op === "interrupted") return "interrupted";
+	if (["cancelled", "canceled"].includes(op)) return "cancelled";
 	if (op === "failed") return "error";
 	if (TERMINAL_OPERATION_STATUSES.has(op)) return "answered";
 	return "pending";
@@ -76,24 +77,41 @@ const ACTION_META = {
 	questionnaire: {name: "问卷", fallbackTitle: "需求问卷"},
 };
 
-function confirmPolarity(result, summary) {
-	for (const source of [result, summary]) {
-		if (!source || typeof source !== "object") continue;
-		if (source.confirmed === true || source.choice === "confirm") return true;
-		if (source.confirmed === false || source.choice === "cancel") return false;
+function confirmDecision(result, summary) {
+	const sources = [result, summary].filter((source) => source && typeof source === "object");
+	if (sources.some((source) => text(source.decision || source.choice).trim().toLowerCase() === "feedback")) return "feedback";
+	if (sources.some((source) => text(source.text).trim().length > 0)) return "feedback";
+	for (const source of sources) {
+		const decision = text(source.decision || source.choice).trim().toLowerCase();
+		if (decision === "confirm") return "confirm";
+		if (["reject", "cancel"].includes(decision)) return "reject";
 	}
-	return null;
+	for (const source of sources) {
+		if (source.confirmed === true) return "confirm";
+		if (source.confirmed === false) return "reject";
+	}
+	return "";
+}
+
+function normalizedSource(result, summary) {
+	for (const value of [result?.source, summary?.source]) {
+		const source = text(value).trim().toLowerCase();
+		if (["web", "telegram"].includes(source)) return source;
+	}
+	return "";
 }
 
 function outcome(action, status, result, sensitive, summary = {}) {
 	if (status === "pending") return {key: "pending", label: "等待回答", tone: "waiting"};
 	if (status === "cancelled") return {key: "cancelled", label: "已取消", tone: "muted"};
+	if (status === "interrupted") return {key: "interrupted", label: "已中断", tone: "muted"};
 	if (status === "timeout") return {key: "timeout", label: "已超时", tone: "warning"};
 	if (status === "error") return {key: "error", label: "出错", tone: "danger"};
 	if (action === "confirm") {
-		const confirmed = confirmPolarity(result, summary);
-		if (confirmed === true) return {key: "confirmed", label: "已确认", tone: "success"};
-		if (confirmed === false) return {key: "rejected", label: "已拒绝", tone: "muted"};
+		const decision = confirmDecision(result, summary);
+		if (decision === "feedback") return {key: "feedback", label: "已反馈", tone: "info"};
+		if (decision === "confirm") return {key: "confirmed", label: "已确认", tone: "success"};
+		if (decision === "reject") return {key: "rejected", label: "已拒绝", tone: "muted"};
 		return {key: "answered", label: "已回答", tone: "success"};
 	}
 	if (action === "prompt") {
@@ -108,7 +126,9 @@ function outcome(action, status, result, sensitive, summary = {}) {
 function introFor(action, outcomeValue) {
 	if (outcomeValue.key === "pending") return `正在等待用户完成${ACTION_META[action].name}`;
 	if (outcomeValue.key === "timeout") return `本次${ACTION_META[action].name}未在限定时间内完成`;
+	if (outcomeValue.key === "interrupted") return `本次${ACTION_META[action].name}因运行中断未完成`;
 	if (["cancelled", "rejected"].includes(outcomeValue.key)) return `用户未继续本次${ACTION_META[action].name}`;
+	if (outcomeValue.key === "feedback") return "用户已提交意见，未授权执行原操作";
 	if (outcomeValue.key === "error") return `本次${ACTION_META[action].name}未能完成`;
 	return `用户已完成本次${ACTION_META[action].name}`;
 }
@@ -185,16 +205,19 @@ export function buildUserInteractionView(input = {}) {
 	const args = parseInteractionObject(source.arguments ?? payload.arguments ?? payload.args);
 	const result = parseInteractionObject(source.result ?? payload.resultText ?? payload.result);
 	const action = normalizeAction(summary.action, args.action, result.action);
-	const sensitive = Boolean(summary.sensitive || summary.secret || args.sensitive || args.secret || containsRedaction(args) || containsRedaction(result));
+	const sensitive = Boolean(summary.sensitive || summary.secret || args.sensitive || args.secret
+		|| result.sensitive || result.sensitiveRedacted || containsRedaction(args) || containsRedaction(result));
 	const status = normalizeInteractionStatus(summary, result, operation.status || source.operationStatus);
 	const outcomeValue = outcome(action, status, result, sensitive, summary);
-	const title = cleanLine(summary.title || args.title || ACTION_META[action].fallbackTitle, 100);
+	const title = cleanLine(sensitive ? (summary.title || "敏感交互") : (summary.title || args.title || ACTION_META[action].fallbackTitle), 100);
+	const responseSource = normalizedSource(result, summary);
+	const selectedDecision = text(result.selectedDecision || summary.selectedDecision).trim().toLowerCase();
 	return {
 		kind: "user_interaction",
 		action,
 		actionName: ACTION_META[action].name,
 		title,
-		body: cleanLine(args.body, 2000),
+		body: sensitive ? "" : cleanLine(args.body, 2000),
 		intro: introFor(action, outcomeValue),
 		status,
 		statusKey: outcomeValue.key,
@@ -202,10 +225,17 @@ export function buildUserInteractionView(input = {}) {
 		statusTone: outcomeValue.tone,
 		sensitive,
 		redactedText: REDACTED_TEXT,
+		source: responseSource,
+		sourceLabel: responseSource === "telegram" ? "Telegram" : (responseSource === "web" ? "网页" : ""),
 		confirmed: !sensitive && outcomeValue.key === "confirmed",
+		confirmText: action === "confirm" && !sensitive ? text(result.text) : "",
+		selectedDecision,
+		selectedDecisionLabel: selectedDecision === "confirm" ? "确认执行" : (selectedDecision === "reject" ? "拒绝" : ""),
 		promptValue: action === "prompt" && !sensitive ? text(result.value) : "",
+		selectText: action === "select" && !sensitive ? text(result.text) : "",
+		answerMode: action === "select" && !sensitive ? text(result.answerMode) : "",
 		options: action === "select" ? selectPresentation(args, result, sensitive) : [],
-		questions: action === "questionnaire" ? questionnairePresentation(args, result, sensitive) : [],
+		questions: action === "questionnaire" && !sensitive ? questionnairePresentation(args, result, false) : [],
 		malformed: !Object.keys(args).length && !Object.keys(summary).length,
 	};
 }

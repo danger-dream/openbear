@@ -56,6 +56,8 @@ async def test_runner_allowlist_derives_edit_batch_from_edit_permission():
     runner.agent = SimpleNamespace(tool_allowlist=["Edit"])
     runner.plan_protocol_enabled = False
     runner._plan_runtime = {}
+    runner.steers = []
+    runner._pending_control_acks = set()
     assert {item["name"] for item in await runner._allowed_tool_schemas()} == {
         "Edit", "EditBatch",
     }
