@@ -90,6 +90,16 @@ const showArchivedConversations = ref(false);
 const conversationDragActive = ref(false);
 const conversationOrderSaving = ref(false);
 const conversationMenu = ref({ open: false, x: 0, y: 0, row: null });
+const conversationSearchQuery = ref("");
+const displayedConversations = computed(() => {
+  const list = conversations.value || [];
+  const q = String(conversationSearchQuery.value || "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((row) => {
+    const title = String(conversationTitle(row) || "").toLowerCase();
+    return title.includes(q);
+  });
+});
 const LOCAL_CONVERSATION_UUID = "local:new";
 const CONVERSATION_REFRESH_ACTIVE_MS = 12000;
 const CONVERSATION_REFRESH_IDLE_MS = 60000;
@@ -825,9 +835,13 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <button class="mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-200/70" @click="startConsoleNewSession">
-        <el-icon :size="16"><Plus /></el-icon>
-        新会话
+      <button
+        type="button"
+        class="mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-200/60 transition-colors"
+        @click="startConsoleNewSession"
+      >
+        <el-icon :size="16" class="text-zinc-600"><Plus /></el-icon>
+        <span>新会话</span>
       </button>
 
       <nav class="space-y-1 text-sm">
@@ -835,48 +849,77 @@ onBeforeUnmount(() => {
           v-for="n in nav"
           :key="n.key"
           @click="selectNav(n.key)"
-          class="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors"
-          :class="active === n.key ? 'bg-zinc-200/80 text-zinc-950 font-medium' : 'text-zinc-700 hover:bg-zinc-200/60'"
+          class="w-full flex items-center gap-3 px-3 py-1.5 rounded-xl text-left transition-colors"
+          :class="active === n.key ? 'bg-zinc-200/80 text-zinc-950 font-medium' : 'text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-950'"
         >
-          <el-icon :size="16"><component :is="n.icon" /></el-icon>
+          <el-icon :size="15"><component :is="n.icon" /></el-icon>
           <span class="truncate">{{ n.label }}</span>
         </button>
       </nav>
 
       <div class="-mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2">
-        <div class="mb-2 flex items-center justify-between px-6">
-          <div class="flex items-center gap-2 text-xs font-medium text-zinc-500">
-            <el-icon :size="16"><ChatLineRound /></el-icon>
+        <!-- 会话头部工具栏 -->
+        <div class="mb-1.5 flex items-center justify-between px-4">
+          <div class="flex items-center gap-1.5 text-xs font-semibold text-zinc-600">
+            <el-icon :size="14" class="text-zinc-400"><ChatLineRound /></el-icon>
             <span>会话</span>
+            <span class="text-[11px] font-normal text-zinc-400">({{ conversations.length }})</span>
           </div>
-          <div class="flex items-center gap-1">
+          <div class="flex items-center gap-0.5">
             <button
               type="button"
-              class="grid h-8 w-8 place-items-center rounded-xl text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
-              :class="showArchivedConversations ? 'bg-zinc-200/80 text-zinc-900' : ''"
+              class="session-tool-btn"
+              :class="showArchivedConversations ? 'is-active' : ''"
               :aria-pressed="showArchivedConversations"
               :title="showArchivedConversations ? '隐藏已归档会话' : '显示已归档会话'"
               @click="toggleShowArchivedConversations"
             >
-              <el-icon :size="16"><Box /></el-icon>
+              <el-icon :size="14"><Box /></el-icon>
             </button>
-            <button class="grid h-8 w-8 place-items-center rounded-xl text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-50" :disabled="conversationsLoading" title="刷新会话" @click="loadConversations">
-              <el-icon :size="16" :class="conversationsLoading && 'animate-spin'"><Refresh /></el-icon>
+            <button
+              type="button"
+              class="session-tool-btn"
+              :disabled="conversationsLoading"
+              title="刷新会话列表"
+              @click="loadConversations"
+            >
+              <el-icon :size="14" :class="conversationsLoading && 'animate-spin'"><Refresh /></el-icon>
             </button>
           </div>
         </div>
-        <div ref="conversationListRef" class="min-h-0 flex-1 overflow-y-auto py-1" :class="conversationDragActive && 'select-none'">
-          <div v-if="conversationsLoading && !conversations.length" class="mx-3 rounded-2xl bg-zinc-100 p-3 text-xs text-zinc-500">加载中…</div>
-          <div v-else-if="!conversations.length" class="mx-3 rounded-2xl bg-zinc-100 p-3 text-xs text-zinc-500">暂无会话</div>
+
+        <!-- 快速搜索会话栏 -->
+        <div class="px-3 mb-2">
+          <div class="relative flex items-center">
+            <input
+              v-model="conversationSearchQuery"
+              class="session-search-input"
+              placeholder="搜索会话标题…"
+            />
+            <span class="session-search-icon" aria-hidden="true">🔍</span>
+            <button
+              v-if="conversationSearchQuery"
+              type="button"
+              class="session-search-clear"
+              title="清空搜索"
+              @click="conversationSearchQuery = ''"
+            >×</button>
+          </div>
+        </div>
+
+        <div ref="conversationListRef" class="min-h-0 flex-1 overflow-y-auto px-2 py-1 space-y-1 scrollbar-none" :class="conversationDragActive && 'select-none'">
+          <div v-if="conversationsLoading && !conversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">加载中…</div>
+          <div v-else-if="!conversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">暂无会话</div>
+          <div v-else-if="conversationSearchQuery && !displayedConversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">未找到匹配「{{ conversationSearchQuery }}」的会话</div>
           <draggable
             v-else
             v-model="conversations"
             item-key="conversationUuid"
             class="space-y-1"
             :animation="160"
-            :disabled="conversationsLoading || conversationOrderSaving"
+            :disabled="Boolean(conversationSearchQuery) || conversationsLoading || conversationOrderSaving"
             :move="canMoveConversation"
-            :filter="'.conversation-menu-trigger'"
+            :filter="'.conversation-menu-trigger, .session-hover-btn'"
             :prevent-on-filter="false"
             :delay="120"
             :delay-on-touch-only="true"
@@ -888,36 +931,64 @@ onBeforeUnmount(() => {
           >
             <template #item="{ element: row }">
               <div
+                v-show="!conversationSearchQuery || displayedConversations.some(c => c.conversationUuid === row.conversationUuid)"
                 :data-conversation-uuid="row.conversationUuid"
-                class="group relative mx-2 rounded-xl transition"
+                class="session-card group relative rounded-xl transition-all"
                 :class="[
-                  active === 'console' && activeConversationUuid === row.conversationUuid ? 'bg-zinc-200/80 text-zinc-950' : 'text-zinc-700 hover:bg-zinc-100',
-                  row.pinned ? 'before:absolute before:left-0 before:top-2 before:bottom-2 before:w-0.5 before:rounded-full before:bg-amber-400' : '',
-                  isRunning(row) ? 'ring-1 ring-inset ring-emerald-200/80 bg-emerald-50/70' : '',
+                  active === 'console' && activeConversationUuid === row.conversationUuid ? 'is-active' : 'is-inactive',
+                  row.pinned ? 'is-pinned' : '',
+                  isRunning(row) ? 'is-running' : '',
                 ]"
                 @contextmenu="openConversationMenu($event, row)"
               >
-                <button class="block w-full min-w-0 overflow-hidden px-4 py-2.5 text-left text-sm" @click="openConversation(row)">
-                  <div class="flex min-w-0 items-center gap-2">
-                    <el-icon v-if="row.pinned" class="shrink-0 text-amber-500" :size="13"><StarFilled /></el-icon>
-                    <div class="min-w-0 flex-1 truncate" :title="conversationTitle(row)">{{ conversationTitle(row) }}</div>
-                    <span v-if="isRunning(row)" class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[11px] leading-none text-emerald-700">运行中</span>
+                <!-- 激活态左侧指示条 -->
+                <span v-if="active === 'console' && activeConversationUuid === row.conversationUuid" class="session-active-bar" aria-hidden="true"></span>
+
+                <button class="block w-full min-w-0 overflow-hidden px-3 py-1.5 text-left" @click="openConversation(row)">
+                  <!-- 标题行 -->
+                  <div class="flex min-w-0 items-center gap-1.5 leading-tight">
+                    <span v-if="row.pinned" class="session-pinned-star shrink-0" title="置顶会话">
+                      <el-icon :size="12"><StarFilled /></el-icon>
+                    </span>
+                    <span class="min-w-0 flex-1 truncate text-xs session-card-title font-medium leading-tight" :title="conversationTitle(row)">
+                      {{ conversationTitle(row) }}
+                    </span>
+                    <!-- 运行中指示器：呼吸绿点 + 标签 -->
+                    <span v-if="isRunning(row)" class="session-running-badge shrink-0" title="正在执行任务">
+                      <span class="running-ping-dot"></span>
+                      <span>运行中</span>
+                    </span>
                   </div>
-                  <div class="mt-0.5 flex min-w-0 items-center gap-2 text-[12px] leading-5 text-zinc-500">
-                    <span class="shrink-0 whitespace-nowrap">{{ createdTime(row) }}</span>
-                    <span class="ml-auto flex max-w-[11rem] shrink-0 items-center justify-end gap-1 whitespace-nowrap text-zinc-500">
-                      <span class="min-w-0 truncate">{{ conversationStats(row) }}</span>
-                      <el-icon v-if="isRunning(row)" :size="12" class="shrink-0 animate-spin" title="正在运行"><Loading /></el-icon>
+
+                  <!-- 第二行信息元数据：创建时间 + 统计指标 (消息数、花费) -->
+                  <div class="mt-0.5 flex min-w-0 items-center justify-between text-[10.5px] leading-tight text-zinc-400">
+                    <span class="shrink-0 session-date">{{ createdTime(row) }}</span>
+                    <span class="session-metrics-pill shrink-0" :title="conversationStats(row)">
+                      <span class="truncate">{{ conversationStats(row) }}</span>
+                      <el-icon v-if="isRunning(row)" :size="11" class="shrink-0 animate-spin text-emerald-600 ml-0.5" title="正在运行"><Loading /></el-icon>
                     </span>
                   </div>
                 </button>
-                <button
-                  class="conversation-menu-trigger absolute right-1.5 top-1.5 grid h-6 w-6 place-items-center rounded-lg text-zinc-400 opacity-0 transition hover:bg-zinc-200 hover:text-zinc-800 group-hover:opacity-100"
-                  title="会话菜单"
-                  @click.stop="openConversationMenu($event, row)"
-                >
-                  <el-icon :size="14"><MoreFilled /></el-icon>
-                </button>
+
+                <!-- 悬停快捷操作组 -->
+                <div class="session-hover-actions absolute right-1.5 top-1 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                  <button
+                    type="button"
+                    class="session-hover-btn"
+                    :title="row.pinned ? '取消置顶' : '置顶会话'"
+                    @click.stop="togglePinConversation(row)"
+                  >
+                    <el-icon :size="12"><component :is="row.pinned ? StarFilled : Star" /></el-icon>
+                  </button>
+                  <button
+                    type="button"
+                    class="session-hover-btn conversation-menu-trigger"
+                    title="会话菜单"
+                    @click.stop="openConversationMenu($event, row)"
+                  >
+                    <el-icon :size="13"><MoreFilled /></el-icon>
+                  </button>
+                </div>
               </div>
             </template>
           </draggable>
@@ -1310,6 +1381,153 @@ onBeforeUnmount(() => {
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
   }
+}
+
+/* === 会话快速搜索栏 === */
+.session-search-input {
+  width: 100%;
+  height: 28px;
+  padding: 0 24px 0 26px;
+  font-size: 11.5px;
+  background: rgba(238, 238, 240, 0.75);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #27272a;
+  outline: none;
+  transition: all 0.15s ease;
+}
+.session-search-input:focus {
+  background: #ffffff;
+  border-color: rgba(212, 212, 216, 0.9);
+  box-shadow: 0 1px 3px rgba(24, 24, 27, 0.04), 0 0 0 2px rgba(39, 39, 42, 0.06);
+}
+.session-search-icon {
+  position: absolute;
+  left: 8px;
+  font-size: 11px;
+  color: #a1a1aa;
+  pointer-events: none;
+}
+.session-search-clear {
+  position: absolute;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  background: transparent;
+  color: #a1a1aa;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.session-search-clear:hover {
+  color: #3f3f46;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+/* === 会话卡片 === */
+.session-card {
+  position: relative;
+  border: 1px solid transparent;
+  transition: background-color 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+}
+.session-card.is-inactive:hover {
+  background: rgba(244, 244, 245, 0.85);
+}
+.session-card.is-active {
+  background: #ffffff;
+  border-color: rgba(228, 228, 231, 0.9);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+.session-card.is-active .session-card-title {
+  color: #09090b;
+  font-weight: 600;
+}
+.session-card.is-inactive .session-card-title {
+  color: #3f3f46;
+}
+.session-active-bar {
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 3px;
+  border-radius: 999px;
+  background: #18181b;
+}
+.session-pinned-star {
+  color: #f59e0b;
+}
+.session-card.is-running {
+  background: rgba(240, 253, 244, 0.75);
+  border-color: rgba(187, 247, 208, 0.85);
+}
+.session-running-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #dcfce7;
+  color: #15803d;
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1;
+}
+.running-ping-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #22c55e;
+}
+.session-metrics-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10.5px;
+  color: #71717a;
+  font-variant-numeric: tabular-nums;
+}
+.session-tool-btn {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 7px;
+  border: 0;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+.session-tool-btn:hover {
+  background: rgba(228, 228, 231, 0.7);
+  color: #18181b;
+}
+.session-tool-btn.is-active {
+  background: rgba(228, 228, 231, 0.9);
+  color: #18181b;
+}
+.session-hover-btn {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #71717a;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+.session-hover-btn:hover {
+  background: #ffffff;
+  color: #18181b;
+  transform: scale(1.08);
 }
 </style>
 

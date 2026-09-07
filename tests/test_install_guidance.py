@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,76 @@ def install_library(tmp_path: Path) -> Path:
     library = tmp_path / "install-library.sh"
     library.write_text(text.rsplit('main "$@"', 1)[0], encoding="utf-8")
     return library
+
+
+def _render_model_menu(tmp_path: Path, payload: dict) -> str:
+    library = install_library(tmp_path)
+    # Use pytest's interpreter, not a potentially newer system python3.
+    harness = '''set -euo pipefail
+source "$1"
+TEST_PYTHON="$2"
+python3() { "$TEST_PYTHON" "$@"; }
+print_model_menu "$3"
+'''
+    result = subprocess.run(
+        [
+            "bash", "-c", harness, "model-menu-test", str(library), sys.executable,
+            json.dumps(payload, ensure_ascii=False),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    return result.stdout
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(
+            {
+                "models": [
+                    {"id": "model-a", "name": "模型 'A' \"别名\""},
+                    {"id": "model-b", "name": "model-b"},
+                    {"id": "model-c", "name": ""},
+                    {"id": "model-d"},
+                    {"id": "model-e", "name": None},
+                ],
+                "endpoint": "https://example.invalid/models",
+            },
+            "    1) model-a  (模型 'A' \"别名\")\n"
+            "    2) model-b\n"
+            "    3) model-c\n"
+            "    4) model-d\n"
+            "    5) model-e\n"
+            "  共 5 个，来自 https://example.invalid/models\n",
+            id="labels-and-optional-names",
+        ),
+        pytest.param({"models": []}, "  共 0 个，来自 ?\n", id="empty-models"),
+        pytest.param(
+            {"models": [{"id": "model-a"}], "endpoint": ""},
+            "    1) model-a\n  共 1 个，来自 ?\n",
+            id="endpoint-fallback",
+        ),
+    ],
+)
+def test_installer_model_menu_renders(tmp_path: Path, payload: dict, expected: str):
+    assert _render_model_menu(tmp_path, payload) == expected
+
+
+@pytest.mark.parametrize("count", [50, 51])
+def test_installer_model_menu_display_limit(tmp_path: Path, count: int):
+    payload = {
+        "models": [{"id": f"model-{i}"} for i in range(1, count + 1)],
+        "endpoint": "https://example.invalid/models",
+    }
+    expected = [f"  {i:>3}) model-{i}" for i in range(1, 51)]
+    if count > 50:
+        expected.append("  ... 还有 1 个未列出，请直接输入模型 ID")
+    expected.append(f"  共 {count} 个，来自 https://example.invalid/models")
+    assert _render_model_menu(tmp_path, payload).splitlines() == expected
 
 
 def test_installer_bootstraps_python_before_configuration(tmp_path: Path):

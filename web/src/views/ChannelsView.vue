@@ -51,6 +51,37 @@ const batchModelsDevPreviewing = ref(false);
 const batchModelsDevSyncing = ref(false);
 let batchModelsDevPreviewRequest = 0;
 
+const modelSearchQuery = ref("");
+const filteredModels = computed(() => {
+  const list = selectedProvider.value?.models || [];
+  const q = String(modelSearchQuery.value || "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((m) => {
+    const id = String(m?.id || "").toLowerCase();
+    const name = String(m?.name || "").toLowerCase();
+    return id.includes(q) || name.includes(q);
+  });
+});
+function compressionRank(row) {
+  if (!row?.fullname) return 0;
+  const idx = compressionModels.value.indexOf(row.fullname);
+  return idx >= 0 ? idx + 1 : 0;
+}
+
+const isCompressionPanelExpanded = ref(false);
+
+function overviewTokenMetric(target) {
+  const stats = target?.stats || {};
+  const totals = tokenTotals(stats);
+  return {
+    total: fmtCompact(totals.input + totals.output),
+    input: fmtCompact(totals.input),
+    output: fmtCompact(totals.output),
+    cache: fmtCompact(totals.cache),
+    pct: totals.pct,
+  };
+}
+
 const MODEL_METADATA_CLIPBOARD_KEY = "openbear:model-metadata:v1";
 
 const providerForm = reactive({ name: "", baseUrl: "", apiKey: "", protocol: "chat", enabled: true, modelsText: "", modelsDevProviderId: "" });
@@ -124,7 +155,7 @@ function fmtMoney(value) {
   const n = Number(value || 0);
   if (!Number.isFinite(n) || n <= 0) return "$0";
   if (n < 0.01) return `$${n.toFixed(4)}`;
-  return `$${n.toFixed(2)}`;
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 function fmtNum(value) { return Number(value || 0).toLocaleString(); }
 function fmtCompact(value) {
@@ -201,7 +232,7 @@ function providerMetrics(provider) {
   const stats = provider?.stats || {};
   return [
     buildTokenMetric(stats),
-    { label: "成功率", value: successRate(stats), sub: `${Number(stats.calls || 0)} 次调用` },
+    { label: "成功率", value: successRate(stats), sub: `${fmtNum(stats.calls || 0)} 次调用` },
     { label: "TPS", value: fmtTps(stats.avg_tps), sub: `峰值 ${fmtTps(stats.peak_tps)}` },
     { label: "总花费", value: fmtMoney(stats.cost_usd), sub: "累计" },
   ];
@@ -210,7 +241,7 @@ function modelMetrics(model) {
   const stats = model?.stats || {};
   return [
     buildTokenMetric(stats),
-    { label: "成功率", value: successRate(stats), sub: `${Number(stats.calls || 0)} 次` },
+    { label: "成功率", value: successRate(stats), sub: `${fmtNum(stats.calls || 0)} 次` },
     { label: "TPS", value: fmtTps(stats.avg_tps), sub: `峰值 ${fmtTps(stats.peak_tps)}` },
     { label: "花费", value: fmtMoney(stats.cost_usd), sub: "模型累计" },
   ];
@@ -1212,57 +1243,114 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="h-full flex flex-col bg-macbg" v-loading="loading">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
-        <h1 class="text-base font-semibold">渠道管理</h1>
-        <span class="text-xs text-macsub">模型渠道、主力/压缩模型、测试与费用配置</span>
+    <header class="h-14 shrink-0 flex items-center justify-between px-3 sm:px-6 border-b border-macborder bg-white/75 backdrop-blur">
+      <div class="flex items-center gap-2 min-w-0">
+        <h1 class="text-base font-semibold whitespace-nowrap">渠道管理</h1>
+        <span class="hidden md:inline text-xs text-macsub truncate">模型渠道、主力与压缩模型、连通性测试与费用配置</span>
       </div>
-      <div class="flex items-center gap-2">
-        <span class="mini-chip" :class="{ 'is-muted': !modelsDev.available }" :title="modelsDev.lastError || '元数据目录会自动刷新；变更需在模型页确认同步'">元数据 · {{ modelsDevStatusText }}</span>
-        <button class="mac-circle-button" :disabled="modelsDevRefreshing" title="立即刷新元数据目录" @click="refreshModelsDev">{{ modelsDevRefreshing ? '…' : '↻' }}</button>
-        <button class="mac-circle-button" :disabled="loading" title="刷新渠道" @click="loadList()">↻</button>
-        <button class="mac-toolbar-button" @click="openCreateProvider">＋ 添加渠道</button>
+      <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+        <!-- 元数据状态与刷新一体化：去歧义，状态清晰 -->
+        <button
+          class="mac-toolbar-button flex items-center gap-1.5 text-xs"
+          :class="{ 'is-muted': !modelsDev.available }"
+          :disabled="modelsDevRefreshing"
+          :title="modelsDev.lastError || '点击立即刷新公共模型元数据目录'"
+          @click="refreshModelsDev"
+        >
+          <span class="inline-block w-1.5 h-1.5 rounded-full" :class="modelsDev.available ? 'bg-emerald-500' : 'bg-zinc-400'"></span>
+          <span>元数据 · {{ modelsDevStatusText }}</span>
+          <span :class="{ 'animate-spin': modelsDevRefreshing }" class="text-zinc-400 font-bold">↻</span>
+        </button>
+        <!-- 刷新渠道数据按钮：带明确文字 -->
+        <button
+          class="mac-toolbar-button flex items-center gap-1 text-xs"
+          :disabled="loading"
+          title="重新加载渠道配置与调用统计"
+          @click="loadList()"
+        >
+          <span :class="{ 'animate-spin': loading }">↻</span>
+          <span class="hidden sm:inline">刷新渠道</span>
+        </button>
+        <!-- 添加渠道主按钮 -->
+        <button class="mac-toolbar-button mac-primary-button" @click="openCreateProvider">＋ 添加渠道</button>
       </div>
     </header>
 
-    <section class="px-6 pt-5 shrink-0" aria-label="渠道累计统计">
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        <div v-for="card in overviewCards" :key="card.label" class="mac-panel mac-shadow min-w-0 px-4 py-3">
-          <div class="text-[11px] font-medium tracking-wide text-macsub">{{ card.label }}</div>
-          <template v-if="card.kind === 'tokens'">
-            <div class="overview-token-value" :title="card.total.title">{{ card.total.compact }}</div>
-            <div class="overview-token-lines">
-              <div class="overview-token-line">
-                <span :title="card.input.title">输入 <b>{{ card.input.compact }}</b></span><i>·</i><span :title="card.output.title">输出 <b>{{ card.output.compact }}</b></span>
-              </div>
-              <div class="overview-token-line">
-                <span :title="card.cache.title">缓存 <b>{{ card.cache.compact }}</b></span><i>·</i><span>占输入 <b>{{ card.pct }}</b></span>
-              </div>
-            </div>
-          </template>
-          <template v-else>
-            <div class="mt-1 text-xl font-semibold tabular-nums text-zinc-900">{{ card.value }}</div>
-            <div class="mt-1 truncate text-[10px] tabular-nums text-zinc-400" :title="card.sub">{{ card.sub }}</div>
-          </template>
+    <!-- 累计统计概览：扁平精简单行条，高度仅38px，极大释放主视区空间 -->
+    <section class="px-3 sm:px-6 pt-3 shrink-0" aria-label="渠道累计统计">
+      <div class="mac-panel mac-shadow px-3 sm:px-4 py-2 flex items-center justify-between gap-3 overflow-x-auto text-xs scrollbar-none bg-white/80">
+        <div class="flex items-center gap-4 sm:gap-7 shrink-0 divide-x divide-zinc-200/80">
+          <div class="flex items-center gap-2">
+            <span class="text-macsub text-[11px]">模型总数</span>
+            <strong class="font-semibold text-zinc-950">{{ fmtNum(totalModels) }}</strong>
+          </div>
+          <div class="flex items-center gap-2 pl-4 sm:pl-7">
+            <span class="text-macsub text-[11px]">调用质量</span>
+            <strong class="font-semibold text-zinc-950">{{ successRate(overviewStats) }}</strong>
+            <span class="text-zinc-400 text-[11px]">({{ fmtNum(overviewStats.calls || 0) }}次)</span>
+          </div>
+          <div class="flex items-center gap-2 pl-4 sm:pl-7">
+            <span class="text-macsub text-[11px]">Tokens</span>
+            <strong class="font-semibold text-zinc-950" :title="overviewCards[1]?.total?.title">{{ overviewCards[1]?.total?.compact || '0' }}</strong>
+            <span class="text-zinc-400 text-[11px] hidden sm:inline">(入 {{ overviewCards[1]?.input?.compact }} · 缓 {{ overviewCards[1]?.pct }})</span>
+          </div>
+          <div class="flex items-center gap-2 pl-4 sm:pl-7">
+            <span class="text-macsub text-[11px]">吞吐速度</span>
+            <strong class="font-semibold text-zinc-950">{{ fmtTps(overviewStats.avg_tps) }}</strong>
+            <span class="text-zinc-400 text-[11px] hidden sm:inline">(峰值 {{ fmtTps(overviewStats.peak_tps) }})</span>
+          </div>
+          <div class="flex items-center gap-2 pl-4 sm:pl-7">
+            <span class="text-macsub text-[11px]">总花费</span>
+            <strong class="font-semibold text-emerald-700">{{ fmtMoney(overviewStats.cost_usd) }}</strong>
+          </div>
         </div>
+        <div class="text-[11px] text-zinc-400 shrink-0 hidden lg:block">全渠道累计</div>
       </div>
     </section>
 
-    <section class="compression-strategy-wrap px-6 pt-4 shrink-0" aria-label="压缩执行顺序">
+    <!-- 压缩执行顺序：支持折叠/收起，默认极简单行，按需展开拖拽排序 -->
+    <section class="compression-strategy-wrap px-3 sm:px-6 pt-2.5 shrink-0" aria-label="压缩执行顺序">
       <div class="mac-panel mac-shadow compression-strategy-panel">
-        <div class="compression-strategy-head">
-          <div class="compression-strategy-heading">
-            <span class="compression-strategy-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M5.8 4.2h12.4A1.8 1.8 0 0 1 20 6v12a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 18V6a1.8 1.8 0 0 1 1.8-1.8Zm2 3v2h8.4v-2H7.8Zm0 4.2v2h6.8v-2H7.8Zm0 4.2v2h5v-2h-5Z"/></svg>
+        <!-- 紧凑头部：整行可点击展开/收起，按钮更突出，明确引导 -->
+        <div
+          class="compression-compact-bar px-3 sm:px-4 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer select-none"
+          title="点击展开或收起压缩候选队列"
+          @click="isCompressionPanelExpanded = !isCompressionPanelExpanded"
+        >
+          <div class="flex items-center gap-2.5 min-w-0 flex-1">
+            <span class="compression-strategy-mark-sm" aria-hidden="true">
+              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M5.8 4.2h12.4A1.8 1.8 0 0 1 20 6v12a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 18V6a1.8 1.8 0 0 1 1.8-1.8Zm2 3v2h8.4v-2H7.8Zm0 4v2h6.8v-2H7.8Zm0 4v2h5v-2h-5Z"/></svg>
             </span>
-            <div class="min-w-0">
-              <div class="compression-strategy-title"><h2>压缩执行顺序</h2><span class="mini-chip">{{ compressionOrderItems.length }} 个候选</span></div>
-              <p>从左到右依次尝试；第一个产出合格摘要的模型结束本次压缩。</p>
-            </div>
+            <span class="font-semibold text-zinc-900 whitespace-nowrap">压缩执行顺序</span>
+            <span class="mini-chip">{{ compressionOrderItems.length }} 个候选</span>
+            <span class="text-macsub text-[11px] truncate hidden md:inline">
+              从左到右尝试，首个成功者完成压缩；全部失败后回退至主力模型 ({{ primaryModel || '未配置主力' }})
+            </span>
+            <span class="text-[10px] text-zinc-400 hidden lg:inline">（点击整行可展开调整）</span>
           </div>
-          <button class="mac-small-button" :disabled="compressionOrderSaving || !compressionOrderItems.length" @click="clearCompressionModels">清空压缩候选</button>
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              class="compression-toggle-btn"
+              :class="{ 'is-expanded': isCompressionPanelExpanded }"
+              :title="isCompressionPanelExpanded ? '点击收起队列' : '点击展开调整候选优先级'"
+              @click.stop="isCompressionPanelExpanded = !isCompressionPanelExpanded"
+            >
+              <span>{{ isCompressionPanelExpanded ? '收起队列' : '⚙️ 调整排序与队列' }}</span>
+              <span class="text-[9px]">{{ isCompressionPanelExpanded ? '▲' : '▼' }}</span>
+            </button>
+            <button
+              v-if="compressionOrderItems.length"
+              type="button"
+              class="mac-small-button text-zinc-500 hover:text-zinc-800"
+              :disabled="compressionOrderSaving"
+              title="清空压缩候选队列"
+              @click.stop="clearCompressionModels"
+            >清空</button>
+          </div>
         </div>
-        <div class="compression-strategy-body">
+
+        <div v-if="isCompressionPanelExpanded" class="compression-strategy-body border-t border-macborder/70 p-3 sm:p-4 bg-zinc-50/50">
           <div class="compression-order-scroll">
             <div class="compression-order-track">
               <draggable
@@ -1281,9 +1369,9 @@ onBeforeUnmount(() => {
                       <button class="compression-drag" title="拖动调整压缩优先级">⋮⋮</button>
                       <span class="compression-rank">{{ index + 1 }}</span>
                       <span class="compression-candidate-copy">
-                        <strong>{{ element.name || element.id }}</strong>
-                        <code>{{ element.fullname }}</code>
-                        <em>第 {{ index + 1 }} 个压缩候选</em>
+                        <strong :title="element.name || element.id">{{ element.name || element.id }}</strong>
+                        <code :title="element.fullname">{{ element.fullname }}</code>
+                        <em>第 {{ index + 1 }} 压缩候选</em>
                       </span>
                       <span class="compression-remove-control">
                         <button
@@ -1299,27 +1387,57 @@ onBeforeUnmount(() => {
                 </template>
               </draggable>
               <div v-else class="compression-empty">当前没有专用压缩候选，将直接使用当前会话或 Agent 模型。</div>
-              <span class="compression-arrow compression-arrow--fallback" aria-hidden="true"><i>→</i></span>
+              <div class="compression-fallback-connector" aria-hidden="true">
+                <span class="connector-line"></span>
+                <span class="connector-arrow">→</span>
+              </div>
               <article class="compression-fallback">
                 <span class="compression-fallback-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24"><path d="M12 2.8a5.2 5.2 0 0 1 5.2 5.2v2h.7a1.8 1.8 0 0 1 1.8 1.8v7.1a1.8 1.8 0 0 1-1.8 1.8H6.1a1.8 1.8 0 0 1-1.8-1.8v-7.1A1.8 1.8 0 0 1 6.1 10h.7V8A5.2 5.2 0 0 1 12 2.8Zm0 2A3.2 3.2 0 0 0 8.8 8v2h6.4V8A3.2 3.2 0 0 0 12 4.8Z"/></svg>
+                  <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M12 2.8a5.2 5.2 0 0 1 5.2 5.2v2h.7a1.8 1.8 0 0 1 1.8 1.8v7.1a1.8 1.8 0 0 1-1.8 1.8H6.1a1.8 1.8 0 0 1-1.8-1.8v-7.1A1.8 1.8 0 0 1 6.1 10h.7V8A5.2 5.2 0 0 1 12 2.8Zm0 2A3.2 3.2 0 0 0 8.8 8v2h6.4V8A3.2 3.2 0 0 0 12 4.8Z"/></svg>
                 </span>
                 <span class="compression-fallback-copy">
                   <em>全部候选失败后</em>
                   <strong>当前会话 / Agent 模型</strong>
-                  <code>默认：{{ primaryModel || '未配置主力模型' }}</code>
+                  <code :title="primaryModel || '未配置主力模型'">默认：{{ primaryModel || '未配置主力模型' }}</code>
                 </span>
-                <span class="mini-chip">固定回退</span>
+                <span class="mini-chip fallback-chip">终态回退</span>
               </article>
             </div>
           </div>
-          <div class="compression-strategy-foot"><i></i><span>拖动候选调整优先级；右侧按钮只会移出压缩候选，不会删除模型。下方模型列表排序不会影响这里的执行顺序。</span></div>
+          <div class="compression-strategy-foot mt-2 text-[11px] text-zinc-400">
+            <span>拖动候选卡片调整优先级顺序；点击卡片右侧 × 仅移出候选队列，不会删除模型。</span>
+          </div>
         </div>
       </div>
     </section>
 
-    <div class="flex-1 min-h-0 grid grid-cols-[320px_minmax(0,1fr)] gap-4 p-6 pb-7">
-      <aside class="mac-panel mac-shadow min-h-0 overflow-hidden flex flex-col">
+    <!-- 移动端渠道横向快捷切换栏 (仅在 lg:hidden 窄屏显示) -->
+    <div class="lg:hidden flex items-center gap-2 overflow-x-auto px-3 py-2 border-b border-macborder bg-white/70 backdrop-blur shrink-0">
+      <button
+        v-for="p in providers"
+        :key="p.name"
+        type="button"
+        class="mobile-channel-pill"
+        :class="{ 'is-active': selectedName === p.name }"
+        @click="loadProvider(p.name)"
+      >
+        <span class="provider-avatar-mini" :class="providerTone(p)">{{ providerInitial(p) }}</span>
+        <span class="mobile-pill-name">{{ p.name }}</span>
+        <span v-if="p.primary" class="role-badge-dot is-primary" title="主力">主</span>
+        <span v-else-if="p.compression" class="role-badge-dot is-comp" title="压缩">压</span>
+        <span v-if="!p.enabled" class="role-badge-dot is-muted" title="停用">停</span>
+      </button>
+      <button class="mobile-channel-pill-add" title="添加渠道" @click="openCreateProvider">＋ 渠道</button>
+    </div>
+
+    <!-- 主工作区 -->
+    <div class="flex-1 min-h-0 flex flex-col lg:grid lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[300px_minmax(0,1fr)] gap-4 p-3 sm:p-4 lg:p-6 pb-6">
+      <!-- 左侧渠道列表 -->
+      <aside class="mac-panel mac-shadow min-h-0 overflow-hidden hidden lg:flex flex-col">
+        <div class="p-3 border-b border-macborder/70 flex items-center justify-between text-xs font-semibold text-zinc-700 bg-zinc-50/50">
+          <span>渠道列表 ({{ providers.length }})</span>
+          <span class="text-[11px] font-normal text-zinc-400">拖动排序</span>
+        </div>
         <div v-if="!providers.length" class="flex-1 min-h-0 p-6 text-center text-sm text-macsub">暂无渠道</div>
         <draggable v-else :list="providers" item-key="name" handle=".drag-handle" ghost-class="drag-ghost" class="channel-list-scroll" @end="persistProviderOrder">
           <template #item="{ element: p }">
@@ -1328,11 +1446,11 @@ onBeforeUnmount(() => {
               <button class="provider-main" @click="loadProvider(p.name)">
                 <span class="provider-avatar" :class="providerTone(p)"><span>{{ providerInitial(p) }}</span></span>
                 <span class="min-w-0 flex-1">
-                  <span class="flex min-w-0 items-center gap-2">
+                  <span class="flex min-w-0 items-center gap-1.5">
                     <span class="truncate text-sm font-medium text-zinc-950">{{ p.name }}</span>
                     <span v-if="!p.enabled" class="mini-chip is-muted">停用</span>
-                    <span v-if="p.primary" class="mini-chip">主力</span>
-                    <span v-if="p.compression" class="mini-chip">压缩</span>
+                    <span v-if="p.primary" class="mini-chip is-highlight-primary">主力</span>
+                    <span v-if="p.compression" class="mini-chip is-highlight-comp">压缩</span>
                   </span>
                   <span class="mt-0.5 block truncate text-[11px] text-zinc-500">{{ protocolLabel(p.protocol) }} · {{ p.modelCount }} 模型</span>
                   <span class="mt-1 flex items-center justify-between gap-2 text-[11px] text-zinc-400">
@@ -1346,153 +1464,229 @@ onBeforeUnmount(() => {
         </draggable>
       </aside>
 
-      <section class="min-h-0 flex flex-col" v-loading="detailLoading">
-        <div v-if="!selectedProvider" class="mac-panel p-10 text-center text-sm text-macsub">选择左侧渠道查看详情</div>
-        <div v-else class="h-full min-h-0 flex flex-col gap-4">
-          <div class="mac-panel mac-shadow p-5 shrink-0">
-            <div class="flex items-start justify-between gap-4">
+      <!-- 右侧详情与模型列表 -->
+      <section class="min-h-0 flex-1 flex flex-col" v-loading="detailLoading">
+        <div v-if="!selectedProvider" class="mac-panel p-10 text-center text-sm text-macsub">选择渠道查看详情</div>
+        <div v-else class="h-full min-h-0 flex flex-col gap-3 sm:gap-4">
+          <!-- 渠道基本信息卡片：URL与Key并排，4项统计严格等高 -->
+          <div class="mac-panel mac-shadow p-4 sm:p-5 shrink-0">
+            <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
               <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-2">
                   <span class="provider-avatar provider-avatar--lg" :class="providerTone(selectedProvider)"><span>{{ providerInitial(selectedProvider) }}</span></span>
-                  <h2 class="text-lg font-semibold">{{ selectedProvider.name }}</h2>
-                  <span class="mini-chip" :class="selectedProvider.enabled ? '' : 'is-muted'">{{ selectedProvider.enabled ? '启用' : '停用' }}</span>
+                  <h2 class="text-lg font-semibold text-zinc-950">{{ selectedProvider.name }}</h2>
+                  <span class="mini-chip" :class="selectedProvider.enabled ? 'is-enabled' : 'is-muted'">{{ selectedProvider.enabled ? '已启用' : '已停用' }}</span>
                   <span class="mini-chip">{{ protocolLabel(selectedProvider.protocol) }}</span>
-                  <span v-if="selectedProvider.primary" class="mini-chip">承载主力</span>
-                  <span v-if="selectedProvider.compression" class="mini-chip">承载压缩</span>
+                  <span v-if="selectedProvider.primary" class="role-badge role-badge--primary">★ 承载主力模型</span>
+                  <span v-if="selectedProvider.compression" class="role-badge role-badge--comp">⚡ 承载压缩候选</span>
                 </div>
-                <div class="mt-3 grid grid-cols-1 gap-1 text-xs text-zinc-600">
+                <!-- URL与Key并排在同一行，告别空旷 -->
+                <div class="mt-2.5 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs text-zinc-600">
                   <div class="channel-kv truncate"><span>URL</span><code>{{ selectedProvider.baseUrl }}</code></div>
-                  <div class="channel-kv"><span>Key</span><code>{{ selectedProvider.apiKeyMasked || '未配置' }}</code></div>
+                  <div class="channel-kv truncate"><span>Key</span><code>{{ selectedProvider.apiKeyMasked || '未配置' }}</code></div>
                 </div>
-                <div class="metric-strip provider-metrics mt-4">
-                  <div v-for="metric in providerMetrics(selectedProvider)" :key="metric.label" class="metric-card" :class="{ 'metric-card--tokens': metric.kind === 'tokens' }">
-                    <template v-if="metric.kind === 'tokens'">
-                      <span>{{ metric.label }}</span>
-                      <div class="provider-token-pair">
-                        <div class="provider-token-value"><em>输入</em><strong :title="metric.input.title">{{ metric.input.compact }}</strong></div>
-                        <div class="provider-token-value"><em>输出</em><strong :title="metric.output.title">{{ metric.output.compact }}</strong></div>
-                      </div>
-                      <div class="provider-token-cache">
-                        <em>缓存</em><strong :title="metric.cache.title">{{ metric.cache.compact }}</strong><i>·</i><em>占输入</em><strong>{{ metric.pct }}</strong>
-                      </div>
-                    </template>
-                    <template v-else>
-                      <span>{{ metric.label }}</span>
-                      <strong>{{ metric.value }}</strong>
-                      <em>{{ metric.sub }}</em>
-                    </template>
+                <!-- 渠道统计4块完全等高对齐 -->
+                <div class="metric-strip provider-metrics mt-3">
+                  <div class="metric-card metric-card--unified">
+                    <span>TOKENS</span>
+                    <strong>{{ overviewTokenMetric(selectedProvider).total }}</strong>
+                    <em>入 {{ overviewTokenMetric(selectedProvider).input }} · 缓 {{ overviewTokenMetric(selectedProvider).pct }}</em>
+                  </div>
+                  <div class="metric-card metric-card--unified">
+                    <span>调用质量</span>
+                    <strong>{{ successRate(selectedProvider.stats) }}</strong>
+                    <em>{{ (selectedProvider.stats?.calls || 0) }} 次调用</em>
+                  </div>
+                  <div class="metric-card metric-card--unified">
+                    <span>吞吐速度</span>
+                    <strong>{{ fmtTps(selectedProvider.stats?.avg_tps) }}</strong>
+                    <em>峰值 {{ fmtTps(selectedProvider.stats?.peak_tps) }}</em>
+                  </div>
+                  <div class="metric-card metric-card--unified">
+                    <span>累计消费</span>
+                    <strong>{{ fmtMoney(selectedProvider.stats?.cost_usd) }}</strong>
+                    <em>渠道累计</em>
                   </div>
                 </div>
               </div>
-              <div class="flex flex-wrap justify-end gap-2">
-                <button class="mac-small-button" :disabled="testing[`channel:${selectedName}`]" @click="testChannel">{{ testing[`channel:${selectedName}`] ? '测试中…' : '测试渠道' }}</button>
-                <button class="mac-small-button" @click="openEditProvider">编辑渠道</button>
-                <button class="mac-small-button is-danger" @click="removeProvider">删除渠道</button>
+              <div class="flex flex-wrap sm:flex-nowrap justify-start sm:justify-end gap-2 shrink-0 pt-1">
+                <button class="mac-small-button" :disabled="testing[`channel:${selectedName}`]" @click="testChannel">{{ testing[`channel:${selectedName}`] ? '测试中…' : '⚡ 测试渠道' }}</button>
+                <button class="mac-small-button" @click="openEditProvider">编辑</button>
+                <button class="mac-small-button is-danger" @click="removeProvider">删除</button>
               </div>
             </div>
           </div>
 
+          <!-- 模型列表区：自适应 3~4 列网格，分组结构清晰 -->
           <div class="mac-panel mac-shadow overflow-hidden flex flex-col min-h-0 flex-1">
-            <div class="flex items-center justify-between border-b border-macborder px-5 py-3 shrink-0">
-              <div>
-                <h3 class="text-sm font-semibold">模型列表</h3>
-                <p class="text-xs text-macsub">拖动左侧把手排序；测试只在手动点击时调用上游。</p>
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-macborder px-4 sm:px-5 py-3 shrink-0">
+              <div class="flex items-center gap-2.5 flex-wrap">
+                <h3 class="text-sm font-semibold whitespace-nowrap">模型列表</h3>
+                <span class="mini-chip">{{ (selectedProvider.models || []).length }} 个模型</span>
+                <div class="relative min-w-[140px] sm:min-w-[190px]">
+                  <input
+                    v-model="modelSearchQuery"
+                    class="mac-input h-7 text-xs pl-7 pr-6"
+                    placeholder="搜索模型 ID / 名称…"
+                  />
+                  <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 text-[11px] pointer-events-none">🔍</span>
+                  <button
+                    v-if="modelSearchQuery"
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 text-xs px-1"
+                    @click="modelSearchQuery = ''"
+                  >×</button>
+                </div>
               </div>
-              <div class="flex gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <button class="mac-small-button" :disabled="!modelsDev.available || batchModelsDevLoading" @click="openModelsDevBatch">{{ batchModelsDevLoading ? '匹配中…' : '批量同步元数据' }}</button>
-                <button class="mac-small-button" @click="clearCompressionModels">压缩跟随主力</button>
-                <button class="mac-small-button" @click="openCreateModel">＋ 添加模型</button>
+                <button class="mac-small-button" :disabled="!compressionModels.length" title="清空专用压缩候选，使压缩回退跟随主力模型" @click="clearCompressionModels">压缩跟随主力</button>
+                <button class="mac-small-button mac-primary-button" @click="openCreateModel">＋ 添加模型</button>
               </div>
             </div>
 
-            <div v-if="!(selectedProvider.models || []).length" class="flex-1 min-h-0 p-8 text-center text-sm text-macsub">暂无模型</div>
-            <draggable v-else :list="selectedProvider.models" item-key="id" handle=".model-drag" ghost-class="drag-ghost" class="model-list-scroll grid grid-cols-1 xl:grid-cols-2 gap-3 p-4" @end="persistModelOrder">
+            <div v-if="!(selectedProvider.models || []).length" class="flex-1 min-h-0 p-8 text-center text-sm text-macsub">该渠道暂无模型，点击右上角「＋ 添加模型」添加。</div>
+            <div v-else-if="!filteredModels.length" class="flex-1 min-h-0 p-8 text-center text-sm text-macsub">未找到匹配「{{ modelSearchQuery }}」的模型</div>
+            <draggable
+              v-else
+              :list="selectedProvider.models"
+              item-key="id"
+              handle=".model-drag"
+              ghost-class="drag-ghost"
+              class="model-list-scroll model-grid-responsive p-3 sm:p-4"
+              :disabled="Boolean(modelSearchQuery)"
+              @end="persistModelOrder"
+            >
               <template #item="{ element: row }">
-                <article class="model-card">
+                <article class="model-card" :class="{ 'is-primary-card': row.primary, 'is-compression-card': row.compression }">
+                  <!-- 1. 头部：把手 + 显示名与ID同行 + 状态药丸 -->
                   <div class="model-head">
-                    <button class="model-drag" title="拖动排序">⋮⋮</button>
+                    <button class="model-drag" :disabled="Boolean(modelSearchQuery)" :title="modelSearchQuery ? '搜索状态下暂停拖动' : '拖动排序'">⋮⋮</button>
                     <div class="model-title-block">
                       <div class="model-title-row">
-                        <button class="model-title model-title-button" :title="hasCustomModelName(row) ? row.id : modelDisplayName(row)" @click="openEditModel(row)">{{ modelDisplayName(row) }}</button>
-                        <div class="model-badges" aria-label="模型状态">
-                          <button class="feature-icon status-icon feature-primary" :class="{ 'is-inactive': !row.primary }" :title="row.primary ? '当前主力模型' : '设为主力模型'" @click="confirmSetPrimary(row)">
-                            <svg viewBox="0 0 24 24"><path d="M12 3.2l2.5 5.1 5.6.8-4 3.9.9 5.5-5-2.6-5 2.6.9-5.5-4-3.9 5.6-.8L12 3.2z"/></svg>
+                        <div class="min-w-0 flex-1 pr-2">
+                          <button class="model-title model-title-button truncate block" :title="hasCustomModelName(row) ? `ID: ${row.id}` : modelDisplayName(row)" @click="openEditModel(row)">
+                            {{ modelDisplayName(row) }}
                           </button>
-                          <button class="feature-icon status-icon feature-compression" :class="{ 'is-inactive': !(row.compression) }" :title="(row.compression) ? '当前压缩模型' : '设为压缩模型'" @click="confirmSetCompression(row)">
-                            <svg viewBox="0 0 24 24"><path d="M4.8 6.5c0-1 .8-1.8 1.8-1.8h10.8c1 0 1.8.8 1.8 1.8v11c0 1-.8 1.8-1.8 1.8H6.6c-1 0-1.8-.8-1.8-1.8v-11zm3 1.2v1.8h8.4V7.7H7.8zm0 4v1.8h6.7v-1.8H7.8zm0 4v1.8h4.9v-1.8H7.8z"/></svg>
+                        </div>
+                        <!-- 核心功能点高亮区域：主力设置与压缩设置 -->
+                        <div class="model-role-actions shrink-0" aria-label="模型角色管理">
+                          <button
+                            type="button"
+                            class="role-pill role-pill--primary"
+                            :class="{ 'is-active': row.primary }"
+                            :title="row.primary ? '当前为全局主力模型' : '点击设为系统全局主力模型'"
+                            @click="confirmSetPrimary(row)"
+                          >
+                            <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M12 3.2l2.5 5.1 5.6.8-4 3.9.9 5.5-5-2.6-5 2.6.9-5.5-4-3.9 5.6-.8L12 3.2z"/></svg>
+                            <span>{{ row.primary ? '主力模型' : '设为主力' }}</span>
                           </button>
-                          <span v-for="feature in modelFeatures(row)" :key="feature.kind" class="feature-icon" :class="`feature-${feature.kind}`" :title="feature.label">
-                            <svg v-if="feature.kind === 'multimodal'" viewBox="0 0 24 24"><path d="M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zm1 2v8.3l3.2-3.1 2.4 2.2 3.8-4.4L19 14.2V7H6z"/></svg>
-                            <svg v-else viewBox="0 0 24 24"><path d="M13.4 2.8 5.2 13h5.5l-1 8.2 8.1-10.6h-5.4l1-7.8z"/></svg>
-                          </span>
+                          <button
+                            type="button"
+                            class="role-pill role-pill--comp"
+                            :class="{ 'is-active': row.compression }"
+                            :title="row.compression ? `第 ${compressionRank(row)} 压缩候选（点击移出）` : '点击加入压缩候选队列'"
+                            @click="confirmSetCompression(row)"
+                          >
+                            <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M4.8 6.5c0-1 .8-1.8 1.8-1.8h10.8c1 0 1.8.8 1.8 1.8v11c0 1-.8 1.8-1.8 1.8H6.6c-1 0-1.8-.8-1.8-1.8v-11zm3 1.2v1.8h8.4V7.7H7.8zm0 4v1.8h6.7v-1.8H7.8zm0 4v1.8h4.9v-1.8H7.8z"/></svg>
+                            <span>{{ row.compression ? `压缩 #${compressionRank(row)}` : '+ 压缩' }}</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <!-- 能力特征标签 -->
+                      <div class="model-feature-strip mt-1.5">
+                        <span v-for="feature in modelFeatures(row)" :key="feature.kind" class="feature-tag" :class="`feature-${feature.kind}`" :title="feature.label">
+                          <svg v-if="feature.kind === 'multimodal'" viewBox="0 0 24 24" class="svg-icon-xs"><path d="M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zm1 2v8.3l3.2-3.1 2.4 2.2 3.8-4.4L19 14.2V7H6z"/></svg>
+                          <svg v-else viewBox="0 0 24 24" class="svg-icon-xs"><path d="M13.4 2.8 5.2 13h5.5l-1 8.2 8.1-10.6h-5.4l1-7.8z"/></svg>
+                          <span>{{ feature.label }}</span>
+                        </span>
+                        <span v-if="row.modelsDev?.bound" class="feature-tag feature-meta" :class="{ 'is-update': row.modelsDev.updateAvailable }" :title="`元数据: ${row.modelsDev.providerId}/${row.modelsDev.modelId}`">
+                          <span>{{ row.modelsDev.providerId }}</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 2. 分组一：【规格与费率】 (纯配置参数集中呈现，不再穿插) -->
+                  <div class="model-group-block mt-3">
+                    <div class="group-header">规格与费率</div>
+                    <div class="grid grid-cols-3 gap-1.5 text-xs">
+                      <div class="soft-stat"><span>上下文</span><strong>{{ fmtCompact(row.contextWindow) }}</strong></div>
+                      <div class="soft-stat"><span>最大输出</span><strong>{{ fmtCompact(row.maxTokens) }}</strong></div>
+                      <div class="soft-stat"><span>压缩触发</span><strong>{{ row.compactTriggerTokens ? fmtCompact(row.compactTriggerTokens) : '按比例' }}</strong></div>
+                    </div>
+                    <div class="rate-row mt-2">
+                      <span v-for="cost in modelCost(row)" :key="cost.label"><em>{{ cost.label }}</em><strong>${{ cost.value }}/1M</strong></span>
+                    </div>
+                    <div v-if="modelTiers(row).length" class="tier-row mt-1.5">
+                      <span>阶梯价</span>
+                      <em v-for="tier in modelTiers(row)" :key="tier.contextTokens">&gt;{{ fmtCompact(tier.contextTokens) }}：{{ tierRate(tier) }}</em>
+                    </div>
+                    <div v-if="(row.thinkingLevels || []).length" class="thinking-row mt-2">
+                      <span>思考档位</span>
+                      <div>
+                        <button
+                          v-for="lv in row.thinkingLevels"
+                          :key="lv"
+                          type="button"
+                          class="thinking-level-chip"
+                          :class="{ 'is-default': isDefaultThinkingLevel(row, lv) }"
+                          :disabled="isDefaultThinkingUpdating(row)"
+                          :title="isDefaultThinkingLevel(row, lv) ? '当前默认思考档位' : `设为默认思考档位：${thinkingLevelLabel(lv)}`"
+                          @click="confirmSetDefaultThinkingLevel(row, lv)"
+                        >{{ lv }}<b v-if="isDefaultThinkingLevel(row, lv)">默认</b></button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 3. 分组二：【运行调用数据】 (2列宽裕布局，字体细腻自然，彻底杜绝打点截断) -->
+                  <div class="model-group-block mt-2.5">
+                    <div class="group-header">运行数据</div>
+                    <div class="grid grid-cols-2 gap-2">
+                      <div class="model-stat-tile">
+                        <span class="stat-k">调用量</span>
+                        <div class="stat-v-row">
+                          <strong class="stat-v">{{ fmtNum(row.stats?.calls || 0) }} 次</strong>
+                          <span class="stat-tag">{{ successRate(row.stats) }}</span>
+                        </div>
+                      </div>
+                      <div class="model-stat-tile">
+                        <span class="stat-k">吞吐速度</span>
+                        <div class="stat-v-row">
+                          <strong class="stat-v">{{ fmtTps(row.stats?.avg_tps) }}</strong>
+                          <span class="stat-sub">峰值 {{ fmtTps(row.stats?.peak_tps) }}</span>
+                        </div>
+                      </div>
+                      <div class="model-stat-tile">
+                        <span class="stat-k">Tokens 消耗</span>
+                        <div class="stat-v-row">
+                          <strong class="stat-v">{{ fmtCompact((row.stats?.input_tokens || 0) + (row.stats?.output_tokens || 0)) }}</strong>
+                          <span class="stat-sub">入 {{ fmtCompact(row.stats?.input_tokens || 0) }} · 缓 {{ tokenTotals(row.stats).pct }}</span>
+                        </div>
+                      </div>
+                      <div class="model-stat-tile">
+                        <span class="stat-k">累计消费</span>
+                        <div class="stat-v-row">
+                          <strong class="stat-v stat-v--money">{{ fmtMoney(row.stats?.cost_usd) }}</strong>
+                          <span class="stat-sub">模型累计</span>
                         </div>
                       </div>
                     </div>
                   </div>
 
-                  <div class="mt-3 grid grid-cols-3 gap-2 text-xs">
-                    <div class="soft-stat"><span>上下文</span><strong>{{ fmtCompact(row.contextWindow) }}</strong></div>
-                    <div class="soft-stat"><span>最大输出</span><strong>{{ fmtCompact(row.maxTokens) }}</strong></div>
-                    <div class="soft-stat"><span>压缩触发</span><strong>{{ row.compactTriggerTokens ? fmtCompact(row.compactTriggerTokens) : '按比例' }}</strong></div>
-                  </div>
-                  <div class="metric-strip model-metrics mt-3">
-                    <div v-for="metric in modelMetrics(row)" :key="metric.label" class="metric-card" :class="{ 'metric-card--tokens': metric.kind === 'tokens' }">
-                      <template v-if="metric.kind === 'tokens'">
-                        <span class="model-token-label">{{ metric.label }}</span>
-                        <div class="model-token-value"><em>输入</em><strong :title="metric.input.title">{{ metric.input.compact }}</strong></div>
-                        <div class="model-token-value"><em>输出</em><strong :title="metric.output.title">{{ metric.output.compact }}</strong></div>
-                        <div class="model-token-value"><em>缓存</em><strong :title="metric.cache.title">{{ metric.cache.compact }}</strong><small>· {{ metric.pct }}</small></div>
-                      </template>
-                      <template v-else>
-                        <span>{{ metric.label }}</span>
-                        <strong>{{ metric.value }}</strong>
-                        <em>{{ metric.sub }}</em>
-                      </template>
-                    </div>
-                  </div>
-                  <div class="rate-row mt-3">
-                    <span v-for="cost in modelCost(row)" :key="cost.label"><em>{{ cost.label }}</em><strong>${{ cost.value }}/1M</strong></span>
-                  </div>
-                  <div v-if="modelTiers(row).length" class="tier-row">
-                    <span>上下文阶梯价</span>
-                    <em v-for="tier in modelTiers(row)" :key="tier.contextTokens">&gt;{{ fmtCompact(tier.contextTokens) }}：{{ tierRate(tier) }}</em>
-                  </div>
-                  <div class="models-dev-row">
-                    <template v-if="row.modelsDev?.bound">
-                      <span :class="{ 'is-update': row.modelsDev.updateAvailable }">元数据 · {{ row.modelsDev.providerId }}/{{ row.modelsDev.modelId }}{{ row.modelsDev.needsSync ? '（待同步）' : (row.modelsDev.updateAvailable ? '（有更新）' : '') }}</span>
-                      <button class="model-action" :disabled="modelsDevSyncing" @click="syncModelFromModelsDev(row)">{{ row.modelsDev.needsSync ? '确认首次同步' : (row.modelsDev.updateAvailable ? '确认同步更新' : '同步元数据') }}</button>
-                    </template>
-                    <template v-else>
-                      <span>未绑定元数据来源</span>
-                      <button class="model-action" @click="openEditModel(row)">绑定元数据</button>
-                    </template>
-                  </div>
-
-                  <div v-if="(row.thinkingLevels || []).length" class="thinking-row thinking-row-bottom">
-                    <span>思考档位</span>
-                    <div>
-                      <button
-                        v-for="lv in row.thinkingLevels"
-                        :key="lv"
-                        type="button"
-                        class="thinking-level-chip"
-                        :class="{ 'is-default': isDefaultThinkingLevel(row, lv) }"
-                        :disabled="isDefaultThinkingUpdating(row)"
-                        :title="isDefaultThinkingLevel(row, lv) ? '当前默认思考档位' : `设为默认思考档位：${thinkingLevelLabel(lv)}`"
-                        @click="confirmSetDefaultThinkingLevel(row, lv)"
-                      >{{ lv }}<b v-if="isDefaultThinkingLevel(row, lv)">默认</b></button>
-                    </div>
-                  </div>
-
-                  <div class="model-action-row">
+                  <!-- 4. 底部操作栏：单行不折行，文案精炼对齐 -->
+                  <div class="model-action-row mt-3">
                     <div class="model-action-group">
-                      <button class="model-action" :disabled="testing[`model:${row.fullname}`]" @click="testModel(row)">{{ testing[`model:${row.fullname}`] ? '测试中…' : '测试' }}</button>
-                      <button class="model-action" @click="openEditModel(row)">编辑</button>
-                      <button class="model-action is-danger" @click="removeModel(row)">删除</button>
+                      <button class="model-action is-primary-action" :disabled="testing[`model:${row.fullname}`]" title="测试模型连通性" @click="testModel(row)">{{ testing[`model:${row.fullname}`] ? '测试中…' : '⚡ 测试' }}</button>
+                      <button class="model-action" title="编辑模型参数" @click="openEditModel(row)">编辑</button>
+                      <button class="model-action is-danger" title="删除该模型" @click="removeModel(row)">删除</button>
                     </div>
                     <div class="model-action-group is-meta">
-                      <button class="model-action" @click="copyModelMetadata(row)">复制元数据</button>
-                      <button v-if="canPasteMetadataTo(row)" class="model-action" @click="pasteCopiedMetadataToModel(row)">粘贴元数据</button>
+                      <button v-if="row.modelsDev?.bound" class="model-action" :disabled="modelsDevSyncing" title="从元数据目录同步配置" @click="syncModelFromModelsDev(row)">
+                        {{ row.modelsDev.needsSync ? '首次同步' : (row.modelsDev.updateAvailable ? '同步更新' : '同步') }}
+                      </button>
+                      <button class="model-action" title="复制模型配置元数据" @click="copyModelMetadata(row)">复制</button>
+                      <button v-if="canPasteMetadataTo(row)" class="model-action" title="粘贴元数据到该模型" @click="pasteCopiedMetadataToModel(row)">粘贴</button>
                     </div>
                   </div>
                 </article>
@@ -1502,7 +1696,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
-
     <el-dialog v-model="providerDialog" class="mac-dialog" :title="providerMode === 'create' ? '添加渠道' : '编辑渠道'" width="720px">
       <div class="dialog-grid">
         <label class="mac-field"><span>渠道名称</span><input v-model="providerForm.name" class="mac-input" placeholder="openai" /></label>
@@ -1729,11 +1922,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .compression-strategy-title h2 { margin: 0; color: #1d1d1f; font-size: 14px; font-weight: 680; letter-spacing: -.01em; }
 .compression-strategy-heading p { margin: 3px 0 0; color: #86868b; font-size: 11px; line-height: 1.4; }
 .compression-strategy-body { background: linear-gradient(180deg, rgba(250,250,251,.58), rgba(255,255,255,.92)); padding: 13px 16px 10px; }
-.compression-order-scroll { overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 0; }
-.compression-order-track { display: flex; min-width: 960px; align-items: stretch; }
-.compression-candidate-list { display: flex; min-width: 0; flex: 1 1 auto; align-items: stretch; }
-.compression-candidate-wrap { display: flex; min-width: 255px; flex: 1 1 270px; align-items: stretch; }
-.compression-candidate { display: grid; min-width: 0; min-height: 76px; flex: 1 1 auto; grid-template-columns: 18px 30px minmax(0,1fr) 24px; align-items: center; gap: 6px; border: 1px solid rgba(228,228,231,.96); border-radius: 15px; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,250,.92)); padding: 9px 6px; box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 4px 14px rgba(24,24,27,.045); transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, opacity .16s ease; }
+.compression-order-scroll { overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 0; width: 100%; scrollbar-width: thin; }
+.compression-order-track { display: flex; width: max-content; min-width: 100%; align-items: stretch; gap: 8px; }
+.compression-candidate-list { display: flex; flex-shrink: 0; align-items: stretch; gap: 8px; }
+.compression-candidate-wrap { display: flex; flex-shrink: 0; align-items: stretch; gap: 8px; }
+.compression-candidate { display: grid; width: 245px; min-width: 245px; flex-shrink: 0; min-height: 74px; grid-template-columns: 18px 30px minmax(0,1fr) 24px; align-items: center; gap: 6px; border: 1px solid rgba(228,228,231,.96); border-radius: 15px; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,250,.92)); padding: 9px 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 4px 14px rgba(24,24,27,.045); transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, opacity .16s ease; }
 .compression-candidate:hover { transform: translateY(-1px); border-color: #a1a1aa; box-shadow: 0 8px 22px rgba(24,24,27,.07); }
 .compression-drag { width: 18px; height: 100%; border: 0; background: transparent; color: #a1a1aa; cursor: grab; font-size: 14px; letter-spacing: -3px; }
 .compression-drag:active { cursor: grabbing; }
@@ -1746,18 +1939,19 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .compression-remove-control { display: grid; place-items: center; }
 .compression-remove-control button { display: grid; width: 24px; height: 24px; place-items: center; border: 1px solid #e4e4e7; border-radius: 8px; background: rgba(255,255,255,.84); color: #71717a; font-size: 16px; line-height: 1; transition: border-color .14s ease, color .14s ease, background .14s ease, transform .14s ease; }
 .compression-remove-control button:hover:not(:disabled) { transform: translateY(-1px); border-color: #a1a1aa; background: #f4f4f5; color: #3f3f46; }
-.compression-arrow { display: grid; width: 30px; flex: 0 0 30px; place-items: center; color: #bbb8c2; font-size: 17px; }
-.compression-arrow--fallback { position: relative; width: 38px; flex-basis: 38px; }
-.compression-arrow--fallback::before { width: 100%; border-top: 1px dashed #d4d4d8; content: ""; }
-.compression-arrow--fallback i { position: absolute; background: #fff; padding: 0 5px; color: #a1a1aa; font-style: normal; }
-.compression-fallback { display: grid; width: 260px; min-width: 260px; min-height: 76px; grid-template-columns: 35px minmax(0,1fr) auto; align-items: center; gap: 8px; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.86); padding: 9px; }
+.compression-arrow { display: grid; width: 24px; flex: 0 0 24px; place-items: center; color: #bbb8c2; font-size: 16px; }
+.compression-fallback-connector { display: flex; flex: 0 0 32px; width: 32px; align-items: center; justify-content: center; position: relative; }
+.compression-fallback-connector .connector-line { position: absolute; left: 0; right: 0; top: 50%; border-top: 1.5px dashed #d4d4d8; z-index: 0; }
+.compression-fallback-connector .connector-arrow { position: relative; z-index: 1; background: #fafafb; padding: 0 4px; color: #8e8e93; font-size: 12px; font-weight: bold; }
+.compression-fallback { display: grid; width: 255px; min-width: 255px; flex-shrink: 0; min-height: 74px; grid-template-columns: 35px minmax(0,1fr) auto; align-items: center; gap: 8px; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.86); padding: 9px; }
 .compression-fallback-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 12px; background: linear-gradient(180deg, #f4f4f5, #e4e4e7); color: #52525b; box-shadow: inset 0 0 0 1px rgba(212,212,216,.72); }
 .compression-fallback-icon svg { width: 16px; height: 16px; fill: currentColor; }
 .compression-fallback-copy { display: block; min-width: 0; }
 .compression-fallback-copy em { display: block; color: #a1a1aa; font-size: 9px; font-style: normal; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
 .compression-fallback-copy strong { display: block; margin-top: 3px; overflow: hidden; color: #3f3f46; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .compression-fallback-copy code { display: block; margin-top: 3px; overflow: hidden; color: #8b8b91; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.compression-empty { display: grid; min-width: 420px; min-height: 76px; flex: 1 1 auto; place-items: center; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.72); color: #86868b; font-size: 11px; }
+.compression-empty { display: grid; min-width: 320px; min-height: 74px; flex: 1 1 auto; place-items: center; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.72); color: #86868b; font-size: 11px; padding: 0 16px; text-align: center; }
+.fallback-chip { background: #ede9fe; color: #6d28d9; border: 1px solid #ddd6fe; font-weight: 600; }
 .compression-strategy-foot { display: flex; align-items: center; gap: 7px; margin-top: 9px; color: #8a8990; font-size: 10px; }
 .compression-strategy-foot i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #a1a1aa; box-shadow: 0 0 0 3px rgba(161,161,170,.12); }
 .provider-row { display: flex; align-items: stretch; gap: 3px; }
@@ -1806,9 +2000,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   .provider-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .provider-metrics .metric-card--tokens { grid-column: 1 / -1; }
 }
-@media (min-width: 1280px) and (max-width: 1399px) {
-  .model-list-scroll { grid-template-columns: minmax(0, 1fr); }
-}
+
 .channel-list-scroll,
 .model-list-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .channel-list-scroll { padding: 8px; }
@@ -1980,4 +2172,466 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .test-result { border: 1px solid rgba(228,228,231,.8); border-radius: 15px; padding: 12px; background: rgba(255,255,255,.72); }
 .test-result.is-ok { box-shadow: inset 3px 0 0 rgba(52,199,89,.68); }
 .test-result.is-bad { box-shadow: inset 3px 0 0 rgba(255,59,48,.68); }
+
+.model-grid-responsive {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+@media (max-width: 640px) {
+  .model-grid-responsive {
+    grid-template-columns: 1fr !important;
+    gap: 10px;
+  }
+}
+.is-primary-card {
+  border-color: rgba(56, 189, 248, 0.7) !important;
+  box-shadow: 0 2px 10px rgba(2, 132, 199, 0.08), inset 0 0 0 1px rgba(56, 189, 248, 0.3) !important;
+}
+.is-compression-card {
+  border-color: rgba(192, 132, 252, 0.7) !important;
+  box-shadow: 0 2px 10px rgba(124, 58, 237, 0.08), inset 0 0 0 1px rgba(192, 132, 252, 0.3) !important;
+}
+.model-role-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.role-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 23px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all .15s ease;
+  white-space: nowrap;
+}
+.role-pill svg { width: 11px; height: 11px; fill: currentColor; }
+.role-pill--primary {
+  color: #64748b;
+  background: rgba(244, 244, 245, 0.9);
+  border-color: rgba(228, 228, 231, 0.9);
+}
+.role-pill--primary:hover {
+  color: #0284c7;
+  background: #e0f2fe;
+  border-color: #bae6fd;
+}
+.role-pill--primary.is-active {
+  color: #0369a1;
+  background: linear-gradient(180deg, #e0f2fe, #bae6fd);
+  border-color: #7dd3fc;
+  box-shadow: 0 1px 3px rgba(3, 105, 161, 0.15);
+}
+.role-pill--comp {
+  color: #64748b;
+  background: rgba(244, 244, 245, 0.9);
+  border-color: rgba(228, 228, 231, 0.9);
+}
+.role-pill--comp:hover {
+  color: #7c3aed;
+  background: #ede9fe;
+  border-color: #ddd6fe;
+}
+.role-pill--comp.is-active {
+  color: #6d28d9;
+  background: linear-gradient(180deg, #ede9fe, #ddd6fe);
+  border-color: #c4b5fd;
+  box-shadow: 0 1px 3px rgba(109, 40, 217, 0.15);
+}
+.role-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.role-badge--primary {
+  background: #e0f2fe;
+  color: #0284c7;
+  border: 1px solid #bae6fd;
+}
+.role-badge--comp {
+  background: #ede9fe;
+  color: #7c3aed;
+  border: 1px solid #ddd6fe;
+}
+.model-sub-id {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-sub-id code {
+  color: #8b8b91;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  background: rgba(244, 244, 245, 0.8);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.model-feature-strip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.feature-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+}
+.feature-tag svg { width: 10px; height: 10px; fill: currentColor; }
+.feature-tag.feature-multimodal { background: #dcfce7; color: #15803d; }
+.feature-tag.feature-fast { background: #fef3c7; color: #b45309; }
+.feature-tag.feature-meta { background: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd; }
+.mac-primary-button {
+  background: linear-gradient(180deg, #3f3f46, #27272a) !important;
+  color: #fff !important;
+  border-color: #27272a !important;
+}
+.mac-primary-button:hover:not(:disabled) {
+  background: linear-gradient(180deg, #27272a, #18181b) !important;
+}
+.is-primary-action {
+  color: #0284c7 !important;
+  border-color: rgba(186, 230, 253, 0.9) !important;
+  background: #f0f9ff !important;
+}
+.is-primary-action:hover:not(:disabled) {
+  background: #e0f2fe !important;
+}
+.is-highlight-primary {
+  background: #e0f2fe !important;
+  color: #0284c7 !important;
+  border: 1px solid #bae6fd !important;
+  font-weight: 600 !important;
+}
+.is-highlight-comp {
+  background: #ede9fe !important;
+  color: #7c3aed !important;
+  border: 1px solid #ddd6fe !important;
+  font-weight: 600 !important;
+}
+.mobile-channel-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: rgba(244, 244, 245, 0.95);
+  border: 1px solid rgba(228, 228, 231, 0.9);
+  color: #3f3f46;
+  font-size: 12px;
+  flex-shrink: 0;
+  transition: all .15s ease;
+}
+.mobile-channel-pill.is-active {
+  background: #27272a;
+  border-color: #27272a;
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(24, 24, 27, 0.15);
+}
+.mobile-channel-pill-add {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px dashed #d4d4d8;
+  background: transparent;
+  color: #71717a;
+  font-size: 11px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.role-badge-dot {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  font-size: 8.5px;
+  font-weight: 700;
+}
+.role-badge-dot.is-primary { background: #38bdf8; color: #082f49; }
+.role-badge-dot.is-comp { background: #c084fc; color: #3b0764; }
+.role-badge-dot.is-muted { background: #a1a1aa; color: #fff; }
+.provider-avatar-mini {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  font-size: 10px;
+  display: grid;
+  place-items: center;
+  font-weight: bold;
+}
+:deep(.mac-dialog.el-dialog) {
+  width: min(94vw, 760px) !important;
+  max-width: calc(100vw - 20px) !important;
+  margin: 16px auto !important;
+}
+@media (max-width: 640px) {
+  :deep(.mac-dialog .el-dialog__body) { padding: 14px 16px !important; }
+  .dialog-grid { grid-template-columns: 1fr !important; }
+  .span-2 { grid-column: span 1 !important; }
+  .triple-grid { grid-template-columns: 1fr !important; }
+  .price-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .rate-row { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+
+
+/* === 彻底规范 SVG 尺寸，避免渲染过大 === */
+.svg-icon-sm {
+  width: 13px !important;
+  height: 13px !important;
+  max-width: 13px !important;
+  max-height: 13px !important;
+  flex-shrink: 0;
+}
+.svg-icon-xs {
+  width: 10.5px !important;
+  height: 10.5px !important;
+  max-width: 10.5px !important;
+  max-height: 10.5px !important;
+  flex-shrink: 0;
+}
+
+/* === 统一 4 块指标卡片：绝对等高对齐，无拉伸 === */
+.metric-card--unified {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 50px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(228, 228, 231, 0.8);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(24,24,27,0.03);
+}
+.metric-card--unified span {
+  display: block;
+  color: #8e8e93;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+.metric-card--unified strong {
+  display: block;
+  margin-top: 2px;
+  color: #1c1c1e;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+.metric-card--unified em {
+  display: block;
+  margin-top: 1px;
+  color: #8e8e93;
+  font-size: 9.5px;
+  font-style: normal;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+/* === 单模型卡片运行数据：2列空间充裕，自然不挤压截断 === */
+.model-stat-tile {
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(228, 228, 231, 0.78);
+  padding: 5px 8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 40px;
+}
+.stat-k {
+  display: block;
+  color: #8e8e93;
+  font-size: 9px;
+  font-weight: 550;
+  letter-spacing: .02em;
+  line-height: 1.1;
+}
+.stat-v-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 5px;
+  margin-top: 2px;
+}
+.stat-v {
+  color: #27272a;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.stat-v--money {
+  color: #047857;
+}
+.stat-tag {
+  font-size: 9px;
+  color: #059669;
+  font-weight: 600;
+  background: #ecfdf5;
+  padding: 0 4px;
+  border-radius: 4px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.stat-sub {
+  font-size: 9.5px;
+  color: #8e8e93;
+  font-weight: 450;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* === 模型操作栏：强制单行不折行，对齐优雅 === */
+.model-action-row {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  flex-wrap: nowrap !important;
+  gap: 6px !important;
+  border-top: 1px solid rgba(228, 228, 231, 0.8) !important;
+  padding-top: 9px !important;
+  margin-top: 10px !important;
+}
+.model-action-group {
+  display: flex !important;
+  align-items: center !important;
+  gap: 5px !important;
+  flex-shrink: 0 !important;
+  flex-wrap: nowrap !important;
+}
+.model-action {
+  height: 25px !important;
+  padding: 0 8px !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  flex-shrink: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* === 模型 ID 药丸：同行显示，不浪费一整行 === */
+.model-id-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(244, 244, 245, 0.88);
+  border: 1px solid rgba(228, 228, 231, 0.85);
+  color: #71717a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.35;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* === 模型卡片分组：清晰归纳【配置】与【数据】 === */
+.model-group-block {
+  border-radius: 12px;
+  background: rgba(248, 248, 250, 0.65);
+  border: 1px solid rgba(228, 228, 231, 0.75);
+  padding: 8px 9px;
+}
+.group-header {
+  font-size: 9.5px;
+  font-weight: 650;
+  color: #a1a1aa;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.group-header::before {
+  content: "";
+  display: inline-block;
+  width: 2.5px;
+  height: 8px;
+  background: #a1a1aa;
+  border-radius: 1px;
+}
+
+/* === 折叠式压缩面板头部 === */
+.compression-strategy-mark-sm {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid #e4e4e7;
+  border-radius: 8px;
+  background: linear-gradient(145deg, #fff, #f4f4f5);
+  color: #52525b;
+  flex-shrink: 0;
+}
+.compression-strategy-mark-sm svg {
+  width: 13px !important;
+  height: 13px !important;
+}
+.compression-compact-bar {
+  background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,251,.85));
+  transition: background-color 0.15s ease;
+}
+.compression-compact-bar:hover {
+  background: linear-gradient(180deg, #fbfbfe, #f4f4f8);
+}
+.compression-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 27px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border: 1px solid rgba(192, 132, 252, 0.45);
+  background: linear-gradient(180deg, #faf5ff, #f3e8ff);
+  color: #6d28d9;
+  box-shadow: 0 1px 3px rgba(109, 40, 217, 0.08);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.compression-toggle-btn:hover {
+  background: linear-gradient(180deg, #f3e8ff, #e9d5ff);
+  border-color: rgba(168, 85, 247, 0.65);
+  color: #581c87;
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(109, 40, 217, 0.15);
+}
+.compression-toggle-btn.is-expanded {
+  background: linear-gradient(180deg, #f4f4f5, #e4e4e7);
+  border-color: #d4d4d8;
+  color: #52525b;
+  box-shadow: none;
+}
+
 </style>

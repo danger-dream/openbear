@@ -285,11 +285,11 @@ d=json.loads(sys.argv[1])
 models=d.get("models") or []
 limit=min(len(models), 50)
 for i, m in enumerate(models[:limit], 1):
-    extra = f"  ({m.get("name")})" if m.get("name") and m.get("name") != m.get("id") else ""
-    print(f"  {i:>3}) {m.get("id","")}{extra}")
+    extra = "  ({})".format(m.get("name")) if m.get("name") and m.get("name") != m.get("id") else ""
+    print("  {:>3}) {}{}".format(i, m.get("id", ""), extra))
 if len(models) > limit:
     print(f"  ... 还有 {len(models)-limit} 个未列出，请直接输入模型 ID")
-print(f"  共 {len(models)} 个，来自 {d.get("endpoint") or "?"}")
+print("  共 {} 个，来自 {}".format(len(models), d.get("endpoint") or "?"))
 ' "$1"
 }
 
