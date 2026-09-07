@@ -265,15 +265,27 @@ async def verify(args):
                             await page.evaluate("window.dispatchEvent(new Event('focus'))")
                             await page.until("Boolean(document.querySelector('.el-message-box')) && document.querySelector('.el-message-box').innerText.includes('前端版本已变化')")
                             await page.evaluate("Array.from(document.querySelectorAll('.el-message-box button')).find(e=>e.innerText.includes('保留当前编辑')).click()")
+                            # Element Plus retains the closing dialog during its
+                            # transition; do not mistake it for the next dialog.
+                            await page.until("!Array.from(document.querySelectorAll('.el-message-box')).some(e=>e.getClientRects().length)")
                             await page.until("Boolean(document.querySelector('[data-testid=frontend-refresh-required]'))")
                         assert await browser.evaluate("document.querySelector('textarea').value") == draft
+                        # Keep advertising the simulated update while focusing
+                        # the first tab: focus rechecks the build identity and
+                        # legitimately removes the banner if it already matches.
+                        await browser.call("Page.bringToFront")
+                        await browser.until("Boolean(document.querySelector('[data-testid=frontend-refresh-required] button'))")
+                        await browser.evaluate("document.querySelector('[data-testid=frontend-refresh-required] button').click()")
+                        await browser.until("Array.from(document.querySelectorAll('.el-message-box')).some(e=>e.getClientRects().length)")
+                        # The actual reload serves the original test bundle, so
+                        # restore its identity only after the dialog is open.
                         server._frontend_build_info = original_build_info
                         server.update_service = None
-                        await browser.call("Page.bringToFront")
-                        await browser.evaluate("document.querySelector('[data-testid=frontend-refresh-required] button').click()")
-                        await browser.until("Boolean(document.querySelector('.el-message-box'))")
-                        await browser.evaluate("Array.from(document.querySelectorAll('.el-message-box button')).find(e=>e.innerText.includes('已处理未提交内容')).click()")
-                        await browser.until("Boolean(document.querySelector('textarea')) && !document.querySelector('[data-testid=frontend-refresh-required]')")
+                        await browser.evaluate("Array.from(document.querySelectorAll('.el-message-box button')).find(e=>e.getClientRects().length && e.innerText.includes('已处理未提交内容')).click()")
+                        await browser.until("performance.getEntriesByType('navigation')[0]?.type === 'reload' && Boolean(document.querySelector('textarea')) && !document.querySelector('[data-testid=frontend-refresh-required]')")
+                        # The composer mounts before its async conversation load
+                        # restores the persisted draft. Wait for that actual result.
+                        await browser.until("document.querySelector('textarea')?.value === " + json.dumps(draft))
                         assert await browser.evaluate("document.querySelector('textarea').value") == draft
                         report["versionHandshake"] = {"tabsNotified": 2, "ackedRestartResultHandled": True, "draftSurvivedRefresh": True}
                         await second.call("Page.navigate", {"url": "about:blank"})
