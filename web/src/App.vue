@@ -9,10 +9,11 @@ import McpView from "./views/McpView.vue";
 import SettingsHubView from "./views/SettingsHubView.vue";
 import LoginView from "./views/LoginView.vue";
 import BearLogo from "./components/BearLogo.vue";
+import ConversationTree from "./components/ConversationTree.vue";
 import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
-import { Box, ChatLineRound, Delete, DocumentCopy, EditPen, Loading, MoreFilled, Plus, Refresh, RefreshLeft, Star, StarFilled } from "@element-plus/icons-vue";
+import { Box, ChatLineRound, Check, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
 import { Api, apiError } from "./api";
 import {
   isLocalConversationRow as isLocalConversation,
@@ -22,6 +23,21 @@ import {
 import { dragAutoScrollOptions } from "./utils/dragScroll";
 import {documentTitle as browserDocumentTitle} from "./pageTitle.js";
 import { frontendMismatch } from "./versionSync.js";
+import { getThemeState, setThemeMode, subscribeTheme } from "./theme.js";
+
+const THEME_OPTIONS = [
+  { value: "light", label: "浅色", hint: "始终使用浅色", icon: Sunny },
+  { value: "dark", label: "深色", hint: "始终使用深色", icon: Moon },
+  { value: "auto", label: "自动", hint: "跟随系统外观", icon: Monitor },
+];
+const themeState = ref(getThemeState());
+const themeMode = computed(() => themeState.value.mode);
+const themeModeMeta = computed(() => THEME_OPTIONS.find((item) => item.value === themeMode.value) || THEME_OPTIONS[2]);
+const themeButtonTitle = computed(() => `主题：${themeModeMeta.value.label}${themeMode.value === "auto" ? `（当前${themeState.value.dark ? "深色" : "浅色"}）` : ""}。点击切换`);
+const stopThemeSubscription = subscribeTheme((state) => { themeState.value = state; });
+function chooseThemeMode(mode) {
+  themeState.value = setThemeMode(mode);
+}
 
 const nav = [
   { key: "memory", label: "记忆管理", icon: "Collection", component: MemoryView },
@@ -84,7 +100,27 @@ const activeView = computed(() => nav.find((x) => x.key === active.value)?.compo
 const conversations = ref([]);
 const conversationsLoading = ref(false);
 const conversationListRef = ref(null);
+const conversationTreeRef = ref(null);
+const consoleViewRef = ref(null);
+const deletingConversations = new Set();
 const activeConversationUuid = ref("");
+const selectedFolderId = ref("");
+const DRAFT_FOLDER_STORAGE_KEY = "openbear.console.draftFolder.v1";
+function readDraftFolderId() {
+  try {
+    return String(window.localStorage.getItem(DRAFT_FOLDER_STORAGE_KEY) || "");
+  } catch {
+    return "";
+  }
+}
+const draftFolderId = ref(readDraftFolderId());
+function setDraftFolderId(folderId = "") {
+  draftFolderId.value = String(folderId || "");
+  try {
+    if (draftFolderId.value) window.localStorage.setItem(DRAFT_FOLDER_STORAGE_KEY, draftFolderId.value);
+    else window.localStorage.removeItem(DRAFT_FOLDER_STORAGE_KEY);
+  } catch { /* Storage denial must not discard the in-memory draft target. */ }
+}
 const sidebarOpen = ref(false);
 const showArchivedConversations = ref(false);
 const conversationDragActive = ref(false);
@@ -111,7 +147,7 @@ let conversationDragSnapshot = null;
 let suppressConversationOpenUntil = 0;
 
 function items(data) { return Array.isArray(data?.items) ? data.items : []; }
-function localConversation() {
+function localConversation(folderId = draftFolderId.value) {
   return {
     local: true,
     conversationUuid: LOCAL_CONVERSATION_UUID,
@@ -119,6 +155,8 @@ function localConversation() {
     status: "draft",
     currentStatus: "未发送",
     running: false,
+    folderId: String(folderId || ""),
+    parentId: String(folderId || ""),
     createdAt: Math.floor(Date.now() / 1000),
     messageCount: 0,
     costUsd: 0,
@@ -201,6 +239,7 @@ function conversationRowSignature(row) {
   return [
     row.local ? "local" : "remote",
     row.conversationUuid || "",
+    row.folderId || "",
     row.title || "",
     row.status || "",
     row.currentStatus || "",
@@ -267,45 +306,11 @@ function scheduleConversationsRefresh(delayMs = CONVERSATION_REFRESH_IDLE_MS) {
 }
 async function loadConversations(options = {}) {
   if (isLoginPath) return false;
-  if (conversationDragActive.value || conversationOrderSaving.value || conversationsRequestInFlight) {
-    conversationsReloadQueued = true;
-    return false;
-  }
-  const silent = Boolean(options?.silent);
-  const requestEpoch = conversationsListEpoch;
-  const includeArchived = Boolean(showArchivedConversations.value);
-  conversationsRequestInFlight = true;
-  if (!silent) conversationsLoading.value = true;
-  try {
-    const data = await Api.conversations(includeArchived ? { includeArchived: 1 } : {});
-    if (requestEpoch !== conversationsListEpoch || conversationDragActive.value || conversationOrderSaving.value) {
-      conversationsReloadQueued = true;
-      return false;
-    }
-    const remoteRows = items(data);
-    const routeConversationUuid = currentRouteConversationUuid();
-    const nextConversations = mergeConversationRows(conversations.value, remoteRows, {
-      ensureLocal: isLocalConversation(activeConversationUuid.value)
-        || (!remoteRows.length && !routeConversationUuid && !activeConversationUuid.value),
-      createLocalRow: localConversation,
-    });
-    const localRows = nextConversations.filter(isLocalConversation);
-    setConversationsIfChanged(nextConversations);
-    if (isLocalConversation(activeConversationUuid.value)) return true;
-    if (routeConversationUuid && routeConversationUuid === activeConversationUuid.value) return true;
-    if (!activeConversationUuid.value || !conversations.value.some((x) => x.conversationUuid === activeConversationUuid.value)) {
-      activeConversationUuid.value = data.activeConversationUuid || remoteRows[0]?.conversationUuid || localRows[0]?.conversationUuid || "";
-      if (active.value === "console") syncRoute({ replace: true });
-    }
+  if (conversationTreeRef.value?.refresh) {
+    await conversationTreeRef.value.refresh(options);
     return true;
-  } catch (error) {
-    if (!silent) ElMessage.error(apiError(error));
-    return false;
-  } finally {
-    conversationsRequestInFlight = false;
-    if (!silent) conversationsLoading.value = false;
-    flushQueuedConversationsReload();
   }
+  return false;
 }
 function isSortableConversation(row) {
   return Boolean(row?.conversationUuid) && !isLocalConversation(row);
@@ -381,19 +386,59 @@ async function refreshConsoleAfterPropSync() {
   await nextTick();
   refreshConsole();
 }
-function focusLocalConversation() {
+function focusLocalConversation(folderId = draftFolderId.value) {
   active.value = "console";
-  setConversationsIfChanged([localConversation(), ...conversations.value.filter((row) => !isLocalConversation(row))]);
+  const existing = conversations.value.find(isLocalConversation);
+  const target = existing ? String(existing.folderId || "") : String(folderId || "");
+  setDraftFolderId(target);
+  setConversationsIfChanged([localConversation(target), ...conversations.value.filter((row) => !isLocalConversation(row))]);
   activeConversationUuid.value = LOCAL_CONVERSATION_UUID;
   closeSidebar();
   syncRoute();
   void refreshConsoleAfterPropSync();
+  void nextTick().then(() => conversationTreeRef.value?.revealDraft(target));
 }
 async function startConsoleNewSession() {
-  const existed = conversations.value.some(isLocalConversation);
-  focusLocalConversation();
-  ElMessage.success(existed ? "已聚焦未发送的新会话" : "已开启新会话");
+  await handleTreeNewConversation(selectedFolderId.value);
 }
+async function handleTreeNewConversation(folderId = "") {
+  const target = String(folderId || "");
+  const existing = conversations.value.find(isLocalConversation);
+  if (existing && String(existing.folderId || "") !== target) {
+    try {
+      await ElMessageBox.confirm(
+        `当前未发送草稿属于「${existing.folderId ? '另一目录' : '临时会话'}」。是否明确把该草稿（含文字和附件）改到新的目标？`,
+        "更改草稿归属",
+        { confirmButtonText: "更改归属", cancelButtonText: "保持原归属", type: "warning" },
+      );
+      setDraftFolderId(target);
+      setConversationsIfChanged(conversations.value.map((row) => isLocalConversation(row) ? { ...row, folderId: target, parentId: target } : row));
+    } catch { /* Repeated new keeps the existing draft and its original folder. */ }
+  } else if (!existing) setDraftFolderId(target);
+  focusLocalConversation(draftFolderId.value);
+  ElMessage.success(existing ? "已聚焦未发送的新会话" : "已开启新会话");
+}
+function handleTreeRows(rows = []) {
+  const draft = conversations.value.find(isLocalConversation);
+  const next = [...(draft ? [draft] : []), ...(Array.isArray(rows) ? rows.filter((row) => !isLocalConversation(row)) : [])];
+  setConversationsIfChanged(next);
+}
+function handleTreeSelectedFolder(folderId = "") { selectedFolderId.value = String(folderId || ""); }
+function handleTreeFolderRemoved({ folderId, targetFolderId = "" }) {
+  const target = String(targetFolderId || "");
+  if (selectedFolderId.value === folderId) selectedFolderId.value = target;
+  const draft = currentDraftConversation();
+  if (draft && String(draft.folderId || "") === folderId) {
+    setDraftFolderId(target);
+    setConversationsIfChanged(conversations.value.map((row) => isLocalConversation(row) ? { ...row, folderId: target, parentId: target } : row));
+    if (activeConversationUuid.value === draft.conversationUuid) void nextTick().then(() => conversationTreeRef.value?.revealDraft(target));
+  }
+}
+async function handleTreeOpen(row) {
+  if (!row?.conversationUuid) return;
+  await openConversation(row);
+}
+function currentDraftConversation() { return conversations.value.find(isLocalConversation) || null; }
 async function openConversation(row) {
   if (!row?.conversationUuid || Date.now() < suppressConversationOpenUntil) return;
   active.value = "console";
@@ -443,13 +488,15 @@ async function duplicateConversation(row) {
   try {
     const data = await Api.duplicateConversation(row.conversationUuid);
     const uuid = data.conversation?.conversationUuid || data.state?.conversationUuid || "";
-    await loadConversations();
     if (uuid) {
       active.value = "console";
       activeConversationUuid.value = uuid;
       syncRoute();
+      await nextTick();
+      if (conversationTreeRef.value?.revealConversation) await conversationTreeRef.value.revealConversation(uuid);
+      else await loadConversations({ conversationUuid: uuid, reveal: true });
       void refreshConsoleAfterPropSync();
-    }
+    } else await loadConversations();
     ElMessage.success("会话已复制");
   } catch (error) {
     const code = apiError(error);
@@ -493,39 +540,87 @@ async function toggleArchiveConversation(row) {
   }
 }
 
+function discardConversationDraft(conversationUuid) {
+  if (consoleViewRef.value?.discardConversationDraft) {
+    consoleViewRef.value.discardConversationDraft(conversationUuid);
+    return;
+  }
+  // The console may be unmounted while a settings page is open. Remove only
+  // this conversation's persisted text; never replace another draft's value.
+  try {
+    const key = "openbear.console.drafts.v1";
+    const drafts = JSON.parse(window.localStorage.getItem(key) || "{}");
+    if (drafts && typeof drafts === "object" && !Array.isArray(drafts) && Object.hasOwn(drafts, conversationUuid)) {
+      delete drafts[conversationUuid];
+      window.localStorage.setItem(key, JSON.stringify(drafts));
+    }
+  } catch { /* Unavailable storage must not block an in-memory removal. */ }
+}
+async function conversationAfterRemoval(row) {
+  const folderId = String(row.folderId || "");
+  const eligible = (item) => item.conversationUuid !== row.conversationUuid && !isLocalConversation(item) && !item.archived;
+  const siblings = conversations.value.filter((item) => !item.archived && !isLocalConversation(item) && String(item.folderId || "") === folderId);
+  const index = siblings.findIndex((item) => item.conversationUuid === row.conversationUuid);
+  const known = index >= 0 ? siblings[index + 1] || siblings[index - 1] : siblings.find(eligible);
+  if (known && eligible(known)) return known;
+  // Lazy branches may have other conversations beyond loaded pages. A local
+  // deletion needs no DELETE request, but can still choose a persisted sibling.
+  try {
+    let cursor = "";
+    do {
+      const data = await Api.conversationTreeChildren({ ...(folderId ? { parentId: folderId } : { systemNode: "temporary" }), limit: 50, ...(cursor ? { cursor } : {}) });
+      const candidate = (data.items || []).find((item) => item.kind === "conversation" && eligible(item));
+      if (candidate) return candidate;
+      const next = data.hasMore ? String(data.nextCursor || "") : "";
+      if (!next || next === cursor) break;
+      cursor = next;
+    } while (cursor);
+  } catch { /* Successful deletion stays successful if successor lookup fails. */ }
+  return conversations.value.find(eligible) || null;
+}
 async function deleteConversation(row) {
-  if (!row?.conversationUuid) return;
+  const uuid = row?.conversationUuid;
+  if (!uuid || deletingConversations.has(uuid)) return;
+  if (isRunning(row)) return ElMessage.warning("运行中的会话不能删除");
+  deletingConversations.add(uuid);
   try {
-    await ElMessageBox.confirm(
-      `确定删除会话「${conversationTitle(row)}」吗？所有消息和历史记录将被清除。`,
-      "删除会话",
-      { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" }
-    );
-  } catch { return; }
-  try {
-    if (isLocalConversation(row)) {
-      setConversationsIfChanged(conversations.value.filter((item) => item.conversationUuid !== row.conversationUuid));
-      if (activeConversationUuid.value === row.conversationUuid) {
-        const remaining = conversations.value.filter((item) => !isLocalConversation(item));
-        activeConversationUuid.value = remaining[0]?.conversationUuid || "";
-        if (!activeConversationUuid.value) focusLocalConversation();
+    const local = isLocalConversation(row);
+    try {
+      await ElMessageBox.confirm(
+        local ? "确定移除这个未发送的新会话吗？其中的草稿文字和待发送附件会一并清除。" : `确定删除会话「${conversationTitle(row)}」吗？所有消息和历史记录将被清除。`,
+        "删除会话",
+        { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
+      );
+    } catch { return; }
+    const current = conversations.value.find((item) => item.conversationUuid === uuid);
+    if (local && !current) return; // It may have become a persisted conversation while the dialog was open.
+    if (isRunning(current || row)) return ElMessage.warning("运行中的会话不能删除");
+    if (!local) await Api.deleteConversation(uuid);
+    const wasActive = activeConversationUuid.value === uuid;
+    const next = wasActive ? await conversationAfterRemoval(row) : null;
+    // Clear the mounted editor before changing its prop; otherwise its navigation
+    // watcher would save the deleted text back into local storage.
+    discardConversationDraft(uuid);
+    setConversationsIfChanged(conversations.value.filter((item) => item.conversationUuid !== uuid));
+    if (local) setDraftFolderId("");
+    await nextTick();
+    conversationTreeRef.value?.forgetConversation(uuid);
+    let revealed = false;
+    if (activeConversationUuid.value === uuid) {
+      if (next?.conversationUuid) {
+        activeConversationUuid.value = next.conversationUuid;
+        selectedFolderId.value = String(next.folderId || "");
         syncRoute({ replace: true });
-      }
-      ElMessage.success("草稿会话已移除");
-      return;
+        await nextTick();
+        await conversationTreeRef.value?.revealConversation(next.conversationUuid);
+        revealed = true;
+      } else focusLocalConversation();
     }
-    await Api.deleteConversation(row.conversationUuid);
-    if (activeConversationUuid.value === row.conversationUuid) {
-      const remaining = conversations.value.filter((r) => r.conversationUuid !== row.conversationUuid && !isLocalConversation(r));
-      activeConversationUuid.value = remaining[0]?.conversationUuid || "";
-      if (!activeConversationUuid.value) focusLocalConversation();
-      syncRoute({ replace: true });
-    }
-    await loadConversations();
-    ElMessage.success("会话已删除");
+    if (!local && !revealed) await loadConversations({ trackActive: false });
+    ElMessage.success(local ? "草稿会话已移除" : "会话已删除");
   } catch (error) {
     ElMessage.error(apiError(error));
-  }
+  } finally { deletingConversations.delete(uuid); }
 }
 function closeConversationMenu() {
   if (!conversationMenu.value.open) return;
@@ -559,18 +654,21 @@ function handleConversationMenuKeydown(event) {
   closeConversationMenu();
   closeSidebar();
 }
-function handleConsoleConversationCreated(uuid) {
+async function handleConsoleConversationCreated(uuid) {
   if (!uuid) return;
   if (isLocalConversation(uuid)) {
     focusLocalConversation();
     return;
   }
   setConversationsIfChanged(conversations.value.filter((row) => !isLocalConversation(row)));
+  setDraftFolderId("");
   activeConversationUuid.value = uuid;
   syncRoute({ replace: true });
-  void loadConversations();
+  await nextTick();
+  if (conversationTreeRef.value?.revealConversation) await conversationTreeRef.value.revealConversation(uuid);
+  else await loadConversations({ conversationUuid: uuid, reveal: true });
 }
-function handleConsoleRefreshList() { void loadConversations(); scheduleConversationsRefresh(CONVERSATION_REFRESH_ACTIVE_MS); }
+function handleConsoleRefreshList() { void loadConversations(); }
 function handleExternalConversationsRefresh() { handleConsoleRefreshList(); }
 function handleMemoryTypeChanged(type) {
   memoryType.value = type || "identity";
@@ -745,6 +843,9 @@ async function startSystemUpdate() {
 }
 
 applyRouteFromLocation({ replaceUnknown: true });
+if (isLocalConversation(activeConversationUuid.value)) {
+  setConversationsIfChanged([localConversation(draftFolderId.value)]);
+}
 
 watch(pageDocumentTitle, (title) => {
   if (typeof document !== "undefined") document.title = title;
@@ -758,8 +859,6 @@ onMounted(() => {
   window.addEventListener("resize", closeConversationMenu);
   window.addEventListener("keydown", handleConversationMenuKeydown);
   if (!isLoginPath) {
-    void loadConversations();
-    scheduleConversationsRefresh(CONVERSATION_REFRESH_IDLE_MS);
     void loadVersionInfo().finally(scheduleVersionPoll);
     window.addEventListener("focus", checkVersionOnResume);
     window.addEventListener("pageshow", checkVersionOnResume);
@@ -768,6 +867,7 @@ onMounted(() => {
   }
 });
 onBeforeUnmount(() => {
+  stopThemeSubscription();
   window.removeEventListener("popstate", applyRouteFromLocation);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.removeEventListener("click", closeConversationMenu);
@@ -814,6 +914,7 @@ onBeforeUnmount(() => {
       id="openbear-sidebar"
       class="app-sidebar w-[300px] shrink-0 flex flex-col border-r border-zinc-200 bg-zinc-50/90 p-3 text-zinc-950"
       :class="{'is-open': sidebarOpen}"
+      @contextmenu.self="conversationTreeRef?.openRootMenu($event)"
     >
       <div class="mb-3 flex items-center gap-2 rounded-2xl px-2 py-2">
         <div class="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white p-1.5 ring-1 ring-zinc-200 shadow-sm">
@@ -823,21 +924,53 @@ onBeforeUnmount(() => {
           <div class="truncate text-[15px] font-semibold leading-tight">OpenBear</div>
           <div class="mt-0.5 truncate text-[12px] leading-tight text-zinc-500">Web 控制台</div>
         </div>
-        <button
-          type="button"
-          class="version-entry inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-medium leading-none tracking-wide shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]"
-          :class="versionInfo?.updateAvailable ? 'border-amber-300 bg-amber-50 text-amber-700' : 'border-zinc-200/80 bg-white/70 text-zinc-500'"
-          :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'"
-          @click="openVersionDialog"
-        >
-          <span class="font-mono text-[11px]">v{{ appVersion || "…" }}</span>
-          <span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span>
-        </button>
+        <div class="sidebar-meta-actions flex shrink-0 items-center gap-1">
+          <el-dropdown trigger="click" placement="bottom-end" @command="chooseThemeMode">
+            <button
+              type="button"
+              class="theme-entry"
+              :title="themeButtonTitle"
+              :aria-label="themeButtonTitle"
+              aria-haspopup="menu"
+              data-testid="theme-menu-trigger"
+            >
+              <el-icon :size="14"><component :is="themeModeMeta.icon" /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu class="theme-mode-menu" aria-label="选择主题模式">
+                <el-dropdown-item
+                  v-for="item in THEME_OPTIONS"
+                  :key="item.value"
+                  :command="item.value"
+                  :class="{'is-theme-selected': themeMode === item.value}"
+                  role="menuitemradio"
+                  :aria-checked="themeMode === item.value ? 'true' : 'false'"
+                  :data-theme-mode="item.value"
+                >
+                  <el-icon :size="15"><component :is="item.icon" /></el-icon>
+                  <span class="theme-menu-copy"><strong>{{ item.label }}</strong><small>{{ item.hint }}</small></span>
+                  <el-icon v-if="themeMode === item.value" class="theme-menu-check" :size="14"><Check /></el-icon>
+                  <span v-else class="theme-menu-check-placeholder" aria-hidden="true"></span>
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <button
+            type="button"
+            class="version-entry inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-medium leading-none tracking-wide shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]"
+            :class="versionInfo?.updateAvailable ? 'border-amber-300 bg-amber-50 text-amber-700' : 'border-zinc-200/80 bg-white/70 text-zinc-500'"
+            :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'"
+            @click="openVersionDialog"
+          >
+            <span class="font-mono text-[11px]">v{{ appVersion || "…" }}</span>
+            <span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span>
+          </button>
+        </div>
       </div>
 
       <button
         type="button"
-        class="mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-200/60 transition-colors"
+        class="mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 transition-colors hover:bg-zinc-200/60"
         @click="startConsoleNewSession"
       >
         <el-icon :size="16" class="text-zinc-600"><Plus /></el-icon>
@@ -857,7 +990,21 @@ onBeforeUnmount(() => {
         </button>
       </nav>
 
-      <div class="-mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2">
+      <div class="-mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
+        <ConversationTree
+          ref="conversationTreeRef"
+          :active-conversation-uuid="activeConversationUuid"
+          :draft-conversation="currentDraftConversation()"
+          @open="handleTreeOpen"
+          @new-conversation="handleTreeNewConversation"
+          @rows="handleTreeRows"
+          @selected-folder="handleTreeSelectedFolder"
+          @refresh-list="handleConsoleRefreshList"
+          @delete-conversation="deleteConversation"
+          @folder-removed="handleTreeFolderRemoved"
+        />
+        <!-- legacy flat-list implementation retained below only as source compatibility; hidden and not mounted -->
+        <div v-if="false">
         <!-- 会话头部工具栏 -->
         <div class="mb-1.5 flex items-center justify-between px-4">
           <div class="flex items-center gap-1.5 text-xs font-semibold text-zinc-600">
@@ -993,10 +1140,11 @@ onBeforeUnmount(() => {
             </template>
           </draggable>
         </div>
+        </div>
       </div>
     </aside>
 
-    <Teleport to="body">
+    <Teleport v-if="false" to="body">
       <div
         v-if="conversationMenu.open"
         class="conversation-menu-backdrop"
@@ -1071,7 +1219,9 @@ onBeforeUnmount(() => {
       </el-alert>
       <ConsoleView
         v-if="active === 'console'"
+        ref="consoleViewRef"
         :conversation-uuid="activeConversationUuid"
+        :folder-id="isLocalConversation(activeConversationUuid) ? draftFolderId : selectedFolderId"
         @conversation-created="handleConsoleConversationCreated"
         @conversations-refresh="handleConsoleRefreshList"
       />
@@ -1156,6 +1306,30 @@ onBeforeUnmount(() => {
 
 
 <style scoped>
+.theme-entry {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(212, 212, 216, .85);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .70);
+  color: #71717a;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .8);
+  cursor: pointer;
+  transition: border-color .14s ease, background .14s ease, color .14s ease;
+}
+.theme-entry:hover,
+.theme-entry:focus-visible {
+  border-color: #c4c4cc;
+  background: #fff;
+  color: #27272a;
+  outline: none;
+}
+.theme-entry:focus-visible {
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, .18);
+}
 .version-entry {
   cursor: pointer;
 }
@@ -1532,6 +1706,231 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
+/* OpenBear system dark theme */
+html.dark .theme-entry {
+  border-color: rgba(82, 82, 91, .9);
+  background: rgba(35, 36, 41, .88);
+  color: #c7c7ce;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08);
+}
+html.dark .theme-entry:hover,
+html.dark .theme-entry:focus-visible {
+  border-color: #62636c;
+  background: #292a30;
+  color: #f4f4f5;
+}
+html.dark .version-dot {
+		box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.16);
+	}
+
+html.dark .conversation-context-menu {
+		border: 1px solid rgba(255, 255, 255, 0.174);
+		background: linear-gradient(180deg, rgba(29, 30, 34, 0.88), rgba(32, 33, 37, 0.82));
+		color: #dedee1;
+		box-shadow: 0 28px 70px rgba(0, 0, 0, 0.24),
+	    0 8px 22px rgba(0, 0, 0, 0.16),
+	    inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+
+html.dark .context-menu-item {
+		color: #dedee1;
+	}
+
+html.dark .context-menu-item .el-icon {
+		color: #c6c6cd;
+	}
+
+html.dark .context-menu-item:hover:not(:disabled),
+html.dark .context-menu-item:focus-visible:not(:disabled) {
+		color: #ffffff;
+	}
+
+html.dark .context-menu-item:hover:not(:disabled) .el-icon,
+html.dark .context-menu-item:focus-visible:not(:disabled) .el-icon,
+html.dark .context-menu-item:hover:not(:disabled) .context-menu-shortcut,
+html.dark .context-menu-item:focus-visible:not(:disabled) .context-menu-shortcut {
+		color: rgba(255, 255, 255, 0.84);
+	}
+
+html.dark .context-menu-item:disabled {
+		color: rgba(198, 198, 205, 0.42);
+	}
+
+html.dark .context-menu-item:disabled .el-icon,
+html.dark .context-menu-item:disabled .context-menu-shortcut {
+		color: rgba(198, 198, 205, 0.32);
+	}
+
+html.dark .context-menu-shortcut {
+		color: #c6c6cd;
+	}
+
+html.dark .context-menu-separator {
+		background: rgba(255, 255, 255, 0.125);
+	}
+
+html.dark .session-search-input {
+		background: rgba(32, 33, 37, 0.75);
+		color: #efeff2;
+	}
+
+html.dark .session-search-input:focus {
+		background: #1d1e22;
+		border-color: rgba(61, 62, 70, 0.9);
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16), 0 0 0 2px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .session-search-icon {
+		color: #a1a1a8;
+	}
+
+html.dark .session-search-clear {
+		color: #a1a1a8;
+	}
+
+html.dark .session-search-clear:hover {
+		color: #dedee1;
+		background: rgba(255, 255, 255, 0.075);
+	}
+
+html.dark .session-card.is-inactive:hover {
+		background: rgba(32, 33, 37, 0.85);
+	}
+
+html.dark .session-card.is-active {
+		background: #1d1e22;
+		border-color: rgba(61, 62, 70, 0.9);
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16), 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .session-card.is-active .session-card-title {
+		color: #efeff2;
+	}
+
+html.dark .session-card.is-inactive .session-card-title {
+		color: #dedee1;
+	}
+
+html.dark .session-active-bar {
+		background: #232428;
+	}
+
+html.dark .session-pinned-star {
+		color: #fbad66;
+	}
+
+html.dark .session-card.is-running {
+		background: rgba(32, 33, 37, 0.75);
+		border-color: rgba(110, 231, 162, 0.52);
+	}
+
+html.dark .session-running-badge {
+		background: #202125;
+		color: #6ee7a2;
+	}
+
+html.dark .session-metrics-pill {
+		color: #c6c6cd;
+	}
+
+html.dark .session-tool-btn {
+		color: #c6c6cd;
+	}
+
+html.dark .session-tool-btn:hover {
+		background: rgba(37, 38, 42, 0.7);
+		color: #efeff2;
+	}
+
+html.dark .session-tool-btn.is-active {
+		background: rgba(37, 38, 42, 0.9);
+		color: #efeff2;
+	}
+
+html.dark .session-hover-btn {
+		background: rgba(29, 30, 34, 0.94);
+		color: #c6c6cd;
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .session-hover-btn:hover {
+		background: #1d1e22;
+		color: #efeff2;
+	}
+
+@media (max-width: 760px) {
+	html.dark .mobile-app-bar {
+		border-bottom: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.92);
+		box-shadow: 0 1px 8px rgba(0, 0, 0, 0.16);
+	}
+	html.dark .mobile-sidebar-toggle {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: #1d1e22;
+		color: #dedee1;
+		box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+	}
+	html.dark .mobile-app-brand {
+		color: #efeff2;
+	}
+	html.dark .mobile-brand-logo {
+		background: #1d1e22;
+		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+	}
+	html.dark .app-sidebar {
+		box-shadow: 18px 0 52px rgba(0, 0, 0, 0.18);
+	}
+	html.dark .app-sidebar-backdrop {
+		background: rgba(255, 255, 255, 0.34);
+	}
+}
+</style>
+
+<style>
+.theme-mode-menu {
+  min-width: 190px;
+  padding: 5px;
+}
+.theme-mode-menu .el-dropdown-menu__item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  gap: 9px;
+  min-height: 42px;
+  border-radius: 8px;
+  padding: 6px 9px;
+}
+.theme-mode-menu .el-dropdown-menu__item.is-theme-selected {
+  background: #f4f4f5;
+  color: #18181b;
+}
+.theme-menu-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.15;
+}
+.theme-menu-copy strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+.theme-menu-copy small {
+  color: #86868b;
+  font-size: 10px;
+  font-weight: 400;
+}
+.theme-menu-check,
+.theme-menu-check-placeholder {
+  width: 14px;
+  justify-self: end;
+}
+.theme-menu-check { color: #0071e3; }
+html.dark .theme-mode-menu .el-dropdown-menu__item.is-theme-selected {
+  background: #303138;
+  color: #f4f4f5;
+}
+html.dark .theme-menu-copy small { color: #a1a1aa; }
+html.dark .theme-menu-check { color: #60a5fa; }
 .version-dialog.el-dialog {
   --el-dialog-padding-primary: 0;
   padding: 0 !important;
@@ -1709,4 +2108,89 @@ onBeforeUnmount(() => {
   opacity: .55;
   cursor: default;
 }
+
+/* OpenBear system dark theme */
+html.dark .version-dialog.el-dialog {
+		background: linear-gradient(180deg, rgba(29, 30, 34, 0.98), rgba(32, 33, 37, 0.96));
+		box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .version-dialog .el-dialog__header {
+		border-bottom: 1px solid rgba(61, 62, 70, 0.82);
+	}
+html.dark .version-dialog .el-dialog__footer {
+		border-top: 1px solid rgba(61, 62, 70, 0.75);
+	}
+html.dark .version-dialog-kicker {
+		color: #c6c6cd;
+	}
+html.dark .version-dialog-title {
+		color: #efeff2;
+	}
+html.dark .version-chip {
+		border: 1px solid rgba(61, 62, 70, 0.95);
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .version-chip.is-update {
+		border-color: rgba(251, 173, 102, 0.52);
+		background: #202125;
+		color: #fbad66;
+	}
+html.dark .version-hero-item {
+		border: 1px solid rgba(61, 62, 70, 0.95);
+		background: #1d1e22;
+	}
+html.dark .version-hero-item span {
+		color: #c6c6cd;
+	}
+html.dark .version-hero-item strong {
+		color: #efeff2;
+	}
+html.dark .version-hero-arrow {
+		color: #a1a1a8;
+	}
+html.dark .version-meta {
+		color: #c6c6cd;
+	}
+html.dark .version-meta a {
+		color: #60a5fa;
+	}
+html.dark .version-callout {
+		background: #202125;
+		color: #dedee1;
+	}
+html.dark .version-callout.is-warn {
+		background: #202125;
+		color: #fb8585;
+	}
+html.dark .version-notes {
+		border: 1px solid rgba(61, 62, 70, 0.95);
+		background: #1d1e22;
+	}
+html.dark .version-notes-head {
+		border-bottom: 1px solid rgba(61, 62, 70, 0.8);
+		color: #c6c6cd;
+	}
+html.dark .version-notes-md {
+		color: #efeff2;
+	}
+html.dark .version-notes-empty {
+		color: #a1a1a8;
+	}
+html.dark .version-btn {
+		border: 1px solid rgba(61, 62, 70, 0.16);
+		background: #1d1e22;
+		color: #efeff2;
+	}
+html.dark .version-btn:hover:not(:disabled) {
+		background: #202125;
+	}
+html.dark .version-btn.is-primary {
+		border-color: rgba(61, 62, 70, 0.22);
+		background: linear-gradient(180deg, #2a2b2f, #232428);
+		color: #ffffff;
+	}
+html.dark .version-btn.is-primary:hover:not(:disabled) {
+		background: #232428;
+	}
 </style>

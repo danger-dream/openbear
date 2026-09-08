@@ -3,6 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (() => {
+        let mode = "auto";
+        try {
+          const saved = window.localStorage.getItem("openbear.theme.v1");
+          if (["light", "dark", "auto"].includes(saved)) mode = saved;
+        } catch (_) { /* blocked storage safely falls back to auto */ }
+        const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const dark = mode === "dark" || (mode === "auto" && systemDark);
+        const root = document.documentElement;
+        root.classList.toggle("dark", dark);
+        root.classList.toggle("light", !dark);
+        root.style.colorScheme = dark ? "dark" : "light";
+        root.dataset.theme = dark ? "dark" : "light";
+        root.dataset.themeMode = mode;
+      })();
+    </script>
+    <style>
+      html, body { background: #f5f5f7; color: #1d1d1f; }
+      html.dark, html.dark body { background: #121315; color: #e4e4e7; }
+    </style>
     <title>OpenBear</title>
   </head>
   <body>

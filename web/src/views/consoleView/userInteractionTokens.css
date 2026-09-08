@@ -13,3 +13,19 @@
 	--ob-interaction-focus: rgba(70, 103, 143, 0.12);
 	--ob-interaction-shadow: 0 14px 42px rgba(15, 23, 42, 0.11);
 }
+
+html.dark .web-confirm-stack,
+html.dark .interaction-event {
+	--ob-interaction-surface: rgba(31, 33, 37, 0.98);
+	--ob-interaction-surface-strong: #24262b;
+	--ob-interaction-surface-selected: #29313b;
+	--ob-interaction-border: #3a4048;
+	--ob-interaction-border-strong: #7089a4;
+	--ob-interaction-ink: #e2e8f0;
+	--ob-interaction-muted: #a3adba;
+	--ob-interaction-accent: #9ab2cf;
+	--ob-interaction-accent-strong: #b8cbe2;
+	--ob-interaction-accent-soft: #2a313b;
+	--ob-interaction-focus: rgba(125, 160, 202, 0.22);
+	--ob-interaction-shadow: 0 14px 42px rgba(0, 0, 0, 0.32);
+}

@@ -22,7 +22,7 @@ log = get_logger("db.engine")
 
 _SCHEMA = "\n".join(
     (Path(__file__).parent / name).read_text(encoding="utf-8")
-    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql")
 )
 
 
@@ -140,6 +140,7 @@ class DB:
         had_display_order = has_web_conversations and "display_order" in await self._columns("web_conversations")
         await self._add_column_if_missing("web_conversations", "pinned_at", "pinned_at INTEGER DEFAULT 0")
         await self._add_column_if_missing("web_conversations", "display_order", "display_order REAL")
+        await self._add_column_if_missing("web_conversations", "folder_uuid", "folder_uuid TEXT NOT NULL DEFAULT ''")
         if has_web_conversations and not had_display_order:
             await self._backfill_web_conversation_display_order()
         await self._add_column_if_missing("web_conversations", "agent_model", "agent_model TEXT DEFAULT ''")

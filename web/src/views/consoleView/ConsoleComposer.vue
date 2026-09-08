@@ -510,6 +510,7 @@ function handleKeydown(event) {
 	if (event.shiftKey) return;
 	if (event.isComposing) return;
 	event.preventDefault();
+	if (!props.canSend) return;
 	emit("send");
 }
 
@@ -2344,4 +2345,358 @@ button.status-chip:hover, .status-chip-active {
 		flex: 1 1 5rem;
 	}
 }
+</style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .steering-queue-card {
+		border: 1px solid rgba(96, 165, 250, 0.22);
+		background: linear-gradient(180deg, rgba(32, 33, 37, 0.98), rgba(29, 30, 34, 0.96));
+		box-shadow: 0 16px 40px rgba(37, 99, 235, 0.1);
+	}
+html.dark .steering-queue-title {
+		color: #60a5fa;
+	}
+html.dark .steering-queue-hint {
+		color: #c6c6cd;
+	}
+html.dark .steering-queue-item {
+		border: 1px solid rgba(96, 165, 250, 0.16);
+		background: rgba(29, 30, 34, 0.82);
+		color: #dedee1;
+	}
+html.dark .interaction-card-meta > span + span::before {
+		color: #7b7b82;
+	}
+html.dark .interaction-expiry.is-expired {
+		color: #fb8585;
+	}
+html.dark .interaction-risk.warning {
+		color: #fbad66;
+	}
+html.dark .interaction-risk.danger {
+		color: #fb8585;
+	}
+html.dark .interaction-expired-notice,
+html.dark .interaction-submit-error {
+		border: 1px solid rgba(251, 133, 133, 0.52);
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .web-interaction-input {
+		color: #c6c6cd;
+	}
+html.dark .web-interaction-input textarea {
+		border: 1px solid #3d3e46;
+	}
+html.dark .web-confirm-btn.reject {
+		border-color: #3d3e46;
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .web-confirm-btn.confirm {
+		color: #ffffff;
+	}
+html.dark .questionnaire-question {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.9);
+	}
+html.dark .questionnaire-question.has-error {
+		border-color: rgba(251, 133, 133, 0.52);
+	}
+html.dark .questionnaire-question legend {
+		color: #dedee1;
+	}
+html.dark .question-number {
+		background: #202125;
+		color: #dedee1;
+	}
+html.dark .required-mark {
+		background: #202125;
+		color: #fb8585;
+	}
+html.dark .optional-mark {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .question-choice-option {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .question-choice-option.is-selected {
+		border-color: rgba(96, 165, 250, 0.52);
+		background: #202125;
+	}
+html.dark .question-choice-copy {
+		color: #dedee1;
+	}
+html.dark .question-choice-copy > small {
+		color: #c6c6cd;
+	}
+html.dark .recommendation-badge {
+		border: 1px solid #3d3e46;
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .recommendation-reason {
+		border-left: 2px solid rgba(96, 165, 250, 0.52);
+		color: #c6c6cd;
+	}
+html.dark .recommendation-reason strong {
+		color: #60a5fa;
+	}
+html.dark .clear-question-choice {
+		color: #60a5fa;
+	}
+html.dark .question-free-text {
+		color: #c6c6cd;
+	}
+html.dark .question-free-text textarea {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #dedee1;
+	}
+html.dark .question-free-text textarea:focus {
+		border-color: rgba(96, 165, 250, 0.52);
+	}
+html.dark .question-hint {
+		color: #c6c6cd;
+	}
+html.dark .question-error {
+		color: #fb8585;
+	}
+html.dark .questionnaire-actions {
+		border-top: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.97);
+	}
+html.dark .composer-box {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		box-shadow: 0 10px 34px rgba(0, 0, 0, 0.16);
+	}
+html.dark .composer-box:focus-within {
+		border-color: #3d3e46;
+		box-shadow: 0 14px 42px rgba(0, 0, 0, 0.16);
+	}
+html.dark .attachment-card {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: linear-gradient(180deg, #1d1e22, #1d1e22);
+		box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
+	}
+html.dark .attachment-file-tile {
+		color: #c6c6cd;
+	}
+html.dark .attachment-file-tile small {
+		color: #a1a1a8;
+	}
+html.dark .attachment-remove {
+		background: rgba(255, 255, 255, 0.34);
+	}
+html.dark .file-preview-icon {
+		color: #c6c6cd;
+	}
+html.dark .composer-textarea {
+		color: #efeff2;
+	}
+html.dark .composer-textarea::placeholder {
+		color: #a1a1a8;
+	}
+html.dark .tool-btn {
+		color: #c6c6cd;
+	}
+html.dark .compact-tool-btn {
+		color: #fbad66;
+	}
+html.dark .tool-btn.compact-tool-btn:hover {
+		background: #202125;
+		color: #fbad66;
+	}
+html.dark .compact-loading-indicator {
+		border: 1.5px solid rgba(251, 173, 102, 0.24);
+		border-right-color: rgba(251, 173, 102, 0.52);
+	}
+html.dark .tool-btn:hover,
+html.dark .tool-btn-active {
+		background: #202125;
+		color: #efeff2;
+	}
+html.dark .status-chip {
+		color: #c6c6cd;
+	}
+html.dark .run-config-chip {
+		color: #c6c6cd;
+	}
+html.dark .run-config-chip:hover,
+html.dark .run-config-chip.status-chip-active {
+		background: #202125;
+		color: #efeff2;
+	}
+html.dark .run-config-chip-meta {
+		color: #a1a1a8;
+	}
+html.dark .run-config-chip-meta::before {
+		color: #7b7b82;
+	}
+html.dark .chip-caret {
+		color: #a1a1a8;
+	}
+html.dark .run-config-chip.status-chip-active .chip-caret {
+		color: #c6c6cd;
+	}
+html.dark .status-chip strong {
+		color: #dedee1;
+	}
+html.dark button.status-chip:hover,
+html.dark .status-chip-active {
+		background: #202125;
+		color: #efeff2;
+	}
+html.dark .run-config-head {
+		border: 1px solid rgba(96, 165, 250, 0.12);
+		background: linear-gradient(180deg, #1d1e22, #1d1e22);
+	}
+html.dark .run-config-head.is-agent {
+		border-color: rgba(196, 181, 253, 0.14);
+		background: linear-gradient(180deg, #1d1e22, #1d1e22);
+	}
+html.dark .run-config-tabs {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .run-config-tabs button {
+		color: #c6c6cd;
+	}
+html.dark .run-config-tabs button:hover {
+		color: #dedee1;
+	}
+html.dark .run-config-tabs button.is-active {
+		background: #1d1e22;
+		color: #efeff2;
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.11);
+	}
+html.dark .run-config-title-row strong {
+		color: #efeff2;
+	}
+html.dark .run-config-title,
+html.dark .context-meter-row {
+		color: #dedee1;
+	}
+html.dark .run-config-title svg,
+html.dark .context-meter-row svg,
+html.dark .run-config-control-head svg,
+html.dark .fast-copy svg {
+		color: #c6c6cd;
+	}
+html.dark .run-config-subtitle,
+html.dark .run-config-context-detail {
+		color: #a1a1a8;
+	}
+html.dark .context-meter-row strong {
+		color: #60a5fa;
+	}
+html.dark .context-meter {
+		background: #25262a;
+	}
+html.dark .model-search {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #a1a1a8;
+	}
+html.dark .model-search input {
+		color: #dedee1;
+	}
+html.dark .run-config-model-list {
+		border: 1px solid #3d3e46;
+	}
+html.dark .agent-follow-group {
+		border-bottom: 1px solid #3d3e46;
+	}
+html.dark .model-group + .model-group {
+		border-top: 1px solid #3d3e46;
+	}
+html.dark .model-group-title {
+		color: #a1a1a8;
+	}
+html.dark .model-empty {
+		color: #a1a1a8;
+	}
+html.dark .menu-row {
+		color: #efeff2;
+	}
+html.dark .menu-row:hover {
+		background: #1d1e22;
+	}
+html.dark .menu-row-active {
+		background: #202125;
+		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.11);
+	}
+html.dark .menu-icon {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .menu-row-active .menu-icon {
+		background: #25262a;
+		color: #dedee1;
+	}
+html.dark .menu-check {
+		color: #dedee1;
+	}
+html.dark .model-meta {
+		color: #a1a1a8;
+	}
+html.dark .model-meta span {
+		background: #1d1e22;
+	}
+html.dark .run-config-controls {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .run-config-control-head small,
+html.dark .fast-copy small {
+		color: #a1a1a8;
+	}
+html.dark .thinking-segments button {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .thinking-segments button small {
+		color: #a1a1a8;
+	}
+html.dark .thinking-segments button:hover:not(:disabled) {
+		border-color: rgba(96, 165, 250, 0.52);
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .thinking-segments button.is-active {
+		border-color: rgba(96, 165, 250, 0.35);
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .control-unavailable {
+		background: #1d1e22;
+		color: #a1a1a8;
+	}
+html.dark .fast-control {
+		border-top: 1px solid #3d3e46;
+	}
+html.dark .fast-copy span {
+		color: #dedee1;
+	}
+html.dark .fast-switch {
+		background: #2b2c30;
+	}
+html.dark .fast-switch span {
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+	}
+html.dark .send-button {
+		background: #232428;
+		box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+	}
+html.dark .stop-button {
+		box-shadow: 0 8px 18px rgba(220, 38, 38, 0.18);
+	}
+html.dark .send-button:disabled {
+		background: #2b2c30;
+	}
 </style>

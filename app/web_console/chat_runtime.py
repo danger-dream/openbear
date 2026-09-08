@@ -1,6 +1,7 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+import inspect
 from xml.sax.saxutils import escape as xml_escape
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
@@ -12,6 +13,7 @@ from app.task_memory import (
     reconcile_task_memory_runtime_state,
     task_memory_runtime_epoch,
 )
+from app.web_console.conversation_prompt import system_prompt_sha256
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -63,8 +65,25 @@ class WebAdminChatRunMixin:
             run_fast_mode_requested = await messages.get_fast_mode(chat_id)
             if not root_turn_uuid and renderer.live is not None:
                 root_turn_uuid = str(getattr(renderer.live, "_agent_turn_uuid", "") or getattr(renderer.live, "current_turn_uuid", "") or "")
-            system_live = await self._build_system_prompt_for_chat()
+            prompt_builder = self._build_system_prompt_for_chat
+            # Keep compatibility with focused tests/integrations that replace the
+            # historical no-argument builder while production passes the owning
+            # conversation explicitly for folder inheritance.
+            if "conversation_uuid" in inspect.signature(prompt_builder).parameters:
+                system_live = await prompt_builder(conversation_uuid=conversation_uuid)
+            else:
+                system_live = await prompt_builder()
             system = await messages.get_or_set_system_snapshot(chat_id, system_live)
+            # The live render is only a candidate; the frozen value below is the
+            # actual system input for this run. Never log either prompt body.
+            log.info(
+                "web.system_prompt.selected", chat_id=chat_id,
+                conversation_uuid=conversation_uuid,
+                effective_sha256=system_prompt_sha256(system),
+                live_sha256=system_prompt_sha256(system_live),
+                matches_live=system == system_live,
+                effective_chars=len(system),
+            )
             history = await self._build_history(chat_id)
 
             # Resolve the immutable per-run model identity before accepting the

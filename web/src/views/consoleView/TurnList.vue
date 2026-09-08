@@ -546,3 +546,55 @@ async function copyMessage(content, key) {
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .time-float {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.92);
+		color: #a1a1a8;
+		box-shadow: 0 12px 26px rgba(0, 0, 0, 0.16);
+	}
+html.dark .user-message-meta {
+		color: #a1a1a8;
+	}
+html.dark .user-message-time {
+		color: #a1a1a8;
+	}
+html.dark .message-icon-action {
+		color: #a1a1a8;
+	}
+html.dark .message-icon-action:hover:not(:disabled),
+html.dark .message-icon-action:focus-visible:not(:disabled) {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .message-icon-action.restart-action:hover:not(:disabled),
+html.dark .message-icon-action.restart-action:focus-visible:not(:disabled) {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .message-icon-action:disabled {
+		color: #7b7b82;
+	}
+html.dark .message-user {
+		background: #202125;
+		color: #efeff2;
+	}
+html.dark .user-attachment {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.76);
+		box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+		color: #dedee1;
+	}
+html.dark .assistant-message-meta {
+		color: #a1a1a8;
+	}
+html.dark .assistant-message-time,
+html.dark .turn-token-usage {
+		color: #a1a1a8;
+	}
+html.dark .assistant-card {
+		color: #efeff2;
+	}
+</style>

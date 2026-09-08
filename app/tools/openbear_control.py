@@ -433,7 +433,8 @@ def register_openbear_control_tool(reg: ToolRegistry, svc: Any) -> None:
         (
             "OpenBear control plane: status/models/mcp_status/skills_status/skills_reload/mcp_reload/think/restart/new/foreground-run stop. "
             "Do not use this tool for Rath/Agent task cancellation; use AgentStop. "
-            "Risky actions ask channel confirmation when supported and run safely after the reply. User text is feedback, not authorization: read confirmation.text and revise the action before asking again; "
+            "Risky actions provide their own required channel confirmation; for an already requested action, call this tool directly without a redundant UserInteraction pre-confirmation. Never bypass its gate. "
+            "Actions run safely after the reply when needed. Confirmation text is feedback, not authorization: read confirmation.text, preserve the user's conditions, and obtain a new confirmation only if a revised action is still requested and requires it. Cancellation or timeout never authorizes execution; "
             "do not restart/stop openbear.service via Bash."
         ),
         {

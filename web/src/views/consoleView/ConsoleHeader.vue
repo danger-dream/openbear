@@ -190,3 +190,44 @@ const props = defineProps({
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .console-header {
+		border-bottom: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.86);
+	}
+html.dark .header-orb {
+		border: 1px solid #3d3e46;
+		background: linear-gradient(145deg, #1d1e22, #1d1e22);
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11), 0 10px 26px rgba(91, 58, 34, 0.1);
+	}
+html.dark .header-metrics {
+		border: 1px solid rgba(255, 255, 255, 0.087);
+		background: rgba(29, 30, 34, 0.72);
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .header-chip {
+		color: #c6c6cd;
+	}
+html.dark .header-chip svg {
+		color: #a1a1a8;
+	}
+html.dark .header-chip .chip-label {
+		color: #a1a1a8;
+	}
+html.dark .header-chip strong {
+		color: #c6c6cd;
+	}
+html.dark .header-chip-live {
+		background: rgba(16, 185, 129, 0.09);
+		color: #6ee7a2;
+	}
+html.dark .header-chip-live svg,
+html.dark .header-chip-live .chip-label {
+		color: #6ee7a2;
+	}
+html.dark .header-chip-live strong {
+		color: #6ee7a2;
+	}
+</style>

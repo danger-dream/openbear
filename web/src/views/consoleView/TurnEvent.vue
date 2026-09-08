@@ -742,3 +742,110 @@ details[open] > summary > .disclosure-icon {
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .disclosure-icon {
+		color: #c6c6cd;
+	}
+html.dark details[open] > summary > .disclosure-icon {
+		color: #60a5fa;
+	}
+html.dark .reasoning-card {
+		color: #c6c6cd;
+	}
+html.dark .reasoning-card summary {
+		color: #c6c6cd;
+	}
+html.dark .reasoning-card summary .inline-icon {
+		color: #a1a1a8;
+	}
+html.dark .reasoning-body {
+		color: #c6c6cd;
+	}
+html.dark .reasoning-body::-webkit-scrollbar-thumb {
+		background: #2b2c30;
+	}
+html.dark .live-tool-dot {
+		background: #313236;
+	}
+html.dark .live-process-summary {
+		color: #c6c6cd;
+	}
+html.dark .live-process-summary .tool-icon {
+		color: #a1a1a8;
+	}
+html.dark .live-process-summary .notification-icon {
+		color: #6ee7a2;
+	}
+html.dark .live-process-summary .agent-notice-icon {
+		color: #a1a1a8;
+	}
+html.dark .live-process-summary .tool-name {
+		color: #c6c6cd;
+	}
+html.dark .live-process-summary .tool-preview {
+		color: #a1a1a8;
+	}
+html.dark .retry-inline-attempt {
+		color: #c6c6cd;
+	}
+html.dark .retry-outcome-icon.is-waiting {
+		color: #fbad66;
+	}
+html.dark .retry-outcome-icon.is-success {
+		color: #6ee7a2;
+	}
+html.dark .retry-outcome-icon.is-cancelled {
+		color: #a1a1a8;
+	}
+html.dark .retry-outcome-icon.is-failed {
+		color: #fb8585;
+	}
+html.dark .retry-inline-state {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .process-live .retry-inline-state {
+		background: #202125;
+		color: #fb8585;
+	}
+html.dark .retry-inline-cancel {
+		color: #fbad66;
+	}
+html.dark .retry-inline-cancel:hover:not(:disabled) {
+		background: #202125;
+		color: #fb8585;
+	}
+html.dark .thinking-dots::after {
+		background: linear-gradient(105deg, transparent 28%, rgba(29, 30, 34, 0.88) 43%, rgba(49, 50, 54, 0.18) 50%, transparent 66%);
+	}
+html.dark .thinking-dots span {
+		background: #313236;
+		box-shadow: 0 0 0 0 rgba(161, 161, 170, 0.2), 0 0 10px rgba(148, 163, 184, 0.18);
+	}
+html.dark .tool-group-event > summary {
+		color: #c6c6cd;
+	}
+html.dark .tool-group-event > summary > .tool-group-icon {
+		color: #a1a1a8;
+	}
+html.dark .tool-group-event > summary strong {
+		color: #c6c6cd;
+	}
+html.dark .tool-group-event > summary em {
+		color: #a1a1a8;
+	}
+html.dark .tool-group-stack {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .process-live .live-process-summary .tool-name,
+html.dark .process-live.tool-group-event:not([open]) > summary strong,
+html.dark .process-live.reasoning-card > summary > span:nth-of-type(1) {
+		color: #c6c6cd;
+	}
+html.dark .process-live .live-process-summary .tool-preview {
+		color: #a1a1a8;
+	}
+</style>

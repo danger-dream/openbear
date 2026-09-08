@@ -424,3 +424,107 @@ onBeforeUnmount(() => {
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .tool-arguments-view {
+		color: #c6c6cd;
+	}
+html.dark .tool-argument-primary {
+		border-left: 2px solid rgba(96, 165, 250, 0.52);
+		background: #1d1e22;
+	}
+html.dark .tool-argument-tag {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .tool-argument-tag.is-primary {
+		border-color: #3d3e46;
+		background: #1d1e22;
+		color: #efeff2;
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+html.dark .tool-argument-tag.is-primary b {
+		color: #60a5fa;
+	}
+html.dark .tool-argument-tag b {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-row,
+html.dark .tool-argument-block {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .tool-argument-row.is-primary {
+		border-color: #3d3e46;
+		box-shadow: inset 2px 0 rgba(99, 102, 241, 0.45), 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+html.dark .tool-argument-row.is-primary .tool-argument-row-head > span {
+		color: #60a5fa;
+	}
+html.dark .tool-argument-row-head > span,
+html.dark .tool-argument-block header span {
+		color: #c6c6cd;
+	}
+html.dark .tool-argument-row button,
+html.dark .tool-argument-block button {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-row button:hover,
+html.dark .tool-argument-block button:hover,
+html.dark .tool-argument-row button:focus-visible,
+html.dark .tool-argument-block button:focus-visible {
+		color: #dedee1;
+	}
+html.dark .tool-argument-row code,
+html.dark .tool-argument-row a,
+html.dark .tool-argument-row p {
+		color: #dedee1;
+	}
+html.dark .tool-argument-row a:hover {
+		color: #60a5fa;
+	}
+html.dark .tool-argument-block header {
+		border-bottom: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .tool-argument-block.is-secondary {
+		background: #1d1e22;
+	}
+html.dark .tool-argument-block.is-secondary > summary {
+		color: #c6c6cd;
+	}
+html.dark .tool-argument-block.is-secondary > summary em {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-block.is-secondary > summary i {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-block.is-secondary[open] > summary {
+		border-bottom: 1px solid #3d3e46;
+	}
+html.dark .secondary-block-actions {
+		border-bottom: 1px solid #3d3e46;
+		color: #a1a1a8;
+	}
+html.dark .secondary-block-actions button {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-block header em {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-block.role-old header span::before,
+html.dark .tool-argument-block.role-new header span::before {
+		color: #a1a1a8;
+	}
+html.dark .tool-argument-block pre {
+		background: #1d1e22;
+	}
+html.dark .tool-argument-block code.hljs {
+		color: #dedee1;
+	}
+html.dark .tool-arguments-empty {
+		color: #a1a1a8;
+	}
+</style>

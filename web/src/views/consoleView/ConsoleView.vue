@@ -96,6 +96,17 @@ import {
 	createToolDetailCache,
 	TOOL_DETAIL_CACHE_KEY,
 } from "./toolDetailCache.js";
+import {
+	createOutboundSendTracker,
+	probeSocket,
+	restoreOutboundDraft,
+	waitForSocketOpen,
+} from "./outboundSend.js";
+import {
+	createRunConfigSaveQueue,
+	mayRetireRunConfigOverride,
+	runConfigForDisplay,
+} from "./runConfigState.js";
 
 const DEFAULT_NEW_CONVERSATION_THINKING = "";
 const DRAFT_STORAGE_KEY = "openbear.console.drafts.v1";
@@ -105,12 +116,24 @@ const STREAM_UI_FRAME_MS = 34;
 const ACTIVE_TURN_SCROLL_UPDATE_MS = 140;
 const INITIAL_TIMELINE_LIMIT = 200;
 const LOAD_EARLIER_SCROLL_THRESHOLD = 180;
-const props = defineProps({conversationUuid: {type: String, default: ""}});
+const props = defineProps({
+	conversationUuid: {type: String, default: ""},
+	// Immutable ownership for the current local draft. App changes it only after
+	// an explicit reassignment confirmation; persisted conversations use it as the
+	// target for cross-family "new conversation" creation.
+	folderId: {type: String, default: ""},
+});
 const emit = defineEmits(["conversation-created", "conversations-refresh"]);
 
 const loading = ref(false);
+// A replacement state request must finish an outstanding entry scroll instead
+// of replacing its bottom intent with the background refresh's preserve mode.
+let pendingLoadBottomScroll = null;
 const running = ref(false);
-const compactPending = ref(false);
+// HTTP compaction can outlive a visit. Keep its pending lock on its own
+// conversation, while the visit generation protects page-local side effects.
+const compactRequests = ref(new Map());
+let compactInteractionGeneration = 0;
 const sendPending = ref(false);
 const foregroundRunning = ref(false);
 const rootTurnRunning = ref(false);
@@ -124,6 +147,9 @@ const revisionByOpId = ref(new Map());
 const lastFrameSeq = ref(0);
 const lastStats = ref(null);
 const chatState = ref(null);
+// Successful config saves update this display-only overlay. Keeping chatState,
+// messages and operation refs untouched prevents an unrelated timeline rebuild.
+const runConfigOverride = ref(null);
 const scroller = ref(null);
 const autoScrollLocked = ref(true);
 const scrollerOverflow = ref(false);
@@ -199,7 +225,11 @@ let appliedDefaultsRevision = 0;
 let optionsLoadPromise = null;
 let agentAutoOpenBoundaryConversation = "";
 let agentAutoOpenPendingConversation = "";
-let pendingOutboundSend = null;
+let sendAttemptGeneration = 0;
+let connectionResumePromise = null;
+const outboundSends = createOutboundSendTracker({
+	onTimeout: (pending) => recoverUnconfirmedSend(pending),
+});
 const handleExternalRefresh = async () => {
 	const shouldFocus = isLocalConversation.value;
 	await load({scrollMode: "preserve"});
@@ -287,6 +317,7 @@ const contextUsage = computed(() => resolveContextUsage(
 ));
 const lastContextTokens = computed(() => contextUsage.value.known ? Number(contextUsage.value.tokens || 0) : 0);
 const serverCompacting = computed(() => Array.from(operationsById.value.values()).some((op) => isContextCompactionOperation(op) && ["active", "paused", "waiting_control"].includes(op?.lifecycle)));
+const compactPending = computed(() => compactRequests.value.has(activeConversationUuid.value));
 const compacting = computed(() => compactPending.value || serverCompacting.value);
 const canCompact = computed(() => !isLocalConversation.value && !running.value && !compacting.value && Boolean(contextUsage.value.authoritative) && Boolean(contextUsage.value.known) && Number(contextUsage.value.percent || 0) >= Number(contextUsage.value.manualMinPercent ?? 50));
 const modelCallRows = computed(() => Array.isArray(chatState.value?.modelCalls) ? chatState.value.modelCalls : []);
@@ -308,6 +339,19 @@ const activeTurnHasWork = computed(() => {
 });
 const activeConversationUuid = computed(() => props.conversationUuid || chatState.value?.conversationUuid || "");
 const isLocalConversation = computed(() => String(props.conversationUuid || "").startsWith("local:"));
+let runConfigInteractionGeneration = 0;
+const runConfigSaves = createRunConfigSaveQueue({
+	captureScope: () => runConfigInteractionGeneration,
+	isCurrent: (uuid, generation) => Boolean(componentMounted && generation === runConfigInteractionGeneration && !isLocalConversation.value && String(props.conversationUuid || "") === uuid),
+	apply: (runConfig) => {
+		runConfigOverride.value = runConfig;
+	},
+});
+const displayedRunConfig = computed(() => runConfigForDisplay(
+	chatState.value,
+	runConfigOverride.value,
+	activeConversationUuid.value,
+));
 const conversationTitle = computed(() => {
 	const title = String(chatState.value?.conversation?.title || "").trim();
 	if (title) return title;
@@ -319,19 +363,19 @@ const localFast = ref(false);
 const localAgentModel = ref("");
 const localAgentThinking = ref("");
 const localAgentFast = ref(null);
-const currentModel = computed(() => (isLocalConversation.value && localModel.value) ? localModel.value : (chatState.value?.model || ""));
-const currentThinking = computed(() => (isLocalConversation.value && localThinking.value) ? localThinking.value : (chatState.value?.thinkingLevel || ""));
-const effectiveThinking = computed(() => chatState.value?.effectiveThinkingLevel || currentThinking.value || "off");
-const currentFast = computed(() => (isLocalConversation.value ? localFast.value : Boolean(chatState.value?.fastMode || chatState.value?.effectiveFastMode)));
+const currentModel = computed(() => (isLocalConversation.value && localModel.value) ? localModel.value : (displayedRunConfig.value?.model || ""));
+const currentThinking = computed(() => (isLocalConversation.value && localThinking.value) ? localThinking.value : (displayedRunConfig.value?.thinkingLevel || ""));
+const effectiveThinking = computed(() => displayedRunConfig.value?.effectiveThinkingLevel || currentThinking.value || "off");
+const currentFast = computed(() => (isLocalConversation.value ? localFast.value : Boolean(displayedRunConfig.value?.fastMode || displayedRunConfig.value?.effectiveFastMode)));
 const currentModelInfo = computed(() => modelOptions.value.find((m) => m.key === currentModel.value) || null);
 const currentThinkLevels = computed(() => {
-	const stateLevels = Array.isArray(chatState.value?.thinkingLevels) ? chatState.value.thinkingLevels.filter(Boolean) : [];
+	const stateLevels = Array.isArray(displayedRunConfig.value?.thinkingLevels) ? displayedRunConfig.value.thinkingLevels.filter(Boolean) : [];
 	if (!isLocalConversation.value && stateLevels.length) return stateLevels;
 	return Array.isArray(currentModelInfo.value?.thinkingLevels) ? currentModelInfo.value.thinkingLevels.filter(Boolean) : [];
 });
 const supportsThinking = computed(() => currentThinkLevels.value.length > 0);
-const fastSupported = computed(() => Boolean(currentModelInfo.value?.supportsFast || chatState.value?.fastSupported));
-const agentRunConfig = computed(() => chatState.value?.agentRunConfig || null);
+const fastSupported = computed(() => Boolean(currentModelInfo.value?.supportsFast || displayedRunConfig.value?.fastSupported));
+const agentRunConfig = computed(() => displayedRunConfig.value?.agentRunConfig || null);
 const agentModel = computed(() => {
 	if (isLocalConversation.value) return localAgentModel.value || "";
 	return String(agentRunConfig.value?.model || "");
@@ -361,21 +405,20 @@ const agentDefaultThinkingLabel = computed(() => {
 	const level = agentEffective.value?.defaultThinkingLevel || modelDefaultThinking(agentEffectiveModelInfo.value);
 	return level ? thinkingLabel(level) : "模型默认";
 });
-const agentEffectiveThinking = computed(() => {
-	if (agentThinkLevel.value) return agentThinkLevel.value;
-	return String(agentEffective.value?.thinkLevel || agentEffective.value?.defaultThinkingLevel || "off");
-});
+const agentEffectiveThinking = computed(() => String(
+	agentEffective.value?.thinkLevel || agentThinkLevel.value || agentEffective.value?.defaultThinkingLevel || "off",
+));
 const agentFastSupported = computed(() => Boolean(agentEffectiveModelInfo.value?.supportsFast || agentEffective.value?.fastSupported));
 const agentEffectiveFast = computed(() => {
 	if (agentFastMode.value === true) return agentFastSupported.value;
 	if (agentFastMode.value === false) return false;
 	return Boolean(agentEffective.value?.fastMode ?? (currentFast.value && agentFastSupported.value));
 });
-const contextWindow = computed(() => Number(currentModelInfo.value?.contextWindow || 0));
+const contextWindow = computed(() => Number(currentModelInfo.value?.contextWindow || displayedRunConfig.value?.contextWindow || 0));
 const compactTriggerTokens = computed(() => {
-	const explicit = Number(currentModelInfo.value?.compactTriggerTokens || chatState.value?.compactTriggerTokens || 0);
+	const explicit = Number(currentModelInfo.value?.compactTriggerTokens || displayedRunConfig.value?.compactTriggerTokens || 0);
 	if (explicit > 0) return explicit;
-	const ratio = Number(currentModelInfo.value?.compactRatio || chatState.value?.compactRatio || 0.7);
+	const ratio = Number(currentModelInfo.value?.compactRatio || displayedRunConfig.value?.compactRatio || 0.7);
 	return contextWindow.value ? Math.round(contextWindow.value * ratio) : 0;
 });
 const contextPercent = computed(() => compactTriggerTokens.value ? Math.min(999, lastContextTokens.value * 100 / compactTriggerTokens.value) : 0);
@@ -493,6 +536,18 @@ function clearDraftAndAttachments() {
 	clearDraftForConversation();
 	clearAttachments();
 }
+
+function discardConversationDraft(conversationUuid) {
+	const key = String(conversationUuid || "");
+	if (!key) return;
+	clearDraftForConversation(key);
+	if (draftKey(props.conversationUuid) === key) {
+		draft.value = "";
+		clearAttachments();
+		adjustComposerHeight();
+	}
+}
+defineExpose({discardConversationDraft});
 
 function primaryModelInfo() {
 	const preferred = currentPrimaryModelKey.value || primaryModelKey.value;
@@ -1034,20 +1089,37 @@ async function toggleModelMenu() {
 	if (modelMenuOpen.value) await loadOptions();
 }
 
+function isRunConfigInteractionCurrent(conversationUuid, localAtRequest) {
+	return Boolean(
+		componentMounted
+		&& String(props.conversationUuid || "") === String(conversationUuid || "")
+		&& isLocalConversation.value === Boolean(localAtRequest)
+	);
+}
+
 async function selectModel(model) {
 	const wasRunning = running.value;
+	const conversationUuid = String(activeConversationUuid.value || "");
+	const localAtRequest = isLocalConversation.value;
 	const switchNow = async () => {
-		if (isLocalConversation.value) {
+		let applied = true;
+		if (localAtRequest) {
 			await patchLocalRunDefaults({mainModel: model.key});
-		} else if (activeConversationUuid.value) await Api.conversationSetModel(activeConversationUuid.value, model.key);
-		else throw new Error("conversation_required");
+		} else if (conversationUuid) {
+			const outcome = await runConfigSaves.enqueue(
+				conversationUuid,
+				() => Api.conversationSetModel(conversationUuid, model.key),
+			);
+			applied = outcome.applied;
+		} else throw new Error("conversation_required");
+		if (!applied || !isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 		modelQuery.value = "";
-		if (!isLocalConversation.value) await load({scrollMode: "preserve"});
 		ElMessage.success(wasRunning ? `已保存模型：${model.key}，下一次调用生效` : `已切换模型：${model.key}`);
 	};
 	try {
 		await switchNow();
 	} catch (error) {
+		if (!isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 		const code = apiError(error);
 		if (code === "cross_family_requires_new_session") {
 			try {
@@ -1056,17 +1128,20 @@ async function selectModel(model) {
 					confirmButtonText: "新会话切换",
 					cancelButtonText: "取消",
 				});
-				const created = await Api.createConversation({title: "新会话", model: model.key});
+				if (!isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
+				const created = await Api.createConversation({title: "新会话", model: model.key, folderId: props.folderId || ""});
+				if (!isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 				const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
 				if (uuid) {
 					const nextThinking = modelDefaultThinking(model);
 					if (nextThinking) await Api.conversationSetThinking(uuid, nextThinking);
+					if (!isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 					emit("conversation-created", uuid);
 				}
 				await load({scrollMode: "bottom"});
 				window.dispatchEvent(new CustomEvent("openbear:conversations-refresh"));
 			} catch (inner) {
-				if (inner === "cancel" || inner === "close") return;
+				if (inner === "cancel" || inner === "close" || !isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 				ElMessage.error(apiError(inner));
 			}
 			return;
@@ -1079,18 +1154,25 @@ async function selectModel(model) {
 async function selectThinking(level) {
 	const wasRunning = running.value;
 	if (!supportsThinking.value || !currentThinkLevels.value.includes(level)) return;
+	const conversationUuid = String(activeConversationUuid.value || "");
+	const localAtRequest = isLocalConversation.value;
 	try {
-		if (isLocalConversation.value) {
+		let applied = true;
+		if (localAtRequest) {
 			await patchLocalRunDefaults({mainThinkingLevel: level});
-		} else if (activeConversationUuid.value) {
-			await Api.conversationSetThinking(activeConversationUuid.value, level);
+		} else if (conversationUuid) {
+			const outcome = await runConfigSaves.enqueue(
+				conversationUuid,
+				() => Api.conversationSetThinking(conversationUuid, level),
+			);
+			applied = outcome.applied;
 		} else {
 			throw new Error("conversation_required");
 		}
-		if (!isLocalConversation.value) await load({scrollMode: "preserve"});
+		if (!applied || !isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 		if (wasRunning) ElMessage.success("思考强度已保存，下一次调用生效");
 	} catch (error) {
-		ElMessage.error(apiError(error));
+		if (isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) ElMessage.error(apiError(error));
 	}
 }
 
@@ -1098,15 +1180,23 @@ async function toggleFastMode() {
 	const wasRunning = running.value;
 	if (!fastSupported.value) return;
 	const next = !currentFast.value;
+	const conversationUuid = String(activeConversationUuid.value || "");
+	const localAtRequest = isLocalConversation.value;
 	try {
-		if (isLocalConversation.value) {
+		let applied = true;
+		if (localAtRequest) {
 			await patchLocalRunDefaults({mainFastMode: next});
-		} else if (activeConversationUuid.value) await Api.conversationSetFast(activeConversationUuid.value, next);
-		else throw new Error("conversation_required");
-		if (!isLocalConversation.value) await load({scrollMode: "preserve"});
+		} else if (conversationUuid) {
+			const outcome = await runConfigSaves.enqueue(
+				conversationUuid,
+				() => Api.conversationSetFast(conversationUuid, next),
+			);
+			applied = outcome.applied;
+		} else throw new Error("conversation_required");
+		if (!applied || !isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 		ElMessage.success(wasRunning ? "Fast 模式已保存，下一次调用生效" : (next ? "Fast 模式已开启" : "Fast 模式已关闭"));
 	} catch (error) {
-		ElMessage.error(apiError(error));
+		if (isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) ElMessage.error(apiError(error));
 	}
 }
 
@@ -1144,22 +1234,29 @@ function buildLocalAgentRunConfig(overrides = {}) {
 
 async function saveAgentRunConfig(patch, successText) {
 	const wasRunning = running.value;
+	const conversationUuid = String(activeConversationUuid.value || "");
+	const localAtRequest = isLocalConversation.value;
 	try {
-		if (isLocalConversation.value) {
+		let applied = true;
+		if (localAtRequest) {
 			const defaultsPatch = {};
 			if (patch.model !== undefined) defaultsPatch.agentModel = patch.model || "";
 			if (patch.thinkLevel !== undefined) defaultsPatch.agentThinkLevel = patch.thinkLevel || "";
 			if (patch.fastMode !== undefined) defaultsPatch.agentFastMode = patch.fastMode;
 			await patchLocalRunDefaults(defaultsPatch);
-		} else if (activeConversationUuid.value) {
-			await Api.conversationSetAgentRunConfig(activeConversationUuid.value, patch);
+		} else if (conversationUuid) {
+			const outcome = await runConfigSaves.enqueue(
+				conversationUuid,
+				() => Api.conversationSetAgentRunConfig(conversationUuid, patch),
+			);
+			applied = outcome.applied;
 		} else {
 			throw new Error("conversation_required");
 		}
-		if (!isLocalConversation.value) await load({scrollMode: "preserve"});
+		if (!applied || !isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) return;
 		ElMessage.success(wasRunning ? `${successText}，下一次新 Agent 生效` : successText);
 	} catch (error) {
-		ElMessage.error(apiError(error));
+		if (isRunConfigInteractionCurrent(conversationUuid, localAtRequest)) ElMessage.error(apiError(error));
 	}
 }
 
@@ -2019,6 +2116,7 @@ function lockAutoScroll() {
 }
 
 function unlockAutoScroll() {
+	pendingLoadBottomScroll = null;
 	explicitUnlockAt = Date.now();
 	autoScrollLocked.value = false;
 	updateScrollerOverflow();
@@ -2384,37 +2482,88 @@ function applyPendingSteeringEvent(data = {}) {
 }
 
 function finishPendingOutboundSend(requestId) {
-	if (!pendingOutboundSend || String(requestId || "") !== pendingOutboundSend.requestId) return false;
-	queueSentAttachmentPreviewRevokes(pendingOutboundSend.previewUrls || []);
-	clearAttachments({revoke: false});
-	pendingOutboundSend = null;
+	const pending = outboundSends.take(String(requestId || ""));
+	if (!pending) return false;
 	sendPending.value = false;
+	// Only release attachments belonging to this request. The user may already
+	// have added files for their next message while this ACK was in flight.
+	const sentIds = new Set(pending.attachments.map((item) => item.id));
+	queueSentAttachmentPreviewRevokes(pending.previewUrls || []);
+	pendingAttachments.value = pendingAttachments.value.filter((item) => !sentIds.has(item.id));
+	attachmentPreviews.value = Object.fromEntries(Object.entries(attachmentPreviews.value).filter(([id]) => !sentIds.has(id)));
+	return true;
+}
+
+function restoreReleasedOutboundSend(pending, error = "send_failed", {uncertain = false} = {}) {
+	if (!pending) return false;
+	sendPending.value = Boolean(outboundSends.current);
+	const uuid = pending.conversationUuid;
+	const isActive = uuid === activeConversationUuid.value;
+	const currentDraft = isActive ? draft.value : (draftByConversation.value[draftKey(uuid)] || "");
+	const restoredDraft = restoreOutboundDraft(pending.draftText, currentDraft);
+	setDraftForConversation(uuid, restoredDraft);
+	if (!isActive) return true;
+	if (pending.optimisticId) {
+		messages.value = messages.value.filter((message) => String(message?.id || "") !== pending.optimisticId);
+	}
+	draft.value = restoredDraft;
+	// Retain the original files as well as any new draft attachments. Recreate
+	// previews if a file was removed while awaiting its acceptance receipt.
+	const attachmentIds = new Set(pendingAttachments.value.map((item) => item.id));
+	for (const item of pending.attachments) {
+		if (attachmentIds.has(item.id)) continue;
+		pendingAttachments.value.push(item);
+		if (item.file.type?.startsWith("image/")) attachmentPreviews.value[item.id] = URL.createObjectURL(item.file);
+	}
+	adjustComposerHeight();
+	// Do not turn off a real run whose frames arrived before a lost ACK.
+	const operations = orderedOperationsList();
+	syncRunStateFromOperations(operations, operations.length ? null : chatState.value);
+	status.value = uncertain ? "发送结果未确认" : (["busy", "conversation_compacting"].includes(error) ? "会话正在压缩" : "发送失败");
 	return true;
 }
 
 function restorePendingOutboundSend(requestId, error = "send_failed") {
-	if (!pendingOutboundSend || String(requestId || "") !== pendingOutboundSend.requestId) return false;
-	const pending = pendingOutboundSend;
-	pendingOutboundSend = null;
-	sendPending.value = false;
-	if (pending.optimisticId) {
-		messages.value = messages.value.filter((message) => String(message?.id || "") !== pending.optimisticId);
-	}
-	if (!draft.value.trim()) draft.value = pending.draftText;
-	setDraftForConversation(activeConversationUuid.value, draft.value);
-	adjustComposerHeight();
-	if (!pending.wasRunning) {
-		running.value = false;
-		foregroundRunning.value = false;
-		rootTurnRunning.value = false;
-		clearActiveRun();
-		runStartedAt.value = 0;
-	}
-	status.value = error === "busy" || error === "conversation_compacting" ? "会话正在压缩" : "发送失败";
+	return restoreReleasedOutboundSend(outboundSends.take(String(requestId || "")), error);
+}
+
+function recoverUnconfirmedSend(pending) {
+	if (!pending) return;
+	const uncertain = pending.phase === "sent";
+	restoreReleasedOutboundSend(pending, "send_timeout", {uncertain});
+	ElMessage.warning({
+		message: uncertain
+			? "发送结果未确认，草稿和附件已保留。请先核对会话再重试；不会自动重发。"
+			: "消息未能发送，草稿和附件已恢复，请检查连接后重试。",
+		duration: 8000,
+	});
+	const uuid = pending.conversationUuid;
+	const generation = sendAttemptGeneration;
+	const isCurrent = () => componentMounted && uuid === activeConversationUuid.value && generation === sendAttemptGeneration;
+	if (!isCurrent() || String(uuid).startsWith("local:")) return;
+	// The UI is already unlocked. A failed HTTP refresh must not lock it again.
+	closeWs();
+	void connectWs(uuid);
+	void load({conversationUuid: uuid, scrollMode: "preserve", manageLoading: false, isCurrent}).then(() => {
+		if (isCurrent() && uncertain && !running.value) status.value = "发送结果未确认，请核对会话";
+	});
+}
+
+function recoverDisconnectedSend() {
+	const pending = outboundSends.current;
+	if (!pending || pending.phase !== "sent") return false;
+	recoverUnconfirmedSend(outboundSends.take(pending.requestId));
 	return true;
 }
 
+function leavePendingSend() {
+	sendAttemptGeneration += 1;
+	const pending = outboundSends.current;
+	if (pending) restoreReleasedOutboundSend(outboundSends.take(pending.requestId));
+}
+
 function handleWsMessage(raw, source = {}) {
+	if (source.socket && (source.socket !== ws || source.conversationUuid !== wsConversationUuid)) return;
 	let data = null;
 	try {
 		data = JSON.parse(raw?.data || raw || "{}");
@@ -2548,14 +2697,18 @@ async function connectWs(conversationUuid = props.conversationUuid) {
 	// Keep the baseline user-visible connection acknowledgement even though the
 	// transport now bootstraps incrementally instead of sending a second state.
 	socket.onopen = () => {
+		if (ws !== socket || wsConversationUuid !== uuid || !componentMounted) return;
 		status.value = running.value ? status.value : "已连接";
 	};
 	socket.onerror = () => {
+		if (ws !== socket || wsConversationUuid !== uuid) return;
 		status.value = "连接异常";
+		recoverDisconnectedSend();
 	};
 	socket.onclose = () => {
 		if (ws !== socket || wsConversationUuid !== uuid) return;
 		terminalStateRefreshScheduler.invalidate();
+		if (recoverDisconnectedSend()) return;
 		if (!reconnectTimer) reconnectTimer = window.setTimeout(() => {
 			reconnectTimer = null;
 			void connectWs();
@@ -2564,33 +2717,58 @@ async function connectWs(conversationUuid = props.conversationUuid) {
 	return socket;
 }
 
-async function waitWsOpen(sock) {
-	if (!sock) throw new Error("ws_not_ready");
-	if (sock.readyState === WebSocket.OPEN) return sock;
-	await new Promise((resolve, reject) => {
-		const t = window.setTimeout(() => reject(new Error("ws_connect_timeout")), 8000);
-		const oldOpen = sock.onopen;
-		const oldError = sock.onerror;
-		sock.onopen = (ev) => {
-			window.clearTimeout(t);
-			oldOpen?.(ev);
-			resolve();
-		};
-		sock.onerror = (ev) => {
-			window.clearTimeout(t);
-			oldError?.(ev);
-			reject(new Error("ws_connect_failed"));
-		};
-	});
-	return sock;
+async function ensureResponsiveWs(conversationUuid, isCurrent) {
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		if (!isCurrent()) throw new Error("send_cancelled");
+		const socket = await connectWs(conversationUuid);
+		try {
+			await waitForSocketOpen(socket);
+			if (!isCurrent() || socket !== ws) throw new Error("send_cancelled");
+			await probeSocket(socket);
+			if (!isCurrent() || socket !== ws) throw new Error("send_cancelled");
+			return socket;
+		} catch (error) {
+			if (!isCurrent()) throw error;
+			if (ws === socket) closeWs();
+			if (attempt === 1) throw error;
+		}
+	}
 }
 
-async function ensureServerConversationForSend(firstText) {
+function checkConnectionOnResume() {
+	if (!componentMounted || document.visibilityState !== "visible") return;
+	outboundSends.checkDeadline();
+	if (outboundSends.current || connectionResumePromise || isLocalConversation.value) return;
+	const uuid = activeConversationUuid.value;
+	if (!uuid) return;
+	const generation = sendAttemptGeneration;
+	const isCurrent = () => componentMounted && uuid === activeConversationUuid.value && generation === sendAttemptGeneration;
+	const promise = (async () => {
+		try {
+			const socket = await connectWs(uuid);
+			await waitForSocketOpen(socket);
+			if (!isCurrent() || socket !== ws) return;
+			await probeSocket(socket);
+		} catch {
+			if (!isCurrent()) return;
+			closeWs();
+			void connectWs(uuid);
+			await load({conversationUuid: uuid, scrollMode: "preserve", manageLoading: false, isCurrent});
+		}
+	})().finally(() => {
+		if (connectionResumePromise === promise) connectionResumePromise = null;
+	});
+	connectionResumePromise = promise;
+}
+
+async function ensureServerConversationForSend(firstText, pending) {
 	if (!isLocalConversation.value) return activeConversationUuid.value;
 	const title = String(firstText || "新会话").replace(/\s+/g, " ").trim().slice(0, 36) || "新会话";
-	const created = await Api.createConversation({title, runConfig: completeLocalRunConfig()});
+	const created = await Api.createConversation({title, runConfig: completeLocalRunConfig(), folderId: props.folderId || ""});
+	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
 	if (!uuid) throw new Error("conversation_create_failed");
+	pending.conversationUuid = uuid;
 	localToServerTransitionUuid.value = uuid;
 	chatState.value = {...(chatState.value || {}), conversationUuid: uuid};
 	emit("conversation-created", uuid);
@@ -2598,7 +2776,7 @@ async function ensureServerConversationForSend(firstText) {
 	return uuid;
 }
 
-function applyLoadedConversationState(data, conversationUuid, {replaceOperations = false} = {}) {
+function applyLoadedConversationState(data, conversationUuid, {replaceOperations = false, runConfigVersionAtRequest = null} = {}) {
 	const mergeExisting = !replaceOperations
 		&& timelinePageConversationUuid === String(conversationUuid || "")
 		&& operationsById.value.size > 0;
@@ -2611,6 +2789,11 @@ function applyLoadedConversationState(data, conversationUuid, {replaceOperations
 		operations: ops,
 		usage: normalizeLedgerUsageBaseline(data.usage || {}),
 	};
+	if (
+		runConfigVersionAtRequest !== null
+		&& runConfigOverride.value?.conversationUuid === String(conversationUuid || "")
+		&& mayRetireRunConfigOverride(runConfigVersionAtRequest, runConfigSaves.appliedVersion)
+	) runConfigOverride.value = null;
 	updatePendingSteering(data.pendingSteering || []);
 	lastStats.value = null;
 	let operationRunState = null;
@@ -2633,6 +2816,7 @@ async function load(options = {}) {
 	const conversationUuid = String(options?.conversationUuid || props.conversationUuid || "").trim();
 	if (!conversationUuid) return;
 	const requestGeneration = ++loadRequestGeneration;
+	const runConfigVersionAtRequest = runConfigSaves.appliedVersion;
 	const externalIsCurrent = typeof options?.isCurrent === "function" ? options.isCurrent : null;
 	const isCurrent = () => Boolean(
 		componentMounted
@@ -2640,8 +2824,13 @@ async function load(options = {}) {
 		&& conversationUuid === String(props.conversationUuid || "").trim()
 		&& (!externalIsCurrent || externalIsCurrent())
 	);
-	const scrollMode = String(options?.scrollMode || "preserve");
-	const lockOnBottom = options?.lock !== false;
+	const requestedScrollMode = String(options?.scrollMode || "preserve");
+	if (requestedScrollMode === "bottom") {
+		pendingLoadBottomScroll = {conversationUuid, lock: options?.lock !== false};
+	}
+	const bottomScroll = pendingLoadBottomScroll?.conversationUuid === conversationUuid ? pendingLoadBottomScroll : null;
+	const scrollMode = bottomScroll ? "bottom" : requestedScrollMode;
+	const lockOnBottom = bottomScroll ? bottomScroll.lock : options?.lock !== false;
 	const preserveAnchor = scrollMode === "preserve" && !autoScrollLocked.value ? captureScrollAnchor() : null;
 	if (conversationUuid.startsWith("local:")) {
 		if (!modelOptions.value.length) await loadOptions();
@@ -2652,9 +2841,10 @@ async function load(options = {}) {
 		resetLocalConversationState(conversationUuid);
 		restoreDraftForConversation(conversationUuid);
 		resetTransientThinking();
-		if (scrollMode === "bottom") {
+		if (scrollMode === "bottom" && bottomScroll === pendingLoadBottomScroll) {
 			if (lockOnBottom) autoScrollLocked.value = true;
 			await scrollBottom({force: true, cause: "load-local", isCurrent});
+			if (isCurrent() && bottomScroll === pendingLoadBottomScroll) pendingLoadBottomScroll = null;
 		} else if (preserveAnchor) {
 			await restoreScrollAnchor(preserveAnchor, {isCurrent});
 		} else {
@@ -2665,7 +2855,7 @@ async function load(options = {}) {
 		}
 		return;
 	}
-	const manageLoading = options?.manageLoading !== false;
+	const manageLoading = options?.manageLoading !== false || loading.value;
 	if (manageLoading && isCurrent()) loading.value = true;
 	try {
 		const outcome = await runGuardedConversationStateRefresh({
@@ -2674,13 +2864,15 @@ async function load(options = {}) {
 			requestState: (uuid) => Api.conversationState(uuid, {timelineLimit: INITIAL_TIMELINE_LIMIT}),
 			applyState: (data, uuid) => applyLoadedConversationState(data, uuid, {
 				replaceOperations: Boolean(options?.replaceOperations),
+				runConfigVersionAtRequest,
 			}),
 			connectState: (uuid) => connectWs(uuid),
 		});
 		if (outcome.stage !== "complete" || !isCurrent()) return;
-		if (scrollMode === "bottom") {
+		if (scrollMode === "bottom" && bottomScroll === pendingLoadBottomScroll) {
 			if (lockOnBottom) autoScrollLocked.value = true;
 			await scrollBottom({force: true, cause: "load", isCurrent});
+			if (isCurrent() && bottomScroll === pendingLoadBottomScroll) pendingLoadBottomScroll = null;
 		} else if (preserveAnchor) {
 			await restoreScrollAnchor(preserveAnchor, {isCurrent});
 		} else {
@@ -2773,21 +2965,37 @@ async function deleteTurnSuffix(turn) {
 
 async function compactConversation() {
 	const uuid = activeConversationUuid.value;
-	if (!uuid || !canCompact.value || compactPending.value) return;
+	const generation = compactInteractionGeneration;
+	const isCurrentVisit = () => componentMounted
+		&& uuid === activeConversationUuid.value
+		&& generation === compactInteractionGeneration;
+	if (!uuid || !isCurrentVisit() || !canCompact.value || compactPending.value) return;
 	try {
 		await ElMessageBox.confirm("将调用压缩模型把现有历史整理为摘要。原始消息仍会保留，但后续模型将主要基于压缩摘要继续对话。", "压缩当前会话？", {type: "warning", confirmButtonText: "开始压缩", cancelButtonText: "取消"});
 	} catch { return; }
-	compactPending.value = true;
+	// Confirmation may resolve after navigation or after another action starts.
+	if (!isCurrentVisit() || !canCompact.value || compactPending.value) return;
+	const request = Symbol("compact");
+	compactRequests.value.set(uuid, request);
+	const isCurrent = () => isCurrentVisit() && compactRequests.value.get(uuid) === request;
 	try {
 		const result = await Api.conversationCompact(uuid);
+		if (!isCurrent()) return;
 		if (result?.state) chatState.value = result.state;
-		await load({scrollMode: "preserve"});
+		await load({conversationUuid: uuid, scrollMode: "preserve", isCurrent});
+		if (!isCurrent()) return;
 		ElMessage.success(result?.outcome?.did ? "上下文压缩完成" : "当前历史没有可压缩内容");
-	} catch (error) { ElMessage.error(apiError(error)); }
-	finally { compactPending.value = false; }
+	} catch (error) {
+		if (isCurrent()) ElMessage.error(apiError(error));
+	} finally {
+		// A late response only releases its own lock, never the visible request's.
+		if (compactRequests.value.get(uuid) === request) compactRequests.value.delete(uuid);
+	}
 }
 
 async function send() {
+	// Enter and click must share the same single-flight guard.
+	if (sendPending.value || outboundSends.current) return;
 	if (compacting.value) { ElMessage.warning("上下文正在压缩，请稍候"); return; }
 	const text = draft.value.trim();
 	if (!text && !pendingAttachments.value.length) return;
@@ -2797,28 +3005,32 @@ async function send() {
 	}
 	const wasRunning = running.value;
 	const requestId = globalThis.crypto?.randomUUID?.() || `send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-	const files = pendingAttachments.value.map((item) => item.file);
+	const attachments = [...pendingAttachments.value];
+	const files = attachments.map((item) => item.file);
 	const sentPreviewUrls = Object.values(attachmentPreviews.value).filter(Boolean);
-	const optimisticAttachments = localAttachmentPayload();
+	const optimisticAttachments = localAttachmentPayload(attachments);
 	const finalText = text || (files.length ? "请根据我上传的附件回答。" : "");
-	let optimisticId = "";
-	pendingOutboundSend = {
+	const pending = outboundSends.begin({
 		requestId,
-		draftText: text,
+		conversationUuid: activeConversationUuid.value,
+		draftText: draft.value,
+		attachments,
 		previewUrls: sentPreviewUrls,
 		wasRunning,
-		optimisticId,
-	};
+		optimisticId: "",
+	});
+	if (!pending) return;
+	const generation = ++sendAttemptGeneration;
+	const isCurrent = () => componentMounted && outboundSends.isCurrent(pending) && generation === sendAttemptGeneration;
 	sendPending.value = true;
 	clearDraftForConversation();
 	draft.value = "";
 	adjustComposerHeight();
 	closeComposerMenus();
 	if (!wasRunning) {
-		optimisticId = `local-${Date.now()}`;
-		pendingOutboundSend.optimisticId = optimisticId;
+		pending.optimisticId = `local-${Date.now()}`;
 		messages.value.push({
-			id: optimisticId,
+			id: pending.optimisticId,
 			role: "user",
 			content: finalText,
 			attachments: optimisticAttachments,
@@ -2834,19 +3046,30 @@ async function send() {
 	}
 	lockAutoScroll();
 	status.value = wasRunning ? "插话排队中" : "提交中";
-	await scrollBottom({force: true});
 	try {
-		const conversationUuid = await ensureServerConversationForSend(finalText);
-		const sock = await waitWsOpen(await connectWs(conversationUuid));
+		await scrollBottom({force: true, isCurrent});
+		if (!isCurrent()) return;
+		const conversationUuid = await ensureServerConversationForSend(finalText, pending);
+		if (!isCurrent()) return;
 		const wsFiles = files.length ? await filesToWsPayload(files) : [];
+		if (!isCurrent()) return;
+		const sock = await ensureResponsiveWs(conversationUuid, isCurrent);
+		if (!isCurrent()) return;
 		sock.send(JSON.stringify({type: "send", requestId, text, files: wsFiles}));
+		outboundSends.markSent(pending);
 		emit("conversations-refresh");
 		window.dispatchEvent(new CustomEvent("openbear:conversations-refresh"));
 	} catch (error) {
+		if (!isCurrent()) return;
 		localToServerTransitionUuid.value = "";
 		restorePendingOutboundSend(requestId, "send_failed");
 		ElMessage.error(apiError(error));
-		await load({scrollMode: "preserve"});
+		await load({
+			conversationUuid: pending.conversationUuid,
+			scrollMode: "preserve",
+			manageLoading: false,
+			isCurrent: () => componentMounted && generation === sendAttemptGeneration && pending.conversationUuid === activeConversationUuid.value,
+		});
 	}
 }
 
@@ -2892,6 +3115,9 @@ async function newSession() {
 
 watch(() => props.conversationUuid, async (next, prev) => {
 	if (next === prev) return;
+	pendingLoadBottomScroll = null;
+	compactInteractionGeneration += 1;
+	runConfigInteractionGeneration += 1;
 	if (prev) setDraftForConversation(prev, draft.value);
 	resetAgentAutoOpenBoundary();
 	const isLocalToServerSend = String(prev || "").startsWith("local:")
@@ -2900,10 +3126,13 @@ watch(() => props.conversationUuid, async (next, prev) => {
 		&& hasOptimisticLocalTurn();
 	if (isLocalToServerSend) {
 		clearDraftForConversation(prev);
+		runConfigOverride.value = null;
 		chatState.value = {...(chatState.value || {}), conversationUuid: next};
 		agentAutoOpenBoundaryConversation = String(next || "");
 		return;
 	}
+	leavePendingSend();
+	runConfigOverride.value = null;
 	pinnedActiveTurnIndex = null;
 	activeTurnIndex.value = 0;
 	closeWs();
@@ -2938,6 +3167,10 @@ watch(messages, () => {
 onMounted(async () => {
 	componentMounted = true;
 	window.addEventListener("openbear:console-refresh", handleExternalRefresh);
+	window.addEventListener("focus", checkConnectionOnResume);
+	window.addEventListener("pageshow", checkConnectionOnResume);
+	window.addEventListener("online", checkConnectionOnResume);
+	document.addEventListener("visibilitychange", checkConnectionOnResume);
 	// Preserve the baseline visible initialization order: model options are
 	// applied before remote state, so no temporary model placeholder can render.
 	await loadOptions();
@@ -2948,11 +3181,17 @@ onMounted(async () => {
 	scheduleActiveTurnFromScroll({force: true});
 });
 onBeforeUnmount(() => {
+	leavePendingSend();
+	pendingLoadBottomScroll = null;
 	componentMounted = false;
 	if (workDetailTooltipReleaseTimer) window.clearTimeout(workDetailTooltipReleaseTimer);
 	toolDetailCache.reset("");
 	terminalStateRefreshScheduler.dispose();
 	window.removeEventListener("openbear:console-refresh", handleExternalRefresh);
+	window.removeEventListener("focus", checkConnectionOnResume);
+	window.removeEventListener("pageshow", checkConnectionOnResume);
+	window.removeEventListener("online", checkConnectionOnResume);
+	document.removeEventListener("visibilitychange", checkConnectionOnResume);
 	closeWs();
 	clearAttachments();
 	revokeSentAttachmentPreviewUrls();
@@ -2964,7 +3203,7 @@ onBeforeUnmount(() => {
 		<div class="console-main min-w-0 flex flex-1 flex-col">
 			<ConsoleHeader
 				:title="conversationTitle"
-				:subtitle="`${chatState?.model || '—'} · ${thinkingLabel(effectiveThinking)} · ${sessionShort}`"
+				:subtitle="`${currentModel || '—'} · ${thinkingLabel(effectiveThinking)} · ${sessionShort}`"
 				:running="running"
 				:run-started-at="runStartedAt"
 				:status="status"
@@ -3409,4 +3648,89 @@ onBeforeUnmount(() => {
 		--console-float-rail-bottom: calc(env(safe-area-inset-bottom, 0px) + var(--console-composer-height, 135px) + 50px);
 	}
 }
+</style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .console-page {
+		--bear-accent: #60a5fa;
+		--bear-accent-soft: #1d2d45;
+		--bear-ink: #e4e4e7;
+		--bear-muted: #a1a1aa;
+		--bear-paper: #1c1d21;
+		--bear-line: rgba(255, 255, 255, .12);
+	}
+html.dark .console-main {
+		background: #1d1e22;
+	}
+html.dark .conversation-column {
+		background: #1d1e22;
+	}
+html.dark .work-detail-toggle {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: rgba(29, 30, 34, 0.92);
+		color: #c6c6cd;
+		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .work-detail-toggle:hover {
+		border-color: rgba(96, 165, 250, 0.28);
+		color: #60a5fa;
+	}
+html.dark .work-detail-toggle.active {
+		border-color: rgba(96, 165, 250, 0.25);
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .work-detail-toggle.working {
+		border-color: rgba(96, 165, 250, 0.2);
+		background: rgba(32, 33, 37, 0.96);
+		color: #60a5fa;
+	}
+html.dark .work-detail-toggle.working::before {
+		border-top-color: rgba(96, 165, 250, 0.52);
+		border-right-color: rgba(96, 165, 250, 0.42);
+	}
+html.dark .console-scroll {
+		background: #1d1e22;
+	}
+html.dark .timeline-page-loading {
+		border: 1px solid rgba(96, 165, 250, 0.16);
+		background: rgba(29, 30, 34, 0.94);
+		color: #c6c6cd;
+		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .timeline-page-loading-icon {
+		color: #60a5fa;
+	}
+html.dark .scroll-lock-toggle {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: rgba(29, 30, 34, 0.92);
+		color: #c6c6cd;
+		box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .scroll-lock-toggle:hover {
+		border-color: rgba(96, 165, 250, 0.26);
+		color: #60a5fa;
+	}
+html.dark .scroll-lock-toggle.locked {
+		background: rgba(16, 185, 129, 0.12);
+		border-color: rgba(110, 231, 162, 0.28);
+		color: #6ee7a2;
+	}
+html.dark .quick-prompt {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.82);
+		color: #c6c6cd;
+		box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
+	}
+html.dark .quick-prompt:hover {
+		border-color: rgba(96, 165, 250, 0.24);
+		color: #60a5fa;
+	}
+html.dark .empty-mark {
+		border: 1px solid #3d3e46;
+		background: linear-gradient(145deg, #1d1e22, #202125);
+		color: #dedee1;
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11), 0 18px 48px rgba(0, 0, 0, 0.16);
+	}
 </style>

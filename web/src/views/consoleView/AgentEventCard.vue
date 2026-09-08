@@ -1138,3 +1138,326 @@ details[open] .disclosure-icon svg { transform: rotate(90deg); }
 	.agent-tabs button { padding: 7px 9px; }
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .agent-tool-event {
+		color: #c6c6cd;
+	}
+html.dark .agent-icon {
+		color: #a1a1a8;
+	}
+html.dark .agent-summary-title {
+		color: #c6c6cd;
+	}
+html.dark .agent-summary-preview {
+		color: #a1a1a8;
+	}
+html.dark .agent-summary-status-icon {
+		color: #a1a1a8;
+	}
+html.dark .agent-summary-status-icon.ok {
+		color: #67d5ed;
+	}
+html.dark .agent-summary-status-icon.error {
+		color: #fb8585;
+	}
+html.dark .agent-summary-status-icon.pending,
+html.dark .agent-summary-status-icon.partial {
+		color: #fbad66;
+	}
+html.dark .agent-summary-status-icon.running {
+		background: rgba(37, 99, 235, 0.1);
+		color: #60a5fa;
+	}
+html.dark .agent-summary-status-icon.running::before {
+		background: conic-gradient(from 0deg, transparent 0 34%, rgba(37, 99, 235, 0.95) 45%, transparent 62% 100%);
+	}
+html.dark .disclosure-icon {
+		color: #c6c6cd;
+	}
+html.dark .agent-tool-detail {
+		border: 1px solid rgba(61, 62, 70, 0.82);
+		background: linear-gradient(180deg, rgba(29, 30, 34, 0.98), rgba(29, 30, 34, 0.96));
+		box-shadow: 0 12px 34px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .agent-panel-head {
+		border-bottom: 1px solid rgba(61, 62, 70, 0.88);
+	}
+html.dark .agent-orb {
+		border: 1px solid rgba(61, 62, 70, 0.9);
+		background: linear-gradient(180deg, #1d1e22, #202125);
+		color: #c6c6cd;
+		box-shadow: 0 2px 7px rgba(0, 0, 0, 0.16);
+	}
+html.dark .agent-orb.running {
+		border-color: rgba(96, 165, 250, 0.52);
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .agent-title {
+		color: #efeff2;
+	}
+html.dark .agent-state {
+		border: 1px solid #3d3e46;
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .agent-state.running {
+		border-color: #3d3e46;
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .agent-state.ok {
+		border-color: #3d3e46;
+		background: #202125;
+		color: #67d5ed;
+	}
+html.dark .agent-state.error {
+		border-color: rgba(251, 133, 133, 0.52);
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .agent-subtitle {
+		color: #a1a1a8;
+	}
+html.dark .agent-metrics-row span {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.82);
+		color: #c6c6cd;
+	}
+html.dark .tiny-icon {
+		color: #a1a1a8;
+	}
+html.dark .agent-continuity-strip {
+		color: #c6c6cd;
+	}
+html.dark .agent-continuity-strip > span {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.76);
+	}
+html.dark .agent-continuity-strip b {
+		color: #a1a1a8;
+	}
+html.dark .agent-tabs {
+		border: 1px solid rgba(61, 62, 70, 0.72);
+		background: rgba(37, 38, 42, 0.5);
+	}
+html.dark .agent-tabs button {
+		color: #c6c6cd;
+	}
+html.dark .agent-tabs button:hover {
+		color: #efeff2;
+	}
+html.dark .agent-tabs button.active {
+		background: rgba(29, 30, 34, 0.96);
+		color: #efeff2;
+		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .agent-tabs button span {
+		background: #25262a;
+		color: #c6c6cd;
+	}
+html.dark .instance-loading {
+		color: #c6c6cd;
+	}
+html.dark .instance-fallback-notice {
+		border: 1px solid rgba(251, 173, 102, 0.52);
+		background: #202125;
+		color: #fbad66;
+	}
+html.dark .instance-fallback-notice button {
+		color: #fbad66;
+	}
+html.dark .instance-session-summary > span {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .instance-session-summary b,
+html.dark .instance-assignment-facts b,
+html.dark .instance-assignment-tools > b {
+		color: #a1a1a8;
+	}
+html.dark .instance-assignment {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.88);
+	}
+html.dark .instance-assignment.is-current {
+		box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.1);
+	}
+html.dark .instance-assignment > header span {
+		color: #a1a1a8;
+	}
+html.dark .instance-assignment > header strong {
+		color: #efeff2;
+	}
+html.dark .instance-assignment > header em {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .instance-assignment > header em.running {
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .instance-assignment > header em.ok {
+		background: #202125;
+		color: #67d5ed;
+	}
+html.dark .instance-assignment > header em.error {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .instance-assignment > header em.pending,
+html.dark .instance-assignment > header em.partial {
+		background: #202125;
+		color: #fbad66;
+	}
+html.dark .instance-assignment-facts {
+		color: #c6c6cd;
+	}
+html.dark .instance-assignment-tools {
+		color: #a1a1a8;
+	}
+html.dark .instance-assignment-tools > span {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .tab-intro strong {
+		color: #efeff2;
+	}
+html.dark .tab-intro span {
+		color: #a1a1a8;
+	}
+html.dark .tab-intro em {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .tab-empty {
+		border: 1px dashed #3d3e46;
+		color: #a1a1a8;
+	}
+html.dark .monitor-timeline::before {
+		background: linear-gradient(#153359, #2b2c30 30%, #19542e);
+	}
+html.dark .monitor-rail time {
+		color: #a1a1a8;
+	}
+html.dark .monitor-dot {
+		border: 2px solid #3d3e46;
+		background: #2a2b2f;
+		box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.11);
+	}
+html.dark .monitor-card-body {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.82);
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+html.dark .monitor-card-heading > span {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .monitor-card-heading strong {
+		color: #efeff2;
+	}
+html.dark .monitor-card-body > p {
+		color: #c6c6cd;
+	}
+html.dark .monitor-card-body li {
+		background: rgba(32, 33, 37, 0.75);
+		color: #c6c6cd;
+	}
+html.dark .monitor-card-body li::before {
+		background: #313236;
+	}
+html.dark .monitor-badges span {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .monitor-card.tone-active .monitor-dot {
+		box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.45);
+	}
+html.dark .monitor-card.tone-active .monitor-card-body {
+		border-color: #3d3e46;
+	}
+html.dark .monitor-card.tone-waiting .monitor-dot,
+html.dark .monitor-card.tone-warning .monitor-dot {
+		box-shadow: 0 0 0 1px rgba(252, 211, 77, 0.45);
+	}
+html.dark .monitor-card.tone-waiting .monitor-card-body,
+html.dark .monitor-card.tone-warning .monitor-card-body {
+		border-color: rgba(251, 173, 102, 0.52);
+	}
+html.dark .monitor-card.tone-success .monitor-dot {
+		box-shadow: 0 0 0 1px rgba(134, 239, 172, 0.45);
+	}
+html.dark .monitor-card.tone-success .monitor-card-body {
+		border-color: #3d3e46;
+	}
+html.dark .monitor-card.tone-danger .monitor-dot {
+		box-shadow: 0 0 0 1px rgba(252, 165, 165, 0.45);
+	}
+html.dark .monitor-card.tone-danger .monitor-card-body {
+		border-color: #3d3e46;
+	}
+html.dark .activity-history-state {
+		color: #a1a1a8;
+	}
+html.dark .activity-history-state button {
+		color: #c6c6cd;
+	}
+html.dark .activity-history-state button:hover {
+		color: #efeff2;
+	}
+html.dark .activity-loading {
+		color: #c6c6cd;
+	}
+html.dark .activity-error {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .activity-error button {
+		color: #fb8585;
+	}
+html.dark .launch-meta-tag {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd !important;
+	}
+html.dark .launch-meta-tag b {
+		color: #a1a1a8;
+	}
+html.dark .content-frame {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.9);
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11);
+	}
+html.dark .content-frame-head {
+		border-bottom: 1px solid #3d3e46;
+		background: rgba(32, 33, 37, 0.72);
+	}
+html.dark .content-frame-head-main > span {
+		color: #c6c6cd;
+	}
+html.dark .content-frame-head-main em {
+		color: #a1a1a8;
+	}
+html.dark .frame-copy-button {
+		border: 1px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.92);
+		color: #c6c6cd;
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+html.dark .frame-copy-button:hover {
+		border-color: #3d3e46;
+		color: #efeff2;
+	}
+html.dark .launch-content-frame pre {
+		color: #dedee1;
+	}
+html.dark .output-panel .agent-output {
+		color: #dedee1;
+	}
+</style>

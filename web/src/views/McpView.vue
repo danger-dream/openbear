@@ -1223,3 +1223,85 @@ code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .settings-link {
+		border: 1px solid rgba(96, 165, 250, 0.28);
+		background: rgba(29, 30, 34, 0.88);
+		color: #60a5fa;
+	}
+html.dark .mcp-card:hover {
+		border-color: rgba(96, 165, 250, 0.18);
+	}
+html.dark .mcp-mark {
+		color: #60a5fa;
+	}
+html.dark .mcp-facts > span {
+		background: rgba(255, 255, 255, 0.056);
+		color: #c6c6cd;
+	}
+html.dark .mcp-facts > span.is-warning {
+		color: #fbad66;
+	}
+html.dark .mcp-facts strong {
+		color: #efeff2;
+	}
+html.dark .mcp-health {
+		color: #c6c6cd;
+	}
+html.dark .status-dot {
+		background: #313236;
+	}
+html.dark .failure-text {
+		color: #fb8585;
+	}
+html.dark .mcp-error-line {
+		background: rgba(32, 33, 37, 0.72);
+		color: #fb8585;
+	}
+html.dark .mcp-intro {
+		color: #c6c6cd;
+	}
+html.dark .mcp-tool-preview {
+		border-top: 1px solid rgba(255, 255, 255, 0.102);
+	}
+html.dark .tool-chip {
+		border: 1px solid rgba(255, 255, 255, 0.131);
+		background: rgba(29, 30, 34, 0.78);
+		color: #dedee1;
+	}
+html.dark .tool-chip:hover {
+		border-color: rgba(96, 165, 250, 0.25);
+		color: #60a5fa;
+	}
+html.dark .tool-chip.risk-destructive,
+html.dark .tool-chip.risk-secret {
+		border-color: rgba(251, 133, 133, 0.16);
+	}
+html.dark .tool-chip.more-tools {
+		color: #60a5fa;
+	}
+html.dark .mcp-card-footer {
+		border-top: 1px solid rgba(255, 255, 255, 0.087);
+	}
+html.dark .tool-row {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.82);
+	}
+html.dark .tool-row:hover {
+		border-color: rgba(96, 165, 250, 0.2);
+	}
+html.dark .parameter-row {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(255, 255, 255, 0.035);
+	}
+html.dark .schema-preview {
+		background: rgba(255, 255, 255, 0.05);
+		color: #dedee1;
+	}
+html.dark code {
+		background: rgba(255, 255, 255, 0.063);
+		color: #efeff2;
+	}
+</style>

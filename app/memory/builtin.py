@@ -407,6 +407,8 @@ class BuiltinMemoryClient:
         ctx.setdefault("defaultThinkLevel", "off")
         ctx.setdefault("runtimeInfo", {})
         ctx.setdefault("workspaceDir", "")
+        ctx.setdefault("folderWorkspaceDir", ctx.get("workspaceDir") or "")
+        ctx.setdefault("folderPrompt", "")
         return ctx
 
     async def _agent_template_context(self, params: dict[str, Any]) -> dict[str, Any]:

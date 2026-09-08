@@ -94,6 +94,26 @@ CREATE INDEX IF NOT EXISTS idx_controller_model_contexts_conversation
 CREATE INDEX IF NOT EXISTS idx_controller_model_contexts_updated
   ON controller_model_contexts(updated_at DESC);
 
+-- Web 会话目录。parent_uuid 为空表示根目录；目录本身不占用运行时 chat_id。
+-- workspace_dir / prompt_markdown 分别就近继承，空字符串表示继承父目录。
+CREATE TABLE IF NOT EXISTS web_conversation_folders (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  folder_uuid           TEXT NOT NULL UNIQUE,
+  owner_chat_id         INTEGER NOT NULL,
+  parent_uuid           TEXT NOT NULL DEFAULT '',
+  name                  TEXT NOT NULL,
+  workspace_dir         TEXT NOT NULL DEFAULT '',
+  prompt_markdown       TEXT NOT NULL DEFAULT '',
+  pinned_at             INTEGER NOT NULL DEFAULT 0,
+  display_order         REAL,
+  created_at            INTEGER NOT NULL DEFAULT 0,
+  updated_at            INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_web_conversation_folders_parent
+  ON web_conversation_folders(owner_chat_id, parent_uuid, pinned_at DESC, display_order, id);
+CREATE INDEX IF NOT EXISTS idx_web_conversation_folders_name
+  ON web_conversation_folders(owner_chat_id, name);
+
 -- Web 版多 live 会话映射表。
 -- owner_chat_id 是真实登录用户(Telegram chat_id)；internal_chat_id 是 OpenBear
 -- 运行时使用的隔离 chat_id。这样可以复用现有 sessions/messages/summaries/
@@ -117,7 +137,9 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   pinned_at             INTEGER DEFAULT 0,
   -- 用户在各自置顶/非置顶组内调整的持久展示顺序；NULL 回退到创建时间排序。
   display_order         REAL,
-  archived_at           INTEGER DEFAULT 0
+  archived_at           INTEGER DEFAULT 0,
+  -- 空值属于“临时会话”；归档只改变状态，不清除目录归属。
+  folder_uuid           TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_time
   ON web_conversations(owner_chat_id, archived_at, pinned_at DESC, updated_at DESC, id DESC);
@@ -127,6 +149,8 @@ CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_created
   ON web_conversations(owner_chat_id, archived_at, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_web_conversations_internal_chat
   ON web_conversations(internal_chat_id);
+CREATE INDEX IF NOT EXISTS idx_web_conversations_folder_order
+  ON web_conversations(owner_chat_id, folder_uuid, archived_at, pinned_at DESC, display_order, id);
 
 -- Task Memory is intentionally isolated from global memory_entries/secrets/docs.
 -- task_uuid is empty for conversation scope and mandatory for agent_task scope.

@@ -25,6 +25,8 @@ from app.web_console.chat_api import WebAdminChatHandlersMixin
 from app.web_console.chat_runtime import WebAdminChatRunMixin
 from app.web_console.chat_state import WebAdminChatStateMixin
 from app.web_console.config_api import WebAdminSettingsChannelsMixin
+from app.web_console.conversation_prompt import WebAdminConversationPromptMixin
+from app.web_console.conversation_tree import WebAdminConversationTreeMixin
 from app.web_console.conversations import WebAdminConversationsMixin
 from app.web_console.core import (
     _COOKIE,
@@ -69,6 +71,7 @@ from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.update_api import WebAdminUpdateMixin
 from app.web_console.uploads import WebAdminUploadsMixin
 from app.web_task_telegram import WebTaskTelegramNotifier
+from app.web_telegram_replies import WebTelegramReplies
 
 
 class WebAdminServer(
@@ -76,6 +79,8 @@ class WebAdminServer(
     WebAdminAuthMixin,
     WebAdminArtifactsMixin,
     WebAdminConversationsMixin,
+    WebAdminConversationTreeMixin,
+    WebAdminConversationPromptMixin,
     WebAdminOperationsMixin,
     WebAdminRathMixin,
     WebAdminSystemMcpMixin,
@@ -131,6 +136,7 @@ class WebAdminServer(
         self.workspace_dir = str((Path.cwd() / "workspace").resolve())
         self._memory_operation_lock = asyncio.Lock()
         self._web_conversation_create_lock = asyncio.Lock()
+        self._conversation_tree_lock = asyncio.Lock()
         self.started_at = time.time()
         self._web_operation_locks: dict[str, asyncio.Lock] = {}
         self._web_live_streams: dict[str, _WebLiveStream] = {}
@@ -161,6 +167,7 @@ class WebAdminServer(
         self._web_confirm_by_conversation = self.interactions.by_conversation
         self._channel_test_jobs: dict[str, _ChannelTestJob] = {}
         self.web_task_telegram = WebTaskTelegramNotifier(config, db, bot)
+        self.telegram_replies = WebTelegramReplies(config, db, bot, self._submit_telegram_reply)
         self.interaction_telegram = InteractionTelegram(config, db, bot, self.interactions)
         self.interactions.add_listener(self.interaction_telegram.on_interaction)
         self.update_service = None
@@ -186,6 +193,7 @@ class WebAdminServer(
             await self.interactions.stop()
             raise
         await self._recover_web_task_notifications(reset_processing=True)
+        await self.telegram_replies.start()
 
         async def _notification_recovery_loop() -> None:
             while True:
@@ -251,6 +259,7 @@ class WebAdminServer(
             await self._runner.cleanup()
             self._runner = None
             self._site = None
+        await self.telegram_replies.stop()
         if self.runs is not None:
             await self.runs.cancel_all_and_wait()
         await self.interactions.stop()
@@ -274,6 +283,7 @@ class WebAdminServer(
         new_web = (config.web.enabled, config.web.host, config.web.port)
         self.config = config
         self.web_task_telegram.apply_config(config)
+        self.telegram_replies.apply_config(config)
         self.interaction_telegram.apply_config(config)
         self.llm_factory = llm_factory
         self.model_selection = model_selection

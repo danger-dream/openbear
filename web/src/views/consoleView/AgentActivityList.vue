@@ -195,3 +195,97 @@ const presentedLines = computed(() => props.lines.map((line) => {
 	.activity-tool-arrow, .activity-compaction > summary svg { transition: none; }
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .activity-list::before {
+		background: #25262a;
+	}
+html.dark .activity-row time {
+		color: #a1a1a8;
+	}
+html.dark .activity-dot {
+		border: 2px solid #3d3e46;
+		background: #313236;
+		box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.11);
+	}
+html.dark .activity-row.tone-active .activity-dot {
+		box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.45);
+	}
+html.dark .activity-row.tone-success .activity-dot {
+		box-shadow: 0 0 0 1px rgba(134, 239, 172, 0.45);
+	}
+html.dark .activity-row.tone-danger .activity-dot {
+		box-shadow: 0 0 0 1px rgba(252, 165, 165, 0.45);
+	}
+html.dark .activity-row p {
+		color: #c6c6cd;
+	}
+html.dark .activity-row.tone-success p {
+		color: #6ee7a2;
+	}
+html.dark .activity-row.tone-danger p {
+		color: #fb8585;
+	}
+html.dark .activity-tool-call > summary,
+html.dark .activity-model-call {
+		color: #c6c6cd;
+	}
+html.dark .activity-process-name {
+		color: #c6c6cd;
+	}
+html.dark .activity-process-separator {
+		color: #7b7b82;
+	}
+html.dark .activity-tool-description,
+html.dark .activity-model-description {
+		color: #a1a1a8;
+	}
+html.dark .activity-model-meta {
+		color: #c6c6cd;
+	}
+html.dark .activity-process-status.tone-active {
+		color: #60a5fa;
+	}
+html.dark .activity-process-status.tone-success {
+		color: #6ee7a2;
+	}
+html.dark .activity-process-status.tone-danger {
+		color: #fb8585;
+	}
+html.dark .activity-tool-arrow {
+		color: #a1a1a8;
+	}
+html.dark .activity-tool-call > summary:hover .activity-tool-name,
+html.dark .activity-tool-call > summary:focus-visible .activity-tool-name {
+		color: #efeff2;
+	}
+html.dark .activity-tool-call > summary:focus-visible {
+		outline: 2px solid rgba(96, 165, 250, 0.16);
+	}
+html.dark .activity-tool-arguments {
+		border-left: 1px solid #3d3e46;
+	}
+html.dark .activity-compaction > summary {
+		color: #6ee7a2;
+	}
+html.dark .activity-row.tone-danger .activity-compaction > summary {
+		color: #fb8585;
+	}
+html.dark .activity-compaction > summary svg {
+		color: #a1a1a8;
+	}
+html.dark .activity-compaction-body {
+		border-left: 1px solid #3d3e46;
+	}
+html.dark .activity-compaction-id {
+		color: #a1a1a8;
+	}
+html.dark .activity-compaction-empty {
+		color: #a1a1a8 !important;
+	}
+html.dark .activity-list-empty {
+		border: 1px dashed #3d3e46;
+		color: #a1a1a8;
+	}
+</style>

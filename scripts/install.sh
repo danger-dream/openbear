@@ -37,6 +37,7 @@ DEFAULT_NAME="老大"
 NODE_VERSION="${OPENBEAR_NODE_VERSION:-v20.19.4}"
 RELEASE_UPGRADE_PENDING=0
 RELEASE_TXN=""
+RELEASE_TXN_OWNER=""
 RELEASE_SERVICE_WAS_ACTIVE=0
 RELEASE_SERVICE_WAS_ENABLED=0
 RELEASE_REQUIRES_DB_BACKUP=1
@@ -815,6 +816,80 @@ PY
     ok "新版本依赖已在 staging 准备完成"
 }
 
+read_upgrade_web_port() {
+    local app_root="$1" py="$2" config="$INSTALL_DIR/openbear.json"
+    [[ -x "$py" ]] || { err "无法读取 Web 端口：Python 不存在: $py"; return 1; }
+    PYTHONPATH="$app_root" "$py" - "$config" "$app_root" <<'PY'
+import json, sys
+from pathlib import Path
+
+# ``python -`` keeps the caller cwd at sys.path[0]; force this release's app ahead of it.
+sys.path.insert(0, str(Path(sys.argv[2]).resolve()))
+from app.config import WebConfig
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit("openbear.json 必须是 JSON 对象")
+web = payload["web"] if "web" in payload else {}
+print(WebConfig.model_validate(web).port)
+PY
+}
+
+release_upgrade_transaction_is_owned_prepared() {
+    local txn="$1" owner_file="$1/.openbear-owner" phase_file="$1/.openbear-phase"
+    [[ -n "$RELEASE_TXN_OWNER" ]] || return 1
+    [[ "$txn" == "$INSTALL_DIR/.openbear-install-transaction" ]] || return 1
+    [[ -d "$txn" && ! -L "$txn" ]] || return 1
+    [[ -f "$owner_file" && ! -L "$owner_file" ]] || return 1
+    [[ -f "$phase_file" && ! -L "$phase_file" ]] || return 1
+    [[ "$(cat "$owner_file" 2>/dev/null || true)" == "$RELEASE_TXN_OWNER" ]] || return 1
+    [[ "$(cat "$phase_file" 2>/dev/null || true)" == "prepared-v1" ]]
+}
+
+mark_release_upgrade_prepared() {
+    local txn="$1" owner owner_tmp="$1/.openbear-owner.tmp" phase_tmp="$1/.openbear-phase.tmp"
+    [[ -d "$txn" && ! -L "$txn" ]] || return 1
+    owner="${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+    if ! printf '%s\n' "$owner" > "$owner_tmp" \
+        || ! chmod 600 "$owner_tmp" \
+        || ! mv -f "$owner_tmp" "$txn/.openbear-owner" \
+        || ! printf 'prepared-v1\n' > "$phase_tmp" \
+        || ! chmod 600 "$phase_tmp" \
+        || ! mv -f "$phase_tmp" "$txn/.openbear-phase"; then
+        rm -f "$owner_tmp" "$phase_tmp"
+        return 1
+    fi
+    RELEASE_TXN_OWNER="$owner"
+    # 只有本进程生成且仍为 prepared 的事务会在普通退出时被清理。
+    trap 'cleanup_prepared_release_upgrade' EXIT
+}
+
+mark_release_upgrade_switching() {
+    local txn="$1" phase_tmp="$1/.openbear-phase.tmp"
+    release_upgrade_transaction_is_owned_prepared "$txn" || return 1
+    if ! printf 'switching-v1\n' > "$phase_tmp" \
+        || ! chmod 600 "$phase_tmp" \
+        || ! mv -f "$phase_tmp" "$txn/.openbear-phase"; then
+        rm -f "$phase_tmp"
+        return 1
+    fi
+}
+
+cleanup_prepared_release_upgrade() {
+    local txn="${RELEASE_TXN:-}"
+    [[ -n "$txn" ]] || return 0
+    if release_upgrade_transaction_is_owned_prepared "$txn"; then
+        warn "升级在停服/切换前中止，清理本次尚未使用的准备事务: $txn"
+        if rm -rf -- "$txn"; then
+            RELEASE_TXN=""
+            RELEASE_TXN_OWNER=""
+            RELEASE_UPGRADE_PENDING=0
+        else
+            err "无法清理本次准备事务，恢复材料仍保留在: $txn"
+        fi
+    fi
+}
+
 classify_release_database_backup_need() {
     local pkg="$1" classification
     RELEASE_REQUIRES_DB_BACKUP=1
@@ -875,6 +950,12 @@ prepare_release_upgrade() {
     if systemctl is-active --quiet "$SERVICE_NAME"; then RELEASE_SERVICE_WAS_ACTIVE=1; else RELEASE_SERVICE_WAS_ACTIVE=0; fi
     if systemctl is-enabled --quiet "$SERVICE_NAME"; then RELEASE_SERVICE_WAS_ENABLED=1; else RELEASE_SERVICE_WAS_ENABLED=0; fi
     RELEASE_TXN="$txn"
+    if ! mark_release_upgrade_prepared "$txn"; then
+        RELEASE_TXN=""
+        RELEASE_TXN_OWNER=""
+        rm -rf "$txn"
+        return 1
+    fi
     ok "代码、前端、依赖和回滚备份均已准备；尚未停止服务或切换文件"
 }
 
@@ -931,6 +1012,7 @@ restore_release_upgrade() {
         return 1
     fi
     RELEASE_TXN=""
+    RELEASE_TXN_OWNER=""
     ok "旧版本代码、依赖、unit 和服务状态已恢复"
     if [[ -n "${RELEASE_DB_BACKUP_PATH:-}" ]]; then
         warn "数据库未自动回退；升级前备份保留在 $RELEASE_DB_BACKUP_PATH。人工恢复会丢失备份后的新数据"
@@ -963,6 +1045,10 @@ backup_release_database() {
 
 commit_release_upgrade() {
     local txn="$1" reason=""
+    if [[ -n "$RELEASE_TXN_OWNER" ]] && ! mark_release_upgrade_switching "$txn"; then
+        err "无法标记升级事务进入切换阶段；尚未停止服务或切换文件"
+        return 1
+    fi
     section "停止服务并切换已准备的新版本"
     if ! systemctl stop "$SERVICE_NAME"; then
         err "无法停止 $SERVICE_NAME，未切换任何文件；staging 与备份保留在 $txn"
@@ -1006,6 +1092,7 @@ commit_release_upgrade() {
     fi
     rm -rf "$txn"
     RELEASE_TXN=""
+    RELEASE_TXN_OWNER=""
     ok "发行版事务切换完成"
 }
 
@@ -1392,10 +1479,12 @@ main() {
     if [[ "$RELEASE_UPGRADE_PENDING" -eq 1 ]]; then
         # 事务升级的依赖已在 staging 中准备；先完成所有无需停服的本机工作。
         if [[ -z "${WEB_PORT:-}" ]]; then
-            WEB_PORT="$("$INSTALL_DIR/.venv/bin/python" -c 'import json; print(json.load(open("openbear.json"))["web"]["port"])')"
+            WEB_PORT="$(read_upgrade_web_port "$RELEASE_TXN/new" "$RELEASE_TXN/new/.venv/bin/python")" \
+                || die "无法从 $INSTALL_DIR/openbear.json 读取 Web 端口"
         fi
         ensure_firewall
         commit_release_upgrade "$RELEASE_TXN" || die "发行版升级失败，已尝试恢复旧版本"
+        trap - EXIT
         INSTALL_DIR="$INSTALL_DIR" REPO_REF="$REPO_REF" write_install_source release "$RELEASE_VERSION" "$RELEASE_TAG"
         ok "已升级到发行版 $RELEASE_TAG"
         print_done
@@ -1405,9 +1494,10 @@ main() {
     build_web
     write_runtime
     write_service
-    # 升级时从已有配置读端口做 health / 防火墙
+    # git/source 升级没有 release staging；依赖同步后从新代码的配置模型读取端口。
     if [[ "$MODE" == "upgrade" && -z "${WEB_PORT:-}" ]]; then
-        WEB_PORT="$("$INSTALL_DIR/.venv/bin/python" -c 'import json; print(json.load(open("openbear.json"))["web"]["port"])')"
+        WEB_PORT="$(read_upgrade_web_port "$INSTALL_DIR" "$INSTALL_DIR/.venv/bin/python")" \
+            || die "无法从 $INSTALL_DIR/openbear.json 读取 Web 端口"
     fi
     ensure_firewall
     start_and_verify "${RELEASE_VERSION:-}"

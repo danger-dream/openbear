@@ -802,3 +802,185 @@ details[open] > summary > .disclosure-icon {
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .tool-event {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: #1d1e22;
+		color: #dedee1;
+	}
+html.dark .disclosure-icon {
+		color: #c6c6cd;
+	}
+html.dark details[open] > summary > .disclosure-icon {
+		color: #60a5fa;
+	}
+html.dark .tool-icon {
+		color: #c6c6cd;
+	}
+html.dark .tool-name {
+		color: #efeff2;
+	}
+html.dark .tool-preview {
+		color: #c6c6cd;
+	}
+html.dark .tool-detail {
+		border-top: 1px solid #3d3e46;
+	}
+html.dark .compaction-facts span {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .compaction-load-state {
+		color: #c6c6cd;
+	}
+html.dark .compaction-load-state.is-error {
+		color: #fb8585;
+	}
+html.dark .compaction-preview > strong {
+		color: #fbad66;
+	}
+html.dark .tool-section-title {
+		color: #c6c6cd;
+	}
+html.dark .tool-arg-line pre {
+		border-left: 2px solid #3d3e46;
+		color: #dedee1;
+	}
+html.dark .tool-result-tabbar button {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .tool-result-tabbar button.active {
+		border-color: rgba(96, 165, 250, 0.52);
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .tool-result {
+		border-left: 2px solid #3d3e46;
+	}
+html.dark .tool-result-empty {
+		border: 1px dashed #3d3e46;
+		color: #a1a1a8;
+	}
+html.dark .tool-event {
+		color: #c6c6cd;
+	}
+html.dark .tool-event summary {
+		color: #c6c6cd;
+	}
+html.dark .tool-icon {
+		color: #a1a1a8;
+	}
+html.dark .tool-name {
+		color: #c6c6cd;
+	}
+html.dark .tool-preview {
+		color: #a1a1a8;
+	}
+html.dark .tool-running > summary .tool-name {
+		color: #c6c6cd;
+	}
+html.dark .tool-running > summary .tool-preview {
+		color: #a1a1a8;
+	}
+html.dark .tool-detail {
+		border-left: 1px solid #3d3e46;
+	}
+html.dark .tool-call-selector {
+		border-bottom: 1px solid #3d3e46;
+	}
+html.dark .tool-call-selector button {
+		color: #a1a1a8;
+	}
+html.dark .tool-call-selector button:hover,
+html.dark .tool-call-selector button:focus-visible,
+html.dark .tool-call-selector button.active {
+		color: #dedee1;
+	}
+html.dark .tool-call-selector button.active {
+		border-bottom-color: rgba(96, 165, 250, 0.52);
+	}
+html.dark .tool-call-selector button:focus-visible,
+html.dark .tool-payload-copy:focus-visible {
+		outline: 2px solid rgba(96, 165, 250, 0.18);
+	}
+html.dark .tool-detail-notice,
+html.dark .tool-payload-empty {
+		color: #a1a1a8;
+	}
+html.dark .tool-detail-notice.is-error,
+html.dark .tool-payload-empty.is-error {
+		color: #fb8585;
+	}
+html.dark .agent-info-readonly {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .agent-info-readonly > header strong {
+		color: #dedee1;
+	}
+html.dark .agent-info-readonly > header span {
+		color: #a1a1a8;
+	}
+html.dark .agent-info-readonly > header em {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .agent-info-session > span {
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .agent-info-session b {
+		color: #a1a1a8;
+	}
+html.dark .agent-info-tasks > div {
+		border-top: 1px solid #3d3e46;
+	}
+html.dark .agent-info-tasks span,
+html.dark .agent-info-tasks small {
+		color: #a1a1a8;
+	}
+html.dark .agent-info-tasks strong {
+		color: #c6c6cd;
+	}
+html.dark .agent-info-tasks em {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .agent-info-tasks em.ok {
+		background: #202125;
+		color: #67d5ed;
+	}
+html.dark .agent-info-tasks em.error {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+html.dark .agent-info-tasks em.running {
+		background: #202125;
+		color: #60a5fa;
+	}
+html.dark .tool-payload-title {
+		color: #c6c6cd;
+	}
+html.dark .tool-payload-meta {
+		color: #a1a1a8;
+	}
+html.dark .tool-payload-copy {
+		color: #a1a1a8;
+	}
+html.dark .tool-payload-copy:hover {
+		color: #dedee1;
+	}
+html.dark .tool-payload-code {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .tool-payload-code code.hljs {
+		color: #c6c6cd;
+	}
+</style>

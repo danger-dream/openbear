@@ -415,9 +415,9 @@ class Agent:
             texts = [text for text in texts if text]
             if not texts:
                 return []
-            # Web 运行中插话在 composer 队列里可以多条排队；到 loop 边界时作为一个
+            # Web / TG 续聊的运行中插话可以多条排队；到 loop 边界时作为一个
             # 真实 user message 注入，保持“取出队列 → 一条插话消息 → 模型处理”的 UI/上下文一致性。
-            if any(isinstance(item, dict) and str(item.get("source") or "") == "web" for item in steers):
+            if any(isinstance(item, dict) and str(item.get("source") or "") in {"web", "telegram"} for item in steers):
                 return ["\n\n".join(texts)]
             return texts
 

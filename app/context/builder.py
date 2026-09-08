@@ -76,6 +76,8 @@ def build_system_prompt_params(
     mcp_server_instructions: list[dict[str, str]] | None = None,
     skills_prompt: str = "",
     workspace_dir: str = "",
+    folder_workspace_dir: str = "",
+    folder_prompt: str = "",
     current_model: str = "",
     default_think_level: str = "off",
     reasoning_level: str = "off",
@@ -125,6 +127,11 @@ def build_system_prompt_params(
         },
         "skillsPrompt": skills_prompt,
         "workspaceDir": workspace_dir,
+        # Main-controller-only conversation organization values. They are
+        # deliberately independent from workspaceDir so tool cwd/artifact roots
+        # keep their existing process-global semantics.
+        "folderWorkspaceDir": folder_workspace_dir or workspace_dir,
+        "folderPrompt": folder_prompt,
         "host": host,
         "runtimeInfo": {
             "channel": "web",

@@ -636,4 +636,37 @@ memory.docNames         文档名称索引</pre>
 .pm-md-preview .md-gap {
 	height: .35rem;
 }
+
+/* OpenBear system dark theme */
+html.dark .pm-md-preview h2 {
+		border-bottom: 1px solid #3d3e46;
+	}
+html.dark .pm-md-preview code {
+		background: rgba(255, 255, 255, 0.069);
+	}
+html.dark .pm-md-preview pre {
+		background: rgba(255, 255, 255, 0.056);
+		border: 1px solid #3d3e46;
+	}
+html.dark .pm-md-preview pre.hljs {
+		background: #1d1e22;
+	}
+html.dark .pm-md-preview th,
+html.dark .pm-md-preview td {
+		border: 1px solid #3d3e46;
+	}
+html.dark .pm-md-preview th {
+		background: #1d1e22;
+	}
+html.dark .pm-md-preview tr:nth-child(even) td {
+		background: rgba(255, 255, 255, 0.035);
+	}
+html.dark .pm-md-preview blockquote {
+		border-left: 3px solid #3d3e46;
+		color: #c6c6cd;
+		background: rgba(255, 255, 255, 0.035);
+	}
+html.dark .pm-md-preview a {
+		color: #60a5fa;
+	}
 </style>

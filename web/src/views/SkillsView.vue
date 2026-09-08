@@ -363,3 +363,12 @@ onMounted(load);
   color: #27272a;
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .skill-content {
+		border: 1px solid rgba(255, 255, 255, 0.116);
+		background: rgba(29, 30, 34, 0.9);
+		color: #efeff2;
+	}
+</style>

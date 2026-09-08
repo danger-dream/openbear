@@ -798,3 +798,236 @@ onBeforeUnmount(() => {
 	.task-memory-entry { transition: none; }
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .task-memory-entry {
+		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+		background: rgba(29, 30, 34, 0.68);
+		color: var(--bear-muted, #c6c6cd);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .task-memory-entry:hover {
+		color: var(--bear-ink, #efeff2);
+	}
+
+html.dark .task-memory-entry.populated {
+		border-color: rgba(96, 165, 250, 0.28);
+		color: var(--bear-accent, #60a5fa);
+	}
+
+html.dark .task-memory-entry.active {
+		background: var(--bear-ink, #232428);
+		color: #ffffff;
+		box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+	}
+
+html.dark .task-memory-entry:focus-visible {
+		box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.22), 0 8px 24px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .task-memory-badge {
+		border: 2px solid #3d3e46;
+		color: #ffffff;
+	}
+
+html.dark .memory-drawer-header {
+		border-bottom: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+	}
+
+html.dark .memory-kicker {
+		color: var(--bear-accent, #60a5fa);
+	}
+
+html.dark .memory-drawer-header h2 {
+		color: var(--bear-ink, #efeff2);
+	}
+
+html.dark .memory-drawer-header p {
+		color: var(--bear-muted, #c6c6cd);
+	}
+
+html.dark .memory-quota {
+		background: #202125;
+		color: #c6c6cd;
+	}
+
+html.dark .task-picker {
+		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+		background: rgba(29, 30, 34, 0.82);
+	}
+
+html.dark .task-picker p {
+		color: var(--bear-muted, #c6c6cd);
+	}
+
+html.dark .task-option small {
+		color: #c6c6cd;
+	}
+
+html.dark .icon-action,
+html.dark .primary-action {
+		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+
+html.dark .primary-action {
+		border-color: var(--bear-ink, #3d3e46);
+		background: var(--bear-ink, #232428);
+		color: #ffffff;
+	}
+
+html.dark .icon-action:hover {
+		background: #202125;
+		color: #efeff2;
+	}
+
+html.dark .icon-action:focus-visible,
+html.dark .primary-action:focus-visible,
+html.dark .memory-row-main:focus-visible,
+html.dark .memory-row-actions button:focus-visible {
+		outline: 2px solid rgba(96, 165, 250, 0.42);
+	}
+
+html.dark .deleted-toggle {
+		color: var(--bear-muted, #c6c6cd);
+	}
+
+html.dark .memory-empty {
+		border: 1px dashed rgba(255, 255, 255, 0.203);
+		color: #a1a1a8;
+	}
+
+html.dark .memory-empty strong {
+		color: #dedee1;
+	}
+
+html.dark .memory-row {
+		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+		border-left: 3px solid #3d3e46;
+		background: rgba(29, 30, 34, 0.88);
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .memory-row.reinject {
+		border-left-color: var(--bear-accent, rgba(96, 165, 250, 0.52));
+	}
+
+html.dark .memory-name-line strong {
+		color: var(--bear-ink, #efeff2);
+	}
+
+html.dark .memory-name-line em {
+		background: #202125;
+		color: #c6c6cd;
+	}
+
+html.dark .memory-description {
+		color: #c6c6cd;
+	}
+
+html.dark .memory-meta,
+html.dark .memory-source {
+		color: #c6c6cd;
+	}
+
+html.dark .memory-flags i {
+		background: #202125;
+		color: #c6c6cd;
+	}
+
+html.dark .memory-flags i.on {
+		background: var(--bear-accent-soft, #202125);
+		color: var(--bear-accent, #60a5fa);
+	}
+
+html.dark .memory-flags i.danger {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+
+html.dark .memory-row-actions button {
+		color: #a1a1a8;
+	}
+
+html.dark .memory-row-actions button:hover {
+		background: #202125;
+		color: #dedee1;
+	}
+
+html.dark .memory-row-actions button.danger:hover {
+		background: #1d1e22;
+		color: #fb8585;
+	}
+
+html.dark .injection-preview {
+		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+		background: #1d1e22;
+	}
+
+html.dark .injection-preview header {
+		border-bottom: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
+	}
+
+html.dark .injection-preview strong {
+		color: #dedee1;
+	}
+
+html.dark .injection-preview span {
+		color: #c6c6cd;
+	}
+
+html.dark .injection-preview pre {
+		color: #c6c6cd;
+	}
+
+html.dark .refresh-policy {
+		color: #c6c6cd;
+	}
+
+html.dark .memory-form > label {
+		color: #dedee1;
+	}
+
+html.dark .memory-form > label span {
+		color: #a1a1a8;
+	}
+
+html.dark .memory-form > label span.danger {
+		color: #fb8585;
+	}
+
+html.dark .memory-form-switches {
+		border-top: 1px solid rgba(255, 255, 255, 0.145);
+	}
+
+html.dark .memory-switch-row label {
+		color: #dedee1;
+	}
+
+html.dark .task-memory-drawer.el-drawer {
+		background: rgba(29, 30, 34, 0.98);
+		box-shadow: -18px 0 58px rgba(0, 0, 0, 0.16);
+	}
+
+html.dark .task-memory-editor .el-dialog__title {
+		color: #efeff2;
+	}
+
+html.dark .task-memory-editor .el-input__inner,
+html.dark .task-memory-editor .el-textarea__inner {
+		color: #efeff2;
+	}
+
+html.dark .task-memory-confirm .el-message-box__message {
+		color: #dedee1;
+	}
+
+@media (max-width: 760px) {
+	html.dark .task-memory-entry {
+		background: rgba(29, 30, 34, 0.9);
+	}
+}
+</style>

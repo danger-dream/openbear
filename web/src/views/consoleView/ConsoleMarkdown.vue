@@ -504,3 +504,80 @@ function onMarkdownClick(event) {
 	background: transparent;
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .bear-md h1,
+html.dark .bear-md h2,
+html.dark .bear-md h3,
+html.dark .bear-md h4 {
+		color: #efeff2;
+	}
+html.dark .bear-md img {
+		box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16);
+	}
+html.dark .bear-md th,
+html.dark .bear-md td {
+		border: 1px solid #3d3e46;
+	}
+html.dark .bear-md th {
+		background: #1d1e22;
+		color: #dedee1;
+	}
+html.dark .bear-md td {
+		background: #1d1e22;
+		color: #dedee1;
+	}
+html.dark .bear-md :deep(tr:nth-child(even) td) {
+		background: #1d1e22;
+	}
+html.dark .bear-md hr {
+		border-top: 1px solid #3d3e46;
+	}
+html.dark .bear-md .hljs {
+		color: #dedee1;
+	}
+html.dark .bear-md pre {
+		background: #1d1e22;
+		border: 1px solid #3d3e46;
+		color: #dedee1;
+	}
+html.dark .bear-md code {
+		background: #202125;
+		color: #dedee1;
+	}
+html.dark .bear-md .md-code-block {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+html.dark .bear-md .md-code-head {
+		color: #a1a1a8;
+	}
+html.dark .bear-md .md-code-copy {
+		color: #a1a1a8;
+	}
+html.dark .bear-md .md-code-copy:hover {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .bear-md .md-code-copy.copied {
+		background: #202125;
+		color: #6ee7a2;
+	}
+html.dark .bear-md .md-code-block pre {
+		background: #1d1e22;
+	}
+html.dark .bear-md a {
+		color: #60a5fa;
+	}
+html.dark .bear-md blockquote {
+		border-left: 3px solid #3d3e46;
+		color: #c6c6cd;
+	}
+html.dark .bear-md pre::-webkit-scrollbar-thumb {
+		background: #2b2c30;
+	}
+html.dark .bear-md .md-table-scroll::-webkit-scrollbar-thumb {
+		background: #2b2c30;
+	}
+</style>

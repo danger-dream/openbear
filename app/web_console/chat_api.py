@@ -322,11 +322,15 @@ class WebAdminChatHandlersMixin:
             normalized = self._normalize_web_run_defaults({**self._web_defaults_storage(selected), "revision": 0, "updated_at": 0})
 
         storage = self._web_defaults_storage(normalized)
+        folder_uuid = str(body.get("folderId") or "").strip()
+        if folder_uuid and not await self._tree_folder_owned(session.chat_id, folder_uuid):
+            return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
         row = await self._create_web_conversation(
             session.chat_id,
             title=title,
             model=normalized["mainModel"],
             run_config=storage,
+            folder_uuid=folder_uuid,
             persist_defaults=persist_defaults,
         )
         live = self._live_for(row)
@@ -779,7 +783,10 @@ class WebAdminChatHandlersMixin:
                 ip=request.remote or "",
                 detail={"conversationUuid": conv_uuid},
             )
-        return web.json_response({"ok": True, "conversation": self._web_conversation_json(row, live=self._web_live_streams.get(conv_uuid))})
+        response = {"ok": True, "conversation": self._web_conversation_json(row, live=self._web_live_streams.get(conv_uuid))}
+        if has_archived and archived_at:
+            response["nextConversation"] = await self._tree_archive_successor(int(session.chat_id), conv_uuid)
+        return web.json_response(response)
 
     async def handle_api_conversation_reorder(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -807,7 +814,7 @@ class WebAdminChatHandlersMixin:
             placeholders = ",".join("?" for _ in lookup_uuids)
             cur = await conn.execute(
                 f"""
-                SELECT conversation_uuid, pinned_at
+                SELECT conversation_uuid, pinned_at, folder_uuid
                 FROM web_conversations
                 WHERE owner_chat_id=? AND conversation_uuid IN ({placeholders})
                 """,
@@ -818,17 +825,20 @@ class WebAdminChatHandlersMixin:
             if moving is None:
                 return web.json_response({"ok": False, "error": "conversation_not_found"}, status=404)
             moving_pinned = int(moving.get("pinned_at") or 0) > 0
+            moving_folder = str(moving.get("folder_uuid") or "")
             for neighbor_uuid in (before_uuid, after_uuid):
                 if not neighbor_uuid:
                     continue
                 neighbor = lookup.get(neighbor_uuid)
                 if neighbor is None:
                     return web.json_response({"ok": False, "error": "reorder_neighbor_not_found"}, status=404)
-                if (int(neighbor.get("pinned_at") or 0) > 0) != moving_pinned:
+                if ((int(neighbor.get("pinned_at") or 0) > 0) != moving_pinned
+                        or str(neighbor.get("folder_uuid") or "") != moving_folder):
                     return web.json_response({"ok": False, "error": "conversation_reorder_group_mismatch"}, status=409)
             display_order = await self._reorder_web_conversation_display_group(
                 session.chat_id,
                 pinned=moving_pinned,
+                folder_uuid=moving_folder,
                 moving_uuid=moving_uuid,
                 before_uuid=before_uuid,
                 after_uuid=after_uuid,
@@ -1287,6 +1297,68 @@ class WebAdminChatHandlersMixin:
             "taskMemoriesDeleted": task_memory_deleted,
         })
 
+    async def _conversation_run_config_public(
+        self, owner_chat_id: int, conversation_uuid: str,
+    ) -> dict[str, Any]:
+        """Return one coherent, timeline-free snapshot of conversation run settings."""
+        cur = await self.db.conn.execute(
+            """
+            SELECT conversations.*,
+                   sessions.thinking_level AS run_thinking_level,
+                   sessions.fast_mode AS run_fast_mode
+            FROM web_conversations AS conversations
+            LEFT JOIN sessions ON sessions.chat_id=conversations.internal_chat_id
+            WHERE conversations.owner_chat_id=? AND conversations.conversation_uuid=?
+            LIMIT 1
+            """,
+            (int(owner_chat_id), str(conversation_uuid or "")),
+        )
+        row = await cur.fetchone()
+        if not row:
+            raise web.HTTPNotFound(text="conversation_not_found")
+        conversation = dict(row)
+        model = (
+            str(conversation.get("model") or "")
+            or str(getattr(self.model_selection, "current", "") or "")
+            or self.config.models.primary
+        )
+        thinking_levels = self._model_thinking_levels(model)
+        thinking_level = normalize_think_level(str(conversation.get("run_thinking_level") or "")) or ""
+        effective_thinking = (
+            thinking_level
+            if thinking_level and thinking_level in thinking_levels
+            else (self._model_default_thinking_level(model) if thinking_levels else "off")
+        )
+        fast_requested = bool(int(conversation.get("run_fast_mode") or 0))
+        fast_supported = self._model_supports_fast(model)
+        model_meta = self.config.models.resolve(model)
+        context_window = int(model_meta[1].context_window or 0) if model_meta else 0
+        agent_runtime = resolve_agent_runtime_config(
+            None,
+            config=self.config,
+            model_selection_current=str(getattr(self.model_selection, "current", "") or ""),
+            conversation=conversation,
+            main_model=model,
+            main_fast_requested=fast_requested,
+        )
+        return {
+            "conversationUuid": str(conversation.get("conversation_uuid") or ""),
+            "model": model,
+            "thinkingLevel": thinking_level,
+            "effectiveThinkingLevel": effective_thinking or "off",
+            "thinkingLevels": thinking_levels,
+            "defaultThinkingLevel": self._model_default_thinking_level(model) if thinking_levels else "",
+            "supportsThinking": bool(thinking_levels),
+            "fastMode": bool(fast_requested and fast_supported),
+            "fastRequested": fast_requested,
+            "fastSupported": bool(fast_supported),
+            "effectiveFastMode": bool(fast_requested and fast_supported),
+            "agentRunConfig": agent_run_config_public(agent_runtime),
+            "contextWindow": context_window,
+            "compactTriggerTokens": self._model_compact_trigger_tokens(model),
+            "compactRatio": float(self.config.agent.compact_ratio or 0.7),
+        }
+
     async def handle_api_conversation_model(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         row = await self._conversation_from_request(request)
@@ -1337,8 +1409,9 @@ class WebAdminChatHandlersMixin:
                 self._web_builtin_run_defaults(),
             )
         row["model"] = model
+        run_config = await self._conversation_run_config_public(session.chat_id, str(row["conversation_uuid"]))
         await self.audit("web.conversation.model", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row.get("conversation_uuid"), "model": model, "nextRun": running})
-        return web.json_response({"ok": True, "model": model, "nextRun": running})
+        return web.json_response({"ok": True, "model": model, "nextRun": running, "runConfig": run_config})
 
     async def handle_api_conversation_thinking(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1365,8 +1438,9 @@ class WebAdminChatHandlersMixin:
                 {"main_thinking_level": level},
                 self._web_builtin_run_defaults(),
             )
+        run_config = await self._conversation_run_config_public(session.chat_id, str(row["conversation_uuid"]))
         await self.audit("web.conversation.thinking", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row.get("conversation_uuid"), "level": level, "nextRun": running})
-        return web.json_response({"ok": True, "level": level, "nextRun": running})
+        return web.json_response({"ok": True, "level": level, "nextRun": running, "runConfig": run_config})
 
     async def handle_api_conversation_fast(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1390,8 +1464,9 @@ class WebAdminChatHandlersMixin:
                 {"main_fast_mode": 1 if enabled else 0},
                 self._web_builtin_run_defaults(),
             )
+        run_config = await self._conversation_run_config_public(session.chat_id, str(row["conversation_uuid"]))
         await self.audit("web.conversation.fast", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row.get("conversation_uuid"), "enabled": enabled, "nextRun": running})
-        return web.json_response({"ok": True, "enabled": enabled, "effectiveFastMode": enabled and self._model_supports_fast(model), "nextRun": running})
+        return web.json_response({"ok": True, "enabled": enabled, "effectiveFastMode": enabled and self._model_supports_fast(model), "nextRun": running, "runConfig": run_config})
 
     async def handle_api_conversation_agent_run_config(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1482,17 +1557,8 @@ class WebAdminChatHandlersMixin:
         row["agent_think_level"] = next_think
         row["agent_fast_mode"] = int(agent_fast_mode)
 
-        main_model = str(row.get("model") or "") or getattr(self.model_selection, "current", "") or self.config.models.primary
-        main_fast = await MessageDAO(self.db).get_fast_mode(internal_chat_id)
-        resolved = resolve_agent_runtime_config(
-            None,
-            config=self.config,
-            model_selection_current=str(getattr(self.model_selection, "current", "") or ""),
-            conversation=row,
-            main_model=main_model,
-            main_fast_requested=bool(main_fast),
-        )
-        payload = agent_run_config_public(resolved)
+        run_config = await self._conversation_run_config_public(session.chat_id, str(row["conversation_uuid"]))
+        payload = run_config["agentRunConfig"]
         await self.audit(
             "web.conversation.agent_run_config",
             actor="web",
@@ -1500,7 +1566,7 @@ class WebAdminChatHandlersMixin:
             ip=request.remote or "",
             detail={"conversationUuid": row.get("conversation_uuid"), "agentRunConfig": payload, "nextRun": running},
         )
-        return web.json_response({"ok": True, "agentRunConfig": payload, "nextRun": running})
+        return web.json_response({"ok": True, "agentRunConfig": payload, "nextRun": running, "runConfig": run_config})
 
     @staticmethod
     def _background_task_display_name(task: Any) -> str:
@@ -1509,7 +1575,12 @@ class WebAdminChatHandlersMixin:
         base_name = str((snapshot or {}).get("name") or getattr(task, "current_agent_key", "") or "Agent").strip() or "Agent"
         return f"{base_name}-{short_id}" if short_id else base_name
 
-    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream) -> dict[str, Any]:
+    async def _submit_telegram_reply(self, row: dict[str, Any], text: str, *, submission_id: int) -> dict[str, Any]:
+        return await self._start_or_steer_web_conversation(
+            row, text, [], self._live_for(row), telegram_submission_id=submission_id,
+        )
+
+    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
         # Sends may retain their existing serialization/steering behavior, but
         # must never queue behind manual compaction and arrive after it finishes.
@@ -1518,7 +1589,19 @@ class WebAdminChatHandlersMixin:
         ) as acquired:
             if not acquired:
                 return {"ok": False, "error": "busy"}
-            return await self._start_or_steer_web_conversation_locked(row, text, media, live)
+            if telegram_submission_id:
+                current = await self._conversation_row(int(row["owner_chat_id"]), str(row["conversation_uuid"]))
+                if (
+                    not self.config.web.enabled
+                    or int(row["owner_chat_id"]) not in self.config.telegram.whitelist_ids
+                    or not current
+                    or int(current.get("archived_at") or 0)
+                ):
+                    return {"ok": False, "error": "conversation_unavailable"}
+                row = current
+            return await self._start_or_steer_web_conversation_locked(
+                row, text, media, live, telegram_submission_id=telegram_submission_id,
+            )
 
     async def _web_media_attachments_public(self, row: dict[str, Any], media: list[InboundMedia], *, turn_uuid: str = "", op_id: str = "") -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1551,11 +1634,13 @@ class WebAdminChatHandlersMixin:
             out.append(public)
         return out
 
-    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream) -> dict[str, Any]:
+    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
         conv_uuid = str(row.get("conversation_uuid") or "")
         turn_uuid = str(uuid.uuid4())
-        user_message_uuid = str(uuid.uuid4())
+        user_message_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"openbear:tg:{conv_uuid}:{telegram_submission_id}")) if telegram_submission_id else str(uuid.uuid4())
+        source = "telegram" if telegram_submission_id else "web"
+        input_metadata = {"source": "telegram", "telegramSubmissionId": telegram_submission_id} if telegram_submission_id else {}
         visible_user_text = (text or "").strip() or ("请根据我发送的附件内容回答。" if media else "")
         attachments_public: list[dict[str, Any]] = []
         active_background_tasks = []
@@ -1582,6 +1667,8 @@ class WebAdminChatHandlersMixin:
             if media:
                 return {"ok": False, "error": "attachments_while_running_not_supported"}
             root_turn_uuid = str(active_round.get("rootTurnUuid") or "").strip() or await self._latest_visible_root_turn_uuid(conv_uuid) or turn_uuid
+            if telegram_submission_id:
+                await self.web_task_telegram.enable_direct_reply(row, root_turn_uuid)
             # Composer interruptions always target the main controller.  The
             # model may then decide to call AgentMessage/AgentStop, but the Web
             # routing layer never interprets or forwards the user's text itself.
@@ -1592,7 +1679,7 @@ class WebAdminChatHandlersMixin:
                 turnUuid=root_turn_uuid,
                 rootTurnUuid=root_turn_uuid,
                 messageUuid=user_message_uuid,
-                source="web",
+                source=source,
             )
             # Wake the sleeping controller immediately. The message remains in
             # the steering queue and is consumed by the same Agent.run/root turn
@@ -1602,6 +1689,7 @@ class WebAdminChatHandlersMixin:
                 wake_event.set()
             await live.publish({
                 "type": "queued",
+                **input_metadata,
                 "turnUuid": root_turn_uuid,
                 "rootTurnUuid": root_turn_uuid,
                 "messageUuid": user_message_uuid,
@@ -1671,9 +1759,13 @@ class WebAdminChatHandlersMixin:
         if starting_turns is not None:
             starting_turns.add(turn_uuid)
         try:
-            await live.publish({"type": "accepted", "chatId": internal_chat_id, "turnUuid": turn_uuid, "runUuid": turn_uuid})
+            if telegram_submission_id:
+                # Persist the return channel before starting any Agent side effect.
+                await self.web_task_telegram.enable_direct_reply(row, turn_uuid)
+            await live.publish({"type": "accepted", "chatId": internal_chat_id, "turnUuid": turn_uuid, "runUuid": turn_uuid, **input_metadata})
             await live.publish({
                 "type": "user",
+                **input_metadata,
                 "turnUuid": turn_uuid,
                 "messageUuid": user_message_uuid,
                 "text": visible_user_text,
@@ -1696,7 +1788,7 @@ class WebAdminChatHandlersMixin:
                 starting_turns.discard(turn_uuid)
                 if not starting_turns:
                     self._web_starting_turns.pop(conv_uuid, None)
-        return {"ok": True, "queued": False}
+        return {"ok": True, "queued": False, **({"rootTurnUuid": turn_uuid} if telegram_submission_id else {})}
 
     async def handle_api_conversation_ws(self, request: web.Request) -> web.WebSocketResponse:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1925,7 +2017,7 @@ class WebAdminChatHandlersMixin:
                 # client facts, so its cursor is authoritative even when lower
                 # than the reconnect query's stale afterFrameSeq.
                 last_sent_frame_seq = int(state_payload.get("frameSeq") or 0)
-                await _send_json({"type": "state", "state": state_payload, "conversations": await self._list_web_conversations(session.chat_id)})
+                await _send_json({"type": "state", "state": state_payload, "conversations": await self._list_web_conversations(session.chat_id, limit=100)})
             writer = asyncio.create_task(_writer())
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
@@ -1942,7 +2034,7 @@ class WebAdminChatHandlersMixin:
                         await _send_json({"type": "pong", "ts": now_ts()})
                     elif kind == "refresh":
                         row = await self._conversation_row(session.chat_id, str(row["conversation_uuid"]), require=True)  # type: ignore[assignment]
-                        await _send_json({"type": "state", "state": await self._chat_payload(int(row["internal_chat_id"]), row), "conversations": await self._list_web_conversations(session.chat_id)})
+                        await _send_json({"type": "state", "state": await self._chat_payload(int(row["internal_chat_id"]), row), "conversations": await self._list_web_conversations(session.chat_id, limit=100)})
                     elif kind == "stop":
                         result = await self._stop_web_conversation(row, message="已停止")
                         if result.get("ok"):

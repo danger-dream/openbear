@@ -69,7 +69,7 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
     }
     reg.add(
         "UserInteraction",
-        "Ask the user via a shared Web/TG interaction. Supports confirm, select, prompt, questionnaire. Choices always permit text-only or options plus original text; user text takes precedence over conflicting selections. Confirmation feedback does not authorize the original action. Telegram delivery/reply follows user settings; sensitive answers are Web-only.",
+        "Ask the user via a shared Web/TG interaction for an unresolved decision or a required confirmation, not to repeat a clear instruction or existing authorization within its scope. Do not add a preliminary confirmation for the same action when its execution tool supplies the required gate. Supports confirm, select, prompt, questionnaire. Choices always permit text-only or options plus original text; user text takes precedence over conflicting selections. Confirmation feedback does not authorize the original action. Telegram delivery/reply follows user settings; sensitive answers are Web-only.",
         {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["confirm", "select", "prompt", "questionnaire"], "description": "Interaction action"},
             "title": {"type": "string", "description": "标题"},

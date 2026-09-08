@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import * as monaco from "monaco-editor";
+import { isDarkTheme, subscribeTheme } from "../theme.js";
 // 注:Monaco worker 配置在 main.js 第一个 import 的 ./monaco-worker.js 里(必须早于 monaco-editor 求值)
 
 const props = defineProps({
@@ -20,6 +21,11 @@ const emit = defineEmits(["update:modelValue"]);
 const el = ref(null);
 let editor = null;
 let suppress = false;
+let stopThemeSubscription = null;
+
+function syncEditorTheme(state) {
+  monaco.editor.setTheme((state?.dark ?? isDarkTheme()) ? "vs-dark" : "vs");
+}
 
 if (typeof window !== "undefined") {
   window.__mdCompletionContext = window.__mdCompletionContext || {
@@ -38,7 +44,9 @@ function syncCompletionContext() {
 
 const TEMPLATE_EXPRESSIONS = [
   // 当前 build_system_prompt_params() 提供的运行时变量
-  { expr: "workspaceDir", detail: "当前工作目录" },
+  { expr: "workspaceDir", detail: "OpenBear 公共 workspace（工具与产物根保持不变）" },
+  { expr: "folderWorkspaceDir", detail: "当前主会话目录继承后的工作目录；无设置时回退 workspaceDir" },
+  { expr: "folderPrompt", detail: "当前主会话目录继承后的 Markdown 提示词（就近覆盖）" },
   { expr: "toolNames", detail: "当前全部可用工具名列表(内置 + MCP)" },
   { expr: "toolSummaries", detail: "全部工具说明映射" },
   { expr: "builtinToolNames", detail: "内置工具名列表" },
@@ -292,11 +300,12 @@ function registerCompletion() {
 
 onMounted(() => {
   syncCompletionContext();
+  stopThemeSubscription = subscribeTheme(syncEditorTheme);
   registerCompletion();
   editor = monaco.editor.create(el.value, {
     value: props.modelValue,
     language: props.language,
-    theme: "vs",
+    theme: isDarkTheme() ? "vs-dark" : "vs",
     fontSize: 13,
     lineHeight: 22,
     minimap: { enabled: false },
@@ -346,7 +355,10 @@ watch(() => props.modelValue, (v) => {
   if (!suppress && editor && v !== editor.getValue()) editor.setValue(v || "");
 });
 
-onBeforeUnmount(() => { editor?.dispose(); });
+onBeforeUnmount(() => {
+  stopThemeSubscription?.();
+  editor?.dispose();
+});
 </script>
 
 <template>

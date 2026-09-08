@@ -7830,19 +7830,38 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
         family_of=lambda label: str(label).split("/", 1)[0],
     )
 
+    chat_id = int(row["internal_chat_id"])
+    web_env.server.runs = SimpleNamespace(is_running=lambda target: int(target) == chat_id)
     thinking = await web_env.client.post(
         f"/api/conversations/{uuid}/thinking",
         json={"level": "high"},
         cookies=cookie,
     )
     assert thinking.status == 200
+    thinking_body = await thinking.json()
+    assert thinking_body["level"] == "high"
+    assert thinking_body["nextRun"] is True
+    assert thinking_body["runConfig"]["conversationUuid"] == uuid
+    assert thinking_body["runConfig"]["model"] == "openai/gpt"
+    assert thinking_body["runConfig"]["thinkingLevel"] == "high"
+    assert thinking_body["runConfig"]["effectiveThinkingLevel"] == "high"
+    web_env.server.runs = None
+
     fast = await web_env.client.post(
         f"/api/conversations/{uuid}/fast",
         json={"enabled": True},
         cookies=cookie,
     )
     assert fast.status == 200
-    chat_id = int(row["internal_chat_id"])
+    fast_body = await fast.json()
+    assert fast_body["enabled"] is True
+    assert fast_body["nextRun"] is False
+    assert fast_body["runConfig"]["fastRequested"] is True
+    assert fast_body["runConfig"]["fastMode"] is True
+    assert fast_body["runConfig"]["effectiveFastMode"] is True
+    assert fast_body["runConfig"]["agentRunConfig"]["effective"]["model"] == "openai/gpt"
+    assert fast_body["runConfig"]["agentRunConfig"]["effective"]["fastMode"] is True
+    assert fast_body["runConfig"]["agentRunConfig"]["effective"]["source"]["fastMode"] == "main"
     session_id = await MessageDAO(web_env.db).current_session_uuid(chat_id)
     await MessageDAO(web_env.db).save_controller_model_context(
         chat_id,
@@ -7859,6 +7878,31 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
         cookies=cookie,
     )
     assert model.status == 200
+    model_body = await model.json()
+    assert model_body["model"] == "openai/cheap"
+    assert model_body["nextRun"] is False
+    model_config = model_body["runConfig"]
+    assert set(model_config) == {
+        "conversationUuid", "model", "thinkingLevel", "effectiveThinkingLevel",
+        "thinkingLevels", "defaultThinkingLevel", "supportsThinking", "fastMode",
+        "fastRequested", "fastSupported", "effectiveFastMode", "agentRunConfig",
+        "contextWindow", "compactTriggerTokens", "compactRatio",
+    }
+    assert model_config["conversationUuid"] == uuid
+    assert model_config["model"] == "openai/cheap"
+    assert model_config["thinkingLevel"] == "low"
+    assert model_config["effectiveThinkingLevel"] == "low"
+    assert model_config["thinkingLevels"] == ["low", "medium"]
+    assert model_config["defaultThinkingLevel"] == "low"
+    assert model_config["supportsThinking"] is True
+    assert model_config["fastRequested"] is False
+    assert model_config["fastSupported"] is False
+    assert model_config["fastMode"] is False
+    assert model_config["effectiveFastMode"] is False
+    assert model_config["agentRunConfig"]["model"] == ""
+    assert model_config["agentRunConfig"]["effective"]["model"] == "openai/cheap"
+    assert model_config["agentRunConfig"]["effective"]["thinkLevel"] == "low"
+    assert model_config["agentRunConfig"]["effective"]["source"]["model"] == "main"
     cur = await web_env.db.conn.execute(
         "SELECT COUNT(*) AS n FROM controller_model_contexts WHERE chat_id=?", (chat_id,)
     )
@@ -7872,6 +7916,13 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
     assert state["model"] == "openai/cheap"
     assert state["thinkingLevel"] == "low"
     assert state["fastMode"] is False
+    for key in (
+        "model", "thinkingLevel", "effectiveThinkingLevel", "thinkingLevels",
+        "defaultThinkingLevel", "supportsThinking", "fastMode", "fastRequested",
+        "fastSupported", "effectiveFastMode", "agentRunConfig", "compactTriggerTokens",
+        "compactRatio",
+    ):
+        assert model_config[key] == state[key]
 
 
 async def test_conversation_agent_run_config_api_and_state(web_env):
@@ -7886,6 +7937,8 @@ async def test_conversation_agent_run_config_api_and_state(web_env):
     assert "agent_think_level" in cols
     assert "agent_fast_mode" in cols
 
+    chat_id = int(row["internal_chat_id"])
+    web_env.server.runs = SimpleNamespace(is_running=lambda target: int(target) == chat_id)
     set_resp = await web_env.client.post(
         f"/api/conversations/{uuid}/agent-run-config",
         json={"model": "openai/cheap", "thinkLevel": "medium", "fastMode": False},
@@ -7894,12 +7947,18 @@ async def test_conversation_agent_run_config_api_and_state(web_env):
     assert set_resp.status == 200
     body = await set_resp.json()
     assert body["ok"] is True
+    assert body["nextRun"] is True
+    web_env.server.runs = None
     assert body["agentRunConfig"]["model"] == "openai/cheap"
     assert body["agentRunConfig"]["thinkLevel"] == "medium"
     assert body["agentRunConfig"]["fastMode"] is False
     assert body["agentRunConfig"]["effective"]["model"] == "openai/cheap"
     assert body["agentRunConfig"]["effective"]["thinkLevel"] == "medium"
     assert body["agentRunConfig"]["effective"]["source"]["model"] == "conversation"
+    assert body["runConfig"]["conversationUuid"] == uuid
+    assert body["runConfig"]["model"] == "openai/gpt"
+    assert body["runConfig"]["agentRunConfig"] == body["agentRunConfig"]
+    assert body["runConfig"]["agentRunConfig"]["effective"]["fastSupported"] is False
     defaults_resp = await web_env.client.get("/api/conversations/defaults", cookies=cookie)
     synced_defaults = (await defaults_resp.json())["defaults"]
     assert synced_defaults["agentModel"] == "openai/cheap"
@@ -7929,6 +7988,11 @@ async def test_conversation_agent_run_config_api_and_state(web_env):
     assert cleared["agentRunConfig"]["fastMode"] is None
     assert cleared["agentRunConfig"]["effective"]["model"] == "openai/gpt"
     assert cleared["agentRunConfig"]["effective"]["source"]["model"] == "main"
+    assert cleared["runConfig"]["agentRunConfig"] == cleared["agentRunConfig"]
+    assert cleared["runConfig"]["agentRunConfig"]["effective"]["thinkLevel"] == "medium"
+    assert cleared["runConfig"]["agentRunConfig"]["effective"]["source"] == {
+        "model": "main", "thinkLevel": "model_default", "fastMode": "main",
+    }
 
 
 async def test_root_compaction_sources_emit_stable_unified_context_compaction_identity(web_env):

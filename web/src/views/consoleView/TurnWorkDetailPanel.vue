@@ -231,3 +231,108 @@ function entryTimeDateTime(timeMs) {
 	.work-detail-kicker.working svg { animation: none; opacity: .72; }
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .work-detail {
+		background: #1d1e22;
+	}
+
+html.dark .work-detail.open {
+		border-left-color: rgba(255, 255, 255, 0.145);
+	}
+
+html.dark .work-detail-surface {
+		background: rgba(29, 30, 34, 0.98);
+	}
+
+html.dark .work-detail-header {
+		border-bottom: 1px solid rgba(255, 255, 255, 0.131);
+		background: rgba(29, 30, 34, 0.96);
+	}
+
+html.dark .work-detail-kicker {
+		color: #c6c6cd;
+	}
+
+html.dark .work-detail-kicker.working svg {
+		color: #60a5fa;
+	}
+
+html.dark .work-detail-heading h2 {
+		color: #efeff2;
+	}
+
+html.dark .work-detail-heading p {
+		color: #c6c6cd;
+	}
+
+html.dark .work-detail-close {
+		color: #c6c6cd;
+	}
+
+html.dark .work-detail-close:hover {
+		background: #202125;
+		color: #efeff2;
+	}
+
+html.dark .work-running-dots::after {
+		background: linear-gradient(105deg, transparent 28%, rgba(29, 30, 34, 0.88) 43%, rgba(49, 50, 54, 0.18) 50%, transparent 66%);
+	}
+
+html.dark .work-running-dots span {
+		background: #313236;
+		box-shadow: 0 0 0 0 rgba(161, 161, 170, 0.2), 0 0 10px rgba(148, 163, 184, 0.18);
+	}
+
+html.dark .work-entry-time {
+		color: #a1a1a8;
+	}
+
+html.dark .work-detail-empty {
+		color: #a1a1a8;
+	}
+
+html.dark .work-detail-empty strong {
+		color: #c6c6cd;
+	}
+
+html.dark .work-reasoning {
+		color: #c6c6cd;
+	}
+
+html.dark .work-reasoning summary {
+		color: #c6c6cd;
+	}
+
+html.dark .work-reasoning-icon {
+		color: #a1a1a8;
+	}
+
+html.dark .work-reasoning-name {
+		color: #c6c6cd;
+	}
+
+html.dark .work-disclosure {
+		color: #c6c6cd;
+	}
+
+html.dark .work-reasoning[open] > summary > .work-disclosure {
+		color: #60a5fa;
+	}
+
+html.dark .work-reasoning-detail {
+		border: 1px solid #3d3e46;
+		background: #1d1e22;
+	}
+
+html.dark .work-reasoning-body {
+		color: #c6c6cd;
+	}
+
+@media (max-width: 1280px) {
+	html.dark .work-detail.open {
+		box-shadow: -20px 0 54px rgba(0, 0, 0, 0.16);
+	}
+}
+</style>

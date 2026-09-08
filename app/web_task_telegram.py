@@ -14,17 +14,21 @@ from urllib.parse import urlparse
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
+from app import telegram_ui
 from app.config import Config, WebTaskNotificationsConfig
 from app.db.engine import DB
+from app.html_chunking import split_html_chunks
 from app.logging import get_logger
-from app.telegram_ui import edit_rich, send_rich
+from app.telegram_ui import send_rich
+from app.web_telegram_replies import bind_message, reply_keyboard
 
 log = get_logger("web_task_telegram")
 
 _TERMINAL_STATUSES = {"completed", "failed", "interrupted", "short"}
 _AGENT_TERMINAL = {"completed", "failed", "cancelled", "interrupted", "needs_openbear_control", "partial"}
-_RESULT_STEP_CHARS = 1200
-_RESULT_EDIT_INTERVAL_S = 0.8
+# Creation/continuation starts a task; AgentMessage only reports an existing
+# task's state while delivering guidance, not a new lifecycle transition.
+_AGENT_TASK_TOOLS = {"Agent", "AgentContinue"}
 _MAX_DELIVERY_ATTEMPTS = 5
 
 
@@ -291,8 +295,35 @@ class WebTaskTelegramNotifier:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
 
+    @staticmethod
+    def _direct_reply_config() -> WebTaskNotificationsConfig:
+        return WebTaskNotificationsConfig(
+            enabled=True, include_result=True,
+            events=["task_completed", "task_failed", "task_interrupted"],
+        )
+
+    async def enable_direct_reply(self, conversation: dict[str, Any], root: str) -> None:
+        """An explicit TG instruction always gets a terminal response, even quickly."""
+        run = await self._run(root)
+        if run is None:
+            await self.register(
+                {"runUuid": root, "conversationUuid": conversation["conversation_uuid"], "source": "telegram"},
+                owner_chat_id=int(conversation["owner_chat_id"]), internal_chat_id=int(conversation["internal_chat_id"]),
+                title=str(conversation.get("title") or "新对话"), model=str(conversation.get("model") or ""),
+            )
+            return
+        cfg = self._run_config(run)
+        cfg.enabled, cfg.include_result = True, True
+        cfg.events = list(dict.fromkeys([*cfg.events, "task_completed", "task_failed", "task_interrupted"]))
+        await self.db.conn.execute(
+            "UPDATE web_tg_notification_runs SET config_json=?, threshold_at=MIN(threshold_at, ?), updated_at=? WHERE root_turn_uuid=? AND status='running'",
+            (cfg.model_dump_json(by_alias=True), _now(), _now(), root),
+        )
+        await self.db.conn.commit()
+
     async def register(self, event: dict[str, Any], *, owner_chat_id: int, internal_chat_id: int, title: str, model: str) -> None:
-        cfg = self.config.web.task_notifications
+        direct = event.get("source") == "telegram"
+        cfg = self._direct_reply_config() if direct else self.config.web.task_notifications
         if not cfg.enabled or event.get("taskNotificationSilent") or event.get("hidden") or event.get("internal"):
             return
         root = str(event.get("runUuid") or event.get("turnUuid") or "").strip()
@@ -303,7 +334,7 @@ class WebTaskTelegramNotifier:
         now = _now()
         event_ts_ms = int(event.get("ts") or 0)
         started_at = event_ts_ms // 1000 if event_ts_ms > 0 else now
-        threshold_at = started_at + int(cfg.threshold_minutes) * 60
+        threshold_at = started_at if direct else started_at + int(cfg.threshold_minutes) * 60
         snapshot = cfg.model_dump(by_alias=True)
         await self.db.conn.execute(
             """
@@ -335,7 +366,7 @@ class WebTaskTelegramNotifier:
         kind = str(event.get("type") or "").strip()
         if kind == "accepted":
             if (
-                not self.config.web.task_notifications.enabled
+                (not self.config.web.task_notifications.enabled and event.get("source") != "telegram")
                 or event.get("taskNotificationSilent")
                 or event.get("hidden")
                 or event.get("internal")
@@ -382,7 +413,7 @@ class WebTaskTelegramNotifier:
             return
         if kind in {"tool_progress", "tool_result", "task_notification"}:
             nested = event.get("payload") if isinstance(event.get("payload"), dict) else event
-            if kind == "tool_result" and str(event.get("name") or "") in {"Agent", "AgentMessage"}:
+            if kind == "tool_result" and str(event.get("name") or "") in _AGENT_TASK_TOOLS:
                 parsed_result = _json_loads(event.get("result"), {})
                 if isinstance(parsed_result, dict):
                     nested = parsed_result
@@ -390,7 +421,7 @@ class WebTaskTelegramNotifier:
             tool_name = str(event.get("name") or nested.get("toolName") or "")
             task_uuid = str(task.get("taskUuid") or nested.get("taskUuid") or event.get("taskUuid") or "").strip()
             status = str(task.get("status") or nested.get("status") or event.get("status") or "").strip()
-            if (tool_name in {"Agent", "AgentMessage"} or kind == "task_notification") and task_uuid:
+            if (tool_name in _AGENT_TASK_TOOLS or kind == "task_notification") and task_uuid:
                 payload = {
                     "taskUuid": task_uuid,
                     "title": _safe_text(task.get("title") or task.get("displayName") or nested.get("title") or "", 120),
@@ -433,15 +464,12 @@ class WebTaskTelegramNotifier:
         )
         await self.db.conn.commit()
         event_type = {"completed": "task_completed", "failed": "task_failed", "interrupted": "task_interrupted"}[normalized]
-        queued_terminal = False
-        if event_type in config.events:
-            await self._queue_event(root_turn_uuid, event_type, event_type, {}, deliver_after=now)
-            queued_terminal = True
         result = str(run.get("result_text") or "")
         if normalized == "completed" and config.include_result and result:
-            if not queued_terminal:
-                await self._queue_event(root_turn_uuid, "result_ready", "result_ready", {}, deliver_after=now)
-            await self._queue_event(root_turn_uuid, "result", "result", {"text": result}, deliver_after=now)
+            # One logical completion message, with metadata and the full answer.
+            await self._queue_event(root_turn_uuid, "result", "result", {"text": result, "combined": True}, deliver_after=now)
+        elif event_type in config.events:
+            await self._queue_event(root_turn_uuid, event_type, event_type, {}, deliver_after=now)
         self._wake.set()
 
     async def _run(self, root_turn_uuid: str) -> dict[str, Any] | None:
@@ -615,10 +643,9 @@ class WebTaskTelegramNotifier:
             return
         try:
             if delivery.event_type == "result":
-                message_ids = await self._stream_result(delivery, owner, str(delivery.payload.get("text") or ""))
+                message_ids = await self._stream_result(delivery, owner, str(delivery.payload.get("text") or ""), run=run)
             else:
-                message = await send_rich(self.bot, owner, await self._event_html(run, delivery))
-                message_ids = [int(message.message_id)] if getattr(message, "message_id", None) else []
+                message_ids = await self._send_notification_page(delivery, owner, run, 1, await self._event_html(run, delivery))
         except asyncio.CancelledError:
             raise
         except TelegramRetryAfter as exc:
@@ -666,6 +693,7 @@ class WebTaskTelegramNotifier:
             "retrying": ("⚠️", "模型调用失败，正在重试"),
             "task_completed": ("✅", "OpenBear 任务已完成"),
             "result_ready": ("✅", "OpenBear 任务已完成"),
+            "result": ("✅", "OpenBear 任务已完成"),
             "task_failed": ("❌", "OpenBear 任务失败"),
             "task_interrupted": ("⏹", "OpenBear 任务已中断"),
         }
@@ -718,42 +746,97 @@ class WebTaskTelegramNotifier:
             lines.extend(["", "最终回答将在下一条消息中显示。"])
         return "\n".join(lines)
 
-    async def _checkpoint_message_ids(self, delivery_id: int, message_ids: list[int]) -> None:
+    async def _save_pages(self, delivery: Delivery, owner: int, run: dict[str, Any], message_id: int = 0) -> None:
+        pages = delivery.payload.get("_telegramPages") or {}
+        ids = [int(mid) for key in sorted(pages, key=int) for mid in pages[key].get("ids", [])]
+        if message_id and run.get("conversation_uuid"):
+            await bind_message(self.db, owner, message_id, str(run["conversation_uuid"]), delivery.root_turn_uuid)
         await self.db.conn.execute(
-            "UPDATE web_tg_notification_outbox SET telegram_message_ids_json=?, updated_at=? WHERE id=? AND state='processing'",
-            (json.dumps(message_ids, separators=(",", ":")), _now(), delivery_id),
+            "UPDATE web_tg_notification_outbox SET payload_json=?, telegram_message_ids_json=?, updated_at=? WHERE id=? AND state='processing'",
+            (json.dumps(delivery.payload, ensure_ascii=False), json.dumps(ids), _now(), delivery.id),
         )
         await self.db.conn.commit()
+        delivery.message_ids = tuple(ids)
 
-    async def _stream_result(self, delivery: Delivery, owner: int, text: str) -> list[int]:
+    async def _send_notification_page(self, delivery: Delivery, owner: int, run: dict[str, Any], page_index: int, body: str) -> list[int]:
+        """Checkpoint every physical message, including ordinary-HTML fallback.
+
+        The answer is already final: send it whole instead of replaying artificial
+        streaming edits. This also avoids re-appending legacy pages on every edit.
+        """
+        states = delivery.payload.setdefault("_telegramPages", {})
+        page = states.setdefault(str(page_index), {
+            "html": body, "mode": "rich" if telegram_ui.USE_RICH_MESSAGES else "html", "ids": [],
+        })
+        body = str(page["html"])
+        markup = reply_keyboard(self.config, str(run.get("conversation_uuid") or ""))
+        if page["mode"] == "rich":
+            if page["ids"] and not page.get("needsEdit"):
+                return list(page["ids"])
+            message_id = int(page["ids"][0]) if page["ids"] else 0
+            try:
+                if message_id:
+                    await self.bot.edit_message_text(
+                        chat_id=owner, message_id=message_id, rich_message=telegram_ui._rich(body), reply_markup=markup,
+                    )
+                else:
+                    message = await self.bot.send_rich_message(
+                        chat_id=owner, rich_message=telegram_ui._rich(body), reply_markup=markup,
+                    )
+                    message_id = int(message.message_id)
+                    page["ids"].append(message_id)
+            except (TelegramBadRequest, AttributeError) as exc:
+                if not (message_id and "message is not modified" in str(exc).lower()):
+                    page["mode"] = "html"
+            if page["mode"] == "rich":
+                page.pop("needsEdit", None)
+                await self._save_pages(delivery, owner, run, message_id)
+                return list(page["ids"])
+            await self._save_pages(delivery, owner, run)
+        chunks = split_html_chunks(telegram_ui._rich_html_to_legacy_html(body), telegram_ui.LEGACY_HTML_LIMIT)
+        if page.get("needsEdit"):
+            message_id = int(page["ids"][0])
+            try:
+                await self.bot.edit_message_text(chunks[0], chat_id=owner, message_id=message_id, parse_mode="HTML", reply_markup=markup)
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    if not telegram_ui._looks_parse_error(exc):
+                        raise
+                    plain = html.unescape(re.sub(r"<[^>]*>", "", chunks[0]))
+                    await self.bot.edit_message_text(plain, chat_id=owner, message_id=message_id, parse_mode=None, reply_markup=markup)
+            page.pop("needsEdit", None)
+            await self._save_pages(delivery, owner, run, message_id)
+        for chunk in chunks[len(page["ids"]):]:
+            try:
+                message = await self.bot.send_message(owner, chunk, parse_mode="HTML", reply_markup=markup)
+            except TelegramBadRequest as exc:
+                if not telegram_ui._looks_parse_error(exc):
+                    raise
+                # Strip only our actual markup; escaped user/model HTML remains text.
+                plain = html.unescape(re.sub(r"<[^>]*>", "", chunk))
+                message = await self.bot.send_message(owner, plain, parse_mode=None, reply_markup=markup)
+            page["ids"].append(int(message.message_id))
+            await self._save_pages(delivery, owner, run, int(message.message_id))
+        return list(page["ids"])
+
+    async def _stream_result(self, delivery: Delivery, owner: int, text: str, *, run: dict[str, Any] | None = None) -> list[int]:
+        run = run or await self._run(delivery.root_turn_uuid) or {}
         blocks = markdown_to_telegram_blocks(text)
-        message_ids = list(delivery.message_ids)
+        ids: list[int] = []
+        legacy_ids = delivery.message_ids if not delivery.payload.get("_telegramPages") else ()
+        bodies = []
         for page_index, page in enumerate(_rich_pages(blocks), start=1):
             prefix = "<b>📄 最终回答</b>\n\n" if page_index == 1 else f"<b>📄 最终回答 · 第 {page_index} 页</b>\n\n"
-            final_body = prefix + "\n\n".join(page)
-            if page_index <= len(message_ids):
-                await edit_rich(self.bot, owner, message_ids[page_index - 1], final_body)
-                continue
-            cumulative: list[str] = []
-            message_id = 0
-            last_size = 0
-            for index, block in enumerate(page):
-                cumulative.append(block)
-                body = prefix + "\n\n".join(cumulative)
-                is_last = index == len(page) - 1
-                if not is_last and len(body) - last_size < _RESULT_STEP_CHARS:
-                    continue
-                if not message_id:
-                    message = await send_rich(self.bot, owner, body)
-                    message_id = int(message.message_id)
-                    message_ids.append(message_id)
-                    await self._checkpoint_message_ids(delivery.id, message_ids)
-                else:
-                    await asyncio.sleep(_RESULT_EDIT_INTERVAL_S)
-                    await edit_rich(self.bot, owner, message_id, body)
-                last_size = len(body)
-            if not message_id:
-                message = await send_rich(self.bot, owner, final_body)
-                message_ids.append(int(message.message_id))
-                await self._checkpoint_message_ids(delivery.id, message_ids)
-        return message_ids
+            if page_index == 1 and delivery.payload.get("combined"):
+                prefix = await self._event_html(run, delivery) + "\n\n" + prefix
+            bodies.append(prefix + "\n\n".join(page))
+        if legacy_ids:
+            # Import all pre-upgrade checkpoints together so a retry while editing
+            # one page cannot forget the other already-sent pages.
+            delivery.payload["_telegramPages"] = {
+                str(index): {"html": bodies[index - 1], "mode": "rich", "ids": [message_id], "needsEdit": True}
+                for index, message_id in enumerate(legacy_ids, start=1) if index <= len(bodies)
+            }
+        for page_index, body in enumerate(bodies, start=1):
+            ids.extend(await self._send_notification_page(delivery, owner, run, page_index, body))
+        return ids

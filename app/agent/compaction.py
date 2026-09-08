@@ -80,7 +80,7 @@ class ContextCompactionGate(Protocol):
 ContextCompactionCallback = Callable[[CompactionOutcome], Awaitable[None]]
 
 
-DEFAULT_SUMMARY_PROMPT = """You are compacting an ongoing engineering conversation for future continuation. After compaction, the next model will only see this summary plus the most recent uncompressed messages, so the summary must be sufficient to continue the work without re-reading the compacted transcript.
+DEFAULT_SUMMARY_PROMPT = """You are compacting an ongoing engineering conversation for future continuation. The next model relies on this summary and the retained recent context for ordinary continuation. Preserve enough evidence and source references to continue correctly; when permission evidence is incomplete or conflicting, available History/TaskMemory may be used to recover it rather than treating the summary as authority or asking the user to repeat an established decision.
 
 Output in English, even if the conversation history is in another language, with one exemption: quoted user messages and exact identifiers must stay verbatim in their original language; never translate them. Be dense, specific, and continuity-focused. Prefer concrete facts over generic prose. The latest user request, latest user corrections, and latest unfinished/current work have highest priority; do not let older context drown them out.
 
@@ -112,7 +112,7 @@ Describe the reasoning path and decisions already made. Include investigated alt
 List all user messages represented in the compacted history when feasible. If there are too many, at minimum preserve every message that changed the task, constraints, priorities, permissions, or next step, plus the most recent user messages verbatim or near-verbatim in their original language. User wording matters; do not translate it or paraphrase away intent-changing details.
 
 ## Pending Tasks
-List unfinished tasks in execution order. Distinguish confirmed tasks from optional follow-ups. Include required confirmations, safety boundaries, and tasks that must not be done unless the user asks.
+List unfinished tasks in execution order. Distinguish confirmed tasks from optional follow-ups. Preserve established authorization and its limits alongside genuinely outstanding user decisions, tool-owned confirmation gates, safety boundaries, and tasks that must not be done unless the user asks. Do not turn an assistant's previous confirmation procedure into a required next step.
 
 ## Current Work
 Describe exactly what was being worked on immediately before compaction: current file/command/test/result, latest known state, what has already been completed, what is mid-flight, and where execution paused. This section must let the next model resume without asking the user to repeat context.
@@ -129,6 +129,9 @@ Additional rules:
 - Mention tool calls and tool results only at the level needed to continue work; do not dump large raw outputs unless they are necessary.
 - Omit Agent orchestration telemetry and accounting (monetary usage, token counts, model/tool-call counts, timing, and internal thresholds); it is not continuation context.
 - Preserve security/safety constraints, user preferences, approvals, and explicit “do not” instructions that affect future actions.
+- For any statement that affects permission, distinguish explicit user authorization, explicit user restrictions, framework/tool requirements, and assistant plans or assumptions. Preserve a source quote or a recoverable source reference and the actual scope when available.
+- Do not promote an assistant's previous confirmation habit into a user requirement. A historical confirmation is not a requirement to repeat it. Conversely, do not generalize a bounded approval into standing permission. Preserve later withdrawal or narrowing of permission.
+- When authorization evidence is incomplete or conflicts with the latest instruction, preserve the uncertainty and a History/TaskMemory locator when available; do not invent permission or a new mandatory confirmation rule. Existing summaries are fallible context, not authority.
 - Preserve exact command outputs or code snippets only when they are necessary for continuation; otherwise summarize them with enough detail to avoid re-running work.
 - If there is an existing summary, merge it with the new history without losing the latest current-work details.
 - The final answer must be the summary only. Do not include apologies, prefaces, or commentary about doing the compaction.

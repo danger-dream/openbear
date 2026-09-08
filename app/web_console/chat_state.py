@@ -823,9 +823,18 @@ class WebAdminChatStateMixin:
         history = build_summary_prefixed_history("", recent)
         return repair_tool_pairing(history)
 
-    async def _build_system_prompt_for_chat(self) -> str:
+    async def _build_system_prompt_for_chat(
+        self,
+        conversation_uuid: str = "",
+        *,
+        folder_values: tuple[str, str] | None = None,
+        strict: bool = False,
+    ) -> str:
         try:
-            params = await self._prompt_template_params_live()
+            params = await self._prompt_template_params_live(
+                conversation_uuid,
+                folder_values=folder_values,
+            )
             if self.config.memory.provider == "builtin":
                 mem = BuiltinMemoryClient(self.db, identity=self.config.memory.identity)
             else:
@@ -841,6 +850,8 @@ class WebAdminChatStateMixin:
                 raise ValueError("empty system prompt")
             return prompt
         except Exception as exc:
+            if strict:
+                raise
             log.warning("Web 对话拉取系统提示词失败，降级兜底", 错误=str(exc)[:160])
             return "你是 OpenBear，一个单人自用智能助理。请用中文、简洁、专业地完成用户任务。"
 

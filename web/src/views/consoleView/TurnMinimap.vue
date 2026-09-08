@@ -197,3 +197,50 @@ function turnNavLabel(turn, index = 0) {
 	}
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .turn-minimap-rail {
+		background: rgba(29, 30, 34, 0.62);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+	}
+html.dark .turn-minimap-dot span {
+		background: #2b2c30;
+	}
+html.dark .turn-minimap-dot:hover span {
+		background: #313236;
+	}
+html.dark .turn-minimap-dot.active span {
+		background: #232428;
+	}
+html.dark .turn-minimap-dot.running span {
+		box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+	}
+html.dark .turn-minimap-popover {
+		border: 1px solid rgba(255, 255, 255, 0.145);
+		background: rgba(29, 30, 34, 0.94);
+		box-shadow: 0 18px 52px rgba(0, 0, 0, 0.16);
+	}
+html.dark .turn-nav-row {
+		color: #c6c6cd;
+	}
+html.dark .turn-nav-row:hover {
+		background: #202125;
+		color: #efeff2;
+	}
+html.dark .turn-nav-row.active {
+		background: #232428;
+		color: #ffffff;
+	}
+html.dark .turn-nav-row.running:not(.active) {
+		color: #60a5fa;
+	}
+html.dark .turn-nav-index {
+		background: #202125;
+		color: #c6c6cd;
+	}
+html.dark .turn-nav-row.active .turn-nav-index {
+		background: rgba(29, 30, 34, 0.18);
+		color: #ffffff;
+	}
+</style>

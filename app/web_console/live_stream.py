@@ -625,6 +625,7 @@ class _WebStreamRenderer:
                 "turnUuid": turn_uuid,
                 "messageUuid": message_uuid or str(uuid.uuid4()),
                 "text": text,
+                **({"source": "telegram"} if first.get("source") == "telegram" else {}),
                 "steeringInjected": True,
             })
         self.live.activate_latest_user_turn()

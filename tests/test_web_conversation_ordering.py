@@ -104,7 +104,7 @@ async def test_list_order_uses_only_created_at_then_id_and_ignores_pin_and_updat
     assert next(row for row in rows if row["conversationUuid"] == "conversation-3")["pinned"] is True
 
 
-async def test_recent_activity_cannot_move_old_rows_into_created_at_limited_window(conversation_harness):
+async def test_recent_activity_cannot_reorder_and_global_list_is_not_silently_truncated(conversation_harness):
     harness = conversation_harness
     for row_id in range(1, 106):
         await _insert_conversation(
@@ -120,9 +120,15 @@ async def test_recent_activity_cannot_move_old_rows_into_created_at_limited_wind
 
     rows = await harness._list_web_conversations(123)
 
-    assert len(rows) == 100
-    assert _listed_ids(rows) == list(range(105, 5, -1))
-    assert 1 not in _listed_ids(rows)
+    assert len(rows) == 105
+    assert _listed_ids(rows) == list(range(105, 0, -1))
+    assert 1 in _listed_ids(rows)
+
+    # Legacy WebSocket callers may explicitly request a bounded compatibility
+    # payload; the organization tree uses its own lazy paginated endpoints.
+    bounded = await harness._list_web_conversations(123, limit=100)
+    assert len(bounded) == 100
+    assert _listed_ids(bounded) == list(range(105, 5, -1))
 
 
 async def test_schema_has_created_at_ordering_index(conversation_harness):

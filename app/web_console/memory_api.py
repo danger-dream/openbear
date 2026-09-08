@@ -55,7 +55,14 @@ class WebAdminMemoryMixin:
                 out[key] = value
         return out
 
-    def _prompt_template_params(self, *, available_agents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _prompt_template_params(
+        self,
+        *,
+        available_agents: list[dict[str, Any]] | None = None,
+        current_model: str = "",
+        folder_workspace_dir: str = "",
+        folder_prompt: str = "",
+    ) -> dict[str, Any]:
         tool_summaries = self.tools.summaries(scope="main") if self.tools is not None else {}
         tool_names = self.tools.names(scope="main") if self.tools is not None else list(tool_summaries.keys())
         builtin_tool_names = self.tools.names(source="builtin", scope="main") if self.tools is not None else tool_names
@@ -65,7 +72,7 @@ class WebAdminMemoryMixin:
         mcp_server_instructions = []
         if getattr(self, "mcp", None) is not None and hasattr(self.mcp, "server_instructions_snapshot"):
             mcp_server_instructions = self.mcp.server_instructions_snapshot()
-        current_model = (
+        current_model = current_model or (
             getattr(self.model_selection, "current", "")
             if self.model_selection is not None else ""
         ) or self.config.models.primary
@@ -79,6 +86,8 @@ class WebAdminMemoryMixin:
             mcp_server_instructions=mcp_server_instructions,
             skills_prompt=str(getattr(self, "skills_prompt", "") or ""),
             workspace_dir=str(getattr(self, "workspace_dir", "") or ""),
+            folder_workspace_dir=folder_workspace_dir,
+            folder_prompt=folder_prompt,
             current_model=current_model,
             available_agents=available_agents or [],
         )
@@ -90,8 +99,34 @@ class WebAdminMemoryMixin:
             log.warning("Web 获取可用 Agent 提示词参数失败", 错误=str(exc)[:120])
             return []
 
-    async def _prompt_template_params_live(self) -> dict[str, Any]:
-        params = self._prompt_template_params(available_agents=await self._available_agents_for_prompt())
+    async def _prompt_template_params_live(
+        self,
+        conversation_uuid: str = "",
+        *,
+        folder_values: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        model = ""
+        values = folder_values
+        conv_uuid = str(conversation_uuid or "").strip()
+        if conv_uuid:
+            cur = await self.db.conn.execute(
+                "SELECT owner_chat_id, folder_uuid, model FROM web_conversations WHERE conversation_uuid=? LIMIT 1",
+                (conv_uuid,),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                model = str(row["model"] or "")
+                if values is None and hasattr(self, "_tree_effective_folder_values"):
+                    values = await self._tree_effective_folder_values(
+                        int(row["owner_chat_id"] or 0), str(row["folder_uuid"] or "")
+                    )
+        workspace, prompt = values or (str(getattr(self, "workspace_dir", "") or ""), "")
+        params = self._prompt_template_params(
+            available_agents=await self._available_agents_for_prompt(),
+            current_model=model,
+            folder_workspace_dir=workspace,
+            folder_prompt=prompt,
+        )
         runtime = params.setdefault("runtimeInfo", {})
         if isinstance(runtime, dict):
             runtime.setdefault("channel", "web")

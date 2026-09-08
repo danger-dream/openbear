@@ -504,3 +504,195 @@ function selectRelevantStep(check) {
 	.completion-list { grid-template-columns: 1fr; }
 }
 </style>
+
+<style>
+/* OpenBear system dark theme */
+html.dark .plan-workspace {
+		--ink: #e4e4e7;
+		--secondary: #b4b4bd;
+		--tertiary: #8b8b95;
+		--line: rgba(255, 255, 255, .12);
+		--line-strong: rgba(255, 255, 255, .20);
+		--blue: #60a5fa;
+		--blue-soft: #1b2b43;
+		--green: #6ee7a2;
+		--green-soft: #183326;
+		--orange: #fbad66;
+		--red: #fb8585;
+	}
+html.dark .plan-state-empty {
+		background: rgba(29, 30, 34, 0.72);
+	}
+html.dark .plan-state-empty button {
+		background: #1d1e22;
+	}
+html.dark .plan-state-empty.is-error {
+		border-color: rgba(251, 133, 133, 0.25);
+		background: #1d1e22;
+	}
+html.dark .plan-sidebar {
+		background: rgba(32, 33, 37, 0.72);
+	}
+html.dark .plan-caption button:hover {
+		background: rgba(42, 43, 47, 0.1);
+	}
+html.dark .plan-attention {
+		border: 1px solid rgba(251, 173, 102, 0.18);
+		background: #202125;
+	}
+html.dark .plan-attention.is-danger {
+		border-color: rgba(251, 133, 133, 0.18);
+		background: #1d1e22;
+	}
+html.dark .plan-attention.is-history {
+		border-color: rgba(96, 165, 250, 0.16);
+		background: rgba(88, 86, 214, 0.06);
+		color: #60a5fa;
+	}
+html.dark .progress-line {
+		background: rgba(42, 43, 47, 0.15);
+	}
+html.dark .step-button:hover {
+		background: rgba(42, 43, 47, 0.08);
+	}
+html.dark .step-button.active:not(.is-current) {
+		background: rgba(29, 30, 34, 0.82);
+		box-shadow: inset 0 0 0 1px rgba(0, 122, 255, 0.2);
+	}
+html.dark .step-button.is-current {
+		background: linear-gradient(90deg, rgba(0, 122, 255, 0.15), rgba(0, 122, 255, 0.055));
+		box-shadow: inset 3px 0 0 var(--blue), inset 0 0 0 1px rgba(0, 122, 255, 0.15), 0 3px 10px rgba(0, 122, 255, 0.07);
+	}
+html.dark .step-button.is-current:hover {
+		background: linear-gradient(90deg, rgba(0, 122, 255, 0.18), rgba(0, 122, 255, 0.075));
+	}
+html.dark .step-number {
+		background: #1d1e22;
+		color: #c6c6cd;
+	}
+html.dark .step-button.tone-success .step-number {
+		border-color: rgba(110, 231, 162, 0.2);
+	}
+html.dark .step-button.tone-danger .step-number {
+		border-color: rgba(251, 133, 133, 0.18);
+		background: #1d1e22;
+	}
+html.dark .step-button.tone-warning .step-number {
+		border-color: rgba(251, 173, 102, 0.2);
+		background: #202125;
+	}
+html.dark .step-button.is-current .step-number {
+		border-color: rgba(96, 165, 250, 0.32);
+		background: #1d1e22;
+		box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.09);
+	}
+html.dark .step-button.is-current .step-text strong {
+		color: #60a5fa;
+	}
+html.dark .step-status {
+		border: 1px solid rgba(61, 62, 70, 0.12);
+		background: rgba(42, 43, 47, 0.07);
+		color: #c6c6cd;
+	}
+html.dark .step-status.tone-success {
+		border-color: rgba(110, 231, 162, 0.15);
+		background: rgba(36, 138, 61, 0.08);
+	}
+html.dark .step-status.tone-active {
+		border-color: rgba(96, 165, 250, 0.2);
+		background: rgba(0, 122, 255, 0.11);
+		color: #60a5fa;
+	}
+html.dark .step-status.tone-danger {
+		border-color: rgba(251, 133, 133, 0.16);
+		background: rgba(215, 0, 21, 0.07);
+	}
+html.dark .step-status.tone-warning {
+		border-color: rgba(251, 173, 102, 0.16);
+		background: rgba(194, 91, 0, 0.07);
+	}
+html.dark .step-status i {
+		box-shadow: 0 0 0 0 rgba(0, 104, 201, 0.35);
+	}
+html.dark .step-arrow {
+		color: #a1a1a8;
+	}
+html.dark .version-switcher select {
+		background: #1d1e22;
+	}
+html.dark .version-switcher select:focus {
+		border-color: rgba(96, 165, 250, 0.52);
+		box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.1);
+	}
+html.dark .info-cell {
+		background: rgba(29, 30, 34, 0.72);
+	}
+html.dark .info-cell p {
+		color: #dedee1;
+	}
+html.dark .method-toggle {
+		color: #60a5fa;
+	}
+html.dark .method-toggle:hover,
+html.dark .method-toggle:focus-visible {
+		background: rgba(0, 122, 255, 0.07);
+		color: #60a5fa;
+	}
+html.dark .method-toggle:focus-visible {
+		outline: 2px solid rgba(96, 165, 250, 0.16);
+	}
+html.dark .step-activity-card {
+		background: rgba(29, 30, 34, 0.72);
+	}
+html.dark .step-activity-card > header strong {
+		color: #dedee1;
+	}
+html.dark .step-activity-error {
+		background: #1d1e22;
+	}
+html.dark .blocker-note {
+		border: 1px solid rgba(251, 133, 133, 0.16);
+		background: #1d1e22;
+	}
+html.dark .section-label {
+		color: #dedee1;
+	}
+html.dark .criterion-check {
+		background: rgba(42, 43, 47, 0.12);
+	}
+html.dark .criterion-check.tone-danger {
+		background: #1d1e22;
+	}
+html.dark .evidence {
+		border: 1px solid rgba(96, 165, 250, 0.14);
+	}
+html.dark .evidence-kind {
+		background: rgba(0, 122, 255, 0.09);
+		color: #60a5fa;
+	}
+html.dark .evidence-info {
+		border-bottom: 1px dotted rgba(96, 165, 250, 0.52);
+		color: #60a5fa;
+	}
+html.dark .evidence-summary {
+		color: #60a5fa;
+	}
+html.dark .evidence-tooltip strong {
+		color: #efeff2;
+	}
+html.dark .evidence-tooltip p {
+		color: #c6c6cd;
+	}
+html.dark .evidence-tooltip code {
+		color: #a1a1a8;
+	}
+html.dark .completion-item strong {
+		color: #dedee1;
+	}
+html.dark .deliverable-check {
+		background: rgba(42, 43, 47, 0.12);
+	}
+html.dark .source-list .source-chip {
+		background: rgba(42, 43, 47, 0.1);
+	}
+</style>

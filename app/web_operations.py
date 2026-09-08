@@ -744,7 +744,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
 
     if typ == "accepted":
         task_notification = bool(event.get("taskNotification"))
-        source = "task_notification" if task_notification else "user"
+        source = "task_notification" if task_notification else ("telegram" if event.get("source") == "telegram" else "user")
         payload = {
             "turnId": turn_uuid,
             "runId": execution_run_uuid,
@@ -776,7 +776,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": str(event.get("status") or ("插话已交给主会话" if event.get("steeringInjected") else "")),
                 "createdAtMs": ts,
             },
-            status="completed", source="user",
+            status="completed", source="telegram" if event.get("source") == "telegram" else "user",
         ))
         return specs
 
@@ -793,7 +793,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": str(event.get("status") or "已追加到当前运行"),
                 "createdAtMs": ts,
             },
-            status="completed", source="queued_steering",
+            status="completed", source="telegram" if event.get("source") == "telegram" else "queued_steering",
         ))
         return specs
 

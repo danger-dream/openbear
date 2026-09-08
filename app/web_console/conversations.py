@@ -95,6 +95,7 @@ class WebAdminConversationsMixin:
             "pinnedAt": int(data.get("pinned_at") or 0),
             "pinned": int(data.get("pinned_at") or 0) > 0,
             "displayOrder": float(data["display_order"]) if data.get("display_order") is not None else None,
+            "folderId": str(data.get("folder_uuid") or ""),
             "archivedAt": int(data.get("archived_at") or 0),
             "archived": int(data.get("archived_at") or 0) > 0,
             "messageCount": int(data.get("message_count") or 0),
@@ -111,6 +112,7 @@ class WebAdminConversationsMixin:
         owner_chat_id: int,
         *,
         pinned: bool,
+        folder_uuid: str = "",
         conn: Any | None = None,
     ) -> float:
         """Place a newly persisted conversation at the head of its visible group."""
@@ -120,9 +122,10 @@ class WebAdminConversationsMixin:
             f"""
             SELECT MIN(display_order) AS min_display_order
             FROM web_conversations
-            WHERE owner_chat_id=? AND {pin_clause} AND display_order IS NOT NULL
+            WHERE owner_chat_id=? AND COALESCE(folder_uuid,'')=?
+              AND {pin_clause} AND display_order IS NOT NULL
             """,
-            (owner_chat_id,),
+            (owner_chat_id, str(folder_uuid or "")),
         )
         row = await cur.fetchone()
         minimum = row["min_display_order"] if row else None
@@ -133,6 +136,7 @@ class WebAdminConversationsMixin:
         owner_chat_id: int,
         *,
         pinned: bool,
+        folder_uuid: str = "",
         moving_uuid: str,
         before_uuid: str = "",
         after_uuid: str = "",
@@ -144,13 +148,13 @@ class WebAdminConversationsMixin:
             f"""
             SELECT id, conversation_uuid
             FROM web_conversations
-            WHERE owner_chat_id=? AND {pin_clause}
+            WHERE owner_chat_id=? AND COALESCE(folder_uuid,'')=? AND {pin_clause}
             ORDER BY CASE WHEN display_order IS NULL THEN 1 ELSE 0 END ASC,
                      display_order ASC,
                      COALESCE(created_at, 0) DESC,
                      id DESC
             """,
-            (owner_chat_id,),
+            (owner_chat_id, str(folder_uuid or "")),
         )
         rows = [dict(row) for row in await cur.fetchall()]
         positions = {str(item["conversation_uuid"] or ""): index for index, item in enumerate(rows)}
@@ -192,6 +196,7 @@ class WebAdminConversationsMixin:
         internal_chat_id: int | None = None,
         conversation_uuid: str = "",
         run_config: dict[str, Any] | None = None,
+        folder_uuid: str = "",
         persist_defaults: bool = False,
         create_lock_held: bool = False,
     ) -> dict[str, Any]:
@@ -223,6 +228,7 @@ class WebAdminConversationsMixin:
                         display_order = await self._next_web_conversation_display_order(
                             owner_chat_id,
                             pinned=False,
+                            folder_uuid=folder_uuid,
                             conn=conn,
                         )
                         await conn.execute(
@@ -230,13 +236,13 @@ class WebAdminConversationsMixin:
                             INSERT INTO web_conversations (
                               conversation_uuid, owner_chat_id, internal_chat_id, title, model,
                               agent_model, agent_think_level, agent_fast_mode,
-                              status, current_status, created_at, updated_at, display_order
-                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              status, current_status, created_at, updated_at, display_order, folder_uuid
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 conv_uuid, owner_chat_id, internal, title or "新对话", model_label,
                                 agent_model, agent_thinking, agent_fast,
-                                "idle", "就绪", ts, ts, display_order,
+                                "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""),
                             ),
                         )
                         await conn.execute(
@@ -523,6 +529,7 @@ class WebAdminConversationsMixin:
             owner_chat_id,
             title=new_title,
             model=str(source.get("model") or ""),
+            folder_uuid=str(source.get("folder_uuid") or ""),
         )
         new_uuid = str(new_row.get("conversation_uuid") or "")
         new_internal = int(new_row.get("internal_chat_id") or 0)
@@ -1235,9 +1242,16 @@ class WebAdminConversationsMixin:
             row["last_error"] = ""
         return [*agent_frames, *frames]
 
-    async def _list_web_conversations(self, owner_chat_id: int, *, include_archived: bool = False) -> list[dict[str, Any]]:
+    async def _list_web_conversations(
+        self,
+        owner_chat_id: int,
+        *,
+        include_archived: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         await self._ensure_default_web_conversation(owner_chat_id)
         archive_clause = "" if include_archived else "AND COALESCE(wc.archived_at,0)=0"
+        limit_clause = "" if limit is None else f"LIMIT {max(1, min(500, int(limit)))}"
         cur = await self.db.conn.execute(
             f"""
             SELECT wc.*,
@@ -1252,7 +1266,7 @@ class WebAdminConversationsMixin:
             FROM web_conversations wc
             WHERE wc.owner_chat_id=? {archive_clause}
             ORDER BY COALESCE(wc.created_at,0) DESC, wc.id DESC
-            LIMIT 100
+            {limit_clause}
             """,
             (owner_chat_id,),
         )

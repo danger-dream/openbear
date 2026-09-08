@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
-from app.bot import admin, interactions
+from app.bot import admin, interactions, task_replies
 from app.bot.menu import setup_menu
 from app.bot.whitelist import WhitelistMiddleware
 from app.config import get_config
@@ -25,29 +25,42 @@ def build_dispatcher(svc: Services) -> Dispatcher:
     wl = WhitelistMiddleware(svc.config.telegram.whitelist_ids)
     dp.message.middleware(wl)
     dp.callback_query.middleware(wl)
-    # Exact interaction replies must precede the admin settings text handler.
-    # This is not a general Telegram chat/Agent input route.
+    # Exact registered replies precede the admin settings text handler.
+    # Neither route accepts ordinary Telegram chat messages as Agent input.
     dp.include_router(interactions.router)
+    dp.include_router(task_replies.router)
     dp.include_router(admin.router)
     return dp
 
 
 async def _drain_startup_backlog(bot: Bot, svc: Services) -> None:
-    """消费 polling backlog，但不重放旧消息。
+    """Persist only exact task-notification replies before advancing the offset.
 
-    TG 不再作为对话客户端；启动时只推进 getUpdates offset，避免重启前积压的
-    普通文本、/new 或媒体消息在新进程里触发 Agent run。
+    Ordinary text, commands, media and interaction callbacks are not replayed as
+    Agent input. Task reply buttons only open prompts; the reply inbox deduplicates
+    Telegram redelivery across restart.
+    A lookup/storage failure aborts draining instead of acknowledging lost work.
     """
     offset: int | None = None
     drained = 0
     while True:
-        updates = await bot.get_updates(offset=offset, timeout=0, limit=100, allowed_updates=["message"])
+        updates = await bot.get_updates(offset=offset, timeout=0, limit=100, allowed_updates=["message", "callback_query"])
         if not updates:
             break
+        bridge = task_replies.transport(svc)
+        for update in updates:
+            message = getattr(update, "message", None)
+            if message is not None and bridge is not None:
+                record = await bridge.match_reply(message)
+                if record is not None:
+                    await bridge.handle_reply(message, record)
+            query = getattr(update, "callback_query", None)
+            if query is not None and bridge is not None and getattr(query, "data", None) == task_replies.REPLY_CALLBACK:
+                await bridge.handle_callback(query)
         drained += len(updates)
         offset = max(int(upd.update_id) for upd in updates) + 1
     if drained:
-        log.info("已消费 Telegram 启动积压消息，不做重放", 数量=drained)
+        log.info("已消费 Telegram 启动积压消息，仅登记匹配的会话回复", 数量=drained)
 
 
 async def run() -> None:

@@ -511,6 +511,212 @@ sync_code_release
     assert (install / "marker").read_text(encoding="utf-8") == "old"
 
 
+@pytest.mark.parametrize(
+    ("config", "explicit_port", "expected_port"),
+    [
+        pytest.param({"web": {"port": 24567}}, "", "24567", id="configured-port"),
+        pytest.param({}, "", "18961", id="missing-web-default"),
+        pytest.param({"web": {}}, "", "18961", id="missing-port-default"),
+        pytest.param({}, "24680", "24680", id="environment-override"),
+    ],
+)
+def test_installer_upgrade_main_resolves_web_port_outside_install_cwd(
+    tmp_path: Path,
+    config: dict,
+    explicit_port: str,
+    expected_port: str,
+):
+    install = tmp_path / "install"
+    outside = tmp_path / "outside"
+    stage = tmp_path / "stage"
+    events = tmp_path / "events"
+    (outside / "app").mkdir(parents=True)
+    (outside / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (outside / "app" / "config.py").write_text(
+        'raise RuntimeError("caller cwd app must not be imported")\n', encoding="utf-8"
+    )
+    install.mkdir()
+    (install / ".venv").symlink_to(ROOT / ".venv", target_is_directory=True)
+    original_config = json.dumps(config, ensure_ascii=False, separators=(",", ":")) + "\n"
+    (install / "openbear.json").write_text(original_config, encoding="utf-8")
+    (stage / "app").mkdir(parents=True)
+    shutil.copy2(ROOT / "app" / "config.py", stage / "app" / "config.py")
+    (stage / "app" / "__init__.py").write_text('__version__ = "2.0.0"\n', encoding="utf-8")
+    (stage / ".venv").symlink_to(ROOT / ".venv", target_is_directory=True)
+
+    library = install_library(tmp_path)
+    harness = tmp_path / "port-main.sh"
+    harness.write_text(
+        f'''#!/bin/bash
+set -euo pipefail
+source {library}
+RELEASE_VERSION=2.0.0
+RELEASE_TAG=v2.0.0
+REPO_REF=main
+print_banner() {{ :; }}
+need_root() {{ :; }}
+need_linux() {{ :; }}
+ensure_bootstrap_packages() {{ :; }}
+collect_config() {{
+    INSTALL_DIR={install}
+    MODE=upgrade
+    WEB_PORT="${{OPENBEAR_WEB_PORT:-}}"
+}}
+ensure_apt_packages() {{ :; }}
+ensure_uv() {{ :; }}
+sync_code() {{
+    RELEASE_TXN="$INSTALL_DIR/.openbear-install-transaction"
+    rm -rf "$RELEASE_TXN"
+    mkdir -p "$RELEASE_TXN/new"
+    cp -a {stage}/. "$RELEASE_TXN/new/"
+    RELEASE_UPGRADE_PENDING=1
+}}
+ensure_firewall() {{ printf 'port:%s\n' "$WEB_PORT" >> {events}; }}
+commit_release_upgrade() {{
+    printf 'commit\n' >> {events}
+    rm -rf "$1"
+    RELEASE_TXN=""
+}}
+write_install_source() {{ :; }}
+print_done() {{ :; }}
+main
+''',
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    if explicit_port:
+        env["OPENBEAR_WEB_PORT"] = explicit_port
+    else:
+        env.pop("OPENBEAR_WEB_PORT", None)
+    result = subprocess.run(
+        ["bash", str(harness)], cwd=outside, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert events.read_text(encoding="utf-8").splitlines() == [
+        f"port:{expected_port}",
+        "commit",
+    ]
+    assert (install / "openbear.json").read_text(encoding="utf-8") == original_config
+
+
+def test_installer_pre_switch_failure_cleans_only_its_prepared_transaction_for_retry(
+    tmp_path: Path,
+):
+    install = tmp_path / "install"
+    outside = tmp_path / "outside"
+    events = tmp_path / "events"
+    outside.mkdir()
+    (install / "app").mkdir(parents=True)
+    (install / "data").mkdir()
+    (install / "app" / "marker").write_text("old-code", encoding="utf-8")
+    (install / "data" / "marker").write_text("old-data", encoding="utf-8")
+    original_config = '{"web":{"port":24444}}\n'
+    (install / "openbear.json").write_text(original_config, encoding="utf-8")
+
+    library = install_library(tmp_path)
+    harness = tmp_path / "retry-main.sh"
+    harness.write_text(
+        f'''#!/bin/bash
+set -euo pipefail
+source {library}
+RELEASE_VERSION=2.0.0
+RELEASE_TAG=v2.0.0
+REPO_REF=main
+print_banner() {{ :; }}
+need_root() {{ :; }}
+need_linux() {{ :; }}
+ensure_bootstrap_packages() {{ :; }}
+collect_config() {{ INSTALL_DIR={install}; MODE=upgrade; WEB_PORT=24444; }}
+ensure_apt_packages() {{ :; }}
+ensure_uv() {{ :; }}
+sync_code() {{
+    RELEASE_TXN="$INSTALL_DIR/.openbear-install-transaction"
+    mkdir -p "$RELEASE_TXN/new"
+    printf 'rollback-material\n' > "$RELEASE_TXN/old-code.tgz"
+    mark_release_upgrade_prepared "$RELEASE_TXN"
+    RELEASE_UPGRADE_PENDING=1
+}}
+ensure_firewall() {{
+    printf 'firewall\n' >> {events}
+    [[ "${{INJECT_PRE_SWITCH_FAILURE:-0}}" != 1 ]]
+}}
+commit_release_upgrade() {{
+    printf 'commit\n' >> {events}
+    rm -rf "$1"
+    RELEASE_TXN=""
+}}
+write_install_source() {{ :; }}
+print_done() {{ :; }}
+main
+''',
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["INJECT_PRE_SWITCH_FAILURE"] = "1"
+    first = subprocess.run(
+        ["bash", str(harness)], cwd=outside, env=env, capture_output=True, text=True
+    )
+    assert first.returncode != 0
+    assert not (install / ".openbear-install-transaction").exists()
+    assert (install / "app" / "marker").read_text(encoding="utf-8") == "old-code"
+    assert (install / "data" / "marker").read_text(encoding="utf-8") == "old-data"
+    assert (install / "openbear.json").read_text(encoding="utf-8") == original_config
+
+    env["INJECT_PRE_SWITCH_FAILURE"] = "0"
+    second = subprocess.run(
+        ["bash", str(harness)], cwd=outside, env=env, capture_output=True, text=True
+    )
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert events.read_text(encoding="utf-8").splitlines() == [
+        "firewall",
+        "firewall",
+        "commit",
+    ]
+    assert not (install / ".openbear-install-transaction").exists()
+    assert (install / "app" / "marker").read_text(encoding="utf-8") == "old-code"
+    assert (install / "data" / "marker").read_text(encoding="utf-8") == "old-data"
+    assert (install / "openbear.json").read_text(encoding="utf-8") == original_config
+
+
+@pytest.mark.parametrize("phase", ["switching-v1", "unknown-v9"])
+def test_installer_cleanup_preserves_switching_or_unknown_transaction(
+    tmp_path: Path, phase: str
+):
+    install = tmp_path / "install"
+    txn = install / ".openbear-install-transaction"
+    txn.mkdir(parents=True)
+    (txn / "old-code.tgz").write_text("only-recovery-copy", encoding="utf-8")
+    (txn / ".openbear-owner").write_text("test-owner\n", encoding="utf-8")
+    (txn / ".openbear-phase").write_text(phase + "\n", encoding="utf-8")
+    (install / "app").mkdir()
+    (install / "app" / "marker").write_text("current-code", encoding="utf-8")
+
+    library = install_library(tmp_path)
+    harness = tmp_path / "protect-transaction.sh"
+    harness.write_text(
+        f'''#!/bin/bash
+set -euo pipefail
+source {library}
+INSTALL_DIR={install}
+RELEASE_TXN={txn}
+RELEASE_TXN_OWNER=test-owner
+cleanup_prepared_release_upgrade
+[[ -f {txn}/old-code.tgz ]]
+if prepare_release_upgrade /unused-package; then
+    exit 2
+fi
+''',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", str(harness)], cwd=ROOT, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (txn / "old-code.tgz").read_text(encoding="utf-8") == "only-recovery-copy"
+    assert (install / "app" / "marker").read_text(encoding="utf-8") == "current-code"
+    assert "拒绝覆盖恢复材料" in result.stderr
+
+
 def test_sqlite_backup_captures_wal_custom_path_and_private_unique_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
