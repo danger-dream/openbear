@@ -539,8 +539,12 @@ def test_installer_upgrade_main_resolves_web_port_outside_install_cwd(
     (install / ".venv").symlink_to(ROOT / ".venv", target_is_directory=True)
     original_config = json.dumps(config, ensure_ascii=False, separators=(",", ":")) + "\n"
     (install / "openbear.json").write_text(original_config, encoding="utf-8")
-    (stage / "app").mkdir(parents=True)
-    shutil.copy2(ROOT / "app" / "config.py", stage / "app" / "config.py")
+    # Stage the real package, not config.py alone: its app.models imports must
+    # resolve inside this release even without a developer editable install.
+    shutil.copytree(
+        ROOT / "app", stage / "app",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     (stage / "app" / "__init__.py").write_text('__version__ = "2.0.0"\n', encoding="utf-8")
     (stage / ".venv").symlink_to(ROOT / ".venv", target_is_directory=True)
 
