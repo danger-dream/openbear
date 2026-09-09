@@ -24,6 +24,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 
+# Target the actual message editor, not an unrelated interaction textarea.
+COMPOSER_SELECTOR = '.reference-editor-content[role="textbox"][contenteditable="true"]'
+COMPOSER = f"document.querySelector({json.dumps(COMPOSER_SELECTOR)})"
+
+
 class FakeBot:
     def __init__(self):
         self.requests = []
@@ -208,7 +213,7 @@ async def verify(args):
                     assert len(bot.requests) - start == 1, "Enter sent multiple Telegram requests"
                     assert sum(x["path"] == "/api/auth/login/start" for x in records) == 1
                     await server.decide_login_request(bot.requests[-1], approved=True, decided_by=123)
-                    await browser.until("location.pathname !== '/login' && Boolean(document.querySelector('textarea'))")
+                    await browser.until(f"location.pathname !== '/login' && Boolean({COMPOSER})")
                     assert sum("/consume/" in x["path"] for x in records) == 1
                     report["nativeEnter"] = {"loginStarts": 1, "notifications": 1, "approvedLoginSucceeded": True}
 
@@ -233,14 +238,16 @@ async def verify(args):
                     await server.decide_login_request(uuid, approved=True, decided_by=123)
                     consumed = await browser.evaluate("fetch('/api/auth/login/consume/" + uuid + "',{method:'POST'}).then(r=>r.status)")
                     assert consumed == 200
-                    await browser.until("location.pathname !== '/login' && Boolean(document.querySelector('textarea'))")
+                    await browser.until(f"location.pathname !== '/login' && Boolean({COMPOSER})")
                     report["consumedWithSession"] = {"resumed": True}
 
                     # Both tabs already contain the original bundle; a backend+frontend
                     # update result may have been acknowledged by a different tab.
                     draft = "release smoke: unsent draft must survive"
-                    await browser.evaluate("(() => {const e=document.querySelector('textarea');e.value=" + json.dumps(draft)
-                        + ";e.dispatchEvent(new Event('input',{bubbles:true}))})()")
+                    await browser.evaluate(f"{COMPOSER}.focus()")
+                    # Browser input must pass through ProseMirror's real transaction
+                    # pipeline so the assertion checks persisted application state.
+                    await browser.call("Input.insertText", {"text": draft})
                     await browser.until("(localStorage.getItem('openbear.console.drafts.v1') || '').includes('unsent draft')")
                     new_target = await browser.call("Target.createTarget", {"url": base + "/chat"})
                     async with http.get(f"http://127.0.0.1:{chrome_port}/json/list") as response:
@@ -250,7 +257,7 @@ async def verify(args):
                         second = CDP(other_ws)
                         await second.call("Page.enable")
                         await second.call("Runtime.enable")
-                        await second.until("Boolean(document.querySelector('textarea'))")
+                        await second.until(f"Boolean({COMPOSER})")
                         original_build_info = server._frontend_build_info
                         real_info = original_build_info()
                         assert real_info, "Release lacks frontend build identity"
@@ -269,7 +276,7 @@ async def verify(args):
                             # transition; do not mistake it for the next dialog.
                             await page.until("!Array.from(document.querySelectorAll('.el-message-box')).some(e=>e.getClientRects().length)")
                             await page.until("Boolean(document.querySelector('[data-testid=frontend-refresh-required]'))")
-                        assert await browser.evaluate("document.querySelector('textarea').value") == draft
+                        assert await browser.evaluate(f"{COMPOSER}.textContent") == draft
                         # Keep advertising the simulated update while focusing
                         # the first tab: focus rechecks the build identity and
                         # legitimately removes the banner if it already matches.
@@ -282,11 +289,11 @@ async def verify(args):
                         server._frontend_build_info = original_build_info
                         server.update_service = None
                         await browser.evaluate("Array.from(document.querySelectorAll('.el-message-box button')).find(e=>e.getClientRects().length && e.innerText.includes('已处理未提交内容')).click()")
-                        await browser.until("performance.getEntriesByType('navigation')[0]?.type === 'reload' && Boolean(document.querySelector('textarea')) && !document.querySelector('[data-testid=frontend-refresh-required]')")
+                        await browser.until(f"performance.getEntriesByType('navigation')[0]?.type === 'reload' && Boolean({COMPOSER}) && !document.querySelector('[data-testid=frontend-refresh-required]')")
                         # The composer mounts before its async conversation load
                         # restores the persisted draft. Wait for that actual result.
-                        await browser.until("document.querySelector('textarea')?.value === " + json.dumps(draft))
-                        assert await browser.evaluate("document.querySelector('textarea').value") == draft
+                        await browser.until(f"{COMPOSER}?.textContent === " + json.dumps(draft))
+                        assert await browser.evaluate(f"{COMPOSER}.textContent") == draft
                         report["versionHandshake"] = {"tabsNotified": 2, "ackedRestartResultHandled": True, "draftSurvivedRefresh": True}
                         await second.call("Page.navigate", {"url": "about:blank"})
                     await browser.call("Page.navigate", {"url": "about:blank"})
