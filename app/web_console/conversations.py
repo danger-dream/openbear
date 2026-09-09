@@ -563,6 +563,7 @@ class WebAdminConversationsMixin:
             old_task_uuids = list(dict.fromkeys(old_task_uuids + [str(row[0]) for row in await retained_heads.fetchall()]))
             task_map = {old: str(uuid.uuid4()) for old in old_task_uuids}
             artifact_map = await self._uuid_map_for_rows("web_artifacts", "artifact_uuid", "conversation_uuid=?", (old_uuid,))
+            reference_bundle_map = await self._uuid_map_for_rows("web_reference_bundles", "bundle_uuid", "conversation_uuid=?", (old_uuid,))
             agent_session_map = await self._uuid_map_for_rows("rath_agent_sessions", "session_uuid", "chat_id=?", (old_internal,))
             old_memories = await self._uuid_map_for_rows("conversation_task_memories", "memory_uuid", "conversation_uuid=?", (old_uuid,))
             memory_uuid_map = {old: f"mem_{uuid.uuid4().hex}" for old in old_memories}
@@ -575,6 +576,7 @@ class WebAdminConversationsMixin:
 
             pairs = self._duplicate_pairs(
                 artifact_map,
+                reference_bundle_map,
                 task_map,
                 agent_session_map,
                 memory_uuid_map,
@@ -583,6 +585,21 @@ class WebAdminConversationsMixin:
                 extra=[(old_uuid, new_uuid), (old_session_uuid, new_session_uuid)],
             )
             message_id_map = await self._copy_messages_for_duplicate(old_internal, new_internal, pairs)
+
+            def copy_reference_bundle(row):
+                material = json.loads(row.get("material_json") or "[]")
+                for item in material:
+                    # Rebind metadata, never rewrite quoted source text or
+                    # encrypted credential bytes inside a frozen snapshot.
+                    item["reference"] = self._rewrite_duplicate_json_obj(item.get("reference") or {}, pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal)
+                return {
+                    "bundle_uuid": reference_bundle_map[str(row["bundle_uuid"])],
+                    "conversation_uuid": new_uuid,
+                    "op_id": self._rewrite_duplicate_text_refs(row.get("op_id"), pairs),
+                    "manifest_json": self._rewrite_duplicate_json_text(row.get("manifest_json"), pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal),
+                    "material_json": json.dumps(material, ensure_ascii=False),
+                }
+            await self._copy_table_rows_for_duplicate("web_reference_bundles", "conversation_uuid=?", (old_uuid,), copy_reference_bundle)
 
             session_cur = await self.db.conn.execute("SELECT * FROM sessions WHERE chat_id=?", (old_internal,))
             if await session_cur.fetchone() is not None:
@@ -2857,7 +2874,8 @@ class WebAdminConversationsMixin:
         title = str(row.get("title") or "").strip()
         if title and title not in {"新对话", "当前对话"}:
             return
-        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        from app.references import reference_display_text
+        clean = re.sub(r"\s+", " ", reference_display_text(text)).strip()
         if not clean:
             return
         new_title = clean[:36] + ("…" if len(clean) > 36 else "")

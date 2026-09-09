@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import {createOutboundSendTracker, probeSocket, restoreOutboundDraft, waitForSocketOpen} from "./outboundSend.js";
+import {referenceDisplayText, referenceErrorText, referenceToken, referencesInText} from "../../references/codec.js";
 
 // Run the actual ConsoleView submission/recovery functions, not a second model
 // of the implementation. Vue rendering and HTTP are isolated side-effect seams.
@@ -63,7 +64,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     createOutboundSendTracker: (options) => createOutboundSendTracker({...options, ...timer}),
     probeSocket: (socket) => probeSocket(socket, timer),
     waitForSocketOpen: (socket) => waitForSocketOpen(socket, timer),
-    restoreOutboundDraft,
+    restoreOutboundDraft, referenceDisplayText, referenceErrorText, referencesInText, referenceCatalog: {ready:true,connected:true},
     props,
     compacting: {value: false}, sendPending: {value: false}, running: {value: false},
     draft: {value: "original message"}, pendingAttachments: {value: []}, attachmentPreviews: {value: {}},
@@ -107,6 +108,33 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     },
   };
 }
+
+test("references wait for backend capability without clearing a draft or sending raw locators", async () => {
+  const h=harness();h.context.referenceCatalog.ready=false;
+  const text=referenceToken({kind:'doc',id:'17',label:'等待后端'});h.context.draft.value=text;
+  await h.run('send()');assert.equal(h.sends().length,0);assert.equal(h.context.draft.value,text);
+});
+
+test("reference nodes survive lost acknowledgement alongside a newly typed draft", async () => {
+  const h = harness();
+  const first = referenceToken({kind:'doc',id:'17',label:'原文档'});
+  const next = referenceToken({kind:'chat',id:'target-chat',label:'新引用',scope:'recent',turns:3});
+  h.context.draft.value = '请看 '+first;
+  await h.run('send()');
+  h.context.draft.value = '再看 '+next;
+  await h.advance(15000);
+  assert.deepEqual(referencesInText(h.context.draft.value).map(ref=>ref.id), ['17','target-chat']);
+  assert.equal(h.sends().length,1);
+});
+
+test("a new conversation title uses capsule labels rather than reference URLs", async () => {
+  let title;
+  const h = harness({local:true,createConversation:async data=>{title=data.title;return {conversation:{conversationUuid:'created-with-ref'}};}});
+  h.context.draft.value = '请看 '+referenceToken({kind:'doc',id:'17',label:'部署文档'});
+  await h.run('send()');
+  assert.equal(title,'请看 部署文档');
+  assert.equal(referencesInText(h.sends()[0].text)[0].id,'17');
+});
 
 test("actual lost-ACK path unlocks click-send and preserves old/new drafts without resending", async () => {
   const h = harness();

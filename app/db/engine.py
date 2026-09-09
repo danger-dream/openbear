@@ -9,6 +9,7 @@ from pathlib import Path
 import aiosqlite
 
 from app.db.connection_router import SQLiteConnectionRouter
+from app.db.reference_schema import reference_schema
 from app.db.agent_continuity_migration import migrate_agent_continuity
 from app.db.schema_migrations import (
     backfill_web_operation_terminal_times,
@@ -49,6 +50,7 @@ class DB:
         await self._pre_migrate_memory_assets_schema()
         await migrate_agent_continuity(self._conn)
         await self._conn.executescript(_SCHEMA)
+        await self._conn.executescript(reference_schema())
         await self._remove_structural_memory_categories()
         backfilled_terminal_times = await backfill_web_operation_terminal_times(self._conn)
         if backfilled_terminal_times:

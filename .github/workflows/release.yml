@@ -75,9 +75,17 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Setup Chrome for frontend tests and packaged release smoke
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: Build frontend
         working-directory: web
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: |
+          set -euo pipefail
+          test -x "$CHROME_BIN"
           npm ci
           npm test
           npm run build
@@ -144,10 +152,6 @@ jobs:
             cd dist
             sha256sum "openbear-${VERSION}.zip" > SHA256SUMS
           )
-
-      - name: Setup Chrome for packaged release smoke
-        id: chrome
-        uses: browser-actions/setup-chrome@v1
 
       - name: Verify packaged login in a real browser
         env:

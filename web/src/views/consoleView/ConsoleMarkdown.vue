@@ -1,9 +1,15 @@
 <script setup>
 import {computed, onBeforeUnmount, ref, watch} from "vue";
 import {renderMarkdown} from "./markdown.js";
+import {vMarkdownHtml} from "./markdownDom.js";
+import {artifactFromUrl, openArtifactPreview} from "../../artifacts/artifactFiles.js";
+import {referenceFromUrl, referenceKey} from "../../references/codec.js";
 
 const props = defineProps({
 	text: {type: String, default: ""},
+	artifactCards: {type: Boolean, default: true},
+	referenceBundleId: {type: String, default: ""},
+	references: {type: Array, default: () => []},
 	tag: {type: String, default: "div"},
 	live: {type: Boolean, default: false},
 	liveIntervalMs: {type: Number, default: 32},
@@ -184,7 +190,27 @@ function appendLiveCaret(rendered) {
 const html = computed(() => appendLiveCaret(renderMarkdown(displayedText.value, {live: props.live})));
 
 function onMarkdownClick(event) {
+	const chip = event.target?.closest?.("[data-reference]");
+	if (chip) {
+		const reference = referenceFromUrl(chip.dataset.reference, chip.dataset.referenceLabel || chip.textContent);
+		if (reference) {
+			const index = Array.from(event.currentTarget.querySelectorAll('[data-reference]')).indexOf(chip);
+			const binding = props.references[index];
+			const bundleId = binding?.key === referenceKey(reference) ? binding.bundleId : props.referenceBundleId;
+			event.preventDefault(); event.stopPropagation(); window.dispatchEvent(new CustomEvent('openbear:inspect-reference', {detail: {reference, anchor: chip.getBoundingClientRect(), bundleId}}));
+		}
+		return;
+	}
 	const img = event.target?.closest?.("img");
+	const link = event.target?.closest?.("a[href]");
+	if (!img && link && !event.defaultPrevented && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey && (!event.button || event.button === 0)) {
+		const artifact = artifactFromUrl(link.getAttribute("href"));
+		if (artifact && !artifact.download) {
+			event.preventDefault(); event.stopPropagation();
+			openArtifactPreview(artifact, link.textContent.trim(), link);
+			return;
+		}
+	}
 	if (!img) return;
 	event.preventDefault();
 	event.stopPropagation();
@@ -200,7 +226,7 @@ function onMarkdownClick(event) {
 </script>
 
 <template>
-	<component :is="componentTag" class="bear-md" v-html="html" @click="onMarkdownClick"></component>
+	<component :is="componentTag" class="bear-md" v-markdown-html="{html, artifactCards}" @click="onMarkdownClick" @keydown="($event.key === 'Enter' || $event.key === ' ') && $event.target?.closest?.('[data-reference]') && onMarkdownClick($event)"></component>
 	<el-image-viewer v-if="imageViewerOpen"
 	                 :url-list="imageViewerUrls"
 	                 :initial-index="imageViewerIndex"

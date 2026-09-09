@@ -1,8 +1,9 @@
 <script setup>
-import {Check, CopyDocument, RefreshLeft} from "@element-plus/icons-vue";
+import {Check, CopyDocument, RefreshLeft, Link} from "@element-plus/icons-vue";
 import {ElMessage} from "element-plus";
 import {ref} from "vue";
 import {copyTextToClipboard} from "../../utils/clipboard.js";
+import {referenceDisplayText} from "../../references/codec.js";
 import {
 	eventDisplayTimeMs as projectedEventDisplayTimeMs,
 	eventStartedAtMs as projectedEventStartedAtMs,
@@ -51,6 +52,12 @@ function canDeleteTurn(turn) {
 function deleteTurnSuffix(turn) {
 	if (!canDeleteTurn(turn) || props.running || props.deletingTurnUuid) return;
 	emit("delete-suffix", turn);
+}
+
+function insertTurnReference(turn) {
+	if (!props.conversationUuid || !canDeleteTurn(turn)) return;
+	const reference = {kind: 'turn', id: props.conversationUuid, itemId: turn.user.turnUuid, label: referenceDisplayText(turn.user.content || '本轮问答').replace(/\s+/g,' ').slice(0, 70), scope: 'full'};
+	window.dispatchEvent(new CustomEvent('openbear:insert-reference', {detail: {reference}}));
 }
 
 function userAttachments(turn) {
@@ -230,7 +237,7 @@ async function copyMessage(content, key) {
 			<div class="user-row">
 				<div class="user-message-group">
 					<article class="message-user">
-						<ConsoleMarkdown v-if="turn.user.content" :text="turn.user.content"/>
+						<ConsoleMarkdown v-if="turn.user.content" :text="turn.user.content" :reference-bundle-id="turn.user.referenceBundleId || ''" :references="turn.user.references || []"/>
 						<div v-if="userAttachments(turn).length" class="user-attachments" :class="{ 'with-text': turn.user.content }">
 							<template v-for="item in userAttachments(turn)" :key="item.id || item.artifactUuid || attachmentName(item)">
 							<el-image v-if="isImageAttachment(item) && attachmentUrl(item)"
@@ -255,6 +262,9 @@ async function copyMessage(content, key) {
 						        @click="copyMessage(turn.user.content, `user-${turn.user.turnUuid || turn.id}`)">
 							<el-icon><Check v-if="copiedMessageKey === `user-${turn.user.turnUuid || turn.id}`"/><CopyDocument v-else/></el-icon>
 						</button>
+					</el-tooltip>
+					<el-tooltip v-if="canDeleteTurn(turn)" content="引用本轮问答" placement="bottom" :show-after="350">
+						<button type="button" class="message-icon-action" aria-label="引用本轮问答" @click="insertTurnReference(turn)"><el-icon><Link/></el-icon></button>
 					</el-tooltip>
 					<el-tooltip v-if="canDeleteTurn(turn)" :content="props.running ? '请先停止当前运行' : '从此处重来'" placement="bottom" :show-after="350">
 						<button type="button" class="message-icon-action restart-action"
@@ -521,6 +531,11 @@ async function copyMessage(content, key) {
 	font-size: 14px;
 	line-height: 1.72;
 	color: #111827;
+}
+
+/* Only the standalone separator between answer entries, not rules inside a message. */
+.assistant-card > :deep(.bear-md > hr:only-child) {
+	opacity: 0.4;
 }
 
 .assistant-row:hover :deep(.turn-action-bar) {

@@ -9,7 +9,10 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import MdEditor from "./MdEditor.vue";
 import ConversationPromptDialog from "./ConversationPromptDialog.vue";
+import ConversationOverview from "./ConversationOverview.vue";
 import { treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop } from "./conversationTreeInteractions.js";
+import { referenceCatalog } from "../references/catalog.js";
+import { REFERENCE_MIME, referenceToken } from "../references/codec.js";
 
 const props = defineProps({
   activeConversationUuid: { type: String, default: "" },
@@ -60,6 +63,8 @@ const moveMode = ref("move");
 const moveRow = ref(null);
 const moveFolderId = ref("");
 const moveFolderQuery = ref("");
+const moveUnarchive = ref(true);
+const moveUpdateSnapshots = ref(true);
 const allFolders = ref([]);
 const impactDialog = ref(false);
 const impactState = reactive({ action: "移动", impact: null, resolve: null });
@@ -72,13 +77,34 @@ let searchTimer = null;
 let statusTimer = null;
 let dragExpandTimer = null;
 let dragExpandTarget = "";
+const overview = ref({ open: false, row: null, anchor: null });
+let overviewOpenTimer = null, overviewCloseTimer = null;
+function closeOverview() {
+  clearTimeout(overviewOpenTimer); clearTimeout(overviewCloseTimer);
+  overview.value = { open: false, row: null, anchor: null };
+}
+function keepOverview() { clearTimeout(overviewOpenTimer); clearTimeout(overviewCloseTimer); }
+function enterOverview(event, row) {
+  if (row.kind !== 'conversation' || row.local || event.pointerType === 'touch' || !window.matchMedia('(hover: hover)').matches || drag.value.row || moveInFlight.value || menu.value.open) return;
+  keepOverview();
+  if (overview.value.open && overview.value.row?.conversationUuid === row.conversationUuid) return;
+  closeOverview();
+  const anchor = event.currentTarget.querySelector('button.conversation') || event.currentTarget;
+  overviewOpenTimer = setTimeout(() => {
+    if (anchor.isConnected && !drag.value.row && !menu.value.open) overview.value = { open: true, row, anchor };
+  }, 280);
+}
+function leaveOverview() {
+  clearTimeout(overviewOpenTimer); clearTimeout(overviewCloseTimer);
+  overviewCloseTimer = setTimeout(closeOverview, 160);
+}
 
 const branchKey = (parentId = "", systemNode = "") => systemNode || `folder:${parentId}`;
 function stateFor(parentId = "", systemNode = "") {
   const key = branchKey(parentId, systemNode);
   if (!branchState[key]) branchState[key] = {
     parentId: String(parentId || ""), systemNode: String(systemNode || ""),
-    items: [], nextCursor: "", hasMore: false, loading: false, error: "",
+    items: [], nextCursor: "", hasMore: false, loading: false, indicating: false, error: "",
     generation: 0, loaded: false, pages: 0, locatedFolderIds: [],
   };
   return branchState[key];
@@ -96,12 +122,12 @@ function nodePath(row) { return String(row?.path || (row?.folderId ? "" : "临�
 function indentation(depth) { return `${Math.min(7, Math.max(0, Number(depth || 0))) * 14}px`; }
 function rowLoading(row) {
   if (!["folder", "conversation", "system"].includes(row.kind)) return false;
-  if (loading.value || (row.search && searchLoading.value) || movingRowId.value === rowId(row)) return true;
-  if (row.kind === "system") return Boolean(branchState[branchKey("", row.systemNode)]?.loading);
-  if (row.kind === "folder" && branchState[branchKey(row.folderId)]?.loading) return true;
-  const parentId = treeItemParent(row);
-  const systemNode = row.archived ? "archive" : row.kind === "conversation" && !parentId ? "temporary" : "";
-  return Boolean(branchState[branchKey(parentId, systemNode)]?.loading);
+  if (movingRowId.value && movingRowId.value === rowId(row)) return true;
+  // A row indicates its OWN user-visible request, never a parent's request or
+  // a background tree calibration. Global refresh has its toolbar indicator.
+  const branch = row.kind === "system" ? branchState[branchKey("", row.systemNode)]
+    : row.kind === "folder" ? branchState[branchKey(row.folderId)] : null;
+  return Boolean(branch?.loading && branch.indicating);
 }
 
 function withDraft(items, folderId) {
@@ -203,7 +229,11 @@ function mergeTreeRows(existing = [], incoming = []) {
 }
 function statusAdjustedRow(row) {
   if (!latestStatusState || !row) return row;
-  if (row.kind === "folder") return { ...row, runningDescendantCount: Number(latestStatusState.folderRunningCounts?.[row.folderId] || 0) };
+  if (row.kind === "folder") {
+    const count = latestStatusState.folderConversationCounts?.[row.folderId];
+    return { ...row, runningDescendantCount: Number(latestStatusState.folderRunningCounts?.[row.folderId] || 0),
+      ...(Number.isFinite(count) ? { conversationCount: count } : {}) };
+  }
   if (row.kind !== "conversation" || row.archived) return row;
   const status = latestStatusState.lookup.get(row.conversationUuid);
   return status ? { ...row, ...status, status: "running", running: true } : { ...row, running: false, status: "idle" };
@@ -244,18 +274,22 @@ function invalidateBranch(parentId = "", systemNode = "", { markUnloaded = true 
   const branch = stateFor(parentId, systemNode);
   branch.generation += 1;
   branch.loading = false;
+  branch.indicating = false;
   branch.error = "";
   if (markUnloaded) branch.loaded = false;
   return branch;
 }
 async function loadChildren(parentId = "", systemNode = "", {
-  append = false, force = false, includeFolderId = "",
+  append = false, force = false, includeFolderId = "", indicate = true,
 } = {}) {
   const branch = stateFor(parentId, systemNode);
   const included = systemNode ? "" : String(includeFolderId || "");
   const trackedFolderIds = [...new Set([...(branch.locatedFolderIds || []), ...(included ? [included] : [])])].slice(-100);
   const includedKnown = included && branch.items.some((row) => row.kind === "folder" && row.folderId === included);
-  if (branch.loading && !force) return branch.items;
+  if (branch.loading && !force) {
+    if (indicate) branch.indicating = true;
+    return branch.items;
+  }
   if (!force && branch.loaded && !append && (!included || includedKnown)) return branch.items;
 
   const generation = ++branch.generation;
@@ -267,6 +301,9 @@ async function loadChildren(parentId = "", systemNode = "", {
   let fetchedPages = 0;
   let incoming = [];
   let returnedTrackedFolderIds = null;
+  // A forced calibration may replace a still-visible request; preserve that
+  // explicit indicator until the latest request completes or is invalidated.
+  branch.indicating = indicate || (branch.loading && branch.indicating);
   branch.loading = true;
   branch.error = "";
   try {
@@ -304,7 +341,7 @@ async function loadChildren(parentId = "", systemNode = "", {
     if (generation === branch.generation) branch.error = apiError(error);
     return branch.items;
   } finally {
-    if (generation === branch.generation) branch.loading = false;
+    if (generation === branch.generation) { branch.loading = false; branch.indicating = false; }
   }
 }
 async function refreshLoadedBranches() {
@@ -314,7 +351,7 @@ async function refreshLoadedBranches() {
       invalidateBranch(branch.parentId, branch.systemNode);
       return;
     }
-    await loadChildren(branch.parentId, branch.systemNode, { force: true });
+    await loadChildren(branch.parentId, branch.systemNode, { force: true, indicate: false });
   }));
 }
 async function ensurePaths(paths = [], folderItems = []) {
@@ -355,7 +392,7 @@ async function refreshTree({
     // A successfully returned bootstrap becomes the newest status calibration and
     // invalidates any poll that began against an older tree snapshot.
     statusRequestGeneration += 1;
-    applyStatus(data.running || {});
+    applyStatus(referenceCatalog.connected && referenceCatalog.treeStatus ? referenceCatalog.treeStatus : (data.running || {}));
 
     const selectedItem = trackActive ? data.selected?.item : null;
     // A mutation is not an instruction to follow a conversation into archive.
@@ -418,15 +455,17 @@ function applyStatus(data = {}) {
   latestStatusState = {
     lookup: new Map((data.items || []).map((item) => [item.conversationUuid, item])),
     folderRunningCounts: { ...(data.folderRunningCounts || {}) },
+    folderConversationCounts: { ...(data.folderConversationCounts || {}) },
   };
   for (const row of everyKnownNode()) {
     if (row.kind === "conversation" && !row.archived) {
       const status = latestStatusState.lookup.get(row.conversationUuid);
       updateKnownNode(row.conversationUuid, status ? { ...status, status: "running", running: true } : { running: false, status: "idle" });
     } else if (row.kind === "folder") {
-      updateKnownNode(row.folderId, { runningDescendantCount: Number(latestStatusState.folderRunningCounts[row.folderId] || 0) });
+      updateKnownNode(row.folderId, statusAdjustedRow(row));
     }
   }
+  searchRows.value = searchRows.value.map(row => row.kind === "folder" ? statusAdjustedRow(row) : row);
   emitRows();
 }
 async function refreshStatus() {
@@ -440,6 +479,7 @@ async function refreshStatus() {
 }
 function scheduleStatus() {
   if (statusTimer) clearTimeout(statusTimer);
+  if (referenceCatalog.connected && referenceCatalog.ready) return;
   const fast = knownConversationRows().some(running);
   statusTimer = window.setTimeout(async () => { await refreshStatus(); scheduleStatus(); }, fast ? 5000 : 20000);
 }
@@ -481,7 +521,8 @@ async function revealDraft(folderId = "") {
   } catch (error) { ElMessage.error(apiError(error)); }
 }
 async function activateRow(row) {
-  if (row.kind === "folder") { selectFolder(row.folderId); return; }
+  closeOverview();
+  if (row.kind === "folder") { selectFolder(row.folderId); await toggleRow(row); return; }
   if (row.kind === "system") {
     if (row.systemNode === "temporary") selectFolder("");
     await toggleRow(row);
@@ -492,6 +533,7 @@ async function activateRow(row) {
   emit("open", row);
 }
 async function locateAndOpen(row) {
+  closeOverview();
   if (row.kind === "folder") {
     const data = await Api.locateConversationFolderInTree(row.folderId);
     await ensurePaths([data.folderPath || []], data.folderItems || [row]);
@@ -526,7 +568,8 @@ async function runSearch({ append = false } = {}) {
   try {
     const data = await Api.conversationTreeSearch({ q: text, limit: 50, ...(append && searchCursor.value ? { cursor: searchCursor.value } : {}), ...(searchArchived.value && archiveUnlocked.value ? { archiveUnlocked: 1 } : {}) });
     if (generation !== searchGeneration || query.value.trim() !== text) return;
-    searchRows.value = append ? [...searchRows.value, ...(data.items || [])] : (data.items || []);
+    const incoming = (data.items || []).map(row => row.kind === "folder" ? statusAdjustedRow(row) : row);
+    searchRows.value = append ? [...searchRows.value, ...incoming] : incoming;
     searchCursor.value = String(data.nextCursor || "");
     searchHasMore.value = Boolean(data.hasMore);
   } catch (error) {
@@ -544,6 +587,7 @@ watch(searchArchived, () => { if (query.value.trim()) void runSearch(); });
 watch(() => props.draftConversation, () => emitRows(), { deep: true });
 
 async function openMenu(event, row) {
+  closeOverview();
   if (!["folder", "conversation", "system", "root"].includes(row?.kind)) return;
   event?.preventDefault?.(); event?.stopPropagation?.();
   const pad = 8;
@@ -687,6 +731,8 @@ async function showMove(row, mode = "move") {
   moveRow.value = row;
   moveFolderId.value = String(row.parentId === "__archive" ? row.folderId || "" : row.parentId ?? row.folderId ?? "");
   moveFolderQuery.value = "";
+  moveUnarchive.value = true;
+  moveUpdateSnapshots.value = true;
   await loadAllFolders();
   moveDialog.value = true;
 }
@@ -707,7 +753,15 @@ async function submitMove() {
       await nextTick();
       ElMessage.success(`目录已删除，聊天内容已迁移${result.skippedRunningCount ? `；运行中快照跳过 ${result.skippedRunningCount} 个` : ""}`);
     } else {
-      if (!await moveTreeItem(row, moveFolderId.value)) return;
+      const archivedMove = row.kind === "conversation" && row.archived;
+      const options = archivedMove ? { unarchive: moveUnarchive.value, updateSnapshots: moveUpdateSnapshots.value } : null;
+      if (!await moveTreeItem(row, moveFolderId.value, "", "", options)) return;
+      if (archivedMove) {
+        // Archive is a separate cached branch, not the conversation's folderId.
+        const archive = invalidateBranch("", "archive");
+        archive.items = archive.items.filter(item => item.conversationUuid !== row.conversationUuid);
+        if (isExpanded("__archive")) await loadChildren("", "archive", { force: true, indicate: false });
+      }
     }
     moveDialog.value = false;
     await invalidateAndRefresh(
@@ -717,16 +771,19 @@ async function submitMove() {
   } catch (error) { if (!['cancel', 'close'].includes(error)) ElMessage.error(apiError(error)); }
   finally { moveBusy.value = false; }
 }
-async function moveTreeItem(row, targetFolderId, beforeId = "", afterId = "") {
+async function moveTreeItem(row, targetFolderId, beforeId = "", afterId = "", options = null) {
   if (moveInFlight.value) return false;
-  const request = { kind: row.kind, id: rowId(row), targetFolderId, beforeId, afterId };
+  const archivedOptions = row.kind === "conversation" && row.archived && options;
+  const request = { kind: row.kind, id: rowId(row), targetFolderId, beforeId, afterId,
+    ...(archivedOptions ? { unarchive: options.unarchive === true } : {}) };
   const currentParent = treeItemParent(row);
-  if (currentParent === String(targetFolderId || "") && !beforeId && !afterId) return true;
+  if (currentParent === String(targetFolderId || "") && !beforeId && !afterId &&
+      !(archivedOptions && (options.unarchive || options.updateSnapshots))) return true;
   moveInFlight.value = true;
   movingRowId.value = rowId(row);
   try {
-    let updateSnapshots = false;
-    if (currentParent !== String(targetFolderId || "")) {
+    let updateSnapshots = archivedOptions ? options.updateSnapshots === true : false;
+    if (!archivedOptions && currentParent !== String(targetFolderId || "")) {
       const impact = await Api.conversationTreeMoveImpact(request);
       const choice = await chooseImpact("移动", impact);
       if (choice === null) return false;
@@ -794,11 +851,21 @@ async function runMenuAction(action) {
 }
 
 function dragStart(event, row) {
-  if (moveInFlight.value || query.value || !["folder", "conversation"].includes(row.kind) || row.local || row.archived) { event.preventDefault(); return; }
+  closeOverview();
+  if (moveInFlight.value || !["folder", "conversation"].includes(row.kind) || row.local || (row.kind === 'folder' && (query.value || row.archived))) { event.preventDefault(); return; }
   closeMenu();
-  drag.value = { row, target: null, zone: "", busy: false };
-  event.dataTransfer.effectAllowed = "move";
-  event.dataTransfer.setData("text/plain", rowId(row));
+  const canMove = !query.value && !row.archived;
+  drag.value = { row: canMove ? row : null, target: null, zone: "", busy: false };
+  event.dataTransfer.setData('application/x-openbear-tree', row.kind);
+  if (row.kind === 'conversation') {
+    const reference = {kind:'chat',id:row.conversationUuid,label:row.title || '新会话',scope:'full'};
+    event.dataTransfer.effectAllowed = canMove ? 'copyMove' : 'copy';
+    event.dataTransfer.setData(REFERENCE_MIME, JSON.stringify(reference));
+    event.dataTransfer.setData('text/plain', referenceToken(reference));
+  } else {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', rowId(row));
+  }
 }
 function dropIntent(event, target) {
   const rect = event.currentTarget.getBoundingClientRect();
@@ -868,12 +935,22 @@ function rowKeydown(event, row) {
 }
 function globalKeydown(event) { if (event.key === "Escape") { closeMenu(); clearDrag(); if (impactDialog.value) finishImpact(null); } }
 
+watch(() => props.activeConversationUuid, closeOverview);
+watch(query, closeOverview);
+watch(displayRows, rows => {
+  if (overview.value.open && !rows.some(row => row.conversationUuid === overview.value.row?.conversationUuid)) closeOverview();
+});
+watch(() => referenceCatalog.treeStatus, data => { if (data) { statusRequestGeneration += 1; applyStatus(data); } });
+watch(() => [referenceCatalog.connected, referenceCatalog.ready], scheduleStatus);
 onMounted(async () => {
   window.addEventListener("keydown", globalKeydown);
+  window.addEventListener("blur", closeOverview);
   await refreshTree({ preserve: false });
   scheduleStatus();
 });
 onBeforeUnmount(() => {
+  closeOverview();
+  window.removeEventListener("blur", closeOverview);
   window.removeEventListener("keydown", globalKeydown);
   if (searchTimer) clearTimeout(searchTimer);
   if (statusTimer) clearTimeout(statusTimer);
@@ -900,7 +977,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
     <div class="tree-search">
-      <el-icon><Search /></el-icon>
+      <el-icon :class="{ 'is-spinning': searchLoading }"><component :is="searchLoading ? Loading : Search" /></el-icon>
       <input v-model="query" aria-label="搜索目录或会话" placeholder="搜索目录或会话…" />
       <button v-if="archiveUnlocked" type="button" :class="{ active: searchArchived }" :aria-pressed="searchArchived" title="搜索已归档会话" @click="searchArchived = !searchArchived"><el-icon><Box /></el-icon></button>
       <button v-if="query" type="button" title="清空搜索" @click="query = ''">×</button>
@@ -908,7 +985,7 @@ onBeforeUnmount(() => {
 
     <div ref="listRef" class="tree-list" :class="{ 'drop-root': drag.target?.kind === 'root' }" role="tree" aria-label="会话和目录"
       @contextmenu.prevent.stop="openRootMenu" @dragover.self="dragOver($event, rootDropTarget)" @drop.self="drop($event, rootDropTarget)"
-      @dragleave.self="clearDropTarget">
+      @dragleave.self="clearDropTarget" @scroll.passive="closeOverview">
       <div v-if="loading && !initialized" class="tree-placeholder"><el-icon class="is-spinning"><Loading /></el-icon> 正在定位最近会话…</div>
       <template v-else>
         <div
@@ -919,8 +996,9 @@ onBeforeUnmount(() => {
           role="treeitem" :aria-level="Number(row.depth || 0) + 1" :aria-busy="rowLoading(row)"
           :aria-expanded="['folder','system'].includes(row.kind) ? String(isExpanded(row.kind === 'system' ? row.id : row.folderId)) : undefined"
           :tabindex="['folder','conversation','system'].includes(row.kind) ? 0 : -1"
-          :draggable="!query && ['folder','conversation'].includes(row.kind) && !row.local && !row.archived && !moveInFlight"
+          :draggable="!row.local && !moveInFlight && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
           @keydown="rowKeydown($event, row)" @contextmenu="openMenu($event, row)"
+          @pointerenter="enterOverview($event, row)" @pointerleave="leaveOverview"
           @dragstart="dragStart($event, row)" @dragover="dragOver($event, row)" @drop="drop($event, row)" @dragend="clearDrag"
         >
           <template v-if="['folder','system'].includes(row.kind)">
@@ -939,8 +1017,8 @@ onBeforeUnmount(() => {
 
           <template v-else-if="row.kind === 'conversation'">
             <span class="tree-leaf-spacer"></span>
-            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationUuid === row.conversationUuid }" :title="`${row.title}\n${row.path || ''}`" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
-              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) }"><component :is="rowLoading(row) ? Loading : ChatLineRound" /></el-icon>
+            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationUuid === row.conversationUuid }" :title="row.local ? row.title : undefined" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
+              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row), 'is-working': running(row) && !rowLoading(row) }"><component :is="rowLoading(row) ? Loading : ChatLineRound" /></el-icon>
               <span class="node-copy"><span class="node-label">{{ row.title }}</span><small v-if="row.search">{{ row.path }}</small></span>
               <span v-if="row.pinned" class="node-star"><el-icon><StarFilled /></el-icon></span>
               <span v-if="running(row)" class="running-leaf" :title="row.currentStatus || '运行中'"><i></i><span>运行中</span></span>
@@ -955,6 +1033,8 @@ onBeforeUnmount(() => {
         <div v-else-if="query && !searchLoading && !searchRows.length" class="tree-placeholder">没有匹配的目录或会话</div>
       </template>
     </div>
+
+    <ConversationOverview :open="overview.open" :row="overview.row" :anchor="overview.anchor" @close="closeOverview" @enter="keepOverview" @leave="leaveOverview"/>
 
     <Teleport to="body">
       <div v-if="menu.open" class="tree-menu-shield" @pointerdown.self="closeMenu" @click.self="closeMenu" @contextmenu.prevent.self="closeMenu">
@@ -991,13 +1071,36 @@ onBeforeUnmount(() => {
     <ConversationPromptDialog v-model="promptDialog" :conversation="promptRow" />
 
     <el-dialog v-model="propertiesDialog" width="min(680px, calc(100vw - 24px))" append-to-body class="folder-properties-dialog" :close-on-click-modal="false">
-      <template #header><div><strong>目录属性 · {{ propertiesForm.name }}</strong><small>{{ propertiesForm.path }}</small></div></template>
+      <template #header>
+        <div class="folder-properties-heading">
+          <h2>目录属性 · {{ propertiesForm.name }}</h2>
+          <p>{{ propertiesForm.path }}</p>
+        </div>
+      </template>
       <div v-loading="propertiesLoading" class="property-form">
-        <label><span>本节点工作目录 <em>清空即继承</em></span><el-input v-model="propertiesForm.workspaceDir" placeholder="例如 /home/user/projects/my-project" clearable /></label>
-        <div class="effective-value"><b>继承后有效值</b><code>{{ propertiesForm.workspaceEffective || '—' }}</code><small>来源：{{ propertiesForm.workspaceSource }}</small></div>
-        <!-- Monaco owns its input focus. A wrapping label redirects clicks to its hidden IME textarea. -->
-        <div class="property-field" role="group" aria-labelledby="folder-prompt-label"><span id="folder-prompt-label">本节点注入提示词（Markdown） <em>清空即继承；就近覆盖，不累加</em></span><div class="folder-prompt-editor"><MdEditor v-model="propertiesForm.promptMarkdown" language="markdown" completion-mode="none" /></div></div>
-        <div class="effective-value"><b>当前继承值</b><pre>{{ propertiesForm.promptEffective || '未设置' }}</pre><small>来源：{{ propertiesForm.promptSource }}</small></div>
+        <section class="property-section" aria-labelledby="folder-workspace-label">
+          <label class="property-field">
+            <span id="folder-workspace-label">本节点工作目录 <em>清空即继承</em></span>
+            <el-input v-model="propertiesForm.workspaceDir" aria-labelledby="folder-workspace-label" placeholder="例如 /home/user/projects/my-project" clearable />
+          </label>
+          <div class="effective-value">
+            <b>继承后有效值</b>
+            <code>{{ propertiesForm.workspaceEffective || '—' }}</code>
+            <small>来源：{{ propertiesForm.workspaceSource }}</small>
+          </div>
+        </section>
+        <section class="property-section" aria-labelledby="folder-prompt-label">
+          <!-- Monaco owns its input focus. A wrapping label redirects clicks to its hidden IME textarea. -->
+          <div class="property-field" role="group" aria-labelledby="folder-prompt-label">
+            <span id="folder-prompt-label">本节点注入提示词（Markdown） <em>清空即继承；就近覆盖，不累加</em></span>
+            <div class="folder-prompt-editor"><MdEditor v-model="propertiesForm.promptMarkdown" language="markdown" completion-mode="none" /></div>
+          </div>
+          <div class="effective-value">
+            <b>当前继承值</b>
+            <pre>{{ propertiesForm.promptEffective || '未设置' }}</pre>
+            <small>来源：{{ propertiesForm.promptSource }}</small>
+          </div>
+        </section>
         <p class="property-note">属性只提供给主会话模板变量 <code>folderWorkspaceDir</code> / <code>folderPrompt</code>。不会创建目录、改变工具 cwd、公共 workspace、产物根或 Agent 快照。</p>
       </div>
       <template #footer><el-button @click="propertiesDialog = false">取消</el-button><el-button type="primary" :loading="propertiesSaving" @click="saveProperties">保存</el-button></template>
@@ -1008,6 +1111,10 @@ onBeforeUnmount(() => {
       <div class="folder-picker" role="listbox">
         <button type="button" :class="{ selected: moveFolderId === '' }" @click="moveFolderId = ''"><el-icon><Folder /></el-icon><span>{{ moveRow?.kind === 'conversation' ? '临时会话' : '根级目录' }}</span></button>
         <button v-for="folder in filteredMoveFolders" :key="folder.folderId" type="button" :disabled="invalidMoveTarget(folder)" :class="{ selected: moveFolderId === folder.folderId }" @click="moveFolderId = folder.folderId"><el-icon><Folder /></el-icon><span>{{ folder.path }}</span></button>
+      </div>
+      <div v-if="moveMode === 'move' && moveRow?.kind === 'conversation' && moveRow?.archived" class="move-archive-options">
+        <div><el-checkbox v-model="moveUnarchive">取消归档</el-checkbox><p>移动后恢复为普通会话。</p></div>
+        <div><el-checkbox v-model="moveUpdateSnapshots">更新系统提示词</el-checkbox><p>按目标目录和当前模板重新组装，现有提示词缓存将失效；运行中的会话跳过更新。</p></div>
       </div>
       <template #footer><el-button @click="moveDialog = false">取消</el-button><el-button type="primary" :loading="moveBusy" @click="submitMove">{{ moveMode === 'delete' ? '下一步' : '移动' }}</el-button></template>
     </el-dialog>
@@ -1054,6 +1161,13 @@ onBeforeUnmount(() => {
 .tree-node-main.is-chat-active { background:rgba(37,99,235,.075); color:#1d4ed8; }
 .tree-node-main:focus-visible,.tree-chevron:focus-visible { outline:2px solid rgba(37,99,235,.5); outline-offset:-2px; }
 .node-icon { flex:0 0 auto; color:#71717a; }
+/* Same rotating top/right border as the work-detail button; the glyph itself
+   stays still and the absolute ring does not alter row/icon geometry. */
+.node-icon.is-working { position:relative; color:#2563eb; }
+.node-icon.is-working::before { content:""; pointer-events:none; position:absolute; inset:-3px; border:1.5px solid transparent; border-top-color:#2563eb; border-right-color:rgba(37,99,235,.42); border-radius:50%; animation:tree-work-border-spin .9s linear infinite; }
+@keyframes tree-work-border-spin { to { transform:rotate(360deg); } }
+html.dark .node-icon.is-working { color:#93b9f7; }
+html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right-color:rgba(147,185,247,.42); }
 .node-label { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:500; line-height:1.4; }
 .node-copy { display:flex; min-width:0; flex:1; flex-direction:column; line-height:1.4; }
 .node-copy small { overflow:hidden; margin-top:2px; color:#a1a1aa; font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
@@ -1070,6 +1184,7 @@ onBeforeUnmount(() => {
 .search-more { width:calc(100% - 24px); margin:7px 12px; padding:7px; border-radius:8px; background:rgba(37,99,235,.08); }
 .is-spinning { animation:tree-spin .8s linear infinite; }
 @keyframes tree-spin { to { transform:rotate(360deg); } } @keyframes tree-pulse { 50% { opacity:.35; transform:scale(.8); } }
+/* Keep the running ring: it is an operational status indicator, not decoration. */
 @media (prefers-reduced-motion: reduce) { .is-spinning,.running-leaf i { animation:none; } }
 @media (pointer:coarse) { .tree-row-wrap { min-height:36px; } .tree-node-main { height:34px; } }
 </style>
@@ -1080,10 +1195,54 @@ onBeforeUnmount(() => {
 .tree-context-menu button { font:inherit; display:grid; grid-template-columns:16px 1fr; align-items:center; gap:7px; width:100%; min-height:28px; padding:4px 8px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 .tree-context-menu button:hover:not(:disabled) { background:#2563eb; color:white; }.tree-context-menu button:disabled { opacity:.38; cursor:not-allowed; }.tree-context-menu button.danger { color:#dc2626; }.tree-context-menu button.danger:hover:not(:disabled) { background:#dc2626; color:white; }
 .tree-context-menu hr { height:1px; margin:5px 7px; border:0; background:rgba(161,161,170,.28); }
-.folder-properties-dialog .el-dialog__header div { display:flex; flex-direction:column; gap:3px; }.folder-properties-dialog .el-dialog__header small { color:#a1a1aa; font-size:11px; font-weight:400; }
-.property-form { display:flex; min-height:220px; flex-direction:column; gap:12px; }.folder-prompt-editor { height:220px; min-height:160px; }.property-form label>span,.property-form .property-field>span { display:block; margin-bottom:6px; font-size:12px; font-weight:650; }.property-form label em,.property-form .property-field em { color:#a1a1aa; font-size:10px; font-style:normal; font-weight:400; }
-.effective-value { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; gap:4px 10px; margin-top:-5px; padding:8px 10px; border-radius:8px; background:var(--el-fill-color-lighter); font-size:10px; }.effective-value b { color:var(--el-text-color-secondary); }.effective-value code,.effective-value pre { min-width:0; overflow:auto; margin:0; color:var(--el-text-color-primary); font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }.effective-value small { grid-column:2; color:var(--el-text-color-placeholder); }
-.property-note,.impact-copy { color:var(--el-text-color-secondary); font-size:12px; line-height:1.65; }.property-note code { color:var(--el-color-primary); }
+/* Local dialog styling: keep the app font, and leave other dialogs/editors alone. */
+.folder-properties-dialog.el-dialog {
+  --el-dialog-padding-primary:0;
+  display:flex; flex-direction:column; max-height:90vh; max-height:90dvh; margin:5vh auto; margin:5dvh auto; padding:0;
+  overflow:hidden; border:1px solid var(--el-border-color-lighter); border-radius:14px;
+  font-family:inherit; font-size:13px; line-height:1.6; color:var(--el-text-color-primary);
+}
+.folder-properties-dialog .el-dialog__header { flex:none; margin:0; padding:18px 52px 16px 22px; border-bottom:1px solid var(--el-border-color-lighter); }
+.folder-properties-dialog .el-dialog__headerbtn { top:15px; right:14px; width:28px; height:28px; border-radius:7px; }
+.folder-properties-dialog .el-dialog__headerbtn:hover { background:var(--el-fill-color-light); }
+.folder-properties-dialog .folder-properties-heading h2 { margin:0; font-size:16px; font-weight:600; line-height:1.5; overflow-wrap:anywhere; }
+.folder-properties-dialog .folder-properties-heading p { margin:4px 0 0; color:var(--el-text-color-secondary); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.folder-properties-dialog .el-dialog__body { min-height:0; padding:20px 22px; overflow:auto; overscroll-behavior:contain; }
+.folder-properties-dialog .el-dialog__footer { flex:none; padding:14px 22px; border-top:1px solid var(--el-border-color-lighter); }
+.folder-properties-dialog .el-button { min-width:72px; height:34px; font-family:inherit; font-size:13px; font-weight:500; }
+.folder-properties-dialog .property-form { display:flex; min-height:220px; flex-direction:column; gap:20px; }
+.folder-properties-dialog .property-section { display:flex; min-width:0; flex-direction:column; gap:10px; }
+.folder-properties-dialog .property-section + .property-section { padding-top:20px; border-top:1px solid var(--el-border-color-lighter); }
+.folder-properties-dialog .property-field { display:block; min-width:0; }
+.folder-properties-dialog .property-field > span { display:block; margin-bottom:9px; font-size:13px; font-weight:600; line-height:1.6; }
+.folder-properties-dialog .property-field em { display:block; margin-top:2px; color:var(--el-text-color-secondary); font-size:12px; font-style:normal; font-weight:400; }
+.folder-properties-dialog .el-input { font-family:inherit; font-size:13px; }
+.folder-properties-dialog .el-input__wrapper { min-height:36px; }
+.folder-properties-dialog .el-input__inner { font-family:inherit; }
+.folder-properties-dialog .folder-prompt-editor { height:220px; min-height:160px; }
+.folder-properties-dialog .effective-value { display:flex; min-width:0; flex-direction:column; gap:5px; padding:10px 12px; border-radius:8px; background:var(--el-fill-color-light); }
+.folder-properties-dialog .effective-value b { color:var(--el-text-color-secondary); font-size:12px; font-weight:500; }
+.folder-properties-dialog .effective-value code,.folder-properties-dialog .effective-value pre { min-width:0; max-height:112px; overflow:auto; margin:0; color:var(--el-text-color-primary); font-size:13px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
+.folder-properties-dialog .effective-value code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.folder-properties-dialog .effective-value pre { font-family:inherit; }
+.folder-properties-dialog .effective-value small { color:var(--el-text-color-secondary); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.folder-properties-dialog .property-note { margin:0; color:var(--el-text-color-secondary); font-size:12px; line-height:1.7; overflow-wrap:anywhere; }
+.folder-properties-dialog .property-note code { color:var(--el-text-color-regular); font-size:inherit; }
+.folder-properties-dialog .el-dialog__body,.folder-properties-dialog .effective-value code,.folder-properties-dialog .effective-value pre { scrollbar-width:none; -ms-overflow-style:none; }
+.folder-properties-dialog .el-dialog__body::-webkit-scrollbar,.folder-properties-dialog .effective-value code::-webkit-scrollbar,.folder-properties-dialog .effective-value pre::-webkit-scrollbar { display:none; }
+@media (max-width:560px) {
+  .folder-properties-dialog.el-dialog { max-height:calc(100vh - 24px); max-height:calc(100dvh - 24px); margin:12px auto; }
+  .folder-properties-dialog .el-dialog__header { padding:16px 48px 14px 16px; }
+  .folder-properties-dialog .el-dialog__headerbtn { top:13px; right:12px; }
+  .folder-properties-dialog .el-dialog__body { padding:16px; }
+  .folder-properties-dialog .el-dialog__footer { padding:12px 16px; }
+  .folder-properties-dialog .folder-prompt-editor { height:200px; }
+}
+.impact-copy { color:var(--el-text-color-secondary); font-size:12px; line-height:1.65; }
+.move-archive-options { display:grid; gap:10px; margin-top:16px; padding-top:14px; border-top:1px solid var(--el-border-color-lighter); }
+.move-archive-options .el-checkbox { height:auto; font-family:inherit; }
+.move-archive-options .el-checkbox__label { font-size:13px; line-height:1.6; font-weight:500; }
+.move-archive-options p { margin:2px 0 0 22px; font-size:12px; line-height:1.6; color:var(--el-text-color-secondary); }
 .folder-picker { max-height:330px; overflow:auto; margin-top:10px; padding:5px; border:1px solid var(--el-border-color-light); border-radius:9px; }.folder-picker button { display:flex; width:100%; align-items:center; gap:7px; padding:7px 9px; border:0; border-radius:7px; background:transparent; color:var(--el-text-color-primary); text-align:left; cursor:pointer; }.folder-picker button:hover:not(:disabled),.folder-picker button.selected { background:var(--el-color-primary-light-9); color:var(--el-color-primary); }.folder-picker button:disabled { opacity:.35; cursor:not-allowed; }.folder-picker span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
 html.dark .conversation-tree { color:#d4d4d8; } html.dark .tree-tool:hover,html.dark .tree-tool:focus-visible,html.dark .tree-node-main:hover { background:rgba(63,63,70,.58); color:#fafafa; } html.dark .tree-search { border-color:#3f3f46; background:rgba(24,24,27,.8); } html.dark .tree-search input { color:#f4f4f5; } html.dark .tree-node-main.is-folder-target { background:rgba(161,161,170,.13); color:#f4f4f5; } html.dark .tree-node-main.is-chat-active { background:rgba(59,130,246,.14); color:#bfdbfe; } html.dark .running-count { background:rgba(22,101,52,.35); color:#86efac; } html.dark .tree-placeholder { background:rgba(63,63,70,.42); } html.dark .tree-context-menu { border-color:rgba(255,255,255,.12); background:rgba(39,39,42,.97); color:#f4f4f5; }
 </style>

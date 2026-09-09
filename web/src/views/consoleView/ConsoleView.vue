@@ -8,6 +8,8 @@ import {
 	Unlock,
 } from "@element-plus/icons-vue";
 import ConsoleComposer from "./ConsoleComposer.vue";
+import {referenceErrorText, referenceDisplayText, referencesInText} from "../../references/codec.js";
+import {referenceCatalog} from "../../references/catalog.js";
 import ConsoleHeader from "./ConsoleHeader.vue";
 import TurnList from "./TurnList.vue";
 import TurnMinimap from "./TurnMinimap.vue";
@@ -140,6 +142,8 @@ const rootTurnRunning = ref(false);
 const activeRunTurnUuid = ref("");
 const messages = ref([]);
 const draft = ref("");
+let draftEditRevision = 0;
+watch(draft, () => { draftEditRevision += 1; }, {flush: 'sync'});
 const status = ref("就绪");
 const operationsById = ref(new Map());
 const orderedOpIds = ref([]);
@@ -2462,6 +2466,7 @@ function normalizePendingSteering(items = []) {
 		.map((item) => ({
 			id: String(item?.id || item?.messageUuid || item?.turnUuid || `${Date.now()}-${Math.random()}`),
 			text: String(item?.visibleText || item?.text || item?.content || "").trim(),
+			...(item?.referenceBundleId ? {referenceBundleId: item.referenceBundleId, references: item.references || []} : {}),
 			submittedAtMs: Number(item?.submittedAtMs || 0) || Date.now(),
 		}))
 		.filter((item) => item.text);
@@ -2680,7 +2685,7 @@ function handleWsMessage(raw, source = {}) {
 		if (restored && ["busy", "conversation_compacting"].includes(error)) {
 			ElMessage.warning("会话正在压缩，消息未发送，草稿已恢复");
 		} else {
-			ElMessage.error(error);
+			ElMessage.error(data.referenceError ? `${referenceErrorText(error)}${data.referenceError.label ? '：' + data.referenceError.label : ''}` : error);
 		}
 	}
 }
@@ -2763,7 +2768,7 @@ function checkConnectionOnResume() {
 
 async function ensureServerConversationForSend(firstText, pending) {
 	if (!isLocalConversation.value) return activeConversationUuid.value;
-	const title = String(firstText || "新会话").replace(/\s+/g, " ").trim().slice(0, 36) || "新会话";
+	const title = referenceDisplayText(firstText || "新会话").replace(/\s+/g, " ").trim().slice(0, 36) || "新会话";
 	const created = await Api.createConversation({title, runConfig: completeLocalRunConfig(), folderId: props.folderId || ""});
 	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
@@ -2901,7 +2906,10 @@ async function deleteTurnSuffix(turn) {
 	const allTurns = turns.value;
 	const index = allTurns.findIndex((item) => String(item?.user?.turnUuid || "") === turnUuid);
 	const affectedTurns = index >= 0 ? allTurns.length - index : 1;
+	// Canonical reference tokens retain exact IDs/scopes through this same
+	// durable draft path; the rich editor restores them as inline nodes.
 	const originalUserText = String(turn?.user?.content || "");
+	const stillHere = () => componentMounted && activeConversationUuid.value === conversationUuid;
 	const originalAttachments = Array.isArray(turn?.user?.attachments) ? turn.user.attachments : [];
 	const preview = plainText(originalUserText).replace(/\s+/g, " ").trim().slice(0, 72);
 	try {
@@ -2935,16 +2943,20 @@ async function deleteTurnSuffix(turn) {
 			return;
 		}
 	}
+	if (!stillHere()) return;
+	const draftRevisionAtDelete = draftEditRevision;
 	deletingTurnUuid.value = turnUuid;
 	try {
 		const result = await Api.deleteConversationTurnSuffix(conversationUuid, turnUuid);
+		if (!stillHere()) { emit("conversations-refresh"); return; }
 		lastFrameSeq.value = 0;
 		closeWs();
 		toolDetailCache.reset(conversationUuid);
 		await load({scrollMode: "bottom", replaceOperations: true});
 		emit("conversations-refresh");
+		if (!stillHere()) return;
 		let restoredOriginalText = false;
-		if (!preserveExistingDraft && originalUserText && !draft.value.trim()) {
+		if (!preserveExistingDraft && originalUserText && !draft.value.trim() && draftRevisionAtDelete === draftEditRevision) {
 			draft.value = originalUserText;
 			setDraftForConversation(conversationUuid, originalUserText);
 			adjustComposerHeight();
@@ -2999,6 +3011,10 @@ async function send() {
 	if (compacting.value) { ElMessage.warning("上下文正在压缩，请稍候"); return; }
 	const text = draft.value.trim();
 	if (!text && !pendingAttachments.value.length) return;
+	if (referencesInText(text).length && (!referenceCatalog.ready || !referenceCatalog.connected)) {
+		ElMessage.warning("引用目录尚未连接，请稍后发送；草稿已保留");
+		return;
+	}
 	if (running.value && pendingAttachments.value.length) {
 		ElMessage.warning("运行中暂不追加附件，可以先停止或等当前轮完成");
 		return;
@@ -3320,6 +3336,7 @@ onBeforeUnmount(() => {
 			<ConsoleComposer
 				ref="composer"
 				v-model:draft="draft"
+				:conversation-uuid="activeConversationUuid"
 				v-model:model-query="modelQuery"
 				:pending-attachments="pendingAttachments"
 				:attachment-previews="attachmentPreviews"

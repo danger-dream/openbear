@@ -5,6 +5,7 @@ import inspect
 from xml.sax.saxutils import escape as xml_escape
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
+from app.references import BUNDLE_FIELD, ReferenceError
 from app.model_cost import resolved_usage_cost_usd
 from app.task_memory import (
     TaskMemoryDAO,
@@ -32,6 +33,7 @@ class WebAdminChatRunMixin:
         background_control_payload: dict[str, Any] | None = None,
         root_turn_uuid: str = "",
         user_op_id: str = "",
+        reference_bundle_id: str = "",
     ) -> bool:
         messages = MessageDAO(self.db)
         user_saved = False
@@ -162,6 +164,7 @@ class WebAdminChatRunMixin:
             user_msg: Message = {
                 "role": "user",
                 "content": build_llm_content(llm_text, media or []),
+                **({BUNDLE_FIELD: [reference_bundle_id]} if reference_bundle_id else {}),
             }
             # Public history and the current user stay clean. The private model
             # context retains trusted runtime-state messages across physical calls
@@ -258,12 +261,21 @@ class WebAdminChatRunMixin:
                     skip_task_memory_runtime=True,
                 )
 
+            async def _reference_request_overlay(request_messages: list[Message]) -> list[Message]:
+                base = await _memory_reminder_overlay(request_messages)
+                expanded = await self._reference_store().overlay(base, conversation_uuid=conversation_uuid)
+                if any(message.get(BUNDLE_FIELD) for message in base) and ctx_window > 0:
+                    required = self._estimate_prompt_tokens(system=system, convo=expanded)
+                    if required + max(2048, int(max_tokens or 0)) > ctx_window:
+                        raise ReferenceError("reference_budget_exceeded", tokens=required)
+                return expanded
+
             # Compact only the already durable history. The active user input is
             # appended afterwards, so a rich image/file request remains a real
             # current message rather than being folded into its own XML tail.
             estimated_prompt_tokens = self._estimate_prompt_tokens(
                 system=system,
-                convo=await _refresh_task_memory_request(convo),
+                convo=await self._reference_store().overlay(await _refresh_task_memory_request(convo), conversation_uuid=conversation_uuid),
             )
             preflight_prompt_tokens = estimated_prompt_tokens
             preflight_source = "pre_model_request"
@@ -335,7 +347,7 @@ class WebAdminChatRunMixin:
                     convo = history + [user_msg]
                     after_tokens = self._estimate_prompt_tokens(
                         system=system,
-                        convo=await _refresh_task_memory_request(convo),
+                        convo=await self._reference_store().overlay(await _refresh_task_memory_request(convo), conversation_uuid=conversation_uuid),
                     )
                     pre_outcome.after_tokens = after_tokens
                     compaction_outcomes.append((pre_outcome, after_tokens))
@@ -977,7 +989,7 @@ class WebAdminChatRunMixin:
                 context_compactor=context_compactor,
                 steer_drain=lambda: steering.drain_items(chat_id),
                 model_request_refresher=_refresh_task_memory_request,
-                model_request_overlay=_memory_reminder_overlay,
+                model_request_overlay=_reference_request_overlay,
                 model_call_hook=_model_call_hook,
                 footer_provider=_footer_provider,
                 result=result,

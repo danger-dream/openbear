@@ -217,7 +217,9 @@ export function buildUserInteractionView(input = {}) {
 		action,
 		actionName: ACTION_META[action].name,
 		title,
-		body: sensitive ? "" : cleanLine(args.body, 2000),
+		// Detail body is Markdown, not a one-line summary. Preserve fences,
+		// indentation and the complete source so displayed code remains copyable.
+		body: sensitive ? "" : text(args.body),
 		intro: introFor(action, outcomeValue),
 		status,
 		statusKey: outcomeValue.key,

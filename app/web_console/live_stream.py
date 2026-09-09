@@ -616,6 +616,7 @@ class _WebStreamRenderer:
                 "itemIds": [str(item.get("id") or "") for item in items if item.get("id")],
             })
         first = items[0] if items else {}
+        references = [reference for item in items for reference in (item.get("references") or [])]
         turn_uuid = str(first.get("turnUuid") or first.get("turn_uuid") or "").strip()
         message_uuid = str(first.get("messageUuid") or first.get("message_uuid") or "").strip()
         text = "\n\n".join(injected) if injected else "\n\n".join([self._steer_item_text(item) for item in (steers or []) if self._steer_item_text(item)])
@@ -627,6 +628,7 @@ class _WebStreamRenderer:
                 "text": text,
                 **({"source": "telegram"} if first.get("source") == "telegram" else {}),
                 "steeringInjected": True,
+                **({"references": references, "referenceBundleId": str(first.get("referenceBundleId") or references[0].get("bundleId") or "")} if references else {}),
             })
         self.live.activate_latest_user_turn()
 

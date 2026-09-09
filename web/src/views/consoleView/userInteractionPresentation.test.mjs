@@ -98,6 +98,16 @@ test("operation interrupted fallback remains interrupted instead of becoming ans
 	assert.equal(model.intro, "本次输入因运行中断未完成");
 });
 
+test("Markdown detail preserves complete code, whitespace and fences without changing sensitive redaction", () => {
+	const body = "**请检查**\n\n```js\nfunction sample() {\n  const text = '" + "x".repeat(2300) + "';\n  return text;\n}\n```\n\n最后的说明";
+	for (const action of ["confirm", "select", "prompt", "questionnaire"]) {
+		const model = view(action, "answered", {body}, {value: "  用户原文\n```js\n  answer();\n```  "});
+		assert.equal(model.body, body);
+		assert.equal(view(action, "answered", {body, sensitive: true}).body, "");
+		if (action === "prompt") assert.equal(model.promptValue, "  用户原文\n```js\n  answer();\n```  ");
+	}
+});
+
 test("loading interaction detail body does not rewrite the collapsed intro", () => {
 	const summary = buildUserInteractionView(userInteractionEventInput({
 		operation: {

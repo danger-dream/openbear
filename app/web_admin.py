@@ -25,6 +25,7 @@ from app.web_console.chat_api import WebAdminChatHandlersMixin
 from app.web_console.chat_runtime import WebAdminChatRunMixin
 from app.web_console.chat_state import WebAdminChatStateMixin
 from app.web_console.config_api import WebAdminSettingsChannelsMixin
+from app.web_console.conversation_overview import WebAdminConversationOverviewMixin
 from app.web_console.conversation_prompt import WebAdminConversationPromptMixin
 from app.web_console.conversation_tree import WebAdminConversationTreeMixin
 from app.web_console.conversations import WebAdminConversationsMixin
@@ -66,6 +67,8 @@ from app.web_console.memory_api import WebAdminMemoryMixin
 from app.web_console.operation_store import WebAdminOperationsMixin
 from app.web_console.rath_api import WebAdminRathMixin
 from app.web_console.routing import WebAdminAppMixin
+from app.web_console.realtime import WebAdminRealtimeMixin
+from app.web_console.reference_api import WebAdminReferenceMixin
 from app.web_console.system_mcp_api import WebAdminSystemMcpMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.update_api import WebAdminUpdateMixin
@@ -76,10 +79,13 @@ from app.web_telegram_replies import WebTelegramReplies
 
 class WebAdminServer(
     WebAdminAppMixin,
+    WebAdminRealtimeMixin,
+    WebAdminReferenceMixin,
     WebAdminAuthMixin,
     WebAdminArtifactsMixin,
     WebAdminConversationsMixin,
     WebAdminConversationTreeMixin,
+    WebAdminConversationOverviewMixin,
     WebAdminConversationPromptMixin,
     WebAdminOperationsMixin,
     WebAdminRathMixin,

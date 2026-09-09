@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
 from app.web_console.core import *
+from app.references import ReferenceError
 from app.web_console.live_stream import *
 
 
@@ -1660,6 +1661,14 @@ class WebAdminChatHandlersMixin:
         # A stranded steering queue alone cannot consume another interruption.
         # Start a controller below and leave the old messages queued for it.
         pending_only = set(active_round.get("activeReasons") or []) == {"steering"}
+        if active_round.get("active") and not pending_only and media:
+            return {"ok": False, "error": "attachments_while_running_not_supported"}
+        try:
+            reference_bundle_id, reference_manifest = await self._prepare_reference_bundle(row, text, f"msg:{user_message_uuid}")
+        except ReferenceError as exc:
+            return {"ok": False, "error": exc.code, "referenceError": exc.public()}
+        if reference_manifest:
+            input_metadata.update(referenceBundleId=reference_bundle_id, references=reference_manifest)
         # A detached Agent does not create a new visible turn. The main
         # controller stays alive in an event-driven wait inside the original root
         # turn, so interruptions use the normal steering queue and wake it now.
@@ -1680,6 +1689,8 @@ class WebAdminChatHandlersMixin:
                 rootTurnUuid=root_turn_uuid,
                 messageUuid=user_message_uuid,
                 source=source,
+                referenceBundleId=reference_bundle_id,
+                references=reference_manifest,
             )
             # Wake the sleeping controller immediately. The message remains in
             # the steering queue and is consumed by the same Agent.run/root turn
@@ -1780,6 +1791,7 @@ class WebAdminChatHandlersMixin:
                 background_control_payload=background_control_payload,
                 root_turn_uuid=turn_uuid,
                 user_op_id=f"msg:{user_message_uuid}",
+                **({"reference_bundle_id": reference_bundle_id} if reference_bundle_id else {}),
             ))
             if self.runs is not None:
                 self.runs.register(internal_chat_id, task)
@@ -2055,7 +2067,7 @@ class WebAdminChatHandlersMixin:
                             continue
                         result = await self._start_or_steer_web_conversation(row, text, media, live)
                         if not result.get("ok"):
-                            await _send_json({"type": "error", "error": result.get("error") or "send_failed", "requestId": request_id})
+                            await _send_json({"type": "error", "error": result.get("error") or "send_failed", "requestId": request_id, **({"referenceError": result["referenceError"]} if result.get("referenceError") else {})})
                         else:
                             await _send_json({"type": "ack", "requestId": request_id, **result})
                     else:

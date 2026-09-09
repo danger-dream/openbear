@@ -1,5 +1,8 @@
 <script setup>
 import {computed, nextTick, onBeforeUnmount, onMounted, ref} from "vue";
+import ReferenceEditor from "../../references/ReferenceEditor.vue";
+import ReferencePlainText from "../../references/ReferencePlainText.vue";
+import InteractionMarkdown from "./InteractionMarkdown.vue";
 import {
 	ArrowDown,
 	CircleCheck,
@@ -49,6 +52,7 @@ import {
 
 const props = defineProps({
 	draft: {type: String, default: ""},
+	conversationUuid: {type: String, default: ""},
 	pendingAttachments: {type: Array, default: () => []},
 	attachmentPreviews: {type: Object, default: () => ({})},
 	pendingConfirmations: {type: Array, default: () => []},
@@ -248,6 +252,7 @@ function insertPlainTextFromPaste(event) {
 	const text = event.clipboardData?.getData?.("text/plain") || "";
 	if (!text) return;
 	const el = composerTextarea.value;
+	if (typeof el?.insertText === "function") { el.insertText(text); return; }
 	const value = String(props.draft || "");
 	const start = Number(el?.selectionStart ?? value.length);
 	const end = Number(el?.selectionEnd ?? start);
@@ -274,6 +279,7 @@ function adjustHeight() {
 	nextTick(() => {
 		const el = composerTextarea.value;
 		if (!el) return;
+		if (typeof el.adjustHeight === "function") { el.adjustHeight(); return; }
 		el.style.height = "auto";
 		el.style.height = `${Math.min(el.scrollHeight, 216)}px`;
 	});
@@ -549,7 +555,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 				</div>
 				<div class="steering-queue-hint">当前运行到轮次边界后，后端会取走这些内容并作为一条 user message 注入模型。</div>
 				<div class="steering-queue-items">
-					<div v-for="item in props.pendingSteering" :key="item.id" class="steering-queue-item">{{ item.text }}</div>
+					<div v-for="item in props.pendingSteering" :key="item.id" class="steering-queue-item"><ReferencePlainText :text="item.text" :references="item.references || []" :bundle-id="item.referenceBundleId || ''"/></div>
 				</div>
 			</div>
 
@@ -572,7 +578,9 @@ defineExpose({focus, adjustHeight, openFilePicker});
 					<div v-if="interactionExpired(item)" class="interaction-expired-notice" role="status">此交互已过期，等待同步最新状态。</div>
 
 					<template v-if="interactionAction(item) === 'questionnaire'">
-						<p v-if="item.body" class="questionnaire-intro">{{ item.body }}</p>
+						<div v-if="item.body" class="web-interaction-content" tabindex="0" role="region" :aria-label="`${item.title || '问卷'}内容`">
+							<InteractionMarkdown class="questionnaire-intro" :text="item.body"/>
+						</div>
 						<div class="questionnaire-questions">
 							<fieldset v-for="(question, questionIndex) in questionnaireQuestions(item)"
 							          :key="questionnaireQuestionId(question) || questionIndex"
@@ -586,7 +594,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 									<span v-if="question.required" class="required-mark">必填</span>
 									<span v-else class="optional-mark">选填</span>
 								</legend>
-								<p v-if="question.description" class="question-description">{{ question.description }}</p>
+								<InteractionMarkdown v-if="question.description" class="question-description" :text="question.description"/>
 								<template v-if="question.type === 'choice'">
 									<div class="question-choice-list">
 										<label v-for="(option, optionIndex) in question.options || []"
@@ -649,7 +657,9 @@ defineExpose({focus, adjustHeight, openFilePicker});
 					</template>
 
 					<template v-else>
-						<pre v-if="item.body" class="web-confirm-body">{{ item.body }}</pre>
+						<div v-if="item.body" class="web-interaction-content" tabindex="0" role="region" :aria-label="`${item.title || '交互'}内容`">
+							<InteractionMarkdown class="web-confirm-body" :text="item.body"/>
+						</div>
 						<template v-if="interactionAction(item) === 'select'">
 							<div class="web-interaction-options">
 								<label v-for="(option, idx) in item.options || []" :key="`${item.confirmationId}-${idx}`"
@@ -721,16 +731,14 @@ defineExpose({focus, adjustHeight, openFilePicker});
 						</el-tooltip>
 					</div>
 				</div>
-				<textarea
+				<ReferenceEditor
 					ref="composerTextarea"
-					:value="props.draft"
-					rows="1"
-					class="composer-textarea"
-					placeholder="在这里输入消息，按 Enter 发送"
-					@input="onDraftInput"
-					@keydown="handleKeydown"
+					:model-value="props.draft"
+					:current-conversation="props.conversationUuid"
+					@update:model-value="emit('update:draft', $event)"
+					@send="props.canSend && emit('send')"
 					@paste="onPaste"
-				></textarea>
+				/>
 				<div class="composer-toolbar">
 					<div class="relative flex min-w-0 flex-1 items-center gap-1.5">
 						<el-tooltip content="新话题（Ctrl+N）" placement="top" :show-after="260">
@@ -1054,7 +1062,40 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	margin-bottom: 0.75rem;
 }
 
+/* A single card owns its content scroll; only stacked cards need an outer rail. */
+.web-confirm-stack:has(.web-confirm-card + .web-confirm-card) {
+	grid-auto-rows: max-content;
+	max-height: min(58vh, 36rem);
+	max-height: min(58dvh, 36rem);
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+}
+
+.web-interaction-content {
+	max-height: min(24vh, 14rem);
+	max-height: min(24dvh, 14rem);
+	min-width: 0;
+	min-height: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+	scrollbar-color: var(--ob-interaction-border-strong) transparent;
+	/* Leave room for input focus rings without moving the card edges. */
+	padding: 0 0.2rem 0.2rem;
+	margin: 0 -0.2rem;
+}
+
+.web-interaction-content:focus-visible {
+	outline: 2px solid var(--ob-interaction-border-strong);
+	outline-offset: -2px;
+}
+
 .web-confirm-card {
+	display: flex;
+	flex-direction: column;
+	box-sizing: border-box;
+	min-width: 0;
 	position: relative;
 	z-index: 45;
 	border: 1px solid var(--ob-interaction-border);
@@ -1071,6 +1112,8 @@ defineExpose({focus, adjustHeight, openFilePicker});
 }
 
 .web-confirm-title {
+	flex: 0 0 auto;
+	overflow-wrap: anywhere;
 	display: flex;
 	align-items: flex-start;
 	gap: 0.52rem;
@@ -1152,9 +1195,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 
 .web-confirm-body {
 	margin: 0.55rem 0 0;
-	max-height: 12rem;
-	overflow: auto;
-	white-space: pre-wrap;
+	white-space: normal;
 	font-family: inherit;
 	font-size: 0.76rem;
 	line-height: 1.5;
@@ -1162,6 +1203,10 @@ defineExpose({focus, adjustHeight, openFilePicker});
 }
 
 .web-interaction-options {
+	max-height: min(20vh, 12rem);
+	max-height: min(20dvh, 12rem);
+	overflow: auto;
+	scrollbar-width: thin;
 	display: grid;
 	grid-template-columns: repeat(2, minmax(0, 1fr));
 	gap: 0.45rem;
@@ -1243,6 +1288,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 }
 
 .web-confirm-actions {
+	flex: 0 0 auto;
 	display: flex;
 	flex-wrap: wrap;
 	justify-content: flex-end;
@@ -1285,22 +1331,30 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	cursor: not-allowed;
 }
 
-.questionnaire-card {
-	max-height: min(70vh, 46rem);
-	overflow: auto;
-}
-
 .questionnaire-intro,
 .question-description {
 	font-size: 0.75rem;
 	font-weight: 400;
 	line-height: 1.5;
 	color: var(--ob-interaction-muted);
-	white-space: pre-wrap;
+	white-space: normal;
 }
 
 .questionnaire-intro {
 	margin: 0.65rem 0 0;
+}
+
+.questionnaire-card > .web-interaction-content {
+	max-height: min(14vh, 8rem);
+	max-height: min(14dvh, 8rem);
+}
+
+.questionnaire-questions:has(.questionnaire-question + .questionnaire-question) {
+	max-height: min(32vh, 20rem);
+	max-height: min(32dvh, 20rem);
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
 }
 
 .questionnaire-questions {
@@ -1367,6 +1421,11 @@ defineExpose({focus, adjustHeight, openFilePicker});
 }
 
 .question-description {
+	max-height: min(12vh, 7rem);
+	max-height: min(12dvh, 7rem);
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
 	margin: 0.25rem 0 0.55rem;
 }
 
@@ -1506,19 +1565,25 @@ defineExpose({focus, adjustHeight, openFilePicker});
 }
 
 .questionnaire-actions {
-	position: sticky;
-	bottom: -0.85rem;
 	margin: 0.75rem -0.85rem -0.85rem;
 	border-top: 1px solid #e2e8f0;
 	background: rgba(248, 250, 252, 0.97);
 	padding: 0.65rem 0.85rem;
 }
 
-@media (max-width: 640px) {
-	.questionnaire-card {
-		max-height: 62vh;
+/* On a short viewport, reserve space for answers rather than scrolling them away. */
+@media (max-height: 600px) {
+	.questionnaire-card > .web-interaction-content {
+		max-height: 8vh;
+		max-height: 8dvh;
 	}
+	.questionnaire-card .question-description {
+		max-height: 6vh;
+		max-height: 6dvh;
+	}
+}
 
+@media (max-width: 640px) {
 	.question-choice-list,
 	.web-interaction-options {
 		grid-template-columns: minmax(0, 1fr);

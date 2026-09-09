@@ -521,9 +521,10 @@ class Agent:
                 open_rendered = False
             await _call_steer_hook(steers, injected_texts, cut=cut)
             for index, steer_text in enumerate(injected_texts):
-                convo.append({"role": "user", "content": steer_text})
+                source_items = steers if len(injected_texts) == 1 else [steers[index]]
+                reference_bundles = [str(item.get("referenceBundleId")) for item in source_items if isinstance(item, dict) and item.get("referenceBundleId")]
+                convo.append({"role": "user", "content": steer_text, **({"openbear_reference_bundle": reference_bundles} if reference_bundles else {})})
                 if persister is not None:
-                    source_items = steers if len(injected_texts) == 1 else [steers[index]]
                     message_uuids = [
                         str(item.get("messageUuid") or item.get("message_uuid") or "").strip()
                         for item in source_items if isinstance(item, dict)

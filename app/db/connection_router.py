@@ -91,6 +91,14 @@ class SQLiteConnectionRouter:
         self._owner: asyncio.Task[Any] | None = None
         self._lock_retries = max(0, int(lock_retries))
         self._closed = False
+        # Notifications only wake consumers; callbacks must not perform database
+        # work or delay the owning transaction. No uncommitted data is broadcast.
+        self.commit_listeners: set[Callable[[], None]] = set()
+
+    def _notify_commit(self) -> None:
+        for callback in tuple(self.commit_listeners):
+            with contextlib.suppress(Exception):
+                callback()
 
     @property
     def in_transaction(self) -> bool:
@@ -186,6 +194,7 @@ class SQLiteConnectionRouter:
             # transaction.  Do not retain the writer lock in that case.
             if not self._writer.in_transaction:
                 self._release_writer(owner)
+                self._notify_commit()
             return cursor
         except BaseException:
             if acquired or self._owner is owner:
@@ -212,6 +221,7 @@ class SQLiteConnectionRouter:
             )
             if not self._writer.in_transaction:
                 self._release_writer(owner)
+                self._notify_commit()
             return cursor
         except BaseException:
             with contextlib.suppress(BaseException):
@@ -229,6 +239,7 @@ class SQLiteConnectionRouter:
             )
             if not self._writer.in_transaction:
                 self._release_writer(owner)
+                self._notify_commit()
             return cursor
         except BaseException:
             with contextlib.suppress(BaseException):
@@ -241,6 +252,7 @@ class SQLiteConnectionRouter:
         owner, _ = await self._acquire_writer()
         try:
             await self._retry_locked(self._writer.commit, label="commit")
+            self._notify_commit()
         finally:
             self._release_writer(owner)
 
@@ -256,6 +268,7 @@ class SQLiteConnectionRouter:
         try:
             if self._writer.in_transaction:
                 await self._writer.commit()
+                self._notify_commit()
             await self._writer.backup(target, **kwargs)
         finally:
             self._release_writer(owner)
@@ -278,6 +291,7 @@ class SQLiteConnectionRouter:
                 await self._writer.execute(f"RELEASE {savepoint}")
             else:
                 await self._retry_locked(self._writer.commit, label=f"{label}:commit")
+                self._notify_commit()
         except BaseException:
             with contextlib.suppress(BaseException):
                 if nested:

@@ -771,6 +771,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 "role": "user",
                 "text": str(event.get("text") or event.get("content") or ""),
                 "attachments": event.get("attachments") if isinstance(event.get("attachments"), list) else [],
+                **({"references": event["references"], "referenceBundleId": str(event.get("referenceBundleId") or "")} if event.get("references") else {}),
                 "queued": bool(event.get("queued", False)),
                 "interruption": bool(event.get("interruption") or event.get("steeringInjected")),
                 "status": str(event.get("status") or ("插话已交给主会话" if event.get("steeringInjected") else "")),
@@ -788,6 +789,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
             payload={
                 "role": "user",
                 "text": str(event.get("text") or ""),
+                **({"references": event["references"], "referenceBundleId": str(event.get("referenceBundleId") or "")} if event.get("references") else {}),
                 "queued": True,
                 "interruption": True,
                 "status": str(event.get("status") or "已追加到当前运行"),

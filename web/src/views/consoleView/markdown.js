@@ -1,10 +1,13 @@
 import MarkdownIt from "markdown-it";
+import cjkFriendly from "markdown-it-cjk-friendly";
 import texmath from "markdown-it-texmath";
 import katex from "katex";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
 import "katex/dist/katex.min.css";
 import "markdown-it-texmath/css/texmath.css";
+import { referenceFromUrl } from "../../references/codec.js";
+import { referenceChipOpen, referenceChipClose, escapeReferenceHtml } from "../../references/presentation.js";
 
 const MAX_HIGHLIGHT_CHARS = 8000;
 const MARKDOWN_CACHE_LIMIT = 220;
@@ -55,6 +58,9 @@ function createMarkdownRenderer({highlightCode = true} = {}) {
 			}
 		},
 	});
+	// CommonMark rejects closing ** after Chinese punctuation when followed by
+	// text (e.g. **中文。**Vue). Apply the same CJK rules to live and final output.
+	renderer.use(cjkFriendly);
 	renderer.use(texmath, {
 		engine: katex,
 		delimiters: ["dollars", "brackets"],
@@ -82,10 +88,23 @@ function createMarkdownRenderer({highlightCode = true} = {}) {
 	renderer.renderer.rules.code_block = (tokens, idx) => renderCodeBlock(tokens[idx].content || "", "");
 	renderer.renderer.rules.link_open = (tokens, idx, options, _env, self) => {
 		const token = tokens[idx];
+		const href = token.attrGet("href") || "";
+		if (href.startsWith("openbear://ref/")) {
+			let end = idx + 1;
+			while (end < tokens.length && tokens[end].type !== "link_close") end++;
+			const label = tokens.slice(idx + 1, end).map(item => item.content || "").join("");
+			const reference = referenceFromUrl(href, label);
+			if (reference && end < tokens.length) {
+				for (let index = idx + 1; index < end; index++) { tokens[index].type = "text"; tokens[index].content = ""; }
+				tokens[end].meta = {...(tokens[end].meta || {}), referenceConsumed: true};
+				return referenceChipOpen(reference) + escapeReferenceHtml(reference.label) + referenceChipClose(reference);
+			}
+		}
 		token.attrSet("target", "_blank");
 		token.attrSet("rel", "noopener noreferrer");
 		return self.renderToken(tokens, idx, options);
 	};
+	renderer.renderer.rules.link_close = (tokens, idx, options, _env, self) => tokens[idx].meta?.referenceConsumed ? "" : self.renderToken(tokens, idx, options);
 	renderer.renderer.rules.table_open = () => `<div class="md-table-scroll"><table>`;
 	renderer.renderer.rules.table_close = () => `</table></div>`;
 	return renderer;

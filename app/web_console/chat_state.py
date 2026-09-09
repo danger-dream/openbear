@@ -820,6 +820,11 @@ class WebAdminChatStateMixin:
             )
         rows = await messages.recent(chat_id)
         recent = [project_history_message_for_controller(row.to_message()) for row in rows]
+        if any("openbear://ref/" in str(row.content or "") for row in rows):
+            bundles = await self._reference_store().bundle_ids_for_rows(rows)
+            for row, message in zip(rows, recent):
+                if bundles.get(row.id):
+                    message["openbear_reference_bundle"] = bundles[row.id]
         history = build_summary_prefixed_history("", recent)
         return repair_tool_pairing(history)
 

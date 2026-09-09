@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ConsoleView from "./views/consoleView/ConsoleView.vue";
 import MemoryView from "./views/MemoryView.vue";
 import SecretsView from "./views/SecretsView.vue";
@@ -24,6 +24,10 @@ import { dragAutoScrollOptions } from "./utils/dragScroll";
 import {documentTitle as browserDocumentTitle} from "./pageTitle.js";
 import { frontendMismatch } from "./versionSync.js";
 import { getThemeState, setThemeMode, subscribeTheme } from "./theme.js";
+import ReferencePicker from "./references/ReferencePicker.vue";
+import ReferenceInspector from "./references/ReferenceInspector.vue";
+import ArtifactPreview from "./artifacts/ArtifactPreview.vue";
+import { referenceCatalog, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
 
 const THEME_OPTIONS = [
   { value: "light", label: "浅色", hint: "始终使用浅色", icon: Sunny },
@@ -68,6 +72,20 @@ const pathToPage = {
 };
 
 const active = ref("console");
+const referenceShelf = shallowRef({open:false,kind:'',anchor:null});
+let referenceShelfTimer = null;
+function closeReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenceShelf.value={...referenceShelf.value,open:false};}
+function keepReferenceShelf(){window.clearTimeout(referenceShelfTimer);}
+function leaveReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenceShelfTimer=window.setTimeout(closeReferenceShelf,200);}
+function showReferenceShelf(event,key,keyboard=false){
+  const kind={memory:'mem',secrets:'secret',docs:'doc'}[key];
+  if(!kind||active.value!=='console'||(!keyboard&&!window.matchMedia('(hover: hover) and (pointer: fine)').matches))return;
+  const anchor=event.currentTarget;window.clearTimeout(referenceShelfTimer);
+  referenceShelfTimer=window.setTimeout(()=>{referenceShelf.value={open:true,kind,anchor};},keyboard?0:220);
+}
+function referenceNavKey(event,key){if(event.key==='ArrowRight'&&['memory','secrets','docs'].includes(key)){event.preventDefault();showReferenceShelf(event,key,true);}}
+function insertShelfReference(reference){window.dispatchEvent(new CustomEvent('openbear:insert-reference',{detail:{reference}}));closeReferenceShelf();}
+watch(active,closeReferenceShelf);
 const memoryType = ref("identity");
 const settingsSection = ref("channels");
 const appVersion = ref("");
@@ -734,46 +752,46 @@ function handlePreloadError(event) {
   void requestFrontendRefresh();
 }
 
+let lastNotifiedVersionResult = "";
+async function applyVersionInfo(data) {
+  if (!data || isLoginPath) return;
+  versionInfo.value = {...(versionInfo.value || {}), ...data};
+  appVersion.value = data.version || "";
+  observeFrontendVersion(data);
+  const banner = resultBanner(data.lastResult);
+  const resultKey = JSON.stringify([data.lastResult?.status,data.lastResult?.toVersion,data.lastResult?.finishedAt]);
+  if (banner && !versionUpdating.value && resultKey !== lastNotifiedVersionResult) {
+    lastNotifiedVersionResult = resultKey;
+    const status = data.lastResult?.status;
+    ElNotification({title: status === "success" ? "更新完成" : "上次更新未成功", message: banner,
+      type: status === "success" ? "success" : "warning", duration: 8000});
+    try { await Api.ackSystemUpdate(); } catch { /* later refresh can acknowledge */ }
+  }
+  if (versionUpdating.value) {
+    const phase = data.phase || "idle";
+    if (["idle", "done"].includes(phase) && data.lastResult?.status === "success" && data.lastResult.toVersion === data.version) {
+      versionUpdating.value = false;
+      ElMessage.success(data.lastResult.message || `已更新到 v${data.version}`);
+    } else if (["idle", "done"].includes(phase) && data.lastResult && ["rolled_back", "failed"].includes(data.lastResult.status)) {
+      versionUpdating.value = false;
+      ElMessage.error(data.lastResult.message || "更新失败");
+    }
+  }
+}
+watch(() => referenceCatalog.version, data => { if (data) void applyVersionInfo(data); });
+watch(() => [referenceCatalog.connected, referenceCatalog.ready], scheduleVersionPoll);
 async function loadVersionInfo() {
   if (isLoginPath || versionRequestInFlight) return;
   versionRequestInFlight = true;
-  try {
-    const data = await Api.systemVersion();
-    versionInfo.value = data;
-    appVersion.value = data.version || "";
-    observeFrontendVersion(data);
-    const banner = resultBanner(data.lastResult);
-    if (banner && !versionUpdating.value) {
-      const status = data.lastResult?.status;
-      ElNotification({
-        title: status === "success" ? "更新完成" : "上次更新未成功",
-        message: banner,
-        type: status === "success" ? "success" : "warning",
-        duration: 8000,
-      });
-      try { await Api.ackSystemUpdate(); } catch { /* ignore */ }
-    }
-    if (versionUpdating.value) {
-      const phase = data.phase || "idle";
-      if (["idle", "done"].includes(phase) && data.lastResult?.status === "success"
-        && data.lastResult.toVersion === data.version) {
-        versionUpdating.value = false;
-        ElMessage.success(data.lastResult.message || `已更新到 v${data.version}`);
-      } else if (["idle", "done"].includes(phase) && data.lastResult && ["rolled_back", "failed"].includes(data.lastResult.status)) {
-        versionUpdating.value = false;
-        ElMessage.error(data.lastResult.message || "更新失败");
-      }
-    }
-  } catch {
-    if (!appVersion.value) appVersion.value = "";
-  } finally {
-    versionRequestInFlight = false;
-  }
+  try { await applyVersionInfo(await Api.systemVersion()); }
+  catch { if (!appVersion.value) appVersion.value = ""; }
+  finally { versionRequestInFlight = false; }
 }
 
 function scheduleVersionPoll() {
   if (isLoginPath) return;
   if (versionPollTimer) window.clearTimeout(versionPollTimer);
+  if (referenceCatalog.connected && referenceCatalog.ready) return;
   const delay = versionUpdating.value ? 2000 : VERSION_POLL_MS;
   versionPollTimer = window.setTimeout(() => {
     void loadVersionInfo().finally(scheduleVersionPoll);
@@ -859,6 +877,7 @@ onMounted(() => {
   window.addEventListener("resize", closeConversationMenu);
   window.addEventListener("keydown", handleConversationMenuKeydown);
   if (!isLoginPath) {
+    startReferenceCatalog();
     void loadVersionInfo().finally(scheduleVersionPoll);
     window.addEventListener("focus", checkVersionOnResume);
     window.addEventListener("pageshow", checkVersionOnResume);
@@ -867,6 +886,8 @@ onMounted(() => {
   }
 });
 onBeforeUnmount(() => {
+  closeReferenceShelf();
+  stopReferenceCatalog({clear:true});
   stopThemeSubscription();
   window.removeEventListener("popstate", applyRouteFromLocation);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
@@ -981,7 +1002,10 @@ onBeforeUnmount(() => {
         <button
           v-for="n in nav"
           :key="n.key"
-          @click="selectNav(n.key)"
+          @click="closeReferenceShelf(); selectNav(n.key)"
+          @pointerenter="showReferenceShelf($event,n.key)"
+          @pointerleave="leaveReferenceShelf"
+          @keydown="referenceNavKey($event,n.key)"
           class="w-full flex items-center gap-3 px-3 py-1.5 rounded-xl text-left transition-colors"
           :class="active === n.key ? 'bg-zinc-200/80 text-zinc-950 font-medium' : 'text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-950'"
         >
@@ -989,6 +1013,9 @@ onBeforeUnmount(() => {
           <span class="truncate">{{ n.label }}</span>
         </button>
       </nav>
+      <ReferencePicker :open="referenceShelf.open" :anchor="referenceShelf.anchor" :kind="referenceShelf.kind" :current-conversation="activeConversationUuid" placement="right-start" searchable allow-drag @select="insertShelfReference" @close="closeReferenceShelf" @enter="keepReferenceShelf" @leave="leaveReferenceShelf"/>
+      <ReferenceInspector :current-conversation="activeConversationUuid"/>
+      <ArtifactPreview :navigation-key="`${active}:${activeConversationUuid}`"/>
 
       <div class="-mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
         <ConversationTree

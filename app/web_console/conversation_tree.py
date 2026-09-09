@@ -171,8 +171,11 @@ class WebAdminConversationTreeMixin:
         }
         running_items: list[dict[str, Any]] = []
         folder_counts: dict[str, int] = {}
+        direct_conversation_counts: dict[str, int] = {}
         folders = await self._tree_folders(owner_chat_id)
         for row in rows:
+            folder_id = str(row.get("folder_uuid") or "")
+            direct_conversation_counts[folder_id] = direct_conversation_counts.get(folder_id, 0) + 1
             conv_uuid = str(row.get("conversation_uuid") or "")
             chat_id = int(row.get("internal_chat_id") or 0)
             facts = operation_facts.get(conv_uuid) or {}
@@ -211,8 +214,22 @@ class WebAdminConversationTreeMixin:
         return {
             "items": running_items,
             "folderRunningCounts": folder_counts,
+            "folderConversationCounts": self._tree_subtree_counts(direct_conversation_counts, folders),
             "revision": int(time.time() * 1000),
         }
+
+    @classmethod
+    def _tree_subtree_counts(cls, direct_counts: dict[str, int], folders: dict[str, dict[str, Any]]) -> dict[str, int]:
+        """Count each conversation once in its folder and every ancestor, including unloaded folders."""
+        totals = {folder_id: int(direct_counts.get(folder_id, 0)) for folder_id in folders}
+        # The empty key remains the temporary node, never the sum of all roots.
+        totals[""] = int(direct_counts.get("", 0))
+        for folder_id, count in direct_counts.items():
+            if not count:
+                continue
+            for ancestor in cls._tree_folder_path(folder_id, folders)[:-1]:
+                totals[ancestor] += count
+        return totals
 
     async def _tree_counts(self, owner_chat_id: int, folders: dict[str, dict[str, Any]]) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
         direct_folders: dict[str, int] = {}
@@ -234,7 +251,7 @@ class WebAdminConversationTreeMixin:
             folder_id = str(row["folder_uuid"] or "")
             active[folder_id] = int(row["active_count"] or 0)
             archived[folder_id] = int(row["archived_count"] or 0)
-        return direct_folders, active, archived
+        return direct_folders, self._tree_subtree_counts(active, folders), archived
 
     def _tree_folder_json(
         self,
@@ -552,6 +569,7 @@ class WebAdminConversationTreeMixin:
                     "name": str(row.get("name") or ""),
                     "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders),
                     "pinned": int(row.get("pinned_at") or 0) > 0,
+                    "conversationCount": int(status.get("folderConversationCounts", {}).get(str(row.get("folder_uuid") or ""), 0)),
                     "runningDescendantCount": int(status.get("folderRunningCounts", {}).get(str(row.get("folder_uuid") or ""), 0)),
                 }
                 results.append(result)
@@ -742,6 +760,7 @@ class WebAdminConversationTreeMixin:
         target_folder_id: str = "",
         workspace_dir: str | None = None,
         prompt_markdown: str | None = None,
+        force_snapshot: bool = False,
     ) -> dict[str, Any]:
         folders_before = await self._tree_folders(owner_chat_id, include_properties=True)
         folders_after = {key: dict(value) for key, value in folders_before.items()}
@@ -775,7 +794,7 @@ class WebAdminConversationTreeMixin:
             old_values = self._tree_effective_from_map(folder_id, folders_before, str(getattr(self, "workspace_dir", "") or ""))[:2]
             new_folder = target_folder_id if kind == "conversation" else folder_id
             new_values = self._tree_effective_from_map(new_folder, folders_after, str(getattr(self, "workspace_dir", "") or ""))[:2]
-            if old_values == new_values:
+            if old_values == new_values and not (force_snapshot and kind == "conversation"):
                 continue
             item = {**row, "old_values": old_values, "new_values": new_values}
             is_running = await self._web_conversation_has_active_runtime(row)
@@ -962,6 +981,7 @@ class WebAdminConversationTreeMixin:
         target_folder: str,
         before_id: str,
         after_id: str,
+        force_reinsert: bool = False,
     ) -> None:
         if kind == "folder":
             table, id_col, parent_col = "web_conversation_folders", "folder_uuid", "parent_uuid"
@@ -978,7 +998,7 @@ class WebAdminConversationTreeMixin:
         current_parent = str(moving.get(parent_col) or "")
         # A same-parent drop without a new destination, including a self-neighbor
         # sent by an older UI, is an idempotent no-op. Never change timestamps.
-        if current_parent == target_folder and (
+        if not force_reinsert and current_parent == target_folder and (
             not before_id and not after_id or before_id == item_id or after_id == item_id
         ):
             return
@@ -1041,14 +1061,26 @@ class WebAdminConversationTreeMixin:
         async with self._conversation_tree_lock:
             row, _folders = await self._tree_validate_move_target(owner, kind, item_id, target)
             current_parent = str(row.get("parent_uuid" if kind == "folder" else "folder_uuid") or "")
-            impact = await self._tree_change_impact(owner, kind=kind, item_id=item_id, target_folder_id=target) if current_parent != target else {
+            archived_conversation = kind == "conversation" and int(row.get("archived_at") or 0) > 0
+            unarchive = archived_conversation and body.get("unarchive") is True
+            refresh_snapshot = archived_conversation and body.get("updateSnapshots") is True
+            impact = await self._tree_change_impact(
+                owner, kind=kind, item_id=item_id, target_folder_id=target, force_snapshot=refresh_snapshot,
+            ) if current_parent != target or refresh_snapshot else {
                 "rows": [], "affectedCount": 0, "archivedCount": 0, "runningCount": 0, "updatableCount": 0, "cacheInvalidated": False,
             }
 
             async def mutate(conn: Any) -> None:
+                if unarchive:
+                    # Visibility, destination, order and optional snapshot change
+                    # commit together. Reorder against active, not archived peers.
+                    await conn.execute(
+                        "UPDATE web_conversations SET archived_at=0 WHERE owner_chat_id=? AND conversation_uuid=?",
+                        (owner, item_id),
+                    )
                 await self._tree_reorder_entity(
                     conn, owner=owner, kind=kind, item_id=item_id,
-                    target_folder=target, before_id=before_id, after_id=after_id,
+                    target_folder=target, before_id=before_id, after_id=after_id, force_reinsert=unarchive,
                 )
 
             result = await self._tree_apply_snapshot_updates_locked(
@@ -1056,6 +1088,7 @@ class WebAdminConversationTreeMixin:
                 update_snapshots=body.get("updateSnapshots") is True,
                 mutate=mutate,
             )
+        result["unarchived"] = unarchive
         await self.audit("web.conversation_tree.move", actor="web", chat_id=owner, ip=request.remote or "", detail={"kind": kind, "id": item_id, "targetFolderId": target, **result})
         return web.json_response({"ok": True, **self._tree_public_impact(impact), **result})
 

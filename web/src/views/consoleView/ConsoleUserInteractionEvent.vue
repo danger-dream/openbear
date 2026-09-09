@@ -4,6 +4,7 @@ import {ArrowRight, CircleCheck, EditPen, Finished, Tickets} from "@element-plus
 import {Api, apiError} from "../../api.js";
 import {useToolDetailCache} from "./toolDetailCache.js";
 import {buildUserInteractionView, userInteractionEventInput} from "./userInteractionPresentation.js";
+import InteractionMarkdown from "./InteractionMarkdown.vue";
 
 const props = defineProps({
 	event: {type: Object, required: true},
@@ -111,7 +112,9 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 					<span class="readonly-title-icon" aria-hidden="true"><component :is="actionIcon"/></span>
 					<div><strong>{{ view.title }}</strong><span>{{ view.actionName }} · {{ view.statusLabel }}<template v-if="view.sourceLabel"> · {{ view.sourceLabel }}处理</template></span></div>
 				</header>
-				<p v-if="view.body" class="readonly-body">{{ view.body }}</p>
+				<div v-if="view.body" class="readonly-content" tabindex="0" role="region" :aria-label="`${view.title || '交互详情'}内容`">
+					<InteractionMarkdown class="readonly-body" :text="view.body"/>
+				</div>
 
 				<div v-if="view.sensitive" class="redacted-answer">{{ view.redactedText }}</div>
 
@@ -150,7 +153,7 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 							<strong>{{ question.question }}</strong>
 							<span :class="question.required ? 'required-mark' : 'optional-mark'">{{ question.required ? '必填' : '选填' }}</span>
 						</header>
-						<p v-if="question.description" class="question-description">{{ question.description }}</p>
+						<InteractionMarkdown v-if="question.description" class="question-description" :text="question.description"/>
 						<div v-if="question.type === 'choice'" class="question-choice-list">
 							<div v-for="option in question.options" :key="option.key || option.value" class="question-choice-option" :class="{'is-selected': option.selected}">
 								<span class="faux-choice" :class="{'is-selected': option.selected, 'is-multiple': question.multiple}" aria-hidden="true"><span></span></span>
@@ -200,13 +203,23 @@ details[open] > summary .disclosure-icon svg { transform: rotate(90deg); }
 .interaction-detail { margin: .25rem 0 .7rem 1.7rem; }
 .detail-notice { margin: 0 0 .45rem; font-size: .72rem; color: #64748b; }
 .detail-notice.is-error { color: #b91c1c; }
-.readonly-card { border: 1px solid var(--ob-interaction-border); border-radius: .9rem; background: var(--ob-interaction-surface); padding: .85rem; box-shadow: 0 10px 28px rgba(15,23,42,.07); }
+.readonly-card { min-width: 0; border: 1px solid var(--ob-interaction-border); border-radius: .9rem; background: var(--ob-interaction-surface); padding: .85rem; box-shadow: 0 10px 28px rgba(15,23,42,.07); }
 .readonly-title { display: flex; align-items: flex-start; gap: .52rem; color: #1e3a5f; }
 .readonly-title-icon { display: grid; width: 1.15rem; height: 1.15rem; flex: 0 0 auto; place-items: center; margin-top: .05rem; }
-.readonly-title > div { display: grid; gap: .12rem; }
+.readonly-title > div { display: grid; min-width: 0; gap: .12rem; overflow-wrap: anywhere; }
+.readonly-content {
+	min-width: 0;
+	max-height: min(24vh, 14rem);
+	max-height: min(24dvh, 14rem);
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+	scrollbar-color: var(--ob-interaction-border-strong) transparent;
+}
+.readonly-content:focus-visible { outline: 2px solid var(--ob-interaction-border-strong); outline-offset: -2px; }
 .readonly-title strong { font-size: .88rem; }
 .readonly-title span { font-size: .7rem; color: #64748b; }
-.readonly-body { margin: .62rem 0 0; font-size: .76rem; line-height: 1.55; color: #64748b; white-space: pre-wrap; }
+.readonly-body { margin: .62rem 0 0; font-size: .76rem; line-height: 1.55; color: #64748b; white-space: normal; }
 .redacted-answer, .empty-answer { margin: .7rem 0 0; border: 1px dashed #cbd5e1; border-radius: .7rem; background: #fff; padding: .65rem; font-size: .75rem; color: #64748b; }
 .confirm-outcome { display: flex; align-items: center; gap: .5rem; margin-top: .7rem; border: 1px solid #d8e0e9; border-radius: .72rem; background: #fff; padding: .6rem; font-size: .78rem; font-weight: 700; }
 .confirm-outcome.is-confirmed { border-color: #bed8c8; background: #f4faf6; color: #35704d; }
@@ -228,14 +241,16 @@ details[open] > summary .disclosure-icon svg { transform: rotate(90deg); }
 .option-label { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem; }
 .readonly-text-answer { display: grid; gap: .3rem; margin-top: .65rem; font-size: .7rem; font-weight: 650; color: #475569; }
 .readonly-text-answer > div { min-height: 2.4rem; border: 1px solid #ced9e5; border-radius: .68rem; background: #fff; padding: .58rem .62rem; font-size: .77rem; font-weight: 400; line-height: 1.5; color: #1f2937; white-space: pre-wrap; overflow-wrap: anywhere; }
+.questionnaire-card > .readonly-content { max-height: min(14vh, 8rem); max-height: min(14dvh, 8rem); }
 .questionnaire-questions { display: grid; gap: .7rem; margin-top: .75rem; }
-.questionnaire-question { border: 1px solid #dbe4ee; border-radius: .85rem; background: rgba(255,255,255,.9); padding: .72rem; }
+.questionnaire-questions:has(.questionnaire-question + .questionnaire-question) { max-height: min(32vh, 20rem); max-height: min(32dvh, 20rem); overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.questionnaire-question { min-width: 0; border: 1px solid #dbe4ee; border-radius: .85rem; background: rgba(255,255,255,.9); padding: .72rem; }
 .questionnaire-question > header { display: flex; align-items: center; gap: .42rem; font-size: .81rem; line-height: 1.45; color: #1e293b; }
 .question-number { display: inline-grid; width: 1.35rem; height: 1.35rem; flex: 0 0 auto; place-items: center; border-radius: 50%; background: #e8eef7; font-size: .7rem; color: #334155; }
 .required-mark, .optional-mark, .recommendation-badge { flex: 0 0 auto; border-radius: 999px; padding: .1rem .38rem; font-size: .63rem; font-weight: 750; }
 .required-mark { background: #fee2e2; color: #991b1b; }
 .optional-mark { background: #f1f5f9; color: #64748b; }
-.question-description { margin: .28rem 0 0; font-size: .72rem; line-height: 1.5; color: #64748b; white-space: pre-wrap; }
+.question-description { max-height: min(12vh, 7rem); max-height: min(12dvh, 7rem); overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; margin: .28rem 0 0; font-size: .72rem; line-height: 1.5; color: #64748b; white-space: normal; }
 .question-choice-list { margin-top: .5rem; }
 .recommendation-badge { border: 1px solid #b8c7da; background: #edf3fa; color: #345477; }
 .recommendation-reason { margin-top: .48rem; border-left: 2px solid #8ba4c3; padding-left: .55rem; font-size: .7rem; line-height: 1.45; color: #526274; white-space: pre-wrap; }

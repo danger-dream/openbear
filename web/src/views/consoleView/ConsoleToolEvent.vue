@@ -806,7 +806,7 @@ details[open] > summary > .disclosure-icon {
 <style>
 /* OpenBear system dark theme */
 html.dark .tool-event {
-		border: 1px solid rgba(255, 255, 255, 0.145);
+		border: 0;
 		background: #1d1e22;
 		color: #dedee1;
 	}

@@ -55,6 +55,8 @@ class WebAdminAppMixin:
 
     def make_app(self) -> web.Application:
         app = web.Application(middlewares=[self._auth_middleware])
+        app.cleanup_ctx.append(self._realtime_context)
+        app.on_shutdown.append(self._realtime_shutdown)
         app.add_routes([
             web.get("/health", self.handle_health),
             web.get("/", self.handle_index),
@@ -98,6 +100,11 @@ class WebAdminAppMixin:
             web.get("/api/conversations/{conversation_uuid}/artifacts/{artifact_uuid}", self.handle_api_conversation_artifact),
             web.get("/api/conversations/{conversation_uuid}/artifacts/{artifact_uuid}/content", self.handle_api_conversation_artifact_content),
             web.get("/api/conversations/{conversation_uuid}/ws", self.handle_api_conversation_ws),
+            web.get("/api/events/ws", self.handle_api_global_ws),
+            web.get("/api/reference-catalog", self.handle_api_reference_catalog),
+            web.post("/api/references/preview", self.handle_api_reference_preview),
+            web.post("/api/references/inspect", self.handle_api_reference_inspect),
+            web.get("/api/reference-history/{conversation_uuid}", self.handle_api_reference_history),
             web.post("/api/conversations/{conversation_uuid}/compact", self.handle_api_conversation_compact),
             web.post("/api/conversations/{conversation_uuid}/system-prompt/preview", self.handle_api_conversation_prompt_preview),
             web.put("/api/conversations/{conversation_uuid}/system-prompt", self.handle_api_conversation_prompt_update),

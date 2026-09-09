@@ -957,6 +957,7 @@ export function projectOperationMessages(operations = [], options = {}) {
         deleteTraceable: Array.isArray(op.transcriptMessageIds) && op.transcriptMessageIds.some((id) => Number(id) > 0),
         role: "user",
         content: String(payload.text || payload.content || ""),
+        ...(payload.referenceBundleId ? {referenceBundleId: payload.referenceBundleId, references: payload.references || []} : {}),
         attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
         createdAt: opTsSec(op),
         queuedSteering: Boolean(turn.queuedSteering),
