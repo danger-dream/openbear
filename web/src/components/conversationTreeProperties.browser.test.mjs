@@ -105,13 +105,16 @@ test('folder defaults preserve sparse semantics, stale-dialog safety and readabl
     await page.locator('.folder-properties-dialog').waitFor();
   };
   const selectValue = async (field, label) => {
-    await page.waitForTimeout(220);
-    await page.locator(`[data-run-default-field="${field}"]`).click();
-    const popper = page.locator('.el-select__popper:visible');
-    const option = popper.locator('.el-select-dropdown__item').filter({hasText: label}).first();
-    await option.waitFor();
-    await page.waitForTimeout(60);
-    await option.click();
+    const control = page.locator(`[data-run-default-field="${field}"]`);
+    const input = control.getByRole('combobox');
+    await control.locator('.el-select__wrapper').click();
+    await control.locator('[role="combobox"][aria-expanded="true"]').waitFor({state:'attached'});
+    // Bind to this select's listbox, not another select's still-leaving popper.
+    // Fixed sleeps are unreliable when CI runs all browser suites in parallel.
+    const list = page.locator(`[id="${await input.getAttribute('aria-controls')}"]`);
+    await list.locator('.el-select-dropdown__item').filter({hasText: label}).first().click();
+    await control.locator('[role="combobox"][aria-expanded="false"]').waitFor({state:'attached'});
+    await list.waitFor({state:'hidden'});
   };
   const selectedText = field => page.locator(`[data-run-default-field="${field}"] .el-select__placeholder`).innerText();
 
