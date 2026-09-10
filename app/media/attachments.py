@@ -35,7 +35,7 @@ class InboundMedia:
     """用户入口附件的协议无关描述。"""
 
     kind: str  # image | audio | video | file | sticker
-    upload_type: str  # web_upload | websocket_upload | limit
+    upload_type: str  # web_upload | limit
     source: str = "current"  # current | reply
     message_id: int = 0
     file_id: str = ""
@@ -47,6 +47,7 @@ class InboundMedia:
     height: int = 0
     duration: int = 0
     path: str = ""
+    artifact_uuid: str = ""
     text_excerpt: str = ""
     transcript: str = ""
     transcription_error: str = ""
@@ -114,17 +115,6 @@ def classify_media(file_name: str, mime: str) -> str:
     return "file"
 
 
-def size_limit_bytes(cfg: MediaConfig, kind: str) -> int:
-    mb = {
-        "image": cfg.max_image_mb,
-        "sticker": cfg.max_image_mb,
-        "audio": cfg.max_audio_mb,
-        "video": cfg.max_video_mb,
-        "file": cfg.max_file_mb,
-    }.get(kind, cfg.max_file_mb)
-    return int(max(0, mb) * 1024 * 1024)
-
-
 def human_size(n: int) -> str:
     if n <= 0:
         return "未知大小"
@@ -137,7 +127,8 @@ def human_size(n: int) -> str:
 
 
 def extract_text(path: Path, *, max_chars: int = _TEXT_EXTRACT_MAX_CHARS) -> tuple[str, bool]:
-    data = path.read_bytes()[: max_chars * 4 + 4]
+    with path.open("rb") as source:
+        data = source.read(max_chars * 4 + 4)
     text = data.decode("utf-8", errors="replace")
     truncated = len(text) > max_chars or path.stat().st_size > len(data)
     if len(text) > max_chars:

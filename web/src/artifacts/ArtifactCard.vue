@@ -10,6 +10,7 @@ const format = computed(() => artifactFormat(record?.metadata));
 const title = computed(() => record?.summary?.title || props.label || record?.metadata?.fileName || "附件");
 const excerpt = computed(() => {
 	if (record?.metadataError) return "暂时无法读取附件信息，点击查看详情。";
+	if (format.value.kind === "html") return "HTML 页面 · 可切换页面预览与源码";
 	if (record?.summary?.excerpt) return record.summary.excerpt;
 	if (!record?.metadata) return "点击即可在对话中查看附件";
 	if (format.value.kind === "image") return "图片附件 · 在对话中查看与缩放";

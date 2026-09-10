@@ -142,10 +142,6 @@
   },
   "media": {
     "downloadDir": "data/media/inbound",
-    "maxImageMb": 20,
-    "maxAudioMb": 25,
-    "maxVideoMb": 50,
-    "maxFileMb": 200,
     "maxMediaPerMessage": 10,
     "mediaGroupFlushMs": 1000
   },

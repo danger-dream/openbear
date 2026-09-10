@@ -6,6 +6,7 @@ read only by the dedicated properties endpoint.
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,6 +21,11 @@ from app.web_console.core import _WEB_SESSION_KEY, WebSession
 
 _TREE_PAGE_SIZE = 50
 _TREE_ORDER_STEP = 1024.0
+_TEMPORARY_PROPERTIES_ID = "__temporary"
+_FOLDER_RUN_FIELDS = frozenset({
+    "mainModel", "mainThinkingLevel", "mainFastMode",
+    "agentModel", "agentThinkLevel", "agentFastMode",
+})
 
 
 class WebAdminConversationTreeMixin:
@@ -51,6 +57,25 @@ class WebAdminConversationTreeMixin:
         )
         return {str(row["folder_uuid"]): dict(row) for row in await cur.fetchall()}
 
+    async def _tree_temporary_properties(self, owner_chat_id: int) -> dict[str, Any]:
+        cur = await self.db.conn.execute(
+            "SELECT * FROM web_temporary_conversation_properties WHERE owner_chat_id=?",
+            (int(owner_chat_id),),
+        )
+        row = await cur.fetchone()
+        return {
+            "folder_uuid": _TEMPORARY_PROPERTIES_ID, "parent_uuid": "", "name": "临时会话",
+            "workspace_dir": "", "prompt_markdown": "", "run_defaults_json": "{}",
+            **(dict(row) if row else {}),
+        }
+
+    async def _tree_context_folders(self, owner_chat_id: int) -> dict[str, dict[str, Any]]:
+        # Only context/property resolution sees this virtual node. Organization
+        # APIs must never expose it as a real folder or a move/create target.
+        folders = await self._tree_folders(owner_chat_id, include_properties=True)
+        folders[_TEMPORARY_PROPERTIES_ID] = await self._tree_temporary_properties(owner_chat_id)
+        return folders
+
     @staticmethod
     def _tree_folder_path(folder_uuid: str, folders: dict[str, dict[str, Any]]) -> list[str]:
         path: list[str] = []
@@ -80,7 +105,9 @@ class WebAdminConversationTreeMixin:
         prompt = ""
         workspace_source = ""
         prompt_source = ""
-        current = str(folder_uuid or "")
+        # An unfiled conversation uses the temporary group's context, but a
+        # real root folder stops at its empty parent and never inherits it.
+        current = str(folder_uuid or _TEMPORARY_PROPERTIES_ID)
         seen: set[str] = set()
         while current:
             if current in seen or current not in folders:
@@ -99,13 +126,88 @@ class WebAdminConversationTreeMixin:
         return workspace or str(default_workspace or ""), prompt, workspace_source, prompt_source
 
     async def _tree_effective_folder_values(self, owner_chat_id: int, folder_uuid: str) -> tuple[str, str]:
-        folders = await self._tree_folders(owner_chat_id, include_properties=True)
+        folders = await self._tree_context_folders(owner_chat_id)
         workspace, prompt, _workspace_source, _prompt_source = self._tree_effective_from_map(
             folder_uuid,
             folders,
             str(getattr(self, "workspace_dir", "") or ""),
         )
         return workspace, prompt
+
+    @staticmethod
+    def _tree_local_run_defaults(row: dict[str, Any]) -> dict[str, Any]:
+        try:
+            values = json.loads(str(row.get("run_defaults_json") or "{}"))
+        except (TypeError, ValueError):
+            return {}
+        return {key: value for key, value in values.items() if key in _FOLDER_RUN_FIELDS} if isinstance(values, dict) else {}
+
+    @classmethod
+    def _tree_effective_run_defaults_from_map(
+        cls, folder_uuid: str, folders: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+        values: dict[str, Any] = {}
+        sources: dict[str, dict[str, str]] = {}
+        # Walk from the nearest node. Presence, not truthiness, determines an
+        # override: False disables Fast; empty strings/null can mean Agent follow.
+        for folder_id in reversed(cls._tree_folder_path(folder_uuid, folders)):
+            for key, value in cls._tree_local_run_defaults(folders[folder_id]).items():
+                if key not in values:
+                    values[key] = value
+                    sources[key] = {"folderId": folder_id, "path": cls._tree_folder_path_text(folder_id, folders)}
+        return values, sources
+
+    async def _tree_run_default_folders(self, owner_chat_id: int) -> dict[str, dict[str, Any]]:
+        # New-conversation defaults must not fetch all folder prompt bodies.
+        cur = await self.db.conn.execute(
+            "SELECT folder_uuid,parent_uuid,name,run_defaults_json FROM web_conversation_folders WHERE owner_chat_id=?",
+            (int(owner_chat_id),),
+        )
+        return {str(row["folder_uuid"]): dict(row) for row in await cur.fetchall()}
+
+    async def _tree_folder_run_defaults(self, owner_chat_id: int, folder_uuid: str) -> dict[str, Any]:
+        if not folder_uuid:
+            return self._tree_local_run_defaults(await self._tree_temporary_properties(owner_chat_id))
+        folders = await self._tree_run_default_folders(owner_chat_id)
+        if folder_uuid not in folders:
+            raise web.HTTPNotFound(text="folder_not_found")
+        effective, _sources = self._tree_effective_run_defaults_from_map(folder_uuid, folders)
+        return effective
+
+    async def _tree_run_property_payload(self, owner: int, folder_id: str, body: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None]:
+        temporary = folder_id == _TEMPORARY_PROPERTIES_ID
+        if temporary and "workspaceDir" in body:
+            raise web.HTTPBadRequest(text="temporary_workspace_not_supported")
+        if "runDefaults" not in body and not temporary:
+            workspace, prompt = self._tree_property_values(body)
+            return workspace, prompt, None  # Preserve new settings for legacy clients.
+        folders = await self._tree_context_folders(owner)
+        row = folders.get(folder_id)
+        if row is None:
+            raise web.HTTPNotFound(text="folder_not_found")
+        workspace, prompt = self._tree_property_values({
+            "workspaceDir": row.get("workspace_dir", ""), "promptMarkdown": row.get("prompt_markdown", ""), **body,
+        })
+        if "runDefaults" not in body:
+            return workspace, prompt, None
+        raw = body["runDefaults"]
+        if not isinstance(raw, dict) or set(raw) - _FOLDER_RUN_FIELDS:
+            raise web.HTTPBadRequest(text="invalid_folder_run_defaults")
+        if not raw:
+            return workspace, prompt, {}
+        inherited, _sources = self._tree_effective_run_defaults_from_map(str(row.get("parent_uuid") or ""), folders)
+        _stored, fallback = await self._web_run_defaults_candidate(owner)
+        base = self._apply_folder_run_defaults(fallback, inherited)
+        updates, error = self._validate_web_defaults_patch(raw, base)
+        if error:
+            code, status = error
+            raise (web.HTTPNotFound if status == 404 else web.HTTPBadRequest)(
+                text=json.dumps({"ok": False, "error": code}), content_type="application/json",
+            )
+        normalized = self._normalize_web_run_defaults({**self._web_defaults_storage(base), **(updates or {})})
+        # Validation may adjust dependent fields, but only explicit local keys
+        # belong in storage. Do not accidentally freeze inherited defaults.
+        return workspace, prompt, {key: normalized[key] for key in raw}
 
     @staticmethod
     def _tree_descendants(folder_uuid: str, folders: dict[str, dict[str, Any]]) -> set[str]:
@@ -716,18 +818,27 @@ class WebAdminConversationTreeMixin:
         session: WebSession = request[_WEB_SESSION_KEY]
         owner = int(session.chat_id)
         folder_id = str(request.match_info.get("folder_uuid") or "").strip()
-        folders = await self._tree_folders(owner, include_properties=True)
+        folders = await self._tree_context_folders(owner)
         row = folders.get(folder_id)
         if row is None:
             return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
         workspace, prompt, workspace_source, prompt_source = self._tree_effective_from_map(
             folder_id, folders, str(getattr(self, "workspace_dir", "") or "")
         )
+        _stored, fallback = await self._web_run_defaults_candidate(owner)
+        effective_run, sources = self._tree_effective_run_defaults_from_map(folder_id, folders)
+        inherited_run, _inherited_sources = self._tree_effective_run_defaults_from_map(str(row.get("parent_uuid") or ""), folders)
         return web.json_response({
             "ok": True,
             "folderId": folder_id,
+            "systemNode": "temporary" if folder_id == _TEMPORARY_PROPERTIES_ID else "",
             "name": str(row.get("name") or ""),
             "path": self._tree_folder_path_text(folder_id, folders),
+            "runDefaults": {
+                "local": self._tree_local_run_defaults(row), "inherited": inherited_run,
+                "effective": effective_run, "sources": sources, "fallback": fallback,
+                "resolved": self._apply_folder_run_defaults(fallback, effective_run),
+            },
             "workspace": {
                 "local": str(row.get("workspace_dir") or ""),
                 "effective": workspace,
@@ -762,7 +873,7 @@ class WebAdminConversationTreeMixin:
         prompt_markdown: str | None = None,
         force_snapshot: bool = False,
     ) -> dict[str, Any]:
-        folders_before = await self._tree_folders(owner_chat_id, include_properties=True)
+        folders_before = await self._tree_context_folders(owner_chat_id)
         folders_after = {key: dict(value) for key, value in folders_before.items()}
         candidates: set[str] = set()
         if kind == "properties":
@@ -772,7 +883,7 @@ class WebAdminConversationTreeMixin:
                 folders_after[item_id]["workspace_dir"] = workspace_dir
             if prompt_markdown is not None:
                 folders_after[item_id]["prompt_markdown"] = prompt_markdown
-            candidates = self._tree_descendants(item_id, folders_before)
+            candidates = {""} if item_id == _TEMPORARY_PROPERTIES_ID else self._tree_descendants(item_id, folders_before)
         elif kind == "folder":
             if item_id not in folders_after:
                 raise web.HTTPNotFound(text="folder_not_found")
@@ -828,7 +939,9 @@ class WebAdminConversationTreeMixin:
     async def handle_api_conversation_folder_properties_impact(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         body = await self._json_body(request)
-        workspace, prompt = self._tree_property_values(body)
+        workspace, prompt, _run_defaults = await self._tree_run_property_payload(
+            int(session.chat_id), str(request.match_info.get("folder_uuid") or ""), body,
+        )
         impact = await self._tree_change_impact(
             int(session.chat_id), kind="properties",
             item_id=str(request.match_info.get("folder_uuid") or ""),
@@ -895,20 +1008,33 @@ class WebAdminConversationTreeMixin:
         owner = int(session.chat_id)
         folder_id = str(request.match_info.get("folder_uuid") or "").strip()
         body = await self._json_body(request)
-        workspace, prompt = self._tree_property_values(body)
         update_snapshots = body.get("updateSnapshots") is True
         async with self._conversation_tree_lock:
+            workspace, prompt, run_defaults = await self._tree_run_property_payload(owner, folder_id, body)
             impact = await self._tree_change_impact(
                 owner, kind="properties", item_id=folder_id,
                 workspace_dir=workspace, prompt_markdown=prompt,
             )
 
             async def mutate(conn: Any) -> None:
+                if folder_id == _TEMPORARY_PROPERTIES_ID:
+                    await conn.execute(
+                        """INSERT INTO web_temporary_conversation_properties
+                           (owner_chat_id, prompt_markdown, run_defaults_json, updated_at)
+                           VALUES (?, ?, COALESCE(?, '{}'), ?)
+                           ON CONFLICT(owner_chat_id) DO UPDATE SET
+                             prompt_markdown=excluded.prompt_markdown,
+                             run_defaults_json=COALESCE(?, web_temporary_conversation_properties.run_defaults_json),
+                             updated_at=excluded.updated_at""",
+                        (owner, prompt, json.dumps(run_defaults) if run_defaults is not None else None,
+                         now_ts(), json.dumps(run_defaults) if run_defaults is not None else None),
+                    )
+                    return
                 await conn.execute(
                     """UPDATE web_conversation_folders
-                       SET workspace_dir=?, prompt_markdown=?, updated_at=?
+                       SET workspace_dir=?, prompt_markdown=?, run_defaults_json=COALESCE(?, run_defaults_json), updated_at=?
                        WHERE owner_chat_id=? AND folder_uuid=?""",
-                    (workspace, prompt, now_ts(), owner, folder_id),
+                    (workspace, prompt, json.dumps(run_defaults) if run_defaults is not None else None, now_ts(), owner, folder_id),
                 )
 
             result = await self._tree_apply_snapshot_updates_locked(
@@ -1100,7 +1226,7 @@ class WebAdminConversationTreeMixin:
         body = await self._json_body(request)
         target = str(body.get("targetFolderId") or "").strip()
         row, _folder_metadata = await self._tree_validate_move_target(owner, "folder", folder_id, target)
-        folders = await self._tree_folders(owner, include_properties=True)
+        folders = await self._tree_context_folders(owner)
         if target == folder_id or target in self._tree_descendants(folder_id, folders):
             return web.json_response({"ok": False, "error": "folder_cycle"}, status=409)
         direct_children = [key for key, value in folders.items() if str(value.get("parent_uuid") or "") == folder_id]

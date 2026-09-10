@@ -117,23 +117,29 @@ async def test_reply_targets_exact_conversation_and_redelivery_does_not_execute_
     assert {r["state"] for r in await inbox(env)} == {"submitted"}
 
 
-async def test_button_only_opens_bound_force_reply_prompt(env):
+async def test_legacy_button_only_shows_callback_hint_without_sending_prompt(env):
     query = Query()
     await env.bridge.handle_callback(query)
-    assert query.answers == [(None, {"show_alert": False})]
-    assert env.submitted == [] and await inbox(env) == []
-    sent = env.bot.sent[-1]
-    markup = sent["reply_markup"]
-    assert markup.model_dump()["force_reply"] is True
-    assert markup.inline_keyboard[0][0].url == "https://console.example.test/chat?id=conv-1"
-    assert "发送文字后才会开始执行" in sent["html"]
+    assert query.answers == [("请直接回复这条结果消息继续。", {"show_alert": False})]
+    assert env.submitted == [] and await inbox(env) == [] and env.bot.sent == []
     restarted = WebTelegramReplies(env.config, env.db, env.bot, env.submit)
-    reply = Incoming(reply_to=sent["message"].message_id)
+    reply = Incoming(reply_to=100)
     record = await restarted.match_reply(reply)
-    assert record["role"] == "prompt" and record["conversation_uuid"] == "conv-1"
+    assert record["conversation_uuid"] == "conv-1"
     await restarted.handle_reply(reply, record)
     await restarted.process_one()
+    assert not await restarted.deliver_receipt()
+    assert len(env.submitted) == 1 and env.bot.sent == []
+
+
+async def test_existing_prompt_messages_remain_replyable_after_upgrade(env):
+    await bind_message(env.db, 123, 900, "conv-1", "old-1", role="prompt")
+    await env.db.conn.commit()
+    await receive(env, Incoming(reply_to=900))
+    await env.bridge.process_one()
     assert len(env.submitted) == 1
+    assert env.submitted[0][0]["conversation_uuid"] == "conv-1"
+    assert not await env.bridge.deliver_receipt() and env.bot.sent == []
 
 
 @pytest.mark.parametrize("message", [Incoming(reply_to=None), Incoming(reply_to=999), Incoming(text="/restart"), Incoming(owner=999), Incoming(sender=999), Incoming(kind="group")])
@@ -183,7 +189,12 @@ async def test_callback_checks_owner_and_message_binding(env):
     assert env.bot.sent == [] and env.submitted == []
 
 
-async def test_receipt_retry_does_not_resubmit_and_receipt_is_replyable(env):
+async def test_error_receipt_retry_does_not_resubmit_and_receipt_is_replyable(env):
+    async def busy(row, text, **kwargs):
+        await env.submit(row, text, **kwargs)
+        return {"ok": False, "error": "busy"}
+
+    env.bridge.submit = busy
     await receive(env, Incoming())
     await env.bridge.process_one()
     env.bot.fail = True
@@ -265,10 +276,13 @@ async def test_filter_failure_is_consumed_not_leaked_into_admin_settings(env, mo
     assert message.answers and not env.submitted
 
 
-def test_notification_keyboard_has_reply_and_web_buttons(env):
+def test_notification_keyboard_only_keeps_web_link_without_forcing_reply(env):
     markup = reply_keyboard(env.config, "conv-1")
-    assert markup.inline_keyboard[0][0].callback_data == REPLY_CALLBACK
-    assert markup.inline_keyboard[0][1].url.endswith("/chat?id=conv-1")
+    assert len(markup.inline_keyboard) == 1 and len(markup.inline_keyboard[0]) == 1
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "打开 Web 会话"
+    assert button.url.endswith("/chat?id=conv-1")
+    assert button.callback_data is None
     assert markup.model_dump()["force_reply"] is False
 
 
@@ -279,11 +293,15 @@ async def test_disabled_web_replies_immediately_without_waiting_for_disabled_wor
     assert "Web 服务已关闭" in env.bot.sent[-1]["html"]
 
 
-async def test_prompt_without_public_web_url_uses_native_force_reply(env):
-    from aiogram.types import ForceReply
+async def test_without_public_web_url_neither_keyboard_nor_prompt_is_needed(env):
     env.config.web.custom_url = ""
+    assert reply_keyboard(env.config, "conv-1") is None
     await env.bridge.handle_callback(Query())
-    assert isinstance(env.bot.sent[-1]["reply_markup"], ForceReply)
+    assert env.bot.sent == []
+    await receive(env, Incoming())
+    await env.bridge.process_one()
+    assert len(env.submitted) == 1
+    assert not await env.bridge.deliver_receipt()
 
 
 async def test_startup_only_replays_task_buttons_and_tolerates_expired_callback_ack(env):
@@ -299,7 +317,52 @@ async def test_startup_only_replays_task_buttons_and_tolerates_expired_callback_
     env.bot.updates = [SimpleNamespace(update_id=10, callback_query=old), SimpleNamespace(update_id=11, callback_query=unrelated)]
     await _drain_startup_backlog(env.bot, SimpleNamespace(web_admin=SimpleNamespace(telegram_replies=env.bridge)))
     assert env.bot.offsets == [None, 12]
-    assert len(env.bot.sent) == 1 and await inbox(env) == [] and env.submitted == []
+    assert env.bot.sent == [] and await inbox(env) == [] and env.submitted == []
+
+
+@pytest.mark.parametrize("queued", [False, True])
+async def test_successful_direct_or_queued_reply_is_silent_and_idempotent(env, queued):
+    async def submit(row, text, **kwargs):
+        await env.submit(row, text, **kwargs)
+        return {"ok": True, "queued": queued, "rootTurnUuid": "same-root"}
+
+    env.bridge.submit = submit
+    message = Incoming()
+    await receive(env, message)
+    assert await env.bridge.process_one()
+    item = (await inbox(env))[0]
+    assert item["state"] == "submitted" and item["root_turn_uuid"] == "same-root"
+    assert item["response_text"] == "" and item["response_sent"] == 1
+    assert not await env.bridge.deliver_receipt()
+    await receive(env, message)
+    assert not await env.bridge.process_one()
+    assert len(env.submitted) == 1 and env.bot.sent == []
+
+
+async def test_upgrade_discards_pending_success_receipts_but_keeps_error_feedback(env, monkeypatch):
+    await receive(env, Incoming())
+    await env.bridge.process_one()
+    await env.db.conn.execute(
+        "UPDATE web_tg_reply_inbox SET response_text=?, response_sent=0",
+        ("已在原会话开始继续处理。结果会回到 Telegram。",),
+    )
+    await env.db.conn.commit()
+    assert not await env.bridge.deliver_receipt(), "legacy success rows must never be delivered"
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(env.bridge, "_worker_loop", idle)
+    await env.bridge.start()
+    item = (await inbox(env))[0]
+    assert item["response_sent"] == 1 and item["response_text"] == ""
+    assert env.bot.sent == []
+    await env.db.conn.execute("UPDATE web_conversations SET archived_at=1 WHERE conversation_uuid='conv-2'")
+    await env.db.conn.commit()
+    await receive(env, Incoming(501, 200))
+    await env.bridge.process_one()
+    assert await env.bridge.deliver_receipt()
+    assert len(env.bot.sent) == 1 and "归档" in env.bot.sent[0]["html"]
 
 
 async def test_terminal_inbox_keeps_dedup_key_not_an_extra_copy_of_user_text(env):

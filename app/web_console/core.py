@@ -87,9 +87,6 @@ from app.media.attachments import (
 from app.media.attachments import (
     safe_filename as _safe_filename,
 )
-from app.media.attachments import (
-    size_limit_bytes as _size_limit_bytes,
-)
 from app.memory.builtin import BuiltinMemoryClient, slugify_ref
 from app.model_cost import resolved_usage_cost_usd as _resolved_usage_cost_usd
 from app.model_cost import usage_cost_usd as _usage_cost_usd

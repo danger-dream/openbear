@@ -180,6 +180,17 @@ class WebAdminArtifactsMixin:
             "downloadUrl": f"{base}?download=1",
         }
 
+    @staticmethod
+    def _copy_web_artifact(source: Path, target: Path) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        size = 0
+        with source.open("rb") as src, target.open("wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+                dst.write(chunk)
+        return digest.hexdigest(), size
+
     async def _register_web_artifact_from_path(
         self,
         source: Path,
@@ -202,18 +213,16 @@ class WebAdminArtifactsMixin:
         tmp_dir = self._web_artifact_root() / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = tmp_dir / f"{uuid.uuid4()}.tmp"
-        digest = hashlib.sha256()
-        size = 0
+        copy_task = asyncio.create_task(asyncio.to_thread(self._copy_web_artifact, source, tmp_path))
         try:
-            with source.open("rb") as src, tmp_path.open("wb") as dst:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    digest.update(chunk)
-                    dst.write(chunk)
-            sha256_value = digest.hexdigest()
+            try:
+                sha256_value, size = await asyncio.shield(copy_task)
+            except asyncio.CancelledError:
+                # Do not unlink an in-progress worker's file and leak its later
+                # output. Wait for its bounded-memory copy before final cleanup.
+                with contextlib.suppress(Exception):
+                    await copy_task
+                raise
             cur = await self.db.conn.execute(
                 """
                 SELECT * FROM web_artifacts

@@ -104,6 +104,8 @@ CREATE TABLE IF NOT EXISTS web_conversation_folders (
   name                  TEXT NOT NULL,
   workspace_dir         TEXT NOT NULL DEFAULT '',
   prompt_markdown       TEXT NOT NULL DEFAULT '',
+  -- Sparse per-field overrides; missing keys inherit, false/null remain explicit.
+  run_defaults_json     TEXT NOT NULL DEFAULT '{}',
   pinned_at             INTEGER NOT NULL DEFAULT 0,
   display_order         REAL,
   created_at            INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +115,14 @@ CREATE INDEX IF NOT EXISTS idx_web_conversation_folders_parent
   ON web_conversation_folders(owner_chat_id, parent_uuid, pinned_at DESC, display_order, id);
 CREATE INDEX IF NOT EXISTS idx_web_conversation_folders_name
   ON web_conversation_folders(owner_chat_id, name);
+
+-- 临时会话是系统分组，不是目录或项目目录的祖先；不支持独立工作目录。
+CREATE TABLE IF NOT EXISTS web_temporary_conversation_properties (
+  owner_chat_id         INTEGER PRIMARY KEY,
+  prompt_markdown       TEXT NOT NULL DEFAULT '',
+  run_defaults_json     TEXT NOT NULL DEFAULT '{}',
+  updated_at            INTEGER NOT NULL DEFAULT 0
+);
 
 -- Web 版多 live 会话映射表。
 -- owner_chat_id 是真实登录用户(Telegram chat_id)；internal_chat_id 是 OpenBear

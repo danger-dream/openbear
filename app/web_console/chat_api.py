@@ -117,6 +117,22 @@ class WebAdminChatHandlersMixin:
             "agent_fast_mode": -1 if defaults.get("agentFastMode") is None else (1 if defaults.get("agentFastMode") is True else 0),
         }
 
+    def _apply_folder_run_defaults(self, defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+        if not overrides:
+            return dict(defaults)
+        selected = dict(defaults)
+        for key, value in overrides.items():
+            # A removed/disabled model cannot become an executable default. Fall
+            # back to the remembered configuration, while properties still show
+            # the stored value so the user can repair it.
+            if key in {"mainModel", "agentModel"} and value and not self.config.models.resolve(str(value)):
+                continue
+            selected[key] = value
+        return self._normalize_web_run_defaults({
+            **self._web_defaults_storage(selected),
+            "revision": defaults.get("revision", 0), "updated_at": defaults.get("updatedAt", 0),
+        })
+
     async def _web_run_defaults(self, owner_chat_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
         row = await WebConversationDefaultsDAO(self.db).get_or_seed(
             owner_chat_id,
@@ -256,8 +272,13 @@ class WebAdminChatHandlersMixin:
 
     async def handle_api_conversation_defaults(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
+        folder_id = str(request.query.get("folderId") or "").strip()
+        folder_defaults = await self._tree_folder_run_defaults(session.chat_id, folder_id)
         _row, defaults = await self._web_run_defaults(session.chat_id)
-        return web.json_response({"ok": True, "defaults": defaults})
+        return web.json_response({
+            "ok": True, "defaults": self._apply_folder_run_defaults(defaults, folder_defaults),
+            "folderId": folder_id, "folderDefaults": folder_defaults,
+        })
 
     async def handle_api_conversation_defaults_patch(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -292,10 +313,13 @@ class WebAdminChatHandlersMixin:
         if not isinstance(title_raw, str):
             return web.json_response({"ok": False, "error": "invalid_title_type"}, status=400)
         title = title_raw.strip() or "新对话"
-        _defaults_row, current = await self._web_run_defaults_candidate(session.chat_id)
+        folder_uuid = str(body.get("folderId") or "").strip()
+        folder_defaults = await self._tree_folder_run_defaults(session.chat_id, folder_uuid)
+        _defaults_row, global_defaults = await self._web_run_defaults_candidate(session.chat_id)
+        current = self._apply_folder_run_defaults(global_defaults, folder_defaults)
 
         run_config_raw = body.get("runConfig")
-        persist_defaults = run_config_raw is not None or "model" in body
+        persist_defaults = not folder_defaults and (run_config_raw is not None or "model" in body)
         if run_config_raw is not None:
             if not isinstance(run_config_raw, dict):
                 return web.json_response({"ok": False, "error": "invalid_run_config_type"}, status=400)
@@ -319,13 +343,10 @@ class WebAdminChatHandlersMixin:
                 selected["mainModel"] = model
                 selected["mainThinkingLevel"] = self._model_default_thinking_level(model)
                 selected["mainFastMode"] = False
-                persist_defaults = True
+                persist_defaults = not folder_defaults
             normalized = self._normalize_web_run_defaults({**self._web_defaults_storage(selected), "revision": 0, "updated_at": 0})
 
         storage = self._web_defaults_storage(normalized)
-        folder_uuid = str(body.get("folderId") or "").strip()
-        if folder_uuid and not await self._tree_folder_owned(session.chat_id, folder_uuid):
-            return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
         row = await self._create_web_conversation(
             session.chat_id,
             title=title,
@@ -333,6 +354,7 @@ class WebAdminChatHandlersMixin:
             run_config=storage,
             folder_uuid=folder_uuid,
             persist_defaults=persist_defaults,
+            defaults_seed=self._web_defaults_storage(global_defaults) if folder_defaults else None,
         )
         live = self._live_for(row)
         await self.audit("web.conversation.create", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row["conversation_uuid"], "internalChatId": row["internal_chat_id"]})
@@ -1620,7 +1642,24 @@ class WebAdminChatHandlersMixin:
             }
             if item.path and conv_uuid and not item.skipped:
                 try:
-                    artifact = await self._register_web_artifact_from_path(Path(item.path), conversation=row, turn_uuid=turn_uuid, op_id=op_id)
+                    artifact = None
+                    if item.upload_type == "web_upload" and item.artifact_uuid:
+                        cur = await self.db.conn.execute(
+                            "SELECT * FROM web_artifacts WHERE artifact_uuid=? AND conversation_uuid=? AND owner_chat_id=? AND deleted_at=0",
+                            (item.artifact_uuid, conv_uuid, int(row["owner_chat_id"])),
+                        )
+                        stored = await cur.fetchone()
+                        artifact = self._web_artifact_public(dict(stored), conv_uuid) if stored else None
+                        if stored and not stored["turn_uuid"]:
+                            await self.db.conn.execute(
+                                "UPDATE web_artifacts SET turn_uuid=?, op_id=? WHERE artifact_uuid=? AND turn_uuid=''",
+                                (turn_uuid, op_id, item.artifact_uuid),
+                            )
+                            await self.db.conn.commit()
+                    if artifact is None:
+                        # A previous message may have been deleted after upload;
+                        # an explicit resend must still get a live attachment URL.
+                        artifact = await self._register_web_artifact_from_path(Path(item.path), conversation=row, turn_uuid=turn_uuid, op_id=op_id)
                 except Exception:
                     artifact = None
                     log.exception("Web 上传附件注册 artifact 失败", 会话=conv_uuid, 文件=file_name)
@@ -1806,7 +1845,7 @@ class WebAdminChatHandlersMixin:
         session: WebSession = request[_WEB_SESSION_KEY]
         row = await self._conversation_from_request(request)
         live = self._live_for(row)
-        ws = web.WebSocketResponse(heartbeat=25, max_msg_size=64 * 1024 * 1024)
+        ws = web.WebSocketResponse(heartbeat=25, max_msg_size=128 * 1024 * 1024)
         await ws.prepare(request)
         try:
             after_frame_seq = max(0, int(request.query.get("afterFrameSeq") or 0))
@@ -2061,7 +2100,11 @@ class WebAdminChatHandlersMixin:
                         row = await self._conversation_row(session.chat_id, str(row["conversation_uuid"]), require=True)  # type: ignore[assignment]
                         text = str(data.get("text") or "").strip()
                         files = data.get("files") if isinstance(data.get("files"), list) else []
-                        media = await self._save_ws_uploads(files, chat_id=int(row["internal_chat_id"])) if files else []
+                        try:
+                            media = await self._resolve_http_uploads(files, conversation=row) if files else []
+                        except web.HTTPException as exc:
+                            await _send_json({"type": "error", "error": json.loads(exc.text)["error"], "requestId": request_id})
+                            continue
                         if not text and not media:
                             await _send_json({"type": "error", "error": "empty_text", "requestId": request_id})
                             continue

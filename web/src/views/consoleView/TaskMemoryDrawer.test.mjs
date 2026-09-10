@@ -80,22 +80,26 @@ test("work-detail tooltip closes before the reference moves with the panel trans
   assert.match(consoleSource, /onBeforeUnmount\(\(\) => \{[\s\S]*?window\.clearTimeout\(workDetailTooltipReleaseTimer\)/);
 });
 
-test("drawer exposes both scopes, lazy body detail, metadata, preview, and minimal refresh policy", () => {
+test("drawer keeps both scopes and actual catalog while separating reading from technical metadata", () => {
   assert.match(source, /label="会话记忆" name="conversation"/);
-  assert.match(source, /label="Agent 任务记忆" name="agent"/);
+  assert.match(source, /label="Agent 记忆" name="agent"/);
   assert.match(source, /taskMemoryTasks/);
-  assert.match(source, /task\.taskShortId/);
+  assert.doesNotMatch(source, /task\.taskShortId/);
+  assert.match(source, /:label="taskSearchLabel\(task\)"/);
   assert.match(source, /statusLabel\(task\.status\)/);
   assert.match(source, /Api\.taskMemories\(/);
   assert.match(source, /async function editMemory[\s\S]*Api\.taskMemory\(/);
-  assert.match(source, /v\{\{ item\.revision \}\}/);
+  assert.match(source, /async function viewMemory[\s\S]*Api\.taskMemory\(/);
+  assert.match(source, /<InteractionMarkdown[^>]*:text="detail\.body"/);
+  assert.match(source, /<details class="memory-technical">[\s\S]*detail\.memoryUuid/);
+  assert.doesNotMatch(source, /v\{\{ item\.revision \}\}/);
   assert.match(source, /formatDate\(item\.updatedAt\)/);
-  assert.match(source, /formatBytes\(item\.sizeBytes\)/);
+  assert.match(source, /formatBytes\(detail\.sizeBytes\)/);
   assert.match(source, /sourceLabel\(item\)/);
-  assert.match(source, /自动重注入/);
-  assert.match(source, /Agent 可见/);
-  assert.match(source, /注入预览/);
-  assert.match(source, /仅目录 · 无正文/);
+  assert.match(source, /目录自动提供给模型/);
+  assert.match(source, /Agent 可读取/);
+  assert.match(source, /模型可见目录/);
+  assert.match(source, /v-if="previewOpen"/);
   assert.match(source, /async function loadPreview[\s\S]*Api\.taskMemoryPreview\(token\.conversationUuid, requestScopeParams\(token\)\)/);
   assert.doesNotMatch(source, /function buildCatalogPreview|\.slice\(0,\s*20\)/);
   assert.doesNotMatch(source.match(/async function loadPreview[\s\S]*?\n\}/)?.[0] || "", /query/);
@@ -147,7 +151,7 @@ test("drawer, editor, and scoped popups keep desktop typography readable", () =>
   assert.doesNotMatch(desktopStyles, /font-size:\s*(?:8(?:\.5)?|9(?:\.5)?)px/);
   assert.match(source, /\.memory-name-line strong[^}]*font-size:\s*14px/);
   assert.match(source, /\.memory-description[^}]*font-size:\s*13px/);
-  assert.match(source, /\.memory-meta, \.memory-source[^}]*font-size:\s*12px/);
+  assert.match(source, /\.memory-meta[^}]*font-size:\s*12px/);
   assert.match(source, /\.memory-form > label[^}]*font-size:\s*13px/);
   assert.match(source, /popper-class="task-memory-task-select-popper"/);
   assert.match(source, /customClass: "task-memory-confirm"/);

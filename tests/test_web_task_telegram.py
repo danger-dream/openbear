@@ -372,7 +372,7 @@ async def test_result_uses_one_full_rich_message(tmp_path, monkeypatch):
         assert "任务已完成" in bot.sent[0]["body"]
         assert "<b>📄 最终回答</b>" in bot.sent[0]["body"]
         assert bot.sent[0]["body"].count("这是安全的最终回答。") == 260
-        assert bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data == "wt:reply"
+        assert bot.sent[0]["reply_markup"] is None  # Native reply works without an extra button.
         bound = await (await db.conn.execute("SELECT * FROM web_tg_messages WHERE telegram_message_id=901")).fetchone()
         assert bound["conversation_uuid"] == "conv-1"
     finally:
@@ -514,7 +514,7 @@ async def test_all_result_pages_bound_and_partial_delivery_retries_without_dupli
         bindings = await (await db.conn.execute("SELECT * FROM web_tg_messages ORDER BY telegram_message_id")).fetchall()
         assert [b["telegram_message_id"] for b in bindings] == ids
         assert {b["conversation_uuid"] for b in bindings} == {"conv-1"}
-        assert all(item["reply_markup"].inline_keyboard[0][0].callback_data == "wt:reply" for item in bot.sent)
+        assert all(item["reply_markup"] is None for item in bot.sent)
         from app.web_telegram_replies import WebTelegramReplies
         bridge = WebTelegramReplies(_config(), db, bot, None)
         assert all([await bridge.message_record(123, mid) for mid in ids])

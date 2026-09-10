@@ -48,6 +48,21 @@ export function createOutboundSendTracker(options = {}) {
     return current;
   }
 
+  function markUploading(pending) {
+    if (current !== pending) return false;
+    clearTimer();
+    pending.phase = "uploading";
+    pending.deadlineAt = Infinity;
+    return true;
+  }
+
+  function markPrepared(pending) {
+    if (current !== pending) return false;
+    pending.phase = "preparing";
+    arm(pending, options.prepareTimeoutMs ?? SEND_PREPARE_TIMEOUT_MS);
+    return true;
+  }
+
   function markSent(pending) {
     if (current !== pending) return false;
     pending.phase = "sent";
@@ -57,6 +72,8 @@ export function createOutboundSendTracker(options = {}) {
 
   return {
     begin,
+    markUploading,
+    markPrepared,
     markSent,
     take,
     checkDeadline,

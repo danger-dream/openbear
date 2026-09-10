@@ -29,6 +29,7 @@ POLL_INTERVAL_S = 300
 USER_AGENT = "OpenBear-UpdateCheck/1.0"
 RESULT_FILE = "update-result.json"
 STATE_FILE = "update-state.json"
+NOTIFICATIONS_FILE = "update-notifications.json"
 REQUEST_FILE = "update-request.json"
 
 
@@ -66,6 +67,7 @@ class UpdateService:
         self.install_root = Path.cwd().resolve()
         self.data_dir = data_dir_from_config(svc.config)
         self.state_path = self.data_dir / STATE_FILE
+        self.notifications_path = self.data_dir / NOTIFICATIONS_FILE
         self.result_path = self.data_dir / RESULT_FILE
         self.request_path = self.data_dir / REQUEST_FILE
         self._task: asyncio.Task[Any] | None = None
@@ -199,15 +201,13 @@ class UpdateService:
             dest = dest_dir / "openbear-update.py"
             shutil.copy2(updater_script_path(), dest)
             atomic_write_json(self.request_path, request)
-            state["phase"] = "starting"
-            state["requestId"] = request_id
-            atomic_write_json(self.state_path, state)
+            self._merge_state(phase="starting", requestId=request_id)
             try:
                 await self._launch_updater(dest)
             except Exception as exc:
-                state["phase"] = "idle"
-                state["lastError"] = f"{type(exc).__name__}: {exc}"
-                atomic_write_json(self.state_path, state)
+                # GitHub checks may have refreshed the release and notification
+                # history while launch yielded. Never write that old snapshot back.
+                self._merge_state(phase="idle", lastError=f"{type(exc).__name__}: {exc}")
                 log.exception("启动更新器失败")
                 return {"ok": False, "error": f"launch_failed: {type(exc).__name__}: {exc}"}
             return {
@@ -291,22 +291,31 @@ class UpdateService:
             return
         available = await self._release_to_available(payload)
         state = read_json(self.state_path)
-        prev = state.get("available") if isinstance(state.get("available"), dict) else {}
-        notified_version = str(prev.get("notifiedVersion") or "")
+        notified_versions = self._notification_history(state)
+        updater = load_updater()
+        latest = str(available.get("version") or "")
+        current = installed_version()
+        notify = bool(latest and updater.is_newer(latest, current) and latest not in notified_versions)
+        if notify:
+            notified_versions.append(latest)
+        if latest in notified_versions:
+            # Keep the old field for compatibility, but never use the replaceable
+            # release snapshot as the durable notification history again.
+            available["notifiedVersion"] = latest
+        # Claim durably BEFORE Telegram I/O. There is deliberately no await from
+        # reading the history through saving it, so overlapping checks cannot
+        # both claim a version. Unknown delivery/shutdown outcomes do not retry:
+        # a missed reminder is preferable to repeatedly notifying the user.
         self._merge_state(
             checkedAt=int(time.time()),
             etag=etag,
             lastError="",
             available=available,
+            notifiedVersions=notified_versions,
         )
-        updater = load_updater()
-        latest = str(available.get("version") or "")
-        current = installed_version()
-        if latest and updater.is_newer(latest, current) and notified_version != latest:
-            await self._notify_admins(self._new_version_text(available))
-            available["notifiedVersion"] = latest
-            self._merge_state(available=available)
         self._etag = etag
+        if notify:
+            await self._notify_admins(self._new_version_text(available))
 
     async def _release_to_available(self, payload: dict[str, Any]) -> dict[str, Any]:
         tag = str(payload.get("tag_name") or "")
@@ -375,7 +384,7 @@ class UpdateService:
         atomic_write_json(self.result_path, result)
 
     async def _notify_admins(self, text: str) -> None:
-        ids = [int(x) for x in (getattr(self.config.telegram, "whitelist_ids", None) or []) if int(x) > 0]
+        ids = list(dict.fromkeys(int(x) for x in (getattr(self.config.telegram, "whitelist_ids", None) or []) if int(x) > 0))
         if not ids or self.bot is None:
             return
         for chat_id in ids:
@@ -409,9 +418,34 @@ class UpdateService:
             return f"❌ <b>OpenBear 更新失败</b>\n目标 <code>v{to}</code>\n{message}"
         return ""
 
+    @staticmethod
+    def _notified_versions(state: dict[str, Any]) -> list[str]:
+        history = state.get("notifiedVersions")
+        versions = [version for version in history if isinstance(version, str) and version] if isinstance(history, list) else []
+        available = state.get("available")
+        legacy = str(available.get("notifiedVersion") or "") if isinstance(available, dict) else ""
+        if legacy:
+            versions.append(legacy)
+        return list(dict.fromkeys(versions))
+
+    def _notification_history(self, state: dict[str, Any]) -> list[str]:
+        # The standalone updater also writes update-state.json and can overwrite
+        # it from an older snapshot. Only this service owns the notification file.
+        return list(dict.fromkeys([
+            *self._notified_versions(read_json(self.notifications_path)),
+            *self._notified_versions(state),
+        ]))
+
     def _merge_state(self, **fields: Any) -> None:
         state = read_json(self.state_path)
+        # Migrate both old notification formats before ANY available replacement,
+        # including a 404/draft response that clears the release snapshot.
+        history = self._notification_history(state)
         state.update(fields)
+        state["notifiedVersions"] = list(dict.fromkeys([*history, *self._notified_versions(state)]))
+        # Persist the independent claim before writing replaceable updater state
+        # or awaiting Telegram; keep the state copy for backwards compatibility.
+        atomic_write_json(self.notifications_path, {"schema": 1, "notifiedVersions": state["notifiedVersions"]})
         state.setdefault("schema", 1)
         atomic_write_json(self.state_path, state)
 

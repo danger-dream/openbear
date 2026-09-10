@@ -26,7 +26,7 @@ test("only same-origin canonical artifact paths become preview identities, using
 
 for (const [fileName, mimeType, kind, language] of [
 	["方案.MD", "text/plain", "markdown", "markdown"], ["log.txt", "text/plain", "text", ""], ["data.json", "application/json", "code", "json"], ["a.yaml", "application/octet-stream", "code", "yaml"], ["script.py", "text/x-python", "code", "python"],
-	["picture.png", "image/png", "image", ""], ["page.html", "text/html", "code", "xml"], ["picture.svg", "image/png", "code", "xml"], ["innocent.png", "image/svg+xml", "code", "xml"], ["not-a-picture.md", "image/png", "unsupported", ""], ["archive.zip", "application/zip", "unsupported", ""], ["doc.pdf", "application/pdf", "unsupported", ""],
+	["picture.png", "image/png", "image", ""], ["page.html", "text/html", "html", "xml"], ["page.HTM", "application/octet-stream", "html", "xml"], ["mislabeled.png", "text/html", "html", "xml"], ["page.html", "image/png", "html", "xml"], ["picture.svg", "image/png", "code", "xml"], ["innocent.png", "image/svg+xml", "code", "xml"], ["not-a-picture.md", "image/png", "unsupported", ""], ["archive.zip", "application/zip", "unsupported", ""], ["doc.pdf", "application/pdf", "unsupported", ""],
 ]) test(`file classification: ${fileName} / ${mimeType}`, () => assert.deepEqual([artifactFormat({fileName, mimeType}).kind, artifactFormat({fileName, mimeType}).language], [kind, language]));
 
 test("missing metadata is a valid loading/error state", () => {
@@ -69,12 +69,25 @@ test("cards and viewer share metadata/text requests and use canonical authentica
 	await loadArtifactText(record); assert.equal(calls.length, 2);
 });
 
-test("large text, image and unsupported cards only fetch metadata; content loads on demand", async () => {
-	for (const meta of [metadata({sizeBytes: SUMMARY_LIMIT + 1}), metadata({fileName: "a.png", mimeType: "image/png"}), metadata({fileName: "a.zip", mimeType: "application/zip"})]) {
+test("large text, HTML, image and unsupported cards only fetch metadata; content loads on demand", async () => {
+	for (const meta of [metadata({sizeBytes: SUMMARY_LIMIT + 1}), metadata({fileName: "a.html", mimeType: "text/html"}), metadata({fileName: "a.png", mimeType: "image/png"}), metadata({fileName: "a.zip", mimeType: "application/zip"})]) {
 		clearArtifactCache(); const calls = fakeFetch(meta); await loadArtifactCard(artifactRecord(identity)); assert.equal(calls.length, 1);
 	}
 	clearArtifactCache(); const calls = fakeFetch(metadata({sizeBytes: TEXT_PREVIEW_LIMIT + 1}));
 	await assert.rejects(loadArtifactText(artifactRecord(identity)), /预览上限/); assert.equal(calls.length, 1);
+});
+
+test("HTML text is fetched unchanged on demand without exposing source in the card summary", async () => {
+	const html = '<!doctype html><h1>演示</h1><script>window.demo = true</script>';
+	const calls = fakeFetch(metadata({fileName: "page.html", mimeType: "text/html"}), html);
+	const record = artifactRecord(identity);
+	await loadArtifactCard(record); assert.equal(calls.length, 1);
+	assert.equal(await loadArtifactText(record), html); assert.equal(calls.length, 2);
+	assert.equal(record.summary, null);
+	const state = readingState("html:v1", "source"); assert.equal(state.mode, "source");
+	state.mode = "preview";
+	assert.equal(readingState("html:v1", "source").mode, "preview");
+	assert.equal(readingState("html:v2", "source").mode, "source");
 });
 
 test("actual response limits are enforced even if metadata or Content-Length is missing/wrong", async () => {

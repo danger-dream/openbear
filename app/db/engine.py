@@ -138,6 +138,9 @@ class DB:
             )
 
     async def _pre_migrate_existing_web_schema(self) -> None:
+        await self._add_column_if_missing(
+            "web_conversation_folders", "run_defaults_json", "run_defaults_json TEXT NOT NULL DEFAULT '{}'"
+        )
         has_web_conversations = await self._table_exists("web_conversations")
         had_display_order = has_web_conversations and "display_order" in await self._columns("web_conversations")
         await self._add_column_if_missing("web_conversations", "pinned_at", "pinned_at INTEGER DEFAULT 0")

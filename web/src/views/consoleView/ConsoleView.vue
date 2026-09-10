@@ -45,7 +45,7 @@ import {
 	toolResultItems,
 	toolResultKey,
 } from "./display.js";
-import {Api, apiError, conversationWsUrl, filesToWsPayload} from "../../api.js";
+import {Api, apiError, conversationWsUrl} from "../../api.js";
 import {copyTextToClipboard} from "../../utils/clipboard.js";
 import {
 	createTerminalStateRefreshScheduler,
@@ -226,6 +226,10 @@ const sentAttachmentPreviewUrls = new Set();
 const localToServerTransitionUuid = ref("");
 let defaultsRequestSeq = 0;
 let appliedDefaultsRevision = 0;
+let localDefaultsFolderId = null;
+let localFolderDefaults = {};
+let localDefaultsOverrides = {};
+let localDefaultsLoading = null;
 let optionsLoadPromise = null;
 let agentAutoOpenBoundaryConversation = "";
 let agentAutoOpenPendingConversation = "";
@@ -614,36 +618,83 @@ function completeLocalRunConfig() {
 	};
 }
 
-async function loadLocalRunDefaults(uuid = props.conversationUuid) {
+async function loadLocalRunDefaults(uuid = props.conversationUuid, {preserveManual = false} = {}) {
 	const requestSeq = ++defaultsRequestSeq;
 	const expectedUuid = String(uuid || "");
-	try {
-		const data = await Api.conversationDefaults();
-		if (requestSeq !== defaultsRequestSeq || props.conversationUuid !== expectedUuid || !isLocalConversation.value) return false;
-		const defaults = data?.defaults || {};
-		appliedDefaultsRevision = Number(defaults.revision || 0);
-		applyLocalRunDefaults(defaults);
-		return true;
-	} catch {
-		// Defaults are an enhancement for unsent local:new only. Keep the existing
-		// primary-model fallback and do not surface a blocking error.
-		return false;
-	}
+	const folderId = String(props.folderId || "");
+	if (!preserveManual) localDefaultsOverrides = {};
+	localDefaultsFolderId = null;
+	const pending = {uuid: expectedUuid, folderId, promise: null};
+	localDefaultsLoading = pending;
+	pending.promise = (async () => {
+		try {
+			const data = await Api.conversationDefaults(folderId ? {folderId} : {});
+			if (requestSeq !== defaultsRequestSeq || props.conversationUuid !== expectedUuid || String(props.folderId || "") !== folderId || !isLocalConversation.value) return false;
+			const defaults = data?.defaults || {};
+			appliedDefaultsRevision = Number(defaults.revision || 0);
+			localFolderDefaults = data?.folderDefaults || {};
+			localDefaultsFolderId = folderId;
+			applyLocalRunDefaults({...defaults, ...localDefaultsOverrides});
+			return true;
+		} catch {
+			// Both temporary and project drafts must load their scoped defaults
+			// before sending, never silently use a previous group's cost tier.
+			return false;
+		} finally {
+			if (localDefaultsLoading === pending) localDefaultsLoading = null;
+		}
+	})();
+	return pending.promise;
+}
+
+async function ensureLocalRunDefaults() {
+	const folderId = String(props.folderId || "");
+	if (!isLocalConversation.value || localDefaultsFolderId === folderId) return;
+	const pending = localDefaultsLoading;
+	const loaded = await (pending?.folderId === folderId && pending.uuid === String(props.conversationUuid || "")
+		? pending.promise : loadLocalRunDefaults());
+	if (!loaded) throw new Error("无法读取会话默认配置，请检查连接后重试");
 }
 
 async function patchLocalRunDefaults(patch) {
-	defaultsRequestSeq += 1;
 	const expectedUuid = String(props.conversationUuid || "");
+	const folderId = String(props.folderId || "");
+	await ensureLocalRunDefaults();
+	if (props.conversationUuid !== expectedUuid || String(props.folderId || "") !== folderId || !isLocalConversation.value) return null;
+	const requestSeq = ++defaultsRequestSeq;
+	if (Object.keys(localFolderDefaults).length) {
+		localDefaultsOverrides = {...localDefaultsOverrides, ...patch};
+		// A one-off choice in a project draft is not a global preference update
+		// and must not reset the other fields inherited from that project.
+		applyLocalRunDefaults({...completeLocalRunConfig(), ...patch});
+		resetLocalConversationState(expectedUuid || "local:new");
+		return completeLocalRunConfig();
+	}
 	const data = await Api.updateConversationDefaults(patch);
 	const defaults = data?.defaults || {};
 	const revision = Number(defaults.revision || 0);
-	if (props.conversationUuid !== expectedUuid || !isLocalConversation.value || revision < appliedDefaultsRevision) {
+	if (requestSeq !== defaultsRequestSeq || props.conversationUuid !== expectedUuid || String(props.folderId || "") !== folderId || !isLocalConversation.value || revision < appliedDefaultsRevision) {
 		return defaults || null;
 	}
 	appliedDefaultsRevision = revision;
+	localDefaultsOverrides = {...localDefaultsOverrides, ...patch};
 	applyLocalRunDefaults(defaults);
 	resetLocalConversationState(expectedUuid || "local:new");
 	return defaults || null;
+}
+
+async function refreshFolderRunDefaults({preserveManual = false} = {}) {
+	if (!isLocalConversation.value || outboundSends.current) return;
+	const uuid = String(props.conversationUuid || "");
+	const folderId = String(props.folderId || "");
+	await loadOptions();
+	const loaded = await loadLocalRunDefaults(uuid, {preserveManual});
+	if (loaded && isLocalConversation.value && props.conversationUuid === uuid && String(props.folderId || "") === folderId && !outboundSends.current) resetLocalConversationState(uuid);
+}
+
+function handleFolderPropertiesChanged(event) {
+	const temporary = event?.detail?.folderId === "__temporary";
+	if (isLocalConversation.value && Boolean(props.folderId) !== temporary) void refreshFolderRunDefaults({preserveManual: true});
 }
 
 function statsUsageSnapshot(stats = {}) {
@@ -2501,6 +2552,7 @@ function finishPendingOutboundSend(requestId) {
 
 function restoreReleasedOutboundSend(pending, error = "send_failed", {uncertain = false} = {}) {
 	if (!pending) return false;
+	pending.uploadController?.abort();
 	sendPending.value = Boolean(outboundSends.current);
 	const uuid = pending.conversationUuid;
 	const isActive = uuid === activeConversationUuid.value;
@@ -2768,6 +2820,8 @@ function checkConnectionOnResume() {
 
 async function ensureServerConversationForSend(firstText, pending) {
 	if (!isLocalConversation.value) return activeConversationUuid.value;
+	await ensureLocalRunDefaults();
+	if (!outboundSends.isCurrent(pending)) return "";
 	const title = referenceDisplayText(firstText || "新会话").replace(/\s+/g, " ").trim().slice(0, 36) || "新会话";
 	const created = await Api.createConversation({title, runConfig: completeLocalRunConfig(), folderId: props.folderId || ""});
 	if (!outboundSends.isCurrent(pending)) return "";
@@ -3067,11 +3121,27 @@ async function send() {
 		if (!isCurrent()) return;
 		const conversationUuid = await ensureServerConversationForSend(finalText, pending);
 		if (!isCurrent()) return;
-		const wsFiles = files.length ? await filesToWsPayload(files) : [];
+		let uploadedFiles = [];
+		if (files.length) {
+			pending.uploadController = new AbortController();
+			outboundSends.markUploading(pending);
+			status.value = "上传附件中";
+			uploadedFiles = await Api.uploadConversationFiles(conversationUuid, files, {
+				signal: pending.uploadController.signal,
+				onProgress: ({loaded, total, fileIndex, fileCount}) => {
+					if (!isCurrent()) return;
+					const percent = total ? Math.min(100, Math.floor(loaded * 100 / total)) : 100;
+					status.value = `上传附件 ${fileIndex + 1}/${fileCount} · ${percent}%${loaded >= total ? " · 保存中" : ""}`;
+				},
+			});
+			if (!isCurrent()) return;
+			outboundSends.markPrepared(pending);
+			status.value = "提交中";
+		}
 		if (!isCurrent()) return;
 		const sock = await ensureResponsiveWs(conversationUuid, isCurrent);
 		if (!isCurrent()) return;
-		sock.send(JSON.stringify({type: "send", requestId, text, files: wsFiles}));
+		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles}));
 		outboundSends.markSent(pending);
 		emit("conversations-refresh");
 		window.dispatchEvent(new CustomEvent("openbear:conversations-refresh"));
@@ -3090,6 +3160,11 @@ async function send() {
 }
 
 async function stop() {
+	if (outboundSends.current?.phase === "uploading") {
+		leavePendingSend();
+		status.value = "上传已取消，草稿和附件已保留";
+		return;
+	}
 	try {
 		await ElMessageBox.confirm(
 			"停止后会中断当前正在执行的模型请求和工具任务，已产生的对话与统计会尽量保留。确定要停止吗？",
@@ -3162,6 +3237,16 @@ watch(() => props.conversationUuid, async (next, prev) => {
 	if (isLocalConversation.value) await focusComposer();
 }, {immediate: false});
 
+watch(() => props.folderId, (next, prev) => {
+	if (next === prev || !isLocalConversation.value) return;
+	leavePendingSend();
+	localDefaultsFolderId = null;
+	localFolderDefaults = {};
+	localDefaultsOverrides = {};
+	applyDefaultLocalModel();
+	void refreshFolderRunDefaults();
+});
+
 watch(() => draft.value, (value) => {
 	if (restoringDraft.value) return;
 	setDraftForConversation(props.conversationUuid, value);
@@ -3183,6 +3268,7 @@ watch(messages, () => {
 onMounted(async () => {
 	componentMounted = true;
 	window.addEventListener("openbear:console-refresh", handleExternalRefresh);
+	window.addEventListener("openbear:folder-properties-changed", handleFolderPropertiesChanged);
 	window.addEventListener("focus", checkConnectionOnResume);
 	window.addEventListener("pageshow", checkConnectionOnResume);
 	window.addEventListener("online", checkConnectionOnResume);
@@ -3204,6 +3290,8 @@ onBeforeUnmount(() => {
 	toolDetailCache.reset("");
 	terminalStateRefreshScheduler.dispose();
 	window.removeEventListener("openbear:console-refresh", handleExternalRefresh);
+	window.removeEventListener("openbear:folder-properties-changed", handleFolderPropertiesChanged);
+	defaultsRequestSeq += 1;
 	window.removeEventListener("focus", checkConnectionOnResume);
 	window.removeEventListener("pageshow", checkConnectionOnResume);
 	window.removeEventListener("online", checkConnectionOnResume);

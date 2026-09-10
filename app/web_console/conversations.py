@@ -198,6 +198,7 @@ class WebAdminConversationsMixin:
         run_config: dict[str, Any] | None = None,
         folder_uuid: str = "",
         persist_defaults: bool = False,
+        defaults_seed: dict[str, Any] | None = None,
         create_lock_held: bool = False,
     ) -> dict[str, Any]:
         conv_uuid = conversation_uuid or str(uuid.uuid4())
@@ -278,6 +279,20 @@ class WebAdminConversationsMixin:
                                     owner_chat_id, model_label, main_thinking, main_fast,
                                     agent_model, agent_thinking, agent_fast, 1, ts,
                                 ),
+                            )
+                        elif defaults_seed is not None:
+                            # Folder defaults are a creation snapshot, not a new
+                            # global last-used preference. Seed the previous
+                            # fallback atomically before this project conversation
+                            # could otherwise become the first preference source.
+                            await conn.execute(
+                                """INSERT OR IGNORE INTO web_conversation_defaults
+                                   (owner_chat_id,main_model,main_thinking_level,main_fast_mode,
+                                    agent_model,agent_think_level,agent_fast_mode,revision,updated_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                                (owner_chat_id, defaults_seed["main_model"], defaults_seed["main_thinking_level"],
+                                 defaults_seed["main_fast_mode"], defaults_seed["agent_model"], defaults_seed["agent_think_level"],
+                                 defaults_seed["agent_fast_mode"], 1, ts),
                             )
                     return await self._conversation_row(owner_chat_id, conv_uuid, require=True)
                 except sqlite3.IntegrityError as exc:

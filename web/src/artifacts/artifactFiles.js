@@ -40,8 +40,9 @@ export function artifactFormat(metadata = {}) {
 	const name = String(metadata.fileName || "").toLowerCase();
 	const ext = name.includes(".") ? name.split(".").pop() : name;
 	const mime = String(metadata.mimeType || "").split(";")[0].trim().toLowerCase();
-	// Active formats are source-only even if the server incorrectly labels them as an image.
-	if (["html", "htm", "svg"].includes(ext) || ["text/html", "application/xhtml+xml", "image/svg+xml"].includes(mime)) return {kind: "code", label: ext === "svg" || mime === "image/svg+xml" ? "SVG 源码" : "HTML 源码", language: "xml", sourceOnly: true};
+	// Never send active formats to the ordinary image renderer, even if mislabeled.
+	if (ext === "svg" || mime === "image/svg+xml") return {kind: "code", label: "SVG 源码", language: "xml", sourceOnly: true};
+	if (["html", "htm"].includes(ext) || ["text/html", "application/xhtml+xml"].includes(mime)) return {kind: "html", label: "HTML", language: "xml"};
 	const generic = !mime || mime === "application/octet-stream";
 	const textMime = generic || mime.startsWith("text/") || Boolean(CODE_MIMES[mime]) || mime === "application/toml";
 	if ((SAFE_IMAGES.has(ext) && (generic || SAFE_IMAGE_MIMES.has(mime))) || SAFE_IMAGE_MIMES.has(mime) && !CODE_EXTENSIONS[ext] && !["md", "markdown", "txt"].includes(ext)) return {kind: "image", label: "图片", language: ""};
@@ -82,8 +83,8 @@ export function artifactRecord(identity) {
 	if (records.has(identity.key)) return touch(records, identity.key, records.get(identity.key));
 	return touch(records, identity.key, shallowReactive({identity, cacheGeneration, metadata: null, summary: null, metadataError: "", busy: false, checkedAt: 0, metadataRequest: null, textRequest: null}));
 }
-export function readingState(key) {
-	return touch(readingStates, key, readingStates.get(key) || {mode: "preview", previewTop: 0, sourceTop: 0, wrap: true});
+export function readingState(key, initialMode = "preview") {
+	return touch(readingStates, key, readingStates.get(key) || {mode: initialMode, previewTop: 0, sourceTop: 0, wrap: true});
 }
 export function clearArtifactCache() { cacheGeneration++; records.clear(); texts.clear(); readingStates.clear(); cachedBytes = 0; }
 
@@ -155,7 +156,7 @@ export async function loadArtifactText(record) {
 	const meta = await loadArtifactMetadata(record);
 	assertCurrentRecord(record);
 	const format = artifactFormat(meta);
-	if (!["markdown", "text", "code"].includes(format.kind)) throw new Error("此格式暂不支持文本预览，请下载原文件。");
+	if (!["markdown", "html", "text", "code"].includes(format.kind)) throw new Error("此格式暂不支持文本预览，请下载原文件。");
 	if (meta.sizeBytes > TEXT_PREVIEW_LIMIT) throw new Error("文件超过 2 MB 的文本预览上限，请下载查看。");
 	const key = `${record.identity.key}:${meta.sha256 || ""}`;
 	if (texts.has(key)) { const cached = texts.get(key); texts.delete(key); texts.set(key, cached); return cached.text; }
@@ -165,7 +166,7 @@ export async function loadArtifactText(record) {
 		if (currentGeneration !== cacheGeneration) return value.text;
 		texts.set(key, value); cachedBytes += value.bytes;
 		while (cachedBytes > TEXT_CACHE_LIMIT || texts.size > 64) { const oldest = texts.keys().next().value; cachedBytes -= texts.get(oldest).bytes; texts.delete(oldest); }
-		record.summary = extractArtifactSummary(value.text, format.kind);
+		if (format.kind !== "html") record.summary = extractArtifactSummary(value.text, format.kind);
 		return value.text;
 	}).finally(() => { record.textRequest = null; });
 	record.textRequest = promise;

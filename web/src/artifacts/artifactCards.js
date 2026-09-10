@@ -5,20 +5,27 @@ import {artifactFromUrl} from "./artifactFiles.js";
 const mountedRoots = new WeakMap();
 const SLOT = "[data-artifact-slot]";
 
+// Split phrasing ancestors rather than inserting a block inside <p>/<strong>/<h2>.
+// List items and blockquotes remain the card's container, preserving their order.
+function liftCard(slot, target) {
+	while (slot.parentElement !== target && !slot.parentElement.matches("li, blockquote, div")) {
+		const parent = slot.parentElement;
+		const before = parent.cloneNode(false), after = parent.cloneNode(false);
+		while (parent.firstChild !== slot) before.appendChild(parent.firstChild);
+		while (slot.nextSibling) after.appendChild(slot.nextSibling);
+		after.removeAttribute("id");
+		const meaningful = node => node.textContent.trim() || node.querySelector("img, br, input, .md-live-caret");
+		parent.replaceWith(...(meaningful(before) ? [before] : []), slot, ...(meaningful(after) ? [after] : []));
+	}
+}
+
 export function prepareArtifactCards(target) {
 	const occurrences = new Map();
-	for (const paragraph of Array.from(target.children)) {
-		// Only standalone paragraphs become cards. Sentences, tables, lists,
-		// blockquotes, code examples and linked/embedded images keep their layout.
-		if (paragraph.tagName !== "P" || paragraph.querySelector("img")) continue;
-		const links = paragraph.querySelectorAll("a[href]");
-		if (links.length !== 1) continue;
-		const link = links[0], identity = artifactFromUrl(link.getAttribute("href"));
-		if (!identity) continue;
-		const rest = paragraph.cloneNode(true);
-		rest.querySelector("a").remove();
-		for (const caret of rest.querySelectorAll(".md-live-caret")) caret.remove();
-		if (!/^[\s\p{Extended_Pictographic}\uFE0F\u200D]*$/u.test(rest.textContent)) continue;
+	for (const link of Array.from(target.querySelectorAll("a[href]"))) {
+		// Keep tables, examples, linked images and explicit download links intact.
+		if (link.closest("pre, code, table") || link.querySelector("img") || link.hasAttribute("download")) continue;
+		const identity = artifactFromUrl(link.getAttribute("href"));
+		if (!identity || identity.download) continue;
 		const occurrence = occurrences.get(identity.key) || 0;
 		occurrences.set(identity.key, occurrence + 1);
 		const slot = target.ownerDocument.createElement("div");
@@ -26,7 +33,19 @@ export function prepareArtifactCards(target) {
 		slot.dataset.artifactSlot = `${identity.key}:${occurrence}`;
 		slot.dataset.artifactHref = identity.contentUrl;
 		slot.dataset.artifactLabel = link.textContent.trim();
-		paragraph.replaceWith(slot);
+		// Preserve the existing compact layout of emoji + standalone file links.
+		const paragraph = link.closest("p");
+		if (paragraph && !paragraph.querySelector("img") && paragraph.querySelectorAll("a").length === 1) {
+			const rest = paragraph.cloneNode(true);
+			rest.querySelector("a").remove();
+			for (const caret of rest.querySelectorAll(".md-live-caret")) caret.remove();
+			if (/^[\s\p{Extended_Pictographic}\uFE0F\u200D]*$/u.test(rest.textContent)) {
+				paragraph.replaceWith(slot);
+				continue;
+			}
+		}
+		link.replaceWith(slot);
+		liftCard(slot, target);
 	}
 }
 

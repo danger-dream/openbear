@@ -8,11 +8,17 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import MdEditor from "./MdEditor.vue";
+import "./conversationTreeProperties.css";
 import ConversationPromptDialog from "./ConversationPromptDialog.vue";
 import ConversationOverview from "./ConversationOverview.vue";
 import { treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop } from "./conversationTreeInteractions.js";
 import { referenceCatalog } from "../references/catalog.js";
 import { REFERENCE_MIME, referenceToken } from "../references/codec.js";
+import { modelDefaultThinking, modelThinkingLevels, thinkingLabel } from "../views/consoleView/display.js";
+import {
+  RUN_DEFAULT_INHERIT, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
+  runDefaultOption, runDefaultSelection, sparseRunDefaults, updateRunDefault,
+} from "./folderRunDefaults.js";
 
 const props = defineProps({
   activeConversationUuid: { type: String, default: "" },
@@ -56,7 +62,16 @@ const promptRow = ref(null);
 const propertiesDialog = ref(false);
 const propertiesLoading = ref(false);
 const propertiesSaving = ref(false);
-const propertiesForm = reactive({ folderId: "", parentId: "", name: "", path: "", workspaceDir: "", promptMarkdown: "", workspaceEffective: "", workspaceSource: "", promptEffective: "", promptSource: "" });
+const propertiesTab = ref("context");
+const propertyModelOptions = ref([]);
+const propertiesRunDefaultsBaseline = ref({});
+const propertiesForm = reactive({
+  folderId: "", parentId: "", name: "", path: "", temporary: false, workspaceDir: "", promptMarkdown: "",
+  workspaceEffective: "", workspaceSource: "", promptEffective: "", promptSource: "",
+  runDefaults: {}, runInherited: {}, runFallback: {}, runResolved: {}, runSources: {},
+});
+let propertiesRequestGeneration = 0;
+let propertiesSaveGeneration = 0;
 const moveDialog = ref(false);
 const moveBusy = ref(false);
 const moveMode = ref("move");
@@ -666,18 +681,273 @@ function removeConversation(row) {
   emit("delete-conversation", row);
 }
 async function showProperties(row) {
+  const request = ++propertiesRequestGeneration;
+  propertiesSaveGeneration += 1;
+  propertiesSaving.value = false;
+  propertiesTab.value = "context";
+  propertyModelOptions.value = [];
+  propertyModelsLoaded.value = false;
+  resetPropertiesForm(row);
+  const folderId = propertiesForm.folderId;
   propertiesDialog.value = true;
   propertiesLoading.value = true;
+  const [propertiesResult, optionsResult] = await Promise.allSettled([
+    Api.conversationFolderProperties(folderId),
+    Api.rathOptions(),
+  ]);
+  if (request !== propertiesRequestGeneration || !propertiesDialog.value) return;
   try {
-    const data = await Api.conversationFolderProperties(row.folderId);
+    if (propertiesResult.status === "rejected") throw propertiesResult.reason;
+    const data = propertiesResult.value;
+    if (optionsResult.status === "fulfilled") {
+      propertyModelOptions.value = Array.isArray(optionsResult.value?.models) ? optionsResult.value.models : [];
+      propertyModelsLoaded.value = true;
+    } else {
+      ElMessage.warning("模型选项加载失败；仍可编辑上下文，运行默认暂不可改");
+    }
     Object.assign(propertiesForm, {
-      folderId: row.folderId, parentId: String(row.parentId || ""), name: data.name, path: data.path,
+      folderId, parentId: String(row.parentId || ""), name: data.name, path: data.path,
       workspaceDir: data.workspace?.local || "", promptMarkdown: data.prompt?.local || "",
       workspaceEffective: data.workspace?.effective || "", workspaceSource: data.workspace?.sourcePath || "",
       promptEffective: data.prompt?.effective || "", promptSource: data.prompt?.sourcePath || "",
+      runDefaults: sparseRunDefaults(data.runDefaults?.local),
+      runInherited: sparseRunDefaults(data.runDefaults?.inherited),
+      runFallback: sparseRunDefaults(data.runDefaults?.fallback),
+      runResolved: sparseRunDefaults(data.runDefaults?.resolved),
+      runSources: data.runDefaults?.sources && typeof data.runDefaults.sources === "object" ? { ...data.runDefaults.sources } : {},
     });
-  } catch (error) { propertiesDialog.value = false; ElMessage.error(apiError(error)); }
-  finally { propertiesLoading.value = false; }
+    propertiesRunDefaultsBaseline.value = sparseRunDefaults(data.runDefaults?.local);
+  } catch (error) {
+    propertiesDialog.value = false;
+    ElMessage.error(apiError(error));
+  } finally {
+    if (request === propertiesRequestGeneration) propertiesLoading.value = false;
+  }
+}
+const propertyModelsLoaded = ref(false);
+const runDefaultsChanged = computed(() => JSON.stringify(sparseRunDefaults(propertiesForm.runDefaults))
+  !== JSON.stringify(propertiesRunDefaultsBaseline.value));
+const draftRunDefaults = computed(() => resolvedRunDefaults(
+  propertiesForm.runDefaults,
+  propertiesForm.runInherited,
+  propertiesForm.runFallback,
+));
+const appliedRunDefaults = computed(() => {
+  if (!propertyModelsLoaded.value) {
+    const serverResolved = sparseRunDefaults(propertiesForm.runResolved);
+    return Object.keys(serverResolved).length ? resolvedRunDefaults(serverResolved, {}, propertiesForm.runFallback) : draftRunDefaults.value;
+  }
+  return normalizedRunDefaults({
+    local: propertiesForm.runDefaults,
+    inherited: propertiesForm.runInherited,
+    fallback: propertiesForm.runFallback,
+    resolved: propertiesForm.runResolved,
+  }, propertyModelOptions.value);
+});
+const hasLocalRunDefaults = computed(() => Object.keys(sparseRunDefaults(propertiesForm.runDefaults)).length > 0);
+function propertyModel(key) {
+  return propertyModelOptions.value.find((model) => model.key === String(key || "")) || null;
+}
+function propertyModelLabel(model) {
+  if (!model) return "";
+  const name = String(model.name || model.label || model.key || "");
+  const key = String(model.key || "");
+  const provider = String(model.provider || "");
+  return [name && name !== key ? `${name} · ${key}` : key, provider].filter(Boolean).join(" · ");
+}
+function propertyModelValueLabel(key) {
+  const value = String(key || "");
+  const model = propertyModel(value);
+  if (model) return propertyModelLabel(model);
+  if (!value) return "未配置";
+  return propertyModelsLoaded.value ? `未知或已移除模型 · ${value}` : value;
+}
+function thinkingValueLabel(value) {
+  if (value === "off") return "关闭（off）";
+  return thinkingLabel(value) || "未配置";
+}
+const mainDefaultModelKey = computed(() => String(appliedRunDefaults.value.mainModel || ""));
+const mainDefaultModel = computed(() => propertyModel(mainDefaultModelKey.value));
+const mainThinkingOptions = computed(() => {
+  const levels = modelThinkingLevels(mainDefaultModel.value);
+  return levels.length ? levels : ["off"];
+});
+const agentDefaultModelKey = computed(() => {
+  const configured = appliedRunDefaults.value.agentModel;
+  return configured === "" ? mainDefaultModelKey.value : String(configured || "");
+});
+const agentDefaultModel = computed(() => propertyModel(agentDefaultModelKey.value));
+const agentThinkingOptions = computed(() => modelThinkingLevels(agentDefaultModel.value));
+function defaultFieldSource(field) {
+  if (hasRunDefault(propertiesForm.runDefaults, field)) return propertiesForm.temporary ? "临时会话设置" : `本目录${propertiesForm.path ? ` · ${propertiesForm.path}` : ""}`;
+  if (hasRunDefault(propertiesForm.runInherited, field)) {
+    const source = propertiesForm.runSources?.[field];
+    if (source?.folderId && String(source.folderId) !== String(propertiesForm.folderId)) return `上级目录 · ${source.path || source.folderId}`;
+    return "上级目录";
+  }
+  if (hasRunDefault(propertiesForm.runFallback, field)) return "服务器默认";
+  return hasRunDefault(propertiesForm.runResolved, field) ? "服务器解析值" : "未配置";
+}
+function defaultFieldValue(field, value, context = appliedRunDefaults.value) {
+  if (field === "mainModel") return propertyModelValueLabel(value);
+  if (field === "mainThinkingLevel") return thinkingValueLabel(value);
+  if (field === "mainFastMode") return value === true ? "开启" : "关闭";
+  if (field === "agentModel") return value === "" ? `跟随主模型 · ${propertyModelValueLabel(context.mainModel)}` : propertyModelValueLabel(value);
+  const configuredAgentModel = context.agentModel === "" ? context.mainModel : context.agentModel;
+  const effectiveAgent = propertyModel(configuredAgentModel);
+  if (field === "agentThinkLevel") {
+    const fallback = modelDefaultThinking(effectiveAgent) || "off";
+    return value === "" ? `跟随模型默认 · ${thinkingValueLabel(fallback)}` : thinkingValueLabel(value);
+  }
+  if (field === "agentFastMode" && value === null) {
+    const mainFast = context.mainFastMode === true;
+    const supported = Boolean(effectiveAgent?.supportsFast);
+    const applied = mainFast && supported;
+    return `跟随主会话 Fast · ${applied ? "开启" : mainFast && !supported ? "关闭（模型不支持）" : "关闭"}`;
+  }
+  if (field === "agentFastMode") return value === true ? "开启" : "关闭";
+  return "未配置";
+}
+function defaultFieldSummary(field) {
+  const selected = draftRunDefaults.value[field];
+  const applied = appliedRunDefaults.value[field];
+  const source = defaultFieldSource(field);
+  const appliedText = defaultFieldValue(field, applied);
+  if (Object.is(selected, applied)) return `实际 ${appliedText} · ${source}`;
+  const inherited = !hasRunDefault(propertiesForm.runDefaults, field) && hasRunDefault(propertiesForm.runInherited, field);
+  return `${inherited ? "继承 " : ""}${defaultFieldValue(field, selected)} → 实际 ${appliedText} · ${source}`;
+}
+function compactPropertyModelLabel(key) {
+  const model = propertyModel(key);
+  return String(model?.name || model?.label || key || "未配置");
+}
+function runDefaultControlLabel(field, value = hasRunDefault(propertiesForm.runDefaults, field) ? propertiesForm.runDefaults[field] : appliedRunDefaults.value[field]) {
+  if (field === "mainModel" || field === "agentModel") return value === "" ? "跟随主模型" : compactPropertyModelLabel(value);
+  if (field === "mainThinkingLevel" || field === "agentThinkLevel") return value === "" ? "模型默认" : value === "off" ? "关闭" : String(value || "未配置");
+  return value === null ? "跟随主会话" : value === true ? "开启" : "关闭";
+}
+function runDefaultHint(field) {
+  const selected = draftRunDefaults.value[field];
+  const applied = appliedRunDefaults.value[field];
+  if ((field === "mainModel" || field === "agentModel") && selected && propertyModelsLoaded.value && !propertyModel(selected)) return `模型已移除 · 实际 ${runDefaultControlLabel(field, applied)}`;
+  if (!Object.is(selected, applied)) {
+    const prefix = !hasRunDefault(propertiesForm.runDefaults, field) && hasRunDefault(propertiesForm.runInherited, field) ? "继承 " : "";
+    const appliedText = field === "agentThinkLevel" && applied === "" ? `模型默认 · ${thinkingValueLabel(modelDefaultThinking(agentDefaultModel.value) || "off")}`
+      : field === "agentFastMode" && applied === null ? `跟随主会话 · ${appliedRunDefaults.value.mainFastMode && agentDefaultModel.value?.supportsFast ? "开启" : "关闭"}` : runDefaultControlLabel(field, applied);
+    return `${prefix}${runDefaultControlLabel(field, selected)} → 实际 ${appliedText}`;
+  }
+  if (field === "agentModel" && applied === "") return `跟随 ${compactPropertyModelLabel(appliedRunDefaults.value.mainModel)}`;
+  if (field === "agentThinkLevel" && applied === "") return `模型默认 · ${thinkingValueLabel(modelDefaultThinking(agentDefaultModel.value) || "off")}`;
+  if ((field === "mainFastMode" && !mainDefaultModel.value?.supportsFast) || (field === "agentFastMode" && !agentDefaultModel.value?.supportsFast)) return "当前模型不支持 Fast";
+  return hasRunDefault(propertiesForm.runDefaults, field) ? (propertiesForm.temporary ? "临时会话设置" : "本目录设置") : defaultFieldSource(field);
+}
+function unknownLocalModel(field) {
+  if (!propertyModelsLoaded.value || !hasRunDefault(propertiesForm.runDefaults, field)) return "";
+  const value = propertiesForm.runDefaults[field];
+  if (field === "agentModel" && value === "") return "";
+  return typeof value !== "string" || !value || propertyModel(value) ? "" : String(value);
+}
+function unknownLocalThinking(field, choices) {
+  if (!hasRunDefault(propertiesForm.runDefaults, field)) return "";
+  const value = propertiesForm.runDefaults[field];
+  if (field === "agentThinkLevel" && value === "") return "";
+  return typeof value === "string" && choices.includes(value) ? "" : String(value ?? "");
+}
+function replaceLocalRunDefault(field, value) {
+  propertiesForm.runDefaults = updateRunDefault(propertiesForm.runDefaults, field, runDefaultOption(value));
+}
+function cleanAgentDefaultsForModel() {
+  if (hasRunDefault(propertiesForm.runDefaults, "agentThinkLevel")) {
+    const value = propertiesForm.runDefaults.agentThinkLevel;
+    if (value !== "" && !agentThinkingOptions.value.includes(value)) replaceLocalRunDefault("agentThinkLevel", "");
+  }
+  if (hasRunDefault(propertiesForm.runDefaults, "agentFastMode")
+      && propertiesForm.runDefaults.agentFastMode === true && !agentDefaultModel.value?.supportsFast) {
+    replaceLocalRunDefault("agentFastMode", false);
+  }
+}
+function cleanMainDefaultsForModel() {
+  if (hasRunDefault(propertiesForm.runDefaults, "mainThinkingLevel")) {
+    const value = propertiesForm.runDefaults.mainThinkingLevel;
+    if (!mainThinkingOptions.value.includes(value)) {
+      const modelDefault = modelDefaultThinking(mainDefaultModel.value);
+      const nextValue = mainThinkingOptions.value.includes(modelDefault) ? modelDefault : mainThinkingOptions.value.at(-1) || "off";
+      replaceLocalRunDefault("mainThinkingLevel", nextValue);
+    }
+  }
+  if (hasRunDefault(propertiesForm.runDefaults, "mainFastMode")
+      && propertiesForm.runDefaults.mainFastMode === true && !mainDefaultModel.value?.supportsFast) {
+    replaceLocalRunDefault("mainFastMode", false);
+  }
+  cleanAgentDefaultsForModel();
+}
+function setRunDefault(field, selection) {
+  propertiesForm.runDefaults = updateRunDefault(propertiesForm.runDefaults, field, selection);
+  if (field === "mainModel") cleanMainDefaultsForModel();
+  else if (field === "agentModel") cleanAgentDefaultsForModel();
+}
+function clearRunDefaults() {
+  propertiesForm.runDefaults = {};
+}
+function runDefaultsValidationError() {
+  if (!propertyModelsLoaded.value) return "";
+  const local = propertiesForm.runDefaults;
+  if (hasRunDefault(local, "mainModel")) {
+    if (typeof local.mainModel !== "string" || !local.mainModel) return "主会话模型不能留空；可选择模型或恢复继承";
+    if (propertyModelsLoaded.value && !propertyModel(local.mainModel)) return `主会话模型 ${local.mainModel} 已不可用，请更换或恢复继承`;
+  }
+  if (hasRunDefault(local, "mainThinkingLevel")
+      && (typeof local.mainThinkingLevel !== "string" || !mainThinkingOptions.value.includes(local.mainThinkingLevel))) {
+    return "主会话思考强度不受当前生效模型支持，请重新选择或恢复继承";
+  }
+  if (hasRunDefault(local, "mainFastMode")) {
+    if (typeof local.mainFastMode !== "boolean") return "主会话 Fast 必须明确选择开启或关闭";
+    if (local.mainFastMode && propertyModelsLoaded.value && !mainDefaultModel.value?.supportsFast) return "当前主会话模型不支持 Fast";
+  }
+  if (hasRunDefault(local, "agentModel")) {
+    if (typeof local.agentModel !== "string") return "Agent 模型配置无效";
+    if (local.agentModel && propertyModelsLoaded.value && !propertyModel(local.agentModel)) return `Agent 模型 ${local.agentModel} 已不可用，请更换或恢复继承`;
+  }
+  if (hasRunDefault(local, "agentThinkLevel")
+      && (typeof local.agentThinkLevel !== "string" || (local.agentThinkLevel !== "" && !agentThinkingOptions.value.includes(local.agentThinkLevel)))) {
+    return "Agent 思考强度不受当前生效模型支持，请重新选择或恢复继承";
+  }
+  if (hasRunDefault(local, "agentFastMode")) {
+    if (![true, false, null].includes(local.agentFastMode)) return "Agent Fast 配置无效";
+    if (local.agentFastMode === true && propertyModelsLoaded.value && !agentDefaultModel.value?.supportsFast) return "当前 Agent 生效模型不支持 Fast";
+  }
+  return "";
+}
+function resetPropertiesForm(row) {
+  propertiesRunDefaultsBaseline.value = {};
+  Object.assign(propertiesForm, {
+    folderId: row.systemNode === "temporary" ? "__temporary" : String(row.folderId || ""),
+    temporary: row.systemNode === "temporary",
+    parentId: String(row.parentId || ""), name: String(row.name || ""), path: String(row.path || ""),
+    workspaceDir: "", promptMarkdown: "", workspaceEffective: "", workspaceSource: "", promptEffective: "", promptSource: "",
+    runDefaults: {}, runInherited: {}, runFallback: {}, runResolved: {}, runSources: {},
+  });
+}
+function closeProperties() {
+  propertiesDialog.value = false;
+  propertiesRequestGeneration += 1;
+}
+watch(propertiesDialog, (open) => {
+  if (!open) propertiesRequestGeneration += 1;
+});
+watch(propertiesTab, async () => {
+  await nextTick();
+  document.querySelector(".folder-properties-dialog .el-dialog__body")?.scrollTo({ top: 0 });
+});
+function navigatePropertiesTab(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...event.currentTarget.querySelectorAll('[role="tab"]')];
+  const index = tabs.indexOf(event.target.closest('[role="tab"]'));
+  if (index < 0) return;
+  event.preventDefault();
+  const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  propertiesTab.value = tabs[next].dataset.tab;
+  tabs[next].focus();
 }
 function chooseImpact(action, impact) {
   if (!Number(impact?.affectedCount || 0)) return Promise.resolve(false);
@@ -693,21 +963,39 @@ function finishImpact(value) {
   resolve?.(value);
 }
 async function saveProperties() {
+  // Context-only edits must not revalidate/rewrite stored defaults that became
+  // unavailable after a model or parent change. An explicit defaults edit still
+  // validates the full replacement; reverting to the loaded values is a no-op.
+  const saveRunDefaults = propertyModelsLoaded.value && runDefaultsChanged.value;
+  const validationError = saveRunDefaults ? runDefaultsValidationError() : "";
+  if (validationError) return ElMessage.warning(validationError);
+  const request = propertiesRequestGeneration;
+  const save = ++propertiesSaveGeneration;
+  const folderId = propertiesForm.folderId;
+  const temporary = propertiesForm.temporary;
   propertiesSaving.value = true;
-  const payload = { workspaceDir: propertiesForm.workspaceDir, promptMarkdown: propertiesForm.promptMarkdown };
+  const payload = {
+    ...(!temporary ? { workspaceDir: propertiesForm.workspaceDir } : {}),
+    promptMarkdown: propertiesForm.promptMarkdown,
+    ...(saveRunDefaults ? { runDefaults: sparseRunDefaults(propertiesForm.runDefaults) } : {}),
+  };
   try {
-    const impact = await Api.conversationFolderPropertiesImpact(propertiesForm.folderId, payload);
+    const impact = await Api.conversationFolderPropertiesImpact(folderId, payload);
+    if (request !== propertiesRequestGeneration || !propertiesDialog.value) return;
     const choice = await chooseImpact("保存", impact);
-    if (choice === null) return;
-    const result = await Api.updateConversationFolderProperties(propertiesForm.folderId, { ...payload, updateSnapshots: choice === true });
-    propertiesDialog.value = false;
-    const located = await Api.locateConversationFolderInTree(propertiesForm.folderId);
-    mergeLocatedFolders(located.folderItems || []);
-    emitRows();
+    if (choice === null || request !== propertiesRequestGeneration || !propertiesDialog.value) return;
+    const result = await Api.updateConversationFolderProperties(folderId, { ...payload, updateSnapshots: choice === true });
+    window.dispatchEvent(new CustomEvent("openbear:folder-properties-changed", { detail: { folderId } }));
+    if (request === propertiesRequestGeneration) propertiesDialog.value = false;
+    if (!temporary) {
+      const located = await Api.locateConversationFolderInTree(folderId);
+      mergeLocatedFolders(located.folderItems || []);
+      emitRows();
+    }
     const skipped = Number(result.skippedRunningCount || 0);
     ElMessage.success(choice === true ? `属性已保存，更新 ${result.updatedCount || 0} 个快照${skipped ? `；运行中跳过 ${skipped} 个` : ""}` : "属性已保存；已有快照保持不变");
   } catch (error) { ElMessage.error(apiError(error)); }
-  finally { propertiesSaving.value = false; }
+  finally { if (save === propertiesSaveGeneration) propertiesSaving.value = false; }
 }
 
 async function loadAllFolders() {
@@ -1053,6 +1341,10 @@ onBeforeUnmount(() => {
           <template v-else-if="['system', 'root'].includes(menu.row?.kind)">
             <button v-if="menu.row?.systemNode === 'temporary' || menu.row?.kind === 'root'" role="menuitem" @click="runMenuAction('new-conversation')"><el-icon><ChatLineRound /></el-icon><span>新建临时会话</span></button>
             <button role="menuitem" @click="runMenuAction('new-folder')"><el-icon><FolderAdd /></el-icon><span>新建根级目录</span></button>
+            <template v-if="menu.row?.systemNode === 'temporary'">
+              <hr />
+              <button role="menuitem" @click="runMenuAction('properties')"><el-icon><InfoFilled /></el-icon><span>临时会话属性</span></button>
+            </template>
           </template>
           <template v-else>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('rename')"><el-icon><EditPen /></el-icon><span>重命名</span></button>
@@ -1070,40 +1362,160 @@ onBeforeUnmount(() => {
 
     <ConversationPromptDialog v-model="promptDialog" :conversation="promptRow" />
 
-    <el-dialog v-model="propertiesDialog" width="min(680px, calc(100vw - 24px))" append-to-body class="folder-properties-dialog" :close-on-click-modal="false">
+    <el-dialog v-model="propertiesDialog" width="min(760px, calc(100vw - 24px))" append-to-body class="folder-properties-dialog" :close-on-click-modal="false" :close-on-press-escape="!propertiesSaving" :show-close="!propertiesSaving">
       <template #header>
         <div class="folder-properties-heading">
-          <h2>目录属性 · {{ propertiesForm.name }}</h2>
-          <p>{{ propertiesForm.path }}</p>
+          <h2>{{ propertiesForm.temporary ? '临时会话属性' : '目录属性' }}</h2>
+          <p :title="propertiesForm.path"><el-icon><Folder /></el-icon>{{ propertiesForm.path || propertiesForm.name }}</p>
         </div>
+        <nav class="property-segmented" role="tablist" aria-label="属性设置分类" @keydown="navigatePropertiesTab">
+          <button id="folder-properties-tab-context" type="button" role="tab" data-tab="context" :aria-selected="propertiesTab === 'context'" aria-controls="folder-properties-panel-context" :tabindex="propertiesTab === 'context' ? 0 : -1" @click="propertiesTab = 'context'">{{ propertiesForm.temporary ? '注入上下文' : '目录上下文' }}</button>
+          <button id="folder-properties-tab-defaults" type="button" role="tab" data-tab="defaults" :aria-selected="propertiesTab === 'defaults'" aria-controls="folder-properties-panel-defaults" :tabindex="propertiesTab === 'defaults' ? 0 : -1" @click="propertiesTab = 'defaults'">新会话默认</button>
+        </nav>
       </template>
       <div v-loading="propertiesLoading" class="property-form">
-        <section class="property-section" aria-labelledby="folder-workspace-label">
-          <label class="property-field">
-            <span id="folder-workspace-label">本节点工作目录 <em>清空即继承</em></span>
-            <el-input v-model="propertiesForm.workspaceDir" aria-labelledby="folder-workspace-label" placeholder="例如 /home/user/projects/my-project" clearable />
-          </label>
-          <div class="effective-value">
-            <b>继承后有效值</b>
-            <code>{{ propertiesForm.workspaceEffective || '—' }}</code>
-            <small>来源：{{ propertiesForm.workspaceSource }}</small>
-          </div>
-        </section>
-        <section class="property-section" aria-labelledby="folder-prompt-label">
-          <!-- Monaco owns its input focus. A wrapping label redirects clicks to its hidden IME textarea. -->
-          <div class="property-field" role="group" aria-labelledby="folder-prompt-label">
-            <span id="folder-prompt-label">本节点注入提示词（Markdown） <em>清空即继承；就近覆盖，不累加</em></span>
-            <div class="folder-prompt-editor"><MdEditor v-model="propertiesForm.promptMarkdown" language="markdown" completion-mode="none" /></div>
-          </div>
-          <div class="effective-value">
-            <b>当前继承值</b>
-            <pre>{{ propertiesForm.promptEffective || '未设置' }}</pre>
-            <small>来源：{{ propertiesForm.promptSource }}</small>
-          </div>
-        </section>
-        <p class="property-note">属性只提供给主会话模板变量 <code>folderWorkspaceDir</code> / <code>folderPrompt</code>。不会创建目录、改变工具 cwd、公共 workspace、产物根或 Agent 快照。</p>
+        <div class="property-panels">
+          <section v-show="propertiesTab === 'context'" id="folder-properties-panel-context" role="tabpanel" aria-labelledby="folder-properties-tab-context">
+            <div class="property-tab-panel context-properties">
+              <section v-if="!propertiesForm.temporary" class="property-section" aria-labelledby="folder-workspace-label">
+                <label class="property-field">
+                  <span id="folder-workspace-label">本节点工作目录 <em>清空即继承</em></span>
+                  <el-input v-model="propertiesForm.workspaceDir" aria-labelledby="folder-workspace-label" placeholder="例如 /home/user/projects/my-project" clearable />
+                </label>
+                <div class="effective-line">
+                  <b>继承后</b><code>{{ propertiesForm.workspaceEffective || '—' }}</code><small>来源：{{ propertiesForm.workspaceSource || '未设置' }}</small>
+                </div>
+              </section>
+              <section class="property-section" aria-labelledby="folder-prompt-label">
+                <!-- Monaco owns its input focus. A wrapping label redirects clicks to its hidden IME textarea. -->
+                <div class="property-field" role="group" aria-labelledby="folder-prompt-label">
+                  <span id="folder-prompt-label">{{ propertiesForm.temporary ? '注入上下文（Markdown）' : '本节点注入提示词（Markdown）' }} <em>{{ propertiesForm.temporary ? '仅用于临时会话；清空即不注入' : '清空即继承；就近覆盖，不累加' }}</em></span>
+                  <div class="folder-prompt-editor"><MdEditor v-model="propertiesForm.promptMarkdown" language="markdown" completion-mode="none" /></div>
+                </div>
+                <details v-if="!propertiesForm.temporary" class="effective-disclosure">
+                  <summary><b>查看当前继承提示词</b><small>来源：{{ propertiesForm.promptSource || '未设置' }}</small></summary>
+                  <pre>{{ propertiesForm.promptEffective || '未设置' }}</pre>
+                </details>
+              </section>
+              <p v-if="propertiesForm.temporary" class="property-note">通过主会话模板变量 <code>folderPrompt</code> 注入，不影响项目目录或 Agent 快照。</p>
+              <p v-else class="property-note">仅提供给主会话模板变量 <code>folderWorkspaceDir</code> / <code>folderPrompt</code>；不会创建目录、改变工具 cwd、公共 workspace、产物根或 Agent 快照。</p>
+            </div>
+          </section>
+          <section v-show="propertiesTab === 'defaults'" id="folder-properties-panel-defaults" role="tabpanel" aria-labelledby="folder-properties-tab-defaults">
+            <div class="property-tab-panel run-defaults-panel">
+              <el-alert v-if="!propertiesLoading && !propertyModelsLoaded" title="模型选项暂不可用，运行默认保持只读" type="warning" :closable="false" show-icon />
+              <div class="run-default-groups">
+                <div class="run-grid-head"><span>设置项</span><h3 id="main-defaults-heading">主会话</h3><h3 id="agent-defaults-heading">Agent</h3></div>
+                <div class="run-setting-row">
+                  <h4 id="run-model-label">模型</h4>
+                  <div class="run-default-cell" data-owner="主会话" :title="defaultFieldSummary('mainModel')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="mainModel" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'mainModel')" aria-labelledby="main-defaults-heading run-model-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('mainModel', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'mainModel')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('mainModel') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option v-if="unknownLocalModel('mainModel')" :label="`已移除 · ${unknownLocalModel('mainModel')}`" :value="runDefaultOption(unknownLocalModel('mainModel'))" disabled />
+                      <el-option v-for="model in propertyModelOptions" :key="`main-${model.key}`" :label="propertyModelLabel(model)" :value="runDefaultOption(model.key)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !mainDefaultModel || unknownLocalModel('mainModel') }">{{ runDefaultHint('mainModel') }}</small>
+                  </div>
+                  <div class="run-default-cell" data-owner="Agent" :title="defaultFieldSummary('agentModel')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="agentModel" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'agentModel')" aria-labelledby="agent-defaults-heading run-model-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('agentModel', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'agentModel')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('agentModel') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option label="跟随主模型（明确设置）" :value="runDefaultOption('')" />
+                      <el-option v-if="unknownLocalModel('agentModel')" :label="`已移除 · ${unknownLocalModel('agentModel')}`" :value="runDefaultOption(unknownLocalModel('agentModel'))" disabled />
+                      <el-option v-for="model in propertyModelOptions" :key="`agent-${model.key}`" :label="propertyModelLabel(model)" :value="runDefaultOption(model.key)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !agentDefaultModel || unknownLocalModel('agentModel') }">{{ runDefaultHint('agentModel') }}</small>
+                  </div>
+                </div>
+                <div class="run-setting-row">
+                  <h4 id="run-thinking-label">思考强度</h4>
+                  <div class="run-default-cell" data-owner="主会话" :title="defaultFieldSummary('mainThinkingLevel')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="mainThinkingLevel" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'mainThinkingLevel')" aria-labelledby="main-defaults-heading run-thinking-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('mainThinkingLevel', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'mainThinkingLevel')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('mainThinkingLevel') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option v-if="unknownLocalThinking('mainThinkingLevel', mainThinkingOptions)" :label="`当前值不可用 · ${unknownLocalThinking('mainThinkingLevel', mainThinkingOptions)}`" :value="runDefaultOption(unknownLocalThinking('mainThinkingLevel', mainThinkingOptions))" disabled />
+                      <el-option v-for="level in mainThinkingOptions" :key="`main-think-${level}`" :label="thinkingValueLabel(level)" :value="runDefaultOption(level)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !mainDefaultModel || unknownLocalModel('mainModel') }">{{ runDefaultHint('mainThinkingLevel') }}</small>
+                  </div>
+                  <div class="run-default-cell" data-owner="Agent" :title="defaultFieldSummary('agentThinkLevel')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="agentThinkLevel" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'agentThinkLevel')" aria-labelledby="agent-defaults-heading run-thinking-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('agentThinkLevel', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'agentThinkLevel')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('agentThinkLevel') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option :label="`跟随模型默认（${thinkingValueLabel(modelDefaultThinking(agentDefaultModel) || 'off')}）`" :value="runDefaultOption('')" />
+                      <el-option v-if="unknownLocalThinking('agentThinkLevel', agentThinkingOptions)" :label="`当前值不可用 · ${unknownLocalThinking('agentThinkLevel', agentThinkingOptions)}`" :value="runDefaultOption(unknownLocalThinking('agentThinkLevel', agentThinkingOptions))" disabled />
+                      <el-option v-for="level in agentThinkingOptions" :key="`agent-think-${level}`" :label="thinkingValueLabel(level)" :value="runDefaultOption(level)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !agentDefaultModel || unknownLocalModel('agentModel') }">{{ runDefaultHint('agentThinkLevel') }}</small>
+                  </div>
+                </div>
+                <div class="run-setting-row">
+                  <h4 id="run-fast-label">Fast</h4>
+                  <div class="run-default-cell" data-owner="主会话" :title="defaultFieldSummary('mainFastMode')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="mainFastMode" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'mainFastMode')" aria-labelledby="main-defaults-heading run-fast-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('mainFastMode', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'mainFastMode')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('mainFastMode') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option label="开启" :value="runDefaultOption(true)" :disabled="!mainDefaultModel?.supportsFast" />
+                      <el-option label="关闭" :value="runDefaultOption(false)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !mainDefaultModel || unknownLocalModel('mainModel') }">{{ runDefaultHint('mainFastMode') }}</small>
+                  </div>
+                  <div class="run-default-cell" data-owner="Agent" :title="defaultFieldSummary('agentFastMode')">
+                    <el-select popper-class="folder-properties-popover" :show-arrow="false" data-run-default-field="agentFastMode" :model-value="runDefaultSelection(propertiesForm.runDefaults, 'agentFastMode')" aria-labelledby="agent-defaults-heading run-fast-label" :disabled="propertiesLoading || !propertyModelsLoaded" @change="setRunDefault('agentFastMode', $event)">
+                      <template #label>
+                        <span class="run-choice">
+                          <span v-if="!hasRunDefault(propertiesForm.runDefaults, 'agentFastMode')" class="run-choice-inherit">{{ propertiesForm.temporary ? '默认' : '继承' }}</span>
+                          <span class="run-choice-value">{{ runDefaultControlLabel('agentFastMode') }}</span>
+                        </span>
+                      </template>
+                      <el-option :label="propertiesForm.temporary ? '使用原有默认' : '继承目录'" :value="RUN_DEFAULT_INHERIT" />
+                      <el-option label="跟随主会话 Fast（明确设置）" :value="runDefaultOption(null)" />
+                      <el-option label="开启" :value="runDefaultOption(true)" :disabled="!agentDefaultModel?.supportsFast" />
+                      <el-option label="关闭" :value="runDefaultOption(false)" />
+                    </el-select>
+                    <small class="run-field-hint" :class="{ warning: !agentDefaultModel || unknownLocalModel('agentModel') }">{{ runDefaultHint('agentFastMode') }}</small>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
       </div>
-      <template #footer><el-button @click="propertiesDialog = false">取消</el-button><el-button type="primary" :loading="propertiesSaving" @click="saveProperties">保存</el-button></template>
+      <template #footer>
+        <div class="property-footer">
+          <div class="property-footer-meta" v-if="propertiesTab === 'defaults'">
+            <span class="property-footer-note" :title="propertiesForm.temporary ? '每项独立设置，未设置时使用原有默认；只影响以后新建的临时会话，不影响项目目录。' : '每项独立向上继承；跟随主模型、模型默认和跟随主会话都是明确设置，不等于继承。仅影响以后新建的会话，不会批量更改已有会话。'"><el-icon><InfoFilled /></el-icon>仅新会话生效</span>
+            <el-button link :disabled="!hasLocalRunDefaults || propertiesLoading || !propertyModelsLoaded || propertiesSaving" @click="clearRunDefaults">{{ propertiesForm.temporary ? '全部使用原有默认' : '全部恢复继承' }}</el-button>
+          </div>
+          <div class="property-footer-buttons"><el-button :disabled="propertiesSaving" @click="closeProperties">取消</el-button><el-button type="primary" :loading="propertiesSaving" :disabled="propertiesLoading" @click="saveProperties">保存</el-button></div>
+        </div>
+      </template>
     </el-dialog>
 
     <el-dialog v-model="moveDialog" width="min(560px, calc(100vw - 24px))" append-to-body :title="moveMode === 'delete' ? '迁移目录内容后删除' : '移动到…'" :close-on-click-modal="false">
@@ -1195,49 +1607,6 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
 .tree-context-menu button { font:inherit; display:grid; grid-template-columns:16px 1fr; align-items:center; gap:7px; width:100%; min-height:28px; padding:4px 8px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 .tree-context-menu button:hover:not(:disabled) { background:#2563eb; color:white; }.tree-context-menu button:disabled { opacity:.38; cursor:not-allowed; }.tree-context-menu button.danger { color:#dc2626; }.tree-context-menu button.danger:hover:not(:disabled) { background:#dc2626; color:white; }
 .tree-context-menu hr { height:1px; margin:5px 7px; border:0; background:rgba(161,161,170,.28); }
-/* Local dialog styling: keep the app font, and leave other dialogs/editors alone. */
-.folder-properties-dialog.el-dialog {
-  --el-dialog-padding-primary:0;
-  display:flex; flex-direction:column; max-height:90vh; max-height:90dvh; margin:5vh auto; margin:5dvh auto; padding:0;
-  overflow:hidden; border:1px solid var(--el-border-color-lighter); border-radius:14px;
-  font-family:inherit; font-size:13px; line-height:1.6; color:var(--el-text-color-primary);
-}
-.folder-properties-dialog .el-dialog__header { flex:none; margin:0; padding:18px 52px 16px 22px; border-bottom:1px solid var(--el-border-color-lighter); }
-.folder-properties-dialog .el-dialog__headerbtn { top:15px; right:14px; width:28px; height:28px; border-radius:7px; }
-.folder-properties-dialog .el-dialog__headerbtn:hover { background:var(--el-fill-color-light); }
-.folder-properties-dialog .folder-properties-heading h2 { margin:0; font-size:16px; font-weight:600; line-height:1.5; overflow-wrap:anywhere; }
-.folder-properties-dialog .folder-properties-heading p { margin:4px 0 0; color:var(--el-text-color-secondary); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
-.folder-properties-dialog .el-dialog__body { min-height:0; padding:20px 22px; overflow:auto; overscroll-behavior:contain; }
-.folder-properties-dialog .el-dialog__footer { flex:none; padding:14px 22px; border-top:1px solid var(--el-border-color-lighter); }
-.folder-properties-dialog .el-button { min-width:72px; height:34px; font-family:inherit; font-size:13px; font-weight:500; }
-.folder-properties-dialog .property-form { display:flex; min-height:220px; flex-direction:column; gap:20px; }
-.folder-properties-dialog .property-section { display:flex; min-width:0; flex-direction:column; gap:10px; }
-.folder-properties-dialog .property-section + .property-section { padding-top:20px; border-top:1px solid var(--el-border-color-lighter); }
-.folder-properties-dialog .property-field { display:block; min-width:0; }
-.folder-properties-dialog .property-field > span { display:block; margin-bottom:9px; font-size:13px; font-weight:600; line-height:1.6; }
-.folder-properties-dialog .property-field em { display:block; margin-top:2px; color:var(--el-text-color-secondary); font-size:12px; font-style:normal; font-weight:400; }
-.folder-properties-dialog .el-input { font-family:inherit; font-size:13px; }
-.folder-properties-dialog .el-input__wrapper { min-height:36px; }
-.folder-properties-dialog .el-input__inner { font-family:inherit; }
-.folder-properties-dialog .folder-prompt-editor { height:220px; min-height:160px; }
-.folder-properties-dialog .effective-value { display:flex; min-width:0; flex-direction:column; gap:5px; padding:10px 12px; border-radius:8px; background:var(--el-fill-color-light); }
-.folder-properties-dialog .effective-value b { color:var(--el-text-color-secondary); font-size:12px; font-weight:500; }
-.folder-properties-dialog .effective-value code,.folder-properties-dialog .effective-value pre { min-width:0; max-height:112px; overflow:auto; margin:0; color:var(--el-text-color-primary); font-size:13px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
-.folder-properties-dialog .effective-value code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-.folder-properties-dialog .effective-value pre { font-family:inherit; }
-.folder-properties-dialog .effective-value small { color:var(--el-text-color-secondary); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
-.folder-properties-dialog .property-note { margin:0; color:var(--el-text-color-secondary); font-size:12px; line-height:1.7; overflow-wrap:anywhere; }
-.folder-properties-dialog .property-note code { color:var(--el-text-color-regular); font-size:inherit; }
-.folder-properties-dialog .el-dialog__body,.folder-properties-dialog .effective-value code,.folder-properties-dialog .effective-value pre { scrollbar-width:none; -ms-overflow-style:none; }
-.folder-properties-dialog .el-dialog__body::-webkit-scrollbar,.folder-properties-dialog .effective-value code::-webkit-scrollbar,.folder-properties-dialog .effective-value pre::-webkit-scrollbar { display:none; }
-@media (max-width:560px) {
-  .folder-properties-dialog.el-dialog { max-height:calc(100vh - 24px); max-height:calc(100dvh - 24px); margin:12px auto; }
-  .folder-properties-dialog .el-dialog__header { padding:16px 48px 14px 16px; }
-  .folder-properties-dialog .el-dialog__headerbtn { top:13px; right:12px; }
-  .folder-properties-dialog .el-dialog__body { padding:16px; }
-  .folder-properties-dialog .el-dialog__footer { padding:12px 16px; }
-  .folder-properties-dialog .folder-prompt-editor { height:200px; }
-}
 .impact-copy { color:var(--el-text-color-secondary); font-size:12px; line-height:1.65; }
 .move-archive-options { display:grid; gap:10px; margin-top:16px; padding-top:14px; border-top:1px solid var(--el-border-color-lighter); }
 .move-archive-options .el-checkbox { height:auto; font-family:inherit; }

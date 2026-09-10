@@ -2,6 +2,7 @@
 import {computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch} from "vue";
 import {ElDialog} from "element-plus";
 import ConsoleMarkdown from "../views/consoleView/ConsoleMarkdown.vue";
+import {htmlPreviewDocument} from "./htmlPreview.js";
 import {highlightCodeHtml} from "../views/consoleView/markdown.js";
 import {artifactFromUrl, artifactRecord, artifactFormat, artifactErrorMessage, formatFileSize, loadArtifactMetadata, loadArtifactText, readingState, clearArtifactCache} from "./artifactFiles.js";
 
@@ -14,6 +15,8 @@ const format = computed(() => artifactFormat(record.value?.metadata));
 const title = computed(() => record.value?.summary?.title || selected.value?.label || record.value?.metadata?.fileName || "附件预览");
 const sourceHtml = computed(() => highlightCodeHtml(text.value, format.value.kind === "markdown" ? "markdown" : format.value.language));
 const fullscreen = computed(() => mobile.value || maximized.value);
+const hasPreview = computed(() => ["markdown", "html"].includes(format.value.kind));
+const htmlDocument = computed(() => format.value.kind === "html" && mode.value === "preview" ? htmlPreviewDocument(text.value) : "");
 let generation = 0, saved = null, opener = null, media = null;
 
 function savePosition() {
@@ -34,10 +37,12 @@ async function loadSelected(force = false) {
 	try {
 		const meta = await loadArtifactMetadata(active, {force});
 		if (current !== generation || !opened.value) return;
-		saved = readingState(`${active.identity.key}:${meta.sha256 || ""}`);
-		mode.value = artifactFormat(meta).kind === "markdown" ? saved.mode : "source";
+		const kind = artifactFormat(meta).kind;
+		// HTML execution is opt-in on first open; remember the user's mode per file/version.
+		saved = readingState(`${active.identity.key}:${meta.sha256 || ""}`, kind === "html" ? "source" : "preview");
+		mode.value = ["markdown", "html"].includes(kind) ? saved.mode : "source";
 		wrap.value = saved.wrap;
-		if (["markdown", "text", "code"].includes(artifactFormat(meta).kind)) {
+		if (["markdown", "html", "text", "code"].includes(kind)) {
 			const content = await loadArtifactText(active);
 			if (current !== generation || !opened.value) return;
 			text.value = content;
@@ -96,13 +101,13 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 			</div>
 		</template>
 		<div class="artifact-preview-toolbar">
-			<div v-if="format.kind === 'markdown' && !busy && !error" class="artifact-preview-tabs" role="group" aria-label="文档查看方式"><button type="button" :class="{active: mode === 'preview'}" :aria-pressed="mode === 'preview'" @click="switchMode('preview')">文档预览</button><button type="button" :class="{active: mode === 'source'}" :aria-pressed="mode === 'source'" @click="switchMode('source')">源码</button></div>
+			<div v-if="hasPreview && !busy && !error" class="artifact-preview-tabs" role="group" aria-label="文档查看方式"><button type="button" :class="{active: mode === 'preview'}" :aria-pressed="mode === 'preview'" @click="switchMode('preview')">{{ format.kind === 'html' ? '页面预览' : '文档预览' }}</button><button type="button" :class="{active: mode === 'source'}" :aria-pressed="mode === 'source'" @click="switchMode('source')">源码</button></div>
 			<span v-else class="artifact-preview-type">{{ busy ? '正在读取附件' : format.label }}</span>
 			<span v-if="format.sourceOnly" class="artifact-preview-source-note">仅显示源码，不执行内容</span>
-			<label v-if="['text', 'code'].includes(format.kind) || format.kind === 'markdown' && mode === 'source'" class="artifact-preview-wrap"><input v-model="wrap" type="checkbox" @change="savePosition">自动换行</label>
+			<label v-if="['text', 'code'].includes(format.kind) || hasPreview && mode === 'source'" class="artifact-preview-wrap"><input v-model="wrap" type="checkbox" @change="savePosition">自动换行</label>
 			<div v-if="format.kind === 'image' && !busy" class="artifact-preview-zoom"><button type="button" aria-label="缩小图片" :disabled="imageLoading || imageFailed" @click="zoom(-.2)">−</button><button type="button" :disabled="imageLoading || imageFailed" @click="imageZoom = null">{{ imageZoom == null ? '适应窗口' : `${Math.round(imageZoom * 100)}%` }}</button><button type="button" aria-label="放大图片" :disabled="imageLoading || imageFailed" @click="zoom(.2)">＋</button></div>
 		</div>
-		<div ref="body" class="artifact-preview-body" :class="{'is-image': format.kind === 'image'}" :aria-busy="busy" @scroll="savePosition" @click="onContentClick">
+		<div ref="body" class="artifact-preview-body" :class="{'is-image': format.kind === 'image', 'is-html': format.kind === 'html' && mode === 'preview' && !busy && !error}" :aria-busy="busy" @scroll="savePosition" @click="onContentClick">
 			<div v-if="busy" class="artifact-preview-empty" role="status"><span class="artifact-preview-spinner" aria-hidden="true"></span><strong>正在打开附件</strong><p>内容将在这里呈现，不会离开当前对话。</p></div>
 			<div v-else-if="error" class="artifact-preview-empty" role="alert"><strong>暂时无法预览</strong><p>{{ error }}</p><button type="button" @click="loadSelected(true)">重新读取</button></div>
 			<template v-else-if="format.kind === 'image'">
@@ -111,10 +116,13 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 			</template>
 			<div v-else-if="format.kind === 'unsupported'" class="artifact-preview-empty"><span class="artifact-preview-file-type">{{ format.label }}</span><strong>这个文件暂不支持站内预览</strong><p>原文件已保留，可以直接下载查看。</p><a :href="selected.identity.downloadUrl" download>下载原文件</a></div>
 			<div v-else-if="text.length === 0" class="artifact-preview-empty"><strong>这是一个空文件</strong><p>仍可通过右上角下载原文件。</p></div>
+			<template v-else-if="format.kind === 'html' && mode === 'preview'">
+				<iframe v-if="opened" class="artifact-preview-html" :title="`HTML 页面预览：${title}`" :srcdoc="htmlDocument" sandbox="allow-scripts" referrerpolicy="no-referrer" allow="camera 'none'; microphone 'none'; geolocation 'none'; clipboard-read 'none'; clipboard-write 'none'"></iframe>
+			</template>
 			<article v-else-if="format.kind === 'markdown' && mode === 'preview'" class="artifact-preview-document"><ConsoleMarkdown :text="text" :artifact-cards="false"/></article>
 			<div v-else class="artifact-preview-source"><p v-if="text.length > 8000" class="artifact-preview-large-note">较大文本以纯文本显示，原始内容保持完整。</p><pre :class="{'is-wrapped': wrap}"><code class="hljs" v-html="sourceHtml"></code></pre></div>
 		</div>
-		<div class="artifact-preview-footer"><span>对话附件<span v-if="!mobile"> · 只读预览</span></span><span>{{ format.kind === 'markdown' && !error && !busy ? (mode === 'preview' ? 'Markdown 已渲染' : '显示原始 Markdown') : '下载始终保留原文件' }}</span></div>
+		<div class="artifact-preview-footer"><span>对话附件<span v-if="!mobile"> · 只读预览</span></span><span>{{ format.kind === 'html' && mode === 'preview' && !error && !busy ? '隔离预览 · 外部资源与接口访问受限' : format.kind === 'markdown' && !error && !busy ? (mode === 'preview' ? 'Markdown 已渲染' : '显示原始 Markdown') : '下载始终保留原文件' }}</span></div>
 	</ElDialog>
 </template>
 
@@ -159,6 +167,8 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 .artifact-preview-file-type { padding: 8px 13px; border: 1px solid var(--ob-border, #e0e6ee); border-radius: 8px; font: 11px ui-monospace, monospace; letter-spacing: .06em; color: var(--ob-text-muted, #909baa); }
 .artifact-preview-spinner { width: 22px; height: 22px; border: 2px solid var(--ob-border-soft, #e3eaf2); border-top-color: var(--ob-blue, #729ac3); border-radius: 50%; animation: artifact-spin .8s linear infinite; }
 .artifact-preview-body.is-image { background: var(--ob-bg, #f3f5f8); }
+.artifact-preview-body.is-html { overflow: hidden; scrollbar-gutter: auto; }
+.artifact-preview-html { display: block; width: 100%; height: 100%; border: 0; background: #fff; color-scheme: normal; }
 .artifact-preview-image-stage { display: grid; place-items: center; position: relative; width: max-content; min-width: 100%; min-height: 100%; padding: 24px; box-sizing: border-box; }
 .artifact-preview-image-stage img { display: block; max-width: none; max-height: none; object-fit: contain; box-shadow: 0 5px 25px rgb(0 0 0 / 8%); }
 .artifact-preview-image-stage.is-fit { width: 100%; height: 100%; }

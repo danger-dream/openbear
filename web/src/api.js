@@ -1,4 +1,5 @@
 import axios from "axios";
+import {uploadFilesViaHttp} from "./uploads.js";
 
 const api = axios.create({ baseURL: "/api", timeout: 30000 });
 
@@ -25,7 +26,7 @@ export const Api = {
 
 
   conversations: (params = {}) => api.get("/conversations", { params }).then(unwrap),
-  conversationDefaults: () => api.get("/conversations/defaults").then(unwrap),
+  conversationDefaults: (params = {}) => api.get("/conversations/defaults", { params }).then(unwrap),
   updateConversationDefaults: (data = {}) => api.patch("/conversations/defaults", data).then(unwrap),
   createConversation: (data = {}) => api.post("/conversations", data).then(unwrap),
   updateConversation: (uuid, data = {}) => api.patch(`/conversations/${encodeURIComponent(uuid)}`, data).then(unwrap),
@@ -54,6 +55,7 @@ export const Api = {
   updateConversationFolderProperties: (uuid, data = {}) => api.put(`/conversation-folders/${encodeURIComponent(uuid)}/properties`, data).then(unwrap),
   deleteConversationFolder: (uuid, data = {}) => api.post(`/conversation-folders/${encodeURIComponent(uuid)}/delete`, data).then(unwrap),
   deleteConversationTurnSuffix: (uuid, turnUuid) => api.delete(`/conversations/${encodeURIComponent(uuid)}/turns/${encodeURIComponent(turnUuid)}/suffix`).then(unwrap),
+  uploadConversationFiles: (uuid, files, options = {}) => uploadFilesViaHttp(api, uuid, files, options),
   conversationState: (uuid, params = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/state`, { params }).then(unwrap),
   conversationOperations: (uuid, params = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations`, { params }).then(unwrap),
   conversationOperationDetail: (uuid, operationId) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations/${encodeURIComponent(operationId)}/detail`).then(unwrap),
@@ -179,20 +181,6 @@ export function conversationWsUrl(uuid, afterFrameSeq = 0, options = {}) {
   if (options?.bootstrap) params.set("bootstrap", String(options.bootstrap));
   const qs = params.toString() ? `?${params.toString()}` : "";
   return `${proto}//${window.location.host}/api/conversations/${encodeURIComponent(uuid)}/ws${qs}`;
-}
-
-export async function filesToWsPayload(files = []) {
-  const rows = [];
-  for (const file of Array.from(files || [])) {
-    const data = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () => reject(reader.error || new Error("file_read_failed"));
-      reader.onload = () => resolve(String(reader.result || ""));
-      reader.readAsDataURL(file);
-    });
-    rows.push({ name: file.name || "upload.bin", type: file.type || "application/octet-stream", size: file.size || 0, data });
-  }
-  return rows;
 }
 
 export function apiError(error) {

@@ -20,6 +20,7 @@ const actual = [
   between("function closeWs() {", "function normalizePendingSteering("),
   between("function finishPendingOutboundSend(", "function applyLoadedConversationState("),
   between("async function send() {", "async function stop() {"),
+  between("async function stop() {", "async function newSession() {"),
 ].join("\n");
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
@@ -54,7 +55,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
   const props = {conversationUuid: local ? "local:new" : "conv-a"};
   let context;
   const globals = {
-    WebSocket: Socket,
+    WebSocket: Socket, AbortController,
     window: {setTimeout: timer.scheduleTimeout, clearTimeout: timer.clearScheduledTimeout, dispatchEvent: noop},
     document: {visibilityState: "visible"},
     URL: {createObjectURL: (file) => `blob:${file.name}`, revokeObjectURL: (url) => revoked.push(url)},
@@ -77,10 +78,12 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     conversationWsUrl: (uuid) => `ws://test.invalid/${uuid}`,
     localAttachmentPayload: () => [], clearDraftForConversation: noop, adjustComposerHeight: noop, closeComposerMenus: noop,
     noteVisibleOutput: noop, clearActiveRun: noop, lockAutoScroll: noop, scrollBottom: async () => {},
-    filesToWsPayload: async (files) => files.map((file) => ({name: file.name})),
     emit: (event, uuid) => {if (event === "conversation-created") props.conversationUuid = uuid;},
-    nextTick: async () => {}, completeLocalRunConfig: () => ({}),
-    Api: {createConversation: createConversation || (async () => ({conversation: {conversationUuid: "conv-created"}}))},
+    nextTick: async () => {}, completeLocalRunConfig: () => ({}), ensureLocalRunDefaults: async () => {},
+    Api: {
+      createConversation: createConversation || (async () => ({conversation: {conversationUuid: "conv-created"}})),
+      uploadConversationFiles: async (_uuid, files) => files.map((file) => ({uploadId: `uploaded-${file.name}`})),
+    },
     load: async (options) => {refreshes.push(options);}, apiError: String,
     queueSentAttachmentPreviewRevokes: (urls) => revoked.push(...urls),
     draftKey: (uuid) => uuid,
@@ -272,6 +275,105 @@ test("resume before a conversation is selected does not open a socket or fetch s
   await flush();
   assert.equal(h.sockets.length, 0);
   assert.equal(h.refreshes.length, 0);
+});
+
+test("slow HTTP upload outlives preparation/ACK timers and only sends opaque references", async () => {
+  const h = harness();
+  let finishUpload, progress;
+  h.context.Api.uploadConversationFiles = (uuid, files, options) => {
+    assert.equal(uuid, "conv-a");
+    assert.equal(files[0].size, 70 * 1024 * 1024);
+    progress = options.onProgress;
+    return new Promise(resolve => { finishUpload = resolve; });
+  };
+  h.context.pendingAttachments.value = [{id: "large", file: {name: "large.zip", size: 70 * 1024 * 1024}}];
+  const sending = h.run("send()");
+  await flush();
+  progress({loaded: 35, total: 70, fileIndex: 0, fileCount: 1});
+  assert.match(h.context.status.value, /50%/);
+  await h.advance(600000);
+  assert.equal(h.context.sendPending.value, true);
+  assert.equal(h.run("outboundSends.current.phase"), "uploading");
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.warnings.length, 0);
+  finishUpload([{uploadId: "opaque-upload-id"}]);
+  await sending;
+  assert.deepEqual(h.sends()[0].files, [{uploadId: "opaque-upload-id"}]);
+  assert.equal(h.run("outboundSends.current.phase"), "sent");
+  await h.advance(15000);
+  assert.equal(h.context.sendPending.value, false);
+  assert.equal(h.context.pendingAttachments.value.length, 1);
+});
+
+test("upload rejection restores draft and all attachments without sending a message", async () => {
+  const h = harness();
+  const file = {id: "first", file: {name: "failed.zip"}};
+  h.context.pendingAttachments.value = [file];
+  h.context.Api.uploadConversationFiles = async () => {throw new Error("disk_full");};
+  await h.run("send()");
+  assert.equal(h.context.sendPending.value, false);
+  assert.equal(h.context.draft.value, "original message");
+  assert.equal(h.context.pendingAttachments.value[0], file);
+  assert.equal(h.sends().length, 0);
+  assert.match(h.warnings[0], /disk_full/);
+});
+
+test("leaving during upload aborts HTTP and ignores late completion/progress", async () => {
+  const h = harness();
+  let finishUpload, options;
+  h.context.pendingAttachments.value = [{id: "first", file: {name: "file.zip"}}];
+  h.context.Api.uploadConversationFiles = (_uuid, _files, opts) => {
+    options = opts;
+    return new Promise(resolve => {finishUpload = resolve;});
+  };
+  const sending = h.run("send()");
+  await flush();
+  h.context.props.conversationUuid = "other";
+  h.context.draft.value = "other draft";
+  h.run("leavePendingSend()");
+  assert.equal(options.signal.aborted, true);
+  h.context.status.value = "other status";
+  options.onProgress({loaded: 1, total: 1, fileIndex: 0, fileCount: 1});
+  finishUpload([{uploadId: "late-upload"}]);
+  await sending;
+  assert.equal(h.context.status.value, "other status");
+  assert.equal(h.context.draft.value, "other draft");
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test("stop during HTTP upload cancels locally and restores draft/attachments without sending stop", async () => {
+  const h = harness();
+  let resolveUpload, signal;
+  h.context.pendingAttachments.value = [{id: "first", file: {name: "file.zip"}}];
+  h.context.Api.uploadConversationFiles = (_uuid, _files, options) => {
+    signal = options.signal;
+    return new Promise(resolve => {resolveUpload = resolve;});
+  };
+  const sending = h.run("send()");
+  await flush();
+  await h.run("stop()");
+  assert.equal(signal.aborted, true);
+  assert.equal(h.context.draft.value, "original message");
+  assert.equal(h.context.pendingAttachments.value.length, 1);
+  assert.equal(h.context.sendPending.value, false);
+  assert.match(h.context.status.value, /上传已取消/);
+  resolveUpload([{uploadId: "late"}]);
+  await sending;
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test("unavailable folder defaults restore the draft without creating or sending a conversation", async () => {
+  const h = harness({local: true});
+  let created = false;
+  h.context.Api.createConversation = async () => {created = true;};
+  h.context.ensureLocalRunDefaults = async () => {throw new Error("无法读取目录默认配置，请检查连接后重试");};
+  await h.run("send()");
+  assert.equal(created, false);
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.context.draft.value, "original message");
+  assert.equal(h.context.sendPending.value, false);
 });
 
 test("first local conversation binds its pending receipt to the created server conversation", async () => {

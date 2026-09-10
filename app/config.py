@@ -343,10 +343,12 @@ class MediaConfig(BaseModel):
     # or retention cleaner; keep parsing old files but omit these fields on write-back.
     enabled: bool = Field(default=True, exclude=True)
     download_dir: str = Field(default="data/media/inbound", alias="downloadDir")
-    max_image_mb: int = Field(default=20, alias="maxImageMb", ge=0)
-    max_audio_mb: int = Field(default=25, alias="maxAudioMb", ge=0)
-    max_video_mb: int = Field(default=50, alias="maxVideoMb", ge=0)
-    max_file_mb: int = Field(default=20, alias="maxFileMb", ge=0)
+    # Legacy inputs only: HTTP uploads have no file-size cap. Accept old configs
+    # without applying these values or advertising/writing them back.
+    max_image_mb: int = Field(default=0, alias="maxImageMb", ge=0, exclude=True)
+    max_audio_mb: int = Field(default=0, alias="maxAudioMb", ge=0, exclude=True)
+    max_video_mb: int = Field(default=0, alias="maxVideoMb", ge=0, exclude=True)
+    max_file_mb: int = Field(default=0, alias="maxFileMb", ge=0, exclude=True)
     max_media_per_message: int = Field(default=10, alias="maxMediaPerMessage", ge=0)
     media_group_flush_ms: int = Field(default=1000, alias="mediaGroupFlushMs", ge=0)
     keep_days: int = Field(default=7, alias="keepDays", ge=0, exclude=True)

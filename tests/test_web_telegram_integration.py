@@ -67,8 +67,10 @@ async def test_tg_reply_uses_real_web_runtime_history_current_model_and_returns_
     monkeypatch.setattr(server.llm_factory, "backend_for", backend_for)
     bot = NotificationBot()
     server.web_task_telegram.bot = bot
+    server.telegram_replies.bot = bot
     for message, expected in [(Incoming(text="按刚才结论继续"), "已继续原来的工作"), (Incoming(501, 901, "再做补充"), "后续补充已完成")]:
         await incoming(server, message)
+        assert not await server.telegram_replies.deliver_receipt()
         await asyncio.wait_for(server.runs.task(chat_id), timeout=5)
         delivery = await server.web_task_telegram._claim_due()
         assert delivery is not None and delivery.event_type == "result" and delivery.payload["combined"]
@@ -115,6 +117,7 @@ async def test_tg_replies_during_run_wake_same_controller_and_merge_at_safe_boun
         await web_env.db.conn.commit()
         await incoming(server, Incoming(text="新增要求一"))
         await incoming(server, Incoming(501, 100, "新增要求二"))
+        assert not await server.telegram_replies.deliver_receipt()
         assert server.runs.task(chat_id) is task
         pending = steering.pending_items(chat_id)
         assert [item["source"] for item in pending] == ["telegram", "telegram"]

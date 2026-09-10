@@ -1,7 +1,8 @@
 <script setup>
 import {computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ElMessage, ElMessageBox} from "element-plus";
-import {Close, CollectionTag, Delete, EditPen, Plus, Refresh, RefreshLeft} from "@element-plus/icons-vue";
+import {ArrowLeft, ArrowRight, Close, CollectionTag, Delete, EditPen, Plus, Refresh, RefreshLeft, Search} from "@element-plus/icons-vue";
+import InteractionMarkdown from "./InteractionMarkdown.vue";
 import {Api, apiError} from "../../api.js";
 import {createTaskMemoryRequestGate} from "./taskMemoryRequestGate.js";
 import {
@@ -9,7 +10,6 @@ import {
 	createTaskMemoryBadgeState,
 	createTaskMemoryChangedEventGate,
 	taskMemoryMutationRecovery,
-	taskMemorySourceLabel,
 } from "./taskMemoryUiState.js";
 
 const props = defineProps({
@@ -34,6 +34,18 @@ const form = ref(emptyForm());
 const injectionPreview = ref("");
 const previewRuntimeTokens = ref(0);
 const previewMaxTokens = ref(1500);
+const detail = ref(null);
+const detailLoading = ref(false);
+const detailError = ref("");
+const detailChanged = ref(false);
+const previewOpen = ref(false);
+const page = ref(1);
+const total = ref(0);
+const pageSize = 50;
+const editorBaseline = ref("");
+const detailHeading = ref(null);
+let lastReadButton = null;
+let searchTimer = 0;
 let refreshTimer = 0;
 const requestGate = createTaskMemoryRequestGate();
 const changedEvent = inject(TASK_MEMORY_CHANGED_EVENT_KEY, ref(null));
@@ -52,7 +64,22 @@ const badgeCount = computed(() => drawerOpen.value
 	: stableBadge.value.count);
 const hasContent = computed(() => badgeCount.value > 0);
 const bodyBytes = computed(() => new TextEncoder().encode(String(form.value.body || "")).length);
-const editorTitle = computed(() => editorMode.value === "create" ? "新增任务记忆" : "编辑任务记忆");
+const editorTitle = computed(() => editorMode.value === "create" ? "新增记忆" : "编辑记忆");
+const canCreate = computed(() => Boolean(usableConversationUuid.value) && (scopeType.value === "conversation" || Boolean(selectedTaskUuid.value)));
+const emptyTitle = computed(() => activeTab.value === "agent" && !selectedTaskUuid.value
+	? "暂无 Agent 任务"
+	: query.value.trim() ? "没有找到匹配的记忆" : "还没有记忆");
+const emptyDescription = computed(() => activeTab.value === "agent" && !selectedTaskUuid.value
+	? "此会话中的 Agent 开始工作后，可在这里选择任务并查看记忆。"
+	: query.value.trim() ? "试试其他关键词，或清空搜索查看全部。" : "保存重要决定和工作进展，方便后续接着处理。");
+
+function taskLabel(task) {
+	return String(task?.title || task?.name || "未命名任务");
+}
+
+function taskSearchLabel(task) {
+	return `${taskLabel(task)} · ${task.name || "Agent"} · ${statusLabel(task.status)} · ${formatDate(task.updatedAt)}`;
+}
 
 function emptyForm() {
 	return {
@@ -102,6 +129,14 @@ function resetContextState({
 } = {}) {
 	resetEditorState();
 	items.value = [];
+	detail.value = null;
+	detailLoading.value = false;
+	detailError.value = "";
+	detailChanged.value = false;
+	previewOpen.value = false;
+	page.value = 1;
+	total.value = 0;
+	window.clearTimeout(searchTimer);
 	if (resetActiveTotal) activeTotal.value = 0;
 	injectionPreview.value = "";
 	previewRuntimeTokens.value = 0;
@@ -154,7 +189,11 @@ function formatBytes(value) {
 }
 
 function sourceLabel(item) {
-	return taskMemorySourceLabel(item);
+	const actor = String(item?.createdBy || "");
+	if (actor.startsWith("web:")) return "手动创建";
+	if (actor === "main-controller") return "助手记录";
+	if (actor.startsWith("agent:")) return "Agent 记录";
+	return "系统记录";
 }
 
 async function loadPreview() {
@@ -242,6 +281,9 @@ async function loadCurrent({silent = false} = {}) {
 	const token = beginRequest("items");
 	const requestQuery = String(query.value || "").trim();
 	const requestIncludeDeleted = includeDeleted.value;
+	const requestPage = page.value;
+	const matchesFilters = () => requestIsCurrent(token) && requestQuery === query.value.trim()
+		&& requestIncludeDeleted === includeDeleted.value && requestPage === page.value;
 	if (!token.conversationUuid || (token.scopeType === "agent_task" && !token.taskUuid)) {
 		items.value = [];
 		activeTotal.value = 0;
@@ -252,11 +294,18 @@ async function loadCurrent({silent = false} = {}) {
 		const data = await Api.taskMemories(token.conversationUuid, requestScopeParams(token, {
 			query: requestQuery,
 			includeDeleted: requestIncludeDeleted ? 1 : 0,
-			offset: 0,
-			limit: 50,
+			offset: (requestPage - 1) * pageSize,
+			limit: pageSize,
 		}));
-		if (!requestIsCurrent(token)) return;
+		if (!matchesFilters()) return;
+		total.value = Number(data?.total || 0);
+		if (requestPage > 1 && (requestPage - 1) * pageSize >= total.value) {
+			page.value = Math.max(1, Math.ceil(total.value / pageSize));
+			return;
+		}
 		items.value = Array.isArray(data?.items) ? data.items : [];
+		const latestDetail = items.value.find(item => item.memoryUuid === detail.value?.memoryUuid);
+		if (latestDetail && latestDetail.revision !== detail.value.revision) detailChanged.value = true;
 		activeTotal.value = Number(data?.activeTotal ?? items.value.filter((item) => !Number(item.deletedAt || 0)).length);
 		updateStableBadge(token, activeTotal.value);
 		if (token.scopeType === "conversation" && !requestIncludeDeleted && !requestQuery) {
@@ -267,6 +316,57 @@ async function loadCurrent({silent = false} = {}) {
 	} finally {
 		if (requestIsCurrent(token)) loading.value = false;
 	}
+}
+
+function searchMemories() {
+	window.clearTimeout(searchTimer);
+	if (page.value !== 1) page.value = 1;
+	else if (drawerOpen.value) void loadCurrent();
+}
+
+async function viewMemory(item, event) {
+	const token = beginRequest("detail");
+	if (event?.currentTarget) lastReadButton = event.currentTarget;
+	detail.value = {...item};
+	detailLoading.value = true;
+	detailError.value = "";
+	detailChanged.value = false;
+	try {
+		const data = await Api.taskMemory(token.conversationUuid, item.memoryUuid,
+			requestScopeParams(token, {includeDeleted: 1}));
+		if (!requestIsCurrent(token)) return;
+		detail.value = data.memory;
+		if (event) {
+			await nextTick();
+			if (requestIsCurrent(token)) detailHeading.value?.focus();
+		}
+	} catch (error) {
+		if (!requestIsCurrent(token)) return;
+		detailError.value = "暂时无法读取正文，请重试。";
+	} finally {
+		if (requestIsCurrent(token)) detailLoading.value = false;
+	}
+}
+
+function backToList() {
+	beginRequest("detail");
+	detail.value = null;
+	detailLoading.value = false;
+	detailError.value = "";
+	void nextTick(() => { if (!detail.value && drawerOpen.value && lastReadButton?.isConnected) lastReadButton.focus(); });
+}
+
+async function closeEditor() {
+	if (saving.value) return;
+	const token = beginRequest("editor-close");
+	if (JSON.stringify(form.value) !== editorBaseline.value) {
+		try {
+			await ElMessageBox.confirm("尚有未保存的修改，确定放弃吗？", "放弃修改", {
+				confirmButtonText: "放弃修改", cancelButtonText: "继续编辑", customClass: "task-memory-confirm",
+			});
+		} catch { return; }
+	}
+	if (requestIsCurrent(token)) editorOpen.value = false;
 }
 
 async function openDrawer() {
@@ -299,7 +399,8 @@ function handleWindowFocus() {
 
 async function handleTaskMemoryChanged(event) {
 	if (!changedEventGate.accept(event, currentRequestIdentity())) return;
-	invalidateRequests();
+	// Refresh read channels without invalidating an in-flight save or erasing its draft.
+	if (detail.value?.memoryUuid === event.memoryUuid) detailChanged.value = true;
 	if (drawerOpen.value) {
 		await Promise.all([loadCurrent({silent: true}), loadConversationCount(), loadPreview()]);
 		return;
@@ -324,7 +425,9 @@ function newMemory() {
 		return;
 	}
 	editorMode.value = "create";
+	beginRequest("detail");
 	form.value = emptyForm();
+	editorBaseline.value = JSON.stringify(form.value);
 	editorOpen.value = true;
 }
 
@@ -339,6 +442,11 @@ async function editMemory(item) {
 		);
 		if (!requestIsCurrent(token)) return;
 		const detail = data?.memory || {};
+		if (detail.deletedAt) {
+			ElMessage.warning("这条记忆已删除，请恢复后再编辑。");
+			await viewMemory(detail);
+			return;
+		}
 		editorMode.value = "edit";
 		form.value = {
 			memoryUuid: detail.memoryUuid || "",
@@ -349,6 +457,7 @@ async function editMemory(item) {
 			visibleToAgents: Boolean(detail.visibleToAgents),
 			revision: Number(detail.revision || 0),
 		};
+		editorBaseline.value = JSON.stringify(form.value);
 		editorOpen.value = true;
 		await nextTick();
 	} catch (error) {
@@ -358,6 +467,7 @@ async function editMemory(item) {
 }
 
 async function saveMemory() {
+	if (saving.value || !canCreate.value) return;
 	const name = String(form.value.name || "").trim();
 	const description = String(form.value.description || "").trim();
 	if (!name) return ElMessage.warning("名称不能为空");
@@ -377,16 +487,18 @@ async function saveMemory() {
 	};
 	saving.value = true;
 	try {
-		if (mode === "create") {
-			await Api.createTaskMemory(token.conversationUuid, payload);
-		} else {
-			await Api.updateTaskMemory(token.conversationUuid, memoryUuid, {
-				...payload,
-				revision: Number(form.value.revision || 0),
+		const result = mode === "create"
+			? await Api.createTaskMemory(token.conversationUuid, payload)
+			: await Api.updateTaskMemory(token.conversationUuid, memoryUuid, {
+				...payload, revision: Number(form.value.revision || 0),
 			});
-		}
 		if (!requestIsCurrent(token)) return;
 		editorOpen.value = false;
+		if (result?.memory) {
+			detail.value = result.memory;
+			detailChanged.value = false;
+			detailError.value = "";
+		}
 		ElMessage.success(mode === "create" ? "任务记忆已创建" : "任务记忆已更新");
 		await Promise.all([loadCurrent(), loadConversationCount(), loadPreview()]);
 	} catch (error) {
@@ -409,7 +521,8 @@ async function deleteMemory(item) {
 			...requestScopeParams(token), revision: Number(item.revision || 0),
 		});
 		if (!requestIsCurrent(token)) return;
-		ElMessage.success("已软删除");
+		if (detail.value?.memoryUuid === item.memoryUuid) backToList();
+		ElMessage.success("已删除，可在已删除记录中恢复");
 		await Promise.all([loadCurrent(), loadConversationCount(), loadPreview()]);
 	} catch (error) {
 		if (error === "cancel" || error === "close" || !requestIsCurrent(token)) return;
@@ -424,6 +537,7 @@ async function restoreMemory(item) {
 			...requestScopeParams(token), revision: Number(item.revision || 0),
 		});
 		if (!requestIsCurrent(token)) return;
+		if (detail.value?.memoryUuid === item.memoryUuid) await viewMemory({...item, deletedAt: 0});
 		ElMessage.success("任务记忆已恢复");
 		await Promise.all([loadCurrent(), loadConversationCount(), loadPreview()]);
 	} catch (error) {
@@ -470,9 +584,14 @@ watch(selectedTaskUuid, () => {
 	resetContextState({resetTasks: false, resetCounts: false, resetFilters: false});
 	if (drawerOpen.value) void Promise.all([loadCurrent(), loadConversationCount(), loadPreview()]);
 });
-watch(includeDeleted, () => {
+watch(query, () => {
+	window.clearTimeout(searchTimer);
+	searchTimer = window.setTimeout(searchMemories, 250);
+});
+watch(page, () => {
 	if (drawerOpen.value) void loadCurrent();
 });
+watch(includeDeleted, searchMemories);
 watch(changedEvent, (event) => {
 	if (event) void handleTaskMemoryChanged(event);
 });
@@ -514,7 +633,7 @@ onBeforeUnmount(() => {
 	<el-drawer
 		v-model="drawerOpen"
 		class="task-memory-drawer"
-		size="min(31rem, 94vw)"
+		size="min(42rem, 100vw)"
 		append-to-body
 		:with-header="false"
 		:destroy-on-close="false"
@@ -522,131 +641,154 @@ onBeforeUnmount(() => {
 	>
 		<header class="memory-drawer-header">
 			<div>
-				<span class="memory-kicker">TASK MEMORY</span>
 				<h2 id="task-memory-drawer-title">任务记忆</h2>
-				<p>目录自动进入下一次安全模型边界；正文仅在编辑时读取。</p>
+				<p>保留重要决定与进展，方便后续继续工作。</p>
 			</div>
-			<div class="memory-drawer-actions">
-				<span class="memory-quota">{{ activeTotal }}/50</span>
-				<button type="button" class="icon-action drawer-close" aria-label="关闭任务记忆" @click="drawerOpen = false"><Close/></button>
-			</div>
+			<button type="button" class="icon-action drawer-close" aria-label="关闭任务记忆" @click="drawerOpen = false"><Close/></button>
 		</header>
 
 		<el-tabs v-model="activeTab" class="memory-tabs" stretch>
 			<el-tab-pane label="会话记忆" name="conversation"/>
-			<el-tab-pane label="Agent 任务记忆" name="agent"/>
+			<el-tab-pane label="Agent 记忆" name="agent"/>
 		</el-tabs>
 
 		<section v-if="activeTab === 'agent'" class="task-picker" aria-labelledby="task-memory-task-label">
-			<label id="task-memory-task-label" class="visually-hidden" for="task-memory-task-select">选择 Agent 任务</label>
+			<label id="task-memory-task-label" for="task-memory-task-select">查看任务</label>
 			<el-select
 				id="task-memory-task-select"
 				v-model="selectedTaskUuid"
 				aria-labelledby="task-memory-task-label"
 				:loading="tasksLoading"
-				placeholder="当前会话暂无 Agent 任务"
+				placeholder="暂无 Agent 任务"
 				filterable
 				popper-class="task-memory-task-select-popper"
-				class="w-full"
+				class="memory-task-select"
 			>
-				<el-option v-for="task in tasks" :key="task.taskUuid" :value="task.taskUuid">
+				<template #label><span>{{ taskLabel(selectedTask) }}</span></template>
+				<el-option v-for="task in tasks" :key="task.taskUuid" :value="task.taskUuid" :label="taskSearchLabel(task)">
 					<div class="task-option">
-						<span>{{ task.name }} · {{ task.taskShortId }}</span>
-						<small>{{ statusLabel(task.status) }}</small>
+						<strong>{{ taskLabel(task) }}</strong>
+						<small><span>{{ task.name || 'Agent' }} · {{ statusLabel(task.status) }}</span><time>{{ formatDate(task.updatedAt) }}</time></small>
 					</div>
 				</el-option>
 			</el-select>
-			<p v-if="selectedTask">{{ selectedTask.title || selectedTask.name }} · {{ statusLabel(selectedTask.status) }}</p>
+			<p v-if="selectedTask">{{ selectedTask.name || 'Agent' }}<span>·</span>{{ statusLabel(selectedTask.status) }}<span>·</span>{{ formatDate(selectedTask.updatedAt) }}</p>
 		</section>
 
-		<div class="memory-toolbar">
-			<el-input
-				v-model="query"
-				clearable
-				placeholder="搜索名称、说明或正文"
-				aria-label="搜索任务记忆"
-				@keyup.enter="loadCurrent()"
-				@clear="loadCurrent()"
-			/>
-			<el-tooltip content="刷新" placement="bottom">
-				<button type="button" class="icon-action" aria-label="刷新任务记忆" @click="loadCurrent()"><Refresh/></button>
-			</el-tooltip>
-			<button type="button" class="primary-action" @click="newMemory"><Plus/>新增</button>
-		</div>
-		<div class="deleted-toggle">
-			<el-switch id="task-memory-show-deleted" v-model="includeDeleted" size="small" aria-labelledby="task-memory-show-deleted-label"/>
-			<label id="task-memory-show-deleted-label" for="task-memory-show-deleted">显示已删除</label>
-		</div>
-
-		<div v-loading="loading" class="memory-list" aria-live="polite">
-			<div v-if="!items.length && !loading" class="memory-empty">
-				<CollectionTag/>
-				<strong>{{ activeTab === "agent" && !selectedTaskUuid ? "请选择 Agent 任务" : "还没有任务记忆" }}</strong>
-				<p>用简短名称和说明维护目录；需要时再读取正文。</p>
+		<section v-show="!detail" class="memory-browse" aria-label="记忆列表">
+			<div class="memory-toolbar">
+				<el-input v-model="query" clearable :prefix-icon="Search" placeholder="搜索名称、说明或正文" aria-label="搜索任务记忆" @keyup.enter="searchMemories"/>
+				<button type="button" class="icon-action" :class="{ refreshing: loading }" aria-label="刷新任务记忆" :disabled="loading" @click="loadCurrent()"><Refresh/></button>
+				<el-button type="primary" class="primary-action" :icon="Plus" :disabled="!canCreate" @click="newMemory">新增</el-button>
 			</div>
-			<article
-				v-for="item in items"
-				:key="item.memoryUuid"
-				class="memory-row"
-				:class="{ deleted: item.deletedAt, reinject: item.autoReinjectCatalog }"
-			>
-				<button type="button" class="memory-row-main" :aria-label="`编辑 ${item.name}`" @click="editMemory(item)">
-					<span class="memory-name-line">
-						<strong>{{ item.name }}</strong>
-						<em>v{{ item.revision }}</em>
-					</span>
-					<span class="memory-description">{{ item.description || "无说明" }}</span>
-					<span class="memory-meta">{{ formatDate(item.updatedAt) }} · {{ formatBytes(item.sizeBytes) }}</span>
-					<span class="memory-source">{{ sourceLabel(item) }}</span>
-					<span class="memory-flags">
-						<i :class="{ on: item.autoReinjectCatalog }">{{ item.autoReinjectCatalog ? "自动重注入" : "仅工具读取" }}</i>
-						<i v-if="activeTab === 'conversation'" :class="{ on: item.visibleToAgents }">{{ item.visibleToAgents ? "Agent 可见" : "Agent 隐藏" }}</i>
-						<i v-if="item.deletedAt" class="danger">已删除</i>
-					</span>
-				</button>
-				<div class="memory-row-actions">
-					<button v-if="!item.deletedAt" type="button" aria-label="编辑" @click="editMemory(item)"><EditPen/></button>
-					<button v-if="!item.deletedAt" type="button" class="danger" aria-label="删除" @click="deleteMemory(item)"><Delete/></button>
-					<button v-else type="button" aria-label="恢复" @click="restoreMemory(item)"><RefreshLeft/></button>
+			<div class="memory-list-summary">
+				<span>{{ query.trim() ? `找到 ${total} 条` : `${activeTotal} 条记忆` }}</span>
+				<div class="deleted-toggle">
+					<el-switch id="task-memory-show-deleted" v-model="includeDeleted" size="small" aria-labelledby="task-memory-show-deleted-label"/>
+					<label id="task-memory-show-deleted-label" for="task-memory-show-deleted">显示已删除</label>
 				</div>
-			</article>
-		</div>
-
-		<section class="injection-preview">
-			<header><strong>注入预览</strong><span>仅目录 · 无正文 · {{ previewRuntimeTokens }}/{{ previewMaxTokens }} tokens</span></header>
-			<pre>{{ injectionPreview || "（当前作用域没有自动重注入条目）" }}</pre>
+			</div>
+			<div class="memory-list" :aria-busy="loading ? 'true' : 'false'">
+				<div v-if="!items.length && !loading" class="memory-empty" role="status">
+					<CollectionTag/>
+					<strong>{{ emptyTitle }}</strong>
+					<p>{{ emptyDescription }}</p>
+					<button v-if="query.trim()" type="button" class="text-action" @click="query = ''">清空搜索</button>
+				</div>
+				<article v-for="item in items" :key="item.memoryUuid" class="memory-row" :class="{ deleted: item.deletedAt }">
+					<button type="button" class="memory-row-main" :aria-label="`查看 ${item.name}`" @click="viewMemory(item, $event)">
+						<span class="memory-name-line"><strong>{{ item.name }}</strong><ArrowRight/></span>
+						<span v-if="item.description" class="memory-description">{{ item.description }}</span>
+						<span class="memory-meta">{{ sourceLabel(item) }}<span>·</span>{{ formatDate(item.updatedAt) }} 更新</span>
+						<span class="memory-flags">
+							<i v-if="item.deletedAt" class="danger">已删除</i>
+							<i v-else-if="item.autoReinjectCatalog" class="on">目录自动提供给模型</i>
+							<i v-else>按需读取</i>
+							<i v-if="activeTab === 'conversation' && item.visibleToAgents">Agent 可读取</i>
+						</span>
+					</button>
+					<div class="memory-row-actions">
+						<button v-if="!item.deletedAt" type="button" :aria-label="`编辑 ${item.name}`" title="编辑" @click="editMemory(item)"><EditPen/></button>
+						<button v-if="!item.deletedAt" type="button" class="danger" :aria-label="`删除 ${item.name}`" title="删除" @click="deleteMemory(item)"><Delete/></button>
+						<button v-else type="button" :aria-label="`恢复 ${item.name}`" title="恢复" @click="restoreMemory(item)"><RefreshLeft/></button>
+					</div>
+				</article>
+			</div>
+			<div v-if="total > pageSize" class="memory-pagination">
+				<span>共 {{ total }} 条</span>
+				<el-pagination v-model:current-page="page" :page-size="pageSize" :total="total" layout="prev, pager, next" :pager-count="5" small/>
+			</div>
 		</section>
-		<p class="refresh-policy">打开时每 5 秒轻量刷新；修改成功、切换 tab/任务、窗口重新聚焦时立即重拉。</p>
+
+		<section v-if="detail" class="memory-detail" aria-label="记忆详情" :aria-busy="detailLoading ? 'true' : 'false'">
+			<div class="memory-detail-toolbar">
+				<button type="button" class="text-action back-action" @click="backToList"><ArrowLeft/>返回列表</button>
+				<el-button v-if="detail.deletedAt" type="primary" class="primary-action" :icon="RefreshLeft" @click="restoreMemory(detail)">恢复记忆</el-button>
+				<el-button v-else type="primary" class="primary-action" :icon="EditPen" :disabled="detailLoading || Boolean(detailError)" @click="editMemory(detail)">编辑</el-button>
+			</div>
+			<div class="memory-detail-scroll" tabindex="0" aria-label="记忆正文">
+				<h3 ref="detailHeading" tabindex="-1">{{ detail.name }}</h3>
+				<p v-if="detail.description" class="memory-detail-description">{{ detail.description }}</p>
+				<div class="memory-detail-meta"><span>{{ sourceLabel(detail) }}</span><span>{{ formatDate(detail.updatedAt) }} 更新</span><span v-if="detail.deletedAt" class="danger">已删除</span></div>
+				<div v-if="detailChanged" class="memory-notice" role="status">这条记忆有新版本。<button type="button" class="text-action" @click="viewMemory(detail)">查看最新内容</button></div>
+				<div v-if="detailError" class="memory-notice" role="alert">{{ detailError }}<button type="button" class="text-action" @click="viewMemory(detail)">重新加载</button></div>
+				<div v-else-if="detailLoading" class="memory-reading-placeholder" aria-label="正在读取正文"></div>
+				<InteractionMarkdown v-else-if="detail.body" class="memory-body" :text="detail.body"/>
+				<p v-else class="memory-no-body">这条记忆没有正文。</p>
+				<details class="memory-technical">
+					<summary>详细信息</summary>
+					<dl>
+						<dt>使用方式</dt><dd>{{ detail.autoReinjectCatalog ? '自动向模型提供名称与说明，正文按需读取' : '名称与正文均按需读取' }}</dd>
+						<template v-if="activeTab === 'conversation'"><dt>Agent 读取</dt><dd>{{ detail.visibleToAgents ? '允许同会话中已获授权的 Agent 读取' : '不向 Agent 共享' }}</dd></template>
+						<dt>版本 / 大小</dt><dd>第 {{ detail.revision }} 版 · {{ formatBytes(detail.sizeBytes) }}</dd>
+						<dt>记忆标识</dt><dd><code>{{ detail.memoryUuid }}</code></dd>
+						<template v-if="detail.sourceTurnUuid"><dt>来源轮次</dt><dd><code>{{ detail.sourceTurnUuid }}</code></dd></template>
+						<template v-if="detail.sourceRunUuid"><dt>来源运行</dt><dd><code>{{ detail.sourceRunUuid }}</code></dd></template>
+					</dl>
+				</details>
+			</div>
+		</section>
+
+		<section v-if="!detail" class="injection-preview">
+			<button type="button" class="preview-toggle" :aria-expanded="previewOpen ? 'true' : 'false'" aria-controls="task-memory-catalog-preview" @click="previewOpen = !previewOpen">
+				<span>模型可见目录</span><small>约 {{ previewRuntimeTokens }} tokens</small><ArrowRight :class="{ expanded: previewOpen }"/>
+			</button>
+			<div v-if="previewOpen" id="task-memory-catalog-preview" class="preview-content">
+				<p>这是系统实际提供的目录，不含正文；预算 {{ previewMaxTokens }} tokens。Agent 目录也可能包含已共享的会话记忆。</p>
+				<pre tabindex="0" aria-label="目录原文">{{ injectionPreview || '暂无自动提供的目录条目' }}</pre>
+			</div>
+		</section>
 	</el-drawer>
 
 	<el-dialog
 		v-model="editorOpen"
 		class="task-memory-editor"
 		:title="editorTitle"
-		width="min(34rem, 94vw)"
+		width="min(42rem, 96vw)"
 		append-to-body
 		:close-on-click-modal="false"
+		:before-close="closeEditor"
 	>
-		<div class="memory-form">
-			<label id="task-memory-name-label" for="task-memory-name">名称 <span>{{ form.name.length }}/80</span></label>
-			<el-input id="task-memory-name" v-model="form.name" aria-labelledby="task-memory-name-label" maxlength="80" show-word-limit placeholder="例如：部署限制"/>
-			<label id="task-memory-description-label" for="task-memory-description">说明 <span>{{ form.description.length }}/200</span></label>
-			<el-input id="task-memory-description" v-model="form.description" aria-labelledby="task-memory-description-label" maxlength="200" show-word-limit placeholder="目录中展示的短说明"/>
-			<label id="task-memory-body-label" for="task-memory-body">正文 <span :class="{ danger: bodyBytes > 16 * 1024 }">{{ formatBytes(bodyBytes) }}/16 KiB</span></label>
-			<el-input id="task-memory-body" v-model="form.body" aria-labelledby="task-memory-body-label" type="textarea" :rows="10" resize="vertical" placeholder="仅 detail/get 会读取正文"/>
+		<form class="memory-form" @submit.prevent="saveMemory">
+			<label id="task-memory-name-label" for="task-memory-name">名称</label>
+			<el-input id="task-memory-name" v-model="form.name" :disabled="saving" aria-labelledby="task-memory-name-label" maxlength="80" show-word-limit placeholder="例如：发布前必须保留的配置"/>
+			<label id="task-memory-description-label" for="task-memory-description">简短说明 <span>帮助快速找到这条记忆</span></label>
+			<el-input id="task-memory-description" v-model="form.description" :disabled="saving" aria-labelledby="task-memory-description-label" maxlength="200" show-word-limit type="textarea" :rows="2" resize="none" placeholder="用一两句话概括重点"/>
+			<label id="task-memory-body-label" for="task-memory-body">正文 <span :class="{ danger: bodyBytes > 16 * 1024 }">{{ formatBytes(bodyBytes) }} / 16 KiB · 支持 Markdown</span></label>
+			<el-input id="task-memory-body" v-model="form.body" :disabled="saving" aria-labelledby="task-memory-body-label" type="textarea" :rows="10" resize="none" placeholder="记录决定、约束、重要发现或后续工作…"/>
 			<div class="memory-form-switches">
 				<div class="memory-switch-row">
-					<el-switch id="task-memory-auto-reinject" v-model="form.autoReinjectCatalog" aria-labelledby="task-memory-auto-reinject-label"/>
-					<label id="task-memory-auto-reinject-label" for="task-memory-auto-reinject">自动重注入目录</label>
+					<div><label id="task-memory-auto-reinject-label" for="task-memory-auto-reinject">自动向模型提供目录</label><p>提供名称与说明，正文仍按需读取。</p></div>
+					<el-switch id="task-memory-auto-reinject" v-model="form.autoReinjectCatalog" :disabled="saving" aria-labelledby="task-memory-auto-reinject-label"/>
 				</div>
 				<div v-if="scopeType === 'conversation'" class="memory-switch-row">
-					<el-switch id="task-memory-visible-agents" v-model="form.visibleToAgents" aria-labelledby="task-memory-visible-agents-label"/>
-					<label id="task-memory-visible-agents-label" for="task-memory-visible-agents">允许已获 TaskMemory 授权的 Agent 只读</label>
+					<div><label id="task-memory-visible-agents-label" for="task-memory-visible-agents">允许 Agent 读取</label><p>仅同会话中已获任务记忆工具授权的 Agent 可读取。</p></div>
+					<el-switch id="task-memory-visible-agents" v-model="form.visibleToAgents" :disabled="saving" aria-labelledby="task-memory-visible-agents-label"/>
 				</div>
 			</div>
-		</div>
+		</form>
 		<template #footer>
-			<el-button @click="editorOpen = false">取消</el-button>
+			<el-button :disabled="saving" @click="closeEditor">取消</el-button>
 			<el-button type="primary" :loading="saving" @click="saveMemory">保存</el-button>
 		</template>
 	</el-dialog>
@@ -706,101 +848,139 @@ onBeforeUnmount(() => {
 	line-height: 1;
 }
 
-.memory-drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: .8rem; border-bottom: 1px solid var(--bear-line, rgba(15,23,42,.1)); }
-.memory-drawer-actions { display: flex; flex: 0 0 auto; align-items: center; gap: .4rem; }
-.drawer-close { width: 2rem; }
-.visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; clip: rect(0 0 0 0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; }
-.memory-kicker { color: var(--bear-accent, #2563eb); font-size: 11px; font-weight: 750; letter-spacing: .12em; }
-.memory-drawer-header h2 { margin: .15rem 0 0; color: var(--bear-ink, #18181b); font-size: 20px; font-weight: 700; letter-spacing: -.025em; }
-.memory-drawer-header p { margin: .28rem 0 0; color: var(--bear-muted, #71717a); font-size: 13px; line-height: 1.5; }
-.memory-quota { flex: 0 0 auto; border-radius: 999px; background: #f4f4f5; padding: .3rem .58rem; color: #52525b; font-size: 12px; font-weight: 700; }
-.memory-tabs { margin-top: .3rem; }
-.task-picker { margin: .1rem 0 .75rem; border: 1px solid var(--bear-line, rgba(15,23,42,.1)); border-radius: .75rem; background: rgba(250,250,250,.82); padding: .6rem; }
-.task-picker p { margin: .42rem .15rem 0; overflow: hidden; color: var(--bear-muted, #71717a); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.task-option { display: flex; width: 100%; justify-content: space-between; gap: .75rem; font-size: 13px; }
-.task-option small { color: #71717a; font-size: 12px; }
-.memory-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 2.15rem auto; gap: .42rem; align-items: center; }
-.icon-action, .primary-action { display: inline-flex; height: 2rem; align-items: center; justify-content: center; gap: .28rem; border: 1px solid var(--bear-line, rgba(15,23,42,.1)); border-radius: .58rem; background: #fff; color: #52525b; cursor: pointer; }
-.icon-action { width: 2.15rem; padding: 0; }
-.icon-action svg, .primary-action svg { width: .8rem; height: .8rem; }
-.primary-action { border-color: var(--bear-ink, #18181b); background: var(--bear-ink, #18181b); padding: 0 .78rem; color: #fff; font-size: 13px; font-weight: 650; }
-.icon-action:hover { background: #f4f4f5; color: #18181b; }
-.icon-action:focus-visible, .primary-action:focus-visible, .memory-row-main:focus-visible, .memory-row-actions button:focus-visible { outline: 2px solid rgba(37,99,235,.42); outline-offset: 2px; }
-.deleted-toggle { display: inline-flex; align-items: center; gap: .46rem; margin: .65rem 0; color: var(--bear-muted, #71717a); font-size: 12px; }
-.memory-list { min-height: 8rem; max-height: calc(100vh - 23rem); overflow-y: auto; padding-right: .12rem; scrollbar-width: thin; }
-.memory-empty { display: grid; min-height: 10rem; place-items: center; align-content: center; border: 1px dashed rgba(15,23,42,.14); border-radius: .8rem; color: #a1a1aa; text-align: center; }
-.memory-empty svg { width: 1.4rem; margin-bottom: .45rem; }
-.memory-empty strong { color: #3f3f46; font-size: 14px; }
-.memory-empty p { margin: .3rem 0 0; font-size: 12px; line-height: 1.5; }
-.memory-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .35rem; margin-bottom: .42rem; border: 1px solid var(--bear-line, rgba(15,23,42,.1)); border-left: 3px solid #d4d4d8; border-radius: 0 .72rem .72rem 0; background: rgba(255,255,255,.88); box-shadow: 0 1px 2px rgba(15,23,42,.025); }
-.memory-row.reinject { border-left-color: var(--bear-accent, #2563eb); }
-.memory-row.deleted { opacity: .62; }
-.memory-row-main { min-width: 0; border: 0; outline: none; background: transparent; padding: .62rem .35rem .62rem .68rem; text-align: left; cursor: pointer; }
-.memory-name-line { display: flex; min-width: 0; align-items: center; gap: .42rem; }
-.memory-name-line strong { min-width: 0; overflow: hidden; color: var(--bear-ink, #18181b); font-size: 14px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.memory-name-line em { flex: 0 0 auto; border-radius: 999px; background: #f4f4f5; padding: .16rem .4rem; color: #52525b; font-size: 11px; font-style: normal; }
-.memory-description { display: block; margin-top: .28rem; overflow: hidden; color: #52525b; font-size: 13px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
-.memory-meta, .memory-source { display: block; margin-top: .28rem; overflow: hidden; color: #71717a; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.memory-flags { display: flex; flex-wrap: wrap; gap: .24rem; margin-top: .38rem; }
-.memory-flags i { border-radius: 999px; background: #f4f4f5; padding: .2rem .44rem; color: #52525b; font-size: 11px; font-style: normal; }
-.memory-flags i.on { background: var(--bear-accent-soft, #eff6ff); color: var(--bear-accent, #2563eb); }
-.memory-flags i.danger { background: #fff1f2; color: #e11d48; }
-.memory-row-actions { display: flex; flex-direction: column; gap: .2rem; padding: .45rem .42rem .45rem 0; }
-.memory-row-actions button { display: grid; width: 1.55rem; height: 1.55rem; place-items: center; border: 0; border-radius: .42rem; background: transparent; color: #a1a1aa; cursor: pointer; }
-.memory-row-actions button:hover { background: #f4f4f5; color: #3f3f46; }
-.memory-row-actions button.danger:hover { background: #fff1f2; color: #e11d48; }
-.memory-row-actions svg { width: .75rem; height: .75rem; }
-.injection-preview { margin-top: .75rem; border: 1px solid var(--bear-line, rgba(15,23,42,.1)); border-radius: .75rem; background: #fafafa; overflow: hidden; }
-.injection-preview header { display: flex; justify-content: space-between; padding: .5rem .62rem; border-bottom: 1px solid var(--bear-line, rgba(15,23,42,.1)); }
-.injection-preview strong { color: #3f3f46; font-size: 12px; }
-.injection-preview span { color: #71717a; font-size: 11px; }
-.injection-preview pre { max-height: 9.5rem; margin: 0; overflow: auto; padding: .58rem .62rem; color: #52525b; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-.refresh-policy { margin: .58rem .1rem 0; color: #71717a; font-size: 11px; line-height: 1.5; }
-.memory-form { display: grid; gap: .42rem; }
-.memory-form > label { display: flex; justify-content: space-between; margin-top: .38rem; color: #3f3f46; font-size: 13px; font-weight: 620; }
-.memory-form > label span { color: #a1a1aa; font-weight: 500; }
-.memory-form > label span.danger { color: #e11d48; }
-.memory-form-switches { display: grid; gap: .45rem; margin-top: .65rem; border-top: 1px solid rgba(15,23,42,.1); padding-top: .7rem; }
-.memory-switch-row { display: flex; align-items: center; gap: .55rem; }
-.memory-switch-row label { color: #3f3f46; font-size: 13px; line-height: 1.45; cursor: pointer; }
-
-:global(.task-memory-drawer .el-drawer__body) { padding: 1rem 1rem 1.25rem; }
-:global(.task-memory-drawer.el-drawer) { background: rgba(255,255,255,.98); box-shadow: -18px 0 58px rgba(15,23,42,.16); }
-:global(.task-memory-drawer .el-tabs__item) { font-size: 13px; font-weight: 620; }
-:global(.task-memory-drawer .el-input__inner),
-:global(.task-memory-drawer .el-select__placeholder),
-:global(.task-memory-drawer .el-select__selected-item) { font-size: 13px; }
-:global(.task-memory-editor.el-dialog) { border-radius: 1rem; overflow: hidden; }
-:global(.task-memory-editor .el-dialog__title) { color: #18181b; font-size: 18px; font-weight: 700; }
-:global(.task-memory-editor .el-input__inner),
-:global(.task-memory-editor .el-textarea__inner) { color: #27272a; font-size: 14px; line-height: 1.6; }
-:global(.task-memory-editor .el-input__count),
-:global(.task-memory-editor .el-input__count-inner) { font-size: 11px; }
-:global(.task-memory-editor .el-button) { font-size: 13px; }
-:global(.task-memory-task-select-popper .el-select-dropdown__item) { min-height: 38px; font-size: 13px; line-height: 1.4; }
-:global(.task-memory-confirm .el-message-box__title) { font-size: 17px; font-weight: 700; }
-:global(.task-memory-confirm .el-message-box__message) { color: #3f3f46; font-size: 14px; line-height: 1.6; }
-:global(.task-memory-confirm .el-button) { font-size: 13px; }
-
+.memory-drawer-header { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; flex-shrink:0; }
+.memory-drawer-header h2 { margin:0; color:var(--bear-ink, #18181b); font-size:18px; font-weight:650; line-height:1.5; }
+.memory-drawer-header p { margin:.3rem 0 0; color:var(--tm-muted); font-size:12px; line-height:1.6; }
+.memory-tabs { flex-shrink:0; margin-top:1rem; }
+.task-picker { flex-shrink:0; margin:0 0 1rem; padding:.75rem; border-radius:.75rem; background:var(--tm-soft); }
+.task-picker > label { display:block; margin-bottom:.4rem; color:var(--tm-muted); font-size:12px; }
+.memory-task-select { width:100%; }
+.task-picker p { display:flex; flex-wrap:wrap; gap:.4rem; margin:.5rem 0 0; font-size:12px; color:var(--tm-muted); }
+.memory-browse { display:flex; flex-direction:column; flex:1; min-height:0; }
+.memory-toolbar { display:flex; align-items:center; gap:.5rem; flex-shrink:0; }
+.memory-toolbar > .el-input { flex:1; min-width:0; }
+.icon-action { display:inline-flex; flex-shrink:0; height:2.1rem; align-items:center; justify-content:center; gap:.35rem; border:1px solid var(--tm-line); border-radius:.5rem; background:transparent; color:var(--tm-muted); cursor:pointer; font:inherit; font-size:13px; }
+.icon-action { width:2.1rem; padding:0; }
+.icon-action svg, .primary-action svg, .text-action svg { width:15px; height:15px; }
+.primary-action.el-button { flex-shrink:0; height:34px; margin:0; padding:0 .8rem; border-radius:8px; font-family:inherit; font-size:13px; font-weight:500; }
+.icon-action:hover { background:var(--tm-soft); color:var(--bear-ink); }
+button:disabled:not(.el-button) { opacity:.5; cursor:not-allowed; }
+button:focus-visible, summary:focus-visible, .memory-detail-scroll:focus-visible { outline:2px solid var(--bear-accent, #2563eb); outline-offset:2px; }
+.memory-list-summary { display:flex; justify-content:space-between; align-items:center; gap:.5rem; flex-shrink:0; padding:.7rem 0; color:var(--tm-muted); font-size:12px; }
+.deleted-toggle { display:flex; align-items:center; gap:.45rem; }
+.deleted-toggle label { cursor:pointer; }
+.memory-list { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; padding:0 .25rem .5rem 0; }
+.memory-empty { display:flex; min-height:13rem; height:100%; flex-direction:column; justify-content:center; align-items:center; padding:1rem; text-align:center; color:var(--tm-muted); box-sizing:border-box; }
+.memory-empty > svg { width:30px; height:30px; margin-bottom:.85rem; opacity:.55; }
+.memory-empty strong { color:var(--bear-ink); font-size:14px; font-weight:550; }
+.memory-empty p { max-width:23rem; font-size:13px; line-height:1.75; margin:.5rem 0; }
+.memory-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.4rem; margin-bottom:.5rem; border:1px solid var(--tm-line); border-radius:.65rem; background:var(--tm-surface); }
+.memory-row:hover { border-color:var(--tm-hover-line); background:var(--tm-soft); }
+.memory-row.deleted .memory-name-line strong { color:var(--tm-muted); }
+.memory-row-main { display:block; min-width:0; border:0; background:transparent; padding:.9rem 0 .9rem .9rem; text-align:left; cursor:pointer; font:inherit; }
+.memory-name-line { display:flex; align-items:flex-start; gap:.5rem; }
+.memory-name-line strong { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; flex:1; min-width:0; overflow:hidden; overflow-wrap:anywhere; color:var(--bear-ink, #18181b); font-size:14px; font-weight:600; line-height:1.5; }
+.memory-name-line > svg { width:13px; height:13px; flex-shrink:0; margin-top:4px; color:var(--tm-muted); opacity:.6; }
+.memory-description { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; margin-top:.4rem; overflow:hidden; overflow-wrap:anywhere; color:var(--tm-muted); font-size:13px; line-height:1.65; }
+.memory-meta { display:flex; flex-wrap:wrap; align-items:baseline; gap:.35rem; margin-top:.6rem; color:var(--tm-muted); font-size:12px; line-height:1.5; }
+.memory-flags { display:flex; flex-wrap:wrap; gap:.45rem; margin-top:.5rem; }
+.memory-flags i { border-radius:.3rem; padding:.15rem .4rem; color:var(--tm-muted); background:var(--tm-soft); font-size:11px; line-height:1.6; font-style:normal; }
+.memory-flags i.on { color:var(--bear-accent, #2563eb); background:var(--tm-accent-soft); }
+.danger, .memory-flags i.danger { color:var(--tm-danger); }
+.memory-row-actions { display:flex; flex-direction:column; gap:.25rem; padding:.65rem .5rem; }
+.memory-row-actions button { display:grid; place-items:center; width:30px; height:30px; padding:0; border:0; border-radius:.4rem; background:transparent; color:var(--tm-muted); cursor:pointer; }
+.memory-row-actions svg { width:15px; height:15px; }
+.memory-row-actions button:hover { color:var(--bear-accent, #2563eb); background:var(--tm-accent-soft); }
+.memory-row-actions button.danger:hover { color:var(--tm-danger); background:var(--tm-soft); }
+.memory-pagination { display:flex; align-items:center; justify-content:space-between; gap:.5rem; flex-shrink:0; padding:.6rem 0; font-size:12px; color:var(--tm-muted); }
+.memory-detail { display:flex; flex-direction:column; flex:1; min-height:0; }
+.memory-detail-toolbar { display:flex; align-items:center; justify-content:space-between; gap:.5rem; flex-shrink:0; padding:0 0 1rem; }
+.text-action { display:inline-flex; align-items:center; gap:.3rem; border:0; background:transparent; padding:.3rem 0; font:inherit; font-size:13px; color:var(--bear-accent, #2563eb); cursor:pointer; }
+.back-action { color:var(--tm-muted); }
+.memory-detail-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; scrollbar-width:thin; padding:0 .4rem 1rem 0; }
+.memory-detail h3 { margin:0; color:var(--bear-ink); font-size:18px; font-weight:600; line-height:1.6; overflow-wrap:anywhere; }
+.memory-detail-description { margin:.55rem 0 0; color:var(--tm-muted); font-size:13px; line-height:1.8; overflow-wrap:anywhere; }
+.memory-detail-meta { display:flex; flex-wrap:wrap; gap:.7rem; margin:.8rem 0 1.25rem; color:var(--tm-muted); font-size:12px; }
+.memory-body { padding-top:1.25rem; border-top:1px solid var(--tm-line); font-size:14px; line-height:1.85; color:var(--bear-ink, #27272a); }
+.memory-body :deep(h1), .memory-body :deep(h2), .memory-body :deep(h3) { font-size:16px; font-weight:600; line-height:1.7; }
+.memory-no-body { color:var(--tm-muted); font-size:13px; padding:1rem 0; }
+.memory-notice { margin:.75rem 0; padding:.6rem .8rem; border-radius:.5rem; background:var(--tm-soft); color:var(--tm-muted); font-size:13px; line-height:1.7; }
+.memory-notice button { margin-left:.6rem; }
+.memory-reading-placeholder { min-height:12rem; border-top:1px solid var(--tm-line); }
+.memory-technical { margin-top:1.5rem; border-top:1px solid var(--tm-line); font-size:12px; color:var(--tm-muted); }
+.memory-technical summary { padding:1rem 0 .6rem; cursor:pointer; }
+.memory-technical dl { display:grid; grid-template-columns:5.5rem minmax(0,1fr); gap:.65rem 1rem; line-height:1.7; }
+.memory-technical dt, .memory-technical dd { margin:0; overflow-wrap:anywhere; }
+.memory-technical code { font-size:11px; }
+.injection-preview { flex-shrink:0; margin-top:.35rem; border-top:1px solid var(--tm-line); }
+.preview-toggle { display:flex; align-items:center; gap:.6rem; width:100%; padding:.85rem 0 .15rem; border:0; background:transparent; color:var(--tm-muted); font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.preview-toggle small { margin-left:auto; font-size:11px; font-variant-numeric:tabular-nums; }
+.preview-toggle svg { width:12px; height:12px; }
+.preview-toggle svg.expanded { transform:rotate(90deg); }
+.preview-content > p { font-size:12px; color:var(--tm-muted); line-height:1.6; }
+.preview-content pre { max-height:16dvh; margin:.5rem 0 0; overflow:auto; padding:.75rem; border-radius:.5rem; color:var(--tm-muted); background:var(--tm-soft); font-size:11px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere; }
+.memory-form { display:grid; gap:.5rem; }
+.memory-form > label { display:flex; flex-wrap:wrap; justify-content:space-between; gap:.3rem; margin-top:.5rem; color:var(--bear-ink, #27272a); font-size:13px; font-weight:550; }
+.memory-form > label:first-child { margin-top:0; }
+.memory-form > label span { color:var(--tm-muted); font-size:12px; font-weight:400; }
+.memory-form > label span.danger { color:var(--tm-danger); }
+.memory-form-switches { display:grid; gap:.85rem; margin-top:.8rem; border-top:1px solid var(--tm-line); padding-top:1rem; }
+.memory-switch-row { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+.memory-switch-row label { color:var(--bear-ink); font-size:13px; cursor:pointer; }
+.memory-switch-row p { margin:.3rem 0 0; color:var(--tm-muted); font-size:12px; line-height:1.6; }
 @media (max-width: 760px) {
-	.task-memory-entry-wrap {
-		top: auto;
-		right: var(--console-float-rail-right);
-		bottom: calc(var(--console-float-rail-bottom) + var(--console-float-control-size) + var(--console-float-control-gap));
-	}
-	.task-memory-entry { width: var(--console-float-control-size); height: var(--console-float-control-size); background: rgba(255,255,255,.9); }
-	.memory-list { max-height: calc(100dvh - 25rem); }
-	.memory-toolbar { grid-template-columns: minmax(0, 1fr) 2.15rem; }
-	.primary-action { grid-column: 1 / -1; }
+	.task-memory-entry-wrap { top:auto; right:var(--console-float-rail-right); bottom:calc(var(--console-float-rail-bottom) + var(--console-float-control-size) + var(--console-float-control-gap)); }
+	.task-memory-entry { width:var(--console-float-control-size); height:var(--console-float-control-size); background:rgba(255,255,255,.9); }
+	.memory-row-main { padding:.75rem 0 .75rem .75rem; }
+	.memory-detail h3 { font-size:17px; }
 }
-
-@media (prefers-reduced-motion: reduce) {
-	.task-memory-entry { transition: none; }
+@media (max-height:600px) {
+	.memory-drawer-header p, .task-picker > label, .task-picker p { display:none; }
+	.memory-tabs { margin-top:.4rem; }
+	.task-picker { margin-bottom:.5rem; padding:.4rem; }
+	.memory-list-summary { padding:.4rem 0; }
 }
+@media (prefers-reduced-motion: reduce) { .task-memory-entry { transition:none; } }
 </style>
 
 <style>
-/* OpenBear system dark theme */
+.task-memory-drawer, .task-memory-editor {
+	--bear-ink:#18181b; --bear-accent:#2563eb; --bear-muted:#71717a;
+	--tm-muted:var(--bear-muted, #71717a); --tm-line:rgba(24,24,27,.09); --tm-hover-line:rgba(24,24,27,.18);
+	--tm-surface:#fff; --tm-soft:#f7f7f8; --tm-accent-soft:#eff6ff; --tm-danger:#c2414b;
+	font-family:inherit;
+}
+html.dark .task-memory-drawer, html.dark .task-memory-editor {
+	--bear-ink:#e4e4e7; --bear-accent:#60a5fa;
+	--tm-muted:#a1a1aa; --tm-line:rgba(255,255,255,.09); --tm-hover-line:rgba(255,255,255,.19);
+	--tm-surface:#1d1e22; --tm-soft:#24252a; --tm-accent-soft:rgba(96,165,250,.1); --tm-danger:#fb8585;
+}
+.task-memory-drawer.el-drawer { height:100dvh; max-height:100dvh; background:var(--tm-surface); }
+.task-memory-drawer .el-drawer__body { display:flex; flex-direction:column; min-height:0; overflow:hidden; padding:1.4rem 1.4rem max(1rem, env(safe-area-inset-bottom)); }
+.task-memory-drawer .el-tabs__header { margin-bottom:1rem; }
+.task-memory-drawer .el-tabs__content { display:none; }
+.task-memory-drawer .el-tabs__item { font-size:13px; font-weight:550; }
+.task-memory-drawer .el-input__inner, .task-memory-drawer .el-select__placeholder { font-size:13px; }
+.task-memory-task-select-popper .el-select-dropdown__item { height:auto; min-height:58px; padding:9px 14px; line-height:1.5; }
+.task-memory-task-select-popper .task-option { min-width:0; max-width:100%; }
+.task-memory-task-select-popper .task-option strong { display:block; overflow:hidden; font-size:13px; font-weight:550; text-overflow:ellipsis; white-space:nowrap; }
+.task-memory-task-select-popper .task-option small { display:flex; justify-content:space-between; gap:1rem; margin-top:3px; font-size:11px; font-weight:400; color:var(--el-text-color-secondary); }
+.task-memory-task-select-popper .task-option small span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.task-memory-task-select-popper .task-option time { flex-shrink:0; }
+.task-memory-editor.el-dialog { display:flex; flex-direction:column; margin:4dvh auto; max-height:92dvh; padding:1.25rem; border-radius:.85rem; overflow:hidden; background:var(--tm-surface); }
+.task-memory-editor .el-dialog__header { flex-shrink:0; padding-bottom:1rem; }
+.task-memory-editor .el-dialog__title { font-size:16px; font-weight:600; }
+.task-memory-editor .el-dialog__body { min-height:0; overflow:auto; overscroll-behavior:contain; scrollbar-width:thin; padding:0 .25rem 0 0; }
+.task-memory-editor .el-dialog__footer { flex-shrink:0; margin-top:1rem; padding-top:.85rem; border-top:1px solid var(--tm-line); }
+.task-memory-editor .el-button, .task-memory-confirm .el-button { min-width:72px; height:34px; font-family:inherit; font-size:13px; font-weight:500; }
+.task-memory-editor .el-input__inner, .task-memory-editor .el-textarea__inner { font-family:inherit; font-size:14px; line-height:1.7; }
+.task-memory-editor .el-input__count, .task-memory-editor .el-textarea .el-input__count { font-size:11px; }
+.task-memory-confirm .el-message-box__title { font-size:16px; }
+.task-memory-confirm .el-message-box__message { font-size:14px; line-height:1.7; }
+@media (max-width:760px) {
+	.task-memory-drawer .el-drawer__body { padding:1rem 1rem max(.75rem, env(safe-area-inset-bottom)); }
+	.task-memory-editor.el-dialog { padding:1rem; }
+}
 html.dark .task-memory-entry {
 		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
 		background: rgba(29, 30, 34, 0.68);
@@ -832,202 +1012,6 @@ html.dark .task-memory-badge {
 		color: #ffffff;
 	}
 
-html.dark .memory-drawer-header {
-		border-bottom: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-	}
 
-html.dark .memory-kicker {
-		color: var(--bear-accent, #60a5fa);
-	}
-
-html.dark .memory-drawer-header h2 {
-		color: var(--bear-ink, #efeff2);
-	}
-
-html.dark .memory-drawer-header p {
-		color: var(--bear-muted, #c6c6cd);
-	}
-
-html.dark .memory-quota {
-		background: #202125;
-		color: #c6c6cd;
-	}
-
-html.dark .task-picker {
-		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-		background: rgba(29, 30, 34, 0.82);
-	}
-
-html.dark .task-picker p {
-		color: var(--bear-muted, #c6c6cd);
-	}
-
-html.dark .task-option small {
-		color: #c6c6cd;
-	}
-
-html.dark .icon-action,
-html.dark .primary-action {
-		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-		background: #1d1e22;
-		color: #c6c6cd;
-	}
-
-html.dark .primary-action {
-		border-color: var(--bear-ink, #3d3e46);
-		background: var(--bear-ink, #232428);
-		color: #ffffff;
-	}
-
-html.dark .icon-action:hover {
-		background: #202125;
-		color: #efeff2;
-	}
-
-html.dark .icon-action:focus-visible,
-html.dark .primary-action:focus-visible,
-html.dark .memory-row-main:focus-visible,
-html.dark .memory-row-actions button:focus-visible {
-		outline: 2px solid rgba(96, 165, 250, 0.42);
-	}
-
-html.dark .deleted-toggle {
-		color: var(--bear-muted, #c6c6cd);
-	}
-
-html.dark .memory-empty {
-		border: 1px dashed rgba(255, 255, 255, 0.203);
-		color: #a1a1a8;
-	}
-
-html.dark .memory-empty strong {
-		color: #dedee1;
-	}
-
-html.dark .memory-row {
-		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-		border-left: 3px solid #3d3e46;
-		background: rgba(29, 30, 34, 0.88);
-		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
-	}
-
-html.dark .memory-row.reinject {
-		border-left-color: var(--bear-accent, rgba(96, 165, 250, 0.52));
-	}
-
-html.dark .memory-name-line strong {
-		color: var(--bear-ink, #efeff2);
-	}
-
-html.dark .memory-name-line em {
-		background: #202125;
-		color: #c6c6cd;
-	}
-
-html.dark .memory-description {
-		color: #c6c6cd;
-	}
-
-html.dark .memory-meta,
-html.dark .memory-source {
-		color: #c6c6cd;
-	}
-
-html.dark .memory-flags i {
-		background: #202125;
-		color: #c6c6cd;
-	}
-
-html.dark .memory-flags i.on {
-		background: var(--bear-accent-soft, #202125);
-		color: var(--bear-accent, #60a5fa);
-	}
-
-html.dark .memory-flags i.danger {
-		background: #1d1e22;
-		color: #fb8585;
-	}
-
-html.dark .memory-row-actions button {
-		color: #a1a1a8;
-	}
-
-html.dark .memory-row-actions button:hover {
-		background: #202125;
-		color: #dedee1;
-	}
-
-html.dark .memory-row-actions button.danger:hover {
-		background: #1d1e22;
-		color: #fb8585;
-	}
-
-html.dark .injection-preview {
-		border: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-		background: #1d1e22;
-	}
-
-html.dark .injection-preview header {
-		border-bottom: 1px solid var(--bear-line, rgba(255, 255, 255, 0.145));
-	}
-
-html.dark .injection-preview strong {
-		color: #dedee1;
-	}
-
-html.dark .injection-preview span {
-		color: #c6c6cd;
-	}
-
-html.dark .injection-preview pre {
-		color: #c6c6cd;
-	}
-
-html.dark .refresh-policy {
-		color: #c6c6cd;
-	}
-
-html.dark .memory-form > label {
-		color: #dedee1;
-	}
-
-html.dark .memory-form > label span {
-		color: #a1a1a8;
-	}
-
-html.dark .memory-form > label span.danger {
-		color: #fb8585;
-	}
-
-html.dark .memory-form-switches {
-		border-top: 1px solid rgba(255, 255, 255, 0.145);
-	}
-
-html.dark .memory-switch-row label {
-		color: #dedee1;
-	}
-
-html.dark .task-memory-drawer.el-drawer {
-		background: rgba(29, 30, 34, 0.98);
-		box-shadow: -18px 0 58px rgba(0, 0, 0, 0.16);
-	}
-
-html.dark .task-memory-editor .el-dialog__title {
-		color: #efeff2;
-	}
-
-html.dark .task-memory-editor .el-input__inner,
-html.dark .task-memory-editor .el-textarea__inner {
-		color: #efeff2;
-	}
-
-html.dark .task-memory-confirm .el-message-box__message {
-		color: #dedee1;
-	}
-
-@media (max-width: 760px) {
-	html.dark .task-memory-entry {
-		background: rgba(29, 30, 34, 0.9);
-	}
-}
+@media(max-width:760px){html.dark .task-memory-entry{background:rgba(29,30,34,.9);}}
 </style>

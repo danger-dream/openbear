@@ -16,7 +16,6 @@ from urllib.parse import quote, urlparse
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     CallbackQuery,
-    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -49,16 +48,15 @@ def reply_candidate(message: Any) -> bool:
     )
 
 
-def reply_keyboard(config: Config, conversation_uuid: str, *, prompt: bool = False) -> InlineKeyboardMarkup | ForceReply:
-    buttons = [] if prompt else [InlineKeyboardButton(text="回复继续", callback_data=REPLY_CALLBACK)]
+def reply_keyboard(config: Config, conversation_uuid: str) -> InlineKeyboardMarkup | None:
+    # Every delivered result is already bound to its Web conversation. Native
+    # Telegram replies need neither a continuation button nor a ForceReply prompt.
     base = str(config.web.custom_url or "").rstrip("/")
     parsed = urlparse(base)
-    if parsed.scheme == "https" and parsed.netloc:
-        buttons.append(InlineKeyboardButton(text="打开 Web 会话", url=f"{base}/chat?id={quote(conversation_uuid, safe='')}"))
-    if prompt and not buttons:
-        return ForceReply(force_reply=True, input_field_placeholder="请输入接下来要做的事")
-    # Bot API 10.3: set at send time; do not try to toggle this field on edit.
-    return InlineKeyboardMarkup(inline_keyboard=[buttons], force_reply=prompt)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    button = InlineKeyboardButton(text="打开 Web 会话", url=f"{base}/chat?id={quote(conversation_uuid, safe='')}")
+    return InlineKeyboardMarkup(inline_keyboard=[[button]], force_reply=False)
 
 
 async def bind_message(db: DB, owner: int, message_id: int, conversation_uuid: str, root: str = "", *, role: str = "notification") -> None:
@@ -88,6 +86,13 @@ class WebTelegramReplies:
             """UPDATE web_tg_reply_inbox SET state='uncertain', text='', response_text=?, updated_at=?
                WHERE state='dispatching'""",
             ("重启前这条回复的提交结果未能确认，未自动重复执行。请先在 Web 核实；如仍需执行，请重新回复通知。", int(time.time())),
+        )
+        # Retire success acknowledgements queued by older versions. They must
+        # not appear after an upgrade; only rejection/uncertain receipts are sent.
+        await self.db.conn.execute(
+            """UPDATE web_tg_reply_inbox SET response_sent=1, response_text='', updated_at=?
+               WHERE state='submitted' AND response_sent=0""",
+            (int(time.time()),),
         )
         await self.db.conn.commit()
         self._worker = asyncio.create_task(self._worker_loop(), name="web-tg-reply-worker")
@@ -192,17 +197,9 @@ class WebTelegramReplies:
         if error or row is None:
             await self._answer_callback(query, error, alert=True)
             return
-        # A callback received during downtime can be too old to acknowledge,
-        # but its exact message binding still permits opening a fresh input prompt.
-        await self._answer_callback(query)
-        title = html.escape(str(row.get("title") or "新对话")[:120])
-        prompt = await send_rich(
-            self.bot, owner, f"<b>继续会话：{title}</b>\n\n请回复这条消息，说明接下来要做什么。发送文字后才会开始执行。",
-            reply_to_message_id=int(message.message_id),
-            reply_markup=reply_keyboard(self.config, str(row["conversation_uuid"]), prompt=True),
-        )
-        await bind_message(self.db, owner, int(prompt.message_id), str(row["conversation_uuid"]), str(record.get("root_turn_uuid") or ""), role="prompt")
-        await self.db.conn.commit()
+        # Compatibility for buttons on already-delivered messages. A transient
+        # callback hint is enough; never send another bound prompt into the chat.
+        await self._answer_callback(query, "请直接回复这条结果消息继续。")
 
     async def process_one(self) -> bool:
         cur = await self.db.conn.execute("SELECT * FROM web_tg_reply_inbox WHERE state='pending' ORDER BY id LIMIT 1")
@@ -226,7 +223,7 @@ class WebTelegramReplies:
                 if result.get("ok"):
                     state = "submitted"
                     root = str(result.get("rootTurnUuid") or "")
-                    error = "已追加到原会话当前任务。结果会回到 Telegram。" if result.get("queued") else "已在原会话开始继续处理。结果会回到 Telegram。"
+                    error = ""  # Success is silent; the actual result returns via Telegram.
                 else:
                     labels = {"busy": "会话正在压缩上下文，请稍后重新回复。", "conversation_unavailable": "原会话已删除或归档，请前往 Web。"}
                     error = labels.get(str(result.get("error") or ""), "回复未提交，请稍后重新回复或前往 Web。")
@@ -238,8 +235,8 @@ class WebTelegramReplies:
             error = "这条回复的提交结果未能确认，未自动重复执行。请先在 Web 核实；如仍需执行，请重新回复通知。"
             log.exception("提交 TG 会话回复失败", inbox_id=item["id"])
         await self.db.conn.execute(
-            "UPDATE web_tg_reply_inbox SET state=?, text='', root_turn_uuid=?, response_text=?, updated_at=? WHERE id=?",
-            (state, root, error, int(time.time()), item["id"]),
+            "UPDATE web_tg_reply_inbox SET state=?, text='', root_turn_uuid=?, response_text=?, response_sent=?, updated_at=? WHERE id=?",
+            (state, root, error, 1 if state == "submitted" else 0, int(time.time()), item["id"]),
         )
         await self.db.conn.commit()
         return True
@@ -247,8 +244,8 @@ class WebTelegramReplies:
     async def deliver_receipt(self) -> bool:
         now = int(time.time())
         cur = await self.db.conn.execute(
-            """SELECT * FROM web_tg_reply_inbox WHERE response_sent=0 AND response_text<>''
-               AND response_after<=? ORDER BY id LIMIT 1""", (now,),
+            """SELECT * FROM web_tg_reply_inbox WHERE state IN ('rejected', 'uncertain')
+               AND response_sent=0 AND response_text<>'' AND response_after<=? ORDER BY id LIMIT 1""", (now,),
         )
         row = await cur.fetchone()
         if row is None:
