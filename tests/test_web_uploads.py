@@ -213,17 +213,19 @@ async def test_ws_message_limit_is_128_mib(web_env, monkeypatch):
     assert limits == [128 * 1024 * 1024]
 
 
-async def test_real_browser_binary_upload_to_backend_and_ws(web_env, monkeypatch):
+async def test_node_binary_upload_to_backend_and_ws(web_env, monkeypatch):
     project = Path(__file__).resolve().parents[1]
-    if not shutil.which("node") or not (project / "web/node_modules/playwright-core").exists():
-        pytest.skip("browser test dependencies unavailable")
-    row = await web_env.server._create_web_conversation(123, title="real browser upload")
+    if not shutil.which("node"):
+        pytest.skip("Node is required for the frontend HTTP integration")
+    row = await web_env.server._create_web_conversation(123, title="Node HTTP upload")
     cookie = await _login_cookie(web_env)
     web_env.server.runs = RunRegistry()
     captured = []
+    received = asyncio.Event()
 
     async def run(chat_id, text, renderer, media=None, **kwargs):
         captured.extend(media)
+        received.set()
         await renderer.finalize("received")
         await renderer.close()
 
@@ -242,12 +244,24 @@ async def test_real_browser_binary_upload_to_backend_and_ws(web_env, monkeypatch
         raise
     assert process.returncode == 0, stderr.decode()
     result = json.loads(stdout)
-    if result.get("skipped"):
-        pytest.skip(result["skipped"])
     assert result["ok"] is True
     assert result["bytes"] > 70 * 1024 * 1024
     assert result["chunks"] == 141
-    assert result["wsBytes"] < 400
+    frame = {"type": "send", "requestId": "node-upload", "text": "Read uploaded attachments", "files": result["refs"]}
+    assert len(json.dumps(frame)) < 400
+    assert all(set(item) == {"uploadId"} for item in frame["files"])
+    async with web_env.client.ws_connect(
+        f"/api/conversations/{row['conversation_uuid']}/ws?bootstrap=incremental",
+        headers={"Cookie": f"openbear_web_session={cookie}"},
+    ) as ws:
+        await ws.send_json(frame)
+        async with asyncio.timeout(10):
+            while True:
+                message = await ws.receive_json()
+                if message.get("requestId") == "node-upload":
+                    assert message["type"] == "ack", message
+                    break
+            await received.wait()
     assert [item.kind for item in captured] == ["file", "image", "file"]
     assert captured[0].size == 70 * 1024 * 1024
     assert captured[2].size == 0

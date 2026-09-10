@@ -65,9 +65,7 @@ jobs:
       - name: Install Python deps
         run: uv sync --frozen --extra dev
 
-      - name: Run tests
-        run: uv run pytest -q
-
+      # Node is also used by the Python suite's actual HTTP upload integration.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -75,17 +73,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Setup Chrome for frontend tests and packaged release smoke
-        id: chrome
-        uses: browser-actions/setup-chrome@v1
+      - name: Run tests
+        run: uv run pytest -q
 
       - name: Build frontend
         working-directory: web
-        env:
-          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -euo pipefail
-          test -x "$CHROME_BIN"
           npm ci
           npm test
           npm run build
@@ -153,10 +147,9 @@ jobs:
             sha256sum "openbear-${VERSION}.zip" > SHA256SUMS
           )
 
-      - name: Verify packaged login in a real browser
+      - name: Verify packaged HTTP login and Web assets
         env:
           VERSION: ${{ steps.tag.outputs.version }}
-          CHROME: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -euo pipefail
           VERIFY="$(mktemp -d)"
@@ -165,9 +158,9 @@ jobs:
           unzip -q "dist/openbear-${VERSION}.zip" -d "$VERIFY"
           python3 scripts/release_validation.py validate-tree --root "$VERIFY" --version "$VERSION"
           # Import backend code from the unzipped release and serve that exact dist.
-          # Disposable DB + fake Bot only; no credentials or external login approval.
+          # HTTP/WebSocket only; disposable DB + fake Bot, no browser or live credentials.
           PYTHONDONTWRITEBYTECODE=1 uv run --no-sync python scripts/smoke_release_login.py \
-            --root "$VERIFY" --chrome "$CHROME" --output dist/login-smoke.json
+            --root "$VERIFY" --output dist/login-smoke.json
 
       - name: Build release notes
         id: notes
