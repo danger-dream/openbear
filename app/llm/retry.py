@@ -1,15 +1,14 @@
 """Shared model-call retry policy and cancellable backoff waits.
 
-The policy intentionally mirrors Claude Code's caller-side behavior: retries are
-classified before this module is called, delays use exponential backoff with
-jitter, and Retry-After wins when present.  This module does not impose a task
-budget; it only controls recovery from one logical model call.
+Errors are classified before this module is called. Retries use an integer
+staircase; a server Retry-After is a minimum delay, not an earlier retry time.
+This module controls one logical call, not permission to restart a failed turn.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
-import random
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -23,25 +22,36 @@ class RetryCancelledError(RuntimeError):
     """The user cancelled a pending retry wait without cancelling prior work."""
 
 
+RETRY_DELAYS_S = (3, 5, 10, 30, 180, 300, 600)
+
+
+def retry_delay_label(seconds: float) -> str:
+    value = max(0, math.ceil(seconds))
+    minutes, remainder = divmod(value, 60)
+    if not minutes:
+        return f"{value} 秒"
+    return f"{minutes} 分钟" + (f" {remainder} 秒" if remainder else "")
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     max_retries: int = 10
-    base_delay_s: float = 0.5
-    max_delay_s: float = 32.0
-    jitter_ratio: float = 0.25
+    base_delay_s: float = 3.0
+    max_delay_s: float = 600.0
+    jitter_ratio: float = 0.0  # Legacy constructor/config input; no fractional jitter.
 
     def delay(self, retry_number: int, *, retry_after_s: float = 0.0, random_value: float | None = None) -> float:
-        """Return the wait before retry ``retry_number`` (1-based)."""
-        if retry_after_s > 0:
-            return float(retry_after_s)
-        retry_number = max(1, int(retry_number or 1))
+        """Integer staircase, scaled by the configured first delay and capped.
+
+        Zero still disables local waiting. ``random_value``/jitter are accepted
+        for compatibility but never introduce fractional or unpredictable waits.
+        """
+        index = min(max(1, int(retry_number or 1)), len(RETRY_DELAYS_S)) - 1
         base = min(
-            max(0.0, float(self.base_delay_s)) * (2 ** (retry_number - 1)),
+            RETRY_DELAYS_S[index] * max(0.0, float(self.base_delay_s)) / RETRY_DELAYS_S[0],
             max(0.0, float(self.max_delay_s)),
         )
-        ratio = max(0.0, float(self.jitter_ratio))
-        sample = random.random() if random_value is None else max(0.0, min(1.0, float(random_value)))
-        return base + sample * ratio * base
+        return float(math.ceil(max(base, float(retry_after_s or 0.0))))
 
 
 def retry_wait_payload(

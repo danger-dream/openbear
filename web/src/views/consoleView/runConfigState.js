@@ -12,8 +12,8 @@ const REQUIRED_RUN_CONFIG_FIELDS = [
   "effectiveFastMode",
   "agentRunConfig",
   "contextWindow",
-  "compactTriggerTokens",
-  "compactRatio",
+  "rolloverTriggerTokens",
+  "windowTriggerRatio",
 ];
 
 /** Validate the complete server snapshot before it becomes the visible override. */

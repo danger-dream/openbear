@@ -8,9 +8,9 @@ from pathlib import Path
 
 import aiosqlite
 
+from app.db.agent_continuity_migration import migrate_agent_continuity
 from app.db.connection_router import SQLiteConnectionRouter
 from app.db.reference_schema import reference_schema
-from app.db.agent_continuity_migration import migrate_agent_continuity
 from app.db.schema_migrations import (
     backfill_web_operation_terminal_times,
     dedupe_active_rath_agent_sessions,
@@ -23,7 +23,7 @@ log = get_logger("db.engine")
 
 _SCHEMA = "\n".join(
     (Path(__file__).parent / name).read_text(encoding="utf-8")
-    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "context_schema.sql")
 )
 
 
@@ -148,6 +148,14 @@ class DB:
         await self._add_column_if_missing("web_conversations", "folder_uuid", "folder_uuid TEXT NOT NULL DEFAULT ''")
         if has_web_conversations and not had_display_order:
             await self._backfill_web_conversation_display_order()
+        await self._add_column_if_missing("web_conversations", "context_strategy", "context_strategy TEXT NOT NULL DEFAULT 'sliding_window'")
+        # Zero watermarks intentionally leave historical completed conversations read.
+        for name, ddl in (
+            ("activity_version", "activity_version INTEGER NOT NULL DEFAULT 0"),
+            ("activity_read_version", "activity_read_version INTEGER NOT NULL DEFAULT 0"),
+            ("activity_result_json", "activity_result_json TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            await self._add_column_if_missing("web_conversations", name, ddl)
         await self._add_column_if_missing("web_conversations", "agent_model", "agent_model TEXT DEFAULT ''")
         await self._add_column_if_missing("web_conversations", "agent_think_level", "agent_think_level TEXT DEFAULT ''")
         await self._add_column_if_missing("web_conversations", "agent_fast_mode", "agent_fast_mode INTEGER DEFAULT -1")

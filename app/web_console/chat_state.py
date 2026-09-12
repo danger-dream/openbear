@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import inspect
 
+from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 from app.rath.controller_projection import project_history_message_for_controller
+from app.tools.base import current_tool_context
 from app.web_console.core import *
 from app.web_console.live_stream import *
-
-
-from app.tools.base import current_tool_context
-from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 
 
 class WebAdminChatStateMixin:
@@ -76,13 +74,13 @@ class WebAdminChatStateMixin:
         resolved = self.config.models.resolve(model_label)
         return bool(resolved and resolved[1].supports_fast)
 
-    def _model_compact_trigger_tokens(self, model_label: str) -> int:
+    def _model_rollover_trigger_tokens(self, model_label: str) -> int:
         """Resolve the same effective threshold used by the root Compactor."""
         resolved = self.config.models.resolve(model_label)
         if not resolved:
             return 0
         model_def = resolved[1]
-        explicit = max(0, int(model_def.compact_trigger_tokens or 0))
+        explicit = max(0, int(model_def.rollover_trigger_tokens or 0))
         if explicit > 0:
             return explicit
         return max(0, int(int(model_def.context_window or 0) * float(self.config.agent.compact_ratio)))
@@ -97,261 +95,20 @@ class WebAdminChatStateMixin:
                 total += estimate_tokens(str(content or ""))
         return total
 
-    @staticmethod
-    def _format_context_compaction_markdown(outcome: CompactionOutcome) -> str:
-        def _tokens(value: int) -> str:
-            n = max(0, int(value or 0))
-            if n >= 1_000_000:
-                return f"{n / 1_000_000:.2f}M".rstrip("0").rstrip(".")
-            if n >= 1000:
-                return f"{n / 1000:.1f}K".rstrip("0").rstrip(".")
-            return str(n)
 
-        return (
-            "## 上下文压缩完成\n"
-            f"- 触发来源：{outcome.source or 'compact'}\n"
-            f"- 压缩前上下文：{_tokens(outcome.trigger_tokens)}\n"
-            f"- 阈值：{_tokens(outcome.threshold_tokens)}\n"
-            f"- 压缩模型：{outcome.compression_model_label or 'unknown'}\n"
-            f"- 压缩消息：{outcome.old_message_count} 条\n"
-            f"- 保留消息：{outcome.kept_message_count} 条\n"
-            f"- 摘要 token：{_tokens(outcome.summary_tokens)}\n"
-            f"- 覆盖至 message_id：{outcome.up_to_message_id}\n"
-            + "\n---\n\n"
-            "## 压缩后摘要\n"
-            f"{outcome.summary or '（摘要为空）'}"
-        )
 
-    @staticmethod
-    def _context_compaction_json(outcome: CompactionOutcome, *, after_tokens: int = 0) -> dict[str, Any]:
-        summary_id = int(outcome.summary_id or 0)
-        identity_suffix = str(summary_id) if summary_id else f"message-{int(outcome.up_to_message_id or 0)}"
-        compaction_id = f"context-compaction:{identity_suffix}"
-        return {
-            "did": bool(outcome.did),
-            "compactionId": compaction_id,
-            "summaryId": summary_id,
-            "scope": "root",
-            "source": outcome.source,
-            "status": "completed" if outcome.did else "unavailable",
-            "beforeTokens": int(outcome.trigger_tokens or 0),
-            "afterTokens": int(after_tokens or outcome.after_tokens or 0),
-            "summaryChars": len(str(outcome.summary or "")),
-            "outputAvailable": bool(outcome.did and outcome.summary),
-            # Compatibility fields retained for stats and older clients.
-            "triggerTokens": int(outcome.trigger_tokens or 0),
-            "thresholdTokens": int(outcome.threshold_tokens or 0),
-            "keepRecent": int(outcome.keep_recent or 0),
-            "upToMessageId": int(outcome.up_to_message_id or 0),
-            "oldMessageCount": int(outcome.old_message_count or 0),
-            "keptMessageCount": int(outcome.kept_message_count or 0),
-            "summaryTokens": int(outcome.summary_tokens or 0),
-            "compressionModelLabel": outcome.compression_model_label,
-            "tokenSource": outcome.token_source,
-            "reason": outcome.reason,
-        }
-
-    async def _invalidate_web_controller_context_usage(
-        self,
-        chat_id: int,
-        *,
-        session_uuid: str = "",
-    ) -> None:
-        """Make post-compaction context explicitly unknown for this generation."""
-        messages = MessageDAO(self.db)
-        session = str(session_uuid or "") or await messages.get_or_create_session_uuid(chat_id)
-        await messages.set_controller_context_usage(
-            chat_id,
-            session_uuid=session,
-            tokens=None,
-        )
-
-    async def _emit_context_compaction_event(
-        self,
-        renderer: Any,
-        outcome: CompactionOutcome,
-        *,
-        source: str = "",
-    ) -> None:
-        if not outcome.did:
-            return
-        live = getattr(renderer, "live", None)
-        compaction_chat_id = int(getattr(live, "internal_chat_id", 0) or 0)
-        if compaction_chat_id > 0:
-            await self._invalidate_web_controller_context_usage(compaction_chat_id)
-        metadata = self._context_compaction_json(outcome)
-        metadata["source"] = source or outcome.source
-        tool_call_id = str(metadata["compactionId"])
-        conversation_uuid = str(getattr(live, "conversation_uuid", "") or "").strip()
-        if conversation_uuid and int(metadata.get("summaryId") or 0):
-            metadata["summaryRef"] = (
-                f"/api/conversations/{conversation_uuid}/compactions/{metadata['summaryId']}"
-            )
-        start_metadata = {
-            **metadata,
-            "status": "running",
-            "outputAvailable": False,
-        }
-        result_metadata = {
-            **metadata,
-            "status": "completed",
-            "outputAvailable": bool(outcome.summary),
-            "outputPreview": str(outcome.summary or "")[:12_000],
-        }
-        start_args = json.dumps(start_metadata, ensure_ascii=False)
-        result_args = json.dumps(result_metadata, ensure_ascii=False)
-        line = "ContextCompaction: 上下文达到阈值，正在压缩历史"
-        start = getattr(renderer, "on_tool_start", None)
-        result = getattr(renderer, "on_tool_result", None)
-        if callable(start):
-            maybe = start(tool_call_id, "ContextCompaction", start_args, line)
-            if inspect.isawaitable(maybe):
-                await maybe
-        else:
-            await renderer.emit({"type": "tool_start", "toolCallId": tool_call_id, "name": "ContextCompaction", "arguments": start_args, "line": line})
-        markdown = self._format_context_compaction_markdown(outcome)
-        if callable(result):
-            maybe = result(tool_call_id, "ContextCompaction", result_args, markdown, 0)
-            if inspect.isawaitable(maybe):
-                await maybe
-        else:
-            await renderer.emit({"type": "tool_result", "toolCallId": tool_call_id, "name": "ContextCompaction", "arguments": result_args, "result": markdown, "durationMs": 0})
-
-    def _compression_candidates_for(self, model_label: str, *, chat_id: int = 0) -> list[tuple[Any, str, str, str]]:
-        """Return ordered compression candidates plus the primary model fallback.
-
-        Each item is (backend, model_id, source, label). Invalid configured
-        compression models are skipped; if none are usable, the primary/current
-        model remains as the final candidate.
-        """
-        fallback_label = model_label or getattr(self.model_selection, "current", "") or self.config.models.primary
-        configured_labels = list(getattr(self.config.models, "compression_models", []) or [])
-        labels = self.config.models.compression_model_candidates(fallback_label)
-        candidates: list[tuple[Any, str, str, str]] = []
-        seen: set[str] = set()
-        for label in labels:
-            if label in seen:
-                continue
-            seen.add(label)
-            source = "primary-fallback" if configured_labels and label == fallback_label and label not in configured_labels else "compression"
-            try:
-                backend, model_id, _ = self.llm_factory.backend_for(label)
-            except Exception as exc:
-                log.warning("压缩候选模型不可用，跳过", 会话=chat_id, 模型=label, 来源=source, 错误=str(exc)[:120])
-                continue
-            candidates.append((backend, model_id, source, label))
-        if not candidates:
-            backend, model_id, _ = self.llm_factory.backend_for(fallback_label)
-            candidates.append((backend, model_id, "primary-fallback", fallback_label))
-        else:
-            primary_already_configured = any(label == fallback_label for _backend, _model_id, _source, label in candidates)
-            if not primary_already_configured:
-                try:
-                    backend, model_id, _ = self.llm_factory.backend_for(fallback_label)
-                    candidates.append((backend, model_id, "primary-fallback", fallback_label))
-                except Exception as exc:
-                    log.warning("压缩 fallback 主模型不可用", 会话=chat_id, 主模型=fallback_label, 错误=str(exc)[:120])
-        return candidates
-
-    def _make_web_compactor(self, chat_id: int, *, model_label: str) -> Compactor:
-        fallback_label = model_label or getattr(self.model_selection, "current", "") or self.config.models.primary
-        candidates = self._compression_candidates_for(fallback_label, chat_id=chat_id)
-        backend, compression_model_id, _source, _label = candidates[0]
-        extra_candidates = [
-            CompressionCandidate(candidate_backend, candidate_model, source, label)
-            for candidate_backend, candidate_model, source, label in candidates[1:]
-        ]
-        fallback_backend = None
-        fallback_model_id = ""
-        for candidate_backend, candidate_model, source, _candidate_label in candidates[1:]:
-            if source == "primary-fallback":
-                fallback_backend = candidate_backend
-                fallback_model_id = candidate_model
-                break
-        async def _on_compaction_model_call(call: dict[str, Any]) -> None:
-            call_model_label = str(call.get("model") or _label or compression_model_id)
-            model_meta = self.config.models.resolve(call_model_label)
-            if model_meta is None:
-                model_meta = next(
-                    (self.config.models.resolve(candidate.label) for candidate in extra_candidates if self.config.models.resolve(candidate.label) is not None),
-                    None,
-                )
-            call_cost = model_meta[1].cost if model_meta else {}
-            session_uuid = await MessageDAO(self.db).get_or_create_session_uuid(chat_id)
-            await self._persist_web_model_call_delta(
-                MessageDAO(self.db),
-                chat_id,
-                session_uuid=session_uuid,
-                call=call,
-                model_cost=call_cost,
-                model_label=call_model_label,
-                protocol=str(call.get("protocol") or ""),
-                think_level="off",
-                call_kind="context_compaction",
-            )
-
-        return Compactor(
-            MessageDAO(self.db), SummaryDAO(self.db), backend,
-            compression_model=compression_model_id,
-            compression_label=_label,
-            summary_source=_source,
-            context_window=self.llm_factory.context_window(fallback_label),
-            ratio=self.config.agent.compact_ratio,
-            # Root compaction keeps no raw protocol tail. ``keep_recent`` is now
-            # the visible XML dialogue limit used by _build_history.
-            keep_recent=self.config.agent.keep_recent_messages,
-            retain_raw_recent=0,
-            summary_max_retries=self.config.agent.compact_max_retries,
-            summary_max_tokens=self.config.agent.compact_max_tokens,
-            summary_timeout_s=self.config.agent.compact_timeout_s,
-            prompt_template=self.config.agent.compact_prompt,
-            trigger_tokens=self._model_compact_trigger_tokens(fallback_label),
-            fallback_backend=fallback_backend,
-            fallback_compression_model=fallback_model_id,
-            fallback_compression_label=next((candidate_label for _candidate_backend, _candidate_model, source, candidate_label in candidates[1:] if source == "primary-fallback"), ""),
-            extra_candidates=extra_candidates,
-            operation_locks=self.operation_locks,
-            on_model_call=_on_compaction_model_call,
-        )
-
-    def _rath_context_compact_kwargs(self, model_label: str) -> dict[str, Any]:
+    def _rath_context_window_kwargs(self, model_label: str) -> dict[str, Any]:
         label = model_label or getattr(self.model_selection, "current", "") or self.config.models.primary
-        kwargs: dict[str, Any] = {
+        resolved = self.config.models.resolve(label)
+        policy = self.config.context_management
+        return {
             "context_window": int(self.llm_factory.context_window(label) if hasattr(self.llm_factory, "context_window") else 0),
-            "context_compact_trigger_tokens": self._model_compact_trigger_tokens(label),
-            "context_compact_ratio": self.config.agent.compact_ratio,
-            "context_compact_keep_recent": self.config.agent.keep_recent_messages,
-            "context_compact_prompt": self.config.agent.compact_prompt,
-            "context_compact_max_tokens": self.config.agent.compact_max_tokens,
-            "context_compact_max_retries": self.config.agent.compact_max_retries,
-            "context_compact_timeout_s": self.config.agent.compact_timeout_s,
+            "rollover_trigger_tokens": int(resolved[1].rollover_trigger_tokens or 0) if resolved else 0,
+            "window_trigger_ratio": self.config.agent.compact_ratio,
+            "context_config": self.config,
+            "context_llm_factory": self.llm_factory,
+            "window_retain_ratio": policy.retain_ratio,
         }
-        candidates = self._compression_candidates_for(label)
-        if not candidates:
-            return kwargs
-        compact_costs: dict[str, dict[str, float]] = {}
-        for _backend, _model_id, _source, candidate_label in candidates:
-            model_meta = self.config.models.resolve(candidate_label)
-            if model_meta:
-                compact_costs[candidate_label] = model_meta[1].cost
-        kwargs["context_compact_costs"] = compact_costs
-        backend, model_id, source, candidate_label = candidates[0]
-        kwargs["context_compact_backend"] = backend
-        kwargs["context_compact_model"] = model_id
-        kwargs["context_compact_source"] = source
-        kwargs["context_compact_label"] = candidate_label
-        extra = [
-            CompressionCandidate(candidate_backend, candidate_model, candidate_source, label_text)
-            for candidate_backend, candidate_model, candidate_source, label_text in candidates[1:]
-        ]
-        if extra:
-            kwargs["context_compact_extra_candidates"] = extra
-        for candidate_backend, candidate_model, candidate_source, _label_text in candidates[1:]:
-            if candidate_source == "primary-fallback":
-                kwargs["context_compact_fallback_backend"] = candidate_backend
-                kwargs["context_compact_fallback_model"] = candidate_model
-                break
-        return kwargs
 
     async def _effective_thinking_level(self, chat_id: int, model_label: str) -> str:
         messages = MessageDAO(self.db)
@@ -733,15 +490,23 @@ class WebAdminChatStateMixin:
         operation_facts["activeRathTaskCount"] = len(background_tasks)
         operation_facts["activeRathTaskUuids"] = [str(task.get("taskUuid") or "") for task in background_tasks if task.get("taskUuid")]
         pending_steering = steering.pending_items(chat_id)
-        exact_context_tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=session_uuid)
-        context_trigger_tokens = self._model_compact_trigger_tokens(model_label)
+        exact_context_tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=session_uuid, expected_model=model_label)
+        context_trigger_tokens = self._model_rollover_trigger_tokens(model_label)
         context_usage = {
             "known": exact_context_tokens is not None,
             "tokens": int(exact_context_tokens or 0),
-            "compactTriggerTokens": context_trigger_tokens,
+            "rolloverTriggerTokens": context_trigger_tokens,
             "percent": ((int(exact_context_tokens) * 100.0 / context_trigger_tokens) if exact_context_tokens is not None and context_trigger_tokens > 0 else None),
-            "manualMinPercent": int(self.config.agent.manual_compact_min_percent),
         }
+        from app.context.store import ContextOwner, WindowStore
+        window = await WindowStore(self.db, ContextOwner.controller(chat_id=chat_id, session_uuid=session_uuid)).load() if session_uuid else None
+        if window:
+            context_usage.update({
+                "ownerId": window["owner_key"], "windowVersion": window["window_version"],
+                "requestSequence": window["usage_request_sequence"], "requestId": window["usage_request_id"],
+                "estimatedNextInputTokens": window["state"].get("estimatedNextInputTokens"),
+                "mediaTokensUnknown": bool(window["state"].get("mediaTokensUnknown")),
+            })
         # The operation timeline is authoritative whenever it exists. Returning
         # raw messages as well duplicates every tool envelope/output and is only
         # needed for a legacy conversation that has no operation snapshots.
@@ -788,9 +553,11 @@ class WebAdminChatStateMixin:
             "fastRequested": bool(fast_requested),
             "fastSupported": bool(fast_supported),
             "effectiveFastMode": bool(fast_requested and fast_supported),
+            "contextStrategy": str((conversation or {}).get("context_strategy") or "sliding_window"),
+            "manualCompactMinPercent": self.config.agent.manual_compact_min_percent,
             "agentRunConfig": agent_run_config,
-            "compactTriggerTokens": self._model_compact_trigger_tokens(model_label),
-            "compactRatio": float(self.config.agent.compact_ratio or 0.7),
+            "rolloverTriggerTokens": self._model_rollover_trigger_tokens(model_label),
+            "windowTriggerRatio": float(self.config.agent.compact_ratio or 0.7),
             "showThinking": await messages.get_show_thinking(chat_id, default=self.config.ui.show_thinking),
             "messages": [self._message_json(r) for r in message_rows],
             "modelCalls": await self._chat_model_calls(chat_id, session_uuid),
@@ -801,32 +568,8 @@ class WebAdminChatStateMixin:
         }
 
     async def _build_history(self, chat_id: int) -> list[Message]:
-        summary = await SummaryDAO(self.db).latest(chat_id)
-        messages = MessageDAO(self.db)
-        summary_text = str((summary or {}).get("summary") or "")
-        if summary_text:
-            # Once a root summary exists, the recent tail is a semantic reminder for
-            # the main model, not a raw protocol replay.  Keep only the visible user
-            # / final-assistant transcript in XML; tool, AgentWait, Plan, TaskMemory,
-            # reasoning and other runtime payloads remain in DB/audit or the summary.
-            visible_rows = await messages.recent_visible_history(
-                chat_id,
-                limit=max(1, int(self.config.agent.keep_recent_messages or 100)),
-            )
-            return build_summary_prefixed_visible_history(
-                summary_text,
-                visible_rows,
-                max_messages=max(1, int(self.config.agent.keep_recent_messages or 100)),
-            )
-        rows = await messages.recent(chat_id)
-        recent = [project_history_message_for_controller(row.to_message()) for row in rows]
-        if any("openbear://ref/" in str(row.content or "") for row in rows):
-            bundles = await self._reference_store().bundle_ids_for_rows(rows)
-            for row, message in zip(rows, recent):
-                if bundles.get(row.id):
-                    message["openbear_reference_bundle"] = bundles[row.id]
-        history = build_summary_prefixed_history("", recent)
-        return repair_tool_pairing(history)
+        from app.context.builder import build_controller_history
+        return await build_controller_history(MessageDAO(self.db), chat_id, reference_store=self._reference_store())
 
     async def _build_system_prompt_for_chat(
         self,
@@ -971,7 +714,6 @@ class WebAdminChatStateMixin:
 
     def _run_stats_json(self, result: RunResult, *, cost_usd: float, model: str,
                         think_level: str, context_window: int, live: bool = False,
-                        compactions: list[tuple[CompactionOutcome, int]] | None = None,
                         ledger_usage: dict[str, Any] | None = None,
                         ledger_cost_usd: float | None = None) -> dict[str, Any]:
         # `contextTokens` means the latest OpenBear controller prompt size shown
@@ -994,20 +736,7 @@ class WebAdminChatStateMixin:
             result.output_tokens_sum / (result.call_time_ms_sum / 1000)
             if result.call_time_ms_sum > 0 else 0.0
         )
-        compaction_items = list(compactions or [])
-        latest_compaction: dict[str, Any] | None = None
-        context_after_compaction_tokens = 0
-        if compaction_items:
-            latest_outcome, latest_after_tokens = compaction_items[-1]
-            context_after_compaction_tokens = int(latest_after_tokens or 0)
-            latest_compaction = self._context_compaction_json(
-                latest_outcome,
-                after_tokens=context_after_compaction_tokens,
-            )
-        epilogue_compacted = bool(
-            compaction_items and str(compaction_items[-1][0].source or "") == "turn_epilogue"
-        )
-        context_usage_known = bool(result.model_ok > 0 and result.last_prompt_usage_reported and not epilogue_compacted)
+        context_usage_known = bool(result.model_ok > 0 and result.last_prompt_usage_reported)
         stats = {
             "live": bool(live),
             "model": model,
@@ -1017,14 +746,14 @@ class WebAdminChatStateMixin:
             "modelCalls": result.model_calls + result.expert_model_calls,
             "modelOk": model_ok,
             "modelRetry": result.model_retry,
-            "modelFail": result.model_fail,
+            "modelFail": result.model_fail + result.summary_model_fail,
             "toolCalls": len(result.tools_used) + result.expert_tool_calls,
             "expertModelCalls": result.expert_model_calls,
             "expertToolCalls": result.expert_tool_calls,
             "expertTasks": result.expert_tasks,
             "expertTaskUuids": sorted(result.expert_accounted_task_uuids),
             # Compatibility display field: older clients already understand this
-            # provider snapshot. Authorization and post-compaction invalidation use
+            # provider snapshot. Authorization and post-rotation invalidation use
             # the explicit contextUsage.known contract below.
             "contextTokens": prompt_tokens,
             "contextWindow": context_window,
@@ -1032,6 +761,11 @@ class WebAdminChatStateMixin:
                 "available": bool(result.model_ok > 0),
                 "known": context_usage_known,
                 "tokens": prompt_tokens if context_usage_known else 0,
+                "ownerId": result.context_owner_id,
+                "windowVersion": result.context_window_version,
+                "requestSequence": result.context_request_sequence,
+                "requestId": result.context_request_id,
+                "estimatedNextInputTokens": result.context_estimated_input_tokens,
             },
             "lastUsage": _usage_json(result.last_usage),
             "expertUsage": _usage_json(result.expert_usage),
@@ -1062,14 +796,6 @@ class WebAdminChatStateMixin:
             stats["ledgerCostUsd"] = normalized_ledger_usage["costUsd"]
         elif ledger_cost_usd is not None:
             stats["ledgerCostUsd"] = max(0.0, float(ledger_cost_usd or 0.0))
-        if latest_compaction is not None:
-            stats["contextCompacted"] = True
-            stats["contextAfterCompactionTokens"] = context_after_compaction_tokens
-            stats["contextCompaction"] = latest_compaction
-            stats["contextCompactions"] = [
-                self._context_compaction_json(outcome, after_tokens=after_tokens)
-                for outcome, after_tokens in compaction_items
-            ]
         return stats
 
     async def _persist_web_model_call_delta(
@@ -1084,7 +810,6 @@ class WebAdminChatStateMixin:
         protocol: str,
         think_level: str,
         call_kind: str = "controller_request",
-        memory_reminder_generation: int | None = None,
         cost_usd_override: float | None = None,
     ) -> float:
         """Commit one completed upstream request before the next tool/model step.
@@ -1095,7 +820,6 @@ class WebAdminChatStateMixin:
         are updated in the same awaited boundary.
         """
         usage_present = isinstance(call.get("usage"), Usage)
-        prompt_usage_reported = bool(call.get("promptUsageReported")) and usage_present
         usage = call.get("usage") if usage_present else Usage()
         if cost_usd_override is None:
             cost = _resolved_usage_cost_usd(
@@ -1167,37 +891,6 @@ class WebAdminChatStateMixin:
                 model_fail_count=fail_count,
                 error_type=str(call.get("errorType") or ""),
             )
-            if call_kind == "controller_request" and status == "ok":
-                cur = await connection.execute(
-                    "SELECT COALESCE(MAX(id),0) AS generation FROM summaries WHERE chat_id=?",
-                    (chat_id,),
-                )
-                generation = int((await cur.fetchone())["generation"] or 0)
-                prompt_tokens = (
-                    max(0, int(usage.input_tokens or 0) + int(usage.cache_read_tokens or 0) + int(usage.cache_write_tokens or 0))
-                    if prompt_usage_reported
-                    else None
-                )
-                # The newest successful request is authoritative. A provider that
-                # omits usage writes an explicit unknown tombstone so immutable
-                # legacy model-call rows cannot revive an older context snapshot.
-                await accounting.set_controller_context_usage(
-                    chat_id,
-                    session_uuid=session_uuid,
-                    tokens=prompt_tokens,
-                    summary_id=generation,
-                    commit=False,
-                )
-                if memory_reminder_generation is not None:
-                    await connection.execute(
-                        """INSERT INTO web_memory_reminders(
-                               chat_id, session_uuid, summary_id, delivered_at
-                           ) VALUES(?,?,?,?)
-                           ON CONFLICT(chat_id, summary_id) DO UPDATE SET
-                               session_uuid=excluded.session_uuid,
-                               delivered_at=excluded.delivered_at""",
-                        (chat_id, session_uuid, int(memory_reminder_generation), now_ts()),
-                    )
         return cost
 
     async def _persist_web_run_metrics(
@@ -1292,40 +985,6 @@ class WebAdminChatStateMixin:
             )
         return request_cost
 
-    async def _post_compact_after_web_turn(
-        self,
-        chat_id: int,
-        last_prompt_tokens: int,
-        *,
-        model_label: str,
-        source: str = "turn_epilogue",
-    ) -> CompactionOutcome:
-        try:
-            compactor = self._make_web_compactor(chat_id, model_label=model_label)
-            outcome = await compactor.maybe_compact_detail(chat_id, prompt_tokens=last_prompt_tokens, source=source)
-            if outcome.did:
-                clear_read_file_state(chat_id=chat_id)
-            return outcome
-        except Exception:
-            log.exception("Web 对话历史压缩后处理异常", 会话=chat_id)
-            return CompactionOutcome(did=False, source=source, trigger_tokens=last_prompt_tokens, reason="exception")
 
-    async def _pre_compact_before_web_turn(
-        self,
-        chat_id: int,
-        prompt_tokens: int,
-        *,
-        model_label: str,
-        source: str = "pre_model_request",
-    ) -> CompactionOutcome:
-        try:
-            compactor = self._make_web_compactor(chat_id, model_label=model_label)
-            outcome = await compactor.maybe_compact_detail(chat_id, prompt_tokens=prompt_tokens, source=source)
-            if outcome.did:
-                clear_read_file_state(chat_id=chat_id)
-            return outcome
-        except Exception:
-            log.exception("Web 对话历史预压缩异常", 会话=chat_id)
-            return CompactionOutcome(did=False, source=source, trigger_tokens=prompt_tokens, reason="exception")
 
 __all__ = [name for name in globals() if not name.startswith("__")]

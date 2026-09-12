@@ -1,18 +1,21 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
-  Box, ArrowDown, ArrowRight, ChatLineRound, Delete, DocumentCopy,
+  Box, ArrowDown, ArrowRight, ChatLineRound, Check, Delete, DocumentCopy,
   EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading,
   Plus, Refresh, RefreshLeft, Search, Star, StarFilled,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import MdEditor from "./MdEditor.vue";
+import ContextStrategySwitch from "./ContextStrategySwitch.vue";
 import "./conversationTreeProperties.css";
 import ConversationPromptDialog from "./ConversationPromptDialog.vue";
 import ConversationOverview from "./ConversationOverview.vue";
+import ConversationActivityFolder from "./ConversationActivityFolder.vue";
+import {activityReadRequests, activityLabel} from "../conversationActivity.js";
 import { treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop } from "./conversationTreeInteractions.js";
-import { referenceCatalog } from "../references/catalog.js";
+import { referenceCatalog, acceptActivityReadReceipt } from "../references/catalog.js";
 import { REFERENCE_MIME, referenceToken } from "../references/codec.js";
 import { modelDefaultThinking, modelThinkingLevels, thinkingLabel } from "../views/consoleView/display.js";
 import {
@@ -35,6 +38,8 @@ defineExpose({
   forgetConversation,
 });
 
+const activityItems = ref([]);
+const activityReadBusy = ref(false);
 const rootFolders = ref([]);
 const branchState = reactive({});
 const expanded = ref(new Set());
@@ -205,6 +210,7 @@ function everyKnownNode() {
 function knownConversationRows() {
   const map = new Map();
   for (const row of everyKnownNode()) if (row.kind === "conversation" && row.conversationUuid) map.set(row.conversationUuid, row);
+  for (const row of activityItems.value) map.set(row.conversationUuid, row);
   if (props.draftConversation) map.set(props.draftConversation.conversationUuid, props.draftConversation);
   return [...map.values()];
 }
@@ -220,6 +226,7 @@ function forgetConversation(conversationUuid) {
     branch.items = (branch.items || []).filter((row) => row.conversationUuid !== conversationUuid);
   }
   searchRows.value = searchRows.value.filter((row) => row.conversationUuid !== conversationUuid);
+  activityItems.value = activityItems.value.filter(row => row.conversationUuid !== conversationUuid);
   emitRows();
 }
 function forgetFolder(folderId) {
@@ -251,7 +258,8 @@ function statusAdjustedRow(row) {
   }
   if (row.kind !== "conversation" || row.archived) return row;
   const status = latestStatusState.lookup.get(row.conversationUuid);
-  return status ? { ...row, ...status, status: "running", running: true } : { ...row, running: false, status: "idle" };
+  const activity = latestStatusState.activityLookup.get(row.conversationUuid);
+  return { ...row, ...(status || {}), ...(activity || {activityUnread: false, activityState: "", activityPending: []}), running: Boolean(status), status: status ? "running" : "idle" };
 }
 function mergeLocatedFolders(rows = []) {
   for (const raw of rows || []) {
@@ -467,21 +475,45 @@ async function refreshTree({
 function applyStatus(data = {}) {
   const revision = Number(data.revision || 0);
   if (revision) statusServerRevision = Math.max(statusServerRevision, revision);
+  const adjust = item => {
+    const read = Math.max(Number(item.activityReadVersion || 0), Number(referenceCatalog.activityReadVersions?.get(item.conversationUuid) || 0));
+    return {...item, activityReadVersion: read, activityUnread: Number(item.activityVersion || 0) > read};
+  };
+  activityItems.value = (data.activityItems || data.items || []).map(adjust).filter(item => !item.archived && (item.running || item.activityUnread));
   latestStatusState = {
+    raw: data,
+    activityLookup: new Map(activityItems.value.map(item => [item.conversationUuid, item])),
     lookup: new Map((data.items || []).map((item) => [item.conversationUuid, item])),
     folderRunningCounts: { ...(data.folderRunningCounts || {}) },
     folderConversationCounts: { ...(data.folderConversationCounts || {}) },
   };
   for (const row of everyKnownNode()) {
     if (row.kind === "conversation" && !row.archived) {
-      const status = latestStatusState.lookup.get(row.conversationUuid);
-      updateKnownNode(row.conversationUuid, status ? { ...status, status: "running", running: true } : { running: false, status: "idle" });
+      updateKnownNode(row.conversationUuid, statusAdjustedRow(row));
     } else if (row.kind === "folder") {
       updateKnownNode(row.folderId, statusAdjustedRow(row));
     }
   }
-  searchRows.value = searchRows.value.map(row => row.kind === "folder" ? statusAdjustedRow(row) : row);
+  searchRows.value = searchRows.value.map(statusAdjustedRow);
   emitRows();
+}
+async function markActivityRead(items) {
+  const requests = activityReadRequests(items);
+  if (!requests.length || activityReadBusy.value) return;
+  activityReadBusy.value = true;
+  try {
+    const receipt = await Api.readConversationActivity(requests);
+    acceptActivityReadReceipt(receipt);
+    if (latestStatusState) applyStatus(latestStatusState.raw);
+  } catch (error) { ElMessage.error(apiError(error)); }
+  finally { activityReadBusy.value = false; }
+}
+function openActivityConversation(row) {
+  // Opening the virtual alias does not expand/move/select its original folder.
+  closeOverview();
+  cacheLocatedConversation(row);
+  emitRows();
+  emit("open", row);
 }
 async function refreshStatus() {
   const request = ++statusRequestGeneration;
@@ -789,6 +821,7 @@ function defaultFieldSource(field) {
   return hasRunDefault(propertiesForm.runResolved, field) ? "服务器解析值" : "未配置";
 }
 function defaultFieldValue(field, value, context = appliedRunDefaults.value) {
+  if (field === "contextStrategy") return value === "model_summary" ? "模型摘要" : "滑动窗口";
   if (field === "mainModel") return propertyModelValueLabel(value);
   if (field === "mainThinkingLevel") return thinkingValueLabel(value);
   if (field === "mainFastMode") return value === true ? "开启" : "关闭";
@@ -1229,6 +1262,7 @@ watch(displayRows, rows => {
   if (overview.value.open && !rows.some(row => row.conversationUuid === overview.value.row?.conversationUuid)) closeOverview();
 });
 watch(() => referenceCatalog.treeStatus, data => { if (data) { statusRequestGeneration += 1; applyStatus(data); } });
+watch(() => referenceCatalog.activityReadVersions, () => { if (latestStatusState) applyStatus(latestStatusState.raw); });
 watch(() => [referenceCatalog.connected, referenceCatalog.ready], scheduleStatus);
 onMounted(async () => {
   window.addEventListener("keydown", globalKeydown);
@@ -1271,6 +1305,9 @@ onBeforeUnmount(() => {
       <button v-if="query" type="button" title="清空搜索" @click="query = ''">×</button>
     </div>
 
+    <ConversationActivityFolder :items="activityItems" :active-conversation-uuid="activeConversationUuid" :read-versions="referenceCatalog.activityReadVersions" :busy="activityReadBusy"
+      @open="openActivityConversation" @read="markActivityRead([$event])" @read-all="markActivityRead(activityItems)" />
+
     <div ref="listRef" class="tree-list" :class="{ 'drop-root': drag.target?.kind === 'root' }" role="tree" aria-label="会话和目录"
       @contextmenu.prevent.stop="openRootMenu" @dragover.self="dragOver($event, rootDropTarget)" @drop.self="drop($event, rootDropTarget)"
       @dragleave.self="clearDropTarget" @scroll.passive="closeOverview">
@@ -1298,7 +1335,6 @@ onBeforeUnmount(() => {
               <span class="node-label">{{ row.name }}</span>
               <span v-if="row.hasLocalWorkspace || row.hasLocalPrompt" class="property-dot" :title="`${row.hasLocalWorkspace ? '本节点设置工作目录' : ''}${row.hasLocalWorkspace && row.hasLocalPrompt ? '；' : ''}${row.hasLocalPrompt ? '本节点设置提示词' : ''}`"><el-icon><InfoFilled /></el-icon></span>
               <span v-if="row.pinned" class="node-star" title="同级置顶"><el-icon><StarFilled /></el-icon></span>
-              <span v-if="Number(row.runningDescendantCount || 0)" class="running-count" :aria-label="`${row.runningDescendantCount} 个后代会话运行中`">{{ row.runningDescendantCount }} 运行中</span>
               <span class="node-count" :aria-label="`${row.kind === 'system' ? row.count : Number(row.conversationCount || 0)} 个会话`">{{ row.kind === 'system' ? row.count : Number(row.conversationCount || 0) }}</span>
             </button>
           </template>
@@ -1309,7 +1345,8 @@ onBeforeUnmount(() => {
               <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row), 'is-working': running(row) && !rowLoading(row) }"><component :is="rowLoading(row) ? Loading : ChatLineRound" /></el-icon>
               <span class="node-copy"><span class="node-label">{{ row.title }}</span><small v-if="row.search">{{ row.path }}</small></span>
               <span v-if="row.pinned" class="node-star"><el-icon><StarFilled /></el-icon></span>
-              <span v-if="running(row)" class="running-leaf" :title="row.currentStatus || '运行中'"><i></i><span>运行中</span></span>
+              <span v-if="running(row)" class="running-leaf" role="img" :aria-label="`${activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`" :title="`${row.currentStatus || activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`"></span>
+              <span v-else-if="row.activityUnread" class="conversation-unread-dot" aria-label="未读" :title="`${activityLabel(row)} · 未读`"></span>
             </button>
           </template>
 
@@ -1347,6 +1384,7 @@ onBeforeUnmount(() => {
             </template>
           </template>
           <template v-else>
+            <button v-if="menu.row?.activityUnread" role="menuitem" :disabled="activityReadBusy" @click="markActivityRead([menu.row]); closeMenu()"><el-icon><Check /></el-icon><span>标为已读</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('rename')"><el-icon><EditPen /></el-icon><span>重命名</span></button>
             <button role="menuitem" :disabled="menu.row?.local || running(menu.row)" @click="runMenuAction('duplicate')"><el-icon><DocumentCopy /></el-icon><span>复制会话</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('pin')"><el-icon><component :is="menu.row?.pinned ? Star : StarFilled" /></el-icon><span>{{ menu.row?.pinned ? '取消置顶' : '置顶' }}</span></button>
@@ -1503,6 +1541,12 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+              <div class="folder-context-strategy">
+                <div class="folder-context-strategy-head"><strong>上下文压缩策略</strong><span>主会话与 Agent 共用</span></div>
+                <ContextStrategySwitch :model-value="hasRunDefault(propertiesForm.runDefaults, 'contextStrategy') ? propertiesForm.runDefaults.contextStrategy : 'inherit'"
+                  inherit :inherited-label="defaultFieldValue('contextStrategy', appliedRunDefaults.contextStrategy) + ' · ' + defaultFieldSource('contextStrategy')" :disabled="propertiesLoading || propertiesSaving"
+                  @update:model-value="setRunDefault('contextStrategy', $event === 'inherit' ? RUN_DEFAULT_INHERIT : runDefaultOption($event))" />
+              </div>
             </div>
           </section>
         </div>
@@ -1543,6 +1587,11 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.folder-context-strategy { padding: 16px; margin-top: 16px; background: #f5f6f8; border: 1px solid #e3e6eb; border-radius: 12px; }
+.folder-context-strategy-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+.folder-context-strategy-head strong { font-size:14px; font-weight:500; }
+.folder-context-strategy-head span { font-size:13px; color:#87909d; }
+:global(html.dark) .folder-context-strategy { background:#2b3038; border-color:#454d59; }
 .conversation-tree { display:flex; min-height:0; flex:1; flex-direction:column; color:#3f3f46; font-family:inherit; }
 .conversation-tree button,.conversation-tree input { font-family:inherit; }
 .tree-list.drop-root { background:rgba(37,99,235,.045); outline:1px dashed rgba(37,99,235,.4); outline-offset:-3px; }
@@ -1586,9 +1635,9 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
 .node-star { display:grid; color:#d97706; font-size:11px; }
 .node-count { color:#a1a1aa; font-size:10px; }
 .property-dot { display:grid; color:#0f766e; font-size:11px; }
-.running-count { padding:2px 5px; border-radius:999px; background:#dcfce7; color:#15803d; font-size:9px; font-weight:650; white-space:nowrap; }
-.running-leaf { display:flex; align-items:center; gap:4px; color:#15803d; font-size:9px; font-weight:650; }
-.running-leaf i { width:6px; height:6px; border-radius:50%; background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.13); animation:tree-pulse 1.8s ease-in-out infinite; }
+.running-leaf { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:#3b82f6; box-shadow:0 0 0 3px rgba(59,130,246,.12); animation:tree-pulse 1.8s ease-in-out infinite; }
+:global(html.dark) .running-leaf { background:#60a5fa; box-shadow:0 0 0 3px rgba(96,165,250,.15); }
+.conversation-unread-dot { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:#3b82f6; }
 .tree-leaf-spacer { width:24px; flex:0 0 auto; }
 .tree-inline-action,.search-more { margin-left:28px; border:0; background:transparent; color:#2563eb; font-size:11px; cursor:pointer; }
 .tree-inline-action.error { color:#dc2626; }.tree-muted { display:flex; align-items:center; gap:5px; padding-left:6px; color:#a1a1aa; font-size:11px; }
@@ -1597,7 +1646,7 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
 .is-spinning { animation:tree-spin .8s linear infinite; }
 @keyframes tree-spin { to { transform:rotate(360deg); } } @keyframes tree-pulse { 50% { opacity:.35; transform:scale(.8); } }
 /* Keep the running ring: it is an operational status indicator, not decoration. */
-@media (prefers-reduced-motion: reduce) { .is-spinning,.running-leaf i { animation:none; } }
+@media (prefers-reduced-motion: reduce) { .is-spinning,.running-leaf { animation:none; } }
 @media (pointer:coarse) { .tree-row-wrap { min-height:36px; } .tree-node-main { height:34px; } }
 </style>
 
@@ -1613,5 +1662,5 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
 .move-archive-options .el-checkbox__label { font-size:13px; line-height:1.6; font-weight:500; }
 .move-archive-options p { margin:2px 0 0 22px; font-size:12px; line-height:1.6; color:var(--el-text-color-secondary); }
 .folder-picker { max-height:330px; overflow:auto; margin-top:10px; padding:5px; border:1px solid var(--el-border-color-light); border-radius:9px; }.folder-picker button { display:flex; width:100%; align-items:center; gap:7px; padding:7px 9px; border:0; border-radius:7px; background:transparent; color:var(--el-text-color-primary); text-align:left; cursor:pointer; }.folder-picker button:hover:not(:disabled),.folder-picker button.selected { background:var(--el-color-primary-light-9); color:var(--el-color-primary); }.folder-picker button:disabled { opacity:.35; cursor:not-allowed; }.folder-picker span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
-html.dark .conversation-tree { color:#d4d4d8; } html.dark .tree-tool:hover,html.dark .tree-tool:focus-visible,html.dark .tree-node-main:hover { background:rgba(63,63,70,.58); color:#fafafa; } html.dark .tree-search { border-color:#3f3f46; background:rgba(24,24,27,.8); } html.dark .tree-search input { color:#f4f4f5; } html.dark .tree-node-main.is-folder-target { background:rgba(161,161,170,.13); color:#f4f4f5; } html.dark .tree-node-main.is-chat-active { background:rgba(59,130,246,.14); color:#bfdbfe; } html.dark .running-count { background:rgba(22,101,52,.35); color:#86efac; } html.dark .tree-placeholder { background:rgba(63,63,70,.42); } html.dark .tree-context-menu { border-color:rgba(255,255,255,.12); background:rgba(39,39,42,.97); color:#f4f4f5; }
+html.dark .conversation-tree { color:#d4d4d8; } html.dark .tree-tool:hover,html.dark .tree-tool:focus-visible,html.dark .tree-node-main:hover { background:rgba(63,63,70,.58); color:#fafafa; } html.dark .tree-search { border-color:#3f3f46; background:rgba(24,24,27,.8); } html.dark .tree-search input { color:#f4f4f5; } html.dark .tree-node-main.is-folder-target { background:rgba(161,161,170,.13); color:#f4f4f5; } html.dark .tree-node-main.is-chat-active { background:rgba(59,130,246,.14); color:#bfdbfe; } html.dark .tree-placeholder { background:rgba(63,63,70,.42); } html.dark .tree-context-menu { border-color:rgba(255,255,255,.12); background:rgba(39,39,42,.97); color:#f4f4f5; }
 </style>

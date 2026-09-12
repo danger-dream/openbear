@@ -6,8 +6,12 @@ from dataclasses import replace
 from typing import Any
 
 from app.rath.continuity import AgentContinuityError, agent_session_public
-from app.rath.schemas import RathTask, TERMINAL_TASK_STATUSES
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, expand_agent_tool_names, agent_phase_tool_names
+from app.rath.schemas import TERMINAL_TASK_STATUSES, RathTask
+from app.tools.allowlist import (
+    AGENT_DELEGATION_TOOL_NAMES,
+    agent_phase_tool_names,
+    expand_agent_tool_names,
+)
 from app.tools.base import current_tool_context
 
 
@@ -151,9 +155,7 @@ class AgentContinuationTools:
                 "presetToolCeiling": list(data.get("presetToolCeiling") or []), "phase": phase}
 
     async def agent_info(self, args: dict[str, Any]) -> str:
-        from app.tools.agents import _task_public
-        from app.rath.single_agent import _is_agent_context_summary_message
-        from app.task_memory import TaskMemoryDAO, task_memory_catalog_snapshot
+        from app.tools.agents import _task_agent_plan_mode, _task_public
         ctx = current_tool_context()
         if ctx.source.startswith("agent:"):
             return _json({"ok": False, "error": "main_controller_only"})
@@ -177,19 +179,43 @@ class AgentContinuationTools:
             independent = session and session.session_kind == "independent"
             tasks = await self.dao.agent_instance_tasks(session.session_uuid) if independent else [task]
             checkpoint = await self.dao.task_model_context(session.context_task_uuid) if independent and session.context_task_uuid else None
-            current = await self.dao.get_task(session.active_task_uuid) if independent and session.active_task_uuid else task
+            from app.context.store import ContextOwner, WindowStore
+            context_task = session.context_task_uuid if independent and session.context_task_uuid else (task.task_uuid if task else "")
+            window_owner = ContextOwner.agent(task_uuid=context_task, agent_session_uuid=session.session_uuid if independent else "") if context_task else None
+            window = await WindowStore(self.dao.db, window_owner).load() if window_owner else None
+            # The checkpoint may still belong to an earlier round, especially
+            # when the latest round ended before saving any context.
+            current_uuid = (session.active_task_uuid or session.last_task_uuid) if independent else ""
+            current = await self.dao.get_task(current_uuid) if current_uuid else task
             capabilities = await self._inspect_capabilities(current)
+            plan_runtime = {"taskUuid": current.task_uuid if current else "",
+                            "planMode": _task_agent_plan_mode(current) if current else None,
+                            "available": False}
+            if current and plan_runtime["planMode"] == "direct":
+                plan_runtime.update(available=True, phase="direct", planVersion=0,
+                                    activePlanVersion=0, pendingPlanVersion=0, currentStepId="",
+                                    plan=None, steps=[], evidence=[])
+            elif current:
+                # Coordinator.snapshot lazily initializes missing Plan state.
+                # Inspection must remain read-only, including for legacy tasks.
+                cur = await self.dao.db.conn.execute(
+                    "SELECT 1 FROM rath_task_plan_state WHERE task_uuid=?", (current.task_uuid,),
+                )
+                snapshot = await self._plan_notification_snapshot(current.task_uuid) if await cur.fetchone() else {}
+                if snapshot:
+                    state = snapshot["state"]
+                    plan_runtime.update(snapshot, available=True, phase=state.get("phase"),
+                                        activePlanVersion=int(state.get("active_plan_version") or 0),
+                                        pendingPlanVersion=int(state.get("pending_plan_version") or 0),
+                                        currentStepId=str(state.get("current_step_id") or ""))
             material_refs = [{"taskUuid": item.task_uuid, "attachments": item.input.get("attachmentRefs") or []}
                              for item in tasks if item.input.get("attachmentRefs")]
             context_detail = {"revision": session.context_revision if independent else 0,
                               "templatePinned": bool(independent and "baseSystemPrompt" in session.metadata),
                               "legacyTemplateUnpinned": bool(session and session.metadata.get("legacyTemplateUnpinned")),
-                              "compacted": (any(_is_agent_context_summary_message(message) for message in checkpoint["state"].get("messages") or []) if checkpoint else None)}
-            memory_catalog = await task_memory_catalog_snapshot(
-                TaskMemoryDAO(self.dao.db), conversation_uuid=ctx.session_uuid,
-                task_uuid=current.task_uuid if current else "", for_agent=True,
-                private_scope=("agent_session", session.session_uuid) if independent else None,
-            )
+                              "windowAvailable": bool(window and window["state"].get("messages") is not None),
+                              "windowVersion": int(window["window_version"]) if window else None,
+                              "historyCoverage": "incremental_originals" if window else "legacy_checkpoint_only"}
             return _json({"ok": True, "agentSession": agent_session_public(session) if session else {},
                           "legacy": not independent, "tasks": [_task_public(item, include_output=True) for item in tasks],
                           "task": _task_public(current, include_output=True),
@@ -197,24 +223,25 @@ class AgentContinuationTools:
                           "contextState": str((checkpoint or {}).get("state", {}).get("stage") or "unavailable"),
                           "memoryScope": "agent_session" if independent else "agent_task",
                           "capabilities": capabilities, "materials": material_refs, "context": context_detail,
-                          "memoryCatalog": memory_catalog.catalog_xml,
+                          "planRuntime": plan_runtime,
                           "workspace": self.workspace_dir})
         except AgentContinuityError as exc:
             return _json(exc.public())
 
 
 def register_continuation_tools(reg, tools) -> None:
-    reg.add("AgentContinue", "Continue the SAME independent Agent after its round has ended. Restores its actual retained context and private memory, appends a new instruction, and creates a new task record without reopening the previous result. Pass the COMPLETE tools array for this round; permissions are not inherited or unioned. Use AgentMessage for unfinished tasks. Main controller only; new scope still requires user authorization.",
+    reg.add("AgentContinue", "Continue the SAME independent Agent after its round has ended. Restores its actual retained context and private memory, appends a new instruction, and creates a new task record without reopening the previous result. No prior memory report or progress note is required. Pass the COMPLETE tools array for this round; permissions are not inherited or unioned. Use AgentMessage for unfinished tasks. Main controller only; new scope still requires user authorization.",
             {"type": "object", "properties": {
                 "to": {"type": "string", "description": "Exact agentId, or exact legacy task UUID to adopt only that task."},
                 "prompt": {"type": "string", "description": "New instruction, changed scope and preserved constraints; do not repeat the retained investigation."},
-                "tools": {"type": "array", "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)}},
+                "tools": {"type": "array", "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)},
+                          "description": "Complete business-tool allowlist for this round. [] means no business tools; runtime AgentHistory and necessary protocol tools may still be present."},
                 "description": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}},
                 "planMode": {"type": "string", "enum": ["direct", "managed"], "default": "direct"},
                 "requestId": {"type": "string", "description": "Optional idempotency key; reuse only for the same continuation request."},
             }, "required": ["to", "prompt", "tools"]}, tools.agent_continue,
             visibility={"main", "runtime"}, preserve_result=True)
-    reg.add("AgentInfo", "Read current-conversation Agent instances, exact retained-context availability, rounds/results and delegable capabilities. Read-only; use on demand, not as a polling timer. Does not expose private model messages.",
+    reg.add("AgentInfo", "Read current-conversation Agent instances, retained-context availability, rounds/results and delegable capabilities. get returns the current task's authoritative planRuntime (phase, active/pending versions, Plan, steps and evidence), not inferred historical notifications. Use its taskUuid and pendingPlanVersion or activePlanVersion for version-checked Plan decisions; direct explicitly has no Plan, and available=false means Plan state could not be read. Read-only; use on demand, not as a polling timer. Does not expose private model messages or memory catalogs/bodies.",
             {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["list", "get", "capabilities"]},
                 "to": {"type": "string", "description": "Exact agentId or task UUID for get."},

@@ -32,21 +32,12 @@ from aiohttp import web
 from app.admin import channels as channel_admin
 from app.admin import settings as settings_admin
 from app.agent import steering
-from app.agent.compaction import (
-    CompactionAccountingError,
-    CompactionOutcome,
-    Compactor,
-    CompressionCandidate,
-)
 from app.agent.loop import Agent
 from app.agent.result import RunResult
 from app.agent.transcript_repair import (
-    build_summary_prefixed_history,
-    build_summary_prefixed_visible_history,
     repair_tool_pairing,
 )
 from app.config import Config, fast_request_mode
-from app.interaction_data import redact_interaction_log
 from app.context.builder import build_system_prompt_params
 from app.control_actions import (
     schedule_openbear_restart,
@@ -54,6 +45,7 @@ from app.control_actions import (
 )
 from app.db.dao import MessageDAO, SummaryDAO, WebConversationDefaultsDAO
 from app.db.engine import DB, now_ts
+from app.interaction_data import redact_interaction_log
 from app.llm.base import Message
 from app.llm.events import Usage
 from app.logging import get_logger

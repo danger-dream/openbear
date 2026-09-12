@@ -46,11 +46,13 @@ def test_setting_catalog_is_complete_and_unique():
     assert len(section_keys) == len(set(section_keys))
 
 
-def test_compaction_timeout_setting_is_available_and_validated():
-    spec = get_spec("agent.compactTimeoutS")
-    assert spec is not None
-    assert spec.parse("2400") == 2400
-    assert "agent.compactTimeoutS" in [item.path for item in group_specs("compact")]
+def test_dual_strategy_settings_preserve_summary_and_remove_only_reminder():
+    for key in ("agent.compactTimeoutS", "agent.compactPrompt", "agent.manualCompactMinPercent"):
+        assert get_spec(key) is not None
+    assert get_spec("agent.memoryReminderPrompt") is None
+    spec = get_spec("contextManagement.retainRatio")
+    assert spec is not None and spec.parse("0.15") == 0.15
+    assert len(group_specs("compaction")) == 10
     with pytest.raises(ValueError):
         spec.parse("0")
 
@@ -64,7 +66,6 @@ def test_agent_and_tool_sections_are_available():
         "模型调用失败重试次数",
         "重试基础等待",
         "重试等待上限",
-        "重试随机抖动",
         "空回复补救次数",
         "只有思考无正文的补救次数",
     ]
@@ -80,6 +81,9 @@ def test_agent_and_tool_sections_are_available():
         "Read 单行字节上限",
         "Read 状态缓存上限",
     ]
+    assert get_spec("agent.retryJitterRatio") is None
+    assert "阶梯" in get_spec("agent.retryBackoffS").desc
+    assert "600 秒" in get_spec("agent.retryMaxDelayS").desc
     mcp = get_spec("mcp.installDir")
     assert mcp is not None
     assert mcp.default_value == "./mcp-servers"

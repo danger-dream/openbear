@@ -117,7 +117,7 @@ test("assistant progress adds a divider between adjacent visible answer entries"
 
 test("only intermediate conversation rows retain hover time and duration badges", () => {
 	assert.doesNotMatch(turnListSource, /class="time-float time-float-right"/);
-	assert.match(turnListSource, /v-if="eventTimeMs\(entry\.event\) && !assistantMetaVisible\(entry\.event, turnIndex, conversationIndex, turn\)" class="time-float time-float-left"/);
+	assert.match(turnListSource, /v-if="eventTimeMs\(entry\.event\) && showEventTimeBadge\(turn, turnIndex, conversationIndex\)" class="time-float time-float-left"/);
 	assert.match(turnListSource, /class="time-float time-float-left"[^>]*>\{\{ timeBadge\(eventTimeMs\(entry\.event\), durationMsForEvent\(entry\.event\)\) \}\}/);
 	assert.match(turnListSource, /\.timed-row:hover > \.time-float\s*\{/);
 });

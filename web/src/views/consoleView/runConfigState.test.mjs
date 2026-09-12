@@ -27,8 +27,8 @@ function config(conversationUuid, model, overrides = {}) {
       effective: {model, thinkLevel: "medium", fastMode: false},
     },
     contextWindow: 128000,
-    compactTriggerTokens: 89600,
-    compactRatio: 0.7,
+    rolloverTriggerTokens: 89600,
+    windowTriggerRatio: 0.7,
     ...overrides,
   };
 }
@@ -53,7 +53,7 @@ test("save responses must contain a complete config for the requested conversati
   assert.equal(runConfigFromResponse(valid, "conv-b"), null);
   assert.equal(runConfigFromResponse({ok: true}, "conv-a"), null);
   const incomplete = response("conv-a", "openai/gpt");
-  delete incomplete.runConfig.compactRatio;
+  delete incomplete.runConfig.windowTriggerRatio;
   assert.equal(runConfigFromResponse(incomplete, "conv-a"), null);
 });
 

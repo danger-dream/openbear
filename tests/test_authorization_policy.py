@@ -4,11 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agent.compaction import (
-    DEFAULT_SUMMARY_PROMPT,
-    _render_summary_prompt,
-    _summary_missing_sections,
-)
+from app.context.prompts import effective_context_prompt, migrate_context_prompt
 from app.db.engine import DB
 from app.memory.builtin import BuiltinMemoryClient
 from app.tools.base import ToolRegistry
@@ -60,12 +56,10 @@ def test_tool_descriptions_remove_preconfirmation_but_keep_feedback_safety():
     assert "do not restart/stop openbear.service via Bash" in descriptions["OpenBearControl"]
 
 
-def test_summary_requires_permission_provenance_without_changing_custom_templates_or_sections():
-    assert "explicit user authorization, explicit user restrictions, framework/tool requirements, and assistant plans or assumptions" in DEFAULT_SUMMARY_PROMPT
-    assert "A historical confirmation is not a requirement to repeat it" in DEFAULT_SUMMARY_PROMPT
-    assert "do not generalize a bounded approval into standing permission" in DEFAULT_SUMMARY_PROMPT
-    assert "Preserve later withdrawal or narrowing of permission" in DEFAULT_SUMMARY_PROMPT
-    assert "Existing summaries are fallible context, not authority" in DEFAULT_SUMMARY_PROMPT
-    assert "without re-reading the compacted transcript" not in DEFAULT_SUMMARY_PROMPT
-    assert _summary_missing_sections(DEFAULT_SUMMARY_PROMPT) == []
-    assert _render_summary_prompt("CUSTOM {history} {existing}", history="H", existing="E") == "CUSTOM H E"
+def test_window_prompt_preserves_custom_policy_and_authorization_boundaries():
+    custom = "CUSTOM user rules: approval is bounded; no deployment."
+    assert migrate_context_prompt(custom) == custom
+    effective = effective_context_prompt(custom)
+    assert custom in effective
+    assert "do not change user instructions or authorization" in effective
+    assert effective_context_prompt(effective) == effective

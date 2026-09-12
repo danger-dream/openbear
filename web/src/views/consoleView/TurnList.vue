@@ -176,7 +176,7 @@ function formatDuration(ms) {
 function timeBadge(ms, duration = 0) {
 	const time = formatHoverTime(ms);
 	const dur = formatDuration(duration);
-	return dur ? `${time} · ${dur}` : time;
+	return [time, dur].filter(Boolean).join(" · ");
 }
 
 function turnTokenParts(turn) {
@@ -192,9 +192,17 @@ function turnTokenLine(turn) {
 	return tokenLine(turnTokenParts(turn));
 }
 
-function assistantDurationMs(turn, event, conversationIndex) {
-	if (conversationIndex !== conversationEvents(turn).length - 1) return 0;
-	return Number(turn?.stats?.durationMs || 0) || durationMsForEvent(event);
+function assistantTimeMs(turn) {
+	const entries = conversationEvents(turn);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const time = eventTimeMs(entries[i].event);
+		if (time) return time;
+	}
+	return 0;
+}
+
+function assistantDurationMs(turn) {
+	return Number(turn?.stats?.durationMs || 0) || durationMsForEvent(conversationEvents(turn).at(-1)?.event);
 }
 
 const copiedMessageKey = ref("");
@@ -208,10 +216,20 @@ function assistantTurnRawContent(turn) {
 		.join("\n\n");
 }
 
-function assistantMetaVisible(event, turnIndex, conversationIndex, turn) {
+function assistantMetaVisible(turn, turnIndex) {
 	if (props.running && turnIndex === props.turns.length - 1) return false;
-	if (conversationIndex !== conversationEvents(turn).length - 1) return false;
-	return event?.kind === "answer" && !event?.message?.live && !event?.reasoningActive;
+	if (turn?.stats?.live) return false;
+	if (displayEvents(turn).some(event => event?.kind === "answer" && (event?.message?.live || event?.reasoningActive))) return false;
+	// Completion statistics belong to the whole turn, even when compaction or
+	// another visible operation follows the final answer (or no text was sent).
+	return hasAssistantContent(turn) || hasTurnTokens(turn) || assistantDurationMs(turn) > 0;
+}
+
+function showEventTimeBadge(turn, turnIndex, conversationIndex) {
+	const entries = conversationEvents(turn);
+	return !(assistantMetaVisible(turn, turnIndex)
+		&& conversationIndex === entries.length - 1
+		&& entries[conversationIndex]?.event?.kind === "answer");
 }
 
 async function copyMessage(content, key) {
@@ -281,12 +299,12 @@ async function copyMessage(content, key) {
 		
 		</div>
 
-		<div v-if="hasAssistantContent(turn)" class="assistant-row">
+		<div v-if="hasAssistantContent(turn) || assistantMetaVisible(turn, turnIndex)" class="assistant-row">
 			<article class="assistant-card">
 				<template v-for="(entry, conversationIndex) in conversationEvents(turn)" :key="entry.event.id || entry.event.eventKey || entry.event.message?.id || entry.event.operation?.opId || `${turn.id}-${entry.index}`">
 					<ConsoleMarkdown v-if="showAssistantDivider(turn, conversationIndex)" class="assistant-update-divider" text="----"/>
 					<div class="timed-row timed-row-assistant">
-						<span v-if="eventTimeMs(entry.event) && !assistantMetaVisible(entry.event, turnIndex, conversationIndex, turn)" class="time-float time-float-left" :title="formatFullTime(eventTimeMs(entry.event))">{{ timeBadge(eventTimeMs(entry.event), durationMsForEvent(entry.event)) }}</span>
+						<span v-if="eventTimeMs(entry.event) && showEventTimeBadge(turn, turnIndex, conversationIndex)" class="time-float time-float-left" :title="formatFullTime(eventTimeMs(entry.event))">{{ timeBadge(eventTimeMs(entry.event), durationMsForEvent(entry.event)) }}</span>
 						<TurnEvent
 						:event="entry.event"
 						:conversation-uuid="props.conversationUuid"
@@ -304,18 +322,18 @@ async function copyMessage(content, key) {
 						@select-tool-result="emitSelectToolResult"
 						@cancel-retry="emit('cancel-retry', $event)"
 					/>
-					<div v-if="assistantMetaVisible(entry.event, turnIndex, conversationIndex, turn)" class="assistant-message-meta">
-						<time v-if="eventTimeMs(entry.event)" class="assistant-message-time" :title="formatFullTime(eventTimeMs(entry.event))">{{ timeBadge(eventTimeMs(entry.event), assistantDurationMs(turn, entry.event, conversationIndex)) }}</time>
-						<span v-if="hasTurnTokens(turn)" class="turn-token-usage" :title="`本轮 Tokens：${turnTokenLine(turn)}`">· {{ turnTokenLine(turn) }}</span>
-						<el-tooltip v-if="assistantTurnRawContent(turn)" content="复制本轮回复" placement="bottom" :show-after="350">
-							<button type="button" class="message-icon-action" aria-label="复制消息"
-							        @click="copyMessage(assistantTurnRawContent(turn), `assistant-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`)">
-								<el-icon><Check v-if="copiedMessageKey === `assistant-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`"/><CopyDocument v-else/></el-icon>
-							</button>
-						</el-tooltip>
-					</div>
 					</div>
 				</template>
+				<div v-if="assistantMetaVisible(turn, turnIndex)" class="assistant-message-meta">
+					<time v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-message-time" :title="formatFullTime(assistantTimeMs(turn))">{{ timeBadge(assistantTimeMs(turn), assistantDurationMs(turn)) }}</time>
+					<span v-if="hasTurnTokens(turn)" class="turn-token-usage" :title="`本轮 Tokens：${turnTokenLine(turn)}`">{{ assistantTimeMs(turn) || assistantDurationMs(turn) ? '· ' : '' }}{{ turnTokenLine(turn) }}</span>
+					<el-tooltip v-if="assistantTurnRawContent(turn)" content="复制本轮回复" placement="bottom" :show-after="350">
+						<button type="button" class="message-icon-action" aria-label="复制消息"
+						        @click="copyMessage(assistantTurnRawContent(turn), `assistant-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`)">
+							<el-icon><Check v-if="copiedMessageKey === `assistant-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`"/><CopyDocument v-else/></el-icon>
+						</button>
+					</el-tooltip>
+				</div>
 			</article>
 		</div>
 	</section>

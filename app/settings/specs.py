@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from app.agent.compaction import DEFAULT_SUMMARY_PROMPT
-from app.config import DEFAULT_MEMORY_REMINDER_PROMPT
+from app.context.summary_prompt import DEFAULT_SUMMARY_PROMPT
 from app.rath.prompts import PROMPT_SPECS
 
 SettingKind = Literal["bool", "int", "float", "str", "multi"]
@@ -64,7 +63,7 @@ class SettingSpec:
             item = str(value or "").strip()
             if not item:
                 continue
-            if item not in allowed:
+            if item not in allowed and self.path != "models.compressionModels":
                 raise ValueError(f"不支持的选项：{item}")
             if item not in out:
                 out.append(item)
@@ -116,7 +115,7 @@ SPECS: dict[str, SettingSpec] = {
     "agent.retryBackoffS": _s(
         "agent.retryBackoffS",
         "重试基础等待",
-        "首次重试前的等待时间；后续按指数增长。",
+        "默认 3 秒；后续按 3、5、10、30、180、300、600 秒阶梯递增。自定义基础值按比例调整，等待向上取整到秒。",
         "float",
         "retry",
         "下一轮生效",
@@ -127,23 +126,13 @@ SPECS: dict[str, SettingSpec] = {
     "agent.retryMaxDelayS": _s(
         "agent.retryMaxDelayS",
         "重试等待上限",
-        "指数退避的单次等待上限；服务端 Retry-After 不受此上限覆盖。",
+        "阶梯等待的单次上限，默认 600 秒；服务端 Retry-After 是最低等待要求，不会提前重试。",
         "float",
         "retry",
         "下一轮生效",
         min_value=0,
         max_value=600,
         unit="秒",
-    ),
-    "agent.retryJitterRatio": _s(
-        "agent.retryJitterRatio",
-        "重试随机抖动",
-        "在指数退避上附加的随机比例，避免多个请求同时再次撞上游。",
-        "float",
-        "retry",
-        "下一轮生效",
-        min_value=0,
-        max_value=1,
     ),
     "agent.emptyResponseRetryLimit": _s(
         "agent.emptyResponseRetryLimit",
@@ -165,76 +154,82 @@ SPECS: dict[str, SettingSpec] = {
         min_value=0,
         max_value=10,
     ),
-    "agent.compactRatio": _s(
+    'agent.compactRatio': _s(
         "agent.compactRatio",
-        "历史压缩触发比例",
-        "最近一次上下文接近模型窗口到这个比例后，后台会压缩旧历史。",
+        "压缩触发比例",
+        "模型未设置独立触发阈值时，按模型窗口的这个比例触发当前会话选择的压缩策略。",
         "float",
-        "compact",
+        "compaction",
         "下一轮生效",
         min_value=0.1,
         max_value=0.95,
     ),
-    "agent.keepRecentMessages": _s(
+    'agent.keepRecentMessages': _s(
         "agent.keepRecentMessages",
-        "压缩后保留最近可见消息数",
-        "主会话仅以 XML 保留最近用户消息与最终助手文本；Rath Agent 仅保留有界的任务/控制/纯文本 XML，并重新注入最新 Plan 与 Task Memory。工具、通知、旧 Plan、TaskMemory 回执和内部运行状态不会作为原始上下文回放。",
+        "摘要后保留近期消息数",
+        "仅模型摘要使用。保留近期原文，边界向前对齐完整工具批次；用户要求、控制和确认问答另行原文保留。主控和 Agent 共用。",
         "int",
-        "compact",
+        "compaction",
         "下一轮生效",
         min_value=2,
         max_value=100,
     ),
-    "agent.compactMaxTokens": _s(
+    'agent.compactMaxTokens': _s(
         "agent.compactMaxTokens",
         "压缩输出上限",
         "生成历史压缩摘要时允许模型输出的最大 token 数。",
         "int",
-        "compact",
+        "compaction",
         "下一轮生效",
         min_value=512,
         max_value=64000,
     ),
-    "agent.compactMaxRetries": _s(
+    'agent.compactMaxRetries': _s(
         "agent.compactMaxRetries",
         "压缩质量重试次数",
         "摘要缺少必需小节或生成失败时，同一模型额外重试的次数；压缩模型失败后仍会回退主模型。",
         "int",
-        "compact",
+        "compaction",
         "下一轮生效",
         min_value=0,
         max_value=10,
     ),
-    "agent.compactTimeoutS": _s(
+    'agent.compactTimeoutS': _s(
         "agent.compactTimeoutS",
         "压缩模型单次超时",
         "压缩请求专用等待上限：覆盖流式首字与整流总时长、非流式读取；连接超时和流式空闲超时仍使用正常模型配置。主会话与 Agent 共用，每个候选模型和质量重试分别独立计时。",
         "float",
-        "compact",
+        "compaction",
         "下一轮生效",
         min_value=1,
         max_value=86400,
         unit="秒",
     ),
-    "agent.manualCompactMinPercent": _s(
-        "agent.manualCompactMinPercent", "手动压缩最低占用", "仅当最新真实主 Controller 上下文达到压缩阈值的这个百分比时允许手动压缩。", "int", "compact", "立即生效", min_value=0, max_value=100, unit="%",
+    'agent.manualCompactMinPercent': _s(
+        "agent.manualCompactMinPercent", "手动压缩最低占用", "仅当最新真实主 Controller 上下文达到压缩阈值的这个百分比时允许手动压缩。", "int", "compaction", "立即生效", min_value=0, max_value=100, unit="%",
     ),
-    "agent.memoryReminderPercent": _s(
-        "agent.memoryReminderPercent", "压缩前记忆提醒占用", "达到压缩阈值的这个百分比后，在下一次安全模型调用提醒保存持久记忆；0 表示关闭。", "int", "compact", "下一次调用生效", min_value=0, max_value=100, unit="%",
-    ),
-    "agent.memoryReminderPrompt": _s(
-        "agent.memoryReminderPrompt", "压缩前记忆提醒提示词", "英文提醒正文；系统会将其封装为 XML，并仅在本次请求中合并到最近一条真实用户消息，不写入会话。", "str", "compact", "下一次调用生效", editor="prompt", variables=("latest_context_tokens", "reminder_threshold_tokens", "compact_trigger_tokens"), default_value=DEFAULT_MEMORY_REMINDER_PROMPT,
-    ),
-    "agent.compactPrompt": _s(
+    'agent.compactPrompt': _s(
         "agent.compactPrompt",
         "压缩提示词",
         "历史压缩使用的提示词模板；留空使用内置模板。",
         "str",
-        "compact",
+        "compaction",
         "下一轮生效",
         editor="prompt",
         variables=("existing", "history"),
         default_value=DEFAULT_SUMMARY_PROMPT,
+    ),
+    "contextManagement.defaultStrategy": _s(
+        "contextManagement.defaultStrategy", "默认压缩策略", "用于没有目录覆盖的新会话；不会改变已有会话。主控与所属 Agent 共用会话策略。",
+        "str", "compaction", "下一轮生效", choices=(("sliding_window", "滑动窗口"), ("model_summary", "模型摘要")),
+    ),
+    "contextManagement.retainRatio": _s(
+        "contextManagement.retainRatio", "滑动窗口保留比例", "相对于触发阈值的软目标，所有必留内容仍受触发阈值约束。仅滑动窗口使用。",
+        "float", "compaction", "下一轮生效", min_value=0.01, max_value=0.95,
+    ),
+    "models.compressionModels": _s(
+        "models.compressionModels", "摘要模型", "按顺序尝试，最后回退当前执行模型；留空仅使用执行模型。仅模型摘要使用。",
+        "multi", "compaction", "下一轮生效",
     ),
     "rath.enabled": _s(
         "rath.enabled",
@@ -736,7 +731,6 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "agent.maxRetries",
         "agent.retryBackoffS",
         "agent.retryMaxDelayS",
-        "agent.retryJitterRatio",
         "agent.emptyResponseRetryLimit",
         "agent.reasoningOnlyRetryLimit",
         ],
@@ -750,19 +744,9 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "agent.llmTotalTimeoutS",
         ],
     ),
-    "compact": (
+    "compaction": (
         "上下文压缩",
-        [
-        "agent.compactRatio",
-        "agent.keepRecentMessages",
-        "agent.compactMaxTokens",
-        "agent.compactMaxRetries",
-        "agent.compactTimeoutS",
-        "agent.manualCompactMinPercent",
-        "agent.memoryReminderPercent",
-        "agent.memoryReminderPrompt",
-        "agent.compactPrompt",
-        ],
+        ['contextManagement.defaultStrategy', 'agent.compactRatio', 'contextManagement.retainRatio', 'models.compressionModels', 'agent.keepRecentMessages', 'agent.compactMaxTokens', 'agent.compactMaxRetries', 'agent.compactTimeoutS', 'agent.manualCompactMinPercent', 'agent.compactPrompt'],
     ),
     "rath": (
         "子 Agent",
@@ -876,7 +860,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
             "agent",
             "retry",
             "timeouts",
-            "compact",
+            "compaction",
             "rath",
             "rath_prompts",
         ],

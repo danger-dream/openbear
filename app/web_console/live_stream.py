@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 
 from app.agent.native_continuation import serialize_messages, validate_model_context
+from app.context.window import mark_source, neutral_context, source_of
 from app.task_memory import without_task_memory_runtime_messages
 from app.web_console.core import *
 
@@ -804,6 +805,8 @@ class _WebDBPersister:
         self.saved_assistant = False
         self.saved_message_ids: list[int] = []
         self._pending_tool_assistant: dict[str, Any] | None = None
+        self._unbound_sources: list[dict[str, Any]] = []
+        self.window_runtime: Any = None
 
     def _ownership_kwargs(self) -> dict[str, str]:
         return {
@@ -851,6 +854,9 @@ class _WebDBPersister:
                 **message_kwargs,
                 **self._ownership_kwargs(),
             )
+        self._unbound_sources.append({"id": int(message_id), "role": role, "content": content, **message_kwargs,
+                                      "turn_uuid": str(binding.get("turnUuid") or self._turn_uuid),
+                                      "run_root_turn_uuid": self._run_root_turn_uuid or self._turn_uuid})
         await self._notify_saved(message_id, role, extra=binding)
         return int(message_id or 0)
 
@@ -938,6 +944,41 @@ class _WebDBPersister:
         )
         await self._m.bump_user_turn(self._chat_id)
 
+    def bind_context_sources(self, messages: list[Message]) -> None:
+        """Bind live units to the exact rows this persister just wrote.
+
+        Tool IDs disambiguate batches; ordinary text units retain persistence
+        order. Runtime-only messages already have typed provenance and no DB row.
+        """
+        remaining = []
+        for saved in self._unbound_sources:
+            bound = False
+            for message in messages:
+                if source_of(message).get("id") or message.get("role") != saved["role"]:
+                    continue
+                calls = message.get("tool_calls") or []
+                saved_calls = saved.get("tool_calls") or []
+                if saved["role"] == "tool" and message.get("tool_call_id") != saved.get("tool_call_id"):
+                    continue
+                if saved["role"] == "assistant":
+                    if bool(calls) != bool(saved_calls):
+                        continue
+                    if calls:
+                        call_ids = [c.get("id") if isinstance(c, dict) else c.id for c in calls]
+                        stored_ids = [c.get("id") if isinstance(c, dict) else c.id for c in saved_calls]
+                        if call_ids != stored_ids:
+                            continue
+                reference_only = isinstance(message.get("content"), str) and message.get("content") == saved.get("content")
+                mark_source(message, kind="human" if saved["role"] == "user" else "execution",
+                            source_id=f"message:{saved['id']}", message_id=saved["id"],
+                            reference_only=reference_only, turn_uuid=saved["turn_uuid"],
+                            run_root_turn_uuid=saved["run_root_turn_uuid"])
+                bound = True
+                break
+            if not bound:
+                remaining.append(saved)
+        self._unbound_sources = remaining
+
     async def save_native_context(self, *, messages: list[Message]) -> None:
         """Persist the complete private model context outside transcript rows."""
         # Trusted Task Memory runtime messages intentionally live only here. Unknown
@@ -956,173 +997,15 @@ class _WebDBPersister:
             protocol=self._protocol,
             model=self._model,
             model_label=self._model_label,
-            state={"version": 1, "messages": payloads},
+            state={"version": 1, "messages": payloads,
+                   "windowVersion": self.window_runtime.window_version if self.window_runtime else 0,
+                   "windowRevision": self.window_runtime.state_revision if self.window_runtime else 0},
         )
 
 
-def _merge_runtime_convo_tail(rebuilt: list, current_convo: list | None, kept_message_count: int) -> list:
-    """Preserve rich visible tail while opening a clean TaskMemory cache epoch.
-
-    DB history is authoritative for the new summary prefix. Attachments and other
-    rich visible payloads may be restored from the in-memory tail, but trusted
-    TaskMemory state belongs to the old cache epoch and is excluded before counts
-    are aligned. Provider-native items are also stripped because they were produced
-    against the old prefix.
-    """
-    clean_rebuilt = without_task_memory_runtime_messages(list(rebuilt or []))
-    clean_current = without_task_memory_runtime_messages(list(current_convo or []))
-    if not clean_rebuilt or not clean_current or kept_message_count <= 0:
-        return clean_rebuilt
-    if len(clean_current) < kept_message_count or len(clean_rebuilt) < kept_message_count:
-        return clean_rebuilt
-    runtime_tail: list[Any] = []
-    for message in clean_current[-kept_message_count:]:
-        if not isinstance(message, dict):
-            runtime_tail.append(message)
-            continue
-        item = dict(message)
-        item.pop("native_output_items", None)
-        runtime_tail.append(item)
-    merged = list(clean_rebuilt[:-kept_message_count]) + runtime_tail
-    return repair_tool_pairing(merged)
 
 
-class _WebContextCompactionGate:
-    """Web normal compaction bridge for Agent.run safe-boundary gates."""
-
-    def __init__(
-        self,
-        owner: Any,
-        chat_id: int,
-        *,
-        model_label: str = "",
-        system: str = "",
-        renderer: Any = None,
-        on_compacted: Callable[[Any, int], Awaitable[None]] | None = None,
-        request_refresher: Callable[[list], Awaitable[list]] | None = None,
-        on_cache_epoch_reset: Callable[[], Any] | None = None,
-        should_defer: Callable[[int], bool] | None = None,
-    ) -> None:
-        self._owner = owner
-        self._chat_id = chat_id
-        self._model_label = model_label
-        self._system = system
-        self._renderer = renderer
-        self._on_compacted = on_compacted
-        self._request_refresher = request_refresher
-        self._on_cache_epoch_reset = on_cache_epoch_reset
-        self._should_defer = should_defer
-
-    async def maybe_compact_and_rebuild(self, *, source: str, prompt_tokens: int | None = None, convo: list | None = None):
-        tokens = max(0, int(prompt_tokens or 0))
-        estimate_convo = convo
-        if convo is not None and self._request_refresher is not None:
-            estimate_convo = await self._request_refresher(list(convo))
-        if estimate_convo is not None:
-            try:
-                # Explicit Agent output usage catches tokenizer under-counting;
-                # the assembled outbound estimate includes the latest runtime-only
-                # catalog while canonical ``convo`` remains unmodified.
-                tokens = max(tokens, int(self._owner._estimate_prompt_tokens(system=self._system, convo=estimate_convo)))
-            except Exception:
-                pass
-        # A pending memory checkpoint may defer one normal compaction long enough
-        # for the next safe provider request to preserve state. The callback sees
-        # the full gate estimate; emergency overflow compaction is never deferred.
-        if self._should_defer is not None:
-            try:
-                if self._should_defer(tokens):
-                    return None
-            except Exception:
-                log.exception("检查压缩前记忆提醒状态失败，继续正常压缩", 会话=self._chat_id)
-        try:
-            compactor = self._owner._make_web_compactor(self._chat_id, model_label=self._model_label)
-            outcome = await compactor.maybe_compact_detail(self._chat_id, prompt_tokens=tokens, source=source)
-        except CompactionAccountingError:
-            raise
-        except Exception:
-            log.exception("Web 对话同步压缩 gate 异常", 会话=self._chat_id, 来源=source)
-            return None
-        if not outcome.did:
-            return None
-        if self._on_cache_epoch_reset is not None:
-            maybe_reset = self._on_cache_epoch_reset()
-            if inspect.isawaitable(maybe_reset):
-                await maybe_reset
-        clear_read_file_state(chat_id=self._chat_id)
-        rebuilt = await self._owner._build_history(self._chat_id)
-        rebuilt = _merge_runtime_convo_tail(rebuilt, convo, int(outcome.kept_message_count or 0))
-        after_tokens = 0
-        refreshed_rebuilt = (
-            await self._request_refresher(list(rebuilt))
-            if self._request_refresher is not None else rebuilt
-        )
-        try:
-            after_tokens = int(self._owner._estimate_prompt_tokens(system=self._system, convo=refreshed_rebuilt))
-        except Exception:
-            after_tokens = 0
-        outcome.after_tokens = after_tokens or int(getattr(outcome, "after_tokens", 0) or 0)
-        if self._renderer is not None:
-            await self._owner._emit_context_compaction_event(self._renderer, outcome, source=source)
-        if self._on_compacted is not None:
-            await self._on_compacted(outcome, after_tokens)
-        return rebuilt
 
 
-class _WebEmergencyCompactor:
-    def __init__(
-        self,
-        owner: Any,
-        chat_id: int,
-        *,
-        model_label: str = "",
-        renderer: Any = None,
-        system: str = "",
-        on_compacted: Callable[[Any, int], Awaitable[None]] | None = None,
-        request_refresher: Callable[[list], Awaitable[list]] | None = None,
-        on_cache_epoch_reset: Callable[[], Any] | None = None,
-    ) -> None:
-        self._owner = owner
-        self._chat_id = chat_id
-        self._model_label = model_label
-        self._renderer = renderer
-        self._system = system
-        self._on_compacted = on_compacted
-        self._request_refresher = request_refresher
-        self._on_cache_epoch_reset = on_cache_epoch_reset
-
-    async def compact_and_rebuild(self, convo: list | None = None):
-        try:
-            compactor = self._owner._make_web_compactor(self._chat_id, model_label=self._model_label)
-            outcome = await compactor.force_compact_detail(self._chat_id, source="emergency")
-        except CompactionAccountingError:
-            raise
-        except Exception:
-            log.exception("Web 对话应急压缩异常", 会话=self._chat_id)
-            return None
-        if not outcome.did:
-            return None
-        if self._on_cache_epoch_reset is not None:
-            maybe_reset = self._on_cache_epoch_reset()
-            if inspect.isawaitable(maybe_reset):
-                await maybe_reset
-        clear_read_file_state(chat_id=self._chat_id)
-        rebuilt = await self._owner._build_history(self._chat_id)
-        rebuilt = _merge_runtime_convo_tail(rebuilt, convo, int(outcome.kept_message_count or 0))
-        after_tokens = 0
-        refreshed_rebuilt = (
-            await self._request_refresher(list(rebuilt))
-            if self._request_refresher is not None else rebuilt
-        )
-        try:
-            after_tokens = int(self._owner._estimate_prompt_tokens(system=self._system, convo=refreshed_rebuilt))
-        except Exception:
-            after_tokens = 0
-        outcome.after_tokens = after_tokens or int(getattr(outcome, "after_tokens", 0) or 0)
-        if self._renderer is not None:
-            await self._owner._emit_context_compaction_event(self._renderer, outcome, source="emergency")
-        if self._on_compacted is not None:
-            await self._on_compacted(outcome, after_tokens)
-        return rebuilt
 
 __all__ = [name for name in globals() if not name.startswith("__")]

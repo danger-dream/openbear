@@ -41,7 +41,7 @@ _SYNC_FIELD_LABELS = {
     "input": "输入模态",
     "contextWindow": "上下文窗口",
     "maxTokens": "最大输出",
-    "compactTriggerTokens": "压缩触发 Token",
+    "rolloverTriggerTokens": "压缩触发 Token",
     "cost": "费率与上下文阶梯价",
     "supportsFast": "Fast 模式",
     "fastCost": "Fast 模式费率",
@@ -677,11 +677,11 @@ def models_dev_metadata_to_openbear(record: Mapping[str, Any]) -> dict[str, Any]
     if projected_cost:
         ordered_tiers = projected_cost.get("tiers")
         if isinstance(ordered_tiers, list) and ordered_tiers:
-            # In OpenBear, an explicit compact trigger is the per-model guard
+            # In OpenBear, an explicit window rollover trigger is the per-model guard
             # against carrying the conversation into a higher price bracket.
             # The first context-price tier is therefore the natural trigger;
-            # later tiers never matter if compaction already happens here.
-            out["compactTriggerTokens"] = int(ordered_tiers[0]["contextTokens"])
+            # later tiers never matter if rotation already happens here.
+            out["rolloverTriggerTokens"] = int(ordered_tiers[0]["contextTokens"])
         out["cost"] = projected_cost
 
     # Fast is an explicit provider-model mode in models.dev, not a heuristic

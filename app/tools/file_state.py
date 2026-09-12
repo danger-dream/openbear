@@ -190,12 +190,17 @@ class FileStateStore:
         self._records[self._key(record.scope, record.resolved_path)] = record
         self._evict_if_needed()
 
-    def clear_scope(self, *, chat_id: int | None = None, session_uuid: str | None = None) -> int:
+    def clear_scope(self, *, chat_id: int | None = None, session_uuid: str | None = None,
+                    agent_session_uuid: str | None = None, task_uuid: str | None = None) -> int:
         removed = 0
         for key, record in list(self._records.items()):
             if chat_id is not None and record.scope.chat_id != chat_id:
                 continue
             if session_uuid is not None and record.scope.session_uuid != session_uuid:
+                continue
+            if agent_session_uuid is not None and record.scope.agent_session_uuid != agent_session_uuid:
+                continue
+            if task_uuid is not None and record.scope.task_uuid != task_uuid:
                 continue
             self._records.pop(key, None)
             removed += 1
@@ -277,9 +282,12 @@ class AtomicWriteError(OSError):
         self.replaced = replaced
 
 
-def clear_read_file_state(chat_id: int | None = None, session_uuid: str | None = None) -> int:
-    """压缩/新会话后清理 Read 状态，避免 dedup 指向已被压缩掉的工具结果。"""
-    return DEFAULT_FILE_STATE.clear_scope(chat_id=chat_id, session_uuid=session_uuid)
+def clear_read_file_state(chat_id: int | None = None, session_uuid: str | None = None, *,
+                          agent_session_uuid: str | None = None, task_uuid: str | None = None,
+                          store: FileStateStore | None = None) -> int:
+    """Invalidate evicted reads for one owner; empty Agent ID selects Controller only."""
+    return (store or DEFAULT_FILE_STATE).clear_scope(chat_id=chat_id, session_uuid=session_uuid,
+                                         agent_session_uuid=agent_session_uuid, task_uuid=task_uuid)
 
 
 def normalize_path(path: str) -> Path:

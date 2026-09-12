@@ -150,9 +150,14 @@ async def test_tg_ingress_rechecks_archive_under_shared_operation_lock(web_env):
     assert await server._web_operations(row["conversation_uuid"]) == []
 
 
-async def test_tg_ingress_respects_manual_compaction_lock(web_env):
+async def test_tg_ingress_waits_for_normal_lock_and_rechecks_availability(web_env):
     server = web_env.server
-    row = await server._create_web_conversation(123, title="正在压缩")
-    async with server.operation_locks.chat(int(row["internal_chat_id"]), "web_manual_compact"):
-        result = await server._submit_telegram_reply(row, "继续", submission_id=1)
-    assert result == {"ok": False, "error": "busy"}
+    row = await server._create_web_conversation(123, title="顺序接收")
+    async with server.operation_locks.chat(int(row["internal_chat_id"]), "conversation_update"):
+        pending = asyncio.create_task(server._submit_telegram_reply(row, "继续", submission_id=1))
+        await asyncio.sleep(0)
+        assert not pending.done()
+        await web_env.db.conn.execute("UPDATE web_conversations SET archived_at=1 WHERE conversation_uuid=?", (row["conversation_uuid"],))
+        await web_env.db.conn.commit()
+    result = await asyncio.wait_for(pending, timeout=3)
+    assert result == {"ok": False, "error": "conversation_unavailable"}

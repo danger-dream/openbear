@@ -1,13 +1,14 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
-from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
-from app.web_console.core import *
+from app.context.configuration import CONTEXT_STRATEGIES, normalize_strategy
+from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers
+from app.interaction_data import redact_result
 from app.references import ReferenceError
+from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
+from app.web_console.activity import clear_deleted_completion
+from app.web_console.core import *
 from app.web_console.live_stream import *
-
-
-from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers, redact_result
 
 
 def _confirmation_answer_audit_result(
@@ -36,6 +37,7 @@ def _confirmation_answer_audit_result(
 
 class WebAdminChatHandlersMixin:
     _WEB_DEFAULT_FIELDS = {
+        "contextStrategy": "context_strategy",
         "mainModel": "main_model",
         "mainThinkingLevel": "main_thinking_level",
         "mainFastMode": "main_fast_mode",
@@ -96,6 +98,7 @@ class WebAdminChatHandlersMixin:
             agent_fast_raw = -1
 
         return {
+            "contextStrategy": normalize_strategy(row.get("context_strategy"), self.config.context_management.default_strategy),
             "mainModel": main_model,
             "mainThinkingLevel": main_think or "off",
             "mainFastMode": main_fast,
@@ -109,6 +112,7 @@ class WebAdminChatHandlersMixin:
     @staticmethod
     def _web_defaults_storage(defaults: dict[str, Any]) -> dict[str, Any]:
         return {
+            "context_strategy": normalize_strategy(defaults.get("contextStrategy")),
             "main_model": str(defaults.get("mainModel") or ""),
             "main_thinking_level": str(defaults.get("mainThinkingLevel") or ""),
             "main_fast_mode": 1 if defaults.get("mainFastMode") is True else 0,
@@ -157,14 +161,18 @@ class WebAdminChatHandlersMixin:
         unknown = set(body) - set(self._WEB_DEFAULT_FIELDS)
         if unknown:
             return None, ("invalid_defaults_field", 400)
-        if require_complete and set(body) != set(self._WEB_DEFAULT_FIELDS):
+        if require_complete and not (set(self._WEB_DEFAULT_FIELDS) - {"contextStrategy"}).issubset(body):
             return None, ("run_config_incomplete", 400)
         if not body:
             return None, ("nothing_to_update", 400)
 
         merged = dict(current)
         for key, value in body.items():
-            if key in {"mainModel", "mainThinkingLevel", "agentModel", "agentThinkLevel"}:
+            if key == "contextStrategy":
+                if not isinstance(value, str) or value not in CONTEXT_STRATEGIES:
+                    return None, ("invalid_context_strategy", 400)
+                merged[key] = value
+            elif key in {"mainModel", "mainThinkingLevel", "agentModel", "agentThinkLevel"}:
                 if not isinstance(value, str):
                     return None, ("invalid_defaults_type", 400)
                 merged[key] = value.strip()
@@ -283,6 +291,8 @@ class WebAdminChatHandlersMixin:
     async def handle_api_conversation_defaults_patch(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         body = await self._json_body(request)
+        if "contextStrategy" in body:
+            return web.json_response({"ok": False, "error": "use_system_context_default"}, status=400)
         # Serialize validation + partial write so dependency checks (for example
         # Fast support after a concurrent model change) observe server commit order.
         async with self._web_conversation_create_lock:
@@ -511,8 +521,6 @@ class WebAdminChatHandlersMixin:
     async def _stop_web_conversation(self, row: dict[str, Any], *, requested_by: str = "web", message: str = "已停止") -> dict[str, Any]:
         internal_chat_id = int(row.get("internal_chat_id") or 0)
         conv_uuid = str(row.get("conversation_uuid") or "")
-        if await self.operation_locks.current_operation(internal_chat_id) == "web_manual_compact":
-            return {"ok": False, "error": "conversation_compacting"}
         stop_at_ms = int(time.time() * 1000)
         if conv_uuid:
             # Set this before cancellation can enter _run_web_turn's handler;
@@ -604,97 +612,123 @@ class WebAdminChatHandlersMixin:
             )
         return {"ok": True, "stoppedRun": stopped_run, "stoppedTasks": stopped_tasks, "stoppedProcesses": killed_processes}
 
-    async def handle_api_conversation_compact(self, request: web.Request) -> web.Response:
+    async def handle_api_conversation_context_strategy(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         row = await self._conversation_from_request(request)
-        chat_id = int(row.get("internal_chat_id") or 0)
-        conv_uuid = str(row.get("conversation_uuid") or "")
-        await self._reconcile_inactive_web_conversation_operations(
-            row,
-            source="manual_compaction_preflight",
+        body = await self._json_body(request)
+        value = body.get("strategy")
+        if set(body) != {"strategy"} or not isinstance(value, str) or value not in CONTEXT_STRATEGIES:
+            return web.json_response({"ok": False, "error": "invalid_context_strategy"}, status=400)
+        async with self.db.conn.transaction(label="conversation-context-strategy") as conn:
+            await conn.execute("UPDATE web_conversations SET context_strategy=?,updated_at=? WHERE conversation_uuid=? AND owner_chat_id=?",
+                               (value, now_ts(), row["conversation_uuid"], session.chat_id))
+        config = await self._conversation_run_config_public(session.chat_id, row["conversation_uuid"])
+        await self.audit("web.conversation.context_strategy", actor="web", chat_id=session.chat_id,
+                         detail={"conversationUuid": row["conversation_uuid"], "strategy": value})
+        return web.json_response({"ok": True, "strategy": value, "effectiveAt": "next_safe_boundary", "runConfig": config})
+
+    async def handle_api_conversation_compact(self, request: web.Request) -> web.Response:
+        from app.context.builder import build_controller_history
+        from app.context.request_view import expanded_request_view
+        from app.context.runtime import ContextManager
+        from app.context.store import ContextOwner, WindowStore
+        from app.context.strategies import ModelSummaryStrategy
+        from app.context.window import WindowPolicy
+        from app.task_memory import (
+            reconcile_task_memory_runtime_state,
+            reset_task_memory_runtime_epoch,
         )
-        row = await self._conversation_row(session.chat_id, conv_uuid, require=True)  # type: ignore[assignment]
-        if await self._web_conversation_has_active_runtime(row):
-            return web.json_response({"ok": False, "error": "busy"}, status=409)
-
-        live = self._live_for(row)
-        op_id = f"manual-compact:{uuid.uuid4()}"
-
-        async def _publish_compaction_state(
-            action: str,
-            status: str,
-            lifecycle: str,
-            payload: dict[str, Any],
-        ) -> None:
-            operation_payload = {**payload, "source": "manual", "internal": False}
-            await live.publish({
-                "type": "context_compaction_state",
-                "internal": False,
-                "_webOperationSpecs": [{
-                    "op_id": op_id,
-                    "op_type": "context_compaction",
-                    "action": action,
-                    "payload": operation_payload,
-                    "status": status,
-                    "lifecycle": lifecycle,
-                    "source": "manual",
-                    "internal": False,
-                }],
-            })
-
+        session: WebSession = request[_WEB_SESSION_KEY]
+        row = await self._conversation_from_request(request)
+        chat_id, conv_uuid = int(row["internal_chat_id"]), str(row["conversation_uuid"])
         async with self.operation_locks.try_chat(chat_id, "web_manual_compact") as acquired:
             if not acquired:
                 return web.json_response({"ok": False, "error": "busy"}, status=409)
-            # The lock closes the check/start race. Re-read every authoritative
-            # runtime source before invoking the long-running compression model.
-            row = await self._conversation_row(session.chat_id, conv_uuid, require=True)  # type: ignore[assignment]
+            row = await self._conversation_row(session.chat_id, conv_uuid, require=True)
+            if row.get("context_strategy") != "model_summary":
+                return web.json_response({"ok": False, "error": "manual_compaction_requires_summary_strategy"}, status=409)
             if await self._web_conversation_has_active_runtime(row):
                 return web.json_response({"ok": False, "error": "busy"}, status=409)
             messages = MessageDAO(self.db)
-            session_uuid = await messages.get_or_create_session_uuid(chat_id)
-            tokens = await messages.latest_controller_context_usage(
-                chat_id,
-                session_uuid=session_uuid,
-            )
-            model_label = str(row.get("model") or "") or getattr(self.model_selection, "current", "") or self.config.models.primary
-            trigger = self._model_compact_trigger_tokens(model_label)
-            minimum = int(self.config.agent.manual_compact_min_percent)
+            sid = await messages.get_or_create_session_uuid(chat_id)
+            label = str(row.get("model") or self.config.models.primary)
+            backend, model, max_tokens = self.llm_factory.backend_for(label)
+            store = WindowStore(self.db, ContextOwner.controller(chat_id=chat_id, session_uuid=sid, conversation_uuid=conv_uuid))
+            tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=sid, expected_model=label)
+            trigger = self._model_rollover_trigger_tokens(label)
+            minimum = self.config.agent.manual_compact_min_percent
             if tokens is None or trigger <= 0:
                 return web.json_response({"ok": False, "error": "context_usage_unknown"}, status=409)
-            if int(tokens) * 100 < trigger * minimum:
-                return web.json_response({"ok": False, "error": "below_threshold", "tokens": tokens, "requiredPercent": minimum}, status=409)
-
-            await _publish_compaction_state(
-                "start",
-                "running",
-                "active",
-                {"beforeTokens": int(tokens)},
-            )
+            if tokens * 100 < trigger * minimum:
+                return web.json_response({"ok": False, "error": "below_threshold", "requiredPercent": minimum}, status=409)
+            # Budget the selected execution model's next request, not the
+            # separate summary model or serializer defaults. Freeze the same
+            # effective mode fields used by _run_web_turn / Agent.run.
+            request_options: dict[str, Any] = {
+                "max_tokens": max_tokens,
+                "think_level": await self._effective_thinking_level(chat_id, label),
+                "session_id": sid, "service_tier": "",
+                "fast_request": {"body": {}, "headers": {}},
+            }
+            if str(getattr(backend, "protocol", "") or "").lower() == "responses":
+                request_options["native_continuation"] = True
+            model_meta = self.config.models.resolve(label)
+            if model_meta and await messages.get_fast_mode(chat_id):
+                provider_def, model_def = model_meta
+                if model_def.supports_fast:
+                    if model_def.fast_request is not None:
+                        request_options["fast_request"] = model_def.fast_request.model_dump(mode="json")
+                    else:
+                        request_options["service_tier"] = fast_request_mode(provider_def, model_def)
+            live = self._live_for(row)
+            op_id = f"context-compaction:{uuid.uuid4()}"
+            async def publish(status: str, detail: dict[str, Any]) -> None:
+                await live.publish({"type": "context_compaction_state", "_webOperationSpecs": [{
+                    "op_id": op_id, "op_type": "context_compaction", "action": "start" if status == "running" else "end",
+                    "payload": {**detail, "strategy": "model_summary", "scope": "root", "source": "manual",
+                                "name": "ContextCompaction", "compactionId": op_id, "status": status, "active": status == "running"},
+                    "status": status, "lifecycle": "active" if status == "running" else "terminal", "source": "manual", "internal": False,
+                }]})
+            async def account(call: dict[str, Any]) -> None:
+                actual = str(call.get("model") or label)
+                resolved = self.config.models.resolve(actual)
+                await self._persist_web_model_call_delta(messages, chat_id, session_uuid=sid, call=call,
+                    model_cost=resolved[1].cost if resolved else {}, model_label=actual, protocol=call.get("protocol", ""),
+                    think_level="off", call_kind="context_compaction")
+            outcome: dict[str, Any] = {}
+            async def done(detail: dict[str, Any]) -> None:
+                outcome.update(detail)
+                clear_read_file_state(chat_id, sid, agent_session_uuid="", task_uuid="", store=self.tools.file_state)
+                await publish("completed", detail)
+            async def strategy() -> str:
+                return "model_summary"  # This already-started manual operation keeps its strategy.
+            manager = ContextManager(store, WindowPolicy(self.llm_factory.context_window(label),
+                trigger_tokens=trigger, trigger_ratio=self.config.agent.compact_ratio,
+                retain_ratio=self.config.context_management.retain_ratio, max_output_tokens=max_tokens),
+                backend=backend, model=model, model_label=label, strategy_resolver=strategy, on_rotated=done,
+                strategies={"model_summary": ModelSummaryStrategy(self.config, self.llm_factory, label, on_model_call=account)})
+            async def refresh_runtime(request_messages: list[Message]) -> list[Message]:
+                epoch = reset_task_memory_runtime_epoch(request_messages)
+                return await reconcile_task_memory_runtime_state(
+                    request_messages, TaskMemoryDAO(self.db), conversation_uuid=conv_uuid, epoch=epoch,
+                )
+            await publish("running", {"beforeTokens": tokens})
             try:
-                compactor = self._make_web_compactor(chat_id, model_label=model_label)
-                outcome = await compactor._force_compact_unlocked(chat_id, source="manual")
-                if outcome.did:
-                    clear_read_file_state(chat_id=chat_id)
-                    await self._invalidate_web_controller_context_usage(
-                        chat_id,
-                        session_uuid=session_uuid,
-                    )
-                await _publish_compaction_state(
-                    "end",
-                    "completed" if outcome.did else "unavailable",
-                    "terminal",
-                    {**self._context_compaction_json(outcome), "beforeTokens": int(tokens)},
-                )
+                history = await build_controller_history(messages, chat_id)
+                manager.bind_sources(history)
+                expanded = await self._reference_store().overlay(history, conversation_uuid=conv_uuid)
+                request_view = expanded_request_view(expanded)
+                system = await messages.get_system_snapshot(chat_id) or await self._build_system_prompt_for_chat(conversation_uuid=conv_uuid)
+                cur = await self.db.conn.execute("SELECT COALESCE(MAX(id),0) AS n FROM messages WHERE chat_id=?", (chat_id,))
+                high_water = int((await cur.fetchone())["n"])
+                await manager.prepare(history, system=system, tools=self.tools.schemas(scope="main"),
+                                      force=True, source="manual", expected_message_high_water=high_water,
+                                      refresh_after_rotation=refresh_runtime, request_view=request_view,
+                                      request_options=request_options)
             except Exception as exc:
-                await _publish_compaction_state(
-                    "error",
-                    "failed",
-                    "terminal",
-                    {"error": str(exc)[:200]},
-                )
-                raise
-        await self.audit("web.conversation.compact", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": conv_uuid, "did": outcome.did})
-        return web.json_response({"ok": True, "outcome": self._context_compaction_json(outcome), "state": await self._chat_payload(chat_id, row)})
+                await publish("failed", {"error": str(exc)[:500], "instructionsPreserved": True})
+                return web.json_response({"ok": False, "error": "context_compaction_failed", "message": str(exc)[:500]}, status=409)
+        return web.json_response({"ok": True, "outcome": outcome, "state": await self._chat_payload(chat_id, row)})
 
     async def handle_api_conversation_stop(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -1065,6 +1099,29 @@ class WebAdminChatHandlersMixin:
                 )
                 deleted_task_uuids = [str(item["task_uuid"] or "") for item in await cur.fetchall() if item["task_uuid"]]
 
+                from app.context.restart import controller_restart_selection
+                from app.context.window import WindowPolicy
+                dao = MessageDAO(self.db)
+                label = str(row.get("model") or self.config.models.primary)
+                resolved = self.config.models.resolve(label)
+                threshold = self._model_rollover_trigger_tokens(label)
+                try:
+                    backend, model, max_output = self.llm_factory.backend_for(label) if self.llm_factory else (None, "", 0)
+                    policy = WindowPolicy(
+                        context_window=int(resolved[1].context_window or 0) if resolved else 0,
+                        trigger_tokens=threshold, trigger_ratio=self.config.agent.compact_ratio,
+                        retain_ratio=self.config.context_management.retain_ratio, max_output_tokens=max_output,
+                    )
+                    restart_messages = await controller_restart_selection(
+                        dao, internal_chat_id, first_message_id, policy=policy,
+                        system=await dao.get_system_snapshot(internal_chat_id) or "",
+                        tools=self.tools.schemas(scope="main") if self.tools else [],
+                        reference_store=self._reference_store(), conversation_uuid=conv_uuid,
+                        backend=backend, model=model,
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    return web.json_response({"ok": False, "error": "restart_context_unavailable",
+                                              "message": str(exc), "originalContextPreserved": True}, status=409)
                 now = now_ts()
                 async with self.db.conn.transaction(label="delete-web-turn-suffix") as conn:
                     await conn.execute(
@@ -1119,24 +1176,13 @@ class WebAdminChatHandlersMixin:
                         """,
                         (conv_uuid, *root_params, *root_params),
                     )
+                    await clear_deleted_completion(conn, conv_uuid)
                     transcript_deleted = await MessageDAO(self.db).delete_from_message_id(
-                        internal_chat_id, first_message_id,
+                        internal_chat_id, first_message_id, restart_messages=restart_messages,
                     )
-                    rath_deleted = await self.rath_dao.delete_task_records(deleted_task_uuids)
-                    if deleted_task_uuids:
-                        task_placeholders = ",".join("?" for _ in deleted_task_uuids)
-                        await conn.execute(
-                            f"""
-                            UPDATE rath_agent_sessions
-                            SET last_task_uuid=COALESCE((
-                              SELECT task_uuid FROM rath_tasks AS remaining
-                              WHERE remaining.agent_session_uuid=rath_agent_sessions.session_uuid
-                              ORDER BY remaining.updated_at DESC, remaining.id DESC LIMIT 1
-                            ), ''), updated_at=?
-                            WHERE chat_id=? AND last_task_uuid IN ({task_placeholders})
-                            """,
-                            (now, internal_chat_id, *deleted_task_uuids),
-                        )
+                    rath_deleted = await self.rath_dao.delete_task_suffix_records(
+                        deleted_task_uuids, chat_id=internal_chat_id, deleted_roots=deleted_roots,
+                    )
                     await conn.execute(
                         """
                         UPDATE sessions SET stat_user_turns=(
@@ -1154,6 +1200,14 @@ class WebAdminChatHandlersMixin:
                         (now, conv_uuid, session.chat_id),
                     )
 
+        # Only after the complete DB transaction commits. A rollback must retain
+        # its original file-read state; other conversations/instances are untouched.
+        cache = self.tools.file_state if self.tools else None
+        clear_read_file_state(internal_chat_id, agent_session_uuid="", task_uuid="", store=cache)
+        for sid in rath_deleted.get("affectedAgentSessions", []):
+            clear_read_file_state(internal_chat_id, agent_session_uuid=sid, store=cache)
+        for tid in deleted_task_uuids:
+            clear_read_file_state(internal_chat_id, task_uuid=tid, store=cache)
         self._web_task_notification_deferred.pop(conv_uuid, None)
         await self.interactions.cancel_conversation(conv_uuid)
         live = self._web_live_streams.get(conv_uuid)
@@ -1277,6 +1331,8 @@ class WebAdminChatHandlersMixin:
             await self.db.conn.execute("DELETE FROM web_operations WHERE conversation_uuid=?", (conv_uuid,))
             await self.db.conn.execute("DELETE FROM web_task_notifications WHERE conversation_uuid=?", (conv_uuid,))
             await self.db.conn.execute("UPDATE web_artifacts SET deleted_at=? WHERE conversation_uuid=? AND deleted_at=0", (now_ts(), conv_uuid))
+            from app.context.lifecycle import delete_controller_windows
+            await delete_controller_windows(self.db.conn, internal_chat_id)
             await self.db.conn.execute("DELETE FROM messages WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM model_calls WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM tool_calls WHERE chat_id=?", (internal_chat_id,))
@@ -1366,6 +1422,8 @@ class WebAdminChatHandlersMixin:
         )
         return {
             "conversationUuid": str(conversation.get("conversation_uuid") or ""),
+            "contextStrategy": normalize_strategy(conversation.get("context_strategy")),
+            "manualCompactMinPercent": self.config.agent.manual_compact_min_percent,
             "model": model,
             "thinkingLevel": thinking_level,
             "effectiveThinkingLevel": effective_thinking or "off",
@@ -1378,8 +1436,8 @@ class WebAdminChatHandlersMixin:
             "effectiveFastMode": bool(fast_requested and fast_supported),
             "agentRunConfig": agent_run_config_public(agent_runtime),
             "contextWindow": context_window,
-            "compactTriggerTokens": self._model_compact_trigger_tokens(model),
-            "compactRatio": float(self.config.agent.compact_ratio or 0.7),
+            "rolloverTriggerTokens": self._model_rollover_trigger_tokens(model),
+            "windowTriggerRatio": float(self.config.agent.compact_ratio or 0.7),
         }
 
     async def handle_api_conversation_model(self, request: web.Request) -> web.Response:
@@ -1410,6 +1468,8 @@ class WebAdminChatHandlersMixin:
         )
         next_fast = bool(await messages.get_fast_mode(internal_chat_id) and self._model_supports_fast(model))
         async with self.db.conn.transaction(label="web-conversation-model-and-defaults") as conn:
+            if not running and model != current_model:
+                await conn.execute("UPDATE context_windows SET usage_known=0,usage_tokens=0,route_fingerprint='',window_version=window_version+1 WHERE owner_kind='controller' AND owner_key LIKE ?", (f"controller:{internal_chat_id}:%",))
             # Even a same-family model change starts a new provider-native chain.
             await conn.execute(
                 "DELETE FROM controller_model_contexts WHERE chat_id=?", (internal_chat_id,)
@@ -1605,13 +1665,10 @@ class WebAdminChatHandlersMixin:
 
     async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
-        # Sends may retain their existing serialization/steering behavior, but
-        # must never queue behind manual compaction and arrive after it finishes.
-        async with self.operation_locks.chat_unless(
-            internal_chat_id, "web_send", reject_operation="web_manual_compact",
-        ) as acquired:
+        # Serialize acceptance while preserving the existing steering behavior.
+        async with self.operation_locks.chat_unless(internal_chat_id, "web_send", reject_operation="web_manual_compact") as acquired:
             if not acquired:
-                return {"ok": False, "error": "busy"}
+                return {"ok": False, "error": "busy", "message": "上下文压缩中，请稍后发送。"}
             if telegram_submission_id:
                 current = await self._conversation_row(int(row["owner_chat_id"]), str(row["conversation_uuid"]))
                 if (

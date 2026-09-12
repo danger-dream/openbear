@@ -9,7 +9,7 @@ let display;
 try {
 	const source = await readFile(sourceUrl, "utf8");
 	const nodeTestSource = source
-		.replace('import ContextCompactionIcon from "./ContextCompactionIcon.vue";', "const ContextCompactionIcon = {};")
+		.replace('import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";', "const ContextCompactionIcon = {};")
 		.replace('import {plainText} from "./markdown.js";', 'const plainText = (value) => String(value || "");');
 	await writeFile(generatedUrl, nodeTestSource);
 	display = await import(`${generatedUrl.href}?test=${Date.now()}`);

@@ -2,21 +2,34 @@
 from __future__ import annotations
 
 import inspect
-from xml.sax.saxutils import escape as xml_escape
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
-from app.references import BUNDLE_FIELD, ReferenceError
+from app.context.configuration import conversation_strategy
+from app.context.prompts import effective_context_prompt
+from app.context.runtime import ContextManager
+from app.context.store import ContextOwner, WindowStore
+from app.context.strategies import ModelSummaryStrategy
+from app.context.window import WindowPolicy, mark_source
 from app.model_cost import resolved_usage_cost_usd
+from app.references import BUNDLE_FIELD, ReferenceError
 from app.task_memory import (
     TaskMemoryDAO,
     inject_runtime_block_into_latest_user,
     is_task_memory_runtime_message,
     reconcile_task_memory_runtime_state,
+    reset_task_memory_runtime_epoch,
     task_memory_runtime_epoch,
 )
+from app.tools.file_state import clear_read_file_state
 from app.web_console.conversation_prompt import system_prompt_sha256
 from app.web_console.core import *
 from app.web_console.live_stream import *
+from app.web_console.notification_delivery import (
+    claim_paused_notifications,
+    notification_context_messages,
+    notification_ids,
+    notification_items,
+)
 
 
 class WebAdminChatRunMixin:
@@ -50,7 +63,6 @@ class WebAdminChatRunMixin:
         ctx_window = 0
         session_id = ""
         stats_task: asyncio.Task[Any] | None = None
-        compaction_outcomes: list[tuple[CompactionOutcome, int]] = []
         post_turn_actions_drained = False
         conversation_uuid = str((conversation or {}).get("conversation_uuid") or "")
         model_label = str((conversation or {}).get("model") or "") or getattr(self.model_selection, "current", "") or self.config.models.primary
@@ -76,6 +88,7 @@ class WebAdminChatRunMixin:
             else:
                 system_live = await prompt_builder()
             system = await messages.get_or_set_system_snapshot(chat_id, system_live)
+            system = effective_context_prompt(system, await conversation_strategy(self.db, conversation_uuid, self.config.context_management.default_strategy))
             # The live render is only a candidate; the frozen value below is the
             # actual system input for this run. Never log either prompt body.
             log.info(
@@ -134,21 +147,29 @@ class WebAdminChatRunMixin:
                 model_label=model_label,
             )
             raw_private_messages = list((private_state or {}).get("messages") or [])
-            restored_private_context = False
             if raw_private_messages:
                 # load_controller_model_context has already verified that this private
-                # checkpoint matches the exact current summary and transcript anchor.
-                # A compaction changes that anchor and invalidates any older checkpoint;
-                # the clean post-compaction checkpoint saved by the epilogue may safely
-                # continue across later root turns.
+                # checkpoint matches the independently persisted window and transcript.
+                # A new window invalidates the older native prefix; neutral selection
+                # remains available across model changes and later root turns.
                 if (
                     all(isinstance(item, dict) for item in raw_private_messages)
                     and validate_model_context(raw_private_messages)
                 ):
                     history = deserialize_messages(raw_private_messages)
-                    restored_private_context = True
                 else:
                     await messages.clear_controller_model_context(chat_id)
+
+            if conversation_uuid and not task_notification:
+                # A real user message, not a timer/reconnect/duplicate callback,
+                # takes ownership of results paused after a terminal model failure.
+                paused = await claim_paused_notifications(self.db, conversation_uuid)
+                for item in paused:
+                    controller_notification_ids.update(notification_ids(item))
+                history += await notification_context_messages(
+                    self.db, chat_id=chat_id, conversation_uuid=conversation_uuid,
+                    turn_uuid=root_turn_uuid, payloads=paused, history=history,
+                )
 
             visible_user_text = (user_text or "").strip() or ("请根据我发送的附件内容回答。" if media else "")
             llm_text = build_llm_text_with_media(user_text, media or [])
@@ -172,12 +193,6 @@ class WebAdminChatRunMixin:
             convo = history + [user_msg]
             task_memory_dao = TaskMemoryDAO(self.db)
             task_memory_epoch = task_memory_runtime_epoch(history)
-            memory_reminder: dict[str, Any] | None = None
-            memory_reminder_attempt_generation: int | None = None
-
-            def _advance_task_memory_epoch() -> None:
-                nonlocal task_memory_epoch
-                task_memory_epoch += 1
 
             async def _refresh_task_memory_request(request_messages: list[Message]) -> list[Message]:
                 return await reconcile_task_memory_runtime_state(
@@ -187,174 +202,24 @@ class WebAdminChatRunMixin:
                     epoch=task_memory_epoch,
                 )
 
-            async def _prepare_memory_reminder() -> dict[str, Any] | None:
-                percent = int(self.config.agent.memory_reminder_percent)
-                prompt = str(self.config.agent.memory_reminder_prompt or "").strip()
-                trigger = self._model_compact_trigger_tokens(model_label)
-                if percent <= 0 or not prompt or trigger <= 0:
-                    return None
-                exact = await messages.latest_controller_context_usage(
-                    chat_id,
-                    session_uuid=session_id,
-                )
-                if exact is None or int(exact) * 100 < trigger * percent:
-                    return None
-                cur = await self.db.conn.execute(
-                    "SELECT COALESCE(MAX(id),0) AS generation FROM summaries WHERE chat_id=?",
-                    (chat_id,),
-                )
-                generation = int((await cur.fetchone())["generation"] or 0)
-                cur = await self.db.conn.execute(
-                    """SELECT 1 FROM web_memory_reminders
-                       WHERE chat_id=? AND session_uuid=? AND summary_id=?""",
-                    (chat_id, session_id, generation),
-                )
-                if await cur.fetchone() is not None:
-                    return None
-                reminder_threshold = (trigger * percent + 99) // 100
-                replacements = {
-                    "{latest_context_tokens}": str(int(exact)),
-                    "{reminder_threshold_tokens}": str(reminder_threshold),
-                    "{compact_trigger_tokens}": str(trigger),
-                }
-                for placeholder, value in replacements.items():
-                    prompt = prompt.replace(placeholder, value)
-                xml = (
-                    '<openbear-memory-checkpoint version="1" runtime-only="true" '
-                    f'latest_controller_prompt_tokens="{int(exact)}" '
-                    f'reminder_threshold_tokens="{reminder_threshold}" '
-                    f'compaction_threshold_tokens="{trigger}">\n'
-                    "<instructions>\n"
-                    f"{xml_escape(prompt)}\n"
-                    "</instructions>\n"
-                    "</openbear-memory-checkpoint>"
-                )
-                return {
-                    "generation": generation,
-                    "latest_context_tokens": int(exact),
-                    "xml": xml,
-                }
-
-            def _memory_reminder_can_defer(prompt_tokens: int) -> bool:
-                if memory_reminder is None or media or ctx_window <= 0:
-                    return False
-                hard_window_reserve = max(2_048, max(0, int(max_tokens or 0)) * 2)
-                return max(0, int(prompt_tokens or 0)) + hard_window_reserve < ctx_window
-
-            async def _memory_reminder_overlay(request_messages: list[Message]) -> list[Message]:
-                nonlocal memory_reminder_attempt_generation
-                memory_reminder_attempt_generation = None
-                if memory_reminder is None:
-                    return list(request_messages)
-                has_real_user = any(
-                    isinstance(message, dict)
-                    and message.get("role") == "user"
-                    and not is_task_memory_runtime_message(message)
-                    for message in request_messages
-                )
-                if not has_real_user:
-                    return list(request_messages)
-                memory_reminder_attempt_generation = int(memory_reminder["generation"])
-                return inject_runtime_block_into_latest_user(
-                    request_messages,
-                    str(memory_reminder["xml"]),
-                    skip_task_memory_runtime=True,
-                )
-
             async def _reference_request_overlay(request_messages: list[Message]) -> list[Message]:
-                base = await _memory_reminder_overlay(request_messages)
-                expanded = await self._reference_store().overlay(base, conversation_uuid=conversation_uuid)
-                if any(message.get(BUNDLE_FIELD) for message in base) and ctx_window > 0:
-                    required = self._estimate_prompt_tokens(system=system, convo=expanded)
-                    if required + max(2048, int(max_tokens or 0)) > ctx_window:
-                        raise ReferenceError("reference_budget_exceeded", tokens=required)
-                return expanded
+                # The shared selector accounts for expanded material before deciding
+                # what can be evicted. A separate pre-selection size gate would
+                # incorrectly reject a request whose optional history can fit.
+                return await self._reference_store().overlay(request_messages, conversation_uuid=conversation_uuid)
 
-            # Compact only the already durable history. The active user input is
-            # appended afterwards, so a rich image/file request remains a real
-            # current message rather than being folded into its own XML tail.
-            estimated_prompt_tokens = self._estimate_prompt_tokens(
-                system=system,
-                convo=await self._reference_store().overlay(await _refresh_task_memory_request(convo), conversation_uuid=conversation_uuid),
-            )
-            preflight_prompt_tokens = estimated_prompt_tokens
-            preflight_source = "pre_model_request"
-            if restored_private_context:
-                # A compatible private checkpoint can carry Responses native items
-                # and other protocol state that the local content-only estimate
-                # cannot reproduce. Reuse its last controller prompt snapshot only
-                # for this restored prefix; ordinary completed turns deliberately do
-                # not use stale previous usage here.
-                resumed_provider_prompt_tokens = await messages.latest_controller_prompt_tokens(
-                    chat_id,
-                    session_uuid=session_id,
+            if task_notification and conversation_uuid:
+                # The receipt and original are one DB transaction. A notification
+                # replay never appends its full body again, including after restart.
+                payload = dict(task_notification_payload or {})
+                payload.setdefault("content", visible_user_text)
+                convo = history + await notification_context_messages(
+                    self.db, chat_id=chat_id, conversation_uuid=conversation_uuid,
+                    turn_uuid=root_turn_uuid, payloads=notification_items(payload), history=history,
                 )
-                preflight_prompt_tokens = max(
-                    preflight_prompt_tokens,
-                    resumed_provider_prompt_tokens,
-                )
-            if task_notification and isinstance(task_notification_payload, dict):
-                result_tokens, result_count = self._task_notification_result_budget(task_notification_payload)
-                if result_count > 0:
-                    # Detached completion starts a fresh controller run, so no
-                    # in-memory last_usage exists. Compare the assembled parent
-                    # estimate with the latest explicitly classified controller
-                    # request, then add the Agent's provider-reported final output
-                    # and a small protocol reserve.
-                    parent_context_tokens = self._estimate_prompt_tokens(system=system, convo=history)
-                    controller_prompt_tokens = await messages.latest_controller_prompt_tokens(
-                        chat_id,
-                        session_uuid=session_id,
-                    )
-                    envelope_reserve = max(256, 64 * result_count)
-                    preflight_prompt_tokens = max(
-                        estimated_prompt_tokens,
-                        parent_context_tokens + result_tokens + envelope_reserve,
-                        controller_prompt_tokens + result_tokens + envelope_reserve,
-                    )
-                    preflight_source = "agent_result_preflight"
-            # Freeze reminder eligibility from the latest real provider snapshot.
-            # If the assembled request still has hard-window headroom, let this
-            # generation receive its checkpoint before one normal compaction. A
-            # huge attachment/result or an unsafe hard-window budget keeps the
-            # existing preflight/emergency compression priority.
-            memory_reminder = await _prepare_memory_reminder()
-            if memory_reminder is not None:
-                current_user_tokens = max(0, estimate_tokens(llm_text))
-                delivery_tokens = max(
-                    preflight_prompt_tokens,
-                    int(memory_reminder["latest_context_tokens"]) + current_user_tokens,
-                )
-                defer_preflight_for_memory = _memory_reminder_can_defer(delivery_tokens)
-            else:
-                defer_preflight_for_memory = False
-
-            # Generic model_calls rows are never used here: child Agent and
-            # aggregate run rows have separate call kinds, and the DAO rejects a
-            # controller request from a pre-summary compaction epoch.
-            if not defer_preflight_for_memory:
-                pre_outcome = await self._pre_compact_before_web_turn(
-                    chat_id,
-                    preflight_prompt_tokens,
-                    model_label=model_label,
-                    source=preflight_source,
-                )
-                if pre_outcome.did:
-                    memory_reminder = None
-                    memory_reminder_attempt_generation = None
-                    _advance_task_memory_epoch()
-                    history = await self._build_history(chat_id)
-                    convo = history + [user_msg]
-                    after_tokens = self._estimate_prompt_tokens(
-                        system=system,
-                        convo=await self._reference_store().overlay(await _refresh_task_memory_request(convo), conversation_uuid=conversation_uuid),
-                    )
-                    pre_outcome.after_tokens = after_tokens
-                    compaction_outcomes.append((pre_outcome, after_tokens))
-                    await self._emit_context_compaction_event(renderer, pre_outcome, source=preflight_source)
-
-            if conversation_uuid:
-                await self._persist_web_transcript_message(
+                user_message_id = 0
+            elif conversation_uuid:
+                user_message_id = await self._persist_web_transcript_message(
                     messages,
                     chat_id,
                     "user",
@@ -366,12 +231,15 @@ class WebAdminChatRunMixin:
                     tokens=estimate_tokens(visible_user_text),
                 )
             else:
-                await messages.add(
+                user_message_id = await messages.add(
                     chat_id,
                     "user",
                     visible_user_text,
                     tokens=estimate_tokens(visible_user_text),
                 )
+            mark_source(user_msg, kind="notification" if task_notification else "human",
+                        source_id=f"message:{user_message_id}", message_id=user_message_id,
+                        turn_uuid=root_turn_uuid, run_root_turn_uuid=root_turn_uuid)
             if not task_notification:
                 await messages.bump_user_turn(chat_id)
             user_saved = True
@@ -430,6 +298,17 @@ class WebAdminChatRunMixin:
                     tool_key = str(meta.get("toolCallId") or "").strip()
                     if tool_key:
                         op_ids.extend([f"tool:{tool_key}", f"agent:{tool_key}", f"agent_control:{tool_key}"])
+                receipt_ids: set[str] = set()
+                if role == "tool" and controller_notification_ids:
+                    try:
+                        parsed = json.loads(content)
+                    except (TypeError, ValueError):
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        for item in parsed.get("notifications") or []:
+                            if isinstance(item, dict):
+                                receipt_ids.update(str(value) for value in item.get("notificationUuids", []))
+                    receipt_ids &= controller_notification_ids
                 return await self._persist_web_transcript_message(
                     messages,
                     chat_id,
@@ -440,6 +319,7 @@ class WebAdminChatRunMixin:
                     run_root_turn_uuid=root_turn_uuid or turn,
                     op_ids=op_ids,
                     binding_meta=meta,
+                    notification_receipt_ids=receipt_ids,
                     **message_kwargs,
                 )
 
@@ -457,36 +337,58 @@ class WebAdminChatRunMixin:
                 artifact_rewriter=_rewrite_assistant_artifacts if conversation_uuid else None,
             )
 
-            async def _on_context_compacted(outcome: CompactionOutcome, after_tokens: int) -> None:
-                nonlocal memory_reminder, memory_reminder_attempt_generation
-                # A safety/emergency compaction may legitimately win before the
-                # checkpoint. Never deliver or mark the old summary generation
-                # after the context has already changed.
-                memory_reminder = None
-                memory_reminder_attempt_generation = None
-                compaction_outcomes.append((outcome, after_tokens))
+            async def _refresh_window_request(request_messages: list[Message]) -> list[Message]:
+                nonlocal task_memory_epoch
+                # The manager supplies a replacement copy. Drop obsolete catalog
+                # snapshots only at this boundary, not from the live/cache prefix.
+                task_memory_epoch = reset_task_memory_runtime_epoch(
+                    request_messages, current_epoch=task_memory_epoch,
+                )
+                return await _refresh_task_memory_request(request_messages)
 
-            context_compactor = _WebContextCompactionGate(
-                self,
-                chat_id,
-                model_label=model_label,
-                system=system,
-                renderer=renderer,
-                on_compacted=_on_context_compacted,
-                request_refresher=_refresh_task_memory_request,
-                on_cache_epoch_reset=_advance_task_memory_epoch,
-                should_defer=_memory_reminder_can_defer,
+            async def _on_window_rotated(detail: dict[str, Any]) -> None:
+                clear_read_file_state(chat_id, session_id, agent_session_uuid="", task_uuid="",
+                                      store=self.tools.file_state)
+                await renderer.emit({"type": "context_compaction", **detail})
+
+            async def _summary_model_call(call: dict[str, Any]) -> None:
+                label = str(call.get("model") or model_label)
+                resolved = self.config.models.resolve(label)
+                committed = await self._persist_web_model_call_delta(
+                    messages, chat_id, session_uuid=session_id, call=call,
+                    model_cost=resolved[1].cost if resolved else {}, model_label=label,
+                    protocol=str(call.get("protocol") or ""), think_level="off", call_kind="context_compaction",
+                )
+                result.controller_cost_usd += committed
+                result.call_time_ms_sum += int(call.get("totalTimeMs") or 0)
+                result.output_tokens_sum += int(call.get("outputTokens") or 0)
+                if isinstance(call.get("usage"), Usage):
+                    result.usage.merge(call["usage"])
+                result.model_calls += 1
+                result.model_ok += int(call.get("status") == "ok")
+                # A failed candidate may be recovered by the next summary model.
+                # Keep its physical failure visible without failing the root turn.
+                result.summary_model_fail += int(call.get("status") != "ok")
+
+            async def _compression_state(detail: dict[str, Any]) -> None:
+                await renderer.emit({"type": "context_compaction", **detail})
+
+            window_runtime = ContextManager(
+                WindowStore(self.db, ContextOwner.controller(
+                    chat_id=chat_id, session_uuid=session_id, conversation_uuid=conversation_uuid)),
+                WindowPolicy(context_window=ctx_window,
+                             trigger_tokens=(int(self.config.models.resolve(model_label)[1].rollover_trigger_tokens or 0)
+                                             if self.config.models.resolve(model_label) else 0),
+                             trigger_ratio=self.config.agent.compact_ratio,
+                             retain_ratio=self.config.context_management.retain_ratio,
+                             max_output_tokens=max_tokens),
+                backend=backend, model=model_id, model_label=model_label,
+                on_rotated=_on_window_rotated, on_state=_compression_state,
+                active_run_root_turn_uuid=root_turn_uuid,
+                strategy_resolver=lambda: conversation_strategy(self.db, conversation_uuid, self.config.context_management.default_strategy),
+                strategies={"model_summary": ModelSummaryStrategy(self.config, self.llm_factory, model_label, on_model_call=_summary_model_call)},
             )
-            emergency_compactor = _WebEmergencyCompactor(
-                self,
-                chat_id,
-                model_label=model_label,
-                renderer=renderer,
-                system=system,
-                on_compacted=_on_context_compacted,
-                request_refresher=_refresh_task_memory_request,
-                on_cache_epoch_reset=_advance_task_memory_epoch,
-            )
+            persister.window_runtime = window_runtime
 
             def _footer_provider(res: RunResult) -> str:
                 if not self.config.ui.show_turn_stats:
@@ -566,7 +468,6 @@ class WebAdminChatRunMixin:
                             think_level=think_level,
                             context_window=ctx_window,
                             live=True,
-                            compactions=compaction_outcomes,
                             ledger_usage=ledger_usage,
                         ),
                     })
@@ -931,13 +832,6 @@ class WebAdminChatRunMixin:
                 return json.dumps({"ok": True, **snapshot}, ensure_ascii=False, default=str)
 
             async def _model_call_hook(call: dict[str, Any]) -> None:
-                nonlocal memory_reminder, memory_reminder_attempt_generation
-                call_status = str(call.get("status") or "ok")
-                delivered_generation = (
-                    memory_reminder_attempt_generation
-                    if call_status == "ok"
-                    else None
-                )
                 call_usage = call.get("usage") if isinstance(call.get("usage"), Usage) else Usage()
                 resolved_cost = resolved_usage_cost_usd(
                     base_model_cost,
@@ -956,19 +850,11 @@ class WebAdminChatRunMixin:
                     model_label=model_label,
                     protocol=backend_protocol,
                     think_level=think_level,
-                    memory_reminder_generation=delivered_generation,
                     cost_usd_override=resolved_cost,
                 )
                 # Cost tiers are non-linear, so retain the durable amount chosen
                 # for this physical request rather than pricing aggregate usage.
                 result.controller_cost_usd += committed_cost
-                if delivered_generation is not None:
-                    memory_reminder = None
-                elif call_status == "ok" and memory_reminder is None:
-                    # A long tool loop can cross the threshold inside this turn.
-                    # Arm the next physical request before its normal compaction gate.
-                    memory_reminder = await _prepare_memory_reminder()
-                memory_reminder_attempt_generation = None
 
             async def _conversation_event_cb(event: dict[str, Any]) -> None:
                 if renderer.live is not None:
@@ -985,8 +871,8 @@ class WebAdminChatRunMixin:
                 fast_request=fast_request,
                 session_id=session_id,
                 persister=persister,
-                emergency_compactor=emergency_compactor,
-                context_compactor=context_compactor,
+                window_runtime=window_runtime,
+                window_request_refresher=_refresh_window_request,
                 steer_drain=lambda: steering.drain_items(chat_id),
                 model_request_refresher=_refresh_task_memory_request,
                 model_request_overlay=_reference_request_overlay,
@@ -1022,59 +908,12 @@ class WebAdminChatRunMixin:
             # _model_call_hook.  The epilogue only publishes the already durable
             # total; writing the aggregate again would double-count billing.
             request_cost = result.controller_cost_usd
-            last_prompt_tokens = (
-                result.last_usage.input_tokens
-                + result.last_usage.cache_read_tokens
-                + result.last_usage.cache_write_tokens
-            )
-            post_gate_tokens = last_prompt_tokens + max(0, int(result.last_usage.output_tokens or 0))
-            if memory_reminder is not None:
-                try:
-                    projected_history = await self._build_history(chat_id)
-                    projected_private = await _refresh_task_memory_request(projected_history)
-                    post_gate_tokens = max(
-                        post_gate_tokens,
-                        self._estimate_prompt_tokens(system=system, convo=projected_private),
-                    )
-                except Exception:
-                    log.exception("估算记忆提醒后的轮末上下文失败，保留安全压缩", 会话=chat_id)
-            if _memory_reminder_can_defer(post_gate_tokens):
-                post_outcome = CompactionOutcome(
-                    did=False,
-                    source="turn_epilogue",
-                    trigger_tokens=post_gate_tokens,
-                    threshold_tokens=self._model_compact_trigger_tokens(model_label),
-                    reason="memory_reminder_pending",
-                )
-            else:
-                post_outcome = await self._post_compact_after_web_turn(
-                    chat_id,
-                    last_prompt_tokens,
-                    model_label=model_label,
-                    source="turn_epilogue",
-                )
-            if post_outcome.did:
-                memory_reminder = None
-                memory_reminder_attempt_generation = None
-                _advance_task_memory_epoch()
-                rebuilt_after = await self._build_history(chat_id)
-                rebuilt_private = await _refresh_task_memory_request(rebuilt_after)
-                # Epilogue compaction happens after Agent.run has made its final
-                # checkpoint. Save the clean summary/XML context for the current
-                # cache epoch; future root turns intentionally rebuild this visible
-                # projection instead of replaying raw protocol messages.
-                await persister.save_native_context(messages=rebuilt_private)
-                after_tokens = self._estimate_prompt_tokens(system=system, convo=rebuilt_private)
-                post_outcome.after_tokens = after_tokens
-                compaction_outcomes.append((post_outcome, after_tokens))
-                await self._emit_context_compaction_event(renderer, post_outcome, source="turn_epilogue")
             ledger_usage = await _ledger_usage()
             await renderer.emit({
                 "type": "stats",
                 "stats": self._run_stats_json(
                     result, cost_usd=request_cost, model=model_label,
                     think_level=think_level, context_window=ctx_window,
-                    compactions=compaction_outcomes,
                     ledger_usage=ledger_usage,
                 ),
             })
@@ -1101,7 +940,7 @@ class WebAdminChatRunMixin:
                     await self._touch_web_conversation(
                         conversation_uuid,
                         status="error",
-                        current_status="出错",
+                        current_status="出错 · 可发送消息继续" if task_notification or controller_notification_ids else "出错",
                         last_error=live_error or result.halted_reason or "模型调用失败",
                     )
                 else:
@@ -1138,8 +977,7 @@ class WebAdminChatRunMixin:
                     "stats": self._run_stats_json(
                         result, cost_usd=request_cost, model=model_label,
                         think_level=think_level, context_window=ctx_window or self.llm_factory.context_window(model_label),
-                        compactions=compaction_outcomes,
-                        ledger_usage=ledger_usage,
+                            ledger_usage=ledger_usage,
                     ),
                 })
             already_stopped = bool(conversation_uuid and self._web_stop_markers.get(conversation_uuid))
@@ -1187,9 +1025,9 @@ class WebAdminChatRunMixin:
                 self.control_actions.consume_soft_stop(chat_id)
             if controller_notification_ids:
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(self._requeue_web_task_notifications(
+                    await asyncio.shield(self._pause_web_task_notifications(
                         controller_notification_ids,
-                        "same-root notification turn stopped before acknowledgement",
+                        "same-root notification turn stopped; awaiting user continuation",
                     ))
                 controller_notification_ids.clear()
             if conversation_uuid:

@@ -96,7 +96,7 @@ def test_catalog_cache_projects_tiers_and_reasoning_options(tmp_path) -> None:
     assert projected["contextWindow"] == 1_000_000
     assert projected["maxTokens"] == 32_768
     assert projected["thinkingLevels"] == ["off", "low", "high"]
-    assert projected["compactTriggerTokens"] == 200_000
+    assert projected["rolloverTriggerTokens"] == 200_000
     assert projected["cost"] == {
         "input": 1.25,
         "output": 10.0,
@@ -193,7 +193,7 @@ def test_bundled_grok_45_override_is_applied_after_cache_without_mutating_snapsh
     assert json.loads(cache_path.read_text(encoding="utf-8"))["providers"]["xai"]["models"]["grok-4.5"]["cost"]["tiers"][0]["cache_read"] == 1
 
 
-def test_preview_and_sync_maps_first_price_tier_to_compact_trigger(tmp_path) -> None:
+def test_preview_and_sync_maps_first_price_tier_to_rollover_trigger(tmp_path) -> None:
     catalog = _catalog_from_cache(tmp_path)
     raw = {
         "models": {
@@ -211,7 +211,7 @@ def test_preview_and_sync_maps_first_price_tier_to_compact_trigger(tmp_path) -> 
                         "maxTokens": 8_192,
                         "cost": {"input": 9, "output": 9},
                         "supportsFast": True,
-                        "compactTriggerTokens": 77_777,
+                        "rolloverTriggerTokens": 77_777,
                     }],
                 }
             },
@@ -228,7 +228,7 @@ def test_preview_and_sync_maps_first_price_tier_to_compact_trigger(tmp_path) -> 
         {"providerId": "acme", "modelId": "demo/v1"},
     )
     changed = {item["field"] for item in preview["changes"]}
-    assert {"contextWindow", "maxTokens", "compactTriggerTokens", "cost", "reasoning"} <= changed
+    assert {"contextWindow", "maxTokens", "rolloverTriggerTokens", "cost", "reasoning"} <= changed
     assert preview["metadataSha256"] == models_dev_metadata_fingerprint(preview["metadata"])
 
     channel_admin.sync_model_from_models_dev_mutator(
@@ -263,7 +263,7 @@ def test_preview_and_sync_maps_first_price_tier_to_compact_trigger(tmp_path) -> 
     assert model.fast_cost["tiers"][0]["output"] == 30.0
     assert model.fast_cost["tiers"][0]["cacheRead"] == 0.0
     assert model.fast_cost["tiers"][0]["cacheWrite"] == 0.0
-    assert model.compact_trigger_tokens == 200_000
+    assert model.rollover_trigger_tokens == 200_000
 
 
 def test_sync_without_published_fast_clears_stale_fast_request(tmp_path) -> None:
@@ -448,8 +448,8 @@ def test_batch_preview_and_sync_apply_all_models_in_one_mutator(tmp_path) -> Non
                     "apiKey": "secret",
                     "protocol": "chat",
                     "models": [
-                        {"id": "one", "name": "One", "compactTriggerTokens": 77_777},
-                        {"id": "two", "name": "Two", "compactTriggerTokens": 88_888},
+                        {"id": "one", "name": "One", "rolloverTriggerTokens": 77_777},
+                        {"id": "two", "name": "Two", "rolloverTriggerTokens": 88_888},
                     ]
                 }
             },
@@ -464,7 +464,7 @@ def test_batch_preview_and_sync_apply_all_models_in_one_mutator(tmp_path) -> Non
 
     preview = channel_admin.models_dev_batch_sync_preview(models, "proxy", catalog, selected)
     assert [item["localModelId"] for item in preview["items"]] == ["one", "two"]
-    assert all(item["metadata"]["compactTriggerTokens"] == 200_000 for item in preview["items"])
+    assert all(item["metadata"]["rolloverTriggerTokens"] == 200_000 for item in preview["items"])
 
     channel_admin.sync_models_from_models_dev_mutator(
         "proxy",
@@ -479,7 +479,7 @@ def test_batch_preview_and_sync_apply_all_models_in_one_mutator(tmp_path) -> Non
         model = resolved[1]
         assert model.models_dev is not None
         assert model.models_dev.provider_id == "acme"
-        assert model.compact_trigger_tokens == 200_000
+        assert model.rollover_trigger_tokens == 200_000
 
 
 def test_source_status_tracks_model_metadata_not_catalog_wide_digest(tmp_path) -> None:

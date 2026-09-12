@@ -198,6 +198,9 @@ class Tool:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # File tools register their actual injected cache, not necessarily the
+        # process-global fallback. Window owners invalidate only their scope.
+        self.file_state: Any = None
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool

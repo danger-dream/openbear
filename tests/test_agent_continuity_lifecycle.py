@@ -16,10 +16,15 @@ from app.rath.dao import RathDAO
 from app.rath.plan import PlanError
 from app.task_memory import TaskMemoryDAO
 from app.tools.base import ToolRuntimeContext
-from tests.test_agent_continuity import call, env
+from tests.test_agent_continuity import call
+from tests.test_agent_continuity import env as continuity_env
 from tests.test_rath_plan import sample_plan
-from tests.test_rath_web_api import web_env
+from tests.test_rath_web_api import web_env as rath_web_env
 from tests.test_tools_agent_orchestration import _FakeConfig
+
+# Register the shared fixtures explicitly without shadowing imported names.
+env = continuity_env
+web_env = rath_web_env
 
 
 async def test_three_rounds_pin_template_and_keep_private_memory(env, monkeypatch):
@@ -105,6 +110,13 @@ async def test_new_round_keeps_control_facts_but_not_old_ack_or_native_state(env
         {"role": "user", "content": "old-finalize-gate", "_openbear_runtime": {"kind": "agent_completion_gate"}},
         {"role": "assistant", "content": "prior-final", "native_output_items": [{"type": "reasoning", "id": "opaque-old"}]},
     ])
+    from app.context.runtime import WindowRuntime
+    from app.context.store import ContextOwner, WindowStore
+    from app.context.window import WindowPolicy
+    window = WindowRuntime(WindowStore(dao.db, ContextOwner.agent(task_uuid=tid, agent_session_uuid=first["agentSession"]["agentId"])),
+                           WindowPolicy(context_window=128000), backend=backend, model="gpt")
+    checkpoint = await window.checkpoint(state["messages"])
+    state.update(windowVersion=checkpoint["windowVersion"], windowRevision=checkpoint["revision"])
     await dao.db.conn.execute("UPDATE rath_task_model_contexts SET state_json=? WHERE task_uuid=?", (json.dumps(state), tid))
     await dao.db.conn.commit()
     backend.protocol = "responses"
@@ -238,40 +250,37 @@ async def test_instance_web_endpoint_separates_presets_and_never_exposes_checkpo
     assert wrong.status == 404
 
 
-async def test_compaction_rebuilds_same_instance_memory_and_reports_retained_summary(env, monkeypatch):
+@pytest.mark.parametrize("trigger", [1000, 32000])
+async def test_window_continuation_keeps_same_instance_memory_without_summary(env, monkeypatch, trigger):
     from app.tools.agents import AgentTools
-    from tests.test_rath_single_agent import _GOOD_COMPACTION_SUMMARY
     dao, reg, backend, ctx, _ = env
     first = await call(reg, "Agent", {"prompt": "investigated-first", "tools": ["TaskMemory"]}, ctx)
     sid = first["agentSession"]["agentId"]
     item, _ = await TaskMemoryDAO(dao.db).create(conversation_uuid=ctx.session_uuid, scope_type="agent_session",
                                                task_uuid=sid, name="persisted-before-compaction", body="exact-fact")
 
-    class Compressor:
-        protocol = "chat"
-        calls = 0
-
-        async def complete(self, messages, **kwargs):
-            self.calls += 1
-            return AgentResult(text=_GOOD_COMPACTION_SUMMARY + "\n已有调查结论 retained-after-compression；当前仅进行只读复查。")
-
-    compressor = Compressor()
-    monkeypatch.setattr(AgentTools, "_context_compact_kwargs", lambda self, model: {
-        "context_compact_trigger_tokens": 1000, "context_compact_backend": compressor,
-        "context_compact_model": "summary", "context_compact_keep_recent": 1,
+    monkeypatch.setattr(AgentTools, "_context_window_kwargs", lambda self, model: {
+        "context_window": 128000, "rollover_trigger_tokens": trigger, "window_retain_ratio": 0.15,
     })
     second = await call(reg, "AgentContinue", {"to": sid, "prompt": "只读复查。" + "已提供材料与保留约束。" * 1000,
                                                "tools": ["TaskMemory"]}, ctx)
+    if trigger == 1000:
+        assert second["status"] == "needs_openbear_control", second
+        assert len(backend.calls) == 1  # Required input cannot bypass the configured threshold.
+        return
     assert second["status"] == "completed", second
-    assert compressor.calls > 0
     request = str(backend.calls[-1]["messages"])
-    assert "retained-after-compression" in request and item["memoryUuid"] in request
+    assert "investigated-first" in request and item["memoryUuid"] in request
     memory_ctx = ToolRuntimeContext(chat_id=123, session_uuid=ctx.session_uuid, source="agent:general-purpose",
                                     task_uuid=second["task"]["taskId"], agent_session_uuid=sid)
     assert (await call(reg, "TaskMemory", {"action": "get", "memoryUuid": item["memoryUuid"]}, memory_ctx))["memory"]["body"] == "exact-fact"
     info = await call(reg, "AgentInfo", {"action": "get", "to": sid}, ctx)
-    assert info["context"]["compacted"] is True
-    assert item["memoryUuid"] in info["memoryCatalog"]
+    assert info["context"]["windowAvailable"] is True
+    assert info["context"]["historyCoverage"] == "incremental_originals"
+    assert "memoryCatalog" not in info
+    assert info["memoryScope"] == "agent_session"
+    for private_value in (item["memoryUuid"], item["name"], item["body"]):
+        assert private_value not in json.dumps(info, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("clean_task_history", [False, True])

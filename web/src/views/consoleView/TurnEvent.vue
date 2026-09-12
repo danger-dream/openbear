@@ -7,6 +7,7 @@ import ConsoleUserInteractionEvent from "./ConsoleUserInteractionEvent.vue";
 import {isAgentEvent, modelRetryReasonLabel, toolResultKey, toolStatus} from "./display.js";
 import {answerContent, hasMeaningfulAnswerText} from "./markdown.js";
 import {isUserInteractionEvent} from "./userInteractionPresentation.js";
+import {retryWaitLabel as formatRetryWait, retryStatusView} from "./modelRetryPresentation.js";
 
 const props = defineProps({
 	event: {type: Object, required: true},
@@ -95,30 +96,16 @@ function retryReasonLabel(event = props.event) {
 }
 
 function retryWaitLabel(event = props.event) {
-	const waitMs = Number(event?.retry?.waitMs || 0);
-	if (!waitMs) return "";
-	if (waitMs < 1000) return `等待 ${Math.round(waitMs)}ms`;
-	const seconds = waitMs / 1000;
-	return `等待 ${seconds < 10 ? seconds.toFixed(1).replace(/\.0$/, "") : Math.round(seconds)} 秒`;
+	return formatRetryWait(event?.retry);
 }
 
 function retryStatusLabel(event = props.event) {
-	const retry = event?.retry || {};
-	if (retry.active) return "等待重试";
-	const status = String(retry.status || "");
-	if (["resumed", "completed", "complete"].includes(status)) return "已恢复";
-	if (["cancelled", "canceled", "stopped"].includes(status)) return "已取消";
-	if (status === "failed") return "重试失败";
-	return status || "已恢复";
+	return retryStatusView(event?.retry).label;
 }
 
 function retryOutcomeMeta(event = props.event) {
-	const retry = event?.retry || {};
-	const status = String(retry.status || "");
-	if (retry.active) return {icon: CircleClose, tone: "waiting"};
-	if (["resumed", "completed", "complete"].includes(status) || !status) return {icon: CircleCheck, tone: "success"};
-	if (["cancelled", "canceled", "stopped"].includes(status)) return {icon: CircleClose, tone: "cancelled"};
-	return {icon: CircleClose, tone: "failed"};
+	const {tone} = retryStatusView(event?.retry);
+	return {icon: tone === "success" ? CircleCheck : tone === "neutral" ? Refresh : CircleClose, tone};
 }
 </script>
 

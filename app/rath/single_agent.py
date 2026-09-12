@@ -6,37 +6,51 @@ used by the selector path for requests like "帮我使用 深度调研员 调研
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import html
 import inspect
 import json
 import re
 import time
+import uuid
 from typing import Any
 
-from app.agent.compaction import (
-    CompressionCandidate,
-    _render_summary_prompt,
-    _summary_missing_sections,
-)
 from app.agent.context_overflow import is_context_overflow_error
 from app.agent.native_continuation import (
     deserialize_messages,
     native_items_for_tool_calls,
-    sanitize_paired_messages,
     serialize_messages,
 )
 from app.agent.transcript_repair import repair_role_alternation
+from app.context.configuration import conversation_strategy
+from app.context.prompts import effective_context_prompt
+from app.context.runtime import ContextManager as WindowRuntime
+from app.context.store import ContextOwner, WindowStore
+from app.context.strategies import ContextCompressionError, ModelSummaryStrategy
+from app.context.window import (
+    RequiredContextTooLarge,
+    WindowPolicy,
+    mark_source,
+    neutral_context,
+    sanitize_window_checkpoint,
+    source_of,
+)
 from app.llm.base import (
     AgentResult,
     LLMBackend,
     Message,
     OpenBearLLMError,
     apply_provider_billing,
-    collect_backend_result,
 )
 from app.llm.events import ToolCall, Usage
-from app.llm.retry import RetryCancelledError, RetryPolicy, retry_wait_payload, wait_for_retry
+from app.llm.retry import (
+    RetryCancelledError,
+    RetryPolicy,
+    retry_delay_label,
+    retry_wait_payload,
+    wait_for_retry,
+)
 from app.model_cost import resolved_usage_cost_usd as _resolved_usage_cost_usd
 from app.rath.plan import PLAN_TOOL_NAMES
 from app.rath.prompts import render_plan_prompt
@@ -50,9 +64,8 @@ from app.task_memory import (
 )
 from app.tools.allowlist import (
     AGENT_DELEGATION_TOOL_NAMES,
-    agent_tool_capability,
     agent_phase_tool_names,
-    expand_agent_tool_names,
+    agent_tool_capability,
     sanitize_tool_allowlist,
 )
 from app.tools.base import (
@@ -64,12 +77,8 @@ from app.tools.base import (
 from app.tools.file_state import clear_read_file_state
 from app.utils import estimate_tokens, now_cn
 
-_CONTEXT_COMPACT_DEFAULT_KEEP_RECENT = 6
-_CONTEXT_COMPACT_DEFAULT_SUMMARY_CHARS = 12_000
-_CONTEXT_COMPACT_DEFAULT_MESSAGE_CHARS = 8_000
-
 # Private metadata is retained in Rath checkpoints but ignored by all provider
-# adapters. It lets compaction distinguish application-generated runtime units
+# adapters. It lets window rotation distinguish application-generated runtime units
 # from task text that merely happens to look like XML.
 _AGENT_RUNTIME_METADATA_KEY = "_openbear_runtime"
 _AGENT_PLAN_RUNTIME_KIND = "rath_agent_plan_runtime"
@@ -168,7 +177,7 @@ def _is_agent_plan_runtime_message(message: Any) -> bool:
     if not isinstance(message, dict) or str(message.get("role") or "") != "user":
         return False
     # Continuation checkpoints written before the metadata marker existed still
-    # need to be removed on their next compaction. Match the whole generated
+    # need to be removed on their next window rotation. Match the whole generated
     # envelope rather than a tag that a task author could legitimately quote.
     content = _safe_text(message.get("content")).strip()
     return (
@@ -304,30 +313,20 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         base_system_prompt: str = "",
         tool_result_max_chars: int = 32_000,
         max_retries: int = 10,
-        retry_backoff_s: float = 0.5,
-        retry_max_delay_s: float = 32.0,
-        retry_jitter_ratio: float = 0.25,
+        retry_backoff_s: float = 3.0,
+        retry_max_delay_s: float = 600.0,
+        retry_jitter_ratio: float = 0.0,
         retry_cancel_check=None,
         model_call_limit: int = 40,
         tool_call_limit: int = 80,
         plan_control_call_limit: int = 200,
         poll_interval_s: float = 0.5,
         context_window: int = 0,
-        context_compact_trigger_tokens: int = 0,
-        context_compact_ratio: float = 0.7,
-        context_compact_keep_recent: int = 8,
-        context_compact_prompt: str = "",
-        context_compact_max_tokens: int = 4096,
-        context_compact_max_retries: int = 1,
-        context_compact_timeout_s: float = 1800.0,
-        context_compact_backend: LLMBackend | None = None,
-        context_compact_model: str = "",
-        context_compact_source: str = "compression",
-        context_compact_label: str = "",
-        context_compact_extra_candidates: list[CompressionCandidate] | None = None,
-        context_compact_fallback_backend: LLMBackend | None = None,
-        context_compact_fallback_model: str = "",
-        context_compact_costs: dict[str, dict[str, float]] | None = None,
+        rollover_trigger_tokens: int = 0,
+        window_trigger_ratio: float = 0.7,
+        window_retain_ratio: float = 0.15,
+        context_config: Any = None,
+        context_llm_factory: Any = None,
         on_model_call=None,
         on_event=None,
         task_notification=None,
@@ -349,6 +348,12 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         self.agent_session_uuid = agent_session_uuid
         self.caller_agent_session_uuid = caller_agent_session_uuid
         self.session_id = session_id or safe_agent_llm_session_id(agent_session_uuid, task_uuid, agent.agent_key)
+        self._request_options = copy.deepcopy({
+            "max_tokens": max_tokens, "think_level": think_level,
+            "service_tier": service_tier, "fast_request": self.fast_request,
+            "session_id": self.session_id,
+            "native_continuation": str(getattr(backend, "protocol", "") or "").lower() == "responses",
+        })
         self.cost = dict(cost or {})
         self.base_cost = dict(base_cost) if base_cost is not None else dict(self.cost)
         self.fast_cost = dict(fast_cost or {})
@@ -366,27 +371,16 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         self.tool_call_limit = max(0, int(tool_call_limit or 0))
         self.plan_control_call_limit = max(1, int(plan_control_call_limit or 200))
         self.context_window = max(0, int(context_window or 0))
-        self.context_compact_trigger_tokens = max(0, int(context_compact_trigger_tokens or 0))
-        self.context_compact_ratio = float(context_compact_ratio or 0.7)
-        self.context_compact_keep_recent = max(1, int(context_compact_keep_recent or 8))
-        self.context_compact_prompt = str(context_compact_prompt or "")
-        self.context_compact_max_tokens = max(512, int(context_compact_max_tokens or 4096))
-        self.context_compact_max_retries = max(0, int(context_compact_max_retries or 0))
-        self.context_compact_timeout_s = max(1.0, float(context_compact_timeout_s or 1800.0))
-        self.context_compact_backend = context_compact_backend
-        self.context_compact_model = str(context_compact_model or "")
-        self.context_compact_source = str(context_compact_source or "compression")
-        self.context_compact_label = str(context_compact_label or self.context_compact_model)
-        self.context_compact_extra_candidates = list(context_compact_extra_candidates or [])
-        self.context_compact_fallback_backend = context_compact_fallback_backend
-        self.context_compact_fallback_model = str(context_compact_fallback_model or "")
-        self.context_compact_costs = dict(context_compact_costs or {})
-        # Provider prompt usage is the authoritative context size after a model
-        # request. Keep a generation marker so a successful fold consumes the old
-        # snapshot instead of repeatedly compacting before the next request.
+        self.window_policy = WindowPolicy(
+            self.context_window, trigger_tokens=max(0, int(rollover_trigger_tokens or 0)),
+            trigger_ratio=window_trigger_ratio, retain_ratio=window_retain_ratio,
+            max_output_tokens=self.max_tokens,
+        )
+        self.context_config = context_config
+        self.context_llm_factory = context_llm_factory
+        self._window_runtime: WindowRuntime | None = None
         self._last_provider_prompt_tokens = 0
         self._provider_prompt_usage_generation = 0
-        self._compacted_provider_prompt_usage_generation = -1
         self.on_model_call = on_model_call
         self.task_notification = task_notification
         self.conversation_event = conversation_event
@@ -559,12 +553,18 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             self._work_tool_calls_made += 1
 
     async def _reconcile_task_memory_context(self, messages: list[Message]) -> bool:
+        # Shared preferences are inputs even without a tool grant. Private notes
+        # and long-reference guidance follow the current phase's real schemas.
+        task_memory_available = any(
+            schema.get("name") == "TaskMemory" for schema in await self._allowed_tool_schemas()
+        )
         reconciled = await reconcile_task_memory_runtime_state(
             messages,
             TaskMemoryDAO(self.dao.db),
             conversation_uuid=self.conversation_uuid,
             task_uuid=self.task_uuid,
             for_agent=True,
+            task_memory_available=task_memory_available,
             epoch=self._task_memory_epoch,
         )
         if len(reconciled) == len(messages):
@@ -600,38 +600,58 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
     ) -> int:
         """Persist the private model context without exposing it to UI/summary."""
         protocol = str(getattr(self.backend, "protocol", "") or "").lower()
-        safe_messages, dropped = self._sanitize_paired_messages(messages)
-        state = {
-            "version": 1,
-            "stage": str(stage or "checkpoint"),
-            "roundNo": max(0, int(round_no or 0)),
-            "lastText": str(last_text or ""),
-            "pendingControlUuids": sorted(self._pending_control_acks),
-            "providerPromptSnapshot": self._provider_prompt_snapshot_state(),
-            "messages": self._serialize_messages(safe_messages),
-            "droppedDanglingToolCallsOrOutputs": int(dropped or 0),
-            "agentKey": self.agent.agent_key,
-            "protocol": protocol,
-            "model": self.model,
-            "sessionId": self.session_id,
-            "agentSessionUuid": self.agent_session_uuid,
-            "openbearSessionUuid": self.openbear_session_uuid,
-        }
-        state.update(extra_state or {})
-        return await self.dao.save_task_model_context(
-            self.task_uuid,
-            protocol=protocol,
-            model=self.model,
-            session_id=self.session_id,
-            state=state,
-        )
+        for message in messages:
+            if _is_agent_context_summary_message(message) and not source_of(message).get("id"):
+                mark_source(message, kind="legacy_handoff")
+        async with self.dao._db.write_transaction(label="agent-window-checkpoint") as conn:
+            window = self._get_window_runtime()
+            window_state = await window.checkpoint(messages, extra_state={"stage": stage, **(extra_state or {})})
+            safe_messages, dropped = self._sanitize_paired_messages(messages)
+            state = {
+                "version": 1,
+                "windowVersion": window_state["windowVersion"],
+                "windowRevision": window_state["revision"],
+                "stage": str(stage or "checkpoint"),
+                "roundNo": max(0, int(round_no or 0)),
+                "lastText": str(last_text or ""),
+                "pendingControlUuids": sorted(self._pending_control_acks),
+                "providerPromptSnapshot": self._provider_prompt_snapshot_state(),
+                "messages": self._serialize_messages(safe_messages),
+                "droppedDanglingToolCallsOrOutputs": int(dropped or 0),
+                "agentKey": self.agent.agent_key,
+                "protocol": protocol,
+                "model": self.model,
+                "sessionId": self.session_id,
+                "agentSessionUuid": self.agent_session_uuid,
+                "openbearSessionUuid": self.openbear_session_uuid,
+            }
+            state.update(extra_state or {})
+            # Consumption and the checkpoint carrying the original/ack set form
+            # one transaction. Queuing in memory alone is not durable delivery.
+            for control_uuid in self._pending_control_acks:
+                control = await self.dao.control(control_uuid)
+                if control and control.status == "pending":
+                    await conn.execute(
+                        "UPDATE rath_task_controls SET status='applied',applied_at=?,result=? WHERE control_uuid=? AND status='pending'",
+                        (int(time.time()), "delivered in model checkpoint", control_uuid),
+                    )
+                    await self.emit("steer_applied", agent_key=self.agent.agent_key,
+                                    summary="追加指导已加入任务上下文",
+                                    detail={"message": control.message, "stage": stage})
+            return await self.dao.save_task_model_context(
+                self.task_uuid,
+                protocol=protocol,
+                model=self.model,
+                session_id=self.session_id,
+                state=state,
+            )
 
     def _tool_call_id(self, call: ToolCall, index: int = 0) -> str:
         return call.id or f"call_{index}_{call.name}"
 
     def _sanitize_paired_messages(self, messages: list[Message]) -> tuple[list[Message], int]:
         """Drop dangling pairs using the shared Controller/Rath safety rule."""
-        return sanitize_paired_messages(messages)
+        return sanitize_window_checkpoint(messages)
 
     async def _latest_continuation_state(self) -> dict[str, Any] | None:
         checkpoint = await self.dao.task_model_context(self.task_uuid)
@@ -778,7 +798,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
 
     async def _run_agent(self, instruction: str) -> str:
         messages = await self._round_context_messages()
-        messages.append({"role": "user", "content": self._user_prompt(instruction)})
+        messages.append(mark_source(
+            {"role": "user", "content": self._user_prompt(instruction)}, kind="task",
+            task_uuid=self.task_uuid, turn_uuid=self.turn_uuid, run_root_turn_uuid=self.run_root_turn_uuid,
+        ))
         tools = await self._allowed_tool_schemas()
         await self._append_plan_runtime_update(messages)
         await self._reconcile_task_memory_context(messages)
@@ -794,18 +817,29 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         if not checkpoint or int(checkpoint["revision"]) != int(source.get("revision") or 0):
             raise RuntimeError("The requested Agent context checkpoint is missing or changed")
         state = checkpoint["state"]
-        messages = self._deserialize_messages(list(state.get("messages") or []))
-        compatible = (
+        window = self._get_window_runtime()
+        saved_window = await window.store.load()
+        same_window = not saved_window or (
+            int(state.get("windowVersion") or 0) == int(saved_window["window_version"])
+            and int(state.get("windowRevision") or 0) == int(saved_window["revision"])
+        )
+        # A half-executed batch may use the atomically paired execution
+        # checkpoint, which records the uncertain tool explicitly. Never use an
+        # unpaired generic window as proof that that tool did not run.
+        reliable_partial = same_window and bool(saved_window and saved_window["state"].get("incompleteBatch"))
+        retained = await window.store.restore_messages() if saved_window and not reliable_partial else None
+        compatible = same_window and (
             state.get("protocol") == str(getattr(self.backend, "protocol", "") or "").lower()
             and state.get("model") == self.model and state.get("sessionId") == self.session_id
         )
-        if not compatible:
-            for message in messages:
-                message.pop("native_output_items", None)
-            await self.emit("agent_native_context_reset", agent_key=self.agent.agent_key,
-                            summary="续接保留业务消息，不兼容的原生模型状态已移除")
-        else:
+        if compatible:
+            messages = self._deserialize_messages(list(state.get("messages") or []))
             self._restore_provider_prompt_snapshot(state.get("providerPromptSnapshot"))
+        else:
+            messages = retained if retained is not None else neutral_context(self._deserialize_messages(list(state.get("messages") or [])))
+            await self.emit("agent_native_context_reset", agent_key=self.agent.agent_key,
+                            summary="保留独立窗口，不兼容的原生模型状态已移除")
+        await window.restore_source_scopes(messages, origin_task_uuid=str(source["taskUuid"]))
         messages = [
             message for message in without_task_memory_runtime_messages(messages)
             if not _is_agent_plan_runtime_message(message)
@@ -819,6 +853,8 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                     + historical.replace("<agent-control ", "<historical-agent-control ").replace("</agent-control>", "</historical-agent-control>")
                 )
                 message.pop(_AGENT_RUNTIME_METADATA_KEY, None)
+                previous_source = source_of(message).get("id", "")
+                mark_source(message, kind="control", source_id=str(uuid.uuid4()), derived_from=previous_source)
         messages, _ = self._sanitize_paired_messages(messages)
         self._task_memory_epoch = task_memory_runtime_epoch(messages)
         if state.get("inflightTool") or source.get("state") == "partial":
@@ -838,7 +874,9 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         payload = {"agentId": self.agent_session_uuid, "taskId": self.task_uuid,
                    "effectiveTools": names, "planMode": "managed" if self.plan_protocol_enabled else "direct"}
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        if any((message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("capabilitySignature") == signature for message in messages):
+        latest = next(((message.get(_AGENT_RUNTIME_METADATA_KEY) or {}) for message in reversed(messages)
+                       if (message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") == "agent_capabilities"), {})
+        if latest.get("capabilitySignature") == signature:
             return
         messages.append({"role": "user", "content": (
             "当前 Agent 运行事实（替代旧轮次和启动模板中的工具清单；不扩大用户授权）：\n" + signature +
@@ -878,11 +916,35 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
             ),
             _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_control"},
         })
+        mark_source(messages[-1], kind="control", task_uuid=self.task_uuid,
+                    turn_uuid=self.turn_uuid, run_root_turn_uuid=self.run_root_turn_uuid)
         return True
+
+    async def _queue_steer(self, control: Any, stage: str, *, agent_key: str = "", paused: bool = False) -> None:
+        # Keep the durable inbox pending until its original text and ack gate
+        # have both entered a checkpoint, including controls received while paused.
+        if control.control_uuid in self._pending_control_acks or any(
+            item.get("controlUuid") == control.control_uuid for item in self.steers
+        ):
+            return
+        self.steers.append({"controlUuid": control.control_uuid, "message": control.message,
+                            "requestedBy": control.requested_by, "metadata": control.metadata})
+
+    async def _save_context_boundary(self, messages: list[Message], stage: str) -> None:
+        previous = (await self.dao.task_model_context(self.task_uuid) or {}).get("state") or {}
+        final_response = previous.get("finalResponse")
+        extra = {"finalResponse": final_response} if final_response and any(
+            source_of(m).get("id") == final_response.get("eventId") for m in messages
+        ) else {}
+        await self._checkpoint_model_context(messages, round_no=int(previous.get("roundNo") or 0),
+            stage=stage, last_text=str(previous.get("lastText") or ""), extra_state=extra)
 
     async def _checkpoint_and_append_steers(self, stage: str, messages: list[Message]) -> bool:
         await self.checkpoint(stage, agent_key=self.agent.agent_key)
-        return self._append_pending_steers(messages)
+        changed = self._append_pending_steers(messages)
+        if changed:
+            await self._save_context_boundary(messages, stage)
+        return changed
 
     async def _run_agent_loop(
         self,
@@ -962,6 +1024,8 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                         last_text=last_text,
                     )
                 await self._checkpoint_and_append_steers("after_tool_call", messages)
+                if self._get_window_runtime().pending:
+                    await self._prepare_context_window(messages, tools)
                 await self._checkpoint_model_context(
                     messages,
                     round_no=round_no,
@@ -996,12 +1060,31 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
 
             await self.checkpoint("after_model", agent_key=self.agent.agent_key)
             if not self.steers:
-                correction = (
-                    "先对所有待回执控制调用 AgentControlAck；尚未完成回执，不能结束本轮。"
-                    if self._pending_control_acks else await self._plan_completion_correction()
-                )
+                correction = await self._completion_correction()
                 if not correction:
                     final_messages = messages + [_assistant_result_message(result)]
+                    window = self._get_window_runtime()
+                    window.bind_sources(final_messages)
+                    final_response = {"text": (result.text or result.reasoning or "").strip(),
+                                      "eventId": source_of(final_messages[-1])["id"]}
+                    revision = await self._checkpoint_model_context(
+                        final_messages, round_no=round_no, stage="final_response_received", last_text=last_text,
+                        extra_state={"finalResponse": final_response},
+                    )
+                    try:
+                        await self._prepare_context_window(final_messages, tools)
+                    except RathNeedsOpenBearControl as exc:
+                        # Preserve the existing completion gate/status decision,
+                        # but expose the already received response and exact ref.
+                        exc.payload["finalResponse"] = {**final_response, "checkpointRevision": revision}
+                        raise
+                    # A control accepted during summary generation must be handled
+                    # before the final completion gate, not silently left behind.
+                    await self.checkpoint("after_final_compression", agent_key=self.agent.agent_key)
+                    if self.steers:
+                        messages[:] = final_messages
+                        self._append_pending_steers(messages)
+                        continue
                     await self._checkpoint_model_context(
                         final_messages,
                         round_no=round_no,
@@ -1044,6 +1127,10 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         task = await self.dao.get_task(self.task_uuid)
         if task is None:
             raise RuntimeError(f"Rath task not found: {self.task_uuid}")
+        output = task.output if isinstance(task.output, dict) else {}
+        detail = output.get("detail") if isinstance(output.get("detail"), dict) else {}
+        if output.get("reason") == "agent_context_overflow_unrecoverable" or detail.get("continuable") is False:
+            raise RuntimeError("agent_task_not_continuable: existing control decision forbids internal resume")
         self.chat_id = int(task.chat_id or 0)
         self._round_input = dict(task.input or {})
         self._task_instruction = str(task.input.get("instruction") or task.title or "")
@@ -1061,6 +1148,20 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         if not state:
             raise RuntimeError("agent continuation state not found")
         messages = self._deserialize_messages(list(state.get("messages") or []))
+        saved_window = await self._get_window_runtime().store.load()
+        same_window = not saved_window or (
+            int(state.get("windowVersion") or 0) == int(saved_window["window_version"])
+            and int(state.get("windowRevision") or 0) == int(saved_window["revision"])
+        )
+        if not same_window:
+            if (int(saved_window["revision"]) < int(state.get("windowRevision") or 0)
+                    or int(saved_window["window_version"]) < int(state.get("windowVersion") or 0)):
+                raise RuntimeError("agent_continuation_checkpoint_mismatch: window predates execution checkpoint")
+            if state.get("inflightTool") or state.get("pendingToolCalls") or saved_window["state"].get("incompleteBatch"):
+                raise RuntimeError("agent_continuation_checkpoint_mismatch: uncertain tool boundary")
+            messages = await self._get_window_runtime().store.restore_messages()
+            if messages is None:
+                raise RuntimeError("agent_continuation_checkpoint_mismatch: reliable window unavailable")
         for control_uuid in state.get("pendingControlUuids") or []:
             control = await self.dao.control(str(control_uuid))
             if control and control.status == "applied" and not control.responded_at:
@@ -1068,7 +1169,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         has_native_items = any(bool(message.get("native_output_items")) for message in messages)
         expected_protocol = str(getattr(self.backend, "protocol", "") or "").lower()
         context_identity_matches = (
-            str(state.get("protocol") or "").lower() == expected_protocol
+            same_window and str(state.get("protocol") or "").lower() == expected_protocol
             and str(state.get("model") or "") == self.model
             and str(state.get("sessionId") or "") == self.session_id
         )
@@ -1100,6 +1201,21 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 state.get("providerPromptSnapshot"),
                 fallback_tokens=fallback_prompt_tokens,
             )
+        # Repair legacy applied-but-uncheckpointed controls from the durable
+        # inbox. An old runtime snapshot cannot prove an acknowledgement.
+        cur = await self.dao.db.conn.execute(
+            "SELECT control_uuid FROM rath_task_controls WHERE task_uuid=? AND action='steer' AND status='applied' AND responded_at=0 ORDER BY id",
+            (self.task_uuid,),
+        )
+        for row in await cur.fetchall():
+            control = await self.dao.control(str(row["control_uuid"]))
+            marker = f'<agent-control id="{html.escape(control.control_uuid, quote=True)}">'
+            if not any(marker in str(m.get("content") or "") for m in messages
+                       if (m.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") == "agent_control"):
+                self.steers.append({"controlUuid": control.control_uuid, "message": control.message,
+                                    "requestedBy": control.requested_by, "metadata": control.metadata})
+            self._pending_control_acks.add(control.control_uuid)
+        await self._get_window_runtime().restore_source_scopes(messages, origin_task_uuid=self.task_uuid)
         messages, dropped_pairs = self._sanitize_paired_messages(messages)
         self._task_memory_epoch = task_memory_runtime_epoch(messages)
         if dropped_pairs:
@@ -1203,6 +1319,8 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                         "请从已保存的位置继续同一个 task，不要从头重查；只补 OpenBear 指出的缺口。"
                     ),
                 })
+                mark_source(messages[-1], kind="control", task_uuid=self.task_uuid,
+                            turn_uuid=self.turn_uuid, run_root_turn_uuid=self.run_root_turn_uuid)
             result = await self._run_agent_loop(
                 messages,
                 await self._allowed_tool_schemas(),
@@ -1422,714 +1540,142 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         self._last_provider_prompt_tokens = tokens
         self._provider_prompt_usage_generation += 1
 
-    def _provider_prompt_tokens_for_compaction(self) -> int:
-        if self._provider_prompt_usage_generation <= self._compacted_provider_prompt_usage_generation:
-            return 0
-        return max(0, int(self._last_provider_prompt_tokens or 0))
-
-    def _consume_provider_prompt_usage_for_compaction(self) -> None:
-        self._compacted_provider_prompt_usage_generation = self._provider_prompt_usage_generation
-
     def _provider_prompt_snapshot_state(self) -> dict[str, int]:
         return {
             "tokens": max(0, int(self._last_provider_prompt_tokens or 0)),
             "usageGeneration": max(0, int(self._provider_prompt_usage_generation or 0)),
-            "compactedUsageGeneration": int(self._compacted_provider_prompt_usage_generation),
+            "windowVersion": self._window_runtime.window_version if self._window_runtime else 0,
         }
 
     def _restore_provider_prompt_snapshot(self, snapshot: Any, *, fallback_tokens: int = 0) -> None:
+        # Legacy snapshots remain readable, but are not promoted into the new
+        # window's authoritative usage. A real new request supplies that value.
         data = snapshot if isinstance(snapshot, dict) else {}
-        try:
-            tokens = max(0, int(data.get("tokens") or 0))
-        except (TypeError, ValueError):
-            tokens = 0
-        try:
-            stored_generation = max(0, int(data.get("usageGeneration") or 0))
-        except (TypeError, ValueError):
-            stored_generation = 0
-        raw_compacted_generation = data.get("compactedUsageGeneration", -1)
-        try:
-            stored_compacted_generation = int(
-                -1 if raw_compacted_generation is None else raw_compacted_generation
-            )
-        except (TypeError, ValueError):
-            stored_compacted_generation = -1
-        if tokens <= 0:
-            try:
-                tokens = max(0, int(fallback_tokens or 0))
-            except (TypeError, ValueError):
-                tokens = 0
-            stored_generation = 0
-            stored_compacted_generation = -1
-        if tokens <= 0:
-            return
-        generation = stored_generation if stored_generation > 0 else 1
-        self._last_provider_prompt_tokens = tokens
-        self._provider_prompt_usage_generation = generation
-        self._compacted_provider_prompt_usage_generation = min(
-            generation,
-            max(-1, stored_compacted_generation) if stored_generation > 0 else -1,
-        )
+        self._last_provider_prompt_tokens = max(0, int(data.get("tokens") or fallback_tokens or 0))
+        self._provider_prompt_usage_generation = max(0, int(data.get("usageGeneration") or 0))
 
     def _context_overflow_max_retries(self) -> int:
         return 3
 
-    def _context_token_threshold(self) -> int:
-        if self.context_compact_trigger_tokens > 0:
-            return self.context_compact_trigger_tokens
-        if self.context_window > 0:
-            return int(self.context_window * self.context_compact_ratio)
-        return 0
+    def _get_window_runtime(self) -> WindowRuntime:
+        if self._window_runtime is None:
+            owner = ContextOwner.agent(
+                task_uuid=self.task_uuid,
+                agent_session_uuid=self.agent_session_uuid if getattr(self, "_round_input", {}).get("sessionKind") == "independent" else "",
+                conversation_uuid=self.conversation_uuid, session_uuid=self.openbear_session_uuid,
+                chat_id=self.chat_id,
+            )
+            self._window_runtime = WindowRuntime(
+                WindowStore(self.dao._db, owner), self.window_policy,
+                backend=self.backend, model=self.model, model_label=self.model_label,
+                on_rotated=self._on_window_rotated, on_state=self._on_compression_state,
+                active_run_root_turn_uuid=self.run_root_turn_uuid,
+                strategy_resolver=(lambda: conversation_strategy(self.dao._db, self.conversation_uuid,
+                    self.context_config.context_management.default_strategy, chat_id=self.chat_id)) if self.context_config else None,
+                strategies={"model_summary": ModelSummaryStrategy(self.context_config, self.context_llm_factory,
+                    self.model_label, on_model_call=self._on_summary_model_call)} if self.context_config else None,
+            )
+        return self._window_runtime
 
-    def _estimate_context_tokens(self, messages: list[Message]) -> int:
-        return estimate_tokens(self._system_prompt()) + sum(_message_token_estimate(m) for m in messages)
+    async def _on_compression_state(self, detail: dict[str, Any]) -> None:
+        active = detail.get("status") == "running"
+        await self.emit("model_context_compaction_started" if active else "model_context_compaction_failed",
+            agent_key=self.agent.agent_key, summary="正在压缩上下文" if active else "上下文压缩未完成", detail=detail)
 
-    def _context_compact_keep_recent(self, attempt: int) -> int:
-        base = _CONTEXT_COMPACT_DEFAULT_KEEP_RECENT
-        if attempt <= 1:
-            return base
-        if attempt == 2:
-            return max(2, base // 2)
-        return 1
+    async def _on_summary_model_call(self, call: dict[str, Any]) -> None:
+        usage = call.get("usage") if isinstance(call.get("usage"), Usage) else Usage()
+        label = str(call.get("model") or self.model_label)
+        resolved = self.context_config.models.resolve(label)
+        cost = _resolved_usage_cost_usd(resolved[1].cost if resolved else {}, usage,
+            actual_service_tier=call.get("serviceTier"), provider_cost_usd=call.get("providerCostUsd"))
+        detail = {**_usage_detail(usage, cost), "modelLabel": label, "model": label,
+            "protocol": call.get("protocol", ""), "thinkLevel": "off", "callKind": "context_compaction",
+            "durationMs": int(call.get("totalTimeMs") or 0), "status": call.get("status", "ok"),
+            "errorType": call.get("errorType", ""), "taskUuid": self.task_uuid}
+        if self.on_model_call:
+            await self.on_model_call(detail)
+        await self.dao.update_task(self.task_uuid, model_call_delta=1,
+            input_tokens_delta=usage.input_tokens, output_tokens_delta=usage.output_tokens,
+            cache_read_tokens_delta=usage.cache_read_tokens, cache_write_tokens_delta=usage.cache_write_tokens,
+            cost_usd_delta=cost)
 
-    def _context_compact_summary_chars(self, attempt: int) -> int:
-        base = _CONTEXT_COMPACT_DEFAULT_SUMMARY_CHARS
-        return max(1200, base // max(1, attempt))
-
-    def _context_compact_message_chars(self, attempt: int) -> int:
-        base = _CONTEXT_COMPACT_DEFAULT_MESSAGE_CHARS
-        return max(800, base // max(1, attempt * 4))
-
-    def _agent_history_char_budget(self, attempt: int) -> int:
-        # Keep the semantic tail informative without allowing a long sequence of
-        # ordinary prose messages to become a second raw context window.
-        return max(2_400, _CONTEXT_COMPACT_DEFAULT_SUMMARY_CHARS // max(1, attempt))
-
-    def _context_compaction_source_messages(self, messages: list[Message]) -> list[Message]:
-        """Return transcript units that must be folded into the new summary.
-
-        Task Memory is regenerated from its DAO and Plan runtime is regenerated
-        from its own durable state. Neither belongs in the LLM summary input.
-        """
-        return [
-            message
-            for message in without_task_memory_runtime_messages(messages)
-            if not _is_agent_plan_runtime_message(message)
-            and (message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") != "agent_capabilities"
-        ]
-
-    def _build_agent_history_xml(
-        self,
-        messages: list[Message],
-        *,
-        max_messages: int,
-        attempt: int,
-    ) -> str:
-        """Build a bounded, semantic-only Agent history tail.
-
-        It deliberately does not retain tool protocol, reasoning, old Plan state,
-        Task Memory runtime, or earlier compaction summaries. The summary carries
-        the work facts; this XML only preserves recent task/control/plain-text
-        dialogue that helps the Agent recover the immediate conversational shape.
-        """
-        try:
-            limit = max(0, int(max_messages or 0))
-        except (TypeError, ValueError):
-            limit = 0
-        if limit <= 0:
-            return ""
-        candidates: list[tuple[int, str, str]] = []
-        for index, message in enumerate(messages, start=1):
-            if not isinstance(message, dict):
-                continue
-            if _is_agent_plan_runtime_message(message) or _is_agent_context_summary_message(message):
-                continue
-            role = str(message.get("role") or "")
-            if role not in {"user", "assistant"}:
-                continue
-            if role == "assistant" and message.get("tool_calls"):
-                continue
-            content = _safe_text(message.get("content")).strip()
-            if content:
-                candidates.append((index, role, content))
-        if not candidates:
-            return ""
-        candidates = candidates[-limit:]
-        budget = self._agent_history_char_budget(attempt)
-        per_message = min(self._context_compact_message_chars(attempt), budget)
-        used = len("<agent-history_messages>\n</agent-history_messages>")
-        selected: list[tuple[int, str, str]] = []
-        for index, role, content in reversed(candidates):
-            available = budget - used
-            if available <= 96:
-                break
-            text_limit = min(per_message, max(1, available - 96))
-            text = _middle_ellipsis(content, text_limit)
-            block = f'<{role} index="{index}">\n{html.escape(text, quote=False)}\n</{role}>'
-            # Escaping can grow the text. Shrink against the actual rendered size.
-            while len(block) > available and text_limit > 1:
-                text_limit = max(1, text_limit - (len(block) - available))
-                text = _middle_ellipsis(content, text_limit)
-                block = f'<{role} index="{index}">\n{html.escape(text, quote=False)}\n</{role}>'
-            if len(block) > available:
-                continue
-            selected.append((index, role, text))
-            used += len(block) + 1
-        if not selected:
-            return ""
-        lines = ["<agent-history_messages>"]
-        for index, role, text in reversed(selected):
-            lines.append(f'<{role} index="{index}">\n{html.escape(text, quote=False)}\n</{role}>')
-        lines.append("</agent-history_messages>")
-        return "\n".join(lines)
-
-    def _build_agent_compacted_context_message(
-        self,
-        summary_message: Message,
-        source_messages: list[Message],
-        *,
-        max_messages: int,
-        attempt: int,
-    ) -> Message:
-        """Combine the summary with the XML tail and mark it for future folds."""
-        replacement = dict(summary_message)
-        content = _safe_text(replacement.get("content")).strip()
-        history_xml = self._build_agent_history_xml(
-            source_messages,
-            max_messages=max_messages,
-            attempt=attempt,
+    async def _on_window_rotated(self, detail: dict[str, Any]) -> None:
+        cleared = clear_read_file_state(
+            chat_id=self.chat_id, session_uuid=self.openbear_session_uuid,
+            agent_session_uuid=self.agent_session_uuid,
+            task_uuid=None if self.agent_session_uuid else self.task_uuid,
+            store=getattr(self.tools, "file_state", None),
         )
-        if history_xml:
-            content = f"{content}\n\n{_AGENT_HISTORY_INTRO}\n{history_xml}".strip()
-        replacement["content"] = content
-        replacement[_AGENT_RUNTIME_METADATA_KEY] = {
-            "kind": _AGENT_CONTEXT_SUMMARY_KIND,
-            "version": _AGENT_RUNTIME_VERSION,
-        }
-        return replacement
+        await self.emit(
+            "model_context_compaction_completed", agent_key=self.agent.agent_key,
+            summary="上下文压缩完成 · " + ("模型摘要" if detail.get("strategy") == "model_summary" else "滑动窗口"),
+            detail={**detail, "clearedReadStates": cleared},
+        )
 
-    async def _rebuild_runtime_context_after_compaction(self, messages: list[Message]) -> None:
-        """Re-add only the current durable Agent runtimes after a fold boundary."""
+    async def _fresh_window_runtime_state(self, messages: list[Message]) -> list[Message]:
+        had_completion_gate = any((message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") == "agent_completion_gate"
+                                  for message in messages)
+        refreshed = [message for message in without_task_memory_runtime_messages(messages)
+                     if not _is_agent_plan_runtime_message(message)
+                     and (message.get(_AGENT_RUNTIME_METADATA_KEY) or {}).get("kind") not in {"agent_capabilities", "agent_completion_gate"}]
+        self._task_memory_epoch += 1
+        self._append_capability_state(refreshed, await self._allowed_tool_schemas())
+        if had_completion_gate:
+            correction = await self._completion_correction()
+            if correction:
+                refreshed.append({"role": "user", "content": correction,
+                                  _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_completion_gate"}})
         if self.plan_protocol_enabled:
             self._plan_runtime_digest = ""
             self._last_plan_runtime_snapshot = None
-            await self._append_plan_runtime_update(messages, force_full=True)
-        await self._reconcile_task_memory_context(messages)
+            await self._append_plan_runtime_update(refreshed, force_full=True)
+        await self._reconcile_task_memory_context(refreshed)
+        return refreshed
 
-    def _message_summary_line(self, index: int, message: Message, *, preview_chars: int) -> str:
-        role = str(message.get("role") or "unknown")
-        parts = [f"### {index}. role={role}"]
-        if message.get("name"):
-            parts.append(f"name={message.get('name')}")
-        if message.get("tool_call_id"):
-            parts.append(f"tool_call_id={message.get('tool_call_id')}")
-        content = _safe_text(message.get("content") or "")
-        if content:
-            parts.append("content:\n" + _middle_ellipsis(content, preview_chars))
-        reasoning = _safe_text(message.get("reasoning") or "")
-        if reasoning:
-            parts.append("reasoning/progress:\n" + _middle_ellipsis(reasoning, preview_chars))
-        calls = message.get("tool_calls") or []
-        if calls:
-            parts.append("tool_calls:\n" + "\n".join(_tool_call_preview(c, limit=360) for c in calls))
-        return "\n".join(parts)
+    def _context_request_view(self, messages: list[Message], retry_tail: list[Message] | None = None) -> list[Message]:
+        """One request-local view for both budgeting and actual transmission."""
+        return repair_role_alternation(_messages_with_task_progress(
+            messages + list(retry_tail or []), protocol=str(getattr(self.backend, "protocol", "") or ""),
+        ))
 
-    def _format_context_history_for_summary(self, old_messages: list[Message], *, preview_chars: int) -> str:
-        old_messages = self._context_compaction_source_messages(old_messages)
-        lines = [
-            f"[Rath Agent] {self.agent.name} ({self.agent.agent_key})",
-            f"[任务] {self.task_uuid}",
-        ]
-        if self.agent_session_uuid:
-            lines.append(f"[Agent Session] {self.agent_session_uuid}")
-        for idx, message in enumerate(old_messages, start=1):
-            lines.append(self._message_summary_line(idx, message, preview_chars=preview_chars))
-        return "\n\n".join(lines)
-
-    async def _summarize_context_with_llm(
-        self,
-        old_messages: list[Message],
-        *,
-        attempt: int,
-        reason: str,
-        error: OpenBearLLMError | None = None,
-    ) -> str | None:
-        if self.context_compact_backend is None or not self.context_compact_model:
-            return None
-        history = self._format_context_history_for_summary(
-            old_messages,
-            preview_chars=max(600, min(1600, self._context_compact_message_chars(max(1, attempt)))),
-        )
-        existing = (
-            f"Rath Agent 上下文压缩原因：{reason}\n"
-            f"Agent：{self.agent.name}（{self.agent.agent_key}）\n"
-            f"任务：{self.task_uuid}\n"
-        )
-        if error is not None:
-            existing += f"上游错误：{_middle_ellipsis(error.message, 800)}\n"
-        prompt = _render_summary_prompt(self.context_compact_prompt, existing=existing + "\n", history=history)
-        candidates: list[CompressionCandidate] = [
-            CompressionCandidate(self.context_compact_backend, self.context_compact_model, self.context_compact_source, self.context_compact_label)
-        ]
-        seen_keys = {self.context_compact_label or self.context_compact_model}
-        seen_targets = {(id(self.context_compact_backend), self.context_compact_model)}
-        for candidate in self.context_compact_extra_candidates:
-            candidate_key = candidate.label or candidate.model
-            candidate_target = (id(candidate.backend), candidate.model)
-            if (
-                not candidate.backend
-                or not candidate.model
-                or candidate_key in seen_keys
-                or candidate_target in seen_targets
-            ):
-                continue
-            seen_keys.add(candidate_key)
-            seen_targets.add(candidate_target)
-            candidates.append(candidate)
-        fallback_key = self.context_compact_fallback_model
-        fallback_target = (id(self.context_compact_fallback_backend), self.context_compact_fallback_model)
-        if (
-            self.context_compact_fallback_backend is not None
-            and self.context_compact_fallback_model
-            and fallback_key not in seen_keys
-            and fallback_target not in seen_targets
-        ):
-            candidates.append(CompressionCandidate(self.context_compact_fallback_backend, self.context_compact_fallback_model, "primary-fallback", fallback_key))
-        max_attempts = 1 + self.context_compact_max_retries
-        last_missing: list[str] = []
-        for candidate_index, (backend, model, source, label) in enumerate(candidates):
-            for idx in range(max_attempts):
-                content = prompt
-                if idx > 0 and last_missing:
-                    content = (
-                        "上一次摘要缺少这些必需小节："
-                        + "、".join(last_missing)
-                        + ". Please regenerate the summary with all required headings in English; write \"None\" for empty sections.\n\n"
-                        + prompt
-                    )
-                compact_session_id = f"{self.session_id}:context-compact"
-                compact_started = time.monotonic()
-                compact_returned = False
-                try:
-                    result, partial, partial_error = await collect_backend_result(
-                        backend,
-                        [{"role": "user", "content": content}],
-                        timeout_s=self.context_compact_timeout_s,
-                        model=model,
-                        max_tokens=self.context_compact_max_tokens,
-                        first_byte_timeout_s=self.context_compact_timeout_s,
-                        total_timeout_s=self.context_compact_timeout_s,
-                        read_timeout_s=self.context_compact_timeout_s,
-                        session_id=compact_session_id,
-                    )
-                    compact_returned = True
-                    compact_duration_ms = int((time.monotonic() - compact_started) * 1000)
-                    if self.on_model_call is not None:
-                        compact_label = label or model
-                        compact_cost = _resolved_usage_cost_usd(
-                            self.context_compact_costs.get(compact_label, {}),
-                            result.usage,
-                            actual_service_tier=result.service_tier,
-                            provider_cost_usd=result.provider_cost_usd,
-                        )
-                        detail = {
-                            **_usage_detail(result.usage, compact_cost),
-                            "model": model,
-                            "modelLabel": compact_label,
-                            "protocol": str(getattr(backend, "protocol", "") or ""),
-                            "thinkLevel": "off",
-                            "durationMs": compact_duration_ms,
-                            "tps": result.usage.output_tokens * 1000 / compact_duration_ms
-                            if compact_duration_ms > 0 and result.usage.output_tokens > 0 else 0.0,
-                            "status": "error" if partial else "ok",
-                            "errorType": partial_error if partial else "",
-                            "kind": "context_compaction",
-                            "taskUuid": self.task_uuid,
-                            "serviceTier": result.service_tier,
-                            "providerCostUsd": result.provider_cost_usd,
-                        }
-                        try:
-                            maybe = self.on_model_call(detail)
-                            if inspect.isawaitable(maybe):
-                                await maybe
-                        except Exception as accounting_exc:
-                            await self.emit(
-                                "model_call_accounting_failed",
-                                agent_key=self.agent.agent_key,
-                                summary="Agent 压缩模型调用即时记账失败",
-                                detail={"error": f"{type(accounting_exc).__name__}: {accounting_exc}"},
-                            )
-                            raise
-                    summary = (result.text or result.reasoning or "").strip()
-                except Exception as exc:
-                    if compact_returned:
-                        # The upstream call succeeded; this exception came from
-                        # durable accounting and must abort rather than be counted
-                        # again as an upstream failure/retried with another model.
-                        raise
-                    if self.on_model_call is not None:
-                        compact_label = label or model
-                        failure_usage = getattr(exc, "usage", None)
-                        if not isinstance(failure_usage, Usage):
-                            failure_usage = Usage()
-                        detail = {
-                            **_usage_detail(
-                                failure_usage,
-                                _resolved_usage_cost_usd(
-                                    self.context_compact_costs.get(compact_label, {}),
-                                    failure_usage,
-                                    actual_service_tier=getattr(exc, "service_tier", ""),
-                                    provider_cost_usd=getattr(exc, "provider_cost_usd", None),
-                                ),
-                            ),
-                            "model": model,
-                            "modelLabel": compact_label,
-                            "protocol": str(getattr(backend, "protocol", "") or ""),
-                            "thinkLevel": "off",
-                            "durationMs": int((time.monotonic() - compact_started) * 1000),
-                            "tps": 0.0,
-                            "status": "error",
-                            "errorType": type(exc).__name__,
-                            "kind": "context_compaction",
-                            "taskUuid": self.task_uuid,
-                            "serviceTier": getattr(exc, "service_tier", ""),
-                            "providerCostUsd": getattr(exc, "provider_cost_usd", None),
-                        }
-                        try:
-                            maybe = self.on_model_call(detail)
-                            if inspect.isawaitable(maybe):
-                                await maybe
-                        except Exception as accounting_exc:
-                            await self.emit(
-                                "model_call_accounting_failed",
-                                agent_key=self.agent.agent_key,
-                                summary="失败 Agent 压缩模型调用即时记账失败",
-                                detail={"error": f"{type(accounting_exc).__name__}: {accounting_exc}"},
-                            )
-                            raise
-                    await self.emit(
-                        "model_context_compaction_failed",
-                        agent_key=self.agent.agent_key,
-                        summary=f"上下文压缩模型调用失败：{source}",
-                        detail={"model": label or model, "modelId": model, "source": source, "error": str(exc)[:1000]},
-                    )
-                    continue
-                if not summary:
-                    continue
-                missing = _summary_missing_sections(summary)
-                if not missing:
-                    if source == "primary-fallback":
-                        await self.emit(
-                            "model_context_compaction_fallback_used",
-                            agent_key=self.agent.agent_key,
-                            summary="压缩模型全部失败后已回退主模型完成 Agent 上下文压缩",
-                            detail={"fallbackModel": label or model, "fallbackModelId": model},
-                        )
-                    elif source != "compression":
-                        await self.emit(
-                            "model_context_compaction_candidate_used",
-                            agent_key=self.agent.agent_key,
-                            summary="压缩候选模型已完成 Agent 上下文压缩",
-                            detail={"model": label or model, "modelId": model, "source": source},
-                        )
-                    return summary
-                last_missing = missing
-            if source != "primary-fallback" and candidate_index < len(candidates) - 1:
-                await self.emit(
-                    "model_context_compaction_fallback_start",
-                    agent_key=self.agent.agent_key,
-                    summary="压缩候选模型未产出合格摘要，准备尝试下一个候选",
-                    detail={"compressionModel": label or model, "compressionModelId": model, "missing": last_missing},
-                )
-        return None
-
-    def _build_context_summary_message(
-        self,
-        summary: str,
-        old_messages: list[Message],
-        *,
-        attempt: int,
-        reason: str,
-        error: OpenBearLLMError | None = None,
-    ) -> Message:
-        prefix = [
-            "【Rath Agent 上下文压缩摘要】",
-            f"触发原因：{reason}",
-            f"Agent：{self.agent.name}（{self.agent.agent_key}）",
-            f"压缩轮次：{attempt}",
-            f"原始消息数：{len(old_messages)}",
-        ]
-        if error is not None:
-            prefix.append(f"错误摘要：{_middle_ellipsis(error.message, 500)}")
-        return {"role": "user", "content": "\n".join(prefix) + "\n\n" + summary.strip()}
-
-    def _build_context_compaction_message(
-        self,
-        old_messages: list[Message],
-        *,
-        attempt: int,
-        error: OpenBearLLMError,
-    ) -> Message:
-        limit = self._context_compact_summary_chars(attempt)
-        per_message = max(300, min(1200, limit // max(1, len(old_messages))))
-        body_lines = [
-            "【Rath Agent 上下文压缩摘要】",
-            "触发原因：子 Agent 模型调用返回上下文超限；系统已把较早的对话/工具结果压缩到这条摘要中。",
-            f"Agent：{self.agent.name}（{self.agent.agent_key}）",
-            f"压缩轮次：{attempt}",
-            f"原始消息数：{len(old_messages)}",
-            f"错误摘要：{_middle_ellipsis(error.message, 500)}",
-            "",
-            "继续任务时请优先依据下方摘要和后续未压缩消息；不要要求 OpenBear 从头重跑。",
-            "",
-            "## 被压缩的历史要点",
-        ]
-        for idx, message in enumerate(old_messages, start=1):
-            body_lines.append(self._message_summary_line(idx, message, preview_chars=per_message))
-        content = _middle_ellipsis("\n\n".join(body_lines), limit)
-        return {"role": "user", "content": content}
-
-    def _context_compaction_event_detail(
-        self,
-        *,
-        status: str,
-        source: str,
-        before_tokens: int,
-        after_tokens: int,
-        compacted_output: str = "",
-        unavailable_reason: str = "",
-        extra: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        output = str(compacted_output or "")
-        identity_material = output or json.dumps({
-            "status": status,
-            "source": source,
-            "beforeTokens": int(before_tokens or 0),
-            "afterTokens": int(after_tokens or 0),
-            "extra": extra or {},
-        }, ensure_ascii=False, sort_keys=True, default=str)
-        digest = hashlib.sha256(identity_material.encode("utf-8", "ignore")).hexdigest()[:16]
-        compaction_id = f"agent-compaction:{self.task_uuid}:{status}:{digest}"
-        detail: dict[str, Any] = {
-            "final": True,
-            "compactionId": compaction_id,
-            "summaryId": compaction_id,
-            "scope": "agent",
-            "source": str(source or "agent_context"),
-            "status": str(status or "failed"),
-            "beforeTokens": int(before_tokens or 0),
-            "afterTokens": int(after_tokens or 0),
-            "summaryChars": len(output),
-            "outputAvailable": bool(output),
-            **dict(extra or {}),
-        }
-        if output:
-            detail["compactedOutput"] = output
-        else:
-            detail["outputUnavailable"] = str(unavailable_reason or "summary_not_available")
-        return detail
-
-    async def _compact_context_after_overflow(
-        self,
-        messages: list[Message],
-        *,
-        attempt: int,
-        error: OpenBearLLMError,
+    async def _prepare_context_window(
+        self, messages: list[Message], tools: list[dict[str, Any]], *,
+        force: bool = False, attempt: int = 0, retry_tail: list[Message] | None = None,
     ) -> bool:
-        estimated_before_tokens = self._estimate_context_tokens(messages)
-        provider_before_tokens = self._provider_prompt_tokens_for_compaction()
-        before_tokens = max(estimated_before_tokens, provider_before_tokens)
-        before_count = len(messages)
-        # Drop every raw protocol unit at the fold boundary. Tool pairing is only
-        # relevant before the boundary; the summary now carries its work facts.
-        working = [dict(message) for message in without_task_memory_runtime_messages(messages)]
-        source_messages = self._context_compaction_source_messages(working)
-        keep_recent = self._context_compact_keep_recent(attempt)
-        can_fold = len(source_messages) > 1 or any(
-            _is_agent_context_summary_message(message) for message in source_messages
-        )
-        if not can_fold:
-            return False
-        summary = await self._summarize_context_with_llm(
-            source_messages,
-            attempt=attempt,
-            reason="模型上下文超限",
-            error=error,
-        )
-        if summary:
-            base_replacement = self._build_context_summary_message(
-                summary,
-                source_messages,
-                attempt=attempt,
-                reason="模型上下文超限",
-                error=error,
+        window = self._get_window_runtime()
+        previous = window.window_version
+        try:
+            prepared = await window.prepare(
+                messages, system=self._system_prompt(), tools=tools, force=force, attempt=attempt,
+                refresh_after_rotation=self._fresh_window_runtime_state,
+                request_view=lambda selected: self._context_request_view(selected, retry_tail),
+                request_options={**self._request_options, "stream": callable(getattr(self.backend, "stream", None))},
             )
-            compaction_source = "llm_summary"
-        else:
-            base_replacement = self._build_context_compaction_message(
-                source_messages,
-                attempt=attempt,
-                error=error,
-            )
-            compaction_source = "deterministic_fallback"
-        replacement = self._build_agent_compacted_context_message(
-            base_replacement,
-            source_messages,
-            max_messages=keep_recent,
-            attempt=attempt,
-        )
-        self._replace_context_in_new_task_memory_epoch(messages, [replacement])
-        await self._rebuild_runtime_context_after_compaction(messages)
-        self._consume_provider_prompt_usage_for_compaction()
-        compacted_output = _safe_text(replacement.get("content"))
-        after_tokens = self._estimate_context_tokens(messages)
-        await self.dao.update_task(
-            self.task_uuid,
-            current_agent_key=self.agent.agent_key,
-            current_status="上下文超限，已压缩后重试",
-        )
-        cleared_read_states = clear_read_file_state(chat_id=self.chat_id)
-        if self.agent_session_uuid:
-            cleared_read_states += clear_read_file_state(session_uuid=self.agent_session_uuid)
-        await self.emit(
-            "model_context_overflow_compacted",
-            agent_key=self.agent.agent_key,
-            summary="模型上下文超限，已压缩 Rath Agent 上下文后重试",
-            detail=self._context_compaction_event_detail(
-                status="overflow_compacted",
-                source=compaction_source,
-                before_tokens=before_tokens,
-                after_tokens=after_tokens,
-                compacted_output=compacted_output,
-                extra={
-                    "attempt": attempt,
-                    "messageCountBefore": before_count,
-                    "messageCountAfter": len(messages),
-                    "estimatedTokensBefore": estimated_before_tokens,
-                    "providerPromptTokensBefore": provider_before_tokens,
-                    "tokenSource": "provider_usage" if provider_before_tokens > estimated_before_tokens else "estimate",
-                    "estimatedTokensAfter": after_tokens,
-                    "trimmedMessages": 0,
-                    "keepRecent": keep_recent,
-                    "keepRecentMode": "semantic_xml",
-                    "rawMessagesKept": 0,
-                    "clearedReadStates": cleared_read_states,
-                    "error": error.message[:1000],
-                },
-            ),
-        )
-        return True
-
-    async def _pre_compact_context_if_needed(self, messages: list[Message]) -> bool:
-        threshold = self._context_token_threshold()
-        if threshold <= 0:
-            return False
-        estimated_before_tokens = self._estimate_context_tokens(messages)
-        provider_before_tokens = self._provider_prompt_tokens_for_compaction()
-        before_tokens = max(estimated_before_tokens, provider_before_tokens)
-        if before_tokens <= threshold:
-            return False
-        working = [dict(message) for message in without_task_memory_runtime_messages(messages)]
-        source_messages = self._context_compaction_source_messages(working)
-        # A lone prior summary is already the smallest semantic transcript we
-        # can safely keep. Leave further shrinking to actual overflow recovery,
-        # whose attempt budget becomes progressively more aggressive.
-        if len(source_messages) <= 1:
-            return False
-        summary = await self._summarize_context_with_llm(
-            source_messages,
-            attempt=1,
-            reason=f"上下文计量超过模型触发阈值 {threshold}",
-        )
-        if not summary:
-            await self.emit(
-                "model_context_compaction_failed",
-                agent_key=self.agent.agent_key,
-                summary="Rath Agent 上下文压缩未生成可用摘要",
-                detail=self._context_compaction_event_detail(
-                    status="failed",
-                    source="pre_model_request",
-                    before_tokens=before_tokens,
-                    after_tokens=before_tokens,
-                    unavailable_reason="summary_not_available",
-                    extra={
-                        "threshold": threshold,
-                        "estimatedTokensBefore": estimated_before_tokens,
-                        "providerPromptTokensBefore": provider_before_tokens,
-                        "tokenSource": "provider_usage" if provider_before_tokens > estimated_before_tokens else "estimate",
-                        "estimatedTokensAfter": before_tokens,
-                        "keepRecent": self.context_compact_keep_recent,
-                        "keepRecentMode": "semantic_xml",
-                    },
-                ),
-            )
-            return False
-        before_count = len(messages)
-        base_replacement = self._build_context_summary_message(
-            summary,
-            source_messages,
-            attempt=1,
-            reason=f"上下文计量超过模型触发阈值 {threshold}",
-        )
-        replacement = self._build_agent_compacted_context_message(
-            base_replacement,
-            source_messages,
-            max_messages=self.context_compact_keep_recent,
-            attempt=1,
-        )
-        self._replace_context_in_new_task_memory_epoch(messages, [replacement])
-        await self._rebuild_runtime_context_after_compaction(messages)
-        self._consume_provider_prompt_usage_for_compaction()
-        compacted_output = _safe_text(replacement.get("content"))
-        after_tokens = self._estimate_context_tokens(messages)
-        cleared_read_states = clear_read_file_state(chat_id=self.chat_id)
-        if self.agent_session_uuid:
-            cleared_read_states += clear_read_file_state(session_uuid=self.agent_session_uuid)
-        await self.emit(
-            "model_context_pre_compacted",
-            agent_key=self.agent.agent_key,
-            summary="Rath Agent 上下文超过模型触发阈值，已先压缩再调用模型",
-            detail=self._context_compaction_event_detail(
-                status="pre_compacted",
-                source="pre_model_request",
-                before_tokens=before_tokens,
-                after_tokens=after_tokens,
-                compacted_output=compacted_output,
-                extra={
-                    "threshold": threshold,
-                    "messageCountBefore": before_count,
-                    "messageCountAfter": len(messages),
-                    "estimatedTokensBefore": estimated_before_tokens,
-                    "providerPromptTokensBefore": provider_before_tokens,
-                    "tokenSource": "provider_usage" if provider_before_tokens > estimated_before_tokens else "estimate",
-                    "estimatedTokensAfter": after_tokens,
-                    "keepRecent": self.context_compact_keep_recent,
-                    "keepRecentMode": "semantic_xml",
-                    "rawMessagesKept": 0,
-                    "clearedReadStates": cleared_read_states,
-                },
-            ),
-        )
-        return True
+        except (RequiredContextTooLarge, ContextCompressionError) as exc:
+            # A blocked retry must not lose the text that already streamed. Keep
+            # it in the private execution archive, not in the active prompt or a
+            # synthetic user instruction. The control handoff names exact refs.
+            partials = [mark_source(dict(item), kind="execution") for item in (retry_tail or [])
+                        if item.get("role") == "assistant" and item.get("content")]
+            if partials:
+                await window.store.archive(partials)
+            raise RathNeedsOpenBearControl({
+                "ok": False, "status": "needs_openbear_control",
+                "reason": "agent_required_context_too_large" if isinstance(exc, RequiredContextTooLarge) else "agent_context_compression_failed",
+                "message": str(exc), "taskUuid": self.task_uuid, "agentSessionUuid": self.agent_session_uuid,
+                "continuable": False, "instructionsPreserved": True,
+                "partialOutputEventIds": [source_of(item)["id"] for item in partials],
+            }) from exc
+        messages[:] = prepared
+        await self._save_context_boundary(messages, "window_prepared")
+        return window.window_version != previous
 
     def _context_overflow_control_payload(self, error: OpenBearLLMError, *, attempts: int) -> dict[str, Any]:
         return {
-            "ok": False,
-            "status": "needs_openbear_control",
-            "reason": "agent_context_overflow_unrecoverable",
-            "message": (
-                f"{self.agent.name} 的上下文超过模型窗口，已尝试压缩 {attempts} 次但仍无法安全恢复。"
-                "需要 OpenBear 缩小任务范围、减少输入/工具结果，或关闭该 Rath Agent Session 后重新派发更窄任务。"
-            ),
-            "taskUuid": self.task_uuid,
-            "agentSessionUuid": self.agent_session_uuid,
-            "agent": agent_to_snapshot(self.agent),
-            "error": error.message[:2000],
-            "continuable": False,
-            "next": (
-                "当前上下文本身已无法进入模型窗口，不能安全续跑同一 task。"
-                "请调用 AgentStop 结束该 task，再用更窄的 prompt 新建 Agent task。"
-            ),
+            "ok": False, "status": "needs_openbear_control", "reason": "agent_context_overflow_unrecoverable",
+            "message": f"{self.agent.name} 已尝试上下文压缩 {attempts} 次仍无法在配置阈值内组成合法输入；已停止继续请求，未删除任务要求，也未重复工具。",
+            "taskUuid": self.task_uuid, "agentSessionUuid": self.agent_session_uuid,
+            "agent": agent_to_snapshot(self.agent), "error": error.message[:2000], "continuable": False,
         }
 
     def _system_prompt(self) -> str:
@@ -2142,6 +1688,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         """
         own = (self.agent.system_prompt or f"你是 {self.agent.name}。{self.agent.description}").strip()
         identity = own if not self.base_system_prompt else f"{self.base_system_prompt.rstrip()}\n\n{own.lstrip()}"
+        identity = effective_context_prompt(identity, self._window_runtime.active_strategy if self._window_runtime else "sliding_window")
         if not self.plan_protocol_enabled:
             return identity
         whitelist = ", ".join(sorted(AGENT_DELEGATION_TOOL_NAMES))
@@ -2419,28 +1966,35 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 last_partial_chars = chars
 
             try:
-                await self._pre_compact_context_if_needed(messages)
                 # Reconcile into the actual private model context on every physical
                 # boundary. Unchanged retries are no-ops; a mutation during retry is
                 # appended once and every previously emitted unit remains untouched.
                 await self._reconcile_task_memory_context(messages)
-                outbound = repair_role_alternation(
-                    _messages_with_task_progress(messages + retry_context, protocol=str(getattr(self.backend, "protocol", "") or ""))
-                )
+                for revision_attempt in range(3):
+                    await self._prepare_context_window(messages, tool_schemas, retry_tail=retry_context)
+                    await self.checkpoint("window_pre_model", agent_key=self.agent.agent_key)
+                    if not self.steers:
+                        break
+                    # Window selection awaits persistence. An intervention accepted
+                    # meanwhile must enter both context and current tool gates before
+                    # the request, not wait for another completed model response.
+                    await self._checkpoint_and_append_steers("window_pre_model", messages)
+                    tool_schemas = await self._allowed_tool_schemas()
+                    self._append_capability_state(messages, tool_schemas)
+                    await self._append_plan_runtime_update(messages)
+                else:
+                    raise RuntimeError("agent_controls_changed_repeatedly_before_request; instructions_preserved")
+                window_ticket = await self._get_window_runtime().begin_request()
+                outbound = self._context_request_view(messages, retry_context)
                 stream_call = getattr(self.backend, "stream", None)
                 if callable(stream_call):
                     used_stream = True
                     async for event in stream_call(
                         outbound,
                         model=self.model,
-                        system=self._system_prompt(),
+                        system=self._get_window_runtime().system or self._system_prompt(),
                         tools=tool_schemas or None,
-                        max_tokens=self.max_tokens,
-                        think_level=self.think_level,
-                        service_tier=self.service_tier,
-                        fast_request=self.fast_request,
-                        session_id=self.session_id,
-                        native_continuation=str(getattr(self.backend, "protocol", "") or "").lower() == "responses",
+                        **copy.deepcopy(self._request_options),
                     ):
                         apply_provider_billing(result, event.details)
                         if event.kind == "error":
@@ -2470,14 +2024,9 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                     result = await self.backend.complete(
                         outbound,
                         model=self.model,
-                        system=self._system_prompt(),
+                        system=self._get_window_runtime().system or self._system_prompt(),
                         tools=tool_schemas or None,
-                        max_tokens=self.max_tokens,
-                        think_level=self.think_level,
-                        service_tier=self.service_tier,
-                        fast_request=self.fast_request,
-                        session_id=self.session_id,
-                        native_continuation=str(getattr(self.backend, "protocol", "") or "").lower() == "responses",
+                        **copy.deepcopy(self._request_options),
                     )
                 break
             except asyncio.CancelledError:
@@ -2492,6 +2041,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 duration_ms = int((time.monotonic() - started) * 1000)
                 failure_usage = result.usage
                 self._record_provider_prompt_usage(failure_usage)
+                await self._get_window_runtime().observe_usage(failure_usage, ticket=window_ticket)
                 failure_cost_usd = self._request_cost(failure_usage, result)
                 failure_detail = {
                     **_usage_detail(failure_usage, failure_cost_usd),
@@ -2538,13 +2088,14 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 if is_context_overflow_error(exc.message):
                     if overflow_attempt < overflow_max:
                         overflow_attempt += 1
-                        compacted = await self._compact_context_after_overflow(
-                            messages,
-                            attempt=overflow_attempt,
-                            error=exc,
+                        rotated = await self._prepare_context_window(
+                            messages, tool_schemas, force=True, attempt=overflow_attempt - 1,
+                            retry_tail=retry_context,
                         )
-                        if compacted:
-                            attempt = 0
+                        if rotated:
+                            retry_context = []
+                            accumulated_text = ""
+                            # Compression recovery must not reset the failed-call retry budget.
                             continue
                     raise RathNeedsOpenBearControl(
                         self._context_overflow_control_payload(exc, attempts=overflow_attempt)
@@ -2651,7 +2202,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                         agent_key=self.agent.agent_key,
                         summary=(
                             f"模型调用失败：{payload.get('summary') or payload.get('reason') or '上游错误'}，"
-                            f"{round(wait, 1):g} 秒后重试 {attempt}/{retry_max}"
+                            f"{retry_delay_label(wait)}后重试 {attempt}/{retry_max}"
                             if payload.get("active") else f"模型重试等待结束 {attempt}/{retry_max}"
                         ),
                         detail={"retry": dict(payload), "round": round_no},
@@ -2710,6 +2261,7 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
         duration_ms = int((time.monotonic() - started) * 1000)
         usage = result.usage
         self._record_provider_prompt_usage(usage)
+        await self._get_window_runtime().observe_usage(usage, ticket=window_ticket)
         cost_usd = self._request_cost(usage, result)
         tps = usage.output_tokens * 1000 / duration_ms if duration_ms > 0 and usage.output_tokens > 0 else 0.0
         await self.dao.update_task(
@@ -2935,6 +2487,11 @@ class SingleAgentWorkflowRunner(RathWorkflowRunner):
                 self._frozen_execution_tool_schemas = json.loads(json.dumps(schemas, ensure_ascii=False))
             return json.loads(json.dumps(self._frozen_execution_tool_schemas, ensure_ascii=False))
         return schemas
+
+    async def _completion_correction(self) -> str:
+        if self._pending_control_acks:
+            return "先对所有待回执控制调用 AgentControlAck；尚未完成回执，不能结束本轮。"
+        return await self._plan_completion_correction()
 
     async def _plan_completion_correction(self) -> str:
         if not self.plan_protocol_enabled:

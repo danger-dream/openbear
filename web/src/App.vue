@@ -10,6 +10,7 @@ import SettingsHubView from "./views/SettingsHubView.vue";
 import LoginView from "./views/LoginView.vue";
 import BearLogo from "./components/BearLogo.vue";
 import ConversationTree from "./components/ConversationTree.vue";
+import {activityInteractionTarget} from "./conversationActivity.js";
 import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
@@ -454,7 +455,12 @@ function handleTreeFolderRemoved({ folderId, targetFolderId = "" }) {
 }
 async function handleTreeOpen(row) {
   if (!row?.conversationUuid) return;
+  const target = activityInteractionTarget(row);
   await openConversation(row);
+  await nextTick();
+  if (target && activeConversationUuid.value === target.conversationUuid) {
+    consoleViewRef.value?.focusPendingInteraction(target);
+  }
 }
 function currentDraftConversation() { return conversations.value.find(isLocalConversation) || null; }
 async function openConversation(row) {
@@ -1248,6 +1254,7 @@ onBeforeUnmount(() => {
         v-if="active === 'console'"
         ref="consoleViewRef"
         :conversation-uuid="activeConversationUuid"
+        :navigation-obscured="sidebarOpen"
         :folder-id="isLocalConversation(activeConversationUuid) ? draftFolderId : selectedFolderId"
         @conversation-created="handleConsoleConversationCreated"
         @conversations-refresh="handleConsoleRefreshList"

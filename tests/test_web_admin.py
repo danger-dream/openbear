@@ -12,7 +12,6 @@ from aiohttp import WSServerHandshakeError
 from aiohttp.test_utils import TestClient, TestServer
 
 from app.agent import steering
-from app.agent.compaction import CompactionOutcome
 from app.agent.result import RunResult
 from app.agent.runs import RunRegistry
 from app.config import Config
@@ -41,8 +40,6 @@ from app.utils import estimate_tokens
 from app.web_admin import (
     WebAdminServer,
     _sha256,
-    _WebContextCompactionGate,
-    _WebEmergencyCompactor,
     _WebLiveStream,
     _WebStreamRenderer,
 )
@@ -1124,219 +1121,14 @@ async def test_conversation_list_ignores_waiting_control_notice_as_runtime(web_e
     assert notice["lifecycle"] == "informational"
 
 
-async def test_context_compaction_stats_fields(web_env):
-    result = RunResult()
-    result.last_usage.input_tokens = 267061
-    outcome = CompactionOutcome(
-        did=True,
-        source="turn_epilogue",
-        trigger_tokens=267061,
-        threshold_tokens=250000,
-        keep_recent=8,
-        up_to_message_id=12121,
-        old_message_count=234,
-        kept_message_count=101,
-        summary_id=7,
-        summary="## Primary Request and Intent\n...",
-        summary_tokens=4500,
-        compression_model_label="openai/deepseek-v4-flash",
-    )
-
-    stats = web_env.server._run_stats_json(
-        result,
-        cost_usd=0,
-        model="openai/gpt",
-        think_level="off",
-        context_window=400000,
-        compactions=[(outcome, 42000)],
-    )
-
-    assert stats["contextTokens"] == 267061
-    assert stats["contextCompacted"] is True
-    assert stats["contextAfterCompactionTokens"] == 42000
-    assert stats["contextCompaction"]["source"] == "turn_epilogue"
-    assert stats["contextCompaction"]["triggerTokens"] == 267061
-    assert stats["contextCompaction"]["afterTokens"] == 42000
 
 
-async def test_web_build_history_after_compaction_replays_visible_xml_only(web_env):
-    row = await web_env.server._create_web_conversation(123, title="visible XML tail", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    messages = MessageDAO(web_env.db)
-    await messages.add(chat_id, "user", "用户可见请求")
-    await messages.add(
-        chat_id, "assistant", "正在执行 AgentWait",
-        tool_calls=[ToolCall(id="wait-1", name="AgentWait", arguments="{}")],
-    )
-    await messages.add(
-        chat_id, "tool", '{"notifications":["huge Plan and AgentWait runtime JSON"]}',
-        tool_call_id="wait-1", name="AgentWait",
-    )
-    final_id = await messages.add(chat_id, "assistant", "最终可见结论")
-    await SummaryDAO(web_env.db).add(chat_id, "已压缩的历史摘要", final_id, 10)
-    await messages.mark_compacted(chat_id, final_id)
-
-    history = await web_env.server._build_history(chat_id)
-
-    assert [message["role"] for message in history] == ["user", "assistant"]
-    context = str(history[0]["content"])
-    assert "<history_messages>" in context
-    assert "用户可见请求" in context
-    assert "最终可见结论" in context
-    assert "正在执行 AgentWait" not in context
-    assert "huge Plan" not in context
 
 
-async def test_web_context_compaction_gate_preserves_runtime_multimodal_tail():
-    runtime_user = {"role": "user", "content": [
-        {"type": "text", "text": "请看图"},
-        {"type": "image", "path": "/tmp/pic.png", "mime_type": "image/png", "name": "pic.png"},
-    ]}
-    rebuilt_from_db = [
-        {"role": "user", "content": "[此前对话摘要]\nsummary"},
-        {"role": "assistant", "content": "好的，我已了解此前的上下文。"},
-        {"role": "user", "content": "请看图"},
-    ]
-    outcome = CompactionOutcome(did=True, source="tool_batch", kept_message_count=1)
-
-    seen_prompt_tokens = []
-
-    class FakeCompactor:
-        async def maybe_compact_detail(self, chat_id, prompt_tokens=None, source=""):
-            seen_prompt_tokens.append(prompt_tokens)
-            return outcome
-
-    class Owner:
-        def _estimate_prompt_tokens(self, *, system="", convo=None):
-            return 123
-        def _make_web_compactor(self, chat_id, *, model_label=""):
-            return FakeCompactor()
-        async def _build_history(self, chat_id):
-            return [dict(m) for m in rebuilt_from_db]
-        async def _emit_context_compaction_event(self, renderer, outcome, *, source=""):
-            return None
-
-    seen = []
-    async def on_compacted(outcome, after_tokens):
-        seen.append((outcome, after_tokens))
-
-    gate = _WebContextCompactionGate(Owner(), 1, system="sys", on_compacted=on_compacted)
-    new_convo = await gate.maybe_compact_and_rebuild(
-        source="agent_result_preflight",
-        prompt_tokens=500,
-        convo=[{"role": "user", "content": "old"}, runtime_user],
-    )
-
-    assert seen_prompt_tokens == [500]
-    assert new_convo[-1]["content"] == runtime_user["content"]
-    assert any(block.get("type") == "image" for block in new_convo[-1]["content"])
-    assert seen and seen[0][1] == 123
 
 
-async def test_web_agent_result_compaction_preserves_complete_tool_pair_tail():
-    full_result = json.dumps({
-        "resultOutputTokens": 9000,
-        "resultCount": 2,
-        "notifications": [{"result": "完整证据" * 20_000}],
-    }, ensure_ascii=False)
-    tool_call = {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [{
-            "id": "wait-full-result",
-            "type": "function",
-            "function": {"name": "AgentWait", "arguments": '{"mode":"event_only"}'},
-        }],
-        "native_output_items": [{
-            "type": "function_call",
-            "call_id": "wait-full-result",
-            "name": "AgentWait",
-            "arguments": '{"mode":"event_only"}',
-        }],
-    }
-    tool_result = {
-        "role": "tool",
-        "tool_call_id": "wait-full-result",
-        "name": "AgentWait",
-        "content": full_result,
-    }
-    outcome = CompactionOutcome(did=True, source="agent_result_preflight", kept_message_count=2)
-
-    class FakeCompactor:
-        async def maybe_compact_detail(self, chat_id, prompt_tokens=None, source=""):
-            return outcome
-
-    class Owner:
-        def _estimate_prompt_tokens(self, *, system="", convo=None):
-            return 123
-
-        def _make_web_compactor(self, chat_id, *, model_label=""):
-            return FakeCompactor()
-
-        async def _build_history(self, chat_id):
-            return [
-                {"role": "user", "content": "[此前对话摘要]\nsummary"},
-                {"role": "assistant", "content": "db placeholder"},
-                {"role": "tool", "tool_call_id": "wait-full-result", "name": "AgentWait", "content": "db placeholder"},
-            ]
-
-        async def _emit_context_compaction_event(self, renderer, outcome, *, source=""):
-            return None
-
-    epoch_resets = []
-    gate = _WebContextCompactionGate(
-        Owner(), 1, system="sys", on_cache_epoch_reset=lambda: epoch_resets.append(1),
-    )
-    rebuilt = await gate.maybe_compact_and_rebuild(
-        source="agent_result_preflight",
-        prompt_tokens=10_000,
-        convo=[
-            {"role": "user", "content": "old"},
-            _trusted_task_memory_state(),
-            tool_call,
-            tool_result,
-        ],
-    )
-
-    assert epoch_resets == [1]
-    assert not any(is_task_memory_runtime_message(message) for message in rebuilt)
-    assert rebuilt[-2] == {key: value for key, value in tool_call.items() if key != "native_output_items"}
-    assert "native_output_items" not in rebuilt[-2]
-    assert rebuilt[-1] == tool_result
-    assert rebuilt[-1]["content"] == full_result
 
 
-async def test_web_emergency_compactor_preserves_runtime_multimodal_tail():
-    runtime_user = {"role": "user", "content": [{"type": "image", "path": "/tmp/pic.png"}]}
-    outcome = CompactionOutcome(did=True, source="emergency", kept_message_count=1)
-
-    class FakeCompactor:
-        async def force_compact_detail(self, chat_id, *, source="emergency", keep=None):
-            return outcome
-
-    class Owner:
-        def _estimate_prompt_tokens(self, *, system="", convo=None):
-            return 77
-        def _make_web_compactor(self, chat_id, *, model_label=""):
-            return FakeCompactor()
-        async def _build_history(self, chat_id):
-            return [{"role": "user", "content": "[此前对话摘要]\nsummary"}, {"role": "user", "content": "visible"}]
-        async def _emit_context_compaction_event(self, renderer, outcome, *, source=""):
-            return None
-
-    epoch_resets = []
-    compactor = _WebEmergencyCompactor(
-        Owner(), 1, system="sys", on_cache_epoch_reset=lambda: epoch_resets.append(1),
-    )
-    new_convo = await compactor.compact_and_rebuild(convo=[
-        {"role": "user", "content": "old"},
-        _trusted_task_memory_state(),
-        runtime_user,
-    ])
-
-    assert epoch_resets == [1]
-    assert not any(is_task_memory_runtime_message(message) for message in new_convo)
-    assert new_convo[-1]["content"] == runtime_user["content"]
 
 
 async def test_web_responses_native_context_persists_privately_and_reloads_next_turn(web_env, monkeypatch):
@@ -1417,7 +1209,8 @@ async def test_web_responses_native_context_persists_privately_and_reloads_next_
     first_request, same_turn_request = first_backend.seen_convos
     assert same_turn_request[:len(first_request)] == first_request
     assert sum(is_task_memory_runtime_message(message) for message in same_turn_request) == 1
-    assert first_backend.seen_systems[0] == first_backend.seen_systems[1] == "stable system"
+    from app.context.prompts import effective_context_prompt
+    assert first_backend.seen_systems[0] == first_backend.seen_systems[1] == effective_context_prompt("stable system")
     assert first_backend.seen_tools[0] == first_backend.seen_tools[1]
 
     cur = await web_env.db.conn.execute(
@@ -1438,7 +1231,7 @@ async def test_web_responses_native_context_persists_privately_and_reloads_next_
     assert "openbear-task-memory-state" not in visible_payload
     plain_history = await web_env.server._build_history(chat_id)
     assert marker not in json.dumps(plain_history, ensure_ascii=False, default=str)
-    assert "openbear-task-memory-state" not in json.dumps(plain_history, ensure_ascii=False, default=str)
+    assert sum(is_task_memory_runtime_message(message) for message in plain_history) == 1
     assert not any(message.get("native_output_items") for message in plain_history)
     global_memory_rows = []
     for table in ("memory_entries", "memory_docs", "memory_secrets"):
@@ -1618,52 +1411,6 @@ async def test_web_controller_physical_retry_keeps_task_memory_state_prefix(web_
     assert backend.seen_tools[0] == backend.seen_tools[1]
 
 
-async def test_web_run_pre_compaction_ignores_stale_previous_usage_and_emits_event(web_env, monkeypatch):
-    cfg = _cfg()
-    cfg.agent.compact_ratio = 0.5
-    cfg.agent.keep_recent_messages = 4
-    cfg.models.providers["openai"].models[0].compact_trigger_tokens = 100
-    backend = FakeStreamBackend([[StreamEvent(kind="content", text="完成"), StreamEvent(kind="finish", finish_reason="stop")]])
-    web_env.server.config = cfg
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=1000)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-    async def _fake_system_prompt():
-        return "sys"
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-
-    row = await web_env.server._create_web_conversation(123, title="新对话", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    messages = MessageDAO(web_env.db)
-    session_uuid = await messages.current_session_uuid(chat_id)
-    await messages.add_model_call(
-        chat_id,
-        session_uuid=session_uuid,
-        model="openai/gpt",
-        protocol="fake",
-        last_usage=Usage(input_tokens=267061),
-    )
-    for i in range(8):
-        await messages.add(chat_id, "user", f"旧消息{i}", tokens=1)
-
-    events_seen = []
-    async def _sink(event):
-        payload = dict(event)
-        payload["seq"] = len(events_seen) + 1
-        payload.setdefault("eventUuid", f"event-{payload['seq']}")
-        payload.setdefault("eventId", payload["eventUuid"])
-        events_seen.append(payload)
-        return payload
-    live = _WebLiveStream(str(row["conversation_uuid"]), chat_id, event_sink=_sink)
-    renderer = _WebStreamRenderer(live)
-    await live.publish({"type": "accepted", "turnUuid": "turn-compact", "ts": 1000})
-    await web_env.server._run_web_turn(chat_id, "新问题", renderer, conversation=row)
-
-    events = list(events_seen)
-    compaction_starts = [e for e in events if e.get("type") == "tool_start" and e.get("name") == "ContextCompaction"]
-    # 如果仍使用 stale previous usage=267061，这里会误触发压缩；修复后估算当前上下文低于阈值，不压缩。
-    assert compaction_starts == []
-    assert backend.complete_calls == 0
 
 
 async def test_web_run_restores_anchored_private_context_after_existing_summary(web_env, monkeypatch):
@@ -1722,236 +1469,15 @@ async def test_web_run_restores_anchored_private_context_after_existing_summary(
 
     assert backend.seen_convos
     first_request = backend.seen_convos[0]
-    assert first_request[:len(private_messages)] == private_messages
+    assert [{key: value for key, value in message.items() if key != "openbear_context_source"} for message in first_request[:len(private_messages)]] == private_messages
     assert first_request[-1]["role"] == "user"
     assert "next question" in str(first_request[-1]["content"])
 
 
-async def test_web_run_pre_compaction_uses_provider_snapshot_for_restored_private_context(web_env, monkeypatch):
-    """Only a compatible restored private context may reuse its last real prompt size."""
-    cfg = _cfg()
-    cfg.models.providers["openai"].models[0].compact_trigger_tokens = 100
-    backend = FakeStreamBackend([[StreamEvent(kind="content", text="completed"), StreamEvent(kind="finish", finish_reason="stop")]])
-    web_env.server.config = cfg
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=1000)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-
-    async def _fake_system_prompt():
-        return "sys"
-
-    def _fake_estimate_prompt_tokens(*, system="", convo=None):
-        return 10
-
-    preflight_calls = []
-
-    async def _fake_precompact(chat_id, prompt_tokens, *, model_label, source="pre_model_request"):
-        preflight_calls.append((chat_id, prompt_tokens, model_label, source))
-        return CompactionOutcome(did=False, source=source, trigger_tokens=prompt_tokens)
-
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    monkeypatch.setattr(web_env.server, "_estimate_prompt_tokens", _fake_estimate_prompt_tokens)
-    monkeypatch.setattr(web_env.server, "_pre_compact_before_web_turn", _fake_precompact)
-
-    row = await web_env.server._create_web_conversation(123, title="restored private context", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    conversation_uuid = str(row["conversation_uuid"])
-    messages = MessageDAO(web_env.db)
-    session_uuid = await messages.current_session_uuid(chat_id)
-    await messages.save_controller_model_context(
-        chat_id,
-        conversation_uuid=conversation_uuid,
-        session_id=session_uuid,
-        protocol="fake",
-        model="fake-gpt",
-        model_label="openai/gpt",
-        state={"version": 1, "messages": [{"role": "user", "content": "private checkpoint"}]},
-    )
-    await messages.add_model_call(
-        chat_id,
-        session_uuid=session_uuid,
-        model="openai/gpt",
-        protocol="fake",
-        call_kind="controller_request",
-        last_usage=Usage(input_tokens=150),
-    )
-    live = _WebLiveStream(conversation_uuid, chat_id)
-    renderer = _WebStreamRenderer(live)
-    await live.publish({"type": "accepted", "turnUuid": "turn-restored-context"})
-
-    assert await web_env.server._run_web_turn(
-        chat_id,
-        "next question",
-        renderer,
-        conversation=row,
-        root_turn_uuid="turn-restored-context",
-    ) is True
-    assert preflight_calls == [(chat_id, 150, "openai/gpt", "pre_model_request")]
 
 
-async def test_detached_agent_result_preflight_adds_batch_output_tokens_before_model(web_env, monkeypatch):
-    cfg = _cfg()
-    backend = FakeStreamBackend([
-        [StreamEvent(kind="content", text="已汇总完整 Agent 结论"), StreamEvent(kind="finish", finish_reason="stop")],
-    ])
-    web_env.server.config = cfg
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128000)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-
-    async def _fake_system_prompt():
-        return "sys"
-
-    def _fake_estimate_prompt_tokens(*, system="", convo=None):
-        return 1200 if convo else 1000
-
-    preflight_calls = []
-
-    async def _fake_precompact(chat_id, prompt_tokens, *, model_label, source="pre_model_request"):
-        preflight_calls.append((chat_id, prompt_tokens, model_label, source))
-        return CompactionOutcome(did=False, source=source, trigger_tokens=prompt_tokens)
-
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    monkeypatch.setattr(web_env.server, "_estimate_prompt_tokens", _fake_estimate_prompt_tokens)
-    monkeypatch.setattr(web_env.server, "_pre_compact_before_web_turn", _fake_precompact)
-
-    row = await web_env.server._create_web_conversation(123, title="Agent 回传", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    messages = MessageDAO(web_env.db)
-    session_uuid = await messages.current_session_uuid(chat_id)
-    await messages.add_model_call(
-        chat_id,
-        session_uuid=session_uuid,
-        model="openai/gpt",
-        protocol="fake",
-        call_kind="controller_request",
-        last_usage=Usage(input_tokens=9000),
-    )
-    # A newer/larger child request must never masquerade as parent context.
-    await messages.add_model_call(
-        chat_id,
-        session_uuid=session_uuid,
-        model="openai/gpt",
-        protocol="fake",
-        call_kind="agent_request",
-        last_usage=Usage(input_tokens=50_000),
-    )
-    live = _WebLiveStream(str(row["conversation_uuid"]), chat_id)
-    renderer = _WebStreamRenderer(live)
-    await live.publish({"type": "accepted", "turnUuid": "turn-agent-batch"})
-
-    ok = await web_env.server._run_web_turn(
-        chat_id,
-        "完整 Agent 结果",
-        renderer,
-        conversation=row,
-        task_notification=True,
-        task_notification_payload={
-            "kind": "task-notification-batch",
-            "status": "completed",
-            "resultOutputTokens": 7000,
-            "resultCount": 2,
-        },
-        root_turn_uuid="turn-agent-batch",
-    )
-
-    assert ok is True
-    assert preflight_calls == [(chat_id, 16_256, "openai/gpt", "agent_result_preflight")]
-    assert backend.seen_convos
-    assert any("完整 Agent 结果" in str(message.get("content") or "") for message in backend.seen_convos[0])
 
 
-async def test_web_run_turn_epilogue_compaction_is_sync_visible_and_updates_stats(web_env, monkeypatch):
-    cfg = _cfg()
-    cfg.agent.compact_ratio = 0.5
-    cfg.agent.keep_recent_messages = 4
-    cfg.models.providers["openai"].models[0].compact_trigger_tokens = 100
-    backend = FakeStreamBackend([[StreamEvent(kind="content", text="完成"), StreamEvent(kind="usage", usage=Usage(input_tokens=150, total_tokens=160)), StreamEvent(kind="finish", finish_reason="stop")]])
-    web_env.server.config = cfg
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=1000)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-    async def _fake_system_prompt():
-        return "sys"
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    # Keep pre-model gates below the threshold; provider usage=150 should be the
-    # sole trigger so this test isolates the turn-epilogue cache-epoch boundary.
-    monkeypatch.setattr(
-        web_env.server, "_estimate_prompt_tokens", lambda *, system="", convo=None: 50,
-    )
-
-    row = await web_env.server._create_web_conversation(123, title="新对话", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    conversation_uuid = str(row["conversation_uuid"])
-    await TaskMemoryDAO(web_env.db).create(
-        conversation_uuid=conversation_uuid,
-        scope_type=SCOPE_CONVERSATION,
-        name="epilogue compaction state",
-        description="must remain private",
-        visible_to_agents=True,
-    )
-    messages = MessageDAO(web_env.db)
-    for i in range(12):
-        await messages.add(chat_id, "user", f"历史{i}", tokens=1)
-
-    events_seen = []
-    async def _sink(event):
-        payload = dict(event)
-        payload["seq"] = len(events_seen) + 1
-        payload.setdefault("eventUuid", f"event-{payload['seq']}")
-        payload.setdefault("eventId", payload["eventUuid"])
-        events_seen.append(payload)
-        return payload
-    live = _WebLiveStream(str(row["conversation_uuid"]), chat_id, event_sink=_sink)
-    renderer = _WebStreamRenderer(live)
-    await live.publish({"type": "accepted", "turnUuid": "turn-compact", "ts": 1000})
-    await web_env.server._run_web_turn(chat_id, "新问题", renderer, conversation=row)
-
-    events = list(events_seen)
-    compaction_starts = [e for e in events if e.get("type") == "tool_start" and e.get("name") == "ContextCompaction"]
-    compaction_results = [e for e in events if e.get("type") == "tool_result" and e.get("name") == "ContextCompaction"]
-    assert len(compaction_starts) == 1
-    assert len(compaction_results) == 1
-    assert "## 上下文压缩完成" in compaction_results[0]["result"]
-    stats_events = [e for e in events if e.get("type") == "stats"]
-    assert stats_events
-    final_stats = stats_events[-1]["stats"]
-    assert final_stats["contextTokens"] == 150
-    ledger_usage = final_stats["ledgerUsage"]
-    assert ledger_usage["ledgerRevision"] > 0
-    assert ledger_usage["inputTokens"] == 150
-    assert ledger_usage["outputTokens"] == 0
-    assert ledger_usage["cacheReadTokens"] == 0
-    assert ledger_usage["cacheWriteTokens"] == 0
-    assert ledger_usage["costUsd"] == final_stats["ledgerCostUsd"]
-    durable = await messages.usage_totals(chat_id)
-    assert ledger_usage["inputTokens"] == durable.input_tokens
-    assert ledger_usage["outputTokens"] == durable.output_tokens
-    assert final_stats["contextCompacted"] is True
-    assert final_stats["contextCompaction"]["source"] == "turn_epilogue"
-    assert final_stats["contextAfterCompactionTokens"] > 0
-    session_uuid = await messages.current_session_uuid(chat_id)
-    private_state = await messages.load_controller_model_context(
-        chat_id,
-        conversation_uuid=conversation_uuid,
-        session_id=session_uuid,
-        protocol="fake",
-        model="fake-gpt",
-        model_label="openai/gpt",
-    )
-    assert private_state is not None
-    private_runtime_states = [
-        message for message in private_state["messages"]
-        if is_task_memory_runtime_message(message)
-    ]
-    assert len(private_runtime_states) == 1
-    assert private_runtime_states[0]["_openbear_runtime"]["epoch"] == 1
-    summary = await SummaryDAO(web_env.db).latest(chat_id)
-    assert summary is not None
-    assert "openbear-task-memory-state" not in json.dumps(summary, ensure_ascii=False, default=str)
-    assert "openbear-task-memory-state" not in json.dumps(
-        await web_env.server._build_history(chat_id), ensure_ascii=False, default=str,
-    )
 
 
 async def test_task_notification_stats_merge_agent_usage(web_env):
@@ -2588,6 +2114,98 @@ async def test_rath_terminal_trigger_survives_missing_python_notification_callba
     assert "internal background Agent completion notification" in calls[0]["text"]
     assert "does not end the root task or restrict controller tools" in calls[0]["text"]
     assert "final user-facing answer only when the root objective is complete" in calls[0]["text"]
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_web_task_notification_persist_snapshot_batches_and_acks_only_resolved(web_env, monkeypatch, concurrent):
+    server = web_env.server
+    server.runs = RunRegistry()
+    row = await server._create_web_conversation(123, title="notification persist snapshot")
+    conv_uuid = row["conversation_uuid"]
+    chat_id = int(row["internal_chat_id"])
+    task_uuids = ("task-persist-resolved-a", "task-persist-unresolved-b")
+    for task_uuid in task_uuids:
+        await server.rath_dao.create_task(
+            chat_id=chat_id, parent_session_uuid=conv_uuid, workflow_uuid="wf-persist-snapshot",
+            title=task_uuid, status="needs_openbear_control", task_uuid=task_uuid,
+        )
+    payloads = [
+        {"taskUuid": task_uuid, "status": "needs_openbear_control", "summary": task_uuid,
+         "content": f"boundary {task_uuid}", "recentEvents": [{"seq": index + 10}]}
+        for index, task_uuid in enumerate(task_uuids)
+    ]
+    calls = []
+    worker_finished = asyncio.Event()
+    original_worker = server._run_web_task_notification_when_idle
+
+    async def observed_worker(**kwargs):
+        try:
+            await original_worker(**kwargs)
+        finally:
+            worker_finished.set()
+
+    async def fake_run_web_turn(chat_id, user_text, renderer, media=None, *, task_notification_payload=None, **kwargs):
+        calls.append(task_notification_payload)
+        changed = await server.rath_dao.update_task(
+            task_uuids[0], status="resuming", control_state="continuation_claimed",
+            current_status="A resumed", expected_statuses=("needs_openbear_control",),
+        )
+        assert changed is True
+        await renderer.finalize("仅处理了 A")
+        await renderer.close()
+        return True
+
+    monkeypatch.setattr(server, "_run_web_task_notification_when_idle", observed_worker)
+    monkeypatch.setattr(server, "_run_web_turn", fake_run_web_turn)
+    try:
+        # Control the real worker's drain boundary, not the debounce wall clock:
+        # both producers must finish and really enqueue before selection begins.
+        async with server._web_task_notification_lock(chat_id):
+            # The two SQL fallback notices already exist. Leave a row unread to
+            # pin the shared reader before either richer callback is inserted.
+            cursor = await web_env.db.conn.execute(
+                "SELECT notification_uuid FROM web_task_notifications ORDER BY id",
+            )
+            assert await cursor.fetchone() is not None
+            try:
+                if concurrent:
+                    await asyncio.gather(*(server._schedule_web_task_notification(row, p) for p in payloads))
+                else:
+                    for payload in payloads:
+                        await server._schedule_web_task_notification(row, payload)
+                pending = list(server._web_task_notification_pending.get(conv_uuid, []))
+            finally:
+                await cursor.close()
+            assert {p["taskUuid"] for p in pending} == set(task_uuids)
+            notification_ids = set().union(*(server._web_task_notification_ids(p) for p in pending))
+            assert len(notification_ids) == 4, "Keep both SQL fallback and callback IDs for each task"
+            assert calls == []
+        await asyncio.wait_for(worker_finished.wait(), timeout=5)
+    finally:
+        # Finish the real claim/ack worker before web_env closes its database,
+        # including when an assertion above fails.
+        if conv_uuid in server._web_task_notification_workers:
+            await asyncio.wait_for(worker_finished.wait(), timeout=5)
+
+    assert len(calls) == 1
+    assert calls[0]["batched"] is True
+    assert calls[0]["batchCount"] == 2
+    assert calls[0]["status"] == "needs_openbear_control"
+    assert set(calls[0]["taskUuids"]) == set(task_uuids)
+    for payload in payloads:
+        assert payload["content"] in calls[0]["content"]
+    cur = await web_env.db.conn.execute(
+        "SELECT notification_uuid,task_uuid,state,attempts FROM web_task_notifications WHERE conversation_uuid=? ORDER BY id",
+        (conv_uuid,),
+    )
+    records = [dict(item) for item in await cur.fetchall()]
+    assert {item["notification_uuid"] for item in records} == notification_ids
+    assert len(records) == 4
+    for item in records:
+        assert item["attempts"] == 1, "Both tasks must be claimed, including the unresolved one"
+        assert item["state"] == ("delivered" if item["task_uuid"] == task_uuids[0] else "pending")
+    assert conv_uuid not in server._web_task_notification_workers
+    assert not server._web_task_notification_pending.get(conv_uuid)
 
 
 @pytest.mark.parametrize("concurrent", [False, True])
@@ -5246,7 +4864,7 @@ async def test_agent_wait_without_active_agents_returns_hidden_terminal_snapshot
         [StreamEvent(kind="content", text="没有待等待的 Agent。"), StreamEvent(kind="finish", finish_reason="stop")],
     ])
     web_env.server.config = cfg
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=1000)
+    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128000)
     web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
     tools = ToolRegistry()
 
@@ -5662,7 +5280,7 @@ async def test_agent_wait_event_only_wakes_when_last_sibling_terminal_notificati
     assert backend.calls == 2
 
 
-async def test_same_root_agent_notification_model_failure_rearms_durable_worker(web_env, monkeypatch):
+async def test_same_root_agent_notification_model_failure_pauses_durable_worker(web_env, monkeypatch):
     cfg = _cfg()
 
     class FailAfterWaitBackend(FakeStreamBackend):
@@ -5733,7 +5351,7 @@ async def test_same_root_agent_notification_model_failure_rearms_durable_worker(
         "SELECT state FROM web_task_notifications WHERE notification_uuid=?",
         (queued["_notificationUuid"],),
     )
-    assert str((await cur.fetchone())["state"]) == "pending"
+    assert str((await cur.fetchone())["state"]) == "paused"
 
 
 async def test_agent_supervision_keeps_each_wait_cycle_in_timeline_order(web_env):
@@ -7692,6 +7310,7 @@ async def test_conversation_defaults_seed_partial_patch_and_failed_request(web_e
         "agentThinkLevel": "medium",
         "agentFastMode": False,
         "revision": 1,
+        "contextStrategy": "sliding_window",
         "updatedAt": seeded["updatedAt"],
     }
 
@@ -7805,6 +7424,7 @@ async def test_conversation_defaults_normalize_stale_models_and_capabilities(web
         "agentThinkLevel": "high",
         "agentFastMode": True,
         "revision": 7,
+        "contextStrategy": "sliding_window",
         "updatedAt": 10,
     }
 
@@ -7886,7 +7506,8 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
         "conversationUuid", "model", "thinkingLevel", "effectiveThinkingLevel",
         "thinkingLevels", "defaultThinkingLevel", "supportsThinking", "fastMode",
         "fastRequested", "fastSupported", "effectiveFastMode", "agentRunConfig",
-        "contextWindow", "compactTriggerTokens", "compactRatio",
+        "contextWindow", "rolloverTriggerTokens", "windowTriggerRatio",
+        "contextStrategy", "manualCompactMinPercent",
     }
     assert model_config["conversationUuid"] == uuid
     assert model_config["model"] == "openai/cheap"
@@ -7919,8 +7540,8 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
     for key in (
         "model", "thinkingLevel", "effectiveThinkingLevel", "thinkingLevels",
         "defaultThinkingLevel", "supportsThinking", "fastMode", "fastRequested",
-        "fastSupported", "effectiveFastMode", "agentRunConfig", "compactTriggerTokens",
-        "compactRatio",
+        "fastSupported", "effectiveFastMode", "agentRunConfig", "rolloverTriggerTokens",
+        "windowTriggerRatio",
     ):
         assert model_config[key] == state[key]
 
@@ -7995,52 +7616,6 @@ async def test_conversation_agent_run_config_api_and_state(web_env):
     }
 
 
-async def test_root_compaction_sources_emit_stable_unified_context_compaction_identity(web_env):
-    class CapturingRenderer:
-        def __init__(self) -> None:
-            self.live = SimpleNamespace(conversation_uuid="conv-compaction")
-            self.starts = []
-            self.results = []
-
-        async def on_tool_start(self, tool_call_id, name, arguments, line):
-            self.starts.append((tool_call_id, name, json.loads(arguments), line))
-
-        async def on_tool_result(self, tool_call_id, name, arguments, result, duration_ms):
-            self.results.append((tool_call_id, name, json.loads(arguments), result, duration_ms))
-
-    sources = ("pre_model_request", "tool_batch", "agent_result_preflight", "emergency")
-    for summary_id, source in enumerate(sources, start=41):
-        renderer = CapturingRenderer()
-        summary = f"summary:{source}:" + ("x" * 200)
-        outcome = CompactionOutcome(
-            did=True,
-            source=source,
-            trigger_tokens=90_000,
-            after_tokens=12_345,
-            summary_id=summary_id,
-            summary=summary,
-            summary_tokens=500,
-        )
-
-        await web_env.server._emit_context_compaction_event(renderer, outcome, source=source)
-
-        expected_id = f"context-compaction:{summary_id}"
-        assert renderer.starts[0][0] == renderer.results[0][0] == expected_id
-        start_metadata = renderer.starts[0][2]
-        metadata = renderer.results[0][2]
-        assert start_metadata["status"] == "running"
-        assert start_metadata["outputAvailable"] is False
-        assert metadata["compactionId"] == start_metadata["compactionId"] == expected_id
-        assert metadata["summaryId"] == start_metadata["summaryId"] == summary_id
-        assert metadata["scope"] == "root"
-        assert metadata["source"] == source
-        assert metadata["status"] == "completed"
-        assert metadata["beforeTokens"] == 90_000
-        assert metadata["afterTokens"] == 12_345
-        assert metadata["summaryChars"] == len(summary)
-        assert metadata["outputAvailable"] is True
-        assert metadata["summaryRef"] == f"/api/conversations/conv-compaction/compactions/{summary_id}"
-        assert summary in renderer.results[0][3]
 
 
 async def test_root_compaction_summary_lazy_load_is_full_owned_and_legacy_projected(web_env):
@@ -8267,48 +7842,6 @@ async def test_agent_final_compaction_output_stays_task_scoped_and_out_of_root_o
         for operation in root_operations
     )
 
-async def test_manual_compact_exact_50_percent_boundary_and_unknown_usage(web_env, monkeypatch):
-    cookies = {"openbear_web_session": await _login_cookie(web_env)}
-    row = await web_env.server._create_web_conversation(123, title="manual boundary", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    url = f"/api/conversations/{row['conversation_uuid']}/compact"
-    monkeypatch.setattr(web_env.server, "_model_compact_trigger_tokens", lambda _label: 1000)
-
-    unknown = await web_env.client.post(url, cookies=cookies)
-    assert unknown.status == 409
-    assert (await unknown.json())["error"] == "context_usage_unknown"
-
-    session_uuid = await MessageDAO(web_env.db).get_or_create_session_uuid(chat_id)
-    await web_env.db.conn.execute(
-        "INSERT INTO web_controller_context_snapshots(chat_id,session_uuid,summary_id,tokens,updated_at) VALUES(?,?,?,?,?)",
-        (chat_id, session_uuid, 0, 499, now_ts()),
-    )
-    await web_env.db.conn.commit()
-    below = await web_env.client.post(url, cookies=cookies)
-    assert below.status == 409
-    assert (await below.json())["error"] == "below_threshold"
-
-    class FakeCompactor:
-        async def _force_compact_unlocked(self, _chat_id, *, source=""):
-            assert source == "manual"
-            return CompactionOutcome(did=True, source=source)
-
-    monkeypatch.setattr(web_env.server, "_make_web_compactor", lambda *_a, **_k: FakeCompactor())
-    await web_env.db.conn.execute("UPDATE web_controller_context_snapshots SET tokens=500 WHERE chat_id=?", (chat_id,))
-    await web_env.db.conn.commit()
-    equal = await web_env.client.post(url, cookies=cookies)
-    assert equal.status == 200
-    equal_payload = await equal.json()
-    assert equal_payload["outcome"]["did"] is True
-    assert equal_payload["state"]["contextUsage"]["known"] is False
-    cur = await web_env.db.conn.execute(
-        "SELECT known, tokens FROM web_controller_context_snapshots WHERE chat_id=?",
-        (chat_id,),
-    )
-    tombstone = await cur.fetchone()
-    assert tombstone is not None
-    assert int(tombstone["known"]) == 0
-    assert int(tombstone["tokens"]) == 0
 
 
 async def test_controller_snapshot_exact_provider_usage_isolated_and_invalidated_by_summary(web_env):
@@ -8357,166 +7890,24 @@ async def test_unknown_controller_usage_does_not_create_snapshot(web_env):
         (chat_id,),
     )
     tombstone = await cur.fetchone()
-    assert tombstone is not None
-    assert int(tombstone["known"]) == 0
-    assert int(tombstone["tokens"]) == 0
+    assert tombstone is None  # New billing does not write legacy summary-era snapshots.
 
 
-async def test_send_is_rejected_not_queued_while_chat_lock_is_held(web_env, monkeypatch):
-    row = await web_env.server._create_web_conversation(123, title="send busy")
+async def test_send_serializes_with_normal_chat_operations(web_env, monkeypatch):
+    row = await web_env.server._create_web_conversation(123, title="send serialized")
     chat_id = int(row["internal_chat_id"])
     called = False
-    async def should_not_run(*_args, **_kwargs):
+    async def run(*_args, **_kwargs):
         nonlocal called
         called = True
         return {"ok": True}
-    monkeypatch.setattr(web_env.server, "_start_or_steer_web_conversation_locked", should_not_run)
-    async with web_env.server.operation_locks.chat(chat_id, "web_manual_compact"):
-        result = await asyncio.wait_for(
-            web_env.server._start_or_steer_web_conversation(row, "must reject", [], web_env.server._live_for(row)),
-            timeout=0.2,
-        )
-    assert result == {"ok": False, "error": "busy"}
-    assert called is False
-
-
-async def test_manual_compact_rejected_while_chat_lock_is_held(web_env):
-    cookies = {"openbear_web_session": await _login_cookie(web_env)}
-    row = await web_env.server._create_web_conversation(123, title="compact busy")
-    chat_id = int(row["internal_chat_id"])
+    monkeypatch.setattr(web_env.server, "_start_or_steer_web_conversation_locked", run)
     async with web_env.server.operation_locks.chat(chat_id, "web_send"):
-        response = await web_env.client.post(f"/api/conversations/{row['conversation_uuid']}/compact", cookies=cookies)
-    assert response.status == 409
-    assert (await response.json())["error"] == "busy"
-
-
-def test_memory_reminder_defaults_are_english_and_zero_disables():
-    cfg = _cfg()
-    assert cfg.agent.memory_reminder_percent == 80
-    assert cfg.agent.memory_reminder_prompt.isascii()
-    assert "TaskMemory" in cfg.agent.memory_reminder_prompt
-    disabled = cfg.model_copy(deep=True)
-    disabled.agent.memory_reminder_percent = 0
-    assert disabled.agent.memory_reminder_percent == 0
-
-async def test_memory_reminder_delivery_deduplicates_generation_and_resets_after_compaction(web_env):
-    row = await web_env.server._create_web_conversation(123, title="reminder generations")
-    chat_id = int(row["internal_chat_id"])
-    for _ in range(2):
-        await web_env.db.conn.execute(
-            "INSERT INTO web_memory_reminders(chat_id,session_uuid,summary_id,delivered_at) VALUES(?,?,?,?) ON CONFLICT(chat_id,summary_id) DO NOTHING",
-            (chat_id, str(row["conversation_uuid"]), 0, now_ts()),
-        )
-    await web_env.db.conn.commit()
-    cur = await web_env.db.conn.execute("SELECT summary_id FROM web_memory_reminders WHERE chat_id=?", (chat_id,))
-    assert [int(r["summary_id"]) for r in await cur.fetchall()] == [0]
-
-    summary_id = await SummaryDAO(web_env.db).add(chat_id, "compacted generation", 0, 1)
-    await web_env.db.conn.execute(
-        "INSERT INTO web_memory_reminders(chat_id,session_uuid,summary_id,delivered_at) VALUES(?,?,?,?) ON CONFLICT(chat_id,summary_id) DO NOTHING",
-        (chat_id, str(row["conversation_uuid"]), summary_id, now_ts()),
-    )
-    await web_env.db.conn.commit()
-    cur = await web_env.db.conn.execute("SELECT summary_id FROM web_memory_reminders WHERE chat_id=? ORDER BY summary_id", (chat_id,))
-    assert [int(r["summary_id"]) for r in await cur.fetchall()] == [0, summary_id]
-
-
-async def test_web_memory_reminder_is_xml_user_overlay_runtime_only_and_deduplicated(web_env, monkeypatch):
-    async def _fake_system_prompt():
-        return "stable reminder system"
-
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-    row = await web_env.server._create_web_conversation(
-        123,
-        title="memory reminder overlay",
-        model="openai/gpt",
-    )
-    chat_id = int(row["internal_chat_id"])
-    conversation_uuid = str(row["conversation_uuid"])
-    dao = MessageDAO(web_env.db)
-    session_uuid = await dao.get_or_create_session_uuid(chat_id)
-    await TaskMemoryDAO(web_env.db).create(
-        conversation_uuid=conversation_uuid,
-        scope_type=SCOPE_CONVERSATION,
-        name="existing runtime state",
-        description="must remain a separate trusted runtime unit",
-    )
-    await web_env.db.conn.execute(
-        """INSERT INTO web_controller_context_snapshots(
-               chat_id, session_uuid, summary_id, tokens, updated_at
-           ) VALUES(?,?,?,?,?)""",
-        (chat_id, session_uuid, 0, 72_000, now_ts()),
-    )
-    await web_env.db.conn.commit()
-
-    first_backend = FakeStreamBackend([[
-        StreamEvent(kind="usage", usage=Usage(input_tokens=72_500, output_tokens=20)),
-        StreamEvent(kind="content", text="checkpoint complete"),
-        StreamEvent(kind="finish", finish_reason="stop"),
-    ]])
-    first_backend.protocol = "responses"
-    web_env.server.llm_factory = FakeRunFactory(first_backend, context_window=128_000)
-    live = _WebLiveStream(conversation_uuid, chat_id)
-    await live.publish({"type": "accepted", "turnUuid": "reminder-turn-1"})
-
-    assert await web_env.server._run_web_turn(
-        chat_id,
-        "preserve this request",
-        _WebStreamRenderer(live),
-        conversation=row,
-        root_turn_uuid="reminder-turn-1",
-    ) is True
-
-    first_request = first_backend.seen_convos[0]
-    real_users = [
-        message for message in first_request
-        if message.get("role") == "user" and not is_task_memory_runtime_message(message)
-    ]
-    assert real_users
-    injected_text = str(real_users[-1]["content"])
-    assert '<openbear-memory-checkpoint version="1" runtime-only="true"' in injected_text
-    assert 'latest_controller_prompt_tokens="72000"' in injected_text
-    assert "Perform this audit before continuing" in injected_text
-    assert "Compare that list against the injected TaskMemory catalog" in injected_text
-    runtime_units = [message for message in first_request if is_task_memory_runtime_message(message)]
-    assert len(runtime_units) == 1
-    assert "openbear-memory-checkpoint" not in str(runtime_units[0]["content"])
-    visible_rows = await dao.recent(chat_id)
-    assert "openbear-memory-checkpoint" not in json.dumps(
-        [web_env.server._message_json(item) for item in visible_rows],
-        ensure_ascii=False,
-    )
-    cur = await web_env.db.conn.execute(
-        "SELECT session_uuid, summary_id FROM web_memory_reminders WHERE chat_id=?",
-        (chat_id,),
-    )
-    delivered = await cur.fetchone()
-    assert delivered is not None
-    assert str(delivered["session_uuid"]) == session_uuid
-    assert int(delivered["summary_id"]) == 0
-
-    second_backend = FakeStreamBackend([[
-        StreamEvent(kind="usage", usage=Usage(input_tokens=73_000, output_tokens=20)),
-        StreamEvent(kind="content", text="second turn"),
-        StreamEvent(kind="finish", finish_reason="stop"),
-    ]])
-    second_backend.protocol = "responses"
-    web_env.server.llm_factory = FakeRunFactory(second_backend, context_window=128_000)
-    await live.publish({"type": "accepted", "turnUuid": "reminder-turn-2"})
-    assert await web_env.server._run_web_turn(
-        chat_id,
-        "continue without duplicate reminder",
-        _WebStreamRenderer(live),
-        conversation=row,
-        root_turn_uuid="reminder-turn-2",
-    ) is True
-    assert "openbear-memory-checkpoint" not in json.dumps(
-        second_backend.seen_convos[0],
-        ensure_ascii=False,
-        default=str,
-    )
+        pending = asyncio.create_task(web_env.server._start_or_steer_web_conversation(row, "queued", [], web_env.server._live_for(row)))
+        await asyncio.sleep(0)
+        assert not pending.done() and not called
+    assert await asyncio.wait_for(pending, timeout=1) == {"ok": True}
+    assert called
 
 
 async def test_controller_context_tracking_is_bound_to_session_and_reset_lifecycle(web_env):
@@ -8543,76 +7934,12 @@ async def test_controller_context_tracking_is_bound_to_session_and_reset_lifecyc
         assert int((await cur.fetchone())["count"] or 0) == 0
 
 
-async def test_effective_compact_trigger_falls_back_to_context_window_ratio(web_env):
+async def test_effective_window_trigger_falls_back_to_context_window_ratio(web_env):
     resolved = web_env.server.config.models.resolve("openai/gpt")
-    assert resolved is not None and int(resolved[1].compact_trigger_tokens or 0) == 0
-    assert web_env.server._model_compact_trigger_tokens("openai/gpt") == 89_600
+    assert resolved is not None and int(resolved[1].rollover_trigger_tokens or 0) == 0
+    assert web_env.server._model_rollover_trigger_tokens("openai/gpt") == 89_600
 
 
-async def test_manual_compaction_broadcasts_standard_lifecycle_and_blocks_delete(web_env, monkeypatch):
-    cookies = {"openbear_web_session": await _login_cookie(web_env)}
-    row = await web_env.server._create_web_conversation(123, title="manual live lifecycle", model="openai/gpt")
-    chat_id = int(row["internal_chat_id"])
-    session_uuid = await MessageDAO(web_env.db).get_or_create_session_uuid(chat_id)
-    await web_env.db.conn.execute(
-        "INSERT INTO web_controller_context_snapshots(chat_id,session_uuid,summary_id,tokens,updated_at) VALUES(?,?,?,?,?)",
-        (chat_id, session_uuid, 0, 500, now_ts()),
-    )
-    await web_env.db.conn.commit()
-    monkeypatch.setattr(web_env.server, "_model_compact_trigger_tokens", lambda _label: 1000)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    class BlockingCompactor:
-        async def _force_compact_unlocked(self, _chat_id, *, source=""):
-            assert source == "manual"
-            started.set()
-            await release.wait()
-            return CompactionOutcome(did=False, source=source, reason="no_history")
-
-    monkeypatch.setattr(web_env.server, "_make_web_compactor", lambda *_a, **_k: BlockingCompactor())
-    live = web_env.server._live_for(row)
-    sub = live.subscribe()
-    compact_task = asyncio.create_task(
-        web_env.client.post(
-            f"/api/conversations/{row['conversation_uuid']}/compact",
-            cookies=cookies,
-        )
-    )
-    try:
-        await asyncio.wait_for(started.wait(), timeout=1)
-        start_event = await asyncio.wait_for(sub.get(), timeout=1)
-        start_frames = start_event.get("_webFrames") or []
-        assert start_frames and start_frames[-1]["action"] == "start"
-        assert start_frames[-1]["opType"] == "context_compaction"
-        cur = await web_env.db.conn.execute(
-            "SELECT lifecycle, status, internal FROM web_operations WHERE conversation_uuid=? AND op_type='context_compaction'",
-            (str(row["conversation_uuid"]),),
-        )
-        active = await cur.fetchone()
-        assert active is not None and str(active["lifecycle"]) == "active"
-        assert int(active["internal"] or 0) == 0
-
-        delete_response = await web_env.client.delete(
-            f"/api/conversations/{row['conversation_uuid']}",
-            cookies=cookies,
-        )
-        assert delete_response.status == 409
-        assert (await delete_response.json())["error"] == "conversation_delete_busy"
-    finally:
-        release.set()
-    response = await asyncio.wait_for(compact_task, timeout=2)
-    assert response.status == 200
-    end_event = await asyncio.wait_for(sub.get(), timeout=1)
-    end_frames = end_event.get("_webFrames") or []
-    assert end_frames and end_frames[-1]["action"] == "end"
-    cur = await web_env.db.conn.execute(
-        "SELECT lifecycle, status FROM web_operations WHERE conversation_uuid=? AND op_type='context_compaction'",
-        (str(row["conversation_uuid"]),),
-    )
-    terminal = await cur.fetchone()
-    assert terminal is not None and str(terminal["lifecycle"]) == "terminal"
-    live.unsubscribe(sub)
 
 
 async def test_context_unknown_tombstone_blocks_legacy_fallback_after_suffix_delete(web_env):
@@ -8652,149 +7979,8 @@ async def test_context_unknown_tombstone_blocks_legacy_fallback_after_suffix_del
     assert len(await dao.recent_model_calls(chat_id)) == 1
 
 
-async def test_memory_reminder_defers_safe_normal_compaction_until_provider_delivery(web_env, monkeypatch):
-    async def _fake_system_prompt():
-        return "stable reminder system"
-
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    web_env.server.tools = ToolRegistry()
-    row = await web_env.server._create_web_conversation(
-        123,
-        title="memory before normal compaction",
-        model="openai/gpt",
-    )
-    chat_id = int(row["internal_chat_id"])
-    conversation_uuid = str(row["conversation_uuid"])
-    session_uuid = await MessageDAO(web_env.db).get_or_create_session_uuid(chat_id)
-    await web_env.db.conn.execute(
-        """INSERT INTO web_controller_context_snapshots(
-               chat_id, session_uuid, summary_id, known, tokens, updated_at
-           ) VALUES(?,?,?,?,?,?)""",
-        (chat_id, session_uuid, 0, 1, 72_000, now_ts()),
-    )
-    await web_env.db.conn.commit()
-
-    backend = FakeStreamBackend([[
-        StreamEvent(kind="usage", usage=Usage(input_tokens=95_000, output_tokens=20)),
-        StreamEvent(kind="content", text="checkpoint delivered before compaction"),
-        StreamEvent(kind="finish", finish_reason="stop"),
-    ]])
-    backend.protocol = "responses"
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128_000)
-    monkeypatch.setattr(web_env.server, "_estimate_prompt_tokens", lambda **_kwargs: 95_000)
-
-    async def _unexpected_preflight(*_args, **_kwargs):
-        raise AssertionError("safe reminder delivery must defer root preflight compaction")
-
-    async def _no_post_compaction(_chat_id, _tokens, **kwargs):
-        return CompactionOutcome(did=False, source=str(kwargs.get("source") or "turn_epilogue"))
-
-    def _unexpected_compactor(*_args, **_kwargs):
-        raise AssertionError("Agent pre-model gate must defer normal compaction")
-
-    monkeypatch.setattr(web_env.server, "_pre_compact_before_web_turn", _unexpected_preflight)
-    monkeypatch.setattr(web_env.server, "_post_compact_after_web_turn", _no_post_compaction)
-    monkeypatch.setattr(web_env.server, "_make_web_compactor", _unexpected_compactor)
-    live = _WebLiveStream(conversation_uuid, chat_id)
-    await live.publish({"type": "accepted", "turnUuid": "memory-before-compact-turn"})
-
-    assert await web_env.server._run_web_turn(
-        chat_id,
-        "preserve state first",
-        _WebStreamRenderer(live),
-        conversation=row,
-        root_turn_uuid="memory-before-compact-turn",
-    ) is True
-
-    outbound = str(backend.seen_convos[0])
-    assert '<openbear-memory-checkpoint version="1" runtime-only="true"' in outbound
-    cur = await web_env.db.conn.execute(
-        "SELECT summary_id FROM web_memory_reminders WHERE chat_id=? AND session_uuid=?",
-        (chat_id, session_uuid),
-    )
-    delivered = await cur.fetchone()
-    assert delivered is not None
-    assert int(delivered["summary_id"]) == 0
 
 
-async def test_memory_reminder_arms_inside_tool_loop_before_normal_compaction(web_env, monkeypatch):
-    async def _fake_system_prompt():
-        return "stable reminder system"
-
-    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
-    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
-    registry = ToolRegistry()
-
-    async def _echo(args):
-        return f"echo:{args.get('value', '')}"
-
-    registry.add("echo", "echo", {"type": "object", "properties": {}}, _echo)
-    web_env.server.tools = registry
-    row = await web_env.server._create_web_conversation(
-        123,
-        title="memory threshold crossed in tool loop",
-        model="openai/gpt",
-    )
-    chat_id = int(row["internal_chat_id"])
-    conversation_uuid = str(row["conversation_uuid"])
-    session_uuid = await MessageDAO(web_env.db).get_or_create_session_uuid(chat_id)
-    await web_env.db.conn.execute(
-        """INSERT INTO web_controller_context_snapshots(
-               chat_id, session_uuid, summary_id, known, tokens, updated_at
-           ) VALUES(?,?,?,?,?,?)""",
-        (chat_id, session_uuid, 0, 1, 70_000, now_ts()),
-    )
-    await web_env.db.conn.commit()
-
-    backend = FakeStreamBackend([
-        [
-            StreamEvent(kind="usage", usage=Usage(input_tokens=72_000, output_tokens=20)),
-            StreamEvent(
-                kind="tool_call",
-                tool_calls=[ToolCall(id="memory-crossing-tool", name="echo", arguments='{"value":"ok"}')],
-            ),
-            StreamEvent(kind="finish", finish_reason="tool_calls"),
-        ],
-        [
-            StreamEvent(kind="usage", usage=Usage(input_tokens=95_000, output_tokens=20)),
-            StreamEvent(kind="content", text="continued after checkpoint"),
-            StreamEvent(kind="finish", finish_reason="stop"),
-        ],
-    ])
-    backend.protocol = "responses"
-    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128_000)
-
-    def _estimate_prompt_tokens(*, system="", convo=None):
-        items = list(convo or [])
-        return 95_000 if any(item.get("role") == "tool" for item in items) else 70_000
-
-    async def _no_post_compaction(_chat_id, _tokens, **kwargs):
-        return CompactionOutcome(did=False, source=str(kwargs.get("source") or "turn_epilogue"))
-
-    monkeypatch.setattr(web_env.server, "_estimate_prompt_tokens", _estimate_prompt_tokens)
-    monkeypatch.setattr(web_env.server, "_post_compact_after_web_turn", _no_post_compaction)
-    live = _WebLiveStream(conversation_uuid, chat_id)
-    await live.publish({"type": "accepted", "turnUuid": "memory-tool-loop-turn"})
-
-    assert await web_env.server._run_web_turn(
-        chat_id,
-        "cross the reminder threshold",
-        _WebStreamRenderer(live),
-        conversation=row,
-        root_turn_uuid="memory-tool-loop-turn",
-    ) is True
-
-    assert len(backend.seen_convos) == 2
-    assert "openbear-memory-checkpoint" not in str(backend.seen_convos[0])
-    assert '<openbear-memory-checkpoint version="1" runtime-only="true"' in str(backend.seen_convos[1])
-    cur = await web_env.db.conn.execute(
-        "SELECT summary_id FROM web_memory_reminders WHERE chat_id=? AND session_uuid=?",
-        (chat_id, session_uuid),
-    )
-    delivered = await cur.fetchone()
-    assert delivered is not None
-    assert int(delivered["summary_id"]) == 0
 
 
 async def test_questionnaire_rejects_invalid_definitions_without_pending(web_env):

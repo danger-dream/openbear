@@ -5,6 +5,7 @@ export const RUN_DEFAULT_FIELDS = Object.freeze([
   "agentModel",
   "agentThinkLevel",
   "agentFastMode",
+  "contextStrategy",
 ]);
 
 export const RUN_DEFAULT_INHERIT = "inherit";
@@ -71,7 +72,8 @@ export function normalizedRunDefaults({local, inherited, fallback, resolved} = {
     ? false
     : selected.agentFastMode === true && agent?.supportsFast ? true : null;
 
-  return {mainModel, mainThinkingLevel: mainThinkingLevel || "off", mainFastMode, agentModel, agentThinkLevel, agentFastMode};
+  const contextStrategy = selected.contextStrategy === "model_summary" ? "model_summary" : "sliding_window";
+  return {mainModel, mainThinkingLevel: mainThinkingLevel || "off", mainFastMode, agentModel, agentThinkLevel, agentFastMode, contextStrategy};
 }
 
 export function runDefaultSelection(value, field) {

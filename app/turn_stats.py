@@ -61,8 +61,9 @@ def build_turn_stats_card(
     extra = []
     if result.model_retry:
         extra.append(f"重试 {result.model_retry}")
-    if result.model_fail:
-        extra.append(f"失败 {result.model_fail}")
+    failed_calls = result.model_fail + result.summary_model_fail
+    if failed_calls:
+        extra.append(f"失败 {failed_calls}")
     if extra:
         calls_str += f"({_esc('、'.join(extra))})"
     tools_n = len(result.tools_used) + result.expert_tool_calls

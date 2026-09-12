@@ -79,6 +79,7 @@ async def deterministic_task_memory(tmp_path, monkeypatch):
         scope_type=SCOPE_CONVERSATION,
         name="shared deterministic memory",
         description="stable shared catalog item",
+        body="Keep the macOS appearance.",
         visible_to_agents=True,
     )
     await dao.create(
@@ -106,6 +107,7 @@ async def test_task_memory_final_provider_units_are_complete_prefixes(
         epoch=0,
     )
     assert sum(is_task_memory_runtime_message(message) for message in first_context) == 1
+    assert "<body>Keep the macOS appearance.</body>" in first_context[-1]["content"]
 
     first_outbound = repair_role_alternation(first_context)
     # Cross a wall-clock second: physical-call time must not enter runtime state.
@@ -142,7 +144,7 @@ async def test_task_memory_final_provider_units_are_complete_prefixes(
         conversation_uuid="provider-prefix-conversation",
         scope_type=SCOPE_CONVERSATION,
         expected_revision=shared["revision"],
-        changes={"description": "updated deterministic catalog item"},
+        changes={"body": "Keep the macOS appearance and current font size."},
     )
     third_context = await reconcile_task_memory_runtime_state(
         second_context,
@@ -153,6 +155,7 @@ async def test_task_memory_final_provider_units_are_complete_prefixes(
     )
     assert third_context[:len(second_context)] == second_context
     assert sum(is_task_memory_runtime_message(message) for message in third_context) == 2
+    assert "<body>Keep the macOS appearance and current font size.</body>" in third_context[-1]["content"]
     third_outbound = repair_role_alternation(third_context)
     assert third_outbound[:len(second_outbound)] == second_outbound
 

@@ -2,6 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onMounted, reactive, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { Api, apiError } from "../api";
+import ModelOrderPicker from "../components/ModelOrderPicker.vue";
 
 const MdEditor = defineAsyncComponent(() => import("../components/MdEditor.vue"));
 
@@ -27,6 +28,7 @@ const promptPreviewText = ref("");
 const promptPreviewTitle = ref("");
 const previewingPrompt = ref("");
 const testingNotification = ref(false);
+const compressionModels = ref([]);
 
 
 const selectOptions = {
@@ -146,7 +148,8 @@ function effectTagType(effect) {
 async function load() {
   loading.value = true;
   try {
-    const [specData, settingsData] = await Promise.all([Api.settingsSpecs(), Api.settings()]);
+    const [specData, settingsData, modelData] = await Promise.all([Api.settingsSpecs(), Api.settings(), Api.rathOptions().catch(() => ({models: []}))]);
+    compressionModels.value = modelData.models || [];
     okOrThrow(specData); okOrThrow(settingsData);
     const apiDomains = (specData.domains || []).filter((domain) => (domain.sections || []).length > 0);
     domains.value = apiDomains.length
@@ -362,11 +365,12 @@ onMounted(load);
               class="settings-row"
               :class="[
                 isDirty(spec) ? 'is-dirty' : '',
+                spec.group === 'compaction' ? 'is-context' : '',
                 isPromptEditorSpec(spec) ? 'is-prompt' : '',
               ]"
             >
               <template v-if="isPromptEditorSpec(spec)">
-                <div class="compact-prompt-card">
+                <div class="settings-prompt-card">
                   <div class="flex flex-wrap items-start justify-between gap-3">
                     <div class="min-w-0">
                       <div class="flex flex-wrap items-center gap-2">
@@ -385,7 +389,7 @@ onMounted(load);
                       <button v-else class="mac-text-button is-primary" @click="editingPromptPath = spec.path">编辑提示词</button>
                     </div>
                   </div>
-                  <div v-if="isPromptEditing(spec)" class="compact-prompt-editor mt-4">
+                  <div v-if="isPromptEditing(spec)" class="settings-prompt-editor mt-4">
                     <MdEditor v-model="draft[spec.path]" completion-mode="none" square />
                   </div>
                   <div class="settings-technical is-open">
@@ -422,6 +426,15 @@ onMounted(load);
                           <span class="mac-toggle__knob">{{ saving[spec.path] ? '…' : '' }}</span>
                           <span class="sr-only">切换 {{ spec.title }}</span>
                         </button>
+                      </div>
+                    </template>
+                    <template v-else-if="spec.path === 'models.compressionModels'">
+                      <div class="summary-model-setting">
+                        <ModelOrderPicker v-model="draft[spec.path]" :models="compressionModels" :disabled="saving[spec.path]" />
+                        <div v-if="isDirty(spec)" class="summary-model-save">
+                          <button type="button" class="mac-text-button" :disabled="saving[spec.path]" @click="reset(spec)">取消更改</button>
+                          <button type="button" class="mac-text-button" :disabled="saving[spec.path]" @click="save(spec)">{{ saving[spec.path] ? '保存中…' : '保存模型及顺序' }}</button>
+                        </div>
                       </div>
                     </template>
                     <template v-else-if="isMulti(spec)">
@@ -520,6 +533,10 @@ onMounted(load);
 
 
 <style scoped>
+.settings-row.is-context p, .settings-row.is-context .settings-technical, .settings-row.is-context .settings-builtin, .settings-row.is-context .mac-text-button { font-size: 13px; }
+.settings-row.is-context .value-pill__label, .settings-row.is-context .mac-segmented button { font-size: 14px; }
+.summary-model-setting { width: 100%; min-width: 0; }
+.summary-model-save { display:flex; justify-content:flex-end; gap:16px; margin-top:10px; font-size:14px; }
 .settings-shell {
   --settings-ink: #18181b;
   --settings-muted: #71717a;
@@ -851,7 +868,7 @@ onMounted(load);
   font-weight: 650;
 }
 .settings-row__copy > p,
-.compact-prompt-card > div:first-child p {
+.settings-prompt-card > div:first-child p {
   max-width: 720px;
   margin-top: 4px;
   color: var(--settings-muted);
@@ -928,10 +945,10 @@ onMounted(load);
   display: flex;
   justify-content: flex-end;
 }
-.compact-prompt-card {
+.settings-prompt-card {
   display: block;
 }
-.compact-prompt-editor {
+.settings-prompt-editor {
   height: min(58vh, 520px);
   min-height: 360px;
   overflow: hidden;
@@ -1293,9 +1310,9 @@ onMounted(load);
   .editor-bar { width: 100%; }
   .mac-segmented { width: 100%; }
   .mac-segmented button { flex: 1; }
-  .compact-prompt-card > div:first-child { display: block; }
-  .compact-prompt-card > div:first-child > div:last-child { margin-top: 12px; }
-  .compact-prompt-editor { min-height: 300px; height: 52vh; }
+  .settings-prompt-card > div:first-child { display: block; }
+  .settings-prompt-card > div:first-child > div:last-child { margin-top: 12px; }
+  .settings-prompt-editor { min-height: 300px; height: 52vh; }
 }
 </style>
 
@@ -1465,7 +1482,7 @@ html.dark .settings-empty {
 html.dark .settings-empty strong {
 		color: #c6c6cd;
 	}
-html.dark .compact-prompt-editor {
+html.dark .settings-prompt-editor {
 		background: #1d1e22;
 		box-shadow: 0 12px 36px rgba(0, 0, 0, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.11);
 	}

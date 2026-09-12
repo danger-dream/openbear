@@ -6,7 +6,8 @@ import {ref,watch} from 'vue';
 import {referenceToken,referencesInText} from './codec.js';
 const source=fs.readFileSync(new URL('../views/consoleView/ConsoleView.vue',import.meta.url),'utf8');
 const start=source.indexOf('async function deleteTurnSuffix(turn) {');
-const end=source.indexOf('async function compactConversation()',start);
+const end=source.indexOf('async function send()',start);
+assert.ok(start >= 0 && end > start, 'extract the real suffix deletion handler');
 const code=source.slice(start,end);
 const original='先读 '+referenceToken({kind:'doc',id:'17',label:'部署文档'})+' 再看 '+referenceToken({kind:'chat',id:'source',label:'原会话',scope:'recent',turns:7});
 function deferred(){let resolve;const promise=new Promise(r=>resolve=r);return {promise,resolve};}

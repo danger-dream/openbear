@@ -1,17 +1,15 @@
 <script setup>
-import {computed, nextTick, onBeforeUnmount, onMounted, ref} from "vue";
+import {computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch} from "vue";
 import ReferenceEditor from "../../references/ReferenceEditor.vue";
 import ReferencePlainText from "../../references/ReferencePlainText.vue";
 import InteractionMarkdown from "./InteractionMarkdown.vue";
+import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
+import ModelFeatureIcon from "./ModelFeatureIcon.vue";
 import {
 	ArrowDown,
 	CircleCheck,
 	Close,
-	Cpu,
-	DataAnalysis,
 	Document,
-	Lightning,
-	MagicStick,
 	Paperclip,
 	Plus,
 	Promotion,
@@ -26,7 +24,6 @@ import {
 	modelDefaultThinking,
 	modelLabel,
 	modelShortLabel,
-	thinkingDesc,
 	thinkingLabel,
 } from "./display.js";
 import {
@@ -80,9 +77,11 @@ const props = defineProps({
 	agentDefaultThinkingLabel: {type: String, default: "模型默认"},
 	running: {type: Boolean, default: false},
 	canSend: {type: Boolean, default: false},
+	modelQuery: {type: String, default: ""},
+	contextStrategy: {type: String, default: "sliding_window"},
+	strategySaving: {type: Boolean, default: false},
 	canCompact: {type: Boolean, default: false},
 	compacting: {type: Boolean, default: false},
-	modelQuery: {type: String, default: ""},
 	contextDisplay: {type: String, default: "—"},
 	contextUsedDisplay: {type: String, default: "—"},
 	contextThresholdDisplay: {type: String, default: "—"},
@@ -99,13 +98,14 @@ const emit = defineEmits([
 	"new-session",
 	"toggle-model-menu",
 	"select-model",
+	"select-context-strategy",
+	"compact",
 	"select-thinking",
 	"toggle-fast-mode",
 	"select-agent-model",
 	"select-agent-thinking",
 	"select-agent-fast",
 	"send",
-	"compact",
 	"stop",
 	"answer-confirmation",
 	"close-menus",
@@ -123,15 +123,34 @@ const questionnaireErrors = ref({});
 const interactionNowMs = ref(Date.now());
 let interactionClockTimer = null;
 const runConfigTab = ref("main"); // main | agent
-const DEFAULT_COMPACT_RATIO = 0.7;
+const DEFAULT_WINDOW_TRIGGER_RATIO = 0.7;
+const modelDetailId = `model-detail-${useId()}`;
+const activeModelDetail = ref(null);
+
+function clearModelDetail() {
+	activeModelDetail.value = null;
+}
+
+function showModelFeature(model, feature, event) {
+	if (!props.modelMenuOpen || (event.pointerType === 'touch' && event.type !== 'click')) return;
+	if (event.type === 'focus' && !event.currentTarget.matches(':focus-visible')) return;
+	// The hint occupies a fixed footer slot, never a layer over model rows.
+	activeModelDetail.value = {modelKey: model.key, feature};
+}
+
+watch([() => props.modelMenuOpen, runConfigTab, () => props.modelQuery, () => props.modelGroups, () => props.conversationUuid], clearModelDetail, {flush: 'sync'});
 const runConfigPopoverVisible = computed({
 	get: () => props.modelMenuOpen,
 	set: (value) => {
 		if (value && !props.modelMenuOpen) emit("toggle-model-menu");
-		else if (!value && props.modelMenuOpen) emit("close-menus");
+		else if (!value && props.modelMenuOpen) {
+			clearModelDetail();
+			emit("close-menus");
+		}
 	},
 });
 const runConfigModelText = computed(() => props.currentModelInfo ? modelShortLabel(props.currentModelInfo) : "模型");
+const runConfigStrategyText = computed(() => props.contextStrategy === 'model_summary' ? '模型摘要' : '滑动窗口');
 const runConfigMetaText = computed(() => {
 	const parts = [];
 	if (props.supportsThinking) parts.push(thinkingLabel(props.effectiveThinking));
@@ -143,56 +162,74 @@ const currentDefaultThinkingLabel = computed(() => {
 	const level = modelDefaultThinking(props.currentModelInfo);
 	return level ? thinkingLabel(level) : "无";
 });
-const agentModelInfo = computed(() => {
-	const key = props.agentModel || props.agentEffectiveModel || props.currentModel || "";
-	for (const group of props.modelGroups || []) {
-		const hit = (group.models || []).find((m) => m.key === key);
-		if (hit) return hit;
-	}
-	return null;
-});
 const agentFastTriState = computed(() => {
 	if (props.agentFastMode === true) return "on";
 	if (props.agentFastMode === false) return "off";
 	return "follow";
 });
 const isAgentTab = computed(() => runConfigTab.value === "agent");
-const headTitleText = computed(() => isAgentTab.value ? "Agent 默认" : "运行配置");
-const headModelText = computed(() => {
-	if (!isAgentTab.value) {
-		return props.currentModelInfo ? modelShortLabel(props.currentModelInfo) : "选择模型";
+const menuThinkingLevels = computed(() => isAgentTab.value ? props.agentThinkLevels : props.currentThinkLevels);
+const menuSupportsThinking = computed(() => isAgentTab.value ? props.agentSupportsThinking : props.supportsThinking);
+const menuThinkingLevel = computed(() => isAgentTab.value ? props.agentThinkLevel : props.effectiveThinking);
+const menuDefaultThinking = computed(() => compactThinkingLabel(isAgentTab.value ? props.agentDefaultThinkingLabel : currentDefaultThinkingLabel.value));
+const menuSelectedModel = computed(() => isAgentTab.value ? props.agentModel : props.currentModel);
+const contextDetailText = computed(() => `已用 ${props.contextUsedDisplay} · 压缩阈值 ${props.contextThresholdDisplay} · 模型窗口 ${props.contextWindowDisplay}`);
+
+function compactThinkingLabel(level) {
+	return {off: '关闭', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高'}[level] || level || '默认';
+}
+
+function selectMenuModel(model) {
+	clearModelDetail();
+	if (isAgentTab.value) emit('select-agent-model', model.key);
+	else emit('select-model', model);
+}
+
+function selectMenuThinking(level) {
+	emit(isAgentTab.value ? 'select-agent-thinking' : 'select-thinking', level);
+}
+
+function modelTags(model) {
+	const tags = [];
+	if (model?.contextWindow) {
+		tags.push({id: 'context', type: 'number', label: `${fmtTokens(model.contextWindow)} 上下文`});
 	}
-	if (!props.agentModel) return "跟随主模型";
-	return agentModelInfo.value ? modelShortLabel(agentModelInfo.value) : (props.agentModel || "选择模型");
-});
-const headModelKey = computed(() => {
-	if (!isAgentTab.value) return props.currentModelInfo?.key || props.currentModel || "未选择模型";
-	if (!props.agentModel) return `跟随 ${props.currentModel || "主模型"}`;
-	return props.agentModel;
-});
-const headMetaText = computed(() => {
-	if (props.running) {
-		return isAgentTab.value ? "运行中修改将在下一次新 Agent 生效" : "运行中修改将在下一次调用生效";
+	const trigger = rolloverTriggerForModel(model);
+	if (trigger > 0) {
+		tags.push({id: 'compression', type: 'number', label: `${fmtTokens(trigger)} 压缩`});
 	}
-	if (!isAgentTab.value) return `默认思考 ${currentDefaultThinkingLabel.value}`;
-	const think = props.agentSupportsThinking
-		? (props.agentThinkLevel ? thinkingLabel(props.agentThinkLevel) : `默认 ${props.agentDefaultThinkingLabel}`)
-		: "无思考档";
-	const fast = agentFastTriState.value === "follow"
-		? `Fast 跟随主会话(${props.currentFast ? "开" : "关"})`
-		: (agentFastTriState.value === "on" ? "Fast 开" : "Fast 关");
-	return `${think} · ${fast}`;
-});
+	if (model?.maxTokens) {
+		tags.push({id: 'output', type: 'number', label: `${fmtTokens(model.maxTokens)} 输出`});
+	}
+	if (model?.reasoning) {
+		tags.push({id: 'reasoning', type: 'feature', icon: 'brain', label: '思考'});
+	}
+	if (model?.supportsFast) {
+		tags.push({id: 'fast', type: 'feature', icon: 'zap', label: 'Fast'});
+	}
+	return tags;
+}
+
+function modelFeatures(model) {
+	const features = [{id: 'protocol', icon: 'protocol', label: '接口协议', value: model.protocol || '未声明'}];
+	const trigger = rolloverTriggerForModel(model);
+	if (trigger > 0) features.push({id: 'compression', icon: 'compression', label: '压缩阈值', value: `${fmtTokens(trigger)} tokens`});
+	if (model.contextWindow) features.push({id: 'context', icon: 'context', label: '上下文窗口', value: `${fmtTokens(model.contextWindow)} tokens`});
+	if (model.maxTokens) features.push({id: 'output', icon: 'output', label: '输出上限', value: `${fmtTokens(model.maxTokens)} tokens`});
+	if (model.reasoning) features.push({id: 'reasoning', icon: 'brain', label: '思考能力', value: '支持推理'});
+	if (model.supportsFast) features.push({id: 'fast', icon: 'zap', label: 'Fast 模式', value: '支持加速'});
+	return features;
+}
 const contextPercentNumber = computed(() => {
 	const value = Number(String(props.contextPercentDisplay || "").replace("%", ""));
 	return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
 });
 const contextMeterStyle = computed(() => ({width: `${contextPercentNumber.value}%`}));
 
-function compactTriggerForModel(model) {
-	const explicit = Number(model?.compactTriggerTokens || 0);
+function rolloverTriggerForModel(model) {
+	const explicit = Number(model?.rolloverTriggerTokens || 0);
 	if (explicit > 0) return explicit;
-	const ratio = Number(model?.compactRatio || DEFAULT_COMPACT_RATIO);
+	const ratio = Number(model?.windowTriggerRatio || DEFAULT_WINDOW_TRIGGER_RATIO);
 	return Math.round(Number(model?.contextWindow || 0) * ratio);
 }
 
@@ -542,7 +579,20 @@ onBeforeUnmount(() => {
 	composerResizeObserver = null;
 });
 
-defineExpose({focus, adjustHeight, openFilePicker});
+function focusInteraction(interactionId) {
+	const pending = props.pendingConfirmations.find(item => item.confirmationId === interactionId);
+	if (!pending || interactionExpired(pending)) return false;
+	const card = Array.from(composerShell.value?.querySelectorAll("[data-interaction-id]") || [])
+		.find(element => element.dataset.interactionId === interactionId);
+	if (!card) return false;
+	card.scrollIntoView({block: "nearest", inline: "nearest"});
+	// Focus the card, not an input: navigation must not summon the phone keyboard
+	// or activate any confirmation/submit button.
+	card.focus({preventScroll: true});
+	return true;
+}
+
+defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
 </script>
 
 <template>
@@ -562,7 +612,8 @@ defineExpose({focus, adjustHeight, openFilePicker});
 			<div v-if="props.pendingConfirmations.length" class="web-confirm-stack">
 				<div v-for="item in props.pendingConfirmations" :key="item.confirmationId" class="web-confirm-card"
 				     :class="{'questionnaire-card': interactionAction(item) === 'questionnaire', 'is-expired': interactionExpired(item)}"
-				     :data-questionnaire-id="interactionAction(item) === 'questionnaire' ? item.confirmationId : undefined">
+				     :data-questionnaire-id="interactionAction(item) === 'questionnaire' ? item.confirmationId : undefined"
+				     :data-interaction-id="item.confirmationId" tabindex="-1" role="region" :aria-label="item.title || '待处理交互'">
 					<div class="web-confirm-title" :class="{'questionnaire-title': interactionAction(item) === 'questionnaire'}">
 						<Warning/>
 						<div>
@@ -752,21 +803,9 @@ defineExpose({focus, adjustHeight, openFilePicker});
 								<Paperclip/>
 							</button>
 						</el-tooltip>
-						<el-tooltip content="手动压缩上下文" placement="top" :show-after="260">
-							<button
-								type="button"
-								class="tool-btn compact-tool-btn"
-								:class="{'is-compacting': props.compacting}"
-								:aria-label="props.compacting ? '正在压缩上下文' : '手动压缩上下文'"
-								:aria-busy="props.compacting ? 'true' : 'false'"
-								:disabled="!props.canCompact || props.compacting"
-								@click="emit('compact')"
-							>
-								<svg class="compact-context-icon" viewBox="0 0 1024 1024" aria-hidden="true" focusable="false">
-									<path d="M489.18 342.76c0.98 0.9 2.22 1.35 3.28 2.14 5.34 4.17 11.78 7.08 19.25 7.08 9.87 0 18.4-4.89 24.34-12.05l126.19-126.19 0.51-0.51c12.28-12.29 11.77-32.77-0.51-45.06-12.29-12.29-32.77-12.29-45.06 0.51l-73.21 73.57V95.97c0-17.41-14.34-31.74-31.75-31.74-17.92 0-32.25 13.82-32.25 31.74v147.1l-73.73-73.36c-12.29-12.29-32.26-12.29-44.55 0-12.29 12.28-12.8 32.25-0.51 45.05l128 128zM95.96 447.72h831.5c17.92 0 32.26-14.34 32.26-31.75s-13.82-31.74-31.75-31.74H95.96c-17.41 0-31.74 14.34-31.74 31.74s13.82 31.75 31.74 31.75zM927.97 576.23H95.96c-17.41 0-31.74 14.34-31.74 31.75s13.82 31.74 31.74 31.74h831.5c17.92 0 32.26-14.34 32.26-31.74 0-17.41-13.83-31.75-31.75-31.75zM536.21 684.19c-5.75-7.25-14.27-12.21-24.5-12.21-8.83 0-16.82 3.59-22.59 9.43-0.13 0.13-0.32 0.16-0.45 0.3l-128 128.01c-5.63 6.14-9.22 13.82-9.22 22.52 0 17.41 14.34 31.75 32.26 31.75 8.71 0 16.39-3.58 22.53-9.22l73.73-74.08v147.3c0 17.41 13.83 31.74 31.75 31.74s32.26-14.34 31.74-31.74V780.83l73.21 73.93c12.29 12.29 32.26 12.29 44.55 0s12.8-32.26 0.51-45.05L536.21 684.19z"/>
-								</svg>
-								<span v-if="props.compacting" class="compact-loading-indicator" aria-hidden="true"></span>
-							</button>
+
+						<el-tooltip v-if="props.contextStrategy === 'model_summary'" :content="props.compacting ? '正在压缩上下文…' : '手动压缩上下文'" placement="top" :show-after="260">
+							<button type="button" class="tool-btn" aria-label="手动压缩上下文" :disabled="!props.canCompact || props.compacting" @click="emit('compact')"><ContextCompactionIcon :class="{'context-compacting-icon': props.compacting}" /></button>
 						</el-tooltip>
 						<el-tooltip content="清空草稿" placement="top" :show-after="260">
 							<button type="button" class="tool-btn" aria-label="清空草稿"
@@ -781,193 +820,110 @@ defineExpose({focus, adjustHeight, openFilePicker});
 						            popper-class="composer-menu-popper run-config-menu-popper"
 						            placement="top-end"
 						            trigger="click"
-						            :width="'min(24rem, calc(100vw - 2rem))'"
+						            :width="'min(26rem, calc(100vw - 2rem))'"
 						            :show-arrow="false"
 						            :hide-after="0">
 							<template #reference>
-								<button type="button" class="status-chip run-config-chip" aria-label="运行配置"
+								<button type="button" class="status-chip run-config-chip" aria-label="运行配置" :aria-description="`上下文压缩：${runConfigStrategyText}`"
 								        :class="props.modelMenuOpen ? 'status-chip-active' : ''">
 									<span class="run-config-chip-main">
 										<span class="run-config-chip-model">{{ runConfigModelText }}</span>
 										<span v-if="runConfigMetaText" class="run-config-chip-meta">{{ runConfigMetaText }}</span>
 									</span>
+									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}`">{{ props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩' }}</span>
 									<ArrowDown class="chip-caret"/>
 								</button>
 							</template>
-							<div class="popover-menu-content run-config-popover">
+							<div class="popover-menu-content run-config-popover" @mouseleave="clearModelDetail" @scroll.capture="clearModelDetail" @keydown.esc="clearModelDetail">
 								<div class="run-config-tabs" role="tablist" aria-label="运行配置切换">
-									<button type="button" role="tab"
-									        :aria-selected="runConfigTab === 'main'"
-									        :class="runConfigTab === 'main' ? 'is-active' : ''"
-									        @click="runConfigTab = 'main'">主会话</button>
-									<button type="button" role="tab"
-									        :aria-selected="runConfigTab === 'agent'"
-									        :class="runConfigTab === 'agent' ? 'is-active' : ''"
-									        @click="runConfigTab = 'agent'">Agent</button>
+									<button type="button" role="tab" :aria-selected="runConfigTab === 'main'" :class="runConfigTab === 'main' ? 'is-active' : ''" @click="runConfigTab = 'main'">主会话</button>
+									<button type="button" role="tab" :aria-selected="runConfigTab === 'agent'" :class="runConfigTab === 'agent' ? 'is-active' : ''" @click="runConfigTab = 'agent'">Agent</button>
 								</div>
-								<div class="run-config-head" :class="isAgentTab ? 'is-agent' : ''">
-									<div class="run-config-title-row">
-										<span class="run-config-title"><Cpu/>{{ headTitleText }}</span>
-										<strong>{{ headModelText }}</strong>
-									</div>
-									<div class="run-config-subtitle">
-										<span>{{ headModelKey }}</span>
-										<span>{{ headMetaText }}</span>
-									</div>
-									<template v-if="!isAgentTab">
+								<el-tooltip v-if="!isAgentTab" :content="contextDetailText" placement="top" :show-after="400">
+									<div class="run-config-context" :aria-label="contextDetailText">
 										<div class="context-meter-row">
-											<span><DataAnalysis/>上下文 {{ props.contextDisplay }}</span>
-											<strong>{{ props.contextPercentDisplay }}</strong>
+											<span class="config-label"><ModelFeatureIcon name="context"/>上下文</span>
+											<span class="context-meter-values"><span>{{ props.contextUsedDisplay }} <span class="context-meter-limit">/ {{ props.contextThresholdDisplay }}</span></span><span class="context-percent">{{ props.contextPercentDisplay }}</span></span>
 										</div>
-										<div class="context-meter"><span :style="contextMeterStyle"></span></div>
-										<div class="run-config-context-detail">
-											<span>已用 {{ props.contextUsedDisplay }}</span>
-											<span>压缩阈值 {{ props.contextThresholdDisplay }}</span>
-											<span>模型窗口 {{ props.contextWindowDisplay }}</span>
-										</div>
-									</template>
-								</div>
-								<template v-if="runConfigTab === 'main'">
-									<label class="model-search run-config-search">
-										<Search/>
-										<input :value="props.modelQuery" type="search" placeholder="搜索模型"
-										       @input="emit('update:modelQuery', $event.target.value)"/>
-									</label>
-									<div class="model-list run-config-model-list">
-										<div v-for="group in props.modelGroups" :key="group.provider" class="model-group">
-											<div class="model-group-title">{{ group.provider }}</div>
-											<button v-for="model in group.models" :key="model.key" type="button" class="menu-row model-row"
-											        :class="props.currentModel === model.key ? 'menu-row-active' : ''"
-											        @click="emit('select-model', model)">
-												<span class="menu-icon"><Cpu/></span>
-												<span class="min-w-0 flex-1">
-													<span class="block truncate font-medium">{{ modelLabel(model) }}</span>
-													<span class="model-meta">
-														<span>{{ model.protocol || '—' }}</span>
-														<span>{{ fmtTokens(compactTriggerForModel(model)) }} trigger</span>
-														<span>{{ fmtTokens(model.contextWindow || 0) }} window</span>
-														<span v-if="model.reasoning">reasoning</span>
-														<span v-if="model.supportsFast">fast</span>
-														<span v-if="model.maxTokens">{{ fmtTokens(model.maxTokens) }} out</span>
-													</span>
-												</span>
-												<CircleCheck v-if="props.currentModel === model.key" class="menu-check"/>
-											</button>
-										</div>
-										<div v-if="!props.modelGroups.length" class="model-empty">没有匹配模型</div>
+										<div class="context-meter" aria-hidden="true"><span :style="contextMeterStyle"></span></div>
 									</div>
-									<div class="run-config-controls">
-										<div class="run-config-control-head">
-											<span><MagicStick/>思考强度</span>
-											<small>来自当前模型元数据 · 默认 {{ currentDefaultThinkingLabel }}</small>
-										</div>
-										<div v-if="props.supportsThinking" class="thinking-segments">
-											<button v-for="level in props.currentThinkLevels" :key="level" type="button"
-											        :class="props.effectiveThinking === level ? 'is-active' : ''"
-											        @click="emit('select-thinking', level)">
-												<span>{{ thinkingLabel(level) }}</span>
-												<small>{{ thinkingDesc(level) || '可用' }}</small>
-											</button>
-										</div>
-										<div v-else class="control-unavailable">当前模型元数据未声明可用思考强度</div>
-										<div class="fast-control" :class="{ 'is-on': props.currentFast, 'is-disabled': !props.fastSupported }">
-											<div class="fast-copy">
-												<span><Lightning/>Fast 模式</span>
-												<small>{{ props.fastSupported ? '当前模型元数据支持 Fast' : '当前模型未标记 Fast 能力' }}</small>
+								</el-tooltip>
+								<p v-if="props.running" class="run-config-notice">{{ isAgentTab ? '模型与执行设置用于新 Agent' : '模型与执行设置在下一次调用生效' }}</p>
+								<label class="model-search run-config-search">
+									<Search/>
+									<input :value="props.modelQuery" type="search" :placeholder="isAgentTab ? '搜索 Agent 模型' : '搜索模型'" :aria-label="isAgentTab ? '搜索 Agent 模型' : '搜索模型'" @input="emit('update:modelQuery', $event.target.value)"/>
+								</label>
+								<div class="run-config-model-section">
+								<div class="model-list run-config-model-list">
+									<div v-if="isAgentTab" class="agent-follow-group">
+										<button type="button" class="model-row follow-model-row" :class="!props.agentModel ? 'is-selected' : ''" :aria-pressed="!props.agentModel" @click="emit('select-agent-model', '')">
+											<div class="model-row-main">
+												<div class="model-row-title-row">
+													<span class="model-row-name">跟随主模型</span>
+												</div>
+												<div class="model-row-tags">
+													<span class="model-tag model-follow-detail">{{ runConfigModelText }}</span>
+												</div>
 											</div>
-											<button type="button" class="fast-switch"
-											        :class="props.currentFast ? 'is-on' : ''"
-											        :disabled="!props.fastSupported"
-											        @click="emit('toggle-fast-mode')">
-												<span></span>
-											</button>
-										</div>
+											<span class="model-selection-mark"><CircleCheck v-if="!props.agentModel" class="model-selected-icon"/></span>
+										</button>
 									</div>
-								</template>
-								<template v-else>
-									<label class="model-search run-config-search">
-										<Search/>
-										<input :value="props.modelQuery" type="search" placeholder="搜索 Agent 模型"
-										       @input="emit('update:modelQuery', $event.target.value)"/>
-									</label>
-									<div class="model-list run-config-model-list">
-										<div class="model-group agent-follow-group">
-												<button type="button" class="menu-row model-row"
-												        :class="!props.agentModel ? 'menu-row-active' : ''"
-												        @click="emit('select-agent-model', '')">
-													<span class="menu-icon"><Cpu/></span>
-													<span class="min-w-0 flex-1">
-														<span class="block truncate font-medium">跟随主模型</span>
-														<span class="model-meta">
-															<span>{{ props.currentModel || '主模型' }}</span>
-															<span>随主会话切换</span>
+									<section v-for="group in props.modelGroups" :key="group.provider" class="model-group" :aria-label="group.provider">
+										<div class="model-group-title">{{ group.provider }}</div>
+										<div v-for="model in group.models" :key="model.key" class="model-row" :class="menuSelectedModel === model.key ? 'is-selected' : ''" @click="selectMenuModel(model)">
+											<button type="button" class="model-select" :aria-pressed="menuSelectedModel === model.key" :aria-label="`${modelLabel(model)}（${model.key}）`" @click.stop="selectMenuModel(model)">
+												<div class="model-row-main">
+													<div class="model-row-title-row">
+														<span class="model-row-name">{{ modelLabel(model) }}</span>
+													</div>
+													<div v-if="modelTags(model).length" class="model-row-tags">
+														<span v-for="tag in modelTags(model)" :key="tag.id" class="model-tag" :class="tag.type === 'feature' ? 'model-tag-feature' : ''">
+															<ModelFeatureIcon v-if="tag.icon" :name="tag.icon"/>
+															<span>{{ tag.label }}</span>
 														</span>
-													</span>
-													<CircleCheck v-if="!props.agentModel" class="menu-check"/>
-												</button>
-											</div>
-										<div v-for="group in props.modelGroups" :key="`agent-${group.provider}`" class="model-group">
-											<div class="model-group-title">{{ group.provider }}</div>
-											<button v-for="model in group.models" :key="`agent-${model.key}`" type="button" class="menu-row model-row"
-											        :class="props.agentModel === model.key ? 'menu-row-active' : ''"
-											        @click="emit('select-agent-model', model.key)">
-												<span class="menu-icon"><Cpu/></span>
-												<span class="min-w-0 flex-1">
-													<span class="block truncate font-medium">{{ modelLabel(model) }}</span>
-													<span class="model-meta">
-														<span>{{ model.protocol || '—' }}</span>
-														<span>{{ fmtTokens(compactTriggerForModel(model)) }} trigger</span>
-														<span>{{ fmtTokens(model.contextWindow || 0) }} window</span>
-														<span v-if="model.reasoning">reasoning</span>
-														<span v-if="model.supportsFast">fast</span>
-														<span v-if="model.maxTokens">{{ fmtTokens(model.maxTokens) }} out</span>
-													</span>
-												</span>
-												<CircleCheck v-if="props.agentModel === model.key" class="menu-check"/>
+													</div>
+												</div>
 											</button>
+											<span class="model-selection-mark"><CircleCheck v-if="menuSelectedModel === model.key" class="model-selected-icon"/></span>
 										</div>
-										<div v-if="!props.modelGroups.length" class="model-empty">没有匹配模型</div>
-									</div>
-									<div class="run-config-controls">
-										<div class="run-config-control-head">
-											<span><MagicStick/>Agent 思考</span>
-											<small>默认 {{ props.agentDefaultThinkingLabel }}</small>
-										</div>
-										<div class="thinking-segments">
-											<button type="button"
-											        :class="!props.agentThinkLevel ? 'is-active' : ''"
-											        @click="emit('select-agent-thinking', '')">
-												<span>模型默认</span>
-												<small>{{ props.agentDefaultThinkingLabel }}</small>
-											</button>
-											<button v-for="level in props.agentThinkLevels" :key="`agent-think-${level}`" type="button"
-											        :class="props.agentThinkLevel === level ? 'is-active' : ''"
-											        @click="emit('select-agent-thinking', level)">
-												<span>{{ thinkingLabel(level) }}</span>
-												<small>{{ thinkingDesc(level) || '可用' }}</small>
-											</button>
-										</div>
-										<div v-if="!props.agentSupportsThinking && !props.agentThinkLevels.length" class="control-unavailable">当前 Agent 生效模型未声明思考强度</div>
-										<div class="run-config-control-head agent-fast-head">
-											<span><Lightning/>Agent Fast</span>
-											<small>{{ props.agentFastSupported ? '可独立于主会话' : '生效模型未标记 Fast' }}</small>
-										</div>
-										<div class="thinking-segments agent-fast-segments">
-											<button type="button" :class="agentFastTriState === 'follow' ? 'is-active' : ''" @click="emit('select-agent-fast', null)">
-												<span>跟随主会话</span>
-												<small>{{ props.currentFast ? '当前开' : '当前关' }}</small>
-											</button>
-											<button type="button" :class="agentFastTriState === 'on' ? 'is-active' : ''" :disabled="!props.agentFastSupported" @click="emit('select-agent-fast', true)">
-												<span>开启</span>
-												<small>强制 Fast</small>
-											</button>
-											<button type="button" :class="agentFastTriState === 'off' ? 'is-active' : ''" @click="emit('select-agent-fast', false)">
-												<span>关闭</span>
-												<small>强制普通</small>
-											</button>
+									</section>
+									<div v-if="!props.modelGroups.length" class="model-empty">没有匹配模型</div>
+								</div>
+								</div>
+								<div class="run-config-controls">
+									<div class="thinking-control">
+										<div class="run-config-control-head"><span class="config-label"><ModelFeatureIcon name="brain"/>思考强度</span><span class="config-hint">{{ menuSupportsThinking ? `默认 ${menuDefaultThinking}` : '未声明支持' }}</span></div>
+										<div v-if="menuSupportsThinking || isAgentTab" class="thinking-segments" role="group" aria-label="思考强度">
+											<el-tooltip v-if="isAgentTab" :content="`使用模型默认思考强度：${props.agentDefaultThinkingLabel}`" placement="top" :show-after="400">
+												<button type="button" :class="!props.agentThinkLevel ? 'is-active' : ''" :aria-pressed="!props.agentThinkLevel" @click="selectMenuThinking('')">默认</button>
+											</el-tooltip>
+											<el-tooltip v-for="level in menuThinkingLevels" :key="level" :content="`思考强度：${level}`" placement="top" :show-after="400">
+												<button type="button" :class="menuThinkingLevel === level ? 'is-active' : ''" :aria-pressed="menuThinkingLevel === level" @click="selectMenuThinking(level)">{{ compactThinkingLabel(level) }}</button>
+											</el-tooltip>
 										</div>
 									</div>
-								</template>
+									<div v-if="!isAgentTab" class="fast-control" :class="{'is-disabled': !props.fastSupported}">
+										<span class="config-label"><ModelFeatureIcon name="zap"/>Fast 模式</span>
+										<div class="config-value"><span v-if="!props.fastSupported" class="config-hint">不支持</span>
+											<button type="button" class="fast-switch" role="switch" aria-label="Fast 模式" :aria-checked="props.currentFast" :class="props.currentFast ? 'is-on' : ''" :disabled="!props.fastSupported" @click="emit('toggle-fast-mode')"><span></span></button>
+										</div>
+									</div>
+									<div v-else class="fast-control">
+										<el-tooltip :content="props.agentFastSupported ? `跟随主会话时当前为${props.currentFast ? '开启' : '关闭'}` : '当前 Agent 模型未声明 Fast 能力'" placement="top" :show-after="400"><span class="config-label"><ModelFeatureIcon name="zap"/>Fast 模式</span></el-tooltip>
+										<div class="thinking-segments agent-fast-segments" role="group" aria-label="Agent Fast 模式">
+											<button type="button" :class="agentFastTriState === 'follow' ? 'is-active' : ''" :aria-pressed="agentFastTriState === 'follow'" aria-label="Fast 跟随主会话" @click="emit('select-agent-fast', null)">跟随</button>
+											<button type="button" :class="agentFastTriState === 'on' ? 'is-active' : ''" :aria-pressed="agentFastTriState === 'on'" :disabled="!props.agentFastSupported" aria-label="开启 Agent Fast" @click="emit('select-agent-fast', true)">开</button>
+											<button type="button" :class="agentFastTriState === 'off' ? 'is-active' : ''" :aria-pressed="agentFastTriState === 'off'" aria-label="关闭 Agent Fast" @click="emit('select-agent-fast', false)">关</button>
+										</div>
+									</div>
+									<div class="fast-control context-strategy-control">
+										<el-tooltip content="主会话与 Agent 共用；关闭使用滑动窗口，开启使用模型摘要" placement="top" :show-after="260"><span class="config-label"><ModelFeatureIcon name="compression"/>上下文压缩</span></el-tooltip>
+										<div class="context-strategy-value config-value">
+											<span class="config-hint" aria-live="polite">{{ props.contextStrategy === 'model_summary' ? '模型摘要' : '滑动窗口' }}</span>
+											<button type="button" class="fast-switch" role="switch" aria-label="使用模型摘要（关闭为滑动窗口）" :aria-checked="props.contextStrategy === 'model_summary'" :class="props.contextStrategy === 'model_summary' ? 'is-on' : ''" :disabled="props.strategySaving" @click="emit('select-context-strategy', props.contextStrategy === 'model_summary' ? 'sliding_window' : 'model_summary')"><span></span></button>
+										</div>
+									</div>
+								</div>
 							</div>
 						</el-popover>
 						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260">
@@ -994,6 +950,9 @@ defineExpose({focus, adjustHeight, openFilePicker});
 
 <style scoped>
 @import "./userInteractionTokens.css";
+
+.context-compacting-icon { animation: context-compress-spin 1.5s linear infinite; }
+@keyframes context-compress-spin { to { transform: rotate(360deg); } }
 
 .composer-shell {
 	pointer-events: none;
@@ -1105,6 +1064,8 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	padding: 0.85rem;
 	color: var(--ob-interaction-ink);
 }
+
+.web-confirm-card:focus { outline: 2px solid var(--ob-interaction-border-strong); outline-offset: 2px; }
 
 .web-confirm-card.is-expired {
 	box-shadow: none;
@@ -1756,52 +1717,6 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	color: var(--bear-accent);
 }
 
-.compact-tool-btn {
-	width: 2.58rem;
-	color: #b26a00;
-}
-
-.compact-tool-btn.is-compacting {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	gap: .28rem;
-}
-
-.tool-btn.compact-tool-btn:hover {
-	background: #fff7e6;
-	color: #8a4f00;
-}
-
-.compact-context-icon {
-	display: block;
-	width: 1rem;
-	height: 1rem;
-	flex: 0 0 auto;
-	fill: currentColor;
-}
-
-.compact-loading-indicator {
-	box-sizing: border-box;
-	display: block;
-	width: .68rem;
-	height: .68rem;
-	flex: 0 0 auto;
-	border: 1.5px solid rgba(178, 106, 0, .24);
-	border-top-color: currentColor;
-	border-right-color: rgba(178, 106, 0, .54);
-	border-radius: 999px;
-	animation: compact-loading-spin .9s linear infinite;
-}
-
-@keyframes compact-loading-spin {
-	to { transform: rotate(360deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-	.compact-loading-indicator { animation: none; }
-}
-
 .tool-btn:hover, .tool-btn-active {
 	background: #f4f4f5;
 	color: #111827;
@@ -1873,6 +1788,13 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	font-weight: 640;
 }
 
+.run-config-chip-strategy {
+	flex: 0 0 auto;
+	white-space: nowrap;
+	color: #94a3b8;
+	font-weight: 520;
+}
+
 .run-config-chip-meta {
 	min-width: 0;
 	overflow: hidden;
@@ -1882,7 +1804,7 @@ defineExpose({focus, adjustHeight, openFilePicker});
 	font-weight: 520;
 }
 
-.run-config-chip-meta::before {
+.run-config-chip-meta::before, .run-config-chip-strategy::before {
 	content: "·";
 	margin-right: 0.28rem;
 	color: #d4d4d8;
@@ -1915,433 +1837,299 @@ button.status-chip:hover, .status-chip-active {
 	color: #111827;
 }
 
-.popover-menu-content {
-	overflow: hidden;
-	border-radius: 12px;
-}
-
+/* Model picker: quiet macOS surfaces, one accent, two readable type sizes. */
+.popover-menu-content { overflow: hidden; border-radius: 12px; }
 .run-config-popover {
+	--rc-text: #2c3038;
+	--rc-muted: #787e8b;
+	--rc-line: #e5e7eb;
+	--rc-surface: #f3f4f6;
+	--rc-hover: #f5f6f8;
+	--rc-selected: #edf2fc;
+	--rc-control: #ffffff;
+	--rc-accent: #3578df;
+	--rc-track: #d8dbe2;
+	--rc-detail-bg: #30343b;
+	--rc-detail-text: #f8fafc;
+	--rc-detail-line: #484e58;
+	position: relative;
 	display: flex;
-	width: 100%;
-	max-height: min(72vh, 36rem);
 	flex-direction: column;
-	gap: 0.42rem;
-}
-
-.run-config-head {
-	display: grid;
-	gap: 0.42rem;
-	border: 1px solid rgba(37, 99, 235, 0.12);
-	border-radius: 12px;
-	background: linear-gradient(180deg, #f8fbff, #ffffff);
-	padding: 0.65rem;
-}
-
-.run-config-head.is-agent {
-	border-color: rgba(124, 58, 237, 0.14);
-	background: linear-gradient(180deg, #faf8ff, #ffffff);
-}
-
-.run-config-tabs {
-	display: grid;
-	grid-template-columns: 1fr 1fr;
-	gap: 0.2rem;
-	padding: 0.16rem;
-	border: 1px solid #e2e8f0;
-	border-radius: 10px;
-	background: #f8fafc;
-}
-
-.run-config-tabs button {
-	border: 0;
-	border-radius: 8px;
-	background: transparent;
-	padding: 0.38rem 0.45rem;
-	color: #64748b;
-	font-size: 11.5px;
-	font-weight: 750;
-	line-height: 1.2;
-	cursor: pointer;
-	transition: background .12s ease, color .12s ease, box-shadow .12s ease;
-}
-
-.run-config-tabs button:hover {
-	color: #334155;
-}
-
-.run-config-tabs button.is-active {
-	background: #ffffff;
-	color: #0f172a;
-	box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), inset 0 0 0 1px #e2e8f0;
-}
-
-
-
-.agent-fast-head {
-	margin-top: 0.1rem;
-}
-
-.agent-fast-segments button:disabled {
-	opacity: 0.45;
-	cursor: not-allowed;
-}
-
-.run-config-title-row,
-.context-meter-row,
-.run-config-context-detail,
-.run-config-control-head,
-.fast-control {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 0.7rem;
-}
-
-.run-config-title,
-.context-meter-row span,
-.run-config-control-head span,
-.fast-copy span {
-	display: inline-flex;
-	align-items: center;
-	gap: 0.34rem;
-}
-
-.run-config-title-row strong {
-	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	color: #111827;
+	gap: 10px;
+	width: 100%;
+	max-height: min(76vh, 600px);
+	max-height: min(76dvh, 600px);
+	color: var(--rc-text);
 	font-size: 13px;
-	font-weight: 800;
+	line-height: 1.45;
 }
-
-.run-config-title,
-.context-meter-row {
-	color: #334155;
-	font-size: 11.5px;
-	font-weight: 800;
-}
-
-.run-config-title svg,
-.context-meter-row svg,
-.run-config-control-head svg,
-.fast-copy svg {
-	width: 0.86rem;
-	height: 0.86rem;
-	color: #475569;
-}
-
-.run-config-subtitle,
-.run-config-context-detail {
-	min-width: 0;
-	flex-wrap: wrap;
-	color: #94a3b8;
-	font-size: 10.5px;
-	line-height: 1.35;
-}
-
-.run-config-subtitle {
+.run-config-popover button, .run-config-popover input { font-family: inherit; }
+.run-config-tabs {
 	display: flex;
-	gap: 0.5rem;
+	flex: 0 0 auto;
+	gap: 3px;
+	padding: 3px;
+	border-radius: 9px;
+	background: var(--rc-surface);
 }
-
-.run-config-subtitle span:first-child {
+.run-config-tabs button {
+	flex: 1;
 	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	padding: 5px 12px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--rc-muted);
+	font-size: 13px;
+	font-weight: 500;
+	line-height: 20px;
+	cursor: pointer;
+	transition: background-color .15s ease, color .15s ease, box-shadow .15s ease;
 }
-
-.context-meter-row strong {
-	color: #2563eb;
-	font-size: 12px;
-	font-weight: 850;
+.run-config-tabs button:hover:not(.is-active) { color: var(--rc-text); }
+.run-config-tabs button.is-active {
+	background: var(--rc-control);
+	color: var(--rc-text);
+	box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 0.5px 1px rgba(15, 23, 42, 0.04);
 }
-
-.context-meter {
-	height: 6px;
-	overflow: hidden;
-	border-radius: 999px;
-	background: #e2e8f0;
+.run-config-context {
+	flex: 0 0 auto;
+	padding: 6px 8px;
+	border-radius: 8px;
+	background: var(--rc-surface);
 }
-
-.context-meter span {
-	display: block;
-	height: 100%;
-	border-radius: inherit;
-	background: linear-gradient(90deg, #60a5fa, #2563eb);
-	transition: width .18s ease;
-}
-
+.context-meter-row, .run-config-control-head, .fast-control { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.config-label { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 7px; font-size: 13px; font-weight: 500; white-space: nowrap; }
+.config-label svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--rc-muted); }
+.context-meter-values { display: flex; align-items: baseline; gap: 8px; font-variant-numeric: tabular-nums; font-size: 12px; white-space: nowrap; }
+.context-meter-limit { color: var(--rc-muted); }
+.context-percent { font-weight: 500; color: var(--rc-text); }
+.context-meter { height: 5px; margin-top: 6px; overflow: hidden; border-radius: 5px; background: rgba(0, 0, 0, 0.06); }
+html.dark .context-meter { background: rgba(255, 255, 255, 0.08); }
+.context-meter span { display: block; height: 100%; border-radius: inherit; background: var(--rc-accent); transition: width .2s ease; }
+.run-config-notice { margin: 0 4px; color: var(--rc-muted); font-size: 12px; }
 .model-search {
 	display: flex;
 	align-items: center;
-	gap: .38rem;
 	flex: 0 0 auto;
-	margin: .02rem .12rem .26rem;
-	border: 1px solid #e2e8f0;
-	border-radius: 8px;
-	background: #f8fafc;
-	padding: .26rem .44rem;
-	color: #94a3b8;
-}
-
-.run-config-search {
+	gap: 8px;
 	margin: 0;
+	padding: 6px 10px;
+	border: 1px solid var(--rc-line);
+	border-radius: 8px;
+	background: var(--rc-control);
+	color: var(--rc-muted);
+	transition: border-color .15s ease, box-shadow .15s ease;
 }
-
-.model-search svg {
-	width: .76rem;
-	height: .76rem;
+.model-search:focus-within {
+	border-color: var(--rc-accent);
+	box-shadow: 0 0 0 2px rgba(53, 120, 223, 0.15);
 }
-
-.model-search input {
-	min-width: 0;
-	flex: 1;
-	border: 0;
-	outline: 0;
-	background: transparent;
-	color: #334155;
-	font-size: 10.5px;
-}
-
-.model-list {
+.model-search svg { width: 14px; height: 14px; flex: 0 0 auto; color: var(--rc-muted); }
+.model-search input { min-width: 0; width: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--rc-text); font-size: 13px; line-height: 20px; }
+.model-search input::placeholder { color: var(--rc-muted); }
+.run-config-model-section { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.run-config-model-list {
 	min-height: 0;
+	max-height: min(42vh, 320px);
 	flex: 1 1 auto;
 	overflow-y: auto;
-	padding-right: .08rem;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+	scrollbar-color: var(--rc-track) transparent;
+	padding: 0 2px;
 }
-
-.run-config-model-list {
-	max-height: min(34vh, 15rem);
-	border: 1px solid #f1f5f9;
-	border-radius: 12px;
-	padding: 0.25rem;
-}
-
-.agent-follow-group {
-	margin-bottom: 0.18rem;
-	padding-bottom: 0.18rem;
-	border-bottom: 1px solid #f1f5f9;
-}
-
-
-.model-group + .model-group {
-	margin-top: .3rem;
-	padding-top: .22rem;
-	border-top: 1px solid #f1f5f9;
-}
-
-.model-group-title {
-	padding: .18rem .42rem;
-	color: #94a3b8;
-	font-size: 9.5px;
-	font-weight: 800;
-	letter-spacing: .12em;
-	text-transform: uppercase;
-}
-
-.model-empty {
-	padding: .9rem .4rem;
-	text-align: center;
-	color: #94a3b8;
-	font-size: 12px;
-}
-
-.menu-row {
+.model-group { margin: 0; }
+.model-group + .model-group { margin-top: 10px; }
+.model-group-title { padding: 4px 8px 3px; color: var(--rc-muted); font-size: 12px; font-weight: 500; letter-spacing: 0.02em; }
+.model-row {
 	display: flex;
-	width: 100%;
 	align-items: center;
-	gap: 0.48rem;
-	border: 0;
+	gap: 6px;
+	width: 100%;
+	padding: 6px 8px;
+	border: 1px solid transparent;
 	border-radius: 8px;
 	background: transparent;
-	padding: 0.36rem 0.42rem;
+	color: var(--rc-text);
 	text-align: left;
-	color: #27272a;
+	cursor: pointer;
+	transition: background-color .14s ease, border-color .14s ease;
+}
+.model-row:hover { background: var(--rc-hover); }
+.model-row.is-selected {
+	background: var(--rc-selected);
+	border-color: rgba(53, 120, 223, 0.2);
+}
+html.dark .model-row.is-selected {
+	border-color: rgba(106, 157, 241, 0.28);
+}
+.model-select {
+	display: flex;
+	align-items: center;
+	flex: 1 1 auto;
+	min-width: 0;
+	align-self: stretch;
+	padding: 0;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	text-align: left;
 	cursor: pointer;
 }
-
-.compact-row {
-	min-height: 1.82rem;
-}
-
-.menu-row:hover {
-	background: #f8fafc;
-}
-
-.menu-row-active {
-	background: #f1f5f9;
-	box-shadow: inset 0 0 0 1px #e2e8f0;
-}
-
-.menu-icon {
-	display: grid;
-	width: 1.18rem;
-	height: 1.18rem;
-	place-items: center;
-	border-radius: 6px;
-	background: #f1f5f9;
-	color: #64748b;
-}
-
-.menu-icon svg {
-	width: 0.72rem;
-	height: 0.72rem;
-}
-
-.menu-row-active .menu-icon {
-	background: #e2e8f0;
-	color: #334155;
-}
-
-.menu-check {
-	width: 0.86rem;
-	height: 0.86rem;
-	color: #334155;
-}
-
-.model-row {
-	padding: 0.34rem 0.42rem;
-}
-
-.model-row .font-medium {
-	font-size: 12px;
-}
-
-.model-meta {
+.follow-model-row { padding: 6px 8px; }
+.model-row-main {
 	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	flex: 1 1 auto;
+	min-width: 0;
+}
+.model-row-title-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+}
+.model-row-name {
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	font-size: 13px;
+	line-height: 18px;
+	font-weight: 500;
+	transition: color .14s ease;
+}
+.model-row.is-selected .model-row-name {
+	color: var(--rc-accent);
+}
+.model-row-tags {
+	display: flex;
+	align-items: center;
 	flex-wrap: wrap;
-	gap: 0.18rem;
-	margin-top: 0.01rem;
-	color: #94a3b8;
-	font-size: 9.2px;
+	gap: 4px;
 }
-
-.model-meta span {
+.model-tag {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	font-size: 12px;
+	line-height: 16px;
+	padding: 1px 6px;
 	border-radius: 4px;
-	background: #f8fafc;
-	padding: 0.01rem 0.24rem;
+	background: var(--rc-surface);
+	color: var(--rc-muted);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
 }
-
+.model-tag-feature {
+	color: var(--rc-text);
+	background: rgba(53, 120, 223, 0.08);
+}
+html.dark .model-tag-feature {
+	background: rgba(106, 157, 241, 0.12);
+	color: var(--rc-text);
+}
+.model-tag .model-feature-icon {
+	width: 12px;
+	height: 12px;
+}
+.config-label .model-feature-icon { color: var(--rc-muted); }
+.model-selection-mark {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	flex: 0 0 auto;
+	margin-left: 4px;
+}
+.model-selected-icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--rc-accent); }
+.agent-follow-group { margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--rc-line); }
+.model-follow-detail { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--rc-muted); font-size: 12px; }
+.model-empty { padding: 22px 10px; text-align: center; color: var(--rc-muted); font-size: 13px; }
 .run-config-controls {
-	display: grid;
-	gap: 0.6rem;
-	border: 1px solid #f1f5f9;
-	border-radius: 12px;
-	background: #fcfcfd;
-	padding: 0.62rem;
+	display: flex;
+	flex: 0 0 auto;
+	flex-direction: column;
+	border-top: 1px solid var(--rc-line);
+	padding: 2px 2px 0;
+	margin-top: 2px;
 }
-
-.run-config-control-head small,
-.fast-copy small {
-	color: #94a3b8;
-	font-size: 10px;
-	line-height: 1.35;
-}
-
+.thinking-control { display: grid; gap: 8px; padding: 9px 0 8px; }
+.config-hint { color: var(--rc-muted); font-size: 12px; font-weight: 400; white-space: nowrap; }
 .thinking-segments {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 0.35rem;
+	gap: 3px;
+	padding: 3px;
+	border-radius: 8px;
+	background: var(--rc-surface);
 }
-
 .thinking-segments button {
-	display: grid;
-	gap: 0.02rem;
-	min-width: 4rem;
-	border: 1px solid #e2e8f0;
-	border-radius: 10px;
-	background: #fff;
-	padding: 0.38rem 0.46rem;
-	color: #475569;
-	font-size: 11px;
-	font-weight: 750;
-	text-align: left;
+	flex: 1;
+	min-width: 34px;
+	padding: 4px 7px;
+	border: 0;
+	border-radius: 6px;
+	color: var(--rc-muted);
+	background: transparent;
+	font-size: 12px;
+	font-weight: 500;
+	line-height: 20px;
+	white-space: nowrap;
 	cursor: pointer;
+	transition: background-color .15s ease, color .15s ease, box-shadow .15s ease;
 }
-
-.thinking-segments button small {
-	color: #94a3b8;
-	font-size: 9.5px;
-	font-weight: 600;
-}
-
-.thinking-segments button:hover:not(:disabled) {
-	border-color: #bfdbfe;
-	background: #eff6ff;
-	color: #1d4ed8;
-}
-
+.thinking-segments button:hover:not(:disabled) { color: var(--rc-text); }
 .thinking-segments button.is-active {
-	border-color: rgba(37, 99, 235, 0.35);
-	background: #eff6ff;
-	color: #1d4ed8;
-	box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.08);
+	color: var(--rc-text);
+	background: var(--rc-control);
+	box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 0.5px 1px rgba(15, 23, 42, 0.04);
 }
-
-.control-unavailable {
-	border-radius: 10px;
-	background: #f8fafc;
-	padding: 0.55rem;
-	color: #94a3b8;
-	font-size: 11px;
-}
-
+.thinking-segments button:disabled { opacity: .4; cursor: not-allowed; }
 .fast-control {
-	border-top: 1px solid #f1f5f9;
-	padding-top: 0.56rem;
+	min-height: 38px;
+	padding: 6px 0;
+	border-top: 1px solid var(--rc-line);
 }
-
-.fast-control.is-disabled {
-	opacity: 0.62;
-}
-
-.fast-copy {
-	display: grid;
-	gap: 0.08rem;
-}
-
-.fast-copy span {
-	color: #334155;
-	font-size: 11.5px;
-	font-weight: 800;
-}
-
+.config-value { display: flex; align-items: center; gap: 9px; }
+.agent-fast-segments { flex: 0 0 auto; }
+.agent-fast-segments button { min-width: 30px; padding: 2px 8px; font-size: 12px; }
 .fast-switch {
 	position: relative;
-	width: 2.42rem;
-	height: 1.36rem;
+	width: 36px;
+	height: 22px;
 	flex: 0 0 auto;
+	padding: 2px;
 	border: 0;
-	border-radius: 999px;
-	background: #cbd5e1;
-	padding: 0.15rem;
+	border-radius: 11px;
+	background: var(--rc-track);
 	cursor: pointer;
-	transition: background .16s ease, opacity .16s ease;
+	transition: background-color .18s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
 .fast-switch span {
 	display: block;
-	width: 1.06rem;
-	height: 1.06rem;
-	border-radius: 999px;
-	background: white;
-	box-shadow: 0 2px 6px rgba(15, 23, 42, 0.18);
-	transition: transform .16s ease;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+	transition: transform .18s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
-.fast-switch.is-on {
-	background: #2563eb;
+.fast-switch.is-on { background: var(--rc-accent); }
+.fast-switch.is-on span { transform: translateX(14px); }
+.fast-switch:disabled { opacity: .45; cursor: not-allowed; }
+.run-config-popover button:focus-visible { outline: 2px solid var(--rc-accent); outline-offset: -2px; }
+.run-config-popover .fast-switch:focus-visible { outline-offset: 3px; }
+@media (max-height: 620px) {
+	.run-config-popover { overflow-y: auto; }
+	.run-config-model-section { flex: 0 0 auto; }
+	.run-config-model-list { flex: 0 0 auto; max-height: 180px; }
 }
-
-.fast-switch.is-on span {
-	transform: translateX(1.06rem);
-}
-
-.fast-switch:disabled {
-	cursor: not-allowed;
+@media (prefers-reduced-motion: reduce) {
+	.run-config-popover *, .run-config-popover *::before { transition: none; }
 }
 
 .send-button {
@@ -2396,23 +2184,24 @@ button.status-chip:hover, .status-chip-active {
 		display: none;
 	}
 
-	.run-config-title-row,
-	.context-meter-row,
-	.run-config-control-head,
-	.fast-control {
-		align-items: flex-start;
-		flex-direction: column;
-		gap: 0.35rem;
-	}
-
-	.thinking-segments button {
-		min-width: 0;
-		flex: 1 1 5rem;
-	}
 }
 </style>
 
 <style>
+.run-config-menu-popper.el-popper {
+	padding: 10px;
+	border: 1px solid rgba(226, 228, 233, 0.9);
+	border-radius: 16px;
+	background: rgba(255, 255, 255, 0.98);
+	box-shadow: 0 16px 40px -6px rgba(15, 23, 42, 0.14), 0 0 1px 1px rgba(15, 23, 42, 0.05);
+	backdrop-filter: blur(24px) saturate(180%);
+	-webkit-backdrop-filter: blur(24px) saturate(180%);
+}
+html.dark .run-config-menu-popper.el-popper {
+	border-color: rgba(62, 65, 74, 0.85);
+	background: rgba(25, 26, 30, 0.96);
+	box-shadow: 0 20px 48px -8px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
 /* OpenBear system dark theme */
 html.dark .steering-queue-card {
 		border: 1px solid rgba(96, 165, 250, 0.22);
@@ -2569,17 +2358,6 @@ html.dark .composer-textarea::placeholder {
 html.dark .tool-btn {
 		color: #c6c6cd;
 	}
-html.dark .compact-tool-btn {
-		color: #fbad66;
-	}
-html.dark .tool-btn.compact-tool-btn:hover {
-		background: #202125;
-		color: #fbad66;
-	}
-html.dark .compact-loading-indicator {
-		border: 1.5px solid rgba(251, 173, 102, 0.24);
-		border-right-color: rgba(251, 173, 102, 0.52);
-	}
 html.dark .tool-btn:hover,
 html.dark .tool-btn-active {
 		background: #202125;
@@ -2596,10 +2374,10 @@ html.dark .run-config-chip.status-chip-active {
 		background: #202125;
 		color: #efeff2;
 	}
-html.dark .run-config-chip-meta {
+html.dark .run-config-chip-meta, html.dark .run-config-chip-strategy {
 		color: #a1a1a8;
 	}
-html.dark .run-config-chip-meta::before {
+html.dark .run-config-chip-meta::before, html.dark .run-config-chip-strategy::before {
 		color: #7b7b82;
 	}
 html.dark .chip-caret {
@@ -2616,144 +2394,20 @@ html.dark .status-chip-active {
 		background: #202125;
 		color: #efeff2;
 	}
-html.dark .run-config-head {
-		border: 1px solid rgba(96, 165, 250, 0.12);
-		background: linear-gradient(180deg, #1d1e22, #1d1e22);
-	}
-html.dark .run-config-head.is-agent {
-		border-color: rgba(196, 181, 253, 0.14);
-		background: linear-gradient(180deg, #1d1e22, #1d1e22);
-	}
-html.dark .run-config-tabs {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-html.dark .run-config-tabs button {
-		color: #c6c6cd;
-	}
-html.dark .run-config-tabs button:hover {
-		color: #dedee1;
-	}
-html.dark .run-config-tabs button.is-active {
-		background: #1d1e22;
-		color: #efeff2;
-		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.11);
-	}
-html.dark .run-config-title-row strong {
-		color: #efeff2;
-	}
-html.dark .run-config-title,
-html.dark .context-meter-row {
-		color: #dedee1;
-	}
-html.dark .run-config-title svg,
-html.dark .context-meter-row svg,
-html.dark .run-config-control-head svg,
-html.dark .fast-copy svg {
-		color: #c6c6cd;
-	}
-html.dark .run-config-subtitle,
-html.dark .run-config-context-detail {
-		color: #a1a1a8;
-	}
-html.dark .context-meter-row strong {
-		color: #60a5fa;
-	}
-html.dark .context-meter {
-		background: #25262a;
-	}
-html.dark .model-search {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-		color: #a1a1a8;
-	}
-html.dark .model-search input {
-		color: #dedee1;
-	}
-html.dark .run-config-model-list {
-		border: 1px solid #3d3e46;
-	}
-html.dark .agent-follow-group {
-		border-bottom: 1px solid #3d3e46;
-	}
-html.dark .model-group + .model-group {
-		border-top: 1px solid #3d3e46;
-	}
-html.dark .model-group-title {
-		color: #a1a1a8;
-	}
-html.dark .model-empty {
-		color: #a1a1a8;
-	}
-html.dark .menu-row {
-		color: #efeff2;
-	}
-html.dark .menu-row:hover {
-		background: #1d1e22;
-	}
-html.dark .menu-row-active {
-		background: #202125;
-		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.11);
-	}
-html.dark .menu-icon {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .menu-row-active .menu-icon {
-		background: #25262a;
-		color: #dedee1;
-	}
-html.dark .menu-check {
-		color: #dedee1;
-	}
-html.dark .model-meta {
-		color: #a1a1a8;
-	}
-html.dark .model-meta span {
-		background: #1d1e22;
-	}
-html.dark .run-config-controls {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-html.dark .run-config-control-head small,
-html.dark .fast-copy small {
-		color: #a1a1a8;
-	}
-html.dark .thinking-segments button {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-		color: #c6c6cd;
-	}
-html.dark .thinking-segments button small {
-		color: #a1a1a8;
-	}
-html.dark .thinking-segments button:hover:not(:disabled) {
-		border-color: rgba(96, 165, 250, 0.52);
-		background: #202125;
-		color: #60a5fa;
-	}
-html.dark .thinking-segments button.is-active {
-		border-color: rgba(96, 165, 250, 0.35);
-		background: #202125;
-		color: #60a5fa;
-	}
-html.dark .control-unavailable {
-		background: #1d1e22;
-		color: #a1a1a8;
-	}
-html.dark .fast-control {
-		border-top: 1px solid #3d3e46;
-	}
-html.dark .fast-copy span {
-		color: #dedee1;
-	}
-html.dark .fast-switch {
-		background: #2b2c30;
-	}
-html.dark .fast-switch span {
-		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
-	}
+html.dark .run-config-popover {
+	--rc-text: #e5e6e9;
+	--rc-muted: #a3a7af;
+	--rc-line: #3a3d43;
+	--rc-surface: #282b31;
+	--rc-hover: #2e3138;
+	--rc-selected: #363941;
+	--rc-control: #41454e;
+	--rc-accent: #6a9df1;
+	--rc-track: #535963;
+	--rc-detail-bg: #e5e7eb;
+	--rc-detail-text: #242831;
+	--rc-detail-line: #f3f4f6;
+}
 html.dark .send-button {
 		background: #232428;
 		box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);

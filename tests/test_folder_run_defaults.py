@@ -265,7 +265,7 @@ async def test_actual_frontend_preview_matches_backend_resolved_defaults(web_env
             process.kill()
             await process.wait()
     assert process.returncode == 0, error.decode()
-    expected = [{key: case["defaults"]["resolved"][key] for key in FIELDS} for case in cases]
+    expected = [{key: case["defaults"]["resolved"][key] for key in (*FIELDS, "contextStrategy")} for case in cases]
     assert json.loads(output) == expected
 
 

@@ -57,6 +57,7 @@ const AGENT_MONITOR_EVENT_KINDS = new Set([
   "agent_control", "agent_supervision", "control_requested", "control_response", "steer_applied",
   "pause_applied", "resume_applied", "cancel_requested", "needs_openbear_control",
   "agent_plan_protocol_corrected", "agent_control_continuation_saved",
+  "model_context_window_rotated",
   "model_context_pre_compacted", "model_context_overflow_compacted", "model_context_compaction_failed",
 ]);
 const ACTIVE_AGENT_STATUSES = new Set([
@@ -211,6 +212,11 @@ export function contextCompactionView(value = {}) {
   const argumentsValue = firstCompactionField([event, detail, payload], ["arguments", "args"]);
   const args = parseJsonObject(argumentsValue);
   const records = [event, detail, payload, nested, args];
+  const strategy = text(firstCompactionField(records, ["strategy"]));
+  if (["sliding_window", "model_summary"].includes(strategy)
+      && (text(firstCompactionField(records, ["name", "toolName"])) === "ContextCompaction"
+          || FINAL_CONTEXT_COMPACTION_KINDS.has(text(event.kind || event.type))
+          || (text(firstCompactionField(records, ["compactionId"])) && ["root", "agent"].includes(text(firstCompactionField(records, ["scope"])))))) return strategyCompactionView(event, records, strategy);
   const kind = text(event.kind || event.type);
   const name = text(event.name || event.toolName || detail.name || payload.name || payload.toolName);
   const compactionId = text(firstCompactionField(records, ["compactionId", "compaction_id"]));
@@ -273,10 +279,54 @@ export function contextCompactionView(value = {}) {
   };
 }
 
+function strategyCompactionView(event, records, strategy) {
+  const get = (keys) => firstCompactionField(records, keys);
+  const window = strategy === "sliding_window";
+  const label = window ? "滑动窗口" : "模型摘要";
+  const status = text(get(["status"]), "completed");
+  const active = ["queued", "running"].includes(status);
+  const failed = status === "failed" || text(event.kind).includes("failed");
+  const before = number(get(["beforeEstimateTokens"]));
+  const after = number(get(["afterEstimateTokens"]));
+  const duration = number(get(["durationMs"]));
+  const summary = window ? "" : text(get(["compactedOutput", "compacted_output", "summary", "output"]));
+  const summaryChars = window ? 0 : number(get(["summaryChars"])) || summary.length;
+  const model = text(get(["compressionModel"]));
+  const reason = text(get(["reason", "error"]));
+  const usage = object(get(["usage"]));
+  const removed = get(["removedBatches"]);
+  const retained = get(["retainedBatches"]);
+  const hasWindowCounts = window && !active && !failed && [removed, retained].every(
+    value => ["number", "string"].includes(typeof value) && value !== "" && Number.isInteger(Number(value)) && Number(value) >= 0,
+  );
+  const facts = [`策略：${label}`];
+  if (hasWindowCounts) facts.push(`移出 ${number(removed)} 组 · 保留 ${number(retained)} 组完整记录`);
+  else if (!window && model) facts.push(`摘要模型：${model}`);
+  if (before || after) facts.push(`上下文估算：${compactionFactNumber(before) || "—"} → ${compactionFactNumber(after) || "—"} tokens`);
+  if (after) facts.push("压缩后的执行输入待下一次请求实测");
+  if (!window && Object.keys(usage).length) facts.push(`摘要调用实测：输入 ${compactionFactNumber(number(usage.inputTokens) + number(usage.cacheReadTokens) + number(usage.cacheWriteTokens)) || "0"} · 输出 ${compactionFactNumber(usage.outputTokens) || "0"} tokens`);
+  if (duration) facts.push(`耗时：${(duration / 1000).toFixed(1)} 秒`);
+  if (failed) facts.push(`压缩失败：${reason || "原上下文已保留"}`);
+  const output = window ? facts.join("\n") : summary;
+  return {
+    isCompaction: true, strategy, kind: text(event.kind || event.type), scope: text(get(["scope"])),
+    compactionId: text(get(["compactionId"])), summaryId: text(get(["summaryId"])), summaryRef: text(get(["summaryRef"])),
+    source: text(get(["source"])), sourceLabel: label, status, active, failed, reason,
+    cardTitle: "上下文压缩", cardPreview: [label, active ? "正在处理" : failed ? "失败" : window ? (hasWindowCounts ? facts[1] : "完成") : (summaryChars ? `摘要 ${compactionFactNumber(summaryChars)} 字` : "完成"), duration ? `${(duration / 1000).toFixed(1)}s` : ""].filter(Boolean).join(" · "),
+    message: `上下文压缩${active ? "中" : failed ? "失败" : "完成"} · ${label}`,
+    detailFacts: facts, beforeEstimateTokens: before, afterEstimateTokens: after, beforeTokens: 0, afterTokens: 0,
+    removedBatches: hasWindowCounts ? number(removed) : null, retainedBatches: hasWindowCounts ? number(retained) : null, durationMs: duration,
+    compressionModel: model, usage, summaryChars, output, outputPreview: window ? "" : text(get(["outputPreview"])),
+    outputAvailable: Boolean(output || get(["outputAvailable"])),
+    emptyOutputText: failed ? reason || "压缩失败，原上下文已保留" : active ? "正在整理上下文…" : "摘要正文未记录",
+    previewLabel: window ? "窗口变化" : "摘要预览（非完整输出）",
+  };
+}
+
 export function agentCompactionActivityView(event = {}) {
   const view = contextCompactionView(event);
   const kind = text(event?.kind || event?.type);
-  if (!FINAL_CONTEXT_COMPACTION_KINDS.has(kind)) return {...view, isCompaction: false};
+  if (!FINAL_CONTEXT_COMPACTION_KINDS.has(kind) && kind !== "model_context_compaction_started") return {...view, isCompaction: false};
   return view;
 }
 
@@ -732,13 +782,24 @@ export function compactAgentStepActivityLines(events = [], options = {}) {
     const detail = object(item?.detail);
     const compaction = agentCompactionActivityView(item);
 
+    if (kind === "model_context_window_rotated") {
+      const version = number(detail.windowVersion);
+      output.push(compactLine(item,
+        `上下文窗口已轮换${version ? ` · v${version}` : ""} · 原始记录可读取，待下一次请求实测`,
+        "muted", "context_window"));
+      continue;
+    }
+
     if (compaction.isCompaction) {
-      output.push(compactLine(
+      const line = compactLine(
         {...item, compaction, compactedOutput: compaction.output, emptyOutputText: compaction.emptyOutputText},
         compaction.message,
-        compaction.failed ? "danger" : "success",
+        compaction.failed ? "danger" : compaction.active ? "active" : "success",
         "context_compaction_compact",
-      ));
+      );
+      const previous = compaction.compactionId ? output.findIndex(entry => entry.compaction?.compactionId === compaction.compactionId) : -1;
+      if (previous >= 0) output[previous] = line;
+      else output.push(line);
       continue;
     }
 

@@ -225,7 +225,7 @@ class WebTelegramReplies:
                     root = str(result.get("rootTurnUuid") or "")
                     error = ""  # Success is silent; the actual result returns via Telegram.
                 else:
-                    labels = {"busy": "会话正在压缩上下文，请稍后重新回复。", "conversation_unavailable": "原会话已删除或归档，请前往 Web。"}
+                    labels = {"busy": "会话正在处理其他操作，请稍后重新回复。", "conversation_unavailable": "原会话已删除或归档，请前往 Web。"}
                     error = labels.get(str(result.get("error") or ""), "回复未提交，请稍后重新回复或前往 Web。")
         except asyncio.CancelledError:
             raise

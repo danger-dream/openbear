@@ -10,6 +10,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 REMOVED_TOOL_NAMES = frozenset({"Glob", "Grep"})
+# Instance-bound context recovery is not a grant of cross-conversation History
+# or an executable business tool. Dispatch still enforces control/finalize gates.
+AGENT_RUNTIME_TOOL_NAMES = frozenset({"AgentHistory"})
 AGENT_DELEGATION_TOOL_NAMES = frozenset({
     "Read",
     "Write",
@@ -55,7 +58,7 @@ def agent_phase_tool_names(
     if cap:
         ordinary &= cap
     if not managed:
-        return expand_agent_tool_names(ordinary | ({"AgentControlAck"} if pending_control else set()))
+        return expand_agent_tool_names(ordinary | AGENT_RUNTIME_TOOL_NAMES | ({"AgentControlAck"} if pending_control else set()))
     protocol = {
         "drafting": {"AgentPlanSubmit"}, "revising": {"AgentPlanSubmit"},
         "executing": {"AgentPlanProgress", "AgentPlanReplan"},
@@ -64,7 +67,7 @@ def agent_phase_tool_names(
         "finalizing": {"AgentPlanProgress", "AgentPlanReplan"},
         "replan_required": {"AgentPlanReplan"},
     }.get(phase or "drafting", set())
-    return expand_agent_tool_names((ordinary if phase in {"executing", "finalizing"} else set()) | protocol | {"AgentControlAck"})
+    return expand_agent_tool_names((ordinary if phase in {"executing", "finalizing"} else set()) | protocol | AGENT_RUNTIME_TOOL_NAMES | {"AgentControlAck"})
 
 
 def sanitize_tool_allowlist(tools: Iterable[object] | None) -> list[str]:

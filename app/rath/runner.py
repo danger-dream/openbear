@@ -78,24 +78,20 @@ class RathWorkflowRunner:
             current_status=current if current else None,
         )
 
+    async def _queue_steer(self, control: Any, stage: str, *, agent_key: str = "", paused: bool = False) -> None:
+        self.steers.append({"controlUuid": control.control_uuid, "message": control.message,
+                            "requestedBy": control.requested_by, "metadata": control.metadata})
+        await self.dao.mark_control(control.control_uuid, "applied", result="steer queued while paused" if paused else "steer queued")
+        await self.emit("steer_applied", agent_key=agent_key,
+                        summary="暂停期间的追加指导已记录" if paused else "追加指导已加入任务上下文",
+                        detail={"message": control.message, "stage": stage})
+
     async def checkpoint(self, stage: str, *, agent_key: str = "") -> None:
         """Apply pending controls at a safe boundary."""
         controls = await self.dao.pending_controls(self.task_uuid)
         for control in controls:
             if control.action == "steer":
-                self.steers.append({
-                    "controlUuid": control.control_uuid,
-                    "message": control.message,
-                    "requestedBy": control.requested_by,
-                    "metadata": control.metadata,
-                })
-                await self.dao.mark_control(control.control_uuid, "applied", result="steer queued")
-                await self.emit(
-                    "steer_applied",
-                    agent_key=agent_key,
-                    summary="追加指导已加入任务上下文",
-                    detail={"message": control.message, "stage": stage},
-                )
+                await self._queue_steer(control, stage, agent_key=agent_key)
             elif control.action == "resume":
                 # A resume outside paused state is harmless. Mark it applied so it
                 # does not get replayed forever.
@@ -124,19 +120,7 @@ class RathWorkflowRunner:
             controls = await self.dao.pending_controls(self.task_uuid)
             for control in controls:
                 if control.action == "steer":
-                    self.steers.append({
-                        "controlUuid": control.control_uuid,
-                        "message": control.message,
-                        "requestedBy": control.requested_by,
-                        "metadata": control.metadata,
-                    })
-                    await self.dao.mark_control(control.control_uuid, "applied", result="steer queued while paused")
-                    await self.emit(
-                        "steer_applied",
-                        agent_key=agent_key,
-                        summary="暂停期间的追加指导已记录",
-                        detail={"message": control.message, "stage": stage},
-                    )
+                    await self._queue_steer(control, stage, agent_key=agent_key, paused=True)
                 elif control.action == "resume":
                     await self.dao.mark_control(control.control_uuid, "applied", result=f"resumed from {stage}")
                     await self.dao.update_task(

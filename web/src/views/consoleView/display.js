@@ -16,7 +16,8 @@ import {
 	User,
 	Warning,
 } from "@element-plus/icons-vue";
-import ContextCompactionIcon from "./ContextCompactionIcon.vue";
+// Read-only icon for pre-window historical cards; never used by the composer.
+import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import {plainText} from "./markdown.js";
 import {contextCompactionView} from "./agentPlanPresentation.js";
 import {taskMemoryToolPreview} from "./taskMemoryPresentation.js";

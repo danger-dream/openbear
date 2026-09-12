@@ -29,7 +29,8 @@ def _base_cfg() -> dict:
 def test_example_config_loads_and_matches_visible_defaults():
     cfg = load_config(Path(__file__).resolve().parents[1] / "openbear.json.example")
     assert cfg.ui.show_turn_stats is True
-    assert cfg.agent.compact_timeout_s == 1800
+    assert cfg.agent.compact_ratio == 0.7
+    assert cfg.context_management.retain_ratio == 0.15
     assert cfg.validate_for_startup() == []
 
 
@@ -57,8 +58,7 @@ def test_load_and_validate_ok(tmp_path):
     cfg = load_config(p)
     assert cfg.validate_for_startup() == []
     assert cfg.models.primary == "openai/deepseek"
-    assert cfg.models.compression_models == ["openai/deepseek"]
-    assert cfg.models.compression_model_candidates("anthropic/claude") == ["openai/deepseek", "anthropic/claude"]
+    assert cfg.models.model_dump(by_alias=True)["compressionModels"] == ["openai/deepseek"]
 
 
 def test_plan_limit_aliases_read_legacy_and_write_canonical_names():
@@ -193,8 +193,9 @@ def test_agent_renamed_fields_only():
     }
     cfg = Config.model_validate(data)
     assert cfg.agent.max_run_wall_seconds == 0
-    assert cfg.agent.keep_recent_messages == 6
-    assert cfg.agent.compact_timeout_s == 2400
+    dumped = cfg.agent.model_dump(by_alias=True)
+    assert dumped["keepRecentMessages"] == 6
+    assert dumped["compactTimeoutS"] == 2400
 
 
 def test_removed_session_history_config_fields_are_rejected():
@@ -247,14 +248,15 @@ def test_validate_primary_on_disabled_provider_fails():
     assert any("primary" in e for e in errors)
 
 
-def test_validate_compression_on_disabled_provider_fails():
+def test_retired_compression_queue_does_not_block_disabled_provider():
     data = _base_cfg()
     data["models"]["providers"]["openai"]["enabled"] = False
     data["models"]["primary"] = "anthropic/claude"
     data["models"]["compressionModels"] = ["openai/deepseek"]
     cfg = Config.model_validate(data)
     errors = cfg.validate_for_startup()
-    assert any("compressionModels" in e for e in errors)
+    assert not any("compressionModels" in e for e in errors)
+    assert cfg.model_dump(by_alias=True)["models"]["compressionModels"] == ["openai/deepseek"]
 
 
 def test_validate_primary_missing():

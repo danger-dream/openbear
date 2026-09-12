@@ -75,6 +75,10 @@ class WebAdminSettingsChannelsMixin:
                 new_cfg = self.config
             else:
                 value = settings_admin.parse_setting_value(path, body.get("value"))
+                if path == "models.compressionModels":
+                    for label in value:
+                        if not self.config.models.resolve(label) and label not in self.config.models.compression_models:
+                            raise ValueError(f"摘要模型不可用：{label}")
                 new_cfg = await self.config_store.update_path(path, value)
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
@@ -484,12 +488,7 @@ class WebAdminSettingsChannelsMixin:
         return await self._mutate_config_api(request, channel_admin.set_primary_mutator(fullname), audit_kind="channels.primary", detail={"model": fullname})
 
     async def handle_api_channels_compression(self, request: web.Request) -> web.Response:
-        body = await self._json_body(request)
-        raw_models = body.get("models") if "models" in body else body.get("fullnames")
-        if raw_models is None:
-            raw_models = body.get("model") if "model" in body else body.get("fullname", "")
-        detail_models = raw_models if isinstance(raw_models, list) else [str(raw_models or "")] if str(raw_models or "").strip() else []
-        return await self._mutate_config_api(request, channel_admin.set_compression_mutator(raw_models), audit_kind="channels.compression", detail={"models": detail_models})
+        return web.json_response({"ok": False, "error": "compression_models_moved", "message": "摘要模型配置已移至系统设置的上下文压缩，请在新入口选择模型并调整顺序。"}, status=410)
 
     async def handle_api_channels_fetch_models(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]

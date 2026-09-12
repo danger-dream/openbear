@@ -595,6 +595,35 @@ def run_history_action(
 def register_history_tools(reg: ToolRegistry, db: Any) -> None:
     async def _history(args: dict[str, Any]) -> str:
         ctx = current_tool_context()
+        if str(args.get("source") or "visible") == "execution":
+            from app.context.history import ControllerExecutionHistory
+            from app.tools.agent_history import query_execution_history
+            if ctx.task_uuid or str(ctx.source or "").startswith("agent:"):
+                return json.dumps({"ok": False, "error": "use_own_AgentHistory"})
+            with _connect_ro(db.path) as con:
+                conv_uuid, info, error = _conversation_from_args(con, args, current_conversation_uuid=ctx.conversation_uuid)
+                if error or info is None:
+                    return json.dumps({"ok": False, "error": error or "conversation_not_found"})
+                row = con.execute("SELECT session_uuid FROM sessions WHERE chat_id=?", (info.internal_chat_id,)).fetchone()
+            session = str(row["session_uuid"] or "") if row else ""
+            if not session:
+                return json.dumps({"ok": False, "error": "conversation_session_unavailable"})
+            current_root = ctx.run_root_turn_uuid or ctx.turn_uuid
+            root = str(args.get("rootTurnUuid") or "")
+            if _bool_arg(args, "currentTask", False):
+                if conv_uuid != ctx.conversation_uuid or not current_root:
+                    return json.dumps({"ok": False, "error": "current_task_requires_current_conversation"})
+                root = current_root
+            exclude = _bool_arg(args, "excludeCurrentTurn", False)
+            if exclude and root and root == current_root:
+                return json.dumps({"ok": False, "error": "current_task_cannot_exclude_itself"})
+            store = ControllerExecutionHistory(db, chat_id=info.internal_chat_id, session_uuid=session,
+                                               root_turn_uuid=root, exclude_turn_uuid=current_root if exclude and conv_uuid == ctx.conversation_uuid else "")
+            try:
+                result = await query_execution_history(store, args)
+            except (RuntimeError, ValueError) as exc:
+                result = {"ok": False, "error": str(exc)}
+            return json.dumps(result, ensure_ascii=False)
         return run_history_action(
             db.path,
             args,
@@ -604,11 +633,17 @@ def register_history_tools(reg: ToolRegistry, db: Any) -> None:
 
     reg.add(
         "History",
-        "Read/search OpenBear Web conversation history as visible transcript. Use when the user asks 看之前/上一轮/上次/接着之前/还有工作没做完/查看某会话结论, and after context compaction to re-read this conversation's earlier visible dialogue (read/search with scope=current) instead of asking the user to repeat it. Read-only; defaults to user+assistant visible text from web_operations and excludes tools, reasoning, stats, raw events.",
+        "Read/search original OpenBear records for a concrete missing fact outside the active context, not mechanically after every window rotation. History is not current task progress; use AgentInfo for current Agent/Plan state. Default source=visible reads Web user/assistant dialogue. source=execution reads original tool arguments/results, including the active task by default: index/search for event IDs, then read_event/read_events with exact character pagination (nextOffset), never hidden reasoning. scope=current selects this conversation; currentTask=true restricts execution lookup to this root turn. Do not ask users to repeat established requirements.",
         {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read", "search", "list", "read_turn"], "description": "History action"},
+                "action": {"type": "string", "enum": ["read", "search", "list", "read_turn", "index", "read_event", "read_events"], "description": "Visible dialogue or execution history action"},
+                "source": {"type": "string", "enum": ["visible", "execution"], "description": "Default visible. Execution includes original tool evidence and supports index/read_event/read_events."},
+                "eventId": {"type": "string"},
+                "eventIds": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                "highWater": {"type": "integer", "description": "Execution index: 0 or omitted starts a fresh index; reuse its positive highWater while paging."},
+                "rootTurnUuid": {"type": "string", "description": "Optional execution root-turn filter."},
+                "currentTask": {"type": "boolean", "description": "Execution-only history filter: restrict to the current root task, not a current-progress query; incompatible with excludeCurrentTurn=true."},
                 "scope": {"type": "string", "description": "current or explicit conversation; for search, scope=current restricts matches to this conversation"},
                 "conversationUuid": {"type": "string", "description": "Web conversation UUID; optional for scope=current; for search, restricts matches to that conversation"},
                 "turnUuid": {"type": "string", "description": "Turn UUID for read_turn"},
@@ -616,13 +651,13 @@ def register_history_tools(reg: ToolRegistry, db: Any) -> None:
                 "from": {"type": "string", "description": "read position: start or end"},
                 "turns": {"type": "integer", "description": "Number of turns to read"},
                 "lastTurns": {"type": "integer", "description": "Alias for turns when reading from end"},
-                "offset": {"type": "integer", "description": "read: skip N turns from the chosen end before returning, to page into the middle of a long conversation"},
+                "offset": {"type": "integer", "description": "Visible read: skip N turns. Execution read_event: exact character offset from nextOffset; no middle truncation."},
                 "before": {"type": "integer", "description": "Turns before target for read_turn"},
-                "after": {"type": "integer", "description": "Turns after target for read_turn"},
+                "after": {"type": "integer", "description": "Turns after target for read_turn; execution index uses nextAfter as its stable cursor."},
                 "limit": {"type": "integer", "description": "Result limit for list/search"},
-                "maxChars": {"type": "integer", "description": "Maximum output chars, default 20000, hard cap 60000"},
+                "maxChars": {"type": "integer", "description": "Visible: default 20000, cap 60000. Execution bodies: total page budget 1000–32000; follow nextOffset."},
                 "maxSnippetChars": {"type": "integer", "description": "Search snippet size"},
-                "excludeCurrentTurn": {"type": "boolean", "description": "For current conversation reads, exclude the active user turn by default"},
+                "excludeCurrentTurn": {"type": "boolean", "description": "Visible reads exclude the active user turn by default. Execution defaults false; do not set true with currentTask."},
                 "includeNotices": {"type": "boolean", "description": "Include visible notice operations; default false"},
                 "includeArchived": {"type": "boolean", "description": "Include archived conversations for list/search; default false"},
             },
@@ -630,4 +665,5 @@ def register_history_tools(reg: ToolRegistry, db: Any) -> None:
         },
         _history,
         visibility={"main", "runtime"},
+        preserve_result=True,
     )

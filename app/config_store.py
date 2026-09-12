@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Config, config_path
+from app.context.configuration import RETIRED_AGENT_CONTEXT_KEYS, migrate_context_config
 
 _BACKUP_KEEP = 3
 _CONFIG_FILE_MODE = 0o600
@@ -69,6 +70,8 @@ class ConfigStore:
 
     async def update_path(self, dotted_path: str, value: Any) -> Config:
         """更新一个点分路径，校验通过后写盘并返回新 Config。"""
+        if dotted_path.startswith("agent.") and dotted_path.split(".", 1)[1] in RETIRED_AGENT_CONTEXT_KEYS:
+            raise ValueError("pre_compaction_reminder_retired")
         async with self._lock:
             raw = self._load_raw_unlocked()
             old = _get_path(raw, dotted_path)
@@ -161,10 +164,10 @@ class ConfigStore:
 
 def _migrate_runtime_config(raw: dict[str, Any]) -> bool:
     """Canonicalize retired keys without materializing evolvable prompt defaults."""
+    changed = migrate_context_config(raw)
     rath = raw.get("rath")
     if not isinstance(rath, dict):
-        return False
-    changed = False
+        return changed
     for legacy, canonical in {
         "agentPlanMaxRevisionRounds": "planMaxRevisionRounds",
         "agentPlanMaxSteps": "planMaxSteps",
@@ -181,6 +184,7 @@ def _migrate_runtime_config(raw: dict[str, Any]) -> bool:
 
 
 def _validate_config(raw: dict[str, Any]) -> Config:
+    migrate_context_config(raw)
     cfg = Config.model_validate(raw)
     errors = cfg.validate_for_startup()
     if errors:

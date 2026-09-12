@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 
 class ChatOperationLocks:
-    """按 chat 串行化新会话、compact、stop 等高风险操作。"""
+    """按 chat 串行化新会话、配置刷新、stop 等高风险操作。"""
 
     def __init__(self) -> None:
         self._guard = asyncio.Lock()

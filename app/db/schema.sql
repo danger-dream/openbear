@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   internal_chat_id      INTEGER NOT NULL UNIQUE,
   title                 TEXT DEFAULT '',
   model                 TEXT DEFAULT '',
+  context_strategy      TEXT NOT NULL DEFAULT 'sliding_window',
+  -- Completed executions and the exact completion version seen by the Web user.
+  activity_version      INTEGER NOT NULL DEFAULT 0,
+  activity_read_version INTEGER NOT NULL DEFAULT 0,
+  activity_result_json  TEXT NOT NULL DEFAULT '{}',
   -- 会话级 Agent 默认运行配置；空/-1 表示跟随主会话或模型默认。
   agent_model           TEXT DEFAULT '',
   agent_think_level     TEXT DEFAULT '',
@@ -356,7 +361,7 @@ CREATE TABLE IF NOT EXISTS web_task_notifications (
   kind                  TEXT DEFAULT 'task-notification',
   task_status           TEXT DEFAULT '',
   payload_json          TEXT NOT NULL,
-  state                 TEXT NOT NULL DEFAULT 'pending', -- pending|processing|delivered|suppressed
+  state                 TEXT NOT NULL DEFAULT 'pending', -- pending|processing|paused (awaiting user)|delivered|suppressed
   attempts              INTEGER NOT NULL DEFAULT 0,
   claim_token           TEXT DEFAULT '',
   claimed_at            INTEGER DEFAULT 0,

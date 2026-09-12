@@ -14,7 +14,7 @@ OpenAI / Anthropic / 任意网关。所以错误处理必须自己判得准,不�
    - 404                 → model_not_found(不可重试)
    - 408                 → timeout(可重试)
    - 400 / 422           → 看文本细分:上下文超限 / 限流(TPM) / 否则 format(不可重试)
-   - 413                 → 看文本:TPM 限流(可重试) / 否则 context_overflow(走压缩)
+   - 413                 → 看文本:TPM 限流(可重试) / 否则 context_overflow(走窗口轮换)
    - 429                 → rate_limit(可重试;但 context-credit 类除外,见文本判定)
    - 500/502/503/504/529 → server_error / overloaded(可重试)
 2. 错误文本(第二判据,覆盖「200 OK 但 body 是错误」、SSE 流内 error 事件无 status、
@@ -23,7 +23,7 @@ OpenAI / Anthropic / 任意网关。所以错误处理必须自己判得准,不�
 输出 reason 枚举 → 推导 retryable:
    可重试   = rate_limit, overloaded, timeout, server_error
    不可重试 = billing, auth, auth_permanent, format, model_not_found, context_overflow
-   (context_overflow 不走普通重试,交给上层应急压缩路径处理)
+   (context_overflow 不走普通重试,交给上层窗口缩减路径处理)
 """
 from __future__ import annotations
 
@@ -261,7 +261,7 @@ def classify_error(message: str | None, status: int = 0) -> str:
     msg = message or ""
     low = msg.lower()
 
-    # —— context overflow 最优先:它要走压缩自救,绝不能被当普通错误吞掉 ——
+    # —— context overflow 最优先:它要走窗口缩减自救,绝不能被当普通错误吞掉 ——
     # (但纯 TPM 限流形如 413 不算 overflow,is_context_overflow_error 内部已排除)
     if is_context_overflow_error(msg):
         return CONTEXT_OVERFLOW
@@ -338,7 +338,7 @@ _USER_MESSAGES = {
     AUTH_PERMANENT: "❌ 上游拒绝访问(权限不足)。",
     FORMAT: "❌ 请求被上游拒绝(参数/格式问题)。",
     MODEL_NOT_FOUND: "❌ 上游找不到该模型(检查模型名)。",
-    CONTEXT_OVERFLOW: "📦 上下文超出模型窗口,正在尝试压缩后重试…",
+    CONTEXT_OVERFLOW: "📦 上下文超出模型窗口,正在尝试缩小上下文窗口后重试…",
 }
 
 

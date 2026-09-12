@@ -17,8 +17,8 @@ const actual = [
   between("watch(() => props.folderId,", "watch(() => draft.value,"),
   between("export function modelThinkingLevels(", "export function thinkingLabel(", display).replaceAll("export function", "function"),
 ].join("\n");
-const cheap = {mainModel: "cheap", mainThinkingLevel: "low", mainFastMode: false, agentModel: "cheap", agentThinkLevel: "low", agentFastMode: false};
-const paid = {mainModel: "paid", mainThinkingLevel: "high", mainFastMode: true, agentModel: "paid", agentThinkLevel: "high", agentFastMode: true};
+const cheap = {contextStrategy: "sliding_window", mainModel: "cheap", mainThinkingLevel: "low", mainFastMode: false, agentModel: "cheap", agentThinkLevel: "low", agentFastMode: false};
+const paid = {contextStrategy: "sliding_window", mainModel: "paid", mainThinkingLevel: "high", mainFastMode: true, agentModel: "paid", agentThinkLevel: "high", agentFastMode: true};
 const flush = async () => {for (let i = 0; i < 20; i++) await Promise.resolve();};
 function deferred() {let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject};}
 
@@ -33,6 +33,7 @@ function harness({folderId = "project", getDefaults} = {}) {
       {key: "cheap", thinkingLevels: ["low", "medium"], defaultThinkingLevel: "low", supportsFast: false},
       {key: "paid", thinkingLevels: ["low", "medium", "high"], defaultThinkingLevel: "high", supportsFast: true},
     ]),
+    localContextStrategy: ref("sliding_window"),
     localModel: ref("cheap"), localThinking: ref("low"), localFast: ref(false),
     localAgentModel: ref(""), localAgentThinking: ref(""), localAgentFast: ref(null),
     isLocalConversation: {get value() {return props.conversationUuid.startsWith("local:");}},

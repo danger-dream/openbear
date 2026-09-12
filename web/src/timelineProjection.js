@@ -1081,7 +1081,7 @@ export function projectOperationMessages(operations = [], options = {}) {
       turn.internal = Boolean(turn.internal || !turn.user);
       continue;
     }
-    if (opType === "notice" || opType === "status" || opType === "run_control") {
+    if (opType === "notice" || opType === "context_window" || opType === "status" || opType === "run_control") {
       // `status` operations drive the header/run-state facts, but they are not
       // transcript events. The visible “正在思考…” row is a transient frontend
       // tail idle-indicator so it can appear only after no visible output for a

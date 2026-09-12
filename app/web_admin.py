@@ -57,18 +57,16 @@ from app.web_console.core import (
     log,
 )
 from app.web_console.live_stream import (
-    _WebContextCompactionGate,
     _WebDBPersister,
-    _WebEmergencyCompactor,
     _WebLiveStream,
     _WebStreamRenderer,
 )
 from app.web_console.memory_api import WebAdminMemoryMixin
 from app.web_console.operation_store import WebAdminOperationsMixin
 from app.web_console.rath_api import WebAdminRathMixin
-from app.web_console.routing import WebAdminAppMixin
 from app.web_console.realtime import WebAdminRealtimeMixin
 from app.web_console.reference_api import WebAdminReferenceMixin
+from app.web_console.routing import WebAdminAppMixin
 from app.web_console.system_mcp_api import WebAdminSystemMcpMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.update_api import WebAdminUpdateMixin
@@ -314,9 +312,7 @@ __all__ = [
     "_WEB_FRONTEND_EVENT_LOG_DIR",
     "_WEB_SESSION_KEY",
     "_WEB_WS_AUDIT_LOG_DIR",
-    "_WebContextCompactionGate",
     "_WebDBPersister",
-    "_WebEmergencyCompactor",
     "_WebLiveStream",
     "_WebStreamRenderer",
     "_human_bytes",

@@ -132,7 +132,7 @@ async def _action_models(svc: Any) -> str:
                     "thinkingLevels": list(getattr(model, "thinking_levels", []) or []),
                     "defaultThinkingLevel": str(getattr(model, "default_thinking_level", "") or ""),
                     "supportsFast": bool(getattr(model, "supports_fast", False)),
-                    "compactTriggerTokens": int(getattr(model, "compact_trigger_tokens", 0) or 0),
+                    "rolloverTriggerTokens": int(getattr(model, "rollover_trigger_tokens", 0) or 0),
                     "input": model.input,
                     "contextWindow": model.context_window,
                     "maxTokens": model.max_tokens,
@@ -145,7 +145,6 @@ async def _action_models(svc: Any) -> str:
         "action": "models",
         "primary": svc.config.models.primary,
         "current": svc.selection.current,
-        "compressionModels": list(getattr(svc.config.models, "compression_models", []) or []),
         "providers": providers,
     })
 

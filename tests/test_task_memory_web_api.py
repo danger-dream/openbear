@@ -231,7 +231,7 @@ async def test_task_memory_web_api_agent_task_ownership_parent_session_and_404(t
     assert [(row["taskUuid"], row["name"]) for row in task_payload["tasks"]] == [("task-valid", "Reviewer")]
 
 
-async def test_task_memory_preview_uses_runtime_formatter_scope_acl_budget_and_no_body(task_memory_api):
+async def test_task_memory_preview_uses_effective_short_body_snapshot_scope_acl_and_budget(task_memory_api):
     client, harness = task_memory_api
     task_uuid = await harness.rath_dao.create_task(
         chat_id=4201,
@@ -246,14 +246,14 @@ async def test_task_memory_preview_uses_runtime_formatter_scope_acl_budget_and_n
         "scopeType": "conversation",
         "name": "Visible shared",
         "description": "shown to Agent",
-        "body": "VISIBLE-BODY-MUST-NOT-LEAK",
+        "body": "VISIBLE-SHORT-BODY",
         "visibleToAgents": True,
     })
     hidden = await client.post("/api/conversations/conv-1/task-memories", json={
         "scopeType": "conversation",
         "name": "Hidden shared",
         "description": "main only",
-        "body": "HIDDEN-BODY-MUST-NOT-LEAK",
+        "body": "HIDDEN-SHORT-BODY",
         "visibleToAgents": False,
     })
     own = await client.post("/api/conversations/conv-1/task-memories", json={
@@ -261,7 +261,7 @@ async def test_task_memory_preview_uses_runtime_formatter_scope_acl_budget_and_n
         "taskUuid": task_uuid,
         "name": "Own task fact",
         "description": "own scope",
-        "body": "OWN-BODY-MUST-NOT-LEAK",
+        "body": "OWN-SHORT-BODY",
     })
     assert visible.status == hidden.status == own.status == 201
 
@@ -300,10 +300,36 @@ async def test_task_memory_preview_uses_runtime_formatter_scope_acl_budget_and_n
     assert "<agent-task-memory revision=" in agent_payload["catalogXml"]
     assert 0 < agent_payload["estimatedRuntimeTokens"] <= agent_payload["maxRuntimeTokens"] == 1500
 
-    serialized = json.dumps({"conversation": conversation_payload, "agent": agent_payload})
-    assert "VISIBLE-BODY-MUST-NOT-LEAK" not in serialized
-    assert "HIDDEN-BODY-MUST-NOT-LEAK" not in serialized
-    assert "OWN-BODY-MUST-NOT-LEAK" not in serialized
+    assert "VISIBLE-SHORT-BODY" in conversation_payload["catalogXml"]
+    assert "HIDDEN-SHORT-BODY" in conversation_payload["catalogXml"]
+    assert "OWN-SHORT-BODY" not in conversation_payload["catalogXml"]
+    assert "VISIBLE-SHORT-BODY" in agent_payload["catalogXml"]
+    assert "HIDDEN-SHORT-BODY" not in agent_payload["catalogXml"]
+    assert "OWN-SHORT-BODY" in agent_payload["catalogXml"]
+    from app.utils import estimate_tokens
+    for payload in (conversation_payload, agent_payload):
+        assert payload["includedCount"] == payload["eligibleCount"] == 2
+        assert payload["omittedCount"] == 0
+        assert payload["shortBodyMaxChars"] == 500
+        assert payload["maxItems"] == 20
+        assert payload["taskMemoryAvailable"] is True
+        assert payload["catalogXml"] in payload["runtimeSnapshot"]
+        assert payload["digest"] in payload["runtimeSnapshot"]
+        assert payload["estimatedRuntimeTokens"] == estimate_tokens(payload["runtimeSnapshot"])
+
+    no_tool = await client.get(
+        "/api/conversations/conv-1/task-memories/preview",
+        params={"scopeType": "agent_task", "taskUuid": task_uuid, "taskMemoryAvailable": "false"},
+    )
+    no_tool_payload = await no_tool.json()
+    assert no_tool_payload["taskMemoryAvailable"] is False
+    assert no_tool_payload["includedCount"] == no_tool_payload["eligibleCount"] == 1
+    assert "VISIBLE-SHORT-BODY" in no_tool_payload["catalogXml"]
+    assert "OWN-SHORT-BODY" not in no_tool_payload["catalogXml"]
+    assert "HIDDEN-SHORT-BODY" not in no_tool_payload["catalogXml"]
+    assert "主控提供必要原文" in no_tool_payload["runtimeSnapshot"]
+    assert "使用 TaskMemory list/search" not in no_tool_payload["runtimeSnapshot"]
+    assert no_tool_payload["digest"] != agent_payload["digest"]
 
     inaccessible = await client.get(
         "/api/conversations/conv-1/task-memories/preview",

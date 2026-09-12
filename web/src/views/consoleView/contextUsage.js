@@ -9,11 +9,17 @@ function nonNegative(value) {
 
 function metadata(currentUsage, defaults = {}) {
   const current = record(currentUsage) || {};
-  const fallback = record(defaults) || {};
   return {
-    compactTriggerTokens: nonNegative(current.compactTriggerTokens || fallback.compactTriggerTokens),
-    manualMinPercent: nonNegative(current.manualMinPercent ?? fallback.manualMinPercent ?? 50),
+    rolloverTriggerTokens: nonNegative(current.rolloverTriggerTokens || defaults.rolloverTriggerTokens),
   };
+}
+
+function older(current, incoming) {
+  if (current.ownerId && incoming.ownerId && current.ownerId !== incoming.ownerId) return true;
+  const version = nonNegative(incoming.windowVersion);
+  const previous = nonNegative(current.windowVersion);
+  if (version !== previous) return version < previous;
+  return nonNegative(incoming.requestSequence) < nonNegative(current.requestSequence);
 }
 
 export function resolveContextUsage(serverUsage, legacyTokens = 0) {
@@ -21,54 +27,27 @@ export function resolveContextUsage(serverUsage, legacyTokens = 0) {
   if (server && typeof server.known === "boolean") {
     const meta = metadata(server);
     const tokens = server.known ? nonNegative(server.tokens) : 0;
-    return {
-      ...server,
-      ...meta,
-      known: server.known,
-      tokens,
-      percent: server.known && meta.compactTriggerTokens > 0
-        ? tokens * 100 / meta.compactTriggerTokens
-        : null,
-      authoritative: true,
-    };
+    return {...server, ...meta, tokens,
+      percent: server.known && meta.rolloverTriggerTokens > 0 ? tokens * 100 / meta.rolloverTriggerTokens : null,
+      authoritative: true};
   }
   const tokens = nonNegative(legacyTokens);
-  return {
-    known: tokens > 0,
-    tokens,
-    compactTriggerTokens: 0,
-    percent: null,
-    manualMinPercent: 50,
-    authoritative: false,
-  };
+  return {known: tokens > 0, tokens, rolloverTriggerTokens: 0, percent: null, authoritative: false};
 }
 
 export function mergeStatsContextUsage(currentUsage, statsUsage, defaults = {}) {
   const stats = record(statsUsage);
-  if (!stats || stats.available !== true || typeof stats.known !== "boolean") {
-    return currentUsage;
-  }
   const current = record(currentUsage) || {};
-  const meta = metadata(current, defaults);
+  if (!stats || stats.available !== true || typeof stats.known !== "boolean" || older(current, stats)) return currentUsage;
+  const meta = metadata(stats, {...current, ...defaults});
   const tokens = stats.known ? nonNegative(stats.tokens) : 0;
-  return {
-    ...current,
-    ...meta,
-    known: stats.known,
-    tokens,
-    percent: stats.known && meta.compactTriggerTokens > 0
-      ? tokens * 100 / meta.compactTriggerTokens
-      : null,
-  };
+  return {...current, ...stats, ...meta, tokens,
+    percent: stats.known && meta.rolloverTriggerTokens > 0 ? tokens * 100 / meta.rolloverTriggerTokens : null};
 }
 
 export function invalidateContextUsage(currentUsage, defaults = {}) {
   const current = record(currentUsage) || {};
-  return {
-    ...current,
-    ...metadata(current, defaults),
-    known: false,
-    tokens: 0,
-    percent: null,
-  };
+  // New window telemetry cannot invalidate a newer completed request.
+  if (defaults.windowVersion != null && older(current, defaults)) return currentUsage;
+  return {...current, ...defaults, ...metadata(current, defaults), known: false, tokens: 0, percent: null};
 }

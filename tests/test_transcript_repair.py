@@ -1,13 +1,8 @@
 """工具配对修复测试 —— 覆盖光杆 / 孤儿 / 重复 / 完整 / 多并行 等场景。"""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from app.agent.transcript_repair import (
     MISSING_TOOL_RESULT_TEXT,
-    build_summary_prefixed_history,
-    build_summary_prefixed_visible_history,
-    build_visible_history_xml,
     repair_role_alternation,
     repair_tool_pairing,
 )
@@ -134,22 +129,8 @@ def test_empty_input():
 
 # ── 角色交替规整:repair_role_alternation ─────────────────────────
 
-def test_summary_prefix_omits_ack_when_kept_starts_with_assistant_tool_call():
-    recent = [
-        _asst_with_calls(ToolCall(id="c1", name="Read", arguments="{}")),
-        _tool_result("c1"),
-        {"role": "user", "content": "继续"},
-    ]
-    history = build_summary_prefixed_history("summary", recent)
-    assert [m["role"] for m in history] == ["user", "assistant", "tool", "user"]
-    assert "此前对话摘要" in history[0]["content"]
-    assert history[1]["tool_calls"][0].id == "c1"
-    assert repair_tool_pairing(history) == history
 
 
-def test_summary_prefix_keeps_ack_when_kept_starts_with_user():
-    history = build_summary_prefixed_history("summary", [{"role": "user", "content": "继续"}])
-    assert [m["role"] for m in history] == ["user", "assistant", "user"]
 
 
 def test_alternation_already_ok_unchanged():
@@ -231,28 +212,3 @@ def test_alternation_tool_to_user_inserts_anthropic_safe_append_only_bridge():
 
 def test_alternation_empty_input():
     assert repair_role_alternation([]) == []
-
-
-def test_visible_history_xml_keeps_only_user_and_final_assistant_text():
-    rows = [
-        SimpleNamespace(role="user", content="我说 <保留>", created_at=1, tool_calls=[]),
-        SimpleNamespace(
-            role="assistant", content="正在调用工具", created_at=2,
-            tool_calls=[ToolCall(id="call-1", name="Read", arguments="{}")],
-        ),
-        SimpleNamespace(role="tool", content="巨大 AgentWait / Plan JSON", created_at=3, tool_calls=[]),
-        SimpleNamespace(role="assistant", content="最终 <回复>", created_at=4, tool_calls=[]),
-    ]
-
-    xml = build_visible_history_xml(rows)
-    history = build_summary_prefixed_visible_history("摘要", rows)
-
-    assert xml.startswith("<history_messages>")
-    assert '<user time="1970-01-01 08:00:01">' in xml
-    assert "我说 &lt;保留&gt;" in xml
-    assert "最终 &lt;回复&gt;" in xml
-    assert "正在调用工具" not in xml
-    assert "AgentWait" not in xml
-    assert [item["role"] for item in history] == ["user", "assistant"]
-    assert "[此前对话摘要]\n摘要" in history[0]["content"]
-    assert xml in history[0]["content"]

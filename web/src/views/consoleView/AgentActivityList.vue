@@ -101,9 +101,14 @@ const presentedLines = computed(() => props.lines.map((line) => {
 					<div v-if="line.compaction?.summaryId || line.compaction?.compactionId" class="activity-compaction-id">
 						{{ line.compaction.summaryId || line.compaction.compactionId }}
 					</div>
-					<ConsoleMarkdown v-if="line.compactedOutput" class="activity-compaction-output" :text="line.compactedOutput"/>
-					<p v-else-if="line.compaction?.failed" class="activity-compaction-empty">{{ line.compaction.reason || '未生成可用压缩摘要' }}</p>
-					<p v-else class="activity-compaction-empty">{{ line.emptyOutputText || '旧记录未持久化压缩摘要' }}</p>
+					<ul v-if="line.compaction?.detailFacts?.length" class="activity-compaction-facts">
+						<li v-for="fact in line.compaction.detailFacts" :key="fact">{{ fact }}</li>
+					</ul>
+					<template v-if="line.compaction?.strategy !== 'sliding_window'">
+						<ConsoleMarkdown v-if="line.compactedOutput" class="activity-compaction-output" :text="line.compactedOutput"/>
+						<p v-else-if="line.compaction?.failed" class="activity-compaction-empty">{{ line.compaction.reason || '未生成可用压缩摘要' }}</p>
+						<p v-else class="activity-compaction-empty">{{ line.emptyOutputText || '旧记录未持久化压缩摘要' }}</p>
+					</template>
 				</div>
 			</details>
 			<div v-else-if="line.processModel" class="activity-model-call">
@@ -177,14 +182,17 @@ const presentedLines = computed(() => props.lines.map((line) => {
 .activity-tool-call > summary:focus-visible { border-radius: 4px; outline: 2px solid rgba(67,56,202,.16); outline-offset: 2px; }
 .activity-tool-arguments { min-width: 0; margin: 7px 0 4px; border-left: 1px solid #e4e4e7; padding-left: 9px; }
 .activity-compaction { min-width: 0; overflow: hidden; }
-.activity-compaction > summary { display: flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden; padding: 0; color: #357047; cursor: pointer; font-size: 12px; line-height: 1.5; list-style: none; }
+.activity-compaction > summary { display: flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden; padding: 0; color: #357047; cursor: pointer; font-size: 14px; line-height: 1.5; list-style: none; }
 .activity-row.tone-danger .activity-compaction > summary { color: #b42318; }
 .activity-compaction > summary::-webkit-details-marker { display: none; }
 .activity-compaction > summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity-compaction > summary svg { width: 10px; flex: 0 0 auto; color: #a1a1aa; transition: transform .14s ease; }
 .activity-compaction[open] > summary svg { transform: rotate(90deg); }
 .activity-compaction-body { max-height: 360px; overflow: auto; margin: 7px 0 4px; border-left: 1px solid #dfe8e1; padding: 2px 0 2px 9px; }
-.activity-compaction-id { margin-bottom: 5px; color: #a1a1aa; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
+.activity-compaction-id { margin-bottom: 5px; color: #a1a1aa; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.activity-compaction-facts { margin: 0 0 9px; padding: 0; list-style: none; color: #737d89; font-size: 13px; line-height: 1.7; }
+.activity-compaction-output :deep(p) { font-size: 14px; }
+.activity-compaction .activity-compaction-empty { font-size: 13px; }
 .activity-compaction-empty { color: #8a8a93 !important; }
 .activity-list-empty { border: 1px dashed #d4d4d8; border-radius: 9px; padding: 13px; color: #a1a1aa; font-size: 11px; text-align: center; }
 .compact .activity-row { padding: 4px 0; }
@@ -278,6 +286,7 @@ html.dark .activity-compaction > summary svg {
 html.dark .activity-compaction-body {
 		border-left: 1px solid #3d3e46;
 	}
+html.dark .activity-compaction-facts { color: #a3adbb; }
 html.dark .activity-compaction-id {
 		color: #a1a1a8;
 	}

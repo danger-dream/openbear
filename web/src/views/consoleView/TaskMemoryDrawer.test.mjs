@@ -58,7 +58,7 @@ test("floating and composer controls use Element Plus tooltips instead of native
   assert.match(minimapSource, /<el-tooltip[\s\S]*?:content="turnNavLabel\(turn, idx\)"[\s\S]*?placement="left"/);
   assert.doesNotMatch(minimapSource, /:title=/);
   assert.doesNotMatch(composerSource, /\btitle=/);
-  for (const label of ["移除附件", "新话题（Ctrl+N）", "上传图片或附件", "手动压缩上下文", "清空草稿", "停止生成", "发送消息（Enter）"]) {
+  for (const label of ["移除附件", "新话题（Ctrl+N）", "上传图片或附件", "清空草稿", "停止生成", "发送消息（Enter）"]) {
     assert.ok(composerSource.includes(`content="${label}"`), `missing Element Plus tooltip: ${label}`);
   }
   assert.match(composerSource, /aria-label="运行配置"/);
@@ -96,9 +96,12 @@ test("drawer keeps both scopes and actual catalog while separating reading from 
   assert.match(source, /formatDate\(item\.updatedAt\)/);
   assert.match(source, /formatBytes\(detail\.sizeBytes\)/);
   assert.match(source, /sourceLabel\(item\)/);
-  assert.match(source, /目录自动提供给模型/);
+  assert.match(source, /自动提供给模型/);
   assert.match(source, /Agent 可读取/);
-  assert.match(source, /模型可见目录/);
+  assert.match(source, /模型可见内容/);
+  assert.match(source, /previewOmittedCount/);
+  assert.match(source, /previewShortBodyMaxChars/);
+  assert.doesNotMatch(source, /保存重要决定和工作进展|保留重要决定与进展|记录决定、约束、重要发现或后续工作/);
   assert.match(source, /v-if="previewOpen"/);
   assert.match(source, /async function loadPreview[\s\S]*Api\.taskMemoryPreview\(token\.conversationUuid, requestScopeParams\(token\)\)/);
   assert.doesNotMatch(source, /function buildCatalogPreview|\.slice\(0,\s*20\)/);

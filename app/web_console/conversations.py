@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from app.task_memory import TaskMemoryDAO
 from app.tools.agents import _render_agent_task_notification, _task_status_label
+from app.web_console.activity import activity_fields
 from app.web_console.core import *
 from app.web_console.live_stream import *
+from app.web_console.notification_delivery import pause_notifications
 
 
 class WebAdminConversationsMixin:
@@ -75,7 +77,9 @@ class WebAdminConversationsMixin:
             "internalChatId": int(data.get("internal_chat_id") or 0),
             "title": str(data.get("title") or "新对话"),
             "model": str(data.get("model") or ""),
+            **activity_fields(data),
             "agentModel": str(data.get("agent_model") or ""),
+            "contextStrategy": str(data.get("context_strategy") or "sliding_window"),
             "agentThinkLevel": str(data.get("agent_think_level") or ""),
             "agentFastMode": (
                 None
@@ -204,6 +208,7 @@ class WebAdminConversationsMixin:
         conv_uuid = conversation_uuid or str(uuid.uuid4())
         config = run_config if isinstance(run_config, dict) else {}
         model_label = str(config.get("main_model") or model or getattr(self.model_selection, "current", "") or self.config.models.primary)
+        context_strategy = str(config.get("context_strategy") or self.config.context_management.default_strategy)
         main_thinking = str(config.get("main_thinking_level") or "")
         main_fast = 1 if bool(config.get("main_fast_mode")) else 0
         agent_model = str(config.get("agent_model") or "")
@@ -237,13 +242,13 @@ class WebAdminConversationsMixin:
                             INSERT INTO web_conversations (
                               conversation_uuid, owner_chat_id, internal_chat_id, title, model,
                               agent_model, agent_think_level, agent_fast_mode,
-                              status, current_status, created_at, updated_at, display_order, folder_uuid
-                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              status, current_status, created_at, updated_at, display_order, folder_uuid, context_strategy
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 conv_uuid, owner_chat_id, internal, title or "新对话", model_label,
                                 agent_model, agent_thinking, agent_fast,
-                                "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""),
+                                "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""), context_strategy,
                             ),
                         )
                         await conn.execute(
@@ -378,10 +383,13 @@ class WebAdminConversationsMixin:
         old_internal_chat_id: int,
         new_internal_chat_id: int,
         message_id_map: dict[int, int] | None = None,
+        summary_id_map: dict[int, int] | None = None,
+        plan_hash_map: dict[str, str] | None = None,
         key_hint: str = "",
     ) -> Any:
         key_norm = re.sub(r"[^a-z0-9]", "", str(key_hint or "").lower())
-        message_keys = {"messageid", "messageids", "transcriptmessageids", "transcriptmessageid"}
+        message_keys = {"messageid", "messageids", "transcriptmessageids", "transcriptmessageid", "uptomessageid"}
+        summary_keys = {"summaryid", "summaryids"}
         if isinstance(value, dict):
             return {
                 key: cls._rewrite_duplicate_json_obj(
@@ -390,6 +398,8 @@ class WebAdminConversationsMixin:
                     old_internal_chat_id=old_internal_chat_id,
                     new_internal_chat_id=new_internal_chat_id,
                     message_id_map=message_id_map,
+                    summary_id_map=summary_id_map,
+                    plan_hash_map=plan_hash_map,
                     key_hint=str(key),
                 )
                 for key, item in value.items()
@@ -402,18 +412,35 @@ class WebAdminConversationsMixin:
                     old_internal_chat_id=old_internal_chat_id,
                     new_internal_chat_id=new_internal_chat_id,
                     message_id_map=message_id_map,
+                    summary_id_map=summary_id_map,
+                    plan_hash_map=plan_hash_map,
                     key_hint=key_hint,
                 )
                 for item in value
             ]
         if isinstance(value, int) and not isinstance(value, bool):
+            if key_norm in summary_keys and summary_id_map:
+                return summary_id_map.get(value, value)
             if int(value) == int(old_internal_chat_id):
                 return int(new_internal_chat_id)
             if key_norm in message_keys and message_id_map:
                 return int(message_id_map.get(int(value), int(value)))
             return value
         if isinstance(value, str):
+            if key_norm == "planhash" and plan_hash_map:
+                return plan_hash_map.get(value, value)
             text = cls._rewrite_duplicate_text_refs(value, pairs)
+            if summary_id_map:
+                if key_norm in summary_keys and text.isdigit():
+                    return str(summary_id_map.get(int(text), int(text)))
+                if key_norm in {"compactionid", "opid", "operationid", "targetid"}:
+                    match = re.fullmatch(r"((?:tool:)?context-compaction:)(\d+)", text)
+                elif key_norm == "summaryref":
+                    match = re.fullmatch(r"(/api/conversations/[^/]+/compactions/)(\d+)", text)
+                else:
+                    match = None
+                if match:
+                    return match[1] + str(summary_id_map.get(int(match[2]), int(match[2])))
             if text == str(old_internal_chat_id):
                 return str(new_internal_chat_id)
             if key_norm in message_keys and message_id_map and text.isdigit():
@@ -430,6 +457,8 @@ class WebAdminConversationsMixin:
         old_internal_chat_id: int,
         new_internal_chat_id: int,
         message_id_map: dict[int, int] | None = None,
+        summary_id_map: dict[int, int] | None = None,
+        plan_hash_map: dict[str, str] | None = None,
     ) -> str:
         text = "" if value is None else str(value)
         if not text:
@@ -444,6 +473,8 @@ class WebAdminConversationsMixin:
             old_internal_chat_id=old_internal_chat_id,
             new_internal_chat_id=new_internal_chat_id,
             message_id_map=message_id_map,
+            summary_id_map=summary_id_map,
+            plan_hash_map=plan_hash_map,
         )
         return json.dumps(rewritten, ensure_ascii=False, separators=(",", ":"))
 
@@ -464,22 +495,30 @@ class WebAdminConversationsMixin:
         where_sql: str,
         params: tuple[Any, ...],
         transform: Callable[[dict[str, Any]], dict[str, Any]],
+        *,
+        id_map: dict[int, int] | None = None,
     ) -> int:
-        columns = [col for col in await self._table_columns_for_copy(table) if col != "id"]
-        cur = await self.db.conn.execute(f"SELECT * FROM {table} WHERE {where_sql}", params)
+        table_columns = await self._table_columns_for_copy(table)
+        columns = [col for col in table_columns if col != "id"]
+        # Reallocated row IDs must preserve source chronology, not the query
+        # planner's chat/updated_at DESC index order (notably Rath task rounds).
+        order = " ORDER BY id ASC" if "id" in table_columns else ""
+        cur = await self.db.conn.execute(f"SELECT * FROM {table} WHERE {where_sql}{order}", params)
         rows = [dict(row) for row in await cur.fetchall()]
         if not rows:
             return 0
         copied = 0
         for row in rows:
-            row.pop("id", None)
+            old_id = row.pop("id", None)
             row.update(transform(dict(row)) or {})
             values = [row.get(col) for col in columns]
             placeholders = ",".join("?" for _ in columns)
-            await self.db.conn.execute(
+            inserted = await self.db.conn.execute(
                 f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values),
             )
+            if id_map is not None and old_id is not None:
+                id_map[int(old_id)] = int(inserted.lastrowid)
             copied += 1
         return copied
 
@@ -488,6 +527,7 @@ class WebAdminConversationsMixin:
         old_internal_chat_id: int,
         new_internal_chat_id: int,
         pairs: list[tuple[str, str]],
+        summary_id_map: dict[int, int],
     ) -> dict[int, int]:
         columns = [col for col in await self._table_columns_for_copy("messages") if col != "id"]
         cur = await self.db.conn.execute(
@@ -508,6 +548,7 @@ class WebAdminConversationsMixin:
                     pairs,
                     old_internal_chat_id=old_internal_chat_id,
                     new_internal_chat_id=new_internal_chat_id,
+                    summary_id_map=summary_id_map,
                 )
             values = [source.get(col) for col in columns]
             placeholders = ",".join("?" for _ in columns)
@@ -544,6 +585,7 @@ class WebAdminConversationsMixin:
             owner_chat_id,
             title=new_title,
             model=str(source.get("model") or ""),
+            run_config={"context_strategy": str(source.get("context_strategy") or "sliding_window")},
             folder_uuid=str(source.get("folder_uuid") or ""),
         )
         new_uuid = str(new_row.get("conversation_uuid") or "")
@@ -584,10 +626,14 @@ class WebAdminConversationsMixin:
             memory_uuid_map = {old: f"mem_{uuid.uuid4().hex}" for old in old_memories}
             rath_artifact_map: dict[str, str] = {}
             control_map: dict[str, str] = {}
+            plan_decision_map: dict[str, str] = {}
+            plan_evidence_map: dict[str, str] = {}
             if old_task_uuids:
                 placeholders = ",".join("?" for _ in old_task_uuids)
                 rath_artifact_map = await self._uuid_map_for_rows("rath_task_artifacts", "artifact_uuid", f"task_uuid IN ({placeholders})", tuple(old_task_uuids))
                 control_map = await self._uuid_map_for_rows("rath_task_controls", "control_uuid", f"task_uuid IN ({placeholders})", tuple(old_task_uuids))
+                plan_decision_map = await self._uuid_map_for_rows("rath_task_plan_decisions", "decision_uuid", f"task_uuid IN ({placeholders})", tuple(old_task_uuids))
+                plan_evidence_map = await self._uuid_map_for_rows("rath_task_plan_evidence", "evidence_uuid", f"task_uuid IN ({placeholders})", tuple(old_task_uuids))
 
             pairs = self._duplicate_pairs(
                 artifact_map,
@@ -597,21 +643,65 @@ class WebAdminConversationsMixin:
                 memory_uuid_map,
                 rath_artifact_map,
                 control_map,
+                plan_decision_map,
+                plan_evidence_map,
                 extra=[(old_uuid, new_uuid), (old_session_uuid, new_session_uuid)],
             )
-            message_id_map = await self._copy_messages_for_duplicate(old_internal, new_internal, pairs)
+            # Allocate independent summary identities before rewriting structured
+            # references. Their transcript boundaries are rebound after messages.
+            summary_id_map: dict[int, int] = {}
+            await self._copy_table_rows_for_duplicate(
+                "summaries", "chat_id=?", (old_internal,),
+                lambda row: {"chat_id": new_internal, "summary": self._rewrite_duplicate_text_refs(row.get("summary"), pairs)},
+                id_map=summary_id_map,
+            )
+            message_id_map = await self._copy_messages_for_duplicate(old_internal, new_internal, pairs, summary_id_map)
+            cur = await self.db.conn.execute("SELECT id,up_to_message_id FROM summaries WHERE chat_id=?", (old_internal,))
+            for summary in await cur.fetchall():
+                await self.db.conn.execute(
+                    "UPDATE summaries SET up_to_message_id=? WHERE id=? AND chat_id=?",
+                    (message_id_map.get(int(summary["up_to_message_id"] or 0), 0), summary_id_map[summary["id"]], new_internal),
+                )
+
+            plan_hash_map: dict[str, str] = {}
+
+            def rewrite(value, *, key_hint=""):
+                return self._rewrite_duplicate_json_obj(
+                    value, pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal,
+                    message_id_map=message_id_map, summary_id_map=summary_id_map,
+                    plan_hash_map=plan_hash_map, key_hint=key_hint,
+                )
+
+            def rewrite_json(value):
+                return self._rewrite_duplicate_json_text(
+                    value, pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal,
+                    message_id_map=message_id_map, summary_id_map=summary_id_map, plan_hash_map=plan_hash_map,
+                )
+
+            # A Plan hash describes its normalized document, unlike the request
+            # ledger fingerprint (which remains the original submitted request's
+            # audit digest). Rebind Plan hashes alongside their event references.
+            if old_task_uuids:
+                cur = await self.db.conn.execute(
+                    f"SELECT plan_json,plan_hash FROM rath_task_plan_versions WHERE task_uuid IN ({placeholders})",
+                    tuple(old_task_uuids),
+                )
+                for plan_row in await cur.fetchall():
+                    document = rewrite(json.loads(plan_row["plan_json"]))
+                    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                    plan_hash_map[plan_row["plan_hash"]] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
             def copy_reference_bundle(row):
                 material = json.loads(row.get("material_json") or "[]")
                 for item in material:
                     # Rebind metadata, never rewrite quoted source text or
                     # encrypted credential bytes inside a frozen snapshot.
-                    item["reference"] = self._rewrite_duplicate_json_obj(item.get("reference") or {}, pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal)
+                    item["reference"] = rewrite(item.get("reference") or {})
                 return {
                     "bundle_uuid": reference_bundle_map[str(row["bundle_uuid"])],
                     "conversation_uuid": new_uuid,
-                    "op_id": self._rewrite_duplicate_text_refs(row.get("op_id"), pairs),
-                    "manifest_json": self._rewrite_duplicate_json_text(row.get("manifest_json"), pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal),
+                    "op_id": rewrite(row.get("op_id"), key_hint="op_id"),
+                    "manifest_json": rewrite_json(row.get("manifest_json")),
                     "material_json": json.dumps(material, ensure_ascii=False),
                 }
             await self._copy_table_rows_for_duplicate("web_reference_bundles", "conversation_uuid=?", (old_uuid,), copy_reference_bundle)
@@ -626,16 +716,6 @@ class WebAdminConversationsMixin:
                     lambda row: {"chat_id": new_internal, "session_uuid": new_session_uuid},
                 )
 
-            await self._copy_table_rows_for_duplicate(
-                "summaries",
-                "chat_id=?",
-                (old_internal,),
-                lambda row: {
-                    "chat_id": new_internal,
-                    "summary": self._rewrite_duplicate_text_refs(row.get("summary"), pairs),
-                    "up_to_message_id": message_id_map.get(int(row.get("up_to_message_id") or 0), int(row.get("up_to_message_id") or 0)),
-                },
-            )
             for table in ("model_calls", "tool_calls"):
                 await self._copy_table_rows_for_duplicate(
                     table,
@@ -650,13 +730,7 @@ class WebAdminConversationsMixin:
                 lambda row: {
                     "operation_uuid": str(uuid.uuid4()),
                     "chat_id": new_internal,
-                    "detail_json": self._rewrite_duplicate_json_text(
-                        row.get("detail_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                        message_id_map=message_id_map,
-                    ),
+                    "detail_json": rewrite_json(row.get("detail_json")),
                 },
             )
             await self._copy_table_rows_for_duplicate(
@@ -678,21 +752,15 @@ class WebAdminConversationsMixin:
                 lambda row: {
                     "conversation_uuid": new_uuid,
                     "internal_chat_id": new_internal,
-                    "op_id": self._rewrite_duplicate_text_refs(row.get("op_id"), pairs),
+                    "op_id": rewrite(row.get("op_id"), key_hint="op_id"),
                     "turn_uuid": self._rewrite_duplicate_text_refs(row.get("turn_uuid"), pairs),
                     "parent_turn_uuid": self._rewrite_duplicate_text_refs(row.get("parent_turn_uuid"), pairs),
                     "run_root_turn_uuid": self._rewrite_duplicate_text_refs(row.get("run_root_turn_uuid"), pairs),
-                    "target_id": self._rewrite_duplicate_text_refs(row.get("target_id"), pairs),
+                    "target_id": rewrite(row.get("target_id"), key_hint="target_id"),
                     "task_uuid": self._rewrite_duplicate_text_refs(row.get("task_uuid"), pairs),
                     "run_id": self._rewrite_duplicate_text_refs(row.get("run_id"), pairs),
                     "transcript_message_ids_json": self._map_message_id_json_list(row.get("transcript_message_ids_json"), message_id_map),
-                    "payload_json": self._rewrite_duplicate_json_text(
-                        row.get("payload_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                        message_id_map=message_id_map,
-                    ),
+                    "payload_json": rewrite_json(row.get("payload_json")),
                 },
             )
             await self._copy_table_rows_for_duplicate(
@@ -701,7 +769,7 @@ class WebAdminConversationsMixin:
                 (old_uuid,),
                 lambda row: {
                     "conversation_uuid": new_uuid,
-                    "op_id": self._rewrite_duplicate_text_refs(row.get("op_id"), pairs),
+                    "op_id": rewrite(row.get("op_id"), key_hint="op_id"),
                     "message_id": message_id_map.get(int(row.get("message_id") or 0), int(row.get("message_id") or 0)),
                 },
             )
@@ -713,29 +781,24 @@ class WebAdminConversationsMixin:
                     "conversation_uuid": new_uuid,
                     "owner_chat_id": owner_chat_id,
                     "internal_chat_id": new_internal,
-                    "op_id": self._rewrite_duplicate_text_refs(row.get("op_id"), pairs),
+                    "op_id": rewrite(row.get("op_id"), key_hint="op_id"),
                     "turn_uuid": self._rewrite_duplicate_text_refs(row.get("turn_uuid"), pairs),
                     "parent_turn_uuid": self._rewrite_duplicate_text_refs(row.get("parent_turn_uuid"), pairs),
                     "run_root_turn_uuid": self._rewrite_duplicate_text_refs(row.get("run_root_turn_uuid"), pairs),
-                    "target_id": self._rewrite_duplicate_text_refs(row.get("target_id"), pairs),
+                    "target_id": rewrite(row.get("target_id"), key_hint="target_id"),
                     "task_uuid": self._rewrite_duplicate_text_refs(row.get("task_uuid"), pairs),
                     "run_id": self._rewrite_duplicate_text_refs(row.get("run_id"), pairs),
-                    "payload_json": self._rewrite_duplicate_json_text(
-                        row.get("payload_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                        message_id_map=message_id_map,
-                    ),
-                    "debug_json": self._rewrite_duplicate_json_text(
-                        row.get("debug_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                        message_id_map=message_id_map,
-                    ),
+                    "payload_json": rewrite_json(row.get("payload_json")),
+                    "debug_json": rewrite_json(row.get("debug_json")),
                 },
             )
+
+            def duplicate_agent_metadata(raw):
+                metadata = json.loads(rewrite_json(raw) or "{}")
+                # Rollback uses a random session ID which is not an Agent/task
+                # UUID reference. Never rely on textual remapping for isolation.
+                metadata["llmSessionId"] = str(uuid.uuid4())
+                return json.dumps(metadata, ensure_ascii=False)
 
             await self._copy_table_rows_for_duplicate(
                 "rath_agent_sessions",
@@ -749,12 +812,7 @@ class WebAdminConversationsMixin:
                     "active_task_uuid": "",
                     "context_task_uuid": task_map.get(str(row.get("context_task_uuid") or ""), ""),
                     "context_revision": int(row.get("context_revision") or 0) if str(row.get("context_task_uuid") or "") in task_map else 0,
-                    "metadata_json": self._rewrite_duplicate_json_text(
-                        row.get("metadata_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                    ),
+                    "metadata_json": duplicate_agent_metadata(row.get("metadata_json")),
                 },
             )
             await self._copy_table_rows_for_duplicate(
@@ -768,18 +826,8 @@ class WebAdminConversationsMixin:
                     "agent_session_uuid": agent_session_map.get(str(row.get("agent_session_uuid") or ""), str(row.get("agent_session_uuid") or "")),
                     "caller_agent_session_uuid": agent_session_map.get(str(row.get("caller_agent_session_uuid") or ""), str(row.get("caller_agent_session_uuid") or "")),
                     "parent_task_uuid": task_map.get(str(row.get("parent_task_uuid") or ""), str(row.get("parent_task_uuid") or "")),
-                    "input_json": self._rewrite_duplicate_json_text(
-                        row.get("input_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                    ),
-                    "output_json": self._rewrite_duplicate_json_text(
-                        row.get("output_json"),
-                        pairs,
-                        old_internal_chat_id=old_internal,
-                        new_internal_chat_id=new_internal,
-                    ),
+                    "input_json": rewrite_json(row.get("input_json")),
+                    "output_json": rewrite_json(row.get("output_json")),
                 },
             )
             await TaskMemoryDAO(self.db).duplicate_conversation(
@@ -795,14 +843,52 @@ class WebAdminConversationsMixin:
                 internal_chat_id=new_internal,
                 task_uuids=task_map.values(),
             )
+            from app.context.lifecycle import duplicate_windows
+            from app.context.window import neutral_context
+
+            windows = await duplicate_windows(
+                self.db, old_chat=old_internal, new_chat=new_internal,
+                old_conversation=old_uuid, new_conversation=new_uuid, new_session=new_session_uuid,
+                message_map=message_id_map, summary_map=summary_id_map,
+                agent_map=agent_session_map, task_map=task_map, rewrite=rewrite,
+            )
+            agent_windows = {item.source["task_uuid"]: item for item in windows.values() if item.source["owner_kind"] == "agent"}
             if old_task_uuids:
                 placeholders = ",".join("?" for _ in old_task_uuids)
+
+                # Preserve historical governance on the copied *old tasks*.
+                # New Continue tasks still initialize their own Plan/permissions.
+                def duplicate_plan_record(row):
+                    return {
+                        key: task_map[value] if key == "task_uuid" else
+                        plan_hash_map.get(value, value) if key == "plan_hash" else
+                        rewrite_json(value) if key.endswith("_json") else
+                        self._rewrite_duplicate_text_refs(value, pairs) if isinstance(value, str) else value
+                        for key, value in row.items()
+                    }
+
+                for table in (
+                    "rath_task_plan_state", "rath_task_plan_versions", "rath_task_plan_decisions",
+                    "rath_task_plan_step_runs", "rath_task_plan_evidence", "rath_task_plan_requests",
+                ):
+                    await self._copy_table_rows_for_duplicate(
+                        table, f"task_uuid IN ({placeholders})", tuple(old_task_uuids), duplicate_plan_record,
+                    )
+
                 def duplicate_agent_context(row):
-                    state = json.loads(self._rewrite_duplicate_json_text(
-                        row.get("state_json"), pairs, old_internal_chat_id=old_internal, new_internal_chat_id=new_internal,
-                    ) or "{}")
-                    for message in state.get("messages") or []:
-                        message.pop("native_output_items", None)
+                    original = json.loads(row.get("state_json") or "{}")
+                    state = rewrite(original)
+                    window = windows.get(f"agent:{original.get('agentSessionUuid')}") or agent_windows.get(str(row["task_uuid"]))
+                    # Compare the source pair before rebinding. A stale source
+                    # must not accidentally match the fresh copy's (0, 1) pair.
+                    state["windowVersion"] = -1
+                    state["windowRevision"] = -1
+                    if window is not None:
+                        state["messages"] = [window.remap(message) for message in original.get("messages") or []]
+                        if window.paired(str(row["task_uuid"]), original):
+                            state["windowVersion"] = window.saved["windowVersion"]
+                            state["windowRevision"] = window.saved["revision"]
+                    state["messages"] = neutral_context(state.get("messages") or [])
                     state["sessionId"] = ""
                     state["providerPromptSnapshot"] = {}
                     return {"task_uuid": task_map[str(row["task_uuid"])], "session_id": "", "state_json": json.dumps(state, ensure_ascii=False)}
@@ -815,12 +901,7 @@ class WebAdminConversationsMixin:
                     tuple(old_task_uuids),
                     lambda row: {
                         "task_uuid": task_map.get(str(row.get("task_uuid") or ""), str(row.get("task_uuid") or "")),
-                        "detail_json": self._rewrite_duplicate_json_text(
-                            row.get("detail_json"),
-                            pairs,
-                            old_internal_chat_id=old_internal,
-                            new_internal_chat_id=new_internal,
-                        ),
+                        "detail_json": rewrite_json(row.get("detail_json")),
                     },
                 )
                 await self._copy_table_rows_for_duplicate(
@@ -830,12 +911,7 @@ class WebAdminConversationsMixin:
                     lambda row: {
                         "artifact_uuid": rath_artifact_map.get(str(row.get("artifact_uuid") or ""), str(uuid.uuid4())),
                         "task_uuid": task_map.get(str(row.get("task_uuid") or ""), str(row.get("task_uuid") or "")),
-                        "source_refs_json": self._rewrite_duplicate_json_text(
-                            row.get("source_refs_json"),
-                            pairs,
-                            old_internal_chat_id=old_internal,
-                            new_internal_chat_id=new_internal,
-                        ),
+                        "source_refs_json": rewrite_json(row.get("source_refs_json")),
                     },
                 )
                 await self._copy_table_rows_for_duplicate(
@@ -953,6 +1029,8 @@ class WebAdminConversationsMixin:
               SUM(CASE WHEN op_type='agent' AND COALESCE(lifecycle,'') IN ('active','paused','waiting_control') THEN 1 ELSE 0 END) AS active_agent_count,
               SUM(CASE WHEN op_type!='notice' AND COALESCE(lifecycle,'')='paused' THEN 1 ELSE 0 END) AS paused_count,
               SUM(CASE WHEN op_type!='notice' AND COALESCE(lifecycle,'')='waiting_control' THEN 1 ELSE 0 END) AS waiting_control_count,
+              SUM(CASE WHEN op_type='user_interaction' AND COALESCE(lifecycle,'')='active' THEN 1 ELSE 0 END) AS pending_interaction_count,
+              MAX(CASE WHEN op_type IN ('run','agent','user_interaction') AND COALESCE(lifecycle,'') IN ('active','paused','waiting_control') THEN created_at_ms ELSE 0 END) AS active_started_at_ms,
               MAX(updated_at_ms) AS latest_updated_at_ms,
               MAX(CASE WHEN op_type!='notice' AND COALESCE(lifecycle,'') IN ('active','paused','waiting_control') THEN updated_at_ms ELSE 0 END) AS latest_active_updated_at_ms
             FROM web_operations
@@ -972,6 +1050,8 @@ class WebAdminConversationsMixin:
                 "activeAgentCount": int(row["active_agent_count"] or 0),
                 "pausedCount": int(row["paused_count"] or 0),
                 "waitingControlCount": int(row["waiting_control_count"] or 0),
+                "pendingInteractionCount": int(row["pending_interaction_count"] or 0),
+                "activeStartedAtMs": int(row["active_started_at_ms"] or 0),
                 "latestUpdatedAtMs": int(row["latest_updated_at_ms"] or 0),
                 "latestActiveUpdatedAtMs": int(row["latest_active_updated_at_ms"] or 0),
             }
@@ -1638,60 +1718,64 @@ class WebAdminConversationsMixin:
         durable_payload = dict(payload)
         durable_payload["conversationUuid"] = conv_uuid
         durable_payload["chatId"] = internal_chat_id
-        await self.db.conn.execute(
-            """
-            INSERT OR IGNORE INTO web_task_notifications (
-              notification_uuid, notification_key, conversation_uuid, internal_chat_id,
-              owner_chat_id, task_uuid, kind, task_status, payload_json, state,
-              attempts, claim_token, claimed_at, next_attempt_at, last_error,
-              created_at, updated_at, delivered_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,'pending',0,'',0,0,'',?,?,0)
-            """,
-            (
-                notification_uuid,
-                notification_key,
-                conv_uuid,
-                internal_chat_id,
-                owner_chat_id,
-                str(payload.get("taskUuid") or payload.get("jobId") or ""),
-                str(payload.get("kind") or "task-notification"),
-                str(payload.get("status") or ""),
-                json.dumps(durable_payload, ensure_ascii=False, separators=(",", ":"), default=str),
-                ts,
-                ts,
-            ),
-        )
-        await self.db.conn.commit()
-        cur = await self.db.conn.execute(
-            "SELECT notification_uuid, state, payload_json FROM web_task_notifications WHERE notification_key=? LIMIT 1",
-            (notification_key,),
-        )
-        stored = await cur.fetchone()
-        if stored is None or str(stored["state"] or "") in {"delivered", "suppressed"}:
-            return None
-        try:
-            queued = json.loads(str(stored["payload_json"] or "{}"))
-        except Exception:
-            queued = durable_payload
-        if not isinstance(queued, dict):
-            queued = durable_payload
-        queued["_notificationUuid"] = str(stored["notification_uuid"] or "")
-        queued["_notificationKey"] = notification_key
-        task_uuid = str(payload.get("taskUuid") or payload.get("jobId") or "").strip()
-        task_status = str(payload.get("status") or "").strip()
-        if task_uuid and task_status:
-            cur = await self.db.conn.execute(
+        # Read back the inserted row and its sibling IDs on the same writer
+        # transaction. A concurrent query can pin the shared reader to an older
+        # snapshot: reading there after commit may return None and silently omit
+        # this durable notification from the live queue.
+        async with self.db.write_transaction(label="persist-web-task-notification") as conn:
+            await conn.execute(
                 """
-                SELECT notification_uuid FROM web_task_notifications
-                WHERE conversation_uuid=? AND task_uuid=? AND task_status=? AND state='pending'
-                ORDER BY id ASC
+                INSERT OR IGNORE INTO web_task_notifications (
+                  notification_uuid, notification_key, conversation_uuid, internal_chat_id,
+                  owner_chat_id, task_uuid, kind, task_status, payload_json, state,
+                  attempts, claim_token, claimed_at, next_attempt_at, last_error,
+                  created_at, updated_at, delivered_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,'pending',0,'',0,0,'',?,?,0)
                 """,
-                (conv_uuid, task_uuid, task_status),
+                (
+                    notification_uuid,
+                    notification_key,
+                    conv_uuid,
+                    internal_chat_id,
+                    owner_chat_id,
+                    str(payload.get("taskUuid") or payload.get("jobId") or ""),
+                    str(payload.get("kind") or "task-notification"),
+                    str(payload.get("status") or ""),
+                    json.dumps(durable_payload, ensure_ascii=False, separators=(",", ":"), default=str),
+                    ts,
+                    ts,
+                ),
             )
-            queued["_notificationUuids"] = [
-                str(item["notification_uuid"] or "") for item in await cur.fetchall()
-                if str(item["notification_uuid"] or "")
-            ]
+            cur = await conn.execute(
+                "SELECT notification_uuid, state, payload_json FROM web_task_notifications WHERE notification_key=? LIMIT 1",
+                (notification_key,),
+            )
+            stored = await cur.fetchone()
+            if stored is None or str(stored["state"] or "") in {"delivered", "suppressed", "paused"}:
+                return None
+            try:
+                queued = json.loads(str(stored["payload_json"] or "{}"))
+            except Exception:
+                queued = durable_payload
+            if not isinstance(queued, dict):
+                queued = durable_payload
+            queued["_notificationUuid"] = str(stored["notification_uuid"] or "")
+            queued["_notificationKey"] = notification_key
+            task_uuid = str(payload.get("taskUuid") or payload.get("jobId") or "").strip()
+            task_status = str(payload.get("status") or "").strip()
+            if task_uuid and task_status:
+                cur = await conn.execute(
+                    """
+                    SELECT notification_uuid FROM web_task_notifications
+                    WHERE conversation_uuid=? AND task_uuid=? AND task_status=? AND state='pending'
+                    ORDER BY id ASC
+                    """,
+                    (conv_uuid, task_uuid, task_status),
+                )
+                queued["_notificationUuids"] = [
+                    str(item["notification_uuid"] or "") for item in await cur.fetchall()
+                    if str(item["notification_uuid"] or "")
+                ]
         return queued
 
     @staticmethod
@@ -2019,6 +2103,9 @@ class WebAdminConversationsMixin:
             )
             claimed = {str(row["notification_uuid"] or "") for row in await cur.fetchall()}
         return token, claimed
+
+    async def _pause_web_task_notifications(self, notification_uuids: set[str], error: str) -> None:
+        await pause_notifications(self.db, notification_uuids, error)
 
     async def _requeue_web_task_notifications(self, notification_uuids: set[str], error: str) -> None:
         ids = sorted({str(item) for item in notification_uuids if str(item)})
@@ -2684,8 +2771,13 @@ class WebAdminConversationsMixin:
                     filtered = combined_notifications
                     _claim_token, claimed_notification_ids = await self._claim_web_task_notifications(filtered)
                     inflight_notification_ids = set(claimed_notification_ids)
-                    if any(item.get("_notificationUuid") for item in filtered) and not claimed_notification_ids:
-                        continue
+                    if any(self._web_task_notification_ids(item) for item in filtered):
+                        filtered = [item for item in filtered if self._web_task_notification_ids(item) & claimed_notification_ids]
+                        if not filtered:
+                            continue
+                        # Stale in-memory mirrors cannot revive paused/delivered rows
+                        # or smuggle them into a batch with a newly claimed result.
+                        batch_payload = self._coalesce_web_task_notifications(filtered)
                     task: asyncio.Task[Any] | None = None
                     while task is None:
                         async with self.operation_locks.chat(internal_chat_id, "web_task_notification"):
@@ -2784,16 +2876,15 @@ class WebAdminConversationsMixin:
                         # explicitly for failed/cancelled notification turns.
                         delivered = delivery_result is not False
                     except asyncio.CancelledError:
-                        await asyncio.shield(self._requeue_web_task_notifications(claimed_notification_ids, "notification turn cancelled"))
+                        await asyncio.shield(self._pause_web_task_notifications(claimed_notification_ids, "notification turn cancelled; awaiting user continuation"))
                         raise
                     except Exception as exc:
-                        await self._requeue_web_task_notifications(
+                        await self._pause_web_task_notifications(
                             claimed_notification_ids,
                             f"{type(exc).__name__}: {exc}",
                         )
                         inflight_notification_ids.clear()
-                        await asyncio.sleep(1.0)
-                        await self._recover_web_task_notifications(conversation_uuid)
+                        return
                     else:
                         if delivered:
                             resolved_ids, unresolved_ids = await self._partition_web_task_notification_ack(
@@ -2813,19 +2904,18 @@ class WebAdminConversationsMixin:
                                 # scan will trigger the next reasonable review.
                                 return
                         else:
-                            await self._requeue_web_task_notifications(
+                            await self._pause_web_task_notifications(
                                 claimed_notification_ids,
-                                "notification turn did not produce a successful final response",
+                                "notification turn failed; retry budget is final, awaiting user continuation",
                             )
                             inflight_notification_ids.clear()
-                            await asyncio.sleep(1.0)
-                            await self._recover_web_task_notifications(conversation_uuid)
+                            return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.exception("Web task notification worker failed", 会话=conversation_uuid)
             if inflight_notification_ids:
-                await asyncio.shield(self._requeue_web_task_notifications(
+                await asyncio.shield(self._pause_web_task_notifications(
                     inflight_notification_ids,
                     f"{type(exc).__name__}: {exc}",
                 ))
@@ -2835,9 +2925,9 @@ class WebAdminConversationsMixin:
         finally:
             if inflight_notification_ids:
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(self._requeue_web_task_notifications(
+                    await asyncio.shield(self._pause_web_task_notifications(
                         inflight_notification_ids,
-                        "notification worker stopped before acknowledgement",
+                        "notification worker stopped before acknowledgement; awaiting user continuation",
                     ))
             # Release ownership and recheck pending without an await in
             # between. Producers use the same no-await enqueue/owner sequence, so

@@ -40,6 +40,7 @@ async def test_config_store_load_keeps_builtin_prompt_as_unmaterialized_default(
 
     cfg = await store.load_config()
 
+    assert cfg.context_management.retain_ratio == 0.15
     assert cfg.agent.compact_prompt == ""
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert "agent" not in raw

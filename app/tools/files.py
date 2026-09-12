@@ -336,6 +336,7 @@ def register_file_tools(
     max_line_bytes: int = DEFAULT_READ_MAX_LINE_BYTES,
     diff_max_chars: int = DEFAULT_DIFF_MAX_CHARS,
 ) -> None:
+    reg.file_state = store
     reg.add(
         "Read",
         "Read text files; rejects binary/special files, supports offset/limit and force.",

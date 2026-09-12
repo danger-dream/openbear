@@ -1,7 +1,7 @@
 """ContextBuilder —— 组装 system + history + 本轮 user。
 
 [system] ← prompt-memory /system-prompt/build（传入 toolNames/skillsPrompt/workspaceDir 等参数）
-[history] ← SQLite（safeguard 压缩见 compaction）
+[history] ← independent saved window + newer original SQLite messages
 [user]    ← 本轮消息 + [⏰ 当前时间] 后缀
 """
 from __future__ import annotations
@@ -10,11 +10,9 @@ import os
 import platform
 from typing import TYPE_CHECKING, Any
 
-from app.agent.transcript_repair import (
-    build_summary_prefixed_history,
-    build_summary_prefixed_visible_history,
-    repair_tool_pairing,
-)
+from app.agent.transcript_repair import repair_tool_pairing
+from app.context.store import ContextOwner, WindowStore
+from app.context.window import mark_source
 from app.db.dao import MessageDAO, SummaryDAO
 from app.llm.base import Message
 from app.logging import get_logger
@@ -159,6 +157,46 @@ def build_system_prompt_params(
     }
 
 
+async def build_controller_history(
+    messages: MessageDAO, chat_id: int, *, reference_store: Any = None,
+) -> list[Message]:
+    """Restore selection independently of provider route, then append new rows.
+
+    On first adoption, retain an existing legacy summary and its uncompressed
+    tail. Do not reload the entire lifetime of old tool outputs just because the
+    default strategy changed. Once a window exists, it alone owns the selection.
+    """
+    session = await messages.get_or_create_session_uuid(chat_id)
+    store = WindowStore(messages._db, ContextOwner.controller(chat_id=chat_id, session_uuid=session))
+    saved = await store.load()
+    restored = await store.restore_messages()
+    high_water = int(((saved or {}).get("state") or {}).get("sourceMessageHighWater") or 0)
+    if restored is None:
+        legacy = await SummaryDAO(messages._db).latest(chat_id)
+        if legacy and legacy.get("summary"):
+            high_water = int(legacy.get("up_to_message_id") or 0)
+            restored = [mark_source({"role": "user", "content": "[Earlier context summary — fallible continuation context]\n" + str(legacy["summary"])},
+                kind="summary", source_id=f"legacy-summary:{legacy['id']}",
+                message_id=high_water, summary_id=int(legacy["id"]))]
+    cur = await messages.connection.execute(
+        "SELECT * FROM messages WHERE chat_id=? AND id>? ORDER BY id ASC",
+        (chat_id, high_water if restored is not None else 0),
+    )
+    rows = [messages._row(row) for row in await cur.fetchall()]
+    bundles = await reference_store.bundle_ids_for_rows(rows) if reference_store and rows else {}
+    tail = []
+    for row in rows:
+        message = project_history_message_for_controller(row.to_message())
+        if bundles.get(row.id):
+            message["openbear_reference_bundle"] = bundles[row.id]
+        mark_source(message, kind="human" if row.role == "user" else "execution",
+                    source_id=f"message:{row.id}", message_id=row.id,
+                    reference_only=message == row.to_message(), turn_uuid=row.turn_uuid,
+                    run_root_turn_uuid=row.run_root_turn_uuid or row.turn_uuid)
+        tail.append(message)
+    return repair_tool_pairing(list(restored or []) + tail)
+
+
 class ContextBuilder:
     def __init__(self, mem: MemoryClient, messages: MessageDAO, summaries: SummaryDAO,
                  skills: list[Skill], tools: ToolRegistry, workspace_dir: str,
@@ -231,18 +269,7 @@ class ContextBuilder:
         return prompt
 
     async def build_history(self, chat_id: int) -> list[Message]:
-        """从 DB 构造历史消息；压缩后只回放可见文本 XML 尾部。"""
-        summary = await self._summaries.latest(chat_id)
-        summary_text = str((summary or {}).get("summary") or "")
-        if summary_text:
-            visible_rows = await self._messages.recent_visible_history(chat_id)
-            return build_summary_prefixed_visible_history(summary_text, visible_rows)
-        rows = await self._messages.recent(chat_id)
-        recent = [project_history_message_for_controller(r.to_message()) for r in rows]
-        history = build_summary_prefixed_history("", recent)
-        # 发往上游前做工具配对净化:光杆 tool_call 补占位、孤儿/重复 tool 结果清理。
-        # 这是所有 convo 的唯一收口,屏蔽存量脏历史 + 兜住任何中断残留(见 transcript_repair)。
-        return repair_tool_pairing(history)
+        return await build_controller_history(self._messages, chat_id)
 
     def wrap_user(self, text) -> Message:
         if isinstance(text, list):

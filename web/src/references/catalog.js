@@ -2,8 +2,9 @@ import { shallowReactive } from 'vue';
 import Fuse from 'fuse.js';
 import { pinyin } from 'pinyin-pro';
 import { catalogKey } from './codec.js';
+import { applyActivityReadVersions } from '../conversationActivity.js';
 
-export const referenceCatalog = shallowReactive({items:[],ready:false,connected:false,stale:false,includeArchived:false,epoch:'',seq:0,version:null,treeStatus:null});
+export const referenceCatalog = shallowReactive({items:[],ready:false,connected:false,stale:false,includeArchived:false,epoch:'',seq:0,version:null,treeStatus:null,activityReadVersions:new Map()});
 const records = new Map();
 let searchIndex = new Fuse([], {includeScore:true,threshold:0.32,ignoreLocation:true,keys:[{name:'normalized',weight:0.6},{name:'pinyin',weight:0.2},{name:'initials',weight:0.12},{name:'pathText',weight:0.08}]});
 let socket = null, timer = null, heartbeat = null, stopped = true, retry = 0, lastMessageAt = 0;
@@ -57,8 +58,14 @@ export function applyCatalogPacket(packet) {
     if (affected.size) referenceCatalog.items = [...records.values()];
   } else return true;
   if (packet.version) referenceCatalog.version = packet.version;
-  if (packet.treeStatus) referenceCatalog.treeStatus = packet.treeStatus;
+  if (packet.treeStatus) referenceCatalog.treeStatus = applyActivityReadVersions(packet.treeStatus, referenceCatalog.activityReadVersions);
   return true;
+}
+export function acceptActivityReadReceipt(receipt = {}) {
+  const versions = new Map(referenceCatalog.activityReadVersions);
+  for (const item of receipt.items || []) versions.set(item.conversationUuid, Math.max(versions.get(item.conversationUuid) || 0, Number(item.activityReadVersion || 0)));
+  referenceCatalog.activityReadVersions = versions;
+  if (referenceCatalog.treeStatus) referenceCatalog.treeStatus = applyActivityReadVersions(referenceCatalog.treeStatus, versions);
 }
 export function referenceItem(ref) { void referenceCatalog.seq; return records.get(catalogKey(ref)); }
 export function searchReferences(query='', {kind='',currentConversation='',limit=30,items=null}={}) {
@@ -131,5 +138,5 @@ export function stopReferenceCatalog({clear=false}={}) {
   stopped=true;clearTimeout(timer);clearInterval(heartbeat);
   const old=socket;socket=null;old?.close();referenceCatalog.connected=false;
   if(typeof window!=='undefined'){window.removeEventListener('pageshow',resume);document.removeEventListener('visibilitychange',resume);}
-  if(clear){overviewSubscription=null;records.clear();rebuild();Object.assign(referenceCatalog,{ready:false,stale:false,epoch:'',seq:0,version:null,treeStatus:null,includeArchived:false});}
+  if(clear){overviewSubscription=null;records.clear();rebuild();Object.assign(referenceCatalog,{ready:false,stale:false,epoch:'',seq:0,version:null,treeStatus:null,includeArchived:false,activityReadVersions:new Map()});}
 }

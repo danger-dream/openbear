@@ -158,6 +158,19 @@ def test_root_retry_wait_maps_each_attempt_to_stable_model_retry_operation():
     assert next_attempt[0]["op_id"] == "model-retry:run-1:3"
 
 
+def test_retry_outcome_is_stable_within_one_call_but_not_across_call_rounds():
+    def spec(round_no, status):
+        return web_event_operation_specs({
+            "type": "retry_wait", "turnUuid": "turn", "executionRunUuid": "run",
+            "retry": {"attempt": 1, "callRound": round_no, "status": status, "active": status == "waiting"},
+        })[0]
+    assert spec(1, "waiting")["op_id"] == spec(1, "completed")["op_id"]
+    assert spec(1, "completed")["op_id"] != spec(2, "waiting")["op_id"]
+    assert spec(1, "resumed")["payload"]["statusText"] == "已发起模型重试"
+    assert spec(1, "completed")["payload"]["statusText"] == "模型重试成功"
+    assert spec(1, "failed")["status"] == "failed"
+
+
 def test_agent_retry_wait_is_not_projected_to_root_operations():
     specs = web_event_operation_specs({
         "type": "retry_wait",

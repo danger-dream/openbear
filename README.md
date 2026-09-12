@@ -146,9 +146,9 @@ curl -fsS http://127.0.0.1:18961/health
 
 ## 前端开发验证
 
-`web` 目录执行 `npm ci && npm test`。真实浏览器专项需要 Chrome／Chromium：可用 `CHROME_BIN=/path/to/chrome npm test` 指定已有浏览器，或先执行 `npx playwright-core install chromium` 安装测试浏览器；Linux 缺少系统依赖时使用 `npx playwright-core install --with-deps chromium`（需要相应安装权限）。
+`web` 目录执行 `npm ci && npm test && npm run build`，运行 Node 单元、组件逻辑和 HTTP/WebSocket 接口测试并构建前端。
 
-发布 CI 会在测试前自动安装 Chrome，并把同一可执行路径传给浏览器专项和发行包登录验证，不依赖开发机缓存。本地无浏览器时允许跳过专项；CI 环境不允许静默跳过，显式提供了无效的 `CHROME_BIN` 也会报告配置错误。
+发布 CI 使用相同命令，发行包登录验证通过 HTTP/WebSocket 接口完成，无需安装或启动浏览器。
 
 ## 配置与安全
 

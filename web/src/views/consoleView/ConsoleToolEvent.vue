@@ -358,7 +358,7 @@ function selectCallTab(index) {
 				</div>
 			</section>
 
-			<section class="tool-payload-section" aria-label="调用参数">
+			<section v-if="!isContextCompaction" class="tool-payload-section" aria-label="调用参数">
 				<header class="tool-payload-heading">
 					<span class="tool-payload-title">调用参数</span>
 					<span v-if="argumentsPayload.content" class="tool-payload-meta">{{ payloadMeta(argumentsPayload) }}</span>
@@ -375,9 +375,10 @@ function selectCallTab(index) {
 				<p v-else class="tool-payload-empty">无调用参数</p>
 			</section>
 
-			<section class="tool-payload-section" aria-label="返回结果">
+			<section class="tool-payload-section" :class="{'context-detail-section': isContextCompaction}" aria-label="返回结果">
+				<div v-if="isContextCompaction && resolvedCompaction.strategy === 'model_summary'" class="context-detail-facts"><p v-for="fact in resolvedCompaction.detailFacts" :key="fact">{{ fact }}</p></div>
 				<header class="tool-payload-heading">
-					<span class="tool-payload-title">返回结果</span>
+					<span class="tool-payload-title">{{ isContextCompaction ? (resolvedCompaction.strategy === 'sliding_window' ? '窗口变化' : '摘要正文') : '返回结果' }}</span>
 					<span v-if="resultPayload.content" class="tool-payload-meta">{{ payloadMeta(resultPayload) }}</span>
 					<button
 						v-if="resultPayload.content"
@@ -396,6 +397,10 @@ function selectCallTab(index) {
 </template>
 
 <style scoped>
+.context-detail-facts { display: grid; gap: 5px; margin-bottom: 14px; color: #7b8594; font-size: 13px; line-height: 1.6; }
+.context-detail-section .tool-payload-title { font-size: 14px; }
+.context-detail-section .tool-payload-code pre { font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.context-detail-section .tool-payload-meta, .context-detail-section .tool-payload-copy, .context-detail-section .tool-payload-empty { font-size: 13px; }
 .tool-event {
 	margin: 0.42rem 0;
 	border: 1px solid rgba(15, 23, 42, .10);

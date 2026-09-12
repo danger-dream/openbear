@@ -177,9 +177,7 @@ def _models_dev_json(model: ModelDef, catalog: Any = None) -> dict[str, Any]:
 
 
 def model_to_json(model: ModelDef, *, fullname: str = "", stats: dict[str, Any] | None = None,
-                  primary: str = "", compression: Any = "", models_dev_catalog: Any = None) -> dict[str, Any]:
-    compression_models = _compression_list(compression)
-    is_compression = fullname in compression_models
+                  primary: str = "", models_dev_catalog: Any = None) -> dict[str, Any]:
     thinking_levels = list(model.thinking_levels or [])
     return {
         "id": model.id,
@@ -196,36 +194,20 @@ def model_to_json(model: ModelDef, *, fullname: str = "", stats: dict[str, Any] 
         "thinkingLevels": thinking_levels,
         "defaultThinkingLevel": model.default_thinking_level or (thinking_levels[-1] if thinking_levels else ""),
         "supportsFast": bool(model.supports_fast),
-        "compactTriggerTokens": int(model.compact_trigger_tokens or 0),
+        "rolloverTriggerTokens": int(model.rollover_trigger_tokens or 0),
         "fullname": fullname,
         "primary": fullname == primary,
-        "compression": is_compression,
         "stats": stats or {},
     }
 
 
-def compression_candidates_to_json(models: ModelsConfig) -> list[dict[str, Any]]:
-    """Ordered display metadata for the configured compression fallback chain."""
-    out: list[dict[str, Any]] = []
-    for fullname in models.compression_models:
-        provider_name, _, model_id = str(fullname or "").partition("/")
-        resolved = models.resolve(fullname, include_disabled=True)
-        model = resolved[1] if resolved is not None else None
-        out.append({
-            "fullname": fullname,
-            "provider": provider_name,
-            "id": model_id,
-            "name": (model.name or model.id) if model is not None else model_id,
-        })
-    return out
 
 
 def provider_to_json(name: str, provider: ProviderDef, *, stats: dict[str, Any] | None = None,
                      model_stats: dict[str, dict[str, Any]] | None = None,
-                     primary: str = "", compression: Any = "", include_models: bool = True,
+                     primary: str = "", include_models: bool = True,
                      models_dev_catalog: Any = None) -> dict[str, Any]:
     model_stats = model_stats or {}
-    compression_models = _compression_list(compression)
     data = {
         "name": name,
         "baseUrl": provider.base_url,
@@ -236,7 +218,6 @@ def provider_to_json(name: str, provider: ProviderDef, *, stats: dict[str, Any] 
         "modelsDevProviderId": provider.models_dev_provider_id,
         "modelCount": len(provider.models),
         "primary": primary.startswith(name + "/"),
-        "compression": any(item.startswith(name + "/") for item in compression_models),
         "stats": stats or {},
     }
     if include_models:
@@ -246,7 +227,6 @@ def provider_to_json(name: str, provider: ProviderDef, *, stats: dict[str, Any] 
                 fullname=f"{name}/{m.id}",
                 stats=model_stats.get(f"{name}/{m.id}", {}),
                 primary=primary,
-                compression=compression,
                 models_dev_catalog=models_dev_catalog,
             )
             for m in provider.models
@@ -263,15 +243,12 @@ def providers_payload(
     stats = {str(row.get("provider") or ""): dict(row) for row in (provider_stats or [])}
     return {
         "primaryModel": models.primary,
-        "compressionModels": list(models.compression_models),
-        "compressionCandidates": compression_candidates_to_json(models),
         "providers": [
             provider_to_json(
                 name,
                 provider,
                 stats=stats.get(name, {}),
                 primary=models.primary,
-                compression=models.compression_models,
                 include_models=False,
                 models_dev_catalog=models_dev_catalog,
             )
@@ -305,10 +282,8 @@ def provider_detail_payload(models: ModelsConfig, name: str, provider_stats: lis
     mstats = {str(row.get("model") or ""): dict(row) for row in (model_stats or [])}
     return {
         "primaryModel": models.primary,
-        "compressionModels": list(models.compression_models),
-        "compressionCandidates": compression_candidates_to_json(models),
         "provider": provider_to_json(name, provider, stats=pstats.get(name, {}), model_stats=mstats,
-                                      primary=models.primary, compression=models.compression_models, include_models=True,
+                                      primary=models.primary, include_models=True,
                                       models_dev_catalog=models_dev_catalog),
     }
 
@@ -324,33 +299,11 @@ def _model_rows(raw_provider: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _compression_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        raw_items = re.split(r"[,;\n]+", value)
-    elif isinstance(value, (list, tuple, set)):
-        raw_items = list(value)
-    else:
-        raw_items = [value]
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        label = str(item or "").strip()
-        if label and label not in seen:
-            seen.add(label)
-            out.append(label)
-    return out
-
-
-def _compression_models(raw_models: dict[str, Any]) -> list[str]:
-    return _compression_list(raw_models.get("compressionModels"))
 
 
 
-def _set_compression_models(raw_models: dict[str, Any], fullnames: list[str] | str) -> None:
-    values = _compression_list(fullnames)
-    raw_models["compressionModels"] = values
+
+
 
 
 
@@ -359,14 +312,21 @@ def _rewrite_model_prefix(value: str, old_prefix: str, new_prefix: str) -> str:
     return new_prefix + text[len(old_prefix):] if text.startswith(old_prefix) else text
 
 
-def _rewrite_compression_prefixes(raw_models: dict[str, Any], old_prefix: str, new_prefix: str) -> None:
-    values = [_rewrite_model_prefix(item, old_prefix, new_prefix) for item in _compression_models(raw_models)]
-    _set_compression_models(raw_models, values)
+def _rewrite_compression_references(models_root: dict[str, Any], old: str, new: str, *, prefix: bool = False) -> None:
+    """Keep ordered summary candidates in the same rename transaction."""
+    for key in ("compressionModels", "compression_models"):
+        if key not in models_root:
+            continue
+        candidates = ModelsConfig._normalize_compression_models(models_root[key])
+        rewritten = [
+            _rewrite_model_prefix(item, old, new) if prefix else new if item == old else item
+            for item in candidates
+        ]
+        models_root[key] = list(dict.fromkeys(rewritten))
 
 
-def _replace_compression_model(raw_models: dict[str, Any], old_full: str, new_full: str) -> None:
-    values = [new_full if item == old_full else item for item in _compression_models(raw_models)]
-    _set_compression_models(raw_models, values)
+
+
 
 def _normalized_model_thinking(data: dict[str, Any]) -> tuple[list[str], str]:
     levels = list(normalize_think_levels(data.get("thinkingLevels", data.get("thinking_levels", ""))))
@@ -460,7 +420,7 @@ def update_provider_mutator(name: str, patch: dict[str, Any]):
             value = str(models_root.get("primary") or "")
             if value.startswith(old_name + "/"):
                 models_root["primary"] = new_name + value[len(old_name):]
-            _rewrite_compression_prefixes(models_root, old_name + "/", new_name + "/")
+            _rewrite_compression_references(models_root, old_name + "/", new_name + "/", prefix=True)
         else:
             providers[old_name] = provider
     return mut
@@ -477,8 +437,6 @@ def delete_provider_mutator(name: str):
         prefix = target + "/"
         if str(models_root.get("primary") or "").startswith(prefix):
             raise ValueError("不能删除当前主力模型所在渠道")
-        if any(item.startswith(prefix) for item in _compression_models(models_root)):
-            raise ValueError("不能删除当前压缩模型所在渠道")
         providers.pop(target)
     return mut
 
@@ -521,7 +479,7 @@ def normalize_model_payload(data: dict[str, Any]) -> dict[str, Any]:
         "thinkingLevels": thinking_levels,
         "defaultThinkingLevel": default_thinking,
         "supportsFast": bool(data.get("supportsFast", data.get("fast", False))),
-        "compactTriggerTokens": int(data.get("compactTriggerTokens", data.get("compact_trigger_tokens", 0)) or 0),
+        "rolloverTriggerTokens": int(data.get("rolloverTriggerTokens", data.get("rollover_trigger_tokens", 0)) or 0),
     }
     if "fastCost" in data or "fast_cost" in data:
         item["fastCost"] = parse_cost_input(data.get("fastCost", data.get("fast_cost")), field="fastCost")
@@ -537,8 +495,8 @@ def normalize_model_payload(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("contextWindow 必须大于 0")
     if item["maxTokens"] <= 0:
         raise ValueError("maxTokens 必须大于 0")
-    if item["compactTriggerTokens"] < 0:
-        raise ValueError("compactTriggerTokens 不能小于 0")
+    if item["rolloverTriggerTokens"] < 0:
+        raise ValueError("rolloverTriggerTokens 不能小于 0")
     return item
 
 
@@ -637,19 +595,18 @@ def update_model_mutator(provider_name: str, model_id: str, patch: dict[str, Any
             target["defaultThinkingLevel"] = configured_default_think_level(levels, str(default_raw or "")) if levels else ""
         if "supportsFast" in patch or "fast" in patch:
             target["supportsFast"] = bool(patch.get("supportsFast", patch.get("fast", False)))
-        if "compactTriggerTokens" in patch or "compact_trigger_tokens" in patch:
-            value = int(patch.get("compactTriggerTokens", patch.get("compact_trigger_tokens", 0)) or 0)
+        if "rolloverTriggerTokens" in patch or "rollover_trigger_tokens" in patch:
+            value = int(patch.get("rolloverTriggerTokens", patch.get("rollover_trigger_tokens", 0)) or 0)
             if value < 0:
-                raise ValueError("compactTriggerTokens 不能小于 0")
-            target["compactTriggerTokens"] = value
+                raise ValueError("rolloverTriggerTokens 不能小于 0")
+            target["rolloverTriggerTokens"] = value
         if new_id != old_model_id:
             models_root = raw.setdefault("models", {})
             old_full = f"{provider_name}/{old_model_id}"
             new_full = f"{provider_name}/{new_id}"
             if models_root.get("primary") == old_full:
                 models_root["primary"] = new_full
-            if old_full in _compression_models(models_root):
-                _replace_compression_model(models_root, old_full, new_full)
+            _rewrite_compression_references(models_root, old_full, new_full)
     return mut
 
 
@@ -662,8 +619,6 @@ def delete_model_mutator(provider_name: str, model_id: str):
         fullname = f"{provider_name}/{model_id}"
         if models_root.get("primary") == fullname:
             raise ValueError("不能删除当前主力模型")
-        if fullname in _compression_models(models_root):
-            raise ValueError("不能删除当前压缩模型")
         providers = _providers(raw)
         if provider_name not in providers:
             raise ValueError(f"渠道不存在：{provider_name}")
@@ -699,17 +654,6 @@ def set_primary_mutator(fullname: str):
     return mut
 
 
-def set_compression_mutator(fullnames: Any):
-    requested = _compression_list(fullnames)
-
-    def mut(raw: dict[str, Any]) -> None:
-        if requested:
-            models = ModelsConfig.model_validate(raw.get("models") or {})
-            for fullname in requested:
-                if models.resolve(fullname) is None:
-                    raise ValueError(f"压缩模型不存在或所属渠道已停用: {fullname}")
-        _set_compression_models(raw.setdefault("models", {}), requested)
-    return mut
 
 
 def _model_for_source_sync(models: ModelsConfig, provider_name: str, model_id: str) -> tuple[ProviderDef, ModelDef]:
@@ -762,7 +706,7 @@ def _current_public_metadata(model: ModelDef) -> dict[str, Any]:
         "input": list(model.input or []),
         "contextWindow": int(model.context_window or 0),
         "maxTokens": int(model.max_tokens or 0),
-        "compactTriggerTokens": int(model.compact_trigger_tokens or 0),
+        "rolloverTriggerTokens": int(model.rollover_trigger_tokens or 0),
         "cost": copy.deepcopy(model.cost or {}),
         "fastCost": copy.deepcopy(model.fast_cost or {}),
         "fastRequest": model.fast_request.model_dump(mode="json") if model.fast_request is not None else None,
@@ -1021,7 +965,7 @@ def sync_models_from_models_dev_mutator(
         for entry in prepared:
             target = targets[entry["localModelId"]]
             metadata = entry["metadata"]
-            for key in ("name", "reasoning", "input", "contextWindow", "maxTokens", "compactTriggerTokens", "reasoningOptions", "supportsFast"):
+            for key in ("name", "reasoning", "input", "contextWindow", "maxTokens", "rolloverTriggerTokens", "reasoningOptions", "supportsFast"):
                 if key in metadata:
                     target[key] = copy.deepcopy(metadata[key])
             if "fastRequest" in metadata:
@@ -1086,7 +1030,7 @@ def sync_model_from_models_dev_mutator(
         )
         if target is None:
             raise ValueError("模型不存在")
-        for key in ("name", "reasoning", "input", "contextWindow", "maxTokens", "compactTriggerTokens", "reasoningOptions", "supportsFast"):
+        for key in ("name", "reasoning", "input", "contextWindow", "maxTokens", "rolloverTriggerTokens", "reasoningOptions", "supportsFast"):
             if key in approved_metadata:
                 target[key] = copy.deepcopy(approved_metadata[key])
         if "fastRequest" in approved_metadata:

@@ -5,6 +5,7 @@ import {ArrowLeft, ArrowRight, Close, CollectionTag, Delete, EditPen, Plus, Refr
 import InteractionMarkdown from "./InteractionMarkdown.vue";
 import {Api, apiError} from "../../api.js";
 import {createTaskMemoryRequestGate} from "./taskMemoryRequestGate.js";
+import {taskMemoryInjectionPreview, taskMemoryInjectionUsage} from "./taskMemoryInjection.js";
 import {
 	TASK_MEMORY_CHANGED_EVENT_KEY,
 	createTaskMemoryBadgeState,
@@ -34,6 +35,9 @@ const form = ref(emptyForm());
 const injectionPreview = ref("");
 const previewRuntimeTokens = ref(0);
 const previewMaxTokens = ref(1500);
+const previewShortBodyMaxChars = ref(0);
+const previewIncludedCount = ref(null);
+const previewOmittedCount = ref(0);
 const detail = ref(null);
 const detailLoading = ref(false);
 const detailError = ref("");
@@ -71,7 +75,7 @@ const emptyTitle = computed(() => activeTab.value === "agent" && !selectedTaskUu
 	: query.value.trim() ? "没有找到匹配的记忆" : "还没有记忆");
 const emptyDescription = computed(() => activeTab.value === "agent" && !selectedTaskUuid.value
 	? "此会话中的 Agent 开始工作后，可在这里选择任务并查看记忆。"
-	: query.value.trim() ? "试试其他关键词，或清空搜索查看全部。" : "保存重要决定和工作进展，方便后续接着处理。");
+	: query.value.trim() ? "试试其他关键词，或清空搜索查看全部。" : "保存本会话的资料和执行偏好，不重复记录任务进度。");
 
 function taskLabel(task) {
 	return String(task?.title || task?.name || "未命名任务");
@@ -140,6 +144,10 @@ function resetContextState({
 	if (resetActiveTotal) activeTotal.value = 0;
 	injectionPreview.value = "";
 	previewRuntimeTokens.value = 0;
+	previewMaxTokens.value = 1500;
+	previewShortBodyMaxChars.value = 0;
+	previewIncludedCount.value = null;
+	previewOmittedCount.value = 0;
 	loading.value = false;
 	tasksLoading.value = false;
 	if (resetTasks) {
@@ -201,18 +209,28 @@ async function loadPreview() {
 	if (!token.conversationUuid || (token.scopeType === "agent_task" && !token.taskUuid)) {
 		injectionPreview.value = "";
 		previewRuntimeTokens.value = 0;
+		previewShortBodyMaxChars.value = 0;
+		previewIncludedCount.value = null;
+		previewOmittedCount.value = 0;
 		return;
 	}
 	try {
 		const data = await Api.taskMemoryPreview(token.conversationUuid, requestScopeParams(token));
 		if (!requestIsCurrent(token)) return;
-		injectionPreview.value = String(data?.catalogXml || "");
-		previewRuntimeTokens.value = Number(data?.estimatedRuntimeTokens || 0);
-		previewMaxTokens.value = Number(data?.maxRuntimeTokens || 1500);
+		const preview = taskMemoryInjectionPreview(data);
+		injectionPreview.value = preview.text;
+		previewRuntimeTokens.value = preview.tokens;
+		previewMaxTokens.value = preview.maxTokens;
+		previewShortBodyMaxChars.value = preview.shortBodyMaxChars;
+		previewIncludedCount.value = preview.includedCount;
+		previewOmittedCount.value = preview.omittedCount;
 	} catch (error) {
 		if (!requestIsCurrent(token)) return;
 		injectionPreview.value = "";
 		previewRuntimeTokens.value = 0;
+		previewShortBodyMaxChars.value = 0;
+		previewIncludedCount.value = null;
+		previewOmittedCount.value = 0;
 		if (drawerOpen.value) ElMessage.error(apiError(error));
 	}
 }
@@ -642,7 +660,7 @@ onBeforeUnmount(() => {
 		<header class="memory-drawer-header">
 			<div>
 				<h2 id="task-memory-drawer-title">任务记忆</h2>
-				<p>保留重要决定与进展，方便后续继续工作。</p>
+				<p>会话专用资料与执行偏好；任务进度由任务与 Plan 管理。</p>
 			</div>
 			<button type="button" class="icon-action drawer-close" aria-label="关闭任务记忆" @click="drawerOpen = false"><Close/></button>
 		</header>
@@ -702,7 +720,7 @@ onBeforeUnmount(() => {
 						<span class="memory-meta">{{ sourceLabel(item) }}<span>·</span>{{ formatDate(item.updatedAt) }} 更新</span>
 						<span class="memory-flags">
 							<i v-if="item.deletedAt" class="danger">已删除</i>
-							<i v-else-if="item.autoReinjectCatalog" class="on">目录自动提供给模型</i>
+							<i v-else-if="item.autoReinjectCatalog" class="on">自动提供给模型</i>
 							<i v-else>按需读取</i>
 							<i v-if="activeTab === 'conversation' && item.visibleToAgents">Agent 可读取</i>
 						</span>
@@ -738,7 +756,7 @@ onBeforeUnmount(() => {
 				<details class="memory-technical">
 					<summary>详细信息</summary>
 					<dl>
-						<dt>使用方式</dt><dd>{{ detail.autoReinjectCatalog ? '自动向模型提供名称与说明，正文按需读取' : '名称与正文均按需读取' }}</dd>
+						<dt>使用方式</dt><dd>{{ taskMemoryInjectionUsage(detail, previewShortBodyMaxChars) }}</dd>
 						<template v-if="activeTab === 'conversation'"><dt>Agent 读取</dt><dd>{{ detail.visibleToAgents ? '允许同会话中已获授权的 Agent 读取' : '不向 Agent 共享' }}</dd></template>
 						<dt>版本 / 大小</dt><dd>第 {{ detail.revision }} 版 · {{ formatBytes(detail.sizeBytes) }}</dd>
 						<dt>记忆标识</dt><dd><code>{{ detail.memoryUuid }}</code></dd>
@@ -751,11 +769,14 @@ onBeforeUnmount(() => {
 
 		<section v-if="!detail" class="injection-preview">
 			<button type="button" class="preview-toggle" :aria-expanded="previewOpen ? 'true' : 'false'" aria-controls="task-memory-catalog-preview" @click="previewOpen = !previewOpen">
-				<span>模型可见目录</span><small>约 {{ previewRuntimeTokens }} tokens</small><ArrowRight :class="{ expanded: previewOpen }"/>
+				<span>模型可见内容预览<span v-if="previewOmittedCount"> · 省略 {{ previewOmittedCount }} 条</span></span><small>约 {{ previewRuntimeTokens }} tokens</small><ArrowRight :class="{ expanded: previewOpen }"/>
 			</button>
 			<div v-if="previewOpen" id="task-memory-catalog-preview" class="preview-content">
-				<p>这是系统实际提供的目录，不含正文；预算 {{ previewMaxTokens }} tokens。Agent 目录也可能包含已共享的会话记忆。</p>
-				<pre tabindex="0" aria-label="目录原文">{{ injectionPreview || '暂无自动提供的目录条目' }}</pre>
+				<p v-if="previewShortBodyMaxChars">按当前注入规则预览：不超过 {{ previewShortBodyMaxChars }} 字符的短正文直接提供，长资料按需读取；总预算 {{ previewMaxTokens }} tokens。</p>
+				<p v-else>当前服务提供名称与说明，正文按需读取；总预算 {{ previewMaxTokens }} tokens。</p>
+				<p v-if="previewIncludedCount !== null">已纳入 {{ previewIncludedCount }} 条<span v-if="previewOmittedCount">，因预算省略 {{ previewOmittedCount }} 条；未显示不代表没有记录</span>。Agent 可见内容也可能包含已共享的会话便笺。</p>
+				<p v-if="scopeType !== 'conversation'">此处按允许 TaskMemory 工具预览。实际私有便笺是否提供取决于本轮有效授权；已共享的会话便笺不依赖此工具授权。</p>
+				<pre tabindex="0" aria-label="模型可见原文">{{ injectionPreview || '暂无自动提供的内容' }}</pre>
 			</div>
 		</section>
 	</el-drawer>
@@ -771,18 +792,18 @@ onBeforeUnmount(() => {
 	>
 		<form class="memory-form" @submit.prevent="saveMemory">
 			<label id="task-memory-name-label" for="task-memory-name">名称</label>
-			<el-input id="task-memory-name" v-model="form.name" :disabled="saving" aria-labelledby="task-memory-name-label" maxlength="80" show-word-limit placeholder="例如：发布前必须保留的配置"/>
-			<label id="task-memory-description-label" for="task-memory-description">简短说明 <span>帮助快速找到这条记忆</span></label>
+			<el-input id="task-memory-name" v-model="form.name" :disabled="saving" aria-labelledby="task-memory-name-label" maxlength="80" show-word-limit placeholder="例如：界面偏好、本次测试服务器"/>
+			<label id="task-memory-description-label" for="task-memory-description">简短说明 <span>帮助定位较长资料，不必重复短正文</span></label>
 			<el-input id="task-memory-description" v-model="form.description" :disabled="saving" aria-labelledby="task-memory-description-label" maxlength="200" show-word-limit type="textarea" :rows="2" resize="none" placeholder="用一两句话概括重点"/>
 			<label id="task-memory-body-label" for="task-memory-body">正文 <span :class="{ danger: bodyBytes > 16 * 1024 }">{{ formatBytes(bodyBytes) }} / 16 KiB · 支持 Markdown</span></label>
-			<el-input id="task-memory-body" v-model="form.body" :disabled="saving" aria-labelledby="task-memory-body-label" type="textarea" :rows="10" resize="none" placeholder="记录决定、约束、重要发现或后续工作…"/>
+			<el-input id="task-memory-body" v-model="form.body" :disabled="saving" aria-labelledby="task-memory-body-label" type="textarea" :rows="10" resize="none" placeholder="记录本会话使用的资料或持续偏好，例如：界面保持 macOS 风格和当前字号。不记录调查过程、测试流水或任务进度。"/>
 			<div class="memory-form-switches">
 				<div class="memory-switch-row">
-					<div><label id="task-memory-auto-reinject-label" for="task-memory-auto-reinject">自动向模型提供目录</label><p>提供名称与说明，正文仍按需读取。</p></div>
+					<div><label id="task-memory-auto-reinject-label" for="task-memory-auto-reinject">自动向模型提供</label><p v-if="previewShortBodyMaxChars">短正文（≤ {{ previewShortBodyMaxChars }} 字符）直接提供，长资料按需读取；受总预算限制。</p><p v-else>按当前服务的注入规则提供；实际内容可在预览中查看。</p></div>
 					<el-switch id="task-memory-auto-reinject" v-model="form.autoReinjectCatalog" :disabled="saving" aria-labelledby="task-memory-auto-reinject-label"/>
 				</div>
 				<div v-if="scopeType === 'conversation'" class="memory-switch-row">
-					<div><label id="task-memory-visible-agents-label" for="task-memory-visible-agents">允许 Agent 读取</label><p>仅同会话中已获任务记忆工具授权的 Agent 可读取。</p></div>
+					<div><label id="task-memory-visible-agents-label" for="task-memory-visible-agents">允许 Agent 读取</label><p>共享便笺作为同会话 Agent 的工作输入；不授予记忆工具或修改权限。</p></div>
 					<el-switch id="task-memory-visible-agents" v-model="form.visibleToAgents" :disabled="saving" aria-labelledby="task-memory-visible-agents-label"/>
 				</div>
 			</div>

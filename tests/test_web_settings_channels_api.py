@@ -166,7 +166,7 @@ async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env
     ]
     agent_sections = next(domain for domain in specs_data["domains"] if domain["key"] == "agent")["sections"]
     assert [section["key"] for section in agent_sections] == [
-        "agent", "retry", "timeouts", "compact", "rath", "rath_prompts",
+        "agent", "retry", "timeouts", "compaction", "rath", "rath_prompts",
     ]
     assert "agent.retryMaxDelayS" in next(section for section in agent_sections if section["key"] == "retry")["paths"]
     assert specs_data["specs"]["memory.accessKey"]["sensitive"] is True
@@ -392,13 +392,8 @@ async def test_web_channels_list_detail_and_primary_switch(admin_env):
     assert resp.status == 200
     data = await resp.json()
     assert data["primaryModel"] == "openai/gpt"
-    assert data["compressionModels"] == ["anthropic/claude"]
-    assert data["compressionCandidates"] == [{
-        "fullname": "anthropic/claude",
-        "provider": "anthropic",
-        "id": "claude",
-        "name": "Claude",
-    }]
+    assert "compressionModels" not in data
+    assert "compressionCandidates" not in data
     openai = next(p for p in data["providers"] if p["name"] == "openai")
     assert openai["apiKeyMasked"] != "sk-openai-secret"
     assert openai["modelCount"] == 2
@@ -421,7 +416,7 @@ async def test_web_channels_list_detail_and_primary_switch(admin_env):
     detail = await admin_env.client.get("/api/channels/openai", cookies=admin_env.cookie)
     assert detail.status == 200
     detail_data = await detail.json()
-    assert detail_data["compressionCandidates"] == data["compressionCandidates"]
+    assert "compressionCandidates" not in detail_data
     provider = detail_data["provider"]
     assert [m["id"] for m in provider["models"]] == ["gpt", "mini"]
     assert next(m for m in provider["models"] if m["id"] == "gpt")["stats"]["calls"] == 2
@@ -631,7 +626,7 @@ async def test_models_dev_batch_matches_and_syncs_selected_models_atomically(adm
     assert preview_response.status == 200
     preview = await preview_response.json()
     item = preview["items"][0]
-    assert item["metadata"]["compactTriggerTokens"] == 272_000
+    assert item["metadata"]["rolloverTriggerTokens"] == 272_000
     assert item["current"]["contextWindow"] == 400_000
 
     # A refreshed record must not let a stale batch preview silently write a
@@ -660,7 +655,7 @@ async def test_models_dev_batch_matches_and_syncs_selected_models_atomically(adm
     detail = await admin_env.client.get("/api/channels/openai", cookies=admin_env.cookie)
     gpt = next(model for model in (await detail.json())["provider"]["models"] if model["id"] == "gpt")
     assert gpt["modelsDev"]["providerId"] == "second"
-    assert gpt["compactTriggerTokens"] == 272_000
+    assert gpt["rolloverTriggerTokens"] == 272_000
     assert gpt["contextWindow"] == 2_000_000
 
 
@@ -700,31 +695,21 @@ async def test_web_channels_rename_model_rewrites_history_stats(admin_env):
     assert mini2["stats"]["calls"] == 2
 
 
-async def test_web_channels_update_model_and_guard_deleting_compression(admin_env):
-    patch = await admin_env.client.patch("/api/channels/openai/models/mini", cookies=admin_env.cookie, json={"id": "mini2", "contextWindow": 64000, "compactTriggerTokens": 250000, "cost": {"input": 1.5, "output": 6}})
+async def test_web_channels_window_threshold_and_retired_compression_api(admin_env):
+    patch = await admin_env.client.patch("/api/channels/openai/models/mini", cookies=admin_env.cookie, json={"id": "mini2", "contextWindow": 64000, "rolloverTriggerTokens": 250000, "cost": {"input": 1.5, "output": 6}})
     assert patch.status == 200
     resolved = admin_env.server.config.models.resolve("openai/mini2")
     assert resolved is not None
-    assert resolved[1].compact_trigger_tokens == 250000
+    assert resolved[1].rollover_trigger_tokens == 250000
     detail = await admin_env.client.get("/api/channels/openai", cookies=admin_env.cookie)
     provider = (await detail.json())["provider"]
-    assert next(m for m in provider["models"] if m["id"] == "mini2")["compactTriggerTokens"] == 250000
+    assert next(m for m in provider["models"] if m["id"] == "mini2")["rolloverTriggerTokens"] == 250000
 
-    delete_compression = await admin_env.client.delete("/api/channels/anthropic/models/claude", cookies=admin_env.cookie)
-    assert delete_compression.status == 400
-    assert "压缩" in (await delete_compression.json())["error"]
-
-    set_multi = await admin_env.client.post("/api/channels/compression", cookies=admin_env.cookie, json={"models": ["anthropic/claude", "openai/gpt"]})
-    assert set_multi.status == 200
-    assert admin_env.server.config.models.compression_models == ["anthropic/claude", "openai/gpt"]
-    ordered = await admin_env.client.get("/api/channels", cookies=admin_env.cookie)
-    assert [item["fullname"] for item in (await ordered.json())["compressionCandidates"]] == [
-        "anthropic/claude",
-        "openai/gpt",
-    ]
-
-    clear_compression = await admin_env.client.post("/api/channels/compression", cookies=admin_env.cookie, json={"models": []})
-    assert clear_compression.status == 200
+    before = admin_env.cfg_path.read_bytes()
+    for models in (["anthropic/claude", "openai/gpt"], []):
+        retired = await admin_env.client.post("/api/channels/compression", cookies=admin_env.cookie, json={"models": models})
+        assert retired.status == 410
+    assert admin_env.cfg_path.read_bytes() == before
     delete_model = await admin_env.client.delete("/api/channels/anthropic/models/claude", cookies=admin_env.cookie)
     assert delete_model.status == 200
 

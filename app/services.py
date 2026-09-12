@@ -32,6 +32,7 @@ from app.rath.builtin_workflows import ensure_builtin_workflows
 from app.rath.dao import RathDAO
 from app.rath.manager import RathTaskManager
 from app.task_memory import TaskMemoryDAO
+from app.tools.agent_history import register_agent_history_tool
 from app.tools.agents import register_agent_tools
 from app.tools.base import ToolRegistry
 from app.tools.bash import register_bash_tool
@@ -135,6 +136,7 @@ class Services:
         register_memory_tools(self.tools, self.mem)
         register_task_memory_tool(self.tools, self.task_memories)
         register_history_tools(self.tools, self.db)
+        register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
         register_agent_tools(
@@ -631,6 +633,7 @@ class Services:
         register_memory_tools(self.tools, self.mem)
         register_task_memory_tool(self.tools, self.task_memories)
         register_history_tools(self.tools, self.db)
+        register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
         register_agent_tools(

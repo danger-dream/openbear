@@ -17,6 +17,7 @@ from aiohttp import web
 
 from app.db.engine import now_ts
 from app.tools import processes
+from app.web_console.activity import activity_fields
 from app.web_console.core import _WEB_SESSION_KEY, WebSession
 
 _TREE_PAGE_SIZE = 50
@@ -24,7 +25,7 @@ _TREE_ORDER_STEP = 1024.0
 _TEMPORARY_PROPERTIES_ID = "__temporary"
 _FOLDER_RUN_FIELDS = frozenset({
     "mainModel", "mainThinkingLevel", "mainFastMode",
-    "agentModel", "agentThinkLevel", "agentFastMode",
+    "agentModel", "agentThinkLevel", "agentFastMode", "contextStrategy",
 })
 
 
@@ -227,7 +228,8 @@ class WebAdminConversationTreeMixin:
         cur = await self.db.conn.execute(
             """
             SELECT conversation_uuid, internal_chat_id, folder_uuid, title, pinned_at,
-                   display_order, created_at, updated_at, status, current_status, last_error
+                   display_order, created_at, updated_at, status, current_status, last_error,
+                   activity_version, activity_read_version, activity_result_json
             FROM web_conversations
             WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
             """,
@@ -248,30 +250,68 @@ class WebAdminConversationTreeMixin:
             for row in rows:
                 conv_uuid = str(row.get("conversation_uuid") or "")
                 if str(row.get("status") or "idle") in {"running", "stopping", "error"} or conv_uuid in operation_candidates:
-                    await self._reconcile_inactive_web_conversation_operations(
+                    reconciled = await self._reconcile_inactive_web_conversation_operations(
                         row, source="conversation_tree_status_reconcile"
                     )
+                    if reconciled:
+                        cur = await self.db.conn.execute(
+                            "SELECT activity_version,activity_read_version,activity_result_json,status,current_status,last_error FROM web_conversations WHERE conversation_uuid=?",
+                            (conv_uuid,),
+                        )
+                        fresh = await cur.fetchone()
+                        if fresh is not None:
+                            row.update(dict(fresh))
         operation_facts = await self._web_operation_facts_for_conversations(uuids)
+        # Use canonical live requests, not tool names or browser-local cards.
+        # Only navigation metadata is exposed here, never titles/questions/answers.
+        pending_interactions: dict[str, list[dict[str, Any]]] = {}
+        if uuids:
+            cur = await self.db.conn.execute(
+                f"""SELECT conversation_uuid, interaction_id, expires_at_ms,
+                           json_extract(payload_json, '$.action') AS action,
+                           json_extract(payload_json, '$.sourceTool') AS source_tool
+                    FROM user_interactions
+                    WHERE owner_chat_id=? AND status='pending' AND expires_at_ms>?
+                      AND conversation_uuid IN ({','.join('?' for _ in uuids)})
+                    ORDER BY expires_at_ms, created_at_ms, interaction_id""",
+                (int(owner_chat_id), int(time.time() * 1000), *uuids),
+            )
+            for pending in await cur.fetchall():
+                pending_interactions.setdefault(str(pending["conversation_uuid"]), []).append({
+                    "interactionId": str(pending["interaction_id"]),
+                    "action": str(pending["action"] or "confirm"),
+                    "sourceTool": str(pending["source_tool"] or "UserInteraction"),
+                    "expiresAtMs": int(pending["expires_at_ms"]),
+                })
 
         rath_counts: dict[int, int] = {}
+        rath_waiting: dict[int, int] = {}
+        rath_started: dict[int, int] = {}
         if rows:
             chat_ids = [int(row.get("internal_chat_id") or 0) for row in rows]
             placeholders = ",".join("?" for _ in chat_ids)
             cur = await self.db.conn.execute(
                 f"""
-                SELECT chat_id, COUNT(*) AS active_count FROM rath_tasks
+                SELECT chat_id, COUNT(*) AS active_count,
+                       SUM(CASE WHEN status IN ('paused','needs_openbear_control') THEN 1 ELSE 0 END) AS waiting_count,
+                       MAX(started_at) AS started_at
+                FROM rath_tasks
                 WHERE chat_id IN ({placeholders})
                   AND COALESCE(status,'') IN ('queued','running','pausing','paused','resuming','stopping','needs_openbear_control')
                 GROUP BY chat_id
                 """,
                 tuple(chat_ids),
             )
-            rath_counts = {int(row["chat_id"]): int(row["active_count"] or 0) for row in await cur.fetchall()}
+            task_rows = await cur.fetchall()
+            rath_counts = {int(row["chat_id"]): int(row["active_count"] or 0) for row in task_rows}
+            rath_waiting = {int(row["chat_id"]): int(row["waiting_count"] or 0) for row in task_rows}
+            rath_started = {int(row["chat_id"]): int(row["started_at"] or 0) * 1000 for row in task_rows}
         process_chat_ids = {
             int(getattr(proc, "chat_id", 0) or 0)
             for proc in processes.active()
         }
         running_items: list[dict[str, Any]] = []
+        activity_items: list[dict[str, Any]] = []
         folder_counts: dict[str, int] = {}
         direct_conversation_counts: dict[str, int] = {}
         folders = await self._tree_folders(owner_chat_id)
@@ -281,6 +321,7 @@ class WebAdminConversationTreeMixin:
             conv_uuid = str(row.get("conversation_uuid") or "")
             chat_id = int(row.get("internal_chat_id") or 0)
             facts = operation_facts.get(conv_uuid) or {}
+            pending = pending_interactions.get(conv_uuid, [])
             live = self._web_live_streams.get(conv_uuid)
             live_snapshot = live.snapshot() if live is not None else {}
             running = bool(
@@ -290,13 +331,25 @@ class WebAdminConversationTreeMixin:
                 or chat_id in process_chat_ids
                 or int(facts.get("activeCount") or 0) > 0
                 or rath_counts.get(chat_id, 0) > 0
+                or bool(pending)
             )
-            if not running:
+            activity = activity_fields(row)
+            if not running and not activity["activityUnread"]:
                 continue
+            needs_attention = bool(
+                pending or int(facts.get("waitingControlCount") or 0)
+                or int(facts.get("pendingInteractionCount") or 0)
+                or int(facts.get("pausedCount") or 0) or rath_waiting.get(chat_id, 0)
+            )
             current = str(live_snapshot.get("currentStatus") or row.get("current_status") or "运行中")
             if rath_counts.get(chat_id, 0) and not live_snapshot.get("running"):
                 current = "Agent 后台执行中"
-            running_items.append({
+            item = {
+                **activity,
+                "activityPending": pending,
+                "activityState": ("waiting" if needs_attention else "running") if running else str(activity["activityResult"].get("status") or "completed"),
+                "activityAtMs": (int(facts.get("activeStartedAtMs") or 0) or rath_started.get(chat_id, 0) or int(row.get("created_at") or 0) * 1000) if running else int(activity["activityResult"].get("atMs") or 0),
+                "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话",
                 "kind": "conversation",
                 "id": conv_uuid,
                 "conversationUuid": conv_uuid,
@@ -308,17 +361,62 @@ class WebAdminConversationTreeMixin:
                 "displayOrder": float(row["display_order"]) if row.get("display_order") is not None else None,
                 "createdAt": int(row.get("created_at") or 0),
                 "archived": False,
-                "running": True,
+                "running": running,
                 "currentStatus": current,
-            })
+            }
+            activity_items.append(item)
+            if not running:
+                continue
+            running_items.append(item)
             for ancestor in self._tree_folder_path(str(row.get("folder_uuid") or ""), folders):
                 folder_counts[ancestor] = folder_counts.get(ancestor, 0) + 1
         return {
             "items": running_items,
+            "activityItems": activity_items,
             "folderRunningCounts": folder_counts,
             "folderConversationCounts": self._tree_subtree_counts(direct_conversation_counts, folders),
             "revision": int(time.time() * 1000),
         }
+
+    async def handle_api_conversation_activity_read(self, request: web.Request) -> web.Response:
+        owner = int(request[_WEB_SESSION_KEY].chat_id)
+        body = await self._json_body(request)
+        items = body.get("items")
+        if not isinstance(items, list) or not items or len(items) > 5000:
+            return web.json_response({"ok": False, "error": "invalid_read_items"}, status=400)
+        wanted: dict[str, int] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                return web.json_response({"ok": False, "error": "invalid_read_items"}, status=400)
+            uuid_value, version = item.get("conversationUuid"), item.get("version")
+            if not isinstance(uuid_value, str) or not uuid_value.strip() or type(version) is not int or version < 1:
+                return web.json_response({"ok": False, "error": "invalid_read_version"}, status=400)
+            wanted[uuid_value] = max(wanted.get(uuid_value, 0), version)
+        receipts = []
+        # Validate the whole batch before updating anything. A stale view may read
+        # version N, never the newer N+1 that finished during its HTTP request.
+        async with self.db.web_operation_transaction() as conn:
+            for conv_uuid, version in wanted.items():
+                cur = await conn.execute(
+                    "SELECT activity_version FROM web_conversations WHERE owner_chat_id=? AND conversation_uuid=?",
+                    (owner, conv_uuid),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return web.json_response({"ok": False, "error": "conversation_not_found"}, status=404)
+                if version > int(row["activity_version"] or 0):
+                    return web.json_response({"ok": False, "error": "unseen_activity_version"}, status=409)
+            for conv_uuid, version in wanted.items():
+                await conn.execute(
+                    "UPDATE web_conversations SET activity_read_version=MAX(activity_read_version,?) WHERE owner_chat_id=? AND conversation_uuid=?",
+                    (version, owner, conv_uuid),
+                )
+                cur = await conn.execute(
+                    "SELECT activity_read_version FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,),
+                )
+                row = await cur.fetchone()
+                receipts.append({"conversationUuid": conv_uuid, "activityReadVersion": int(row["activity_read_version"])})
+        return web.json_response({"ok": True, "items": receipts})
 
     @classmethod
     def _tree_subtree_counts(cls, direct_counts: dict[str, int], folders: dict[str, dict[str, Any]]) -> dict[str, int]:
@@ -394,6 +492,9 @@ class WebAdminConversationTreeMixin:
         conv_uuid = str(row.get("conversation_uuid") or "")
         running = running_lookup.get(conv_uuid) or {}
         return {
+            **activity_fields(row),
+            "activityState": str(running.get("activityState") or ""),
+            "activityPending": list(running.get("activityPending") or []),
             "kind": "conversation",
             "id": conv_uuid,
             "conversationUuid": conv_uuid,

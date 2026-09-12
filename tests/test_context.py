@@ -168,21 +168,24 @@ async def test_build_system_fallback(db, tmp_path):
     assert system == _FALLBACK_SYSTEM  # 降级兜底
 
 
-async def test_build_history_with_summary(db, tmp_path):
+async def test_build_history_adopts_legacy_summary_without_reloading_compressed_history(db, tmp_path):
     def handler(req):
         return httpx.Response(200, json={"prompt": "x"})
     mdao = MessageDAO(db)
     sdao = SummaryDAO(db)
-    await sdao.add(1, "之前聊过天气", 0, 5)
+    old_id = await mdao.add(1, "user", "old compressed input")
+    await sdao.add(1, "之前聊过天气", old_id, 5)
     await mdao.add(1, "user", "现在呢")
     await mdao.add(1, "assistant", "在的")
     cb = ContextBuilder(_mem(handler), mdao, sdao, [], _tools(), str(tmp_path))
     history = await cb.build_history(1)
-    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert [item["role"] for item in history] == ["user", "user", "assistant"]
     assert "之前聊过天气" in history[0]["content"]
-    assert "<history_messages>" in history[0]["content"]
-    assert "<user" in history[0]["content"] and "现在呢" in history[0]["content"]
-    assert "<assistant" in history[0]["content"] and "在的" in history[0]["content"]
+    assert history[0]["openbear_context_source"]["kind"] == "summary"
+    assert history[1]["content"] == "现在呢"
+    assert history[2]["content"] == "在的"
+    assert "old compressed input" not in str(history)
+    assert (await sdao.latest(1))["summary"] == "之前聊过天气"
 
 
 async def test_wrap_user_has_time(db, tmp_path):

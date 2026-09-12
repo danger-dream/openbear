@@ -1,7 +1,6 @@
 """数据访问 —— 消息历史 + 摘要读写。"""
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -334,39 +333,41 @@ class MessageDAO:
         return new_uuid
 
     async def _controller_context_anchor(self, chat_id: int, *, connection: Any | None = None) -> dict[str, Any]:
-        """Fingerprint the exact ordinary transcript projection used for fallback.
+        """Bind opaque replay to an independent window and its current originals.
 
-        The anchor contains no private provider data. It lets a private model
-        checkpoint prove that messages/summary were not edited, truncated, or
-        compacted before any opaque item is replayed.
+        Summary IDs and compacted flags are legacy display data, not active
+        context generations. Hash only selected originals after lazy migration.
         """
         conn = connection if connection is not None else self._conn
         cur = await conn.execute(
-            "SELECT id, summary, up_to_message_id FROM summaries "
-            "WHERE chat_id=? ORDER BY id DESC LIMIT 1",
-            (chat_id,),
-        )
-        summary_row = await cur.fetchone()
-        summary_text = str(summary_row["summary"] or "") if summary_row else ""
-        summary_anchor = {
-            "id": int(summary_row["id"] or 0) if summary_row else 0,
-            "upToMessageId": int(summary_row["up_to_message_id"] or 0) if summary_row else 0,
-            "fingerprint": hashlib.sha256(summary_text.encode("utf-8")).hexdigest() if summary_text else "",
-        }
-        cur = await conn.execute(
-            "SELECT * FROM messages WHERE chat_id=? AND compacted=0 ORDER BY id ASC",
-            (chat_id,),
-        )
-        rows = await cur.fetchall()
+            "SELECT session_uuid FROM sessions WHERE chat_id=?", (chat_id,))
+        session = await cur.fetchone()
+        key = f"controller:{chat_id}:{str(session['session_uuid'] or '') if session else ''}"
+        cur = await conn.execute("SELECT revision,window_version,state_json FROM context_windows WHERE owner_key=?", (key,))
+        window = await cur.fetchone()
+        cur = await conn.execute("SELECT COALESCE(MAX(id),0) AS high_water FROM messages WHERE chat_id=?", (chat_id,))
+        high_water = int((await cur.fetchone())["high_water"])
+        if window is not None:
+            state = json.loads(window["state_json"])
+            ids = [int((message.get("openbear_context_source") or {}).get("message_id") or 0)
+                   for message in state.get("messages") or []]
+            ids = sorted({value for value in ids if value})
+            rows = []
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset:offset + 400]
+                cur = await conn.execute(
+                    "SELECT * FROM messages WHERE chat_id=? AND id IN (" + ",".join("?" for _ in batch) + ") ORDER BY id",
+                    (chat_id, *batch))
+                rows.extend(await cur.fetchall())
+        else:
+            cur = await conn.execute("SELECT * FROM messages WHERE chat_id=? ORDER BY id", (chat_id,))
+            rows = await cur.fetchall()
         return {
-            "summary": summary_anchor,
-            "messages": [
-                {
-                    "id": int(row["id"] or 0),
-                    "fingerprint": transcript_message_fingerprint(self._row(row).to_message()),
-                }
-                for row in rows
-            ],
+            "windowVersion": int(window["window_version"]) if window else 0,
+            "windowRevision": int(window["revision"]) if window else 0,
+            "sourceHighWater": high_water,
+            "messages": [{"id": int(row["id"]), "fingerprint": transcript_message_fingerprint(self._row(row).to_message())}
+                         for row in rows],
         }
 
     async def load_controller_model_context(
@@ -698,14 +699,32 @@ class MessageDAO:
         if commit:
             await self._conn.commit()
 
-    async def latest_controller_context_usage(self, chat_id: int, *, session_uuid: str = "") -> int | None:
+    async def latest_controller_context_usage(
+        self, chat_id: int, *, session_uuid: str = "", expected_model: str = "",
+    ) -> int | None:
         """Return exact latest successful controller prompt usage, or None when unknown.
 
         The summary generation binds each snapshot. An explicit unknown tombstone
-        prevents legacy model-call fallback after compaction or transcript mutation.
+        prevents legacy model-call fallback after rotation or transcript mutation.
+        When expected_model is supplied, only a measurement bound to that exact
+        provider/model label is usable. Running requests keep their own frozen
+        identity and billing; changing the next-run model does not relabel them.
         """
         if not session_uuid:
             return None
+        cur = await self._conn.execute(
+            "SELECT usage_known,usage_tokens,state_json FROM context_windows WHERE owner_key=?",
+            (f"controller:{int(chat_id)}:{str(session_uuid)}",))
+        window = await cur.fetchone()
+        if window is not None:
+            if expected_model:
+                state = json.loads(window["state_json"] or "{}")
+                if state.get("requestModelLabel") != expected_model:
+                    # An old window with no request identity is unknown too;
+                    # never borrow a possibly unrelated billing row to fill it.
+                    return None
+            return int(window["usage_tokens"]) if window["usage_known"] else None
+        # Read-only compatibility for conversations not yet using a window.
         cur = await self._conn.execute(
             """SELECT snapshot.known, snapshot.tokens FROM web_controller_context_snapshots snapshot
                WHERE snapshot.chat_id=? AND snapshot.session_uuid=?
@@ -714,6 +733,10 @@ class MessageDAO:
         )
         snapshot = await cur.fetchone()
         if snapshot is not None:
+            # Legacy snapshots have no model identity. Keep their tombstone
+            # semantics, but do not claim they measure a requested model.
+            if expected_model:
+                return None
             return max(0, int(snapshot["tokens"] or 0)) if bool(snapshot["known"]) else None
 
         where = "mc.chat_id=? AND mc.call_kind='controller_request' AND mc.status='ok'"
@@ -722,13 +745,15 @@ class MessageDAO:
             where += " AND mc.session_uuid=?"
             params.append(str(session_uuid))
         cur = await self._conn.execute(
-            f"""SELECT mc.last_input_tokens, mc.last_cache_read_tokens, mc.last_cache_write_tokens,
+            f"""SELECT mc.model, mc.last_input_tokens, mc.last_cache_read_tokens, mc.last_cache_write_tokens,
                        mc.input_tokens, mc.cache_read_tokens, mc.cache_write_tokens
                 FROM model_calls mc WHERE {where}
                   AND mc.created_at > COALESCE((SELECT MAX(s.created_at) FROM summaries s WHERE s.chat_id=mc.chat_id),0)
                 ORDER BY mc.created_at DESC, mc.id DESC LIMIT 1""", tuple(params))
         row = await cur.fetchone()
-        if row is None:
+        if row is None or (expected_model and row["model"] != expected_model):
+            # Compare after selecting the latest request. Filtering SQL by model
+            # would resurrect an older matching measurement after a switch.
             return None
         last_total = sum(int(row[key] or 0) for key in ("last_input_tokens", "last_cache_read_tokens", "last_cache_write_tokens"))
         aggregate_total = max(0, sum(int(row[key] or 0) for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens")))
@@ -742,7 +767,7 @@ class MessageDAO:
 
         Child Agent requests and aggregate run rows have different ``call_kind``
         values. A controller request at or before the latest summary may belong to
-        the pre-compaction epoch, so ambiguous same-second ordering deliberately
+        the pre-rotation epoch, so ambiguous same-second ordering deliberately
         falls back to the caller's assembled-prompt estimate.
         """
         exact = await self.latest_controller_context_usage(chat_id, session_uuid=session_uuid)
@@ -1185,6 +1210,8 @@ class MessageDAO:
             WHERE chat_id = ?
             """,
             (now_ts(), chat_id))
+        from app.context.lifecycle import delete_controller_windows
+        await delete_controller_windows(self._conn, chat_id)
         await self._conn.execute(
             "DELETE FROM controller_model_contexts WHERE chat_id=?", (chat_id,)
         )
@@ -1383,6 +1410,8 @@ class MessageDAO:
         return [self._row(r) for r in rows]
 
     async def clear(self, chat_id: int) -> None:
+        from app.context.lifecycle import delete_controller_windows
+        await delete_controller_windows(self._conn, chat_id)
         await self._conn.execute(
             "DELETE FROM web_operation_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=?)",
             (chat_id,),
@@ -1395,7 +1424,10 @@ class MessageDAO:
         # model_calls / tool_calls 是全时间统计明细，不随新会话清理；新会话只换 session_uuid。
         await self._conn.commit()
 
-    async def delete_from_message_id(self, chat_id: int, first_message_id: int) -> dict[str, int]:
+    async def delete_from_message_id(
+        self, chat_id: int, first_message_id: int, *,
+        restart_messages: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
         """Delete one transcript suffix and invalidate any summary that covered it.
 
         The compacted source rows remain in ``messages`` until this transaction,
@@ -1413,6 +1445,13 @@ class MessageDAO:
             )
             if await cur.fetchone() is None:
                 return {"messages": 0, "summaries": 0, "links": 0, "remainingSummaryUpTo": 0}
+            from app.context.lifecycle import delete_controller_windows
+            cur = await conn.execute(
+                "SELECT COALESCE(MAX(window_version),0),COALESCE(MAX(revision),0) FROM context_windows WHERE owner_kind='controller' AND owner_key LIKE ?",
+                (f"controller:{int(chat_id)}:%",),
+            )
+            previous_version, previous_revision = await cur.fetchone()
+            await delete_controller_windows(conn, chat_id)
             await conn.execute(
                 "DELETE FROM controller_model_contexts WHERE chat_id=?", (chat_id,)
             )
@@ -1435,9 +1474,13 @@ class MessageDAO:
                 (chat_id, cutoff),
             )
             deleted_messages = int(cur.rowcount or 0)
+            # Summaries are cumulative. A later compaction can report a smaller
+            # raw-row anchor while still incorporating its preceding summary;
+            # invalidate that whole descendant lineage, not only large anchors.
             cur = await conn.execute(
-                "DELETE FROM summaries WHERE chat_id=? AND up_to_message_id>=?",
-                (chat_id, cutoff),
+                """DELETE FROM summaries WHERE chat_id=? AND id>=(
+                     SELECT MIN(id) FROM summaries WHERE chat_id=? AND up_to_message_id>=?)""",
+                (chat_id, chat_id, cutoff),
             )
             deleted_summaries = int(cur.rowcount or 0)
             cur = await conn.execute(
@@ -1470,6 +1513,25 @@ class MessageDAO:
                 """,
                 (remaining_up_to, chat_id),
             )
+            if restart_messages is not None and session_uuid:
+                from app.context.store import ContextOwner, WindowStore
+                from app.context.window import source_of
+                if any(int(source_of(m).get("message_id") or 0) >= cutoff for m in restart_messages):
+                    raise ValueError("restart_selection_contains_deleted_source")
+                store = WindowStore(self._db, ContextOwner.controller(chat_id=chat_id, session_uuid=session_uuid))
+                archived = await store.archive(restart_messages)
+                await store.save(restart_messages, expected_revision=archived["revision"],
+                                 expected_source_revision=archived["sourceRevision"], route="",
+                                 extra_state={"restartCutoff": cutoff})
+                # An empty/summary-only selection must still cover the entire
+                # surviving transcript, otherwise the next build reloads it all.
+                cur = await conn.execute("SELECT COALESCE(MAX(id),0) AS n FROM messages WHERE chat_id=?", (chat_id,))
+                high_water = int((await cur.fetchone())["n"])
+                await conn.execute(
+                    """UPDATE context_windows SET state_json=json_set(state_json,'$.sourceMessageHighWater',?),
+                       window_version=?,revision=? WHERE owner_key=?""",
+                    (high_water, int(previous_version) + 1, int(previous_revision) + 1, store.owner.key),
+                )
         return {
             "messages": deleted_messages,
             "summaries": deleted_summaries,

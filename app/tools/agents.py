@@ -17,7 +17,6 @@ from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
-from app.agent.compaction import CompressionCandidate
 from app.config import Config
 from app.db.dao import MessageDAO
 from app.llm.events import Usage
@@ -27,6 +26,7 @@ from app.models.agent_runtime import resolve_agent_runtime_config
 from app.models.selection import ModelSelection
 from app.rath.agent_prompt import render_agent_base_system_prompt
 from app.rath.builtin_workflows import SINGLE_AGENT_WORKFLOW_SLUG, ensure_builtin_workflows
+from app.rath.continuity import agent_session_public
 from app.rath.controller_projection import project_agent_payload_for_controller
 from app.rath.dao import RathDAO
 from app.rath.manager import RathTaskManager
@@ -46,9 +46,12 @@ from app.rath.single_agent import (
 from app.stream.tool_progress import (
     format_agent_task_progress_card,
 )
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist, expand_agent_tool_names
 from app.tools.agent_continuation import AgentContinuationTools, register_continuation_tools
-from app.rath.continuity import agent_session_public
+from app.tools.allowlist import (
+    AGENT_DELEGATION_TOOL_NAMES,
+    expand_agent_tool_names,
+    sanitize_tool_allowlist,
+)
 from app.tools.base import (
     ToolRegistry,
     ToolRuntimeContext,
@@ -497,7 +500,7 @@ class AgentTools(AgentContinuationTools):
                 model=effective_model_label,
                 protocol=effective_protocol,
                 think_level=str(detail.get("thinkLevel") or ""),
-                call_kind="agent_request",
+                call_kind=str(detail.get("callKind") or "agent_request"),
                 usage=usage,
                 last_usage=usage,
                 cost_usd=cost,
@@ -631,7 +634,8 @@ class AgentTools(AgentContinuationTools):
                     "ref": ref,
                     "message": (
                         "Secrets are never materialized into attachment files. "
-                        "Reference the credential through the granted tools instead."
+                        "The main controller must provide the needed material or an available access method "
+                        "through an authorized work package; Agents cannot access global Memory secrets."
                     ),
                 }
             if ref.startswith("@doc/") or ref.startswith("@mem/"):
@@ -1191,7 +1195,7 @@ class AgentTools(AgentContinuationTools):
                 and _task_agent_plan_mode(task) == _AGENT_PLAN_MODE_MANAGED
             ),
             plan_prompts=self._plan_prompts(),
-            **self._context_compact_kwargs(model_name),
+            **self._context_window_kwargs(model_name),
         )
         progress_task: asyncio.Task | None = None
         if progress_cb is not None or progress_payload_cb is not None:
@@ -1647,85 +1651,23 @@ class AgentTools(AgentContinuationTools):
         agent_cfg = getattr(self.config, "agent", None)
         return {
             "max_retries": int(getattr(agent_cfg, "max_retries", 10) or 0),
-            "retry_backoff_s": float(getattr(agent_cfg, "retry_backoff_s", 0.5) or 0.0),
-            "retry_max_delay_s": float(getattr(agent_cfg, "retry_max_delay_s", 32.0) or 0.0),
-            "retry_jitter_ratio": float(getattr(agent_cfg, "retry_jitter_ratio", 0.25) or 0.0),
+            "retry_backoff_s": float(getattr(agent_cfg, "retry_backoff_s", 3.0) or 0.0),
+            "retry_max_delay_s": float(getattr(agent_cfg, "retry_max_delay_s", 600.0) or 0.0),
+            "retry_jitter_ratio": float(getattr(agent_cfg, "retry_jitter_ratio", 0.0) or 0.0),
             "retry_cancel_check": lambda: self.manager.consume_retry_cancel(task_uuid),
         }
 
-    def _model_compact_trigger_tokens(self, model_name: str) -> int:
+    def _context_window_kwargs(self, model_name: str) -> dict[str, Any]:
         resolved = self.config.models.resolve(model_name)
-        if not resolved:
-            return 0
-        return max(0, int(getattr(resolved[1], "compact_trigger_tokens", 0) or 0))
-
-    def _compression_candidates_for(self, model_name: str) -> list[tuple[Any, str, str, str]]:
-        models_cfg = getattr(self.config, "models", None)
-        configured_labels = list(getattr(models_cfg, "compression_models", []) or [])
-        if hasattr(models_cfg, "compression_model_candidates"):
-            labels = models_cfg.compression_model_candidates(model_name)
-        else:
-            labels = [*list(getattr(models_cfg, "compression_models", []) or []), model_name]
-        candidates: list[tuple[Any, str, str, str]] = []
-        seen: set[str] = set()
-        for label in labels:
-            label = str(label or "").strip()
-            if not label or label in seen:
-                continue
-            seen.add(label)
-            source = "primary-fallback" if configured_labels and label == model_name and label not in configured_labels else "compression"
-            try:
-                backend, model_id, _ = self.llm_factory.backend_for(label)
-            except Exception:
-                continue
-            candidates.append((backend, model_id, source, label))
-        primary_already_configured = any(label == model_name for _backend, _model, _source, label in candidates)
-        if not primary_already_configured:
-            try:
-                backend, model_id, _ = self.llm_factory.backend_for(model_name)
-                candidates.append((backend, model_id, "primary-fallback", model_name))
-            except Exception:
-                pass
-        return candidates
-
-    def _context_compact_kwargs(self, model_name: str) -> dict[str, Any]:
-        agent_cfg = getattr(self.config, "agent", None)
-        kwargs: dict[str, Any] = {
+        policy = self.config.context_management
+        return {
             "context_window": int(self.llm_factory.context_window(model_name) or 0),
-            "context_compact_trigger_tokens": self._model_compact_trigger_tokens(model_name),
-            "context_compact_ratio": float(getattr(agent_cfg, "compact_ratio", 0.7) or 0.7),
-            "context_compact_keep_recent": int(getattr(agent_cfg, "keep_recent_messages", 8) or 8),
-            "context_compact_prompt": str(getattr(agent_cfg, "compact_prompt", "") or ""),
-            "context_compact_max_tokens": int(getattr(agent_cfg, "compact_max_tokens", 4096) or 4096),
-            "context_compact_max_retries": int(getattr(agent_cfg, "compact_max_retries", 1) or 1),
-            "context_compact_timeout_s": float(getattr(agent_cfg, "compact_timeout_s", 1800.0) or 1800.0),
+            "rollover_trigger_tokens": int(resolved[1].rollover_trigger_tokens or 0) if resolved else 0,
+            "window_trigger_ratio": self.config.agent.compact_ratio,
+            "context_config": self.config,
+            "context_llm_factory": self.llm_factory,
+            "window_retain_ratio": policy.retain_ratio,
         }
-        candidates = self._compression_candidates_for(model_name)
-        if not candidates:
-            return kwargs
-        compact_costs: dict[str, dict[str, float]] = {}
-        for _backend, _model_id, _source, candidate_label in candidates:
-            model_meta = self.config.models.resolve(candidate_label)
-            if model_meta:
-                compact_costs[candidate_label] = model_meta[1].cost
-        kwargs["context_compact_costs"] = compact_costs
-        backend, model_id, source, label = candidates[0]
-        kwargs["context_compact_backend"] = backend
-        kwargs["context_compact_model"] = model_id
-        kwargs["context_compact_source"] = source
-        kwargs["context_compact_label"] = label
-        extra = [
-            CompressionCandidate(candidate_backend, candidate_model, candidate_source, candidate_label)
-            for candidate_backend, candidate_model, candidate_source, candidate_label in candidates[1:]
-        ]
-        if extra:
-            kwargs["context_compact_extra_candidates"] = extra
-        for candidate_backend, candidate_model, candidate_source, _candidate_label in candidates[1:]:
-            if candidate_source == "primary-fallback":
-                kwargs["context_compact_fallback_backend"] = candidate_backend
-                kwargs["context_compact_fallback_model"] = candidate_model
-                break
-        return kwargs
 
     async def _agent_session_for(
         self,
@@ -2168,7 +2110,7 @@ class AgentTools(AgentContinuationTools):
                     and plan_mode == _AGENT_PLAN_MODE_MANAGED
                 ),
                 plan_prompts=self._plan_prompts(),
-                **self._context_compact_kwargs(model_name),
+                **self._context_window_kwargs(model_name),
             )
 
             async def _run_registered_child() -> dict[str, Any]:
@@ -2292,7 +2234,7 @@ class AgentTools(AgentContinuationTools):
         """Return the complete Agent result verbatim.
 
         Agent conclusions are protected controller input. Context pressure is
-        handled by compacting the parent conversation before delivery, never by
+        handled by the parent context window before its next request, never by
         summarizing or truncating the child result itself.
         """
         del task
@@ -2325,7 +2267,7 @@ def register_agent_tools(
     register_continuation_tools(reg, tools)
     reg.add(
         "Agent",
-        "Create a NEW independent Agent instance and its first task. For another instruction to an existing instance use AgentContinue, which retains its context. The child receives only the supplied prompt, attachments, explicitly shared TaskMemory, and the granted tools; it cannot see this conversation. New tasks run directly by default without the Agent Plan protocol; use planMode=managed only for explicitly Plan-governed work. Empty tools means the child Agent receives no tools. In Web mode this usually returns running/detached; do not poll or redo delegated work.",
+        "Create a NEW independent Agent instance and its first task. For another instruction to an existing instance use AgentContinue, which retains its context. The child receives only the supplied prompt, attachments, explicitly shared TaskMemory, and the granted tools; it cannot see this conversation. New tasks run directly by default without the Agent Plan protocol; use planMode=managed only for explicitly Plan-governed work. Empty tools means no business tools; runtime AgentHistory and necessary protocol tools may still be present. In Web mode this usually returns running/detached; do not poll or redo delegated work.",
         {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "Self-contained brief written from the child's point of view in plain language: the question to answer or change to make, the specific locations involved, the facts and evidence already established that must not be redone, the constraints, and what makes the work finished. Reference attachments by purpose."},
             "tools": {
@@ -2333,7 +2275,8 @@ def register_agent_tools(
                 "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)},
                 "description": (
                     "Required explicit allowlist of tool names this child Agent may use, chosen minimally for this task. "
-                    "Use [] for no tools. Values are generated from the canonical child-Agent delegation allowlist."
+                    "Use [] for no business tools; runtime AgentHistory and necessary protocol tools may still be present. "
+                    "Values are generated from the canonical child-Agent delegation allowlist."
                 ),
             },
             "description": {"type": "string", "description": "Short task label for progress display."},

@@ -2,18 +2,19 @@
 from __future__ import annotations
 
 from app.task_memory import (
-    SCOPE_AGENT_TASK,
     SCOPE_AGENT_SESSION,
+    SCOPE_AGENT_TASK,
     SCOPE_CONVERSATION,
     TASK_MEMORY_ACTIVE_MAX,
+    TASK_MEMORY_CATALOG_MAX_ITEMS,
     TASK_MEMORY_RUNTIME_MAX_TOKENS,
     TaskMemoryConflict,
     TaskMemoryDAO,
     TaskMemoryError,
     TaskMemoryNotFound,
-    render_task_memory_runtime_block,
+    render_task_memory_state_content,
     task_memory_audit_detail,
-    task_memory_catalog_xml,
+    task_memory_catalog_snapshot,
     task_memory_result_for_exception,
 )
 from app.utils import estimate_tokens
@@ -215,21 +216,38 @@ class WebAdminTaskMemoryMixin:
         row = await self._conversation_from_request(request)
         scope_type, task_uuid = await self._task_memory_scope(request, row)
         conversation_uuid = str(row["conversation_uuid"])
-        catalog_xml = await task_memory_catalog_xml(
+        for_agent = scope_type != SCOPE_CONVERSATION
+        # This is a configuration preview, not a grant or a claim about a running
+        # Agent's phase. Callers may preview the no-TaskMemory input explicitly.
+        task_memory_available = not for_agent or self._task_memory_bool(
+            request.query.get("taskMemoryAvailable"), default=True,
+        )
+        snapshot = await task_memory_catalog_snapshot(
             TaskMemoryDAO(self.db),
             conversation_uuid=conversation_uuid,
             task_uuid=task_uuid,
-            for_agent=scope_type != SCOPE_CONVERSATION,
-            private_scope=(scope_type, task_uuid) if scope_type != SCOPE_CONVERSATION else None,
+            for_agent=for_agent,
+            private_scope=(scope_type, task_uuid) if for_agent else None,
+            task_memory_available=task_memory_available,
         )
-        runtime_block = render_task_memory_runtime_block(catalog_xml)
+        runtime_snapshot = render_task_memory_state_content(
+            snapshot.runtime_block, digest=snapshot.digest, epoch=0, item_count=snapshot.item_count,
+        )
         return web.json_response({
             "ok": True,
             "conversationUuid": conversation_uuid,
             "scopeType": scope_type,
             "taskUuid": task_uuid,
-            "catalogXml": catalog_xml,
-            "estimatedRuntimeTokens": estimate_tokens(runtime_block) if runtime_block else 0,
+            "catalogXml": snapshot.catalog_xml,
+            "runtimeSnapshot": runtime_snapshot,
+            "digest": snapshot.digest,
+            "includedCount": snapshot.item_count,
+            "omittedCount": snapshot.omitted_count,
+            "eligibleCount": snapshot.eligible_count,
+            "shortBodyMaxChars": snapshot.short_body_max_chars,
+            "maxItems": TASK_MEMORY_CATALOG_MAX_ITEMS,
+            "taskMemoryAvailable": task_memory_available,
+            "estimatedRuntimeTokens": estimate_tokens(runtime_snapshot),
             "maxRuntimeTokens": TASK_MEMORY_RUNTIME_MAX_TOKENS,
         })
 

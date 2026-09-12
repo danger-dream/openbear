@@ -89,6 +89,6 @@ test('running icon ring reuses work-detail border colors/speed and does not chan
  assert.match(detail,/border-top-color: #2563eb/);assert.match(treeSource,/border-top-color:#2563eb/);
  assert.match(treeSource,/border-right-color:rgba\(37,99,235,.42\)/);assert.match(treeSource,/tree-work-border-spin .9s linear infinite/);
  assert.match(treeSource,/position:absolute; inset:-3px/);assert.match(treeSource,/'is-working': running\(row\) && !rowLoading\(row\)/);
- assert.match(treeSource,/@media \(prefers-reduced-motion: reduce\) \{ \.is-spinning,\.running-leaf i \{ animation:none; \} \}/);
+ assert.match(treeSource,/@media \(prefers-reduced-motion: reduce\) \{ \.is-spinning,\.running-leaf \{ animation:none; \} \}/);
  assert.doesNotMatch(treeSource,/<el-popover/i);
 });

@@ -221,8 +221,6 @@ async def _status_text(svc: Services, chat_id: int) -> str:
     current = getattr(getattr(svc, "selection", None), "current", "?")
     resolved = svc.config.models.resolve(current) if getattr(svc.config, "models", None) else None
     proto = resolved[0].protocol if resolved else "?"
-    compression_models = list(getattr(svc.config.models, "compression_models", []) or [])
-    compression_model = " → ".join(compression_models) if compression_models else "跟随主力模型"
     uptime = int(time.time() - float(getattr(svc, "started_at", time.time())))
     running = svc.runs.count() if getattr(svc, "runs", None) is not None else 0
     rath_running = svc.rath.count() if getattr(svc, "rath", None) is not None else 0
@@ -296,7 +294,6 @@ async def _status_text(svc: Services, chat_id: int) -> str:
         f"⚙️ 进程：运行中 · uptime <code>{html.escape(_format_uptime(uptime))}</code>\n"
         f"🚦 任务：OpenBear <code>{running}</code> 个 · Rath <code>{rath_running}</code> 个 · 子进程 <code>{child_count}</code> 个\n"
         f"🤖 主力模型：<code>{html.escape(current)}</code> · <code>{html.escape(proto)}</code>\n"
-        f"🧹 压缩模型：<code>{html.escape(compression_model)}</code>\n"
         f"🛠 工具：<code>{_safe_tool_count(svc)}</code> · Skills：<code>{_safe_skill_count(svc)}</code>"
         f"{chr(10).join(operation_lines)}\n\n"
         "📊 <b>总计统计</b>\n"

@@ -89,7 +89,7 @@ test('directory deletion leaves descendant-folder and unrelated drafts in their 
 });
 test('mounted editor clearing is targeted and removes active text before navigation saves it',()=>{
  const cleared=[],attachments=[];const ctx=vm.createContext({props:{conversationUuid:'local:new'},draft:ref('deleted text'),draftKey:s=>s,clearDraftForConversation:id=>cleared.push(id),clearAttachments:()=>attachments.push(true),adjustComposerHeight(){},defineExpose(){}});
- vm.runInContext(between(consoleSource,'function discardConversationDraft(','function primaryModelInfo('),ctx);vm.runInContext("discardConversationDraft('other')",ctx);assert.equal(ctx.draft.value,'deleted text');assert.equal(attachments.length,0);vm.runInContext("discardConversationDraft('local:new')",ctx);assert.equal(ctx.draft.value,'');assert.equal(attachments.length,1);assert.deepEqual(cleared,['other','local:new']);
+ vm.runInContext(between(consoleSource,'function discardConversationDraft(','defineExpose('),ctx);vm.runInContext("discardConversationDraft('other')",ctx);assert.equal(ctx.draft.value,'deleted text');assert.equal(attachments.length,0);vm.runInContext("discardConversationDraft('local:new')",ctx);assert.equal(ctx.draft.value,'');assert.equal(attachments.length,1);assert.deepEqual(cleared,['other','local:new']);
 });
 test('mutation refresh reruns current search, and cancelled folder removal emits no migration',async()=>{
  const calls=[];const ctx=vm.createContext({moveRow:ref({kind:'folder',folderId:'a',name:'A'}),moveMode:ref('delete'),moveFolderId:ref('b'),moveBusy:ref(false),moveDialog:ref(true),Api:{deleteConversationFolder:async (_,payload)=>{calls.push(payload);return{};}},ElMessageBox:{confirm:async()=>{throw 'cancel';}},ElMessage:{error(){throw Error('unexpected');}},apiError:String});
@@ -98,9 +98,9 @@ test('mutation refresh reruns current search, and cancelled folder removal emits
 });
 test('removal invalidates old branch/search responses and releases search loading state',()=>{
  const branches={a:{items:[conv('removed'),conv('kept')],generation:2,loading:true}};
- const ctx=vm.createContext({branchState:branches,loading:ref(true),searchRows:ref([conv('removed'),conv('kept')]),searchLoading:ref(true),emitRows(){}});
+ const ctx=vm.createContext({branchState:branches,loading:ref(true),activityItems:ref([conv('removed'),conv('kept')]),searchRows:ref([conv('removed'),conv('kept')]),searchLoading:ref(true),emitRows(){}});
  vm.runInContext(`let bootstrapGeneration=1,searchGeneration=1;${between(tree,'function forgetConversation(','function forgetFolder(')};forgetConversation('removed');`,ctx);
- assert.equal(branches.a.generation,3);assert.equal(branches.a.loading,false);assert.deepEqual(branches.a.items.map(x=>x.conversationUuid),['kept']);assert.equal(ctx.searchLoading.value,false);assert.equal(ctx.searchRows.value.length,1);assert.equal(vm.runInContext('searchGeneration',ctx),2);
+ assert.equal(branches.a.generation,3);assert.equal(branches.a.loading,false);assert.deepEqual(branches.a.items.map(x=>x.conversationUuid),['kept']);assert.equal(ctx.searchLoading.value,false);assert.equal(ctx.searchRows.value.length,1);assert.equal(vm.runInContext('searchGeneration',ctx),2);assert.deepEqual(ctx.activityItems.value.map(row=>row.conversationUuid),['kept']);
 });
 test('local draft submitted while removal confirmation is open is not deleted as a server conversation',async()=>{
  const pending=defer();const h=harness({confirm:()=>pending.promise});const job=h.remove(local());h.ctx.conversations.value=[conv('persisted')];h.ctx.activeConversationUuid.value='persisted';pending.resolve();await job;assert.deepEqual(h.calls.deletes,[]);assert.deepEqual(h.calls.clears,[]);assert.equal(h.ctx.activeConversationUuid.value,'persisted');

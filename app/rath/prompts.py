@@ -72,7 +72,7 @@ PLAN_EXECUTION_PROMPT = """
 """.strip()
 
 PLAN_CONTEXT_RESTORE_PROMPT = """
-以下是 Runtime 从数据库重建的权威 Plan 事实。压缩摘要、旧消息或续跑指导与它冲突时，以本状态块为准。
+以下是 Runtime 从数据库重建的权威 Plan 事实。旧窗口中的运行状态或续跑指导与它冲突时，以本状态块为准。
 
 原始任务：
 {task}

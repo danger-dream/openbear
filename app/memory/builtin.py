@@ -339,6 +339,9 @@ class BuiltinMemoryClient:
                     (builtin_template_name("agent"), agent_content, now_ts()),
                 )
         await self._db.conn.commit()
+        # Existing template versions, including inactive built-ins, are history.
+        # Apply strategy wording only to the in-memory request view; changing a
+        # stored template requires creating/activating a new version explicitly.
         self._bootstrapped = True
 
     def _default_template(self) -> str:

@@ -67,7 +67,7 @@ class HTTPClient:
                         *, protocol: str = "", read_timeout_s: float | None = None) -> dict[str, Any]:
         request_kwargs: dict[str, Any] = {}
         if read_timeout_s is not None and float(read_timeout_s) > 0:
-            # 压缩等长响应只放宽 read；connect/write/pool 仍沿用正常模型配置。
+            # 长响应可单独放宽 read；connect/write/pool 仍沿用正常模型配置。
             request_kwargs["timeout"] = httpx.Timeout(
                 self._default_timeout_s,
                 connect=self._connect_timeout_s,
@@ -104,7 +104,7 @@ class HTTPClient:
                         行不重置该截止点 —— 上游只发心跳不出数据照样会超时。
           - idle:       收到首个数据块后,相邻数据块之间的最长空闲(每块刷新)。
           - total:      整条流的总时长上限(<=0 禁用)。
-        调用方可仅覆盖 first_byte / total（用于压缩请求）；connect / idle 始终保留正常模型配置。
+        调用方可仅覆盖 first_byte / total（用于长响应请求）；connect / idle 始终保留正常模型配置。
         传输层瞬时错误始终标为 retryable；是否已有 partial、如何携带 partial 续写，
         由调用者侧 Agent retry state machine 统一处理，避免传输层直接杀掉长任务。
         """

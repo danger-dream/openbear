@@ -1,8 +1,10 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.web_console.activity import record_completion
 from app.web_console.core import *
 from app.web_console.live_stream import *
+from app.web_console.notification_delivery import bind_notification_receipts
 
 
 class WebAdminOperationsMixin:
@@ -405,6 +407,12 @@ class WebAdminOperationsMixin:
                 now_ms_value,
                 now_ms_value,
             ),
+        )
+        await record_completion(
+            conn, conv_uuid, op_id=op_id, op_type=op_type,
+            lifecycle=lifecycle_value, status=status_value, payload=snapshot_payload,
+            previous=dict(existing) if existing is not None else None,
+            revision=revision, frame_seq=frame_seq, at_ms=now_ms_value,
         )
         return frame_public({
             "conversation_uuid": conv_uuid,
@@ -887,7 +895,8 @@ class WebAdminOperationsMixin:
         binding_meta: dict[str, Any] | None = None,
         **message_kwargs: Any,
     ) -> int:
-        """Atomically persist one model transcript row and all exact UI links."""
+        """Atomically persist one model transcript row, UI links and notification receipts."""
+        receipt_ids = set(message_kwargs.pop("notification_receipt_ids", None) or [])
         conv_uuid = str(conversation_uuid or "").strip()
         turn = str(turn_uuid or "").strip()
         meta = dict(binding_meta or {})
@@ -918,6 +927,7 @@ class WebAdminOperationsMixin:
                 await self._attach_transcript_message_ids_tx(
                     conn, conv_uuid, message_id=message_id, target_op_ids=targets,
                 )
+                await bind_notification_receipts(conn, conv_uuid, receipt_ids, message_id)
                 return int(message_id or 0)
 
     async def _web_message_operation_ids(self, conversation_uuid: str, message_id: int) -> list[str]:

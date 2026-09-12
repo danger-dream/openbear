@@ -28,8 +28,13 @@ class RunResult:
     # Each physical call selects a tier independently. Web accounting appends the
     # committed per-call amount here instead of re-pricing the aggregate usage.
     controller_cost_usd: float = 0.0
-    last_usage: Usage = field(default_factory=Usage)     # 最后一次 API 调用的快照：prompt 体积 = 模型实际看到的整个上下文（用于上下文占用/压缩判定）
+    last_usage: Usage = field(default_factory=Usage)     # 最后一次 API 调用的快照：prompt 体积 = 模型实际看到的整个上下文（用于上下文占用/轮换判定）
     last_prompt_usage_reported: bool = False  # 最近一次成功物理调用是否由渠道明确返回 prompt usage
+    context_window_version: int = 0
+    context_request_sequence: int = 0
+    context_request_id: str = ""
+    context_owner_id: str = ""
+    context_estimated_input_tokens: int = 0
     stopped: bool = False          # 被停止或新消息打断
     halted_reason: str = ""        # 软约束触发（token/时长/打转）
     steered: int = 0               # 本轮被运行中插话注入的消息数（steering）
@@ -45,7 +50,8 @@ class RunResult:
     model_calls: int = 0            # 模型调用次数（每次发起 stream 计一次，含重试）
     model_ok: int = 0               # 成功完成的调用次数
     model_retry: int = 0            # 重试次数
-    model_fail: int = 0             # 终态失败次数
+    model_fail: int = 0             # 终态失败次数；不能计入已被候选回退恢复的摘要调用
+    summary_model_fail: int = 0     # 摘要物理调用失败次数，仅用于统计，不决定回合终态
     # —— 每次成功调用的指标累加（求会话平均用，分母 = model_ok）——
     connect_ms_sum: int = 0
     first_token_ms_sum: int = 0

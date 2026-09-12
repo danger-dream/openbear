@@ -9,7 +9,8 @@ import {
 } from "@element-plus/icons-vue";
 import ConsoleComposer from "./ConsoleComposer.vue";
 import {referenceErrorText, referenceDisplayText, referencesInText} from "../../references/codec.js";
-import {referenceCatalog} from "../../references/catalog.js";
+import {referenceCatalog, acceptActivityReadReceipt} from "../../references/catalog.js";
+import {createActivityReadTracker, withActivityReadVersion} from "../../conversationActivity.js";
 import ConsoleHeader from "./ConsoleHeader.vue";
 import TurnList from "./TurnList.vue";
 import TurnMinimap from "./TurnMinimap.vue";
@@ -67,7 +68,6 @@ import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
 	deriveOperationRunState,
-	isContextCompactionOperation,
 	isTerminalOperationFrame,
 	normalizeOperations,
 	projectOperationMessages as projectOperationMessagesFromOperations,
@@ -120,6 +120,7 @@ const INITIAL_TIMELINE_LIMIT = 200;
 const LOAD_EARLIER_SCROLL_THRESHOLD = 180;
 const props = defineProps({
 	conversationUuid: {type: String, default: ""},
+	navigationObscured: {type: Boolean, default: false},
 	// Immutable ownership for the current local draft. App changes it only after
 	// an explicit reassignment confirmation; persisted conversations use it as the
 	// target for cross-family "new conversation" creation.
@@ -132,10 +133,6 @@ const loading = ref(false);
 // of replacing its bottom intent with the background refresh's preserve mode.
 let pendingLoadBottomScroll = null;
 const running = ref(false);
-// HTTP compaction can outlive a visit. Keep its pending lock on its own
-// conversation, while the visit generation protects page-local side effects.
-const compactRequests = ref(new Map());
-let compactInteractionGeneration = 0;
 const sendPending = ref(false);
 const foregroundRunning = ref(false);
 const rootTurnRunning = ref(false);
@@ -178,6 +175,7 @@ const restoringDraft = ref(false);
 const toolResultTabs = ref({});
 const detailOpen = ref(loadAgentPanelIntents());
 const pendingConfirmations = ref([]);
+const pendingInteractionFocus = ref(null);
 const confirmationSubmitting = ref({});
 const confirmationErrors = ref({});
 const pendingSteering = ref([]);
@@ -324,10 +322,6 @@ const contextUsage = computed(() => resolveContextUsage(
 	legacyContextTokens.value,
 ));
 const lastContextTokens = computed(() => contextUsage.value.known ? Number(contextUsage.value.tokens || 0) : 0);
-const serverCompacting = computed(() => Array.from(operationsById.value.values()).some((op) => isContextCompactionOperation(op) && ["active", "paused", "waiting_control"].includes(op?.lifecycle)));
-const compactPending = computed(() => compactRequests.value.has(activeConversationUuid.value));
-const compacting = computed(() => compactPending.value || serverCompacting.value);
-const canCompact = computed(() => !isLocalConversation.value && !running.value && !compacting.value && Boolean(contextUsage.value.authoritative) && Boolean(contextUsage.value.known) && Number(contextUsage.value.percent || 0) >= Number(contextUsage.value.manualMinPercent ?? 50));
 const modelCallRows = computed(() => Array.isArray(chatState.value?.modelCalls) ? chatState.value.modelCalls : []);
 const toolCallRows = computed(() => Array.isArray(chatState.value?.toolCalls) ? chatState.value.toolCalls : []);
 const turns = computed(() => withTransientIdleThinking(attachTurnStats(buildTurns(displayMessages.value), modelCallRows.value, toolCallRows.value)));
@@ -371,6 +365,11 @@ const localFast = ref(false);
 const localAgentModel = ref("");
 const localAgentThinking = ref("");
 const localAgentFast = ref(null);
+const localContextStrategy = ref("sliding_window");
+const contextStrategy = computed(() => isLocalConversation.value ? localContextStrategy.value : (displayedRunConfig.value?.contextStrategy || "sliding_window"));
+const strategySaving = ref(false);
+const compactingUuid = ref("");
+const compacting = computed(() => compactingUuid.value === activeConversationUuid.value);
 const currentModel = computed(() => (isLocalConversation.value && localModel.value) ? localModel.value : (displayedRunConfig.value?.model || ""));
 const currentThinking = computed(() => (isLocalConversation.value && localThinking.value) ? localThinking.value : (displayedRunConfig.value?.thinkingLevel || ""));
 const effectiveThinking = computed(() => displayedRunConfig.value?.effectiveThinkingLevel || currentThinking.value || "off");
@@ -423,19 +422,20 @@ const agentEffectiveFast = computed(() => {
 	return Boolean(agentEffective.value?.fastMode ?? (currentFast.value && agentFastSupported.value));
 });
 const contextWindow = computed(() => Number(currentModelInfo.value?.contextWindow || displayedRunConfig.value?.contextWindow || 0));
-const compactTriggerTokens = computed(() => {
-	const explicit = Number(currentModelInfo.value?.compactTriggerTokens || displayedRunConfig.value?.compactTriggerTokens || 0);
+const rolloverTriggerTokens = computed(() => {
+	const explicit = Number(currentModelInfo.value?.rolloverTriggerTokens || displayedRunConfig.value?.rolloverTriggerTokens || 0);
 	if (explicit > 0) return explicit;
-	const ratio = Number(currentModelInfo.value?.compactRatio || displayedRunConfig.value?.compactRatio || 0.7);
+	const ratio = Number(currentModelInfo.value?.windowTriggerRatio || displayedRunConfig.value?.windowTriggerRatio || 0.7);
 	return contextWindow.value ? Math.round(contextWindow.value * ratio) : 0;
 });
-const contextPercent = computed(() => compactTriggerTokens.value ? Math.min(999, lastContextTokens.value * 100 / compactTriggerTokens.value) : 0);
-const contextUsedDisplay = computed(() => contextUsage.value.known ? fmtTokens(lastContextTokens.value) : "—");
-const contextThresholdDisplay = computed(() => compactTriggerTokens.value ? fmtTokens(compactTriggerTokens.value) : "∞");
+const contextPercent = computed(() => rolloverTriggerTokens.value ? Math.min(999, lastContextTokens.value * 100 / rolloverTriggerTokens.value) : 0);
+const canCompact = computed(() => !isLocalConversation.value && !running.value && !compacting.value && contextStrategy.value === "model_summary" && contextUsage.value.known && contextPercent.value >= Number(displayedRunConfig.value?.manualCompactMinPercent ?? 50));
+const contextUsedDisplay = computed(() => contextUsage.value.known ? fmtTokens(lastContextTokens.value) : "待实测");
+const contextThresholdDisplay = computed(() => rolloverTriggerTokens.value ? fmtTokens(rolloverTriggerTokens.value) : "∞");
 const contextWindowDisplay = computed(() => contextWindow.value ? fmtTokens(contextWindow.value) : "∞");
-const contextPercentDisplay = computed(() => contextUsage.value.known && compactTriggerTokens.value ? `${contextPercent.value.toFixed(1)}%` : "—");
+const contextPercentDisplay = computed(() => contextUsage.value.known && rolloverTriggerTokens.value ? `${contextPercent.value.toFixed(1)}%` : "—");
 const contextDisplay = computed(() => {
-	if (!compactTriggerTokens.value) return `${contextUsedDisplay.value} / ∞`;
+	if (!rolloverTriggerTokens.value) return `${contextUsedDisplay.value} / ∞`;
 	return `${contextUsedDisplay.value} / ${contextThresholdDisplay.value}（${contextPercentDisplay.value}）`;
 });
 const sessionLedgerUsage = computed(() => normalizeLedgerUsageBaseline(chatState.value?.usage || {}));
@@ -459,7 +459,7 @@ const totalDurationDisplay = computed(() => fmtMs(totalDurationMs.value));
 const totalCostUsd = computed(() => Number(sessionLedgerUsage.value.cost_usd || 0));
 const totalCostDisplay = computed(() => fmtCost(totalCostUsd.value));
 const canSend = computed(() => {
-	if (compacting.value || sendPending.value) return false;
+	if (sendPending.value || compacting.value) return false;
 	if (running.value) return Boolean(draft.value.trim()) && pendingAttachments.value.length === 0;
 	return Boolean(draft.value.trim() || pendingAttachments.value.length);
 });
@@ -555,7 +555,7 @@ function discardConversationDraft(conversationUuid) {
 		adjustComposerHeight();
 	}
 }
-defineExpose({discardConversationDraft});
+defineExpose({discardConversationDraft, focusPendingInteraction});
 
 function primaryModelInfo() {
 	const preferred = currentPrimaryModelKey.value || primaryModelKey.value;
@@ -586,6 +586,7 @@ function applyDefaultLocalModel() {
 }
 
 function applyLocalRunDefaults(defaults = {}) {
+	localContextStrategy.value = defaults.contextStrategy === "model_summary" ? "model_summary" : "sliding_window";
 	const main = modelOptions.value.find((item) => item.key === String(defaults.mainModel || "")) || primaryModelInfo();
 	if (!main) return applyDefaultLocalModel();
 	const mainLevels = modelThinkingLevels(main);
@@ -609,6 +610,7 @@ function applyLocalRunDefaults(defaults = {}) {
 
 function completeLocalRunConfig() {
 	return {
+		contextStrategy: localContextStrategy.value,
 		mainModel: localModel.value,
 		mainThinkingLevel: localThinking.value || "off",
 		mainFastMode: Boolean(localFast.value),
@@ -662,7 +664,7 @@ async function patchLocalRunDefaults(patch) {
 	await ensureLocalRunDefaults();
 	if (props.conversationUuid !== expectedUuid || String(props.folderId || "") !== folderId || !isLocalConversation.value) return null;
 	const requestSeq = ++defaultsRequestSeq;
-	if (Object.keys(localFolderDefaults).length) {
+	if (Object.keys(localFolderDefaults).length || Object.hasOwn(patch, "contextStrategy")) {
 		localDefaultsOverrides = {...localDefaultsOverrides, ...patch};
 		// A one-off choice in a project draft is not a global preference update
 		// and must not reset the other fields inherited from that project.
@@ -678,7 +680,7 @@ async function patchLocalRunDefaults(patch) {
 	}
 	appliedDefaultsRevision = revision;
 	localDefaultsOverrides = {...localDefaultsOverrides, ...patch};
-	applyLocalRunDefaults(defaults);
+	applyLocalRunDefaults({...defaults, ...(Object.hasOwn(localDefaultsOverrides, "contextStrategy") ? {contextStrategy: localDefaultsOverrides.contextStrategy} : {})});
 	resetLocalConversationState(expectedUuid || "local:new");
 	return defaults || null;
 }
@@ -737,8 +739,7 @@ function mergeStatsUsageIntoState(opId, stats = {}) {
 		chatState.value.contextUsage,
 		stats.contextUsage,
 		{
-			compactTriggerTokens: Number(chatState.value.compactTriggerTokens || 0),
-			manualMinPercent: Number(chatState.value.contextUsage?.manualMinPercent ?? 50),
+			rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0),
 		},
 	);
 	chatState.value = {
@@ -812,7 +813,7 @@ function resetLocalConversationState(uuid = props.conversationUuid || "local:new
 		effectiveFastMode: localFast.value && Boolean(model?.supportsFast),
 		fastSupported: Boolean(model?.supportsFast),
 		agentRunConfig: buildLocalAgentRunConfig(),
-		compactTriggerTokens: Number(model?.compactTriggerTokens || 0),
+		rolloverTriggerTokens: Number(model?.rolloverTriggerTokens || 0),
 		usage: normalizeLedgerUsageBaseline({}),
 		modelCalls: [],
 		toolCalls: [],
@@ -934,6 +935,24 @@ function onReasoningDetailsToggle(event, key, active) {
 	}
 	onDetailsToggle(event, key);
 }
+
+function focusPendingInteraction(target) {
+	if (!target?.interactionId || target.conversationUuid !== props.conversationUuid) return;
+	pendingInteractionFocus.value = {...target};
+	void nextTick(tryFocusPendingInteraction);
+}
+function tryFocusPendingInteraction() {
+	const target = pendingInteractionFocus.value;
+	if (!target) return;
+	if (target.conversationUuid !== props.conversationUuid) {
+		pendingInteractionFocus.value = null;
+		return;
+	}
+	if (loading.value || chatState.value?.conversationUuid !== target.conversationUuid) return;
+	if (!pendingConfirmations.value.some(item => item.confirmationId === target.interactionId)) return;
+	if (composer.value?.focusInteraction(target.interactionId)) pendingInteractionFocus.value = null;
+}
+watch(() => [props.conversationUuid, loading.value, chatState.value, pendingConfirmations.value], tryFocusPendingInteraction, {flush: "post"});
 
 function normalizeConfirmations(list = []) {
 	return Array.isArray(list) ? list.filter((item) => item?.confirmationId) : [];
@@ -1124,8 +1143,8 @@ async function loadOptions() {
 						fastMode: false,
 						effectiveFastMode: false,
 						fastSupported: Boolean(model.supportsFast),
-						compactTriggerTokens: Number(model.compactTriggerTokens || 0),
-						compactRatio: Number(model.compactRatio || 0.7),
+						rolloverTriggerTokens: Number(model.rolloverTriggerTokens || 0),
+						windowTriggerRatio: Number(model.windowTriggerRatio || 0.7),
 					};
 				}
 			}
@@ -1150,6 +1169,35 @@ function isRunConfigInteractionCurrent(conversationUuid, localAtRequest) {
 		&& String(props.conversationUuid || "") === String(conversationUuid || "")
 		&& isLocalConversation.value === Boolean(localAtRequest)
 	);
+}
+
+async function selectContextStrategy(strategy) {
+	if (strategySaving.value || !["sliding_window", "model_summary"].includes(strategy)) return;
+	const uuid = String(activeConversationUuid.value || "");
+	const local = isLocalConversation.value;
+	strategySaving.value = true;
+	try {
+		if (local) await patchLocalRunDefaults({contextStrategy: strategy});
+		else await runConfigSaves.enqueue(uuid, () => Api.conversationSetContextStrategy(uuid, strategy));
+		if (isRunConfigInteractionCurrent(uuid, local)) ElMessage.success(`已切换${strategy === "model_summary" ? "模型摘要" : "滑动窗口"}${running.value ? "，下个安全边界生效" : ""}`);
+	} catch (error) {
+		if (isRunConfigInteractionCurrent(uuid, local)) ElMessage.error(apiError(error));
+	} finally { strategySaving.value = false; }
+}
+
+async function compactContext() {
+	if (!canCompact.value) return;
+	const uuid = String(activeConversationUuid.value || "");
+	compactingUuid.value = uuid;
+	try {
+		const data = await Api.conversationCompact(uuid);
+		if (data?.ok === false) throw new Error(data.message || data.error || "压缩失败");
+		if (!isRunConfigInteractionCurrent(uuid, false)) return;
+		await load();
+		ElMessage.success("上下文压缩完成");
+	} catch (error) {
+		if (isRunConfigInteractionCurrent(uuid, false)) ElMessage.error(apiError(error));
+	} finally { if (compactingUuid.value === uuid) compactingUuid.value = ""; }
 }
 
 async function selectModel(model) {
@@ -2027,16 +2075,17 @@ function applyOperationFrameMessage(frame, options = {}) {
 	else if (changed) {
 		const appliedOperation = operationsById.value.get(frame.opId);
 		if (
-			appliedOperation?.opType === "context_compaction"
+			["context_window", "context_compaction"].includes(appliedOperation?.opType)
 			&& appliedOperation?.lifecycle === "terminal"
-			&& appliedOperation?.payload?.did === true
+			&& appliedOperation?.status === "completed"
+			&& appliedOperation?.payload?.windowVersion
 			&& chatState.value
 		) {
 			chatState.value = {
 				...chatState.value,
 				contextUsage: invalidateContextUsage(
 					chatState.value.contextUsage,
-					{compactTriggerTokens: Number(chatState.value.compactTriggerTokens || 0)},
+					{...appliedOperation.payload, rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0)},
 				),
 			};
 		}
@@ -2368,6 +2417,7 @@ function requestEarlierPageFromUser({explicitUpward = false, previousScrollTop =
 }
 
 function handleScrollerScroll() {
+	scheduleActivityRead();
 	const el = scroller.value;
 	if (!el) return;
 	const previousScrollTop = lastScrollerScrollTop;
@@ -2576,7 +2626,7 @@ function restoreReleasedOutboundSend(pending, error = "send_failed", {uncertain 
 	// Do not turn off a real run whose frames arrived before a lost ACK.
 	const operations = orderedOperationsList();
 	syncRunStateFromOperations(operations, operations.length ? null : chatState.value);
-	status.value = uncertain ? "发送结果未确认" : (["busy", "conversation_compacting"].includes(error) ? "会话正在压缩" : "发送失败");
+	status.value = uncertain ? "发送结果未确认" : (["busy", "conversation_compacting"].includes(error) ? "会话正在处理其他操作" : "发送失败");
 	return true;
 }
 
@@ -2735,7 +2785,7 @@ function handleWsMessage(raw, source = {}) {
 		const error = String(data.error || "WebSocket 错误");
 		const restored = restorePendingOutboundSend(data.requestId, error);
 		if (restored && ["busy", "conversation_compacting"].includes(error)) {
-			ElMessage.warning("会话正在压缩，消息未发送，草稿已恢复");
+			ElMessage.warning("会话正在处理其他操作，消息未发送，草稿已恢复");
 		} else {
 			ElMessage.error(data.referenceError ? `${referenceErrorText(error)}${data.referenceError.label ? '：' + data.referenceError.label : ''}` : error);
 		}
@@ -2968,7 +3018,7 @@ async function deleteTurnSuffix(turn) {
 	const preview = plainText(originalUserText).replace(/\s+/g, " ").trim().slice(0, 72);
 	try {
 		await ElMessageBox.confirm(
-			`将永久删除这轮${affectedTurns > 1 ? `及后续 ${affectedTurns - 1} 轮` : ""}内容。相关回答、工具/Agent 过程、附件引用和模型摘要都会一起移除，之后可从删除点之前继续对话。${preview ? `\n\n起点：${preview}${preview.length >= 72 ? "…" : ""}` : ""}`,
+			`将永久删除这轮${affectedTurns > 1 ? `及后续 ${affectedTurns - 1} 轮` : ""}内容。相关回答、工具/Agent 过程、附件引用和覆盖删除点的模型摘要会一起移除，Agent 仅能从可靠的存活检查点续接，之后可从删除点之前继续对话。会话/实例便笺仍保留当前版本；这不会撤销已发生的文件修改、配置变更、发送或其他现实副作用。${preview ? `\n\n起点：${preview}${preview.length >= 72 ? "…" : ""}` : ""}`,
 			"从此处重新开始？",
 			{
 				type: "warning",
@@ -3029,40 +3079,11 @@ async function deleteTurnSuffix(turn) {
 	}
 }
 
-async function compactConversation() {
-	const uuid = activeConversationUuid.value;
-	const generation = compactInteractionGeneration;
-	const isCurrentVisit = () => componentMounted
-		&& uuid === activeConversationUuid.value
-		&& generation === compactInteractionGeneration;
-	if (!uuid || !isCurrentVisit() || !canCompact.value || compactPending.value) return;
-	try {
-		await ElMessageBox.confirm("将调用压缩模型把现有历史整理为摘要。原始消息仍会保留，但后续模型将主要基于压缩摘要继续对话。", "压缩当前会话？", {type: "warning", confirmButtonText: "开始压缩", cancelButtonText: "取消"});
-	} catch { return; }
-	// Confirmation may resolve after navigation or after another action starts.
-	if (!isCurrentVisit() || !canCompact.value || compactPending.value) return;
-	const request = Symbol("compact");
-	compactRequests.value.set(uuid, request);
-	const isCurrent = () => isCurrentVisit() && compactRequests.value.get(uuid) === request;
-	try {
-		const result = await Api.conversationCompact(uuid);
-		if (!isCurrent()) return;
-		if (result?.state) chatState.value = result.state;
-		await load({conversationUuid: uuid, scrollMode: "preserve", isCurrent});
-		if (!isCurrent()) return;
-		ElMessage.success(result?.outcome?.did ? "上下文压缩完成" : "当前历史没有可压缩内容");
-	} catch (error) {
-		if (isCurrent()) ElMessage.error(apiError(error));
-	} finally {
-		// A late response only releases its own lock, never the visible request's.
-		if (compactRequests.value.get(uuid) === request) compactRequests.value.delete(uuid);
-	}
-}
+
 
 async function send() {
 	// Enter and click must share the same single-flight guard.
 	if (sendPending.value || outboundSends.current) return;
-	if (compacting.value) { ElMessage.warning("上下文正在压缩，请稍候"); return; }
 	const text = draft.value.trim();
 	if (!text && !pendingAttachments.value.length) return;
 	if (referencesInText(text).length && (!referenceCatalog.ready || !referenceCatalog.connected)) {
@@ -3207,7 +3228,6 @@ async function newSession() {
 watch(() => props.conversationUuid, async (next, prev) => {
 	if (next === prev) return;
 	pendingLoadBottomScroll = null;
-	compactInteractionGeneration += 1;
 	runConfigInteractionGeneration += 1;
 	if (prev) setDraftForConversation(prev, draft.value);
 	resetAgentAutoOpenBoundary();
@@ -3265,8 +3285,37 @@ watch(messages, () => {
 	maybeRevokeSentAttachmentPreviews();
 });
 
+let activityReadTracker = null;
+function activityReadSnapshot() {
+	const uuid = String(activeConversationUuid.value || "");
+	const catalogItems = referenceCatalog.treeStatus?.activityItems;
+	const raw = Array.isArray(catalogItems)
+		? catalogItems.find(item => item.conversationUuid === uuid)
+		: chatState.value?.conversation;
+	const item = raw ? withActivityReadVersion(raw, referenceCatalog.activityReadVersions?.get(uuid)) : null;
+	const el = scroller.value;
+	return {
+		item, conversationUuid: uuid, loadedConversationUuid: String(chatState.value?.conversationUuid || ""),
+		visible: document.visibilityState === "visible"
+			&& !(props.navigationObscured && window.matchMedia("(max-width: 760px)").matches),
+		focused: document.hasFocus(),
+		ready: componentMounted && !loading.value && !streamFlushPending && turns.value.length > 0 && !turns.value.at(-1)?.stats?.live,
+		atLatest: Boolean(el && el.clientHeight > 0 && scrollerDistanceFromBottom(el) <= 12),
+		running: running.value || sendPending.value,
+		operation: operationsById.value.get(item?.activityResult?.opId),
+	};
+}
+function scheduleActivityRead() { activityReadTracker?.schedule(); }
+watch(() => [props.conversationUuid, props.navigationObscured, chatState.value, referenceCatalog.treeStatus, referenceCatalog.activityReadVersions,
+	running.value, loading.value, messages.value, operationsById.value], scheduleActivityRead, {flush: "post"});
+
 onMounted(async () => {
 	componentMounted = true;
+	activityReadTracker = createActivityReadTracker({snapshot: activityReadSnapshot, send: items => Api.readConversationActivity(items), accepted: acceptActivityReadReceipt});
+	window.addEventListener("focus", scheduleActivityRead);
+	window.addEventListener("blur", scheduleActivityRead);
+	window.addEventListener("resize", scheduleActivityRead);
+	document.addEventListener("visibilitychange", scheduleActivityRead);
 	window.addEventListener("openbear:console-refresh", handleExternalRefresh);
 	window.addEventListener("openbear:folder-properties-changed", handleFolderPropertiesChanged);
 	window.addEventListener("focus", checkConnectionOnResume);
@@ -3283,6 +3332,11 @@ onMounted(async () => {
 	scheduleActiveTurnFromScroll({force: true});
 });
 onBeforeUnmount(() => {
+	activityReadTracker?.dispose();
+	window.removeEventListener("focus", scheduleActivityRead);
+	window.removeEventListener("blur", scheduleActivityRead);
+	window.removeEventListener("resize", scheduleActivityRead);
+	document.removeEventListener("visibilitychange", scheduleActivityRead);
 	leavePendingSend();
 	pendingLoadBottomScroll = null;
 	componentMounted = false;
@@ -3453,6 +3507,8 @@ onBeforeUnmount(() => {
 				:agent-default-thinking-label="agentDefaultThinkingLabel"
 				:running="running"
 				:can-send="canSend"
+				:context-strategy="contextStrategy"
+				:strategy-saving="strategySaving"
 				:can-compact="canCompact"
 				:compacting="compacting"
 				:context-display="contextDisplay"
@@ -3467,13 +3523,14 @@ onBeforeUnmount(() => {
 				@new-session="newSession"
 				@toggle-model-menu="toggleModelMenu"
 				@select-model="selectModel"
+				@select-context-strategy="selectContextStrategy"
+				@compact="compactContext"
 				@select-thinking="selectThinking"
 				@toggle-fast-mode="toggleFastMode"
 				@select-agent-model="selectAgentModel"
 				@select-agent-thinking="selectAgentThinking"
 				@select-agent-fast="selectAgentFast"
 				@send="send"
-				@compact="compactConversation"
 				@stop="stop"
 				@answer-confirmation="answerPendingConfirmation"
 				@close-menus="closeComposerMenus"

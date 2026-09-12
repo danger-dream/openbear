@@ -8,7 +8,6 @@ from dataclasses import replace
 
 import pytest
 
-from app.agent.compaction import CompressionCandidate
 from app.agent.transcript_repair import repair_role_alternation
 from app.db.engine import DB
 from app.llm.base import AgentResult, OpenBearLLMError
@@ -179,7 +178,8 @@ async def test_single_agent_runner_prepends_base_system_prompt(env):
     output = await runner.run()
 
     assert output["summary"] == "ok"
-    assert backend.systems == ["基础规则\n基础记忆\n\n你是代码阅读员"]
+    from app.context.prompts import effective_context_prompt
+    assert backend.systems == [effective_context_prompt("基础规则\n基础记忆\n\n你是代码阅读员")]
 
 
 async def test_single_agent_runner_forwards_fast_request_to_every_model_call(env):
@@ -880,100 +880,6 @@ async def test_responses_native_context_resumes_after_db_reconnect(env):
     assert checkpoint["state"]["stage"] == "completed"
 
 
-async def test_resumed_agent_restores_provider_snapshot_before_first_model_request(env, monkeypatch):
-    """A paused Agent must retain an unconsumed real prompt snapshot across processes."""
-    dao, task_uuid, agent = env
-    agent.tool_allowlist = ["Read"]
-    reg = ToolRegistry()
-
-    async def read(_args):
-        return "durable tool result"
-
-    reg.add("Read", "read", {"type": "object", "properties": {}}, read)
-
-    class FirstProcessBackend:
-        protocol = "responses"
-
-        async def complete(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
-            assert opts.get("native_continuation") is True
-            return AgentResult(
-                tool_calls=[ToolCall(id="resume-read", name="Read", arguments="{}")],
-                native_output_items=[
-                    {"type": "reasoning", "id": "resume-r", "encrypted_content": "opaque-resume"},
-                    {
-                        "type": "function_call",
-                        "id": "resume-fc",
-                        "call_id": "resume-read",
-                        "name": "Read",
-                        "arguments": "{}",
-                    },
-                ],
-                usage=Usage(input_tokens=782, cache_read_tokens=271_616, output_tokens=1),
-                finish_reason="tool_calls",
-            )
-
-    first_runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=FirstProcessBackend(),
-        model="resume-model",
-        max_tokens=2048,
-        tools=reg,
-        model_call_limit=1,
-        context_compact_trigger_tokens=272_000,
-    )
-    paused = await first_runner.run()
-    assert paused["status"] == "needs_openbear_control"
-    state = await first_runner._latest_continuation_state()
-    assert state is not None
-    assert state["providerPromptSnapshot"] == {
-        "tokens": 272_398,
-        "usageGeneration": 1,
-        "compactedUsageGeneration": -1,
-    }
-
-    class SecondProcessBackend:
-        protocol = "responses"
-
-        def __init__(self):
-            self.messages: list[dict] = []
-
-        async def complete(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
-            self.messages = copy.deepcopy(messages)
-            assert opts.get("native_continuation") is True
-            return AgentResult(text="resumed after compaction", usage=Usage(input_tokens=20, output_tokens=2))
-
-    second_backend = SecondProcessBackend()
-    second_runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=second_backend,
-        model="resume-model",
-        max_tokens=2048,
-        tools=reg,
-        model_call_limit=2,
-        context_compact_trigger_tokens=272_000,
-        session_id=first_runner.session_id,
-    )
-
-    async def summarize(_old_messages, **_kwargs):
-        return _GOOD_COMPACTION_SUMMARY.strip()
-
-    monkeypatch.setattr(second_runner, "_summarize_context_with_llm", summarize)
-    continued = await second_runner.run_continue("continue safely")
-
-    assert continued["summary"] == "resumed after compaction"
-    assert any(
-        "【Rath Agent 上下文压缩摘要】" in str(message.get("content") or "")
-        for message in second_backend.messages
-    )
-    assert not any(message.get("native_output_items") for message in second_backend.messages)
-    events = await dao.events(task_uuid)
-    detail = [event for event in events if event.kind == "model_context_pre_compacted"][-1].detail
-    assert detail["providerPromptTokensBefore"] == 272_398
-    assert detail["tokenSource"] == "provider_usage"
 
 
 async def test_native_context_sanitizer_drops_unpaired_function_calls(env):
@@ -1416,626 +1322,22 @@ async def test_single_agent_uses_streaming_transport_for_long_final_output(env):
     assert finished[-1].detail["status"] == "ok"
 
 
-async def test_single_agent_compaction_timeout_is_configured_per_attempt(env, monkeypatch):
-    """Agent 压缩不再受 30/75 秒硬编码限制，且每个重试独立使用配置值。"""
-    dao, task_uuid, agent = env
-    timeouts = []
-
-    async def fake_collect(_backend, _messages, *, timeout_s, **kwargs):
-        timeouts.append(
-            {
-            "outer": timeout_s,
-            "firstByte": kwargs.get("first_byte_timeout_s"),
-            "total": kwargs.get("total_timeout_s"),
-            "read": kwargs.get("read_timeout_s"),
-            "connect": kwargs.get("connect_timeout_s"),
-            "idle": kwargs.get("idle_timeout_s"),
-            }
-        )
-        if len(timeouts) == 1:
-            raise TimeoutError
-        return AgentResult(text=_GOOD_COMPACTION_SUMMARY), False, ""
-
-    monkeypatch.setattr("app.rath.single_agent.collect_backend_result", fake_collect)
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        context_compact_backend=_Backend(),
-        context_compact_model="compact-model",
-        context_compact_max_retries=1,
-        context_compact_timeout_s=2345,
-    )
-
-    summary = await runner._summarize_context_with_llm(
-        [{"role": "user", "content": "old context"}],
-        attempt=1,
-        reason="test",
-    )
-
-    assert summary == _GOOD_COMPACTION_SUMMARY.strip()
-    assert timeouts == [
-        {
-            "outer": 2345,
-            "firstByte": 2345,
-            "total": 2345,
-            "read": 2345,
-            "connect": None,
-            "idle": None,
-        },
-        {
-            "outer": 2345,
-            "firstByte": 2345,
-            "total": 2345,
-            "read": 2345,
-            "connect": None,
-            "idle": None,
-        },
-    ]
 
 
-async def test_single_agent_compaction_deduplicates_primary_fallback_candidate(env, monkeypatch):
-    """主模型已在有序候选中时，不应再因 label/model ID 不同而重复追加。"""
-    dao, task_uuid, agent = env
-    compression_backend = _Backend()
-    fallback_backend = _Backend()
-    calls = []
-
-    async def fake_collect(backend, _messages, *, model, **_kwargs):
-        calls.append((backend, model))
-        raise RuntimeError("compaction unavailable")
-
-    monkeypatch.setattr("app.rath.single_agent.collect_backend_result", fake_collect)
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        context_compact_backend=compression_backend,
-        context_compact_model="compact-model",
-        context_compact_label="OpenAI/compact-model",
-        context_compact_extra_candidates=[
-            CompressionCandidate(
-                fallback_backend,
-                "primary-model",
-                "primary-fallback",
-                "OpenAI/primary-model",
-            )
-        ],
-        context_compact_fallback_backend=fallback_backend,
-        context_compact_fallback_model="primary-model",
-        context_compact_max_retries=0,
-    )
-
-    summary = await runner._summarize_context_with_llm(
-        [{"role": "user", "content": "old context"}],
-        attempt=1,
-        reason="test",
-    )
-
-    assert summary is None
-    assert calls == [
-        (compression_backend, "compact-model"),
-        (fallback_backend, "primary-model"),
-    ]
 
 
-async def test_single_agent_compacts_context_overflow_from_large_tool_result(env):
-    dao, task_uuid, agent = env
-    agent.tool_allowlist = ["Read"]
-    await TaskMemoryDAO(dao.db).create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_CONVERSATION,
-        name="overflow runtime",
-        description="must be rebuilt, never summarized",
-        visible_to_agents=True,
-    )
-
-    class OverflowAfterToolBackend:
-        protocol = "chat"
-
-        def __init__(self) -> None:
-            self.calls = 0
-            self.messages_after_compaction = None
-
-        async def complete(
-            self, messages, *, model, system="", tools=None, max_tokens=8192, **opts
-        ):
-            self.calls += 1
-            tool_messages = [m for m in messages if m.get("role") == "tool"]
-            history_rebuilt = any(
-                "<agent-history_messages>" in str(message.get("content") or "")
-                for message in messages
-            )
-            if history_rebuilt:
-                self.messages_after_compaction = messages
-                return AgentResult(text="压缩后成功", usage=Usage(input_tokens=20, output_tokens=3))
-            if not tool_messages:
-                return AgentResult(
-                    tool_calls=[ToolCall(id="read", name="Read", arguments='{"path":"huge.log"}')],
-                    finish_reason="tool_calls",
-                    usage=Usage(input_tokens=10, output_tokens=1),
-                )
-            raise OpenBearLLMError(
-                "Prompt is too long: context_length_exceeded: Your input exceeds the context window of this model.",
-                status=400,
-                retryable=False,
-            )
-
-    reg = ToolRegistry()
-
-    async def read(_args):
-        return "TOO_BIG_START\n" + ("x" * 20_000) + "\nTOO_BIG_END"
-
-    reg.add("Read", "read", {"type": "object", "properties": {}}, read)
-    backend = OverflowAfterToolBackend()
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=backend,
-        model="gpt",
-        max_tokens=2048,
-        tools=reg,
-        tool_result_max_chars=32_000,
-    )
-
-    output = await runner.run()
-
-    assert output["summary"] == "压缩后成功"
-    assert backend.calls == 3
-    assert backend.messages_after_compaction is not None
-    overflow_states = [
-        message
-        for message in backend.messages_after_compaction
-        if is_task_memory_runtime_message(message)
-    ]
-    assert len(overflow_states) == 1
-    assert overflow_states[0]["_openbear_runtime"]["epoch"] == 1
-    compacted_tool_text = "\n".join(
-        str(m.get("content") or "")
-        for m in backend.messages_after_compaction
-        if m.get("role") == "tool"
-    )
-    assert compacted_tool_text == ""
-    rebuilt_context = "\n".join(
-        str(m.get("content") or "") for m in backend.messages_after_compaction
-    )
-    assert "<agent-history_messages>" in rebuilt_context
-    # The deterministic fallback may retain a short summary preview when the
-    # compression model is unavailable, but never replays the 20k raw tool body.
-    assert rebuilt_context.count("x") < 2_000
-    task = await dao.get_task(task_uuid)
-    assert task is not None
-    assert task.status == "completed"
-    events = await dao.events(task_uuid)
-    compacted = [e for e in events if e.kind == "model_context_overflow_compacted"][-1]
-    detail = compacted.detail
-    assert detail["final"] is True
-    assert detail["scope"] == "agent"
-    assert detail["status"] == "overflow_compacted"
-    assert detail["beforeTokens"] == detail["estimatedTokensBefore"]
-    assert detail["afterTokens"] == detail["estimatedTokensAfter"]
-    assert detail["summaryChars"] == len(detail["compactedOutput"])
-    assert detail["outputAvailable"] is True
-    assert detail["keepRecentMode"] == "semantic_xml"
-    assert detail["rawMessagesKept"] == 0
-    assert "openbear-task-memory-state" not in detail["compactedOutput"]
-    assert detail["compactionId"] == detail["summaryId"]
-    assert detail["compactionId"].startswith(f"agent-compaction:{task_uuid}:overflow_compacted:")
-    assert any(
-        str(message.get("content") or "") == detail["compactedOutput"]
-        for message in backend.messages_after_compaction
-    )
 
 
-async def test_single_agent_pre_compaction_final_event_persists_actual_injected_output(
-    env, monkeypatch
-):
-    dao, task_uuid, agent = env
-    memories = TaskMemoryDAO(dao.db)
-    await memories.create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_CONVERSATION,
-        name="compaction runtime",
-        description="must not enter summary",
-        visible_to_agents=True,
-    )
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        context_window=100,
-        context_compact_trigger_tokens=5,
-        context_compact_keep_recent=1,
-    )
-    runner.chat_id = 123
-    runner.conversation_uuid = "session-1"
-    summarized_messages: list[dict] = []
-
-    async def summarize(old_messages, **_kwargs):
-        summarized_messages.extend(copy.deepcopy(old_messages))
-        return _GOOD_COMPACTION_SUMMARY.strip()
-
-    monkeypatch.setattr(runner, "_summarize_context_with_llm", summarize)
-    messages = [
-        {"role": "user", "content": "old-a" * 200},
-        {"role": "assistant", "content": "old-b" * 200},
-        {"role": "user", "content": "latest"},
-    ]
-    await runner._reconcile_task_memory_context(messages)
-    assert len([message for message in messages if is_task_memory_runtime_message(message)]) == 1
-
-    assert await runner._pre_compact_context_if_needed(messages) is True
-    assert runner._task_memory_epoch == 1
-    rebuilt_states = [message for message in messages if is_task_memory_runtime_message(message)]
-    assert len(rebuilt_states) == 1
-    assert rebuilt_states[0]["_openbear_runtime"]["epoch"] == 1
-    assert "openbear-task-memory-state" not in json.dumps(summarized_messages, ensure_ascii=False)
-    events = await dao.events(task_uuid)
-    compacted = [e for e in events if e.kind == "model_context_pre_compacted"][-1]
-    detail = compacted.detail
-    assert detail["final"] is True
-    assert detail["scope"] == "agent"
-    assert detail["source"] == "pre_model_request"
-    assert detail["status"] == "pre_compacted"
-    assert detail["outputAvailable"] is True
-    assert detail["summaryChars"] == len(detail["compactedOutput"])
-    assert messages[0]["content"] == detail["compactedOutput"]
-    assert "openbear-task-memory-state" not in detail["compactedOutput"]
-    assert detail["compactionId"] == detail["summaryId"]
-    assert detail["compactionId"].startswith(f"agent-compaction:{task_uuid}:pre_compacted:")
-    await runner._reconcile_task_memory_context(messages)
-    rebuilt_states = [message for message in messages if is_task_memory_runtime_message(message)]
-    assert len(rebuilt_states) == 1
-    assert rebuilt_states[0]["_openbear_runtime"]["epoch"] == 1
-    assert await runner._reconcile_task_memory_context(messages) is False
 
 
-@pytest.mark.parametrize(
-    ("protocol", "usage"),
-    [
-        ("chat", Usage(input_tokens=272_398, output_tokens=1)),
-        ("anthropic", Usage(input_tokens=782, cache_read_tokens=271_616, output_tokens=1)),
-        ("responses", Usage(input_tokens=782, cache_read_tokens=271_616, output_tokens=1)),
-    ],
-)
-async def test_single_agent_pre_compaction_uses_provider_prompt_snapshot_for_all_protocols(
-    env, monkeypatch, protocol, usage
-):
-    """The common Rath path must prefer normalized provider usage for every protocol."""
-    dao, task_uuid, agent = env
-
-    class PassiveBackend:
-        def __init__(self, protocol_name):
-            self.protocol = protocol_name
-
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=PassiveBackend(protocol),
-        model="model-under-test",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        context_compact_trigger_tokens=272_000,
-        context_compact_keep_recent=1,
-    )
-    runner.chat_id = 123
-    runner._record_provider_prompt_usage(usage)
-
-    async def summarize(_old_messages, **_kwargs):
-        return _GOOD_COMPACTION_SUMMARY.strip()
-
-    monkeypatch.setattr(runner, "_summarize_context_with_llm", summarize)
-    messages = [
-        {"role": "user", "content": "short prior request"},
-        {"role": "assistant", "content": "short prior answer"},
-        {"role": "user", "content": "continue"},
-    ]
-
-    assert await runner._pre_compact_context_if_needed(messages) is True
-    events = await dao.events(task_uuid)
-    detail = [event for event in events if event.kind == "model_context_pre_compacted"][-1].detail
-    assert detail["beforeTokens"] == 272_398
-    assert detail["providerPromptTokensBefore"] == 272_398
-    assert detail["estimatedTokensBefore"] < 272_000
-    assert detail["tokenSource"] == "provider_usage"
-    # The old snapshot is consumed by the fold and must not compact the rebuilt
-    # context once more before a fresh provider response arrives.
-    assert runner._provider_prompt_tokens_for_compaction() == 0
-    assert await runner._pre_compact_context_if_needed(messages) is False
 
 
-async def test_single_agent_provider_snapshot_round_trips_generation_zero(env):
-    """A prior local fold at generation zero must not consume the next real snapshot."""
-    dao, task_uuid, agent = env
-    first = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="model-under-test",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-    )
-    first._consume_provider_prompt_usage_for_compaction()
-    first._record_provider_prompt_usage(
-        Usage(input_tokens=782, cache_read_tokens=271_616, output_tokens=1)
-    )
-    snapshot = first._provider_prompt_snapshot_state()
-    assert snapshot == {
-        "tokens": 272_398,
-        "usageGeneration": 1,
-        "compactedUsageGeneration": 0,
-    }
-
-    restored = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="model-under-test",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-    )
-    restored._restore_provider_prompt_snapshot(snapshot)
-    assert restored._provider_prompt_tokens_for_compaction() == 272_398
 
 
-async def test_responses_agent_precompacts_from_provider_usage_after_tool_batch(env, monkeypatch):
-    """Responses native context must compact before the next tool-loop request."""
-    dao, task_uuid, agent = env
-    agent.tool_allowlist = ["Read"]
-    reg = ToolRegistry()
-
-    async def read(_args):
-        return "read result"
-
-    reg.add("Read", "read", {"type": "object", "properties": {}}, read)
-
-    class ResponsesBackend:
-        protocol = "responses"
-
-        def __init__(self):
-            self.calls = 0
-            self.second_messages: list[dict] = []
-
-        async def stream(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
-            self.calls += 1
-            assert opts.get("native_continuation") is True
-            if self.calls == 1:
-                yield StreamEvent(
-                    kind="native_output_item",
-                    native_output_items=[
-                        {"type": "reasoning", "id": "r1", "encrypted_content": "opaque-reasoning"}
-                    ],
-                )
-                yield StreamEvent(
-                    kind="native_output_item",
-                    native_output_items=[
-                        {
-                            "type": "function_call",
-                            "id": "fc1",
-                            "call_id": "read-1",
-                            "name": "Read",
-                            "arguments": '{"path":"README.md"}',
-                        }
-                    ],
-                )
-                yield StreamEvent(
-                    kind="tool_call",
-                    tool_calls=[ToolCall(id="read-1", name="Read", arguments='{"path":"README.md"}')],
-                )
-                yield StreamEvent(
-                    kind="usage",
-                    usage=Usage(input_tokens=782, cache_read_tokens=271_616, output_tokens=1),
-                )
-                yield StreamEvent(kind="finish", finish_reason="tool_calls")
-                return
-
-            self.second_messages = copy.deepcopy(messages)
-            yield StreamEvent(kind="content", text="compacted continuation completed")
-            yield StreamEvent(kind="usage", usage=Usage(input_tokens=20, output_tokens=2))
-            yield StreamEvent(kind="finish", finish_reason="stop")
-
-    backend = ResponsesBackend()
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=backend,
-        model="responses-model",
-        max_tokens=2048,
-        tools=reg,
-        context_compact_trigger_tokens=272_000,
-        context_compact_keep_recent=1,
-    )
-
-    async def summarize(_old_messages, **_kwargs):
-        return _GOOD_COMPACTION_SUMMARY.strip()
-
-    monkeypatch.setattr(runner, "_summarize_context_with_llm", summarize)
-    output = await runner.run()
-
-    assert output["summary"] == "compacted continuation completed"
-    assert backend.calls == 2
-    assert any(
-        "【Rath Agent 上下文压缩摘要】" in str(message.get("content") or "")
-        for message in backend.second_messages
-    )
-    assert not any(message.get("native_output_items") for message in backend.second_messages)
-    events = await dao.events(task_uuid)
-    detail = [event for event in events if event.kind == "model_context_pre_compacted"][-1].detail
-    assert detail["beforeTokens"] == 272_398
-    assert detail["providerPromptTokensBefore"] == 272_398
-    assert detail["estimatedTokensBefore"] < 272_000
-    assert detail["tokenSource"] == "provider_usage"
 
 
-async def test_single_agent_compaction_rebuilds_semantic_xml_and_single_fresh_plan_runtime(
-    env, monkeypatch
-):
-    dao, task_uuid, agent = env
-    memories = TaskMemoryDAO(dao.db)
-    await memories.create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_CONVERSATION,
-        name="fresh runtime",
-        description="must be injected after compaction",
-        visible_to_agents=True,
-    )
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        plan_protocol_enabled=True,
-        context_compact_trigger_tokens=1,
-        context_compact_keep_recent=10,
-    )
-    runner.chat_id = 123
-    runner.conversation_uuid = "session-1"
-    runner._task_instruction = "检查 Agent 压缩边界"
-    summarized_messages: list[dict] = []
-
-    async def summarize(old_messages, **_kwargs):
-        summarized_messages.extend(copy.deepcopy(old_messages))
-        return _GOOD_COMPACTION_SUMMARY.strip()
-
-    monkeypatch.setattr(runner, "_summarize_context_with_llm", summarize)
-    messages = [
-        {"role": "user", "content": "原始任务：检查压缩"},
-        {
-            "role": "user",
-            "content": (
-                '<agent-plan-runtime revision="old" mode="full">\n'
-                "<state-json>OLD_PLAN_SENTINEL</state-json>\n"
-                "</agent-plan-runtime>\n"
-                "这是系统追加的权威运行时状态，不是新的用户任务。按最新 revision 继续。"
-            ),
-            "_openbear_runtime": {"kind": "rath_agent_plan_runtime", "version": 1},
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [ToolCall(id="read-old", name="Read", arguments='{"path":"old.txt"}')],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "read-old",
-            "name": "Read",
-            "content": "RAW_READ_SENTINEL",
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [ToolCall(id="tm-old", name="TaskMemory", arguments="{}")],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "tm-old",
-            "name": "TaskMemory",
-            "content": "TASK_MEMORY_RECEIPT_SENTINEL",
-        },
-        {
-            "role": "assistant",
-            "content": "中间结论：已定位主要问题。",
-            "reasoning": "internal reasoning",
-        },
-        {"role": "user", "content": "主控制器补充：只处理当前范围。"},
-    ]
-    await runner._reconcile_task_memory_context(messages)
-
-    assert await runner._pre_compact_context_if_needed(messages) is True
-
-    # The compacted canonical transcript has one semantic summary/HTML-safe XML
-    # tail, one newly generated full Plan state, and one fresh Task Memory state.
-    assert len(messages) == 3
-    compacted_text = str(messages[0]["content"])
-    assert "<agent-history_messages>" in compacted_text
-    assert "原始任务：检查压缩" in compacted_text
-    assert "中间结论：已定位主要问题。" in compacted_text
-    assert "主控制器补充：只处理当前范围。" in compacted_text
-    assert "RAW_READ_SENTINEL" not in compacted_text
-    assert "TASK_MEMORY_RECEIPT_SENTINEL" not in compacted_text
-    assert "OLD_PLAN_SENTINEL" not in compacted_text
-    assert "internal reasoning" not in compacted_text
-    assert messages[0]["_openbear_runtime"]["kind"] == "rath_agent_context_summary"
-
-    plan_messages = [
-        message
-        for message in messages
-        if "<agent-plan-runtime" in str(message.get("content") or "")
-    ]
-    assert len(plan_messages) == 1
-    assert 'mode="full"' in plan_messages[0]["content"]
-    assert "OLD_PLAN_SENTINEL" not in plan_messages[0]["content"]
-    assert plan_messages[0]["_openbear_runtime"]["kind"] == "rath_agent_plan_runtime"
-    runtime_messages = [message for message in messages if is_task_memory_runtime_message(message)]
-    assert len(runtime_messages) == 1
-    assert runtime_messages[0]["_openbear_runtime"]["epoch"] == 1
-
-    summarized_text = json.dumps(summarized_messages, ensure_ascii=False, default=str)
-    assert "RAW_READ_SENTINEL" in summarized_text
-    assert "TASK_MEMORY_RECEIPT_SENTINEL" in summarized_text
-    assert "OLD_PLAN_SENTINEL" not in summarized_text
-    assert "openbear-task-memory-state" not in summarized_text
 
 
-async def test_single_agent_pre_compaction_failure_emits_final_unavailable_event(env, monkeypatch):
-    dao, task_uuid, agent = env
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=_Backend(),
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        context_window=100,
-        context_compact_trigger_tokens=5,
-        context_compact_keep_recent=1,
-    )
-    runner.chat_id = 123
-
-    async def unavailable(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(runner, "_summarize_context_with_llm", unavailable)
-    messages = [
-        {"role": "user", "content": "old-a" * 200},
-        {"role": "assistant", "content": "old-b" * 200},
-        {"role": "user", "content": "latest"},
-    ]
-
-    assert await runner._pre_compact_context_if_needed(messages) is False
-    events = await dao.events(task_uuid)
-    failed = [
-        e
-        for e in events
-        if e.kind == "model_context_compaction_failed" and e.detail.get("final") is True
-    ][-1]
-    assert failed.detail["scope"] == "agent"
-    assert failed.detail["source"] == "pre_model_request"
-    assert failed.detail["status"] == "failed"
-    assert failed.detail["outputAvailable"] is False
-    assert failed.detail["outputUnavailable"] == "summary_not_available"
-    assert "compactedOutput" not in failed.detail
 
 
 async def test_single_agent_context_overflow_pauses_when_nothing_to_compact(env):
@@ -2629,7 +1931,8 @@ async def test_agent_task_memory_state_keeps_cross_second_tool_round_provider_pr
         scope_type=SCOPE_AGENT_TASK,
         task_uuid=task_uuid,
         name="own",
-        description="initial task state",
+        description="private preference",
+        body="initial private preference",
     )
     calls: list[list[dict]] = []
     systems: list[str] = []
@@ -2663,7 +1966,7 @@ async def test_agent_task_memory_state_keeps_cross_second_tool_round_provider_pr
             scope_type=SCOPE_AGENT_TASK,
             task_uuid=task_uuid,
             expected_revision=own["revision"],
-            changes={"description": "intermediate task state"},
+            changes={"body": "intermediate private preference"},
         )
         own = await memories.update(
             own["memoryUuid"],
@@ -2671,12 +1974,14 @@ async def test_agent_task_memory_state_keeps_cross_second_tool_round_provider_pr
             scope_type=SCOPE_AGENT_TASK,
             task_uuid=task_uuid,
             expected_revision=own["revision"],
-            changes={"description": "latest task state"},
+            changes={"body": "latest private preference"},
         )
         return "catalog mutated twice"
 
     registry = ToolRegistry()
     registry.add("Read", "mutate catalog", {"type": "object", "properties": {}}, mutate_catalog)
+    register_task_memory_tool(registry, memories)
+    agent = replace(agent, tool_allowlist=["Read", "TaskMemory"])
     runner = SingleAgentWorkflowRunner(
         dao,
         task_uuid,
@@ -2700,8 +2005,9 @@ async def test_agent_task_memory_state_keeps_cross_second_tool_round_provider_pr
     assert len(first_states) == 1
     assert len(second_states) == 2
     assert second_states[0] == first_states[0]
-    assert "latest task state" in second_states[-1]["content"]
-    assert "intermediate task state" not in second_states[-1]["content"]
+    assert "<body>initial private preference</body>" in first_states[0]["content"]
+    assert "<body>latest private preference</body>" in second_states[-1]["content"]
+    assert "intermediate private preference" not in second_states[-1]["content"]
     assert "[⏰ 当前时间:" not in json.dumps(calls, ensure_ascii=False, default=str)
 
     checkpoint = await dao.task_model_context(task_uuid)
@@ -2711,88 +2017,3 @@ async def test_agent_task_memory_state_keeps_cross_second_tool_round_provider_pr
         len([message for message in checkpoint_messages if is_task_memory_runtime_message(message)])
         == 2
     )
-
-
-async def test_agent_compaction_rebuild_injects_latest_task_memory_runtime_only(env):
-    dao, task_uuid, agent = env
-    memories = TaskMemoryDAO(dao.db)
-    await memories.create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_CONVERSATION,
-        name="shared visible",
-        description="from conversation",
-        body="shared-secret-body",
-        visible_to_agents=True,
-    )
-    await memories.create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_CONVERSATION,
-        name="shared hidden",
-        description="must stay hidden",
-        body="hidden-secret-body",
-        visible_to_agents=False,
-    )
-    await memories.create(
-        conversation_uuid="session-1",
-        scope_type=SCOPE_AGENT_TASK,
-        task_uuid=task_uuid,
-        name="own task",
-        description="from current task",
-        body="own-secret-body",
-    )
-
-    class CaptureBackend:
-        protocol = "chat"
-
-        def __init__(self):
-            self.messages = []
-            self.system = ""
-
-        async def complete(
-            self, messages, *, model, system="", tools=None, max_tokens=8192, **opts
-        ):
-            self.messages = messages
-            self.system = system
-            return AgentResult(text="catalog rebuilt", usage=Usage(input_tokens=1, output_tokens=1))
-
-    backend = CaptureBackend()
-    runner = SingleAgentWorkflowRunner(
-        dao,
-        task_uuid,
-        agent=agent,
-        backend=backend,
-        model="gpt",
-        max_tokens=2048,
-        tools=ToolRegistry(),
-        plan_protocol_enabled=False,
-    )
-
-    compacted_messages = []
-
-    async def simulate_compaction(messages):
-        messages[:] = [{"role": "user", "content": "compacted task prompt"}]
-        compacted_messages[:] = messages
-        return True
-
-    runner._pre_compact_context_if_needed = simulate_compaction
-    output = await runner.run()
-    assert output["summary"] == "catalog rebuilt"
-    user_text = str(backend.messages[-1]["content"])
-    assert "<conversation-memory revision=" in user_text
-    assert "shared visible" in user_text
-    assert "shared hidden" not in user_text
-    assert "<agent-task-memory revision=" in user_text
-    assert "own task" in user_text
-    assert "shared-secret-body" not in user_text
-    assert "hidden-secret-body" not in user_text
-    assert "own-secret-body" not in user_text
-    assert "[⏰ 当前时间:" not in user_text
-    assert "不是新的用户任务" in user_text
-    assert "conversation-memory" not in backend.system
-    assert "agent-task-memory" not in backend.system
-
-    durable_state = json.dumps(compacted_messages, ensure_ascii=False)
-    assert "conversation-memory" not in durable_state
-    assert "agent-task-memory" not in durable_state
-    assert "shared-secret-body" not in durable_state
-    assert "own-secret-body" not in durable_state

@@ -50,13 +50,13 @@ test('effective defaults normalize inherited values against the selected models 
     {key: 'low-only', thinkingLevels: ['low'], defaultThinkingLevel: 'low', supportsFast: false},
     {key: 'plain', thinkingLevels: [], defaultThinkingLevel: '', supportsFast: false},
   ];
-  assert.deepEqual(normalizedRunDefaults({local, inherited, fallback, resolved: {}}, models), {
+  assert.deepEqual(normalizedRunDefaults({local, inherited, fallback, resolved: {}}, models), {contextStrategy: "sliding_window",
     mainModel: 'low-only', mainThinkingLevel: 'low', mainFastMode: false,
     agentModel: 'low-only', agentThinkLevel: '', agentFastMode: null,
   });
   assert.deepEqual(local, {mainModel: 'low-only'});
   assert.deepEqual(inherited, {mainThinkingLevel: 'high', mainFastMode: true, agentModel: 'low-only', agentThinkLevel: 'high', agentFastMode: true});
-  assert.deepEqual(normalizedRunDefaults({local: {mainModel: 'plain'}, inherited: {}, fallback, resolved: {}}, models), {
+  assert.deepEqual(normalizedRunDefaults({local: {mainModel: 'plain'}, inherited: {}, fallback, resolved: {}}, models), {contextStrategy: "sliding_window",
     mainModel: 'plain', mainThinkingLevel: 'off', mainFastMode: false,
     agentModel: '', agentThinkLevel: '', agentFastMode: null,
   });
@@ -70,7 +70,7 @@ test('removed model overrides keep their stored value but effective defaults use
     fallback: {mainModel: 'fallback', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null},
     resolved: {mainModel: 'fallback', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null},
   }, models);
-  assert.deepEqual(value, {mainModel: 'fallback', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null});
+  assert.deepEqual(value, {contextStrategy: "sliding_window", mainModel: 'fallback', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null});
 });
 
 test('server resolved values remain the executable fallback when stored fallback models are removed', () => {
@@ -79,7 +79,7 @@ test('server resolved values remain the executable fallback when stored fallback
     local: {}, inherited: {},
     fallback: {mainModel: 'removed', mainThinkingLevel: 'high', mainFastMode: true, agentModel: 'removed-agent', agentThinkLevel: 'high', agentFastMode: true},
     resolved: {mainModel: 'live', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null},
-  }, models), {mainModel: 'live', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null});
+  }, models), {contextStrategy: "sliding_window",mainModel: 'live', mainThinkingLevel: 'low', mainFastMode: false, agentModel: '', agentThinkLevel: '', agentFastMode: null});
 });
 
 test('selection encoding distinguishes inherit from all explicit falsy values', () => {

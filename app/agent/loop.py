@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import time
@@ -15,15 +16,22 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, Protocol
 
-from app.agent.compaction import ContextCompactionGate
 from app.agent.context_overflow import is_context_overflow_error
 from app.agent.native_continuation import native_items_for_tool_calls
 from app.agent.result import RunResult
 from app.agent.tool_call_hooks import normalize_tool_calls
 from app.agent.transcript_repair import MISSING_TOOL_RESULT_TEXT, repair_role_alternation
+from app.context.request_view import expanded_request_view
+from app.context.runtime import WindowRuntime
 from app.llm.base import LLMBackend, Message, OpenBearLLMError
 from app.llm.events import ToolCall, Usage
-from app.llm.retry import RetryCancelledError, RetryPolicy, retry_wait_payload, wait_for_retry
+from app.llm.retry import (
+    RetryCancelledError,
+    RetryPolicy,
+    retry_delay_label,
+    retry_wait_payload,
+    wait_for_retry,
+)
 from app.logging import get_logger
 from app.rath.controller_projection import project_agent_tool_result_for_controller
 from app.stream.tool_progress import (
@@ -227,16 +235,6 @@ class Persister(Protocol):
     async def save_native_context(self, *, messages: list[Message]) -> None: ...
 
 
-class EmergencyCompactor(Protocol):
-    """应急压缩抽象：识别到「上下文超限」错误时强制压缩历史并重建会话。
-
-    返回压缩后应当用于重试的完整 convo（system 之外的消息列表）。返回 None 表示
-    无法再压缩（已到底/压缩失败），调用方应放弃重试、如实报错。convo 用于 Web
-    多模态/运行时注入消息的内存态尾部合并，避免只从 DB 重建后丢附件/image blocks。
-    """
-    async def compact_and_rebuild(self, convo: list[Message] | None = None) -> list[Message] | None: ...
-
-
 def _calls_signature(calls: list[ToolCall]) -> str:
     return "|".join(f"{c.name}:{c.arguments}" for c in calls)
 
@@ -278,9 +276,9 @@ class Agent:
                  no_progress_rounds: int = 8,
                  tool_result_max_chars: int = 16_000,
                  max_retries: int = 10,
-                 retry_backoff_s: float = 0.5,
-                 retry_max_delay_s: float = 32.0,
-                 retry_jitter_ratio: float = 0.25,
+                 retry_backoff_s: float = 3.0,
+                 retry_max_delay_s: float = 600.0,
+                 retry_jitter_ratio: float = 0.0,
                  max_overflow_retries: int = 3,
                  empty_response_retry_limit: int = 1,
                  reasoning_only_retry_limit: int = 2) -> None:
@@ -316,8 +314,8 @@ class Agent:
         service_tier: str = "",
         fast_request: dict[str, Any] | None = None,
         persister: Persister | None = None,
-        emergency_compactor: EmergencyCompactor | None = None,
-        context_compactor: ContextCompactionGate | None = None,
+        window_runtime: WindowRuntime | None = None,
+        window_request_refresher: Callable[[list[Message]], Awaitable[list[Message]]] | None = None,
         steer_drain: Callable[[], list[str]] | None = None,
         model_request_refresher: Callable[[list[Message]], Awaitable[list[Message]]] | None = None,
         model_request_overlay: Callable[[list[Message]], Awaitable[list[Message]]] | None = None,
@@ -353,18 +351,19 @@ class Agent:
         agent_wait_required = False
         last_agent_wait_delay_s = 0.0
         round_no = 0
-        emergency_overflow_tries = 0  # 本轮 run 已触发的应急压缩次数（防无限压缩）
+        emergency_overflow_tries = 0  # 本轮 run 已触发的应急窗口缩减次数（防无限重试）
         empty_retry = 0           # 已触发的「空响应」补救重试次数
         reasoning_only_retry = 0  # 已触发的「只思考无正文」补救重试次数
         open_rendered = False         # 当前 renderer 草稿里是否已有可封口内容（正文/工具行）
         native_continuation = str(getattr(self._backend, "protocol", "") or "").lower() == "responses"
-        # The provider's last successful prompt-usage snapshot is authoritative for
-        # compaction.  A local estimate cannot faithfully include Responses native
-        # items, encrypted reasoning, function-call payloads, or tool schemas.
-        # Track which snapshot a successful compaction consumed so an old oversized
-        # value does not trigger a second compaction before the next model request.
-        provider_prompt_usage_generation = 0
-        compacted_provider_prompt_usage_generation = -1
+        # One frozen set drives both serializer budgeting and every physical
+        # request. Do not re-read mutable model/Fast settings after selection.
+        request_options = copy.deepcopy({
+            "max_tokens": max_tokens, "think_level": think_level,
+            "session_id": session_id, "service_tier": service_tier,
+            "fast_request": dict(fast_request or {}),
+            **({"native_continuation": True} if native_continuation else {}),
+        })
 
         async def _persist_assistant(
             *,
@@ -396,6 +395,11 @@ class Agent:
             await save_assistant(**kwargs)
 
         async def _checkpoint_native_context(context: list[Message], *, replayable: bool) -> None:
+            bind = getattr(persister, "bind_context_sources", None)
+            if callable(bind):
+                bind(context)
+            if window_runtime is not None:
+                await window_runtime.checkpoint(context)
             if persister is None or (native_continuation and not replayable):
                 return
             checkpoint = getattr(persister, "save_native_context", None)
@@ -436,42 +440,58 @@ class Agent:
             if inspect.isawaitable(maybe):
                 await maybe
 
-        def _latest_provider_prompt_tokens() -> int:
-            usage = result.last_usage
-            return max(0, (
-                int(usage.input_tokens or 0)
-                + int(usage.cache_read_tokens or 0)
-                + int(usage.cache_write_tokens or 0)
-            ))
-
-        async def _run_context_compaction_gate(source: str, prompt_tokens: int | None = None) -> bool:
-            """Run normal compaction only at protocol-safe boundaries.
-
-            The last provider usage is the exact size of the preceding outbound
-            prompt.  Reuse it at the next safe boundary so a long tool loop cannot
-            silently stay below the threshold merely because the local estimator
-            omits opaque/native protocol state.  Explicit preflight projections
-            remain additive and win when they are larger.
-            """
-            nonlocal convo, compacted_provider_prompt_usage_generation
-            if context_compactor is None:
+        async def _prepare_window_once(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None) -> bool:
+            nonlocal convo
+            if window_runtime is None:
                 return False
-            gate_prompt_tokens = max(0, int(prompt_tokens or 0))
-            if provider_prompt_usage_generation > compacted_provider_prompt_usage_generation:
-                gate_prompt_tokens = max(gate_prompt_tokens, _latest_provider_prompt_tokens())
-            new_convo = await context_compactor.maybe_compact_and_rebuild(
-                source=source,
-                prompt_tokens=gate_prompt_tokens or None,
-                convo=convo,
+            # A steering message accepted during retry belongs to this request,
+            # not an arbitrary later tool round.
+            await _inject_steers(_drain_steers(), cut=open_rendered)
+            bind = getattr(persister, "bind_context_sources", None)
+            if callable(bind):
+                bind(convo)
+            window_runtime.bind_sources(convo)
+            expanded = list(await model_request_overlay(list(convo))) if model_request_overlay else list(convo)
+            request_view = expanded_request_view(expanded, retry_tail=retry_tail)
+
+            expected_high_water = None
+            if window_runtime.store.owner.kind == "controller":
+                cur = await window_runtime.store.db.conn.execute(
+                    "SELECT COALESCE(MAX(id),0) AS high_water FROM messages WHERE chat_id=?",
+                    (window_runtime.store.owner.chat_id,),
+                )
+                expected_high_water = int((await cur.fetchone())["high_water"])
+            previous = window_runtime.window_version
+            convo = await window_runtime.prepare(
+                convo, system=system, tools=tool_schemas, force=force, attempt=overflow_attempt,
+                refresh_after_rotation=window_request_refresher,
+                expected_message_high_water=expected_high_water, request_view=request_view,
+                request_options={**request_options, "stream": True},
             )
-            if new_convo is None:
+            changed = window_runtime.window_version != previous
+            result.context_window_version = window_runtime.window_version
+            result.context_owner_id = window_runtime.store.owner.key
+            result.context_estimated_input_tokens = window_runtime.last_estimate.tokens if window_runtime.last_estimate else 0
+            if changed:
+                result.last_prompt_usage_reported = False
+            return changed
+
+        async def _prepare_window(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None) -> bool:
+            if window_runtime is None:
                 return False
-            # A rebuilt context begins a new cache epoch. Do not repeatedly apply
-            # the old oversized snapshot; the next provider response supplies a
-            # fresh authoritative snapshot before another normal compaction.
-            compacted_provider_prompt_usage_generation = provider_prompt_usage_generation
-            convo = list(new_convo)
-            return True
+            changed = False
+            for revision_attempt in range(3):
+                changed = await _prepare_window_once(
+                    force=force and revision_attempt == 0, overflow_attempt=overflow_attempt,
+                    retry_tail=retry_tail,
+                ) or changed
+                # Incoming Web/TG steering lives in the queue until injection, so
+                # the database high-water CAS alone cannot see arrival during the
+                # asynchronous local selection. Rebudget the accepted originals
+                # before opening a physical model request, never execute a tool.
+                if not await _inject_steers(_drain_steers(), cut=open_rendered):
+                    return changed
+            raise RuntimeError("controller_inputs_changed_repeatedly_before_request; instructions_preserved")
 
         async def _close_unexecuted_tool_calls(calls: list[ToolCall], *, reason: str) -> None:
             """Close assistant-emitted tool calls that will not be dispatched.
@@ -562,10 +582,6 @@ class Agent:
             # 放在每轮请求模型之前，模型下一轮即可见老大的补充指导/改目标。
             await _inject_steers(_drain_steers(), cut=open_rendered)
 
-            # 正常上下文压缩 gate：只在请求模型前运行，避开 streaming 中间和
-            # assistant tool_calls 已产生但 tool result 未完整落库的非法窗口。
-            await _run_context_compaction_gate("pre_model_request")
-
             round_no += 1
             result.rounds = round_no
             await renderer.on_status("正在思考 …")
@@ -587,13 +603,22 @@ class Agent:
                     if inspect.isawaitable(maybe):
                         await maybe
                 if state.get("active"):
-                    delay_display = round(int(state.get("delayMs") or 0) / 1000, 1)
+                    delay_display = retry_delay_label(int(state.get("delayMs") or 0) / 1000)
                     readable_reason = str(state.get("summary") or "").strip()
                     await renderer.on_status(
                         f"模型调用失败{f'：{readable_reason}' if readable_reason else ''}，"
-                        f"{delay_display:g} 秒后重试 "
+                        f"{delay_display}后重试 "
                         f"（{state.get('attempt')}/{state.get('maxRetries')}）…"
                     )
+
+            last_retry_state: dict[str, Any] | None = None
+
+            async def _settle_retry(status: str) -> None:
+                nonlocal last_retry_state
+                if last_retry_state is not None:
+                    await _publish_retry_state({**last_retry_state, "active": False, "cancelable": False,
+                                                "retryAtMs": 0, "status": status, "terminal": True})
+                    last_retry_state = None
 
             attempt = 0
             primary_model_error: OpenBearLLMError | None = None
@@ -608,7 +633,6 @@ class Agent:
                 call_provider_cost_usd: float | None = None
                 call_reasoning_t0 = 0.0   # 本次调用首个 reasoning 增量时刻
                 call_reasoning_ms = 0     # 本次调用思考时长（首个 reasoning → 首个 content）
-                result.model_calls += 1
                 # Reconcile application runtime state into the actual private model
                 # context before composing request-local retry recovery. Retaining the
                 # returned context is what makes digest deduplication and cross-turn
@@ -616,6 +640,11 @@ class Agent:
                 # without merging an already emitted user unit.
                 if model_request_refresher is not None:
                     convo = list(await model_request_refresher(convo))
+                await _prepare_window(retry_tail=retry_context)
+                request_ticket = await window_runtime.begin_request() if window_runtime else None
+                if request_ticket is not None:
+                    result.context_request_id = request_ticket.request_id
+                    result.context_request_sequence = request_ticket.sequence
                 request_prefix = list(convo)
                 if model_request_overlay is not None:
                     # Request-local overlays target the durable conversation prefix.
@@ -630,16 +659,11 @@ class Agent:
                 attempt_native_output_items: list[dict[str, Any]] = []
                 stream_options: dict[str, Any] = {
                     "model": model,
-                    "system": system,
+                    "system": window_runtime.system if window_runtime else system,
                     "tools": tool_schemas,
-                    "max_tokens": max_tokens,
-                    "think_level": think_level,
-                    "session_id": session_id,
-                    "service_tier": service_tier,
-                    "fast_request": dict(fast_request or {}),
+                    **copy.deepcopy(request_options),
                 }
-                if native_continuation:
-                    stream_options["native_continuation"] = True
+                result.model_calls += 1
                 try:
                     async for ev in self._backend.stream(outbound, **stream_options):
                         billing = ev.details if isinstance(ev.details, dict) else {}
@@ -694,7 +718,7 @@ class Agent:
                         elif ev.kind == "usage" and ev.usage:
                             # 累加进总账（计费）；同时记下这一次 API 调用的快照。
                             # 最后一次调用的 prompt(input+cache) = 模型实际看到的整个上下文体积，
-                            # 是上下文占用 / 压缩阈值判定唯一正确的依据。
+                            # 是上下文占用 / 轮换阈值判定唯一正确的依据。
                             result.usage.merge(ev.usage)
                             call_usage.merge(ev.usage)
                             # A usage event that only reports output is still useful
@@ -703,10 +727,12 @@ class Agent:
                                     + call_usage.cache_write_tokens) > 0:
                                 call_prompt_usage_reported = True
                                 result.last_usage = call_usage
-                                provider_prompt_usage_generation += 1
                             call_output_tokens = ev.usage.output_tokens
                         elif ev.kind == "finish":
                             finish = ev.finish_reason
+                    await _settle_retry("completed")
+                    if window_runtime is not None:
+                        await window_runtime.observe_usage(call_usage if call_prompt_usage_reported else None, ticket=request_ticket)
                     # 流正常结束：本次调用成功，累计指标用于求会话平均；同时记录最后一次调用快照。
                     call_time_ms = int((time.monotonic() - call_t0) * 1000)
                     # 思考收尾：若这次调用全程只有 reasoning、没等到 content（如纯思考后
@@ -753,11 +779,14 @@ class Agent:
                     )
                     break  # 流正常结束
                 except OpenBearLLMError as e:
+                    await _settle_retry("failed")
+                    if window_runtime is not None:
+                        await window_runtime.observe_usage(call_usage if call_prompt_usage_reported else None, ticket=request_ticket)
                     if primary_model_error is None and e.structured:
                         primary_model_error = e
                     # Every physical upstream attempt gets its own durable row,
                     # including retryable/overflow failures.  Do this before any
-                    # retry/compaction branch can issue the next request. RunResult's
+                    # retry/window-rotation branch can issue the next request. RunResult's
                     # model_fail still means terminal failures, so it is incremented
                     # only after all recovery/retry branches are exhausted below.
                     if model_call_hook is not None:
@@ -780,33 +809,25 @@ class Agent:
                         except Exception:
                             log.exception("失败模型调用即时记账失败，终止当前运行以避免继续产生未入账请求", 轮次=round_no)
                             raise
-                    # 上下文超限自救：靠错误文本识别（不依赖 usage，覆盖不报 usage 的模型）。
-                    # 即使已经流出少量正文，也应压缩后重试；Responses/代理层可能先吐出
-                    # partial output，随后才以 context_length_exceeded/incomplete 结束。
-                    if (emergency_compactor is not None
+                    # Retry only the failed model request, never the tools already
+                    # committed to convo. Provider-only opaque weight may require a
+                    # neutral rebuild even when the estimated tail is already small.
+                    if (window_runtime is not None
                             and emergency_overflow_tries < self._max_overflow_retries
                             and is_context_overflow_error(e.message)):
                         emergency_overflow_tries += 1
-                        log.warning("上下文超限，触发应急压缩后重试", 轮次=round_no,
-                                    应急次数=emergency_overflow_tries, 错误=e.message[:120])
-                        await renderer.on_status("上下文偏长，正在压缩历史后重试 …")
-                        try:
-                            new_convo = await emergency_compactor.compact_and_rebuild(convo=convo)
-                        except TypeError:
-                            # Backward compatibility for existing test/fallback compactor shims.
-                            new_convo = await emergency_compactor.compact_and_rebuild()
-                        if new_convo is not None:
+                        await renderer.on_status("上下文偏长，正在按会话策略压缩后重试 …")
+                        if await _prepare_window(force=True, overflow_attempt=emergency_overflow_tries, retry_tail=retry_context):
                             result.model_retry += 1
-                            if full_text or reasoning_text or pending or attempt_native_output_items:
-                                native_round_replayable = False
+                            native_round_replayable = False
                             native_output_items = []
-                            convo = new_convo
                             full_text = reasoning_text = signature = ""
                             pending = []
                             finish = ""
                             produced_any = False
                             continue
-                        # 压不动了（已到底/失败）→ 落到下面如实报错
+                        # Required originals and the minimum recent tail cannot be
+                        # reduced further: report the original capacity error.
                     # 完整 tool call 已经到达时不重放请求，直接执行该工具，避免副作用重复。
                     # content/reasoning partial 则作为 recovery context 交给下一 attempt 续写；
                     # 这与 Agent 的职责一致：一次传输中断不能直接杀掉整个任务。
@@ -859,7 +880,9 @@ class Agent:
                             attempts=e.attempts,
                             details=e.details,
                         )
-                        log.warning("上游可重试错误，指数退避后恢复", 轮次=round_no, 尝试=attempt,
+                        state["callRound"] = round_no
+                        last_retry_state = dict(state)
+                        log.warning("上游可重试错误，阶梯等待后重试", 轮次=round_no, 尝试=attempt,
                                     等待秒=round(wait, 3), 已产出=produced_any, 错误=e.message[:120])
                         try:
                             await wait_for_retry(
@@ -1156,34 +1179,13 @@ class Agent:
                 # Agent detached 只是异步工具结果；继续主控循环，由模型基于返回的
                 # task id/status 决定是否继续调度、向用户说明等待，或用 AgentMessage/AgentStop 控制后台任务。
 
-                # 工具批次已全部回灌并落库，此时才允许正常压缩；压缩成功后替换
-                # convo，下一次 continue 请求模型会看到新摘要窗口而非旧长历史。
-                # Agent terminal results use their provider-reported final output
-                # tokens in addition to the latest real controller prompt. The Web
-                # gate also compares the fully assembled convo estimate so JSON/tool
-                # envelopes cannot make this preflight under-count.
-                if delivered_agent_result_count > 0:
-                    controller_prompt_tokens = (
-                        int(result.last_usage.input_tokens or 0)
-                        + int(result.last_usage.cache_read_tokens or 0)
-                        + int(result.last_usage.cache_write_tokens or 0)
-                    )
-                    envelope_reserve = max(256, 64 * delivered_agent_result_count)
-                    projected_tokens = controller_prompt_tokens + delivered_agent_output_tokens + envelope_reserve
-                    await _run_context_compaction_gate(
-                        "agent_result_preflight",
-                        prompt_tokens=projected_tokens,
-                    )
-                else:
-                    await _run_context_compaction_gate("tool_batch")
-
                 # Only a fully persisted assistant/tool batch may advance the
-                # private model chain. If compaction rebuilt convo, checkpoint the
+                # private model chain. If rotation rebuilt convo, checkpoint the
                 # rebuilt neutral context rather than stale opaque items.
-                await _checkpoint_native_context(
-                    convo,
-                    replayable=native_round_replayable,
-                )
+                await _checkpoint_native_context(convo, replayable=native_round_replayable)
+                if window_runtime is not None and window_runtime.pending:
+                    await _prepare_window()
+                    await _checkpoint_native_context(convo, replayable=native_round_replayable)
 
                 # 软约束检查
                 if self._max_wall > 0 and time.monotonic() - t0 > self._max_wall:
@@ -1341,10 +1343,19 @@ class Agent:
                     tool_calls=[],
                     native_output_items=list(assistant_message.get("native_output_items") or []),
                 )
+                convo.append(assistant_message)
+                # Maintenance can fail/cancel; the completed model response must
+                # already be recoverable without rebuilding a lossy transcript.
+                if window_runtime is not None:
+                    await _checkpoint_native_context(convo, replayable=native_round_replayable)
+                steered_before_compression = result.steered
+                await _prepare_window()
                 await _checkpoint_native_context(
-                    convo + [assistant_message],
+                    convo,
                     replayable=native_round_replayable,
                 )
+                if result.steered != steered_before_compression:
+                    continue
             result.total_time_ms = int((time.monotonic() - t0) * 1000)
             # 统计页脚拼进这条最终消息末尾（与正文同属一条消息）
             _apply_footer()

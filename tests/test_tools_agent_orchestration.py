@@ -118,7 +118,7 @@ class _FakeModelDef:
         self.default_thinking_level = default_thinking_level
         self.supports_fast = supports_fast
         self.cost = cost or {}
-        self.compact_trigger_tokens = 0
+        self.rollover_trigger_tokens = 0
 
 
 class _FakeProviderDef:
@@ -127,6 +127,9 @@ class _FakeProviderDef:
 
 
 class _FakeConfig:
+    from app.config import AgentConfig, ContextManagementConfig
+    context_management = ContextManagementConfig()
+    agent = AgentConfig()
     class _Models:
         primary = "openai/gpt"
         compression_models = ["openai/gpt"]
@@ -1519,6 +1522,12 @@ async def test_agent_attachments_reject_secrets_and_missing_material(agent_tool_
         data = json.loads(raw)
         assert data["ok"] is False
         assert data["error"] == expected_error
+        if expected_error == "agent_attachment_forbidden":
+            assert "never materialized" in data["message"]
+            assert "main controller" in data["message"]
+            assert "authorized work package" in data["message"]
+            assert "available access method" in data["message"]
+            assert "Reference the credential through the granted tools" not in data["message"]
     # No task may be created for a launch whose promised material cannot be delivered.
     assert await dao.list_tasks(chat_id=123, limit=10) == []
 

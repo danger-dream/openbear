@@ -13,7 +13,7 @@ _RATH_MONITOR_EVENT_KINDS = frozenset({
     "pause_applied", "resume_applied", "cancel_requested", "needs_openbear_control",
     "plan_submitted", "plan_decision", "plan_decision_approve", "plan_decision_revise", "plan_decision_cancel",
     "plan_replan_requested", "agent_plan_protocol_corrected", "agent_control_continuation_saved",
-    "model_context_pre_compacted", "model_context_overflow_compacted", "model_context_compaction_failed",
+    "model_context_window_rotated", "model_context_pre_compacted", "model_context_overflow_compacted", "model_context_compaction_failed",
 })
 
 
@@ -297,10 +297,9 @@ class WebAdminRathMixin:
                     "thinkingLevels": list(model.thinking_levels or []),
                     "defaultThinkingLevel": model.default_thinking_level,
                     "supportsFast": bool(model.supports_fast),
-                    "compactTriggerTokens": int(model.compact_trigger_tokens or 0),
-                    "compactRatio": float(self.config.agent.compact_ratio or 0.7),
+                    "rolloverTriggerTokens": int(model.rollover_trigger_tokens or 0),
+                    "windowTriggerRatio": float(self.config.agent.compact_ratio or 0.7),
                     "primary": key == self.config.models.primary,
-                    "compression": key in self.config.models.compression_models,
                 })
         tool_summaries = self.tools.summaries(scope="agent") if self.tools is not None else {}
         available_agent_tools = set(self.tools.names(scope="agent")) if self.tools is not None else set()
@@ -313,7 +312,6 @@ class WebAdminRathMixin:
             "models": models,
             "tools": tools,
             "primaryModel": self.config.models.primary,
-            "compressionModels": list(self.config.models.compression_models),
             "currentModel": getattr(self.model_selection, "current", "") if self.model_selection else "",
             "thinkLevels": sorted({level for item in models for level in item.get("thinkingLevels", [])}) or ["off"],
         })
@@ -479,6 +477,7 @@ class WebAdminRathMixin:
                     # physical call. Do not re-price it with the model's normal
                     # table when committing the Web ledger.
                     cost_usd_override=detail.get("costUsd"),
+                    call_kind=str(detail.get("callKind") or "agent_request"),
                 )
 
             runner = SingleAgentWorkflowRunner(
@@ -517,7 +516,7 @@ class WebAdminRathMixin:
                 plan_protocol_enabled=False,
                 poll_interval_s=0.5,
                 on_model_call=_on_model_call,
-                **self._rath_context_compact_kwargs(model_name),
+                **self._rath_context_window_kwargs(model_name),
             )
             await runner.run()
 

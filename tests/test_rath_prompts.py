@@ -56,12 +56,10 @@ def test_prompt_setting_metadata_validation_preview_and_builtin_tracking() -> No
     assert parse_setting_value(spec.path, "") == ""
 
 
-def test_compact_prompt_uses_generic_prompt_editor_validation() -> None:
-    spec = get_spec("agent.compactPrompt")
-    assert spec is not None and spec.editor == "prompt"
-    assert "现有" in preview_prompt_setting(spec.path, "摘要={existing}\n历史={history}")
-    with pytest.raises(ValueError, match="未知占位符"):
-        parse_setting_value(spec.path, "{task}")
+def test_summary_prompt_setting_is_preserved() -> None:
+    assert get_spec("agent.compactPrompt") is not None
+    template = "摘要={existing}\n历史={history}"
+    assert parse_setting_value("agent.compactPrompt", template) == template
 
 
 def test_plan_version_diff_reports_structural_changes() -> None:

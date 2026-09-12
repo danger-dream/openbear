@@ -115,6 +115,10 @@ class AgentContinuityDAO:
                  task["title"], task_uuid, task_uuid, checkpoint["revision"],
                  json.dumps(metadata, ensure_ascii=False), ts, ts),
             )
+            old_owner, new_owner = f"legacy-task:{task_uuid}", f"agent:{sid}"
+            for table in ("context_execution_events", "context_window_rotations"):
+                await conn.execute(f"UPDATE {table} SET owner_key=? WHERE owner_key=?", (new_owner, old_owner))
+            await conn.execute("UPDATE context_windows SET owner_key=?,agent_session_uuid=? WHERE owner_key=?", (new_owner, sid, old_owner))
             data.update(sessionKind="independent", sessionTurn=1, legacyAgentSessionUuid=task["agent_session_uuid"])
             await conn.execute("UPDATE rath_tasks SET agent_session_uuid=?,input_json=? WHERE task_uuid=?",
                                (sid, json.dumps(data, ensure_ascii=False), task_uuid))

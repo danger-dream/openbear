@@ -4,19 +4,12 @@ import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import { copyTextToClipboard } from "../utils/clipboard.js";
-import {
-  buildCompressionOrderItems,
-  compressionOrderFullnames,
-} from "./compressionOrder.js";
 
 const loading = ref(false);
 const detailLoading = ref(false);
 const providers = ref([]);
 const overview = ref({ stats: {} });
 const primaryModel = ref("");
-const compressionModels = ref([]);
-const compressionOrderItems = ref([]);
-const compressionOrderSaving = ref(false);
 const selectedName = ref("");
 const detail = ref(null);
 const providerDialog = ref(false);
@@ -62,13 +55,8 @@ const filteredModels = computed(() => {
     return id.includes(q) || name.includes(q);
   });
 });
-function compressionRank(row) {
-  if (!row?.fullname) return 0;
-  const idx = compressionModels.value.indexOf(row.fullname);
-  return idx >= 0 ? idx + 1 : 0;
-}
 
-const isCompressionPanelExpanded = ref(false);
+
 
 function overviewTokenMetric(target) {
   const stats = target?.stats || {};
@@ -98,7 +86,7 @@ const modelForm = reactive({
   supportsFast: false,
   fastCost: {},
   fastRequest: null,
-  compactTriggerTokens: 0,
+  rolloverTriggerTokens: 0,
   contextWindow: 128000,
   maxTokens: 8192,
   modelsDevProviderId: "",
@@ -142,14 +130,8 @@ const modelsDevStatusText = computed(() => {
 });
 
 function items(data) { return Array.isArray(data?.providers) ? data.providers : []; }
-function compressionListFrom(data) {
-  return Array.isArray(data?.compressionModels) ? data.compressionModels.filter(Boolean).map(String) : [];
-}
-function applyCompressionData(data) {
-  const models = compressionListFrom(data);
-  compressionModels.value = models;
-  compressionOrderItems.value = buildCompressionOrderItems(models, data?.compressionCandidates);
-}
+
+
 function okOrThrow(data) { if (data?.ok === false) throw new Error(data.error || "操作失败"); return data; }
 function fmtMoney(value) {
   const n = Number(value || 0);
@@ -347,7 +329,7 @@ function humanPreviewRows(preview = {}) {
     input: formatModalities,
     contextWindow: (value) => fmtTokenValue(value),
     maxTokens: (value) => fmtTokenValue(value),
-    compactTriggerTokens: (value) => fmtTokenValue(value, "按全局比例"),
+    rolloverTriggerTokens: (value) => fmtTokenValue(value, "按全局比例"),
     cost: formatCost,
   };
   const labels = {
@@ -355,10 +337,10 @@ function humanPreviewRows(preview = {}) {
     input: "输入能力",
     contextWindow: "上下文窗口",
     maxTokens: "最大输出",
-    compactTriggerTokens: "压缩触发 Token",
+    rolloverTriggerTokens: "压缩触发 Token",
     cost: "费率与阶梯价",
   };
-  for (const field of ["name", "input", "contextWindow", "maxTokens", "compactTriggerTokens", "cost"]) {
+  for (const field of ["name", "input", "contextWindow", "maxTokens", "rolloverTriggerTokens", "cost"]) {
     if (!changed.has(field)) continue;
     rows.push({ label: labels[field], current: formatters[field](current[field]), proposed: formatters[field](proposed[field]) });
   }
@@ -376,7 +358,7 @@ function modelsDevPreviewNode(preview) {
   return h("div", { class: "models-dev-preview" }, [
     h("p", [h("strong", "来源 · "), `${source.providerId || ""} · ${source.name || source.modelId || ""}`]),
     h("ul", nodeRows),
-    h("p", { class: "models-dev-preview-note" }, "首个价格阶梯会同步为压缩触发 Token；Fast 会同步来源给出的请求参数、请求头和有效费率，但不会自动开启当前会话的 Fast。不会修改上游模型 ID、Base URL、主力/压缩模型。"),
+    h("p", { class: "models-dev-preview-note" }, "首个价格阶梯会同步为压缩触发 Token；Fast 会同步来源给出的请求参数、请求头和有效费率，但不会自动开启当前会话的 Fast。不会修改上游模型 ID、Base URL、主力模型。"),
   ]);
 }
 function modelDisplayName(model) {
@@ -404,7 +386,6 @@ function providerInitial(provider) {
 function providerTone(provider) {
   if (!provider?.enabled) return "is-disabled";
   if (provider?.primary) return "is-primary";
-  if (provider?.compression) return "is-compression";
   return "is-enabled";
 }
 function modelsTextFromFetched(rows = []) {
@@ -470,7 +451,7 @@ function validateModelForm() {
   if (!modelForm.capText && !modelForm.capImage) throw new Error("模型能力至少选择文本或图片之一");
   const contextWindow = numericValue("上下文窗口", modelForm.contextWindow, { min: 1, integer: true });
   const maxTokens = numericValue("最大输出", modelForm.maxTokens, { min: 1, integer: true });
-  const compactTriggerTokens = numericValue("压缩触发 Token", modelForm.compactTriggerTokens, { min: 0, integer: true });
+  const rolloverTriggerTokens = numericValue("压缩触发 Token", modelForm.rolloverTriggerTokens, { min: 0, integer: true });
   const cost = {
     input: numericValue("输入费用", modelForm.cost.input, { min: 0 }),
     output: numericValue("输出费用", modelForm.cost.output, { min: 0 }),
@@ -480,7 +461,7 @@ function validateModelForm() {
   };
   const levels = modelForm.reasoning ? syncThinkingLevelsFromText({ forceLast: false }) : [];
   if (modelForm.reasoning && modelForm.defaultThinkingLevel && !levels.includes(modelForm.defaultThinkingLevel)) throw new Error("默认思考强度必须来自支持思考强度列表");
-  return { contextWindow, maxTokens, compactTriggerTokens, cost, thinkingLevels: levels.join(","), defaultThinkingLevel: modelForm.reasoning ? (modelForm.defaultThinkingLevel || "") : "" };
+  return { contextWindow, maxTokens, rolloverTriggerTokens, cost, thinkingLevels: levels.join(","), defaultThinkingLevel: modelForm.reasoning ? (modelForm.defaultThinkingLevel || "") : "" };
 }
 function cloneCostTable(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -526,7 +507,7 @@ function metadataFromModel(row) {
       supportsFast: Boolean(row?.supportsFast),
       fastCost: cloneCostTable(row?.fastCost),
       fastRequest: cloneFastRequest(row?.fastRequest),
-      compactTriggerTokens: Number(row?.compactTriggerTokens || 0),
+      rolloverTriggerTokens: Number(row?.rolloverTriggerTokens || 0),
       contextWindow: Number(row?.contextWindow || 128000),
       maxTokens: Number(row?.maxTokens || 8192),
       cost: { input: row?.cost?.input || 0, output: row?.cost?.output || 0, cacheRead: row?.cost?.cacheRead || 0, cacheWrite: row?.cost?.cacheWrite || 0, tiers: Array.isArray(row?.cost?.tiers) ? row.cost.tiers.map((tier) => ({ ...tier })) : [] },
@@ -542,7 +523,7 @@ function applyModelMetadata(meta) {
     reasoningOptions: Array.isArray(data.reasoningOptions) ? data.reasoningOptions : [],
     thinkingLevels: String(data.thinkingLevels || ""),
     defaultThinkingLevel: String(data.defaultThinkingLevel || ""),
-    compactTriggerTokens: Number(data.compactTriggerTokens || 0),
+    rolloverTriggerTokens: Number(data.rolloverTriggerTokens || 0),
     contextWindow: Number(data.contextWindow || 128000),
     maxTokens: Number(data.maxTokens || 8192),
     cost: { input: data.cost?.input || 0, output: data.cost?.output || 0, cacheRead: data.cost?.cacheRead || 0, cacheWrite: data.cost?.cacheWrite || 0, tiers: Array.isArray(data.cost?.tiers) ? data.cost.tiers.map((tier) => ({ ...tier })) : [] },
@@ -584,7 +565,7 @@ function payloadWithMetadataForRow(row, meta) {
     supportsFast: Boolean(fast?.supportsFast),
     fastCost: cloneCostTable(fast?.fastCost),
     fastRequest: cloneFastRequest(fast?.fastRequest),
-    compactTriggerTokens: Number(data.compactTriggerTokens || 0),
+    rolloverTriggerTokens: Number(data.rolloverTriggerTokens || 0),
     input: input.length ? input : ["text"],
     contextWindow: Number(data.contextWindow || 128000),
     maxTokens: Number(data.maxTokens || 8192),
@@ -846,7 +827,6 @@ async function loadList(preferred = selectedName.value) {
     providers.value = items(data);
     overview.value = data.overview || { stats: {} };
     primaryModel.value = data.primaryModel || "";
-    applyCompressionData(data);
     if (data.modelsDev) modelsDev.value = data.modelsDev;
     const next = preferred && providers.value.some((p) => p.name === preferred) ? preferred : providers.value[0]?.name || "";
     if (next) await loadProvider(next);
@@ -863,7 +843,6 @@ async function loadProvider(name) {
     const data = okOrThrow(await Api.channel(name));
     detail.value = data;
     primaryModel.value = data.primaryModel || primaryModel.value;
-    applyCompressionData(data);
     if (data.modelsDev) modelsDev.value = data.modelsDev;
   } catch (error) {
     ElMessage.error(apiError(error));
@@ -922,7 +901,7 @@ async function saveProvider() {
 async function removeProvider() {
   const name = selectedName.value;
   if (!name) return;
-  await ElMessageBox.confirm(`删除渠道 ${name}？如果它承载主力/压缩模型会被后端拒绝。`, "确认删除", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+  await ElMessageBox.confirm(`删除渠道 ${name}？如果它承载主力模型会被后端拒绝。`, "确认删除", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
   try {
     okOrThrow(await Api.deleteChannel(name));
     ElMessage.success("渠道已删除");
@@ -933,7 +912,7 @@ function openCreateModel() {
   modelMode.value = "create";
   modelsDevSourceMode.value = "same-id";
   const defaultProviderId = selectedProvider.value?.modelsDevProviderId || "";
-  Object.assign(modelForm, { id: "", oldId: "", name: "", capText: true, capImage: false, reasoning: false, reasoningOptions: [], thinkingLevels: "", defaultThinkingLevel: "", supportsFast: false, fastCost: {}, fastRequest: null, compactTriggerTokens: 0, contextWindow: 128000, maxTokens: 8192, modelsDevProviderId: defaultProviderId, modelsDevModelId: "", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [] } });
+  Object.assign(modelForm, { id: "", oldId: "", name: "", capText: true, capImage: false, reasoning: false, reasoningOptions: [], thinkingLevels: "", defaultThinkingLevel: "", supportsFast: false, fastCost: {}, fastRequest: null, rolloverTriggerTokens: 0, contextWindow: 128000, maxTokens: 8192, modelsDevProviderId: defaultProviderId, modelsDevModelId: "", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [] } });
   void loadModelsDevProviders();
   if (defaultProviderId) void loadModelsDevModels(defaultProviderId);
   modelDialog.value = true;
@@ -959,7 +938,7 @@ function openEditModel(row) {
     supportsFast: Boolean(row.supportsFast),
     fastCost: cloneCostTable(row.fastCost),
     fastRequest: cloneFastRequest(row.fastRequest),
-    compactTriggerTokens: Number(row.compactTriggerTokens || 0),
+    rolloverTriggerTokens: Number(row.rolloverTriggerTokens || 0),
     contextWindow: row.contextWindow || 128000,
     maxTokens: row.maxTokens || 8192,
     modelsDevProviderId: sourceProviderId,
@@ -986,7 +965,7 @@ function modelPayload(validated = validateModelForm()) {
     supportsFast: Boolean(modelForm.supportsFast),
     fastCost: cloneCostTable(modelForm.fastCost),
     fastRequest: cloneFastRequest(modelForm.fastRequest),
-    compactTriggerTokens: validated.compactTriggerTokens,
+    rolloverTriggerTokens: validated.rolloverTriggerTokens,
     input: input.length ? input : ["text"],
     contextWindow: validated.contextWindow,
     maxTokens: validated.maxTokens,
@@ -1109,66 +1088,12 @@ async function confirmSetPrimary(row) {
   await ElMessageBox.confirm(`将「${modelDisplayName(row)}」设为主力模型？`, "确认设置主力", { type: "warning", confirmButtonText: "设为主力", cancelButtonText: "取消" });
   await setPrimary(row);
 }
-async function setCompressionModels(models = []) {
-  if (compressionOrderSaving.value) return;
-  compressionOrderSaving.value = true;
-  try {
-    okOrThrow(await Api.setCompressionModel(models));
-    await loadList(selectedName.value);
-    ElMessage.success(models.length ? "压缩模型已更新" : "压缩模型已清空");
-  } catch (error) { ElMessage.error(apiError(error)); }
-  finally { compressionOrderSaving.value = false; }
-}
-async function persistCompressionOrder() {
-  if (compressionOrderSaving.value) return;
-  const ordered = compressionOrderFullnames(compressionOrderItems.value);
-  const previous = compressionModels.value.slice();
-  if (ordered.length === previous.length && ordered.every((item, index) => item === previous[index])) return;
-  compressionOrderSaving.value = true;
-  try {
-    okOrThrow(await Api.setCompressionModel(ordered));
-    compressionModels.value = ordered;
-    ElMessage.success("压缩执行顺序已更新");
-  } catch (error) {
-    compressionModels.value = previous;
-    compressionOrderItems.value = buildCompressionOrderItems(previous, compressionOrderItems.value);
-    ElMessage.error(apiError(error));
-  } finally { compressionOrderSaving.value = false; }
-}
-async function confirmRemoveCompressionCandidate(item) {
-  if (compressionOrderSaving.value || !item?.fullname) return;
-  try {
-    await ElMessageBox.confirm(
-      `将「${item.name || item.id || item.fullname}」移出压缩候选？这不会删除模型。`,
-      "确认移出压缩候选",
-      { type: "warning", confirmButtonText: "移出候选", cancelButtonText: "取消" },
-    );
-  } catch (action) {
-    if (action === "cancel" || action === "close") return;
-    throw action;
-  }
-  await setCompressionModels(compressionModels.value.filter((fullname) => fullname !== item.fullname));
-}
-async function clearCompressionModels() {
-  await setCompressionModels([]);
-}
-async function toggleCompression(row) {
-  if (!row?.fullname) return;
-  const current = compressionModels.value.slice();
-  const exists = current.includes(row.fullname);
-  const next = exists ? current.filter((item) => item !== row.fullname) : [...current, row.fullname];
-  await setCompressionModels(next);
-}
-async function confirmSetCompression(row) {
-  if (!row?.fullname) return;
-  const exists = compressionModels.value.includes(row.fullname);
-  if (exists) {
-    await ElMessageBox.confirm(`从压缩候选中移除「${modelDisplayName(row)}」？`, "确认移除压缩模型", { type: "warning", confirmButtonText: "移除", cancelButtonText: "取消" });
-  } else {
-    await ElMessageBox.confirm(`将「${modelDisplayName(row)}」追加为压缩候选？候选会按设置顺序尝试，全部失败后回退主模型。`, "确认设置压缩模型", { type: "warning", confirmButtonText: "追加为压缩", cancelButtonText: "取消" });
-  }
-  await toggleCompression(row);
-}
+
+
+
+
+
+
 async function testModel(row) {
   if (!selectedName.value || !row?.id) return;
   const key = `model:${row.fullname}`;
@@ -1246,7 +1171,7 @@ onBeforeUnmount(() => {
     <header class="h-14 shrink-0 flex items-center justify-between px-3 sm:px-6 border-b border-macborder bg-white/75 backdrop-blur">
       <div class="flex items-center gap-2 min-w-0">
         <h1 class="text-base font-semibold whitespace-nowrap">渠道管理</h1>
-        <span class="hidden md:inline text-xs text-macsub truncate">模型渠道、主力与压缩模型、连通性测试与费用配置</span>
+        <span class="hidden md:inline text-xs text-macsub truncate">模型渠道、默认模型、连通性测试与费用配置</span>
       </div>
       <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
         <!-- 元数据状态与刷新一体化：去歧义，状态清晰 -->
@@ -1308,108 +1233,6 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <!-- 压缩执行顺序：支持折叠/收起，默认极简单行，按需展开拖拽排序 -->
-    <section class="compression-strategy-wrap px-3 sm:px-6 pt-2.5 shrink-0" aria-label="压缩执行顺序">
-      <div class="mac-panel mac-shadow compression-strategy-panel">
-        <!-- 紧凑头部：整行可点击展开/收起，按钮更突出，明确引导 -->
-        <div
-          class="compression-compact-bar px-3 sm:px-4 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer select-none"
-          title="点击展开或收起压缩候选队列"
-          @click="isCompressionPanelExpanded = !isCompressionPanelExpanded"
-        >
-          <div class="flex items-center gap-2.5 min-w-0 flex-1">
-            <span class="compression-strategy-mark-sm" aria-hidden="true">
-              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M5.8 4.2h12.4A1.8 1.8 0 0 1 20 6v12a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 18V6a1.8 1.8 0 0 1 1.8-1.8Zm2 3v2h8.4v-2H7.8Zm0 4v2h6.8v-2H7.8Zm0 4v2h5v-2h-5Z"/></svg>
-            </span>
-            <span class="font-semibold text-zinc-900 whitespace-nowrap">压缩执行顺序</span>
-            <span class="mini-chip">{{ compressionOrderItems.length }} 个候选</span>
-            <span class="text-macsub text-[11px] truncate hidden md:inline">
-              从左到右尝试，首个成功者完成压缩；全部失败后回退至主力模型 ({{ primaryModel || '未配置主力' }})
-            </span>
-            <span class="text-[10px] text-zinc-400 hidden lg:inline">（点击整行可展开调整）</span>
-          </div>
-          <div class="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              class="compression-toggle-btn"
-              :class="{ 'is-expanded': isCompressionPanelExpanded }"
-              :title="isCompressionPanelExpanded ? '点击收起队列' : '点击展开调整候选优先级'"
-              @click.stop="isCompressionPanelExpanded = !isCompressionPanelExpanded"
-            >
-              <span>{{ isCompressionPanelExpanded ? '收起队列' : '⚙️ 调整排序与队列' }}</span>
-              <span class="text-[9px]">{{ isCompressionPanelExpanded ? '▲' : '▼' }}</span>
-            </button>
-            <button
-              v-if="compressionOrderItems.length"
-              type="button"
-              class="mac-small-button text-zinc-500 hover:text-zinc-800"
-              :disabled="compressionOrderSaving"
-              title="清空压缩候选队列"
-              @click.stop="clearCompressionModels"
-            >清空</button>
-          </div>
-        </div>
-
-        <div v-if="isCompressionPanelExpanded" class="compression-strategy-body border-t border-macborder/70 p-3 sm:p-4 bg-zinc-50/50">
-          <div class="compression-order-scroll">
-            <div class="compression-order-track">
-              <draggable
-                v-if="compressionOrderItems.length"
-                :list="compressionOrderItems"
-                item-key="fullname"
-                handle=".compression-drag"
-                ghost-class="compression-drag-ghost"
-                class="compression-candidate-list"
-                :disabled="compressionOrderSaving"
-                @end="persistCompressionOrder"
-              >
-                <template #item="{ element, index }">
-                  <div class="compression-candidate-wrap">
-                    <article class="compression-candidate">
-                      <button class="compression-drag" title="拖动调整压缩优先级">⋮⋮</button>
-                      <span class="compression-rank">{{ index + 1 }}</span>
-                      <span class="compression-candidate-copy">
-                        <strong :title="element.name || element.id">{{ element.name || element.id }}</strong>
-                        <code :title="element.fullname">{{ element.fullname }}</code>
-                        <em>第 {{ index + 1 }} 压缩候选</em>
-                      </span>
-                      <span class="compression-remove-control">
-                        <button
-                          title="移出压缩候选，不会删除模型"
-                          :aria-label="`将 ${element.name || element.id} 移出压缩候选`"
-                          :disabled="compressionOrderSaving"
-                          @click="confirmRemoveCompressionCandidate(element)"
-                        >×</button>
-                      </span>
-                    </article>
-                    <span v-if="index < compressionOrderItems.length - 1" class="compression-arrow" aria-hidden="true">→</span>
-                  </div>
-                </template>
-              </draggable>
-              <div v-else class="compression-empty">当前没有专用压缩候选，将直接使用当前会话或 Agent 模型。</div>
-              <div class="compression-fallback-connector" aria-hidden="true">
-                <span class="connector-line"></span>
-                <span class="connector-arrow">→</span>
-              </div>
-              <article class="compression-fallback">
-                <span class="compression-fallback-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M12 2.8a5.2 5.2 0 0 1 5.2 5.2v2h.7a1.8 1.8 0 0 1 1.8 1.8v7.1a1.8 1.8 0 0 1-1.8 1.8H6.1a1.8 1.8 0 0 1-1.8-1.8v-7.1A1.8 1.8 0 0 1 6.1 10h.7V8A5.2 5.2 0 0 1 12 2.8Zm0 2A3.2 3.2 0 0 0 8.8 8v2h6.4V8A3.2 3.2 0 0 0 12 4.8Z"/></svg>
-                </span>
-                <span class="compression-fallback-copy">
-                  <em>全部候选失败后</em>
-                  <strong>当前会话 / Agent 模型</strong>
-                  <code :title="primaryModel || '未配置主力模型'">默认：{{ primaryModel || '未配置主力模型' }}</code>
-                </span>
-                <span class="mini-chip fallback-chip">终态回退</span>
-              </article>
-            </div>
-          </div>
-          <div class="compression-strategy-foot mt-2 text-[11px] text-zinc-400">
-            <span>拖动候选卡片调整优先级顺序；点击卡片右侧 × 仅移出候选队列，不会删除模型。</span>
-          </div>
-        </div>
-      </div>
-    </section>
 
     <!-- 移动端渠道横向快捷切换栏 (仅在 lg:hidden 窄屏显示) -->
     <div class="lg:hidden flex items-center gap-2 overflow-x-auto px-3 py-2 border-b border-macborder bg-white/70 backdrop-blur shrink-0">
@@ -1424,7 +1247,7 @@ onBeforeUnmount(() => {
         <span class="provider-avatar-mini" :class="providerTone(p)">{{ providerInitial(p) }}</span>
         <span class="mobile-pill-name">{{ p.name }}</span>
         <span v-if="p.primary" class="role-badge-dot is-primary" title="主力">主</span>
-        <span v-else-if="p.compression" class="role-badge-dot is-comp" title="压缩">压</span>
+
         <span v-if="!p.enabled" class="role-badge-dot is-muted" title="停用">停</span>
       </button>
       <button class="mobile-channel-pill-add" title="添加渠道" @click="openCreateProvider">＋ 渠道</button>
@@ -1450,7 +1273,7 @@ onBeforeUnmount(() => {
                     <span class="truncate text-sm font-medium text-zinc-950">{{ p.name }}</span>
                     <span v-if="!p.enabled" class="mini-chip is-muted">停用</span>
                     <span v-if="p.primary" class="mini-chip is-highlight-primary">主力</span>
-                    <span v-if="p.compression" class="mini-chip is-highlight-comp">压缩</span>
+
                   </span>
                   <span class="mt-0.5 block truncate text-[11px] text-zinc-500">{{ protocolLabel(p.protocol) }} · {{ p.modelCount }} 模型</span>
                   <span class="mt-1 flex items-center justify-between gap-2 text-[11px] text-zinc-400">
@@ -1478,7 +1301,7 @@ onBeforeUnmount(() => {
                   <span class="mini-chip" :class="selectedProvider.enabled ? 'is-enabled' : 'is-muted'">{{ selectedProvider.enabled ? '已启用' : '已停用' }}</span>
                   <span class="mini-chip">{{ protocolLabel(selectedProvider.protocol) }}</span>
                   <span v-if="selectedProvider.primary" class="role-badge role-badge--primary">★ 承载主力模型</span>
-                  <span v-if="selectedProvider.compression" class="role-badge role-badge--comp">⚡ 承载压缩候选</span>
+
                 </div>
                 <!-- URL与Key并排在同一行，告别空旷 -->
                 <div class="mt-2.5 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs text-zinc-600">
@@ -1539,7 +1362,7 @@ onBeforeUnmount(() => {
               </div>
               <div class="flex items-center gap-2 flex-wrap">
                 <button class="mac-small-button" :disabled="!modelsDev.available || batchModelsDevLoading" @click="openModelsDevBatch">{{ batchModelsDevLoading ? '匹配中…' : '批量同步元数据' }}</button>
-                <button class="mac-small-button" :disabled="!compressionModels.length" title="清空专用压缩候选，使压缩回退跟随主力模型" @click="clearCompressionModels">压缩跟随主力</button>
+
                 <button class="mac-small-button mac-primary-button" @click="openCreateModel">＋ 添加模型</button>
               </div>
             </div>
@@ -1557,7 +1380,7 @@ onBeforeUnmount(() => {
               @end="persistModelOrder"
             >
               <template #item="{ element: row }">
-                <article class="model-card" :class="{ 'is-primary-card': row.primary, 'is-compression-card': row.compression }">
+                <article class="model-card" :class="{ 'is-primary-card': row.primary }">
                   <!-- 1. 头部：把手 + 显示名与ID同行 + 状态药丸 -->
                   <div class="model-head">
                     <button class="model-drag" :disabled="Boolean(modelSearchQuery)" :title="modelSearchQuery ? '搜索状态下暂停拖动' : '拖动排序'">⋮⋮</button>
@@ -1568,7 +1391,7 @@ onBeforeUnmount(() => {
                             {{ modelDisplayName(row) }}
                           </button>
                         </div>
-                        <!-- 核心功能点高亮区域：主力设置与压缩设置 -->
+                        <!-- 核心功能点高亮区域：主力设置 -->
                         <div class="model-role-actions shrink-0" aria-label="模型角色管理">
                           <button
                             type="button"
@@ -1580,16 +1403,7 @@ onBeforeUnmount(() => {
                             <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M12 3.2l2.5 5.1 5.6.8-4 3.9.9 5.5-5-2.6-5 2.6.9-5.5-4-3.9 5.6-.8L12 3.2z"/></svg>
                             <span>{{ row.primary ? '主力模型' : '设为主力' }}</span>
                           </button>
-                          <button
-                            type="button"
-                            class="role-pill role-pill--comp"
-                            :class="{ 'is-active': row.compression }"
-                            :title="row.compression ? `第 ${compressionRank(row)} 压缩候选（点击移出）` : '点击加入压缩候选队列'"
-                            @click="confirmSetCompression(row)"
-                          >
-                            <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M4.8 6.5c0-1 .8-1.8 1.8-1.8h10.8c1 0 1.8.8 1.8 1.8v11c0 1-.8 1.8-1.8 1.8H6.6c-1 0-1.8-.8-1.8-1.8v-11zm3 1.2v1.8h8.4V7.7H7.8zm0 4v1.8h6.7v-1.8H7.8zm0 4v1.8h4.9v-1.8H7.8z"/></svg>
-                            <span>{{ row.compression ? `压缩 #${compressionRank(row)}` : '+ 压缩' }}</span>
-                          </button>
+
                         </div>
                       </div>
 
@@ -1613,7 +1427,7 @@ onBeforeUnmount(() => {
                     <div class="grid grid-cols-3 gap-1.5 text-xs">
                       <div class="soft-stat"><span>上下文</span><strong>{{ fmtCompact(row.contextWindow) }}</strong></div>
                       <div class="soft-stat"><span>最大输出</span><strong>{{ fmtCompact(row.maxTokens) }}</strong></div>
-                      <div class="soft-stat"><span>压缩触发</span><strong>{{ row.compactTriggerTokens ? fmtCompact(row.compactTriggerTokens) : '按比例' }}</strong></div>
+                      <div class="soft-stat"><span>压缩触发</span><strong>{{ row.rolloverTriggerTokens ? fmtCompact(row.rolloverTriggerTokens) : '按比例' }}</strong></div>
                     </div>
                     <div class="rate-row mt-2">
                       <span v-for="cost in modelCost(row)" :key="cost.label"><em>{{ cost.label }}</em><strong>${{ cost.value }}/1M</strong></span>
@@ -1776,7 +1590,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="dialog-grid span-2 triple-grid">
           <label class="mac-field"><span>上下文窗口</span><input v-model.number="modelForm.contextWindow" class="mac-input" type="number" min="1" /></label>
-          <label class="mac-field"><span>压缩触发 Token</span><input v-model.number="modelForm.compactTriggerTokens" class="mac-input" type="number" min="0" placeholder="0=按全局比例" /></label>
+          <label class="mac-field"><span>压缩触发 Token</span><input v-model.number="modelForm.rolloverTriggerTokens" class="mac-input" type="number" min="0" placeholder="0=按全局比例" /></label>
           <label class="mac-field"><span>最大输出</span><input v-model.number="modelForm.maxTokens" class="mac-input" type="number" min="1" /></label>
         </div>
         <div class="mac-field span-2"><span>费用 / 1M tokens</span><div class="price-grid"><label><em>输入</em><input v-model.number="modelForm.cost.input" type="number" min="0" step="0.0001" /></label><label><em>输出</em><input v-model.number="modelForm.cost.output" type="number" min="0" step="0.0001" /></label><label><em>缓存读</em><input v-model.number="modelForm.cost.cacheRead" type="number" min="0" step="0.0001" /></label><label><em>缓存写</em><input v-model.number="modelForm.cost.cacheWrite" type="number" min="0" step="0.0001" /></label></div></div>
@@ -1870,7 +1684,7 @@ onBeforeUnmount(() => {
             </div>
           </article>
         </div>
-        <p class="batch-sync-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"/><path d="M12 10v5M12 7h.01"/></svg>同步会写入本次预览的公共元数据，包括 Fast 支持、请求配置与有效费率；不会修改上游模型 ID、渠道地址或主力/压缩模型。首个价格阶梯的 Token 阈值会同步为压缩触发 Token。</p>
+        <p class="batch-sync-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"/><path d="M12 10v5M12 7h.01"/></svg>同步会写入本次预览的公共元数据，包括 Fast 支持、请求配置与有效费率；不会修改上游模型 ID、渠道地址或主力模型。首个价格阶梯的 Token 阈值会同步为压缩触发 Token。</p>
       </div>
       <template #footer>
         <div class="dialog-footer">
@@ -1913,47 +1727,7 @@ onBeforeUnmount(() => {
 .mac-dialog-button.is-primary { border-color: rgba(82,82,91,.22); background: linear-gradient(180deg, #3f3f46, #27272a); color: #fff; }
 .is-danger { color: #a61b1b; border-color: rgba(239,68,68,.22); }
 button:disabled { cursor: not-allowed; opacity: .48; }
-.compression-strategy-panel { overflow: hidden; }
-.compression-strategy-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid rgba(228,228,231,.86); padding: 13px 16px 11px; }
-.compression-strategy-heading { display: flex; min-width: 0; align-items: center; gap: 11px; }
-.compression-strategy-mark { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border: 1px solid #e4e4e7; border-radius: 12px; background: linear-gradient(145deg, #fff, #f4f4f5); color: #52525b; box-shadow: 0 2px 6px rgba(24,24,27,.06); }
-.compression-strategy-mark svg { width: 18px; height: 18px; fill: currentColor; }
-.compression-strategy-title { display: flex; align-items: center; gap: 8px; }
-.compression-strategy-title h2 { margin: 0; color: #1d1d1f; font-size: 14px; font-weight: 680; letter-spacing: -.01em; }
-.compression-strategy-heading p { margin: 3px 0 0; color: #86868b; font-size: 11px; line-height: 1.4; }
-.compression-strategy-body { background: linear-gradient(180deg, rgba(250,250,251,.58), rgba(255,255,255,.92)); padding: 13px 16px 10px; }
-.compression-order-scroll { overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 0; width: 100%; scrollbar-width: thin; }
-.compression-order-track { display: flex; width: max-content; min-width: 100%; align-items: stretch; gap: 8px; }
-.compression-candidate-list { display: flex; flex-shrink: 0; align-items: stretch; gap: 8px; }
-.compression-candidate-wrap { display: flex; flex-shrink: 0; align-items: stretch; gap: 8px; }
-.compression-candidate { display: grid; width: 245px; min-width: 245px; flex-shrink: 0; min-height: 74px; grid-template-columns: 18px 30px minmax(0,1fr) 24px; align-items: center; gap: 6px; border: 1px solid rgba(228,228,231,.96); border-radius: 15px; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,250,.92)); padding: 9px 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 4px 14px rgba(24,24,27,.045); transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, opacity .16s ease; }
-.compression-candidate:hover { transform: translateY(-1px); border-color: #a1a1aa; box-shadow: 0 8px 22px rgba(24,24,27,.07); }
-.compression-drag { width: 18px; height: 100%; border: 0; background: transparent; color: #a1a1aa; cursor: grab; font-size: 14px; letter-spacing: -3px; }
-.compression-drag:active { cursor: grabbing; }
-.compression-drag-ghost { opacity: .45; }
-.compression-rank { display: grid; width: 31px; height: 31px; place-items: center; border-radius: 11px; background: linear-gradient(180deg, #f4f4f5, #e4e4e7); color: #52525b; font-size: 12px; font-weight: 760; box-shadow: inset 0 0 0 1px rgba(255,255,255,.72); }
-.compression-candidate-copy { display: block; min-width: 0; }
-.compression-candidate-copy strong { display: block; overflow: hidden; color: #27272a; font-size: 13px; font-weight: 690; text-overflow: ellipsis; white-space: nowrap; }
-.compression-candidate-copy code { display: block; margin-top: 3px; overflow: hidden; color: #8b8b91; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
-.compression-candidate-copy em { display: inline-flex; margin-top: 5px; color: #71717a; font-size: 9.5px; font-style: normal; font-weight: 620; }
-.compression-remove-control { display: grid; place-items: center; }
-.compression-remove-control button { display: grid; width: 24px; height: 24px; place-items: center; border: 1px solid #e4e4e7; border-radius: 8px; background: rgba(255,255,255,.84); color: #71717a; font-size: 16px; line-height: 1; transition: border-color .14s ease, color .14s ease, background .14s ease, transform .14s ease; }
-.compression-remove-control button:hover:not(:disabled) { transform: translateY(-1px); border-color: #a1a1aa; background: #f4f4f5; color: #3f3f46; }
-.compression-arrow { display: grid; width: 24px; flex: 0 0 24px; place-items: center; color: #bbb8c2; font-size: 16px; }
-.compression-fallback-connector { display: flex; flex: 0 0 32px; width: 32px; align-items: center; justify-content: center; position: relative; }
-.compression-fallback-connector .connector-line { position: absolute; left: 0; right: 0; top: 50%; border-top: 1.5px dashed #d4d4d8; z-index: 0; }
-.compression-fallback-connector .connector-arrow { position: relative; z-index: 1; background: #fafafb; padding: 0 4px; color: #8e8e93; font-size: 12px; font-weight: bold; }
-.compression-fallback { display: grid; width: 255px; min-width: 255px; flex-shrink: 0; min-height: 74px; grid-template-columns: 35px minmax(0,1fr) auto; align-items: center; gap: 8px; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.86); padding: 9px; }
-.compression-fallback-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 12px; background: linear-gradient(180deg, #f4f4f5, #e4e4e7); color: #52525b; box-shadow: inset 0 0 0 1px rgba(212,212,216,.72); }
-.compression-fallback-icon svg { width: 16px; height: 16px; fill: currentColor; }
-.compression-fallback-copy { display: block; min-width: 0; }
-.compression-fallback-copy em { display: block; color: #a1a1aa; font-size: 9px; font-style: normal; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
-.compression-fallback-copy strong { display: block; margin-top: 3px; overflow: hidden; color: #3f3f46; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.compression-fallback-copy code { display: block; margin-top: 3px; overflow: hidden; color: #8b8b91; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.compression-empty { display: grid; min-width: 320px; min-height: 74px; flex: 1 1 auto; place-items: center; border: 1px dashed #d4d4d8; border-radius: 15px; background: rgba(250,250,250,.72); color: #86868b; font-size: 11px; padding: 0 16px; text-align: center; }
 .fallback-chip { background: #ede9fe; color: #6d28d9; border: 1px solid #ddd6fe; font-weight: 600; }
-.compression-strategy-foot { display: flex; align-items: center; gap: 7px; margin-top: 9px; color: #8a8990; font-size: 10px; }
-.compression-strategy-foot i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #a1a1aa; box-shadow: 0 0 0 3px rgba(161,161,170,.12); }
 .provider-row { display: flex; align-items: stretch; gap: 3px; }
 .provider-row:hover { background: rgba(244,244,245,.78); }
 .provider-row.is-active { background: rgba(228,228,231,.78); }
@@ -1967,7 +1741,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .provider-avatar::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 10px; height: 10px; border: 2px solid #fff; border-radius: 999px; background: #a1a1aa; }
 .provider-avatar.is-enabled::after { background: #34c759; }
 .provider-avatar.is-primary::after { background: #007aff; }
-.provider-avatar.is-compression::after { background: #8e8e93; }
 .provider-avatar.is-disabled { opacity: .62; }
 .provider-avatar.is-disabled::after { background: #ff3b30; }
 .provider-avatar--lg { width: 38px; height: 38px; border-radius: 14px; }
@@ -2020,7 +1793,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .status-icon:hover { transform: translateY(-1px); filter: saturate(1.08); box-shadow: inset 0 0 0 1px rgba(255,255,255,.6), 0 7px 16px rgba(24,24,27,.12); }
 .status-icon.is-inactive { color: #a1a1aa; background: linear-gradient(180deg, rgba(244,244,245,.95), rgba(228,228,231,.9)); box-shadow: inset 0 0 0 1px rgba(212,212,216,.9); }
 .feature-primary:not(.is-inactive) { color: #075985; background: linear-gradient(180deg, #e0f2fe, #bae6fd); }
-.feature-compression:not(.is-inactive) { color: #6d28d9; background: linear-gradient(180deg, #ede9fe, #ddd6fe); }
 .feature-multimodal { color: #047857; background: linear-gradient(180deg, #d1fae5, #a7f3d0); }
 .feature-fast { color: #b45309; background: linear-gradient(180deg, #fef3c7, #fde68a); }
 .thinking-row { display: flex; min-width: 0; align-items: center; gap: 8px; margin-top: 8px; color: #71717a; font-size: 11px; }
@@ -2189,10 +1961,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   border-color: rgba(56, 189, 248, 0.7) !important;
   box-shadow: 0 2px 10px rgba(2, 132, 199, 0.08), inset 0 0 0 1px rgba(56, 189, 248, 0.3) !important;
 }
-.is-compression-card {
-  border-color: rgba(192, 132, 252, 0.7) !important;
-  box-shadow: 0 2px 10px rgba(124, 58, 237, 0.08), inset 0 0 0 1px rgba(192, 132, 252, 0.3) !important;
-}
 .model-role-actions {
   display: inline-flex;
   flex: 0 0 auto;
@@ -2231,22 +1999,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   border-color: #7dd3fc;
   box-shadow: 0 1px 3px rgba(3, 105, 161, 0.15);
 }
-.role-pill--comp {
-  color: #64748b;
-  background: rgba(244, 244, 245, 0.9);
-  border-color: rgba(228, 228, 231, 0.9);
-}
-.role-pill--comp:hover {
-  color: #7c3aed;
-  background: #ede9fe;
-  border-color: #ddd6fe;
-}
-.role-pill--comp.is-active {
-  color: #6d28d9;
-  background: linear-gradient(180deg, #ede9fe, #ddd6fe);
-  border-color: #c4b5fd;
-  box-shadow: 0 1px 3px rgba(109, 40, 217, 0.15);
-}
 .role-badge {
   display: inline-flex;
   align-items: center;
@@ -2260,11 +2012,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   background: #e0f2fe;
   color: #0284c7;
   border: 1px solid #bae6fd;
-}
-.role-badge--comp {
-  background: #ede9fe;
-  color: #7c3aed;
-  border: 1px solid #ddd6fe;
 }
 .model-sub-id {
   margin-top: 2px;
@@ -2322,12 +2069,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   border: 1px solid #bae6fd !important;
   font-weight: 600 !important;
 }
-.is-highlight-comp {
-  background: #ede9fe !important;
-  color: #7c3aed !important;
-  border: 1px solid #ddd6fe !important;
-  font-weight: 600 !important;
-}
 .mobile-channel-pill {
   display: inline-flex;
   align-items: center;
@@ -2371,7 +2112,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   font-weight: 700;
 }
 .role-badge-dot.is-primary { background: #38bdf8; color: #082f49; }
-.role-badge-dot.is-comp { background: #c084fc; color: #3b0764; }
 .role-badge-dot.is-muted { background: #a1a1aa; color: #fff; }
 .provider-avatar-mini {
   width: 18px;
@@ -2581,58 +2321,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 }
 
 /* === 折叠式压缩面板头部 === */
-.compression-strategy-mark-sm {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  border: 1px solid #e4e4e7;
-  border-radius: 8px;
-  background: linear-gradient(145deg, #fff, #f4f4f5);
-  color: #52525b;
-  flex-shrink: 0;
-}
-.compression-strategy-mark-sm svg {
-  width: 13px !important;
-  height: 13px !important;
-}
-.compression-compact-bar {
-  background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,251,.85));
-  transition: background-color 0.15s ease;
-}
-.compression-compact-bar:hover {
-  background: linear-gradient(180deg, #fbfbfe, #f4f4f8);
-}
-.compression-toggle-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 27px;
-  padding: 0 12px;
-  border-radius: 999px;
-  font-size: 11.5px;
-  font-weight: 600;
-  border: 1px solid rgba(192, 132, 252, 0.45);
-  background: linear-gradient(180deg, #faf5ff, #f3e8ff);
-  color: #6d28d9;
-  box-shadow: 0 1px 3px rgba(109, 40, 217, 0.08);
-  cursor: pointer;
-  transition: all 0.15s ease;
-  white-space: nowrap;
-}
-.compression-toggle-btn:hover {
-  background: linear-gradient(180deg, #f3e8ff, #e9d5ff);
-  border-color: rgba(168, 85, 247, 0.65);
-  color: #581c87;
-  transform: translateY(-1px);
-  box-shadow: 0 3px 8px rgba(109, 40, 217, 0.15);
-}
-.compression-toggle-btn.is-expanded {
-  background: linear-gradient(180deg, #f4f4f5, #e4e4e7);
-  border-color: #d4d4d8;
-  color: #52525b;
-  box-shadow: none;
-}
 </style>
 
 <style>
@@ -2665,104 +2353,10 @@ html.dark .is-danger {
 		color: #fb8585;
 		border-color: rgba(251, 133, 133, 0.22);
 	}
-html.dark .compression-strategy-head {
-		border-bottom: 1px solid rgba(61, 62, 70, 0.86);
-	}
-html.dark .compression-strategy-mark {
-		border: 1px solid #3d3e46;
-		background: linear-gradient(145deg, #1d1e22, #202125);
-		color: #c6c6cd;
-		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16);
-	}
-html.dark .compression-strategy-title h2 {
-		color: #efeff2;
-	}
-html.dark .compression-strategy-heading p {
-		color: #a1a1a8;
-	}
-html.dark .compression-strategy-body {
-		background: linear-gradient(180deg, rgba(29, 30, 34, 0.58), rgba(29, 30, 34, 0.92));
-	}
-html.dark .compression-candidate {
-		border: 1px solid rgba(61, 62, 70, 0.96);
-		background: linear-gradient(180deg, rgba(29, 30, 34, 0.98), rgba(29, 30, 34, 0.92));
-		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11), 0 4px 14px rgba(0, 0, 0, 0.16);
-	}
-html.dark .compression-candidate:hover {
-		border-color: #3d3e46;
-		box-shadow: 0 8px 22px rgba(0, 0, 0, 0.16);
-	}
-html.dark .compression-drag {
-		color: #a1a1a8;
-	}
-html.dark .compression-rank {
-		background: linear-gradient(180deg, #202125, #25262a);
-		color: #c6c6cd;
-		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.11);
-	}
-html.dark .compression-candidate-copy strong {
-		color: #efeff2;
-	}
-html.dark .compression-candidate-copy code {
-		color: #a1a1a8;
-	}
-html.dark .compression-candidate-copy em {
-		color: #c6c6cd;
-	}
-html.dark .compression-remove-control button {
-		border: 1px solid #3d3e46;
-		background: rgba(29, 30, 34, 0.84);
-		color: #c6c6cd;
-	}
-html.dark .compression-remove-control button:hover:not(:disabled) {
-		border-color: #3d3e46;
-		background: #202125;
-		color: #dedee1;
-	}
-html.dark .compression-arrow {
-		color: #7b7b82;
-	}
-html.dark .compression-fallback-connector .connector-line {
-		border-top: 1.5px dashed #3d3e46;
-	}
-html.dark .compression-fallback-connector .connector-arrow {
-		background: #1d1e22;
-		color: #a1a1a8;
-	}
-html.dark .compression-fallback {
-		border: 1px dashed #3d3e46;
-		background: rgba(29, 30, 34, 0.86);
-	}
-html.dark .compression-fallback-icon {
-		background: linear-gradient(180deg, #202125, #25262a);
-		color: #c6c6cd;
-		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.11);
-	}
-html.dark .compression-fallback-copy em {
-		color: #a1a1a8;
-	}
-html.dark .compression-fallback-copy strong {
-		color: #dedee1;
-	}
-html.dark .compression-fallback-copy code {
-		color: #a1a1a8;
-	}
-html.dark .compression-empty {
-		border: 1px dashed #3d3e46;
-		background: rgba(29, 30, 34, 0.72);
-		color: #a1a1a8;
-	}
 html.dark .fallback-chip {
 		background: #202125;
 		color: #c4b5fd;
 		border: 1px solid #3d3e46;
-	}
-html.dark .compression-strategy-foot {
-		color: #a1a1a8;
-	}
-html.dark .compression-strategy-foot i {
-		background: #313236;
-		box-shadow: 0 0 0 3px rgba(161, 161, 170, 0.12);
 	}
 html.dark .provider-row:hover {
 		background: rgba(32, 33, 37, 0.78);
@@ -2781,9 +2375,6 @@ html.dark .provider-avatar {
 	}
 html.dark .provider-avatar::after {
 		border: 2px solid #3d3e46;
-		background: #313236;
-	}
-html.dark .provider-avatar.is-compression::after {
 		background: #313236;
 	}
 html.dark .mini-chip {
@@ -2871,10 +2462,6 @@ html.dark .status-icon.is-inactive {
 html.dark .feature-primary:not(.is-inactive) {
 		color: #67d5ed;
 		background: linear-gradient(180deg, #202125, #154159);
-	}
-html.dark .feature-compression:not(.is-inactive) {
-		color: #c4b5fd;
-		background: linear-gradient(180deg, #202125, #25262a);
 	}
 html.dark .feature-multimodal {
 		color: #6ee7a2;
@@ -3235,9 +2822,6 @@ html.dark .test-result.is-bad {
 html.dark .is-primary-card {
 		border-color: rgba(103, 213, 237, 0.52) !important;
 	}
-html.dark .is-compression-card {
-		border-color: rgba(196, 181, 253, 0.52) !important;
-	}
 html.dark .role-pill--primary {
 		color: #c6c6cd;
 		background: rgba(32, 33, 37, 0.9);
@@ -3253,30 +2837,10 @@ html.dark .role-pill--primary.is-active {
 		background: linear-gradient(180deg, #202125, #154159);
 		border-color: rgba(103, 213, 237, 0.52);
 	}
-html.dark .role-pill--comp {
-		color: #c6c6cd;
-		background: rgba(32, 33, 37, 0.9);
-		border-color: rgba(61, 62, 70, 0.9);
-	}
-html.dark .role-pill--comp:hover {
-		color: #c4b5fd;
-		background: #202125;
-		border-color: #3d3e46;
-	}
-html.dark .role-pill--comp.is-active {
-		color: #c4b5fd;
-		background: linear-gradient(180deg, #202125, #25262a);
-		border-color: rgba(96, 165, 250, 0.52);
-	}
 html.dark .role-badge--primary {
 		background: #202125;
 		color: #67d5ed;
 		border: 1px solid rgba(103, 213, 237, 0.52);
-	}
-html.dark .role-badge--comp {
-		background: #202125;
-		color: #c4b5fd;
-		border: 1px solid #3d3e46;
 	}
 html.dark .model-sub-id code {
 		color: #a1a1a8;
@@ -3316,11 +2880,6 @@ html.dark .is-highlight-primary {
 		color: #67d5ed !important;
 		border: 1px solid rgba(103, 213, 237, 0.52) !important;
 	}
-html.dark .is-highlight-comp {
-		background: #202125 !important;
-		color: #c4b5fd !important;
-		border: 1px solid #3d3e46 !important;
-	}
 html.dark .mobile-channel-pill {
 		background: rgba(32, 33, 37, 0.95);
 		border: 1px solid rgba(61, 62, 70, 0.9);
@@ -3338,9 +2897,6 @@ html.dark .mobile-channel-pill-add {
 	}
 html.dark .role-badge-dot.is-primary {
 		color: #67d5ed;
-	}
-html.dark .role-badge-dot.is-comp {
-		color: #c4b5fd;
 	}
 html.dark .role-badge-dot.is-muted {
 		background: #313236;
@@ -3397,31 +2953,5 @@ html.dark .group-header {
 	}
 html.dark .group-header::before {
 		background: #313236;
-	}
-html.dark .compression-strategy-mark-sm {
-		border: 1px solid #3d3e46;
-		background: linear-gradient(145deg, #1d1e22, #202125);
-		color: #c6c6cd;
-	}
-html.dark .compression-compact-bar {
-		background: linear-gradient(180deg, rgba(29, 30, 34, 0.98), rgba(29, 30, 34, 0.85));
-	}
-html.dark .compression-compact-bar:hover {
-		background: linear-gradient(180deg, #1d1e22, #202125);
-	}
-html.dark .compression-toggle-btn {
-		border: 1px solid rgba(196, 181, 253, 0.45);
-		background: linear-gradient(180deg, #1d1e22, #202125);
-		color: #c4b5fd;
-	}
-html.dark .compression-toggle-btn:hover {
-		background: linear-gradient(180deg, #202125, #25262a);
-		border-color: rgba(196, 181, 253, 0.52);
-		color: #c4b5fd;
-	}
-html.dark .compression-toggle-btn.is-expanded {
-		background: linear-gradient(180deg, #202125, #25262a);
-		border-color: #3d3e46;
-		color: #c6c6cd;
 	}
 </style>

@@ -913,14 +913,17 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 if retry_status == "cancelled"
                 else "模型重试失败"
                 if retry_status == "failed"
-                else "继续运行"
+                else "模型重试成功"
+                if retry_status in {"completed", "complete"}
+                else "已发起模型重试"
             ),
             "source": "model_retry",
             "updatedAtMs": ts,
             "runId": execution_run_uuid,
         }
         specs.append(_operation_spec(
-            op_id=f"model-retry:{execution_run_uuid or turn_uuid or 'current'}:{attempt}",
+            op_id=f"model-retry:{execution_run_uuid or turn_uuid or 'current'}:"
+                  + (f"round-{int(retry['callRound'])}:" if retry.get('callRound') else "") + str(attempt),
             op_type="model_retry",
             action="start" if active else "end",
             turn_uuid=turn_uuid,
@@ -930,6 +933,31 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
             status=operation_status,
             lifecycle="active" if active else "terminal",
             source="model_retry",
+        ))
+        return specs
+
+    if typ == "context_compaction":
+        payload = {key: value for key, value in event.items() if key != "type"}
+        status = str(event.get("status") or "completed")
+        active = status == "running"
+        payload.update({"name": "ContextCompaction", "status": status, "active": active,
+                        "compactedOutput": str(payload.pop("summary", "") or ""), "updatedAtMs": ts})
+        specs.append(_operation_spec(
+            op_id=str(event.get("compactionId") or f"context-compaction:{event.get('ownerId')}:{event.get('windowVersion')}"),
+            op_type="context_compaction", action="start" if active else "end", turn_uuid=turn_uuid,
+            run_root_turn_uuid=run_root_turn_uuid, run_id=execution_run_uuid,
+            payload=payload, status=status, lifecycle="active" if active else "terminal", source="context_compaction",
+        ))
+        return specs
+
+    if typ == "context_window":
+        payload = {key: value for key, value in event.items() if key != "type"}
+        payload.update({"statusText": "上下文窗口已轮换", "active": False, "updatedAtMs": ts})
+        specs.append(_operation_spec(
+            op_id=f"context-window:{event.get('ownerId', '')}:{event.get('windowVersion', 0)}",
+            op_type="context_window", action="end", turn_uuid=turn_uuid,
+            run_root_turn_uuid=run_root_turn_uuid, run_id=execution_run_uuid,
+            payload=payload, status="completed", lifecycle="terminal", source="context_window",
         ))
         return specs
 
@@ -1120,7 +1148,7 @@ def _operation_target_fields(row: dict[str, Any], payload: dict[str, Any]) -> di
     run_id = str(payload.get("runId") or payload.get("run_id") or turn_uuid or "").strip()
     if task_uuid and op_type in {"agent", "agent_control", "notice"}:
         return {"targetType": "task", "targetId": task_uuid, "taskUuid": task_uuid, "runId": run_id}
-    if op_type in {"run", "user_message", "assistant_message", "reasoning", "tool", "user_interaction", "context_compaction", "status", "model_retry", "run_control", "stats"}:
+    if op_type in {"run", "user_message", "assistant_message", "reasoning", "tool", "user_interaction", "context_compaction", "context_window", "status", "model_retry", "run_control", "stats"}:
         return {"targetType": "run" if run_id else "conversation", "targetId": run_id, "taskUuid": task_uuid, "runId": run_id}
     if task_uuid:
         return {"targetType": "task", "targetId": task_uuid, "taskUuid": task_uuid, "runId": run_id}
@@ -1136,6 +1164,8 @@ _TOOL_SUMMARY_PAYLOAD_FIELDS = frozenset({
     "compactionId", "summaryId", "scope", "source", "beforeTokens",
     "afterTokens", "summaryChars", "summaryTokens", "upToMessageId",
     "outputAvailable", "outputPreview", "summaryRef",
+    "strategy", "beforeEstimateTokens", "afterEstimateTokens", "estimateOnly", "removedBatches", "retainedBatches",
+    "removedMessages", "retainedMessages", "compressionModel", "usage", "rolloverTriggerTokens",
 })
 _TOOL_SUMMARY_TEXT_CHARS = 512
 _TOOL_ERROR_STATUSES = {"failed", "cancelled", "interrupted"}

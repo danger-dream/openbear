@@ -11,8 +11,7 @@ test("authoritative unknown context never revives stale legacy tokens", () => {
   const resolved = resolveContextUsage({
     known: false,
     tokens: 0,
-    compactTriggerTokens: 1000,
-    manualMinPercent: 50,
+    rolloverTriggerTokens: 1000,
   }, 750);
 
   assert.equal(resolved.known, false);
@@ -28,12 +27,11 @@ test("legacy exact usage remains visible during rolling frontend/backend upgrade
   assert.equal(resolved.authoritative, false);
 });
 
-test("live provider stats replace state and a successful manual compaction invalidates it", () => {
+test("live provider stats replace state and a window rotation invalidates it", () => {
   const initial = {
     known: false,
     tokens: 0,
-    compactTriggerTokens: 1000,
-    manualMinPercent: 50,
+    rolloverTriggerTokens: 1000,
   };
   const live = mergeStatsContextUsage(initial, {
     available: true,
@@ -52,7 +50,7 @@ test("live provider stats replace state and a successful manual compaction inval
 });
 
 test("stats without a completed provider call cannot overwrite current context", () => {
-  const current = {known: true, tokens: 400, compactTriggerTokens: 1000};
+  const current = {known: true, tokens: 400, rolloverTriggerTokens: 1000};
   assert.equal(
     mergeStatsContextUsage(current, {available: false, known: false, tokens: 0}),
     current,

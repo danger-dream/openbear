@@ -115,7 +115,7 @@ def _project_task(value: dict[str, Any]) -> dict[str, Any]:
 def _project_event(value: dict[str, Any]) -> dict[str, Any] | None:
     kind = str(value.get("kind") or "")
     # Every model_* event is execution telemetry (request lifecycle, retry,
-    # streaming, accounting, or compaction). It remains in Rath/Web audit but
+    # streaming, accounting, or window rotation). It remains in Rath/Web audit but
     # has no role in controller supervision.
     if kind.startswith("model_") or kind in _INTERNAL_EVENT_KINDS:
         return None

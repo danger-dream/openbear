@@ -685,8 +685,194 @@ class RathDAO(AgentContinuityDAO):
         deleted["tasks"] = int(tasks.rowcount or 0)
         return {**empty, **deleted}
 
+    async def delete_task_suffix_records(
+        self, task_uuids: list[str], *, chat_id: int | None = None,
+        deleted_roots: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Time rollback, unlike ordinary task-history cleanup.
+
+        The caller's suffix transaction owns all stores. An independent instance
+        can only resume a surviving task's actual reliable checkpoint; a future
+        head, window, summary or provider session must never be reused.
+        """
+        from app.agent.native_continuation import (
+            deserialize_messages,
+            serialize_messages,
+            validate_model_context,
+        )
+        from app.context.store import ContextOwner, WindowStore
+        from app.context.window import mark_source, neutral_context, source_of
+
+        ids = list(dict.fromkeys(str(t) for t in task_uuids if t))
+        affected = []
+        conn = self._db.conn
+        # Ordinary task-history cleanup can deliberately leave an orphan head.
+        # Its checkpoint provenance, not a missing task row, determines whether
+        # it belongs to the removed roots. Unscoped orphan heads cannot be safely
+        # time-positioned, so make their continuation unavailable on rollback.
+        if chat_id is not None and deleted_roots:
+            cur = await conn.execute(
+                """SELECT s.session_uuid,s.context_task_uuid,c.state_json FROM rath_agent_sessions s
+                   JOIN rath_task_model_contexts c ON c.task_uuid=s.context_task_uuid
+                   WHERE s.chat_id=? AND s.session_kind='independent'
+                   AND NOT EXISTS (SELECT 1 FROM rath_tasks t WHERE t.task_uuid=s.context_task_uuid)""",
+                (chat_id,),
+            )
+            for row in await cur.fetchall():
+                orphan = _json_loads(row["state_json"], {})
+                roots = {source_of(m).get("run_root_turn_uuid") or source_of(m).get("turn_uuid")
+                         for m in orphan.get("messages", []) if isinstance(m, dict)} if isinstance(orphan, dict) else set()
+                roots.discard(None)
+                roots.discard("")
+                if not roots or roots.intersection(deleted_roots):
+                    affected.append(str(row["session_uuid"]))
+                    ids.append(str(row["context_task_uuid"]))
+            ids = list(dict.fromkeys(ids))
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            cur = await conn.execute(
+                f"SELECT DISTINCT agent_session_uuid FROM rath_tasks WHERE task_uuid IN ({placeholders}) AND agent_session_uuid<>''",
+                tuple(ids),
+            )
+            affected = list(dict.fromkeys([*affected, *(str(row[0]) for row in await cur.fetchall())]))
+        for sid in affected:
+            session = await self.agent_session(sid)
+            if not session or session.session_kind != "independent":
+                continue
+            cur = await conn.execute("SELECT * FROM rath_tasks WHERE agent_session_uuid=? ORDER BY id", (sid,))
+            tasks = [self._task_from_row(row) for row in await cur.fetchall()]
+            survivors = [task for task in tasks if task.task_uuid not in ids]
+            rounds = [(task.input or {}).get("sessionTurn") for task in survivors]
+            logical_order = bool(rounds) and all(type(n) is int and n > 0 for n in rounds) and len(set(rounds)) == len(rounds)
+            legacy_order = all(n is None for n in rounds)
+            # Copied row IDs (and mutable updated_at) are not instance chronology.
+            # Never silently fall back to an earlier valid checkpoint when the
+            # latest logical round has no reliable one. Ambiguous round metadata
+            # likewise makes continuation unavailable instead of guessing.
+            last = max(survivors, key=lambda task: task.input["sessionTurn"]) if logical_order else max(
+                survivors, key=lambda task: (task.started_at, task.id), default=None,
+            )
+            checkpoint = await self.task_model_context(last.task_uuid) if last else None
+            stored_state = (checkpoint or {}).get("state")
+            state = dict(stored_state) if isinstance(stored_state, dict) else {}
+            raw = state.get("messages")
+            reliable = bool((logical_order or legacy_order) and last and last.status in TERMINAL_TASK_STATUSES and isinstance(raw, list) and raw)
+            try:
+                restored = deserialize_messages(raw) if reliable else []
+            except (TypeError, ValueError, AttributeError):
+                restored = []
+            reliable = reliable and bool(restored) and len(restored) == len(raw) and validate_model_context(restored) and not any(
+                source_of(m).get("task_uuid") in ids for m in restored
+            )
+            # Runtime gates/capabilities/notes are regenerated from the NEW task;
+            # historical control text stays historical with no pending ack state.
+            restored = neutral_context([m for m in restored if source_of(m).get("kind") not in {"runtime", "required_runtime"}
+                and (m.get("_openbear_runtime") or {}).get("kind") not in {
+                    "task_memory_state", "rath_agent_plan_runtime", "agent_capabilities", "agent_completion_gate"}]) if reliable else []
+            owner_key = f"agent:{sid}"
+            cur = await conn.execute("SELECT window_version,revision FROM context_windows WHERE owner_key=?", (owner_key,))
+            prior_window = await cur.fetchone()
+            keep_tasks = [task.task_uuid for task in survivors]
+            source_ids = [str(source_of(m).get("id")) for m in restored if source_of(m).get("id")]
+            boundary_seq = 0
+            for offset in range(0, len(source_ids), 400):
+                chunk = source_ids[offset:offset + 400]
+                cur = await conn.execute(
+                    f"SELECT COALESCE(MAX(seq),0) FROM context_execution_events WHERE owner_key=? AND event_id IN ({','.join('?' for _ in chunk)})",
+                    (owner_key, *chunk),
+                )
+                boundary_seq = max(boundary_seq, int((await cur.fetchone())[0]))
+            if reliable and boundary_seq:
+                # Source sequences are append-only. The old checkpoint's exact
+                # high water also preserves earlier evicted records whose task
+                # rows were deliberately cleaned before this rollback.
+                await conn.execute("DELETE FROM context_execution_events WHERE owner_key=? AND seq>?", (owner_key, boundary_seq))
+            elif keep_tasks:
+                await conn.execute(
+                    f"DELETE FROM context_execution_events WHERE owner_key=? AND task_uuid NOT IN ({','.join('?' for _ in keep_tasks)})",
+                    (owner_key, *keep_tasks),
+                )
+            else:
+                await conn.execute("DELETE FROM context_execution_events WHERE owner_key=?", (owner_key,))
+            if ids:
+                await conn.execute(
+                    f"DELETE FROM context_execution_events WHERE owner_key=? AND task_uuid IN ({','.join('?' for _ in ids)})",
+                    (owner_key, *ids),
+                )
+            # Rotations contain derived summaries and no old selected-message
+            # snapshots. Reconstruct the neutral selection from the checkpoint.
+            await conn.execute("DELETE FROM context_window_rotations WHERE owner_key=?", (owner_key,))
+            await conn.execute("DELETE FROM context_windows WHERE owner_key=?", (owner_key,))
+            context_task, revision = "", 0
+            metadata = dict(session.metadata or {})
+            metadata["llmSessionId"] = str(uuid.uuid4())
+            metadata["contextResetReason"] = "conversation_turn_suffix_deleted"
+            if reliable:
+                for message in restored:
+                    if not source_of(message).get("id"):
+                        mark_source(message, kind="task" if message.get("role") == "user" else "execution",
+                                    task_uuid=last.task_uuid, run_root_turn_uuid=last.run_root_turn_uuid)
+                owner = ContextOwner.agent(task_uuid=last.task_uuid, agent_session_uuid=sid,
+                                           conversation_uuid=session.openbear_session_uuid,
+                                           session_uuid=session.openbear_session_uuid, chat_id=session.chat_id)
+                store = WindowStore(self._db, owner)
+                archive = await store.archive(restored)
+                # Reusing immutable events may add zero rows; archive() then
+                # intentionally leaves the brand-new window counters alone.
+                # Re-anchor both counters to ALL surviving history explicitly.
+                cur = await conn.execute("SELECT COUNT(*),COALESCE(MAX(seq),0) FROM context_execution_events WHERE owner_key=?", (owner_key,))
+                source_count, source_high_water = await cur.fetchone()
+                await conn.execute("UPDATE context_windows SET source_revision=?,source_high_water=? WHERE owner_key=?",
+                                   (source_count, source_high_water, owner_key))
+                archive["sourceRevision"] = int(source_count)
+                saved = await store.save(restored, expected_revision=archive["revision"],
+                                         expected_source_revision=archive["sourceRevision"], route="",
+                                         extra_state={"stage": state.get("stage", "checkpoint"), "restartRestored": True})
+                # Never recycle an old ticket's version/sequence after rollback.
+                saved["windowVersion"] = max(int((prior_window or [0, 0])[0]), int(state.get("windowVersion") or 0)) + 1
+                saved["revision"] = max(int((prior_window or [0, 0])[1]), int(state.get("windowRevision") or 0)) + 1
+                await conn.execute("UPDATE context_windows SET window_version=?,revision=? WHERE owner_key=?",
+                                   (saved["windowVersion"], saved["revision"], owner_key))
+                # Keep the reliable partial/inflight evidence, but discard all
+                # native/provider usage and old phase permissions.
+                for key in ("providerPromptSnapshot", "providerPromptSnapshotState", "pendingControlUuids"):
+                    state.pop(key, None)
+                state.update(messages=serialize_messages(restored), protocol="", model="",
+                             sessionId=metadata["llmSessionId"], windowVersion=saved["windowVersion"],
+                             windowRevision=saved["revision"])
+                await conn.execute(
+                    "UPDATE rath_task_model_contexts SET state_json=?,protocol='',model='',session_id=?,revision=revision+1,updated_at=? WHERE task_uuid=?",
+                    (_json_dumps(state), metadata["llmSessionId"], now_ts(), last.task_uuid),
+                )
+                context_task, revision = last.task_uuid, int(checkpoint["revision"]) + 1
+            await conn.execute(
+                """UPDATE rath_agent_sessions SET context_task_uuid=?,context_revision=?,last_task_uuid=?,
+                   active_task_uuid='',turn_count=?,summary='',metadata_json=?,revision=revision+1,updated_at=?,
+                   status=CASE WHEN ? THEN status ELSE 'closed' END,
+                   closed_at=CASE WHEN ? THEN closed_at ELSE ? END WHERE session_uuid=?""",
+                (context_task, revision, last.task_uuid if last else "",
+                 (last.input["sessionTurn"] if logical_order else len(survivors)) if last else 0, _json_dumps(metadata),
+                 now_ts(), bool(survivors), bool(survivors), now_ts(), sid),
+            )
+        # Heads have moved (or become unavailable), so the ordinary delete no
+        # longer exempts the deleted task's checkpoint. Its public semantics stay unchanged.
+        result = await self.delete_task_records(ids)
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            # Legacy task owners also have private windows/History. Remove them,
+            # without touching another task or an unaffected sibling instance.
+            for tid in ids:
+                key = f"legacy-task:{tid}"
+                await conn.execute("DELETE FROM context_execution_events WHERE owner_key=?", (key,))
+                await conn.execute("DELETE FROM context_window_rotations WHERE owner_key=?", (key,))
+                await conn.execute("DELETE FROM context_windows WHERE owner_key=?", (key,))
+            await conn.execute(f"DELETE FROM rath_task_model_contexts WHERE task_uuid IN ({placeholders})", tuple(ids))
+        return {**result, "affectedAgentSessions": affected}
+
     async def delete_task_records_for_chat(self, chat_id: int) -> dict[str, int]:
         """Whole-conversation deletion also removes instance-owned retained data."""
+        from app.context.lifecycle import delete_windows
+        await delete_windows(self._db.conn, where="owner_kind='agent' AND (agent_session_uuid IN (SELECT session_uuid FROM rath_agent_sessions WHERE chat_id=?) OR task_uuid IN (SELECT task_uuid FROM rath_tasks WHERE chat_id=?))", params=(chat_id, chat_id))
         contexts = await self._db.conn.execute(
             "DELETE FROM rath_task_model_contexts WHERE task_uuid IN (SELECT context_task_uuid FROM rath_agent_sessions WHERE chat_id=?)",
             (chat_id,),
