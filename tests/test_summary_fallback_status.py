@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.agent.result import RunResult
+from app.context.builder import build_controller_history
 from app.context.runtime import ContextManager
 from app.context.store import ContextOwner, WindowStore
 from app.context.window import WindowPolicy
@@ -20,7 +21,11 @@ web_env = web_fixture
 
 @pytest.mark.parametrize("case", ["pre_request", "after_final", "execution_failure", "all_summary_fail"])
 async def test_summary_fallback_preserves_actual_turn_status_and_failure_ledger(web_env, monkeypatch, case):
-    server, _, row = await setup_server(web_env, monkeypatch, "no_channels", "model_summary")
+    original = history()
+    if case == "after_final":
+        original[2]["content"] = "old A " * 400
+        original[4]["content"] = "old B " * 400
+    server, _, row = await setup_server(web_env, monkeypatch, "no_channels", "model_summary", original=original)
     config = server.config
     model = config.models.resolve("openai/gpt")[1]
     model.rollover_trigger_tokens = 8000
@@ -62,11 +67,9 @@ async def test_summary_fallback_preserves_actual_turn_status_and_failure_ledger(
     store = WindowStore(web_env.db, ContextOwner.controller(chat_id=row["internal_chat_id"], session_uuid=sid,
                                                           conversation_uuid=row["conversation_uuid"]))
     manager = ContextManager(store, WindowPolicy(128000, trigger_tokens=8000), backend=main, model="fake-gpt")
-    original = history()
-    if case == "after_final":
-        original[2]["content"] = "old A " * 400
-        original[4]["content"] = "old B " * 400
-    await manager.checkpoint(original)
+    # Archive the actual transcript identities, not a standalone unit-test
+    # window whose synthetic source IDs have no corresponding original rows.
+    await manager.checkpoint(await build_controller_history(dao, row["internal_chat_id"]))
     queued = await server._persist_web_task_notification(row, {"taskUuid": "finished-task", "status": "completed",
         "summary": "result", "content": "A task finished successfully; report its result."})
     await worker(server, row, queued)

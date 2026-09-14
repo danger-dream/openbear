@@ -9,6 +9,7 @@ import pytest
 
 from app.agent.loop import Agent
 from app.agent.runs import RunRegistry
+from app.db.dao import MessageDAO
 from app.llm.base import OpenBearLLMError
 from app.llm.events import StreamEvent
 from app.llm.retry import wait_for_retry
@@ -43,7 +44,7 @@ async def no_delay(delay_s, **kwargs):
     await wait_for_retry(0, **kwargs)
 
 
-async def setup_server(web_env, monkeypatch, kind, strategy):
+async def setup_server(web_env, monkeypatch, kind, strategy, *, original=None, task_uuid="finished-task"):
     server = web_env.server
     cfg = _cfg()
     server.config = cfg
@@ -63,6 +64,35 @@ async def setup_server(web_env, monkeypatch, kind, strategy):
     row = await server._create_web_conversation(123, title="persistent upstream failure", model="openai/gpt")
     await web_env.db.conn.execute("UPDATE web_conversations SET context_strategy=? WHERE conversation_uuid=?", (strategy, row["conversation_uuid"]))
     await web_env.db.conn.commit()
+    # A background result resumes a real user-owned root, never an empty chat.
+    # Persist the source rows and user operation before creating the task's
+    # operation/run link. Do not grant provenance by fabricating window metadata.
+    original = original if original is not None else [
+        {"role": "user", "content": "ORIGINAL_REQUEST: inspect the requested files and summarize the background result; do not deploy."},
+        {"role": "assistant", "content": "The inspection is running in the background."},
+    ]
+    root = "notification-origin"
+    live, dao = server._live_for(row), MessageDAO(web_env.db)
+    await live.publish({"type": "accepted", "turnUuid": root, "runUuid": "notification-origin-run"})
+    for index, message in enumerate(original):
+        op_ids = None
+        if message["role"] == "user":
+            message_uuid = f"{root}-{index}"
+            await live.publish({"type": "user", "turnUuid": root, "messageUuid": message_uuid, "text": message["content"]})
+            op_ids = [f"msg:{message_uuid}"]
+        await server._persist_web_transcript_message(
+            dao, row["internal_chat_id"], message["role"], message.get("content") or "",
+            conversation_uuid=row["conversation_uuid"], turn_uuid=root, run_root_turn_uuid=root,
+            op_ids=op_ids, **{key: message[key] for key in ("tool_calls", "tool_call_id", "name") if key in message},
+        )
+    await server.rath_dao.create_task(
+        chat_id=row["internal_chat_id"], parent_session_uuid=row["conversation_uuid"],
+        workflow_uuid="notification-fixture", title="Background inspection", status="completed", task_uuid=task_uuid,
+    )
+    await live.publish({"type": "tool_progress", "turnUuid": root, "toolCallId": "origin-agent", "name": "Agent",
+                        "payload": {"status": "completed", "detached": True, "task": {"taskUuid": task_uuid, "status": "completed"}}})
+    await live.publish({"type": "done", "turnUuid": root})
+    assert await server._root_turn_for_task_notification(row["conversation_uuid"], {"taskUuid": task_uuid}) == root
     return server, backend, row
 
 
@@ -86,6 +116,7 @@ async def test_failed_notification_stops_through_restart_and_manual_continuation
     queued = await server._persist_web_task_notification(row, payload)
     await worker(server, row, queued)
     assert backend.calls == expected
+    assert all("ORIGINAL_REQUEST" in str(messages) for messages in backend.seen_convos)
     stored = await stored_notification(web_env.db, queued)
     assert stored["state"] == "paused" and stored["attempts"] == 1
     receipt = json.loads(stored["payload_json"])["_contextMessageId"]
@@ -126,12 +157,14 @@ async def test_failed_notification_stops_through_restart_and_manual_continuation
 
 @pytest.mark.parametrize("strategy", ["sliding_window", "model_summary"])
 async def test_compression_failure_also_pauses_instead_of_starting_again(web_env, monkeypatch, strategy):
-    server, backend, row = await setup_server(web_env, monkeypatch, "quota", strategy)
+    server, backend, row = await setup_server(web_env, monkeypatch, "quota", strategy, task_uuid="large-result")
     server.config.models.resolve("openai/gpt")[1].rollover_trigger_tokens = 5000
     queued = await server._persist_web_task_notification(row, {"taskUuid": "large-result", "status": "completed",
         "content": "original-large-result " * 10000, "summary": "large result"})
     await worker(server, row, queued)
     assert (await stored_notification(web_env.db, queued))["state"] == "paused"
+    failure = (await server._conversation_row(123, row["conversation_uuid"]))["last_error"]
+    assert ("required_context_too_large" if strategy == "sliding_window" else "nothing_to_summarize") in failure
     assert backend.calls == 0
     await server._recover_web_task_notifications(reset_processing=True)
     await worker(server, row, queued)

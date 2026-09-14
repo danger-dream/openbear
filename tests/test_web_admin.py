@@ -2805,7 +2805,8 @@ async def test_web_task_notification_two_control_waits_are_batched_without_deadl
     assert set(calls[0]["taskUuids"]) == {"task-wait-a", "task-wait-b"}
 
 
-async def test_active_controller_generation_hands_late_control_to_post_turn_worker(web_env, monkeypatch):
+@pytest.mark.parametrize("strategy", ["sliding_window", "model_summary"])
+async def test_active_controller_generation_hands_late_control_to_post_turn_worker(web_env, monkeypatch, strategy):
     cfg = _cfg()
     generation_entered = asyncio.Event()
     release_generation = asyncio.Event()
@@ -2864,8 +2865,21 @@ async def test_active_controller_generation_hands_late_control_to_post_turn_work
 
     monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
     monkeypatch.setattr(web_env.server, "_recover_web_task_notifications", _fake_recover)
-    row = await web_env.server._create_web_conversation(123, title="late active notification", model="openai/gpt")
+    row = await web_env.server._create_web_conversation(
+        123, title="late active notification", model="openai/gpt", run_config={"context_strategy": strategy},
+    )
     chat_id = int(row["internal_chat_id"])
+    # Both background tasks belong to this persisted user request. A task-only
+    # empty conversation must fail closed, not enter the generation barrier.
+    root = "late-control-origin"
+    original = "ORIGINAL_CONTROL_REQUEST: inspect with agents A and B; resolve their control requests without deployment."
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": root, "runUuid": "late-control-origin-run"})
+    await live.publish({"type": "user", "turnUuid": root, "messageUuid": "late-control-input", "text": original})
+    await web_env.server._persist_web_transcript_message(
+        MessageDAO(web_env.db), chat_id, "user", original, conversation_uuid=row["conversation_uuid"],
+        turn_uuid=root, run_root_turn_uuid=root, op_ids=["msg:late-control-input"],
+    )
     await web_env.server.rath_dao.create_task(
         chat_id=chat_id, parent_session_uuid=row["conversation_uuid"], workflow_uuid="wf-late-active",
         title="A waiting control", status="needs_openbear_control", task_uuid="task-active-a",
@@ -2874,6 +2888,12 @@ async def test_active_controller_generation_hands_late_control_to_post_turn_work
         chat_id=chat_id, parent_session_uuid=row["conversation_uuid"], workflow_uuid="wf-late-active",
         title="B waiting control", status="needs_openbear_control", task_uuid="task-active-b",
     )
+    for task_uuid in ("task-active-a", "task-active-b"):
+        await live.publish({"type": "tool_progress", "turnUuid": root, "toolCallId": f"launch-{task_uuid}", "name": "Agent",
+                            "payload": {"status": "needs_openbear_control", "detached": True,
+                                        "task": {"taskUuid": task_uuid, "status": "needs_openbear_control"}}})
+        assert await web_env.server._root_turn_for_task_notification(row["conversation_uuid"], {"taskUuid": task_uuid}) == root
+    await live.publish({"type": "done", "turnUuid": root})
 
     await web_env.server._schedule_web_task_notification(row, {
         "taskUuid": "task-active-a", "status": "needs_openbear_control", "summary": "A needs a ruling",
@@ -2908,6 +2928,7 @@ async def test_active_controller_generation_hands_late_control_to_post_turn_work
         await asyncio.sleep(0.02)
 
     assert backend.calls == 3
+    assert all(original in str(messages) for messages in backend.seen_convos)
     assert set(states_by_task["task-active-a"]) == {"delivered"}
     assert set(states_by_task["task-active-b"]) == {"pending"}
     assert recover_calls == []

@@ -23,12 +23,15 @@ class ObservedEvent(asyncio.Event):
     def __init__(self):
         super().__init__()
         self.entered = asyncio.Event()
+        self.returned = asyncio.Event()
         self.waiter = None
 
     async def wait(self):
         self.waiter = asyncio.current_task()
         self.entered.set()
-        return await super().wait()
+        result = await super().wait()
+        self.returned.set()
+        return result
 
 
 def make_hub():
@@ -88,9 +91,13 @@ async def test_close_finishes_when_event_completion_races_cancellation(subscribe
         child = hub.wake.waiter
         hub.wake.set()
         await asyncio.sleep(0)
-        # The Event.wait child has completed, but wait_for's outer task has
-        # not resumed. On Python 3.11 this exact order swallows its cancellation.
-        assert child.done() and not child.cancelled()
+        # Event.wait has returned in both implementations. Python 3.11 runs
+        # it in a child task; 3.12+ awaits it inline in the owned hub task.
+        # Keep the 3.11 cancellation-swallowing race assertion without
+        # requiring the inline 3.12+ hub task to have already finished.
+        assert hub.wake.returned.is_set()
+        if child is not hub.task:
+            assert child.done() and not child.cancelled()
         assert not hub.task.done()
         closing = [asyncio.create_task(hub.close()) for _ in range(closers)]
         await completed(*closing)
