@@ -10,7 +10,6 @@ const props = defineProps({
 	compact: {type: Boolean, default: false},
 });
 
-const MAX_VISIBLE_BLOCK_CHARS = 12000;
 const copiedKey = ref("");
 let copiedTimer = 0;
 
@@ -19,15 +18,12 @@ const primaryTags = computed(() => view.value.tags.filter((item) => item.primary
 const secondaryTags = computed(() => view.value.tags.filter((item) => !item.primary));
 const blocks = computed(() => view.value.blocks.map((block, index) => {
 	const source = String(block.content ?? "");
-	const truncated = source.length > MAX_VISIBLE_BLOCK_CHARS;
-	const visible = truncated ? `${source.slice(0, MAX_VISIBLE_BLOCK_CHARS)}\n\n…（界面预览已截断，复制按钮仍会复制完整内容）` : source;
 	return {
 		...block,
 		key: `${block.label}-${index}`,
 		source,
-		truncated,
 		charCount: source.length,
-		html: highlightCodeHtml(visible, block.language),
+		html: highlightCodeHtml(source, block.language),
 	};
 }));
 
@@ -124,7 +120,7 @@ onBeforeUnmount(() => {
 							{{ copiedKey === `block-${block.key}` ? "已复制" : "复制" }}
 						</button>
 					</div>
-					<pre><code class="hljs" :class="block.language ? `language-${block.language}` : ''" v-html="block.html"></code></pre>
+					<pre tabindex="0" :aria-label="`${block.label}，可滚动`"><code class="hljs" :class="block.language ? `language-${block.language}` : ''" v-html="block.html"></code></pre>
 				</component>
 			</div>
 		</template>
@@ -168,7 +164,8 @@ onBeforeUnmount(() => {
 	color: #52525b;
 	font-size: 10.5px;
 	line-height: 1.45;
-	white-space: nowrap;
+	white-space: normal;
+	overflow-wrap: anywhere;
 }
 
 .tool-argument-tag.is-wide {
@@ -194,8 +191,8 @@ onBeforeUnmount(() => {
 }
 
 .tool-argument-tag span {
-	overflow: hidden;
-	text-overflow: ellipsis;
+	min-width: 0;
+	overflow-wrap: anywhere;
 }
 
 .tool-argument-tag.is-mono span,
@@ -373,6 +370,9 @@ onBeforeUnmount(() => {
 .tool-argument-block.role-new header span::before { content: "+"; }
 
 .tool-argument-block pre {
+	box-sizing: border-box;
+	min-width: 0;
+	max-width: 100%;
 	max-height: 280px;
 	overflow: auto;
 	margin: 0;
@@ -413,15 +413,20 @@ onBeforeUnmount(() => {
 	max-height: 220px;
 }
 
-@media (max-width: 640px) {
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
 	.tool-argument-tag,
 	.tool-argument-tag.is-wide {
 		max-width: 100%;
 	}
 
-	.tool-argument-block pre {
-		max-height: 230px;
+	.tool-argument-block pre,
+	.tool-arguments-view.compact .tool-argument-block pre {
+		max-height: min(230px, calc(var(--mobile-viewport-height, 100dvh) * .35));
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		-webkit-overflow-scrolling: touch;
 	}
+	.tool-argument-block code.hljs { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 }
 </style>
 

@@ -6,6 +6,7 @@ import inspect
 from app.agent.native_continuation import deserialize_messages, validate_model_context
 from app.context.configuration import conversation_strategy
 from app.context.prompts import effective_context_prompt
+from app.context.resume import restore_controller_run_inputs
 from app.context.runtime import ContextManager
 from app.context.store import ContextOwner, WindowStore
 from app.context.strategies import ModelSummaryStrategy
@@ -159,6 +160,12 @@ class WebAdminChatRunMixin:
                     history = deserialize_messages(raw_private_messages)
                 else:
                     await messages.clear_controller_model_context(chat_id)
+
+            if conversation_uuid and task_notification:
+                history = await restore_controller_run_inputs(
+                    messages, chat_id, history, session_uuid=session_id,
+                    run_root_turn_uuid=root_turn_uuid, reference_store=self._reference_store(),
+                )
 
             if conversation_uuid and not task_notification:
                 # A real user message, not a timer/reconnect/duplicate callback,

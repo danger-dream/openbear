@@ -88,7 +88,7 @@ test("top-level activity and managed step activity share the source-line present
   assert.match(eventCardSource, /\.filter\(\(item\) => !isActivityExcludedEventKind\(item\.kind\)\)/);
   assert.match(eventCardSource, /agentCompactionActivityView\(item\)/);
   assert.match(eventCardSource, /toolArgumentsSummary\(toolName, rawArguments\)/);
-  assert.match(eventCardSource, /toolDescription: summary/);
+  assert.match(eventCardSource, /toolDescription: String\(item\.toolDescription \|\| item\.description \|\| item\.detail\?\.description \|\| summary\)/);
 
   assert.match(workspaceSource, /selectedStepActivitySource = computed\(\(\) => agentStepActivityLines\(/);
   assert.match(workspaceSource, /<AgentProcessActivity[\s\S]*?:source-lines="selectedStepActivitySource"[\s\S]*?:think-level="launchInfo\.thinkLevel[^"]*"[\s\S]*?:fast-mode="launchInfo\.fastMode"[\s\S]*?:limit="5"[\s\S]*?\/>/);
@@ -138,8 +138,12 @@ test("shared tool and model rows use the original timeline dot with status-only 
   assert.doesNotMatch(activityListSource, /\.activity-row\.tone-(?:active|success|danger) \.activity-tool-call > summary/);
   assert.match(activityListSource, /\.activity-tool-call > summary, \.activity-model-call \{[^}]*color: #52525b/);
   assert.match(activityListSource, /\.activity-tool-call, \.activity-model-call \{[^}]*grid-column: 3/);
-  assert.match(activityListSource, /\.activity-tool-description, \.activity-model-description \{[^}]*flex: 0 1 auto;[^}]*text-overflow: ellipsis/);
-  assert.match(activityListSource, /\.activity-process-status \{[^}]*flex: 0 0 auto;[^}]*white-space: nowrap/);
-  assert.doesNotMatch(activityListSource, /justify-self:\s*end|margin-left:\s*auto|justify-content:\s*space-between|text-align:\s*right/);
+  assert.match(activityListSource, /\.activity-tool-description \{[^}]*text-overflow: ellipsis/, 'collapsed tool descriptions remain summaries');
+  assert.match(activityListSource, /\.activity-model-description \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
+  assert.match(activityListSource, /\.activity-tool-call\[open\] > summary \.activity-tool-description \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
+  assert.match(activityListSource, /\.activity-process-status \{[^}]*max-width: 100%;[^}]*flex: 0 0 auto;[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
+  const statusRule = activityListSource.match(/\.activity-process-status \{[^}]*\}/)?.[0];
+  assert.ok(statusRule);
+  assert.doesNotMatch(statusRule, /justify-self:\s*end|margin-left:\s*auto|justify-content:\s*space-between|text-align:\s*right/, 'status remains beside its tool/model, not aligned to the far edge');
   assert.match(activityListSource, /<ToolArgumentsView :tool-name="line\.processTool\.name" :raw-arguments="line\.processTool\.rawArguments" compact\/>/);
 });

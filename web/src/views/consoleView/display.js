@@ -1213,16 +1213,21 @@ function agentOutputSection(entry) {
 	};
 }
 
-export function agentRowArgumentsDisplay(event, row, rowIndex = 0) {
+export function agentRowArgumentsDisplay(event, row, rowIndex = 0, {full = false} = {}) {
+	const present = (value) => full ? value : previewText(value, TOOL_ARGUMENT_PREVIEW_CHARS, "Agent 参数");
 	const item = row?.argItem;
 	if (item && typeof item === "object") {
 		const pretty = humanizeAgentArguments(item);
-		if (pretty) return previewText(pretty, TOOL_ARGUMENT_PREVIEW_CHARS, "Agent 参数");
-		try { return previewText(JSON.stringify(item, null, 2), TOOL_ARGUMENT_PREVIEW_CHARS, "Agent 参数"); }
+		if (pretty) return present(pretty);
+		try { return present(JSON.stringify(item, null, 2)); }
 		catch { return String(item); }
 	}
 	const rows = agentRows(event);
-	if (rows.length <= 1 || Number(rowIndex || 0) === 0) return agentArgumentsDisplay(event);
+	if (rows.length <= 1 || Number(rowIndex || 0) === 0) {
+		if (!full) return agentArgumentsDisplay(event);
+		const call = (event?.calls || []).find((item) => isAgentTool(callName(item))) || event?.calls?.[0];
+		return humanizeAgentArguments(agentArgs(event)) || (call ? callArguments(call) : "");
+	}
 	return "";
 }
 

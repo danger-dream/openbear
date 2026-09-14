@@ -4,7 +4,7 @@ import { ElMessage } from "element-plus";
 import { Api, apiError } from "../api";
 import ModelOrderPicker from "../components/ModelOrderPicker.vue";
 
-const MdEditor = defineAsyncComponent(() => import("../components/MdEditor.vue"));
+const MdEditor = defineAsyncComponent(() => import("../components/AdaptiveMdEditor.vue"));
 
 function builtinPrompt(spec) {
   return spec?.defaultValue || "";
@@ -293,6 +293,13 @@ onMounted(load);
 
     <div class="settings-layout">
       <aside class="settings-sidebar">
+        <label class="settings-domain-picker admin-mobile-only">
+          <span>设置领域</span>
+          <select :value="activeDomain" aria-label="切换设置领域" @change="activeDomain = $event.target.value; query = ''">
+            <option v-for="domain in domains" :key="domain.key" :value="domain.key">{{ domain.title }} · {{ domainSettingCount(domain) }} 项</option>
+          </select>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
+        </label>
         <div class="settings-sidebar__eyebrow">设置领域</div>
         <nav class="settings-domain-list" aria-label="设置领域">
           <button
@@ -390,7 +397,7 @@ onMounted(load);
                     </div>
                   </div>
                   <div v-if="isPromptEditing(spec)" class="settings-prompt-editor mt-4">
-                    <MdEditor v-model="draft[spec.path]" completion-mode="none" square />
+                    <MdEditor mobile-flow v-model="draft[spec.path]" completion-mode="none" square />
                   </div>
                   <div class="settings-technical is-open">
                     <code>{{ spec.path }}</code>
@@ -521,7 +528,7 @@ onMounted(load);
       </main>
     </div>
 
-    <el-dialog v-model="promptPreviewOpen" class="mac-dialog" :title="promptPreviewTitle" width="860px" top="7vh" append-to-body>
+    <el-dialog v-model="promptPreviewOpen" class="admin-dialog mac-dialog" :title="promptPreviewTitle" width="860px" top="7vh" append-to-body>
       <div class="prompt-preview-note">使用示例变量渲染；保存时仍会再次执行相同的占位符校验。</div>
       <pre class="prompt-preview-output">{{ promptPreviewText }}</pre>
       <template #footer>
@@ -1253,29 +1260,52 @@ onMounted(load);
   .settings-summary { display: none; }
 }
 
-@media (max-width: 720px) {
-  .settings-shell { overflow-y: auto; }
+@media (max-width: 760px) {
+  .settings-shell { display: flex; min-width: 0; overflow: hidden; overflow-wrap: anywhere; }
+  .settings-toolbar > div:first-child { display: none; }
+  .settings-domain-picker { display: flex; align-items: center; gap: 10px; position: relative; }
+  .settings-domain-picker > span { flex: none; color: var(--settings-muted); }
+  .settings-domain-picker select { appearance: none; min-width: 0; width: 100%; min-height: 32px; padding: 0 34px 0 10px; border: 1px solid var(--settings-line); border-radius: 9px; background: transparent; color: inherit; }
+  .settings-domain-picker svg { position: absolute; right: 12px; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; pointer-events: none; }
+  .settings-sidebar .settings-domain-list { display: none; }
+  .settings-prompt-card > div:first-child > div:last-child { flex-wrap: wrap; gap: 8px; }
+  .settings-technical { min-width: 0; overflow-wrap: anywhere; }
+  .settings-technical code { white-space: normal; }
+  .settings-intro h2 { overflow-wrap: anywhere; }
+  .settings-intro__mark { flex-shrink: 0; }
+  .settings-section__header { flex-wrap: wrap; gap: 8px; }
+  .mac-segmented { flex-wrap: wrap; }
+  .mac-segmented button { min-height: 40px; white-space: normal; }
+  .mac-text-button { min-height: 40px; }
+  .settings-prompt-editor { max-width: 100%; }
+  .settings-refresh { min-width: 32px; min-height: 32px; width: 32px; height: 32px; }
+  .settings-search { min-height: 32px; height: 32px; }
   .settings-toolbar {
-    position: sticky;
-    z-index: 8;
-    top: 0;
+    position: relative;
+    z-index: 1;
     min-height: auto;
     flex-direction: column;
     align-items: stretch;
-    gap: 11px;
-    padding: 13px 14px;
+    gap: 6px;
+    padding: 6px 12px;
   }
   .settings-toolbar__actions { width: 100%; }
   .settings-search { width: auto; flex: 1; }
   .settings-layout {
-    display: block;
-    overflow: visible;
-    padding: 10px;
+    display: flex;
+    flex: 1 1 0%;
+    min-height: 0;
+    flex-direction: column;
+    overflow: hidden;
+    gap: 0;
+    padding: 0 10px;
   }
   .settings-sidebar {
-    margin-bottom: 10px;
-    padding: 8px;
-    border-radius: 16px;
+    flex: none;
+    margin-bottom: 6px;
+    padding: 6px 0;
+    border-radius: 0;
+    box-shadow: none;
   }
   .settings-sidebar__eyebrow,
   .settings-sidebar__footer { display: none; }
@@ -1298,7 +1328,8 @@ onMounted(load);
   .settings-domain__icon { width: 26px; height: 26px; border-radius: 8px; font-size: 12px; }
   .settings-domain__copy small,
   .settings-domain__count { display: none; }
-  .settings-content { overflow: visible; padding: 0 0 24px; }
+  .settings-content { flex: 1 1 0%; min-height: 0; overflow-y: auto; padding: 0 0 12px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .settings-content::-webkit-scrollbar { display: none; }
   .settings-intro { padding: 13px; border-radius: 16px; }
   .settings-intro__mark { width: 36px; height: 36px; border-radius: 11px; }
   .settings-section { border-radius: 16px; }
@@ -1312,7 +1343,7 @@ onMounted(load);
   .mac-segmented button { flex: 1; }
   .settings-prompt-card > div:first-child { display: block; }
   .settings-prompt-card > div:first-child > div:last-child { margin-top: 12px; }
-  .settings-prompt-editor { min-height: 300px; height: 52vh; }
+  .settings-prompt-editor { min-height: 0; height: auto; }
 }
 </style>
 

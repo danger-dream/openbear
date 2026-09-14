@@ -1,8 +1,8 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
-import MdEditor from "../components/MdEditor.vue";
+import MdEditor from "../components/AdaptiveMdEditor.vue";
 import draggable from "vuedraggable";
 import { assetTimeLine } from "../utils/assetTime";
 import { dragAutoScrollOptions } from "../utils/dragScroll";
@@ -11,6 +11,9 @@ const docs = ref([]);
 const loading = ref(false);
 const editing = ref(null);
 const original = ref("");
+const saving = ref(false);
+let alive = true;
+onBeforeUnmount(() => { alive = false; });
 const dialogOpen = ref(false);
 const showArchived = ref(false);
 const selectedIds = ref([]);
@@ -92,8 +95,8 @@ async function openEdit(d) {
   original.value = editSnapshot(editing.value);
   dialogOpen.value = true;
 }
-function normalizeDocForSave() {
-  const d = { ...editing.value };
+function normalizeDocForSave(row = editing.value) {
+  const d = { ...row };
   d.project = joinList(d.projectList);
   d.tags = joinList(d.tagList);
   delete d.projectList;
@@ -102,15 +105,33 @@ function normalizeDocForSave() {
 }
 function docPayload(d, patch = {}) { return { ...d, grp: d.grp || "", sort: Number(d.sort || 0), enabled: d.enabled ?? 1, archived: d.archived || 0, ...patch }; }
 async function save() {
-  const d = normalizeDocForSave();
+  if (!alive || saving.value || !editing.value || !dialogOpen.value) return;
+  const target = editing.value;
+  const submitted = JSON.parse(JSON.stringify(target));
+  const snapshot = editSnapshot(submitted);
+  const d = normalizeDocForSave(submitted);
   if (!d.name?.trim()) { ElMessage.warning("名称不能为空"); return; }
+  saving.value = true;
+  let committed = false;
   try {
     const r = d.id ? await Api.updateDoc(d.id, d) : await Api.createDoc(d);
     if (r?.ok === false) throw new Error(r.error || "保存失败");
-    ElMessage.success("已保存");
-    dialogOpen.value = false;
+    committed = true;
+    if (!alive) return;
+    if (editing.value === target && dialogOpen.value) {
+      const unchanged = editSnapshot(target) === snapshot;
+      if (r?.item?.id) target.id = submitted.id = r.item.id;
+      original.value = editSnapshot(submitted);
+      if (unchanged) dialogOpen.value = false;
+      ElMessage.success(unchanged ? "已保存" : "已保存提交内容；后续修改仍未保存");
+    }
     await load();
-  } catch (e) { ElMessage.error("保存失败: " + (e.message || e)); }
+  } catch (e) {
+    if (alive) {
+      if (committed) ElMessage.warning("已保存，但列表刷新失败: " + apiError(e));
+      else ElMessage.error("保存失败: " + apiError(e));
+    }
+  } finally { saving.value = false; }
 }
 async function tryClose(done) {
   if (dirty()) {
@@ -188,9 +209,9 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
 </script>
 
 <template>
-  <div class="h-full flex flex-col">
+  <div class="admin-page docs-page h-full flex flex-col">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
+      <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">文档库</h1>
         <span class="text-xs text-macsub">点卡片编辑 · Memory(resource=doc) 按需取全文</span>
       </div>
@@ -201,7 +222,7 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
       </div>
     </header>
 
-    <div v-if="selectedIds.length" class="mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="selectedIds.length" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 篇</span>
       <el-button size="small" :icon="'Box'" @click="batchUpdateDocs({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
@@ -212,7 +233,7 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
       <el-button size="small" text @click="clearSelection">取消选择</el-button>
     </div>
 
-    <div ref="scrollContainer" class="flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
+    <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
       <div v-if="!shownDocs.length" class="text-center text-macsub py-16 text-sm">暂无文档</div>
       <draggable v-model="groups" item-key="name" handle=".group-handle" :animation="180"
         v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
@@ -229,12 +250,12 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
               :group="{ name: 'doc-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" class="space-y-2 min-h-6">
               <template #item="{ element: d }">
                 <div @click="openEdit(d)"
-                  class="mac-panel mac-shadow p-4 flex items-start gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
+                  class="doc-card mac-panel mac-shadow p-4 flex items-start gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
           :class="{ 'opacity-50 border-dashed': d.archived || !d.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(d.id) }">
                   <div class="pt-0.5" @click.stop><el-checkbox :model-value="isSelected(d.id)" @change="(v) => setSelected(d.id, v)" /></div>
                   <el-icon class="drag-handle cursor-move select-none text-gray-300 hover:text-macsub mt-0.5" :size="18" @click.stop><Rank /></el-icon>
                   <el-icon :size="18" class="text-macsub mt-0.5"><Document /></el-icon>
-          <div class="flex-1 min-w-0">
+          <div class="doc-copy flex-1 min-w-0">
             <div class="flex items-center gap-2 min-w-0">
               <span class="font-medium text-sm truncate">{{ d.title || d.name }}</span>
               <el-tag size="small" :type="impColor(d.importance)" effect="light">P{{ d.importance }}</el-tag>
@@ -249,7 +270,7 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
             </div>
             <div class="text-[10px] text-macsub/75 mt-1 tabular-nums">{{ assetTimeLine(d) }}</div>
           </div>
-          <div class="flex gap-2 shrink-0" @click.stop>
+          <div class="asset-actions flex gap-2 shrink-0" @click.stop>
             <el-switch :model-value="!!d.enabled" size="small" :disabled="!!d.archived" @change="toggleEnabled(d)" />
             <el-button size="small" plain :icon="'Edit'" @click="openEdit(d)">编辑</el-button>
             <el-button size="small" plain :icon="d.archived ? 'RefreshLeft' : 'Box'" @click="toggleArchive(d)">{{ d.archived ? '取消归档' : '归档' }}</el-button>
@@ -263,9 +284,9 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
       </draggable>
     </div>
 
-    <el-dialog v-model="dialogOpen" :title="editing?.id ? '编辑文档' : '新建文档'" width="980px" top="4vh" :close-on-click-modal="true" :before-close="tryClose">
-      <div v-if="editing" class="flex flex-col gap-3" style="height: 72vh;">
-        <div class="grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_200px_110px] gap-3 items-end">
+    <el-dialog append-to-body class="admin-dialog docs-dialog" v-model="dialogOpen" :title="editing?.id ? '编辑文档' : '新建文档'" width="980px" top="4vh" :close-on-click-modal="true" :before-close="tryClose">
+      <div v-if="editing" class="asset-edit-body flex flex-col gap-3" style="height: 72vh;">
+        <div class="asset-form-grid grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_200px_110px] gap-3 items-end">
           <div><label class="text-xs text-macsub mb-1 block">名称(引用用)</label><el-input v-model="editing.name" placeholder="如 poker-deploy" /></div>
           <div><label class="text-xs text-macsub mb-1 block">标题</label><el-input v-model="editing.title" /></div>
           <div>
@@ -276,7 +297,7 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
           </div>
           <div><label class="text-xs text-macsub mb-1 block">序号</label><el-input-number v-model="editing.sort" :min="0" :step="10" class="!w-full" /></div>
         </div>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="asset-form-grid grid grid-cols-2 gap-3">
           <div>
             <label class="text-xs text-macsub mb-1 block">关联项目（可多选）</label>
             <el-select v-model="editing.projectList" multiple filterable allow-create default-first-option class="w-full" placeholder="选择或输入项目名">
@@ -289,18 +310,22 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
           </div>
         </div>
         <div><label class="text-xs text-macsub mb-1 block">备注</label><el-input v-model="editing.summary" placeholder="简短说明这篇文档何时该取用" /></div>
-        <div class="flex items-center gap-4">
+        <div class="asset-form-toggles flex items-center gap-4">
           <el-switch v-model="editing.enabled" :active-value="1" :inactive-value="0" :disabled="!!editing.archived" active-text="注入提示词" inactive-text="不注入" />
           <el-switch v-model="editing.archived" :active-value="1" :inactive-value="0" @change="(v) => { if (v) editing.enabled = 0 }" active-text="归档" inactive-text="未归档" />
         </div>
-        <div class="flex-1 min-h-0 flex flex-col">
+        <div class="admin-mobile-only asset-form-meta">
+          <div class="asset-importance"><span>重要度</span><el-rate v-model="editing.importance" :max="5" size="small" /><span>P{{ editing.importance }}</span></div>
+          <span v-if="editing.id">{{ assetTimeLine(editing) }}</span>
+        </div>
+        <div class="asset-editor flex-1 min-h-0 flex flex-col">
           <label class="text-xs text-macsub mb-1 block">正文（Markdown）</label>
-          <div class="flex-1 min-h-0"><MdEditor v-model="editing.content" /></div>
+          <div class="flex-1 min-h-0"><MdEditor mobile-flow v-model="editing.content" /></div>
         </div>
       </div>
       <template #footer>
-        <div class="flex items-center justify-between w-full">
-          <div class="flex items-center gap-4">
+        <div class="asset-footer flex items-center justify-between w-full">
+          <div class="asset-form-toggles flex items-center gap-4">
             <div class="flex items-center gap-2">
               <span class="text-xs text-macsub">重要度</span>
               <el-rate v-model="editing.importance" :max="5" size="small" />
@@ -310,7 +335,7 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
           </div>
           <div>
             <el-button @click="tryClose()">取消</el-button>
-            <el-button type="primary" @click="save">保存</el-button>
+            <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
           </div>
         </div>
       </template>

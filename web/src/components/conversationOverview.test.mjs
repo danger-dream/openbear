@@ -12,6 +12,8 @@ const strip=source=>source.match(/<script setup>([\s\S]*?)<\/script>/)[1].replac
 function hoverHarness(){
  let time=0,serial=0;const timers=new Map();
  const env={computed,nextTick,reactive,ref,compareTreeItems,watch(){},onMounted(){},onBeforeUnmount(){},defineProps:()=>({}),defineEmits:()=>()=>{},defineExpose(){},
+  // UI import seam only; keep the real hover/timer handlers and assertions.
+  defineLazyView:()=>({}),
   setTimeout:(fn,ms)=>{timers.set(++serial,{fn,at:time+ms});return serial;},clearTimeout:id=>timers.delete(id),
   window:{matchMedia:()=>({matches:true})}};
  const context=vm.createContext(env);

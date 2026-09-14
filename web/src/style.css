@@ -36,3 +36,38 @@ body {
 /* macOS 卡片阴影 */
 .mac-shadow { box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 6px 16px rgba(0,0,0,0.04); }
 .mac-panel { background: #fff; border: 1px solid #e5e5ea; border-radius: 12px; }
+
+/* Only the authenticated mobile shell owns viewport/safe-area geometry. No
+   desktop height override, global touch-action, zoom restriction or body scroll
+   correction. The transform makes chat's fixed floating controls shell-relative. */
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+  html[data-openbear-mobile-viewport],
+  html[data-openbear-mobile-viewport] body,
+  html[data-openbear-mobile-viewport] #app {
+    overflow: hidden;
+    overscroll-behavior-y: none;
+  }
+  html[data-openbear-mobile-viewport] .app-shell {
+    position: fixed;
+    inset: 0 0 auto;
+    box-sizing: border-box;
+    height: var(--mobile-viewport-height, 100dvh);
+    min-height: 0;
+    overflow: hidden;
+    transform: translateY(var(--mobile-viewport-top, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+  html[data-openbear-mobile-viewport] .app-main {
+    min-height: 0;
+    overflow: hidden;
+  }
+}
+/* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
+   is added in that layout. Only its safe area needs reserving. */
+@media (min-width: 761px) and (hover: none) and (pointer: coarse) {
+  html[data-openbear-mobile-viewport] .app-shell {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+}

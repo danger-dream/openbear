@@ -19,6 +19,7 @@ const props = defineProps({
 
 <template>
 	<header class="console-header">
+		<div class="header-mobile-navigation"><slot name="mobile-navigation"/></div>
 		<div class="min-w-0 flex flex-1 items-center gap-3 overflow-hidden">
 			<div class="header-orb">
 				<BearLogo/>
@@ -29,7 +30,7 @@ const props = defineProps({
 						{{ props.title }}
 					</h1>
 				</div>
-				<div class="mt-0.5 truncate text-[11px] text-[#6b7280]">{{ props.subtitle }}</div>
+				<div class="header-subtitle mt-0.5 truncate text-[11px] text-[#6b7280]">{{ props.subtitle }}</div>
 			</div>
 		</div>
 		<div class="header-metrics">
@@ -57,10 +58,16 @@ const props = defineProps({
 				<strong>{{ props.costText }}</strong>
 			</div>
 		</div>
+		<span v-if="props.running" class="header-mobile-running" role="status" aria-label="运行中"><i aria-hidden="true"></i><span>运行中</span></span>
+		<div class="header-mobile-actions"><slot name="mobile-actions"/></div>
 	</header>
 </template>
 
 <style scoped>
+.header-mobile-navigation,
+.header-mobile-actions,
+.header-mobile-running { display: none; }
+
 .console-header {
 	display: flex;
 	min-height: 4rem;
@@ -170,29 +177,32 @@ const props = defineProps({
 
 @media (max-width: 760px) {
 	.console-header {
-		min-height: 3.5rem;
+		box-sizing: border-box;
+		height: calc(48px + env(safe-area-inset-top, 0px));
+		min-height: calc(48px + env(safe-area-inset-top, 0px));
 		gap: .5rem;
-		padding: .5rem .75rem;
+		padding: env(safe-area-inset-top, 0px) .5rem 0;
 	}
+
+	.header-mobile-navigation,
+	.header-mobile-actions { display: flex; flex: 0 0 44px; }
+	.header-subtitle { display: none; }
+	.header-mobile-running { display: inline-flex; flex: none; align-items: center; gap: 5px; height: 22px; padding: 0 7px; border: 1px solid rgba(16, 185, 129, .18); border-radius: 7px; background: rgba(16, 185, 129, .09); color: #047857; font-size: 11px; font-weight: 500; line-height: 1; white-space: nowrap; }
+	.header-mobile-running i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 
 	.header-orb {
 		display: none;
 	}
 
-	.header-metrics {
-		min-width: 0;
-		max-width: 9rem;
-		flex: 0 0 auto;
-	}
-
-	.header-metrics .header-chip:nth-child(n+2) {
-		display: none;
-	}
+	.header-metrics { display: none; }
 }
 </style>
 
 <style>
 /* OpenBear system dark theme */
+@media (max-width: 760px) {
+	html.dark .header-mobile-running { color: #6ee7a2; border-color: rgba(110, 231, 162, .2); }
+}
 html.dark .console-header {
 		border-bottom: 1px solid rgba(255, 255, 255, 0.116);
 		background: rgba(29, 30, 34, 0.86);

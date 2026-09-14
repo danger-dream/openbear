@@ -1,15 +1,13 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ConsoleView from "./views/consoleView/ConsoleView.vue";
-import MemoryView from "./views/MemoryView.vue";
-import SecretsView from "./views/SecretsView.vue";
-import DocsView from "./views/DocsView.vue";
-import SkillsView from "./views/SkillsView.vue";
-import McpView from "./views/McpView.vue";
-import SettingsHubView from "./views/SettingsHubView.vue";
+import { defineLazyView } from "./lazyView.js";
+import { installMobileViewport } from "./mobileViewport.js";
 import LoginView from "./views/LoginView.vue";
-import BearLogo from "./components/BearLogo.vue";
+import BearLogoPreview from "./components/BearLogoPreview.vue";
 import ConversationTree from "./components/ConversationTree.vue";
+import MobileSidebarResources from "./components/MobileSidebarResources.vue";
+import "./components/sidebarResources.css";
 import {activityInteractionTarget} from "./conversationActivity.js";
 import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
@@ -43,6 +41,13 @@ const stopThemeSubscription = subscribeTheme((state) => { themeState.value = sta
 function chooseThemeMode(mode) {
   themeState.value = setThemeMode(mode);
 }
+
+const MemoryView = defineLazyView(() => import("./views/MemoryView.vue"), "记忆管理");
+const SecretsView = defineLazyView(() => import("./views/SecretsView.vue"), "凭证库");
+const DocsView = defineLazyView(() => import("./views/DocsView.vue"), "文档库");
+const SkillsView = defineLazyView(() => import("./views/SkillsView.vue"), "Skills");
+const McpView = defineLazyView(() => import("./views/McpView.vue"), "MCP 管理");
+const SettingsHubView = defineLazyView(() => import("./views/SettingsHubView.vue"), "设置");
 
 const nav = [
   { key: "memory", label: "记忆管理", icon: "Collection", component: MemoryView },
@@ -81,7 +86,8 @@ function leaveReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenc
 function showReferenceShelf(event,key,keyboard=false){
   const kind={memory:'mem',secrets:'secret',docs:'doc'}[key];
   if(!kind||active.value!=='console'||(!keyboard&&!window.matchMedia('(hover: hover) and (pointer: fine)').matches))return;
-  const anchor=event.currentTarget;window.clearTimeout(referenceShelfTimer);
+  // Keep the shelf outside the entire launcher, not over the next grid column.
+  const anchor=event.currentTarget.closest('.sidebar-desktop-nav')||event.currentTarget;window.clearTimeout(referenceShelfTimer);
   referenceShelfTimer=window.setTimeout(()=>{referenceShelf.value={open:true,kind,anchor};},keyboard?0:220);
 }
 function referenceNavKey(event,key){if(event.key==='ArrowRight'&&['memory','secrets','docs'].includes(key)){event.preventDefault();showReferenceShelf(event,key,true);}}
@@ -89,6 +95,7 @@ function insertShelfReference(reference){window.dispatchEvent(new CustomEvent('o
 watch(active,closeReferenceShelf);
 const memoryType = ref("identity");
 const settingsSection = ref("channels");
+const settingsHeaderReady = ref(false);
 const appVersion = ref("");
 const versionInfo = ref(null);
 const versionDialogOpen = ref(false);
@@ -875,7 +882,12 @@ watch(pageDocumentTitle, (title) => {
   if (typeof document !== "undefined") document.title = title;
 }, {immediate: true});
 
+let stopMobileViewport = null;
 onMounted(() => {
+  if (!isLoginPath) stopMobileViewport = installMobileViewport({
+    beforeChange: () => consoleViewRef.value?.captureMobileViewportAnchor(),
+    afterChange: anchor => consoleViewRef.value?.restoreMobileViewportAnchor(anchor),
+  });
   window.addEventListener("popstate", applyRouteFromLocation);
   window.addEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.addEventListener("click", closeConversationMenu);
@@ -892,6 +904,7 @@ onMounted(() => {
   }
 });
 onBeforeUnmount(() => {
+  stopMobileViewport?.();
   closeReferenceShelf();
   stopReferenceCatalog({clear:true});
   stopThemeSubscription();
@@ -912,7 +925,7 @@ onBeforeUnmount(() => {
 
 <template>
   <LoginView v-if="isLoginPath" />
-  <div v-else class="app-shell h-full flex">
+  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && settingsHeaderReady}">
     <div class="mobile-app-bar">
       <button
         type="button"
@@ -925,9 +938,9 @@ onBeforeUnmount(() => {
       >
         <span></span><span></span><span></span>
       </button>
-      <div class="mobile-app-brand" aria-hidden="true">
-        <span class="mobile-brand-logo"><BearLogo /></span>
-        <strong>OpenBear</strong>
+      <div class="mobile-app-brand">
+        <span class="mobile-brand-logo"><BearLogoPreview /></span>
+        <strong>{{ nav.find(item => item.key === active)?.label || 'OpenBear' }}</strong>
       </div>
     </div>
     <button
@@ -943,13 +956,13 @@ onBeforeUnmount(() => {
       :class="{'is-open': sidebarOpen}"
       @contextmenu.self="conversationTreeRef?.openRootMenu($event)"
     >
-      <div class="mb-3 flex items-center gap-2 rounded-2xl px-2 py-2">
-        <div class="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white p-1.5 ring-1 ring-zinc-200 shadow-sm">
-          <BearLogo />
+      <div class="sidebar-heading mb-3 flex items-center gap-2 rounded-2xl px-2 py-2">
+        <div class="sidebar-brand-logo grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white p-1.5 ring-1 ring-zinc-200 shadow-sm">
+          <BearLogoPreview />
         </div>
         <div class="min-w-0 flex-1">
           <div class="truncate text-[15px] font-semibold leading-tight">OpenBear</div>
-          <div class="mt-0.5 truncate text-[12px] leading-tight text-zinc-500">Web 控制台</div>
+          <div class="sidebar-caption mt-0.5 truncate text-[12px] leading-tight text-zinc-500">Web 控制台</div>
         </div>
         <div class="sidebar-meta-actions flex shrink-0 items-center gap-1">
           <el-dropdown trigger="click" placement="bottom-end" @command="chooseThemeMode">
@@ -997,33 +1010,34 @@ onBeforeUnmount(() => {
 
       <button
         type="button"
-        class="mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 transition-colors hover:bg-zinc-200/60"
+        class="sidebar-new-session mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 transition-colors hover:bg-zinc-200/60"
         @click="startConsoleNewSession"
       >
         <el-icon :size="16" class="text-zinc-600"><Plus /></el-icon>
         <span>新会话</span>
       </button>
 
-      <nav class="space-y-1 text-sm">
+      <nav class="sidebar-desktop-nav sidebar-resource-grid text-sm" aria-label="资源与设置">
         <button
           v-for="n in nav"
           :key="n.key"
+          type="button"
+          :aria-current="active === n.key ? 'page' : undefined"
           @click="closeReferenceShelf(); selectNav(n.key)"
           @pointerenter="showReferenceShelf($event,n.key)"
           @pointerleave="leaveReferenceShelf"
           @keydown="referenceNavKey($event,n.key)"
-          class="w-full flex items-center gap-3 px-3 py-1.5 rounded-xl text-left transition-colors"
-          :class="active === n.key ? 'bg-zinc-200/80 text-zinc-950 font-medium' : 'text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-950'"
+          class="sidebar-resource-tile"
         >
-          <el-icon :size="15"><component :is="n.icon" /></el-icon>
-          <span class="truncate">{{ n.label }}</span>
+          <el-icon class="sidebar-resource-icon" :size="18" aria-hidden="true"><component :is="n.icon" /></el-icon>
+          <span class="sidebar-resource-label">{{ n.label }}</span>
         </button>
       </nav>
       <ReferencePicker :open="referenceShelf.open" :anchor="referenceShelf.anchor" :kind="referenceShelf.kind" :current-conversation="activeConversationUuid" placement="right-start" searchable allow-drag @select="insertShelfReference" @close="closeReferenceShelf" @enter="keepReferenceShelf" @leave="leaveReferenceShelf"/>
       <ReferenceInspector :current-conversation="activeConversationUuid"/>
       <ArtifactPreview :navigation-key="`${active}:${activeConversationUuid}`"/>
 
-      <div class="-mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
+      <div class="sidebar-conversations -mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
         <ConversationTree
           ref="conversationTreeRef"
           :active-conversation-uuid="activeConversationUuid"
@@ -1175,6 +1189,7 @@ onBeforeUnmount(() => {
         </div>
         </div>
       </div>
+      <MobileSidebarResources :items="nav" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)"/>
     </aside>
 
     <Teleport v-if="false" to="body">
@@ -1258,14 +1273,38 @@ onBeforeUnmount(() => {
         :folder-id="isLocalConversation(activeConversationUuid) ? draftFolderId : selectedFolderId"
         @conversation-created="handleConsoleConversationCreated"
         @conversations-refresh="handleConsoleRefreshList"
-      />
+      >
+        <template #mobile-navigation>
+          <button
+            type="button"
+            class="mobile-sidebar-toggle"
+            :aria-expanded="sidebarOpen"
+            aria-controls="openbear-sidebar"
+            aria-label="打开导航"
+            @click="sidebarOpen = true"
+          ><span></span><span></span><span></span></button>
+        </template>
+      </ConsoleView>
       <MemoryView v-else-if="active === 'memory'" :active-type="memoryType" @type-changed="handleMemoryTypeChanged" />
       <component
         v-else
         :is="activeView"
         :section="settingsSection"
         @section-changed="handleSettingsSectionChanged"
-      />
+        @mobile-header-ready="settingsHeaderReady = $event"
+      >
+        <template #mobile-navigation>
+          <button
+            v-if="active === 'settings'"
+            type="button"
+            class="mobile-sidebar-toggle"
+            :aria-expanded="sidebarOpen"
+            aria-controls="openbear-sidebar"
+            aria-label="打开导航"
+            @click="sidebarOpen = true"
+          ><span></span><span></span><span></span></button>
+        </template>
+      </component>
     </main>
 
     <el-dialog
@@ -1340,6 +1379,9 @@ onBeforeUnmount(() => {
 
 
 <style scoped>
+/* This top-level action is phone-only; desktop keeps the conversation tree actions. */
+.sidebar-new-session { display: none; }
+
 .theme-entry {
   display: grid;
   width: 26px;
@@ -1498,12 +1540,12 @@ onBeforeUnmount(() => {
     right: 0;
     left: 0;
     display: flex;
-    height: 48px;
+    height: calc(48px + env(safe-area-inset-top, 0px));
     align-items: center;
     gap: 10px;
     border-bottom: 1px solid rgba(15, 23, 42, .08);
     background: rgba(255, 255, 255, .92);
-    padding: 0 12px;
+    padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
     box-shadow: 0 1px 8px rgba(15, 23, 42, .04);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
@@ -1511,8 +1553,8 @@ onBeforeUnmount(() => {
 
   .mobile-sidebar-toggle {
     display: grid;
-    width: 34px;
-    height: 34px;
+    width: 44px;
+    height: 44px;
     flex: 0 0 auto;
     place-content: center;
     gap: 4px;
@@ -1554,13 +1596,27 @@ onBeforeUnmount(() => {
     box-sizing: border-box;
     width: 100%;
     min-width: 0;
-    padding-top: 48px;
+    padding-top: calc(48px + env(safe-area-inset-top, 0px));
+  }
+
+  /* Chat and settings own their combined header; other views keep the app bar. */
+  .app-shell.is-console .mobile-app-bar,
+  .app-shell.is-settings .mobile-app-bar { display: none; }
+  .app-shell.is-console .app-main,
+  .app-shell.is-settings .app-main { padding-top: 0; }
+  .app-shell.is-console .mobile-sidebar-toggle,
+  .app-shell.is-settings .mobile-sidebar-toggle {
+    border: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .app-sidebar {
     position: absolute;
     z-index: 100;
     inset: 0 auto 0 0;
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     width: min(300px, calc(100vw - 48px)) !important;
     max-width: calc(100vw - 48px);
     visibility: hidden;
@@ -1570,6 +1626,29 @@ onBeforeUnmount(() => {
     transition: transform .2s cubic-bezier(.2, .8, .2, 1), visibility 0s linear .2s;
     will-change: transform;
   }
+
+  /* Mobile sidebar hierarchy: compact identity + one primary action, tree,
+     then an on-demand resource launcher. Desktop classes remain untouched. */
+  .app-sidebar .sidebar-heading {
+    flex: 0 0 44px;
+    height: 44px;
+    margin-bottom: 4px;
+    padding: 0;
+  }
+  .app-sidebar .sidebar-brand-logo { width: 28px; height: 28px; padding: 4px; border-radius: 9px; }
+  .app-sidebar .sidebar-caption,
+  .app-sidebar .sidebar-desktop-nav { display: none; }
+  .app-sidebar .sidebar-new-session {
+    display: flex;
+    flex: 0 0 44px;
+    height: 44px;
+    margin-bottom: 0;
+    padding: 0 8px;
+    gap: 10px;
+  }
+  .app-sidebar .sidebar-conversations { margin-top: 8px; }
+  .app-sidebar .theme-entry { width: 44px; height: 44px; border: 0; background: transparent; box-shadow: none; }
+  .app-sidebar .version-entry { min-height: 44px; padding: 0 4px; border: 0; background: transparent; box-shadow: none; }
 
   .app-sidebar.is-open {
     visibility: visible;

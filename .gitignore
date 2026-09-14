@@ -29,6 +29,7 @@ htmlcov/
 
 # ─── 工作区与本地分析 ────────────────────────────────────────
 workspace/
+/evals/agent_delegation/reports/
 .serena/
 .cloakbrowser/
 .DS_Store

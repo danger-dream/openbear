@@ -1,4 +1,5 @@
 <script setup>
+import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
@@ -197,9 +198,9 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="h-full flex flex-col" v-loading="loading">
+  <div class="admin-page skills-page h-full flex flex-col" v-loading="loading">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="min-w-0 flex items-center gap-2">
+      <div class="admin-heading min-w-0 flex items-center gap-2">
         <h1 class="text-base font-semibold">Skills</h1>
         <span class="truncate text-xs text-macsub">任务技能管理 · 启用后下一轮对话生效</span>
       </div>
@@ -209,7 +210,7 @@ onMounted(load);
       </div>
     </header>
 
-    <div class="grid grid-cols-1 gap-3 px-6 pt-5 shrink-0 md:grid-cols-4">
+    <div class="admin-desktop-only admin-stats grid grid-cols-1 gap-3 px-6 pt-5 shrink-0 md:grid-cols-4">
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">Skill 总数</div>
         <div class="text-lg font-semibold">{{ stats.total || 0 }}</div>
@@ -228,21 +229,23 @@ onMounted(load);
       </div>
     </div>
 
-    <section class="mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-white/70 p-3 backdrop-blur">
+    <MobileAdminSummary :items="[{ label: 'Skill 总数', value: stats.total }, { label: '已注入 / 启用', value: stats.enabled }, { label: '依赖缺失', value: stats.dependencyMissing }, { label: 'Skills 目录', value: skillsDir || stats.directory }, { label: '当前匹配', value: filteredItems.length }]">共 {{ stats.total || 0 }} · 启用 {{ stats.enabled || 0 }} · 缺依赖 {{ stats.dependencyMissing || 0 }}</MobileAdminSummary>
+
+    <section class="admin-filters mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-white/70 p-3 backdrop-blur">
       <div class="flex flex-col gap-3 lg:flex-row lg:items-center">
         <el-input v-model="query" clearable :prefix-icon="'Search'" placeholder="搜索 name / description / path / reason" class="lg:max-w-md" />
         <el-select v-model="statusFilter" class="w-full lg:w-44">
           <el-option v-for="option in statusOptions" :key="option.value" :label="option.label" :value="option.value" />
         </el-select>
         <el-checkbox v-model="showDisabled">显示停用</el-checkbox>
-        <div class="ml-auto text-xs text-macsub">当前显示 {{ filteredItems.length }} / {{ items.length }}</div>
+        <div class="admin-desktop-only ml-auto text-xs text-macsub">当前显示 {{ filteredItems.length }} / {{ items.length }}</div>
       </div>
     </section>
 
-    <main class="min-h-0 flex-1 overflow-y-auto p-6">
+    <main class="admin-list min-h-0 flex-1 overflow-y-auto p-6">
       <el-empty v-if="!filteredItems.length" description="暂无匹配的 Skills" />
       <div v-else class="grid grid-cols-1 gap-3 xl:grid-cols-2">
-        <article v-for="row in filteredItems" :key="row.name" class="mac-panel mac-shadow p-4">
+        <article v-for="row in filteredItems" :key="row.name" class="skill-card mac-panel mac-shadow p-4">
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0 flex-1">
               <div class="flex min-w-0 items-center gap-2">
@@ -264,7 +267,7 @@ onMounted(load);
                 {{ row.reason }}
               </div>
             </div>
-            <div class="flex shrink-0 gap-1">
+            <div class="admin-card-actions flex shrink-0 gap-1">
               <el-button size="small" text type="primary" @click="openDetail(row)">详情</el-button>
               <el-button size="small" text :type="configuredEnabled(row) ? 'warning' : 'success'" :disabled="isUninstalling(row)" @click="toggleSkill(row)">
                 {{ configuredEnabled(row) ? '停用' : '启用' }}
@@ -276,7 +279,7 @@ onMounted(load);
       </div>
     </main>
 
-    <el-drawer v-model="detailOpen" size="70%" :title="detail?.name ? `Skill 详情 · ${detail.name}` : 'Skill 详情'">
+    <el-drawer append-to-body class="admin-drawer skill-drawer" v-model="detailOpen" size="70%" :title="detail?.name ? `Skill 详情 · ${detail.name}` : 'Skill 详情'">
       <div v-if="detail" class="h-full min-h-0 overflow-y-auto" v-loading="detailLoading">
         <section class="mac-panel p-4">
           <div class="flex items-start justify-between gap-4">
@@ -330,7 +333,7 @@ onMounted(load);
       </div>
     </el-drawer>
 
-    <el-dialog v-model="installOpen" title="安装 Skill 的推荐方式" width="620px">
+    <el-dialog append-to-body class="admin-dialog" v-model="installOpen" title="安装 Skill 的推荐方式" width="620px">
       <div class="space-y-3 text-sm leading-6 text-zinc-700">
         <p>Web 管理界面负责浏览、启停、可恢复卸载和重新加载，不提供上传 ZIP、Git clone、在线编辑或新增安装功能。</p>
         <p>推荐在对话里让 OpenBear 人工处理安装：说明 Skill 来源、用途和安全边界，由 OpenBear 检查目录结构、依赖和 <code>SKILL.md</code> 后放入 Skills 目录。</p>

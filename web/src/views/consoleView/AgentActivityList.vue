@@ -50,6 +50,11 @@ function declaredStatus(line = {}, allowed = {}) {
 	return "running";
 }
 
+function recordedText(value) {
+	if (value === null || value === undefined) return "";
+	return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
 const presentedLines = computed(() => props.lines.map((line) => {
 	const detail = line?.detail && typeof line.detail === "object" ? line.detail : {};
 	if (isModelProcessLine(line)) {
@@ -78,6 +83,11 @@ const presentedLines = computed(() => props.lines.map((line) => {
 			name,
 			rawArguments,
 			description,
+			// Only show fields actually supplied by the event. A preview is not a full result.
+			result: recordedText(detail.resultText ?? detail.result ?? detail.resultPreview ?? detail.result_preview),
+			resultIsPreview: detail.resultText == null && detail.result == null,
+			fullDescription: String(line.description || detail.description || line.toolDescription || ""),
+			failure: recordedText(detail.error ?? detail.reason),
 			status: TOOL_STATUS_LABELS[status],
 			statusTone: STATUS_TONES[status],
 		},
@@ -97,7 +107,7 @@ const presentedLines = computed(() => props.lines.map((line) => {
 			<span class="activity-dot"></span>
 			<details v-if="line.kind === 'context_compaction_compact'" class="activity-compaction">
 				<summary><span>{{ line.message }}</span><ArrowRight/></summary>
-				<div class="activity-compaction-body">
+				<div class="activity-compaction-body" tabindex="0" aria-label="上下文压缩详情，可滚动">
 					<div v-if="line.compaction?.summaryId || line.compaction?.compactionId" class="activity-compaction-id">
 						{{ line.compaction.summaryId || line.compaction.compactionId }}
 					</div>
@@ -127,6 +137,7 @@ const presentedLines = computed(() => props.lines.map((line) => {
 				</template>
 				<i class="activity-process-separator" aria-hidden="true">·</i>
 				<span class="activity-process-status" :class="`tone-${line.processModel.statusTone}`">{{ line.processModel.status }}</span>
+				<p v-if="line.detail?.error || line.detail?.reason" class="activity-failure">{{ recordedText(line.detail.error ?? line.detail.reason) }}</p>
 			</div>
 			<details v-else-if="line.processTool" class="activity-tool-call">
 				<summary>
@@ -138,10 +149,19 @@ const presentedLines = computed(() => props.lines.map((line) => {
 					<ArrowRight class="activity-tool-arrow"/>
 				</summary>
 				<div class="activity-tool-arguments">
+					<p v-if="line.processTool.fullDescription" class="activity-tool-full-description" :class="{'is-summary-copy': line.processTool.fullDescription === line.processTool.description}">{{ line.processTool.fullDescription }}</p>
+					<p v-if="line.processTool.failure" class="activity-failure">{{ line.processTool.failure }}</p>
 					<ToolArgumentsView :tool-name="line.processTool.name" :raw-arguments="line.processTool.rawArguments" compact/>
+					<div v-if="line.processTool.result" class="activity-tool-result">
+						<strong>{{ line.processTool.resultIsPreview ? '结果（已有预览）' : '结果' }}</strong>
+						<pre tabindex="0" aria-label="已记录工具结果，可滚动">{{ line.processTool.result }}</pre>
+					</div>
 				</div>
 			</details>
-			<p v-else>{{ line.message }}</p>
+			<div v-else class="activity-message">
+				<p>{{ line.message }}</p>
+				<p v-if="line.kind === 'agent_control' && (line.detail?.text || line.detail?.message)" class="activity-control-text">{{ line.detail.text || line.detail.message }}</p>
+			</div>
 		</div>
 	</div>
 	<div v-else class="activity-list-empty">{{ emptyText }}</div>
@@ -170,9 +190,20 @@ const presentedLines = computed(() => props.lines.map((line) => {
 .activity-tool-call > summary::-webkit-details-marker { display: none; }
 .activity-process-name { min-width: max-content; flex: 0 0 auto; overflow: visible; color: #52525b; font-weight: 620; text-overflow: clip; white-space: nowrap; }
 .activity-process-separator { flex: 0 0 auto; color: #c4c4ca; font-style: normal; }
-.activity-tool-description, .activity-model-description { min-width: 0; flex: 0 1 auto; overflow: hidden; color: #8a8a93; text-overflow: ellipsis; white-space: nowrap; }
+.activity-tool-description { min-width: 0; flex: 0 1 auto; overflow: hidden; color: #8a8a93; text-overflow: ellipsis; white-space: nowrap; }
+.activity-model-description { min-width: 0; flex: 0 1 auto; color: #8a8a93; white-space: normal; overflow-wrap: anywhere; }
+.activity-model-call, .activity-tool-call[open] > summary { flex-wrap: wrap; overflow: visible; }
+.activity-tool-call[open] > summary .activity-tool-description { white-space: normal; overflow-wrap: anywhere; overflow: visible; }
+.activity-process-name { min-width: 0; max-width: 100%; flex-shrink: 1; overflow-wrap: anywhere; white-space: normal; }
+.activity-message { min-width: 0; }
+.activity-failure { flex-basis: 100%; white-space: pre-wrap; }
+.activity-control-text, .activity-tool-full-description { margin-bottom: 6px; white-space: pre-wrap; }
+.activity-compaction[open] > summary span { white-space: normal; overflow-wrap: anywhere; }
+.activity-tool-result { min-width: 0; margin-top: 8px; }
+.activity-tool-result > strong { font-size: 10px; color: #71717a; }
+.activity-tool-result pre { box-sizing: border-box; max-width: 100%; max-height: 220px; overflow: auto; margin: 4px 0 0; border: 1px solid #e4e4e7; border-radius: 7px; padding: 8px; color: inherit; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: thin; }
 .activity-model-meta { min-width: max-content; flex: 0 0 auto; color: #71717a; white-space: nowrap; }
-.activity-process-status { min-width: max-content; flex: 0 0 auto; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.activity-process-status { min-width: 0; max-width: 100%; flex: 0 0 auto; font-size: 11px; font-weight: 600; white-space: normal; overflow-wrap: anywhere; }
 .activity-process-status.tone-active { color: #2563eb; }
 .activity-process-status.tone-success { color: #357047; }
 .activity-process-status.tone-danger { color: #b42318; }
@@ -198,6 +229,26 @@ const presentedLines = computed(() => props.lines.map((line) => {
 .compact .activity-row { padding: 4px 0; }
 .compact .activity-row time { font-size: 10.5px; }
 .compact .activity-row p, .compact .activity-tool-call > summary, .compact .activity-model-call { font-size: 11.5px; }
+
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	/* Put time above the content, rather than sacrificing 64px of every line
+	   to a desktop rail inside an already narrow work drawer. */
+	.activity-row { grid-template-columns: 8px minmax(0, 1fr); gap: 2px 8px; padding: 7px 0; }
+	.activity-list::before { left: 7px; }
+	.activity-row time { grid-column: 2; grid-row: 1; width: auto; }
+	.activity-dot { grid-column: 1; grid-row: 1; margin-top: 4px; }
+	.activity-tool-call, .activity-model-call, .activity-compaction, .activity-message { grid-column: 2; grid-row: 2; }
+	.activity-tool-call > summary { flex-wrap: wrap; align-items: baseline; gap: 3px 6px; min-height: 36px; }
+	.activity-tool-description { flex: 1 1 100%; order: 1; white-space: normal; overflow: visible; overflow-wrap: anywhere; color: var(--el-text-color-regular); }
+	.activity-tool-call > summary .activity-tool-arrow { margin-left: auto; }
+	.activity-tool-call > summary > .activity-process-separator { display: none; }
+	.activity-compaction > summary { min-height: 36px; }
+	.activity-compaction > summary span { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+	.activity-tool-arguments { padding-left: 0; border: 0; }
+	.activity-compaction-body { box-sizing: border-box; border: 1px solid var(--el-border-color-lighter); border-radius: 9px; padding: 8px; }
+	.activity-tool-full-description.is-summary-copy { display: none; } /* Hide only an exact copy already fully visible above. */
+	.activity-compaction-body, .activity-tool-result pre { max-height: min(240px, calc(var(--mobile-viewport-height, 100dvh) * .35)); -webkit-overflow-scrolling: touch; }
+}
 
 @media (prefers-reduced-motion: reduce) {
 	.activity-tool-arrow, .activity-compaction > summary svg { transition: none; }
@@ -274,6 +325,8 @@ html.dark .activity-tool-call > summary:focus-visible {
 html.dark .activity-tool-arguments {
 		border-left: 1px solid #3d3e46;
 	}
+html.dark .activity-tool-result pre { border-color: #3d3e46; }
+html.dark .activity-tool-result > strong { color: #c6c6cd; }
 html.dark .activity-compaction > summary {
 		color: #6ee7a2;
 	}

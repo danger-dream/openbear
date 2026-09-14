@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.agent.native_continuation import deserialize_messages
+from app.agent.native_continuation import deserialize_messages, serialize_messages
 from app.context.store import ContextOwner, WindowStore
 from app.context.window import mark_source, source_of
 
@@ -55,7 +55,10 @@ class DuplicatedWindow:
 
     def remap(self, message: dict[str, Any]) -> dict[str, Any]:
         source = source_of(message)
-        result = self.rewrite(copy.deepcopy(message))
+        # Archives/windows may carry ToolCall objects, while private checkpoints
+        # carry JSON dictionaries. Rewrite exactly the same semantic representation
+        # in all three carriers before binding their shared event identity.
+        result = self.rewrite(copy.deepcopy(serialize_messages([message])[0]))
         metadata = {"message_id": self.message_map.get(int(source.get("message_id") or 0), 0)}
         if "summary_id" in source:
             metadata["summary_id"] = self.summary_map.get(int(source["summary_id"] or 0), 0)

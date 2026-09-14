@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""把 app/__init__.py 的版本同步到 pyproject.toml 和 web/package.json。
+"""把 app/__init__.py 的版本同步到 pyproject.toml、前端 package 及两种锁文件。
 
 用法：
   python scripts/bump_version.py 0.2.0
-  python scripts/bump_version.py --check   # 三个文件必须与 __version__ 一致
+  python scripts/bump_version.py --check   # 所有版本字段必须与 __version__ 一致
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INIT_PATH = ROOT / "app" / "__init__.py"
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 PACKAGE_PATH = ROOT / "web" / "package.json"
+PACKAGE_LOCK_PATH = ROOT / "web" / "package-lock.json"
 LOCK_PATH = ROOT / "uv.lock"
 INIT_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
 PYPROJECT_RE = re.compile(r'^version\s*=\s*["\']([^"\']+)["\']', re.M)
@@ -62,6 +63,19 @@ def write_package_version(version: str) -> None:
     PACKAGE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def read_package_lock_versions() -> tuple[str, str]:
+    data = json.loads(PACKAGE_LOCK_PATH.read_text(encoding="utf-8"))
+    root_package = (data.get("packages") or {}).get("") or {}
+    return str(data.get("version") or ""), str(root_package.get("version") or "")
+
+
+def write_package_lock_version(version: str) -> None:
+    data = json.loads(PACKAGE_LOCK_PATH.read_text(encoding="utf-8"))
+    data["version"] = version
+    data["packages"][""]["version"] = version
+    PACKAGE_LOCK_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def read_lock_version() -> str:
     text = LOCK_PATH.read_text(encoding="utf-8")
     match = re.search(r'name = "openbear"\nversion = "([^"]+)"', text)
@@ -85,6 +99,7 @@ def check(expected: str | None = None) -> int:
         return 1
     pyproject = read_pyproject_version()
     package = read_package_version()
+    package_lock, package_lock_root = read_package_lock_versions()
     lock = read_lock_version()
     bad = False
     if pyproject != init:
@@ -93,6 +108,10 @@ def check(expected: str | None = None) -> int:
     if package != init:
         print(f"web/package.json version={package} 与 __version__={init} 不一致", file=sys.stderr)
         bad = True
+    for field, value in (("version", package_lock), ('packages[""].version', package_lock_root)):
+        if value != init:
+            print(f"web/package-lock.json {field}={value} 与 __version__={init} 不一致", file=sys.stderr)
+            bad = True
     if lock != init:
         print(f"uv.lock openbear version={lock} 与 __version__={init} 不一致", file=sys.stderr)
         bad = True
@@ -105,7 +124,7 @@ def check(expected: str | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("version", nargs="?", help="要写入的 semver，不含 v")
-    parser.add_argument("--check", action="store_true", help="只检查三个文件是否一致")
+    parser.add_argument("--check", action="store_true", help="只检查所有版本字段是否一致")
     parser.add_argument("--expect", default="", help="check 时额外要求等于该版本")
     args = parser.parse_args(argv)
     if args.check:
@@ -116,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     write_init_version(version)
     write_pyproject_version(version)
     write_package_version(version)
+    write_package_lock_version(version)
     write_lock_version(version)
     return check(version)
 

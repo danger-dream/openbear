@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
+import postcss from "postcss";
+import {parse} from "@vue/compiler-sfc";
 
 const source = readFileSync(new URL("./TaskMemoryDrawer.vue", import.meta.url), "utf8");
 const consoleSource = readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
@@ -8,31 +10,22 @@ const minimapSource = readFileSync(new URL("./TurnMinimap.vue", import.meta.url)
 const composerSource = readFileSync(new URL("./ConsoleComposer.vue", import.meta.url), "utf8");
 const apiSource = readFileSync(new URL("../../api.js", import.meta.url), "utf8");
 
-test("task memory and scroll lock share a fixed mobile rail without Android/iOS overlap", () => {
-  assert.match(consoleSource, /<TaskMemoryDrawer :conversation-uuid="activeConversationUuid"\/>/);
-  assert.match(source, /\.task-memory-entry-wrap\s*\{[\s\S]*position:\s*fixed/);
-  assert.match(source, /top:\s*calc\(48% - 3\.25rem\)/);
-  assert.match(source, /z-index:\s*32/);
-  assert.match(consoleSource, /\.scroll-lock-toggle\s*\{[\s\S]*position:\s*fixed/);
-  assert.match(consoleSource, /--console-float-rail-right:\s*\.75rem/);
-  assert.match(consoleSource, /--console-float-control-size:\s*2\.35rem/);
-  assert.match(consoleSource, /--console-float-control-gap:\s*\.75rem/);
-  assert.match(consoleSource, /--console-float-rail-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ var\(--console-composer-height, 135px\) \+ 50px\)/);
-  assert.match(consoleSource, /right:\s*var\(--console-float-rail-right\)/);
-  assert.match(source, /right:\s*var\(--console-float-rail-right\)/);
-  assert.match(source, /bottom:\s*calc\(var\(--console-float-rail-bottom\) \+ var\(--console-float-control-size\) \+ var\(--console-float-control-gap\)\)/);
-
-  const rem = 16;
-  for (const {name, safeArea, viewportHeight} of [
-    {name: "Android", safeArea: 0, viewportHeight: 667},
-    {name: "iOS", safeArea: 34, viewportHeight: 844},
-  ]) {
-    const scrollBottom = safeArea + 135 + 50;
-    const size = 2.35 * rem;
-    const memoryBottom = scrollBottom + size + 0.75 * rem;
-    assert.equal(memoryBottom - (scrollBottom + size), 0.75 * rem, `${name} rail gap`);
-    assert.ok(memoryBottom + size < viewportHeight, `${name} controls remain in viewport`);
-  }
+test("phone memory and other tools are in the header menu, not a permanent rail", () => {
+  const mobile = (text, selector) => {
+    const declarations = {};
+    postcss.parse(parse(text).descriptor.styles.map(style => style.content).join("\n")).walkRules(rule => {
+      if (!rule.selectors.includes(selector) || rule.parent.name !== "media" || rule.parent.params !== "(max-width: 760px)") return;
+      rule.walkDecls(decl => { declarations[decl.prop] = decl.value; });
+    });
+    return declarations;
+  };
+  assert.equal(mobile(consoleSource, ".console-controls").display, "none");
+  assert.equal(mobile(consoleSource, ".conversation-column")["grid-template-columns"], undefined);
+  assert.equal(mobile(minimapSource, ".turn-minimap").display, "none");
+  assert.match(consoleSource, /<MobileConversationTools/);
+  assert.match(consoleSource, /@open-memory="taskMemoryDrawer\?\.open\(\)"/);
+  assert.match(source, /defineExpose\(\{open: openDrawer\}\)/);
+  assert.match(source, /async function openDrawer\(\) \{\s*if \(!usableConversationUuid\.value\) return;/);
 });
 
 test("desktop floating rail keeps task memory, work details, and quick navigation separate", () => {

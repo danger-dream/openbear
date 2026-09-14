@@ -1,8 +1,9 @@
 <script setup>
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
-import MdEditor from "../components/MdEditor.vue";
+import MdEditor from "../components/AdaptiveMdEditor.vue";
+import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 import draggable from "vuedraggable";
 import { encode } from "gpt-tokenizer";
 import { pinyin } from "pinyin-pro";
@@ -45,6 +46,9 @@ const scrollContainer = ref(null);
 const dragging = ref(false);
 const editing = ref(null);
 const original = ref("");
+const saving = ref(false);
+let alive = true;
+onBeforeUnmount(() => { alive = false; });
 const dialogOpen = ref(false);
 const showArchived = ref(false);
 const selectedIds = ref([]);
@@ -234,24 +238,39 @@ async function openEdit(e) {
   dialogOpen.value = true;
 }
 async function save() {
-  const e = editing.value;
-  if (!e.title?.trim()) { ElMessage.warning("名称不能为空"); return; }
-  if (!e.ref?.trim()) e.ref = toKey(e.title);
-  else e.ref = toKey(e.ref);
+  if (!alive || saving.value || !editing.value || !dialogOpen.value) return;
+  const target = editing.value;
+  if (!target.title?.trim()) { ElMessage.warning("名称不能为空"); return; }
+  if (!target.ref?.trim()) target.ref = toKey(target.title);
+  else target.ref = toKey(target.ref);
+  const submitted = JSON.parse(JSON.stringify(target));
+  const snapshot = editSnapshot(submitted);
+  saving.value = true;
+  let committed = false;
   try {
-    JSON.parse(e.fieldsJson || "{}");
-    const payload = entryPayload(e);
-    const r = e.id ? await Api.updateEntry(e.id, payload) : await Api.createEntry(payload);
+    JSON.parse(submitted.fieldsJson || "{}");
+    const payload = entryPayload(submitted);
+    const r = submitted.id ? await Api.updateEntry(submitted.id, payload) : await Api.createEntry(payload);
     if (r?.ok === false) throw new Error(r.error || "保存失败");
-    const cells = r?.refCascade?.totalCells || 0;
-    ElMessage.success(cells ? `已保存，并自动更新 ${cells} 处 @mem 引用` : "已保存");
-    original.value = editSnapshot(editing.value);
-    dialogOpen.value = false;
+    committed = true;
+    if (!alive) return;
+    if (editing.value === target && dialogOpen.value) {
+      const unchanged = editSnapshot(target) === snapshot;
+      if (r?.item?.id) target.id = submitted.id = r.item.id;
+      original.value = editSnapshot(submitted);
+      if (unchanged) dialogOpen.value = false;
+      const cells = r?.refCascade?.totalCells || 0;
+      const message = cells ? `已保存，并自动更新 ${cells} 处 @mem 引用` : "已保存";
+      ElMessage.success(unchanged ? message : `${message}；后续修改仍未保存`);
+    }
     await loadEntries();
     await loadRefData();
   } catch (err) {
-    ElMessage.error("保存失败: " + (err.message || err));
-  }
+    if (alive) {
+      if (committed) ElMessage.warning("已保存，但列表刷新失败: " + apiError(err));
+      else ElMessage.error("保存失败: " + apiError(err));
+    }
+  } finally { saving.value = false; }
 }
 async function tryClose(done) {
   if (dirty.value) {
@@ -335,9 +354,9 @@ function finishDrag() {
 </script>
 
 <template>
-  <div class="h-full flex flex-col">
+  <div class="admin-page memory-page h-full flex flex-col">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
+      <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">记忆管理</h1>
         <span class="text-xs text-macsub">正文为本体 · 启用 {{ enabledCount }} 条 · 展开 {{ expandedEntries.length }} 条 / ~{{ expandedTokens.toLocaleString() }} tk · 总计 ~{{ totalTokens.toLocaleString() }} tk</span>
       </div>
@@ -348,7 +367,9 @@ function finishDrag() {
       </div>
     </header>
 
-    <div class="px-6 pt-4 pb-3 flex gap-2 flex-wrap shrink-0">
+    <MobileAdminSummary :items="[{ label: '启用条目', value: enabledCount }, { label: '展开条目', value: expandedEntries.length }, { label: '展开 tokens', value: expandedTokens.toLocaleString() }, { label: '总 tokens', value: totalTokens.toLocaleString() }]">启用 {{ enabledCount }} · 展开 {{ expandedEntries.length }} · ~{{ expandedTokens.toLocaleString() }} tk</MobileAdminSummary>
+
+    <div class="memory-categories px-6 pt-4 pb-3 flex gap-2 flex-wrap shrink-0">
       <button v-for="c in categories" :key="c.key" @click="activeCat = c.key"
         class="px-3.5 py-1.5 rounded-full text-sm transition-all border flex items-center gap-1"
         :class="activeCat === c.key ? 'bg-mactext text-white border-mactext' : 'bg-white text-mactext border-macborder hover:border-gray-400'">
@@ -356,7 +377,7 @@ function finishDrag() {
       </button>
     </div>
 
-    <div v-if="selectedIds.length" class="mx-6 mb-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="selectedIds.length" class="admin-batch mx-6 mb-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 条</span>
       <el-button size="small" :icon="'Box'" @click="batchUpdateEntries({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
@@ -367,7 +388,7 @@ function finishDrag() {
       <el-button size="small" text @click="clearSelection">取消选择</el-button>
     </div>
 
-    <div ref="scrollContainer" class="flex-1 min-h-0 overflow-y-auto px-6 pb-6" :class="{ 'select-none': dragging }" v-loading="loading">
+    <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto px-6 pb-6" :class="{ 'select-none': dragging }" v-loading="loading">
       <div v-if="!entries.length" class="text-center text-macsub py-16 text-sm">
         {{ showArchived ? '该分类暂无条目' : '该分类暂无未归档条目' }}
       </div>
@@ -377,7 +398,7 @@ function finishDrag() {
         @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" :disabled="!hasGroups">
         <template #item="{ element: g }">
           <div class="mb-4" :class="g.expanded ? 'rounded-2xl border border-amber-300/70 bg-amber-50/45 p-3' : ''">
-            <div class="text-xs font-semibold text-macsub mb-1.5 flex items-center gap-2 group/grp">
+            <div class="asset-group-heading text-xs font-semibold text-macsub mb-1.5 flex items-center gap-2 group/grp">
               <el-icon v-if="!g.expanded" class="group-handle cursor-move select-none text-gray-300 hover:text-macsub" :size="14"><Rank /></el-icon>
               <span v-else class="w-[14px] text-center select-none">📌</span>
               <span class="w-1 h-3.5 rounded" :class="g.expanded ? 'bg-amber-500' : 'bg-macblue'"></span>{{ g.expanded ? '提示词展开' : (g.name || '未分组') }}
@@ -390,7 +411,7 @@ function finishDrag() {
               class="space-y-2 min-h-8" :class="g.expanded && !g.items.length ? 'rounded-xl border border-dashed border-amber-300/70' : ''">
               <template #item="{ element: e }">
                 <div @click="openEdit(e)"
-                  class="mac-panel px-3.5 py-3 grid grid-cols-[28px_20px_40px_minmax(0,1fr)_auto] items-stretch gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
+                  class="memory-card mac-panel px-3.5 py-3 grid grid-cols-[28px_20px_40px_minmax(0,1fr)_auto] items-stretch gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
                   :class="{ 'opacity-45': !e.enabled || e.archived, 'border-dashed': e.archived, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(e.id) }">
                   <div class="self-stretch flex items-center justify-center" @click.stop>
                     <el-checkbox :model-value="isSelected(e.id)" @change="(v) => setSelected(e.id, v)" />
@@ -398,8 +419,8 @@ function finishDrag() {
                   <div class="drag-handle cursor-move select-none self-stretch flex items-center justify-center text-gray-300 hover:text-macsub" @click.stop>
                     <el-icon :size="16"><Rank /></el-icon>
                   </div>
-                  <span class="text-[11px] text-macsub text-right tabular-nums self-stretch flex items-center justify-end">{{ e.sort }}</span>
-                  <div class="min-w-0 self-start">
+                  <span class="memory-sort text-[11px] text-macsub text-right tabular-nums self-stretch flex items-center justify-end">{{ e.sort }}</span>
+                  <div class="memory-copy min-w-0 self-start">
                     <div class="flex items-center gap-2 min-w-0">
                       <span class="text-sm font-semibold truncate">{{ e.title }}</span>
                       <el-tag v-if="g.expanded" size="small" type="warning" effect="plain">已展开</el-tag>
@@ -410,7 +431,7 @@ function finishDrag() {
                     <div v-if="snippet(e.body)" class="pm-clamp2 text-xs text-macsub mt-1.5 leading-relaxed">{{ snippet(e.body) }}</div>
                     <div class="text-[10px] text-macsub/75 mt-1.5 tabular-nums">{{ assetTimeLine(e) }}</div>
                   </div>
-                  <div class="flex items-center gap-2 shrink-0 self-center" @click.stop>
+                  <div class="asset-actions flex items-center gap-2 shrink-0 self-center" @click.stop>
                     <span class="text-[10px] text-macsub tabular-nums shrink-0">{{ tokenCount(e.body) }} tk</span>
                     <el-switch :model-value="!!e.enabled" @change="toggleEnabled(e)" size="small" :disabled="!!e.archived" />
                     <el-button size="small" text :type="e.archived ? 'primary' : 'info'" :icon="e.archived ? 'RefreshLeft' : 'Box'" @click="toggleArchived(e)">{{ e.archived ? '恢复' : '归档' }}</el-button>
@@ -424,10 +445,10 @@ function finishDrag() {
       </draggable>
     </div>
 
-    <el-dialog v-model="dialogOpen" :title="editing?.id ? '编辑条目' : '新建条目'" width="900px" top="4vh"
-      :close-on-click-modal="true" :before-close="tryClose" class="mac-edit-dialog">
-      <div v-if="editing" class="flex flex-col gap-3" style="height: 70vh;">
-        <div class="flex items-end gap-3">
+    <el-dialog append-to-body v-model="dialogOpen" :title="editing?.id ? '编辑条目' : '新建条目'" width="900px" top="4vh"
+      :close-on-click-modal="true" :before-close="tryClose" class="admin-dialog memory-dialog mac-edit-dialog">
+      <div v-if="editing" class="asset-edit-body flex flex-col gap-3" style="height: 70vh;">
+        <div class="asset-form-row flex items-end gap-3">
           <div class="flex-1">
             <label class="text-xs text-macsub mb-1 block">名称</label>
             <el-input v-model="editing.title" placeholder="条目名称" />
@@ -455,7 +476,7 @@ function finishDrag() {
             <span class="text-xs whitespace-nowrap">归档</span>
           </div>
         </div>
-        <div class="flex items-end gap-3">
+        <div class="asset-form-row flex items-end gap-3">
           <div class="w-80">
             <label class="text-xs text-macsub mb-1 block">引用 key（留空自动按名称生成）</label>
             <el-input v-model="editing.ref" placeholder="自动生成">
@@ -471,16 +492,17 @@ function finishDrag() {
           实际引用：<code class="text-macblue">@mem/{{ keyPreview }}</code>
           <span class="opacity-60"> · 改名称不影响已生成的 key，引用始终稳定</span>
         </div>
-        <div class="flex-1 min-h-0 flex flex-col">
+        <div v-if="editing.id" class="admin-mobile-only asset-form-meta">{{ assetTimeLine(editing) }}</div>
+        <div class="asset-editor flex-1 min-h-0 flex flex-col">
           <label class="text-xs text-macsub mb-1 block">正文（Markdown · 记忆本体）</label>
-          <div class="flex-1 min-h-0"><MdEditor v-model="editing.body" :ref-data="refData" /></div>
+          <div class="flex-1 min-h-0"><MdEditor mobile-flow v-model="editing.body" :ref-data="refData" /></div>
         </div>
       </div>
       <template #footer>
-        <span v-if="editing?.id" class="text-[11px] text-macsub mr-auto">{{ assetTimeLine(editing) }}</span>
+        <span v-if="editing?.id" class="asset-footer-time text-[11px] text-macsub mr-auto">{{ assetTimeLine(editing) }}</span>
         <span v-if="dirty" class="text-xs text-orange-500 mr-3">● 有未保存修改</span>
         <el-button @click="tryClose()">取消</el-button>
-        <el-button type="primary" @click="save">保存</el-button>
+        <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
       </template>
     </el-dialog>
   </div>

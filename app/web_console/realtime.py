@@ -141,6 +141,7 @@ class GlobalRealtime:
         self.lock = asyncio.Lock()
         self.clients: dict[asyncio.Queue, dict] = {}
         self.task: asyncio.Task | None = None
+        self._stopping = False
         self.serial = 0
         self.last_cursor = -1
         self.last_calibration = 0.0
@@ -148,6 +149,9 @@ class GlobalRealtime:
         self.version_at = 0.0
 
     async def start(self):
+        if self.task and not self.task.done():
+            return
+        self._stopping = False
         listeners = getattr(self.owner.db.conn, "commit_listeners", None)
         if listeners is not None:
             listeners.add(self.wake.set)
@@ -157,8 +161,13 @@ class GlobalRealtime:
         listeners = getattr(self.owner.db.conn, "commit_listeners", None)
         if listeners is not None:
             listeners.discard(self.wake.set)
+        if not self._stopping:
+            # Own the stop transition before cancelling. Repeated close calls
+            # must join the task, not interrupt its cancellation cleanup again.
+            self._stopping = True
+            if self.task:
+                self.task.cancel()
         if self.task:
-            self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.task
         for queue in tuple(self.clients):
@@ -293,14 +302,20 @@ class GlobalRealtime:
             )
 
     async def run(self):
-        while True:
+        while not self._stopping:
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
+            # Python 3.11 wait_for can swallow cancellation when Event.wait
+            # completes at the same time. The stop state remains authoritative.
+            if self._stopping:
+                break
             self.wake.clear()
             # Coalesce one transaction/bulk import, not every streamed character.
             await asyncio.sleep(0.06)
+            if self._stopping:
+                break
             try:
                 await self.refresh()
             except asyncio.CancelledError:

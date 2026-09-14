@@ -1,18 +1,24 @@
 <script setup>
-import {computed, onMounted, ref, watch} from "vue";
+import {computed, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ElMessage, ElMessageBox} from "element-plus";
 import {encode} from "gpt-tokenizer";
 import MarkdownIt from "markdown-it";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
 import {Api, apiError} from "../api";
-import MdEditor from "../components/MdEditor.vue";
+import MdEditor from "../components/AdaptiveMdEditor.vue";
+import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 
 const templates = ref([]);
 const activeId = ref(null);
 const editing = ref(null);
 const original = ref("");
+const saving = ref(false);
+const changingTemplate = ref(false);
+let alive = true;
+let loadRequest = 0;
 const showHelp = ref(false);
+const mobilePane = ref("edit");
 const showParams = ref(false);
 const showBuiltinImport = ref(false);
 const builtinImportKinds = ref(["main", "agent"]);
@@ -113,13 +119,19 @@ const renderedPreview = computed(() => markdown.render(previewResult.value || ""
 const activeTemplateName = computed(() => templates.value.find((t) => t.is_active)?.name || "未设置");
 const agentActiveTemplateName = computed(() => templates.value.find((t) => t.is_agent_active)?.name || "未设置");
 
-async function load(keepId = activeId.value, {preserveDirty = false} = {}) {
+async function load(keepId = activeId.value, {preserveDirty = false, selectEditor = true} = {}) {
+	const request = ++loadRequest;
+	const target = editing.value;
+	const snapshot = JSON.stringify(target);
 	const data = await Api.templates();
+	if (!alive || request !== loadRequest) return;
 	templates.value = data.items || [];
 	if (data.promptParams) {
 		runtimePromptParams.value = data.promptParams;
 		if (!sampleParams.value || sampleParams.value === "{}" || sampleParamsNeedRuntimeRefresh()) resetParamsFromRuntime();
 	}
+	// List refreshes must never overwrite a different editor or a newer draft.
+	if (!selectEditor || editing.value !== target || JSON.stringify(editing.value) !== snapshot) return;
 	if (preserveDirty && dirty()) return;
 	if (keepId) {
 		const t = templates.value.find((x) => x.id === keepId);
@@ -143,52 +155,82 @@ function select(t) {
 	schedulePreview(120);
 }
 
-async function selectById(id) {
+async function confirmDiscard() {
+	const target = editing.value;
+	const snapshot = JSON.stringify(target);
 	if (dirty()) {
 		try {
 			await ElMessageBox.confirm("当前模板有未保存修改，切换后会丢失这些修改。确定切换？", "切换模板", {
 				type: "warning", confirmButtonText: "放弃并切换", cancelButtonText: "继续编辑",
 			});
-		} catch {
-			activeId.value = editing.value?.id || null;
-			return;
-		}
+		} catch { return false; }
 	}
-	const t = templates.value.find((x) => x.id === id);
-	if (t) select(t);
+	return alive && editing.value === target && JSON.stringify(editing.value) === snapshot;
+}
+
+async function selectById(id) {
+	if (changingTemplate.value) { activeId.value = editing.value?.id || null; return; }
+	changingTemplate.value = true;
+	try {
+		if (!await confirmDiscard()) { activeId.value = editing.value?.id || null; return; }
+		const t = templates.value.find((x) => x.id === id);
+		if (t) select(t);
+	} finally { changingTemplate.value = false; }
 }
 
 onMounted(async () => {
 	await load();
 });
 
-async function save() {
-	if (!editing.value) return;
-	const r = await Api.updateTemplate(editing.value.id, editing.value);
-	if (r?.ok === false) throw new Error(r.error || "保存失败");
-	original.value = JSON.stringify(editing.value);
-	ElMessage.success("已保存");
-	await load(editing.value.id);
+async function saveTemplate(patch = {}, message = "已保存") {
+	if (!alive || !editing.value || saving.value || changingTemplate.value) return;
+	const target = editing.value;
+	const submitted = {...JSON.parse(JSON.stringify(target)), ...patch};
+	saving.value = true;
+	let committed = false;
+	try {
+		const r = await Api.updateTemplate(submitted.id, submitted);
+		if (r?.ok === false) throw new Error(r.error || "保存失败");
+		committed = true;
+		if (!alive) return;
+		const current = editing.value === target;
+		if (current) {
+			Object.assign(target, patch);
+			original.value = JSON.stringify(submitted);
+		}
+		ElMessage.success(current && dirty() ? `${message}；后续修改仍未保存` : message);
+		await load(submitted.id, {preserveDirty: true, selectEditor: current});
+	} catch (error) {
+		if (alive) {
+			if (committed) ElMessage.warning(`已保存，但列表刷新失败：${apiError(error)}`);
+			else ElMessage.error(`保存失败：${apiError(error)}`);
+		}
+	} finally { saving.value = false; }
 }
 
-async function activate() {
-	const r = await Api.updateTemplate(editing.value.id, {...editing.value, is_active: 1});
-	if (r?.ok === false) throw new Error(r.error || "设置失败");
-	ElMessage.success("已设为激活模板");
-	await load(editing.value.id);
-}
-
-async function activateAgent() {
-	const r = await Api.updateTemplate(editing.value.id, {...editing.value, is_agent_active: 1});
-	if (r?.ok === false) throw new Error(r.error || "设置失败");
-	ElMessage.success("已设为 Agent 提示词");
-	await load(editing.value.id);
-}
+function save() { return saveTemplate(); }
+function activate() { return saveTemplate({is_active: 1}, "已设为激活模板"); }
+function activateAgent() { return saveTemplate({is_agent_active: 1}, "已设为 Agent 提示词"); }
 
 async function newTpl() {
-	const r = await Api.createTemplate({name: "新模板", content: SAMPLE, is_active: 0, is_agent_active: 0});
-	if (r?.ok === false) throw new Error(r.error || "创建失败");
-	await load(r.id);
+	if (!alive || saving.value || changingTemplate.value) return;
+	changingTemplate.value = true;
+	let created = false;
+	try {
+		if (!await confirmDiscard()) return;
+		const target = editing.value;
+		const snapshot = JSON.stringify(target);
+		const r = await Api.createTemplate({name: "新模板", content: SAMPLE, is_active: 0, is_agent_active: 0});
+		if (r?.ok === false) throw new Error(r.error || "创建失败");
+		created = true;
+		if (!alive) return;
+		await load(r.id, {selectEditor: editing.value === target && JSON.stringify(editing.value) === snapshot});
+	} catch (error) {
+		if (alive) {
+			if (created) ElMessage.warning(`模板已创建，但列表刷新失败：${apiError(error)}`);
+			else ElMessage.error(`创建失败：${apiError(error)}`);
+		}
+	} finally { changingTemplate.value = false; }
 }
 
 function openBuiltinImport() {
@@ -235,7 +277,7 @@ async function importBuiltinTemplates() {
 }
 
 async function removeCurrent() {
-	if (!editing.value) return;
+	if (!editing.value || saving.value || changingTemplate.value) return;
 	const name = editing.value.name;
 	await ElMessageBox.confirm(`确定删除模板「${name}」？不可恢复。`, "删除确认", {
 		type: "warning", confirmButtonText: "删除", cancelButtonText: "取消",
@@ -286,10 +328,12 @@ async function runPreview({silent = false} = {}) {
 }
 
 function schedulePreview(delay = 700) {
-	if (!autoPreview.value || !editing.value) return;
+	if (!alive || !autoPreview.value || !editing.value) return;
 	clearTimeout(previewTimer);
 	previewTimer = setTimeout(() => runPreview({silent: true}), delay);
 }
+
+onBeforeUnmount(() => { alive = false; loadRequest++; previewSeq++; clearTimeout(previewTimer); });
 
 watch(() => editing.value?.content, () => schedulePreview(), {flush: "post"});
 watch(sampleParams, () => schedulePreview(500));
@@ -301,35 +345,49 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 </script>
 
 <template>
-	<div class="h-full flex flex-col">
+	<div class="admin-page template-page h-full flex flex-col">
 		<header
 			class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-			<div class="flex items-center gap-2 min-w-0">
+			<div class="admin-heading flex items-center gap-2 min-w-0">
 				<h1 class="text-base font-semibold shrink-0">提示词模板</h1>
 				<span class="text-xs text-macsub truncate">选择模板 · 编辑 · 自动补全 · 实时预览</span>
 			</div>
-			<div class="flex gap-2 shrink-0">
+			<div class="admin-desktop-only template-actions flex gap-2 shrink-0">
 				<el-button :icon="'QuestionFilled'" @click="showHelp = true" round>语法说明</el-button>
 				<el-button :icon="'Download'" @click="openBuiltinImport" round>导入随版本模板</el-button>
-				<el-button :icon="'Plus'" @click="newTpl" round>新建</el-button>
-				<el-button @click="save" round :disabled="!dirty()">保存</el-button>
-				<el-button type="primary" @click="activate" round :disabled="editing?.is_active">设为激活</el-button>
-				<el-button type="success" @click="activateAgent" round :disabled="editing?.is_agent_active">设为Agent提示词</el-button>
+				<el-button :icon="'Plus'" @click="newTpl" round :disabled="saving || changingTemplate">新建</el-button>
+				<el-button @click="save" round :disabled="saving || changingTemplate || !dirty()">保存</el-button>
+				<el-button type="primary" @click="activate" round :disabled="saving || changingTemplate || !editing || editing.is_active">设为激活</el-button>
+				<el-button type="success" @click="activateAgent" round :disabled="saving || changingTemplate || !editing || editing.is_agent_active">设为Agent提示词</el-button>
+			</div>
+			<div class="admin-mobile-only template-mobile-actions">
+				<button type="button" :disabled="saving || changingTemplate" @click="newTpl">新建</button>
+				<button type="button" class="is-primary" :disabled="saving || changingTemplate || !dirty()" @click="save">保存</button>
+				<details class="template-more" @keydown.esc="$event.currentTarget.open = false">
+					<summary>更多 <span aria-hidden="true">⌄</span></summary>
+					<div class="template-more-menu" @click="$event.currentTarget.closest('details').open = false">
+						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_active" @click="activate">设为主提示词</button>
+						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_agent_active" @click="activateAgent">设为 Agent 提示词</button>
+						<button type="button" @click="openBuiltinImport">导入随版本模板</button>
+						<button type="button" @click="showHelp = true">语法说明</button>
+						<button type="button" class="is-danger" :disabled="saving || changingTemplate || !editing" @click="removeCurrent">删除当前模板</button>
+					</div>
+				</details>
 			</div>
 		</header>
 		
-		<div v-if="editing" class="h-14 shrink-0 px-4 border-b border-macborder bg-white/55 flex items-center gap-3">
+		<div v-if="editing" class="template-meta h-14 shrink-0 px-4 border-b border-macborder bg-white/55 flex items-center gap-3">
 			<div class="flex items-center gap-2 min-w-0">
 				<span class="text-xs text-macsub shrink-0">模板</span>
-				<el-select v-model="activeId" @change="selectById" filterable class="!w-72" placeholder="选择模板">
+				<el-select v-model="activeId" :disabled="changingTemplate" @change="selectById" filterable class="!w-72" aria-label="选择模板" placeholder="选择模板">
 					<el-option v-for="t in templates" :key="t.id"
 					           :label="t.name + (t.is_active ? ' · 激活' : '') + (t.is_agent_active ? ' · Agent提示词' : '')"
 					           :value="t.id"/>
 				</el-select>
-				<el-input v-model="editing.name" placeholder="模板名" class="!w-72"/>
+				<el-input v-model="editing.name" aria-label="模板名称" placeholder="模板名" class="!w-72"/>
 			</div>
 			
-			<div class="flex items-center gap-2 text-xs shrink-0">
+			<div class="template-status flex items-center gap-2 text-xs shrink-0">
 				<span v-if="editing.is_active" class="text-green-600">● 当前激活</span>
 				<span v-else class="text-macsub">激活: {{ activeTemplateName }}</span>
 				<span v-if="editing.is_agent_active" class="text-emerald-600">● Agent提示词</span>
@@ -337,7 +395,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 				<span v-if="dirty()" class="text-orange-500">● 未保存</span>
 			</div>
 			
-			<div class="ml-auto flex items-center gap-2 shrink-0">
+			<div class="template-counters ml-auto flex items-center gap-2 shrink-0">
 				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-black/[0.04]">模板 {{
 						formatNum(templateChars)
 					}} 字 / {{ formatNum(templateTokens) }} tk</span>
@@ -348,17 +406,22 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 		</div>
 		
-		<div class="flex-1 min-h-0 flex">
+		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-orange-500">· 未保存</span></MobileAdminSummary>
+		<div v-if="editing" class="admin-mobile-only template-pane-switch" role="group" aria-label="模板工作区">
+			<button type="button" :aria-pressed="mobilePane === 'edit'" aria-controls="template-editor-pane" @click="mobilePane = 'edit'">编辑模板</button>
+			<button type="button" :aria-pressed="mobilePane === 'preview'" aria-controls="template-preview-pane" @click="mobilePane = 'preview'">实时预览</button>
+		</div>
+		<div class="template-workspace flex-1 min-h-0 flex" :class="`mobile-pane-${mobilePane}`">
 			<template v-if="editing">
-				<section class="flex-[1.18] min-w-0 flex flex-col p-4 gap-3 border-r border-macborder">
+				<section id="template-editor-pane" class="template-editor-pane flex-[1.18] min-w-0 flex flex-col p-4 gap-3 border-r border-macborder">
 					<div class="flex-1 min-h-0">
 						<MdEditor v-model="editing.content" completion-mode="template"/>
 					</div>
 				</section>
 				
-				<aside class="flex-[0.92] min-w-[420px] max-w-[820px] flex flex-col bg-[#fbfbfd]">
+				<aside id="template-preview-pane" class="template-preview-pane flex-[0.92] min-w-[420px] max-w-[820px] flex flex-col bg-[#fbfbfd]">
 					<div
-						class="h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between bg-white/80 backdrop-blur">
+						class="template-preview-toolbar h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between bg-white/80 backdrop-blur">
 						<div class="flex items-center gap-2">
 							<div class="w-2 h-2 rounded-full"
 							     :class="previewError ? 'bg-red-500' : previewResult ? 'bg-green-500' : 'bg-gray-300'"></div>
@@ -380,7 +443,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 						</div>
 					</div>
 					
-					<div class="grid grid-cols-3 gap-2 p-3 shrink-0 border-b border-macborder bg-white/55">
+					<div class="admin-desktop-only grid grid-cols-3 gap-2 p-3 shrink-0 border-b border-macborder bg-white/55">
 						<div class="mac-panel px-3 py-2">
 							<div class="text-[10px] text-macsub">输出 tokens</div>
 							<div class="text-base font-semibold">{{ formatNum(outputTokens) }}</div>
@@ -418,7 +481,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			<div v-else class="flex-1 flex items-center justify-center text-macsub text-sm">选择或新建一个模板</div>
 		</div>
 		
-		<el-dialog
+		<el-dialog append-to-body class="admin-dialog template-dialog"
 			v-model="showBuiltinImport"
 			title="导入随版本模板"
 			width="520px"
@@ -452,7 +515,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</template>
 		</el-dialog>
 
-		<el-dialog v-model="showParams" title="预览样例运行时参数" width="760px">
+		<el-dialog append-to-body class="admin-dialog template-dialog" v-model="showParams" title="预览样例运行时参数" width="760px">
 			<div class="text-xs text-macsub mb-2">默认来自后端当前运行时 params；改完会自动刷新预览。</div>
 			<el-input v-model="sampleParams" type="textarea" resize="none" class="template-param-input"/>
 			<template #footer>
@@ -462,7 +525,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</template>
 		</el-dialog>
 		
-		<el-dialog v-model="showHelp" title="模板语法说明" width="760px">
+		<el-dialog append-to-body class="admin-dialog template-dialog" v-model="showHelp" title="模板语法说明" width="760px">
 			<div class="text-sm space-y-3 leading-relaxed">
 				<p class="text-macsub">模板用兼容 prompt-memory 的语法拼装系统提示词，不与 Markdown 冲突。模板页输入
 					<code>[[</code> 会补变量/函数，输入 <code>@</code> 会补模板指令。</p>

@@ -194,6 +194,8 @@ test("real tree alias opens the same row without moving/expanding folders; stale
   let resolve;
   const catalog = {connected: false, ready: false, activityReadVersions: new Map()};
   const ctx = vm.createContext({computed, nextTick, reactive, ref, rowId, treeItemParent, compareTreeItems, resolveTreeDrop, activityLabel, activityReadRequests,
+    // UI import seam only; alias navigation and read-receipt behavior remain real.
+    defineLazyView: () => ({}),
     clearTimeout, defineProps: () => ({activeConversationUuid: "", draftConversation: null}), defineEmits: () => (...args) => emitted.push(args), defineExpose() {},
     watch() {}, onMounted() {}, onBeforeUnmount() {}, referenceCatalog: catalog,
     acceptActivityReadReceipt(receipt) {catalog.activityReadVersions = new Map(receipt.items.map(item => [item.conversationUuid, item.activityReadVersion]));},

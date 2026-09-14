@@ -13,6 +13,8 @@ function deferred() { let resolve, reject; const promise = new Promise((a, b) =>
 function harness(Api = {}) {
   const errors = [];
   const context = vm.createContext({ computed, nextTick, reactive, ref, rowId, treeItemParent, compareTreeItems, resolveTreeDrop, Api, apiError: String, referenceCatalog: { connected: false, ready: false },
+    // Imports are seams in this loader-only fixture; lazy UI rendering is exercised in lazyView.test.mjs.
+    defineLazyView: () => ({}),
     defineProps: () => ({ activeConversationUuid: '', draftConversation: null }), defineEmits: () => () => {}, defineExpose() {},
     watch() {}, onMounted() {}, onBeforeUnmount() {}, ElMessage: { error(value) { errors.push(value); }, warning() {} }, document: { querySelector: () => null }, CSS: { escape: s => s },
   });

@@ -7,6 +7,7 @@ from app.agent.native_continuation import serialize_messages, validate_model_con
 from app.context.window import mark_source, neutral_context, source_of
 from app.task_memory import without_task_memory_runtime_messages
 from app.web_console.core import *
+from app.web_operations import AGENT_TOOL_NAMES
 
 
 class _WebLiveStream:
@@ -159,7 +160,7 @@ class _WebLiveStream:
         nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
         task = nested.get("task") if isinstance(nested.get("task"), dict) else {}
         tool_name = str(payload.get("name") or nested.get("toolName") or nested.get("name") or "").strip()
-        if tool_name not in {"Agent", "AgentMessage", "AgentStop"}:
+        if tool_name not in AGENT_TOOL_NAMES:
             return False
         return bool(nested.get("detached") is True or task.get("detached") is True)
 
@@ -380,7 +381,7 @@ class _WebLiveStream:
         elif typ == "tool_update":
             if not self._is_detached_agent_progress(event):
                 self._after_tool_boundary = True
-            self.draft_text = ""
+                self.draft_text = ""
             line = str(event.get("line") or "工具更新")
             if self.live_tools:
                 self.live_tools[-1] = line
@@ -391,7 +392,7 @@ class _WebLiveStream:
         elif typ == "tool_progress":
             if not self._is_detached_agent_progress(event):
                 self._after_tool_boundary = True
-            self.draft_text = ""
+                self.draft_text = ""
             if not self._is_detached_agent_progress(event):
                 self.current_status = "工具执行中"
                 self.status_started_at_ms = event_ts

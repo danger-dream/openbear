@@ -136,7 +136,7 @@ function selectRelevantStep(check) {
 		</div>
 
 		<div v-else class="plan-overview">
-			<aside class="plan-sidebar">
+			<aside class="plan-sidebar" tabindex="0" aria-label="计划步骤与版本，可滚动">
 				<div class="plan-caption">
 					<div class="plan-caption-head">
 						<strong>{{ view.phaseMeta.label }} · {{ view.counts.completedSteps }}/{{ view.counts.requiredSteps }}</strong>
@@ -201,7 +201,7 @@ function selectRelevantStep(check) {
 				</div>
 			</aside>
 
-			<main class="plan-inspector">
+			<main class="plan-inspector" tabindex="0" aria-label="计划步骤详情，可滚动">
 				<div v-if="selectedStep" class="inspector-content">
 					<div class="inspector-kicker">步骤 {{ selectedStep.index }} · {{ selectedStep.id }}</div>
 					<div class="inspector-title-row">
@@ -259,6 +259,7 @@ function selectRelevantStep(check) {
 									</ElTooltip>
 								</div>
 								<p class="evidence-summary">{{ evidence.summary }}</p>
+								<details class="plan-touch-details"><summary>依据详情</summary><code>记录 ID：{{ evidence.uuid }}</code></details>
 							</article>
 						</div>
 						<div v-else class="evidence-missing"><Warning/>尚未绑定验收依据</div>
@@ -288,6 +289,10 @@ function selectRelevantStep(check) {
 											<span class="source-chip">{{ source.label }}</span>
 										</ElTooltip>
 									</div>
+									<details v-if="output.sources.length" class="plan-touch-details">
+										<summary>来源详情</summary>
+										<div v-for="source in output.sources" :key="source.raw"><strong>{{ source.typeLabel }}</strong><p>{{ source.summary }}</p><code v-if="source.uuid">记录 ID：{{ source.uuid }}</code></div>
+									</details>
 								</div>
 							</article>
 						</div>
@@ -408,13 +413,13 @@ function selectRelevantStep(check) {
 .inspector-content, .criterion, .criterion-copy, .evidence-list, .deliverable, .deliverable > div { max-width: 100%; min-width: 0; }
 .inspector-kicker { color: var(--blue); font-size: 10px; font-weight: 680; letter-spacing: .06em; text-transform: uppercase; }
 .inspector-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 4px; }
-.inspector-title-row h2 { margin: 0; color: var(--ink); font-size: 19px; font-weight: 700; letter-spacing: -.025em; }
+.inspector-title-row h2 { min-width: 0; overflow-wrap: anywhere; margin: 0; color: var(--ink); font-size: 19px; font-weight: 700; letter-spacing: -.025em; }
 .done-label { display: inline-flex; align-items: center; gap: 4px; color: var(--secondary); font-size: 11px; font-weight: 620; white-space: nowrap; }
 .done-label svg { width: 12px; }
 .done-label.tone-success { color: var(--green); }
 .done-label.tone-active { color: var(--blue); }
 .done-label.tone-danger { color: var(--red); }
-.inspector-summary { margin: 7px 0 16px; color: var(--secondary); font-size: 12.5px; line-height: 1.58; }
+.inspector-summary { overflow-wrap: anywhere; margin: 7px 0 16px; color: var(--secondary); font-size: 12.5px; line-height: 1.58; }
 
 .step-detail-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; margin-bottom: 16px; }
 .info-cell { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.72); padding: 9px 10px; }
@@ -493,15 +498,34 @@ function selectRelevantStep(check) {
 .source-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .source-list .source-chip { display: inline-block; max-width: 100%; overflow: hidden; border-radius: 999px; background: rgba(118,118,128,.1); padding: 3px 7px; color: var(--secondary); font-size: 9.5px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
 
+.plan-touch-details { display: none; }
 .spin { animation: planSpin 1s linear infinite; }
 @keyframes planSpin { to { transform: rotate(360deg); } }
 
-@media (max-width: 720px) {
+/* The same card can be narrow inside a desktop work pane. Size this fallback
+   by the actual card as well as the viewport, without changing wide plans. */
+@container agent-detail (max-width: 600px) {
 	.plan-overview { display: block; overflow: auto; }
 	.plan-sidebar { overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
 	.plan-inspector { overflow: visible; }
 	.step-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 	.completion-list { grid-template-columns: 1fr; }
+	.inspector-title-row { flex-wrap: wrap; }
+}
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	.plan-state-empty { overflow: auto; align-items: flex-start; justify-content: flex-start; flex-direction: column; gap: 8px; padding: 12px; }
+	.plan-overview { display: block; overflow: auto; -webkit-overflow-scrolling: touch; }
+	.plan-sidebar { overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
+	.plan-inspector { overflow: visible; padding: 12px 10px 16px; }
+	.plan-sidebar { padding: 10px 6px; }
+	.step-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	.completion-list { grid-template-columns: 1fr; }
+	.inspector-title-row { flex-wrap: wrap; }
+	.plan-touch-details { display: block; margin-top: 6px; font-size: 11px; overflow-wrap: anywhere; }
+	.plan-touch-details summary { cursor: pointer; min-height: 32px; padding: 6px 0; color: var(--secondary); }
+	.plan-touch-details code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+	.step-activity-card > header { flex-wrap: wrap; }
+	.step-activity-card > header span { white-space: normal; overflow-wrap: anywhere; }
 }
 </style>
 

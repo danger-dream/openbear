@@ -388,6 +388,7 @@ async function closeEditor() {
 }
 
 async function openDrawer() {
+	if (!usableConversationUuid.value) return;
 	drawerOpen.value = true;
 	const token = beginRequest("open");
 	if (scopeType.value === "agent_task") await loadTasks();
@@ -626,6 +627,7 @@ onBeforeUnmount(() => {
 	window.removeEventListener("focus", handleWindowFocus);
 	stopRefreshTimer();
 });
+defineExpose({open: openDrawer});
 </script>
 
 <template>
@@ -950,8 +952,6 @@ button:focus-visible, summary:focus-visible, .memory-detail-scroll:focus-visible
 .memory-switch-row label { color:var(--bear-ink); font-size:13px; cursor:pointer; }
 .memory-switch-row p { margin:.3rem 0 0; color:var(--tm-muted); font-size:12px; line-height:1.6; }
 @media (max-width: 760px) {
-	.task-memory-entry-wrap { top:auto; right:var(--console-float-rail-right); bottom:calc(var(--console-float-rail-bottom) + var(--console-float-control-size) + var(--console-float-control-gap)); }
-	.task-memory-entry { width:var(--console-float-control-size); height:var(--console-float-control-size); background:rgba(255,255,255,.9); }
 	.memory-row-main { padding:.75rem 0 .75rem .75rem; }
 	.memory-detail h3 { font-size:17px; }
 }

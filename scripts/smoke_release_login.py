@@ -83,6 +83,17 @@ async def verify(args):
                 assert response.status == 200, f"Missing entry asset: {ref}"
                 expected = dist / ref.lstrip("/").split("?", 1)[0]
                 assert await response.read() == expected.read_bytes(), f"Wrong served asset: {ref}"
+            if (dist / "manifest.webmanifest").is_file():
+                installation_resources = []
+                for url, (relative_path, mime) in auth_module.PWA_PUBLIC_FILES.items():
+                    response = await client.get(url, allow_redirects=False)
+                    assert response.status == 200, f"Installation resource requires login: {url}"
+                    assert response.content_type == mime, f"Wrong installation resource MIME: {url}"
+                    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+                    assert "no-cache" in response.headers.get("Cache-Control", "")
+                    assert await response.read() == (dist / relative_path).read_bytes(), url
+                    installation_resources.append(url)
+                report["pwaInstallationResources"] = installation_resources
             assert (await client.get("/api/system/version")).status == 401
             assert (await client.get("/api/auth/session")).status == 401
             assert not bot.requests

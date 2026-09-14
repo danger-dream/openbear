@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import draggable from "vuedraggable";
@@ -10,6 +10,9 @@ const secrets = ref([]);
 const loading = ref(false);
 const editing = ref(null);
 const original = ref("");
+const saving = ref(false);
+let alive = true;
+onBeforeUnmount(() => { alive = false; });
 const dialogOpen = ref(false);
 const showSecretValues = ref(false);
 const showArchived = ref(false);
@@ -95,17 +98,34 @@ const dirty = () => editing.value && editSnapshot(editing.value) !== original.va
 function addKv() { editing.value.kv.push({ key: "", value: "" }); }
 function delKv(i) { editing.value.kv.splice(i, 1); }
 async function save() {
-  const s = editing.value;
-  if (!s.name?.trim()) { ElMessage.warning("名称不能为空"); return; }
-  s.kv = s.kv.filter((x) => String(x.key || "").trim());
+  if (!alive || saving.value || !editing.value || !dialogOpen.value) return;
+  const target = editing.value;
+  if (!target.name?.trim()) { ElMessage.warning("名称不能为空"); return; }
+  target.kv = target.kv.filter((x) => String(x.key || "").trim());
+  const submitted = JSON.parse(JSON.stringify(target));
+  const snapshot = editSnapshot(submitted);
+  const payload = { ...submitted, kvJson: JSON.stringify(submitted.kv || [], null, 2) };
+  saving.value = true;
+  let committed = false;
   try {
-    const payload = { ...s, kvJson: JSON.stringify(s.kv || [], null, 2) };
-    const r = s.id ? await Api.updateSecret(s.id, payload) : await Api.createSecret(payload);
+    const r = submitted.id ? await Api.updateSecret(submitted.id, payload) : await Api.createSecret(payload);
     if (r?.ok === false) throw new Error(r.error || "保存失败");
-    ElMessage.success("已保存");
-    dialogOpen.value = false;
+    committed = true;
+    if (!alive) return;
+    if (editing.value === target && dialogOpen.value) {
+      const unchanged = editSnapshot(target) === snapshot;
+      if (r?.item?.id) target.id = submitted.id = r.item.id;
+      original.value = editSnapshot(submitted);
+      if (unchanged) dialogOpen.value = false;
+      ElMessage.success(unchanged ? "已保存" : "已保存提交内容；后续修改仍未保存");
+    }
     await load();
-  } catch (e) { ElMessage.error("保存失败: " + (e.message || e)); }
+  } catch (e) {
+    if (alive) {
+      if (committed) ElMessage.warning("已保存，但列表刷新失败: " + apiError(e));
+      else ElMessage.error("保存失败: " + apiError(e));
+    }
+  } finally { saving.value = false; }
 }
 async function tryClose(done) {
   if (dirty()) {
@@ -174,9 +194,9 @@ async function persistGroups() {
 </script>
 
 <template>
-  <div class="h-full flex flex-col">
+  <div class="admin-page secrets-page h-full flex flex-col">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
+      <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">凭证库</h1>
         <span class="text-xs text-macsub">拖手柄排序 · 点卡片编辑 · 审计日志不记录 value 明文</span>
       </div>
@@ -188,7 +208,7 @@ async function persistGroups() {
       </div>
     </header>
 
-    <div v-if="selectedIds.length" class="mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="selectedIds.length" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 条</span>
       <el-button size="small" :icon="'Box'" @click="batchUpdateSecrets({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
@@ -199,7 +219,7 @@ async function persistGroups() {
       <el-button size="small" text @click="clearSelection">取消选择</el-button>
     </div>
 
-    <div ref="scrollContainer" class="flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
+    <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
       <div v-if="!shownSecrets.length" class="text-center text-macsub py-16 text-sm">暂无凭证</div>
       <draggable v-model="groups" item-key="name" handle=".group-handle" :animation="180"
         v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
@@ -217,7 +237,7 @@ async function persistGroups() {
               class="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3 min-h-6">
               <template #item="{ element: s }">
                 <div v-if="showArchived || !s.archived" @click="openEdit(s)"
-            class="mac-panel mac-shadow p-4 flex flex-col gap-2 cursor-pointer hover:border-macblue/50 transition-colors"
+            class="secret-card mac-panel mac-shadow p-4 flex flex-col gap-2 cursor-pointer hover:border-macblue/50 transition-colors"
             :class="{ 'opacity-50 border-dashed': s.archived || !s.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(s.id) }">
             <div class="flex items-center justify-between gap-2">
               <div class="flex items-center gap-2 min-w-0">
@@ -232,14 +252,14 @@ async function persistGroups() {
                   <div v-if="s.note" class="text-xs text-macsub mt-0.5 truncate">{{ s.note }}</div>
                 </div>
               </div>
-              <div class="flex items-center gap-1" @click.stop>
+              <div class="asset-actions flex items-center gap-1" @click.stop>
                 <el-switch :model-value="!!s.enabled" size="small" :disabled="!!s.archived" @change="toggleEnabled(s)" />
                 <el-button size="small" text :type="s.archived ? 'primary' : 'info'" :icon="s.archived ? 'RefreshLeft' : 'Box'" @click="toggleArchived(s)">{{ s.archived ? '恢复' : '归档' }}</el-button>
                 <el-button size="small" text type="danger" :icon="'Delete'" @click="remove(s)" />
               </div>
             </div>
                   <div class="border-t border-macborder pt-2 space-y-1">
-                    <div v-for="(kv, j) in s.kv" :key="j" class="grid grid-cols-[120px_minmax(0,1fr)] gap-2 text-xs">
+                    <div v-for="(kv, j) in s.kv" :key="j" class="secret-value-row grid grid-cols-[120px_minmax(0,1fr)] gap-2 text-xs">
                       <span class="text-macsub truncate" :title="kv.key">{{ kv.key }}</span>
                       <span class="font-mono break-all whitespace-pre-wrap text-mactext">{{ showSecretValues ? kv.value : maskValue(kv.value) }}</span>
                     </div>
@@ -253,9 +273,9 @@ async function persistGroups() {
       </draggable>
     </div>
 
-    <el-dialog v-model="dialogOpen" :title="editing?.id ? '编辑凭证' : '新建凭证'" width="860px" top="6vh" :close-on-click-modal="true" :before-close="tryClose">
+    <el-dialog append-to-body class="admin-dialog secrets-dialog" v-model="dialogOpen" :title="editing?.id ? '编辑凭证' : '新建凭证'" width="860px" top="6vh" :close-on-click-modal="true" :before-close="tryClose">
       <div v-if="editing" class="flex flex-col gap-4">
-        <div class="grid grid-cols-[minmax(0,1fr)_220px_120px] gap-3 items-end">
+        <div class="asset-form-grid grid grid-cols-[minmax(0,1fr)_220px_120px] gap-3 items-end">
           <div><label class="text-xs text-macsub mb-1 block">名称（引用用，如 github）</label><el-input v-model="editing.name" /></div>
           <div>
             <label class="text-xs text-macsub mb-1 block">分组（可选）</label>
@@ -266,17 +286,21 @@ async function persistGroups() {
           <div><label class="text-xs text-macsub mb-1 block">序号</label><el-input-number v-model="editing.sort" :min="0" :step="10" class="!w-full" /></div>
         </div>
         <div><label class="text-xs text-macsub mb-1 block">备注</label><el-input v-model="editing.note" /></div>
-        <div class="flex items-center gap-4">
+        <div class="asset-form-toggles flex items-center gap-4">
           <el-switch v-model="editing.enabled" :active-value="1" :inactive-value="0" :disabled="!!editing.archived" active-text="注入提示词" inactive-text="不注入" />
           <el-switch v-model="editing.archived" :active-value="1" :inactive-value="0" @change="(v) => { if (v) editing.enabled = 0 }" active-text="归档" inactive-text="未归档" />
+        </div>
+        <div class="admin-mobile-only asset-form-meta">
+          <el-switch v-model="showSecretValues" size="small" active-text="显示密码内容" />
+          <div v-if="editing.id">{{ assetTimeLine(editing) }}</div>
         </div>
         <div>
           <div class="flex items-center justify-between mb-1">
             <label class="text-xs text-macsub">字段（key-value）</label>
             <el-button size="small" text :icon="'Plus'" @click="addKv">加一行</el-button>
           </div>
-          <div class="space-y-2 max-h-[46vh] overflow-y-auto pr-1">
-            <div v-for="(kv, i) in editing.kv" :key="i" class="grid grid-cols-[220px_minmax(0,1fr)_40px] gap-2">
+          <div class="secret-kv-list space-y-2 max-h-[46vh] overflow-y-auto pr-1">
+            <div v-for="(kv, i) in editing.kv" :key="i" class="secret-kv-edit grid grid-cols-[220px_minmax(0,1fr)_40px] gap-2">
               <el-input v-model="kv.key" placeholder="字段名 / key" />
               <el-input v-if="showSecretValues" v-model="kv.value" placeholder="值（支持多行）" type="textarea" :autosize="{ minRows: 2, maxRows: 10 }" />
               <el-input v-else v-model="kv.value" placeholder="值" type="password" />
@@ -286,14 +310,14 @@ async function persistGroups() {
         </div>
       </div>
       <template #footer>
-        <div class="flex items-center justify-between w-full">
-          <div class="flex items-center gap-4">
+        <div class="asset-footer flex items-center justify-between w-full">
+          <div class="asset-form-toggles flex items-center gap-4">
             <el-switch v-model="showSecretValues" active-text="显示密码内容" inactive-text="隐藏密码内容" />
             <span v-if="editing?.id" class="text-[11px] text-macsub">{{ assetTimeLine(editing) }}</span>
           </div>
           <div>
             <el-button @click="tryClose()">取消</el-button>
-            <el-button type="primary" @click="save">保存</el-button>
+            <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
           </div>
         </div>
       </template>

@@ -12,6 +12,7 @@ import {referenceErrorText, referenceDisplayText, referencesInText} from "../../
 import {referenceCatalog, acceptActivityReadReceipt} from "../../references/catalog.js";
 import {createActivityReadTracker, withActivityReadVersion} from "../../conversationActivity.js";
 import ConsoleHeader from "./ConsoleHeader.vue";
+import MobileConversationTools from "./MobileConversationTools.vue";
 import TurnList from "./TurnList.vue";
 import TurnMinimap from "./TurnMinimap.vue";
 import TaskMemoryDrawer from "./TaskMemoryDrawer.vue";
@@ -52,6 +53,8 @@ import {
 	createTerminalStateRefreshScheduler,
 	runGuardedConversationStateRefresh,
 } from "./terminalStateRefresh.js";
+import {createConversationStateRequests} from "./conversationStateRequests.js";
+import {createOperationFrameBuffer} from "./operationFrameBuffer.js";
 import {
 	applyLedgerUsageSnapshot,
 	ledgerTokenParts,
@@ -132,6 +135,13 @@ const loading = ref(false);
 // A replacement state request must finish an outstanding entry scroll instead
 // of replacing its bottom intent with the background refresh's preserve mode.
 let pendingLoadBottomScroll = null;
+let pendingLoadReplaceOperations = false;
+const operationFrameBuffer = createOperationFrameBuffer();
+const conversationStateRequests = createConversationStateRequests(async (uuid, signal) => {
+	const runConfigVersionAtRequest = runConfigSaves.appliedVersion;
+	const data = await Api.conversationState(uuid, {timelineLimit: INITIAL_TIMELINE_LIMIT}, {signal});
+	return {data, runConfigVersionAtRequest};
+});
 const running = ref(false);
 const sendPending = ref(false);
 const foregroundRunning = ref(false);
@@ -156,6 +166,7 @@ const autoScrollLocked = ref(true);
 const scrollerOverflow = ref(false);
 const activeTurnIndex = ref(0);
 const workDetailOpen = ref(false);
+const taskMemoryDrawer = ref(null);
 const workDetailTooltip = ref(null);
 const workDetailTooltipSuppressed = ref(false);
 const composer = ref(null);
@@ -192,7 +203,7 @@ let ws = null;
 let wsConversationUuid = "";
 let reconnectTimer = null;
 let operationResyncTimer = null;
-let operationResyncInFlight = false;
+let operationResyncInFlight = null;
 let timelinePageGeneration = 0;
 let timelinePageRequestToken = 0;
 let timelinePageConversationUuid = "";
@@ -555,7 +566,7 @@ function discardConversationDraft(conversationUuid) {
 		adjustComposerHeight();
 	}
 }
-defineExpose({discardConversationDraft, focusPendingInteraction});
+defineExpose({discardConversationDraft, focusPendingInteraction, captureMobileViewportAnchor, restoreMobileViewportAnchor});
 
 function primaryModelInfo() {
 	const preferred = currentPrimaryModelKey.value || primaryModelKey.value;
@@ -771,6 +782,9 @@ function resetTimelinePagination(conversationUuid = "") {
 }
 
 function resetOperationStore(conversationUuid = "") {
+	conversationStateRequests.invalidate();
+	operationFrameBuffer.reset();
+	pendingLoadReplaceOperations = false;
 	operationsById.value = new Map();
 	orderedOpIds.value = [];
 	revisionByOpId.value = new Map();
@@ -981,7 +995,7 @@ async function answerPendingConfirmation(item, answer = {}) {
 		const errorCode = interactionErrorCode(error);
 		if (isTerminalInteractionError(error)) {
 			pendingConfirmations.value = pendingConfirmations.value.filter((x) => x.confirmationId !== confirmationId);
-			await load({conversationUuid, scrollMode: "preserve", manageLoading: false});
+			await load({conversationUuid, scrollMode: "preserve", manageLoading: false, fresh: true});
 			return;
 		}
 		const message = apiError(error);
@@ -1193,7 +1207,7 @@ async function compactContext() {
 		const data = await Api.conversationCompact(uuid);
 		if (data?.ok === false) throw new Error(data.message || data.error || "压缩失败");
 		if (!isRunConfigInteractionCurrent(uuid, false)) return;
-		await load();
+		await load({fresh: true});
 		ElMessage.success("上下文压缩完成");
 	} catch (error) {
 		if (isRunConfigInteractionCurrent(uuid, false)) ElMessage.error(apiError(error));
@@ -1767,10 +1781,10 @@ function loadOperationsFromState(state = {}, {merge = false} = {}) {
 	const ops = merge
 		? mergeOperationSnapshots(orderedOperationsList(), incoming)
 		: incoming;
-	if (!merge) lastFrameSeq.value = 0;
-	return replaceOperationSnapshots(ops, {
-		frameSeq: Number(state.frameSeq || state.facts?.latestFrameSeq || 0) || 0,
-	});
+	// HTTP owns this baseline. Frames crossing the snapshot boundary are replayed
+	// from the buffer, never acknowledged via an unrelated newer high-water mark.
+	lastFrameSeq.value = Number(state.frameSeq || state.facts?.latestFrameSeq || 0) || 0;
+	return replaceOperationSnapshots(ops, {frameSeq: lastFrameSeq.value});
 }
 
 function applyTimelinePageMetadata(data = {}, conversationUuid = "", {preserve = false} = {}) {
@@ -1875,41 +1889,76 @@ function syncRunStateFromOperations(operations = orderedOperationsList(), stateF
 }
 
 async function resyncOperationFrames(reason = {}) {
-	if (!props.conversationUuid || isLocalConversation.value || operationResyncInFlight) return;
-	operationResyncInFlight = true;
+	if (!componentMounted || !props.conversationUuid || isLocalConversation.value) return;
+	if (reason?.resetOperations) pendingLoadReplaceOperations = true;
+	if (reason?.frameSeq && (reason?.requiresFullState || reason?.resyncMode === "full_state")) {
+		operationFrameBuffer.requireSnapshotThrough(reason.frameSeq);
+	}
+	if (operationResyncInFlight) return;
+	const recovery = {conversationUuid: String(props.conversationUuid), socket: ws};
+	operationResyncInFlight = recovery;
+	const isCurrent = () => componentMounted
+		&& operationResyncInFlight === recovery
+		&& recovery.conversationUuid === String(props.conversationUuid)
+		&& recovery.socket === ws;
+	let snapshotApplied = false;
+	const refreshState = async () => {
+		const result = await load({
+			conversationUuid: recovery.conversationUuid,
+			scrollMode: "preserve",
+			manageLoading: false,
+			replaceOperations: Boolean(reason?.resetOperations),
+			fresh: true,
+			isCurrent,
+		});
+		snapshotApplied ||= Boolean(result?.applied);
+	};
+	const finishReplay = async () => {
+		if (!replayBufferedOperationFrames(lastFrameSeq.value)) await refreshState();
+	};
 	try {
 		if (reason?.requiresFullState || reason?.resyncMode === "full_state") {
 			debugFrames("frame-resync-full-state", {reason});
-			await load({scrollMode: "preserve"});
+			await refreshState();
 			return;
 		}
 		let after = Number(reason?.afterFrameSeq ?? lastFrameSeq.value) || 0;
 		for (let i = 0; i < 8; i += 1) {
-			const data = await Api.conversationFrames(props.conversationUuid, after, 1000);
+			const data = await Api.conversationFrames(recovery.conversationUuid, after, 1000);
+			if (!isCurrent()) return;
 			const frames = Array.isArray(data?.frames) ? data.frames : [];
-			if (!frames.length) break;
+			if (!frames.length) { await finishReplay(); return; }
 			for (const frame of frames) {
-				// During gap recovery, replay even frames whose frameSeq is <= the current
-				// high-water mark. The skipped WebSocket frame may have an older frameSeq
-				// but the missing op revision needed to make the later frame applicable.
-				applyOperationFrameMessage(frame, {resyncing: true});
+				// Replay older revisions to repair a gap, but stop at the first frame
+				// whose base was pruned. One snapshot replaces the unusable replay;
+				// a page of 1000 missing bases must never launch 1000 HTTP requests.
+				const result = applyOperationFrameMessage(frame, {resyncing: true});
+				if (result?.needsResync) {
+					await refreshState();
+					return;
+				}
 			}
 			const nextAfter = Number(data?.frameSeq || frames.at(-1)?.frameSeq || after) || after;
-			if (nextAfter <= after) break;
+			if (nextAfter <= after || frames.length < 1000) { await finishReplay(); return; }
 			after = nextAfter;
-			if (frames.length < 1000) break;
 		}
+		// A bounded replay must converge instead of leaving a long backlog half applied.
+		if (isCurrent()) await refreshState();
 	} catch (error) {
+		if (!isCurrent()) return;
 		console.warn("operation frame resync failed", reason, error);
-		await load({scrollMode: "preserve"});
+		await refreshState();
 	} finally {
-		operationResyncInFlight = false;
+		if (operationResyncInFlight === recovery) {
+			operationResyncInFlight = null;
+			if (snapshotApplied && operationFrameBuffer.blocked) scheduleOperationStateResync({requiresFullState: true});
+		}
 	}
 }
 
 function scheduleOperationStateResync(reason = {}) {
 	if (!props.conversationUuid || isLocalConversation.value) return;
-	if (operationResyncTimer) return;
+	if (operationResyncTimer || operationResyncInFlight) return;
 	operationResyncTimer = window.setTimeout(async () => {
 		operationResyncTimer = null;
 		await resyncOperationFrames(reason);
@@ -1931,6 +1980,7 @@ const terminalStateRefreshScheduler = createTerminalStateRefreshScheduler({
 		await load({
 			scrollMode: "preserve",
 			conversationUuid,
+			fresh: true,
 			isCurrent,
 			manageLoading: false,
 		});
@@ -2057,10 +2107,8 @@ function applyOperationFrameMessage(frame, options = {}) {
 	if (store.needsResync) {
 		debugFrames("frame-revision-gap", {revisionGap: store.revisionGap, frame});
 		const previousFrameSeq = lastFrameSeq.value;
-		lastFrameSeq.value = Number(store.lastFrameSeq || 0) || lastFrameSeq.value;
-		if (options?.resyncing) {
-			void load({scrollMode: "preserve"});
-		} else {
+		operationFrameBuffer.block(frame);
+		if (!options?.resyncing) {
 			scheduleOperationStateResync({...(store.revisionGap || frame), afterFrameSeq: previousFrameSeq});
 		}
 		return {applied: false, scrollImpact: "none", needsResync: true};
@@ -2229,6 +2277,18 @@ function unlockAutoScroll() {
 function toggleAutoScrollLock() {
 	if (autoScrollLocked.value) unlockAutoScroll();
 	else lockAutoScroll();
+}
+
+// App calls these only around mobile shell geometry changes. Reuse the existing
+// reading anchor; never turn a viewport/keyboard change into a scroll-to-bottom.
+function captureMobileViewportAnchor() {
+	return {uuid: props.conversationUuid, generation: loadRequestGeneration, anchor: autoScrollLocked.value ? null : captureScrollAnchor()};
+}
+function restoreMobileViewportAnchor(snapshot) {
+	if (!snapshot?.anchor) return;
+	return restoreScrollAnchor(snapshot.anchor, {
+		isCurrent: () => componentMounted && props.conversationUuid === snapshot.uuid && loadRequestGeneration === snapshot.generation && !autoScrollLocked.value,
+	});
 }
 
 function captureScrollAnchor() {
@@ -2539,7 +2599,7 @@ function cancelScheduledUiWork() {
 		window.clearTimeout(operationResyncTimer);
 		operationResyncTimer = null;
 	}
-	operationResyncInFlight = false;
+	operationResyncInFlight = null;
 }
 
 function closeWs() {
@@ -2694,11 +2754,7 @@ function handleWsMessage(raw, source = {}) {
 	}
 	if (data.type === "resync_required") {
 		debugFrames("ws-resync-required", data);
-		void load({
-			scrollMode: "preserve",
-			manageLoading: false,
-			replaceOperations: Boolean(data.resetOperations),
-		});
+		void resyncOperationFrames({...data, requiresFullState: true});
 		return;
 	}
 	if (data.type === "state") {
@@ -2726,6 +2782,8 @@ function handleWsMessage(raw, source = {}) {
 			status.value = state.backgroundRunning ? (state.backgroundStatus || "Agent 后台执行中") : (state.conversation?.currentStatus || (running.value ? "运行中" : "就绪"));
 			if (!running.value) runStartedAt.value = 0;
 		}
+		replayBufferedOperationFrames(Number(state.frameSeq || state.facts?.latestFrameSeq || 0));
+		if (operationFrameBuffer.blocked) scheduleOperationStateResync({requiresFullState: true});
 		const afterSignature = visibleEventSignatureForMessages(messages.value);
 		noteVisibleOutput(messages.value, {force: true});
 		if (autoScrollLocked.value && beforeSignature !== afterSignature) scrollBottom();
@@ -2734,6 +2792,8 @@ function handleWsMessage(raw, source = {}) {
 	}
 	if (data.type === "conversation_reset") {
 		lastFrameSeq.value = 0;
+		conversationStateRequests.invalidate();
+		operationFrameBuffer.reset();
 		closeWs();
 		void load({scrollMode: "preserve", replaceOperations: true});
 		return;
@@ -2756,6 +2816,8 @@ function handleWsMessage(raw, source = {}) {
 	}
 	if (data.type === "frame") {
 		const frame = data.frame || {};
+		if (conversationStateRequests.pending || operationResyncInFlight || operationFrameBuffer.blocked) operationFrameBuffer.add(frame);
+		if (operationFrameBuffer.blocked) return;
 		const shouldApply = shouldApplyOperationFrame(frame, {
 			operationsById: operationsById.value,
 			revisionByOpId: revisionByOpId.value,
@@ -2806,6 +2868,7 @@ async function connectWs(conversationUuid = props.conversationUuid) {
 	socket.onopen = () => {
 		if (ws !== socket || wsConversationUuid !== uuid || !componentMounted) return;
 		status.value = running.value ? status.value : "已连接";
+		if (operationFrameBuffer.blocked) scheduleOperationStateResync({requiresFullState: true});
 	};
 	socket.onerror = () => {
 		if (ws !== socket || wsConversationUuid !== uuid) return;
@@ -2847,17 +2910,20 @@ function checkConnectionOnResume() {
 	outboundSends.checkDeadline();
 	if (outboundSends.current || connectionResumePromise || isLocalConversation.value) return;
 	const uuid = activeConversationUuid.value;
-	if (!uuid) return;
+	// pageshow/focus may arrive before the first HTTP snapshot (or mid-switch).
+	// Connecting here with the reset cursor would replay all retained history.
+	if (!uuid || !timelinePageInitialized || timelinePageConversationUuid !== uuid) return;
 	const generation = sendAttemptGeneration;
 	const isCurrent = () => componentMounted && uuid === activeConversationUuid.value && generation === sendAttemptGeneration;
 	const promise = (async () => {
+		let socket = null;
 		try {
-			const socket = await connectWs(uuid);
+			socket = await connectWs(uuid);
 			await waitForSocketOpen(socket);
 			if (!isCurrent() || socket !== ws) return;
 			await probeSocket(socket);
 		} catch {
-			if (!isCurrent()) return;
+			if (!isCurrent() || !socket || socket !== ws) return;
 			closeWs();
 			void connectWs(uuid);
 			await load({conversationUuid: uuid, scrollMode: "preserve", manageLoading: false, isCurrent});
@@ -2919,14 +2985,22 @@ function applyLoadedConversationState(data, conversationUuid, {replaceOperations
 	}
 	hydrateAgentAutoOpenBoundary(conversationUuid, ops, operationRunState);
 	noteVisibleOutput(messages.value, {force: true});
+	replayBufferedOperationFrames(Number(data.frameSeq || data.facts?.latestFrameSeq || 0));
+}
+
+function replayBufferedOperationFrames(cursor) {
+	return operationFrameBuffer.replayAfter(cursor, frame => applyOperationFrameMessage(frame, {resyncing: true}));
 }
 
 async function load(options = {}) {
 	const conversationUuid = String(options?.conversationUuid || props.conversationUuid || "").trim();
-	if (!conversationUuid) return;
-	const requestGeneration = ++loadRequestGeneration;
-	const runConfigVersionAtRequest = runConfigSaves.appliedVersion;
 	const externalIsCurrent = typeof options?.isCurrent === "function" ? options.isCurrent : null;
+	// A stale caller must not invalidate the selected conversation's valid request.
+	if (!componentMounted || !conversationUuid || conversationUuid !== String(props.conversationUuid || "").trim()
+		|| (externalIsCurrent && !externalIsCurrent())) return;
+	const requestGeneration = ++loadRequestGeneration;
+	let runConfigVersionAtRequest = runConfigSaves.appliedVersion;
+	if (options?.replaceOperations) pendingLoadReplaceOperations = true;
 	const isCurrent = () => Boolean(
 		componentMounted
 		&& requestGeneration === loadRequestGeneration
@@ -2970,14 +3044,22 @@ async function load(options = {}) {
 		const outcome = await runGuardedConversationStateRefresh({
 			conversationUuid,
 			isCurrent,
-			requestState: (uuid) => Api.conversationState(uuid, {timelineLimit: INITIAL_TIMELINE_LIMIT}),
-			applyState: (data, uuid) => applyLoadedConversationState(data, uuid, {
-				replaceOperations: Boolean(options?.replaceOperations),
-				runConfigVersionAtRequest,
-			}),
+			requestState: async (uuid) => {
+				const result = await conversationStateRequests.request(uuid, {fresh: Boolean(options?.fresh || options?.replaceOperations)});
+				runConfigVersionAtRequest = result.runConfigVersionAtRequest;
+				return result.data;
+			},
+			applyState: (data, uuid) => {
+				applyLoadedConversationState(data, uuid, {
+					replaceOperations: pendingLoadReplaceOperations,
+					runConfigVersionAtRequest,
+				});
+				pendingLoadReplaceOperations = false;
+			},
 			connectState: (uuid) => connectWs(uuid),
 		});
 		if (outcome.stage !== "complete" || !isCurrent()) return;
+		if (operationFrameBuffer.blocked && !operationResyncInFlight) scheduleOperationStateResync({requiresFullState: true});
 		if (scrollMode === "bottom" && bottomScroll === pendingLoadBottomScroll) {
 			if (lockOnBottom) autoScrollLocked.value = true;
 			await scrollBottom({force: true, cause: "load", isCurrent});
@@ -2990,8 +3072,10 @@ async function load(options = {}) {
 			updateScrollerOverflow();
 			scheduleActiveTurnFromScroll({force: true});
 		}
+		return {applied: true};
 	} catch (error) {
 		if (isCurrent()) ElMessage.error(apiError(error));
+		return {applied: false};
 	} finally {
 		if (manageLoading && requestGeneration === loadRequestGeneration && componentMounted && conversationUuid === String(props.conversationUuid || "").trim()) {
 			loading.value = false;
@@ -3165,7 +3249,6 @@ async function send() {
 		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles}));
 		outboundSends.markSent(pending);
 		emit("conversations-refresh");
-		window.dispatchEvent(new CustomEvent("openbear:conversations-refresh"));
 	} catch (error) {
 		if (!isCurrent()) return;
 		localToServerTransitionUuid.value = "";
@@ -3340,6 +3423,8 @@ onBeforeUnmount(() => {
 	leavePendingSend();
 	pendingLoadBottomScroll = null;
 	componentMounted = false;
+	conversationStateRequests.invalidate();
+	operationFrameBuffer.reset();
 	if (workDetailTooltipReleaseTimer) window.clearTimeout(workDetailTooltipReleaseTimer);
 	toolDetailCache.reset("");
 	terminalStateRefreshScheduler.dispose();
@@ -3369,29 +3454,29 @@ onBeforeUnmount(() => {
 				:tokens-text="totalTokensDisplay"
 				:duration-text="totalDurationDisplay"
 				:cost-text="totalCostDisplay"
-			/>
+			>
+				<template #mobile-navigation><slot name="mobile-navigation"/></template>
+				<template #mobile-actions>
+					<MobileConversationTools
+						:conversation-uuid="activeConversationUuid"
+						:token-parts="totalTokenParts"
+						:duration-text="totalDurationDisplay"
+						:cost-text="totalCostDisplay"
+						:turns="turns"
+						:active-turn-index="activeTurnIndex"
+						:can-open-work="activeTurnHasWork || workDetailOpen"
+						:work-open="workDetailOpen"
+						:auto-scroll-locked="autoScrollLocked"
+						@open-memory="taskMemoryDrawer?.open()"
+						@toggle-work="toggleWorkDetailPanel"
+						@toggle-scroll-lock="toggleAutoScrollLock"
+						@scroll-to-turn="scrollToTurnIndex"
+					/>
+				</template>
+			</ConsoleHeader>
 
 			<div class="console-workspace min-h-0 flex-1">
 				<div class="conversation-column min-w-0">
-					<el-tooltip
-						v-if="activeTurnHasWork || workDetailOpen"
-						ref="workDetailTooltip"
-						:content="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
-						placement="left"
-						:show-after="260"
-						:disabled="workDetailTooltipSuppressed"
-						:popper-style="workDetailTooltipSuppressed ? {display: 'none'} : undefined"
-					>
-						<button
-							type="button"
-							class="work-detail-toggle"
-							:class="{ active: workDetailOpen, working: activeTurnWorking }"
-							:aria-label="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
-							:aria-expanded="workDetailOpen ? 'true' : 'false'"
-							@click.stop="toggleWorkDetailPanel"
-						><WorkDetailIcon/></button>
-					</el-tooltip>
-
 					<div
 						v-if="timelinePageInFlight"
 						class="timeline-page-loading"
@@ -3449,14 +3534,32 @@ onBeforeUnmount(() => {
 				</div>
 			</div>
 			
+			<aside class="console-controls" aria-label="会话工具与导航">
+				<TaskMemoryDrawer ref="taskMemoryDrawer" :conversation-uuid="activeConversationUuid"/>
+				<el-tooltip
+					v-if="activeTurnHasWork || workDetailOpen"
+					ref="workDetailTooltip"
+					:content="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
+					placement="left"
+					:show-after="260"
+					:disabled="workDetailTooltipSuppressed"
+					:popper-style="workDetailTooltipSuppressed ? {display: 'none'} : undefined"
+				>
+					<button
+						type="button"
+						class="work-detail-toggle"
+						:class="{ active: workDetailOpen, working: activeTurnWorking }"
+						:aria-label="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
+						:aria-expanded="workDetailOpen ? 'true' : 'false'"
+						@click.stop="toggleWorkDetailPanel"
+					><WorkDetailIcon/></button>
+				</el-tooltip>
 			<TurnMinimap
 				:turns="turns"
 				:active-turn-index="activeTurnIndex"
 				:running="running"
 				@scroll-to-turn="scrollToTurnIndex"
 			/>
-			<TaskMemoryDrawer :conversation-uuid="activeConversationUuid"/>
-			
 			<el-tooltip
 				v-if="scrollerOverflow"
 				:content="autoScrollLocked ? '滚动已锁定到底部，点击解锁' : '滚动未锁定，点击锁定到底部'"
@@ -3474,6 +3577,7 @@ onBeforeUnmount(() => {
 					<Unlock v-else/>
 				</button>
 			</el-tooltip>
+			</aside>
 			
 			<ConsoleComposer
 				ref="composer"
@@ -3595,6 +3699,8 @@ onBeforeUnmount(() => {
 	min-width: 0;
 	overflow: hidden;
 }
+
+.console-controls { display: contents; }
 
 .conversation-column {
 	position: relative;
@@ -3803,12 +3909,14 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
-	.console-page {
-		--console-float-rail-right: .75rem;
-		--console-float-control-size: 2.35rem;
-		--console-float-control-gap: .75rem;
-		--console-float-rail-bottom: calc(env(safe-area-inset-bottom, 0px) + var(--console-composer-height, 135px) + 50px);
-	}
+	.console-page { --console-content-gutter: 1rem; }
+	/* Phone tools are available on demand in the header, never beside or over
+	   the transcript. Keep the existing drawer mounted for its scoped state. */
+	.console-controls { display: none; }
+}
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	.console-page { --console-float-control-size: 44px; }
+	.work-detail-toggle { width: 44px; height: 44px; }
 }
 </style>
 

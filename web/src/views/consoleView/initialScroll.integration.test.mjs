@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {ref, nextTick} from 'vue';
 import {runGuardedConversationStateRefresh} from './terminalStateRefresh.js';
+import {createConversationStateRequests} from './conversationStateRequests.js';
+import {createOperationFrameBuffer} from './operationFrameBuffer.js';
 
 // Run the component's actual loader and unlock handler, not a parallel model of
 // the scroll policy. Only HTTP and rendered scroll/anchor operations are seams.
@@ -19,15 +21,15 @@ function deferred() {
   return {promise, resolve, reject};
 }
 function harness() {
-  const calls = [], scrolls = [], applied = [], errors = [];
+  const calls = [], scrolls = [], applied = [], errors = [], applyOptions = [];
   const props = {conversationUuid: 'A'};
   const noop = () => {};
   const context = vm.createContext({
-    ref, nextTick, props, runGuardedConversationStateRefresh,
+    ref, nextTick, props, runGuardedConversationStateRefresh, createConversationStateRequests, createOperationFrameBuffer,
     autoScrollLocked: ref(true), runConfigSaves: {appliedVersion: 0},
     modelOptions: ref([{}]), localModel: ref('test'),
     Api: {conversationState: (uuid) => {const item = {uuid, ...deferred()}; calls.push(item); return item.promise;}},
-    applyLoadedConversationState: (data, uuid) => applied.push({uuid, tag: data.tag}),
+    applyLoadedConversationState: (data, uuid, options) => {applied.push({uuid, tag: data.tag});applyOptions.push(options);},
     connectWs: async () => {},
     scrollBottom: async (options) => {await nextTick(); if (options.isCurrent()) scrolls.push('bottom');},
     captureScrollAnchor: () => ({id: 'reading-position'}),
@@ -46,20 +48,54 @@ function harness() {
     ${between('async function load(options = {})', 'async function deleteTurnSuffix(')}
   `, context);
   const run = code => vm.runInContext(code, context);
-  return {calls, scrolls, applied, errors, props, context, run,
+  return {calls, scrolls, applied, errors, applyOptions, props, context, run,
     load: (mode='preserve', options={}) => run(`load(${JSON.stringify({scrollMode: mode, ...options})})`),
     resolve: (index, tag='loaded') => calls[index].resolve({conversationUuid: calls[index].uuid, tag}),
   };
 }
 
+test('stale A refresh and expired external caller cannot invalidate B or leave its loading stuck',async()=>{
+  const h=harness();h.props.conversationUuid='B';const current=h.load('bottom');
+  await h.load('preserve',{conversationUuid:'A'});
+  await h.run('load({isCurrent:()=>false})');
+  assert.equal(h.run('loadRequestGeneration'),1);assert.equal(h.calls.length,1);
+  h.resolve(0,'valid B');await current;
+  assert.deepEqual(h.applied,[{uuid:'B',tag:'valid B'}]);assert.equal(h.run('loading.value'),false);
+});
+
+test('20 same-visit calibrations share one HTTP request and apply the final scroll owner once',async()=>{
+  const h=harness();const pending=Array.from({length:20},()=>h.load());
+  assert.equal(h.calls.length,1);h.resolve(0);await Promise.all(pending);
+  assert.equal(h.applied.length,1);assert.equal(h.run('loading.value'),false);
+});
+
+test('a shared older read retains its true run-config version rather than retiring a newer override',async()=>{
+  const h=harness();const first=h.load();h.context.runConfigSaves.appliedVersion=3;
+  const second=h.load();h.resolve(0);await Promise.all([first,second]);
+  assert.equal(h.applyOptions[0].runConfigVersionAtRequest,0);
+});
+
+test('mutation refreshes queue one newer snapshot and preserve authoritative reset across joined loads',async()=>{
+  const h=harness();const first=h.load();
+  const reset=h.load('preserve',{replaceOperations:true});
+  const joined=h.load('preserve');assert.equal(h.calls.length,1);
+  h.resolve(0,'before mutation');await first;
+  for(let i=0;i<8;i++)await Promise.resolve();
+  assert.equal(h.calls.length,2);assert.equal(h.applied.length,0);
+  h.resolve(1,'after mutation');await Promise.all([reset,joined]);
+  assert.equal(h.applyOptions[0].replaceOperations,true);
+  assert.deepEqual(h.applied,[{uuid:'A',tag:'after mutation'}]);
+});
+
 test('a resume/recovery refresh replacing first load still finishes its bottom scroll', async () => {
   const h = harness();
   const first = h.load('bottom');
   const replacement = h.load('preserve', {manageLoading: false});
-  h.resolve(1, 'replacement'); await replacement;
+  assert.equal(h.calls.length,1,'same-visit recovery shares the entry HTTP request');
+  h.resolve(0, 'replacement'); await replacement;
   assert.deepEqual(h.scrolls, ['bottom']);
   assert.equal(h.run('loading.value'), false, 'replacement must also settle the inherited loading indicator');
-  h.resolve(0, 'stale'); await first;
+  await first;
   assert.deepEqual(h.applied, [{uuid:'A',tag:'replacement'}]);
   assert.deepEqual(h.scrolls, ['bottom']);
 });
@@ -67,13 +103,11 @@ test('a resume/recovery refresh replacing first load still finishes its bottom s
 test('a chain of superseding background loads retains bottom intent only until the latest succeeds', async () => {
   const h=harness();
   const first=h.load('bottom'), second=h.load('preserve'), third=h.load('preserve');
-  h.resolve(1); await second;
-  h.resolve(0); await first;
-  assert.deepEqual(h.scrolls, []);
-  h.resolve(2); await third;
+  assert.equal(h.calls.length,1);
+  h.resolve(0); await Promise.all([first,second,third]);
   assert.deepEqual(h.scrolls, ['bottom']);
   h.run('unlockAutoScroll()');
-  const refresh=h.load('preserve'); h.resolve(3); await refresh;
+  const refresh=h.load('preserve'); h.resolve(1); await refresh;
   assert.deepEqual(h.scrolls, ['bottom', 'anchor'], 'completed entry intent must not force later reading-position refreshes');
 });
 
@@ -97,8 +131,9 @@ test('A -> B -> A old response cannot consume or perform the new visit bottom sc
   h.resolve(1,'old B'); await b;
   assert.deepEqual(h.scrolls, []);
   const replacement=h.load('preserve');
-  h.resolve(3,'current A'); await replacement;
-  h.resolve(2,'superseded A'); await secondA;
+  assert.equal(h.calls.length,3);
+  h.resolve(2,'current A'); await replacement;
+  await secondA;
   assert.deepEqual(h.scrolls, ['bottom']);
   assert.deepEqual(h.applied, [{uuid:'A',tag:'current A'}]);
 });

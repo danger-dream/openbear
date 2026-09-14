@@ -714,7 +714,9 @@ class WebAdminChatHandlersMixin:
                 )
             await publish("running", {"beforeTokens": tokens})
             try:
-                history = await build_controller_history(messages, chat_id)
+                history = await build_controller_history(
+                    messages, chat_id, reference_store=self._reference_store(),
+                )
                 manager.bind_sources(history)
                 expanded = await self._reference_store().overlay(history, conversation_uuid=conv_uuid)
                 request_view = expanded_request_view(expanded)

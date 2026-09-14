@@ -9,6 +9,14 @@ const records = new Map();
 let searchIndex = new Fuse([], {includeScore:true,threshold:0.32,ignoreLocation:true,keys:[{name:'normalized',weight:0.6},{name:'pinyin',weight:0.2},{name:'initials',weight:0.12},{name:'pathText',weight:0.08}]});
 let socket = null, timer = null, heartbeat = null, stopped = true, retry = 0, lastMessageAt = 0;
 let overviewSubscription = null, overviewSerial = 0;
+let scopeSync = null, scopeSyncTimer = null;
+function clearScopeSync() { clearTimeout(scopeSyncTimer); scopeSyncTimer = null; scopeSync = null; }
+function waitForScope(current, includeArchived) {
+  clearScopeSync();
+  scopeSync = {socket: current, includeArchived};
+  // Reconnect with backoff if a handshake/resync never produces its snapshot.
+  scopeSyncTimer = setTimeout(() => { if (socket === current && scopeSync?.socket === current) current.close(); }, 10000);
+}
 function sendOverviewSubscription() {
   if (socket?.readyState === 1 && overviewSubscription) socket.send(JSON.stringify({type:'conversation-overview',conversationUuid:overviewSubscription.uuid,subscriptionId:overviewSubscription.id}));
 }
@@ -41,9 +49,11 @@ function rebuild() {
 }
 export function applyCatalogPacket(packet) {
   if (packet.type === 'snapshot') {
+    // User intent is not a property an older server response may overwrite.
+    if (Boolean(packet.includeArchived) !== referenceCatalog.includeArchived) { referenceCatalog.stale = true; return false; }
     records.clear();
     for (const row of packet.items || []) records.set(row.key,searchableItem(row));
-    Object.assign(referenceCatalog,{epoch:packet.epoch,seq:packet.seq,includeArchived:Boolean(packet.includeArchived),ready:true,stale:false});
+    Object.assign(referenceCatalog,{epoch:packet.epoch,seq:packet.seq,ready:true,stale:false});
     rebuild();
   } else if (packet.type === 'patch') {
     if (packet.epoch !== referenceCatalog.epoch || packet.previousSeq !== referenceCatalog.seq) {
@@ -96,16 +106,27 @@ export function searchReferences(query='', {kind='',currentConversation='',limit
   }
   return [...matches.values()].sort((a,b)=>a.score-b.score || Number(b.item.updatedAt || 0)-Number(a.item.updatedAt || 0) || a.item.label.localeCompare(b.item.label,'zh-CN')).slice(0,limit).map(x=>x.item);
 }
-function sendScope() { if (socket?.readyState===1) socket.send(JSON.stringify({type:'resync',includeArchived:referenceCatalog.includeArchived})); }
+function sendScope() {
+  if (socket?.readyState !== 1 || scopeSync) return;
+  const current = socket, includeArchived = referenceCatalog.includeArchived;
+  waitForScope(current, includeArchived);
+  current.send(JSON.stringify({type:'resync',includeArchived}));
+}
 export function includeArchivedReferences(value) {
   if (referenceCatalog.includeArchived===Boolean(value)) return;
   referenceCatalog.includeArchived=Boolean(value); referenceCatalog.stale=true; sendScope();
 }
 function connect() {
   if (stopped || typeof window==='undefined') return;
-  const current = new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/events/ws${referenceCatalog.includeArchived?'?archived=1':''}`);
+  timer = null;
+  const initialScope = referenceCatalog.includeArchived;
+  const current = new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/events/ws${initialScope?'?archived=1':''}`);
   socket=current;
-  current.onopen=()=>{if(socket!==current)return;referenceCatalog.connected=true;lastMessageAt=Date.now();retry=0;sendOverviewSubscription();};
+  current.onopen=()=>{
+    if(socket!==current)return;
+    referenceCatalog.connected=true;lastMessageAt=Date.now();
+    waitForScope(current, initialScope);sendOverviewSubscription();
+  };
   current.onmessage=event=>{
     if(socket!==current)return;
     lastMessageAt=Date.now();
@@ -113,29 +134,38 @@ function connect() {
     if(packet.type==='conversation-overview'){applyConversationOverviewPacket(packet);return;}
     if(packet.type==='ping'){current.send(JSON.stringify({type:'ping'}));return;}
     if(packet.type==='resync'||packet.type==='stale'){referenceCatalog.stale=true;sendScope();return;}
+    if(packet.type==='snapshot') {
+      // Only the response for the pending scope releases its single-flight gate.
+      if (scopeSync && Boolean(packet.includeArchived) !== scopeSync.includeArchived) return;
+      clearScopeSync();
+      if (applyCatalogPacket(packet)) retry = 0;
+      else sendScope(); // An old scope completed; send the newest user choice once.
+      return;
+    }
+    if(packet.type==='patch' && scopeSync) return;
     if(!applyCatalogPacket(packet))sendScope();
   };
   current.onerror=()=>{};
   current.onclose=event=>{
     if(socket!==current)return;
-    socket=null;referenceCatalog.connected=false;referenceCatalog.stale=true;
+    clearScopeSync();socket=null;referenceCatalog.connected=false;referenceCatalog.stale=true;
     if(event.code===1008){stopReferenceCatalog({clear:true});return;}
-    if(!stopped)timer=setTimeout(connect,Math.min(15000,800*2**Math.min(retry++,5)));
+    if(!stopped)timer=setTimeout(connect,Math.min(15000,800*2**Math.min(retry++,5)*(0.85+Math.random()*0.3)));
   };
 }
 function resume() {
   if (stopped || document.visibilityState==='hidden') return;
   if (socket?.readyState===1) sendScope();
-  else if(!socket){clearTimeout(timer);connect();}
+  else if(!socket && !timer)connect();
 }
 export function startReferenceCatalog() {
   if(!stopped || typeof window==='undefined')return;
-  stopped=false;connect();
+  stopped=false;retry=0;connect();
   window.addEventListener('pageshow',resume);document.addEventListener('visibilitychange',resume);
   heartbeat=setInterval(()=>{if(socket?.readyState===1 && Date.now()-lastMessageAt>65000)socket.close();},15000);
 }
 export function stopReferenceCatalog({clear=false}={}) {
-  stopped=true;clearTimeout(timer);clearInterval(heartbeat);
+  stopped=true;clearTimeout(timer);timer=null;clearInterval(heartbeat);clearScopeSync();
   const old=socket;socket=null;old?.close();referenceCatalog.connected=false;
   if(typeof window!=='undefined'){window.removeEventListener('pageshow',resume);document.removeEventListener('visibilitychange',resume);}
   if(clear){overviewSubscription=null;records.clear();rebuild();Object.assign(referenceCatalog,{ready:false,stale:false,epoch:'',seq:0,version:null,treeStatus:null,includeArchived:false,activityReadVersions:new Map()});}

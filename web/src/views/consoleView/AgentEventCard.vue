@@ -9,7 +9,6 @@ import AgentPlanWorkspace from "./AgentPlanWorkspace.vue";
 import AgentProcessActivity from "./AgentProcessActivity.vue";
 import {agentEventIdentity, agentPanelDetailKey} from "./agentPanelState.js";
 import {
-	agentOutputDisplay,
 	agentDisplayState,
 	agentTasks,
 	agentRowMetricChips,
@@ -60,6 +59,7 @@ const instanceTaskUuid = ref("");
 const instanceLoading = ref(false);
 const instanceError = ref("");
 const panelTab = ref("plan");
+const mobileMetaOpen = ref(false);
 const activityScroller = ref(null);
 const activityLines = ref([]);
 const activityLoading = ref(false);
@@ -153,7 +153,7 @@ const primaryRowIndex = computed(() => agentState.value.rows.findIndex((row) => 
 const primaryActionRow = computed(() => primaryRowIndex.value >= 0 ? agentState.value.rows[primaryRowIndex.value] : null);
 const primaryOutputSection = computed(() => primaryActionRow.value ? agentRowOutputSection(primaryActionRow.value) : null);
 const fallbackArguments = computed(() => primaryActionRow.value
-	? agentRowArgumentsDisplay(props.event, primaryActionRow.value, primaryRowIndex.value)
+	? agentRowArgumentsDisplay(props.event, primaryActionRow.value, primaryRowIndex.value, {full: true})
 	: "");
 
 const taskUuid = computed(() => {
@@ -230,7 +230,7 @@ const activityDisplayLines = computed(() => {
 				...item,
 				toolName,
 				rawArguments,
-				toolDescription: summary,
+				toolDescription: String(item.toolDescription || item.description || item.detail?.description || summary),
 				message: `调用工具 ${toolName}${summary ? ` · ${summary}` : ""}`,
 			};
 		});
@@ -806,8 +806,14 @@ watch(agentPushKey, (value, oldValue) => {
 			<span class="disclosure-icon"><ArrowRight/></span>
 		</summary>
 
-		<div v-if="isOpen" class="agent-tool-detail">
+		<div v-if="isOpen" class="agent-tool-detail" :class="{'mobile-meta-open': mobileMetaOpen}" tabindex="0" aria-label="Agent 详情">
 			<div class="agent-event-card agent-panel-card">
+				<div class="agent-mobile-toolbar">
+					<select aria-label="Agent 详情分类" :value="panelTab" @change="mobileMetaOpen = false; selectTab($event.target.value)">
+						<option v-for="tab in panelTabs" :key="tab.id" :value="tab.id">{{ tab.label }}{{ Number(tab.count || 0) ? ` · ${tab.count}` : '' }}</option>
+					</select>
+					<button type="button" :aria-expanded="mobileMetaOpen" :class="{'is-active': mobileMetaOpen}" @click="mobileMetaOpen = !mobileMetaOpen">{{ mobileMetaOpen ? '返回正文' : '运行信息' }}<ArrowRight/></button>
+				</div>
 				<header class="agent-panel-head">
 					<div class="agent-identity">
 						<div class="agent-orb" :class="panelStatusClass"><Cpu/></div>
@@ -835,7 +841,7 @@ watch(agentPushKey, (value, oldValue) => {
 					</button>
 				</nav>
 
-				<section class="agent-tab-panel">
+				<section class="agent-tab-panel" :class="`tab-${panelTab}`" tabindex="0" aria-label="Agent 详情正文，可滚动">
 					<AgentPlanWorkspace
 						v-if="panelTab === 'plan'"
 						:data="workspaceData"
@@ -886,6 +892,8 @@ watch(agentPushKey, (value, oldValue) => {
 						<div
 							ref="activityScroller"
 							class="activity-scroll"
+							tabindex="0"
+							aria-label="Agent 事件记录，可滚动"
 							@scroll.passive="onActivityScroll"
 							@wheel.passive="markActivityInteraction"
 							@touchmove.passive="markActivityInteraction"
@@ -912,6 +920,8 @@ watch(agentPushKey, (value, oldValue) => {
 						<div
 							ref="activityScroller"
 							class="activity-scroll"
+							tabindex="0"
+							aria-label="Agent 事件记录，可滚动"
 							@scroll.passive="onActivityScroll"
 							@wheel.passive="markActivityInteraction"
 							@touchmove.passive="markActivityInteraction"
@@ -956,7 +966,7 @@ watch(agentPushKey, (value, oldValue) => {
 								<div class="content-frame-head-main"><span>原始任务 Prompt</span></div>
 								<button class="frame-copy-button" type="button" @click="copyText(launchInfo.prompt, '原始任务')"><Operation/>复制任务</button>
 							</div>
-							<pre class="content-frame-scroll">{{ launchInfo.prompt || '未找到原始任务参数' }}</pre>
+							<pre class="content-frame-scroll" tabindex="0" aria-label="原始任务全文，可滚动">{{ launchInfo.prompt || '未找到原始任务参数' }}</pre>
 						</div>
 					</div>
 
@@ -967,7 +977,7 @@ watch(agentPushKey, (value, oldValue) => {
 								<div class="content-frame-head-main"><span>结论内容</span><em v-if="primaryOutputSection.segmented">{{ fmtNum(primaryOutputSection.originalChars) }} 字符 · 当前展示摘要和首段</em></div>
 								<button class="frame-copy-button" type="button" @click="copyText(primaryOutputSection.text, 'Agent 结果')"><Document/>复制结果</button>
 							</div>
-							<div class="content-frame-scroll markdown-scroll"><ConsoleMarkdown class="agent-output" :text="agentOutputDisplay(primaryOutputSection.text)"/></div>
+							<div class="content-frame-scroll markdown-scroll" tabindex="0" aria-label="Agent 结果正文，可滚动"><ConsoleMarkdown class="agent-output" :text="primaryOutputSection.text"/></div>
 						</div>
 						<div v-else class="tab-empty">Agent 尚未生成最终结果。</div>
 					</div>
@@ -1013,7 +1023,8 @@ watch(agentPushKey, (value, oldValue) => {
 .disclosure-icon svg { width: .72rem; transition: transform .14s ease; }
 .agent-summary-row:hover .disclosure-icon, details[open] .disclosure-icon { opacity: 1; }
 details[open] .disclosure-icon svg { transform: rotate(90deg); }
-.agent-tool-detail { box-sizing: border-box; width: 100%; max-width: 100%; margin: .3rem 0 .45rem; border: 1px solid rgba(212,212,216,.82); border-radius: 18px; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(247,247,248,.96)); box-shadow: 0 12px 34px rgba(24,24,27,.08), inset 0 1px 0 rgba(255,255,255,.92); padding: 14px; }
+.agent-panel-card { min-width: 0; max-width: 100%; container: agent-detail / inline-size; }
+.agent-tool-detail { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; margin: .3rem 0 .45rem; border: 1px solid rgba(212,212,216,.82); border-radius: 18px; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(247,247,248,.96)); box-shadow: 0 12px 34px rgba(24,24,27,.08), inset 0 1px 0 rgba(255,255,255,.92); padding: 14px; }
 .agent-panel-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(228,228,231,.88); padding: 1px 2px 12px; }
 .agent-identity { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .agent-orb { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border: 1px solid rgba(212,212,216,.9); border-radius: 11px; background: linear-gradient(180deg, #fff, #f4f4f5); color: #52525b; box-shadow: 0 2px 7px rgba(24,24,27,.06); }
@@ -1039,9 +1050,9 @@ details[open] .disclosure-icon svg { transform: rotate(90deg); }
 .agent-tabs button:hover { color: #27272a; }
 .agent-tabs button.active { background: rgba(255,255,255,.96); color: #18181b; box-shadow: 0 1px 4px rgba(24,24,27,.12), inset 0 1px 0 #fff; }
 .agent-tabs button span { border-radius: 999px; background: #e4e4e7; padding: 1px 5px; color: #71717a; font-size: 10px; }
-.agent-tab-panel { height: 450px; min-width: 0; min-height: 0; overflow: hidden; }
+.agent-tab-panel { box-sizing: border-box; height: 450px; min-width: 0; min-height: 0; overflow: auto; }
 .agent-tab-panel :deep(.plan-workspace) { width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; }
-.activity-panel, .launch-panel, .output-panel, .instance-panel { box-sizing: border-box; display: flex; width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+.activity-panel, .launch-panel, .output-panel, .instance-panel { box-sizing: border-box; display: flex; width: 100%; max-width: 100%; height: 100%; min-width: 0; min-height: 0; flex-direction: column; overflow: auto; }
 .activity-panel > .tab-intro, .launch-panel > .tab-intro, .output-panel > .tab-intro, .instance-panel > .tab-intro { flex: 0 0 auto; }
 .instance-loading { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; color: #71717a; font-size: 11px; }
 .instance-loading svg { width: 12px; animation: agentOrbit 1s linear infinite; }
@@ -1128,14 +1139,64 @@ details[open] .disclosure-icon svg { transform: rotate(90deg); }
 .markdown-scroll { padding: 12px 14px 16px; }
 .output-panel .agent-output { max-width: 100%; max-height: none; overflow: visible; color: #1f2937; font-size: 12px; line-height: 1.65; }
 @keyframes agentOrbit { to { transform: rotate(360deg); } }
-@media (max-width: 760px) {
-	.agent-tool-detail { padding: 9px; }
-	.agent-tab-panel { height: min(450px, 68vh); }
-	.agent-panel-head { align-items: flex-start; flex-direction: column; }
-	.agent-metrics-row { justify-content: flex-start; }
-	.launch-meta-tag { max-width: 220px; }
-	.launch-tools-tag { max-width: 100%; }
-	.agent-tabs button { padding: 7px 9px; }
+/* Expanded text must wrap; only the outer collapsed summary stays ellipsized. */
+.agent-title, .agent-subtitle, .instance-assignment > header strong { white-space: normal; overflow-wrap: anywhere; overflow: visible; }
+.agent-continuity-strip > span, .instance-session-summary > span, .launch-meta-tag { white-space: normal; overflow-wrap: anywhere; }
+.agent-continuity-strip code, .instance-panel code { white-space: normal; overflow-wrap: anywhere; }
+.agent-state, .frame-copy-button { flex-shrink: 0; }
+.activity-scroll, .instance-assignment-list { min-width: 0; min-height: 100px; }
+.content-frame { min-height: 140px; }
+.agent-mobile-toolbar { display: none; }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	/* One reading stage: title/picker stay outside the active reading surface.
+	   Activity keeps its real scroll target and history-loading hooks. */
+	.agent-tool-detail { height: min(480px, calc(var(--mobile-viewport-height, 100dvh) * .65)); max-height: min(480px, calc(var(--mobile-viewport-height, 100dvh) * .65)); overflow: hidden; padding: 0; border-radius: 14px; background: var(--el-bg-color-overlay); box-shadow: 0 2px 8px rgba(24,24,27,.035); }
+	.agent-panel-card { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+	.agent-mobile-toolbar { position: sticky; top: 0; z-index: 2; display: flex; flex: 0 0 auto; align-items: center; gap: 6px; padding: 2px 8px; background: var(--el-bg-color-overlay); }
+	.agent-mobile-toolbar select { flex: 1 1 0; width: 0; min-width: 0; min-height: 44px; padding: 0 6px; border: 0; border-radius: 8px; background: transparent; color: var(--el-text-color-primary); font: inherit; font-weight: 600; }
+	.agent-mobile-toolbar button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; min-height: 44px; padding: 0 6px; border: 0; border-radius: 8px; background: transparent; color: var(--el-text-color-secondary); font: inherit; }
+	.agent-mobile-toolbar button svg { width: 11px; }
+	.agent-mobile-toolbar button.is-active { color: var(--el-color-primary); }
+	.agent-mobile-toolbar button.is-active svg { transform: rotate(180deg); }
+	.agent-mobile-toolbar :focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
+	.agent-panel-head { flex: 0 0 auto; max-height: 30%; overflow: auto; align-items: center; flex-direction: row; gap: 6px; padding: 0 12px 8px; }
+	.agent-orb { width: 24px; height: 24px; border-radius: 7px; box-shadow: none; }
+	.agent-orb svg { width: 13px; }
+	.agent-title-row { flex-wrap: wrap; gap: 3px 6px; }
+	.agent-tabs, .agent-subtitle, .agent-metrics-row, .agent-continuity-strip { display: none; }
+	.agent-tab-panel { flex: 1 1 0; height: auto; min-height: 0; padding: 8px 10px 10px; overflow: auto; -webkit-overflow-scrolling: touch; }
+	.agent-tab-panel.tab-activity, .agent-tab-panel.tab-monitor, .agent-tab-panel.tab-plan { overflow: hidden; }
+	.activity-panel { height: 100%; min-height: 0; overflow: hidden; }
+	.activity-panel > .tab-intro > div { display: none; }
+	.activity-panel > .tab-intro { justify-content: flex-end; margin-bottom: 2px; }
+	.activity-panel > .tab-intro em { padding: 0; background: transparent; }
+	.activity-scroll { min-height: 0; padding-right: 0; -webkit-overflow-scrolling: touch; }
+	.launch-panel, .output-panel, .instance-panel { height: auto; overflow: visible; }
+	.launch-panel .content-frame, .output-panel .content-frame { flex: none; min-height: 0; overflow: visible; }
+	.content-frame-scroll, .instance-assignment-list { flex: none; min-height: 0; overflow: visible; }
+	.content-frame-head { height: auto; min-height: 38px; flex-wrap: wrap; gap: 3px; }
+	.content-frame-head-main { flex-wrap: wrap; }
+	.content-frame-head-main em { white-space: normal; overflow-wrap: anywhere; }
+	.frame-copy-button { min-height: 32px; }
+	.launch-meta-tag, .launch-tools-tag { max-width: 100%; }
+	.tab-intro { flex-wrap: wrap; gap: 4px; }
+	/* Metadata is a separate view of this same frame, not a tall permanent
+	   block above the log. Existing data and tab state remain mounted. */
+	.agent-tool-detail.mobile-meta-open { overflow: auto; -webkit-overflow-scrolling: touch; }
+	.mobile-meta-open .agent-panel-card { height: auto; min-height: 100%; }
+	.mobile-meta-open .agent-panel-head { max-height: none; overflow: visible; align-items: flex-start; flex-direction: column; padding: 6px 12px 10px; }
+	.mobile-meta-open .agent-subtitle { display: block; }
+	.mobile-meta-open .agent-metrics-row { display: flex; justify-content: flex-start; gap: 4px; margin-top: 6px; }
+	.mobile-meta-open .agent-metrics-row span { padding: 4px 6px; }
+	.mobile-meta-open .agent-continuity-strip { display: flex; margin: 0; padding: 10px 12px 14px; gap: 6px; }
+	.mobile-meta-open .agent-continuity-strip > span { border-radius: 7px; padding: 5px 7px; }
+	.mobile-meta-open .agent-tab-panel { display: none; }
+	.monitor-card { grid-template-columns: 8px minmax(0, 1fr); gap: 3px 8px; }
+	.monitor-timeline::before { left: 7px; }
+	.monitor-rail time { grid-column: 2; grid-row: 1; padding-top: 0; }
+	.monitor-dot { grid-column: 1; grid-row: 1; margin-top: 4px; }
+	.monitor-card-body { grid-column: 2; grid-row: 2; padding: 8px; }
+	.monitor-card-heading { flex-wrap: wrap; gap: 4px; }
 }
 </style>
 

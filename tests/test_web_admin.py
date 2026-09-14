@@ -5765,28 +5765,35 @@ async def test_assistant_events_use_source_native_operation_specs_without_hidden
     assert all("_webOperationSpecs" not in json.dumps(frame.get("payload") or {}, ensure_ascii=False) for frame in assistant_frames + reasoning_frames)
 
 
-async def test_detached_agent_progress_does_not_split_foreground_assistant_segment(web_env):
+@pytest.mark.parametrize("tool_name", ["Agent", "AgentContinue", "AgentMessage", "AgentStop"])
+@pytest.mark.parametrize("event_type", ["tool_progress", "tool_update"])
+async def test_detached_agent_progress_does_not_split_foreground_assistant_segment(web_env, tool_name, event_type):
     row = await web_env.server._create_web_conversation(123, title="detached agent progress")
     chat_id = int(row["internal_chat_id"])
     conv_uuid = row["conversation_uuid"]
     live = web_env.server._live_for(row)
 
     await live.publish({"type": "accepted", "turnUuid": "turn-detached-agent"})
-    await live.publish({"type": "tool_start", "turnUuid": "turn-detached-agent", "toolCallId": "call-agent", "name": "Agent", "arguments": "{}", "line": "Agent running"})
-    await live.publish({"type": "delta", "turnUuid": "turn-detached-agent", "text": "已启动后台 Agent"})
+    await live.publish({"type": "tool_start", "turnUuid": "turn-detached-agent", "toolCallId": "call-agent", "name": tool_name, "arguments": "{}", "line": "Agent running"})
+    await live.publish({"type": "delta", "turnUuid": "turn-detached-agent", "text": "已启动后台 Agent", "reasoning": "前台仍在输出"})
+    foreground_snapshot = live.snapshot()
     await live.publish({
-        "type": "tool_progress",
+        "type": event_type,
         "turnUuid": "turn-detached-agent",
         "toolCallId": "call-agent",
-        "name": "Agent",
+        "name": tool_name,
         "arguments": "{}",
         "payload": {
-            "toolName": "Agent",
+            "toolName": tool_name,
             "status": "running",
             "detached": True,
             "task": {"taskUuid": "task-1", "status": "running", "detached": True},
         },
     })
+    progress_snapshot = live.snapshot()
+    assert progress_snapshot["draftText"] == foreground_snapshot["draftText"]
+    assert progress_snapshot["draftReasoning"] == foreground_snapshot["draftReasoning"]
+    assert progress_snapshot["currentStatus"] == foreground_snapshot["currentStatus"]
     await live.publish({"type": "delta", "turnUuid": "turn-detached-agent", "text": "已启动后台 Agent，等待结果"})
     await live.publish({"type": "final", "turnUuid": "turn-detached-agent", "text": "已启动后台 Agent，等待结果"})
 
@@ -5797,6 +5804,25 @@ async def test_detached_agent_progress_does_not_split_foreground_assistant_segme
 
     assistant_frames = [frame for frame in await web_env.server._web_frames(conv_uuid) if frame["debug"].get("eventType") in {"delta", "final"} and frame["opType"] == "assistant_message"]
     assert {frame["opId"] for frame in assistant_frames} == {"assistant:turn-detached-agent:1"}
+
+
+@pytest.mark.parametrize("event_type", ["tool_progress", "tool_update"])
+@pytest.mark.parametrize("tool_name, detached", [("AgentContinue", False), ("Bash", False), ("Bash", True)])
+async def test_foreground_tool_progress_still_creates_a_real_assistant_boundary(event_type, tool_name, detached):
+    live = _WebLiveStream("foreground-boundary", -1)
+    await live.publish({"type": "accepted", "turnUuid": "foreground-turn"})
+    first = await live.publish({"type": "delta", "text": "调用前的说明"})
+    await live.publish({
+        "type": event_type, "name": tool_name, "toolCallId": "foreground-tool",
+        "payload": {"toolName": tool_name, "detached": detached},
+    })
+    assert live.snapshot()["draftText"] == ""
+    second = await live.publish({"type": "delta", "text": "调用后的说明"})
+    assert first["eventKey"] == "assistant:draft:0"
+    assert second["eventKey"] == "assistant:draft:1"
+    await live.publish({"type": "cut"})
+    third = await live.publish({"type": "delta", "text": "等待之后的新说明"})
+    assert third["eventKey"] == "assistant:draft:2"
 
 
 async def test_tool_events_use_source_native_operation_specs_without_hidden_payload(web_env):

@@ -1,4 +1,5 @@
 <script setup>
+import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 import { computed, onMounted, ref } from "vue";
 import { encode } from "gpt-tokenizer";
 import { Api, apiError } from "../api";
@@ -70,32 +71,43 @@ function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catc
 </script>
 
 <template>
-  <div class="h-full flex flex-col">
+  <div class="admin-page logs-page h-full flex flex-col">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
+      <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">系统日志</h1>
         <span class="text-xs text-macsub">提示词渲染记录 + Web 审计日志</span>
       </div>
       <el-button :icon="'Refresh'" @click="load" round :loading="loading">刷新</el-button>
     </header>
 
-    <div class="grid grid-cols-4 gap-3 px-6 pt-5 shrink-0">
+    <div class="admin-desktop-only admin-stats grid grid-cols-4 gap-3 px-6 pt-5 shrink-0">
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">今日组装</div><div class="text-lg font-semibold">{{ formatNum(todayStats.count) }}</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">今日字符</div><div class="text-lg font-semibold">{{ formatNum(todayStats.chars) }}</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">平均耗时</div><div class="text-lg font-semibold">{{ todayStats.avgMs }}ms</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">日志总数</div><div class="text-lg font-semibold">{{ formatNum(total) }}</div></div>
     </div>
 
-    <div class="px-6 pt-4 shrink-0">
+    <MobileAdminSummary :items="[{ label: '今日组装', value: todayStats.count }, { label: '今日字符', value: formatNum(todayStats.chars) }, { label: '平均耗时', value: todayStats.avgMs + 'ms' }, { label: '日志总数', value: formatNum(total) }]">今日 {{ todayStats.count }} · 平均 {{ todayStats.avgMs }}ms · 共 {{ formatNum(total) }}</MobileAdminSummary>
+
+    <div class="logs-tabs px-6 pt-4 shrink-0">
       <el-tabs v-model="activeTab" class="mac-logs-tabs">
         <el-tab-pane label="Render logs" name="render" />
         <el-tab-pane label="Audit logs" name="audit" />
       </el-tabs>
     </div>
 
-    <div class="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
+    <div class="admin-list flex-1 min-h-0 overflow-y-auto px-6 pb-6">
       <template v-if="activeTab === 'render'">
-        <el-table :data="logs" size="small" stripe class="mac-shadow rounded-xl overflow-hidden" @row-click="viewDetail" v-loading="loading">
+        <div class="admin-mobile-only log-cards" v-loading="loading">
+          <el-empty v-if="!logs.length" description="暂无渲染日志" />
+          <button v-for="row in logs" :key="row.id" type="button" class="log-card mac-panel" @click="viewDetail(row)">
+            <span class="log-card-heading"><strong>{{ row.template_name || '未命名模板' }}</strong><span class="text-macblue">详情 →</span></span>
+            <span class="text-macsub">{{ fmtTime(row.ts) }}</span>
+            <span class="log-card-meta"><span>来源 {{ row.source || '—' }}</span><span>IP {{ row.client_ip || '—' }}</span><span>{{ formatNum(row.output_len) }} 字符</span><span>{{ row.ms }}ms</span></span>
+            <code class="line-clamp-2 text-macsub">{{ row.params_json?.slice(0, 140) }}</code>
+          </button>
+        </div>
+        <el-table :data="logs" size="small" stripe class="admin-desktop-only mac-shadow rounded-xl overflow-hidden" @row-click="viewDetail" v-loading="loading">
           <el-table-column label="时间" width="170"><template #default="{ row }">{{ fmtTime(row.ts) }}</template></el-table-column>
           <el-table-column prop="source" label="来源" width="120" show-overflow-tooltip />
           <el-table-column prop="client_ip" label="调用IP" width="130" show-overflow-tooltip />
@@ -105,13 +117,25 @@ function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catc
           <el-table-column prop="params_json" label="参数摘要" show-overflow-tooltip><template #default="{ row }"><span class="text-xs text-macsub font-mono">{{ row.params_json?.slice(0, 140) }}</span></template></el-table-column>
           <el-table-column label="" width="70"><template #default="{ row }"><el-button size="small" text type="primary" @click.stop="viewDetail(row)">详情</el-button></template></el-table-column>
         </el-table>
-        <div class="mt-4 flex justify-end">
+        <div class="admin-desktop-only mt-4 flex justify-end">
           <el-pagination background layout="total, sizes, prev, pager, next, jumper" :total="total" :current-page="page" :page-size="pageSize" :page-sizes="[10, 20, 50, 100]" @current-change="onPageChange" @size-change="onSizeChange" />
+        </div>
+        <div class="admin-mobile-only log-pagination">
+          <div class="log-page-size"><span>共 {{ formatNum(total) }} 条</span><select :value="pageSize" aria-label="每页日志数量" @change="onSizeChange(Number($event.target.value))"><option v-for="size in [10, 20, 50, 100]" :key="size" :value="size">{{ size }} 条 / 页</option></select></div>
+          <el-pagination layout="prev, pager, next" :pager-count="5" :total="total" :current-page="page" :page-size="pageSize" @current-change="onPageChange" />
         </div>
       </template>
 
       <template v-else>
-        <el-table :data="auditLogs" size="small" stripe class="mac-shadow rounded-xl overflow-hidden" v-loading="loading">
+        <div class="admin-mobile-only log-cards" v-loading="loading">
+          <el-empty v-if="!auditLogs.length" description="暂无审计日志" />
+          <details v-for="row in auditLogs" :key="row.id" class="log-card mac-panel">
+            <summary><strong>{{ row.kind || '审计记录' }}</strong><span class="text-macsub">{{ fmtTime(row.created_at) }}</span><span class="text-macblue">展开详情</span></summary>
+            <div class="log-card-meta"><span>来源 {{ row.actor || '—' }}</span><span>Chat {{ row.chat_id || '—' }}</span><span>IP {{ row.ip || '—' }}</span></div>
+            <pre>{{ prettyJson(row.detail || {}) }}</pre>
+          </details>
+        </div>
+        <el-table :data="auditLogs" size="small" stripe class="admin-desktop-only mac-shadow rounded-xl overflow-hidden" v-loading="loading">
           <el-table-column label="时间" width="170"><template #default="{ row }">{{ fmtTime(row.created_at) }}</template></el-table-column>
           <el-table-column prop="kind" label="动作" min-width="220" show-overflow-tooltip />
           <el-table-column prop="actor" label="来源" width="90" />
@@ -122,7 +146,7 @@ function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catc
       </template>
     </div>
 
-    <el-drawer v-model="drawerOpen" title="系统日志详情" size="60%">
+    <el-drawer append-to-body class="admin-drawer logs-drawer" v-model="drawerOpen" title="系统日志详情" size="60%">
       <div v-if="detail" class="h-full flex flex-col">
         <div class="flex gap-4 text-xs text-macsub mb-3 flex-wrap">
           <span>#{{ detail.id }}</span>

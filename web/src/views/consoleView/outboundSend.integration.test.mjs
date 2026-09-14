@@ -4,6 +4,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import {createOutboundSendTracker, probeSocket, restoreOutboundDraft, waitForSocketOpen} from "./outboundSend.js";
 import {referenceDisplayText, referenceErrorText, referenceToken, referencesInText} from "../../references/codec.js";
+import {createOperationFrameBuffer} from './operationFrameBuffer.js';
 
 // Run the actual ConsoleView submission/recovery functions, not a second model
 // of the implementation. Vue rendering and HTTP are isolated side-effect seams.
@@ -56,6 +57,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
   let context;
   const globals = {
     WebSocket: Socket, AbortController,
+    operationFrameBuffer: createOperationFrameBuffer(), conversationStateRequests: {pending:false,invalidate(){}},
     window: {setTimeout: timer.scheduleTimeout, clearTimeout: timer.clearScheduledTimeout, dispatchEvent: noop},
     document: {visibilityState: "visible"},
     URL: {createObjectURL: (file) => `blob:${file.name}`, revokeObjectURL: (url) => revoked.push(url)},
@@ -98,6 +100,8 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
   context = vm.createContext(globals);
   vm.runInContext(`let ws=null; let wsConversationUuid=""; let reconnectTimer=null;
     let componentMounted=true; let sendAttemptGeneration=0; let connectionResumePromise=null;
+    let timelinePageInitialized=!props.conversationUuid.startsWith('local:');
+    let timelinePageConversationUuid=props.conversationUuid;
     const outboundSends=createOutboundSendTracker({onTimeout:(pending)=>recoverUnconfirmedSend(pending)});
     ${actual}`, context);
   return {
@@ -111,6 +115,17 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     },
   };
 }
+
+test('one accepted send uses only one parent directory-refresh path, never component plus global notification',async()=>{
+  const h=harness(),componentEvents=[],globalEvents=[];
+  h.context.emit=(name)=>componentEvents.push(name);
+  h.context.window.dispatchEvent=(event)=>globalEvents.push(event.type);
+  await h.run('send()');
+  assert.equal(h.sends().length,1);
+  assert.equal(componentEvents.filter(x=>x==='conversations-refresh').length,1);
+  assert.equal(globalEvents.filter(x=>x==='openbear:conversations-refresh').length,0);
+  h.run('leavePendingSend()');
+});
 
 test("references wait for backend capability without clearing a draft or sending raw locators", async () => {
   const h=harness();h.context.referenceCatalog.ready=false;

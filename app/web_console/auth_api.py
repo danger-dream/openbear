@@ -5,6 +5,14 @@ from app.mcp.audit import record_audit
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
+# Deliberately exact, public GET/HEAD resources. No root/static-directory wildcard.
+PWA_PUBLIC_FILES = {
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "/icons/openbear-192.png": ("icons/openbear-192.png", "image/png"),
+    "/icons/openbear-512.png": ("icons/openbear-512.png", "image/png"),
+    "/icons/apple-touch-icon.png": ("icons/apple-touch-icon.png", "image/png"),
+}
+
 
 class WebAdminAuthMixin:
     @web.middleware
@@ -24,6 +32,7 @@ class WebAdminAuthMixin:
                 )
         if (
             path in {"/health", "/login", "/api/auth/login/start"}
+            or (request.method in {"GET", "HEAD"} and path in PWA_PUBLIC_FILES)
             or path.startswith("/assets/")
             or path.startswith("/api/auth/login/status/")
             or path.startswith("/api/auth/login/consume/")
@@ -71,6 +80,28 @@ class WebAdminAuthMixin:
         if not candidate.is_file():
             raise web.HTTPNotFound(text="asset not found")
         return web.FileResponse(candidate)
+
+    async def handle_pwa_asset(self, request: web.Request) -> web.Response:
+        resource = PWA_PUBLIC_FILES.get(request.path)
+        if resource is None:
+            raise web.HTTPNotFound(text="installation resource not found")
+        dist = self._web_dist_dir().resolve()
+        expected = dist / resource[0]
+        candidate = expected.resolve()
+        if candidate != expected:
+            raise web.HTTPNotFound(text="installation resource not found")
+        try:
+            candidate.relative_to(dist)
+        except ValueError:
+            raise web.HTTPNotFound(text="installation resource not found") from None
+        if not candidate.is_file():
+            raise web.HTTPNotFound(text="installation resource not found")
+        return web.FileResponse(candidate, headers={
+            "Content-Type": resource[1],
+            # Stable URLs must be revalidated on upgrades, never immutable/offline.
+            "Cache-Control": "no-cache, max-age=0, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+        })
 
     def _login_cooldown_seconds(self) -> int:
         return max(60, int(self.config.web.failed_login_cooldown_minutes) * 60)

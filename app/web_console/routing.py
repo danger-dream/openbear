@@ -1,6 +1,7 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.web_console.auth_api import PWA_PUBLIC_FILES
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -68,6 +69,7 @@ class WebAdminAppMixin:
             web.get("/mcp", self.handle_index),
             web.get("/settings", self.handle_index),
             web.get("/assets/{path:.*}", self.handle_asset),
+            *(web.get(path, self.handle_pwa_asset) for path in PWA_PUBLIC_FILES),
             web.post("/api/auth/login/start", self.handle_login_post),
             web.get("/api/auth/login/status/{request_uuid}", self.handle_api_auth_status),
             web.post("/api/auth/login/consume/{request_uuid}", self.handle_api_auth_consume),

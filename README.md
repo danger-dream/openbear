@@ -88,6 +88,14 @@ OPENBEAR_SKIP_FIREWALL=1 bash -c '
 
 Telegram 用户 ID 不是 Bot Token，也不是 `@用户名`。可在 Telegram 里找 `@userinfobot` 查询。
 
+## 安装为应用（PWA）
+
+已有用户升级到包含此功能的版本后，从**自己的可信 HTTPS 地址**打开 OpenBear，在「设置 → 安装应用 (PWA)」检查当前入口并按浏览器指引安装；无需按域名重新构建或额外安装脚本。地址自动使用当前 `location.origin`，不会绑定会话链接。
+
+Chrome / Edge 只有在浏览器实际提供安装事件时才显示系统安装按钮；HTTPS 并不保证能弹安装框。iPhone / iPad 可在 Safari 分享菜单选择「添加到主屏幕」，内置浏览器建议改用系统浏览器。HTTP 页面允许输入自己的 HTTPS 入口，核对后手动前往（仅 origin，不复制路径、查询参数、片段、会话或密钥），随时可取消。
+
+安装后仍使用同源 API、WebSocket 和现有登录认证；首期不包含 Service Worker、离线业务缓存或 Web Push。网页不能可靠判断设备是否已经安装，检测结果只说明当前窗口模式、资源与浏览器提供的能力。
+
 ## 更新
 
 ### 公开 v0.1.2 用户首次升级到 v0.2.0

@@ -2,12 +2,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   Box, ArrowDown, ArrowRight, ChatLineRound, Check, Delete, DocumentCopy,
-  EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading,
+  EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading, MoreFilled,
   Plus, Refresh, RefreshLeft, Search, Star, StarFilled,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
-import MdEditor from "./MdEditor.vue";
+import { defineLazyView } from "../lazyView.js";
+import { MOBILE_VIEWPORT_QUERY } from "../mobileViewport.js";
 import ContextStrategySwitch from "./ContextStrategySwitch.vue";
 import "./conversationTreeProperties.css";
 import ConversationPromptDialog from "./ConversationPromptDialog.vue";
@@ -22,6 +23,8 @@ import {
   RUN_DEFAULT_INHERIT, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
   runDefaultOption, runDefaultSelection, sparseRunDefaults, updateRunDefault,
 } from "./folderRunDefaults.js";
+
+const MdEditor = defineLazyView(() => import("./MdEditor.vue"), "提示词编辑器");
 
 const props = defineProps({
   activeConversationUuid: { type: String, default: "" },
@@ -646,11 +649,28 @@ async function openMenu(event, row) {
   const element = document.querySelector("[data-conversation-tree-menu]");
   const bounds = element?.getBoundingClientRect?.();
   if (!bounds) return;
+  const viewport = window.matchMedia?.(MOBILE_VIEWPORT_QUERY)?.matches && window.visualViewport;
+  const left = viewport?.offsetLeft || 0;
+  const top = viewport?.offsetTop || 0;
   menu.value = {
     ...menu.value,
-    x: Math.max(pad, Math.min(pointerX, window.innerWidth - bounds.width - pad)),
-    y: Math.max(pad, Math.min(pointerY, window.innerHeight - bounds.height - pad)),
+    x: Math.max(left + pad, Math.min(pointerX, left + (viewport?.width || window.innerWidth) - bounds.width - pad)),
+    y: Math.max(top + pad, Math.min(pointerY, top + (viewport?.height || window.innerHeight) - bounds.height - pad)),
   };
+}
+function moreMenuKeydown(event) {
+  // Keep native button activation, without the enclosing treeitem's Enter-open.
+  // Escape, context-menu keys and application shortcuts still bubble normally.
+  if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+}
+function openMoreMenu(event, row) {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return openMenu({
+    preventDefault: () => event.preventDefault(),
+    stopPropagation: () => event.stopPropagation(),
+    clientX: rect.right - 8,
+    clientY: rect.bottom + 4,
+  }, row);
 }
 function openRootMenu(event) { return openMenu(event, rootDropTarget); }
 function closeMenu() { menu.value = { open: false, x: 0, y: 0, row: null }; }
@@ -1353,6 +1373,12 @@ onBeforeUnmount(() => {
           <button v-else-if="row.kind === 'more'" class="tree-inline-action" type="button" :disabled="stateFor(row.parentId || '', row.systemNode || '').loading" @click="loadChildren(row.parentId || '', row.systemNode || '', { append: true })">加载更多</button>
           <button v-else-if="row.kind === 'error'" class="tree-inline-action error" type="button" @click="loadChildren(row.parentId || '', row.systemNode || '', { force: true })">加载失败，点击重试</button>
           <span v-else class="tree-muted">此目录为空</span>
+          <button v-if="['folder', 'conversation', 'system'].includes(row.kind)"
+            class="tree-touch-more" type="button" :aria-label="`${row.name || rowLabel(row)}：更多操作`"
+            aria-haspopup="menu" :aria-expanded="menu.open && rowId(menu.row) === rowId(row)"
+            @pointerdown.stop @keydown="moreMenuKeydown" @dragstart.prevent.stop @click.stop="openMoreMenu($event, row)">
+            <el-icon><MoreFilled /></el-icon>
+          </button>
         </div>
         <button v-if="query && searchHasMore" class="search-more" type="button" :disabled="searchLoading" @click="runSearch({ append: true })">{{ searchLoading ? '加载中…' : '更多搜索结果' }}</button>
         <div v-else-if="query && !searchLoading && !searchRows.length" class="tree-placeholder">没有匹配的目录或会话</div>
@@ -1648,12 +1674,24 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
 /* Keep the running ring: it is an operational status indicator, not decoration. */
 @media (prefers-reduced-motion: reduce) { .is-spinning,.running-leaf { animation:none; } }
 @media (pointer:coarse) { .tree-row-wrap { min-height:36px; } .tree-node-main { height:34px; } }
+.tree-touch-more { display:none; }
+@media (max-width:760px), (hover:none) and (pointer:coarse) {
+  .tree-row-wrap { min-height:44px; }
+  .tree-node-main { min-height:44px; }
+  .tree-touch-more { display:grid; width:44px; height:44px; flex:0 0 44px; place-items:center; border:0; border-radius:8px; background:transparent; color:inherit; font-size:14px; }
+  .tree-touch-more:focus-visible { outline:2px solid #007aff; outline-offset:-3px; }
+  .tree-touch-more:active { background:rgba(127,127,127,.12); }
+}
 </style>
 
 <style>
 .tree-menu-shield { position:fixed; inset:0; z-index:3200; background:transparent; }
 .tree-context-menu { font-family:inherit; font-size:12px; font-weight:400; line-height:1.4; position:fixed; width:min(194px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:auto; padding:5px; border:1px solid rgba(0,0,0,.11); border-radius:10px; background:rgba(250,250,250,.97); color:#27272a; box-shadow:0 16px 42px rgba(15,23,42,.2),0 4px 12px rgba(15,23,42,.08); backdrop-filter:blur(18px) saturate(1.3); }
 .tree-context-menu button { font:inherit; display:grid; grid-template-columns:16px 1fr; align-items:center; gap:7px; width:100%; min-height:28px; padding:4px 8px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
+@media (max-width:760px), (hover:none) and (pointer:coarse) {
+  .tree-context-menu { max-height:calc(var(--mobile-viewport-height, 100dvh) - 16px); }
+  .tree-context-menu button { min-height:44px; }
+}
 .tree-context-menu button:hover:not(:disabled) { background:#2563eb; color:white; }.tree-context-menu button:disabled { opacity:.38; cursor:not-allowed; }.tree-context-menu button.danger { color:#dc2626; }.tree-context-menu button.danger:hover:not(:disabled) { background:#dc2626; color:white; }
 .tree-context-menu hr { height:1px; margin:5px 7px; border:0; background:rgba(161,161,170,.28); }
 .impact-copy { color:var(--el-text-color-secondary); font-size:12px; line-height:1.65; }

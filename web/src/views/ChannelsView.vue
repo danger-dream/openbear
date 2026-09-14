@@ -44,6 +44,14 @@ const batchModelsDevPreviewing = ref(false);
 const batchModelsDevSyncing = ref(false);
 let batchModelsDevPreviewRequest = 0;
 
+// Presentation state only: desktop keeps all existing panels visible.
+const channelToolsOpen = ref(false);
+const channelOverviewOpen = ref(false);
+const providerDetailsOpen = ref(false);
+const modelSectionOpen = reactive({});
+function modelSectionId(row, section) {
+  return `channel-model-${section}-${encodeURIComponent(row.fullname || `${selectedName.value}/${row.id}`)}`;
+}
 const modelSearchQuery = ref("");
 const filteredModels = computed(() => {
   const list = selectedProvider.value?.models || [];
@@ -1167,16 +1175,20 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="h-full flex flex-col bg-macbg" v-loading="loading">
-    <header class="h-14 shrink-0 flex items-center justify-between px-3 sm:px-6 border-b border-macborder bg-white/75 backdrop-blur">
-      <div class="flex items-center gap-2 min-w-0">
+  <div class="channels-view h-full flex flex-col bg-macbg" v-loading="loading">
+    <header class="channels-header h-14 shrink-0 flex items-center justify-between px-3 sm:px-6 border-b border-macborder bg-white/75 backdrop-blur">
+      <div class="channels-heading flex items-center gap-2 min-w-0">
         <h1 class="text-base font-semibold whitespace-nowrap">渠道管理</h1>
         <span class="hidden md:inline text-xs text-macsub truncate">模型渠道、默认模型、连通性测试与费用配置</span>
       </div>
-      <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+      <div class="channels-mobile-header-actions mobile-channel-only">
+        <button type="button" class="channel-quiet-control text-xs" :class="{ 'is-selected': channelOverviewOpen }" :aria-expanded="channelOverviewOpen" aria-controls="channels-cumulative-stats" @click="channelOverviewOpen = !channelOverviewOpen">统计</button>
+        <button type="button" class="channel-quiet-control text-xs" :class="{ 'is-selected': channelToolsOpen }" :aria-expanded="channelToolsOpen" aria-controls="channels-management-tools" @click="channelToolsOpen = !channelToolsOpen">管理<svg class="channel-chevron" :class="{ 'is-open': channelToolsOpen }" viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></svg></button>
+      </div>
+      <div id="channels-management-tools" class="channels-toolbar flex items-center gap-1.5 sm:gap-2 shrink-0" :class="{ 'is-open': channelToolsOpen }">
         <!-- 元数据状态与刷新一体化：去歧义，状态清晰 -->
         <button
-          class="mac-toolbar-button flex items-center gap-1.5 text-xs"
+          class="channels-metadata mac-toolbar-button flex items-center gap-1.5 text-xs"
           :class="{ 'is-muted': !modelsDev.available }"
           :disabled="modelsDevRefreshing"
           :title="modelsDev.lastError || '点击立即刷新公共模型元数据目录'"
@@ -1188,23 +1200,24 @@ onBeforeUnmount(() => {
         </button>
         <!-- 刷新渠道数据按钮：带明确文字 -->
         <button
-          class="mac-toolbar-button flex items-center gap-1 text-xs"
+          class="channels-refresh mac-toolbar-button flex items-center gap-1 text-xs"
+          aria-label="刷新渠道"
           :disabled="loading"
           title="重新加载渠道配置与调用统计"
           @click="loadList()"
         >
           <span :class="{ 'animate-spin': loading }">↻</span>
-          <span class="hidden sm:inline">刷新渠道</span>
+          <span class="channels-refresh-label hidden sm:inline">刷新渠道</span>
         </button>
         <!-- 添加渠道主按钮 -->
-        <button class="mac-toolbar-button mac-primary-button" @click="openCreateProvider">＋ 添加渠道</button>
+        <button class="channels-add mac-toolbar-button mac-primary-button" @click="openCreateProvider">＋ 添加渠道</button>
       </div>
     </header>
 
     <!-- 累计统计概览：扁平精简单行条，高度仅38px，极大释放主视区空间 -->
-    <section class="px-3 sm:px-6 pt-3 shrink-0" aria-label="渠道累计统计">
-      <div class="mac-panel mac-shadow px-3 sm:px-4 py-2 flex items-center justify-between gap-3 overflow-x-auto text-xs scrollbar-none bg-white/80">
-        <div class="flex items-center gap-4 sm:gap-7 shrink-0 divide-x divide-zinc-200/80">
+    <section id="channels-cumulative-stats" class="channels-overview px-3 sm:px-6 pt-3 shrink-0" :class="{ 'is-open': channelOverviewOpen }" aria-label="渠道累计统计">
+      <div class="channels-overview-panel mac-panel mac-shadow px-3 sm:px-4 py-2 flex items-center justify-between gap-3 overflow-x-auto text-xs scrollbar-none bg-white/80">
+        <div class="channels-overview-grid flex items-center gap-4 sm:gap-7 shrink-0 divide-x divide-zinc-200/80">
           <div class="flex items-center gap-2">
             <span class="text-macsub text-[11px]">模型总数</span>
             <strong class="font-semibold text-zinc-950">{{ fmtNum(totalModels) }}</strong>
@@ -1235,7 +1248,7 @@ onBeforeUnmount(() => {
 
 
     <!-- 移动端渠道横向快捷切换栏 (仅在 lg:hidden 窄屏显示) -->
-    <div class="lg:hidden flex items-center gap-2 overflow-x-auto px-3 py-2 border-b border-macborder bg-white/70 backdrop-blur shrink-0">
+    <div class="channels-switcher lg:hidden flex items-center gap-2 overflow-x-auto px-3 py-2 border-b border-macborder bg-white/70 backdrop-blur shrink-0">
       <button
         v-for="p in providers"
         :key="p.name"
@@ -1254,7 +1267,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 主工作区 -->
-    <div class="flex-1 min-h-0 flex flex-col lg:grid lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[300px_minmax(0,1fr)] gap-4 p-3 sm:p-4 lg:p-6 pb-6">
+    <div class="channels-workspace flex-1 min-h-0 flex flex-col lg:grid lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[300px_minmax(0,1fr)] gap-4 p-3 sm:p-4 lg:p-6 pb-6">
       <!-- 左侧渠道列表 -->
       <aside class="mac-panel mac-shadow min-h-0 overflow-hidden hidden lg:flex flex-col">
         <div class="p-3 border-b border-macborder/70 flex items-center justify-between text-xs font-semibold text-zinc-700 bg-zinc-50/50">
@@ -1288,23 +1301,41 @@ onBeforeUnmount(() => {
       </aside>
 
       <!-- 右侧详情与模型列表 -->
-      <section class="min-h-0 flex-1 flex flex-col" v-loading="detailLoading">
-        <div v-if="!selectedProvider" class="mac-panel p-10 text-center text-sm text-macsub">选择渠道查看详情</div>
-        <div v-else class="h-full min-h-0 flex flex-col gap-3 sm:gap-4">
+      <section class="channel-detail min-h-0 flex-1 flex flex-col" v-loading="detailLoading">
+        <div v-if="!selectedProvider" class="mac-panel p-10 text-center text-sm text-macsub">
+          选择渠道查看详情
+          <div class="channel-empty-actions mobile-channel-only">
+            <select v-if="providers.length" class="mac-input" aria-label="切换渠道" :value="selectedName" @change="loadProvider($event.target.value)"><option value="" disabled>选择渠道</option><option v-for="p in providers" :key="p.name" :value="p.name">{{ p.name }}{{ !p.enabled ? '（停用）' : '' }}</option></select>
+            <button class="mac-small-button mac-primary-button" @click="openCreateProvider">＋ 添加渠道</button>
+          </div>
+        </div>
+        <div v-else class="channel-detail-stack h-full min-h-0 flex flex-col gap-3 sm:gap-4">
           <!-- 渠道基本信息卡片：URL与Key并排，4项统计严格等高 -->
-          <div class="mac-panel mac-shadow p-4 sm:p-5 shrink-0">
-            <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+          <div class="channel-overview-card mac-panel mac-shadow p-4 sm:p-5 shrink-0" :class="{ 'is-open': providerDetailsOpen }">
+            <div class="channel-overview-layout flex flex-col sm:flex-row sm:items-start justify-between gap-4">
               <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap items-center gap-2">
+                <div class="channel-identity flex flex-wrap items-center gap-2">
                   <span class="provider-avatar provider-avatar--lg" :class="providerTone(selectedProvider)"><span>{{ providerInitial(selectedProvider) }}</span></span>
-                  <h2 class="text-lg font-semibold text-zinc-950">{{ selectedProvider.name }}</h2>
-                  <span class="mini-chip" :class="selectedProvider.enabled ? 'is-enabled' : 'is-muted'">{{ selectedProvider.enabled ? '已启用' : '已停用' }}</span>
-                  <span class="mini-chip">{{ protocolLabel(selectedProvider.protocol) }}</span>
-                  <span v-if="selectedProvider.primary" class="role-badge role-badge--primary">★ 承载主力模型</span>
-
+                  <h2 class="channel-desktop-name text-lg font-semibold text-zinc-950">{{ selectedProvider.name }}</h2>
+                  <div class="channel-mobile-picker mobile-channel-only">
+                    <span class="text-[11px] text-macsub">当前渠道 · {{ providers.length }}</span>
+                    <label class="channel-provider-select">
+                      <select class="text-sm font-semibold" aria-label="切换渠道" :value="selectedName" @change="loadProvider($event.target.value)">
+                        <option v-for="p in providers" :key="p.name" :value="p.name">{{ p.name }}{{ !p.enabled ? '（停用）' : '' }}</option>
+                      </select>
+                      <svg class="channel-switch-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 5h10m-3-3 3 3-3 3M13 11H3m3-3-3 3 3 3" /></svg>
+                    </label>
+                  </div>
+                  <button type="button" class="channel-provider-toggle channel-quiet-control mobile-channel-only text-xs" :aria-expanded="providerDetailsOpen" aria-controls="channel-provider-details channel-provider-actions" @click="providerDetailsOpen = !providerDetailsOpen">详情<svg class="channel-chevron" :class="{ 'is-open': providerDetailsOpen }" viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></svg></button>
+                  <div class="channel-identity-badges">
+                    <span class="mini-chip" :class="selectedProvider.enabled ? 'is-enabled' : 'is-muted'">{{ selectedProvider.enabled ? '已启用' : '已停用' }}</span>
+                    <span class="mini-chip">{{ protocolLabel(selectedProvider.protocol) }}</span>
+                    <span v-if="selectedProvider.primary" class="role-badge role-badge--primary">★ 承载主力模型</span>
+                  </div>
                 </div>
+                <div id="channel-provider-details" class="channel-provider-details">
                 <!-- URL与Key并排在同一行，告别空旷 -->
-                <div class="mt-2.5 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs text-zinc-600">
+                <div class="channel-connection mt-2.5 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs text-zinc-600">
                   <div class="channel-kv truncate"><span>URL</span><code>{{ selectedProvider.baseUrl }}</code></div>
                   <div class="channel-kv truncate"><span>Key</span><code>{{ selectedProvider.apiKeyMasked || '未配置' }}</code></div>
                 </div>
@@ -1332,7 +1363,8 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
-              <div class="flex flex-wrap sm:flex-nowrap justify-start sm:justify-end gap-2 shrink-0 pt-1">
+              </div>
+              <div id="channel-provider-actions" class="channel-actions flex flex-wrap sm:flex-nowrap justify-start sm:justify-end gap-2 shrink-0 pt-1">
                 <button class="mac-small-button" :disabled="testing[`channel:${selectedName}`]" @click="testChannel">{{ testing[`channel:${selectedName}`] ? '测试中…' : '⚡ 测试渠道' }}</button>
                 <button class="mac-small-button" @click="openEditProvider">编辑</button>
                 <button class="mac-small-button is-danger" @click="removeProvider">删除</button>
@@ -1341,27 +1373,31 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- 模型列表区：自适应 3~4 列网格，分组结构清晰 -->
-          <div class="mac-panel mac-shadow overflow-hidden flex flex-col min-h-0 flex-1">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-macborder px-4 sm:px-5 py-3 shrink-0">
-              <div class="flex items-center gap-2.5 flex-wrap">
-                <h3 class="text-sm font-semibold whitespace-nowrap">模型列表</h3>
-                <span class="mini-chip">{{ (selectedProvider.models || []).length }} 个模型</span>
-                <div class="relative min-w-[140px] sm:min-w-[190px]">
+          <div class="channel-models-panel mac-panel mac-shadow overflow-hidden flex flex-col min-h-0 flex-1">
+            <div class="channel-models-header flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-macborder px-4 sm:px-5 py-3 shrink-0">
+              <div class="channel-models-heading flex items-center gap-2.5 flex-wrap">
+                <div class="channel-models-title">
+                  <h3 class="text-sm font-semibold whitespace-nowrap">模型列表</h3>
+                  <span class="mini-chip">{{ (selectedProvider.models || []).length }} 个模型</span>
+                </div>
+                <div class="channel-model-search relative min-w-[140px] sm:min-w-[190px]">
                   <input
                     v-model="modelSearchQuery"
                     class="mac-input h-7 text-xs pl-7 pr-6"
                     placeholder="搜索模型 ID / 名称…"
+                    aria-label="搜索模型 ID / 名称"
                   />
-                  <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 text-[11px] pointer-events-none">🔍</span>
+                  <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 text-[11px] pointer-events-none"><span class="channel-desktop-search-icon">🔍</span><svg class="channel-search-icon mobile-channel-only" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.2" /><path d="m10 10 3.5 3.5" /></svg></span>
                   <button
                     v-if="modelSearchQuery"
+                    aria-label="清空模型搜索"
                     class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 text-xs px-1"
                     @click="modelSearchQuery = ''"
                   >×</button>
                 </div>
               </div>
-              <div class="flex items-center gap-2 flex-wrap">
-                <button class="mac-small-button" :disabled="!modelsDev.available || batchModelsDevLoading" @click="openModelsDevBatch">{{ batchModelsDevLoading ? '匹配中…' : '批量同步元数据' }}</button>
+              <div class="channel-models-actions flex items-center gap-2 flex-wrap">
+                <button class="channel-batch-sync mac-small-button" :disabled="!modelsDev.available || batchModelsDevLoading" title="批量同步元数据" aria-label="批量同步元数据" @click="openModelsDevBatch"><span class="channel-batch-desktop-label">{{ batchModelsDevLoading ? '匹配中…' : '批量同步元数据' }}</span><span class="mobile-channel-only">{{ batchModelsDevLoading ? '匹配中…' : '同步元数据' }}</span></button>
 
                 <button class="mac-small-button mac-primary-button" @click="openCreateModel">＋ 添加模型</button>
               </div>
@@ -1375,6 +1411,7 @@ onBeforeUnmount(() => {
               item-key="id"
               handle=".model-drag"
               ghost-class="drag-ghost"
+              chosen-class="model-sort-chosen"
               class="model-list-scroll model-grid-responsive p-3 sm:p-4"
               :disabled="Boolean(modelSearchQuery)"
               @end="persistModelOrder"
@@ -1383,7 +1420,7 @@ onBeforeUnmount(() => {
                 <article class="model-card" :class="{ 'is-primary-card': row.primary }">
                   <!-- 1. 头部：把手 + 显示名与ID同行 + 状态药丸 -->
                   <div class="model-head">
-                    <button class="model-drag" :disabled="Boolean(modelSearchQuery)" :title="modelSearchQuery ? '搜索状态下暂停拖动' : '拖动排序'">⋮⋮</button>
+                    <button type="button" class="model-drag" :disabled="Boolean(modelSearchQuery)" :aria-label="`拖动排序：${modelDisplayName(row)}`" :title="modelSearchQuery ? '搜索状态下暂停拖动' : '拖动排序'"><span class="model-drag-desktop">⋮⋮</span><svg class="model-drag-grip mobile-channel-only" viewBox="0 0 16 20" aria-hidden="true"><circle cx="5" cy="4" r="1.3"/><circle cx="11" cy="4" r="1.3"/><circle cx="5" cy="10" r="1.3"/><circle cx="11" cy="10" r="1.3"/><circle cx="5" cy="16" r="1.3"/><circle cx="11" cy="16" r="1.3"/></svg></button>
                     <div class="model-title-block">
                       <div class="model-title-row">
                         <div class="min-w-0 flex-1 pr-2">
@@ -1422,7 +1459,12 @@ onBeforeUnmount(() => {
                   </div>
 
                   <!-- 2. 分组一：【规格与费率】 (纯配置参数集中呈现，不再穿插) -->
-                  <div class="model-group-block mt-3">
+                  <div class="model-group-block model-specs-group mt-3" :class="{ 'is-open': modelSectionOpen[modelSectionId(row, 'specs')] }">
+                    <button type="button" class="model-section-toggle mobile-channel-only" :aria-expanded="Boolean(modelSectionOpen[modelSectionId(row, 'specs')])" :aria-controls="modelSectionId(row, 'specs')" @click="modelSectionOpen[modelSectionId(row, 'specs')] = !modelSectionOpen[modelSectionId(row, 'specs')]">
+                      <span class="model-specs-summary text-xs"><span>上下文 <strong>{{ fmtCompact(row.contextWindow) }}</strong></span><span>输出 <strong>{{ fmtCompact(row.maxTokens) }}</strong></span></span>
+                      <span class="model-section-label text-[11px]">规格与费率<svg class="channel-chevron" :class="{ 'is-open': modelSectionOpen[modelSectionId(row, 'specs')] }" viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></svg></span>
+                    </button>
+                    <div :id="modelSectionId(row, 'specs')" class="model-section-body">
                     <div class="group-header">规格与费率</div>
                     <div class="grid grid-cols-3 gap-1.5 text-xs">
                       <div class="soft-stat"><span>上下文</span><strong>{{ fmtCompact(row.contextWindow) }}</strong></div>
@@ -1453,8 +1495,14 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
-                  <!-- 3. 分组二：【运行调用数据】 (2列宽裕布局，字体细腻自然，彻底杜绝打点截断) -->
-                  <div class="model-group-block mt-2.5">
+                  </div>
+                  <!-- Runtime totals are secondary to model identity and configuration on phones. -->
+                  <div class="model-group-block model-runtime-group mt-2.5" :class="{ 'is-open': modelSectionOpen[modelSectionId(row, 'runtime')] }">
+                    <button type="button" class="model-section-toggle mobile-channel-only" :aria-expanded="Boolean(modelSectionOpen[modelSectionId(row, 'runtime')])" :aria-controls="modelSectionId(row, 'runtime')" @click="modelSectionOpen[modelSectionId(row, 'runtime')] = !modelSectionOpen[modelSectionId(row, 'runtime')]">
+                      <span class="model-runtime-summary text-[11px]">{{ fmtNum(row.stats?.calls || 0) }} 次调用<span aria-hidden="true">·</span><strong>{{ fmtMoney(row.stats?.cost_usd) }}</strong></span>
+                      <span class="model-section-label text-[11px]">运行数据<svg class="channel-chevron" :class="{ 'is-open': modelSectionOpen[modelSectionId(row, 'runtime')] }" viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></svg></span>
+                    </button>
+                    <div :id="modelSectionId(row, 'runtime')" class="model-section-body">
                     <div class="group-header">运行数据</div>
                     <div class="grid grid-cols-2 gap-2">
                       <div class="model-stat-tile">
@@ -1489,18 +1537,19 @@ onBeforeUnmount(() => {
                   </div>
 
                   <!-- 4. 底部操作栏：单行不折行，文案精炼对齐 -->
-                  <div class="model-action-row mt-3">
+                  </div>
+                  <div class="model-action-row mt-3" :class="{ 'has-sync': row.modelsDev?.bound }">
                     <div class="model-action-group">
                       <button class="model-action is-primary-action" :disabled="testing[`model:${row.fullname}`]" title="测试模型连通性" @click="testModel(row)">{{ testing[`model:${row.fullname}`] ? '测试中…' : '⚡ 测试' }}</button>
-                      <button class="model-action" title="编辑模型参数" @click="openEditModel(row)">编辑</button>
-                      <button class="model-action is-danger" title="删除该模型" @click="removeModel(row)">删除</button>
+                      <button class="model-action model-edit-action" title="编辑模型参数" @click="openEditModel(row)">编辑</button>
+                      <button :id="modelSectionId(row, 'delete')" class="model-action is-danger" title="删除该模型" @click="removeModel(row)">删除</button>
                     </div>
-                    <div class="model-action-group is-meta">
-                      <button v-if="row.modelsDev?.bound" class="model-action" :disabled="modelsDevSyncing" title="从元数据目录同步配置" @click="syncModelFromModelsDev(row)">
+                    <div :id="modelSectionId(row, 'actions')" class="model-action-group is-meta">
+                      <button v-if="row.modelsDev?.bound" class="model-action model-sync-action" :disabled="modelsDevSyncing" title="从元数据目录同步配置" @click="syncModelFromModelsDev(row)">
                         {{ row.modelsDev.needsSync ? '首次同步' : (row.modelsDev.updateAvailable ? '同步更新' : '同步') }}
                       </button>
-                      <button class="model-action" title="复制模型配置元数据" @click="copyModelMetadata(row)">复制</button>
-                      <button v-if="canPasteMetadataTo(row)" class="model-action" title="粘贴元数据到该模型" @click="pasteCopiedMetadataToModel(row)">粘贴</button>
+                      <button class="model-action model-copy-action" title="复制模型配置元数据" @click="copyModelMetadata(row)">复制</button>
+                      <button v-if="canPasteMetadataTo(row)" :id="modelSectionId(row, 'paste')" class="model-action model-paste-action" title="粘贴元数据到该模型" @click="pasteCopiedMetadataToModel(row)">粘贴</button>
                     </div>
                   </div>
                 </article>
@@ -2320,7 +2369,229 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   border-radius: 1px;
 }
 
-/* === 折叠式压缩面板头部 === */
+/* These wrappers are layout-neutral on desktop; only phone disclosures collapse. */
+.channels-view .mobile-channel-only { display: none; }
+.channel-provider-details, .model-section-body, .channel-models-title, .channel-identity-badges { display: contents; }
+
+/* Phone: a quiet macOS inspector above a model-first list, with a single page
+   scroller. Secondary data expands in flow, never in a clipped floating layer. */
+@media (max-width: 760px) {
+  .channels-view {
+    --channel-surface: #fff;
+    --channel-inset: #f4f5f7;
+    --channel-line: rgba(24, 24, 27, .09);
+    --channel-ink: #27272a;
+    --channel-muted: #71717a;
+    --channel-accent: #2563eb;
+    --channel-accent-wash: #eff5ff;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    overscroll-behavior-y: contain;
+    touch-action: pan-y pinch-zoom;
+  }
+  .channels-workspace, .channel-detail, .channel-detail-stack, .channel-models-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0%;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .channels-workspace { padding: 0 12px 8px; }
+  .channel-detail-stack { height: 100%; gap: 8px; }
+  .channels-heading { display: none; }
+  .channel-models-header { flex: none; }
+  .channels-overview { flex: none; max-height: 120px; overflow-y: auto; }
+  .channels-view .channel-overview-card { flex: none; max-height: 40%; overflow-y: auto; }
+  .channels-mobile-header-actions { grid-column: 1 / -1; justify-self: end; }
+  .model-list-scroll {
+    flex: 1 1 0%; min-height: 0; min-width: 0; overflow-y: auto; scrollbar-width: none;
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-auto-rows: max-content;
+    overscroll-behavior: auto;
+    scrollbar-gutter: auto;
+    padding: 12px 0 0;
+    gap: 12px;
+  }
+  .channels-view .mobile-channel-only { display: inline-flex; }
+  .channel-chevron, .channel-search-icon {
+    width: 16px; height: 16px; flex: 0 0 auto; fill: none;
+    stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .channel-chevron { transition: transform .16s ease; }
+  .channel-chevron.is-open { transform: rotate(180deg); }
+  .channel-quiet-control {
+    display: inline-flex; align-items: center; justify-content: center; gap: 2px;
+    min-height: 44px; min-width: 44px; padding: 0 8px; border-radius: 9px;
+    color: var(--channel-muted); background: transparent;
+  }
+  .channel-quiet-control.is-selected { color: var(--channel-accent); background: var(--channel-accent-wash); }
+  .channels-header {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0 8px; height: auto; padding: 8px 14px;
+    border: 0; background: transparent; backdrop-filter: none;
+  }
+  .channels-mobile-header-actions { align-items: center; gap: 2px; }
+  .channels-toolbar { display: none; }
+  .channels-toolbar.is-open {
+    display: flex; grid-column: 1 / -1; flex-wrap: wrap; gap: 4px;
+    padding: 6px; margin-top: 6px; border: 1px solid var(--channel-line);
+    border-radius: 12px; background: var(--channel-surface);
+  }
+  .channels-refresh-label { display: inline; }
+  .channels-view .mac-toolbar-button, .channels-view .mac-small-button {
+    min-height: 44px; height: auto; padding: 0 10px;
+    border: 1px solid transparent; border-radius: 10px;
+    background: transparent; box-shadow: none;
+  }
+  .channels-view .channels-add { margin-left: auto; }
+  .channels-view .mac-primary-button {
+    background: var(--channel-ink) !important; border-color: transparent !important;
+    border-radius: 10px; color: #fff !important;
+  }
+  .channels-view .mac-toolbar-button:hover:not(:disabled),
+  .channels-view .mac-small-button:hover:not(:disabled),
+  .channels-view .model-action:hover:not(:disabled) { transform: none; box-shadow: none; }
+  .channels-view button:focus-visible, .channels-view select:focus-visible {
+    outline: 2px solid var(--channel-accent); outline-offset: -2px;
+  }
+  .channels-overview { display: none; padding: 0 14px 12px; }
+  .channels-overview.is-open { display: block; }
+  .channels-view .channels-overview-panel {
+    display: block; overflow: visible; padding: 12px;
+    border: 1px solid var(--channel-line); border-radius: 14px;
+    background: var(--channel-surface); box-shadow: 0 2px 8px rgba(24, 24, 27, .025);
+  }
+  .channels-overview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .channels-view .channels-overview-grid > div {
+    min-width: 0; flex-wrap: wrap; gap: 2px 6px; padding: 0; border: 0; overflow-wrap: anywhere;
+  }
+  .channels-overview-grid > div:last-child { grid-column: 1 / -1; padding-top: 10px; border-top: 1px solid var(--channel-line); }
+  .channels-switcher { display: none; }
+  /* Empty channels still expose creation immediately, not behind an unexplained blank state. */
+  .channels-view .channel-empty-actions { display: flex; flex-direction: column; align-items: stretch; gap: 8px; margin-top: 12px; }
+  .channel-empty-actions select { min-height: 44px; }
+  .channels-view .channel-overview-card {
+    padding: 12px 14px; border: 1px solid var(--channel-line); border-radius: 16px;
+    background: var(--channel-surface); box-shadow: 0 2px 8px rgba(24, 24, 27, .025);
+  }
+  .channel-overview-layout { flex-direction: column; gap: 0; }
+  .channel-overview-layout > div { width: 100%; }
+  .channel-identity { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 6px 10px; }
+  .channel-identity-badges { display: flex; grid-column: 2 / -1; flex-wrap: wrap; gap: 4px; min-width: 0; }
+  .channel-identity .channel-desktop-name { display: none; }
+  .channel-identity .provider-avatar--lg { width: 34px; height: 34px; border-radius: 11px; margin: 0 4px 5px 0; align-self: end; }
+  .channels-view .channel-mobile-picker { flex-direction: column; flex: 1 1 0; min-width: 0; gap: 5px; }
+  .channel-provider-select { position: relative; display: block; min-width: 0; }
+  .channel-mobile-picker select {
+    appearance: none; -webkit-appearance: none; background-image: none;
+    width: 100%; min-width: 0; min-height: 44px; margin: 0;
+    padding: 0 34px 0 10px; border: 1px solid var(--channel-line); border-radius: 9px;
+    background-color: var(--channel-inset); color: var(--channel-ink); cursor: pointer;
+  }
+  .channel-switch-icon { position: absolute; right: 10px; top: calc(50% - 8px); width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; color: var(--channel-muted); }
+  .channel-provider-toggle { align-self: end; height: 44px; }
+  .channel-identity .mini-chip { box-shadow: none; background: var(--channel-inset); color: var(--channel-muted); }
+  .channel-identity .role-badge { margin: 0; }
+  .channel-identity .mini-chip.is-enabled::before {
+    content: ''; width: 5px; height: 5px; margin-right: 4px; border-radius: 50%; background: #30a46c;
+  }
+  .channel-provider-details { display: block; }
+  .channel-overview-card:not(.is-open) .channel-provider-details,
+  .channel-overview-card:not(.is-open) .channel-actions { display: none; }
+  .channel-connection { margin-top: 12px; gap: 6px; border-top: 1px solid var(--channel-line); padding-top: 12px; }
+  .channel-kv { overflow: visible; }
+  .channel-kv > span { width: 28px; }
+  .channel-kv > code { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
+  .provider-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+  .provider-metrics .metric-card--unified {
+    height: auto; padding: 8px 10px; border: 0; border-radius: 10px;
+    background: var(--channel-inset); box-shadow: none;
+  }
+  .provider-metrics .metric-card strong, .provider-metrics .metric-card em {
+    overflow: visible; white-space: normal; overflow-wrap: anywhere;
+  }
+  .channel-actions { padding: 8px 0 0; margin-top: 10px; gap: 4px; border-top: 1px solid var(--channel-line); }
+  .channel-actions .is-danger { margin-left: auto; }
+  .channels-view .channel-models-panel { border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .channel-models-header {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; padding: 0; gap: 10px 8px; border: 0;
+  }
+  .channel-models-heading, .channel-models-actions { display: contents; }
+  .channel-models-title { display: flex; align-items: center; gap: 6px; min-width: 0; grid-area: 1 / 1; }
+  .channel-models-title .mini-chip { background: transparent; box-shadow: none; padding: 0; color: var(--channel-muted); }
+  .channel-models-actions .mac-primary-button { grid-area: 1 / 2; }
+  .channel-model-search { grid-area: 2 / 1; min-width: 0; }
+  .channel-model-search input { min-height: 44px; border-radius: 10px; background: var(--channel-surface); padding-left: 30px; padding-right: 36px; }
+  .channel-model-search button { min-width: 44px; min-height: 44px; right: 0; }
+  .channel-batch-sync { grid-area: 2 / 2; }
+  .channel-batch-desktop-label, .channel-desktop-search-icon { display: none; }
+  .channels-view .model-card {
+    min-width: 0; padding: 14px 14px 6px; border: 1px solid var(--channel-line); border-radius: 16px;
+    background: var(--channel-surface); box-shadow: 0 2px 8px rgba(24, 24, 27, .025);
+  }
+  .channels-view .model-card.is-primary-card {
+    border-color: color-mix(in srgb, var(--channel-accent) 25%, var(--channel-line)) !important;
+    box-shadow: inset 0 2px 0 color-mix(in srgb, var(--channel-accent) 55%, transparent), 0 2px 8px rgba(24, 24, 27, .025);
+  }
+  .channels-view .model-card:hover { transform: none; }
+  .model-head { display: grid; grid-template-columns: minmax(0, 1fr) 44px; position: relative; gap: 4px; }
+  .model-title-block { grid-area: 1 / 1; padding-right: 0; }
+  /* A real grid cell, not an absolute button beneath the following title's
+     padding box. Only this target captures sorting; the card scrolls normally. */
+  .channels-view .model-drag { display: grid; place-items: center; grid-area: 1 / 2; position: relative; z-index: 1; align-self: start; width: 44px; min-height: 44px; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; border-radius: 8px; }
+  .model-drag-desktop { display: none; }
+  .channels-view .model-drag-grip { width: 14px; height: 18px; fill: currentColor; pointer-events: none; }
+  .channels-view .model-sort-chosen .model-drag { color: var(--channel-accent); background: var(--channel-accent-wash); }
+  .channels-view .model-drag:disabled { touch-action: pan-y pinch-zoom; }
+  .model-title-row { flex-wrap: wrap; gap: 0 8px; }
+  .model-title-row > .min-w-0 { flex: 1 1 120px; padding-right: 0; }
+  .channels-view .model-title { min-height: 44px; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+  .channels-view .role-pill { min-height: 44px; padding: 0; border: 0; background: transparent; border-radius: 6px; box-shadow: none; }
+  .channels-view .role-pill.is-active { background: transparent; }
+  .model-feature-strip { margin-top: 0; gap: 4px; }
+  .channels-view .feature-tag { height: auto; min-height: 18px; max-width: 100%; overflow-wrap: anywhere; }
+  .channels-view .model-group-block { padding: 0; margin-top: 0; border: 0; border-radius: 0; background: transparent; }
+  .channels-view .model-specs-group { margin-top: 12px; border-top: 1px solid var(--channel-line); }
+  .channels-view .model-section-toggle {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; min-height: 44px; padding: 5px 0; border-radius: 6px; text-align: left;
+  }
+  .model-specs-summary { display: flex; flex-wrap: wrap; gap: 2px 12px; min-width: 0; color: var(--channel-muted); }
+  .model-specs-summary strong { color: var(--channel-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .model-section-label { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; color: var(--channel-muted); }
+  .model-runtime-summary { display: flex; flex-wrap: wrap; gap: 2px 6px; min-width: 0; color: var(--channel-muted); overflow-wrap: anywhere; }
+  .model-runtime-summary strong { font-weight: 500; }
+  .model-section-body { display: block; padding: 8px; margin: 0 0 8px; border-radius: 10px; background: var(--channel-inset); }
+  .model-group-block:not(.is-open) .model-section-body { display: none; }
+  .model-section-body > .group-header { display: none; }
+  .channels-view .soft-stat { min-width: 0; padding: 6px; border-radius: 6px; overflow-wrap: anywhere; }
+  .channels-view .rate-row span { padding: 4px 6px; border-radius: 6px; box-shadow: none; }
+  .channels-view .rate-row strong { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
+  .channels-view .model-stat-tile { min-width: 0; border: 0; border-radius: 6px; padding: 5px 6px; }
+  .stat-v-row { flex-wrap: wrap; gap: 2px 5px; }
+  .channels-view .stat-v, .channels-view .stat-sub, .channels-view .stat-tag { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+  .channels-view .thinking-level-chip { min-height: 44px; border-radius: 8px; }
+  /* Legacy desktop groups use display:flex !important. Flatten them explicitly
+     on phones so the four everyday actions share one row, in both disclosure states. */
+  .channels-view .model-action-row { display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) 44px; gap: 2px !important; margin-top: 4px; padding-top: 6px !important; border-top-color: var(--channel-line) !important; }
+  .channels-view .model-action-row.has-sync { grid-template-columns: minmax(0, 1fr) minmax(0, .8fr) minmax(0, 1.3fr) minmax(0, .8fr) 44px; }
+  .channels-view .model-action-row .model-action-group { display: contents !important; }
+  .channels-view .model-action { display: inline-flex; align-items: center; min-width: 0; min-height: 44px; height: auto !important; justify-content: center; margin: 0; padding: 0 4px !important; border: 0; border-radius: 9px; background: transparent; box-shadow: none; }
+  .channels-view .model-action.is-primary-action { order: 0; color: var(--channel-accent) !important; background: var(--channel-accent-wash) !important; }
+  .model-edit-action { order: 1; }
+  .model-sync-action { order: 2; }
+  .model-copy-action { order: 3; }
+  /* Do not hide a lone delete action behind an empty-looking overflow menu.
+     Paste remains conditional on a compatible copied configuration. */
+  .model-action-row .is-danger { order: 4; grid-column: -2 / -1; }
+  .model-paste-action { order: 5; grid-column: 1 / -1; justify-self: end; }
+}
+@media (prefers-reduced-motion: reduce) { .channel-chevron { transition: none; } }
 </style>
 
 <style>
@@ -2954,4 +3225,24 @@ html.dark .group-header {
 html.dark .group-header::before {
 		background: #313236;
 	}
+/* Preserve the existing graphite theme and the phone action hierarchy. */
+@media (max-width: 760px) {
+  html.dark .channels-view {
+    --channel-surface: #222327;
+    --channel-inset: #2a2b30;
+    --channel-line: rgba(255, 255, 255, .1);
+    --channel-ink: #eeeef1;
+    --channel-muted: #a4a4ad;
+    --channel-accent: #8eb7ff;
+    --channel-accent-wash: #26354c;
+  }
+  html.dark .channels-view .mac-primary-button {
+    background: #e4e5eb !important; border-color: transparent !important; color: #25262b !important;
+  }
+  html.dark .channels-view .model-card { background: var(--channel-surface); }
+  html.dark .channels-view .model-group-block { background: transparent; }
+  html.dark .channels-view .role-pill { background: transparent; }
+  html.dark .channels-view .model-action-row { border-top-color: var(--channel-line) !important; }
+  html.dark .channels-view .model-action.is-primary-action { background: var(--channel-accent-wash) !important; color: var(--channel-accent) !important; }
+}
 </style>

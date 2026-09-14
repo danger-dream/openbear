@@ -1,23 +1,20 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
-import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import path from "node:path";
+import { createBuildInfo } from "./buildIdentity.mjs";
 
 const webRoot = fileURLToPath(new URL(".", import.meta.url));
-const packageInfo = JSON.parse(readFileSync(path.join(webRoot, "package.json"), "utf8"));
-function sourceFiles(dir) {
-  return readdirSync(path.join(webRoot, dir), {withFileTypes: true}).flatMap((entry) => {
-    const name = `${dir}/${entry.name}`;
-    return entry.isDirectory() ? sourceFiles(name) : (/\.(vue|js|css)$/.test(name) ? [name] : []);
-  });
+const buildInfo = createBuildInfo(webRoot);
+
+// Monaco has its own dynamic language imports. Do not let its manual chunk
+// absorb Vite's shared preload helper: that would make every lazy page (and
+// the chat entry itself) statically import the full editor again.
+export function manualChunk(id) {
+  if (id === "\0vite/preload-helper.js") return "vendor";
+  if (id.includes("/node_modules/monaco-editor/") && !id.includes("?worker")) return "monaco";
+  if (/\/node_modules\/(?:vue|element-plus)\//.test(id)) return "vendor";
 }
-const hash = createHash("sha256");
-for (const name of [...sourceFiles("src"), "index.html", "package.json", "package-lock.json", "vite.config.js"].sort()) {
-  hash.update(name).update("\0").update(readFileSync(path.join(webRoot, name))).update("\0");
-}
-const buildInfo = {schema: 1, version: packageInfo.version, buildId: hash.digest("hex").slice(0, 16)};
+
 const buildIdentity = {
   name: "openbear-build-identity",
   transformIndexHtml() {
@@ -57,10 +54,7 @@ export default defineConfig({
         warn(warning);
       },
       output: {
-        manualChunks: {
-          monaco: ["monaco-editor"],
-          vendor: ["vue", "element-plus"],
-        },
+        manualChunks: manualChunk,
       },
     },
   },

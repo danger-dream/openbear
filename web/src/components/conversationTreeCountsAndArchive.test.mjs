@@ -8,6 +8,8 @@ const source=fs.readFileSync(new URL('./ConversationTree.vue',import.meta.url),'
 const script=source.match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import[\s\S]*?;\n/gm,'');
 function harness(Api={}){
  const context=vm.createContext({computed,nextTick,reactive,ref,rowId,treeItemParent,compareTreeItems,resolveTreeDrop,Api,apiError:String,referenceCatalog:{connected:false,ready:false},
+ // Stub only the new UI import seam; all original tree/count/archive assertions remain intact.
+ defineLazyView:()=>({}),
  defineProps:()=>({activeConversationUuid:'',draftConversation:null}),defineEmits:()=>()=>{},defineExpose(){},watch(){},onMounted(){},onBeforeUnmount(){},ElMessage:{error(){},warning(){}},document:{querySelector:()=>null},CSS:{escape:s=>s}});
  vm.runInContext(script+'\nglobalThis.tree={rootFolders,stateFor,setExpanded,expanded,applyStatus,statusAdjustedRow,searchRows,query,runSearch,showMove,moveUnarchive,moveUpdateSnapshots,moveTreeItem,loading};',context);return context.tree;
 }

@@ -90,7 +90,8 @@ function entryTimeDateTime(timeMs) {
 				<button type="button" class="work-detail-close" aria-label="关闭工作详情" @click="emit('close')"><Close/></button>
 			</header>
 
-			<div class="work-detail-body">
+			<div class="work-detail-body" tabindex="0" aria-label="工作详情内容，可滚动">
+				<p v-if="userPreview" class="work-detail-turn-preview" :title="String(props.turn?.user?.content || '')">{{ userPreview }}</p>
 				<div v-if="!workEntries.length" class="work-detail-empty">
 					<WorkDetailIcon/>
 					<strong>这一轮没有工作详情</strong>
@@ -146,6 +147,8 @@ function entryTimeDateTime(timeMs) {
 
 <style scoped>
 .work-detail {
+	box-sizing: border-box;
+	min-height: 0;
 	position: relative;
 	flex: 0 0 0;
 	width: 0;
@@ -164,13 +167,18 @@ function entryTimeDateTime(timeMs) {
 	opacity: 1;
 }
 .work-detail-surface {
+	box-sizing: border-box;
 	display: flex;
-	width: clamp(24rem, 32vw, 32rem);
+	width: 100%;
+	min-width: 0;
+	min-height: 0;
 	height: 100%;
 	flex-direction: column;
 	background: rgba(250, 250, 250, .98);
 }
 .work-detail-header {
+	box-sizing: border-box;
+	flex: 0 0 auto;
 	display: flex;
 	min-height: 7rem;
 	align-items: flex-start;
@@ -190,8 +198,9 @@ function entryTimeDateTime(timeMs) {
 .work-detail-close { display: grid; width: 2rem; height: 2rem; flex: 0 0 auto; place-items: center; border: 0; border-radius: .65rem; background: transparent; color: #71717a; cursor: pointer; transition: background .14s ease, color .14s ease; }
 .work-detail-close:hover { background: #f4f4f5; color: #18181b; }
 .work-detail-close svg { width: .92rem; height: .92rem; }
-.work-detail-body { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow-y: auto; padding: .85rem .9rem 1.4rem; scrollbar-width: thin; }
+.work-detail-body { box-sizing: border-box; display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; overflow: auto; padding: .85rem .9rem 1.4rem; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
 .work-detail-body > * { flex: 0 0 auto; }
+.work-detail-turn-preview { display: none; }
 .work-detail-running { display: flex; min-height: 2rem; flex: 0 0 auto; align-items: center; margin-top: .58rem; padding: .8rem .2rem .1rem; }
 .work-running-dots { position: relative; display: inline-flex; width: max-content; min-width: 1.74rem; height: 1.05rem; align-items: center; gap: .22rem; overflow: hidden; border-radius: 999px; padding: 0 .2rem; isolation: isolate; }
 .work-running-dots::after { content: ""; position: absolute; inset: -45% -70%; z-index: -1; background: linear-gradient(105deg, transparent 28%, rgba(255, 255, 255, .88) 43%, rgba(148, 163, 184, .18) 50%, transparent 66%); transform: translateX(-46%); animation: work-sun-sweep 2.05s ease-in-out infinite; }
@@ -203,7 +212,7 @@ function entryTimeDateTime(timeMs) {
 .work-detail-entry { display: flex; align-items: center; gap: .4rem; min-width: 0; }
 .work-detail-entry + .work-detail-entry { margin-top: .6rem; }
 .work-entry-time { display: inline-flex; height: 1.45rem; flex: 0 0 auto; align-self: flex-start; align-items: center; margin-top: .16rem; padding: 0; color: #a1a1aa; font-size: 10.5px; font-variant-numeric: tabular-nums; line-height: 1; white-space: nowrap; }
-.work-detail-entry > .work-event, .work-detail-entry > .work-reasoning { min-width: 0; flex: 1 1 auto; }
+.work-detail-entry > .work-event, .work-detail-entry > .work-reasoning { min-width: 0; flex: 1 1 0%; }
 .work-detail-empty { display: flex; min-height: 17rem; align-items: center; justify-content: center; flex-direction: column; color: #a1a1aa; text-align: center; }
 .work-detail-empty > svg { width: 1.5rem; height: 1.5rem; margin-bottom: .7rem; }
 .work-detail-empty strong { color: #52525b; font-size: 14px; }
@@ -222,9 +231,34 @@ function entryTimeDateTime(timeMs) {
 .work-reasoning-detail { margin: .16rem 0 .28rem; border: 1px solid #eceff3; border-radius: 9px; background: #fff; padding: .54rem .62rem; }
 .work-reasoning-body { max-height: min(340px, 48vh); overflow: auto; color: #52525b; font-size: 12px; line-height: 1.55; overscroll-behavior: contain; scrollbar-width: thin; }
 @media (max-width: 1280px) {
-	.work-detail { position: absolute; inset: 0 0 0 auto; z-index: 24; box-shadow: none; transform: translateX(100%); transition: transform .24s cubic-bezier(.22, 1, .36, 1), opacity .15s ease; }
+	/* This overlay shares the workspace with the composer (z-index 40).
+	   End above its observed height instead of letting content scroll behind it. */
+	.work-detail { position: absolute; inset: 0 0 var(--console-composer-height, 135px) auto; height: auto; z-index: 24; box-shadow: none; transform: translateX(100%); transition: transform .24s cubic-bezier(.22, 1, .36, 1), opacity .15s ease; }
 	.work-detail.open { width: min(32rem, 88%); flex-basis: 0; transform: translateX(0); box-shadow: -20px 0 54px rgba(15, 23, 42, .16); }
-	.work-detail-surface { width: min(32rem, 88vw); }
+}
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	/* Keep the close row touch-sized even with the keyboard open; the turn
+	   preview moves into the scroll body rather than consuming fixed height. */
+	.work-detail-header { min-height: 0; align-items: center; gap: .5rem; padding: .25rem .65rem; }
+	.work-detail-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: .2rem .5rem; }
+	.work-detail-heading h2 { margin: 0; }
+	.work-detail-heading p { display: none; }
+	.work-detail-turn-preview { display: block; margin: 0 0 .5rem; color: #71717a; font-size: 12px; overflow-wrap: anywhere; }
+	.work-detail-close { width: 44px; height: 44px; }
+	.work-detail-body { padding: .5rem .75rem 1rem; }
+	.work-detail-entry { display: block; }
+	.work-detail-entry + .work-detail-entry { margin-top: 1rem; }
+	.work-entry-time { display: flex; height: auto; margin: 0 0 .2rem; }
+	.work-detail-entry > .work-event, .work-detail-entry > .work-reasoning { width: 100%; }
+	.work-reasoning-detail { box-sizing: border-box; min-width: 0; max-width: 100%; }
+	.work-reasoning-body { max-height: min(340px, calc(var(--mobile-viewport-height, 100dvh) * .45)); -webkit-overflow-scrolling: touch; }
+}
+@media (max-width: 760px) {
+	/* Phone reading layer covers the composer rather than competing with it.
+	   Closing restores the untouched chat/input underneath. */
+	.work-detail { inset: 0; z-index: 50; }
+	.work-detail.open { width: 100%; }
+	.work-detail-body { padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px)); }
 }
 @media (prefers-reduced-motion: reduce) {
 	.work-detail, .work-disclosure { transition: none; }
@@ -263,6 +297,7 @@ html.dark .work-detail-heading h2 {
 		color: #efeff2;
 	}
 
+html.dark .work-detail-turn-preview,
 html.dark .work-detail-heading p {
 		color: #c6c6cd;
 	}

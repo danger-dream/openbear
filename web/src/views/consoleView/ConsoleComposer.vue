@@ -775,7 +775,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
 							<small>{{ fmtBytes(item.file.size) }}</small>
 						</div>
 						<el-tooltip content="移除附件" placement="top" :show-after="260">
-							<button type="button" class="attachment-remove" aria-label="移除附件"
+							<button type="button" class="attachment-remove" :aria-label="`移除附件：${item.file.name}`"
 							        @click.stop="emit('remove-attachment', item.id)">
 								<Close/>
 							</button>
@@ -791,7 +791,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
 					@paste="onPaste"
 				/>
 				<div class="composer-toolbar">
-					<div class="relative flex min-w-0 flex-1 items-center gap-1.5">
+					<div class="composer-actions relative flex min-w-0 flex-1 items-center gap-1.5">
 						<el-tooltip content="新话题（Ctrl+N）" placement="top" :show-after="260">
 							<button type="button" class="tool-btn" aria-label="新话题（Ctrl+N）" @click="emit('new-session')">
 								<Plus/>
@@ -808,7 +808,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
 							<button type="button" class="tool-btn" aria-label="手动压缩上下文" :disabled="!props.canCompact || props.compacting" @click="emit('compact')"><ContextCompactionIcon :class="{'context-compacting-icon': props.compacting}" /></button>
 						</el-tooltip>
 						<el-tooltip content="清空草稿" placement="top" :show-after="260">
-							<button type="button" class="tool-btn" aria-label="清空草稿"
+							<button type="button" class="tool-btn composer-clear" aria-label="清空草稿"
 							        :disabled="props.running || (!props.draft && !props.pendingAttachments.length)"
 							        @click="clearDraft">
 								<Close/>
@@ -940,7 +940,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
 					</div>
 				</div>
 			</div>
-			<div class="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[11px] text-[#8b949e]">
+			<div class="composer-hints mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[11px] text-[#8b949e]">
 				<span>Enter 发送 · Ctrl/⌘+Enter 也可发送</span>
 				<span>图片/文本附件会随本轮发送</span>
 			</div>
@@ -2163,27 +2163,72 @@ html.dark .model-tag-feature {
 }
 
 @media (max-width: 760px) {
+	.composer-shell { padding: .5rem .75rem; }
+	.composer-box { padding: .375rem; border-radius: 20px; }
 	.composer-toolbar {
-		grid-template-columns: 1fr;
+		display: flex;
+		flex-wrap: nowrap;
+		gap: 0;
+		padding: 0;
 	}
-
+	.composer-actions { flex: 0 0 auto; gap: 0; }
 	.composer-status {
+		flex: 1 1 0;
+		min-width: 0;
 		justify-content: flex-end;
-		flex-wrap: wrap;
+		flex-wrap: nowrap;
+		gap: 0;
 	}
-
-	.tool-btn {
-		width: 1.85rem;
+	/* The hit area stays generous; the model is a quiet text link, not a pill.
+	   Scope above the global dark .status-chip rule from interaction cards. */
+	.composer-toolbar button.run-config-chip {
+		flex: 0 1 auto;
+		min-width: 0;
+		max-width: 100%;
+		appearance: none;
+		border: 0;
+		border-radius: 6px;
+		background: transparent;
+		box-shadow: none;
+		padding-inline: .375rem;
 	}
+	.run-config-chip-model { font-weight: 500; }
+	.composer-clear:disabled { display: none; }
+	.composer-toolbar button.run-config-chip:focus-visible { outline: 2px solid var(--bear-accent); outline-offset: -2px; }
+	.run-config-chip-meta { display: none; }
+	.composer-hints { display: none; }
+	:deep(.reference-editor-content) { min-height: min(4.5rem, calc(var(--mobile-viewport-height, 100dvh) * .22)); padding: .65rem .5rem; }
+	:deep(.reference-editor-placeholder) { padding: .65rem .5rem; }
+}
 
-	.run-config-chip {
-		max-width: min(100%, 82vw);
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	/* In an exceptionally short landscape/keyboard viewport, keep every input
+	   action reachable inside the composer rather than overflowing the page. */
+	.composer-shell { max-height: 100%; overflow-y: auto; pointer-events: auto; }
+	/* Larger hit areas, not larger glyphs or global control typography. */
+	.tool-btn, .send-button {
+		width: 44px;
+		height: 44px;
+		flex: 0 0 auto;
 	}
-
-	.run-config-chip-meta {
-		display: none;
+	.run-config-chip { min-height: 44px; }
+	.attachment-remove {
+		top: 0;
+		right: 0;
+		width: 44px;
+		height: 44px;
+		opacity: 1;
+		transform: none;
+		/* Keep the small macOS remove badge inside its 44px tap target. */
+		background: radial-gradient(circle, rgba(15, 23, 42, .8) 0 12px, transparent 13px);
 	}
-
+	:global(html.dark) .attachment-remove {
+		background: radial-gradient(circle, rgba(15, 23, 42, .8) 0 12px, transparent 13px);
+	}
+	.attachment-remove:hover, :global(html.dark) .attachment-remove:hover {
+		background: radial-gradient(circle, rgba(220, 38, 38, .92) 0 12px, transparent 13px);
+	}
+	:deep(.reference-editor-content) { max-height: min(13.5rem, calc(var(--mobile-viewport-height, 100dvh) * .28)); }
 }
 </style>
 

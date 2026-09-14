@@ -1,4 +1,5 @@
 <script setup>
+import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
@@ -249,9 +250,9 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="h-full flex flex-col" v-loading="loading">
+  <div class="admin-page agents-page h-full flex flex-col" v-loading="loading">
     <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="flex items-center gap-2">
+      <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">Agent Presets</h1>
         <span class="text-xs text-macsub">system prompt 与适用场景</span>
       </div>
@@ -262,17 +263,19 @@ onMounted(load);
       </div>
     </header>
 
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-3 px-6 pt-5 shrink-0">
+    <div class="admin-desktop-only admin-stats grid grid-cols-1 md:grid-cols-4 gap-3 px-6 pt-5 shrink-0">
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">Preset 总数</div><div class="text-lg font-semibold">{{ visibleAgents.length }}</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">当前显示</div><div class="text-lg font-semibold">{{ visibleAgents.length }}</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">启用中</div><div class="text-lg font-semibold">{{ enabledAgents.length }}</div></div>
       <div class="mac-panel px-4 py-3"><div class="text-[11px] text-macsub">默认 Worker</div><div class="text-lg font-semibold">general-purpose</div></div>
     </div>
 
-    <div class="flex-1 min-h-0 overflow-y-auto p-6">
+    <MobileAdminSummary :items="[{ label: 'Preset 总数', value: visibleAgents.length }, { label: '当前显示', value: visibleAgents.length }, { label: '启用中', value: enabledAgents.length }, { label: '默认 Worker', value: 'general-purpose' }]">当前 {{ visibleAgents.length }} · 启用 {{ enabledAgents.length }}</MobileAdminSummary>
+
+    <div class="admin-list flex-1 min-h-0 overflow-y-auto p-6">
       <div v-if="!visibleAgents.length" class="text-center text-macsub py-16 text-sm">暂无 Preset</div>
       <div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
-        <article v-for="row in visibleAgents" :key="row.id" class="mac-panel mac-shadow p-4">
+        <article v-for="row in visibleAgents" :key="row.id" class="agent-card mac-panel mac-shadow p-4">
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
@@ -288,7 +291,7 @@ onMounted(load);
                 <span class="px-2 py-0.5 rounded-full bg-black/[0.04]">{{ fmtTime(row.updated_at) }}</span>
               </div>
             </div>
-            <div class="flex gap-1 shrink-0">
+            <div class="admin-card-actions flex gap-1 shrink-0">
               <el-button size="small" text type="success" :disabled="!row.enabled" @click="trial(row)">试运行</el-button>
               <el-button size="small" text type="primary" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" text @click="toggle(row)">{{ row.enabled ? '停用' : '启用' }}</el-button>
@@ -299,9 +302,9 @@ onMounted(load);
       </div>
     </div>
 
-    <el-drawer v-model="drawerOpen" size="72%" :title="editing?.id ? '编辑 Preset' : '新建 Preset'">
+    <el-drawer append-to-body class="admin-drawer agent-drawer" v-model="drawerOpen" size="72%" :title="editing?.id ? '编辑 Preset' : '新建 Preset'">
       <template v-if="editing">
-        <div class="h-full flex flex-col min-h-0 gap-4">
+        <div class="agent-edit-body h-full flex flex-col min-h-0 gap-4">
           <section class="mac-panel p-4 grid grid-cols-1 md:grid-cols-4 gap-3 shrink-0">
             <div><label class="text-xs text-macsub mb-1 block">名称</label><el-input v-model="editing.name" placeholder="如 深度调研员" /></div>
             <div><label class="text-xs text-macsub mb-1 block">Key</label><el-input v-model="editing.agentKey" placeholder="researcher" /></div>
@@ -324,7 +327,7 @@ onMounted(load);
             <div class="md:col-span-4 flex items-center gap-5"><el-switch v-model="editing.enabled" active-text="启用" inactive-text="停用" /></div>
           </section>
 
-          <section class="grid grid-cols-1 lg:grid-cols-[1fr_240px] gap-4 flex-1 min-h-0">
+          <section class="agent-prompt-layout grid grid-cols-1 lg:grid-cols-[1fr_240px] gap-4 flex-1 min-h-0">
             <div class="mac-panel p-4 flex flex-col min-h-0">
               <div class="flex items-center justify-between gap-3 mb-2">
                 <label class="text-xs text-macsub block">System Prompt</label>
@@ -344,10 +347,16 @@ onMounted(load);
             </div>
           </section>
 
-          <footer class="shrink-0 flex justify-end gap-2 border-t border-macborder pt-3">
+          <footer class="agent-desktop-footer shrink-0 flex justify-end gap-2 border-t border-macborder pt-3">
             <el-button @click="drawerOpen = false">取消</el-button>
             <el-button type="primary" @click="save">保存</el-button>
           </footer>
+        </div>
+      </template>
+      <template #footer>
+        <div v-if="editing" class="admin-mobile-only agent-mobile-footer">
+          <el-button @click="drawerOpen = false">取消</el-button>
+          <el-button type="primary" @click="save">保存</el-button>
         </div>
       </template>
     </el-drawer>

@@ -57,7 +57,7 @@ export const Api = {
   deleteConversationFolder: (uuid, data = {}) => api.post(`/conversation-folders/${encodeURIComponent(uuid)}/delete`, data).then(unwrap),
   deleteConversationTurnSuffix: (uuid, turnUuid) => api.delete(`/conversations/${encodeURIComponent(uuid)}/turns/${encodeURIComponent(turnUuid)}/suffix`).then(unwrap),
   uploadConversationFiles: (uuid, files, options = {}) => uploadFilesViaHttp(api, uuid, files, options),
-  conversationState: (uuid, params = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/state`, { params }).then(unwrap),
+  conversationState: (uuid, params = {}, options = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/state`, { params, signal: options.signal }).then(unwrap),
   conversationOperations: (uuid, params = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations`, { params }).then(unwrap),
   conversationOperationDetail: (uuid, operationId) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations/${encodeURIComponent(operationId)}/detail`).then(unwrap),
   conversationCompaction: (uuid, summaryId) => api.get(`/conversations/${encodeURIComponent(uuid)}/compactions/${encodeURIComponent(summaryId)}`).then(unwrap),

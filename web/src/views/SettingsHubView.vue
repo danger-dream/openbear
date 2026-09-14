@@ -1,15 +1,21 @@
 <script setup>
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
-import TemplateView from "./TemplateView.vue";
-import LogsView from "./LogsView.vue";
-import SettingsView from "./SettingsView.vue";
-import ChannelsView from "./ChannelsView.vue";
-import RathAgentsView from "./RathAgentsView.vue";
+import { defineLazyView } from "../lazyView.js";
+
+const TemplateView = defineLazyView(() => import("./TemplateView.vue"), "提示词模板");
+const LogsView = defineLazyView(() => import("./LogsView.vue"), "系统日志");
+const SettingsView = defineLazyView(() => import("./SettingsView.vue"), "系统设置");
+const ChannelsView = defineLazyView(() => import("./ChannelsView.vue"), "渠道设置");
+const RathAgentsView = defineLazyView(() => import("./RathAgentsView.vue"), "Agents");
+const InstallAppView = defineLazyView(() => import("./InstallAppView.vue"), "安装应用 (PWA)");
 
 const props = defineProps({ section: { type: String, default: "channels" } });
-const emit = defineEmits(["section-changed"]);
+const emit = defineEmits(["section-changed", "mobile-header-ready"]);
+// Keep the app navigation available while this lazy shell is loading or fails.
+onMounted(() => emit("mobile-header-ready", true));
+onBeforeUnmount(() => emit("mobile-header-ready", false));
 
 const sections = [
   { key: "channels", label: "渠道设置", hint: "模型渠道、Key、协议和测试", icon: "Connection", component: ChannelsView },
@@ -17,6 +23,7 @@ const sections = [
   { key: "agents", label: "Agents", hint: "子 Agent 池和预设能力", icon: "UserFilled", component: RathAgentsView },
   { key: "system-settings", label: "系统设置", hint: "运行配置、模型策略、记忆注入", icon: "Setting", component: SettingsView },
   { key: "logs", label: "系统日志", hint: "审计记录与操作追踪", icon: "List", component: LogsView },
+  { key: "install-app", label: "安装应用 (PWA)", hint: "当前站点安装检查与指引", icon: "Download", component: InstallAppView },
 ];
 
 function normalizeSection(value) {
@@ -83,14 +90,26 @@ watch(activeSection, (next) => emit("section-changed", next));
 </script>
 
 <template>
-  <section class="h-full min-h-0 flex flex-col bg-macbg">
-    <header class="shrink-0 border-b border-macborder bg-white/75 px-5 py-3 backdrop-blur">
-      <div class="flex min-w-0 items-center gap-4">
-        <div class="shrink-0">
+  <section class="settings-hub h-full min-h-0 flex flex-col bg-macbg">
+    <header class="settings-header shrink-0 border-b border-macborder bg-white/75 px-5 py-3 backdrop-blur">
+      <div class="settings-header-row flex min-w-0 items-center gap-4">
+        <div class="settings-mobile-navigation"><slot name="mobile-navigation" /></div>
+        <div class="settings-heading shrink-0">
           <div class="text-base font-semibold leading-tight text-mactext">设置</div>
-          <div class="mt-0.5 text-[11px] leading-tight text-macsub">系统功能入口</div>
+          <div class="settings-subtitle mt-0.5 text-[11px] leading-tight text-macsub">系统功能入口</div>
         </div>
-        <nav class="min-w-0 flex-1 overflow-x-auto">
+        <div class="settings-section-control">
+        <select
+          class="settings-section-select text-sm font-medium text-mactext"
+          aria-label="切换设置分区"
+          :value="activeSection"
+          @change="selectSection($event.target.value)"
+        >
+          <option v-for="item in sections" :key="item.key" :value="item.key">{{ item.label }}</option>
+        </select>
+        <svg class="settings-section-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6" /></svg>
+        </div>
+        <nav class="settings-desktop-tabs min-w-0 flex-1 overflow-x-auto">
           <div class="flex w-max items-center gap-1 rounded-2xl bg-zinc-100/80 p-1 ring-1 ring-inset ring-zinc-200/70">
             <button
               v-for="item in sections"
@@ -106,11 +125,57 @@ watch(activeSection, (next) => emit("section-changed", next));
             </button>
           </div>
         </nav>
-        <el-button type="danger" plain round :loading="restarting" @click="confirmRestart">重启 OpenBear</el-button>
+        <el-button class="settings-restart" type="danger" plain round :loading="restarting" :aria-busy="restarting" aria-label="重启 OpenBear" title="重启 OpenBear" @click="confirmRestart"><span>重启<span class="settings-restart-product"> OpenBear</span></span></el-button>
       </div>
     </header>
-    <div class="min-h-0 flex-1">
+    <div class="settings-content min-h-0 flex-1">
       <component :is="activeComponent" />
     </div>
   </section>
 </template>
+
+<style scoped>
+.settings-section-select, .settings-section-control, .settings-mobile-navigation { display: none; }
+@media (max-width: 760px) {
+  .settings-hub { min-width: 0; }
+  .settings-header { padding: calc(4px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) 4px max(8px, env(safe-area-inset-left, 0px)); background: var(--el-bg-color-overlay); }
+  .settings-header-row { gap: 8px; }
+  .settings-mobile-navigation { display: flex; flex: 0 0 auto; }
+  .settings-section-control { display: block; position: relative; flex: 1 1 0%; min-width: 0; }
+  .settings-section-chevron { position: absolute; right: 14px; top: calc(50% - 8px); width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; color: var(--el-text-color-secondary); }
+  .settings-heading,
+  .settings-subtitle,
+  .settings-desktop-tabs,
+  .settings-restart-product { display: none; }
+  .settings-section-select {
+    display: block;
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: none;
+    min-width: 0;
+    min-height: 44px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 10px;
+    background-color: var(--el-fill-color-light);
+    padding: 0 40px 0 12px;
+    cursor: pointer;
+  }
+  .settings-header .settings-restart {
+    flex: 0 0 auto;
+    min-width: 44px;
+    min-height: 44px;
+    margin: 0;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--el-text-color-secondary);
+    box-shadow: none;
+  }
+  .settings-header .settings-restart:hover:not(:disabled) { color: var(--el-color-danger); }
+  .settings-section-select:focus-visible,
+  .settings-header .settings-restart:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
+  .settings-content { min-width: 0; }
+}
+</style>

@@ -1,0 +1,65 @@
+/* Shared desktop/phone launcher: six existing destinations, one quiet 3×2 grid.
+   Typography is inherited from each original navigation surface. */
+.sidebar-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.sidebar-resource-grid > .sidebar-resource-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 60px;
+  margin: 0;
+  padding: 8px 4px;
+  gap: 5px;
+  appearance: none;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--el-text-color-regular);
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  transition: background-color .14s ease, color .14s ease;
+}
+.sidebar-resource-icon {
+  flex: none;
+  color: var(--el-text-color-secondary);
+}
+.sidebar-resource-label {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-resource-grid > .sidebar-resource-tile[aria-current='page'] {
+  background: var(--el-fill-color-darker);
+  color: var(--el-text-color-primary);
+  font-weight: 500;
+}
+.sidebar-resource-tile[aria-current='page'] > .sidebar-resource-icon {
+  color: var(--el-color-primary);
+}
+@media (hover: hover) and (pointer: fine) {
+  .sidebar-resource-grid > .sidebar-resource-tile:hover:not([aria-current='page']) {
+    background: var(--el-fill-color);
+    color: var(--el-text-color-primary);
+  }
+}
+.sidebar-resource-grid > .sidebar-resource-tile:active {
+  background: var(--el-fill-color-darker);
+}
+.sidebar-resource-grid > .sidebar-resource-tile:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: -2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-resource-grid > .sidebar-resource-tile { transition: none; }
+}

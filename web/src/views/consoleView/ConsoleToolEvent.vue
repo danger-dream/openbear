@@ -322,7 +322,7 @@ function selectCallTab(index) {
 			<span class="disclosure-icon"><ArrowRight/></span>
 			<span class="tool-preview">{{ toolState.preview }}</span>
 		</summary>
-		<div v-if="open" class="tool-detail">
+		<div v-if="open" class="tool-detail" tabindex="0" aria-label="工具详情，可滚动">
 			<div v-if="toolState.isBatch" class="tool-call-selector" role="tablist" aria-label="选择工具调用">
 				<button
 					v-for="(label, idx) in toolState.tabLabels"
@@ -369,7 +369,7 @@ function selectCallTab(index) {
 						@click.stop="copyPayload(argumentsPayload, 'arguments')"
 					>{{ copiedPayload === 'arguments' ? '已复制' : '复制' }}</button>
 				</header>
-				<div v-if="argumentsPayload.content" class="tool-payload-code">
+				<div v-if="argumentsPayload.content" class="tool-payload-code" tabindex="0" aria-label="调用参数正文，可滚动">
 					<pre><code class="hljs" :class="argumentsPayload.language ? `language-${argumentsPayload.language}` : ''" v-html="argumentsHtml"></code></pre>
 				</div>
 				<p v-else class="tool-payload-empty">无调用参数</p>
@@ -387,7 +387,7 @@ function selectCallTab(index) {
 						@click.stop="copyPayload(resultPayload, 'result')"
 					>{{ copiedPayload === 'result' ? '已复制' : '复制' }}</button>
 				</header>
-				<div v-if="resultPayload.content" class="tool-payload-code">
+				<div v-if="resultPayload.content" class="tool-payload-code" tabindex="0" aria-label="返回结果正文，可滚动">
 					<pre><code class="hljs" :class="resultPayload.language ? `language-${resultPayload.language}` : ''" v-html="resultHtml"></code></pre>
 				</div>
 				<p v-else class="tool-payload-empty" :class="{'is-error': resultNoticeIsError}" aria-live="polite">{{ resultNotice }}</p>
@@ -640,12 +640,15 @@ details[open] > summary > .disclosure-icon {
 }
 
 .tool-detail {
+	box-sizing: border-box;
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	min-width: 0;
+	max-width: 100%;
 	gap: .72rem;
 	margin: .22rem 0 .34rem;
-	border-left: 1px solid #e7e9ee;
-	padding: .12rem 0 .12rem .72rem;
+	border: 1px solid #e7e9ee;
+	padding: .12rem .72rem;
 }
 
 .tool-call-selector {
@@ -721,6 +724,7 @@ details[open] > summary > .disclosure-icon {
 
 .tool-payload-section {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	min-width: 0;
 	gap: .32rem;
 }
@@ -769,6 +773,10 @@ details[open] > summary > .disclosure-icon {
 }
 
 .tool-payload-code {
+	box-sizing: border-box;
+	min-width: 0;
+	max-width: 100%;
+	min-height: 0;
 	max-height: min(280px, 34vh);
 	overflow: auto;
 	border: 1px solid #eceef2;
@@ -786,7 +794,8 @@ details[open] > summary > .disclosure-icon {
 
 .tool-payload-code code.hljs {
 	display: block;
-	min-width: max-content;
+	width: max-content;
+	min-width: 100%;
 	background: transparent;
 	padding: 0;
 	color: #52525b;
@@ -794,6 +803,22 @@ details[open] > summary > .disclosure-icon {
 	font-size: 10.5px;
 	line-height: 1.55;
 	tab-size: 4;
+}
+
+/* A pre's intrinsic width must scroll inside its frame, not size the grid.
+   Compaction prose wraps on both desktop and phone. */
+.context-detail-section .tool-payload-code code.hljs { width: auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	.tool-detail { grid-auto-rows: max-content; align-content: start; max-height: min(480px, calc(var(--mobile-viewport-height, 100dvh) * .65)); overflow: auto; padding: 10px; gap: 12px; border-radius: 12px; background: var(--el-bg-color-overlay); -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+	.tool-payload-section { align-content: start; }
+	.tool-payload-code { max-height: min(280px, calc(var(--mobile-viewport-height, 100dvh) * .35)); -webkit-overflow-scrolling: touch; }
+	.tool-payload-code pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+	.tool-payload-code code.hljs { width: auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+	.tool-payload-heading { flex-wrap: wrap; }
+	.tool-payload-header { gap: 6px; }
+	.tool-payload-code { border-radius: 9px; }
+	.tool-payload-code pre { padding: 9px; }
+	.tool-payload-copy { min-height: 32px; min-width: 36px; }
 }
 
 @keyframes toolLivePulse {
@@ -893,7 +918,7 @@ html.dark .tool-running > summary .tool-preview {
 		color: #a1a1a8;
 	}
 html.dark .tool-detail {
-		border-left: 1px solid #3d3e46;
+		border-color: #3d3e46;
 	}
 html.dark .tool-call-selector {
 		border-bottom: 1px solid #3d3e46;

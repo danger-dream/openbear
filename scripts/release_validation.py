@@ -13,11 +13,13 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections.abc import Iterable
 from html.parser import HTMLParser
 from pathlib import Path
@@ -187,6 +189,8 @@ class _IndexParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.references: list[str] = []
         self.scripts: list[str] = []
+        self.manifests: list[str] = []
+        self.apple_icons: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {str(key).lower(): value for key, value in attrs}
@@ -195,7 +199,13 @@ class _IndexParser(HTMLParser):
             self.references.append(ref)
             self.scripts.append(ref)
         elif tag.lower() == "link" and values.get("href"):
-            self.references.append(str(values["href"]))
+            ref = str(values["href"])
+            self.references.append(ref)
+            relations = str(values.get("rel") or "").lower().split()
+            if "manifest" in relations:
+                self.manifests.append(ref)
+            if "apple-touch-icon" in relations:
+                self.apple_icons.append(ref)
 
 
 def index_references(text: str) -> tuple[list[str], list[str]]:
@@ -239,6 +249,109 @@ def _text_resource_references(path: Path, text: str) -> Iterable[str]:
             yield match.group("ref")
 
 
+def _validate_pwa_png(path: Path, size: int) -> None:
+    try:
+        data = path.read_bytes()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("not PNG")
+        offset, pixels, header, ended = 8, bytearray(), None, False
+        while offset < len(data):
+            length = struct.unpack_from(">I", data, offset)[0]
+            kind = data[offset + 4:offset + 8]
+            body = data[offset + 8:offset + 8 + length]
+            crc = struct.unpack_from(">I", data, offset + 8 + length)[0]
+            if zlib.crc32(kind + body) != crc:
+                raise ValueError("PNG CRC mismatch")
+            if offset == 8 and kind != b"IHDR":
+                raise ValueError("missing IHDR")
+            if kind == b"IHDR":
+                if header is not None:
+                    raise ValueError("duplicate IHDR")
+                header = struct.unpack(">IIBBBBB", body)
+            elif kind == b"IDAT":
+                pixels.extend(body)
+            elif kind == b"IEND":
+                ended = length == 0 and offset + 12 == len(data)
+                break
+            offset += length + 12
+        if not ended or header is None or header[:2] != (size, size) or header[2] != 8 or header[3] not in (2, 6) or header[4:] != (0, 0, 0):
+            raise ValueError("invalid PNG dimensions/format")
+        stride = 1 + size * (3 if header[3] == 2 else 4)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(pixels, stride * size + 1)
+        if len(raw) != stride * size or not decoder.eof or decoder.unused_data or any(raw[row * stride] > 4 for row in range(size)):
+            raise ValueError("invalid PNG pixel data")
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        raise ReleaseValidationError(f"PWA 图标无效 {path}: {exc}") from exc
+
+
+def _validate_pwa_resources(dist: Path, html: str) -> set[str]:
+    parser = _IndexParser()
+    parser.feed(html)
+    manifest_path = dist / "manifest.webmanifest"
+    # Historical update baselines have neither file nor link: preserve their
+    # existing validation. Once either advertises PWA, require the entire set.
+    if not parser.manifests and not manifest_path.exists():
+        return set()
+
+    def local(ref: Any, source: Path) -> Path:
+        if not isinstance(ref, str) or not ref or "\\" in ref:
+            raise ReleaseValidationError("PWA 资源地址无效")
+        try:
+            parts = urllib.parse.urlsplit(ref)
+        except ValueError as exc:
+            raise ReleaseValidationError(f"PWA 资源地址无效: {ref}") from exc
+        if parts.scheme or parts.netloc or parts.query or parts.fragment:
+            raise ReleaseValidationError(f"PWA 资源必须是无查询参数的相对同源地址: {ref}")
+        candidate = _reference_path(dist, source, ref)
+        if candidate is None or not candidate.is_file():
+            raise ReleaseValidationError(f"PWA 资源缺失: {ref}")
+        return candidate
+
+    if len(parser.manifests) != 1 or local(parser.manifests[0], dist / "index.html") != dist.resolve() / "manifest.webmanifest":
+        raise ReleaseValidationError("PWA 必须链接唯一的 manifest.webmanifest")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ReleaseValidationError(f"PWA manifest 无效: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("display") != "standalone" or not all(isinstance(manifest.get(key), str) and manifest[key].strip() for key in ("name", "short_name")):
+        raise ReleaseValidationError("PWA manifest 名称或显示模式无效")
+    for key in ("id", "start_url", "scope"):
+        value = manifest.get(key)
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise ReleaseValidationError(f"PWA manifest {key} 无效")
+        try:
+            parts = urllib.parse.urlsplit(value)
+        except ValueError as exc:
+            raise ReleaseValidationError(f"PWA manifest {key} 无效") from exc
+        if parts.scheme or parts.netloc or parts.query or parts.fragment or urllib.parse.urljoin("https://openbear.invalid/manifest.webmanifest", value) != "https://openbear.invalid/":
+            raise ReleaseValidationError(f"PWA manifest {key} 必须是同源根地址且不绑定会话")
+    icons = manifest.get("icons")
+    if not isinstance(icons, list):
+        raise ReleaseValidationError("PWA manifest 缺少 icons")
+    checked = {"manifest.webmanifest"}
+    sizes_found: set[int] = set()
+    for icon in icons:
+        if not isinstance(icon, dict) or icon.get("type") != "image/png" or icon.get("purpose", "any") != "any":
+            raise ReleaseValidationError("PWA manifest 图标类型无效")
+        path = local(icon.get("src"), manifest_path)
+        declared_size = icon.get("sizes")
+        size = {"192x192": 192, "512x512": 512}.get(declared_size) if isinstance(declared_size, str) else None
+        if size is None or path != dist.resolve() / f"icons/openbear-{size}.png":
+            raise ReleaseValidationError("PWA manifest 图标必须使用已开放的 192/512 路径")
+        _validate_pwa_png(path, size)
+        sizes_found.add(size)
+        checked.add(path.relative_to(dist.resolve()).as_posix())
+    if sizes_found != {192, 512}:
+        raise ReleaseValidationError("PWA manifest 缺少 192/512 图标")
+    apple = dist / "icons/apple-touch-icon.png"
+    if len(parser.apple_icons) != 1 or local(parser.apple_icons[0], dist / "index.html") != dist.resolve() / "icons/apple-touch-icon.png":
+        raise ReleaseValidationError("PWA 缺少 apple-touch-icon 链接")
+    _validate_pwa_png(apple, 180)
+    checked.add("icons/apple-touch-icon.png")
+    return checked
+
+
 def validate_frontend_resources(dist: Path) -> dict[str, Any]:
     dist = Path(dist)
     index = dist / "index.html"
@@ -278,6 +391,7 @@ def validate_frontend_resources(dist: Path) -> dict[str, Any]:
     if missing:
         preview = ", ".join(sorted(missing)[:20])
         raise ReleaseValidationError(f"前端资源引用缺失 ({len(missing)}): {preview}")
+    checked.update(_validate_pwa_resources(dist, html))
     return {"indexReferences": len(direct), "checkedResources": len(checked)}
 
 

@@ -1,7 +1,7 @@
 name: Release
 
-# 推送 v* tag 后：校验版本、全量测试、构建前端、打包 zip，全部通过才创建 Release。
-# 测试失败 = 没有这个发行版。
+# 推送 v* tag 后：校验版本、全量测试、构建前端、打包 zip，全部通过才创建草稿 Release。
+# 草稿中的同一 ZIP 验收通过后再公开；测试失败 = 没有这个发行版。
 
 on:
   push:
@@ -200,7 +200,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create release
+      - name: Create draft release
         if: steps.exist.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -215,6 +215,7 @@ jobs:
             EXTRA+=(--prerelease)
           fi
           gh release create "$TAG" \
+            --draft \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --notes "$BODY" \
