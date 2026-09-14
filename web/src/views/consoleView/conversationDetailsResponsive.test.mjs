@@ -1,8 +1,7 @@
 import test, {after} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {registerHooks} from 'node:module';
-import {fileURLToPath} from 'node:url';
+import {register} from 'node:module';
 import postcss from 'postcss';
 import {parse, compileScript, compileStyle, compileTemplate} from '@vue/compiler-sfc';
 import {createRenderer, h, nextTick} from 'vue';
@@ -16,17 +15,24 @@ const styles = Object.fromEntries(files.map(f => [f, postcss.parse(descriptors[f
 // browser, layout engine, network, service, tool or Agent execution is involved.
 // Markdown's DOM-patching/artifact lifecycle is outside this package; use its
 // real markdown renderer in a DOM-free leaf instead. CSS is checked separately.
-const hooks = registerHooks({load(url, context, nextLoad) {
-  if (url.endsWith('.css')) return {format: 'module', source: 'export default {};', shortCircuit: true};
-  if (url.endsWith('.vue')) {
-    const filename = fileURLToPath(url), name = filename.split('/').at(-1);
-    if (name === 'ConsoleMarkdown.vue') return {format: 'module', shortCircuit: true, source: `import {h} from 'vue'; import {renderMarkdown} from './markdown.js'; export default {props:['text'], render(){return h('div',{class:'bear-md',innerHTML:renderMarkdown(this.text || '')})}};`};
-    if (!files.includes(name)) return {format: 'module', source: 'export default {render(){return null}};', shortCircuit: true};
-    return {format: 'module', source: compileScript(descriptors[name], {id: name, inlineTemplate: true}).content, shortCircuit: true};
+// module.register is available in the supported Node 20 runtime. Compile here
+// and transfer source strings to its loader thread; Vue still runs in this test
+// process. The node:test per-file process owns the loader's lifetime.
+const compiledSources = Object.fromEntries(files.map(name => [name, compileScript(descriptors[name], {id: name, inlineTemplate: true}).content]));
+compiledSources['ConsoleMarkdown.vue'] = `import {h} from 'vue'; import {renderMarkdown} from './markdown.js'; export default {props:['text'], render(){return h('div',{class:'bear-md',innerHTML:renderMarkdown(this.text || '')})}};`;
+register(`data:text/javascript,${encodeURIComponent(`
+  import {fileURLToPath} from 'node:url';
+  let sources;
+  export function initialize(data) { sources = data; }
+  export function load(url, context, nextLoad) {
+    if (url.endsWith('.css')) return {format: 'module', source: 'export default {};', shortCircuit: true};
+    if (url.endsWith('.vue')) {
+      const name = fileURLToPath(url).split('/').at(-1);
+      return {format: 'module', source: sources[name] || 'export default {render(){return null}};', shortCircuit: true};
+    }
+    return nextLoad(url, context);
   }
-  return nextLoad(url, context);
-}});
-after(() => hooks.deregister());
+`)}`, {parentURL: import.meta.url, data: compiledSources});
 const components = Object.fromEntries(await Promise.all(files.map(async f => [f, (await import(new URL(f, import.meta.url))).default])));
 const {Api} = await import('../../api.js');
 const originals = {...Api}, unexpectedCalls = [];
@@ -127,7 +133,11 @@ test('native disclosure, result selection, copying and close relay use the actua
   try {
     await find(root, 'tool-payload-copy').props.onClick({stopPropagation() {}});
     assert.equal(JSON.parse(copied).command, 'alpha');
-  } finally {Object.defineProperty(globalThis, 'navigator', oldNavigator); globalThis.window = oldWindow; globalThis.isSecureContext = oldSecure;}
+  } finally {
+    if (oldNavigator) Object.defineProperty(globalThis, 'navigator', oldNavigator);
+    else delete globalThis.navigator;
+    globalThis.window = oldWindow; globalThis.isSecureContext = oldSecure;
+  }
 });
 
 test('Agent process retains >12000 characters in parameters, recorded results, failures and non-collapsible model descriptions', t => {
