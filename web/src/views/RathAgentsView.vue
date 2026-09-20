@@ -10,6 +10,30 @@ const options = ref({ models: [], tools: [], thinkLevels: ["", "off", "low", "me
 const drawerOpen = ref(false);
 const editing = ref(null);
 const showDisabled = ref(true);
+const saving = ref(false);
+const editingBaseline = ref(null);
+const optionsLoading = ref(false);
+let optionsRequest = 0;
+const toolGroups = computed(() => {
+  const groups = new Map();
+  for (const tool of options.value.tools || []) {
+    const label = tool.kind === "mcp" ? `MCP · ${tool.serverKey}` : "内置工具";
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(tool);
+  }
+  return [...groups].map(([label, tools]) => ({ label, tools }));
+});
+const unavailableSelected = computed(() => normalizeTools(editing.value?.toolAllowlist).filter(name => !(options.value.tools || []).some(tool => tool.name === name)));
+async function loadOptions() {
+  const request = ++optionsRequest;
+  optionsLoading.value = true;
+  try {
+    const data = okOrThrow(await Api.rathOptions());
+    if (request === optionsRequest) options.value = { ...options.value, ...data };
+  } catch {
+    if (request === optionsRequest) ElMessage.warning("工具目录刷新失败，已保留当前选择。");
+  } finally { if (request === optionsRequest) optionsLoading.value = false; }
+}
 
 const AGENT_PROMPT_PRESETS = [
   {
@@ -90,7 +114,7 @@ function okOrThrow(data) { if (data?.ok === false) throw new Error(data.error ||
 function fmtTime(ts) { return ts ? new Date(Number(ts) * 1000).toLocaleString("zh-CN", { hour12: false }) : "—"; }
 function toolText(row) {
   const tools = Array.isArray(row?.tool_allowlist) ? row.tool_allowlist : [];
-  return tools.length ? tools.join(", ") : "无工具";
+  return tools.length ? tools.join(", ") : "不附加预设工具限制";
 }
 function normalizeTools(value) {
   if (Array.isArray(value)) return value.map((x) => String(x || "").trim()).filter(Boolean);
@@ -150,11 +174,10 @@ async function run(action, success = "已完成") {
 async function load() {
   loading.value = true;
   try {
-    const [opt, ag] = await Promise.all([
-      Api.rathOptions(),
+    const [, ag] = await Promise.all([
+      loadOptions(),
       Api.rathAgents({ disabled: showDisabled.value ? 1 : 0 }),
     ]);
-    options.value = { ...options.value, ...(opt || {}) };
     agents.value = items(ag);
   } catch (error) {
     ElMessage.error(apiError(error));
@@ -182,10 +205,12 @@ function openEdit(row = null) {
     enabled: true,
   };
   syncEditingModelCapabilities({ resetThinking: false });
+  editingBaseline.value = row ? fullPayload() : null;
   drawerOpen.value = true;
+  void loadOptions();
 }
 
-function payload() {
+function fullPayload() {
   return {
     name: editing.value.name,
     agentKey: editing.value.agentKey,
@@ -198,18 +223,33 @@ function payload() {
   };
 }
 
+function payload() {
+  const current = fullPayload();
+  if (!editingBaseline.value) return current;
+  const changed = Object.fromEntries(Object.entries(current).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(editingBaseline.value[key])));
+  if ("toolAllowlist" in changed) changed.expectedToolAllowlist = [...editingBaseline.value.toolAllowlist];
+  return changed;
+}
+
 async function save() {
+  if (saving.value) return;
   if (!editing.value?.name?.trim()) {
     ElMessage.warning("Agent 名称不能为空");
     return;
   }
-  await run(async () => {
+  saving.value = true;
+  try {
     const data = payload();
     if (editing.value.id) okOrThrow(await Api.updateRathAgent(editing.value.id, data));
     else okOrThrow(await Api.createRathAgent(data));
     drawerOpen.value = false;
+    ElMessage.success("Agent 已保存");
     await load();
-  }, "Agent 已保存");
+  } catch (error) {
+    const code = error?.response?.data?.error;
+    ElMessage.error(code === "agent_tool_allowlist_conflict" ? "工具上限已被其他操作修改，草稿未覆盖，请重新打开预设后确认。" : code === "agent_tool_not_available" ? "有新增工具当前不可委派，选择已保留，请刷新目录后确认。" : apiError(error));
+    await loadOptions();
+  } finally { saving.value = false; }
 }
 
 async function remove(row) {
@@ -318,11 +358,22 @@ onMounted(load);
             <div><label class="text-xs text-macsub mb-1 block">思考模式</label><el-select v-model="editing.thinkLevel" clearable class="w-full" :disabled="!editingThinkLevels.length" :placeholder="editingThinkLevels.length ? `默认=${editingDefaultThinkLevel || '模型默认'}` : '该模型未配置思考强度'"><el-option :label="`模型默认（${editingDefaultThinkLevel || 'off'}）`" value="" /><el-option v-for="lv in editingThinkLevels" :key="lv" :label="lv" :value="lv" /></el-select></div>
             <div class="md:col-span-4"><label class="text-xs text-macsub mb-1 block">适用场景</label><el-input v-model="editing.description" type="textarea" :rows="3" /></div>
             <div class="md:col-span-4">
-              <label class="text-xs text-macsub mb-1 block">授权工具</label>
-              <el-select v-model="editing.toolAllowlist" multiple filterable class="w-full" placeholder="选择授权工具；留空=无工具">
-                <el-option v-for="t in options.tools" :key="t.name" :label="t.name" :value="t.name" />
+              <label class="text-xs text-macsub mb-1 block">工具上限</label>
+              <el-select v-model="editing.toolAllowlist" multiple filterable class="w-full" :loading="optionsLoading" :disabled="saving" placeholder="选择工具上限；留空不附加预设限制" @visible-change="(visible) => { if (visible) loadOptions(); }">
+                <el-option-group v-for="group in toolGroups" :key="group.label" :label="group.label">
+                  <el-option v-for="t in group.tools" :key="t.name" :label="t.kind === 'mcp' ? `${t.serverKey} / ${t.originalToolName}` : t.name" :value="t.name" :title="`${t.name} · ${t.description || ''}`" />
+                </el-option-group>
+                <el-option-group v-if="unavailableSelected.length" label="已选但当前不可用">
+                  <el-option v-for="name in unavailableSelected" :key="name" :label="`${name}（当前不可用 · 已保留）`" :value="name" disabled />
+                </el-option-group>
               </el-select>
-              <div class="text-[11px] text-macsub mt-1">留空表示不授权任何工具；只能从固定 Agent 白名单中选择。</div>
+              <div v-if="unavailableSelected.length" class="mt-2 space-y-1 text-xs text-amber-700">
+                <div v-for="name in unavailableSelected" :key="name" class="flex items-start gap-2">
+                  <span class="break-all">{{ name }} · 当前不可用，恢复后按已选设置处理</span>
+                  <el-button text size="small" :disabled="saving" @click="editing.toolAllowlist = editing.toolAllowlist.filter(item => item !== name)">移除</el-button>
+                </div>
+              </div>
+              <div class="text-[11px] leading-5 text-macsub mt-1">留空不附加预设限制，本轮仍须显式授权；Agent 的 tools=[] 表示本轮无业务工具。MCP 需先在 <a href="/mcp" class="text-macblue">MCP 管理</a> 开放 Agent 访问；实际执行仍遵守调用审批。</div>
             </div>
             <div class="md:col-span-4 flex items-center gap-5"><el-switch v-model="editing.enabled" active-text="启用" inactive-text="停用" /></div>
           </section>
@@ -349,14 +400,14 @@ onMounted(load);
 
           <footer class="agent-desktop-footer shrink-0 flex justify-end gap-2 border-t border-macborder pt-3">
             <el-button @click="drawerOpen = false">取消</el-button>
-            <el-button type="primary" @click="save">保存</el-button>
+            <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
           </footer>
         </div>
       </template>
       <template #footer>
         <div v-if="editing" class="admin-mobile-only agent-mobile-footer">
           <el-button @click="drawerOpen = false">取消</el-button>
-          <el-button type="primary" @click="save">保存</el-button>
+          <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
         </div>
       </template>
     </el-drawer>

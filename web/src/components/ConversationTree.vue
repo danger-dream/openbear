@@ -42,6 +42,7 @@ defineExpose({
 });
 
 const activityItems = ref([]);
+const recentItems = ref([]);
 const activityReadBusy = ref(false);
 const rootFolders = ref([]);
 const branchState = reactive({});
@@ -110,9 +111,11 @@ function keepOverview() { clearTimeout(overviewOpenTimer); clearTimeout(overview
 function enterOverview(event, row) {
   if (row.kind !== 'conversation' || row.local || event.pointerType === 'touch' || !window.matchMedia('(hover: hover)').matches || drag.value.row || moveInFlight.value || menu.value.open) return;
   keepOverview();
-  if (overview.value.open && overview.value.row?.conversationUuid === row.conversationUuid) return;
-  closeOverview();
+  // Activity rows include status/read actions outside the title button. Anchor
+  // their overview to the full row, not inside that trailing status area.
   const anchor = event.currentTarget.querySelector('button.conversation') || event.currentTarget;
+  if (overview.value.open && overview.value.row?.conversationUuid === row.conversationUuid && overview.value.anchor === anchor) return;
+  closeOverview();
   overviewOpenTimer = setTimeout(() => {
     if (anchor.isConnected && !drag.value.row && !menu.value.open) overview.value = { open: true, row, anchor };
   }, 280);
@@ -157,7 +160,10 @@ function withDraft(items, folderId) {
   const rows = Array.isArray(items) ? items.slice() : [];
   const draft = props.draftConversation;
   if (draft && String(draft.folderId || "") === String(folderId || "") && !rows.some((item) => item.conversationUuid === draft.conversationUuid)) {
-    rows.unshift({ ...draft, kind: "conversation", id: draft.conversationUuid, parentId: folderId, path: folderId ? folderPath(folderId) : "临时会话" });
+    rows.push({ ...draft, kind: "conversation", id: draft.conversationUuid, parentId: folderId, path: folderId ? folderPath(folderId) : "临时会话" });
+    // A local draft is still a conversation: respect folder/pin/manual ordering
+    // before and after its first send instead of jumping ahead of child folders.
+    rows.sort(compareTreeRows);
   }
   return rows;
 }
@@ -213,7 +219,7 @@ function everyKnownNode() {
 function knownConversationRows() {
   const map = new Map();
   for (const row of everyKnownNode()) if (row.kind === "conversation" && row.conversationUuid) map.set(row.conversationUuid, row);
-  for (const row of activityItems.value) map.set(row.conversationUuid, row);
+  for (const row of [...activityItems.value, ...recentItems.value]) map.set(row.conversationUuid, row);
   if (props.draftConversation) map.set(props.draftConversation.conversationUuid, props.draftConversation);
   return [...map.values()];
 }
@@ -230,6 +236,7 @@ function forgetConversation(conversationUuid) {
   }
   searchRows.value = searchRows.value.filter((row) => row.conversationUuid !== conversationUuid);
   activityItems.value = activityItems.value.filter(row => row.conversationUuid !== conversationUuid);
+  recentItems.value = recentItems.value.filter(row => row.conversationUuid !== conversationUuid);
   emitRows();
 }
 function forgetFolder(folderId) {
@@ -252,17 +259,32 @@ function mergeTreeRows(existing = [], incoming = []) {
   for (const row of incoming || []) if (rowId(row)) merged.set(rowId(row), row);
   return [...merged.values()].sort(compareTreeRows);
 }
+function sameRowShape(a, b) {
+  // Status rows are JSON data. Arrays/objects arrive with fresh identities on
+  // each packet, so compare their contents before replacing a published row.
+  if (Object.is(a, b)) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(b);
+  if (keys.length !== Object.keys(a).length) return false;
+  for (const key of keys) {
+    if (!Object.hasOwn(a, key) || !sameRowShape(a[key], b[key])) return false;
+  }
+  return true;
+}
 function statusAdjustedRow(row) {
   if (!latestStatusState || !row) return row;
   if (row.kind === "folder") {
     const count = latestStatusState.folderConversationCounts?.[row.folderId];
-    return { ...row, runningDescendantCount: Number(latestStatusState.folderRunningCounts?.[row.folderId] || 0),
+    const next = { ...row, runningDescendantCount: Number(latestStatusState.folderRunningCounts?.[row.folderId] || 0),
       ...(Number.isFinite(count) ? { conversationCount: count } : {}) };
+    return sameRowShape(row, next) ? row : next;
   }
   if (row.kind !== "conversation" || row.archived) return row;
   const status = latestStatusState.lookup.get(row.conversationUuid);
   const activity = latestStatusState.activityLookup.get(row.conversationUuid);
-  return { ...row, ...(status || {}), ...(activity || {activityUnread: false, activityState: "", activityPending: []}), running: Boolean(status), status: status ? "running" : "idle" };
+  const next = { ...row, ...(status || {}), ...(activity || {activityUnread: false, activityState: "", activityPending: []}), running: Boolean(status), status: status ? "running" : "idle" };
+  return sameRowShape(row, next) ? row : next;
 }
 function mergeLocatedFolders(rows = []) {
   for (const raw of rows || []) {
@@ -285,10 +307,19 @@ function cacheLocatedConversation(raw) {
   const branch = stateFor(parentId, system);
   branch.items = mergeTreeRows(branch.items, [row]);
 }
-function updateKnownNode(id, patch) {
-  const update = (rows) => rows.map((row) => rowId(row) === id ? { ...row, ...patch } : row);
-  rootFolders.value = update(rootFolders.value);
-  for (const branch of Object.values(branchState)) branch.items = update(branch.items || []);
+// Rebuild a branch only when at least one row actually changed, so a status
+// refresh with no real change reuses every existing reference.
+function remapRows(rows = []) {
+  if (!rows.length) return rows;
+  let changed = false;
+  const next = rows.map((row) => {
+    if (row.kind !== "conversation" && row.kind !== "folder") return row;
+    if (row.kind === "conversation" && row.archived) return row;
+    const adjusted = statusAdjustedRow(row);
+    if (adjusted !== row) changed = true;
+    return adjusted;
+  });
+  return changed ? next : rows;
 }
 function folderPath(folderId) {
   const match = everyKnownNode().find((row) => row.kind === "folder" && row.folderId === folderId)
@@ -483,6 +514,9 @@ function applyStatus(data = {}) {
     return {...item, activityReadVersion: read, activityUnread: Number(item.activityVersion || 0) > read};
   };
   activityItems.value = (data.activityItems || data.items || []).map(adjust).filter(item => !item.archived && (item.running || item.activityUnread));
+  // Recency is independent of completion/read state; server supplies the newest
+  // five actual interactions, including rows absent from the loaded tree pages.
+  recentItems.value = (data.recentItems || []).map(adjust).filter(item => !item.archived && !item.local).slice(0, 5);
   latestStatusState = {
     raw: data,
     activityLookup: new Map(activityItems.value.map(item => [item.conversationUuid, item])),
@@ -490,14 +524,12 @@ function applyStatus(data = {}) {
     folderRunningCounts: { ...(data.folderRunningCounts || {}) },
     folderConversationCounts: { ...(data.folderConversationCounts || {}) },
   };
-  for (const row of everyKnownNode()) {
-    if (row.kind === "conversation" && !row.archived) {
-      updateKnownNode(row.conversationUuid, statusAdjustedRow(row));
-    } else if (row.kind === "folder") {
-      updateKnownNode(row.folderId, statusAdjustedRow(row));
-    }
-  }
-  searchRows.value = searchRows.value.map(statusAdjustedRow);
+  // One pass per branch instead of one pass per node. An unchanged refresh
+  // preserves the published row and branch references instead of invalidating
+  // every subtree merely because a new JSON packet arrived.
+  rootFolders.value = remapRows(rootFolders.value);
+  for (const branch of Object.values(branchState)) branch.items = remapRows(branch.items || []);
+  searchRows.value = remapRows(searchRows.value);
   emitRows();
 }
 async function markActivityRead(items) {
@@ -1278,7 +1310,7 @@ function globalKeydown(event) { if (event.key === "Escape") { closeMenu(); clear
 
 watch(() => props.activeConversationUuid, closeOverview);
 watch(query, closeOverview);
-watch(displayRows, rows => {
+watch(() => [...displayRows.value, ...activityItems.value, ...recentItems.value], rows => {
   if (overview.value.open && !rows.some(row => row.conversationUuid === overview.value.row?.conversationUuid)) closeOverview();
 });
 watch(() => referenceCatalog.treeStatus, data => { if (data) { statusRequestGeneration += 1; applyStatus(data); } });
@@ -1325,8 +1357,9 @@ onBeforeUnmount(() => {
       <button v-if="query" type="button" title="清空搜索" @click="query = ''">×</button>
     </div>
 
-    <ConversationActivityFolder :items="activityItems" :active-conversation-uuid="activeConversationUuid" :read-versions="referenceCatalog.activityReadVersions" :busy="activityReadBusy"
-      @open="openActivityConversation" @read="markActivityRead([$event])" @read-all="markActivityRead(activityItems)" />
+    <ConversationActivityFolder :items="activityItems" :recent-items="recentItems" :active-conversation-uuid="activeConversationUuid" :read-versions="referenceCatalog.activityReadVersions" :busy="activityReadBusy"
+      @open="openActivityConversation" @read="markActivityRead([$event])" @read-all="markActivityRead(activityItems)"
+      @overview-enter="enterOverview" @overview-leave="leaveOverview" @overview-close="closeOverview" />
 
     <div ref="listRef" class="tree-list" :class="{ 'drop-root': drag.target?.kind === 'root' }" role="tree" aria-label="会话和目录"
       @contextmenu.prevent.stop="openRootMenu" @dragover.self="dragOver($event, rootDropTarget)" @drop.self="drop($event, rootDropTarget)"

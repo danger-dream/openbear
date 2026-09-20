@@ -187,7 +187,7 @@ function appendLiveCaret(rendered) {
 	return `${rendered}${caret}`;
 }
 
-const html = computed(() => appendLiveCaret(renderMarkdown(displayedText.value, {live: props.live})));
+const html = computed(() => appendLiveCaret(renderMarkdown(displayedText.value, {live: props.live, references: props.references})));
 
 function onMarkdownClick(event) {
 	const chip = event.target?.closest?.("[data-reference]");

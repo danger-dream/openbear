@@ -1027,7 +1027,15 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
         # stable operation per turn so DB/state keep only the latest snapshot
         # instead of appending an operation for every timer tick.
         stats = event.get("stats") if isinstance(event.get("stats"), dict) else {}
-        op_key = execution_run_uuid or turn_uuid or run_root_turn_uuid or str(event.get("eventUuid") or event.get("eventId") or "current")
+        # The operation identity must come from a real turn/run. The event uuid
+        # fallback is conversation-level (the stable stats event key carries no
+        # turn), so a snapshot arriving without an identity would overwrite an
+        # unrelated operation while leaving its own turn without a footer. Such a
+        # snapshot is still broadcast to live subscribers; it just owns no durable
+        # operation.
+        op_key = execution_run_uuid or turn_uuid or run_root_turn_uuid
+        if not op_key:
+            return specs
         specs.append(_operation_spec(
             op_id=f"stats:{op_key}",
             op_type="stats", action="patch", turn_uuid=turn_uuid,

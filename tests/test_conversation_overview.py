@@ -7,6 +7,7 @@ import json
 from app.web_console.conversation_overview import read_conversation_overview
 from tests.test_builtin_template_import import _login_cookie, web_env  # noqa: F401
 from tests.test_reference_catalog import receive_type
+from tests.test_reference_mentions import insert_op
 
 
 async def seed(e, uuid="overview-a", chat=-901, owner=123, archived=0):
@@ -283,6 +284,49 @@ async def test_background_only_task_has_its_own_start_not_parent_last_update(web
     data = await e.server._conversation_overview(123, uuid)
     assert data["running"] and data["startedAtMs"] == 100000
     assert data["status"] == "Agent 后台执行中"
+
+
+async def test_multi_conversation_catalog_cold_start_and_resync_keep_overview_available(web_env):
+    e = web_env
+    expected = {}
+    # With only one or two rows, SQLite finishes the outer cursor before a
+    # repeated length-function registration. Three rows expose the live cursor.
+    for index in range(3):
+        uuid, _, _ = await seed(e, uuid=f"overview-{index}", chat=-901-index)
+        body = "会话正文🙂" * (index + 1)
+        await insert_op(e, uuid, f"msg:{index}", f"turn-{index}", 1, text=body)
+        expected[uuid] = len(body)
+
+    cookies = await _login_cookie(e)
+    response = await e.client.get("/api/reference-catalog", cookies=cookies)
+    assert response.status == 200
+    catalog = await response.json()
+    assert {row["id"]: row["bodyChars"] for row in catalog["items"] if row["kind"] == "chat"} == expected
+
+    hub = e.server.global_realtime
+    hub.reference_length_cache.clear()
+    ws = await e.client.ws_connect(
+        "/api/events/ws", headers={"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+    )
+    try:
+        snapshot = await receive_type(ws, "snapshot")
+        assert {row["id"]: row["bodyChars"] for row in snapshot["items"] if row["kind"] == "chat"} == expected
+        await ws.send_json({
+            "type": "conversation-overview", "conversationUuid": "overview-1", "subscriptionId": "multi"
+        })
+        data = await receive_type(ws, "conversation-overview")
+        assert data["subscriptionId"] == "multi"
+        assert data["overview"]["usage"]["cost_usd"] == 1.25
+        assert data["overview"]["configuration"]["model"] == "openai/gpt"
+
+        hub.reference_length_cache.clear()
+        await ws.send_json({"type": "resync"})
+        snapshot = await receive_type(ws, "snapshot")
+        assert {row["id"]: row["bodyChars"] for row in snapshot["items"] if row["kind"] == "chat"} == expected
+        await hub.refresh()
+        assert (await receive_type(ws, "conversation-overview"))["subscriptionId"] == "multi"
+    finally:
+        await ws.close()
 
 
 async def test_ws_only_reads_subscribed_conversation_and_unsubscribe_stops_work(

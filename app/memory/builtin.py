@@ -417,20 +417,26 @@ class BuiltinMemoryClient:
     async def _agent_template_context(self, params: dict[str, Any]) -> dict[str, Any]:
         memory = await self._memory_object()
         ctx = dict(params or {})
-        for main_only_key in ("mcpToolNames", "mcpToolSummaries", "mcpToolGroups", "mcpServerInstructions", "skillsPrompt", "availableAgents", "agents"):
+        for main_only_key in ("mcpToolGroups", "skillsPrompt", "availableAgents", "agents"):
             ctx.pop(main_only_key, None)
         tool_names = list(ctx.get("toolNames") or [])
         tool_summaries = dict(ctx.get("toolSummaries") or {})
-        builtin_summaries = dict(ctx.get("builtinToolSummaries") or tool_summaries)
+        mcp_names = [name for name in ctx.get("mcpToolNames") or [] if name in tool_names]
+        builtin_names = [name for name in tool_names if name not in mcp_names]
+        builtin_summaries = {name: tool_summaries.get(name, "") for name in builtin_names}
+        ctx["mcpToolNames"] = mcp_names
+        ctx["mcpToolSummaries"] = {name: tool_summaries.get(name, "") for name in mcp_names}
+        ctx["mcpServerInstructions"] = list(ctx.get("mcpServerInstructions") or []) if mcp_names else []
         ctx["memory"] = memory
         ctx["toolNames"] = tool_names
         ctx["toolSummaries"] = tool_summaries
-        ctx["builtinToolNames"] = tool_names
+        ctx["builtinToolNames"] = builtin_names
         ctx["builtinToolSummaries"] = builtin_summaries
         ctx["tools"] = {
             "allowlist": tool_names,
             "summaries": tool_summaries,
-            "builtin": {"names": tool_names, "summaries": builtin_summaries},
+            "builtin": {"names": builtin_names, "allowlist": builtin_names, "summaries": builtin_summaries},
+            "mcp": {"names": mcp_names, "allowlist": mcp_names, "summaries": ctx["mcpToolSummaries"], "serverInstructions": ctx["mcpServerInstructions"]},
         }
         ctx.setdefault("reasoningLevel", "off")
         ctx.setdefault("defaultThinkLevel", "off")

@@ -99,20 +99,23 @@ test('desktop six-grid renders native buttons in original order, marks the activ
   ssr.config.warnHandler=message=>assert.fail(message);
   const html=await renderToString(ssr);
   const buttons=walk([tree]).filter(n=>n.type==='button');
-  assert.equal(buttons.length,6);
-  assert.equal(buttons.length/3,2);
-  for(const [index,item] of r.props.items.entries()){
+  assert.equal(buttons.length,5);
+  const desktopItems=r.props.items.filter(item=>item.key!=='settings');
+  for(const [index,item] of desktopItems.entries()){
     const button=buttons[index];
     assert.equal(button.props.type,'button');
     assert.equal(button.props.class,'sidebar-resource-tile');
     assert.equal(button.props['aria-current'],item.key==='docs'?'page':undefined);
-    assert.ok(html.includes(item.label));
+    assert.ok(html.includes(item.shortLabel||item.label));
     button.props.onClick();assert.deepEqual(calls.slice(-2),[['close'],['select',item.key]]);
     const event={key:'ArrowRight',currentTarget:{}};
     button.props.onPointerenter(event);assert.deepEqual(calls.at(-1),['hover',item.key,event]);
     button.props.onPointerleave();assert.deepEqual(calls.at(-1),['leave']);
     button.props.onKeydown(event);assert.deepEqual(calls.at(-1),['key',item.key,event]);
   }
+  const footerButton=appNodes.find(n=>hasClass(n,'sidebar-footer-settings'));
+  assert.ok(footerButton,'footer contains dedicated desktop settings action');
+  assert.match(footerButton.loc.source,/@click="closeReferenceShelf\(\); selectNav\('settings'\)"/);
   r.unmount.forEach(fn=>fn());
 });
 
@@ -125,9 +128,9 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
   }});
   const source=app.slice(app.indexOf('function showReferenceShelf('),app.indexOf('function insertShelfReference('));
   vm.runInContext(source,context);
-  for(const [key,kind] of [['memory','mem'],['secrets','secret'],['docs','doc']]){
+  for(const [index,[key,kind]] of [['memory','mem'],['secrets','secret'],['docs','doc']].entries()){
     context.showReferenceShelf({currentTarget:target},key);
-    assert.equal(timers.at(-1).delay,220);timers.at(-1).fn();
+    assert.equal(timers.at(-1).delay,index===0?220:500);timers.at(-1).fn();
     assert.equal(shelf.value.kind,kind);assert.equal(shelf.value.anchor,grid);
   }
   const count=timers.length;

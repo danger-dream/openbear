@@ -64,6 +64,68 @@ def _lcp_bytes(left: bytes, right: bytes) -> int:
     return count
 
 
+def _anthropic_content_units(units: list[dict]) -> list[dict]:
+    """Compare content, not movable cache annotations or text shorthand.
+
+    Strip only each provider content block's annotation, never recursively:
+    tool input and user text may legitimately contain a cache_control key.
+    """
+    normalized = []
+    for unit in units:
+        content = unit.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        normalized.append({**unit, "content": [
+            {key: value for key, value in block.items() if key != "cache_control"}
+            for block in blocks
+        ]})
+    return normalized
+
+
+def _assert_anthropic_cache_breakpoints(payload: dict) -> None:
+    messages = payload["messages"]
+    expected = {len(messages) - 1}
+    previous_user = next((i for i in range(len(messages) - 2, -1, -1)
+                          if messages[i]["role"] == "user"), None)
+    if previous_user is not None:
+        expected.add(previous_user)
+    actual = set()
+    for index, message in enumerate(messages):
+        blocks = message["content"]
+        if not isinstance(blocks, list):
+            continue
+        for block_index, block in enumerate(blocks):
+            if "cache_control" in block:
+                assert block_index == len(blocks) - 1
+                assert block["cache_control"] == {"type": "ephemeral"}
+                actual.add(index)
+    assert actual == expected
+    # System and tools retain their stable last-block markers; all four cache
+    # slots are validated independently of the content-prefix assertion.
+    for key in ("system", "tools"):
+        blocks = payload[key]
+        assert blocks[-1]["cache_control"] == {"type": "ephemeral"}
+        assert all("cache_control" not in block for block in blocks[:-1])
+    assert len(actual) + 2 <= 4
+
+
+def test_anthropic_prefix_normalization_keeps_tool_arguments_and_message_order():
+    plain = [{"role": "user", "content": "fixed"}]
+    marked = [{"role": "user", "content": [{"type": "text", "text": "fixed", "cache_control": {"type": "ephemeral"}}]}]
+    original = json.dumps(marked)
+    assert _anthropic_content_units(plain) == _anthropic_content_units(marked)
+    assert json.dumps(marked) == original
+    tools = [{"role": "assistant", "content": [{"type": "tool_use", "id": "call-a", "name": "Echo",
+              "input": {"cache_control": "user-owned-value"}, "cache_control": {"type": "ephemeral"}}]}]
+    normalized = _anthropic_content_units(tools)
+    assert normalized[0]["content"][0]["input"] == {"cache_control": "user-owned-value"}
+    for field, replacement in (("id", "call-b"), ("name", "Other"), ("input", {"cache_control": "changed"})):
+        changed = json.loads(json.dumps(tools))
+        changed[0]["content"][0][field] = replacement
+        assert _anthropic_content_units(changed) != normalized
+    assert _anthropic_content_units(plain + tools) != _anthropic_content_units(tools + plain)
+    assert _anthropic_content_units([{**plain[0], "content": "changed"}]) != _anthropic_content_units(plain)
+
+
 @pytest.fixture
 async def deterministic_task_memory(tmp_path, monkeypatch):
     uuid_counter = itertools.count(1)
@@ -242,6 +304,13 @@ async def test_task_memory_final_provider_units_are_complete_prefixes(
         ]
         unit_key = "input" if provider == "responses" else "messages"
         unit_sequences = [payload[unit_key] for payload in payloads]
+        if provider == "anthropic":
+            # Rolling cache_control positions do not change prompt content.
+            # Keep raw-byte stability for the other protocols, and independently
+            # require the Anthropic markers to roll to the correct positions.
+            for payload in payloads:
+                _assert_anthropic_cache_breakpoints(payload)
+            unit_sequences = [_anthropic_content_units(units) for units in unit_sequences]
         byte_sequences = [_unit_stream(units) for units in unit_sequences]
         transitions = []
         for index in range(1, len(unit_sequences)):
@@ -284,6 +353,7 @@ async def test_task_memory_final_provider_units_are_complete_prefixes(
             assert all(payload["system"] == payloads[0]["system"] for payload in payloads)
             provider_system = payloads[0]["system"]
         evidence[provider] = {
+            "comparison": "content_without_cache_annotations" if provider == "anthropic" else "wire_units",
             "requests": [{
                 "unitHashes": _unit_hashes(units),
                 "units": len(units),

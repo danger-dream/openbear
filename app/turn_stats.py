@@ -52,7 +52,9 @@ def build_turn_stats_card(
     cache_read = u.cache_read_tokens + expert_u.cache_read_tokens
     cache_write = u.cache_write_tokens + expert_u.cache_write_tokens
     out = u.output_tokens + expert_u.output_tokens
-    cache_base = prompt_in + cache_read
+    # 缓存命中率 = 读缓存 / 完整 prompt(fresh + 读 + 写)，与 parrot 口径一致；
+    # 写缓存是全价新输入，计入分母但不算命中。
+    cache_base = prompt_in + cache_read + cache_write
     cache_pct = (cache_read / cache_base * 100) if cache_base > 0 else 0.0
     total_tok = prompt_in + cache_read + cache_write + out
 

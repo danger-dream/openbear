@@ -307,6 +307,9 @@ class StreamableHTTPTransport(MCPTransport):
             base_url="",
             headers=self._base_headers,
             timeout=httpx.Timeout(float(self.config.connect_timeout_s or 20)),
+            # A redirect must be checked before sending custom credentials and
+            # JSON-RPC arguments. _post permits only the same endpoint's slash.
+            follow_redirects=False,
         )
         log.info("mcp.http.connected", server=self.server_key, url=self._safe_url(), headers=redact_headers(self._base_headers))
 
@@ -317,11 +320,8 @@ class StreamableHTTPTransport(MCPTransport):
         request_id = self._next_id
         payload = {"jsonrpc": _JSONRPC_VERSION, "id": request_id, "method": method, "params": params or {}}
         try:
-            resp = await self._client.post(
-                self.config.url,
-                json=payload,
-                headers=self._request_headers(),
-                timeout=float(timeout_s or self.config.tool_call_timeout_s or 120),
+            resp = await self._post(
+                payload, timeout_s=float(timeout_s or self.config.tool_call_timeout_s or 120),
             )
         except TimeoutError as exc:
             raise MCPTimeoutError(f"MCP {self.server_key} {method} timeout after {timeout_s}s") from exc
@@ -347,8 +347,43 @@ class StreamableHTTPTransport(MCPTransport):
             return
         payload = {"jsonrpc": _JSONRPC_VERSION, "method": method, "params": params or {}}
         with contextlib.suppress(Exception):
-            resp = await self._client.post(self.config.url, json=payload, headers=self._request_headers(), timeout=5.0)
+            resp = await self._post(payload, timeout_s=5.0)
             self._capture_session_headers(resp)
+
+    async def _post(self, payload: dict[str, Any], *, timeout_s: float) -> httpx.Response:
+        client = self._client
+        if client is None:
+            raise MCPConnectionError(f"MCP server {self.server_key} is not connected")
+        url = httpx.URL(self.config.url)
+        redirected = False
+        while True:
+            resp = await client.post(
+                url, json=payload, headers=self._request_headers(),
+                timeout=timeout_s, follow_redirects=False,
+            )
+            if not 300 <= resp.status_code < 400:
+                return resp
+            # Preserve encoded path and query bytes. URL equality also checks
+            # scheme, host, port and userinfo: a slash is not permission to move
+            # credentials or the request body to another endpoint/origin.
+            path, separator, query = resp.url.raw_path.partition(b"?")
+            expected = resp.url.copy_with(raw_path=path + b"/" + separator + query)
+            location = resp.headers.get("location", "")
+            try:
+                target = resp.url.join(location)
+            except httpx.InvalidURL:
+                target = None
+            allowed = (
+                not redirected and resp.status_code in (307, 308)
+                and not path.endswith(b"/") and bool(location) and target == expected
+            )
+            await resp.aclose()
+            if not allowed:
+                raise MCPConnectionError(
+                    f"MCP {self.server_key} refused redirect: only a same-endpoint trailing slash is allowed"
+                )
+            url = expected
+            redirected = True
 
     async def close(self) -> None:
         client = self._client

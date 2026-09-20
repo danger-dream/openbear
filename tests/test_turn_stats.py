@@ -88,6 +88,24 @@ def test_cache_percentage():
     assert "$" not in card
 
 
+def test_cache_percentage_excludes_cache_write_from_hits():
+    """Anthropic 滚动断点下 fresh≈0、新增全部进写缓存：命中率不得显示 100%。
+
+    口径与 parrot 一致：读缓存 / (fresh + 读 + 写)。
+    """
+    r = _result(
+        total_time_ms=5000, model_calls=1, model_ok=1,
+        usage=Usage(input_tokens=3, output_tokens=900,
+                    cache_read_tokens=120000, cache_write_tokens=1800),
+    )
+    card = build_turn_stats_card(r, model="m", cost_usd=0.0)
+    # 120000 / (3 + 120000 + 1800) = 98.5%
+    assert "98.5%" in card
+    assert "100.0%" not in card
+    # 缓存数值只展示读缓存
+    assert "缓存 120.0k" in card
+
+
 def test_no_reasoning_when_zero():
     r = _result(total_time_ms=3000, model_calls=1, model_ok=1,
                 reasoning_ms_sum=0,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-REMOVED_TOOL_NAMES = frozenset({"Glob", "Grep"})
+REMOVED_TOOL_NAMES = frozenset({"Glob", "Grep", "WebSearch", "WebExtract"})
 # Instance-bound context recovery is not a grant of cross-conversation History
 # or an executable business tool. Dispatch still enforces control/finalize gates.
 AGENT_RUNTIME_TOOL_NAMES = frozenset({"AgentHistory"})
@@ -18,8 +18,6 @@ AGENT_DELEGATION_TOOL_NAMES = frozenset({
     "Write",
     "Edit",
     "Bash",
-    "WebSearch",
-    "WebExtract",
     "Process",
     "TaskMemory",
 })
@@ -51,11 +49,15 @@ def agent_phase_tool_names(
     initial: Iterable[object], *, managed: bool = False,
     phase: str = "", approved: Iterable[object] = (),
     pending_control: bool = False, ceiling: Iterable[object] = (),
+    available: Iterable[str] | None = None,
 ) -> set[str]:
     """Canonical phase capabilities for runner schemas and inspection surfaces."""
-    ordinary = set(sanitize_tool_allowlist(approved if managed else initial)) & AGENT_DELEGATION_TOOL_NAMES
-    cap = set(sanitize_tool_allowlist(ceiling))
-    if cap:
+    ordinary = set(sanitize_tool_allowlist(approved if managed else initial)) & set(AGENT_DELEGATION_TOOL_NAMES if available is None else available)
+    configured_ceiling = preserve_tool_allowlist(ceiling)
+    cap = set(sanitize_tool_allowlist(configured_ceiling))
+    # A persisted non-empty ceiling must remain restrictive even when every
+    # stored name has since been removed. Empty alone means "no preset limit".
+    if configured_ceiling:
         ordinary &= cap
     if not managed:
         return expand_agent_tool_names(ordinary | AGENT_RUNTIME_TOOL_NAMES | ({"AgentControlAck"} if pending_control else set()))
@@ -70,14 +72,69 @@ def agent_phase_tool_names(
     return expand_agent_tool_names((ordinary if phase in {"executing", "finalizing"} else set()) | protocol | AGENT_RUNTIME_TOOL_NAMES | {"AgentControlAck"})
 
 
-def sanitize_tool_allowlist(tools: Iterable[object] | None) -> list[str]:
-    """Return a stable tool allowlist without removed/empty/duplicate entries."""
+def preserve_tool_allowlist(tools: Iterable[object] | None) -> list[str]:
+    """Normalize stored names without erasing unavailable historical choices."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in tools or []:
         name = str(raw or "").strip()
-        if not name or name in REMOVED_TOOL_NAMES or name in seen:
+        if not name or name in seen:
             continue
         seen.add(name)
         out.append(name)
     return out
+
+
+def sanitize_tool_allowlist(tools: Iterable[object] | None) -> list[str]:
+    """Return runtime-callable names without removed/empty/duplicate entries."""
+    return [name for name in preserve_tool_allowlist(tools) if name not in REMOVED_TOOL_NAMES]
+
+
+def agent_delegation_catalog(registry) -> list[dict]:
+    """Only explicitly delegable builtins plus real, currently eligible MCP tools.
+
+    Does not follow current_registry: a running round keeps its own contracts.
+    Creation/Continue and the persistent coordinator explicitly use the latest
+    registry. Both paths still consult the same live MCP access gate.
+    """
+    if registry is None:
+        return []
+    summaries = registry.summaries(scope="agent", source="builtin")
+    rows = [{"name": name, "description": summaries[name], "kind": "builtin"}
+            for name in sorted(set(registry.names(scope="agent", source="builtin")) & AGENT_DELEGATION_TOOL_NAMES)]
+    manager = getattr(registry, "mcp_manager", None)
+    if manager is not None:
+        registered = set(registry.names(source="mcp"))
+        rows.extend({"name": meta.public_name, "description": meta.description, "kind": "mcp",
+                     "serverKey": meta.server_key, "originalToolName": meta.original_tool_name}
+                    for meta in manager.agent_tools() if meta.public_name in registered
+                    and registry.mcp_tool_identities.get(meta.public_name) == (meta.server_key, meta.original_tool_name))
+    return rows
+
+
+def agent_delegation_names(registry) -> set[str]:
+    return {row["name"] for row in agent_delegation_catalog(registry)}
+
+
+def agent_tool_unavailable_reason(registry, name: str) -> str:
+    if name in agent_delegation_names(registry):
+        return ""
+    manager = getattr(registry, "mcp_manager", None)
+    if manager is not None and name in registry.names(source="mcp"):
+        return manager.agent_tool_unavailable_reason(name) or "agent_tool_not_available"
+    return "agent_tool_not_available"
+
+
+def refresh_agent_tool_enums(registry) -> None:
+    """Finalize only the Agent/Plan declaration enums after all tools registered."""
+    names = sorted(agent_delegation_names(registry))
+    for tool in registry._tools.values():
+        props = tool.parameters.get("properties", {})
+        if tool.name in {"Agent", "AgentContinue"}:
+            props["tools"]["items"]["enum"] = names
+        elif tool.name == "AgentPlanDecision":
+            props["grantedTools"]["items"]["enum"] = names
+        elif tool.name in {"AgentPlanSubmit", "AgentPlanReplan"}:
+            requests = props["plan"]["properties"]["toolRequests"]
+            requests["maxItems"] = len(names)
+            requests["items"]["properties"]["name"]["enum"] = names

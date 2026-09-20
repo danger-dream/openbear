@@ -1,10 +1,10 @@
 import { shallowReactive } from 'vue';
 import Fuse from 'fuse.js';
 import { pinyin } from 'pinyin-pro';
-import { catalogKey } from './codec.js';
+import { catalogKey, referenceKey } from './codec.js';
 import { applyActivityReadVersions } from '../conversationActivity.js';
 
-export const referenceCatalog = shallowReactive({items:[],ready:false,connected:false,stale:false,includeArchived:false,epoch:'',seq:0,version:null,treeStatus:null,activityReadVersions:new Map()});
+export const referenceCatalog = shallowReactive({items:[],ready:false,connected:false,stale:false,includeArchived:false,epoch:'',seq:0,version:null,treeStatus:null,activityReadVersions:new Map(),conversationContentLimit:0,referenceSizes:new Map()});
 const records = new Map();
 let searchIndex = new Fuse([], {includeScore:true,threshold:0.32,ignoreLocation:true,keys:[{name:'normalized',weight:0.6},{name:'pinyin',weight:0.2},{name:'initials',weight:0.12},{name:'pathText',weight:0.08}]});
 let socket = null, timer = null, heartbeat = null, stopped = true, retry = 0, lastMessageAt = 0;
@@ -47,6 +47,22 @@ function rebuild() {
   referenceCatalog.items = [...records.values()];
   searchIndex.setCollection([...records.values()]);
 }
+export function acceptReferenceSizes(items=[],limit=0) {
+  if (Number(limit)>0) referenceCatalog.conversationContentLimit=Number(limit);
+  const sizes=new Map(referenceCatalog.referenceSizes);
+  for (const item of items) if (Number.isFinite(item.bodyChars)) sizes.set(referenceKey({...item,mode:''}),item.bodyChars);
+  referenceCatalog.referenceSizes=sizes;
+}
+export function referenceBodyChars(ref) {
+  if (Number.isFinite(ref.bodyChars)) return ref.bodyChars;
+  const source=referenceItem(ref);
+  if (ref.kind==='chat' && source) {
+    if (ref.scope==='recent' && Array.isArray(source.recentTurnChars)) return source.recentTurnChars.slice(0,ref.turns||20).reduce((a,b)=>a+b,0);
+    if (ref.scope!=='recent' && Number.isFinite(source.bodyChars)) return source.bodyChars;
+  }
+  return referenceCatalog.referenceSizes.get(referenceKey({...ref,mode:''}));
+}
+export function referencePolicyOptions() {return {limit:referenceCatalog.conversationContentLimit,sizeOf:referenceBodyChars};}
 export function applyCatalogPacket(packet) {
   if (packet.type === 'snapshot') {
     // User intent is not a property an older server response may overwrite.
@@ -67,6 +83,7 @@ export function applyCatalogPacket(packet) {
     referenceCatalog.seq = packet.seq; referenceCatalog.stale = false;
     if (affected.size) referenceCatalog.items = [...records.values()];
   } else return true;
+  acceptReferenceSizes(packet.items||packet.upserts||[],packet.conversationContentLimit);
   if (packet.version) referenceCatalog.version = packet.version;
   if (packet.treeStatus) referenceCatalog.treeStatus = applyActivityReadVersions(packet.treeStatus, referenceCatalog.activityReadVersions);
   return true;
@@ -78,8 +95,21 @@ export function acceptActivityReadReceipt(receipt = {}) {
   if (referenceCatalog.treeStatus) referenceCatalog.treeStatus = applyActivityReadVersions(referenceCatalog.treeStatus, versions);
 }
 export function referenceItem(ref) { void referenceCatalog.seq; return records.get(catalogKey(ref)); }
+// Ordered substrings give '*' its literal glob meaning without regex injection
+// or fuzzy fallback admitting candidates that do not satisfy the wildcard.
+function wildcardMatch(value, pattern) {
+  let offset = 0;
+  for (const part of pattern.split('*')) {
+    if (!part) continue;
+    const at = value.indexOf(part, offset);
+    if (at < 0) return false;
+    offset = at + part.length;
+  }
+  return true;
+}
 export function searchReferences(query='', {kind='',currentConversation='',limit=30,items=null}={}) {
   const q = normalizeQuery(query), compact = q.replace(/[\s._-]/g,'');
+  const wildcard = q.includes('*');
   const queryForms = /\p{Script=Han}/u.test(q) ? searchableItem({label:q}) : null;
   const candidates = items ? items.map(searchableItem) : referenceCatalog.items;
   const matches = new Map();
@@ -89,6 +119,12 @@ export function searchReferences(query='', {kind='',currentConversation='',limit
     let score = Infinity;
     const label = normalizeQuery(item.label), full = item.pinyin, initials = item.initials;
     if (!q) score = 10;
+    else if (wildcard) {
+      if (wildcardMatch(item.normalized, q)) score = 2;
+      else if (wildcardMatch(full, compact) || (queryForms && wildcardMatch(full, queryForms.pinyin))) score = 3;
+      else if (wildcardMatch(initials, compact) || (queryForms && wildcardMatch(initials, queryForms.initials))) score = 4;
+      else if (wildcardMatch(item.pathText, q)) score = 5;
+    }
     else if (label === q || normalizeQuery(item.name) === q) score = 0;
     else if (label.startsWith(q)) score = 1;
     else if (item.normalized.includes(q)) score = 2;
@@ -97,7 +133,7 @@ export function searchReferences(query='', {kind='',currentConversation='',limit
     else if (item.pathText.includes(q)) score = 5;
     if (Number.isFinite(score)) matches.set(item.key,{item,score});
   }
-  if (q.length > 1) {
+  if (q.length > 1 && !wildcard) {
     const engine = items ? new Fuse(candidates,{includeScore:true,threshold:0.3,ignoreLocation:true,keys:['normalized','pinyin','initials']}) : searchIndex;
     for (const {item,score} of engine.search(compact,{limit:limit*3})) {
       if ((kind && item.kind!==kind) || (item.kind==='chat' && item.id===currentConversation)) continue;
@@ -168,5 +204,5 @@ export function stopReferenceCatalog({clear=false}={}) {
   stopped=true;clearTimeout(timer);timer=null;clearInterval(heartbeat);clearScopeSync();
   const old=socket;socket=null;old?.close();referenceCatalog.connected=false;
   if(typeof window!=='undefined'){window.removeEventListener('pageshow',resume);document.removeEventListener('visibilitychange',resume);}
-  if(clear){overviewSubscription=null;records.clear();rebuild();Object.assign(referenceCatalog,{ready:false,stale:false,epoch:'',seq:0,version:null,treeStatus:null,includeArchived:false,activityReadVersions:new Map()});}
+  if(clear){overviewSubscription=null;records.clear();rebuild();Object.assign(referenceCatalog,{ready:false,stale:false,epoch:'',seq:0,version:null,treeStatus:null,includeArchived:false,activityReadVersions:new Map(),conversationContentLimit:0,referenceSizes:new Map()});}
 }

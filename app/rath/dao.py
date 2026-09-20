@@ -22,7 +22,7 @@ from app.rath.schemas import (
     RathTaskEvent,
     RathWorkflow,
 )
-from app.tools.allowlist import sanitize_tool_allowlist
+from app.tools.allowlist import preserve_tool_allowlist, sanitize_tool_allowlist
 
 
 def _new_uuid() -> str:
@@ -179,9 +179,11 @@ class RathDAO(AgentContinuityDAO):
         model: str | None = None,
         think_level: str | None = None,
         tool_allowlist: list[str] | None = None,
+        expected_tool_allowlist: list[str] | None = None,
+        preserve_unavailable_tools: bool = False,
         sort: int | None = None,
         enabled: bool | None = None,
-    ) -> None:
+    ) -> bool:
         fields: list[str] = ["updated_at=?"]
         params: list[Any] = [now_ts()]
         updates = {
@@ -197,18 +199,24 @@ class RathDAO(AgentContinuityDAO):
             if val is not None:
                 fields.append(f"{col}=?")
                 params.append(val)
+        normalize_tools = preserve_tool_allowlist if preserve_unavailable_tools else sanitize_tool_allowlist
         if tool_allowlist is not None:
             fields.append("tool_allowlist_json=?")
-            params.append(_json_dumps(sanitize_tool_allowlist(tool_allowlist)))
+            params.append(_json_dumps(normalize_tools(tool_allowlist)))
         if enabled is not None:
             fields.append("enabled=?")
             params.append(1 if enabled else 0)
         params.append(int(agent_id))
-        await self._db.conn.execute(
-            f"UPDATE rath_agents SET {', '.join(fields)} WHERE id=?",
+        condition = ""
+        if expected_tool_allowlist is not None:
+            condition = " AND tool_allowlist_json=?"
+            params.append(_json_dumps(normalize_tools(expected_tool_allowlist)))
+        cursor = await self._db.conn.execute(
+            f"UPDATE rath_agents SET {', '.join(fields)} WHERE id=?{condition}",
             tuple(params),
         )
         await self._db.conn.commit()
+        return cursor.rowcount == 1
 
     async def delete_agent(self, agent_id: int) -> None:
         await self._db.conn.execute("DELETE FROM rath_agents WHERE id=?", (int(agent_id),))
@@ -258,7 +266,9 @@ class RathDAO(AgentContinuityDAO):
             system_prompt=d["system_prompt"] or "",
             model=d["model"] or "",
             think_level=d["think_level"] or "",
-            tool_allowlist=sanitize_tool_allowlist(_json_loads(d["tool_allowlist_json"], [])),
+            # Preserve unavailable historical choices for settings round-trips.
+            # Runtime authorization sanitizes removed names separately.
+            tool_allowlist=preserve_tool_allowlist(_json_loads(d["tool_allowlist_json"], [])),
             sort=int(d["sort"] or 0),
             enabled=bool(d["enabled"]),
             created_at=int(d["created_at"] or 0),

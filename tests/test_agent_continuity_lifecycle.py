@@ -171,12 +171,13 @@ async def test_managed_initial_extra_tools_obey_instance_preset_ceiling(env):
     plan = sample_plan()
     plan["toolRequests"] = [{"name": "Bash", "reason": "test ceiling", "neededForSteps": ["s1"]}]
     coordinator = manager.plan_coordinator
-    submitted = await coordinator.submit_plan(tid, plan, request_id="submit", wait_for_decision=False)
+    # A Plan may request only tools currently allowed by this instance's preset;
+    # reject before it can be presented as an approvable expansion.
     with pytest.raises(PlanError, match="ceiling"):
-        await coordinator.decide(tid, expected_version=submitted["planVersion"], action="approve",
-                                 request_id="reject-outside-ceiling", reason="extra tool", granted_tools=["Bash"])
+        await coordinator.submit_plan(tid, plan, request_id="submit", wait_for_decision=False)
     snapshot = await coordinator.snapshot(tid)
-    assert snapshot["state"]["phase"] == "awaiting_plan_decision"
+    assert snapshot["state"]["phase"] == "drafting"
+    assert snapshot["state"]["pending_plan_version"] == 0
 
 
 async def test_task_cleanup_keeps_instance_context_until_conversation_deleted(env):

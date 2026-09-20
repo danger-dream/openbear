@@ -6,7 +6,7 @@ import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
 import "katex/dist/katex.min.css";
 import "markdown-it-texmath/css/texmath.css";
-import { referenceFromUrl } from "../../references/codec.js";
+import { referenceFromUrl, referenceKey, boundReference, preserveReferenceDestinations } from "../../references/codec.js";
 import { referenceChipOpen, referenceChipClose, escapeReferenceHtml } from "../../references/presentation.js";
 
 const MAX_HIGHLIGHT_CHARS = 8000;
@@ -86,15 +86,21 @@ function createMarkdownRenderer({highlightCode = true} = {}) {
 
 	renderer.renderer.rules.fence = (tokens, idx) => renderCodeBlock(tokens[idx].content || "", tokens[idx].info || "");
 	renderer.renderer.rules.code_block = (tokens, idx) => renderCodeBlock(tokens[idx].content || "", "");
-	renderer.renderer.rules.link_open = (tokens, idx, options, _env, self) => {
+	renderer.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 		const token = tokens[idx];
 		const href = token.attrGet("href") || "";
 		if (href.startsWith("openbear://ref/")) {
 			let end = idx + 1;
 			while (end < tokens.length && tokens[end].type !== "link_close") end++;
 			const label = tokens.slice(idx + 1, end).map(item => item.content || "").join("");
-			const reference = referenceFromUrl(href, label);
+			let reference = referenceFromUrl(href, label);
 			if (reference && end < tokens.length) {
+				const binding = env.referenceBindings?.[env.referenceIndex++];
+				// Frozen metadata is authoritative for old messages too. Do not
+				// advertise mention-only when an older parser froze content.
+				if (binding && referenceKey({...binding, mode: ''}) === referenceKey({...reference, mode: ''})) {
+					reference = boundReference(reference,binding);
+				}
 				for (let index = idx + 1; index < end; index++) { tokens[index].type = "text"; tokens[index].content = ""; }
 				tokens[end].meta = {...(tokens[end].meta || {}), referenceConsumed: true};
 				return referenceChipOpen(reference) + escapeReferenceHtml(reference.label) + referenceChipClose(reference);
@@ -198,14 +204,16 @@ export function normalizeLegacyMathBlocks(text) {
 
 export function renderMarkdownRaw(text, options = {}) {
 	const renderer = options?.live || options?.highlight === false ? liveMd : md;
-	return renderer.render(normalizeLegacyMathBlocks(richHtmlToMarkdown(text)));
+	const source = preserveReferenceDestinations(text, richHtmlToMarkdown);
+	return renderer.render(normalizeLegacyMathBlocks(source), {referenceBindings: options.references, referenceIndex: 0});
 }
 
 export function renderMarkdown(text, options = {}) {
 	const source = String(text || "");
 	if (!source) return "";
 	const live = Boolean(options?.live || options?.disableCache || options?.highlight === false);
-	if (live || source.length > MARKDOWN_CACHE_MAX_SOURCE_CHARS) return renderMarkdownRaw(source, {live, highlight: live ? false : options?.highlight});
+	// A source-only cache key cannot represent different frozen bindings.
+	if (live || options.references?.length || source.length > MARKDOWN_CACHE_MAX_SOURCE_CHARS) return renderMarkdownRaw(source, {...options, live, highlight: live ? false : options?.highlight});
 	const cached = markdownCache.get(source);
 	if (cached !== undefined) return touchCache(markdownCache, source, cached, MARKDOWN_CACHE_LIMIT);
 	return touchCache(markdownCache, source, renderMarkdownRaw(source, options), MARKDOWN_CACHE_LIMIT);

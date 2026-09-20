@@ -15,6 +15,11 @@ const props = defineProps({
 	turnId: {type: [String, Number], required: true},
 	index: {type: Number, required: true},
 	autoScrollLocked: {type: Boolean, default: false},
+	// Reasoning follow-scroll depends on the lock state *and* this row being the
+	// live reasoning row. The parent resolves that conjunction so rows that can
+	// never follow (every historical event) keep a constant prop and are skipped
+	// by Vue when the lock toggles.
+	reasoningAutoscroll: {type: Boolean, default: false},
 	retryCancelPending: {type: Boolean, default: false},
 	liveTextTarget: {type: String, default: ""},
 	detailKey: {type: Function, required: true},
@@ -107,11 +112,21 @@ function retryOutcomeMeta(event = props.event) {
 	const {tone} = retryStatusView(event?.retry);
 	return {icon: tone === "success" ? CircleCheck : tone === "neutral" ? Refresh : CircleClose, tone};
 }
+
+// A failed run appends a dedicated failure row after the partial text it managed
+// to produce. The cascade that terminalizes the in-flight assistant rows stamps
+// them with the error text too, so `error` cannot distinguish "this row is the
+// failure" from "this row was open when the run failed". Only the boolean
+// `failure` marker identifies the failure itself; partial text keeps its normal
+// rendering.
+function isFailureAnswer(event = {}) {
+	return event?.message?.failure === true || event?.failure === true;
+}
 </script>
 
 <template>
 	<div v-if="props.event.kind === 'answer'" class="answer-block"
-	     :class="{ 'answer-has-text': hasMeaningfulAnswerText(props.event.message.content || '') }">
+	     :class="{ 'answer-has-text': hasMeaningfulAnswerText(props.event.message.content || ''), 'answer-is-error': isFailureAnswer(props.event) }">
 		<details
 			v-if="props.showReasoning && props.event.message.reasoning"
 			:key="`${key('reasoning')}-${props.event.reasoningActive ? 'live' : 'done'}`"
@@ -126,10 +141,14 @@ function retryOutcomeMeta(event = props.event) {
 				<span class="disclosure-icon"><ArrowRight/></span>
 			</summary>
 			<div v-if="props.event.reasoningActive || isOpen('reasoning')" class="reasoning-body"
-			     v-reasoning-autoscroll="props.event.reasoningActive && props.autoScrollLocked">
+			     v-reasoning-autoscroll="props.reasoningAutoscroll">
 				<ConsoleMarkdown :text="props.event.message.reasoning" :live="props.liveTextTarget === 'reasoning'"/>
 			</div>
 		</details>
+		<p v-if="isFailureAnswer(props.event)" class="answer-error-banner">
+			<CircleClose class="inline-icon"/>
+			<span>本轮执行失败</span>
+		</p>
 		<ConsoleMarkdown v-if="hasMeaningfulAnswerText(props.event.message.content || '')" class="answer-text"
 		                 :text="answerContent(props.event.message.content || '')"
 		                 :live="props.liveTextTarget === 'answer'"/>
@@ -299,6 +318,22 @@ details[open] > summary > .disclosure-icon {
 
 .answer-block + .answer-block {
 	margin-top: 0.7rem;
+}
+
+/* A failed run keeps its partial text, so the failure needs its own visible
+   anchor instead of blending into the preceding streamed sentences. */
+.answer-is-error {
+	border-left: 2px solid #fecaca;
+	padding-left: .6rem;
+}
+
+.answer-error-banner {
+	display: flex;
+	align-items: center;
+	margin: .12rem 0 .3rem;
+	color: #b42318;
+	font-size: 12px;
+	font-weight: 600;
 }
 
 .answer-text + .reasoning-card {
@@ -734,6 +769,12 @@ details[open] > summary > .disclosure-icon {
 /* OpenBear system dark theme */
 html.dark .disclosure-icon {
 		color: #c6c6cd;
+	}
+html.dark .answer-is-error {
+		border-left-color: rgba(251, 133, 133, 0.52);
+	}
+html.dark .answer-error-banner {
+		color: #fb8585;
 	}
 html.dark details[open] > summary > .disclosure-icon {
 		color: #60a5fa;

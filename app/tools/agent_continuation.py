@@ -9,7 +9,9 @@ from app.rath.continuity import AgentContinuityError, agent_session_public
 from app.rath.schemas import TERMINAL_TASK_STATUSES, RathTask
 from app.tools.allowlist import (
     AGENT_DELEGATION_TOOL_NAMES,
+    agent_delegation_names,
     agent_phase_tool_names,
+    agent_tool_unavailable_reason,
     expand_agent_tool_names,
 )
 from app.tools.base import current_tool_context
@@ -141,7 +143,8 @@ class AgentContinuationTools:
         pending = await cur.fetchone() is not None
         schemas = agent_phase_tool_names(granted, managed=managed, phase=phase,
                                          approved=approved, pending_control=pending,
-                                         ceiling=data.get("presetToolCeiling") or [])
+                                         ceiling=data.get("presetToolCeiling") or [],
+                                         available=agent_delegation_names(self.registry))
         schemas &= set(self.registry.names(scope="agent"))
         effective = set(schemas)
         if task.status in TERMINAL_TASK_STATUSES or task.status == "needs_openbear_control":
@@ -149,9 +152,10 @@ class AgentContinuationTools:
         elif pending or (managed and phase == "finalizing"):
             effective &= {"AgentControlAck"}
         elif managed and phase == "executing" and not state.get("current_step_id"):
-            effective -= expand_agent_tool_names(AGENT_DELEGATION_TOOL_NAMES)
+            effective -= expand_agent_tool_names(agent_delegation_names(self.registry))
         return {"schemaTools": sorted(schemas), "effectiveTools": sorted(effective),
-                "grantedTools": sorted(expand_agent_tool_names(granted)),
+                "grantedTools": sorted(expand_agent_tool_names(approved if managed and state.get("active_plan_version") else granted)),
+                "unavailableTools": {name: agent_tool_unavailable_reason(self.registry, name) for name in (approved if managed and state.get("active_plan_version") else granted) if name not in agent_delegation_names(self.registry)},
                 "presetToolCeiling": list(data.get("presetToolCeiling") or []), "phase": phase}
 
     async def agent_info(self, args: dict[str, Any]) -> str:

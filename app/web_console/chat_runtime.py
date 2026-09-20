@@ -65,6 +65,10 @@ class WebAdminChatRunMixin:
         session_id = ""
         stats_task: asyncio.Task[Any] | None = None
         post_turn_actions_drained = False
+        # Turn/run identity for this run's stats snapshots. Populated once the run
+        # is established; kept outside the try so the cancellation path can still
+        # publish its terminal snapshot.
+        stats_identity: dict[str, str] = {}
         conversation_uuid = str((conversation or {}).get("conversation_uuid") or "")
         model_label = str((conversation or {}).get("model") or "") or getattr(self.model_selection, "current", "") or self.config.models.primary
         if self.control_actions is not None:
@@ -80,6 +84,18 @@ class WebAdminChatRunMixin:
             run_fast_mode_requested = await messages.get_fast_mode(chat_id)
             if not root_turn_uuid and renderer.live is not None:
                 root_turn_uuid = str(getattr(renderer.live, "_agent_turn_uuid", "") or getattr(renderer.live, "current_turn_uuid", "") or "")
+            # A terminal event (error/stopped/done) clears the live stream's turn
+            # and run identity. A stats snapshot published afterwards would then
+            # have no turn to attach to and could land on an unrelated
+            # conversation-level operation, leaving the real turn without its
+            # completion footer. Capture this run's identity while it is still
+            # available; omit empty values so the existing live fallback stays
+            # authoritative for them.
+            if root_turn_uuid:
+                stats_identity["turnUuid"] = str(root_turn_uuid)
+            live_run_uuid = str(getattr(renderer.live, "current_run_uuid", "") or "") if renderer.live is not None else ""
+            if live_run_uuid:
+                stats_identity["runUuid"] = live_run_uuid
             prompt_builder = self._build_system_prompt_for_chat
             # Keep compatibility with focused tests/integrations that replace the
             # historical no-argument builder while production passes the owning
@@ -148,6 +164,7 @@ class WebAdminChatRunMixin:
                 model_label=model_label,
             )
             raw_private_messages = list((private_state or {}).get("messages") or [])
+            restored_controller_anchor = None
             if raw_private_messages:
                 # load_controller_model_context has already verified that this private
                 # checkpoint matches the independently persisted window and transcript.
@@ -158,6 +175,7 @@ class WebAdminChatRunMixin:
                     and validate_model_context(raw_private_messages)
                 ):
                     history = deserialize_messages(raw_private_messages)
+                    restored_controller_anchor = private_state["anchor"]
                 else:
                     await messages.clear_controller_model_context(chat_id)
 
@@ -177,6 +195,42 @@ class WebAdminChatRunMixin:
                     self.db, chat_id=chat_id, conversation_uuid=conversation_uuid,
                     turn_uuid=root_turn_uuid, payloads=paused, history=history,
                 )
+
+            if conversation_uuid and root_turn_uuid and not task_notification:
+                # A failed run may leave original Web/TG instructions in memory.
+                # Adopt them BEFORE the new user row, after restoring the private
+                # checkpoint, so both message IDs and model order remain A,B,C.
+                # Same-root arrivals belong to this run's ordinary loop boundary.
+                prior_steers = [item for item in steering.pending_items(chat_id)
+                                if item.get("source") in {"web", "telegram"}
+                                and str(item.get("turnUuid") or item.get("turn_uuid") or "")
+                                and str(item.get("turnUuid") or item.get("turn_uuid")) != root_turn_uuid]
+                for item in prior_steers:
+                    text = str(item.get("text") or item.get("content") or "").strip()
+                    turn = str(item.get("turnUuid") or item.get("turn_uuid"))
+                    original_root = str(item.get("rootTurnUuid") or turn)
+                    message_uuid = str(item.get("messageUuid") or item.get("message_uuid") or "")
+                    message_id = await self._persist_web_transcript_message(
+                        messages, chat_id, "user", text,
+                        conversation_uuid=conversation_uuid, turn_uuid=turn,
+                        run_root_turn_uuid=original_root,
+                        op_ids=[f"msg:{message_uuid}"] if message_uuid else None,
+                        tokens=estimate_tokens(text),
+                    )
+                    # Remove only the durable original. A newer same-run steer
+                    # may have arrived during the write and must stay queued.
+                    steering.drain_items(chat_id, item_ids={str(item["id"])})
+                    bundles = [str(item["referenceBundleId"])] if item.get("referenceBundleId") else []
+                    history.append(mark_source(
+                        {"role": "user", "content": text, **({BUNDLE_FIELD: bundles} if bundles else {})},
+                        kind="human", source_id=f"message:{message_id}", message_id=message_id,
+                        turn_uuid=turn, run_root_turn_uuid=original_root, reference_only=not bundles,
+                    ))
+                    await messages.bump_user_turn(chat_id)
+                    result.steered += 1
+                    # Update the old input's existing operation, not the current
+                    # live execution identity. Answers/stats still belong to C.
+                    await renderer.on_steers_injected([item], injected_texts=[text], restored=True)
 
             visible_user_text = (user_text or "").strip() or ("请根据我发送的附件内容回答。" if media else "")
             llm_text = build_llm_text_with_media(user_text, media or [])
@@ -392,6 +446,7 @@ class WebAdminChatRunMixin:
                 backend=backend, model=model_id, model_label=model_label,
                 on_rotated=_on_window_rotated, on_state=_compression_state,
                 active_run_root_turn_uuid=root_turn_uuid,
+                restored_controller_anchor=restored_controller_anchor,
                 strategy_resolver=lambda: conversation_strategy(self.db, conversation_uuid, self.config.context_management.default_strategy),
                 strategies={"model_summary": ModelSummaryStrategy(self.config, self.llm_factory, model_label, on_model_call=_summary_model_call)},
             )
@@ -468,6 +523,7 @@ class WebAdminChatRunMixin:
                     ledger_usage = await _ledger_usage()
                     await renderer.emit({
                         "type": "stats",
+                        **stats_identity,
                         "stats": self._run_stats_json(
                             result,
                             cost_usd=result.controller_cost_usd,
@@ -918,6 +974,7 @@ class WebAdminChatRunMixin:
             ledger_usage = await _ledger_usage()
             await renderer.emit({
                 "type": "stats",
+                **stats_identity,
                 "stats": self._run_stats_json(
                     result, cost_usd=request_cost, model=model_label,
                     think_level=think_level, context_window=ctx_window,
@@ -981,6 +1038,7 @@ class WebAdminChatRunMixin:
                 ledger_usage = await _ledger_usage()
                 await renderer.emit({
                     "type": "stats",
+                    **stats_identity,
                     "stats": self._run_stats_json(
                         result, cost_usd=request_cost, model=model_label,
                         think_level=think_level, context_window=ctx_window or self.llm_factory.context_window(model_label),

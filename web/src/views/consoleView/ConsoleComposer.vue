@@ -592,7 +592,8 @@ function focusInteraction(interactionId) {
 	return true;
 }
 
-defineExpose({focus, adjustHeight, openFilePicker, focusInteraction});
+function getReferenceOrder() { return composerTextarea.value?.getReferenceOrder?.() || []; }
+defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenceOrder});
 </script>
 
 <template>

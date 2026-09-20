@@ -448,6 +448,21 @@ class MCPToolFilterConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
+class MCPAgentAccessConfig(BaseModel):
+    mode: Literal["disabled", "all", "selected"] = "disabled"
+    tools: list[str] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _exact_tool_names(cls, value: Any) -> list[str]:
+        if not isinstance(value, list) or any(not isinstance(name, str) or not name.strip() for name in value):
+            raise ValueError("agentAccess.tools must be an array of nonempty original tool names")
+        # Preserve case and spelling; these are literal MCP names, not glob rules.
+        return list(dict.fromkeys(value))
+
+
 class MCPServerConfig(BaseModel):
     enabled: bool = True
     transport: Literal["stdio", "streamable_http"] = "stdio"
@@ -472,6 +487,7 @@ class MCPServerConfig(BaseModel):
     # None means inherit from mcp.defaultApproval.
     approval: Literal["allow", "ask", "deny"] | None = None
     tools: MCPToolFilterConfig = Field(default_factory=MCPToolFilterConfig)
+    agent_access: MCPAgentAccessConfig = Field(default_factory=MCPAgentAccessConfig, alias="agentAccess")
 
     model_config = {"populate_by_name": True, "extra": "forbid"}
 

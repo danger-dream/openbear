@@ -214,7 +214,8 @@ function successRate(stats = {}) {
 function tokenTotals(stats = {}) {
   const input = Number(stats.input_tokens || 0) + Number(stats.cache_read_tokens || 0) + Number(stats.cache_write_tokens || 0);
   const output = Number(stats.output_tokens || 0);
-  const cache = Number(stats.cache_read_tokens || 0) + Number(stats.cache_write_tokens || 0);
+  // 缓存仅计读缓存(命中)，写缓存计入完整 prompt 但不算命中，与 parrot 口径一致。
+  const cache = Number(stats.cache_read_tokens || 0);
   const pct = input ? `${(cache / input * 100).toFixed(1)}%` : "—";
   return { input, output, cache, pct };
 }

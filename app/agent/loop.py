@@ -23,6 +23,7 @@ from app.agent.tool_call_hooks import normalize_tool_calls
 from app.agent.transcript_repair import MISSING_TOOL_RESULT_TEXT, repair_role_alternation
 from app.context.request_view import expanded_request_view
 from app.context.runtime import WindowRuntime
+from app.context.store import ControllerMessagesAppended, StaleWindow, merge_controller_additions
 from app.llm.base import LLMBackend, Message, OpenBearLLMError
 from app.llm.events import ToolCall, Usage
 from app.llm.retry import (
@@ -341,6 +342,7 @@ class Agent:
             except Exception:
                 pass
         convo = list(messages)
+        controller_seen_high_water: int | None = None
         tool_schemas = self._tools.schemas(scope="main")
         t0 = time.monotonic()
         result.start_monotonic = t0  # 供取消兜底现算 total_time_ms
@@ -440,8 +442,9 @@ class Agent:
             if inspect.isawaitable(maybe):
                 await maybe
 
-        async def _prepare_window_once(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None) -> bool:
-            nonlocal convo
+        async def _prepare_window_once(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None,
+                                       phase: str = "pre_model_request") -> bool:
+            nonlocal convo, controller_seen_high_water, open_rendered
             if window_runtime is None:
                 return False
             # A steering message accepted during retry belongs to this request,
@@ -451,23 +454,46 @@ class Agent:
             if callable(bind):
                 bind(convo)
             window_runtime.bind_sources(convo)
-            expanded = list(await model_request_overlay(list(convo))) if model_request_overlay else list(convo)
-            request_view = expanded_request_view(expanded, retry_tail=retry_tail)
-
-            expected_high_water = None
-            if window_runtime.store.owner.kind == "controller":
-                cur = await window_runtime.store.db.conn.execute(
-                    "SELECT COALESCE(MAX(id),0) AS high_water FROM messages WHERE chat_id=?",
-                    (window_runtime.store.owner.chat_id,),
-                )
-                expected_high_water = int((await cur.fetchone())["high_water"])
             previous = window_runtime.window_version
-            convo = await window_runtime.prepare(
-                convo, system=system, tools=tool_schemas, force=force, attempt=overflow_attempt,
-                refresh_after_rotation=window_request_refresher,
-                expected_message_high_water=expected_high_water, request_view=request_view,
-                request_options={**request_options, "stream": True},
-            )
+            boundary = None
+            for boundary_attempt in range(3):
+                if window_runtime.store.owner.kind == "controller":
+                    boundary, additions = await window_runtime.store.controller_boundary(
+                        convo, since=controller_seen_high_water, phase=phase,
+                        expected_revision=window_runtime.state_revision, previous=boundary,
+                        restored_anchor=window_runtime.restored_controller_anchor if controller_seen_high_water is None else None,
+                    )
+                    # These originals already exist in SQLite. Do not replay the
+                    # persister, injection hooks, model, tools or their side effects.
+                    # Cut only for genuinely NEW input, as ordinary steering does.
+                    new_user_count = sum(message.get("role") == "user" for message in additions)
+                    if new_user_count and open_rendered:
+                        await renderer.cut()
+                        open_rendered = False
+                    convo = merge_controller_additions(convo, additions)
+                    result.steered += new_user_count
+                expanded = list(await model_request_overlay(list(convo))) if model_request_overlay else list(convo)
+                request_view = expanded_request_view(expanded, retry_tail=retry_tail)
+                try:
+                    prepared = await window_runtime.prepare(
+                        convo, system=system, tools=tool_schemas, force=force, attempt=overflow_attempt,
+                        refresh_after_rotation=window_request_refresher,
+                        expected_message_high_water=boundary.high_water if boundary else None,
+                        controller_boundary=boundary, request_view=request_view,
+                        request_options={**request_options, "stream": True},
+                    )
+                except ControllerMessagesAppended as exc:
+                    # Only retry this safe stage, from the uncompressed originals
+                    # plus verified new rows. The OLD prefix/window guard survives
+                    # the retry; editing/deletion/owner changes remain fatal.
+                    if boundary is None or boundary_attempt == 2:
+                        raise StaleWindow("controller_inputs_changed_repeatedly_before_request; instructions_preserved",
+                                          **exc.metadata) from exc
+                    continue
+                convo = prepared
+                if boundary is not None:
+                    controller_seen_high_water = boundary.high_water
+                break
             changed = window_runtime.window_version != previous
             result.context_window_version = window_runtime.window_version
             result.context_owner_id = window_runtime.store.owner.key
@@ -476,14 +502,15 @@ class Agent:
                 result.last_prompt_usage_reported = False
             return changed
 
-        async def _prepare_window(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None) -> bool:
+        async def _prepare_window(*, force: bool = False, overflow_attempt: int = 0, retry_tail: list[Message] | None = None,
+                                  phase: str = "pre_model_request") -> bool:
             if window_runtime is None:
                 return False
             changed = False
             for revision_attempt in range(3):
                 changed = await _prepare_window_once(
                     force=force and revision_attempt == 0, overflow_attempt=overflow_attempt,
-                    retry_tail=retry_tail,
+                    retry_tail=retry_tail, phase=phase,
                 ) or changed
                 # Incoming Web/TG steering lives in the queue until injection, so
                 # the database high-water CAS alone cannot see arrival during the
@@ -1184,7 +1211,7 @@ class Agent:
                 # rebuilt neutral context rather than stale opaque items.
                 await _checkpoint_native_context(convo, replayable=native_round_replayable)
                 if window_runtime is not None and window_runtime.pending:
-                    await _prepare_window()
+                    await _prepare_window(phase="post_tool_results")
                     await _checkpoint_native_context(convo, replayable=native_round_replayable)
 
                 # 软约束检查
@@ -1300,9 +1327,17 @@ class Agent:
             # #11 空响应 / 只思考补救重试：模型这轮调用成功(finish=stop)但没吐正文。
             # 偶发于上游波动或推理模型卡在思考阶段。注入一句引导后重发本轮,大概率恢复;
             # 用独立计数上限封死,避免模型持续不出正文导致死循环。
+            #
+            # finish=length（输出被上游上限截断）不走补救：那不是「偶发没输出」,而是模型已经
+            # 烧满预算被强制腰斩。同一份上下文 + 同一档位重发只会再截断一次,白烧一整份输出
+            # token。降档属于用户设置,框架不代为修改,按终止处理并告知(见下方 #14)。
             if not full_text.strip():
                 only_reasoning = bool(reasoning_text.strip())
-                if only_reasoning and reasoning_only_retry < self._reasoning_only_retry_limit:
+                truncated = finish == "length"
+                if truncated:
+                    log.warning("输出被截断且无正文，不补救重试，直接终止",
+                                轮次=round_no, 思考长度=len(reasoning_text))
+                elif only_reasoning and reasoning_only_retry < self._reasoning_only_retry_limit:
                     reasoning_only_retry += 1
                     result.model_retry += 1
                     log.warning("模型只思考无正文，补救重试", 轮次=round_no, 次数=reasoning_only_retry)
@@ -1310,7 +1345,7 @@ class Agent:
                     convo.append({"role": "user",
                                   "content": "你刚才只有思考、没有输出正文回复。请基于已有信息直接给出最终回答。"})
                     continue
-                if not only_reasoning and empty_retry < self._empty_response_retry_limit:
+                elif not only_reasoning and empty_retry < self._empty_response_retry_limit:
                     empty_retry += 1
                     result.model_retry += 1
                     log.warning("模型空响应，补救重试", 轮次=round_no, 次数=empty_retry)
@@ -1349,7 +1384,7 @@ class Agent:
                 if window_runtime is not None:
                     await _checkpoint_native_context(convo, replayable=native_round_replayable)
                 steered_before_compression = result.steered
-                await _prepare_window()
+                await _prepare_window(phase="post_model_response")
                 await _checkpoint_native_context(
                     convo,
                     replayable=native_round_replayable,
@@ -1361,8 +1396,16 @@ class Agent:
             _apply_footer()
             final_body = full_text or "（空回复）"
             if finish == "length":
-                # 被模型 max_tokens 截断:给老大明确提示,免得以为回复莫名其妙断在半截。
-                final_body = f"{final_body}\n\n⚠️ 回复达到长度上限被截断。"
+                if full_text.strip():
+                    # 被模型 max_tokens 截断:给老大明确提示,免得以为回复莫名其妙断在半截。
+                    final_body = f"{final_body}\n\n⚠️ 回复达到长度上限被截断。"
+                else:
+                    # 截断且完全没吐出正文：说明这一轮的输出预算全被思考吃掉了。
+                    # 只依据 finish / 正文 / 思考三者是否为空判断，不解析思考内容。
+                    final_body = (
+                        "⚠️ 模型思考输出超限且未产出正文，"
+                        "可尝试降低思考档位或更换模型后重试。"
+                    )
             await renderer.finalize(final_body,
                                     reasoning_text if show_thinking else "")
             log.info("Agent完成", 轮次=round_no, 工具=result.tools_used or "无",

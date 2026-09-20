@@ -224,7 +224,7 @@ class WebAdminConversationTreeMixin:
         return wanted
 
     async def _tree_running_state(self, owner_chat_id: int) -> dict[str, Any]:
-        """Return complete unarchived runtime truth without loading timelines or attributes."""
+        """Return runtime truth and recent interaction metadata, never message bodies."""
         cur = await self.db.conn.execute(
             """
             SELECT conversation_uuid, internal_chat_id, folder_uuid, title, pinned_at,
@@ -236,6 +236,41 @@ class WebAdminConversationTreeMixin:
             (int(owner_chat_id),),
         )
         rows = [dict(row) for row in await cur.fetchall()]
+        # Creation is stable for user/queued input; assistant activity advances
+        # only at a completed visible response, not each streaming append. The
+        # terminal snapshot survives frame retention; old rows may use the first
+        # durable end frame. Never use conversation/operation updated_at here.
+        cur = await self.db.conn.execute(
+            """
+            SELECT o.conversation_uuid,
+                   MAX(CASE WHEN o.op_type='user_message' THEN o.created_at_ms ELSE
+                       COALESCE(NULLIF(CAST(json_extract(o.payload_json,'$.terminalAtMs') AS INTEGER),0),
+                           (SELECT MIN(f.created_at_ms) FROM web_event_frames f
+                            WHERE f.conversation_uuid=o.conversation_uuid AND f.op_id=o.op_id AND f.action='end'),
+                           o.created_at_ms)
+                   END) AS last_interaction_at_ms
+            FROM web_conversations c JOIN web_operations o ON o.conversation_uuid=c.conversation_uuid
+            WHERE c.owner_chat_id=? AND COALESCE(c.archived_at,0)=0
+              AND o.op_type IN ('user_message','assistant_message')
+              AND COALESCE(o.internal,0)=0
+              AND COALESCE(json_extract(o.payload_json,'$.internal'),0)=0
+              AND COALESCE(json_extract(o.payload_json,'$.hidden'),0)=0
+              AND (
+                  (o.op_type='user_message' AND
+                      (LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0
+                       OR COALESCE(json_array_length(o.payload_json,'$.attachments'),0)>0))
+                  OR (o.op_type='assistant_message' AND o.lifecycle='terminal' AND o.status='completed'
+                      AND COALESCE(json_extract(o.payload_json,'$.error'),0)=0
+                      AND LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0)
+              )
+            GROUP BY o.conversation_uuid
+            HAVING last_interaction_at_ms>0
+            ORDER BY last_interaction_at_ms DESC, o.conversation_uuid ASC
+            LIMIT 5
+            """,
+            (int(owner_chat_id),),
+        )
+        recent_times = {str(row["conversation_uuid"]): int(row["last_interaction_at_ms"]) for row in await cur.fetchall()}
         uuids = [str(row.get("conversation_uuid") or "") for row in rows]
         if uuids:
             placeholders = ",".join("?" for _ in uuids)
@@ -312,6 +347,7 @@ class WebAdminConversationTreeMixin:
         }
         running_items: list[dict[str, Any]] = []
         activity_items: list[dict[str, Any]] = []
+        recent_items: dict[str, dict[str, Any]] = {}
         folder_counts: dict[str, int] = {}
         direct_conversation_counts: dict[str, int] = {}
         folders = await self._tree_folders(owner_chat_id)
@@ -334,20 +370,20 @@ class WebAdminConversationTreeMixin:
                 or bool(pending)
             )
             activity = activity_fields(row)
-            if not running and not activity["activityUnread"]:
+            if not running and not activity["activityUnread"] and conv_uuid not in recent_times:
                 continue
             needs_attention = bool(
                 pending or int(facts.get("waitingControlCount") or 0)
                 or int(facts.get("pendingInteractionCount") or 0)
                 or int(facts.get("pausedCount") or 0) or rath_waiting.get(chat_id, 0)
             )
-            current = str(live_snapshot.get("currentStatus") or row.get("current_status") or "运行中")
+            current = str(live_snapshot.get("currentStatus") or row.get("current_status") or ("运行中" if running or activity["activityUnread"] else "就绪"))
             if rath_counts.get(chat_id, 0) and not live_snapshot.get("running"):
                 current = "Agent 后台执行中"
             item = {
                 **activity,
                 "activityPending": pending,
-                "activityState": ("waiting" if needs_attention else "running") if running else str(activity["activityResult"].get("status") or "completed"),
+                "activityState": ("waiting" if needs_attention else "running") if running else str(activity["activityResult"].get("status") or ("completed" if activity["activityUnread"] else "idle")),
                 "activityAtMs": (int(facts.get("activeStartedAtMs") or 0) or rath_started.get(chat_id, 0) or int(row.get("created_at") or 0) * 1000) if running else int(activity["activityResult"].get("atMs") or 0),
                 "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话",
                 "kind": "conversation",
@@ -364,7 +400,10 @@ class WebAdminConversationTreeMixin:
                 "running": running,
                 "currentStatus": current,
             }
-            activity_items.append(item)
+            if conv_uuid in recent_times:
+                recent_items[conv_uuid] = {**item, "lastInteractionAtMs": recent_times[conv_uuid]}
+            if running or activity["activityUnread"]:
+                activity_items.append(item)
             if not running:
                 continue
             running_items.append(item)
@@ -373,6 +412,7 @@ class WebAdminConversationTreeMixin:
         return {
             "items": running_items,
             "activityItems": activity_items,
+            "recentItems": [recent_items[key] for key in recent_times if key in recent_items],
             "folderRunningCounts": folder_counts,
             "folderConversationCounts": self._tree_subtree_counts(direct_conversation_counts, folders),
             "revision": int(time.time() * 1000),
@@ -689,50 +729,78 @@ class WebAdminConversationTreeMixin:
         folders = await self._tree_folders(owner)
         status = await self._tree_running_state(owner) if system_node != "archive" else {"items": [], "folderRunningCounts": {}}
         running_lookup = {str(item["conversationUuid"]): item for item in status.get("items") or []}
-        nodes: list[dict[str, Any]] = []
+        folder_nodes: list[dict[str, Any]] = []
         if system_node == "":
-            nodes.extend(await self._tree_direct_folder_nodes(owner, parent))
+            folder_nodes.extend(await self._tree_direct_folder_nodes(owner, parent))
         archive_clause = "COALESCE(wc.archived_at,0)>0" if system_node == "archive" else "COALESCE(wc.archived_at,0)=0"
         folder_clause = "" if system_node == "archive" else "AND COALESCE(wc.folder_uuid,'')=?"
         params: tuple[Any, ...] = (owner,) if system_node == "archive" else (owner, parent)
+        conv_where = f"wc.owner_chat_id=? AND {archive_clause} {folder_clause}"
+        conv_order = """
+                     ORDER BY CASE WHEN COALESCE(wc.pinned_at,0)>0 THEN 0 ELSE 1 END,
+                              CASE WHEN wc.display_order IS NULL THEN 1 ELSE 0 END,
+                              wc.display_order ASC, COALESCE(wc.created_at,0) DESC, wc.id DESC
+                     """
+        # Folders lead the page window and are never paginated, so a page
+        # boundary can fall inside the conversation group. Fetch ONLY the
+        # conversations that can land in this window: the per-row
+        # last_conversation_at subquery then runs at most `limit` times instead
+        # of once per conversation in the branch.
+        folder_count = len(folder_nodes)
         cur = await self.db.conn.execute(
-            f"""
-            SELECT wc.*,
-                   COALESCE((SELECT MAX(m.created_at) FROM messages m
-                             WHERE m.chat_id=wc.internal_chat_id
-                               AND COALESCE(m.task_uuid,'')=''
-                               AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) AS last_conversation_at
-            FROM web_conversations wc
-            WHERE wc.owner_chat_id=? AND {archive_clause} {folder_clause}
-            ORDER BY CASE WHEN COALESCE(wc.pinned_at,0)>0 THEN 0 ELSE 1 END,
-                     CASE WHEN wc.display_order IS NULL THEN 1 ELSE 0 END,
-                     wc.display_order ASC, COALESCE(wc.created_at,0) DESC, wc.id DESC
-            """,
-            params,
+            f"SELECT COUNT(*) FROM web_conversations wc WHERE {conv_where}", params
         )
-        nodes.extend(self._tree_conversation_json(dict(row), folders, running_lookup) for row in await cur.fetchall())
-        page = nodes[offset:offset + limit]
+        total_conversations = int((await cur.fetchone())[0] or 0)
+        total_nodes = folder_count + total_conversations
+        start = max(offset, folder_count)
+        end = min(offset + limit, total_nodes)
+        conv_offset = start - folder_count
+        conv_limit = max(0, end - start)
+        conversation_nodes: list[dict[str, Any]] = []
+        if conv_limit > 0:
+            cur = await self.db.conn.execute(
+                f"""
+                SELECT w.*,
+                       COALESCE((SELECT MAX(m.created_at) FROM messages m
+                                 WHERE m.chat_id=w.internal_chat_id
+                                   AND COALESCE(m.task_uuid,'')=''
+                                   AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) AS last_conversation_at
+                FROM (SELECT wc.* FROM web_conversations wc WHERE {conv_where} {conv_order} LIMIT ? OFFSET ?) w
+                """,
+                (*params, conv_limit, conv_offset),
+            )
+            conversation_nodes.extend(self._tree_conversation_json(dict(row), folders, running_lookup) for row in await cur.fetchall())
+        # `conversation_nodes` already starts at global index `start`, so the
+        # page is assembled by segment: any leading folders in range, then the
+        # conversations that follow them.
+        if offset < folder_count:
+            page = folder_nodes[offset:offset + limit]
+            remaining = limit - len(page)
+            if remaining > 0:
+                page = page + conversation_nodes[:remaining]
+        else:
+            page = list(conversation_nodes[:limit])
         included_folder_ids: list[str] = []
         if tracked_folder_ids and system_node == "":
-            folder_nodes = {
+            folder_nodes_by_id = {
                 str(item.get("folderId") or ""): item
-                for item in nodes
+                for item in folder_nodes
                 if item.get("kind") == "folder"
             }
-            if include_folder_id and include_folder_id not in folder_nodes:
+            if include_folder_id and include_folder_id not in folder_nodes_by_id:
                 return web.json_response({"ok": False, "error": "included_folder_not_direct_child"}, status=400)
             page_folder_ids = {
                 str(item.get("folderId") or "") for item in page if item.get("kind") == "folder"
             }
             for folder_id in tracked_folder_ids:
-                included_folder = folder_nodes.get(folder_id)
+                included_folder = folder_nodes_by_id.get(folder_id)
                 if included_folder is None:
                     continue
                 included_folder_ids.append(folder_id)
                 if folder_id not in page_folder_ids:
                     page.append(included_folder)
                     page_folder_ids.add(folder_id)
-        next_cursor = str(offset + limit) if offset + limit < len(nodes) else ""
+        next_cursor = str(offset + limit) if offset + limit < total_nodes else ""
         return web.json_response({
             "ok": True,
             "parentId": parent,

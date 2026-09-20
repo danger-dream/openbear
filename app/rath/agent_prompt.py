@@ -8,14 +8,18 @@ from typing import Any
 
 from app.db.engine import DB
 from app.memory.builtin import BuiltinMemoryClient
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES, sanitize_tool_allowlist, expand_agent_tool_names
+from app.tools.allowlist import (
+    agent_delegation_names,
+    expand_agent_tool_names,
+    sanitize_tool_allowlist,
+)
 from app.tools.base import ToolRegistry
 
 
 def allowed_agent_tool_names(registry: ToolRegistry | None, tool_allowlist: list[str] | tuple[str, ...] | None) -> list[str]:
     if registry is None:
         return []
-    requested = set(sanitize_tool_allowlist(tool_allowlist or [])) & set(AGENT_DELEGATION_TOOL_NAMES)
+    requested = set(sanitize_tool_allowlist(tool_allowlist or [])) & agent_delegation_names(registry)
     if not requested:
         return []
     requested = expand_agent_tool_names(requested)
@@ -32,6 +36,12 @@ def agent_system_prompt_params(
     tool_names = allowed_agent_tool_names(registry, tool_allowlist)
     all_summaries = registry.summaries(scope="agent") if registry is not None else {}
     tool_summaries = {name: str(all_summaries.get(name) or "") for name in tool_names}
+    builtin_names = [name for name in tool_names if name in registry.names(source="builtin")] if registry else []
+    builtin_summaries = {name: tool_summaries[name] for name in builtin_names}
+    mcp_names = [name for name in tool_names if name not in builtin_names]
+    manager = getattr(registry, "mcp_manager", None)
+    servers = {meta.server_key for meta in manager.agent_tools() if meta.public_name in mcp_names} if manager else set()
+    instructions = [row for row in manager.server_instructions_snapshot() if row["server"] in servers] if manager else []
     host = {
         "hostname": platform.node(),
         "os": platform.system(),
@@ -42,13 +52,17 @@ def agent_system_prompt_params(
     return {
         "toolNames": tool_names,
         "toolSummaries": tool_summaries,
-        "builtinToolNames": tool_names,
-        "builtinToolSummaries": tool_summaries,
+        "builtinToolNames": builtin_names,
+        "builtinToolSummaries": builtin_summaries,
         "tools": {
             "allowlist": tool_names,
             "summaries": tool_summaries,
-            "builtin": {"names": tool_names, "summaries": tool_summaries},
+            "builtin": {"names": builtin_names, "summaries": builtin_summaries},
+            "mcp": {"names": mcp_names, "summaries": {name: tool_summaries[name] for name in mcp_names}},
         },
+        "mcpToolNames": mcp_names,
+        "mcpToolSummaries": {name: tool_summaries[name] for name in mcp_names},
+        "mcpServerInstructions": instructions,
         "workspaceDir": workspace,
         "host": host,
         "runtimeInfo": {

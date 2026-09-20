@@ -153,7 +153,7 @@ def test_alternation_bridges_two_text_users_without_rewriting_first_unit():
     assert out[:len(first_request)] == first_request
     assert [message["role"] for message in out] == ["user", "assistant", "user"]
     assert out[0] == msgs[0]
-    assert out[1]["content"] == "(继续)"
+    assert out[1]["content"] == "[protocol: role-alternation bridge]"
     assert out[2] == msgs[1]
 
 
@@ -207,7 +207,7 @@ def test_alternation_tool_to_user_inserts_anthropic_safe_append_only_bridge():
     out = repair_role_alternation(msgs)
     assert out[:len(first)] == first
     assert [message["role"] for message in out] == ["assistant", "tool", "assistant", "user"]
-    assert out[2]["content"] == "(继续)"
+    assert out[2]["content"] == "[protocol: role-alternation bridge]"
 
 
 def test_alternation_empty_input():

@@ -117,9 +117,11 @@ async def test_agent_system_prompt_template_uses_minimal_context(db):
         "agents": {"available": [{"name": "hidden"}]},
         "tools": {"mcp": {"names": ["mcp__serena__find_symbol"]}},
     })  # noqa: SLF001
-    for main_only_key in ("mcpToolNames", "mcpToolSummaries", "mcpToolGroups", "mcpServerInstructions", "skillsPrompt", "availableAgents", "agents"):
+    for main_only_key in ("mcpToolGroups", "skillsPrompt", "availableAgents", "agents"):
         assert main_only_key not in ctx
-    assert "mcp" not in ctx["tools"]
+    assert ctx["mcpToolNames"] == []
+    assert ctx["mcpServerInstructions"] == []
+    assert ctx["tools"]["mcp"]["names"] == []
 
 
 def test_template_helpers_render_compact_mcp_groups_and_literal_blocks():

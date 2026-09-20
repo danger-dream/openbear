@@ -124,6 +124,7 @@ function entryTimeDateTime(timeMs) {
 							:turn-id="props.turn?.id || props.turnIndex"
 							:index="entry.index"
 							:auto-scroll-locked="props.autoScrollLocked"
+							:reasoning-autoscroll="Boolean(entry.event.reasoningActive) && props.autoScrollLocked"
 							:retry-cancel-pending="props.retryCancelPending"
 							:agent-preview-only="true"
 							:compact="true"

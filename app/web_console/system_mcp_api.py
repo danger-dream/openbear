@@ -1,7 +1,10 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.config import MCPAgentAccessConfig
 from app.config_store import ConfigConflictError
+from app.mcp.manager import MCPManager
+from app.mcp.permissions import agent_access_reason
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -226,24 +229,13 @@ class WebAdminSystemMcpMixin:
         }
 
     async def handle_api_mcp_status(self, request: web.Request) -> web.Response:
-        manager = getattr(self, "mcp", None)
-        if manager is None:
-            return web.json_response({
-                "ok": True,
-                "enabled": False,
-                "summary": {
-                    "enabled": False,
-                    "serverCount": 0,
-                    "connectedCount": 0,
-                    "failedCount": 0,
-                    "visibleTools": 0,
-                    "filteredTools": 0,
-                },
-                "servers": [],
-                "tools": [],
-                "sensitiveConfigHidden": True,
-                "note": "MCP 管理只返回安全摘要；command/env/headers/token/apiKey 不会从 Web API 返回。",
-            })
+        saved_config = self.config
+        if self.config_store is not None:
+            try:
+                saved_config = Config.model_validate(await self.config_store.load_raw())
+            except Exception:
+                return web.json_response({"ok": False, "error": "config_read_failed", "sensitiveConfigHidden": True}, status=503)
+        manager = getattr(self, "mcp", None) or MCPManager(saved_config)
         snapshot = manager.status_snapshot()
         all_tool_meta = manager.all_tools_snapshot()
         prompt_meta = manager.prompts_snapshot() if hasattr(manager, "prompts_snapshot") else {}
@@ -261,7 +253,10 @@ class WebAdminSystemMcpMixin:
             risk_counts[meta.risk] = int(risk_counts.get(meta.risk, 0)) + 1
             approval_counts[meta.approval] = int(approval_counts.get(meta.approval, 0)) + 1
 
-        configured_servers = getattr(getattr(manager, "mcp_config", None), "servers", {}) or {}
+        configured_servers = saved_config.mcp.servers
+        runtime_servers = manager.mcp_config.servers
+        states = {state.key: state for state in snapshot.servers}
+        snapshot.servers = [states.get(state.key, state) for state in MCPManager(saved_config).status_snapshot().servers]
         servers = []
         for server in snapshot.servers:
             cfg = configured_servers.get(server.key)
@@ -275,6 +270,9 @@ class WebAdminSystemMcpMixin:
                 "status": server.status,
                 "enabled": bool(getattr(cfg, "enabled", server.status != "disabled")) if cfg is not None else server.status != "disabled",
                 "required": bool(server.required),
+                "agentAccess": cfg.agent_access.model_dump() if cfg else {"mode": "disabled", "tools": []},
+                "agentAccessApplied": bool(getattr(self, "mcp", None) and cfg and server.key in runtime_servers and cfg.agent_access == runtime_servers[server.key].agent_access),
+                "agentDelegatableTools": sum(meta.server_key == server.key for meta in manager.agent_tools()),
                 "approval": server.approval,
                 "approvalSource": "server" if cfg is not None and getattr(cfg, "approval", None) else "default",
                 "toolCount": int(server.tool_count or counts.get("visible") or 0),
@@ -307,6 +305,9 @@ class WebAdminSystemMcpMixin:
                 "visible": not meta.filtered,
                 "filtered": meta.filtered,
                 "filterReason": meta.filter_reason,
+                "agentAccessAllowed": bool(meta.server_key in configured_servers and not agent_access_reason(configured_servers[meta.server_key], meta.original_tool_name)),
+                "agentDelegatable": not bool(manager.agent_tool_unavailable_reason(meta.public_name)),
+                "agentUnavailableReason": manager.agent_tool_unavailable_reason(meta.public_name),
             }
             for meta in all_tool_meta
         ]
@@ -344,6 +345,7 @@ class WebAdminSystemMcpMixin:
             "prompts": prompts,
             "sensitiveConfigHidden": True,
             "settingsAvailable": self._config_writer_available(),
+            "agentAccessAvailable": self._config_writer_available() and self._mcp_agent_access_hook is not None,
             "note": "MCP 管理只返回安全摘要；command/env/headers/token/apiKey 不会从 Web API 返回。卸载只移除 OpenBear 注册，不操作外部软件。",
         })
 
@@ -506,6 +508,58 @@ class WebAdminSystemMcpMixin:
             audit_kind="web.mcp.server.approval.update",
             detail={"scope": "mcp.server", "server": server, "approval": approval},
         )
+
+    async def handle_api_mcp_server_agent_access(self, request: web.Request) -> web.Response:
+        if not self._config_writer_available() or self._mcp_agent_access_hook is None:
+            return web.json_response({"ok": False, "error": "mcp_agent_access_unavailable", "saved": False, "applied": False}, status=503)
+        server = str(request.match_info.get("server") or "")
+        body = await self._json_body(request)
+        try:
+            if not isinstance(body.get("agentAccess"), dict) or not isinstance(body.get("expectedAgentAccess"), dict):
+                raise ValueError("agent_access_invalid")
+            access = MCPAgentAccessConfig.model_validate(body["agentAccess"])
+            expected = MCPAgentAccessConfig.model_validate(body["expectedAgentAccess"])
+            def mutator(raw: dict[str, Any]) -> None:
+                servers = (raw.get("mcp") or {}).get("servers") or {}
+                if server not in servers:
+                    raise _MCPServerNotFoundError(server)
+                row = servers[server]
+                current = MCPAgentAccessConfig.model_validate(row.get("agentAccess", row.get("agent_access", {})))
+                if current != expected:
+                    raise ConfigConflictError("mcp_agent_access_conflict")
+                row.pop("agent_access", None)
+                row["agentAccess"] = access.model_dump()
+            await self.config_store.mutate(mutator)
+        except _MCPServerNotFoundError:
+            return web.json_response({"ok": False, "error": "mcp_server_not_found", "saved": False, "applied": False}, status=404)
+        except ConfigConflictError:
+            return web.json_response({"ok": False, "error": "mcp_agent_access_conflict", "saved": False, "applied": False}, status=409)
+        except Exception:
+            return web.json_response({"ok": False, "error": "agent_access_invalid", "saved": False, "applied": False, "sensitiveConfigHidden": True}, status=400)
+        applied = False
+        try:
+            result = await self._mcp_agent_access_hook(server)
+            applied = bool(result.get("ok") and result.get("applied"))
+        except Exception:
+            result = {}
+        session: WebSession = request[_WEB_SESSION_KEY]
+        await self.audit("web.mcp.server.agent_access.update", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"server": server, "agentAccess": access.model_dump(), "saved": True, "applied": applied})
+        return web.json_response({"ok": applied, "saved": True, "applied": applied, "server": server,
+                                  "agentAccess": result.get("agentAccess", access.model_dump()),
+                                  "revision": self.config_store.revision, "sensitiveConfigHidden": True,
+                                  **({} if applied else {"error": "mcp_agent_access_apply_failed"})}, status=200 if applied else 503)
+
+    async def handle_api_mcp_server_refresh_tools(self, request: web.Request) -> web.Response:
+        manager = getattr(self, "mcp", None)
+        server = str(request.match_info.get("server") or "")
+        if manager is None:
+            return web.json_response({"ok": False, "error": "mcp_manager_unavailable"}, status=503)
+        try:
+            result = await manager.refresh_server_tools(server)
+        except Exception as exc:
+            code = str(exc) if isinstance(exc, ValueError) and str(exc) in {"mcp_server_not_found", "mcp_server_not_connected", "mcp_server_draining", "mcp_refresh_superseded"} else "mcp_tools_refresh_failed"
+            return web.json_response({"ok": False, "error": code, "sensitiveConfigHidden": True}, status=404 if code == "mcp_server_not_found" else 409 if code in {"mcp_server_draining", "mcp_refresh_superseded"} else 503)
+        return web.json_response({**result, "sensitiveConfigHidden": True})
 
     async def handle_api_mcp_server_uninstall(self, request: web.Request) -> web.Response:
         if not self._config_writer_available():

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { nextTick, ref } from 'vue';
 import { installMobileViewport, MOBILE_VIEWPORT_QUERY } from './mobileViewport.js';
+import {captureTranscriptContentAnchor, transcriptContentAnchorDelta} from './views/consoleView/transcriptContentAnchor.js';
 
 function target(extra = {}) {
   const listeners = new Map();
@@ -103,7 +104,8 @@ function anchorHarness() {
   const node = { dataset: { turnIndex: '2' }, getBoundingClientRect: () => ({ top: 80 + shift - (scrollTop - 300), bottom: 200 + shift - (scrollTop - 300) }) };
   const scroller = { get scrollTop() { return scrollTop; }, set scrollTop(value) { scrollTop = value; writes.push(value); },
     scrollHeight: 2400, clientHeight: 500, getBoundingClientRect: () => ({ top: 100, bottom: 600 }), querySelectorAll: () => [node], querySelector: () => node };
-  const ctx = vm.createContext({ props, ref, nextTick, scroller: ref(scroller), autoScrollLocked: ref(false),
+  const ctx = vm.createContext({ props, ref, nextTick, captureTranscriptContentAnchor, transcriptContentAnchorDelta,
+    scroller: ref(scroller), autoScrollLocked: ref(false),
     runProgrammaticScroll: fn => fn(), updateScrollerOverflow() {}, scheduleActiveTurnFromScroll() {} });
   vm.runInContext('let componentMounted = true, loadRequestGeneration = 1;\n' + actualAnchors, ctx);
   const run = text => vm.runInContext(text, ctx);

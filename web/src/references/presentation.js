@@ -1,4 +1,5 @@
 import {KIND_LABELS,referenceUrl} from './codec.js';
+import {policyReasonTitle} from './sizePolicy.js';
 export const ICON_PATHS = {
   doc:'M7 3h7l4 4v14H7z M14 3v5h5 M10 12h5 M10 16h5',
   mem:'M9 5a3 3 0 0 0-5 3 4 4 0 0 0 0 8 3 3 0 0 0 5 3V5z M15 5a3 3 0 0 1 5 3 4 4 0 0 1 0 8 3 3 0 0 1-5 3V5z M7 10h2 M15 14h2',
@@ -19,7 +20,7 @@ export function referenceCandidateDetail(item) {
   }
   return detail + (item.archived ? ' · 已归档' : '');
 }
-export function referenceScopeLabel(ref) {return ref.kind==='chat' ? (ref.scope==='recent'?`最近${ref.turns || 20}轮`:'全文') : '';}
-export function referenceTitle(ref) {return `${KIND_LABELS[ref.kind] || '引用'}：${ref.label}${referenceScopeLabel(ref)?' · '+referenceScopeLabel(ref):''}${ref.kind==='secret'?' · 发送时将向当前模型提供凭证':''}`;}
+export function referenceScopeLabel(ref) {return ref.mode==='mention' ? '仅提及' : ref.kind==='chat' ? (ref.scope==='recent'?`最近${ref.turns || 20}轮`:'全文') : '';}
+export function referenceTitle(ref) {return `${KIND_LABELS[ref.kind] || '引用'}：${ref.label}${referenceScopeLabel(ref)?' · '+referenceScopeLabel(ref):''}${ref.mode==='mention'?' · 只提供定位，不附正文':ref.kind==='secret'?' · 发送时将向当前模型提供凭证':''}${ref.modeReason?' · '+policyReasonTitle(ref).replace('将仅提及','已仅提及'):''}`;}
 export function referenceChipOpen(ref) {return `<span class="reference-chip reference-chip--${ref.kind}" data-reference="${escapeReferenceHtml(referenceUrl(ref))}" data-reference-label="${escapeReferenceHtml(ref.label)}" role="button" tabindex="0" title="${escapeReferenceHtml(referenceTitle(ref))}">${referenceIconHtml(ref.kind)}<span class="reference-chip__label">`;}
 export function referenceChipClose(ref) {return `</span>${referenceScopeLabel(ref)?`<small class="reference-chip__scope">${escapeReferenceHtml(referenceScopeLabel(ref))}</small>`:''}</span>`;}

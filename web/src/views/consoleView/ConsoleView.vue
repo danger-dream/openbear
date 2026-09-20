@@ -1,5 +1,5 @@
 <script setup>
-import {computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch} from "vue";
+import {computed, markRaw, nextTick, onBeforeUnmount, onMounted, provide, ref, watch} from "vue";
 import {ElMessage, ElMessageBox} from "element-plus";
 import {
 	ChatLineRound,
@@ -112,6 +112,8 @@ import {
 	mayRetireRunConfigOverride,
 	runConfigForDisplay,
 } from "./runConfigState.js";
+import {createAttachmentDraftStorage} from "./attachmentDraftStorage.js";
+import {captureTranscriptContentAnchor, transcriptContentAnchorDelta} from "./transcriptContentAnchor.js";
 
 const DEFAULT_NEW_CONVERSATION_THINKING = "";
 const DRAFT_STORAGE_KEY = "openbear.console.drafts.v1";
@@ -148,7 +150,10 @@ const foregroundRunning = ref(false);
 const rootTurnRunning = ref(false);
 const activeRunTurnUuid = ref("");
 const messages = ref([]);
-const draft = ref("");
+const draftByConversation = ref(loadDraftStore());
+// Bind persisted text before the first editable render, not after options/state
+// HTTP completes. Subsequent edits are authoritative while initialization waits.
+const draft = ref(String(draftByConversation.value[draftKey(props.conversationUuid)] || ""));
 let draftEditRevision = 0;
 watch(draft, () => { draftEditRevision += 1; }, {flush: 'sync'});
 const status = ref("就绪");
@@ -181,7 +186,17 @@ const currentPrimaryModelKey = ref("");
 const thinkLevels = ref([]);
 const modelQuery = ref("");
 const runStartedAt = ref(0);
-const draftByConversation = ref(loadDraftStore());
+// Attachments belong to their conversation just like the text draft. File objects
+// cannot be written to localStorage next to it, so they are kept per conversation
+// in this map plus an IndexedDB record. The map holds the conversations the user
+// switched away from; the conversation on screen is always represented by
+// pendingAttachments/attachmentPreviews, never by both at once.
+const attachmentsByConversation = new Map();
+const attachmentDrafts = createAttachmentDraftStorage();
+let attachmentsLoadedKey = "";
+const attachmentHydrations = new Map();
+const attachmentRestoring = ref(false);
+let conversationSwitchGeneration = 0;
 const restoringDraft = ref(false);
 const toolResultTabs = ref({});
 const detailOpen = ref(loadAgentPanelIntents());
@@ -227,6 +242,11 @@ let userScrollIntentAt = 0;
 let lastScrollerScrollTop = 0;
 let touchScrollClientY = null;
 let pinnedActiveTurnIndex = null;
+let scrollerResizeObserver = null;
+let scrollerReflowFrame = 0;
+let observedScrollerWidth = 0;
+// Reading position of the last settled scroll, in pre-reflow coordinates.
+let readingAnchor = null;
 let explicitUnlockAt = 0;
 let visibleOutputSignature = "";
 let lastVisibleOutputAt = 0;
@@ -470,7 +490,7 @@ const totalDurationDisplay = computed(() => fmtMs(totalDurationMs.value));
 const totalCostUsd = computed(() => Number(sessionLedgerUsage.value.cost_usd || 0));
 const totalCostDisplay = computed(() => fmtCost(totalCostUsd.value));
 const canSend = computed(() => {
-	if (sendPending.value || compacting.value) return false;
+	if (sendPending.value || compacting.value || attachmentRestoring.value) return false;
 	if (running.value) return Boolean(draft.value.trim()) && pendingAttachments.value.length === 0;
 	return Boolean(draft.value.trim() || pendingAttachments.value.length);
 });
@@ -538,9 +558,17 @@ function setDraftForConversation(uuid, text) {
 	saveDraftStore(next);
 }
 
+function persistComposerDraft(value) {
+	const pending = outboundSends.current;
+	const preparing = pending && !pending.storageReleased && draftKey(pending.conversationUuid) === draftKey(props.conversationUuid);
+	setDraftForConversation(props.conversationUuid, preparing ? restoreOutboundDraft(pending.draftText, value) : value);
+}
+
 function restoreDraftForConversation(uuid = props.conversationUuid) {
+	if (!componentMounted || draftKey(uuid) !== draftKey(props.conversationUuid)) return;
 	restoringDraft.value = true;
 	draft.value = String(draftByConversation.value[draftKey(uuid)] || "");
+	void restoreAttachmentsForConversation(uuid);
 	nextTick(() => {
 		restoringDraft.value = false;
 		adjustComposerHeight();
@@ -552,14 +580,23 @@ function clearDraftForConversation(uuid = props.conversationUuid) {
 }
 
 function clearDraftAndAttachments() {
+	const key = activeAttachmentKey();
 	clearDraftForConversation();
+	const hydration = attachmentHydrations.get(key);
+	if (hydration) { hydration.cleared = true; hydration.dirty = true; }
 	clearAttachments();
+	void attachmentDrafts.remove(key);
 }
 
 function discardConversationDraft(conversationUuid) {
 	const key = String(conversationUuid || "");
 	if (!key) return;
 	clearDraftForConversation(key);
+	// Deleting a conversation invalidates the read even if it is still off screen.
+	attachmentHydrations.delete(draftKey(key));
+	if (activeAttachmentKey() === draftKey(key)) attachmentRestoring.value = false;
+	releaseStashedAttachments(key);
+	void attachmentDrafts.remove(draftKey(key));
 	if (draftKey(props.conversationUuid) === key) {
 		draft.value = "";
 		clearAttachments();
@@ -802,6 +839,7 @@ function clearUiCaches() {
 
 function resetLocalConversationState(uuid = props.conversationUuid || "local:new") {
 	pinnedActiveTurnIndex = null;
+	readingAnchor = null;
 	activeTurnIndex.value = 0;
 	closeWs();
 	clearUiCaches();
@@ -1019,9 +1057,11 @@ function addAttachment(file) {
 	const item = {id, file};
 	pendingAttachments.value.push(item);
 	if (file.type?.startsWith("image/")) attachmentPreviews.value[id] = URL.createObjectURL(file);
+	persistActiveAttachments();
 }
 
 async function removeAttachment(id) {
+	const key = activeAttachmentKey();
 	const item = pendingAttachments.value.find((entry) => entry.id === id);
 	try {
 		await ElMessageBox.confirm(`确定移除附件「${item?.file?.name || '未命名附件'}」吗？`, "移除附件", {
@@ -1032,12 +1072,22 @@ async function removeAttachment(id) {
 	} catch {
 		return;
 	}
-	const url = attachmentPreviews.value[id];
-	if (url) URL.revokeObjectURL(url);
-	const next = {...attachmentPreviews.value};
+	// The confirmation may outlive a conversation switch. Edit its original owner.
+	const active = key === attachmentsLoadedKey;
+	const stash = attachmentsByConversation.get(key);
+	const files = active ? pendingAttachments.value : (stash?.attachments || []);
+	const previews = active ? attachmentPreviews.value : (stash?.previews || {});
+	if (previews[id]) URL.revokeObjectURL(previews[id]);
+	const next = {...previews};
 	delete next[id];
-	attachmentPreviews.value = next;
-	pendingAttachments.value = pendingAttachments.value.filter((entry) => entry.id !== id);
+	const attachments = files.filter((entry) => entry.id !== id);
+	const hydration = attachmentHydrations.get(key);
+	if (hydration) hydration.removed.add(id);
+	if (active) {
+		attachmentPreviews.value = next;
+		pendingAttachments.value = attachments;
+	} else if (stash) attachmentsByConversation.set(key, {...stash, attachments, previews: next});
+	persistAttachmentList(key, attachments);
 }
 
 function clearAttachments({revoke = true} = {}) {
@@ -1046,6 +1096,191 @@ function clearAttachments({revoke = true} = {}) {
 	}
 	attachmentPreviews.value = {};
 	pendingAttachments.value = [];
+}
+
+function activeAttachmentKey() {
+	return attachmentsLoadedKey || draftKey();
+}
+
+function persistAttachmentList(key, attachments) {
+	const hydration = attachmentHydrations.get(key);
+	if (hydration) {
+		// Do not overwrite the durable files with a not-yet-hydrated partial list.
+		hydration.dirty = true;
+		return;
+	}
+	const pending = outboundSends.current;
+	const sent = pending?.storageReleased && draftKey(pending.conversationUuid) === key
+		? new Set(pending.attachments.map(item => item.id)) : new Set();
+	void attachmentDrafts.save(key, attachments.filter(item => !sent.has(item.id)));
+}
+
+function persistActiveAttachments() {
+	persistAttachmentList(activeAttachmentKey(), pendingAttachments.value);
+}
+
+function ensureAttachmentPreviews() {
+	let previews = attachmentPreviews.value;
+	for (const item of pendingAttachments.value) {
+		if (previews[item.id] || !item.file?.type?.startsWith("image/")) continue;
+		if (previews === attachmentPreviews.value) previews = {...previews};
+		previews[item.id] = URL.createObjectURL(item.file);
+	}
+	if (previews !== attachmentPreviews.value) attachmentPreviews.value = previews;
+}
+
+// Switching away parks the composer's files under the conversation they were
+// chosen for. Their preview URLs travel with them: revoking here would leave
+// empty thumbnails when the user comes back.
+function stashAttachmentsForConversation(uuid) {
+	const key = draftKey(uuid);
+	if (pendingAttachments.value.length) attachmentsByConversation.set(key, {attachments: pendingAttachments.value, previews: attachmentPreviews.value});
+	else attachmentsByConversation.delete(key);
+	pendingAttachments.value = [];
+	attachmentPreviews.value = {};
+	attachmentsLoadedKey = "";
+}
+
+function warnSkippedAttachments(skipped = []) {
+	if (!skipped.length) return;
+	ElMessage.warning({
+		message: `${skipped.length} 个较大的附件无法在刷新后保留，请重新选择：${skipped.map((item) => item.fileName).join("、")}`,
+		duration: 8000,
+	});
+}
+
+async function restoreAttachmentsForConversation(uuid = props.conversationUuid) {
+	const key = draftKey(uuid);
+	if (!componentMounted || key !== draftKey(props.conversationUuid)) return;
+	if (attachmentsLoadedKey === key) return attachmentHydrations.get(key)?.promise;
+	if (attachmentsLoadedKey) stashAttachmentsForConversation(attachmentsLoadedKey);
+	attachmentsLoadedKey = key;
+	const stash = attachmentsByConversation.get(key);
+	if (stash) {
+		attachmentsByConversation.delete(key);
+		pendingAttachments.value = stash.attachments;
+		attachmentPreviews.value = stash.previews;
+		ensureAttachmentPreviews();
+		warnSkippedAttachments(stash.skipped);
+	}
+	const existing = attachmentHydrations.get(key);
+	attachmentRestoring.value = Boolean(existing || !stash);
+	if (existing) return existing.promise;
+	if (stash) return;
+	// One hydration per owner, even across A -> B -> A. Edits made meanwhile
+	// are an overlay, not a replacement for the unread durable files.
+	const hydration = {cleared: false, dirty: false, removed: new Set()};
+	attachmentHydrations.set(key, hydration);
+	hydration.promise = (async () => {
+		const stored = await attachmentDrafts.load(key);
+		if (attachmentHydrations.get(key) !== hydration) return;
+		const active = componentMounted && attachmentsLoadedKey === key;
+		const parked = attachmentsByConversation.get(key);
+		const current = hydration.detached || (active ? pendingAttachments.value : (parked?.attachments || []));
+		const known = new Set(current.map(item => item.id));
+		const restored = hydration.cleared ? [] : stored.items.filter(item => !known.has(item.id) && !hydration.removed.has(item.id));
+		const merged = [...current, ...restored];
+		const skipped = hydration.cleared ? [] : stored.skipped;
+		attachmentHydrations.delete(key);
+		if (active) {
+			pendingAttachments.value = merged;
+			ensureAttachmentPreviews();
+			attachmentRestoring.value = false;
+			adjustComposerHeight();
+			warnSkippedAttachments(skipped);
+		} else if (componentMounted) {
+			attachmentsByConversation.set(key, {attachments: merged, previews: parked?.previews || {}, skipped});
+		}
+		// Include both restored files and edits. A clear/delete never revives an
+		// old snapshot; skipped-file warnings are consumed once on this page.
+		if (hydration.dirty || skipped.length) persistAttachmentList(key, merged);
+	})();
+	return hydration.promise;
+}
+
+function detachAttachmentHydrations() {
+	// SPA unmount may precede an IDB read. Finish its persistence without touching
+	// the detached composer or creating preview URLs after teardown.
+	for (const [key, hydration] of attachmentHydrations) {
+		hydration.detached = [...(key === attachmentsLoadedKey
+			? pendingAttachments.value : (attachmentsByConversation.get(key)?.attachments || []))];
+	}
+}
+
+// The local draft just became a real conversation: the same files are still in
+// the composer, since only a send receipt releases them. Move their storage key
+// instead of parking them under the retired local id.
+function migrateAttachmentDraft(from, to) {
+	const fromKey = draftKey(from);
+	const toKey = draftKey(to);
+	if (!fromKey || !toKey || fromKey === toKey) return;
+	const stash = attachmentsByConversation.get(fromKey);
+	if (stash) {
+		attachmentsByConversation.delete(fromKey);
+		attachmentsByConversation.set(toKey, stash);
+	}
+	if (attachmentsLoadedKey === fromKey) attachmentsLoadedKey = toKey;
+	void attachmentDrafts.move(fromKey, toKey);
+}
+
+// A send receipt belongs to the conversation that was sent to, which may no
+// longer be the one on screen. The persisted copy must lose the sent files too,
+// or a reload would offer them again.
+function releaseSentAttachments(uuid, sentIds) {
+	if (!sentIds.size) return;
+	const key = draftKey(uuid);
+	const keepPreviews = (previews) => Object.fromEntries(Object.entries(previews).filter(([id]) => !sentIds.has(id)));
+	if (key === attachmentsLoadedKey) {
+		pendingAttachments.value = pendingAttachments.value.filter((item) => !sentIds.has(item.id));
+		attachmentPreviews.value = keepPreviews(attachmentPreviews.value);
+	} else {
+		const stash = attachmentsByConversation.get(key);
+		if (stash) {
+			const attachments = stash.attachments.filter((item) => !sentIds.has(item.id));
+			if (attachments.length) attachmentsByConversation.set(key, {attachments, previews: keepPreviews(stash.previews)});
+			else attachmentsByConversation.delete(key);
+		}
+	}
+	void attachmentDrafts.removeItems(key, sentIds);
+}
+
+// Files whose send was released return to their own conversation's draft, even
+// when the user has already moved on to another one.
+function restoreReleasedAttachments(uuid, attachments = []) {
+	const key = draftKey(uuid);
+	if (key === attachmentsLoadedKey) {
+		const known = new Set(pendingAttachments.value.map((item) => item.id));
+		const added = attachments.filter((item) => !known.has(item.id));
+		if (added.length) {
+			pendingAttachments.value = [...pendingAttachments.value, ...added];
+			ensureAttachmentPreviews();
+		}
+		// These files are draft again, so they are stored again even when they never
+		// left the composer: sending had cleared their stored copy.
+		persistActiveAttachments();
+		return;
+	}
+	const stash = attachmentsByConversation.get(key);
+	const parked = stash?.attachments || [];
+	const known = new Set(parked.map((item) => item.id));
+	const merged = [...parked, ...attachments.filter((item) => !known.has(item.id))];
+	if (!merged.length) return;
+	// Previews are recreated when this conversation is opened again; a conversation
+	// off screen has no thumbnail to keep alive.
+	attachmentsByConversation.set(key, {attachments: merged, previews: stash?.previews || {}});
+	persistAttachmentList(key, merged);
+}
+
+function releaseStashedAttachments(uuid) {
+	const key = draftKey(uuid);
+	const stash = attachmentsByConversation.get(key);
+	if (!stash) return;
+	for (const url of Object.values(stash.previews)) if (url) URL.revokeObjectURL(url);
+	attachmentsByConversation.delete(key);
+}
+
+function releaseAllStashedAttachments() {
+	for (const key of [...attachmentsByConversation.keys()]) releaseStashedAttachments(key);
 }
 
 function queueSentAttachmentPreviewRevokes(urls = []) {
@@ -1751,8 +1986,23 @@ function orderedOperationsList() {
 	return orderedOpIds.value.map((id) => operationsById.value.get(id)).filter(Boolean);
 }
 
+// Rendering reads one event at a time. Letting Vue deep-proxy every projected
+// event turns each read into a dependency-tracked reactive traversal, which is
+// what makes a long conversation freeze for a second per repaint. The timeline
+// contract is already immutable — every projection and every operation frame
+// produces new arrays/objects — so the event payload can be marked raw while the
+// message list itself stays reactive for optimistic `push` and whole-list
+// replacement.
+function withRawTimeline(list) {
+	return list.map((message) => (
+		Array.isArray(message?.localTimeline)
+			? {...message, localTimeline: markRaw(message.localTimeline.map((event) => markRaw(event)))}
+			: message
+	));
+}
+
 function projectOperationMessages(operations = orderedOperationsList()) {
-	return projectOperationMessagesFromOperations(operations, operationProjectionOptions());
+	return withRawTimeline(projectOperationMessagesFromOperations(operations, operationProjectionOptions()));
 }
 
 function clearActiveRun() {
@@ -2291,37 +2541,45 @@ function restoreMobileViewportAnchor(snapshot) {
 	});
 }
 
+// Read every turn's viewport box once; the anchor policy and the active-turn
+// policy both need the same geometry.
+function scrollerTurnBoxes(el) {
+	const scrollerRect = el.getBoundingClientRect();
+	const nodes = Array.from(el.querySelectorAll(".turn-block[data-turn-index]"));
+	const rows = nodes.map((node) => {
+		const rect = node.getBoundingClientRect();
+		return {node, index: Number(node.dataset.turnIndex || 0), top: rect.top, bottom: rect.bottom};
+	});
+	return {scrollerRect, rows};
+}
+
 function captureScrollAnchor() {
 	const el = scroller.value;
 	if (!el) return null;
-	const scrollerRect = el.getBoundingClientRect();
-	const nodes = Array.from(el.querySelectorAll(".turn-block[data-turn-index]"));
-	for (const node of nodes) {
-		const rect = node.getBoundingClientRect();
-		if (rect.bottom < scrollerRect.top) continue;
-		if (rect.top > scrollerRect.bottom) break;
-		return {
-			index: Number(node.dataset.turnIndex || 0),
-			offset: rect.top - scrollerRect.top,
-			scrollTop: el.scrollTop,
-		};
+	const {scrollerRect, rows} = scrollerTurnBoxes(el);
+	for (const row of rows) {
+		if (row.bottom < scrollerRect.top) continue;
+		if (row.top > scrollerRect.bottom) break;
+		return {index: row.index, offset: row.top - scrollerRect.top, scrollTop: el.scrollTop,
+			content: captureTranscriptContentAnchor(row.node, scrollerRect)};
 	}
 	return {index: -1, offset: 0, scrollTop: el.scrollTop};
 }
 
-async function restoreScrollAnchor(anchor, options = {}) {
-	if (!anchor || autoScrollLocked.value || (options?.isCurrent && !options.isCurrent())) return;
-	await nextTick();
-	if (options?.isCurrent && !options.isCurrent()) return;
+// The single place that moves scrollTop back onto a captured reading anchor.
+// Both the async restore paths and width-reflow compensation go through here so
+// they share the programmatic-scroll guard and active-turn bookkeeping.
+function applyReadingAnchor(anchor) {
 	const el = scroller.value;
-	if (!el) return;
+	if (!el || !anchor) return;
 	runProgrammaticScroll(() => {
 		if (Number(anchor.index) >= 0) {
 			const node = el.querySelector(`.turn-block[data-turn-index="${Number(anchor.index)}"]`);
 			if (node) {
 				const scrollerRect = el.getBoundingClientRect();
 				const rect = node.getBoundingClientRect();
-				el.scrollTop += (rect.top - scrollerRect.top) - Number(anchor.offset || 0);
+				const contentDelta = transcriptContentAnchorDelta(anchor.content, node, scrollerRect);
+				el.scrollTop += contentDelta ?? ((rect.top - scrollerRect.top) - Number(anchor.offset || 0));
 				return;
 			}
 		}
@@ -2332,26 +2590,98 @@ async function restoreScrollAnchor(anchor, options = {}) {
 	scheduleActiveTurnFromScroll();
 }
 
+async function restoreScrollAnchor(anchor, options = {}) {
+	if (!anchor || autoScrollLocked.value || (options?.isCurrent && !options.isCurrent())) return;
+	await nextTick();
+	if (options?.isCurrent && !options.isCurrent()) return;
+	applyReadingAnchor(anchor);
+}
+
+// A width change re-wraps every turn without emitting a scroll event, so the
+// transcript silently slides under the reader: the same scrollTop now sits
+// above newer lines, and the work-detail panel keeps showing the turn the
+// reader has already moved past. Re-apply the intent of each scroll state
+// instead of leaving the stale pixel offset in place.
+function compensateTranscriptReflow() {
+	const el = scroller.value;
+	if (!el) return;
+	if (autoScrollLocked.value) {
+		runProgrammaticScroll(() => {
+			el.scrollTop = el.scrollHeight;
+		}, 120);
+	} else if (readingAnchor) {
+		// ResizeObserver reports after the new layout exists, so the DOM cannot say
+		// where the reader was. Restore the position this component observed while
+		// the old layout was still on screen.
+		applyReadingAnchor(readingAnchor);
+	} else {
+		// Without evidence of a reading position, guessing one would move the
+		// transcript for no reason.
+		return;
+	}
+	// Re-derive both the reading position and the active turn from the corrected
+	// layout. The panel width animates, so the next frame of the same transition
+	// starts from what the reader can actually see, and the panel never describes
+	// a turn the correction has just scrolled past.
+	updateActiveTurnFromScroll();
+	updateScrollerOverflow();
+}
+
+function observeScrollerReflow() {
+	if (typeof ResizeObserver === "undefined") return;
+	const el = scroller.value;
+	if (!el) return;
+	scrollerResizeObserver = new ResizeObserver(() => {
+		const target = scroller.value;
+		if (!target) return;
+		const width = Math.round(target.clientWidth);
+		// The first callback only establishes the baseline. Height-only changes
+		// (composer growth, keyboard) already own their own restore paths.
+		if (!observedScrollerWidth) {
+			observedScrollerWidth = width;
+			return;
+		}
+		if (width === observedScrollerWidth) return;
+		observedScrollerWidth = width;
+		// The panel width animates for 240 ms, so one width change arrives as a
+		// burst of callbacks. Coalesce them into one compensation per frame that
+		// reads the layout as it stands when it runs.
+		if (scrollerReflowFrame) return;
+		scrollerReflowFrame = window.requestAnimationFrame(() => {
+			scrollerReflowFrame = 0;
+			compensateTranscriptReflow();
+		});
+	});
+	scrollerResizeObserver.observe(el);
+}
+
 function updateActiveTurnFromScroll() {
 	activeTurnScrollFrame = 0;
 	lastActiveTurnScrollUpdateAt = performance.now();
 	const el = scroller.value;
 	if (!el) return;
-	const nodes = Array.from(el.querySelectorAll(".turn-block[data-turn-index]"));
-	if (!nodes.length) {
+	const {scrollerRect, rows} = scrollerTurnBoxes(el);
+	if (!rows.length) {
 		pinnedActiveTurnIndex = null;
+		readingAnchor = null;
 		activeTurnIndex.value = 0;
 		return;
 	}
-	const scrollerRect = el.getBoundingClientRect();
-	const rows = nodes.map((node) => {
-		const rect = node.getBoundingClientRect();
-		return {index: Number(node.dataset.turnIndex || 0), top: rect.top, bottom: rect.bottom};
-	});
-	activeTurnIndex.value = chooseActiveTurnIndex(rows, scrollerRect.top, scrollerRect.height, {
+	const nextActiveTurnIndex = chooseActiveTurnIndex(rows, scrollerRect.top, scrollerRect.height, {
 		atBottom: scrollerAtBottom(el),
 		preferredIndex: pinnedActiveTurnIndex,
 	});
+	activeTurnIndex.value = nextActiveTurnIndex;
+	// Record the reading position while the current layout is still observable.
+	// It has to be the same turn this function just decided the panel describes:
+	// a width change rewraps the transcript without emitting a scroll event, so
+	// this anchor is the only evidence of what the reader was looking at.
+	const activeRow = rows.find((row) => row.index === nextActiveTurnIndex);
+	readingAnchor = activeRow
+		? {index: activeRow.index, offset: activeRow.top - scrollerRect.top, scrollTop: Number(el.scrollTop || 0),
+			content: autoScrollLocked.value ? null : captureTranscriptContentAnchor(activeRow.node, scrollerRect,
+				readingAnchor?.index === activeRow.index ? readingAnchor.content : null)}
+		: null;
 }
 
 function scheduleActiveTurnFromScroll({force = false} = {}) {
@@ -2583,11 +2913,13 @@ function cancelScheduledUiWork() {
 	if (scrollFrame) window.cancelAnimationFrame(scrollFrame);
 	if (activeTurnScrollFrame) window.cancelAnimationFrame(activeTurnScrollFrame);
 	if (activeTurnScrollTimer) window.clearTimeout(activeTurnScrollTimer);
+	if (scrollerReflowFrame) window.cancelAnimationFrame(scrollerReflowFrame);
 	if (streamFlushFrame) window.cancelAnimationFrame(streamFlushFrame);
 	if (streamFlushTimer) window.clearTimeout(streamFlushTimer);
 	scrollFrame = 0;
 	activeTurnScrollFrame = 0;
 	activeTurnScrollTimer = 0;
+	scrollerReflowFrame = 0;
 	streamFlushFrame = 0;
 	streamFlushTimer = 0;
 	streamFlushPending = false;
@@ -2655,8 +2987,7 @@ function finishPendingOutboundSend(requestId) {
 	// have added files for their next message while this ACK was in flight.
 	const sentIds = new Set(pending.attachments.map((item) => item.id));
 	queueSentAttachmentPreviewRevokes(pending.previewUrls || []);
-	pendingAttachments.value = pendingAttachments.value.filter((item) => !sentIds.has(item.id));
-	attachmentPreviews.value = Object.fromEntries(Object.entries(attachmentPreviews.value).filter(([id]) => !sentIds.has(id)));
+	releaseSentAttachments(pending.conversationUuid, sentIds);
 	return true;
 }
 
@@ -2669,19 +3000,14 @@ function restoreReleasedOutboundSend(pending, error = "send_failed", {uncertain 
 	const currentDraft = isActive ? draft.value : (draftByConversation.value[draftKey(uuid)] || "");
 	const restoredDraft = restoreOutboundDraft(pending.draftText, currentDraft);
 	setDraftForConversation(uuid, restoredDraft);
+	// Retain the original files as well as any new draft attachments. Recreate
+	// previews if a file was removed while awaiting its acceptance receipt.
+	restoreReleasedAttachments(uuid, pending.attachments);
 	if (!isActive) return true;
 	if (pending.optimisticId) {
 		messages.value = messages.value.filter((message) => String(message?.id || "") !== pending.optimisticId);
 	}
 	draft.value = restoredDraft;
-	// Retain the original files as well as any new draft attachments. Recreate
-	// previews if a file was removed while awaiting its acceptance receipt.
-	const attachmentIds = new Set(pendingAttachments.value.map((item) => item.id));
-	for (const item of pending.attachments) {
-		if (attachmentIds.has(item.id)) continue;
-		pendingAttachments.value.push(item);
-		if (item.file.type?.startsWith("image/")) attachmentPreviews.value[item.id] = URL.createObjectURL(item.file);
-	}
 	adjustComposerHeight();
 	// Do not turn off a real run whose frames arrived before a lost ACK.
 	const operations = orderedOperationsList();
@@ -2945,6 +3271,9 @@ async function ensureServerConversationForSend(firstText, pending) {
 	if (!uuid) throw new Error("conversation_create_failed");
 	pending.conversationUuid = uuid;
 	localToServerTransitionUuid.value = uuid;
+	// The composer keeps these files until a receipt releases them, so they must
+	// follow the conversation to its server id before any receipt can arrive.
+	migrateAttachmentDraft(props.conversationUuid, uuid);
 	chatState.value = {...(chatState.value || {}), conversationUuid: uuid};
 	emit("conversation-created", uuid);
 	await nextTick();
@@ -3022,7 +3351,8 @@ async function load(options = {}) {
 		if (options?.refreshDefaults) await loadLocalRunDefaults(conversationUuid);
 		if (!isCurrent()) return;
 		resetLocalConversationState(conversationUuid);
-		restoreDraftForConversation(conversationUuid);
+		// Initial setup and navigation already own the composer draft. A late
+		// defaults/state load must not restore text over edits made meanwhile.
 		resetTransientThinking();
 		if (scrollMode === "bottom" && bottomScroll === pendingLoadBottomScroll) {
 			if (lockOnBottom) autoScrollLocked.value = true;
@@ -3167,8 +3497,9 @@ async function deleteTurnSuffix(turn) {
 
 async function send() {
 	// Enter and click must share the same single-flight guard.
-	if (sendPending.value || outboundSends.current) return;
+	if (sendPending.value || outboundSends.current || attachmentRestoring.value) return;
 	const text = draft.value.trim();
+	const referenceOrder = composer.value?.getReferenceOrder?.() || [];
 	if (!text && !pendingAttachments.value.length) return;
 	if (referencesInText(text).length && (!referenceCatalog.ready || !referenceCatalog.connected)) {
 		ElMessage.warning("引用目录尚未连接，请稍后发送；草稿已保留");
@@ -3198,7 +3529,8 @@ async function send() {
 	const generation = ++sendAttemptGeneration;
 	const isCurrent = () => componentMounted && outboundSends.isCurrent(pending) && generation === sendAttemptGeneration;
 	sendPending.value = true;
-	clearDraftForConversation();
+	// The editor can clear immediately, but preparation is still safely unsent.
+	setDraftForConversation(pending.conversationUuid, pending.draftText);
 	draft.value = "";
 	adjustComposerHeight();
 	closeComposerMenus();
@@ -3226,6 +3558,7 @@ async function send() {
 		if (!isCurrent()) return;
 		const conversationUuid = await ensureServerConversationForSend(finalText, pending);
 		if (!isCurrent()) return;
+		setDraftForConversation(conversationUuid, restoreOutboundDraft(pending.draftText, draft.value));
 		let uploadedFiles = [];
 		if (files.length) {
 			pending.uploadController = new AbortController();
@@ -3246,7 +3579,16 @@ async function send() {
 		if (!isCurrent()) return;
 		const sock = await ensureResponsiveWs(conversationUuid, isCurrent);
 		if (!isCurrent()) return;
-		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles}));
+		pending.storageReleased = true;
+		if (attachments.length) {
+			// Upload/preparation is definitely unsent: retain its reloadable files.
+			// Fence storage just before send, not at ACK (which may never arrive).
+			const cleared = await attachmentDrafts.removeItems(conversationUuid, new Set(attachments.map(item => item.id)));
+			if (!isCurrent()) return;
+			if (!cleared) throw new Error("attachment_draft_clear_failed");
+		}
+		setDraftForConversation(conversationUuid, draft.value);
+		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles, referenceOrder}));
 		outboundSends.markSent(pending);
 		emit("conversations-refresh");
 	} catch (error) {
@@ -3308,8 +3650,12 @@ async function newSession() {
 	await focusComposer();
 }
 
-watch(() => props.conversationUuid, async (next, prev) => {
-	if (next === prev) return;
+async function switchConversation(next, prev) {
+	const generation = ++conversationSwitchGeneration;
+	// The width baseline tracks the scroller element itself, not the
+	// conversation, so it stays valid across a switch. Only the reading position
+	// belongs to the conversation being left.
+	readingAnchor = null;
 	pendingLoadBottomScroll = null;
 	runConfigInteractionGeneration += 1;
 	if (prev) setDraftForConversation(prev, draft.value);
@@ -3319,15 +3665,21 @@ watch(() => props.conversationUuid, async (next, prev) => {
 		&& next === localToServerTransitionUuid.value
 		&& hasOptimisticLocalTurn();
 	if (isLocalToServerSend) {
+		// Same conversation under a new id: the draft attachments already moved with
+		// it in ensureServerConversationForSend and stay in the composer.
 		clearDraftForConversation(prev);
 		runConfigOverride.value = null;
 		chatState.value = {...(chatState.value || {}), conversationUuid: next};
 		agentAutoOpenBoundaryConversation = String(next || "");
 		return;
 	}
+	// Park this conversation's files before the released send hands its own files
+	// back, so both end up in the same place.
+	if (attachmentsLoadedKey) stashAttachmentsForConversation(attachmentsLoadedKey);
 	leavePendingSend();
 	runConfigOverride.value = null;
 	pinnedActiveTurnIndex = null;
+	readingAnchor = null;
 	activeTurnIndex.value = 0;
 	closeWs();
 	clearUiCaches();
@@ -3335,9 +3687,17 @@ watch(() => props.conversationUuid, async (next, prev) => {
 	messages.value = [];
 	runStartedAt.value = 0;
 	lastStats.value = null;
-	await load({scrollMode: "bottom", refreshDefaults: String(next || "").startsWith("local:")});
+	// Bind the draft immediately, before any HTTP await. A stale load must never
+	// resurrect its files in the next conversation's composer.
 	restoreDraftForConversation(next);
+	await load({scrollMode: "bottom", refreshDefaults: String(next || "").startsWith("local:")});
+	if (!componentMounted || generation !== conversationSwitchGeneration || props.conversationUuid !== next) return;
 	if (isLocalConversation.value) await focusComposer();
+}
+
+watch(() => props.conversationUuid, async (next, prev) => {
+	if (next === prev) return;
+	await switchConversation(next, prev);
 }, {immediate: false});
 
 watch(() => props.folderId, (next, prev) => {
@@ -3352,7 +3712,7 @@ watch(() => props.folderId, (next, prev) => {
 
 watch(() => draft.value, (value) => {
 	if (restoringDraft.value) return;
-	setDraftForConversation(props.conversationUuid, value);
+	persistComposerDraft(value);
 });
 
 watch(() => turns.value.length, async (length) => {
@@ -3394,6 +3754,8 @@ watch(() => [props.conversationUuid, props.navigationObscured, chatState.value, 
 
 onMounted(async () => {
 	componentMounted = true;
+	void attachmentDrafts.prune();
+	void restoreAttachmentsForConversation(props.conversationUuid);
 	activityReadTracker = createActivityReadTracker({snapshot: activityReadSnapshot, send: items => Api.readConversationActivity(items), accepted: acceptActivityReadReceipt});
 	window.addEventListener("focus", scheduleActivityRead);
 	window.addEventListener("blur", scheduleActivityRead);
@@ -3409,12 +3771,20 @@ onMounted(async () => {
 	// applied before remote state, so no temporary model placeholder can render.
 	await loadOptions();
 	await load({scrollMode: "bottom", refreshDefaults: isLocalConversation.value});
-	restoreDraftForConversation(props.conversationUuid);
 	adjustComposerHeight();
+	observeScrollerReflow();
 	await nextTick();
 	scheduleActiveTurnFromScroll({force: true});
 });
 onBeforeUnmount(() => {
+	detachAttachmentHydrations();
+	attachmentRestoring.value = false;
+	conversationSwitchGeneration += 1;
+	scrollerResizeObserver?.disconnect();
+	scrollerResizeObserver = null;
+	scrollerReflowFrame = 0;
+	observedScrollerWidth = 0;
+	readingAnchor = null;
 	activityReadTracker?.dispose();
 	window.removeEventListener("focus", scheduleActivityRead);
 	window.removeEventListener("blur", scheduleActivityRead);
@@ -3437,6 +3807,7 @@ onBeforeUnmount(() => {
 	document.removeEventListener("visibilitychange", checkConnectionOnResume);
 	closeWs();
 	clearAttachments();
+	releaseAllStashedAttachments();
 	revokeSentAttachmentPreviewUrls();
 });
 </script>

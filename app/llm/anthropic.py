@@ -133,10 +133,15 @@ def _to_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, An
     ]
 
 
-# ── Anthropic Prompt Cache 断点注入(沿用 parrot 已验证策略) ───────
+# ── Anthropic Prompt Cache 断点注入 ─────────────────────────────────
 # 4 个 ephemeral 断点(Anthropic 上限):system 末 block / tools 末 block /
-# 最早两个 user turn。消息断点按不可变的前向位置固定，后续 append 不会把
-# cache_control 从历史 unit 移走；经过 parrot 时会被 strip 重打(无害)。
+# 最后一条 message / 倒数第二个 user turn。
+#
+# Anthropic 是前缀缓存，只缓存到断点为止：断点必须随会话滚动到最新一条
+# 消息，否则断点之后追加的全部历史每次都按未缓存输入全价重发。
+# cache_control 标记本身不参与前缀匹配，移动它不会破坏已缓存前缀；
+# 倒数第二个 user turn 上的断点保证新一轮追加后仍能命中上一轮的前缀。
+# parrot ≥ 0.23.5 尊重客户端显式断点、不再 strip 重打，这里的位置即实际生效位置。
 
 def _inject_cache_on_block(block: dict) -> dict:
     """给单个 content block 打 ephemeral 断点(浅拷贝,不改原对象)。"""
@@ -175,20 +180,18 @@ def _apply_cache_breakpoints(payload: dict) -> None:
         tools[-1] = {**tools[-1], "cache_control": _CACHE_EPHEMERAL}
         payload["tools"] = tools
 
-    # messages:pin the earliest two user turns. A rolling "last message" marker
-    # rewrites an already emitted provider unit on every append, defeating literal
-    # prompt-prefix stability. Fixed forward positions stay valid indefinitely and,
-    # together with system/tools, remain within Anthropic's four-breakpoint limit.
+    # messages:最后一条 + 倒数第二个 user turn(滚动断点,缓存全部多轮历史前缀)
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
         messages = list(messages)
-        pinned = 0
-        for index, message in enumerate(messages):
+        last = len(messages) - 1
+        if isinstance(messages[last], dict):
+            messages[last] = _inject_cache_on_msg(messages[last])
+        for index in range(last - 1, -1, -1):
+            message = messages[index]
             if isinstance(message, dict) and message.get("role") == "user":
                 messages[index] = _inject_cache_on_msg(message)
-                pinned += 1
-                if pinned == 2:
-                    break
+                break
         payload["messages"] = messages
 
 
@@ -253,7 +256,7 @@ class AnthropicBackend(LLMBackend):
             payload["metadata"] = {"user_id": json.dumps(
                 {"session_id": session_id}, separators=(",", ":"))}
         # Prompt Cache:在 system/tools/messages 上注入 ephemeral 断点。
-        # 经过 parrot 时被 strip 重打(无害);直连裸 Anthropic 时自己生效(有用)。
+        # parrot ≥ 0.23.5 尊重客户端显式断点,直连裸 Anthropic 时同样生效,位置即实际生效位置。
         _apply_cache_breakpoints(payload)
         fast_body, _ = fast_request_parts(fast_request)
         return apply_fast_request_body(payload, fast_body)
@@ -353,8 +356,17 @@ class AnthropicBackend(LLMBackend):
                 if d.get("stop_reason"):
                     stop_reason = d["stop_reason"]
                 u = data.get("usage") or {}
-                if u.get("output_tokens"):
-                    in_usage.output_tokens = u.get("output_tokens", 0)
+                # message_delta usage is a cumulative snapshot, not an amount
+                # to add. Managed server tools may revise input/cache totals
+                # after message_start; absent fields still retain that snapshot.
+                for field, attr in (
+                    ("input_tokens", "input_tokens"),
+                    ("cache_read_input_tokens", "cache_read_tokens"),
+                    ("cache_creation_input_tokens", "cache_write_tokens"),
+                    ("output_tokens", "output_tokens"),
+                ):
+                    if field in u and u[field] is not None:
+                        setattr(in_usage, attr, u[field])
             elif t == "message_stop":
                 pass
 

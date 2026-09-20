@@ -335,6 +335,10 @@ class _WebLiveStream:
             self.started_at_ms = self.updated_at_ms
             self.status_started_at_ms = 0
         elif typ == "user":
+            if event.get("steeringRestored"):
+                # A prior run's queued original is now durable, but the new
+                # accepted run still owns subsequent replies and live state.
+                return
             next_turn_uuid = str(event.get("turnUuid") or event.get("turn_uuid") or uuid.uuid4())
             previous_agent_turn = self._agent_turn_uuid or self.current_turn_uuid
             same_turn = bool(next_turn_uuid and previous_agent_turn and next_turn_uuid == previous_agent_turn)
@@ -605,7 +609,7 @@ class _WebStreamRenderer:
             return str(item.get("text") or item.get("content") or "").strip()
         return str(item or "").strip()
 
-    async def on_steers_injected(self, steers: list[Any] | None = None, *, injected_texts: list[str] | None = None, cut: bool = False) -> None:
+    async def on_steers_injected(self, steers: list[Any] | None = None, *, injected_texts: list[str] | None = None, cut: bool = False, restored: bool = False) -> None:
         if self.live is None:
             return
         items = [dict(item) for item in (steers or []) if isinstance(item, dict)]
@@ -630,9 +634,11 @@ class _WebStreamRenderer:
                 "text": text,
                 **({"source": "telegram"} if first.get("source") == "telegram" else {}),
                 "steeringInjected": True,
+                **({"steeringRestored": True} if restored else {}),
                 **({"references": references, "referenceBundleId": str(first.get("referenceBundleId") or references[0].get("bundleId") or "")} if references else {}),
             })
-        self.live.activate_latest_user_turn()
+        if not restored:
+            self.live.activate_latest_user_turn()
 
     async def on_status(self, status: str) -> None:
         await self.emit({"type": "status", "status": status})

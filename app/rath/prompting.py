@@ -5,11 +5,20 @@ from typing import Any
 
 from app.rath.dao import RathDAO
 from app.rath.schemas import RathAgentDef
+from app.tools.allowlist import sanitize_tool_allowlist
 
 
 def agent_prompt_item(agent: RathAgentDef) -> dict[str, Any]:
     """Return the compact Agent descriptor exposed to prompt templates."""
     description = str(agent.description or "")
+    configured_tools = [str(name) for name in (agent.tool_allowlist or []) if str(name).strip()]
+    available_tools = sanitize_tool_allowlist(configured_tools)
+    if available_tools:
+        tools_text = ", ".join(available_tools)
+    elif configured_tools:
+        tools_text = "no currently available tools (configured preset tools are unavailable)"
+    else:
+        tools_text = "no additional preset restriction"
     return {
         "id": int(agent.id or 0),
         "key": agent.agent_key,
@@ -17,8 +26,8 @@ def agent_prompt_item(agent: RathAgentDef) -> dict[str, Any]:
         "name": agent.name,
         "description": description,
         "scenario": description,
-        "allowedTools": [str(name) for name in (agent.tool_allowlist or []) if str(name).strip()],
-        "allowedToolsText": ", ".join(str(name) for name in (agent.tool_allowlist or []) if str(name).strip()) or "no additional preset restriction",
+        "allowedTools": available_tools,
+        "allowedToolsText": tools_text,
     }
 
 

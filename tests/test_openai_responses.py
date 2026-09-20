@@ -259,6 +259,7 @@ async def test_responses_tools_preserve_separate_edit_contracts():
     out = _to_responses_tools(edit_tools)
 
     assert all(item["type"] == "function" for item in out)
+    assert all(item["strict"] is False for item in out)
     by_name = {item["name"]: item["parameters"] for item in out}
     assert set(by_name["Edit"]["properties"]) == {"path", "old_string", "new_string", "replace_all"}
     assert by_name["Edit"]["required"] == ["path", "old_string", "new_string"]
@@ -267,6 +268,68 @@ async def test_responses_tools_preserve_separate_edit_contracts():
     edits = by_name["EditBatch"]["properties"]["edits"]
     assert edits["items"]["properties"]["replace_all"]["type"] == "boolean"
     assert edits["items"]["required"] == ["old_string", "new_string"]
+
+
+async def test_responses_mcp_optional_parameters_remain_optional_on_wire():
+    tool = {
+        "name": "mcp__parrot__web_search",
+        "description": "Search with an optional freshness filter.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "freshness": {"type": "string", "enum": ["day", "week", "month", "year"]},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+        },
+    }
+    original = json.dumps(tool, sort_keys=True)
+    captured = {}
+    lines = _ev("response.output_item.done", {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call", "call_id": "search_1",
+            "name": tool["name"], "arguments": '{"query":"RFC 2606"}',
+        },
+    })
+    lines += _ev("response.completed", {
+        "type": "response.completed", "response": {"status": "completed", "usage": {}},
+    })
+
+    def handler(req):
+        captured.update(json.loads(req.content.decode()))
+        return sse_response(lines)
+
+    backend = OpenAIResponsesBackend(make_client(handler), "https://x/v1", "k")
+    result = await aggregate(backend.stream(
+        [{"role": "user", "content": "Search RFC 2606 without a freshness filter."}],
+        model="gpt-test", tools=[tool],
+    ))
+
+    sent = captured["tools"][0]
+    # Responses otherwise auto-normalizes omitted strict into all-fields-required.
+    assert sent["strict"] is False
+    assert sent["parameters"] == tool["parameters"]
+    assert sent["parameters"]["required"] == ["query"]
+    assert json.dumps(tool, sort_keys=True) == original
+    assert json.loads(result.tool_calls[0].arguments) == {"query": "RFC 2606"}
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_responses_tools_preserve_explicit_strict_choice(strict):
+    tool = {
+        "name": "ExplicitTool", "strict": strict,
+        "parameters": {
+            "type": "object", "properties": {"value": {"type": "string"}},
+            "required": ["value"], "additionalProperties": False,
+        },
+    }
+
+    converted = _to_responses_tools([tool])[0]
+
+    assert converted["strict"] is strict
+    assert converted["parameters"] == tool["parameters"]
 
 
 async def test_responses_stream_error_event_raises():
@@ -444,3 +507,56 @@ def test_responses_build_payload_sets_parallel_tool_calls_for_gpt_models():
     other = backend.build_payload([{"role": "user", "content": "hi"}], model="o3", tools=tools)
     assert gpt["parallel_tool_calls"] is True
     assert "parallel_tool_calls" not in other
+
+
+async def test_responses_incomplete_max_output_tokens_maps_to_length():
+    """response.incomplete + incomplete_details.reason=max_output_tokens → finish_reason=length。
+
+    回归：以前 response.incomplete 只被用来取 usage，finish 恒为 "stop"，
+    Agent 层于是把「输出被截断」误判成「模型偶发没输出」，触发无效补救重试。
+    """
+    lines = []
+    lines += _ev("response.reasoning_summary_text.delta", {
+        "type": "response.reasoning_summary_text.delta", "delta": "想" * 50})
+    lines += _ev("response.incomplete", {
+        "type": "response.incomplete",
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 10, "output_tokens": 31999, "total_tokens": 32009},
+        },
+    })
+    backend = OpenAIResponsesBackend(make_client(lambda _r: sse_response(lines)), "https://x/v1", "k")
+    result = await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="deepseek"))
+    assert result.text == ""
+    assert result.finish_reason == "length"
+    assert result.usage.output_tokens == 31999
+
+
+async def test_responses_incomplete_other_reason_passes_through():
+    """其它 incomplete reason（如 content_filter）按原值传出，不伪装成 stop/length。"""
+    lines = _ev("response.incomplete", {
+        "type": "response.incomplete",
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        },
+    })
+    backend = OpenAIResponsesBackend(make_client(lambda _r: sse_response(lines)), "https://x/v1", "k")
+    result = await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="m"))
+    assert result.finish_reason == "content_filter"
+
+
+async def test_responses_completed_still_stop():
+    """response.completed 仍归一到 stop，不受 incomplete 处理影响。"""
+    lines = _ev("response.completed", {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        },
+    })
+    backend = OpenAIResponsesBackend(make_client(lambda _r: sse_response(lines)), "https://x/v1", "k")
+    result = await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="m"))
+    assert result.finish_reason == "stop"

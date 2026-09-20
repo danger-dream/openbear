@@ -8,9 +8,22 @@ from app.admin.settings import (
     safe_settings_payload,
     serialize_spec,
 )
+from app.rath.prompting import agent_prompt_item
 from app.rath.prompts import PROMPT_SPECS, render_plan_prompt
+from app.rath.schemas import RathAgentDef
 from app.settings.specs import get_spec
 from app.web_console.rath_api import WebAdminRathMixin
+
+
+def test_legacy_removed_preset_tools_are_not_advertised_as_callable() -> None:
+    old_only = agent_prompt_item(RathAgentDef(agent_key="old", name="Old", tool_allowlist=["WebSearch"]))
+    assert old_only["allowedTools"] == []
+    assert "configured preset tools are unavailable" in old_only["allowedToolsText"]
+
+    mixed = agent_prompt_item(RathAgentDef(agent_key="mixed", name="Mixed", tool_allowlist=["WebExtract", "Read"]))
+    assert mixed["allowedTools"] == ["Read"]
+    assert mixed["allowedToolsText"] == "Read"
+
 
 
 def test_all_plan_prompt_defaults_render_with_sample_values() -> None:

@@ -172,6 +172,20 @@ def is_tool_allowed(
     return True, "allowed"
 
 
+def agent_access_reason(server_config: MCPServerConfig, original_name: str) -> str:
+    """An independent, exact-name Agent exposure gate; never an approval grant."""
+    access = server_config.agent_access
+    if access.mode == "disabled":
+        return "mcp_agent_access_disabled"
+    if access.mode == "selected" and original_name not in access.tools:
+        return "mcp_agent_tool_not_allowed"
+    return ""
+
+
+def is_agent_context(context: ToolRuntimeContext) -> bool:
+    return bool(context.agent_session_uuid or context.agent_key or context.source == "agent" or context.source.startswith("agent:"))
+
+
 def _annotation_bool(annotations: dict[str, Any], key: str) -> bool:
     value = annotations.get(key)
     if isinstance(value, bool):

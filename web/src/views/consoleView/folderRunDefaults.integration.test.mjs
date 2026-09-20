@@ -24,7 +24,7 @@ function deferred() {let resolve, reject; const promise = new Promise((yes, no) 
 
 function harness({folderId = "project", getDefaults} = {}) {
   const props = {conversationUuid: "local:new", folderId};
-  const requests = [], patches = [], creates = [], resets = [];
+  const requests = [], patches = [], creates = [], resets = [], migrations = [];
   const ref = value => ({value});
   const state = {
     props, DEFAULT_NEW_CONVERSATION_THINKING: "",
@@ -39,6 +39,7 @@ function harness({folderId = "project", getDefaults} = {}) {
     isLocalConversation: {get value() {return props.conversationUuid.startsWith("local:");}},
     activeConversationUuid: {get value() {return props.conversationUuid;}},
     chatState: ref({}), localToServerTransitionUuid: ref(""),
+    migrateAttachmentDraft: (from, to) => migrations.push([from, to]),
     loadOptions: async () => {}, nextTick: async () => {},
     resetLocalConversationState: uuid => resets.push(uuid),
     referenceDisplayText: text => text,
@@ -58,7 +59,7 @@ function harness({folderId = "project", getDefaults} = {}) {
   const context = vm.createContext(state);
   vm.runInContext(actual, context);
   const run = code => vm.runInContext(code, context);
-  return {state, requests, patches, creates, resets, run, config: () => JSON.parse(run("JSON.stringify(completeLocalRunConfig())"))};
+  return {state, requests, patches, creates, resets, migrations, run, config: () => JSON.parse(run("JSON.stringify(completeLocalRunConfig())"))};
 }
 
 test("folder defaults populate all six controls and are the exact create payload", async () => {
@@ -70,6 +71,8 @@ test("folder defaults populate all six controls and are the exact create payload
   assert.equal(h.requests[0].folderId, "project");
   assert.deepEqual(JSON.parse(JSON.stringify(h.creates[0].runConfig)), paid);
   assert.equal(h.creates[0].folderId, "project");
+  // The composer still holds the files of this send, so their draft follows the new id.
+  assert.deepEqual(h.migrations, [["local:new", "created"]]);
 });
 
 test("manual draft overrides retain other folder values without updating global preferences", async () => {

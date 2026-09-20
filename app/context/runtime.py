@@ -17,7 +17,7 @@ from app.agent.native_continuation import (
 )
 from app.context.configuration import normalize_strategy
 from app.context.prompts import effective_context_prompt
-from app.context.store import RequestTicket, StaleWindow, WindowStore
+from app.context.store import ControllerBoundary, RequestTicket, StaleWindow, WindowStore
 from app.context.strategies import (
     CompressionRequest,
     ContextCompressionError,
@@ -47,12 +47,14 @@ class ContextManager:
         on_state: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         active_run_root_turn_uuid: str = "",
         model_label: str = "",
+        restored_controller_anchor: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.policy = policy
         self.backend = backend
         self.model = model
         self.model_label = model_label
+        self.restored_controller_anchor = copy.deepcopy(restored_controller_anchor)
         self.request_options: dict[str, Any] = {}
         self.replay_identity = ""
         self.on_rotated = on_rotated
@@ -179,7 +181,7 @@ class ContextManager:
         safe, dropped = sanitize_window_checkpoint(messages)
         if dropped:
             archived = await self.store.archive(safe)
-        saved_state = ((await self.store.load()) or {}).get("state") or {}
+        saved_state = ((await self.store.load(fresh=True)) or {}).get("state") or {}
         # Checkpoints do not change the request identity; keep it even when a
         # compatibility caller has not supplied the full label/options yet.
         identity = {key: saved_state[key] for key in ("requestModelLabel", "replayIdentity") if key in saved_state}
@@ -195,7 +197,7 @@ class ContextManager:
         extra = {**measurement, **(extra_state or {}), **identity, "incompleteBatch": bool(dropped)}
         saved_route = route if route is not None else self.route
         if not saved_route:
-            saved_route = str(((await self.store.load()) or {}).get("route_fingerprint") or "")
+            saved_route = str(((await self.store.load(fresh=True)) or {}).get("route_fingerprint") or "")
         saved = await self.store.save(
             safe, expected_revision=archived["revision"], expected_source_revision=archived["sourceRevision"],
             route=saved_route, extra_state=extra,
@@ -209,14 +211,15 @@ class ContextManager:
         force: bool = False, attempt: int = 0, source: str = "",
         refresh_after_rotation: Callable[[list[Message]], Awaitable[list[Message]]] | None = None,
         expected_message_high_water: int | None = None,
+        controller_boundary: ControllerBoundary | None = None,
         request_view: Callable[[list[Message]], list[Message]] | None = None,
         request_options: dict[str, Any] | None = None,
     ) -> list[Message]:
         if not validate_model_context(messages):
             raise ValueError("window_prepare_requires_closed_tool_batch")
         self.bind_sources(messages)
-        archived = await self.store.archive(messages)
-        saved = await self.store.load()
+        archived = await self.store.archive(messages, controller_boundary=controller_boundary)
+        saved = await self.store.load(fresh=True)
         system = effective_context_prompt(system, self.active_strategy)
         self.system = system
         self.request_options = copy.deepcopy(request_options or {})
@@ -322,7 +325,7 @@ class ContextManager:
         if rotated:
             # Algorithms may create a new summary source. Archive it only after
             # budget validation; the active state is still swapped atomically.
-            with_generated = await self.store.archive(outgoing)
+            with_generated = await self.store.archive(outgoing, controller_boundary=controller_boundary)
             if (with_generated["revision"] != archived["revision"]
                     or with_generated["sourceRevision"] != archived["sourceRevision"] + with_generated["added"]):
                 raise StaleWindow("context_changed_during_compression; original_context_preserved")
@@ -330,7 +333,8 @@ class ContextManager:
         result = await self.store.save(
             outgoing, expected_revision=archived["revision"], expected_source_revision=archived["sourceRevision"],
             route=route, rotated=rotated, reason=detail["source"], detail=detail,
-            expected_message_high_water=expected_message_high_water,
+            expected_message_high_water=expected_message_high_water, controller_boundary=controller_boundary,
+            source_message_high_water=controller_boundary.high_water if controller_boundary else None,
             extra_state={"strategy": self.active_strategy, "compressionPending": False,
                          "replayIdentity": self.replay_identity,
                          **({"requestModelLabel": self.model_label or saved["state"]["requestModelLabel"]}

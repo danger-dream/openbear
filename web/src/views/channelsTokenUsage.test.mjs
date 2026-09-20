@@ -30,14 +30,15 @@ async function renderTile(render, stats) {
 }
 
 const cases = [
-  { name: "cache reads and writes are both included", stats: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 600, cache_write_tokens: 200 }, total: "950", input: "900", pct: "88.9%" },
+  { name: "cache writes count toward prompt but not toward hit rate", stats: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 600, cache_write_tokens: 200 }, total: "950", input: "900", pct: "66.7%" },
   { name: "cache-read-only usage", stats: { cache_read_tokens: 600 }, total: "600", input: "600", pct: "100.0%" },
-  { name: "cache-write-only usage", stats: { cache_write_tokens: 200 }, total: "200", input: "200", pct: "100.0%" },
+  { name: "cache-write-only usage", stats: { cache_write_tokens: 200 }, total: "200", input: "200", pct: "0.0%" },
+  { name: "anthropic rolling breakpoint: fresh≈0, write>0 must not read 100%", stats: { input_tokens: 3, output_tokens: 900, cache_read_tokens: 120000, cache_write_tokens: 1800 }, total: "123K", input: "122K", pct: "98.5%" },
   { name: "uncached usage remains unchanged", stats: { input_tokens: 100, output_tokens: 50 }, total: "150", input: "100", pct: "0.0%" },
   { name: "output-only usage", stats: { output_tokens: 50 }, total: "50", input: "0", pct: "—" },
   { name: "zero usage", stats: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 }, total: "0", input: "0", pct: "—" },
   { name: "missing stats", stats: undefined, total: "0", input: "0", pct: "—" },
-  { name: "numeric strings use numeric addition", stats: { input_tokens: "100", output_tokens: "50", cache_read_tokens: "600", cache_write_tokens: "200" }, total: "950", input: "900", pct: "88.9%" },
+  { name: "numeric strings use numeric addition", stats: { input_tokens: "100", output_tokens: "50", cache_read_tokens: "600", cache_write_tokens: "200" }, total: "950", input: "900", pct: "66.7%" },
   { name: "reported large-usage regression", stats: { input_tokens: 22553108, output_tokens: 2692527, cache_read_tokens: 581175424, cache_write_tokens: 0 }, total: "606M", input: "604M", pct: "96.3%" },
 ];
 for (const fixture of cases) {

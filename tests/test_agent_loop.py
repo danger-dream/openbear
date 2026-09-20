@@ -1982,3 +1982,66 @@ async def test_multiple_agent_calls_are_normalized_before_persist_and_dispatch()
     assert [call["title"] for call in agent_calls] == ["开发审查", "验证审查"]
     assert json.loads(tool_results[1]["content"])["task"]["taskUuid"] == "t1"
     assert json.loads(tool_results[2]["content"])["task"]["taskUuid"] == "t2"
+
+
+async def test_truncated_reasoning_only_does_not_retry():
+    """finish=length 且无正文 → 不补救重试，直接终止并明确告知。
+
+    回归：以前该场景掉进「只思考无正文」补救分支，注入引导语后重发同一份上下文，
+    模型再烧满一次输出预算又截断（实测 3 次请求、白烧 6.4 万输出 token）。
+    """
+    backend = FakeBackend([[
+        StreamEvent(kind="reasoning", text="我在反复纠结措辞" * 20),
+        StreamEvent(kind="finish", finish_reason="length"),
+    ]])
+    agent = Agent(backend, _echo_registry(), reasoning_only_retry_limit=2)
+    rec = RecordRenderer()
+    r = await agent.run([{"role": "user", "content": "hi"}], rec, model="m")
+    # 只发 1 次请求：不注入、不重发
+    assert r.model_calls == 1
+    assert r.model_retry == 0
+    assert len(backend.seen_convos) == 1
+    # 明确告知，而不是「（空回复）」
+    assert "模型思考输出超限且未产出正文" in rec.final
+    assert "降低思考档位或更换模型" in rec.final
+
+
+async def test_truncated_with_content_keeps_existing_notice():
+    """finish=length 但有正文 → 保留原「长度上限被截断」提示，文案不被替换。"""
+    backend = FakeBackend([[
+        StreamEvent(kind="content", text="很长的回答被截断"),
+        StreamEvent(kind="finish", finish_reason="length"),
+    ]])
+    agent = Agent(backend, _echo_registry())
+    rec = RecordRenderer()
+    r = await agent.run([{"role": "user", "content": "hi"}], rec, model="m")
+    assert "很长的回答被截断" in rec.final
+    assert "回复达到长度上限被截断" in rec.final
+    assert "未产出正文" not in rec.final
+
+
+async def test_empty_stop_still_retries_when_not_truncated():
+    """finish=stop 的空响应仍走补救重试，不被截断改动误伤。"""
+    backend = FakeBackend([
+        [StreamEvent(kind="finish", finish_reason="stop")],
+        [StreamEvent(kind="content", text="恢复了"),
+         StreamEvent(kind="finish", finish_reason="stop")],
+    ])
+    agent = Agent(backend, _echo_registry(), empty_response_retry_limit=1)
+    r = await agent.run([{"role": "user", "content": "hi"}], RecordRenderer(), model="m")
+    assert r.text == "恢复了"
+    assert r.model_calls == 2
+
+
+async def test_reasoning_only_stop_still_retries_when_not_truncated():
+    """finish=stop 的「只思考无正文」仍走补救重试，不被截断改动误伤。"""
+    backend = FakeBackend([
+        [StreamEvent(kind="reasoning", text="我在想..."),
+         StreamEvent(kind="finish", finish_reason="stop")],
+        [StreamEvent(kind="content", text="想好了"),
+         StreamEvent(kind="finish", finish_reason="stop")],
+    ])
+    agent = Agent(backend, _echo_registry(), reasoning_only_retry_limit=2)
+    r = await agent.run([{"role": "user", "content": "hi"}], RecordRenderer(), model="m")
+    assert r.text == "想好了"
+    assert r.model_calls == 2

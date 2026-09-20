@@ -198,6 +198,7 @@ def _visible_history_items(
     conversation_uuid: str,
     *,
     include_notices: bool = False,
+    op_id: str | None = None,
 ) -> list[HistoryItem]:
     op_types = sorted(VISIBLE_OP_TYPES | ({"notice"} if include_notices else set()))
     placeholders = ",".join("?" for _ in op_types)
@@ -208,9 +209,10 @@ def _visible_history_items(
         FROM web_operations
         WHERE conversation_uuid=?
           AND op_type IN ({placeholders})
+          {"AND op_id=?" if op_id is not None else ""}
         ORDER BY display_seq ASC, id ASC
         """,
-        (conversation_uuid, *op_types),
+        (conversation_uuid, *op_types, *((op_id,) if op_id is not None else ())),
     ).fetchall()
     items: list[HistoryItem] = []
     for row in rows:
@@ -318,6 +320,17 @@ def history_read(
         if err:
             return err
         assert info is not None
+        if "opId" in args:
+            op_id = args["opId"]
+            if not isinstance(op_id, str) or not op_id.strip():
+                return "error: invalid opId"
+            # An explicit message locator is not a window over nearby turns.
+            # Filter in SQL and retain the same owner/visibility boundary, even
+            # when the selected message belongs to the active turn.
+            items = _visible_history_items(con, conv_uuid, op_id=op_id)
+            if not items:
+                return f"error: message not found: {op_id}"
+            return _render_turns(info, _group_turns(items), total_turns=1, max_chars=_max_chars(args))
         include_notices = _bool_arg(args, "includeNotices", False) or _bool_arg(args, "include_notices", False)
         items = _visible_history_items(con, conv_uuid, include_notices=include_notices)
         turns = _group_turns(items)
@@ -576,6 +589,8 @@ def run_history_action(
     current_turn_uuid: str = "",
 ) -> str:
     action = str(args.get("action") or "read").strip().lower()
+    if "opId" in args and action != "read":
+        return "error: opId requires action=read"
     if action == "read":
         return history_read(
             db_path,
@@ -595,6 +610,8 @@ def run_history_action(
 def register_history_tools(reg: ToolRegistry, db: Any) -> None:
     async def _history(args: dict[str, Any]) -> str:
         ctx = current_tool_context()
+        if "opId" in args and str(args.get("source") or "visible") != "visible":
+            return "error: opId requires source=visible"
         if str(args.get("source") or "visible") == "execution":
             from app.context.history import ControllerExecutionHistory
             from app.tools.agent_history import query_execution_history
@@ -647,6 +664,7 @@ def register_history_tools(reg: ToolRegistry, db: Any) -> None:
                 "scope": {"type": "string", "description": "current or explicit conversation; for search, scope=current restricts matches to this conversation"},
                 "conversationUuid": {"type": "string", "description": "Web conversation UUID; optional for scope=current; for search, restricts matches to that conversation"},
                 "turnUuid": {"type": "string", "description": "Turn UUID for read_turn"},
+                "opId": {"type": "string", "description": "Exact visible user/assistant message operation ID for action=read. Returns only that message, without turn paging or current-turn exclusion."},
                 "query": {"type": "string", "description": "Search query for action=search"},
                 "from": {"type": "string", "description": "read position: start or end"},
                 "turns": {"type": "integer", "description": "Number of turns to read"},

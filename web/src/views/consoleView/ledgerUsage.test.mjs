@@ -27,7 +27,8 @@ test("header token parts use only the absolute sessions ledger", () => {
     cost_usd: 0.25,
   });
 
-  assert.deepEqual(ledgerTokenParts(usage), {input: 135, output: 20, cache: 35});
+  // input 为完整 prompt(100+30+5)；缓存仅计读缓存 30，写缓存 5 不算命中。
+  assert.deepEqual(ledgerTokenParts(usage), {input: 135, output: 20, cache: 30});
   assert.equal(usage.cost_usd, 0.25);
 });
 

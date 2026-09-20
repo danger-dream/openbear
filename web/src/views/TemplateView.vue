@@ -534,12 +534,13 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					<pre class="bg-black/[0.04] p-2 rounded text-xs font-mono">[[ runtimeInfo.host ]]          运行时信息
 [[ workspaceDir ]]             工作目录
 [[ helpers.toolLines(builtinToolNames, builtinToolSummaries) ]]  内置工具清单
-[[ helpers.toolLines(mcpToolNames, mcpToolSummaries) ]]  MCP 工具清单
+[[ helpers.toolLines(mcpToolNames, mcpToolSummaries) ]]  MCP 工具清单（Agent 仅含本轮授权）
 [[ helpers.runtimeLine(runtimeInfo, defaultThinkLevel) ]]  Runtime 行
 availableAgents / agents.available  当前可用 Agent 数组</pre>
 				</div>
 				<div>
 					<div class="font-semibold mb-1">条件 / 循环 / 块</div>
+                    <p class="text-xs text-macsub">Agent 模板的 MCP 名单与服务说明仅来自授权工具，不包含未授权服务；服务说明不扩大权限。</p>
 					<pre class="bg-black/[0.04] p-2 rounded text-xs font-mono">@if helpers.has(toolNames,'gateway')
   ...内容...
 @endif

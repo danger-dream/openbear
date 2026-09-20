@@ -126,6 +126,23 @@ def test_plan_validation_rejects_duplicate_ids_and_cycles():
         normalize_plan(plan)
 
 
+async def test_removed_only_legacy_preset_ceiling_cannot_expand_through_plan(env):
+    db, _dao, _manager, coordinator, task_uuid, _workflow_uuid = env
+    await db.conn.execute(
+        "UPDATE rath_tasks SET input_json=? WHERE task_uuid=?",
+        (json.dumps({
+            "planMode": "managed",
+            "presetToolCeiling": ["WebSearch"],
+            "agentSnapshot": {"toolAllowlist": []},
+        }), task_uuid),
+    )
+    await db.conn.commit()
+    plan = sample_plan()
+    plan["toolRequests"] = [{"name": "Read", "reason": "must not expand", "neededForSteps": ["s1"]}]
+    with pytest.raises(PlanError, match="preset ceiling"):
+        await coordinator.submit_plan(task_uuid, plan, request_id="legacy-removed-ceiling", wait_for_decision=False)
+
+
 async def test_initial_plan_tool_request_is_audited_and_execution_permissions_freeze(env):
     _db, _dao, _manager, coordinator, task_uuid, _workflow_uuid = env
     plan = sample_plan()

@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import {createOutboundSendTracker, probeSocket, restoreOutboundDraft, waitForSocketOpen} from "./outboundSend.js";
-import {referenceDisplayText, referenceErrorText, referenceToken, referencesInText} from "../../references/codec.js";
+import {referenceDisplayText, referenceErrorText, referenceToken, referenceKey, referencesInText} from "../../references/codec.js";
 import {createOperationFrameBuffer} from './operationFrameBuffer.js';
+import {createAttachmentDraftStorage} from './attachmentDraftStorage.js';
+import {createMemoryAttachmentDraftDriver} from './attachmentDraftMemoryDriver.mjs';
 
 // Run the actual ConsoleView submission/recovery functions, not a second model
 // of the implementation. Vue rendering and HTTP are isolated side-effect seams.
-const source = fs.readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
+const source = fs.readFileSync(process.env.CONSOLE_TEST_SOURCE || new URL("./ConsoleView.vue", import.meta.url), "utf8");
 const composer = fs.readFileSync(new URL("./ConsoleComposer.vue", import.meta.url), "utf8");
 function between(start, end, text = source) {
   const a = text.indexOf(start);
@@ -18,6 +20,7 @@ function between(start, end, text = source) {
 }
 const actual = [
   between("const canSend = computed(() => {", "const modelGroups = computed("),
+  between("function activeAttachmentKey()", "function queueSentAttachmentPreviewRevokes("),
   between("function closeWs() {", "function normalizePendingSteering("),
   between("function finishPendingOutboundSend(", "function applyLoadedConversationState("),
   between("async function send() {", "async function stop() {"),
@@ -30,6 +33,8 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
   let timerSeq = 0;
   let requestSeq = 0;
   const timers = new Map();
+  const attachmentRecords = new Map();
+  const attachmentDriver = createMemoryAttachmentDraftDriver({records: attachmentRecords});
   const sockets = [];
   const warnings = [];
   const refreshes = [];
@@ -68,7 +73,8 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     probeSocket: (socket) => probeSocket(socket, timer),
     waitForSocketOpen: (socket) => waitForSocketOpen(socket, timer),
     restoreOutboundDraft, referenceDisplayText, referenceErrorText, referencesInText, referenceCatalog: {ready:true,connected:true},
-    props,
+    props, composer: {value: null},
+    attachmentRestoring: {value: false},
     compacting: {value: false}, sendPending: {value: false}, running: {value: false},
     draft: {value: "original message"}, pendingAttachments: {value: []}, attachmentPreviews: {value: {}},
     messages: {value: []}, lastStats: {value: null}, foregroundRunning: {value: false}, rootTurnRunning: {value: false},
@@ -79,6 +85,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     localToServerTransitionUuid: {value: ""}, terminalStateRefreshScheduler: {invalidate: noop}, cancelScheduledUiWork: noop,
     conversationWsUrl: (uuid) => `ws://test.invalid/${uuid}`,
     localAttachmentPayload: () => [], clearDraftForConversation: noop, adjustComposerHeight: noop, closeComposerMenus: noop,
+    attachmentDrafts: createAttachmentDraftStorage({driver: attachmentDriver}),
     noteVisibleOutput: noop, clearActiveRun: noop, lockAutoScroll: noop, scrollBottom: async () => {},
     emit: (event, uuid) => {if (event === "conversation-created") props.conversationUuid = uuid;},
     nextTick: async () => {}, completeLocalRunConfig: () => ({}), ensureLocalRunDefaults: async () => {},
@@ -98,14 +105,17 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     normalizeLedgerUsageBaseline: (value) => value,
   };
   context = vm.createContext(globals);
-  vm.runInContext(`let ws=null; let wsConversationUuid=""; let reconnectTimer=null;
+  vm.runInContext(`let attachmentsLoadedKey=props.conversationUuid; let attachmentRestoreGeneration=0;
+    const attachmentsByConversation=new Map(); const attachmentHydrations=new Map();
+    let ws=null; let wsConversationUuid=""; let reconnectTimer=null;
     let componentMounted=true; let sendAttemptGeneration=0; let connectionResumePromise=null;
     let timelinePageInitialized=!props.conversationUuid.startsWith('local:');
     let timelinePageConversationUuid=props.conversationUuid;
     const outboundSends=createOutboundSendTracker({onTimeout:(pending)=>recoverUnconfirmedSend(pending)});
     ${actual}`, context);
   return {
-    context, sockets, warnings, refreshes, revoked, timers,
+    context, sockets, warnings, refreshes, revoked, timers, attachmentDriver,
+    stored: (key) => Array.from(attachmentRecords.get(key)?.items || [], (item) => item.fileName),
     run: (code) => vm.runInContext(code, context),
     sends: () => sockets.flatMap((socket) => socket.sent).filter((item) => item.type === "send"),
     advance: async (ms, {run = true} = {}) => {
@@ -125,6 +135,19 @@ test('one accepted send uses only one parent directory-refresh path, never compo
   assert.equal(componentEvents.filter(x=>x==='conversations-refresh').length,1);
   assert.equal(globalEvents.filter(x=>x==='openbear:conversations-refresh').length,0);
   h.run('leavePendingSend()');
+});
+
+test('send snapshots selection order before clearing the editor; newly inserted front item stays last in priority',async()=>{
+  const h=harness();
+  const old={kind:'chat',id:'old',label:'先选'},added={kind:'chat',id:'added',label:'后选'};
+  const keys=referencesInText(referenceToken(old)+' '+referenceToken(added)).map(referenceKey);
+  const child={getReferenceOrder:()=>[...keys]},context=vm.createContext({composerTextarea:{value:child}});
+  vm.runInContext(between('function getReferenceOrder()', 'defineExpose(', composer),context);
+  h.context.composer.value={getReferenceOrder:()=>vm.runInContext('getReferenceOrder()',context)};
+  h.context.draft.value=referenceToken(added)+' 原问题 '+referenceToken(old);
+  await h.run('send()');keys.splice(0);
+  assert.deepEqual(h.sends()[0].referenceOrder,[referenceKey(old),referenceKey(added)]);
+  assert.equal(referencesInText(h.sends()[0].text)[0].id,'added');
 });
 
 test("references wait for backend capability without clearing a draft or sending raw locators", async () => {
@@ -243,6 +266,19 @@ test("ACK removes only submitted attachments; recovery retains original plus new
       assert.equal(h.context.attachmentPreviews.value.first, "blob:first");
     }
   }
+});
+
+test("submitting clears the stored files of that draft, and a released send stores them again", async () => {
+  const h = harness();
+  const only = {id: "only", file: {name: "only.txt", type: "text/plain", size: 4}};
+  h.context.pendingAttachments.value = [only];
+  await h.context.attachmentDrafts.save("conv-a", [only]);
+  await h.run("send()");
+  // A reload during the send must not offer a file whose message may be accepted.
+  assert.deepEqual(h.stored("conv-a"), []);
+  await h.advance(15000);
+  assert.deepEqual(Array.from(h.context.pendingAttachments.value, (item) => item.id), ["only"]);
+  assert.deepEqual(h.stored("conv-a"), ["only.txt"]);
 });
 
 test("failed ACK does not falsely stop a real run that already produced frames", async () => {
@@ -399,4 +435,91 @@ test("first local conversation binds its pending receipt to the created server c
   await h.advance(15000);
   assert.equal(h.context.draftByConversation.value["conv-created"], "original message");
   assert.equal(h.context.sendPending.value, false);
+});
+
+function deferred() {let resolve; const promise = new Promise(r => {resolve = r;}); return {promise, resolve};}
+const draftFile = id => ({id, file: new File([id], `${id}.txt`, {type: 'text/plain'})});
+const reloadNames = async (h, key = 'conv-a') => (await h.context.attachmentDrafts.load(key)).items.map(item => item.file.name);
+
+test('C05: preparing/uploading files survive reload, but sent-unacknowledged files do not', async () => {
+  for (const local of [false, true]) {
+    const creation = deferred();
+    const h = harness({local, createConversation: () => creation.promise});
+    const only = draftFile('file'); const uploading = deferred();
+    h.context.pendingAttachments.value = [only];
+    await h.context.attachmentDrafts.save(local ? 'local:new' : 'conv-a', [only]);
+    h.context.Api.uploadConversationFiles = () => uploading.promise;
+    const sending = h.run('send()'); await flush();
+    if (local) {
+      assert.deepEqual(await reloadNames(h, 'local:new'), ['file.txt'], 'creation is definitely unsent');
+      creation.resolve({conversation: {conversationUuid: 'conv-created'}}); await flush();
+    }
+    const key = local ? 'conv-created' : 'conv-a';
+    assert.equal(h.run('outboundSends.current.phase'), 'uploading');
+    assert.equal(h.sends().length, 0);
+    assert.deepEqual(await reloadNames(h, key), ['file.txt']);
+    assert.equal(h.context.draftByConversation.value[key], 'original message', 'preparing text is reloadable with its files');
+    uploading.resolve([{uploadId: 'uploaded'}]); await sending;
+    assert.equal(h.run('outboundSends.current.phase'), 'sent');
+    assert.equal(h.sends().length, 1);
+    assert.deepEqual(await reloadNames(h, key), [], 'a missing ACK must not make sent files reloadable');
+    assert.equal(h.context.draftByConversation.value[key] || '', '', 'submitted text does not reappear awaiting ACK');
+    // A draft edit while awaiting ACK must not re-save the submitted files.
+    h.context.pendingAttachments.value.push(draftFile('next'));
+    h.run('persistActiveAttachments()');
+    assert.deepEqual(await reloadNames(h, key), ['next.txt']);
+    h.run(`finishPendingOutboundSend(${JSON.stringify(h.sends()[0].requestId)})`);
+    assert.deepEqual(await reloadNames(h, key), ['next.txt']);
+  }
+});
+
+test('C05: cancelled preparation while the final storage fence is pending cannot send or lose restored files', async () => {
+  const h = harness(); const only = draftFile('only');
+  h.context.pendingAttachments.value = [only];
+  await h.context.attachmentDrafts.save('conv-a', [only]);
+  const entered = deferred(), gate = deferred(), get = h.attachmentDriver.get;
+  h.attachmentDriver.get = async key => {h.attachmentDriver.get = get; const record = await get(key); entered.resolve(); await gate.promise; return record;};
+  const sending = h.run('send()'); await entered.promise;
+  assert.equal(h.sends().length, 0, 'persistence fence must finish before actual WS send');
+  h.run('leavePendingSend()');
+  gate.resolve(); await sending;
+  assert.equal(h.sends().length, 0);
+  assert.deepEqual(await reloadNames(h), ['only.txt']);
+  assert.equal(h.context.sendPending.value, false);
+});
+
+test('C05: a failed persistence fence prevents send and leaves a recoverable draft', async () => {
+  const h = harness(); const only = draftFile('only');
+  h.context.pendingAttachments.value = [only];
+  await h.context.attachmentDrafts.save('conv-a', [only]);
+  h.attachmentDriver.delete = async () => {throw new Error('denied');};
+  await h.run('send()');
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.context.sendPending.value, false);
+  assert.deepEqual(await reloadNames(h), ['only.txt']);
+  assert.match(h.context.draft.value, /original message/);
+});
+
+test('storage disabled from the start still sends newly selected memory-only attachments', async () => {
+  for (const local of [false, true]) {
+    const h = harness({local}); const only = draftFile('memory-only');
+    const key = h.context.props.conversationUuid;
+    for (const method of ['get', 'list', 'put', 'delete']) {
+      h.attachmentDriver[method] = async () => {throw new Error('storage_disabled');};
+    }
+    h.context.pendingAttachments.value = [only];
+    await h.context.attachmentDrafts.save(key, [only]);
+    await h.run('send()');
+    assert.equal(h.sends().length, 1, local ? 'new conversation' : 'existing conversation');
+    assert.equal(h.sends()[0].files[0].uploadId, 'uploaded-memory-only.txt');
+    assert.deepEqual(h.stored(h.context.props.conversationUuid), [], 'does not claim reload persistence');
+    h.run(`finishPendingOutboundSend(${JSON.stringify(h.sends()[0].requestId)})`);
+  }
+});
+
+test('C03: both send entry points wait for hydration instead of sending a partial attachment list', async () => {
+  const h = harness(); h.context.attachmentRestoring.value = true;
+  assert.equal(h.run('canSend.value'), false);
+  await h.run('send()'); assert.equal(h.sends().length, 0);
+  assert.equal(h.context.draft.value, 'original message');
 });

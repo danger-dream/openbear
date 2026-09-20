@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ConsoleView from "./views/consoleView/ConsoleView.vue";
+import {createAttachmentDraftStorage} from "./views/consoleView/attachmentDraftStorage.js";
 import { defineLazyView } from "./lazyView.js";
 import { installMobileViewport } from "./mobileViewport.js";
 import LoginView from "./views/LoginView.vue";
@@ -12,7 +13,7 @@ import {activityInteractionTarget} from "./conversationActivity.js";
 import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
-import { Box, ChatLineRound, Check, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
+import { Box, ChatLineRound, Check, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Setting, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
 import { Api, apiError } from "./api";
 import {
   isLocalConversationRow as isLocalConversation,
@@ -50,12 +51,12 @@ const McpView = defineLazyView(() => import("./views/McpView.vue"), "MCP 管理"
 const SettingsHubView = defineLazyView(() => import("./views/SettingsHubView.vue"), "设置");
 
 const nav = [
-  { key: "memory", label: "记忆管理", icon: "Collection", component: MemoryView },
-  { key: "secrets", label: "凭证库", icon: "Key", component: SecretsView },
-  { key: "docs", label: "文档库", icon: "Files", component: DocsView },
-  { key: "skills", label: "Skills", icon: "MagicStick", component: SkillsView },
-  { key: "mcp", label: "MCP 管理", icon: "Connection", component: McpView },
-  { key: "settings", label: "设置", icon: "Setting", component: SettingsHubView },
+  { key: "memory", label: "记忆管理", shortLabel: "记忆", icon: "Collection", component: MemoryView },
+  { key: "secrets", label: "凭证库", shortLabel: "凭证", icon: "Key", component: SecretsView },
+  { key: "docs", label: "文档库", shortLabel: "文档", icon: "Files", component: DocsView },
+  { key: "skills", label: "Skills", shortLabel: "Skills", icon: "MagicStick", component: SkillsView },
+  { key: "mcp", label: "MCP 管理", shortLabel: "MCP", icon: "Connection", component: McpView },
+  { key: "settings", label: "设置", shortLabel: "设置", icon: "Setting", component: SettingsHubView },
 ];
 const pageToPath = {
   console: "/chat",
@@ -77,6 +78,7 @@ const pathToPage = {
   "/settings": "settings",
 };
 
+const desktopNav = computed(() => nav.filter((n) => n.key !== "settings"));
 const active = ref("console");
 const referenceShelf = shallowRef({open:false,kind:'',anchor:null});
 let referenceShelfTimer = null;
@@ -88,11 +90,22 @@ function showReferenceShelf(event,key,keyboard=false){
   if(!kind||active.value!=='console'||(!keyboard&&!window.matchMedia('(hover: hover) and (pointer: fine)').matches))return;
   // Keep the shelf outside the entire launcher, not over the next grid column.
   const anchor=event.currentTarget.closest('.sidebar-desktop-nav')||event.currentTarget;window.clearTimeout(referenceShelfTimer);
-  referenceShelfTimer=window.setTimeout(()=>{referenceShelf.value={open:true,kind,anchor};},keyboard?0:220);
+  const delay = keyboard ? 0 : (referenceShelf.value.open && referenceShelf.value.kind !== kind ? 500 : 220);
+  referenceShelfTimer=window.setTimeout(()=>{referenceShelf.value={open:true,kind,anchor};}, delay);
 }
 function referenceNavKey(event,key){if(event.key==='ArrowRight'&&['memory','secrets','docs'].includes(key)){event.preventDefault();showReferenceShelf(event,key,true);}}
 function insertShelfReference(reference){window.dispatchEvent(new CustomEvent('openbear:insert-reference',{detail:{reference}}));closeReferenceShelf();}
 watch(active,closeReferenceShelf);
+const channelStatsText = ref("系统就绪");
+async function refreshChannelStats() {
+  try {
+    const data = await Api.channels();
+    const count = Array.isArray(data?.providers) ? data.providers.length : 0;
+    if (count > 0) {
+      channelStatsText.value = `${count} 渠道就绪`;
+    }
+  } catch {}
+}
 const memoryType = ref("identity");
 const settingsSection = ref("channels");
 const settingsHeaderReady = ref(false);
@@ -128,6 +141,7 @@ const conversationsLoading = ref(false);
 const conversationListRef = ref(null);
 const conversationTreeRef = ref(null);
 const consoleViewRef = ref(null);
+const attachmentDrafts = createAttachmentDraftStorage();
 const deletingConversations = new Set();
 const activeConversationUuid = ref("");
 const selectedFolderId = ref("");
@@ -577,7 +591,7 @@ function discardConversationDraft(conversationUuid) {
     return;
   }
   // The console may be unmounted while a settings page is open. Remove only
-  // this conversation's persisted text; never replace another draft's value.
+  // this conversation's persisted text and files, leaving other drafts intact.
   try {
     const key = "openbear.console.drafts.v1";
     const drafts = JSON.parse(window.localStorage.getItem(key) || "{}");
@@ -586,6 +600,7 @@ function discardConversationDraft(conversationUuid) {
       window.localStorage.setItem(key, JSON.stringify(drafts));
     }
   } catch { /* Unavailable storage must not block an in-memory removal. */ }
+  return attachmentDrafts.remove(conversationUuid);
 }
 async function conversationAfterRemoval(row) {
   const folderId = String(row.folderId || "");
@@ -631,7 +646,9 @@ async function deleteConversation(row) {
     const next = wasActive ? await conversationAfterRemoval(row) : null;
     // Clear the mounted editor before changing its prop; otherwise its navigation
     // watcher would save the deleted text back into local storage.
-    discardConversationDraft(uuid);
+    // The unmounted fallback must finish deleting stored files before a fresh
+    // local:new composer can mount and read that same key again.
+    await discardConversationDraft(uuid);
     setConversationsIfChanged(conversations.value.filter((item) => item.conversationUuid !== uuid));
     if (local) setDraftFolderId("");
     await nextTick();
@@ -897,6 +914,7 @@ onMounted(() => {
   if (!isLoginPath) {
     startReferenceCatalog();
     void loadVersionInfo().finally(scheduleVersionPoll);
+    void refreshChannelStats();
     window.addEventListener("focus", checkVersionOnResume);
     window.addEventListener("pageshow", checkVersionOnResume);
     document.addEventListener("visibilitychange", checkVersionOnResume);
@@ -1019,7 +1037,7 @@ onBeforeUnmount(() => {
 
       <nav class="sidebar-desktop-nav sidebar-resource-grid text-sm" aria-label="资源与设置">
         <button
-          v-for="n in nav"
+          v-for="n in nav.filter(x => x.key !== 'settings')"
           :key="n.key"
           type="button"
           :aria-current="active === n.key ? 'page' : undefined"
@@ -1029,8 +1047,8 @@ onBeforeUnmount(() => {
           @keydown="referenceNavKey($event,n.key)"
           class="sidebar-resource-tile"
         >
-          <el-icon class="sidebar-resource-icon" :size="18" aria-hidden="true"><component :is="n.icon" /></el-icon>
-          <span class="sidebar-resource-label">{{ n.label }}</span>
+          <el-icon class="sidebar-resource-icon" :size="16" aria-hidden="true"><component :is="n.icon" /></el-icon>
+          <span class="sidebar-resource-label">{{ n.shortLabel || n.label }}</span>
         </button>
       </nav>
       <ReferencePicker :open="referenceShelf.open" :anchor="referenceShelf.anchor" :kind="referenceShelf.kind" :current-conversation="activeConversationUuid" placement="right-start" searchable allow-drag @select="insertShelfReference" @close="closeReferenceShelf" @enter="keepReferenceShelf" @leave="leaveReferenceShelf"/>
@@ -1189,6 +1207,23 @@ onBeforeUnmount(() => {
         </div>
         </div>
       </div>
+      <footer class="sidebar-desktop-footer">
+        <button
+          type="button"
+          class="sidebar-footer-settings"
+          :class="{ 'is-active': active === 'settings' }"
+          :aria-current="active === 'settings' ? 'page' : undefined"
+          title="系统与通道设置"
+          @click="closeReferenceShelf(); selectNav('settings')"
+        >
+          <el-icon :size="15"><Setting /></el-icon>
+          <span>系统设置</span>
+        </button>
+        <div class="sidebar-footer-status" title="模型渠道池与系统状态">
+          <span class="status-indicator-dot"></span>
+          <span class="status-indicator-text">{{ channelStatsText }}</span>
+        </div>
+      </footer>
       <MobileSidebarResources :items="nav" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)"/>
     </aside>
 

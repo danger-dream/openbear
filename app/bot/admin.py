@@ -240,8 +240,9 @@ async def _status_text(svc: Services, chat_id: int) -> str:
     total_retry = int(totals.get("retry_count") or 0)
     total_input = int(totals.get("input_tokens") or 0)
     total_output = int(totals.get("output_tokens") or 0)
-    total_cache = int(totals.get("cache_read_tokens") or 0) + int(totals.get("cache_write_tokens") or 0)
-    total_prompt = total_input + total_cache
+    # 缓存仅计读缓存(命中)；写缓存计入完整 prompt 分母，不算命中(与 parrot 口径一致)。
+    total_cache = int(totals.get("cache_read_tokens") or 0)
+    total_prompt = total_input + total_cache + int(totals.get("cache_write_tokens") or 0)
     total_cost = float(totals.get("cost_usd") or 0.0)
     total_model_ms = int(totals.get("total_time_ms") or 0)
     total_rate = (total_output / (total_model_ms / 1000.0)) if total_model_ms > 0 else 0.0

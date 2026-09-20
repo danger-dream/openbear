@@ -18,12 +18,13 @@ import stat
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from markdown_it import MarkdownIt
 
 from app.memory.builtin import BuiltinMemoryClient
+from app.reference_policy import CONVERSATION_CONTENT_LIMIT, CONVERSATION_KINDS, CONVERSATION_MODE_REASONS, conversation_material
 from app.tools.history import run_history_action
 from app.utils import estimate_tokens
 
@@ -34,6 +35,7 @@ REFERENCE_MARKDOWN = MarkdownIt("default", {"html": False, "linkify": False})
 BUNDLE_FIELD = "openbear_reference_bundle"
 KINDS = {"mem", "doc", "secret", "chat", "turn", "message"}
 MAX_REFERENCES = 30
+MENTION_NOTICE = "仅提及：仅提供名称和定位，未提供正文；不表示要求读取。"
 
 
 class ReferenceError(ValueError):
@@ -48,6 +50,11 @@ class ReferenceError(ValueError):
             "key": self.key,
             "estimatedTokens": self.tokens,
         }
+
+
+def _reference_mode(query: str) -> str | None:
+    modes = parse_qs(query, keep_blank_values=True).get("mode", ["content"])
+    return modes[0] if len(modes) == 1 and modes[0] in {"content", "mention"} else None
 
 
 def reference_from_url(url: str, label: str = "") -> dict | None:
@@ -69,12 +76,20 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
             return None
         if kind not in {"turn", "message"} and len(parts) != 2:
             return None
+        mode = _reference_mode(parsed.query)
+        if mode is None:
+            return None
         query = parse_qs(parsed.query)
         scope = query.get("scope", ["full"])[0]
         if scope not in {"full", "recent"}:
             return None
         turns = max(1, min(50, int(query.get("turns", ["20"])[0])))
         ref = {"kind": kind, "id": identity, "label": str(label)[:300], "scope": scope}
+        if mode == "mention":
+            ref["mode"] = mode
+            reason = query.get("reason", [""])[0]
+            if kind in CONVERSATION_KINDS and reason in CONVERSATION_MODE_REASONS:
+                ref["modeReason"] = reason
         if scope == "recent":
             ref["turns"] = turns
         if len(parts) == 3:
@@ -86,7 +101,8 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
 
 
 def reference_key(ref: dict) -> str:
-    return ":".join(str(ref.get(k) or "") for k in ["kind", "id", "itemId", "scope", "turns"])
+    key = ":".join(str(ref.get(k) or "") for k in ["kind", "id", "itemId", "scope", "turns"])
+    return key + (":mention" if ref.get("mode") == "mention" else "")
 
 
 def _reference_matches(text: str):
@@ -110,23 +126,26 @@ def _reference_matches(text: str):
         offset = start + len("openbear://ref/")
     parts.append(text[offset:])
     marker = re.compile(r"^" + re.escape(prefix) + r"([0-9]+)/")
-    valid = set()
+    destinations = {}
     for block in REFERENCE_MARKDOWN.parse("".join(parts)):
         for token in block.children or []:
             if token.type != "link_open":
                 continue
-            tagged = marker.match(token.attrGet("href") or "")
+            href = token.attrGet("href") or ""
+            tagged = marker.match(href)
             if tagged:
-                valid.add(int(tagged[1]))
-    return [match for index, match in enumerate(matches) if index in valid]
+                # Markdown resolves destination entities/backslash escapes once.
+                # Use that href, not the undecoded source query, for mode/identity.
+                destinations[int(tagged[1])] = "openbear://ref/" + href[tagged.end():]
+    return [(match, destinations[index]) for index, match in enumerate(matches) if index in destinations]
 
 
 def reference_display_text(text: str) -> str:
     text = str(text or "")
     parts, offset = [], 0
-    for match in _reference_matches(text):
+    for match, href in _reference_matches(text):
         label = re.sub(r"\\(.)", r"\1", match.group(1))
-        if reference_from_url(match.group(2), label):
+        if reference_from_url(href, label):
             parts.extend((text[offset:match.start()], label))
             offset = match.end()
     return "".join([*parts, text[offset:]])
@@ -136,9 +155,16 @@ def reference_occurrences(text: str) -> list[dict]:
     if "openbear://ref/" not in str(text or ""):
         return []
     found = []
-    for match in _reference_matches(str(text or "")):
+    for match, href in _reference_matches(str(text or "")):
         label = re.sub(r"\\(.)", r"\1", match.group(1))
-        ref = reference_from_url(match.group(2), label)
+        ref = reference_from_url(href, label)
+        if ref is None:
+            try:
+                invalid_mode = _reference_mode(urlsplit(href).query) is None
+            except ValueError:
+                invalid_mode = False
+            if invalid_mode:
+                raise ReferenceError("invalid_reference_mode", label)
         if ref:
             found.append(ref)
             if len(found) > 1000:
@@ -155,6 +181,31 @@ def parse_references(text: str) -> list[dict]:
     if len(found) > MAX_REFERENCES:
         raise ReferenceError("too_many_references")
     return found
+
+
+def effective_reference_text(text: str, bindings: list[dict]) -> str:
+    """Change only effective reference destinations, never labels or user prose."""
+    parts, offset, ordinal = [], 0, 0
+    for match, href in _reference_matches(text):
+        ref = reference_from_url(href)
+        if not ref:
+            continue
+        binding = bindings[ordinal] if ordinal < len(bindings) else {}
+        ordinal += 1
+        if reference_key({**ref, "mode": ""}) != reference_key({**binding, "mode": ""}):
+            continue
+        if ref.get("mode", "content") == binding.get("mode", "content") and ref.get("modeReason") == binding.get("modeReason"):
+            continue
+        parsed = urlsplit(href)
+        params = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in {"mode", "reason"}]
+        if binding.get("mode") == "mention":
+            params.append(("mode", "mention"))
+            if binding.get("modeReason"):
+                params.append(("reason", binding["modeReason"]))
+        destination = urlunsplit(parsed._replace(query=urlencode(params)))
+        parts.extend((text[offset:match.start(2)], destination))
+        offset = match.end(2)
+    return "".join([*parts, text[offset:]])
 
 
 def _history_material(db_path: str, ref: dict, current: str) -> str:
@@ -237,13 +288,136 @@ class ReferenceMaterials:
         self._cipher_instance = Fernet(key_path.read_bytes())
         return self._cipher_instance
 
+    async def _mention_metadata(self, ref: dict, *, owner: int) -> tuple[str, dict]:
+        """Resolve identity and visibility, never fetch a resource's body.
+
+        Memory resources have the same global availability boundary as content
+        references. History references are scoped to the authenticated owner and
+        the exact visible operation/turn (including History's legacy seq IDs).
+        """
+        unavailable = ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
+        kind = ref["kind"]
+        if kind in {"mem", "doc", "secret"}:
+            queries = {
+                "mem": "SELECT e.id,e.title,e.ref,e.enabled,e.archived FROM memory_entries e JOIN memory_categories c ON c.id=e.category_id WHERE e.id=?",
+                "doc": "SELECT id,title,name,enabled,archived FROM memory_docs WHERE id=?",
+                "secret": "SELECT id,name,enabled,archived FROM memory_secrets WHERE id=?",
+            }
+            cursor = await self.db.conn.execute(queries[kind], (int(ref["id"]),))
+            row = await cursor.fetchone()
+            if not row or (not row["enabled"] and not row["archived"]):
+                raise unavailable
+            item = dict(row)
+            locator = {"tool": "Memory", "action": "get", "resource": "entry" if kind == "mem" else kind, "id": item["id"]}
+            name_key = "ref" if kind == "mem" else "name"
+            locator[name_key] = item[name_key]
+            return str(item.get("title") or item.get("name") or ref["label"]), locator
+
+        cursor = await self.db.conn.execute(
+            "SELECT title FROM web_conversations WHERE conversation_uuid=? AND owner_chat_id=?",
+            (ref["id"], owner),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise unavailable
+        label = str(row["title"] or ref["label"])
+        locator = {"tool": "History", "action": "read", "conversationUuid": ref["id"]}
+        if kind in {"turn", "message"}:
+            target = (
+                "COALESCE(NULLIF(turn_uuid,''),'seq:' || display_seq)=?"
+                if kind == "turn" else "op_id=?"
+            )
+            # JSON visibility flags and a boolean nonblank-text check are
+            # projected inside SQLite. No payload/text/summary is returned to
+            # Python and no History read/list helper materializes the transcript.
+            # Match History's `text or summary or ""` truthiness (also for
+            # legacy non-string values), then Python str.strip() whitespace.
+            whitespace = " \t\n\r\v\f\x1c\x1d\x1e\x1f\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+            cursor = await self.db.conn.execute(
+                f"""
+                SELECT internal,
+                       json_quote(json_extract(payload,'$.hidden')) AS hidden,
+                       json_quote(json_extract(payload,'$.internal')) AS payload_internal,
+                       length(trim(CASE
+                           WHEN text_value IS NOT NULL AND text_value NOT IN ('',0)
+                                AND NOT (json_type(payload,'$.text') IN ('array','object')
+                                         AND NOT EXISTS (SELECT 1 FROM json_each(payload,'$.text')))
+                               THEN text_value
+                           WHEN summary_value IS NOT NULL AND summary_value NOT IN ('',0)
+                                AND NOT (json_type(payload,'$.summary') IN ('array','object')
+                                         AND NOT EXISTS (SELECT 1 FROM json_each(payload,'$.summary')))
+                               THEN summary_value
+                           ELSE '' END,?)) > 0 AS has_text
+                FROM (
+                    SELECT internal,payload,
+                           json_extract(payload,'$.text') AS text_value,
+                           json_extract(payload,'$.summary') AS summary_value
+                    FROM (
+                        SELECT internal,
+                               CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{{}}' END AS payload
+                        FROM web_operations
+                        WHERE conversation_uuid=? AND {target}
+                          AND op_type IN ('user_message','assistant_message')
+                    )
+                )
+                """,
+                (whitespace, ref["id"], ref["itemId"]),
+            )
+            if not any(
+                not item["internal"]
+                and not json.loads(item["hidden"])
+                and not json.loads(item["payload_internal"])
+                and item["has_text"]
+                for item in await cursor.fetchall()
+            ):
+                raise unavailable
+            locator["turnUuid" if kind == "turn" else "opId"] = ref["itemId"]
+            if kind == "turn":
+                locator.update({"action": "read_turn", "before": 0, "after": 0})
+        return label, locator
+
     async def resolve(
-        self, text: str, *, owner: int, conversation_uuid: str = "", budget: int = 100000
+        self, text: str, *, owner: int, conversation_uuid: str = "", budget: int = 100000,
+        existing_keys: list[str] | None = None,
     ) -> dict:
         refs = parse_references(text)
-        materials, manifest = [], []
+        materials, manifest, by_requested = [], [], {}
+        existing = {key: index for index, key in enumerate(existing_keys or [])}
+        ordered = sorted(refs, key=lambda ref: existing.get(ref["key"], len(existing)))
+        used_chars = 0
         memory = BuiltinMemoryClient(self.db)
-        for ref in refs:
+        for original in ordered:
+            ref = dict(original)
+            history = None
+            if ref["kind"] in CONVERSATION_KINDS and (ref.get("mode") != "mention" or ref.get("modeReason")):
+                history = await asyncio.to_thread(
+                    conversation_material, self.db.path, ref, owner=owner,
+                    remaining=CONVERSATION_CONTENT_LIMIT - used_chars, metadata_only=ref.get("mode") == "mention",
+                )
+                if history is None:
+                    raise ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
+                ref.update(bodyChars=history["bodyChars"], contentLimit=CONVERSATION_CONTENT_LIMIT)
+                if ref.get("mode") != "mention":
+                    reason = "conversation_too_long" if ref["bodyChars"] > CONVERSATION_CONTENT_LIMIT else "conversation_total_limit" if used_chars + ref["bodyChars"] > CONVERSATION_CONTENT_LIMIT else ""
+                    if reason:
+                        ref.update(mode="mention", modeReason=reason)
+                        ref["key"] = reference_key(ref)
+                    else:
+                        used_chars += ref["bodyChars"]
+            if ref.get("mode") == "mention":
+                label, locator = await self._mention_metadata(ref, owner=owner)
+                public = {
+                    **ref,
+                    "sourceLabel": label,
+                    "locator": locator,
+                    "sensitive": ref["kind"] == "secret",
+                }
+                material = {"reference": public, "notice": MENTION_NOTICE}
+                # Only the supplied metadata counts; no body is read, hashed or frozen.
+                public["estimatedTokens"] = estimate_tokens(json.dumps(material, ensure_ascii=False))
+                by_requested[original["key"]] = public
+                materials.append(material)
+                continue
             if ref["kind"] in {"mem", "doc", "secret"}:
                 resource = "entry" if ref["kind"] == "mem" else ref["kind"]
                 result = await memory.tool_call(resource, {"action": "get", "id": int(ref["id"])})
@@ -267,35 +441,7 @@ class ReferenceMaterials:
                 else:
                     content = json.dumps(item.get("kv") or [], ensure_ascii=False)
             else:
-                cursor = await self.db.conn.execute(
-                    "SELECT title FROM web_conversations WHERE conversation_uuid=? AND owner_chat_id=?",
-                    (ref["id"], owner),
-                )
-                row = await cursor.fetchone()
-                if not row:
-                    raise ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
-                label = str(row["title"] or ref["label"])
-                if ref["kind"] == "message":
-                    # Same visible-operation boundary as History; the selected
-                    # message ID is exact, never title/content search.
-                    cursor = await self.db.conn.execute(
-                        "SELECT op_type,payload_json,internal FROM web_operations WHERE conversation_uuid=? AND op_id=? AND op_type IN ('user_message','assistant_message')",
-                        (ref["id"], ref["itemId"]),
-                    )
-                    message = await cursor.fetchone()
-                    payload = json.loads(message["payload_json"]) if message else {}
-                    if (
-                        not message
-                        or message["internal"]
-                        or payload.get("hidden")
-                        or payload.get("internal")
-                    ):
-                        raise ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
-                    content = str(payload.get("text") or payload.get("summary") or "")
-                else:
-                    content = await asyncio.to_thread(
-                        _history_material, self.db.path, ref, conversation_uuid
-                    )
+                label, content = history["sourceLabel"], history["content"]
             tokens = estimate_tokens(content)
             public = {
                 **ref,
@@ -305,19 +451,35 @@ class ReferenceMaterials:
             }
             if not public["sensitive"]:
                 public["contentHash"] = hashlib.sha256(content.encode()).hexdigest()
-            manifest.append(public)
+            by_requested[original["key"]] = public
             materials.append({"reference": public, "content": content})
+        # A content ref may now share a mention key with an explicit mention.
+        # Bind every source occurrence separately; freeze each effective key once.
+        material_by_key = {}
+        for item in materials:
+            key = item["reference"]["key"]
+            if key not in material_by_key or item["reference"].get("modeReason"):
+                material_by_key[key] = item
+        effective = dict.fromkeys(by_requested[ref["key"]]["key"] for ref in refs)
+        materials = [material_by_key[key] for key in effective]
+        manifest = [item["reference"] for item in materials]
+        bindings = [{**by_requested[ref["key"]], "requestedKey": ref["key"]} for ref in reference_occurrences(text)]
         total = sum(item["estimatedTokens"] for item in manifest)
-        if total > budget:
-            raise ReferenceError("reference_budget_exceeded", tokens=total)
-        return {"manifest": manifest, "materials": materials, "estimatedTokens": total}
+        budget_tokens = sum(item["estimatedTokens"] for item in manifest if item["kind"] not in CONVERSATION_KINDS)
+        if budget_tokens > budget:
+            raise ReferenceError("reference_budget_exceeded", tokens=budget_tokens)
+        return {"manifest": manifest, "materials": materials, "bindings": bindings, "estimatedTokens": total,
+                "bodyChars": used_chars, "conversationContentLimit": CONVERSATION_CONTENT_LIMIT}
 
     async def save(self, resolved: dict, *, conversation_uuid: str, op_id: str) -> str:
         if not resolved["manifest"]:
             return ""
         bundle_id = str(uuid.uuid4())
-        normal = [m for m in resolved["materials"] if not m["reference"]["sensitive"]]
-        protected = [m for m in resolved["materials"] if m["reference"]["sensitive"]]
+        normal, protected = [], []
+        for material in resolved["materials"]:
+            ref = material["reference"]
+            target = protected if ref["sensitive"] and ref.get("mode") != "mention" else normal
+            target.append(material)
         encrypted = (
             self.cipher().encrypt(json.dumps(protected, ensure_ascii=False).encode()).decode()
             if protected

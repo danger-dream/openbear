@@ -484,7 +484,7 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     }
     canonical_tools = sorted(AGENT_DELEGATION_TOOL_NAMES)
     assert set(canonical_tools) == {
-        "Bash", "Edit", "Process", "Read", "TaskMemory", "WebExtract", "WebSearch", "Write",
+        "Bash", "Edit", "Process", "Read", "TaskMemory", "Write",
     }
     main_schemas = {item["name"]: item for item in reg.schemas(scope="main")}
     agent_schemas = {item["name"]: item for item in reg.schemas(scope="agent")}
@@ -493,7 +493,7 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     # behavioral delegation evals (evals/agent_delegation), not by keyword
     # assertions that pass regardless of actual model behavior.
     assert agent_schema["parameters"]["required"] == ["prompt", "tools"]
-    assert agent_schema["parameters"]["properties"]["tools"]["items"]["enum"] == canonical_tools
+    assert agent_schema["parameters"]["properties"]["tools"]["items"]["enum"] == []  # no business tools registered in this fixture
     assert agent_schema["parameters"]["properties"]["attachments"]["items"]["type"] == "string"
     plan_mode_schema = agent_schema["parameters"]["properties"]["planMode"]
     assert plan_mode_schema["enum"] == ["direct", "managed"]
@@ -521,10 +521,10 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     ]
 
     tool_request_schema = plan_schema["properties"]["toolRequests"]
-    assert tool_request_schema["items"]["properties"]["name"]["enum"] == canonical_tools
+    assert tool_request_schema["items"]["properties"]["name"]["enum"] == []  # no business tools registered in this fixture
     assert (
         main_schemas["AgentPlanDecision"]["parameters"]["properties"]["grantedTools"]["items"]["enum"]
-        == canonical_tools
+        == []  # no business tools registered in this fixture
     )
     assert "TaskMemory" in canonical_tools
 

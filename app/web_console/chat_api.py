@@ -4,7 +4,7 @@ from __future__ import annotations
 from app.context.configuration import CONTEXT_STRATEGIES, normalize_strategy
 from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers
 from app.interaction_data import redact_result
-from app.references import ReferenceError
+from app.references import ReferenceError, effective_reference_text
 from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
 from app.web_console.activity import clear_deleted_completion
 from app.web_console.core import *
@@ -1665,7 +1665,7 @@ class WebAdminChatHandlersMixin:
             row, text, [], self._live_for(row), telegram_submission_id=submission_id,
         )
 
-    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0) -> dict[str, Any]:
+    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
         # Serialize acceptance while preserving the existing steering behavior.
         async with self.operation_locks.chat_unless(internal_chat_id, "web_send", reject_operation="web_manual_compact") as acquired:
@@ -1682,7 +1682,7 @@ class WebAdminChatHandlersMixin:
                     return {"ok": False, "error": "conversation_unavailable"}
                 row = current
             return await self._start_or_steer_web_conversation_locked(
-                row, text, media, live, telegram_submission_id=telegram_submission_id,
+                row, text, media, live, telegram_submission_id=telegram_submission_id, reference_order=reference_order,
             )
 
     async def _web_media_attachments_public(self, row: dict[str, Any], media: list[InboundMedia], *, turn_uuid: str = "", op_id: str = "") -> list[dict[str, Any]]:
@@ -1733,7 +1733,7 @@ class WebAdminChatHandlersMixin:
             out.append(public)
         return out
 
-    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0) -> dict[str, Any]:
+    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
         conv_uuid = str(row.get("conversation_uuid") or "")
         turn_uuid = str(uuid.uuid4())
@@ -1762,10 +1762,14 @@ class WebAdminChatHandlersMixin:
         if active_round.get("active") and not pending_only and media:
             return {"ok": False, "error": "attachments_while_running_not_supported"}
         try:
-            reference_bundle_id, reference_manifest = await self._prepare_reference_bundle(row, text, f"msg:{user_message_uuid}")
+            reference_bundle_id, reference_manifest = await self._prepare_reference_bundle(row, text, f"msg:{user_message_uuid}", existing_keys=reference_order)
         except ReferenceError as exc:
             return {"ok": False, "error": exc.code, "referenceError": exc.public()}
         if reference_manifest:
+            # Only reference destinations change. Publish/persist the effective
+            # mode so history, copying and the model agree after source growth.
+            text = effective_reference_text(text, reference_manifest)
+            visible_user_text = effective_reference_text(visible_user_text, reference_manifest)
             input_metadata.update(referenceBundleId=reference_bundle_id, references=reference_manifest)
         # A detached Agent does not create a new visible turn. The main
         # controller stays alive in an event-driven wait inside the original root
@@ -2167,7 +2171,9 @@ class WebAdminChatHandlersMixin:
                         if not text and not media:
                             await _send_json({"type": "error", "error": "empty_text", "requestId": request_id})
                             continue
-                        result = await self._start_or_steer_web_conversation(row, text, media, live)
+                        reference_order = data.get("referenceOrder")
+                        reference_kwargs = {"reference_order": [key for key in reference_order if isinstance(key, str)]} if isinstance(reference_order, list) else {}
+                        result = await self._start_or_steer_web_conversation(row, text, media, live, **reference_kwargs)
                         if not result.get("ok"):
                             await _send_json({"type": "error", "error": result.get("error") or "send_failed", "requestId": request_id, **({"referenceError": result["referenceError"]} if result.get("referenceError") else {})})
                         else:

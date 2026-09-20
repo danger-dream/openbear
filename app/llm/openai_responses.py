@@ -7,6 +7,7 @@
   response.output_text.delta / .done           ← 正文增量
   response.reasoning_summary_text.delta / .done ← 思考摘要增量
   response.completed                            ← usage 在这里
+  response.incomplete                           ← usage + incomplete_details.reason（截断语义）
 
 出：output_text.delta（正文）/ reasoning_summary_text.delta（思考）/ function_call item（工具）
 入：input[] 数组；assistant 工具调用是 function_call item，工具结果是 function_call_output item
@@ -88,12 +89,18 @@ def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
 
 
 def _to_responses_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-    """中性 schema → Responses flat function tools。"""
+    """中性 schema → Responses flat function tools。
+
+    Responses auto-normalizes an omitted strict flag into all-fields-required.
+    Keep ordinary tool schemas non-strict so their optional parameters remain
+    optional, while preserving an explicit strict choice from the definition.
+    """
     if not tools:
         return None
     return [
         {"type": "function", "name": t["name"], "description": t.get("description", ""),
-         "parameters": t.get("parameters", {"type": "object", "properties": {}})}
+         "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+         "strict": t.get("strict", False)}
         for t in tools
     ]
 
@@ -243,6 +250,16 @@ class OpenAIResponsesBackend(LLMBackend):
                     provider_billing.update(terminal_billing)
                 if u:
                     final_usage = _usage_from(u)
+                if t == "response.incomplete":
+                    # Responses 用 incomplete + incomplete_details.reason 表达「未正常收尾」，
+                    # 而 Anthropic / Chat 用 max_tokens / length。不归一化的话 finish 会永远
+                    # 停在 "stop"，Agent 层就会把「输出被截断」误判成「模型偶发没输出」。
+                    details = resp.get("incomplete_details")
+                    reason = str(details.get("reason") or "") if isinstance(details, dict) else ""
+                    if reason == "max_output_tokens":
+                        stop = "length"
+                    elif reason:
+                        stop = reason
                 if t == "response.failed" or resp.get("status") == "failed":
                     # Failed Responses may still carry billable usage. Emit it
                     # before the normalized terminal error.

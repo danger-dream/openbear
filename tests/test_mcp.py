@@ -10,6 +10,7 @@ import pytest
 
 from app.config import Config, MCPServerConfig
 from app.mcp.client import MCPClient
+from app.mcp.errors import MCPConnectionError
 from app.mcp.manager import MCPManager
 from app.mcp.output import govern_text_output, redact_secrets, redact_text_secrets
 from app.mcp.permissions import (
@@ -288,7 +289,12 @@ async def test_mcp_server_uninstall_reservation_does_not_interrupt_active_call()
             await release.wait()
             return MCPRawResult(content=[{"type": "text", "text": "done"}])
 
-    manager = MCPManager(_cfg())
+    config = _cfg()
+    config.mcp.servers["serena"].agent_access.mode = "all"
+    config.mcp.deny_tools = []
+    config.mcp.servers["serena"].tools.allow = ["*"]
+    config.mcp.servers["serena"].tools.deny = []
+    manager = MCPManager(config)
     meta = MCPToolMeta(
         public_name="mcp__serena__read_symbol",
         server_key="serena",
@@ -299,6 +305,7 @@ async def test_mcp_server_uninstall_reservation_does_not_interrupt_active_call()
         risk="read",
     )
     manager._tools[meta.public_name] = meta
+    manager._all_tools = list(manager._tools.values())
     manager._clients[meta.server_key] = FakeClient()  # type: ignore[assignment]
     context = ToolRuntimeContext(source="agent")
 
@@ -354,7 +361,12 @@ async def test_mcp_conversation_grant_is_scoped_to_one_tool():
             calls.append(name)
             return MCPRawResult(content=[{"type": "text", "text": "called"}])
 
-    manager = MCPManager(_cfg())
+    config = _cfg()
+    config.mcp.servers["serena"].agent_access.mode = "all"
+    config.mcp.deny_tools = []
+    config.mcp.servers["serena"].tools.allow = ["*"]
+    config.mcp.servers["serena"].tools.deny = []
+    manager = MCPManager(config)
     granted = MCPToolMeta(
         public_name="mcp__serena__write_one",
         server_key="serena",
@@ -371,6 +383,7 @@ async def test_mcp_conversation_grant_is_scoped_to_one_tool():
         "risk": "destructive",
     })
     manager._tools = {granted.public_name: granted, other.public_name: other}
+    manager._all_tools = list(manager._tools.values())
     manager._clients[granted.server_key] = FakeClient()  # type: ignore[assignment]
     context = ToolRuntimeContext(source="agent", conversation_uuid="conv-1", agent_session_uuid="agent-1")
     manager._grant_conversation(granted, context)
@@ -387,7 +400,12 @@ async def test_mcp_tool_errors_are_redacted_before_return():
         async def call_tool(self, name: str, arguments: dict) -> MCPRawResult:
             raise RuntimeError("upstream token=secret12345")
 
-    manager = MCPManager(_cfg())
+    config = _cfg()
+    config.mcp.servers["serena"].agent_access.mode = "all"
+    config.mcp.deny_tools = []
+    config.mcp.servers["serena"].tools.allow = ["*"]
+    config.mcp.servers["serena"].tools.deny = []
+    manager = MCPManager(config)
     meta = MCPToolMeta(
         public_name="mcp__serena__find_symbol",
         server_key="serena",
@@ -398,6 +416,7 @@ async def test_mcp_tool_errors_are_redacted_before_return():
         risk="read",
     )
     manager._tools[meta.public_name] = meta
+    manager._all_tools = list(manager._tools.values())
     manager._clients[meta.server_key] = FakeClient()  # type: ignore[assignment]
     result = await manager.call_tool(meta.public_name, {}, ToolRuntimeContext(source="agent"))
     assert "secret12345" not in result
@@ -554,6 +573,144 @@ async def test_streamable_http_preserves_session_header():
     assert seen_headers[0].get("mcp-session-id") is None
     assert seen_headers[1].get("mcp-session-id") == "session-1"
     await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [307, 308])
+async def test_streamable_http_follows_trailing_slash_redirect(status_code):
+    """Starlette mounts redirect ``/mcp`` to ``/mcp/`` with an empty 307 body.
+
+    A client that does not follow the redirect parses that empty body as
+    JSON-RPC and fails, so the bare path must work as well as the slashed one.
+    The redirect setting here comes from ``connect()``, not from the test.
+    """
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/mcp":
+            return httpx.Response(status_code, headers={"location": "https://mcp.example/mcp/"})
+        body = json_loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body.get("id"), "result": {"ok": True}})
+
+    server = _cfg().mcp.servers["serena"].model_copy(
+        update={"transport": "streamable_http", "url": "https://mcp.example/mcp"}
+    )
+    client = StreamableHTTPTransport("serena", server)
+    await client.connect()
+    try:
+        assert client._client is not None
+        client._client._transport = httpx.MockTransport(handler)
+        assert await client.request("initialize", {}, timeout_s=5) == {"ok": True}
+        assert paths == ["/mcp", "/mcp/"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_connect_disables_unchecked_redirect_following():
+    server = _cfg().mcp.servers["serena"].model_copy(
+        update={"transport": "streamable_http", "url": "https://mcp.example/mcp"}
+    )
+    client = StreamableHTTPTransport("serena", server)
+    await client.connect()
+    try:
+        assert client._client is not None
+        assert client._client.follow_redirects is False
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification", [False, True])
+@pytest.mark.parametrize("status_code,location", [
+    (307, "https://other.example/mcp/"),
+    (308, "http://mcp.example/mcp/"),
+    (307, "https://mcp.example:8443/mcp/"),
+    (307, "/another-endpoint/"),
+    (307, "/mcp/?changed=1"),
+    (302, "/mcp/"),
+    (307, ""),
+])
+async def test_streamable_http_refuses_redirect_before_sending_credentials(status_code, location, notification):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(status_code, headers={"location": location, "Mcp-Session-Id": "untrusted"})
+
+    server = MCPServerConfig(transport="streamable_http", url="https://mcp.example/mcp",
+                             headers={"X-Api-Key": "synthetic-key", "Authorization": "Bearer synthetic"})
+    client = StreamableHTTPTransport("audit", server)
+    # Even an externally replaced client configured to auto-follow must not
+    # bypass the per-request check. No request leaves this MockTransport.
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                     headers=server.headers, follow_redirects=True)
+    client._session_id = "synthetic-session"
+    try:
+        if notification:
+            await client.notify("notifications/initialized", {"private": "synthetic-body"})
+        else:
+            with pytest.raises(MCPConnectionError, match="refused redirect"):
+                await client.request("tools/call", {"private": "synthetic-body"}, timeout_s=5)
+        assert len(requests) == 1
+        assert str(requests[0].url) == server.url
+        assert requests[0].headers["x-api-key"] == "synthetic-key"
+        assert requests[0].headers["mcp-session-id"] == "synthetic-session"
+        assert json_loads(requests[0].content)["params"] == {"private": "synthetic-body"}
+        assert client._session_id == "synthetic-session"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification", [False, True])
+async def test_streamable_http_slash_preserves_encoded_path_query_and_body(notification):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(308, headers={"location": "/a%2Fb/mcp/?token=synthetic%2Bvalue"})
+        body = json_loads(request.content)
+        return httpx.Response(200, headers={"Mcp-Session-Id": "final-session"},
+                              json={"jsonrpc": "2.0", "id": body.get("id"), "result": {"ok": True}})
+
+    server = MCPServerConfig(transport="streamable_http", url="https://mcp.example/a%2Fb/mcp?token=synthetic%2Bvalue",
+                             headers={"X-Api-Key": "synthetic-key"})
+    client = StreamableHTTPTransport("audit", server)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers=server.headers)
+    client._session_id = "synthetic-session"
+    try:
+        if notification:
+            await client.notify("notifications/initialized", {"private": "synthetic-body"})
+        else:
+            assert await client.request("tools/call", {"private": "synthetic-body"}, timeout_s=5) == {"ok": True}
+        assert len(requests) == 2
+        assert requests[1].url.raw_path == b"/a%2Fb/mcp/?token=synthetic%2Bvalue"
+        assert requests[0].content == requests[1].content
+        assert all(r.headers["x-api-key"] == "synthetic-key" and r.headers["mcp-session-id"] == "synthetic-session" for r in requests)
+        assert client._session_id == "final-session"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_refuses_second_redirect():
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(307, headers={"location": "/mcp/" if len(requests) == 1 else "https://other.example/mcp/"})
+
+    client = StreamableHTTPTransport("audit", MCPServerConfig(transport="streamable_http", url="https://mcp.example/mcp"))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(MCPConnectionError, match="refused redirect"):
+            await client.request("tools/call", {}, timeout_s=5)
+        assert [str(r.url) for r in requests] == ["https://mcp.example/mcp", "https://mcp.example/mcp/"]
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

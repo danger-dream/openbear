@@ -18,6 +18,77 @@ const drawerItem = ref(null);
 const settingsSpecLoaded = ref(false);
 const mcpSettingsAvailable = ref(false);
 const mcpSettingPaths = ref([]);
+const accessDraft = ref({ mode: "disabled", tools: [] });
+const accessBaseline = ref({ mode: "disabled", tools: [] });
+const accessServer = ref("");
+const accessDirty = computed(() => JSON.stringify(accessDraft.value) !== JSON.stringify(accessBaseline.value));
+const accessChoices = computed(() => {
+  const discovered = asArray(drawerItem.value?.tools);
+  const names = [...new Set([...discovered.map(t => t.originalToolName), ...accessBaseline.value.tools, ...accessDraft.value.tools])].filter(Boolean);
+  return names.map(name => ({ name, tool: discovered.find(t => t.originalToolName === name) }));
+});
+function copyAccess(value) {
+  return { mode: ["disabled", "all", "selected"].includes(value?.mode) ? value.mode : "disabled", tools: [...asArray(value?.tools)] };
+}
+function accessText(row) {
+  const access = copyAccess(row?.agentAccess);
+  return access.mode === "all" ? "全部工具" : access.mode === "selected" ? `指定 ${access.tools.length} 项` : "未开放";
+}
+function resetAccessDraft(row = drawerItem.value) {
+  accessServer.value = serverKey(row);
+  accessBaseline.value = copyAccess(row?.agentAccess);
+  accessDraft.value = copyAccess(row?.agentAccess);
+}
+async function saveAgentAccess() {
+  const row = drawerItem.value;
+  const key = accessServer.value;
+  if (!key || isServerToggling(row) || !accessDirty.value) return;
+  setServerToggling(key, true);
+  try {
+    if (accessDraft.value.mode === "all" && accessBaseline.value.mode !== "all") {
+      try {
+        await ElMessageBox.confirm("当前及未来新增工具都会进入 Agent 开放范围；仍须逐轮明确授权并遵守调用审批。", "开放全部工具", { type: "warning", confirmButtonText: "开放全部工具", cancelButtonText: "取消" });
+      } catch { return; }
+    }
+    const submitted = copyAccess(accessDraft.value);
+    const result = await Api.setMcpServerAgentAccess(key, submitted, copyAccess(accessBaseline.value));
+    if (!result?.saved || !result?.applied || result?.ok === false) {
+      const error = new Error("设置未应用"); error.response = { data: result }; throw error;
+    }
+    if (accessServer.value === key) {
+      accessBaseline.value = copyAccess(result.agentAccess || submitted);
+      accessDraft.value = copyAccess(result.agentAccess || submitted);
+    }
+    ElMessage.success("Agent 访问设置已保存并应用");
+    await load({ silent: true });
+  } catch (error) {
+    const result = error?.response?.data || {};
+    if (result.error === "mcp_agent_access_conflict") ElMessage.warning("此 MCP 的 Agent 访问设置已被其他操作修改。你的草稿已保留，请重新载入设置后确认。");
+    else if (result.saved) ElMessage.warning("设置已保存，但尚未应用；请重新加载配置重试应用。");
+    else ElMessage.error(result.error === "mcp_server_not_found" ? "此 MCP 已被移除，未保存修改。" : apiError(error));
+    await load({ silent: true });
+  } finally { setServerToggling(key, false); }
+}
+async function refreshServerTools(row) {
+  const key = serverKey(row);
+  if (!key || isServerToggling(row) || row?.status !== "connected") return;
+  setServerToggling(key, true);
+  try {
+    const result = okOrThrow(await Api.refreshMcpServerTools(key));
+    ElMessage.success(result.changed ? "工具名称、说明和参数已更新" : "已重新获取工具，内容未变化");
+    await load({ silent: true });
+  } catch (error) {
+    ElMessage.error(`刷新工具失败，原工具清单已保留：${apiError(error)}`);
+  } finally { setServerToggling(key, false); }
+}
+async function closeDrawer(done) {
+  if (isServerToggling(drawerItem.value)) return;
+  if (accessDirty.value && drawerKind.value === "server") {
+    try { await ElMessageBox.confirm("未保存的 Agent 访问修改将被丢弃。", "放弃修改？", { confirmButtonText: "放弃修改", cancelButtonText: "继续编辑" }); }
+    catch { return; }
+  }
+  done();
+}
 
 const STATUS_TEXT = {
   connected: "已连接",
@@ -531,7 +602,10 @@ function syncDrawerItem() {
   if (drawerKind.value === "server") {
     const key = serverKey(drawerItem.value);
     const next = serverCards.value.find((card) => serverKey(card) === key);
-    if (next) drawerItem.value = next;
+    if (next) {
+      drawerItem.value = next;
+      if (!accessDirty.value) resetAccessDraft(next);
+    }
   } else if (drawerKind.value === "tool") {
     const publicName = String(drawerItem.value?.publicName || "").trim();
     const originalName = String(drawerItem.value?.originalToolName || "").trim();
@@ -563,7 +637,7 @@ async function setMcpEnabled(value) {
 }
 async function setServerEnabled(row, value) {
   const key = serverKey(row);
-  if (!key) return;
+  if (!key || isServerToggling(row)) return;
   const previous = Boolean(row?.enabled);
   setServerToggling(key, true);
   setServerEnabledLocal(key, value);
@@ -582,7 +656,7 @@ async function setServerEnabled(row, value) {
 }
 async function uninstallServer(row) {
   const key = serverKey(row);
-  if (!key) return;
+  if (!key || isServerToggling(row)) return;
   try {
     await ElMessageBox.prompt(
       `这会删除 OpenBear 中的 MCP 注册并关闭当前连接，但不会卸载外部软件或关闭远程服务。请输入完整内部标识「${key}」确认。`,
@@ -619,11 +693,11 @@ async function uninstallServer(row) {
 async function setServerApproval(row, value) {
   const key = serverKey(row);
   const approval = String(value || "").trim().toLowerCase();
-  if (!key || !["allow", "ask", "deny"].includes(approval) || approval === row?.approval) return;
+  if (!key || isServerToggling(row) || !["allow", "ask", "deny"].includes(approval) || approval === row?.approval) return;
   if (approval === "allow") {
     try {
       await ElMessageBox.confirm(
-        `信任「${serverName(row)}」后，它的全部可用接口将在主会话、子 Agent 和后台任务中直接执行。风险标签仍会展示并记录审计。`,
+        `信任「${serverName(row)}」只改变调用审批，不会开放 Agent 访问或替代本轮授权。符合访问条件的调用将按此审批策略执行。`,
         "始终信任此 MCP",
         { type: "warning", confirmButtonText: "始终信任", cancelButtonText: "取消" },
       );
@@ -647,12 +721,24 @@ async function setServerApproval(row, value) {
     setServerToggling(key, false);
   }
 }
-function openServer(row) {
+async function mayLeaveAccess(row = null) {
+  if (!drawerOpen.value || drawerKind.value !== "server" || !accessDirty.value) return true;
+  if (row && serverKey(row) === accessServer.value) return false;
+  if (isServerToggling(drawerItem.value)) return false;
+  try {
+    await ElMessageBox.confirm("未保存的 Agent 访问修改将被丢弃。", "放弃修改？", { confirmButtonText: "放弃修改", cancelButtonText: "继续编辑" });
+    return true;
+  } catch { return false; }
+}
+async function openServer(row) {
+  if (!(await mayLeaveAccess(row))) return;
   drawerKind.value = "server";
   drawerItem.value = row;
+  resetAccessDraft(row);
   drawerOpen.value = true;
 }
-function openTool(row) {
+async function openTool(row) {
+  if (!(await mayLeaveAccess())) return;
   drawerKind.value = "tool";
   drawerItem.value = row;
   drawerOpen.value = true;
@@ -815,7 +901,7 @@ onMounted(load);
                 :model-value="card.approval"
                 size="small"
                 :loading="isServerToggling(card)"
-                :disabled="!serverKey(card) || !status.settingsAvailable"
+                :disabled="!serverKey(card) || !status.settingsAvailable || isServerToggling(card)"
                 aria-label="MCP 审批策略"
                 title="审批策略"
                 @change="(value) => setServerApproval(card, value)"
@@ -827,7 +913,7 @@ onMounted(load);
               <el-switch
                 :model-value="Boolean(card.enabled)"
                 :loading="isServerToggling(card)"
-                :disabled="!serverKey(card)"
+                :disabled="!serverKey(card) || isServerToggling(card)"
                 inline-prompt
                 active-text="开"
                 inactive-text="关"
@@ -845,6 +931,7 @@ onMounted(load);
             <span v-if="card.promptCount"><strong>{{ card.promptCount }}</strong> 个提示词</span>
             <span v-if="card.filteredTools" class="is-warning"><strong>{{ card.filteredTools }}</strong> 个已过滤</span>
             <span v-if="card.required">必需连接</span>
+            <span>Agent：{{ accessText(card) }} · 当前可委派 {{ card.agentDelegatableTools || 0 }} 项</span>
           </div>
 
           <div class="mcp-health" :class="card.lastFailedAt ? 'has-failure' : ''">
@@ -886,7 +973,9 @@ onMounted(load);
           <div class="mcp-card-footer">
             <span class="truncate text-[11px] text-macsub" :title="card.key">{{ card.key }}</span>
             <div class="flex shrink-0 items-center gap-1">
-              <el-button size="small" text type="danger" :loading="isServerToggling(card)" @click="uninstallServer(card)">卸载</el-button>
+              <el-button size="small" text :loading="isServerToggling(card)" :disabled="card.status !== 'connected' || isServerToggling(card)" @click="refreshServerTools(card)">刷新工具</el-button>
+              <el-button size="small" text type="primary" @click="openServer(card)">Agent 访问</el-button>
+              <el-button size="small" text type="danger" :loading="isServerToggling(card)" :disabled="isServerToggling(card)" @click="uninstallServer(card)">卸载</el-button>
               <el-button size="small" text type="primary" @click="openServer(card)">查看详情 →</el-button>
             </div>
           </div>
@@ -894,10 +983,10 @@ onMounted(load);
       </div>
     </main>
 
-    <el-drawer append-to-body class="admin-drawer mcp-drawer" v-model="drawerOpen" size="44%" :title="drawerTitle" direction="rtl">
+    <el-drawer append-to-body class="admin-drawer mcp-drawer" v-model="drawerOpen" :before-close="closeDrawer" size="44%" :title="drawerTitle" direction="rtl">
       <div v-if="drawerItem" class="space-y-4 text-sm">
         <section class="rounded-2xl border border-macborder bg-zinc-50/80 p-4 text-xs leading-6 text-zinc-700">
-          这是只读安全摘要视图。敏感连接配置与错误明文不会在详情中展示；如需修改连接参数，请到配置文件或设置入口处理后重新加载。
+          连接信息为安全摘要，Agent 访问设置可在下方修改。敏感连接配置与错误明文不会在详情中展示；如需修改连接参数，请到配置文件或设置入口处理后重新加载。
         </section>
 
         <template v-if="drawerKind === 'server'">
@@ -911,7 +1000,7 @@ onMounted(load);
                 <el-switch
                   :model-value="Boolean(drawerItem.enabled)"
                   :loading="isServerToggling(drawerItem)"
-                  :disabled="!serverKey(drawerItem)"
+                  :disabled="!serverKey(drawerItem) || isServerToggling(drawerItem)"
                   inline-prompt
                   active-text="启用"
                   inactive-text="禁用"
@@ -928,6 +1017,45 @@ onMounted(load);
             <el-descriptions-item label="最近失败">{{ formatTime(drawerItem.lastFailedAt) }}</el-descriptions-item>
             <el-descriptions-item label="错误明文">{{ drawerItem.errorPresent ? '已隐藏' : '无' }}</el-descriptions-item>
           </el-descriptions>
+
+          <section class="rounded-2xl border border-macborder bg-white p-4" aria-label="允许 Agent 访问">
+            <h3 class="mb-2 text-sm font-semibold">允许 Agent 访问</h3>
+            <p class="mb-3 text-xs leading-5 text-macsub">仅设置此 MCP 可向 Agent 开放的工具范围，不影响主控访问，也不会替代 Agent 预设、本轮工具授权或调用审批。</p>
+            <fieldset :disabled="isServerToggling(drawerItem) || !status.agentAccessAvailable" class="space-y-3 min-w-0">
+              <el-radio-group v-model="accessDraft.mode" class="flex flex-wrap" :disabled="isServerToggling(drawerItem) || !status.agentAccessAvailable">
+                <el-radio value="disabled">关闭（默认）</el-radio>
+                <el-radio value="all">全部工具</el-radio>
+                <el-radio value="selected">指定工具</el-radio>
+              </el-radio-group>
+              <p v-if="accessDraft.mode === 'all'" class="text-xs leading-5 text-amber-700">当前及未来新增工具都会进入开放范围。如只希望开放当前这些工具，请选择“指定工具”并全选当前工具。</p>
+              <template v-if="accessDraft.mode === 'selected'">
+                <div class="flex gap-3 text-xs">
+                  <button type="button" class="text-macblue" @click="accessDraft.tools = [...new Set([...accessDraft.tools, ...asArray(drawerItem.tools).map(t => t.originalToolName)])]">全选当前工具</button>
+                  <button type="button" class="text-macsub" @click="accessDraft.tools = []">清空选择</button>
+                </div>
+                <p v-if="drawerItem.status !== 'connected'" class="text-xs text-amber-700">服务未连接，暂无法确认工具列表；已选项已保留。</p>
+                <label v-for="choice in accessChoices" :key="choice.name" class="flex items-start gap-2 rounded-xl border border-macborder p-2">
+                  <input type="checkbox" v-model="accessDraft.tools" :value="choice.name" class="mt-1 shrink-0" />
+                  <span class="min-w-0 break-all text-xs leading-5"><code>{{ choice.name }}</code>
+                    <span v-if="!choice.tool" class="text-amber-700"> · 当前未发现 · 已保留</span>
+                    <span v-else-if="choice.tool.filtered" class="text-amber-700"> · {{ filterReasonText(choice.tool.filterReason) }}</span>
+                    <span v-else-if="choice.tool.approval === 'deny'" class="text-amber-700"> · 审批禁止调用</span>
+                    <span v-if="choice.tool?.description" class="block text-macsub">{{ choice.tool.description }}</span>
+                  </span>
+                </label>
+                <p class="text-xs text-macsub">已选 {{ accessDraft.tools.length }} 项；已保存设置当前可委派 {{ drawerItem.agentDelegatableTools || 0 }} 项</p>
+                <p v-if="!accessDraft.tools.length" class="text-xs text-amber-700">尚未选择工具；保存后 Agent 无法访问此服务的工具。</p>
+              </template>
+              <p v-if="drawerItem.agentAccessApplied === false" class="text-xs text-amber-700">已保存策略尚未应用，请重新加载配置。</p>
+              <div class="flex flex-wrap justify-end gap-2">
+                <el-button :disabled="isServerToggling(drawerItem)" @click="resetAccessDraft()">取消 / 重新载入设置</el-button>
+                <el-button type="primary" :loading="isServerToggling(drawerItem)" :disabled="!accessDirty || isServerToggling(drawerItem) || !status.agentAccessAvailable" @click="saveAgentAccess">保存 Agent 访问设置</el-button>
+              </div>
+            </fieldset>
+          </section>
+          <div class="flex justify-end">
+            <el-button :loading="isServerToggling(drawerItem)" :disabled="drawerItem.status !== 'connected' || isServerToggling(drawerItem)" @click="refreshServerTools(drawerItem)">刷新工具</el-button>
+          </div>
 
           <div class="rounded-2xl border border-macborder bg-white p-4">
             <h3 class="mb-2 text-sm font-semibold">简介</h3>
@@ -999,6 +1127,7 @@ onMounted(load);
             <el-descriptions-item label="风险等级"><el-tag :type="riskType(drawerItem.risk)" round>{{ riskText(drawerItem.risk) }}</el-tag></el-descriptions-item>
             <el-descriptions-item label="审批策略"><el-tag :type="approvalType(drawerItem.approval)" effect="plain" round>{{ approvalText(drawerItem.approval) }}</el-tag></el-descriptions-item>
             <el-descriptions-item label="可用状态"><el-tag :type="toolAvailabilityType(drawerItem)" effect="plain" round>{{ toolAvailabilityText(drawerItem) }}</el-tag></el-descriptions-item>
+            <el-descriptions-item label="Agent 访问">{{ !drawerItem.agentAccessAllowed ? '未开放' : drawerItem.agentDelegatable ? '已开放' : '已开放但当前不可用' }}</el-descriptions-item>
             <el-descriptions-item label="过滤原因">{{ drawerItem.filtered ? filterReasonText(drawerItem.filterReason) : '—' }}</el-descriptions-item>
           </el-descriptions>
           <div class="rounded-2xl border border-macborder bg-white p-4">

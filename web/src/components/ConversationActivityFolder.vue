@@ -1,15 +1,48 @@
 <script setup>
-import {computed, ref, watch} from "vue";
+import {computed, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ArrowRight, Check, Folder, FolderOpened} from "@element-plus/icons-vue";
-import {activityLabel, activityState, groupActivityItems} from "../conversationActivity.js";
+import {activityLabel, activityState} from "../conversationActivity.js";
 const props = defineProps({
   items: {type: Array, default: () => []},
+  recentItems: {type: Array, default: () => []},
   activeConversationUuid: {type: String, default: ""},
   readVersions: {type: Map, default: () => new Map()},
   busy: Boolean,
 });
-const emit = defineEmits(["open", "read", "read-all"]);
+const emit = defineEmits(["open", "read", "read-all", "overview-enter", "overview-leave", "overview-close"]);
 const expanded = ref(true);
+const clock = ref(Date.now());
+let clockTimer;
+onMounted(() => { clockTimer = setInterval(() => { clock.value = Date.now(); }, 60000); });
+onBeforeUnmount(() => clearInterval(clockTimer));
+function recentInteractionTime(value, now = clock.value) {
+  const elapsed = Math.max(0, now - Number(value || 0));
+  if (elapsed < 60000) return "刚刚";
+  if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)} 分钟前`;
+  if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)} 小时前`;
+  return `${Math.floor(elapsed / 86400000)} 天前`;
+}
+function interactionAt(item) { return Number(item.lastInteractionAtMs || item.activityAtMs || 0); }
+function rowState(item) {
+  // A read receipt is not a successful result and cannot clear pending work.
+  return item.activityPending?.length ? "waiting" : activityState({...item, readWhileSelected: false});
+}
+function statusLabel(item) {
+  const state = rowState(item);
+  const label = activityLabel({...item, activityState: state, readWhileSelected: false});
+  if (state === "waiting" || state === "running") return label;
+  const settled = ["completed", "idle", "read"].includes(state);
+  if (item.activityUnread) return settled ? "完成待查看" : `${label}待查看`;
+  // Failures, interruptions and partial/cancelled results remain explicit even
+  // after reading. Only an ordinary settled, read conversation uses time.
+  return settled ? "" : label;
+}
+function rowLabel(item) {
+  return statusLabel(item) || (interactionAt(item) > 0 ? recentInteractionTime(interactionAt(item)) : activityLabel(item));
+}
+function rowTitle(item) {
+  return statusLabel(item) || (interactionAt(item) > 0 ? `最后交互：${new Date(interactionAt(item)).toLocaleString()}` : activityLabel(item));
+}
 const selectedRow = ref(null);
 watch(() => [props.items, props.activeConversationUuid, props.readVersions], () => {
   const current = props.items.find(item => item.conversationUuid === props.activeConversationUuid);
@@ -25,40 +58,54 @@ const visibleItems = computed(() => {
   }
   return items;
 });
-const groups = computed(() => groupActivityItems(visibleItems.value));
-const unreadCount = computed(() => props.items.filter(item => item.activityUnread).length);
-const waitingCount = computed(() => props.items.filter(item => activityState(item) === "waiting").length);
+const recent = computed(() => [...new Map((props.recentItems || [])
+  .filter(item => item?.conversationUuid && !item.archived && !item.local && Number(item.lastInteractionAtMs) > 0)
+  .map(item => [item.conversationUuid, item])).values()]
+  .sort((a, b) => Number(b.lastInteractionAtMs) - Number(a.lastInteractionAtMs) || a.conversationUuid.localeCompare(b.conversationUuid))
+  .slice(0, 5));
+const rows = computed(() => {
+  const unique = new Map(recent.value.map(item => [item.conversationUuid, item]));
+  for (const item of visibleItems.value) {
+    if (!item?.conversationUuid || item.archived || item.local) continue;
+    const current = unique.get(item.conversationUuid);
+    // Current live status wins; a selected-row retention snapshot must never
+    // overwrite a newer recent result or create a second row for it.
+    if (!current || !item.readWhileSelected) unique.set(item.conversationUuid, {...current, ...item});
+  }
+  // The five-item limit applies to ordinary recents, not outstanding work.
+  return [...unique.values()].sort((a, b) => interactionAt(b) - interactionAt(a)
+    || a.conversationUuid.localeCompare(b.conversationUuid));
+});
+const unreadCount = computed(() => rows.value.filter(item => item.activityUnread).length);
+const waitingCount = computed(() => rows.value.filter(item => rowState(item) === "waiting").length);
 </script>
 
 <template>
-  <section class="activity-folder" aria-label="运行与未读">
+  <section class="activity-folder" aria-label="最近会话">
     <div class="activity-folder-heading">
-      <button class="activity-folder-toggle" type="button" :aria-expanded="expanded" @click="expanded = !expanded">
+      <button class="activity-folder-toggle" type="button" :aria-expanded="expanded" @click="expanded = !expanded; emit('overview-close')">
         <ArrowRight class="activity-chevron" :class="{'is-expanded': expanded}" />
         <component :is="expanded ? FolderOpened : Folder" class="activity-folder-icon" />
-        <span class="activity-heading-label">运行与未读</span>
+        <span class="activity-heading-label">最近会话</span>
         <span v-if="waitingCount" class="activity-waiting-count" :title="`${waitingCount} 个会话等待你处理`" role="status">待处理 {{ waitingCount }}</span>
-        <span v-else class="activity-total">{{ props.items.length }}</span>
+        <span v-else class="activity-total">{{ rows.length }}</span>
       </button>
       <button v-if="unreadCount" class="activity-read-all" type="button" :disabled="busy" aria-label="全部标为已读" title="全部标为已读" @click="emit('read-all')"><Check /><span class="activity-touch-label">全部已读</span></button>
     </div>
-    <div v-if="expanded" class="activity-folder-content">
-      <section v-for="group in groups" :key="group.key" class="activity-group" :aria-label="group.label">
-        <h5>{{ group.label }}<span>{{ group.items.length }}</span></h5>
-        <div v-for="item in group.items" :key="item.conversationUuid" class="activity-row" :class="{'is-selected': item.conversationUuid === activeConversationUuid, 'is-waiting': activityState(item) === 'waiting'}" :data-activity-id="item.conversationUuid">
-          <button class="activity-row-open" type="button" :title="`${item.title} · ${item.path || '临时会话'} · ${activityLabel(item)}${item.activityUnread ? '，未读' : ''}`" @click="emit('open', item)">
-            <i class="activity-state-dot" :class="`is-${activityState(item)}`" aria-hidden="true"></i>
-            <span class="activity-row-copy">
-              <span class="activity-row-title">{{ item.title }}</span>
-              <span class="activity-row-status activity-row-status-touch">{{ activityLabel(item) }}</span>
-            </span>
-            <span v-if="item.activityUnread" class="activity-unread-dot" aria-label="未读"></span>
-          </button>
-          <button v-if="item.activityUnread" class="activity-row-read" type="button" :disabled="busy" :aria-label="`标为已读：${item.title}`" title="标为已读" @click="emit('read', item)"><Check /><span class="activity-touch-label">标已读</span></button>
-          <span class="activity-row-status activity-row-status-desktop" @click="emit('open', item)">{{ activityLabel(item) }}</span>
-        </div>
-      </section>
-      <p v-if="!groups.length" class="activity-empty">暂无运行或未读任务</p>
+    <div v-if="expanded" class="activity-folder-content" data-recent-conversations @scroll.passive="emit('overview-close')">
+      <div v-for="item in rows" :key="item.conversationUuid" class="activity-row" :class="{'is-selected': item.conversationUuid === activeConversationUuid, 'is-waiting': rowState(item) === 'waiting'}" :data-activity-id="item.conversationUuid" @pointerenter="emit('overview-enter', $event, item)" @pointerleave="emit('overview-leave')">
+        <button class="activity-row-open" type="button" :aria-label="`${item.title} · ${item.path || '临时会话'} · ${rowLabel(item)}`" @click="emit('open', item)">
+          <i class="activity-state-dot" :class="`is-${rowState(item)}`" aria-hidden="true"></i>
+          <span class="activity-row-copy">
+            <span class="activity-row-title">{{ item.title }}</span>
+            <span class="activity-row-status activity-row-status-touch" :aria-label="rowTitle(item)">{{ rowLabel(item) }}</span>
+          </span>
+          <span v-if="item.activityUnread" class="activity-unread-dot" aria-label="未读"></span>
+        </button>
+        <button v-if="item.activityUnread" class="activity-row-read" type="button" :disabled="busy" :aria-label="`标为已读：${item.title}`" @click="emit('read', item)"><Check /><span class="activity-touch-label">标已读</span></button>
+        <span class="activity-row-status activity-row-status-desktop" :aria-label="rowTitle(item)" @click="emit('open', item)">{{ rowLabel(item) }}</span>
+      </div>
+      <p v-if="!rows.length" class="activity-empty">暂无最近会话</p>
     </div>
   </section>
 </template>
@@ -79,7 +126,6 @@ const waitingCount = computed(() => props.items.filter(item => activityState(ite
 .activity-read-all, .activity-row-read { display: grid; flex: 0 0 24px; width: 24px; height: 25px; padding: 5px; place-items: center; border-radius: 5px; }
 .activity-read-all svg, .activity-row-read svg { width: 13px; height: 13px; }
 .activity-folder-content { flex: 0 1 auto; min-height: 0; max-height: min(32vh, 260px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
-.activity-group h5 { display: flex; gap: 7px; margin: 5px 7px 2px 26px; color: #a1a1aa; font-size: 11px; font-weight: 400; }
 .activity-row { display: flex; align-items: center; margin-left: 18px; border-radius: 7px; }
 .activity-row:hover { background: rgba(228,228,231,.58); }
 .activity-row.is-selected { background: rgba(37,99,235,.075); color: #1d4ed8; }
@@ -103,7 +149,7 @@ const waitingCount = computed(() => props.items.filter(item => activityState(ite
 .activity-folder button:focus-visible { outline: 2px solid rgba(37,99,235,.5); outline-offset: -2px; }
 .activity-empty { margin: 4px 8px 5px 26px; color: #a1a1aa; font-size: 11px; }
 @keyframes activity-spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .activity-state-dot.is-running { animation: none; } }
+/* Keep the running ring, like the ordinary tree: operational status, not decoration. */
 @media (max-width: 760px), (pointer: coarse) {
   .activity-folder { max-height: 50%; margin: 0 7px 6px; font-size: 13px; }
   .activity-folder button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -115,7 +161,6 @@ const waitingCount = computed(() => props.items.filter(item => activityState(ite
   .activity-touch-label { display: inline; white-space: nowrap; font-size: 12px; }
   .activity-read-all { display: flex; flex: 0 0 auto; gap: 4px; width: auto; min-width: 44px; height: 44px; padding: 0 6px; align-items: center; justify-content: center; }
   .activity-folder-content { max-height: min(36vh, 300px); max-height: min(36dvh, 300px); overflow-x: hidden; -webkit-overflow-scrolling: touch; }
-  .activity-group h5 { margin: 5px 7px 3px 7px; font-size: 12px; }
   .activity-row { margin-left: 0; align-items: stretch; }
   .activity-row-open { gap: 8px; height: auto; min-height: 56px; padding: 7px 6px; }
   .activity-row-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; align-items: flex-start; gap: 2px; }

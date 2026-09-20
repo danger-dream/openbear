@@ -23,11 +23,11 @@ export function normalizeLedgerUsageBaseline(usage = {}) {
 
 export function ledgerTokenParts(usage = {}) {
   const ledger = normalizeLedgerUsageBaseline(usage);
-  const cache = ledger.cache_read_tokens + ledger.cache_write_tokens;
+  // 与 parrot 口径一致：input 为完整 prompt，cache 仅计读缓存(命中)，写缓存不算命中。
   return {
-    input: ledger.input_tokens + cache,
+    input: ledger.input_tokens + ledger.cache_read_tokens + ledger.cache_write_tokens,
     output: ledger.output_tokens,
-    cache,
+    cache: ledger.cache_read_tokens,
   };
 }
 

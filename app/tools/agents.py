@@ -49,7 +49,9 @@ from app.stream.tool_progress import (
 from app.tools.agent_continuation import AgentContinuationTools, register_continuation_tools
 from app.tools.allowlist import (
     AGENT_DELEGATION_TOOL_NAMES,
+    agent_delegation_names,
     expand_agent_tool_names,
+    refresh_agent_tool_enums,
     sanitize_tool_allowlist,
 )
 from app.tools.base import (
@@ -161,7 +163,8 @@ def _task_public(
         "tokens": {
             "input": task.input_tokens + task.cache_read_tokens + task.cache_write_tokens,
             "output": task.output_tokens,
-            "cache": task.cache_read_tokens + task.cache_write_tokens,
+            # 缓存仅计读缓存(命中)；写缓存已计入 input，不算命中。
+            "cache": task.cache_read_tokens,
         },
         "lastUsage": {
             "inputTokens": task.last_input_tokens,
@@ -329,7 +332,7 @@ class AgentTools(AgentContinuationTools):
         self.manager = manager
         self.llm_factory = llm_factory
         self.model_selection = model_selection
-        self.registry = registry
+        self._registry = registry
         self.messages = messages or MessageDAO(dao.db)
         self.workspace_dir = str(workspace_dir or "").strip()
         self.memory = memory
@@ -349,6 +352,7 @@ class AgentTools(AgentContinuationTools):
             )
             manager.plan_coordinator = coordinator
         self.plan: AgentPlanCoordinator = coordinator
+        self.plan.available_tools = lambda: agent_delegation_names(self.registry)
         self.plan.max_revision_rounds = max(1, int(getattr(config.rath, "agent_plan_max_revision_rounds", 3) or 3))
         self.plan.max_steps = max(1, int(getattr(config.rath, "agent_plan_max_steps", 30) or 30))
         self.plan.max_criteria_per_step = max(
@@ -532,8 +536,13 @@ class AgentTools(AgentContinuationTools):
             }
         return ledger_usage
 
+    @property
+    def registry(self) -> ToolRegistry:
+        provider = self._registry.current_registry
+        return provider() if provider is not None else self._registry
+
     def _agent_tool_names(self) -> list[str]:
-        return sorted(set(self.registry.names(scope="agent")) & set(AGENT_DELEGATION_TOOL_NAMES))
+        return sorted(agent_delegation_names(self.registry))
 
     @staticmethod
     def _raw_tool_list(value: Any) -> list[Any] | None:
@@ -586,8 +595,9 @@ class AgentTools(AgentContinuationTools):
                 "unknownTools": unknown,
                 "availableTools": available,
             }
+        preset_configured = bool(agent.tool_allowlist)
         preset_allowed = sanitize_tool_allowlist(agent.tool_allowlist or [])
-        if preset_allowed:
+        if preset_configured:
             preset_set = set(preset_allowed)
             denied_by_preset = [name for name in requested if name not in preset_set]
             if denied_by_preset:
@@ -2360,3 +2370,4 @@ def register_agent_tools(
         preserve_result=True,
     )
     register_agent_plan_tools(reg, tools.plan)
+    refresh_agent_tool_enums(reg)

@@ -201,6 +201,10 @@ class ToolRegistry:
         # File tools register their actual injected cache, not necessarily the
         # process-global fallback. Window owners invalidate only their scope.
         self.file_state: Any = None
+        # Trusted wiring only; MCP eligibility is resolved against the live manager.
+        self.mcp_manager: Any = None
+        self.mcp_tool_identities: dict[str, tuple[str, str]] = {}
+        self.current_registry: Callable[[], ToolRegistry] | None = None
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool

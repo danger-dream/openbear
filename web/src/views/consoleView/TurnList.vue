@@ -31,8 +31,29 @@ function displayEvents(turn) {
 	return Array.isArray(turn?.events) ? turn.events : [];
 }
 
+// Every projection hands a turn a brand-new event array, so the array identity
+// is a safe memo key: while the same array is on screen its derived view cannot
+// change, and any new projection invalidates it automatically. Caching this is
+// what keeps a long turn from re-filtering its whole event list once per
+// rendered row.
+const turnViewMemo = new WeakMap();
+
+function turnView(turn) {
+	const events = displayEvents(turn);
+	let view = turnViewMemo.get(events);
+	if (!view) {
+		view = {
+			entries: conversationTimelineEntries(displayEvents(turn), eventPrimaryToolName, isAgentEvent),
+			liveAnswer: events.some((event) => event?.kind === "answer" && (event?.message?.live || event?.reasoningActive)),
+			liveText: activeLiveTextInfoFor(events),
+		};
+		turnViewMemo.set(events, view);
+	}
+	return view;
+}
+
 function conversationEvents(turn) {
-	return conversationTimelineEntries(displayEvents(turn), eventPrimaryToolName, isAgentEvent);
+	return turnView(turn).entries;
 }
 
 function hasAssistantContent(turn) {
@@ -110,8 +131,7 @@ function liveTextMode(event) {
 	return "";
 }
 
-function activeLiveTextInfo(turn) {
-	const events = displayEvents(turn);
+function activeLiveTextInfoFor(events) {
 	for (let i = events.length - 1; i >= 0; i--) {
 		const event = events[i];
 		if (isPersistentRunIndicator(event)) continue;
@@ -122,7 +142,7 @@ function activeLiveTextInfo(turn) {
 }
 
 function liveTextTargetForEvent(turn, idx) {
-	const active = activeLiveTextInfo(turn);
+	const active = turnView(turn).liveText;
 	return active.index === idx ? active.mode : "";
 }
 
@@ -219,7 +239,7 @@ function assistantTurnRawContent(turn) {
 function assistantMetaVisible(turn, turnIndex) {
 	if (props.running && turnIndex === props.turns.length - 1) return false;
 	if (turn?.stats?.live) return false;
-	if (displayEvents(turn).some(event => event?.kind === "answer" && (event?.message?.live || event?.reasoningActive))) return false;
+	if (turnView(turn).liveAnswer) return false;
 	// Completion statistics belong to the whole turn, even when compaction or
 	// another visible operation follows the final answer (or no text was sent).
 	return hasAssistantContent(turn) || hasTurnTokens(turn) || assistantDurationMs(turn) > 0;
@@ -311,6 +331,7 @@ async function copyMessage(content, key) {
 						:turn-id="turn.id"
 						:index="entry.index"
 						:auto-scroll-locked="props.autoScrollLocked"
+						:reasoning-autoscroll="Boolean(entry.event.reasoningActive) && props.autoScrollLocked"
 						:retry-cancel-pending="props.retryCancelPending"
 						:live-text-target="liveTextTargetForEvent(turn, entry.index)"
 						:detail-key="props.detailKey"
@@ -576,6 +597,15 @@ async function copyMessage(content, key) {
 		display: flex;
 		flex-direction: column;
 		align-items: flex-end;
+	}
+}
+
+/* Touch browsers can retain :hover after a tap; never insert a time badge
+   above the message on mobile. Persistent footer metadata is unchanged. */
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	.time-float,
+	.timed-row:hover > .time-float {
+		display: none;
 	}
 }
 </style>

@@ -50,10 +50,15 @@ def pending_items(chat_id: int) -> list[dict[str, Any]]:
         return [dict(item) for item in _QUEUE.get(chat_id, [])]
 
 
-def drain_items(chat_id: int) -> list[dict[str, Any]]:
-    """取出并清空某会话排队的插话记录（按到达顺序）。"""
+def drain_items(chat_id: int, *, item_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    """取出排队记录；恢复旧输入时只消费已持久化的指定项，保留新插话。"""
     with _LOCK:
         items = _QUEUE.pop(chat_id, [])
+        if item_ids is not None:
+            remaining = [item for item in items if str(item.get("id") or "") not in item_ids]
+            items = [item for item in items if str(item.get("id") or "") in item_ids]
+            if remaining:
+                _QUEUE[chat_id] = remaining
     return [dict(item) for item in items]
 
 

@@ -39,6 +39,36 @@ async def test_anthropic_stream_content():
     assert result.usage.output_tokens == 5
 
 
+@pytest.mark.parametrize("updates, expected", [
+    ([{"input_tokens": 24, "cache_read_input_tokens": 6,
+       "cache_creation_input_tokens": 4, "output_tokens": 10}] * 2,
+     (24, 6, 4, 10)),  # repeated cumulative snapshots are not additive
+    ([{"output_tokens": 10}], (12, 3, 2, 10)),  # omitted inputs retain start
+    ([{"input_tokens": 0, "cache_read_input_tokens": 0,
+       "cache_creation_input_tokens": 0, "output_tokens": 0}], (0, 0, 0, 0)),
+    ([{"input_tokens": 24, "cache_read_input_tokens": None,
+       "output_tokens": 10}], (24, 3, 2, 10)),
+])
+async def test_anthropic_stream_cumulative_usage_updates(updates, expected):
+    lines = _ev("message_start", {"message": {"usage": {
+        "input_tokens": 12, "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 2,
+    }}})
+    for usage in updates:
+        lines += _ev("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": usage})
+    lines += _ev("message_stop", {})
+    client = make_client(lambda r: sse_response(lines))
+    try:
+        backend = AnthropicBackend(client, "https://x/v1", "k")
+        result = await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="claude"))
+        usage = result.usage
+        assert (usage.input_tokens, usage.cache_read_tokens,
+                usage.cache_write_tokens, usage.output_tokens) == expected
+        assert usage.total_tokens == sum(expected)
+    finally:
+        await client.close()
+
+
 async def test_anthropic_stream_thinking_with_signature():
     """thinking_delta + signature_delta → reasoning + signature 落到 result。"""
     lines = []
@@ -292,8 +322,8 @@ def test_cache_breakpoints_tools():
     assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
 
 
-def test_cache_breakpoints_pin_first_two_user_turns_for_append_only_prefix():
-    """messages:最早两个 user turn固定打断点，append不迁移历史标记。"""
+def test_cache_breakpoints_roll_to_last_message_and_previous_user_turn():
+    """messages:断点滚动到最后一条 + 倒数第二个 user turn，不再钉在会话开头。"""
     payload = {
         "messages": [
             {"role": "user", "content": "第一轮"},
@@ -305,15 +335,46 @@ def test_cache_breakpoints_pin_first_two_user_turns_for_append_only_prefix():
     }
     _apply_cache_breakpoints(payload)
     msgs = payload["messages"]
-    # 第一、第二个 user turn固定带断点；后来追加的第三个 user不回写旧unit。
-    assert msgs[0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # 最后一条(第三轮)与倒数第二个 user(第二轮)带断点；前缀缓存因此覆盖全部历史。
+    assert msgs[4]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     assert msgs[2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert "cache_control" not in msgs[4]["content"]
+    # 会话开头的 user 不再固定占用断点；assistant 不打。
+    assert msgs[0]["content"] == "第一轮"
     assert "cache_control" not in msgs[1]["content"][-1]
+    assert "cache_control" not in msgs[3]["content"][-1]
+
+
+def test_cache_breakpoints_move_forward_when_turn_appended():
+    """追加一轮后，断点跟随前进，旧的最后一条上不再保留标记。"""
+    history = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+        {"role": "user", "content": "q2"},
+    ]
+    first = {"messages": list(history)}
+    _apply_cache_breakpoints(first)
+    assert first["messages"][2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert first["messages"][0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    second = {"messages": history + [
+        {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]},
+    ]}
+    _apply_cache_breakpoints(second)
+    msgs = second["messages"]
+    assert msgs[4]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert msgs[2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert msgs[0]["content"] == "q1"
+    # 总断点数不超过 2(加 system/tools 后仍在 Anthropic 4 个上限内)
+    marked = sum(
+        1 for m in msgs
+        if isinstance(m["content"], list) and "cache_control" in m["content"][-1]
+    )
+    assert marked == 2
 
 
 def test_cache_breakpoints_short_messages_no_crash():
-    """消息数 < 4 时不打倒数第二个 user(不越界)。"""
+    """单条消息时只打最后一条，往前找不到 user 也不越界。"""
     payload = {"messages": [{"role": "user", "content": "solo"}]}
     _apply_cache_breakpoints(payload)
     assert isinstance(payload["messages"][0]["content"], list)
@@ -339,5 +400,5 @@ async def test_cache_breakpoints_end_to_end_payload():
     # system 已转成 list 带断点
     assert isinstance(p["system"], list)
     assert p["system"][0]["cache_control"] == {"type": "ephemeral"}
-    # 单个 user既是最早固定断点，也保持端到端cache_control。
+    # 单条 user 即最后一条消息，端到端带 cache_control。
     assert p["messages"][0]["content"][-1]["cache_control"] == {"type": "ephemeral"}

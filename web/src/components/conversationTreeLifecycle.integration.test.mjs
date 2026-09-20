@@ -19,6 +19,7 @@ function harness({rows=[local(),conv('saved')],active='local:new',confirm=async(
   window:{localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)}},
   conversationTreeRef:ref({forgetConversation:id=>calls.forgotten.push(id),revealConversation:async id=>calls.reveals.push(id),revealDraft:async id=>calls.reveals.push('draft:'+id)}),
   consoleViewRef:ref(mounted?{discardConversationDraft:id=>calls.clears.push(id)}:null),
+  attachmentDrafts:{remove:async()=>{}},
   ElMessageBox:{confirm:(...args)=>{calls.confirms.push(args);return confirm();}},
   ElMessage:Object.fromEntries(['success','error','warning'].map(k=>[k,v=>calls[k].push(v)])),apiError:String,
   Api:{deleteConversation:async id=>{calls.deletes.push(id);return remove(id);},conversationTreeChildren:async options=>{calls.lookups.push(options);return children(options);}},
@@ -88,8 +89,13 @@ test('directory deletion leaves descendant-folder and unrelated drafts in their 
  const h=harness({rows:[{...local(),folderId:'child'},conv('saved')]});h.ctx.draftFolderId.value='child';h.run("handleTreeFolderRemoved({folderId:'a',targetFolderId:'b'})");assert.equal(h.ctx.draftFolderId.value,'child');assert.equal(h.ctx.conversations.value.find(isLocalConversation).folderId,'child');assert.deepEqual(h.calls.clears,[]);
 });
 test('mounted editor clearing is targeted and removes active text before navigation saves it',()=>{
- const cleared=[],attachments=[];const ctx=vm.createContext({props:{conversationUuid:'local:new'},draft:ref('deleted text'),draftKey:s=>s,clearDraftForConversation:id=>cleared.push(id),clearAttachments:()=>attachments.push(true),adjustComposerHeight(){},defineExpose(){}});
+ const cleared=[],attachments=[],released=[],forgotten=[];const props={conversationUuid:'local:new'};
+ const hydration=new Map([['other',{}],['local:new',{}],['kept',{}]]);
+ const ctx=vm.createContext({props,attachmentHydrations:hydration,activeAttachmentKey:()=>props.conversationUuid,attachmentRestoring:ref(true),draft:ref('deleted text'),draftKey:s=>s,clearDraftForConversation:id=>cleared.push(id),clearAttachments:()=>attachments.push(true),releaseStashedAttachments:id=>released.push(id),attachmentDrafts:{remove:async id=>{forgotten.push(id);}},adjustComposerHeight(){},defineExpose(){}});
  vm.runInContext(between(consoleSource,'function discardConversationDraft(','defineExpose('),ctx);vm.runInContext("discardConversationDraft('other')",ctx);assert.equal(ctx.draft.value,'deleted text');assert.equal(attachments.length,0);vm.runInContext("discardConversationDraft('local:new')",ctx);assert.equal(ctx.draft.value,'');assert.equal(attachments.length,1);assert.deepEqual(cleared,['other','local:new']);
+ // A deleted conversation loses its parked files and its stored copy whether or not it is the one on screen.
+ assert.deepEqual(released,['other','local:new']);assert.deepEqual(forgotten,['other','local:new']);
+ assert.deepEqual([...hydration.keys()],['kept']);assert.equal(ctx.attachmentRestoring.value,false);
 });
 test('mutation refresh reruns current search, and cancelled folder removal emits no migration',async()=>{
  const calls=[];const ctx=vm.createContext({moveRow:ref({kind:'folder',folderId:'a',name:'A'}),moveMode:ref('delete'),moveFolderId:ref('b'),moveBusy:ref(false),moveDialog:ref(true),Api:{deleteConversationFolder:async (_,payload)=>{calls.push(payload);return{};}},ElMessageBox:{confirm:async()=>{throw 'cancel';}},ElMessage:{error(){throw Error('unexpected');}},apiError:String});
@@ -98,9 +104,9 @@ test('mutation refresh reruns current search, and cancelled folder removal emits
 });
 test('removal invalidates old branch/search responses and releases search loading state',()=>{
  const branches={a:{items:[conv('removed'),conv('kept')],generation:2,loading:true}};
- const ctx=vm.createContext({branchState:branches,loading:ref(true),activityItems:ref([conv('removed'),conv('kept')]),searchRows:ref([conv('removed'),conv('kept')]),searchLoading:ref(true),emitRows(){}});
+ const ctx=vm.createContext({branchState:branches,loading:ref(true),activityItems:ref([conv('removed'),conv('kept')]),recentItems:ref([conv('removed'),conv('kept')]),searchRows:ref([conv('removed'),conv('kept')]),searchLoading:ref(true),emitRows(){}});
  vm.runInContext(`let bootstrapGeneration=1,searchGeneration=1;${between(tree,'function forgetConversation(','function forgetFolder(')};forgetConversation('removed');`,ctx);
- assert.equal(branches.a.generation,3);assert.equal(branches.a.loading,false);assert.deepEqual(branches.a.items.map(x=>x.conversationUuid),['kept']);assert.equal(ctx.searchLoading.value,false);assert.equal(ctx.searchRows.value.length,1);assert.equal(vm.runInContext('searchGeneration',ctx),2);assert.deepEqual(ctx.activityItems.value.map(row=>row.conversationUuid),['kept']);
+ assert.equal(branches.a.generation,3);assert.equal(branches.a.loading,false);assert.deepEqual(branches.a.items.map(x=>x.conversationUuid),['kept']);assert.equal(ctx.searchLoading.value,false);assert.equal(ctx.searchRows.value.length,1);assert.equal(vm.runInContext('searchGeneration',ctx),2);assert.deepEqual(ctx.activityItems.value.map(row=>row.conversationUuid),['kept']);assert.deepEqual(ctx.recentItems.value.map(row=>row.conversationUuid),['kept']);
 });
 test('local draft submitted while removal confirmation is open is not deleted as a server conversation',async()=>{
  const pending=defer();const h=harness({confirm:()=>pending.promise});const job=h.remove(local());h.ctx.conversations.value=[conv('persisted')];h.ctx.activeConversationUuid.value='persisted';pending.resolve();await job;assert.deepEqual(h.calls.deletes,[]);assert.deepEqual(h.calls.clears,[]);assert.equal(h.ctx.activeConversationUuid.value,'persisted');

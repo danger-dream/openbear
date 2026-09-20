@@ -145,6 +145,8 @@ class WebAdminAppMixin:
             web.patch("/api/mcp/enabled", self.handle_api_mcp_enabled),
             web.patch("/api/mcp/servers/{server}/enabled", self.handle_api_mcp_server_enabled),
             web.patch("/api/mcp/servers/{server}/approval", self.handle_api_mcp_server_approval),
+            web.patch("/api/mcp/servers/{server}/agent-access", self.handle_api_mcp_server_agent_access),
+            web.post("/api/mcp/servers/{server}/refresh-tools", self.handle_api_mcp_server_refresh_tools),
             web.post("/api/mcp/servers/{server}/uninstall", self.handle_api_mcp_server_uninstall),
             web.post("/api/mcp/reload", self.handle_api_mcp_reload),
             web.post("/api/system/restart", self.handle_api_system_restart),

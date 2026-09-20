@@ -34,6 +34,7 @@ from app.rath.manager import RathTaskManager
 from app.task_memory import TaskMemoryDAO
 from app.tools.agent_history import register_agent_history_tool
 from app.tools.agents import register_agent_tools
+from app.tools.allowlist import refresh_agent_tool_enums
 from app.tools.base import ToolRegistry
 from app.tools.bash import register_bash_tool
 from app.tools.file_state import FileStateStore
@@ -45,7 +46,6 @@ from app.tools.openbear_control import register_openbear_control_tool
 from app.tools.skills import filter_skills, load_skills, render_skills_block
 from app.tools.task_memory import register_task_memory_tool
 from app.tools.user_interaction import UserInteractionManager, register_user_interaction_tools
-from app.tools.web_search import register_web_search_tools
 from app.update.service import UpdateService
 
 log = get_logger("services")
@@ -110,6 +110,7 @@ class Services:
             models_dev_catalog=self.models_dev_catalog,
             apply_config_hook=self.apply_config,
             mcp_reload_hook=self.reload_mcp_from_disk,
+            mcp_agent_access_hook=self.apply_mcp_agent_access,
         )
         self.web_admin.mcp = self.mcp
         self.update = UpdateService(self)
@@ -118,6 +119,7 @@ class Services:
         # 工具注册
         self.file_state = FileStateStore(config.tools.file_state_max_entries)
         self.tools = ToolRegistry()
+        self.tools.current_registry = lambda: self.tools
         register_file_tools(
             self.tools,
             store=self.file_state,
@@ -126,7 +128,6 @@ class Services:
             max_line_bytes=config.tools.file_read_max_line_bytes,
             diff_max_chars=config.tools.file_diff_max_chars,
         )
-        register_web_search_tools(self.tools, skills_dir=config.tools.skills_dir)
         register_bash_tool(self.tools,
                            default_timeout_s=config.tools.bash_timeout_s,
                            output_limit=config.tools.bash_output_limit,
@@ -589,6 +590,23 @@ class Services:
         await self.db.conn.commit()
         return changed
 
+    async def apply_mcp_agent_access(self, server: str) -> dict[str, Any]:
+        """Apply only the latest saved access policy, never connection settings."""
+        async with self._mcp_reload_lock:
+            saved = await self.config_store.load_raw()
+            from app.config import MCPAgentAccessConfig
+            rows = (saved.get("mcp") or {}).get("servers") or {}
+            if server not in rows or server not in self.mcp.mcp_config.servers:
+                raise ValueError("mcp_server_not_found")
+            access = MCPAgentAccessConfig.model_validate(rows[server].get("agentAccess", rows[server].get("agent_access", {})))
+            config = self.mcp.config.model_copy(deep=True)
+            config.mcp.servers[server].agent_access = access
+            await self.mcp.apply_agent_access_config(config)
+            self.config = self.config.model_copy(update={"mcp": config.mcp})
+            self.web_admin.config = self.config
+            self._rebuild_tools_and_context(include_mcp=True, preserve_file_state=True)
+            return {"ok": True, "applied": True, "agentAccess": access.model_dump()}
+
     async def _on_mcp_tools_changed(self) -> None:
         """Publish a refreshed MCP tool list to subsequent Agent turns."""
         self._rebuild_tools_and_context(include_mcp=True, preserve_file_state=True)
@@ -615,6 +633,7 @@ class Services:
         if not preserve_file_state:
             self.file_state = FileStateStore(config.tools.file_state_max_entries)
         self.tools = ToolRegistry()
+        self.tools.current_registry = lambda: self.tools
         register_file_tools(
             self.tools,
             store=self.file_state,
@@ -623,7 +642,6 @@ class Services:
             max_line_bytes=config.tools.file_read_max_line_bytes,
             diff_max_chars=config.tools.file_diff_max_chars,
         )
-        register_web_search_tools(self.tools, skills_dir=config.tools.skills_dir)
         register_bash_tool(self.tools,
                            default_timeout_s=config.tools.bash_timeout_s,
                            output_limit=config.tools.bash_output_limit,
@@ -649,6 +667,7 @@ class Services:
         )
         if include_mcp:
             register_mcp_tools(self.tools, self.mcp)
+        refresh_agent_tool_enums(self.tools)
         self.web_admin.tools = self.tools
         all_skills = load_skills(config.tools.skills_dir)
         result = filter_skills(all_skills, disabled_names=set(config.tools.disabled_skills or []))

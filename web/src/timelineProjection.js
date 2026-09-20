@@ -1003,6 +1003,11 @@ export function projectOperationMessages(operations = [], options = {}) {
     if (opType === "assistant_message") {
       const text = operationPayloadText(payload);
       const isError = Boolean(payload.error || op.status === "failed");
+      // The row that *reports* a run failure carries a boolean marker; rows that
+      // were still open when the run failed receive the error text instead. Both
+      // satisfy `isError`, so only the boolean can identify the failure itself
+      // for display.
+      const isFailure = payload.error === true;
       if (text || isError) {
         finishActiveReasoning(turn);
         mergeAnswerEvent(turn.events, {
@@ -1013,9 +1018,10 @@ export function projectOperationMessages(operations = [], options = {}) {
           ts: opTsMs(op),
           startedAt: opStartedAtMs(op),
           error: isError,
+          failure: isFailure,
           reasoningActive: false,
           operation: op,
-          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: helpers.answerContent(text), reasoning: "", error: isError, live: !payload.complete },
+          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: helpers.answerContent(text), reasoning: "", error: isError, failure: isFailure, live: !payload.complete },
         });
       }
       continue;

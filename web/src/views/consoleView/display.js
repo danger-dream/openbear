@@ -138,14 +138,15 @@ export function fmtBytes(value) {
 	return `${n} B`;
 }
 
+// 缓存口径与 parrot 一致：input = 完整 prompt(fresh + 读缓存 + 写缓存)，
+// cache = 仅读缓存(命中)，百分比 = 读缓存 / 完整 prompt。写缓存是全价新输入，不算命中。
 export function tokenPartsFromStats(stats) {
 	const u = stats?.usage || {};
 	const eu = stats?.expertUsage || {};
 	const input = Number(u.inputTokens || 0) + Number(u.cacheReadTokens || 0) + Number(u.cacheWriteTokens || 0)
 		+ Number(eu.inputTokens || 0) + Number(eu.cacheReadTokens || 0) + Number(eu.cacheWriteTokens || 0);
 	const output = Number(u.outputTokens || 0) + Number(eu.outputTokens || 0);
-	const cache = Number(u.cacheReadTokens || 0) + Number(u.cacheWriteTokens || 0)
-		+ Number(eu.cacheReadTokens || 0) + Number(eu.cacheWriteTokens || 0);
+	const cache = Number(u.cacheReadTokens || 0) + Number(eu.cacheReadTokens || 0);
 	return {input, output, cache};
 }
 
@@ -832,7 +833,7 @@ export function taskTokens(task) {
 		context,
 		input: context,
 		output: Number(last.outputTokens || 0),
-		cache: Number(last.cacheReadTokens || 0) + Number(last.cacheWriteTokens || 0),
+		cache: Number(last.cacheReadTokens || 0),
 	};
 }
 

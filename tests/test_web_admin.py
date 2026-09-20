@@ -4196,6 +4196,91 @@ async def test_web_operations_stats_are_persisted_on_current_turn(web_env):
     assert {k: _frame_payload(stat_frames[0])[k] for k in stats} == stats
 
 
+async def test_web_stats_without_turn_identity_owns_no_operation(web_env):
+    """A stats snapshot that lost its turn identity must not claim another turn's row.
+
+    The stable stats event key carries no turn, so the removed event-uuid fallback
+    resolved to one conversation-level operation id. A terminal error clears the
+    live identities, and the completion snapshot that followed then overwrote that
+    unrelated row instead of the turn that had just failed.
+    """
+    row = await web_env.server._create_web_conversation(123, title="identity-less stats")
+    conv_uuid = str(row["conversation_uuid"])
+    live = web_env.server._live_for(row)
+
+    await live.publish({"type": "accepted", "turnUuid": "turn-keeps"})
+    await live.publish({"type": "stats", "turnUuid": "turn-keeps", "stats": {"modelCalls": 1}})
+    kept = await _web_frames_for(web_env, conv_uuid, op_type="stats")
+    assert [frame["turnUuid"] for frame in kept] == ["turn-keeps"]
+
+    # A terminal error clears the live turn/run identity, so a snapshot published
+    # afterwards carries none of them. It is still broadcast, but persists nothing.
+    await live.publish({"type": "error", "error": "boom"})
+    assert live.current_turn_uuid == "" and live.current_run_uuid == ""
+    anonymous = await live.publish({"type": "stats", "stats": {"modelCalls": 9, "modelFail": 1}})
+    assert anonymous["stats"]["modelCalls"] == 9
+    assert "turnUuid" not in anonymous and "runUuid" not in anonymous
+
+    stat_frames = await _web_frames_for(web_env, conv_uuid, op_type="stats")
+    assert [frame["turnUuid"] for frame in stat_frames] == ["turn-keeps"]
+    assert _frame_payload(stat_frames[-1])["modelCalls"] == 1
+    stats_ops = [op for op in await web_env.server._web_operations(conv_uuid) if op["opType"] == "stats"]
+    assert [op["opId"] for op in stats_ops] == ["stats:turn-keeps"]
+
+
+async def test_web_terminal_stats_keeps_turn_after_error_clears_live_identity(web_env, monkeypatch):
+    """The failing turn must still receive its completion footer.
+
+    `renderer.fail()` publishes the terminal error, which clears the live stream's
+    turn/run identity. The stats snapshot the run then publishes must still land on
+    the visible turn instead of losing its identity and overwriting another
+    operation.
+    """
+    cfg = _cfg()
+
+    class FailOnceBackend(FakeStreamBackend):
+        async def stream(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
+            self.seen_convos.append([dict(message) for message in messages])
+            self.calls += 1
+            raise OpenBearLLMError("forced upstream rejection", status=400, retryable=False)
+            yield  # pragma: no cover
+
+    backend = FailOnceBackend()
+    web_env.server.config = cfg
+    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128000)
+    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
+    web_env.server.tools = ToolRegistry()
+
+    async def _fake_system_prompt():
+        return "sys"
+
+    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
+
+    row = await web_env.server._create_web_conversation(123, title="terminal stats identity", model="openai/gpt")
+    conv_uuid = str(row["conversation_uuid"])
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": "turn-failing"})
+
+    assert await web_env.server._run_web_turn(
+        int(row["internal_chat_id"]),
+        "会失败的请求",
+        _WebStreamRenderer(live),
+        conversation=row,
+        root_turn_uuid="turn-failing",
+    ) is False
+
+    # The error cleared the live identity; the run's own snapshot must not depend on it.
+    stats_ops = [
+        op for op in await web_env.server._web_operations(conv_uuid)
+        if op["opType"] == "stats"
+    ]
+    assert len(stats_ops) == 1
+    assert stats_ops[0]["turnUuid"] == "turn-failing"
+    assert stats_ops[0]["opId"] == "stats:turn-failing"
+    assert stats_ops[0]["payload"]["live"] is False
+    assert stats_ops[0]["payload"]["modelFail"] >= 1
+
+
 async def test_web_operations_mutable_delta_reasoning_survives_tool_start(web_env):
     row = await web_env.server._create_web_conversation(123, title="operation reasoning")
     live = web_env.server._live_for(row)
@@ -5092,6 +5177,8 @@ async def test_agent_wait_plan_notification_wakes_immediately_and_requeues_if_un
 
 
 async def test_agent_wait_user_interruption_returns_stable_instruction_id(web_env, monkeypatch):
+    from app.agent.loop import Agent
+
     cfg = _cfg()
     backend = FakeStreamBackend([
         [
@@ -5106,6 +5193,18 @@ async def test_agent_wait_user_interruption_returns_stable_instruction_id(web_en
     web_env.server.llm_factory = FakeRunFactory(backend, context_window=128000)
     web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
     tools = ToolRegistry()
+    run_registered = asyncio.Event()
+    allow_agent_run = asyncio.Event()
+    wait_entered = asyncio.Event()
+    original_run = Agent.run
+
+    async def _run_after_registration_gate(agent, *args, **kwargs):
+        if agent._backend is backend:
+            run_registered.set()
+            await allow_agent_run.wait()
+        return await original_run(agent, *args, **kwargs)
+
+    monkeypatch.setattr(Agent, "run", _run_after_registration_gate)
 
     async def _agent_wait(args):
         ctx = current_tool_context()
@@ -5134,6 +5233,14 @@ async def test_agent_wait_user_interruption_returns_stable_instruction_id(web_en
     steering.clear(chat_id)
     live = web_env.server._live_for(row)
     renderer = _WebStreamRenderer(live)
+    original_emit = renderer.emit
+
+    async def _observe_wait_cycle(payload):
+        await original_emit(payload)
+        if payload.get("type") == "agent_supervision" and payload.get("active") is True:
+            wait_entered.set()
+
+    monkeypatch.setattr(renderer, "emit", _observe_wait_cycle)
     await live.publish({"type": "accepted", "turnUuid": root_turn_uuid})
     run = asyncio.create_task(web_env.server._run_web_turn(
         chat_id,
@@ -5143,13 +5250,15 @@ async def test_agent_wait_user_interruption_returns_stable_instruction_id(web_en
         root_turn_uuid=root_turn_uuid,
     ))
     try:
-        for _ in range(200):
-            wake = web_env.server._web_controller_wake_events.get(row["conversation_uuid"])
-            if wake is not None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("controller AgentWait was not registered")
+        # Registration precedes Agent.run: deliberately hold this gap open so
+        # waiting only for the wake object would inject steering too early.
+        await asyncio.wait_for(run_registered.wait(), timeout=2)
+        wake = web_env.server._web_controller_wake_events.get(row["conversation_uuid"])
+        assert wake is not None
+        assert not wait_entered.is_set()
+        allow_agent_run.set()
+        # Observe the real AgentWait supervision cycle, not scheduler timing.
+        await asyncio.wait_for(wait_entered.wait(), timeout=2)
         item = steering.enqueue(
             chat_id,
             "用户决定继续，但缩小范围",
@@ -5161,6 +5270,7 @@ async def test_agent_wait_user_interruption_returns_stable_instruction_id(web_en
         wake.set()
         assert await asyncio.wait_for(run, timeout=3) is True
     finally:
+        allow_agent_run.set()
         steering.clear(chat_id)
         if not run.done():
             run.cancel()

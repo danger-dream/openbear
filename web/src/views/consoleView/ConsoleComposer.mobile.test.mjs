@@ -58,7 +58,7 @@ test('actual composer paste and file chooser retain files, draft text and focus 
 
 test('actual ReferenceEditor IME flags, candidate selection, Enter and Shift+Enter behavior remain unchanged', () => {
   const emitted = [], inserted = [], chosen = [], focus = [];
-  const c = vm.createContext({ emit: (...args) => emitted.push(args), editor: ref({ commands: { insertContent: content => inserted.push(content), focus: (...args) => focus.push(args) } }), mention: ref(null), picker: ref({ choose: () => chosen.push('choose'), move: step => chosen.push(step) }), closeMention() {} });
+  const c = vm.createContext({ emit: (...args) => emitted.push(args), editor: ref({ commands: { insertContent: content => inserted.push(content), focus: (...args) => focus.push(args) } }), mention: ref(null), picker: ref({ key: event => { if (['Enter','Tab'].includes(event.key)) chosen.push('choose'); else if (event.key === 'ArrowDown') chosen.push(1); else return false; event.preventDefault(); return true; } }), closeMention() {} });
   vm.runInContext(between(editor, 'function onKey(', 'function onPaste(') + between(editor, 'function focus()', 'function adjustHeight('), c);
   const key = (event = {}, view = {}) => { c.event = { key: 'Enter', preventDefault() { this.prevented = true; }, ...event }; c.view = view; return vm.runInContext('onKey(view,event)', c); };
   for (const [event, view] of [[{ isComposing: true }, {}], [{ keyCode: 229 }, {}], [{}, { composing: true }]]) {

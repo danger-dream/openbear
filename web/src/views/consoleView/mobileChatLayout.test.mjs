@@ -8,7 +8,7 @@ import {baseParse} from '@vue/compiler-dom';
 import {compile, createSSRApp, h, ref, nextTick} from 'vue';
 import {renderToString} from 'vue/server-renderer';
 
-const paths=['../../App.vue','ConsoleHeader.vue','ConsoleView.vue','ConsoleComposer.vue','TurnMinimap.vue','TaskMemoryDrawer.vue','MobileConversationTools.vue'];
+const paths=['../../App.vue','ConsoleHeader.vue','ConsoleView.vue','ConsoleComposer.vue','TurnMinimap.vue','TaskMemoryDrawer.vue','MobileConversationTools.vue','TurnList.vue'];
 const sources=Object.fromEntries(paths.map(path=>[path,fs.readFileSync(new URL(path,import.meta.url),'utf8')]));
 const descriptors=Object.fromEntries(paths.map(path=>[path,parse(sources[path]).descriptor]));
 const styles=Object.fromEntries(paths.map(path=>[path,postcss.parse(descriptors[path].styles.map(s=>s.content).join('\n'))]));
@@ -82,6 +82,35 @@ test('desktop title/subtitle, toolbar, editor size and floating rail are unchang
   assert.equal(css('ConsoleComposer.vue','.tool-btn',desktop).width,'2rem');
   assert.deepEqual(css('ConsoleComposer.vue','.composer-toolbar button.run-config-chip',desktop),{});
   assert.deepEqual(css('ConsoleComposer.vue',':deep(.reference-editor-content)',desktop),{});
+});
+
+test('message hover timestamps stay hidden on phones and touch-only landscape screens',()=>{
+  const file='TurnList.vue';
+  const environments=[
+    ...[320,390,760,844,1024,1440].map(width=>({...phone,width})),
+    {...desktop,width:760},
+  ];
+  for(const env of environments){
+    assert.equal(css(file,'.time-float',env).display,'none',`resting time badge at ${env.width}px`);
+    assert.equal(css(file,'.timed-row:hover > .time-float',env).display,'none',`sticky touch hover at ${env.width}px`);
+    for(const selector of ['.user-message-meta','.assistant-message-meta'])
+      assert.equal(css(file,selector,env).display,'flex','persistent message metadata and actions remain available');
+  }
+});
+
+test('message hover timestamps keep desktop hover and compact-window behavior',()=>{
+  for(const width of [761,900,1120,1440]){
+    const env={...desktop,width};
+    const resting=css('TurnList.vue','.time-float',env);
+    const hovered=css('TurnList.vue','.timed-row:hover > .time-float',env);
+    assert.equal(resting.opacity,'0');
+    assert.equal(hovered.opacity,'1');
+    assert.equal(hovered.display||resting.display,'inline-flex');
+    assert.equal(resting.position,width<=1120?'static':'absolute');
+  }
+  const compiled=compileStyle({source:descriptors['TurnList.vue'].styles[0].content,filename:'TurnList.vue',id:'data-v-turn-list',scoped:true});
+  assert.deepEqual(compiled.errors,[]);
+  assert.match(compiled.code,/\.timed-row:hover > \.time-float\[data-v-turn-list\]/);
 });
 
 // Exercise the production formatters without importing the unrelated .vue icons in display.js.

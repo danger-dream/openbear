@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_agent_history_survives_without_memory_permission():
     source = (ROOT / 'prompts/openbear-agent.tpl').read_text()
     engine = TemplateEngine()
-    common = {'workspaceDir': '/isolated', 'builtinToolSummaries': {}}
+    common = {'workspaceDir': '/isolated', 'builtinToolSummaries': {}, 'mcpToolNames': [], 'mcpToolSummaries': {}, 'mcpServerInstructions': []}
     without_memory = engine.render(source, {**common, 'builtinToolNames': ['AgentHistory', 'Read']})
     with_memory = engine.render(source, {**common, 'builtinToolNames': ['AgentHistory', 'Read', 'TaskMemory']})
     assert '[[ERROR:' not in without_memory + with_memory

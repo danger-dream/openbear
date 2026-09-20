@@ -15,11 +15,15 @@ from typing import Any
 from app.agent.native_continuation import (
     deserialize_messages,
     serialize_messages,
+    transcript_message_fingerprint,
     validate_model_context,
 )
 from app.context.window import CONTEXT_META, mark_source, neutral_context, source_of
 from app.db.engine import DB, now_ts
 from app.llm.base import Message
+from app.logging import get_logger
+
+log = get_logger("context.store")
 
 
 def _json(value: Any) -> str:
@@ -31,7 +35,53 @@ def _hash(value: Any) -> str:
 
 
 class StaleWindow(RuntimeError):
-    pass
+    def __init__(self, reason: str, **metadata: Any) -> None:
+        super().__init__(reason)
+        self.metadata = metadata
+
+
+class ControllerMessagesAppended(StaleWindow):
+    """Only a verified append may retry the context stage, never the Agent run."""
+
+
+@dataclass
+class ControllerBoundary:
+    high_water: int
+    prefix_count: int
+    window_stamp: tuple[Any, ...]
+    session: str | None
+    rows: dict[int, str]
+    phase: str
+
+
+def merge_controller_additions(messages: list[Message], additions: list[Message]) -> list[Message]:
+    """Backfill older originals without rewriting existing units or tool groups.
+
+    Rows older than an already adopted user belong before that user's request,
+    not after its cancellation/changed instructions. Truly new inputs still go
+    after the live assistant/tool batch, even if they were persisted mid-batch.
+    The caller validates the merged batch before advancing its coverage.
+    """
+    def row_id(message: Message) -> int:
+        meta = source_of(message)
+        value = int(meta.get("message_id") or 0)
+        return value if meta.get("id") == f"message:{value}" else 0
+
+    newest_user = max((row_id(m) for m in messages if m.get("role") == "user"), default=0)
+    ordered = sorted(additions, key=row_id)
+    backfill = [m for m in ordered if row_id(m) < newest_user]
+    new_inputs = [m for m in ordered if row_id(m) >= newest_user]
+    merged: list[Message] = []
+    offset = 0
+    for message in messages:
+        # Never insert a user (or another assistant) inside a declared tool batch.
+        if message.get("role") != "tool":
+            anchor = row_id(message)
+            while offset < len(backfill) and row_id(backfill[offset]) < anchor:
+                merged.append(backfill[offset])
+                offset += 1
+        merged.append(message)
+    return [*merged, *backfill[offset:], *new_inputs]
 
 
 class ContextHistoryUnavailable(RuntimeError):
@@ -86,7 +136,12 @@ class WindowStore:
             (owner.key, owner.kind, owner.conversation_uuid, owner.session_uuid, owner.agent_session_uuid, owner.task_uuid, ts, ts),
         )
 
-    async def load(self) -> dict[str, Any] | None:
+    async def load(self, *, fresh: bool = False) -> dict[str, Any] | None:
+        if fresh:
+            # A live cursor on the shared reader can pin an old WAL snapshot.
+            # Context CAS inputs must come from the same authoritative writer.
+            async with self.db.conn.transaction(label="context-state-read"):
+                return await self.load()
         cur = await self.db.conn.execute("SELECT * FROM context_windows WHERE owner_key=?", (self.owner.key,))
         row = await cur.fetchone()
         if row is None:
@@ -95,7 +150,174 @@ class WindowStore:
         data["state"] = json.loads(data.pop("state_json"))
         return data
 
-    async def archive(self, messages: list[Message]) -> dict[str, int]:
+    async def _window_stamp(self, conn: Any) -> tuple[Any, ...]:
+        cur = await conn.execute(
+            """SELECT revision,source_revision,source_high_water,window_version,route_fingerprint,
+                      owner_kind,session_uuid,agent_session_uuid,task_uuid,request_sequence
+               FROM context_windows WHERE owner_key=?""", (self.owner.key,))
+        row = await cur.fetchone()
+        return tuple(row) if row is not None else ()
+
+    async def _controller_session(self, conn: Any) -> str | None:
+        cur = await conn.execute("SELECT session_uuid FROM sessions WHERE chat_id=?", (self.owner.chat_id,))
+        row = await cur.fetchone()
+        return str(row[0] or "") if row is not None else None
+
+    async def _row_fingerprints(self, conn: Any, ids: Any) -> dict[int, str]:
+        # Only active source rows are read, never reload the lifetime transcript.
+        # Historical edits use the existing lineage invalidation protocol. Counts
+        # additionally catch prefix deletion, even outside the selected tail.
+        ids = list(ids)
+        fingerprints = {}
+        for offset in range(0, len(ids), 400):
+            chunk = ids[offset:offset + 400]
+            cur = await conn.execute(
+                f"SELECT * FROM messages WHERE chat_id=? AND id IN ({','.join('?' for _ in chunk)})",
+                (self.owner.chat_id, *chunk))
+            for row in await cur.fetchall():
+                fingerprints[int(row["id"])] = _hash({key: row[key] for key in row.keys() if key not in {"tokens", "compacted"}})
+        return fingerprints
+
+    def _boundary_conflict(self, reason: str, boundary: ControllerBoundary, actual: int,
+                           stamp: tuple[Any, ...], *, append: bool = False) -> StaleWindow:
+        metadata = {"owner": self.owner.key, "phase": boundary.phase,
+                    "expectedHighWater": boundary.high_water, "actualHighWater": actual,
+                    "expectedRevision": boundary.window_stamp[0] if boundary.window_stamp else None,
+                    "actualRevision": stamp[0] if stamp else None}
+        log.warning("context.window_conflict", reason=reason, **metadata)
+        return (ControllerMessagesAppended if append else StaleWindow)(reason, **metadata)
+
+    async def _check_controller_boundary(self, conn: Any, boundary: ControllerBoundary, *, allow_append: bool = False) -> int:
+        cur = await conn.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE chat_id=?", (self.owner.chat_id,))
+        actual = int((await cur.fetchone())[0])
+        stamp = await self._window_stamp(conn)
+        if stamp != boundary.window_stamp or await self._controller_session(conn) != boundary.session:
+            raise self._boundary_conflict("context_source_or_window_changed", boundary, actual, stamp)
+        cur = await conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id=? AND id<=?", (self.owner.chat_id, boundary.high_water))
+        if (int((await cur.fetchone())[0]) != boundary.prefix_count
+                or await self._row_fingerprints(conn, boundary.rows) != boundary.rows):
+            raise self._boundary_conflict("controller_history_changed", boundary, actual, stamp)
+        if actual < boundary.high_water:
+            raise self._boundary_conflict("controller_history_changed", boundary, actual, stamp)
+        if actual > boundary.high_water and not allow_append:
+            raise self._boundary_conflict("new_controller_message_arrived", boundary, actual, stamp, append=True)
+        return actual
+
+    async def controller_boundary(
+        self, messages: list[Message], *, since: int | None, phase: str,
+        expected_revision: int = 0, previous: ControllerBoundary | None = None,
+        restored_anchor: dict[str, Any] | None = None,
+    ) -> tuple[ControllerBoundary, list[Message]]:
+        """Take/refresh one authoritative boundary, preserving the original guard.
+
+        A refresh checks the OLD prefix and window before accepting any new IDs.
+        Earlier execution may be restored only as a closed batch, never as user
+        steering. Other-owner/concurrent execution stays fatal. Returned originals
+        are already durable: merge them with merge_controller_additions, without
+        replaying persistence or tool side effects.
+        """
+        from app.db.dao import MessageDAO
+        from app.rath.controller_projection import project_history_message_for_controller
+
+        if self.owner.kind != "controller":
+            raise ValueError("controller_boundary_requires_controller")
+        ids = {int(source_of(m).get("message_id") or 0) for m in messages
+               if source_of(m).get("id") == f"message:{int(source_of(m).get('message_id') or 0)}"}
+        async with self.db.conn.transaction(label="controller-context-boundary") as conn:
+            if previous is not None:
+                high_water = await self._check_controller_boundary(conn, previous, allow_append=True)
+                floor = previous.high_water
+                ids.update(previous.rows)
+                stamp, session = previous.window_stamp, previous.session
+            else:
+                stamp = await self._window_stamp(conn)
+                session = await self._controller_session(conn)
+                cur = await conn.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE chat_id=?", (self.owner.chat_id,))
+                high_water = int((await cur.fetchone())[0])
+                provisional = ControllerBoundary(high_water, 0, (expected_revision,), session, {}, phase)
+                if (expected_revision and (not stamp or stamp[0] != expected_revision)) or (
+                    session and session != self.owner.session_uuid
+                ):
+                    raise self._boundary_conflict("context_source_or_window_changed", provisional, high_water, stamp)
+                restored_floor = 0
+                if restored_anchor is not None and since is None:
+                    # The Web loader supplies this ONLY when it actually adopted
+                    # an identity/anchor-validated private checkpoint. A legacy
+                    # private projection need not map 1:1 to public message IDs.
+                    expected_window = (restored_anchor["windowRevision"], restored_anchor["windowVersion"])
+                    if expected_window != ((stamp[0], stamp[3]) if stamp else (0, 0)):
+                        raise self._boundary_conflict("restored_controller_window_changed", provisional, high_water, stamp)
+                    if not stamp:
+                        # Recheck the exact legacy covered prefix on the writer;
+                        # newer rows remain outside this proof and are reconciled
+                        # below. Never derive consumption from the current MAX.
+                        restored_floor = int(restored_anchor["sourceHighWater"])
+                        cur = await conn.execute("SELECT * FROM messages WHERE chat_id=? AND id<=? ORDER BY id",
+                                                 (self.owner.chat_id, restored_floor))
+                        covered_rows = await cur.fetchall()
+                        proof = [{"id": int(row["id"]), "fingerprint": transcript_message_fingerprint(MessageDAO._row(row).to_message())}
+                                 for row in covered_rows]
+                        if (proof != restored_anchor["messages"]
+                                or max((item["id"] for item in proof), default=0) != restored_floor):
+                            raise self._boundary_conflict("restored_controller_history_changed", provisional, high_water, stamp)
+                        ids.update(item["id"] for item in proof)
+                await self._ensure(conn)
+                stamp = await self._window_stamp(conn)
+                state = await self.load()
+                floor = since if since is not None else max(restored_floor, int((state or {}).get("state", {}).get("sourceMessageHighWater") or 0))
+                # Legacy summaries cover a prefix without individual row sources.
+                if since is None:
+                    floor = max(floor, max((int(source_of(m).get("message_id") or 0) for m in messages
+                                            if source_of(m).get("kind") == "summary"), default=0))
+            cur = await conn.execute("SELECT id FROM messages WHERE chat_id=? AND id>? ORDER BY id", (self.owner.chat_id, floor))
+            missing = [int(row[0]) for row in await cur.fetchall() if int(row[0]) not in ids]
+            # Only execution before an ALREADY adopted user can be historical.
+            # A newly discovered user must not camouflage a concurrent writer.
+            # Earlier does not mean discardable: retain its real evidence and
+            # prove the complete merged protocol below before advancing coverage.
+            newest_user_id = max((int(source_of(m).get("message_id") or 0) for m in messages
+                                  if m.get("role") == "user"), default=0)
+            additions = []
+            for message_id in missing:
+                cur = await conn.execute("SELECT * FROM messages WHERE chat_id=? AND id=?", (self.owner.chat_id, message_id))
+                row = MessageDAO._row(await cur.fetchone())
+                if row.task_uuid or row.agent_session_uuid:
+                    guard = previous or ControllerBoundary(floor, 0, stamp, session, {}, phase)
+                    raise self._boundary_conflict("controller_unrecognized_execution_append", guard, high_water, stamp)
+                historical_execution = row.role in ("assistant", "tool") and row.id < newest_user_id
+                if row.role == "user" or historical_execution:
+                    original = row.to_message()
+                    message = project_history_message_for_controller(original)
+                    mark_source(message, kind="human" if row.role == "user" else "execution", source_id=f"message:{row.id}",
+                                message_id=row.id, reference_only=message == original, turn_uuid=row.turn_uuid,
+                                run_root_turn_uuid=row.run_root_turn_uuid or row.turn_uuid)
+                    # Use the same durable bundle links as history restoration. Only
+                    # IDs are bound here; the request overlay expands frozen content.
+                    cur = await conn.execute(
+                        """SELECT b.bundle_uuid FROM web_operation_messages l JOIN web_reference_bundles b
+                           ON b.conversation_uuid=l.conversation_uuid AND b.op_id=l.op_id
+                           WHERE l.message_id=? ORDER BY b.created_at,b.bundle_uuid""", (row.id,))
+                    bundles = [str(item[0]) for item in await cur.fetchall()]
+                    if bundles:
+                        message["openbear_reference_bundle"] = bundles
+                        message[CONTEXT_META]["reference_only"] = False
+                    additions.append(message)
+                else:
+                    guard = previous or ControllerBoundary(floor, 0, stamp, session, {}, phase)
+                    raise self._boundary_conflict("controller_unrecognized_execution_append", guard, high_water, stamp)
+            if additions and not validate_model_context(merge_controller_additions(messages, additions)):
+                guard = previous or ControllerBoundary(floor, 0, stamp, session, {}, phase)
+                raise self._boundary_conflict("controller_recovery_requires_closed_tool_batch", guard, high_water, stamp)
+            ids.update(missing)
+            fingerprints = await self._row_fingerprints(conn, ids)
+            if set(fingerprints) != ids:
+                guard = previous or ControllerBoundary(floor, 0, stamp, session, {}, phase)
+                raise self._boundary_conflict("controller_history_changed", guard, high_water, stamp)
+            cur = await conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?", (self.owner.chat_id,))
+            count = int((await cur.fetchone())[0])
+            return ControllerBoundary(high_water, count, stamp, session, fingerprints, phase), additions
+
+    async def archive(self, messages: list[Message], *, controller_boundary: ControllerBoundary | None = None) -> dict[str, int]:
         """Append previously unseen semantic units before any window can evict them.
 
         Agent payloads are private originals, not 1000-character audit previews.
@@ -128,6 +350,8 @@ class WindowStore:
                              str(meta.get("task_uuid") or self.owner.task_uuid),
                              str(meta.get("turn_uuid") or ""), message_id, _json(body), _hash(item)))
         async with self.db.conn.transaction(label="context-history-append") as conn:
+            if controller_boundary is not None:
+                await self._check_controller_boundary(conn, controller_boundary)
             await self._ensure(conn)
             added = 0
             for event_id, kind, task_uuid, turn_uuid, message_id, body, fingerprint in payloads:
@@ -156,13 +380,20 @@ class WindowStore:
                 )
             cur = await conn.execute("SELECT revision,source_revision FROM context_windows WHERE owner_key=?", (self.owner.key,))
             row = await cur.fetchone()
-            return {"revision": int(row["revision"]), "sourceRevision": int(row["source_revision"]), "highWater": high_water, "added": added}
+            result = {"revision": int(row["revision"]), "sourceRevision": int(row["source_revision"]), "highWater": high_water, "added": added}
+            if controller_boundary is not None:
+                stamp = await self._window_stamp(conn)
+        if controller_boundary is not None:
+            # Only OUR committed archive additions advance this expectation.
+            controller_boundary.window_stamp = stamp
+        return result
 
     async def save(
         self, messages: list[Message], *, expected_revision: int,
         expected_source_revision: int, route: str, rotated: bool = False,
         reason: str = "checkpoint", detail: dict[str, Any] | None = None,
         expected_message_high_water: int | None = None,
+        controller_boundary: ControllerBoundary | None = None,
         source_message_high_water: int | None = None,
         extra_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -174,6 +405,8 @@ class WindowStore:
         state = {**(extra_state or {}), "version": 1, "messages": serialize_messages(clean),
                  "sourceMessageHighWater": max((int(source_of(message).get("message_id") or 0) for message in clean), default=0)}
         async with self.db.conn.transaction(label="context-window-save") as conn:
+            if controller_boundary is not None:
+                await self._check_controller_boundary(conn, controller_boundary)
             await self._ensure(conn)
             cur = await conn.execute("SELECT * FROM context_windows WHERE owner_key=?", (self.owner.key,))
             old = dict(await cur.fetchone())
@@ -181,8 +414,13 @@ class WindowStore:
                 raise StaleWindow("context_source_or_window_changed")
             if expected_message_high_water is not None:
                 cur = await conn.execute("SELECT COALESCE(MAX(id),0) AS high_water FROM messages WHERE chat_id=?", (self.owner.chat_id,))
-                if int((await cur.fetchone())["high_water"]) != expected_message_high_water:
-                    raise StaleWindow("new_controller_message_arrived")
+                actual = int((await cur.fetchone())["high_water"])
+                if actual != expected_message_high_water:
+                    metadata = {"owner": self.owner.key, "phase": reason,
+                                "expectedHighWater": expected_message_high_water, "actualHighWater": actual,
+                                "expectedRevision": expected_revision, "actualRevision": old["revision"]}
+                    log.warning("context.window_conflict", reason="new_controller_message_arrived", **metadata)
+                    raise StaleWindow("new_controller_message_arrived", **metadata)
             for message in clean:
                 meta = source_of(message)
                 if meta.get("kind") == "runtime":

@@ -13,11 +13,22 @@ from app.logging import get_logger
 from app.mcp.audit import record_audit
 from app.mcp.client import MCPClient
 from app.mcp.output import format_mcp_result, redact_text_secrets
-from app.mcp.permissions import build_tool_meta, can_call_without_prompt, summarize_arguments
+from app.mcp.permissions import (
+    agent_access_reason,
+    build_tool_meta,
+    can_call_without_prompt,
+    is_agent_context,
+    is_tool_allowed,
+    summarize_arguments,
+)
 from app.mcp.types import MCPManagerState, MCPServerState, MCPToolMeta
 from app.tools.base import ToolRuntimeContext
 
 log = get_logger("mcp")
+
+
+class MCPAgentAccessRevoked(RuntimeError):
+    pass
 
 
 class MCPManager:
@@ -46,6 +57,7 @@ class MCPManager:
         # config generation change, so they can never authorize a replacement server.
         self._conversation_grants: set[tuple[str, str, str]] = set()
         self._registry_lock = asyncio.Lock()
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._call_lifecycle_lock = asyncio.Lock()
         self._active_calls: dict[str, int] = {}
         self._draining_servers: set[str] = set()
@@ -187,62 +199,115 @@ class MCPManager:
         del params
         if method != "notifications/tools/list_changed":
             return
-        client = self._clients.get(server_key)
-        server_config = self.mcp_config.servers.get(server_key)
-        if client is None or server_config is None:
-            return
         try:
-            timeout_s = float(server_config.connect_timeout_s or self.mcp_config.startup_timeout_s)
-            raw_tools = await asyncio.wait_for(client.list_tools(), timeout=timeout_s)
-            replacements: list[MCPToolMeta] = []
-            visible: dict[str, MCPToolMeta] = {}
-            async with self._registry_lock:
-                # Ignore a stale notification that completed after a hot swap.
-                if self._clients.get(server_key) is not client:
-                    return
-                retained_all = [meta for meta in self._all_tools if meta.server_key != server_key]
-                retained_visible = {
-                    name: meta for name, meta in self._tools.items() if meta.server_key != server_key
-                }
-                used = set(retained_visible)
-                for raw_tool in raw_tools:
-                    meta = build_tool_meta(
-                        self.mcp_config,
-                        server_config,
-                        server_key=server_key,
-                        raw_tool=raw_tool,
-                        used_names=used,
-                    )
-                    replacements.append(meta)
-                    if not meta.filtered:
-                        visible[meta.public_name] = meta
-                self._all_tools = retained_all + replacements
-                self._tools = {**retained_visible, **visible}
-                state = self._states.get(server_key)
-                if state is not None:
-                    state.tool_count = len(visible)
-            log.info(
-                "mcp.tools.list_changed",
-                server=server_key,
-                total=len(replacements),
-                visible=len(visible),
-            )
-            await record_audit(
-                self.db,
-                "mcp.tools.list_changed",
-                detail={"server": server_key, "total": len(replacements), "visible": len(visible)},
-            )
-            if self.tools_changed_callback is not None:
-                await self.tools_changed_callback()
+            await self.refresh_server_tools(server_key)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.warning("mcp.tools.refresh_failed", server=server_key, error=_short_error(exc))
-            await record_audit(
-                self.db,
-                "mcp.tools.refresh_failed",
-                detail={"server": server_key, "error": _short_error(exc)},
-            )
+            await record_audit(self.db, "mcp.tools.refresh_failed", detail={"server": server_key, "error": _short_error(exc)})
+
+    async def refresh_server_tools(self, server_key: str) -> dict[str, Any]:
+        """Rediscover all pages on the existing connection and publish atomically.
+
+        Manual refresh and tools/list_changed share this path. Failed discovery
+        leaves the previous descriptions, schemas and other services intact.
+        """
+        async with self._refresh_locks.setdefault(server_key, asyncio.Lock()):
+            if server_key not in self.mcp_config.servers:
+                raise ValueError("mcp_server_not_found")
+            client = self._clients.get(server_key)
+            if client is None:
+                raise ValueError("mcp_server_not_connected")
+            if not await self._begin_server_call(server_key):
+                raise ValueError("mcp_server_draining")
+            try:
+                cfg = self.mcp_config.servers[server_key]
+                raw_tools = await asyncio.wait_for(client.list_tools(), timeout=float(cfg.connect_timeout_s or self.mcp_config.startup_timeout_s))
+                async with self._registry_lock:
+                    if self._clients.get(server_key) is not client:
+                        raise ValueError("mcp_refresh_superseded")
+                    cfg = self.mcp_config.servers[server_key]
+                    previous_all, previous_tools = self._all_tools, self._tools
+                    old = [m for m in self._all_tools if m.server_key == server_key]
+                    retained = [m for m in self._all_tools if m.server_key != server_key]
+                    old_names = {m.original_tool_name: m.public_name for m in old}
+                    used = {m.public_name for m in retained} | set(old_names.values())
+                    replacements = []
+                    for raw in raw_tools:
+                        meta = build_tool_meta(self.mcp_config, cfg, server_key=server_key, raw_tool=raw, used_names=used)
+                        if raw.name in old_names:
+                            meta.public_name = old_names[raw.name]
+                            allowed, reason = is_tool_allowed(self.mcp_config, cfg, server_key=server_key, raw_tool_name=raw.name, public_tool_name=meta.public_name)
+                            meta.filtered, meta.filter_reason = not allowed, reason
+                        replacements.append(meta)
+                    changed = old != replacements
+                    by_server = {key: [m for m in retained if m.server_key == key] for key in self.mcp_config.servers}
+                    by_server[server_key] = replacements
+                    self._all_tools = [m for rows in by_server.values() for m in rows]
+                    self._tools = {m.public_name: m for m in self._all_tools if not m.filtered}
+                    state = self._states.get(server_key)
+                    if state is not None:
+                        state.tool_count = sum(not m.filtered for m in replacements)
+                published = self._all_tools
+                try:
+                    if self.tools_changed_callback is not None:
+                        await self.tools_changed_callback()
+                except Exception:
+                    async with self._registry_lock:
+                        if self._clients.get(server_key) is client and self._all_tools is published:
+                            self._all_tools, self._tools = previous_all, previous_tools
+                            if state is not None:
+                                state.tool_count = sum(not meta.filtered for meta in old)
+                    raise
+                await record_audit(self.db, "mcp.tools.list_changed", detail={"server": server_key, "total": len(replacements), "changed": changed})
+                return {"ok": True, "server": server_key, "changed": changed, "totalTools": len(replacements)}
+            finally:
+                await self._end_server_call(server_key)
+
+    def agent_tool_unavailable_reason(self, public_name: str) -> str:
+        meta = next((m for m in self._all_tools if m.public_name == public_name), None)
+        if meta is None:
+            return "mcp_tool_not_found"
+        cfg = self.mcp_config.servers.get(meta.server_key)
+        if cfg is None:
+            return "mcp_server_not_found"
+        reason = agent_access_reason(cfg, meta.original_tool_name)
+        if reason:
+            return reason
+        allowed, reason = is_tool_allowed(self.mcp_config, cfg, server_key=meta.server_key, raw_tool_name=meta.original_tool_name, public_tool_name=public_name)
+        if not allowed:
+            return reason
+        if meta.filtered:
+            return meta.filter_reason or "mcp_tool_filtered"
+        if meta.approval == "deny":
+            return "approval_deny"
+        if meta.server_key not in self._clients or self._closed:
+            return "mcp_server_not_connected"
+        if meta.server_key in self._draining_servers:
+            return "mcp_server_draining"
+        return ""
+
+    def agent_tools(self) -> list[MCPToolMeta]:
+        return [meta for meta in self.available_tools() if not self.agent_tool_unavailable_reason(meta.public_name)]
+
+    @staticmethod
+    def connection_config(config: Config) -> dict[str, Any]:
+        data = config.mcp.model_dump(mode="json", by_alias=True)
+        for server in data["servers"].values():
+            server.pop("agentAccess", None)
+        return data
+
+    def access_only_change(self, config: Config) -> bool:
+        return self.connection_config(self.config) == self.connection_config(config)
+
+    async def apply_agent_access_config(self, config: Config) -> None:
+        if not self.access_only_change(config):
+            raise ValueError("mcp_non_access_config_changed")
+        async with self._registry_lock:
+            self.config = config
+            self.mcp_config = config.mcp
+        # Clients, main-session grants and in-flight calls are untouched.
 
     async def close(self) -> None:
         if self._closed:
@@ -270,6 +335,14 @@ class MCPManager:
         active.  If a prepared reload is superseded before commit, call ``abort`` to
         close the fresh-but-unused clients.
         """
+        if self.access_only_change(config) and self.config.mcp != config.mcp:
+            async def commit_access() -> None:
+                await self.apply_agent_access_config(config)
+
+            async def abort_access() -> None:
+                return None
+
+            return commit_access, abort_access
         if not config.mcp.enabled:
             async def commit_disabled() -> None:
                 old_clients = list(self._clients.items())
@@ -429,9 +502,9 @@ class MCPManager:
             else:
                 self._active_calls[server_key] = active - 1
 
-    async def call_tool(self, public_tool_name: str, arguments: dict[str, Any], context: ToolRuntimeContext) -> str:
+    async def call_tool(self, public_tool_name: str, arguments: dict[str, Any], context: ToolRuntimeContext, *, expected_identity: tuple[str, str] | None = None) -> str:
         meta = self._tools.get(public_tool_name)
-        if meta is None:
+        if meta is None or (expected_identity is not None and expected_identity != (meta.server_key, meta.original_tool_name)):
             return _json({"status": "error", "error": "mcp_tool_not_found", "tool": public_tool_name})
         client = self._clients.get(meta.server_key)
         if client is None:
@@ -450,6 +523,11 @@ class MCPManager:
         arguments: dict[str, Any],
         context: ToolRuntimeContext,
     ) -> str:
+        if is_agent_context(context):
+            reason = self.agent_tool_unavailable_reason(meta.public_name)
+            if reason:
+                return _json({"status": "needs_openbear_control", "error": reason, "reason": reason,
+                              "tool": meta.public_name, "message": "MCP Agent access is unavailable; the call was not sent."})
         persist_trust = False
         allowed, reason = can_call_without_prompt(meta, context)
         # Explicit deny is authoritative. A conversation grant can only satisfy an
@@ -500,7 +578,7 @@ class MCPManager:
         try:
             log.info("mcp.tool.called", server=meta.server_key, tool=meta.original_tool_name, public=meta.public_name, risk=meta.risk)
             raw_result = await asyncio.wait_for(
-                client.call_tool(meta.original_tool_name, arguments or {}),
+                self._send_tool(client, meta, arguments, context),
                 timeout=timeout_s,
             )
             rendered = format_mcp_result(raw_result, meta, self.mcp_config)
@@ -508,6 +586,8 @@ class MCPManager:
             if persist_trust:
                 await self._persist_server_trust(meta, context)
             return rendered
+        except MCPAgentAccessRevoked as exc:
+            return _json({"status": "needs_openbear_control", "error": str(exc), "reason": str(exc), "tool": meta.public_name})
         except TimeoutError:
             log.warning("mcp.tool.timeout", server=meta.server_key, tool=meta.original_tool_name)
             await record_audit(self.db, "mcp.tool.failed", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "error": "timeout"})
@@ -517,6 +597,13 @@ class MCPManager:
             log.warning("mcp.tool.failed", server=meta.server_key, tool=meta.original_tool_name, error=err)
             await record_audit(self.db, "mcp.tool.failed", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "error": err})
             return _json({"status": "error", "error": "mcp_tool_failed", "server": meta.server_key, "tool": meta.original_tool_name, "detail": err})
+
+    async def _send_tool(self, client: MCPClient, meta: MCPToolMeta, arguments: dict[str, Any], context: ToolRuntimeContext):
+        if is_agent_context(context):
+            reason = self.agent_tool_unavailable_reason(meta.public_name)
+            if reason:
+                raise MCPAgentAccessRevoked(reason)
+        return await client.call_tool(meta.original_tool_name, arguments or {})
 
     async def _confirm_call(self, meta: MCPToolMeta, arguments: dict[str, Any], context: ToolRuntimeContext, *, feedback: dict[str, Any] | None = None) -> str:
         if not (context.source == "web" and context.web_confirm is not None):

@@ -222,11 +222,19 @@ async def test_node_binary_upload_to_backend_and_ws(web_env, monkeypatch):
     web_env.server.runs = RunRegistry()
     captured = []
     received = asyncio.Event()
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    turn_task = None
 
     async def run(chat_id, text, renderer, media=None, **kwargs):
+        nonlocal turn_task
+        turn_task = asyncio.current_task()
         captured.extend(media)
         received.set()
         await renderer.finalize("received")
+        # Hold cleanup open: receiving the upload is not task completion.
+        close_started.set()
+        await allow_close.wait()
         await renderer.close()
 
     monkeypatch.setattr(web_env.server, "_run_web_turn", run)
@@ -250,21 +258,39 @@ async def test_node_binary_upload_to_backend_and_ws(web_env, monkeypatch):
     frame = {"type": "send", "requestId": "node-upload", "text": "Read uploaded attachments", "files": result["refs"]}
     assert len(json.dumps(frame)) < 400
     assert all(set(item) == {"uploadId"} for item in frame["files"])
-    async with web_env.client.ws_connect(
-        f"/api/conversations/{row['conversation_uuid']}/ws?bootstrap=incremental",
-        headers={"Cookie": f"openbear_web_session={cookie}"},
-    ) as ws:
-        await ws.send_json(frame)
-        async with asyncio.timeout(10):
-            while True:
-                message = await ws.receive_json()
-                if message.get("requestId") == "node-upload":
-                    assert message["type"] == "ack", message
-                    break
-            await received.wait()
-    assert [item.kind for item in captured] == ["file", "image", "file"]
-    assert captured[0].size == 70 * 1024 * 1024
-    assert captured[2].size == 0
+    try:
+        async with web_env.client.ws_connect(
+            f"/api/conversations/{row['conversation_uuid']}/ws?bootstrap=incremental",
+            headers={"Cookie": f"openbear_web_session={cookie}"},
+        ) as ws:
+            await ws.send_json(frame)
+            async with asyncio.timeout(10):
+                while True:
+                    message = await ws.receive_json()
+                    if message.get("requestId") == "node-upload":
+                        assert message["type"] == "ack", message
+                        break
+                await received.wait()
+                await close_started.wait()
+                assert turn_task is not None and not turn_task.done()
+                allow_close.set()
+                # Await the real task so finalize/close errors fail this test,
+                # rather than escaping after the DB fixture has been closed.
+                await asyncio.shield(turn_task)
+                assert turn_task.done()
+        assert [item.kind for item in captured] == ["file", "image", "file"]
+        assert captured[0].size == 70 * 1024 * 1024
+        assert captured[2].size == 0
+    finally:
+        allow_close.set()
+        task = turn_task or web_env.server.runs.task(int(row["internal_chat_id"]))
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
+            except asyncio.CancelledError:
+                pass
 
 
 async def test_resending_after_artifact_deletion_still_provides_a_live_url(web_env):

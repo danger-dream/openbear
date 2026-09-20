@@ -69,6 +69,42 @@ async def test_workflow_task_event_artifact_control_roundtrip(db):
     assert await dao.pending_controls(task_uuid) == []
 
 
+async def test_legacy_agent_tool_names_roundtrip_without_runtime_reintroduction(db):
+    dao = RathDAO(db)
+    await db.conn.execute(
+        """
+        INSERT INTO rath_agents (
+          agent_key, name, tool_allowlist_json, enabled, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        ("legacy-search", "Legacy search", '["WebSearch","Read"]', 1, 1, 1),
+    )
+    await db.conn.commit()
+
+    agent = await dao.agent_by_key("legacy-search")
+    assert agent is not None
+    assert agent.tool_allowlist == ["WebSearch", "Read"]
+
+    # Settings updates opt into preserving unavailable historical names; normal
+    # programmatic writes still cannot create or restore removed built-ins.
+    await dao.update_agent(
+        agent.id,
+        name="Renamed",
+        tool_allowlist=agent.tool_allowlist,
+        expected_tool_allowlist=agent.tool_allowlist,
+        preserve_unavailable_tools=True,
+    )
+    current = await dao.agent_by_id(agent.id)
+    assert current is not None
+    assert current.name == "Renamed"
+    assert current.tool_allowlist == ["WebSearch", "Read"]
+
+    await dao.update_agent(agent.id, tool_allowlist=["WebSearch", "Bash"])
+    sanitized = await dao.agent_by_id(agent.id)
+    assert sanitized is not None
+    assert sanitized.tool_allowlist == ["Bash"]
+
+
 async def test_agent_registry_crud(db):
     dao = RathDAO(db)
 
@@ -82,13 +118,13 @@ async def test_agent_registry_crud(db):
         system_prompt="你是深度调研员",
         model="openai/gpt",
         think_level="high",
-        tool_allowlist=["WebSearch", "WebExtract"],
+        tool_allowlist=["Read", "Bash"],
         sort=99,
     )
     agent = await dao.agent_by_id(agent_id)
     assert agent is not None
     assert agent.name == "深度调研员"
-    assert agent.tool_allowlist == ["WebSearch", "WebExtract"]
+    assert agent.tool_allowlist == ["Read", "Bash"]
     assert agent.sort == 99
 
     await dao.update_agent(agent_id, enabled=False, model="openai/other", tool_allowlist=["Read"])

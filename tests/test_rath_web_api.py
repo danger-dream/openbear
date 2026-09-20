@@ -11,6 +11,7 @@ from app.db.engine import DB
 from app.llm.base import AgentResult
 from app.llm.events import Usage
 from app.rath.builtin_workflows import ensure_builtin_workflows
+from app.tools.base import ToolRegistry
 from app.web_admin import WebAdminServer, _sha256
 
 
@@ -59,7 +60,12 @@ async def web_env(tmp_path):
     db = DB(str(tmp_path / "web-rath.db"))
     await db.connect()
     bot = FakeBot()
-    server = WebAdminServer(_cfg(), db, bot)  # type: ignore[arg-type]
+    tools = ToolRegistry()
+    async def builtin(_args):
+        return "fixture"
+    for name in ("Read", "Bash"):
+        tools.add(name, name, {"type": "object"}, builtin)
+    server = WebAdminServer(_cfg(), db, bot, tools=tools)  # type: ignore[arg-type]
     await server.ensure_secret_key()
     await ensure_builtin_workflows(server.rath_dao)
     client = TestClient(TestServer(server.make_app()))
@@ -129,7 +135,7 @@ async def test_rath_web_agent_registry_crud(web_env):
         json={
             "enabled": False,
             "model": "openai/other",
-            "toolAllowlist": "WebSearch, WebExtract",
+            "toolAllowlist": "Read, Bash",
         },
         cookies=web_env.cookie,
     )
@@ -137,13 +143,61 @@ async def test_rath_web_agent_registry_crud(web_env):
     updated_item = (await updated.json())["item"]
     assert updated_item["enabled"] is False
     assert updated_item["model"] == "openai/other"
-    assert updated_item["tool_allowlist"] == ["WebSearch", "WebExtract"]
+    assert updated_item["tool_allowlist"] == ["Read", "Bash"]
 
     deleted = await web_env.client.delete(f"/api/rath/agents/{agent['id']}", cookies=web_env.cookie)
     assert deleted.status == 200
     listed_after_delete = await web_env.client.get("/api/rath/agents?disabled=1", cookies=web_env.cookie)
     assert listed_after_delete.status == 200
     assert not any(a["id"] == agent["id"] for a in (await listed_after_delete.json())["items"])
+
+
+async def test_rath_web_agent_update_preserves_and_can_remove_unavailable_legacy_tools(web_env):
+    await web_env.db.conn.execute(
+        """
+        INSERT INTO rath_agents (
+          agent_key, name, description, system_prompt, tool_allowlist_json,
+          enabled, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?)
+        """,
+        ("legacy-search", "旧搜索预设", "before", "custom prompt", '["WebSearch","Read"]', 1, 1, 1),
+    )
+    await web_env.db.conn.commit()
+    row = await web_env.server.rath_dao.agent_by_key("legacy-search")
+    assert row is not None
+
+    listed = await web_env.client.get("/api/rath/agents?disabled=1", cookies=web_env.cookie)
+    item = next(item for item in (await listed.json())["items"] if item["id"] == row.id)
+    assert item["tool_allowlist"] == ["WebSearch", "Read"]
+    assert item["system_prompt"] == "custom prompt"
+
+    # This is the payload emitted by the settings page when another field is
+    # edited while its "currently unavailable" tool chip remains selected.
+    updated = await web_env.client.put(
+        f"/api/rath/agents/{row.id}",
+        json={
+            "description": "after",
+            "toolAllowlist": ["WebSearch", "Read"],
+            "expectedToolAllowlist": ["WebSearch", "Read"],
+        },
+        cookies=web_env.cookie,
+    )
+    assert updated.status == 200
+    updated_item = (await updated.json())["item"]
+    assert updated_item["description"] == "after"
+    assert updated_item["tool_allowlist"] == ["WebSearch", "Read"]
+    assert updated_item["system_prompt"] == "custom prompt"
+
+    removed = await web_env.client.put(
+        f"/api/rath/agents/{row.id}",
+        json={
+            "toolAllowlist": ["Read"],
+            "expectedToolAllowlist": ["WebSearch", "Read"],
+        },
+        cookies=web_env.cookie,
+    )
+    assert removed.status == 200
+    assert (await removed.json())["item"]["tool_allowlist"] == ["Read"]
 
 
 async def test_rath_web_agent_trial_requires_controller_or_explicit_legacy_mode(web_env):

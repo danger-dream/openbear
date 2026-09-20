@@ -788,7 +788,7 @@ class MessageDAO:
                    SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)) AS ok_count,
                    SUM(input_tokens + cache_read_tokens + cache_write_tokens) AS prompt_tokens,
                    SUM(output_tokens) AS output_tokens,
-                   SUM(cache_read_tokens + cache_write_tokens) AS cache_tokens,
+                   SUM(cache_read_tokens) AS cache_tokens,
                    SUM(cost_usd) AS cost_usd,
                    SUM(first_token_ms) * 1.0 / NULLIF(SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)), 0) AS avg_first_ms,
                    SUM(total_time_ms) * 1.0 / NULLIF(SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)), 0) AS avg_total_ms

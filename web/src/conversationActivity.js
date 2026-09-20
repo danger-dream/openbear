@@ -12,6 +12,9 @@ export function applyActivityReadVersions(status = {}, versions = new Map()) {
     ...(Array.isArray(status.activityItems) ? {
       activityItems: status.activityItems.map(adjust).filter(item => item.running || item.activityUnread),
     } : {}),
+    ...(Array.isArray(status.recentItems) ? {
+      recentItems: status.recentItems.map(adjust),
+    } : {}),
   };
 }
 

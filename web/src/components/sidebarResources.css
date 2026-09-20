@@ -1,4 +1,4 @@
-/* Shared desktop/phone launcher: six existing destinations, one quiet 3×2 grid.
+/* Base mobile/popover launcher: six existing destinations, one quiet 3×2 grid.
    Typography is inherited from each original navigation surface. */
 .sidebar-resource-grid {
   display: grid;
@@ -62,4 +62,115 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .sidebar-resource-grid > .sidebar-resource-tile { transition: none; }
+}
+
+/* =========================================================================
+   PC 桌面端专属：单行 5 联微胶囊坞 (One-Row 5-Pill Dock)
+   ========================================================================= */
+.sidebar-desktop-nav.sidebar-resource-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 2px;
+  border-radius: 12px;
+  padding: 3px;
+  margin-bottom: 6px;
+}
+
+.sidebar-desktop-nav > .sidebar-resource-tile {
+  min-height: 46px;
+  padding: 4px 2px;
+  gap: 3px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.sidebar-desktop-nav > .sidebar-resource-tile .sidebar-resource-icon {
+  width: 16px;
+  height: 16px;
+}
+.sidebar-desktop-nav > .sidebar-resource-tile:hover:not([aria-current='page']) {
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--el-text-color-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+html.dark .sidebar-desktop-nav > .sidebar-resource-tile:hover:not([aria-current='page']) {
+  background: rgba(255, 255, 255, 0.1);
+  box-shadow: none;
+}
+.sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] {
+  background: #ffffff;
+  color: var(--el-color-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+html.dark .sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] {
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: none;
+}
+.sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] > .sidebar-resource-icon {
+  color: var(--el-color-primary);
+}
+
+/* =========================================================================
+   PC 桌面端侧边栏底部工具条 (系统设置 + 多渠道健康状态)
+   ========================================================================= */
+.sidebar-desktop-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 6px -12px -12px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--el-border-color-lighter, #e4e4e7);
+  background: rgba(0, 0, 0, 0.015);
+  flex: 0 0 auto;
+}
+html.dark .sidebar-desktop-footer {
+  border-top-color: var(--el-border-color-darker, #27272a);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sidebar-footer-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 0;
+  background: transparent;
+  color: var(--el-text-color-regular);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.sidebar-footer-settings:hover {
+  background: var(--el-fill-color);
+  color: var(--el-text-color-primary);
+}
+.sidebar-footer-settings.is-active,
+.sidebar-footer-settings[aria-current='page'] {
+  background: var(--el-fill-color-darker);
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+
+.sidebar-footer-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  user-select: none;
+}
+.status-indicator-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+  display: inline-block;
+}
+
+@media (max-width: 760px) {
+  .sidebar-desktop-footer {
+    display: none !important;
+  }
 }

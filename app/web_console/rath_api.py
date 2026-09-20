@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.rath.agent_prompt import render_agent_base_system_prompt
 from app.rath.plan import PlanError
-from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES
+from app.tools.allowlist import agent_delegation_catalog, agent_delegation_names, preserve_tool_allowlist
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -48,10 +48,9 @@ class WebAdminRathMixin:
 
     def _rath_agent_item(self, agent) -> dict[str, Any]:
         item = asdict(agent)
-        item["tool_allowlist"] = [
-            name for name in sanitize_tool_allowlist(item.get("tool_allowlist") or [])
-            if name in AGENT_DELEGATION_TOOL_NAMES
-        ]
+        # Settings must round-trip unavailable historical names so the user can
+        # retain or explicitly remove them. Execution paths sanitize separately.
+        item["tool_allowlist"] = preserve_tool_allowlist(item.get("tool_allowlist") or [])
         return item
 
     async def _default_agent_workflow_uuid(self) -> str:
@@ -83,7 +82,7 @@ class WebAdminRathMixin:
 真实任务目标始终来自每次指派的任务消息，不来自本预设。按任务要求的深度完成指定的结果并交回 OpenBear，不套用固定的工作流程或报告栏目。本预设未定义额外专长时，按通用能力处理任务。
 """.strip()
 
-    def _normalize_agent_payload(self, body: dict[str, Any], *, partial: bool = False) -> dict[str, Any]:
+    def _normalize_agent_payload(self, body: dict[str, Any], *, partial: bool = False, existing_tools: list[str] | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {}
         if not partial or "name" in body:
             name = str(body.get("name") or "").strip()
@@ -117,7 +116,14 @@ class WebAdminRathMixin:
                 tools = [str(x).strip() for x in raw if str(x).strip()]
             else:
                 tools = []
-            out["tool_allowlist"] = [name for name in sanitize_tool_allowlist(tools) if name in AGENT_DELEGATION_TOOL_NAMES]
+            # Existing presets may contain tool names removed by an upgrade.
+            # Keep those names for an update round-trip so the settings page can
+            # display/remove them explicitly; creation still accepts only live tools.
+            selected = preserve_tool_allowlist(tools) if existing_tools is not None else sanitize_tool_allowlist(tools)
+            permitted = agent_delegation_names(self.tools) | set(existing_tools or [])
+            if any(name not in permitted for name in selected):
+                raise ValueError("agent_tool_not_available")
+            out["tool_allowlist"] = selected
         if "sort" in body:
             out["sort"] = int(body.get("sort") or 0)
         if "enabled" in body:
@@ -301,12 +307,7 @@ class WebAdminRathMixin:
                     "windowTriggerRatio": float(self.config.agent.compact_ratio or 0.7),
                     "primary": key == self.config.models.primary,
                 })
-        tool_summaries = self.tools.summaries(scope="agent") if self.tools is not None else {}
-        available_agent_tools = set(self.tools.names(scope="agent")) if self.tools is not None else set()
-        tools = [
-            {"name": name, "description": str(tool_summaries.get(name) or "")}
-            for name in sorted(set(AGENT_DELEGATION_TOOL_NAMES) & available_agent_tools)
-        ]
+        tools = agent_delegation_catalog(self.tools)
         return web.json_response({
             "ok": True,
             "models": models,
@@ -349,11 +350,23 @@ class WebAdminRathMixin:
             return web.json_response({"ok": False, "error": "rath_agent_not_found"}, status=404)
         body = await self._json_body(request)
         try:
-            payload = self._normalize_agent_payload(body, partial=True)
+            payload = self._normalize_agent_payload(body, partial=True, existing_tools=existing.tool_allowlist)
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         try:
-            await self.rath_dao.update_agent(agent_id, **payload)
+            if "expectedToolAllowlist" in body and "tool_allowlist" in payload:
+                if not isinstance(body["expectedToolAllowlist"], list):
+                    return web.json_response({"ok": False, "error": "agent_tools_invalid"}, status=400)
+                changed = await self.rath_dao.update_agent(
+                    agent_id,
+                    **payload,
+                    expected_tool_allowlist=body["expectedToolAllowlist"],
+                    preserve_unavailable_tools=True,
+                )
+                if not changed:
+                    return web.json_response({"ok": False, "error": "agent_tool_allowlist_conflict"}, status=409)
+            else:
+                await self.rath_dao.update_agent(agent_id, **payload, preserve_unavailable_tools=True)
         except Exception as exc:
             return web.json_response({"ok": False, "error": f"rath_agent_update_failed: {type(exc).__name__}: {exc}"}, status=400)
         agent = await self.rath_dao.agent_by_id(agent_id)

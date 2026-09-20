@@ -115,6 +115,7 @@ class WebAdminServer(
         models_dev_catalog: Any = None,
         apply_config_hook: Callable[[Config], None] | None = None,
         mcp_reload_hook: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        mcp_agent_access_hook: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.config = config
         self.db = db
@@ -135,6 +136,7 @@ class WebAdminServer(
         self.models_dev_catalog = models_dev_catalog
         self._apply_config_hook = apply_config_hook
         self._mcp_reload_hook = mcp_reload_hook
+        self._mcp_agent_access_hook = mcp_agent_access_hook
         self.skills_prompt = ""
         self.skills_count = 0
         self.workspace_dir = str((Path.cwd() / "workspace").resolve())

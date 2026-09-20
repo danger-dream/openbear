@@ -34,6 +34,18 @@ test('native multi-paragraph input preserves newline trigger and code-fence supp
   assert.equal(mentionAtPosition(paragraphs(['```','@doc/发布'])),null);
   assert.equal(mentionAtPosition(paragraphs(['```','code','```','@doc/发布'])).query,'发布');
 });
+for (const tail of [' ', '\n', "'", '"', '`', '。', '，', '.', ',', '!', '?', '：', ')', ' 这份文档里添加内容']) {
+ test(`prose boundary ends completion: ${JSON.stringify(tail)}`,()=>assert.equal(mentionAtPosition(position('@mem/name'+tail)),null));
+}
+for (const text of ['`@doc/name', '``example ` @doc/name', '~~~js\n@doc/name', '  ````js\n```\n@doc/name', '"@mem/name', "'@mem/name", '“@mem/name']) {
+ test(`quoted literal or code does not trigger: ${JSON.stringify(text)}`,()=>assert.equal(mentionAtPosition(position(text)),null));
+}
+test('wildcard and numeric searches remain valid; a new @ after punctuation opens normally',()=>{
+ assert.equal(mentionAtPosition(position('@dkg*ss')).query,'dkg*ss');
+ assert.equal(mentionAtPosition(position('@chat/2026')).query,'2026');
+ assert.equal(mentionAtPosition(position('我在 @doc/name。再看 @mem/wl')).query,'wl');
+ assert.equal(mentionAtPosition(position('`code` @doc/发布')).query,'发布');
+});
 test('candidate detail uses excerpts or key names, never credential value/notes',()=>{
   assert.equal(referenceCandidateDetail({kind:'mem',preview:'记忆正文约三十个字…'}),'记忆正文约三十个字…');
   assert.equal(referenceCandidateDetail({kind:'doc',preview:'文档正文',archived:true}),'文档正文 · 已归档');

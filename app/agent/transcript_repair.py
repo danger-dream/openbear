@@ -33,7 +33,12 @@ MISSING_TOOL_RESULT_TEXT = (
     "[openbear] 该工具调用未返回结果(可能被中止或上游中断),已插入占位以修复对话结构。"
 )
 
-ROLE_ALTERNATION_BRIDGE_TEXT = "(继续)"
+# Non-empty placeholder so strict providers (Anthropic-style alternation)
+# accept the sequence. Deliberately machine-marked: a natural phrase like
+# "(继续)" gets imitated by the model as a final answer after enough
+# repetitions in context (observed live, message 113539). A protocol marker
+# is never mistaken for the assistant's own words.
+ROLE_ALTERNATION_BRIDGE_TEXT = "[protocol: role-alternation bridge]"
 
 
 def _tool_calls_of(msg: Message) -> list[dict]:

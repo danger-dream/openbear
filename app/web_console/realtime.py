@@ -14,6 +14,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from app.web_console.core import _WEB_SESSION_KEY
+from app.reference_policy import CONVERSATION_CONTENT_LIMIT, catalog_history_sizes
 
 
 def catalog_preview(value: str) -> str:
@@ -35,7 +36,7 @@ _SECRET_KEYS_SQL = """(
 
 
 def read_catalog(
-    db_path: str, owner: int, include_archived: bool = False
+    db_path: str, owner: int, include_archived: bool = False, length_cache: dict | None = None
 ) -> tuple[int, dict[str, dict]]:
     """Read a metadata snapshot and watermark in the SAME SQLite snapshot."""
     with sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True) as conn:
@@ -111,15 +112,21 @@ def read_catalog(
                 key = str(folders[key]["parent_uuid"] or "")
             return " / ".join(reversed(names))
 
+        # Finish this metadata cursor before nested length reads register their
+        # SQLite function; re-registering while a statement is active fails once
+        # the catalog has at least three conversations. Keep the same snapshot.
         for row in conn.execute(
             """SELECT conversation_uuid,title,folder_uuid,archived_at,updated_at
                 FROM web_conversations WHERE owner_chat_id=? ORDER BY id DESC""",
             (owner,),
-        ):
+        ).fetchall():
             if row["archived_at"] and not include_archived:
                 continue
             key = "chat:" + row["conversation_uuid"]
+            sizes = catalog_history_sizes(conn, row["conversation_uuid"], length_cache)
             items[key] = {
+                "bodyChars": sizes["bodyChars"],
+                "recentTurnChars": sizes["recentTurnChars"],
                 "key": key,
                 "kind": "chat",
                 "id": row["conversation_uuid"],
@@ -145,6 +152,7 @@ class GlobalRealtime:
         self.serial = 0
         self.last_cursor = -1
         self.last_calibration = 0.0
+        self.reference_length_cache = {}
         self.cached_version: dict = {}
         self.version_at = 0.0
 
@@ -212,7 +220,7 @@ class GlobalRealtime:
     async def snapshot(self, queue: asyncio.Queue, owner: int, archive: bool):
         async with self.lock:
             cursor, items = await asyncio.to_thread(
-                read_catalog, self.owner.db.path, owner, archive
+                read_catalog, self.owner.db.path, owner, archive, self.reference_length_cache
             )
             status = await self.owner._tree_running_state(owner)
             version = await self.version()
@@ -239,6 +247,7 @@ class GlobalRealtime:
                     "seq": self.serial,
                     "items": list(items.values()),
                     "includeArchived": archive,
+                    "conversationContentLimit": CONVERSATION_CONTENT_LIMIT,
                     "treeStatus": status,
                     "version": version,
                 },
@@ -337,7 +346,8 @@ class GlobalRealtime:
                 "SELECT COALESCE(MAX(seq),0) FROM web_catalog_changes"
             )
             latest = int((await cur.fetchone())[0])
-            if latest == self.last_cursor and time.monotonic() - self.last_calibration < 2:
+            calibration = time.monotonic() - self.last_calibration >= 2
+            if latest == self.last_cursor and not calibration:
                 return
             self.last_cursor, self.last_calibration = latest, time.monotonic()
             version = await self.version()
@@ -346,10 +356,10 @@ class GlobalRealtime:
                 owner, archive = state["owner"], state["archive"]
                 scope = (owner, archive)
                 upserts, removed = [], []
-                if latest != state["cursor"]:
+                if latest != state["cursor"] or calibration:
                     if scope not in catalogs:
                         catalogs[scope] = await asyncio.to_thread(
-                            read_catalog, self.owner.db.path, owner, archive
+                            read_catalog, self.owner.db.path, owner, archive, self.reference_length_cache
                         )
                     cursor, current = catalogs[scope]
                     upserts = [
@@ -380,6 +390,7 @@ class GlobalRealtime:
                             "seq": self.serial,
                             "previousSeq": state["seq"],
                             "upserts": upserts,
+                            "conversationContentLimit": CONVERSATION_CONTENT_LIMIT,
                             "removed": removed,
                             **({"treeStatus": status} if not same_status else {}),
                             **({"version": version} if state["version"] != version else {}),
@@ -404,7 +415,7 @@ class WebAdminRealtimeMixin:
         cursor, items = await asyncio.to_thread(
             read_catalog, self.db.path, int(session.chat_id), archive
         )
-        return web.json_response({"ok": True, "cursor": cursor, "items": list(items.values())})
+        return web.json_response({"ok": True, "cursor": cursor, "items": list(items.values()), "conversationContentLimit": CONVERSATION_CONTENT_LIMIT})
 
     async def handle_api_global_ws(self, request):
         session = request[_WEB_SESSION_KEY]

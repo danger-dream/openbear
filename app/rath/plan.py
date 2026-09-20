@@ -106,6 +106,7 @@ def normalize_plan(
     max_criteria_per_step: int = 10,
     max_final_outputs: int = 20,
     external_step_ids: Iterable[str] = (),
+    available_tools: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Validate and canonicalize an immutable Plan definition."""
     if not isinstance(raw, dict):
@@ -238,10 +239,11 @@ def normalize_plan(
             "supportedBy": _string_list(supports, field=f"output {output_id}.supportedBy", item_limit=200),
         })
 
+    available = set(AGENT_DELEGATION_TOOL_NAMES if available_tools is None else available_tools)
     tool_requests_raw = raw.get("toolRequests") or []
     if not isinstance(tool_requests_raw, list):
         raise PlanError("invalid_plan", "toolRequests must be an array")
-    if len(tool_requests_raw) > len(AGENT_DELEGATION_TOOL_NAMES):
+    if len(tool_requests_raw) > len(available):
         raise PlanError("invalid_plan", "toolRequests contains too many items")
     tool_requests: list[dict[str, Any]] = []
     requested_tool_names: set[str] = set()
@@ -249,7 +251,7 @@ def normalize_plan(
         if not isinstance(item, dict):
             raise PlanError("invalid_plan", f"toolRequests[{index}] must be an object")
         name = _text(item.get("name"), field=f"toolRequests[{index}].name", required=True, limit=120)
-        if name not in AGENT_DELEGATION_TOOL_NAMES:
+        if name not in available:
             raise PlanError("invalid_plan", f"toolRequests contains unavailable Agent tool: {name}")
         if name in requested_tool_names:
             raise PlanError("invalid_plan", f"duplicate tool request: {name}")
@@ -300,6 +302,7 @@ class AgentPlanCoordinator:
         max_criteria_per_step: int = 10,
         max_final_outputs: int = 20,
         plan_review_prompt: str = "",
+        available_tools: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         self.dao = dao
         self.manager = manager
@@ -308,6 +311,7 @@ class AgentPlanCoordinator:
         self.max_criteria_per_step = max(1, int(max_criteria_per_step))
         self.max_final_outputs = max(1, int(max_final_outputs))
         self.plan_review_prompt = str(plan_review_prompt or "")
+        self.available_tools = available_tools or (lambda: AGENT_DELEGATION_TOOL_NAMES)
         self._locks: dict[str, asyncio.Lock] = {}
         self._waiters: dict[tuple[str, int], set[asyncio.Future[dict[str, Any]]]] = {}
         manager.set_plan_waiter_canceller(self.cancel_waiter)
@@ -528,6 +532,7 @@ class AgentPlanCoordinator:
             max_criteria_per_step=self.max_criteria_per_step,
             max_final_outputs=self.max_final_outputs,
             external_step_ids=external,
+            available_tools=self.available_tools(),
         )
         plan_json = _json(plan)
         plan_hash = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
@@ -545,6 +550,10 @@ class AgentPlanCoordinator:
                 requested_tools = [
                     str(item.get("name") or "") for item in plan.get("toolRequests") or []
                 ]
+                configured_ceiling = task_input.get("presetToolCeiling") or []
+                ceiling = set(sanitize_tool_allowlist(configured_ceiling))
+                if configured_ceiling and any(name not in ceiling for name in requested_tools):
+                    raise PlanError("agent_tool_not_allowed_by_preset", "Tool requests exceed the preset ceiling")
                 already_initialized = [name for name in requested_tools if name in initial_tools]
                 if already_initialized:
                     raise PlanError(
@@ -926,8 +935,9 @@ class AgentPlanCoordinator:
                         "grantedTools is valid only for action=approve",
                     )
                 if action == "approve":
-                    ceiling = set(sanitize_tool_allowlist(task_input.get("presetToolCeiling") or []))
-                    outside_ceiling = [name for name in granted_tools if ceiling and name not in ceiling]
+                    configured_ceiling = task_input.get("presetToolCeiling") or []
+                    ceiling = set(sanitize_tool_allowlist(configured_ceiling))
+                    outside_ceiling = [name for name in granted_tools if configured_ceiling and name not in ceiling]
                     if outside_ceiling:
                         raise PlanError("agent_tool_not_allowed_by_preset", "Tool grants exceed this instance's preset ceiling", tools=outside_ceiling)
                     if active_version:
@@ -967,12 +977,12 @@ class AgentPlanCoordinator:
                         unavailable_grants = [
                             name
                             for name in granted_tools
-                            if name not in AGENT_DELEGATION_TOOL_NAMES or name not in requested_tools
+                            if name not in set(self.available_tools()) or name not in requested_tools
                         ]
                         if unavailable_grants:
                             raise PlanError(
                                 "invalid_tool_grant",
-                                "grantedTools must be requested by this Plan and belong to the Agent base whitelist",
+                                "grantedTools must be requested by this Plan and belong to the current Agent delegation catalog",
                                 tools=unavailable_grants,
                                 requestedTools=requested_tools,
                             )
@@ -2357,7 +2367,7 @@ def register_agent_plan_tools(registry: ToolRegistry, coordinator: AgentPlanCoor
                 "completedWork": {"type": "array", "items": {"type": "string"}},
                 "retainedResults": {"type": "array", "items": {"type": "string"}},
                 "invalidatedResults": {"type": "array", "items": {"type": "string"}},
-                "plan": {"type": "object"},
+                "plan": plan_definition_schema,
                 "requestId": {"type": "string"},
             },
             "required": ["changeReason", "plan"],
