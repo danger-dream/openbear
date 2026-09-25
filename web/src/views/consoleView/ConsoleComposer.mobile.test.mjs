@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { compile, createSSRApp, h, nextTick, ref } from 'vue';
+import { compile, createSSRApp, h, nextTick, reactive, ref, watch } from 'vue';
 import { renderToString } from 'vue/server-renderer';
 import { parse } from '@vue/compiler-sfc';
 import { baseParse } from '@vue/compiler-dom';
@@ -35,7 +35,7 @@ test('actual attachment remove button has a filename, stops preview bubbling and
 
 test('actual send entry retains disabled state and ReferenceEditor canSend guard, without altering input content', async () => {
   const calls = [], props = { canSend: false, draft: '未提交引用和输入', conversationUuid: 'A' };
-  const bindings = { props, emit: (...args) => calls.push(args), composerTextarea: null, onPaste() {} };
+  const bindings = { props, emit: (...args) => calls.push(args), composerTextarea: null, onPaste() {}, onComposerKeydownCapture() {}, scheduleRunConfigPosition() {} };
   let rendered = await render(sendTemplate, bindings); assert.equal(rendered.nodes.find(node => node.type === 'button').props.disabled, true);
   rendered = await render(editorTemplate, bindings); rendered.nodes[0].props.onSend(); assert.deepEqual(calls, []);
   props.canSend = true; rendered.nodes[0].props.onSend(); assert.deepEqual(calls, [['send']]); assert.equal(props.draft, '未提交引用和输入');
@@ -54,6 +54,64 @@ test('actual composer paste and file chooser retain files, draft text and focus 
   props.running = true; vm.runInContext('onPaste(event)', c); assert.equal(emitted.length, 1, 'running still prohibits new attachment paste');
   await vm.runInContext('focus()', c); assert.equal(focuses[0].preventScroll, true);
   const input = { files: [file], value: 'old-file' }; c.change = { target: input }; vm.runInContext('onAttachmentChange(change)', c); assert.equal(input.value, '');
+});
+
+test('touch keyboard Enter inserts a hard break before ReferenceEditor sends; desktop, modifiers, IME and suggestions keep their handlers', async () => {
+  const breaks = [], calls = [], props = { canSend: true, draft: 'draft', conversationUuid: 'A' };
+  let touch = true, suggestion = false;
+  const composerTextarea = ref({ editor: { view: { composing: false }, commands: { insertContent: node => breaks.push(node) } } });
+  const c = vm.createContext({ composerTextarea, window: { matchMedia: () => ({ matches: touch }) }, document: { querySelector: () => suggestion ? {} : null } });
+  vm.runInContext(between(source, 'function onComposerKeydownCapture(', 'function scheduleRunConfigPosition('), c);
+  const { nodes } = await render(editorTemplate, { props, composerTextarea, emit: (...args) => calls.push(args), onPaste() {}, onComposerKeydownCapture: c.onComposerKeydownCapture, scheduleRunConfigPosition() {} });
+  const node = nodes[0];
+  assert.equal(typeof node.props.onKeydownCapture, 'function');
+  const key = (overrides = {}) => {
+    const event = { key: 'Enter', target: { closest: selector => selector === '.reference-editor-content' ? {} : null }, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; }, ...overrides };
+    node.props.onKeydownCapture(event); return event;
+  };
+  let event = key(); assert.equal(event.prevented, true); assert.equal(event.stopped, true);
+  assert.equal(breaks[0].type, 'hardBreak'); assert.deepEqual(calls, []);
+  for (const variant of [{ shiftKey: true }, { ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { keyCode: 229 }, { key: 'Tab' }, { target: { closest: () => null } }]) {
+    event = key(variant); assert.equal(event.prevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  composerTextarea.value.editor.view.composing = true; assert.equal(key().prevented, undefined);
+  composerTextarea.value.editor.view.composing = false;
+  suggestion = true; assert.equal(key().prevented, undefined);
+  suggestion = false; touch = false; assert.equal(key().prevented, undefined);
+  assert.equal(breaks.length, 1, 'only plain mobile Enter inserts a break');
+  nodes[0].props.onSend(); assert.deepEqual(calls, [['send']], 'explicit send is still available on phones');
+});
+
+test('open run-config popover follows the composer through keyboard blur and visual viewport changes, then detaches', async () => {
+  const popover = ast.find(node => node.type === 1 && node.tag === 'el-popover');
+  assert.ok(popover.props.some(prop => prop.name === 'ref' && prop.value?.content === 'runConfigPopover'));
+  const editorNode = ast.find(node => node.type === 1 && node.tag === 'ReferenceEditor');
+  assert.ok(editorNode.props.some(prop => prop.name === 'on' && prop.arg?.content === 'focusout'));
+  const createTarget = () => {
+    const listeners = new Map();
+    return { listeners, addEventListener(name, listener) { listeners.set(name, listener); }, removeEventListener(name, listener) { if (listeners.get(name) === listener) listeners.delete(name); }, fire(name) { listeners.get(name)?.(); } };
+  };
+  const win = createTarget(), viewport = createTarget(), pending = new Map();
+  let frameId = 0, anchorY = 80;
+  win.visualViewport = viewport;
+  win.requestAnimationFrame = callback => { pending.set(++frameId, callback); return frameId; };
+  win.cancelAnimationFrame = id => pending.delete(id);
+  const flushFrame = () => { const frames = [...pending.values()]; pending.clear(); frames.forEach(callback => callback()); };
+  const positions = [], props = reactive({modelMenuOpen: false});
+  const runConfigPopover = ref({ popperRef: { popperInstanceRef: { update: () => positions.push(anchorY) } } });
+  let stopWatch;
+  const c = vm.createContext({ props, runConfigPopover, window: win, nextTick, watch: (...args) => { stopWatch = watch(...args); } });
+  vm.runInContext('let runConfigPositionFrame = 0;\n' + between(source, 'function scheduleRunConfigPosition()', 'onMounted(() => {'), c);
+  props.modelMenuOpen = true; await nextTick(); await nextTick(); flushFrame();
+  assert.deepEqual(positions, [80]);
+  anchorY = 320; c.scheduleRunConfigPosition(); viewport.fire('resize'); flushFrame();
+  assert.deepEqual(positions, [80, 320], 'blur and viewport resize coalesce into one reposition at the new anchor');
+  anchorY = 360; viewport.fire('scroll'); flushFrame(); assert.deepEqual(positions, [80, 320, 360]);
+  anchorY = 400; win.fire('resize'); flushFrame(); assert.deepEqual(positions, [80, 320, 360, 400]);
+  viewport.fire('resize'); props.modelMenuOpen = false; await nextTick(); flushFrame();
+  assert.deepEqual(positions, [80, 320, 360, 400], 'closed popup does not update');
+  assert.equal(viewport.listeners.size, 0); assert.equal(win.listeners.size, 0);
+  stopWatch();
 });
 
 test('actual ReferenceEditor IME flags, candidate selection, Enter and Shift+Enter behavior remain unchanged', () => {

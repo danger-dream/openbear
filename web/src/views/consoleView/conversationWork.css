@@ -1,0 +1,41 @@
+/* Local names express process roles; the shared root owns both appearances. */
+.conversation-work, .context-usage-popover, .context-usage-trigger {
+	--work-text: var(--ob-text);
+	--work-muted: var(--ob-text-subtle);
+	--work-faint: var(--ob-text-muted);
+	--work-rule: var(--ob-border);
+	--work-panel: var(--ob-surface-raised);
+	--work-hover: var(--ob-hover);
+	--work-sweep-soft: var(--ob-process-sweep-soft);
+	--work-sweep-strong: var(--ob-process-sweep-strong);
+}
+.conversation-work {
+	--work-muted: var(--ob-text-muted);
+	--work-faint: var(--ob-text-muted);
+	--work-summary-rule: var(--ob-border-soft);
+	--work-panel-rule: var(--ob-border-soft);
+	--work-panel: var(--ob-surface);
+	--work-detail-text: var(--ob-text-subtle);
+}
+.work-status-sweep {
+	display: inline-block;
+	/* Apply to the text-bearing element, not its flex parent. Keep glyph paint
+	   and animated background on the same element instead of inheriting a
+	   transparent fill across separate descendant paint layers. */
+	background-image: linear-gradient(90deg, var(--work-sweep-soft) 0%, var(--work-sweep-soft) 38%, var(--work-sweep-strong) 50%, var(--work-sweep-soft) 62%, var(--work-sweep-soft) 100%);
+	background-size: 250% 100%;
+	background-repeat: no-repeat;
+	background-position: 100% 0;
+	background-clip: text;
+	-webkit-background-clip: text;
+	color: transparent;
+	-webkit-text-fill-color: transparent;
+	animation: work-status-light 2s linear infinite;
+	animation-delay: -.2s;
+}
+@keyframes work-status-light { from { background-position: 100% 0; } to { background-position: 0% 0; } }
+@media (prefers-reduced-motion: reduce) {
+	/* This is an explicit execution-state cue, not decorative movement.
+	   Reduce its speed without removing the requested running indication. */
+	.work-status-sweep { animation-duration: 4s; }
+}

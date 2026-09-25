@@ -13,7 +13,7 @@ import {activityInteractionTarget} from "./conversationActivity.js";
 import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
-import { Box, ChatLineRound, Check, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Setting, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
+import { Box, ChatLineRound, Check, Close, DataAnalysis, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Setting, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
 import { Api, apiError } from "./api";
 import {
   isLocalConversationRow as isLocalConversation,
@@ -27,7 +27,7 @@ import { getThemeState, setThemeMode, subscribeTheme } from "./theme.js";
 import ReferencePicker from "./references/ReferencePicker.vue";
 import ReferenceInspector from "./references/ReferenceInspector.vue";
 import ArtifactPreview from "./artifacts/ArtifactPreview.vue";
-import { referenceCatalog, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
+import { referenceCatalog, referenceItem, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
 
 const THEME_OPTIONS = [
   { value: "light", label: "浅色", hint: "始终使用浅色", icon: Sunny },
@@ -49,6 +49,7 @@ const DocsView = defineLazyView(() => import("./views/DocsView.vue"), "文档库
 const SkillsView = defineLazyView(() => import("./views/SkillsView.vue"), "Skills");
 const McpView = defineLazyView(() => import("./views/McpView.vue"), "MCP 管理");
 const SettingsHubView = defineLazyView(() => import("./views/SettingsHubView.vue"), "设置");
+const StatisticsView = defineLazyView(() => import("./views/StatisticsView.vue"), "数据统计");
 
 const nav = [
   { key: "memory", label: "记忆管理", shortLabel: "记忆", icon: "Collection", component: MemoryView },
@@ -57,6 +58,7 @@ const nav = [
   { key: "skills", label: "Skills", shortLabel: "Skills", icon: "MagicStick", component: SkillsView },
   { key: "mcp", label: "MCP 管理", shortLabel: "MCP", icon: "Connection", component: McpView },
   { key: "settings", label: "设置", shortLabel: "设置", icon: "Setting", component: SettingsHubView },
+  { key: "statistics", label: "数据统计", shortLabel: "统计", icon: "DataAnalysis", component: StatisticsView, headerOnly: true },
 ];
 const pageToPath = {
   console: "/chat",
@@ -66,6 +68,7 @@ const pageToPath = {
   skills: "/skills",
   mcp: "/mcp",
   settings: "/settings",
+  statistics: "/statistics",
 };
 const pathToPage = {
   "/": "console",
@@ -76,9 +79,10 @@ const pathToPage = {
   "/skills": "skills",
   "/mcp": "mcp",
   "/settings": "settings",
+  "/statistics": "statistics",
 };
 
-const desktopNav = computed(() => nav.filter((n) => n.key !== "settings"));
+const desktopNav = computed(() => nav.filter((n) => n.key !== "settings" && !n.headerOnly));
 const active = ref("console");
 const referenceShelf = shallowRef({open:false,kind:'',anchor:null});
 let referenceShelfTimer = null;
@@ -99,8 +103,8 @@ watch(active,closeReferenceShelf);
 const channelStatsText = ref("系统就绪");
 async function refreshChannelStats() {
   try {
-    const data = await Api.channels();
-    const count = Array.isArray(data?.providers) ? data.providers.length : 0;
+    const data = await Api.settings();
+    const count = Number(data?.providerCount || 0);
     if (count > 0) {
       channelStatsText.value = `${count} 渠道就绪`;
     }
@@ -108,7 +112,9 @@ async function refreshChannelStats() {
 }
 const memoryType = ref("identity");
 const settingsSection = ref("channels");
-const settingsHeaderReady = ref(false);
+const pageHeaderReady = ref(false);
+// Keep fallback navigation available while a newly selected lazy page loads.
+watch(active, () => { pageHeaderReady.value = false; });
 const appVersion = ref("");
 const versionInfo = ref(null);
 const versionDialogOpen = ref(false);
@@ -211,7 +217,14 @@ function routeForCurrentState() {
   const params = new URLSearchParams();
   if (active.value === "console" && activeConversationUuid.value) params.set("id", activeConversationUuid.value);
   if (active.value === "memory") params.set("type", memoryType.value || "identity");
-  if (active.value === "settings") params.set("section", settingsSection.value || "channels");
+  if (active.value === "settings") {
+    params.set("section", settingsSection.value || "channels");
+    // Keep a system-setting deep link through the initial route normalization.
+    if (settingsSection.value === "system-settings" && window.location.pathname === "/settings") {
+      const setting = new URLSearchParams(window.location.search).get("setting");
+      if (setting) params.set("setting", setting);
+    }
+  }
   const query = params.toString();
   return `${path}${query ? `?${query}` : ""}`;
 }
@@ -250,7 +263,15 @@ function fmtTime(ts) {
     ? { hour: "2-digit", minute: "2-digit", hour12: false }
     : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
-function conversationTitle(row) { return row?.title || "新会话"; }
+function conversationTitle(row) {
+  if (!row) return "新会话";
+  if (!row.local && row.conversationUuid) {
+    const catalog = referenceItem({kind: "chat", id: row.conversationUuid});
+    if (catalog?.label) return catalog.label;
+  }
+  return row.title || "新会话";
+}
+const activeConversationPath = computed(() => conversationTreeRef.value?.conversationPath(activeConversationUuid.value) || "");
 const activeConversationTitle = computed(() => conversationTitle(
   conversations.value.find((row) => row.conversationUuid === activeConversationUuid.value),
 ));
@@ -943,7 +964,7 @@ onBeforeUnmount(() => {
 
 <template>
   <LoginView v-if="isLoginPath" />
-  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && settingsHeaderReady}">
+  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'skills', 'mcp'].includes(active) && pageHeaderReady}">
     <div class="mobile-app-bar">
       <button
         type="button"
@@ -970,19 +991,31 @@ onBeforeUnmount(() => {
     ></button>
     <aside
       id="openbear-sidebar"
-      class="app-sidebar w-[300px] shrink-0 flex flex-col border-r border-zinc-200 bg-zinc-50/90 p-3 text-zinc-950"
+      class="app-sidebar w-[280px] shrink-0 flex flex-col border-r border-ob-border bg-ob-sidebar p-3 text-ob-strong"
       :class="{'is-open': sidebarOpen}"
       @contextmenu.self="conversationTreeRef?.openRootMenu($event)"
     >
       <div class="sidebar-heading mb-3 flex items-center gap-2 rounded-2xl px-2 py-2">
-        <div class="sidebar-brand-logo grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white p-1.5 ring-1 ring-zinc-200 shadow-sm">
+        <div class="sidebar-brand-logo grid h-9 w-9 shrink-0 place-items-center bg-transparent">
           <BearLogoPreview />
         </div>
         <div class="min-w-0 flex-1">
-          <div class="truncate text-[15px] font-semibold leading-tight">OpenBear</div>
-          <div class="sidebar-caption mt-0.5 truncate text-[12px] leading-tight text-zinc-500">Web 控制台</div>
+          <div class="truncate text-[14px] font-semibold leading-tight">OpenBear</div>
+          <div class="sidebar-caption mt-0.5 truncate text-[10px] leading-tight text-ob-muted">Web 控制台</div>
         </div>
         <div class="sidebar-meta-actions flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            class="theme-entry statistics-entry"
+            :class="{'is-active': active === 'statistics'}"
+            title="数据统计"
+            aria-label="打开数据统计"
+            :aria-current="active === 'statistics' ? 'page' : undefined"
+            data-testid="statistics-entry"
+            @click="selectNav('statistics')"
+          >
+            <el-icon :size="14"><DataAnalysis /></el-icon>
+          </button>
           <el-dropdown trigger="click" placement="bottom-end" @command="chooseThemeMode">
             <button
               type="button"
@@ -1013,31 +1046,22 @@ onBeforeUnmount(() => {
               </el-dropdown-menu>
             </template>
           </el-dropdown>
-          <button
-            type="button"
-            class="version-entry inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-medium leading-none tracking-wide shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]"
-            :class="versionInfo?.updateAvailable ? 'border-amber-300 bg-amber-50 text-amber-700' : 'border-zinc-200/80 bg-white/70 text-zinc-500'"
-            :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'"
-            @click="openVersionDialog"
-          >
-            <span class="font-mono text-[11px]">v{{ appVersion || "…" }}</span>
-            <span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span>
-          </button>
+          <button type="button" class="sidebar-close theme-entry" aria-label="关闭导航" @click="closeSidebar"><el-icon :size="16"><Close/></el-icon></button>
         </div>
       </div>
 
       <button
         type="button"
-        class="sidebar-new-session mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-zinc-800 transition-colors hover:bg-zinc-200/60"
+        class="sidebar-new-session mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-ob-text transition-colors hover:bg-ob-soft/60"
         @click="startConsoleNewSession"
       >
-        <el-icon :size="16" class="text-zinc-600"><Plus /></el-icon>
+        <el-icon :size="16" class="text-ob-subtle"><Plus /></el-icon>
         <span>新会话</span>
       </button>
 
       <nav class="sidebar-desktop-nav sidebar-resource-grid text-sm" aria-label="资源与设置">
         <button
-          v-for="n in nav.filter(x => x.key !== 'settings')"
+          v-for="n in desktopNav"
           :key="n.key"
           type="button"
           :aria-current="active === n.key ? 'page' : undefined"
@@ -1055,7 +1079,7 @@ onBeforeUnmount(() => {
       <ReferenceInspector :current-conversation="activeConversationUuid"/>
       <ArtifactPreview :navigation-key="`${active}:${activeConversationUuid}`"/>
 
-      <div class="sidebar-conversations -mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-zinc-200/80 pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
+      <div class="sidebar-conversations -mx-3 mt-3 flex min-h-0 flex-1 flex-col border-t border-ob-border pt-2" @contextmenu.self="conversationTreeRef?.openRootMenu($event)">
         <ConversationTree
           ref="conversationTreeRef"
           :active-conversation-uuid="activeConversationUuid"
@@ -1072,10 +1096,10 @@ onBeforeUnmount(() => {
         <div v-if="false">
         <!-- 会话头部工具栏 -->
         <div class="mb-1.5 flex items-center justify-between px-4">
-          <div class="flex items-center gap-1.5 text-xs font-semibold text-zinc-600">
-            <el-icon :size="14" class="text-zinc-400"><ChatLineRound /></el-icon>
+          <div class="flex items-center gap-1.5 text-xs font-semibold text-ob-subtle">
+            <el-icon :size="14" class="text-ob-muted"><ChatLineRound /></el-icon>
             <span>会话</span>
-            <span class="text-[11px] font-normal text-zinc-400">({{ conversations.length }})</span>
+            <span class="text-[11px] font-normal text-ob-muted">({{ conversations.length }})</span>
           </div>
           <div class="flex items-center gap-0.5">
             <button
@@ -1120,9 +1144,9 @@ onBeforeUnmount(() => {
         </div>
 
         <div ref="conversationListRef" class="min-h-0 flex-1 overflow-y-auto px-2 py-1 space-y-1 scrollbar-none" :class="conversationDragActive && 'select-none'">
-          <div v-if="conversationsLoading && !conversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">加载中…</div>
-          <div v-else-if="!conversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">暂无会话</div>
-          <div v-else-if="conversationSearchQuery && !displayedConversations.length" class="mx-2 rounded-xl bg-zinc-100/70 p-4 text-center text-xs text-zinc-400">未找到匹配「{{ conversationSearchQuery }}」的会话</div>
+          <div v-if="conversationsLoading && !conversations.length" class="mx-2 rounded-xl bg-ob-soft/70 p-4 text-center text-xs text-ob-muted">加载中…</div>
+          <div v-else-if="!conversations.length" class="mx-2 rounded-xl bg-ob-soft/70 p-4 text-center text-xs text-ob-muted">暂无会话</div>
+          <div v-else-if="conversationSearchQuery && !displayedConversations.length" class="mx-2 rounded-xl bg-ob-soft/70 p-4 text-center text-xs text-ob-muted">未找到匹配「{{ conversationSearchQuery }}」的会话</div>
           <draggable
             v-else
             v-model="conversations"
@@ -1173,7 +1197,7 @@ onBeforeUnmount(() => {
                   </div>
 
                   <!-- 第二行信息元数据：创建时间 + 统计指标 (消息数、花费) -->
-                  <div class="mt-0.5 flex min-w-0 items-center justify-between text-[10.5px] leading-tight text-zinc-400">
+                  <div class="mt-0.5 flex min-w-0 items-center justify-between text-[10.5px] leading-tight text-ob-muted">
                     <span class="shrink-0 session-date">{{ createdTime(row) }}</span>
                     <span class="session-metrics-pill shrink-0" :title="conversationStats(row)">
                       <span class="truncate">{{ conversationStats(row) }}</span>
@@ -1219,12 +1243,13 @@ onBeforeUnmount(() => {
           <el-icon :size="15"><Setting /></el-icon>
           <span>系统设置</span>
         </button>
-        <div class="sidebar-footer-status" title="模型渠道池与系统状态">
-          <span class="status-indicator-dot"></span>
-          <span class="status-indicator-text">{{ channelStatsText }}</span>
+        <div class="sidebar-footer-status">
+          <button type="button" class="version-entry sidebar-version" :class="{'has-update': versionInfo?.updateAvailable}" :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'" @click="openVersionDialog">v{{ appVersion || '…' }}<span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span></button>
         </div>
       </footer>
-      <MobileSidebarResources :items="nav" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)"/>
+      <MobileSidebarResources :items="nav.filter(item => !item.headerOnly)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)">
+        <template #footer><div class="sidebar-mobile-status"><span class="status-indicator-dot"></span><span>{{ channelStatsText }}</span><button type="button" class="version-entry sidebar-version" :class="{'has-update': versionInfo?.updateAvailable}" :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'" @click="openVersionDialog">v{{ appVersion || '…' }}<span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span></button></div></template>
+      </MobileSidebarResources>
     </aside>
 
     <Teleport v-if="false" to="body">
@@ -1304,6 +1329,8 @@ onBeforeUnmount(() => {
         v-if="active === 'console'"
         ref="consoleViewRef"
         :conversation-uuid="activeConversationUuid"
+        :canonical-title="activeConversationTitle"
+        :conversation-path="activeConversationPath"
         :navigation-obscured="sidebarOpen"
         :folder-id="isLocalConversation(activeConversationUuid) ? draftFolderId : selectedFolderId"
         @conversation-created="handleConsoleConversationCreated"
@@ -1320,17 +1347,29 @@ onBeforeUnmount(() => {
           ><span></span><span></span><span></span></button>
         </template>
       </ConsoleView>
-      <MemoryView v-else-if="active === 'memory'" :active-type="memoryType" @type-changed="handleMemoryTypeChanged" />
+      <MemoryView v-else-if="active === 'memory'" :active-type="memoryType" @type-changed="handleMemoryTypeChanged" @mobile-header-ready="pageHeaderReady = $event">
+        <template #mobile-navigation>
+          <button
+            type="button"
+            class="mobile-sidebar-toggle"
+            :aria-expanded="sidebarOpen"
+            aria-controls="openbear-sidebar"
+            aria-label="打开导航"
+            @click="sidebarOpen = true"
+          ><span></span><span></span><span></span></button>
+        </template>
+      </MemoryView>
       <component
         v-else
         :is="activeView"
         :section="settingsSection"
+        :navigation-obscured="sidebarOpen"
         @section-changed="handleSettingsSectionChanged"
-        @mobile-header-ready="settingsHeaderReady = $event"
+        @mobile-header-ready="pageHeaderReady = $event"
       >
         <template #mobile-navigation>
           <button
-            v-if="active === 'settings'"
+            v-if="['settings', 'secrets', 'docs', 'skills', 'mcp'].includes(active)"
             type="button"
             class="mobile-sidebar-toggle"
             :aria-expanded="sidebarOpen"
@@ -1416,6 +1455,17 @@ onBeforeUnmount(() => {
 <style scoped>
 /* This top-level action is phone-only; desktop keeps the conversation tree actions. */
 .sidebar-new-session { display: none; }
+.app-sidebar { background: var(--ob-chat-sidebar); color: var(--ob-chat-text); border-color: var(--ob-chat-line); }
+.sidebar-heading { min-height: 53px; margin-bottom: 7px; padding-inline: 5px; }
+.sidebar-brand-logo { width: 29px; height: 29px; }
+.sidebar-conversations { border-color: var(--ob-chat-line); }
+.theme-entry.sidebar-close { display: none; }
+.sidebar-version { display: inline-flex; flex: none; align-items: center; gap: 3px; border: 0; background: transparent; padding: 4px 0; color: var(--ob-chat-muted); font-size: 9px; cursor: pointer; }
+.sidebar-version.has-update { color: var(--ob-warning); }
+.sidebar-mobile-status { display: flex; align-items: center; gap: 6px; padding: 0 8px; color: var(--ob-chat-muted); font-size: 9px; }
+.sidebar-mobile-status .sidebar-version { margin-left: auto; }
+.sidebar-mobile-status .status-indicator-dot { width: 4px; height: 4px; }
+@media (min-width: 761px) and (max-width: 1250px) { .app-sidebar { width: 250px; } }
 
 .theme-entry {
   display: grid;
@@ -1423,23 +1473,28 @@ onBeforeUnmount(() => {
   height: 26px;
   flex: 0 0 auto;
   place-items: center;
-  border: 1px solid rgba(212, 212, 216, .85);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, .70);
-  color: #71717a;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .8);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ob-chat-subtle);
+  box-shadow: none;
   cursor: pointer;
   transition: border-color .14s ease, background .14s ease, color .14s ease;
 }
 .theme-entry:hover,
 .theme-entry:focus-visible {
-  border-color: #c4c4cc;
-  background: #fff;
-  color: #27272a;
+  border-color: var(--ob-border-strong);
+  background: var(--ob-surface);
+  color: var(--ob-text);
   outline: none;
 }
 .theme-entry:focus-visible {
-  box-shadow: 0 0 0 3px rgba(0, 122, 255, .18);
+  box-shadow: 0 0 0 3px var(--ob-focus);
+}
+.statistics-entry.is-active {
+  border-color: var(--ob-focus);
+  background: var(--ob-selected);
+  color: var(--ob-blue);
 }
 .version-entry {
   cursor: pointer;
@@ -1448,8 +1503,8 @@ onBeforeUnmount(() => {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: #d97706;
-  box-shadow: 0 0 0 3px rgba(217, 119, 6, .16);
+  background: var(--ob-warning);
+  box-shadow: 0 0 0 3px var(--ob-warning-soft);
 }
 .conversation-drag-ghost {
   opacity: .45;
@@ -1466,15 +1521,15 @@ onBeforeUnmount(() => {
   position: fixed;
   width: 218px;
   padding: 6px;
-  border: 1px solid rgba(0, 0, 0, .12);
+  border: 1px solid var(--ob-border-strong);
   border-radius: 12px;
   background:
-    linear-gradient(180deg, rgba(255,255,255,.88), rgba(246,246,247,.82));
-  color: #1f2933;
+    rgb(var(--ob-surface-raised-rgb) / .95);
+  color: var(--ob-text);
   box-shadow:
-    0 28px 70px rgba(15, 23, 42, .24),
-    0 8px 22px rgba(15, 23, 42, .12),
-    inset 0 1px 0 rgba(255, 255, 255, .75);
+    0 28px 70px rgb(var(--ob-shadow-rgb) / .24),
+    0 8px 22px rgb(var(--ob-shadow-rgb) / .12),
+    var(--ob-shadow-inset);
   backdrop-filter: blur(22px) saturate(1.55);
   -webkit-backdrop-filter: blur(22px) saturate(1.55);
   transform-origin: top left;
@@ -1492,7 +1547,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: #1f2937;
+  color: var(--ob-text);
   font-size: 14px;
   line-height: 1.25;
   text-align: left;
@@ -1500,40 +1555,40 @@ onBeforeUnmount(() => {
 }
 
 .context-menu-item :deep(.el-icon) {
-  color: #6b7280;
+  color: var(--ob-text-subtle);
   font-size: 15px;
 }
 
 .context-menu-item:hover:not(:disabled),
 .context-menu-item:focus-visible:not(:disabled) {
-  background: linear-gradient(180deg, #2f8cff, #0a73ff);
-  color: #fff;
+  background: var(--ob-blue);
+  color: var(--ob-text-inverse);
 }
 
 .context-menu-item:hover:not(:disabled) :deep(.el-icon),
 .context-menu-item:focus-visible:not(:disabled) :deep(.el-icon),
 .context-menu-item:hover:not(:disabled) .context-menu-shortcut,
 .context-menu-item:focus-visible:not(:disabled) .context-menu-shortcut {
-  color: rgba(255, 255, 255, .84);
+  color: rgb(var(--ob-text-inverse-rgb) / .84);
 }
 
 .context-menu-item.danger:hover:not(:disabled),
 .context-menu-item.danger:focus-visible:not(:disabled) {
-  background: linear-gradient(180deg, #ff5d5d, #ef2f2f);
+  background: var(--ob-danger);
 }
 
 .context-menu-item:disabled {
-  color: rgba(107, 114, 128, .42);
+  color: var(--ob-text-disabled);
   cursor: default;
 }
 
 .context-menu-item:disabled :deep(.el-icon),
 .context-menu-item:disabled .context-menu-shortcut {
-  color: rgba(107, 114, 128, .32);
+  color: var(--ob-text-disabled);
 }
 
 .context-menu-shortcut {
-  color: #6b7280;
+  color: var(--ob-text-subtle);
   font-size: 13px;
   letter-spacing: .01em;
 }
@@ -1541,7 +1596,7 @@ onBeforeUnmount(() => {
 .context-menu-separator {
   height: 1px;
   margin: 5px 6px;
-  background: rgba(0, 0, 0, .10);
+  background: var(--ob-border);
 }
 
 @keyframes mac-context-in {
@@ -1578,10 +1633,10 @@ onBeforeUnmount(() => {
     height: calc(48px + env(safe-area-inset-top, 0px));
     align-items: center;
     gap: 10px;
-    border-bottom: 1px solid rgba(15, 23, 42, .08);
-    background: rgba(255, 255, 255, .92);
+    border-bottom: 1px solid var(--ob-border);
+    background: rgb(var(--ob-header-rgb) / .92);
     padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
-    box-shadow: 0 1px 8px rgba(15, 23, 42, .04);
+    box-shadow: 0 1px 8px rgb(var(--ob-shadow-rgb) / .04);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
   }
@@ -1593,11 +1648,11 @@ onBeforeUnmount(() => {
     flex: 0 0 auto;
     place-content: center;
     gap: 4px;
-    border: 1px solid rgba(15, 23, 42, .10);
+    border: 1px solid var(--ob-border);
     border-radius: 11px;
-    background: #fff;
-    color: #3f3f46;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, .08);
+    background: var(--ob-surface);
+    color: var(--ob-text);
+    box-shadow: 0 4px 14px var(--ob-border);
   }
 
   .mobile-sidebar-toggle span {
@@ -1612,7 +1667,7 @@ onBeforeUnmount(() => {
     min-width: 0;
     align-items: center;
     gap: 7px;
-    color: #27272a;
+    color: var(--ob-text);
     font-size: 13px;
   }
 
@@ -1622,9 +1677,9 @@ onBeforeUnmount(() => {
     height: 25px;
     place-items: center;
     border-radius: 8px;
-    background: #fffaf1;
+    background: transparent;
     padding: 4px;
-    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, .08);
+    box-shadow: inset 0 0 0 1px var(--ob-border);
   }
 
   .app-main {
@@ -1634,13 +1689,16 @@ onBeforeUnmount(() => {
     padding-top: calc(48px + env(safe-area-inset-top, 0px));
   }
 
-  /* Chat and settings own their combined header; other views keep the app bar. */
+  /* Mounted combined headers own navigation; lazy loading keeps the app bar. */
   .app-shell.is-console .mobile-app-bar,
-  .app-shell.is-settings .mobile-app-bar { display: none; }
+  .app-shell.is-settings .mobile-app-bar,
+  .app-shell.is-admin .mobile-app-bar { display: none; }
   .app-shell.is-console .app-main,
-  .app-shell.is-settings .app-main { padding-top: 0; }
+  .app-shell.is-settings .app-main,
+  .app-shell.is-admin .app-main { padding-top: 0; }
   .app-shell.is-console .mobile-sidebar-toggle,
-  .app-shell.is-settings .mobile-sidebar-toggle {
+  .app-shell.is-settings .mobile-sidebar-toggle,
+  .app-shell.is-admin .mobile-sidebar-toggle {
     border: 0;
     background: transparent;
     box-shadow: none;
@@ -1652,12 +1710,12 @@ onBeforeUnmount(() => {
     inset: 0 auto 0 0;
     padding-top: calc(12px + env(safe-area-inset-top, 0px));
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
-    width: min(300px, calc(100vw - 48px)) !important;
+    width: min(350px, calc(100vw - 48px)) !important;
     max-width: calc(100vw - 48px);
     visibility: hidden;
     pointer-events: none;
     transform: translateX(-102%);
-    box-shadow: 18px 0 52px rgba(15, 23, 42, .18);
+    box-shadow: 18px 0 52px rgb(var(--ob-shadow-rgb) / .18);
     transition: transform .2s cubic-bezier(.2, .8, .2, 1), visibility 0s linear .2s;
     will-change: transform;
   }
@@ -1670,8 +1728,8 @@ onBeforeUnmount(() => {
     margin-bottom: 4px;
     padding: 0;
   }
-  .app-sidebar .sidebar-brand-logo { width: 28px; height: 28px; padding: 4px; border-radius: 9px; }
-  .app-sidebar .sidebar-caption,
+  .app-sidebar .sidebar-brand-logo { width: 28px; height: 28px; padding: 0; }
+  .app-sidebar .sidebar-caption { display: block; }
   .app-sidebar .sidebar-desktop-nav { display: none; }
   .app-sidebar .sidebar-new-session {
     display: flex;
@@ -1683,7 +1741,8 @@ onBeforeUnmount(() => {
   }
   .app-sidebar .sidebar-conversations { margin-top: 8px; }
   .app-sidebar .theme-entry { width: 44px; height: 44px; border: 0; background: transparent; box-shadow: none; }
-  .app-sidebar .version-entry { min-height: 44px; padding: 0 4px; border: 0; background: transparent; box-shadow: none; }
+  .app-sidebar .version-entry { min-height: 30px; padding: 0 4px; border: 0; background: transparent; box-shadow: none; }
+  .app-sidebar .sidebar-close { display: grid; }
 
   .app-sidebar.is-open {
     visibility: visible;
@@ -1698,7 +1757,7 @@ onBeforeUnmount(() => {
     inset: 0;
     display: block;
     border: 0;
-    background: rgba(15, 23, 42, .28);
+    background: var(--ob-mask);
     padding: 0;
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
@@ -1711,23 +1770,23 @@ onBeforeUnmount(() => {
   height: 28px;
   padding: 0 24px 0 26px;
   font-size: 11.5px;
-  background: rgba(238, 238, 240, 0.75);
+  background: var(--ob-surface-soft);
   border: 1px solid transparent;
   border-radius: 8px;
-  color: #27272a;
+  color: var(--ob-text);
   outline: none;
   transition: all 0.15s ease;
 }
 .session-search-input:focus {
-  background: #ffffff;
-  border-color: rgba(212, 212, 216, 0.9);
-  box-shadow: 0 1px 3px rgba(24, 24, 27, 0.04), 0 0 0 2px rgba(39, 39, 42, 0.06);
+  background: var(--ob-surface);
+  border-color: var(--ob-border-strong);
+  box-shadow: 0 1px 3px rgb(var(--ob-shadow-rgb) / .04), 0 0 0 2px var(--ob-focus);
 }
 .session-search-icon {
   position: absolute;
   left: 8px;
   font-size: 11px;
-  color: #a1a1aa;
+  color: var(--ob-text-muted);
   pointer-events: none;
 }
 .session-search-clear {
@@ -1739,14 +1798,14 @@ onBeforeUnmount(() => {
   height: 16px;
   border: 0;
   background: transparent;
-  color: #a1a1aa;
+  color: var(--ob-text-muted);
   font-size: 12px;
   border-radius: 4px;
   cursor: pointer;
 }
 .session-search-clear:hover {
-  color: #3f3f46;
-  background: rgba(0, 0, 0, 0.06);
+  color: var(--ob-text);
+  background: var(--ob-hover);
 }
 
 /* === 会话卡片 === */
@@ -1756,19 +1815,19 @@ onBeforeUnmount(() => {
   transition: background-color 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
 }
 .session-card.is-inactive:hover {
-  background: rgba(244, 244, 245, 0.85);
+  background: var(--ob-hover);
 }
 .session-card.is-active {
-  background: #ffffff;
-  border-color: rgba(228, 228, 231, 0.9);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+  background: var(--ob-surface);
+  border-color: var(--ob-hover);
+  box-shadow: 0 1px 3px rgb(var(--ob-shadow-rgb) / .04), 0 1px 2px rgb(var(--ob-shadow-rgb) / .02);
 }
 .session-card.is-active .session-card-title {
-  color: #09090b;
+  color: var(--ob-text-strong);
   font-weight: 600;
 }
 .session-card.is-inactive .session-card-title {
-  color: #3f3f46;
+  color: var(--ob-text);
 }
 .session-active-bar {
   position: absolute;
@@ -1777,14 +1836,14 @@ onBeforeUnmount(() => {
   bottom: 5px;
   width: 3px;
   border-radius: 999px;
-  background: #18181b;
+  background: var(--ob-text-strong);
 }
 .session-pinned-star {
-  color: #f59e0b;
+  color: var(--ob-warning);
 }
 .session-card.is-running {
-  background: rgba(240, 253, 244, 0.75);
-  border-color: rgba(187, 247, 208, 0.85);
+  background: var(--ob-success-soft);
+  border-color: var(--ob-success);
 }
 .session-running-badge {
   display: inline-flex;
@@ -1793,8 +1852,8 @@ onBeforeUnmount(() => {
   height: 16px;
   padding: 0 5px;
   border-radius: 999px;
-  background: #dcfce7;
-  color: #15803d;
+  background: var(--ob-success-soft);
+  color: var(--ob-success);
   font-size: 9.5px;
   font-weight: 600;
   line-height: 1;
@@ -1803,14 +1862,14 @@ onBeforeUnmount(() => {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: #22c55e;
+  background: var(--ob-success);
 }
 .session-metrics-pill {
   display: inline-flex;
   align-items: center;
   gap: 2px;
   font-size: 10.5px;
-  color: #71717a;
+  color: var(--ob-text-subtle);
   font-variant-numeric: tabular-nums;
 }
 .session-tool-btn {
@@ -1821,17 +1880,17 @@ onBeforeUnmount(() => {
   border-radius: 7px;
   border: 0;
   background: transparent;
-  color: #71717a;
+  color: var(--ob-text-subtle);
   cursor: pointer;
   transition: all 0.14s ease;
 }
 .session-tool-btn:hover {
-  background: rgba(228, 228, 231, 0.7);
-  color: #18181b;
+  background: var(--ob-hover);
+  color: var(--ob-text-strong);
 }
 .session-tool-btn.is-active {
-  background: rgba(228, 228, 231, 0.9);
-  color: #18181b;
+  background: var(--ob-hover);
+  color: var(--ob-text-strong);
 }
 .session-hover-btn {
   display: grid;
@@ -1840,199 +1899,19 @@ onBeforeUnmount(() => {
   place-items: center;
   border: 0;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.94);
-  color: #71717a;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  background: var(--ob-surface);
+  color: var(--ob-text-subtle);
+  box-shadow: 0 1px 3px rgb(var(--ob-shadow-rgb) / .08);
   cursor: pointer;
   transition: all 0.14s ease;
 }
 .session-hover-btn:hover {
-  background: #ffffff;
-  color: #18181b;
+  background: var(--ob-surface);
+  color: var(--ob-text-strong);
   transform: scale(1.08);
 }
 </style>
 
-<style>
-/* OpenBear system dark theme */
-html.dark .theme-entry {
-  border-color: rgba(82, 82, 91, .9);
-  background: rgba(35, 36, 41, .88);
-  color: #c7c7ce;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08);
-}
-html.dark .theme-entry:hover,
-html.dark .theme-entry:focus-visible {
-  border-color: #62636c;
-  background: #292a30;
-  color: #f4f4f5;
-}
-html.dark .version-dot {
-		box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.16);
-	}
-
-html.dark .conversation-context-menu {
-		border: 1px solid rgba(255, 255, 255, 0.174);
-		background: linear-gradient(180deg, rgba(29, 30, 34, 0.88), rgba(32, 33, 37, 0.82));
-		color: #dedee1;
-		box-shadow: 0 28px 70px rgba(0, 0, 0, 0.24),
-	    0 8px 22px rgba(0, 0, 0, 0.16),
-	    inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-
-html.dark .context-menu-item {
-		color: #dedee1;
-	}
-
-html.dark .context-menu-item .el-icon {
-		color: #c6c6cd;
-	}
-
-html.dark .context-menu-item:hover:not(:disabled),
-html.dark .context-menu-item:focus-visible:not(:disabled) {
-		color: #ffffff;
-	}
-
-html.dark .context-menu-item:hover:not(:disabled) .el-icon,
-html.dark .context-menu-item:focus-visible:not(:disabled) .el-icon,
-html.dark .context-menu-item:hover:not(:disabled) .context-menu-shortcut,
-html.dark .context-menu-item:focus-visible:not(:disabled) .context-menu-shortcut {
-		color: rgba(255, 255, 255, 0.84);
-	}
-
-html.dark .context-menu-item:disabled {
-		color: rgba(198, 198, 205, 0.42);
-	}
-
-html.dark .context-menu-item:disabled .el-icon,
-html.dark .context-menu-item:disabled .context-menu-shortcut {
-		color: rgba(198, 198, 205, 0.32);
-	}
-
-html.dark .context-menu-shortcut {
-		color: #c6c6cd;
-	}
-
-html.dark .context-menu-separator {
-		background: rgba(255, 255, 255, 0.125);
-	}
-
-html.dark .session-search-input {
-		background: rgba(32, 33, 37, 0.75);
-		color: #efeff2;
-	}
-
-html.dark .session-search-input:focus {
-		background: #1d1e22;
-		border-color: rgba(61, 62, 70, 0.9);
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16), 0 0 0 2px rgba(0, 0, 0, 0.16);
-	}
-
-html.dark .session-search-icon {
-		color: #a1a1a8;
-	}
-
-html.dark .session-search-clear {
-		color: #a1a1a8;
-	}
-
-html.dark .session-search-clear:hover {
-		color: #dedee1;
-		background: rgba(255, 255, 255, 0.075);
-	}
-
-html.dark .session-card.is-inactive:hover {
-		background: rgba(32, 33, 37, 0.85);
-	}
-
-html.dark .session-card.is-active {
-		background: #1d1e22;
-		border-color: rgba(61, 62, 70, 0.9);
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16), 0 1px 2px rgba(0, 0, 0, 0.16);
-	}
-
-html.dark .session-card.is-active .session-card-title {
-		color: #efeff2;
-	}
-
-html.dark .session-card.is-inactive .session-card-title {
-		color: #dedee1;
-	}
-
-html.dark .session-active-bar {
-		background: #232428;
-	}
-
-html.dark .session-pinned-star {
-		color: #fbad66;
-	}
-
-html.dark .session-card.is-running {
-		background: rgba(32, 33, 37, 0.75);
-		border-color: rgba(110, 231, 162, 0.52);
-	}
-
-html.dark .session-running-badge {
-		background: #202125;
-		color: #6ee7a2;
-	}
-
-html.dark .session-metrics-pill {
-		color: #c6c6cd;
-	}
-
-html.dark .session-tool-btn {
-		color: #c6c6cd;
-	}
-
-html.dark .session-tool-btn:hover {
-		background: rgba(37, 38, 42, 0.7);
-		color: #efeff2;
-	}
-
-html.dark .session-tool-btn.is-active {
-		background: rgba(37, 38, 42, 0.9);
-		color: #efeff2;
-	}
-
-html.dark .session-hover-btn {
-		background: rgba(29, 30, 34, 0.94);
-		color: #c6c6cd;
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
-	}
-
-html.dark .session-hover-btn:hover {
-		background: #1d1e22;
-		color: #efeff2;
-	}
-
-@media (max-width: 760px) {
-	html.dark .mobile-app-bar {
-		border-bottom: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.92);
-		box-shadow: 0 1px 8px rgba(0, 0, 0, 0.16);
-	}
-	html.dark .mobile-sidebar-toggle {
-		border: 1px solid rgba(255, 255, 255, 0.145);
-		background: #1d1e22;
-		color: #dedee1;
-		box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
-	}
-	html.dark .mobile-app-brand {
-		color: #efeff2;
-	}
-	html.dark .mobile-brand-logo {
-		background: #1d1e22;
-		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
-	}
-	html.dark .app-sidebar {
-		box-shadow: 18px 0 52px rgba(0, 0, 0, 0.18);
-	}
-	html.dark .app-sidebar-backdrop {
-		background: rgba(255, 255, 255, 0.34);
-	}
-}
-</style>
 
 <style>
 .theme-mode-menu {
@@ -2048,8 +1927,8 @@ html.dark .session-hover-btn:hover {
   padding: 6px 9px;
 }
 .theme-mode-menu .el-dropdown-menu__item.is-theme-selected {
-  background: #f4f4f5;
-  color: #18181b;
+  background: var(--ob-surface-soft);
+  color: var(--ob-text-strong);
 }
 .theme-menu-copy {
   display: flex;
@@ -2063,7 +1942,7 @@ html.dark .session-hover-btn:hover {
   font-weight: 650;
 }
 .theme-menu-copy small {
-  color: #86868b;
+  color: var(--ob-text-muted);
   font-size: 10px;
   font-weight: 400;
 }
@@ -2072,32 +1951,26 @@ html.dark .session-hover-btn:hover {
   width: 14px;
   justify-self: end;
 }
-.theme-menu-check { color: #0071e3; }
-html.dark .theme-mode-menu .el-dropdown-menu__item.is-theme-selected {
-  background: #303138;
-  color: #f4f4f5;
-}
-html.dark .theme-menu-copy small { color: #a1a1aa; }
-html.dark .theme-menu-check { color: #60a5fa; }
+.theme-menu-check { color: var(--ob-blue); }
 .version-dialog.el-dialog {
   --el-dialog-padding-primary: 0;
   padding: 0 !important;
   overflow: hidden;
   border-radius: 20px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, .98), rgba(246, 246, 247, .96));
-  box-shadow: 0 24px 80px rgba(24, 24, 27, .22), inset 0 1px 0 rgba(255, 255, 255, .9);
+  background: var(--ob-surface-raised);
+  box-shadow: var(--ob-shadow-dialog);
 }
 .version-dialog .el-dialog__header {
   margin: 0;
   padding: 18px 22px 12px;
-  border-bottom: 1px solid rgba(228, 228, 231, .82);
+  border-bottom: 1px solid var(--ob-border);
 }
 .version-dialog .el-dialog__body {
   padding: 0;
 }
 .version-dialog .el-dialog__footer {
   padding: 12px 22px 16px;
-  border-top: 1px solid rgba(228, 228, 231, .75);
+  border-top: 1px solid var(--ob-border);
 }
 .version-dialog-head {
   display: flex;
@@ -2107,7 +1980,7 @@ html.dark .theme-menu-check { color: #60a5fa; }
   padding-right: 28px;
 }
 .version-dialog-kicker {
-  color: #71717a;
+  color: var(--ob-text-subtle);
   font-size: 11px;
   font-weight: 650;
   letter-spacing: .08em;
@@ -2115,7 +1988,7 @@ html.dark .theme-menu-check { color: #60a5fa; }
 }
 .version-dialog-title {
   margin: 2px 0 0;
-  color: #18181b;
+  color: var(--ob-text-strong);
   font-size: 17px;
   font-weight: 680;
   letter-spacing: -.02em;
@@ -2124,18 +1997,18 @@ html.dark .theme-menu-check { color: #60a5fa; }
   display: inline-flex;
   align-items: center;
   height: 22px;
-  border: 1px solid rgba(228, 228, 231, .95);
+  border: 1px solid var(--ob-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--ob-surface);
   padding: 0 9px;
-  color: #52525b;
+  color: var(--ob-text-subtle);
   font-size: 11px;
   font-weight: 650;
 }
 .version-chip.is-update {
-  border-color: #fcd34d;
-  background: #fffbeb;
-  color: #b45309;
+  border-color: var(--ob-warning);
+  background: var(--ob-warning-soft);
+  color: var(--ob-warning);
 }
 .version-dialog-body {
   padding: 16px 22px 8px;
@@ -2149,27 +2022,27 @@ html.dark .theme-menu-check { color: #60a5fa; }
 }
 .version-hero-item {
   min-width: 0;
-  border: 1px solid rgba(228, 228, 231, .95);
+  border: 1px solid var(--ob-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--ob-surface);
   padding: 10px 12px;
 }
 .version-hero-item span {
   display: block;
-  color: #71717a;
+  color: var(--ob-text-subtle);
   font-size: 11px;
 }
 .version-hero-item strong {
   display: block;
   margin-top: 3px;
-  color: #18181b;
+  color: var(--ob-text-strong);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 18px;
   font-weight: 700;
   letter-spacing: -.03em;
 }
 .version-hero-arrow {
-  color: #a1a1aa;
+  color: var(--ob-text-muted);
   font-size: 16px;
 }
 .version-meta {
@@ -2177,11 +2050,11 @@ html.dark .theme-menu-check { color: #60a5fa; }
   flex-wrap: wrap;
   gap: 8px 14px;
   margin-bottom: 12px;
-  color: #71717a;
+  color: var(--ob-text-subtle);
   font-size: 12px;
 }
 .version-meta a {
-  color: #2563eb;
+  color: var(--ob-blue);
   text-decoration: none;
 }
 .version-meta a:hover {
@@ -2190,26 +2063,26 @@ html.dark .theme-menu-check { color: #60a5fa; }
 .version-callout {
   margin-bottom: 12px;
   border-radius: 12px;
-  background: #f4f4f5;
+  background: var(--ob-surface-soft);
   padding: 10px 12px;
-  color: #3f3f46;
+  color: var(--ob-text);
   font-size: 13px;
   line-height: 1.5;
 }
 .version-callout.is-warn {
-  background: #fff7ed;
-  color: #9a3412;
+  background: var(--ob-warning-soft);
+  color: var(--ob-warning);
 }
 .version-notes {
   overflow: hidden;
-  border: 1px solid rgba(228, 228, 231, .95);
+  border: 1px solid var(--ob-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--ob-surface);
 }
 .version-notes-head {
   padding: 10px 14px 8px;
-  border-bottom: 1px solid rgba(228, 228, 231, .8);
-  color: #52525b;
+  border-bottom: 1px solid var(--ob-border);
+  color: var(--ob-text-subtle);
   font-size: 12px;
   font-weight: 650;
 }
@@ -2217,13 +2090,13 @@ html.dark .theme-menu-check { color: #60a5fa; }
   max-height: min(48vh, 420px);
   overflow: auto;
   padding: 12px 16px 16px;
-  color: #27272a;
+  color: var(--ob-text);
   font-size: 14px;
   line-height: 1.65;
 }
 .version-notes-empty {
   padding: 28px 16px;
-  color: #a1a1aa;
+  color: var(--ob-text-muted);
   font-size: 13px;
   text-align: center;
 }
@@ -2234,111 +2107,27 @@ html.dark .theme-menu-check { color: #60a5fa; }
 }
 .version-btn {
   height: 32px;
-  border: 1px solid rgba(82, 82, 91, .16);
+  border: 1px solid var(--ob-border-strong);
   border-radius: 10px;
-  background: #fff;
+  background: var(--ob-surface);
   padding: 0 14px;
-  color: #27272a;
+  color: var(--ob-text);
   font-size: 13px;
 }
 .version-btn:hover:not(:disabled) {
-  background: #f4f4f5;
+  background: var(--ob-surface-soft);
 }
 .version-btn.is-primary {
-  border-color: rgba(82, 82, 91, .22);
-  background: linear-gradient(180deg, #3f3f46, #27272a);
-  color: #fff;
+  border-color: var(--ob-border-strong);
+  background: var(--ob-text-strong);
+  color: var(--ob-text-inverse);
 }
 .version-btn.is-primary:hover:not(:disabled) {
-  background: #18181b;
+  background: var(--ob-text-strong);
 }
 .version-btn:disabled {
   opacity: .55;
   cursor: default;
 }
 
-/* OpenBear system dark theme */
-html.dark .version-dialog.el-dialog {
-		background: linear-gradient(180deg, rgba(29, 30, 34, 0.98), rgba(32, 33, 37, 0.96));
-		box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-html.dark .version-dialog .el-dialog__header {
-		border-bottom: 1px solid rgba(61, 62, 70, 0.82);
-	}
-html.dark .version-dialog .el-dialog__footer {
-		border-top: 1px solid rgba(61, 62, 70, 0.75);
-	}
-html.dark .version-dialog-kicker {
-		color: #c6c6cd;
-	}
-html.dark .version-dialog-title {
-		color: #efeff2;
-	}
-html.dark .version-chip {
-		border: 1px solid rgba(61, 62, 70, 0.95);
-		background: #1d1e22;
-		color: #c6c6cd;
-	}
-html.dark .version-chip.is-update {
-		border-color: rgba(251, 173, 102, 0.52);
-		background: #202125;
-		color: #fbad66;
-	}
-html.dark .version-hero-item {
-		border: 1px solid rgba(61, 62, 70, 0.95);
-		background: #1d1e22;
-	}
-html.dark .version-hero-item span {
-		color: #c6c6cd;
-	}
-html.dark .version-hero-item strong {
-		color: #efeff2;
-	}
-html.dark .version-hero-arrow {
-		color: #a1a1a8;
-	}
-html.dark .version-meta {
-		color: #c6c6cd;
-	}
-html.dark .version-meta a {
-		color: #60a5fa;
-	}
-html.dark .version-callout {
-		background: #202125;
-		color: #dedee1;
-	}
-html.dark .version-callout.is-warn {
-		background: #202125;
-		color: #fb8585;
-	}
-html.dark .version-notes {
-		border: 1px solid rgba(61, 62, 70, 0.95);
-		background: #1d1e22;
-	}
-html.dark .version-notes-head {
-		border-bottom: 1px solid rgba(61, 62, 70, 0.8);
-		color: #c6c6cd;
-	}
-html.dark .version-notes-md {
-		color: #efeff2;
-	}
-html.dark .version-notes-empty {
-		color: #a1a1a8;
-	}
-html.dark .version-btn {
-		border: 1px solid rgba(61, 62, 70, 0.16);
-		background: #1d1e22;
-		color: #efeff2;
-	}
-html.dark .version-btn:hover:not(:disabled) {
-		background: #202125;
-	}
-html.dark .version-btn.is-primary {
-		border-color: rgba(61, 62, 70, 0.22);
-		background: linear-gradient(180deg, #2a2b2f, #232428);
-		color: #ffffff;
-	}
-html.dark .version-btn.is-primary:hover:not(:disabled) {
-		background: #232428;
-	}
 </style>

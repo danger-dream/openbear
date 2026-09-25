@@ -8,6 +8,8 @@ import {renderToString} from "vue/server-renderer";
 import {parse} from "@vue/compiler-sfc";
 import {projectOperationMessages, eventDisplayTimeMs, eventStartedAtMs, eventUpdatedAtMs} from "../../timelineProjection.js";
 import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conversationTimeline.js";
+import {visibilitySelectionClasses, selectVisibilityRow} from './messageVisibility.js';
+import {isInlineProcess} from './conversationWork.js';
 
 // Use the actual display/usage functions, omitting only browser-only icon/markdown imports.
 const displayUrl = new URL(`./.turn-footer-display-${process.pid}.mjs`, import.meta.url);
@@ -26,21 +28,30 @@ const script = descriptor.scriptSetup.content.replace(/^import[\s\S]*?;\n/gm, ""
 const render = compile(descriptor.template.content);
 const setupNames = [...script.matchAll(/^(?:async )?function (\w+)\(/gm)].map(match => match[1]);
 const slot = {inheritAttrs: false, setup: (_, {slots}) => () => slots.default?.()};
-function turnList(turns, running = false) {
+function turnList(turns, running = false, hiddenIds = []) {
   const copies = [];
   const props = {turns, running, conversationUuid: "test-conversation", detailKey: () => "detail", isDetailOpen: () => false, activeToolResultIndex: () => 0};
-  const context = vm.createContext({ref, ...display, conversationTimelineEntries, shouldRenderAssistantDivider,
+  const hidden = new Set(hiddenIds);
+  const visibility = {hiddenIds: ref(hidden), selecting: ref(false), selected: ref(new Set()), canTarget: () => true, isHidden: value => hidden.has(value?.operation?.opId || value?.opId || value?.eventKey || value?.id)};
+  const context = vm.createContext({ref, ...display, isInlineProcess, conversationTimelineEntries, shouldRenderAssistantDivider, visibilitySelectionClasses, selectVisibilityRow,
+    useMessageVisibility: () => visibility,
     projectedEventDisplayTimeMs: eventDisplayTimeMs, projectedEventStartedAtMs: eventStartedAtMs, projectedEventUpdatedAtMs: eventUpdatedAtMs,
     defineProps: () => props, defineEmits: () => () => {}, referenceDisplayText: value => value,
     copyTextToClipboard: async text => copies.push(text), ElMessage: {success() {}, error() {}},
     window: {clearTimeout() {}, setTimeout() { return 1; }},
   });
   vm.runInContext(script, context);
-  const app = createSSRApp({render, setup: () => vm.runInContext(`({props, emit, copiedMessageKey, ${setupNames.join(", ")}})`, context)});
+  const app = createSSRApp({render, setup: () => vm.runInContext(`({props, emit, visibility, visibilitySelectionClasses, selectVisibilityRow, copiedMessageKey, ${setupNames.join(", ")}})`, context)});
   for (const name of ["el-tooltip", "el-icon", "el-image", "Check", "CopyDocument", "RefreshLeft", "Link"]) app.component(name, slot);
+  app.component("MessageVisibilityAction", {render: () => null});
+  // This suite isolates footer/copy contracts. Work grouping itself is mounted
+  // with its real lifecycle in conversationWork.integration.test.mjs.
+  app.component('ConversationWorkBlock', {props: ['entries'], setup: (p, {slots}) => () => p.entries.map((entry, conversationIndex) => slots.default({entry, conversationIndex}))});
+  app.component('ConversationProcessEvent', {props: ['event'], setup: p => () => h('div', {'data-event-id': p.event.id}, p.event.message?.reasoning || '上下文压缩')});
+  app.directive('message-long-press', {getSSRProps: () => ({})});
   app.component("ConsoleMarkdown", {props: ["text"], setup: props => () => h("p", props.text)});
   app.component("TurnEvent", {props: ["event"], setup: props => () => h("div", {"data-event-id": props.event.id}, props.event.message?.content || "上下文压缩")});
-  return {props, copies, html: () => renderToString(app), run: code => vm.runInContext(code, context)};
+  return {props, copies, hidden, html: () => renderToString(app), run: code => vm.runInContext(code, context)};
 }
 const answer = (id = "answer", content = "已完成") => ({kind: "answer", id, message: {content, createdAt: 1789044000, live: false}});
 const savedStats = () => ({live: false, durationMs: 128664,
@@ -124,4 +135,19 @@ test("ordinary and legacy answers retain the same footer and intermediate hover 
   assert.match(footer(html), /assistant-message-time/);
   assert.match(footer(html), /aria-label="复制消息"/);
   assert.doesNotMatch(footer(html), /turn-token-usage/);
+});
+
+test('hidden user content and attachments leave no DOM; copied answer excludes hidden segments', async () => {
+  const turn = {id: 'hidden', user: {opId: 'u', content: 'private user', attachments: [{fileName: 'private.pdf', contentUrl: '/private.pdf'}]}, events: [answer('a', 'private answer'), answer('b', 'public answer')], stats: savedStats()};
+  const component = turnList([turn], false, ['u', 'a']);
+  const html = await component.html();
+  assert.doesNotMatch(html, /private user|private answer|private.pdf/);
+  assert.match(html, /public answer/);
+  assert.equal(component.run('assistantTurnRawContent(props.turns[0])'), 'public answer');
+  assert.equal(turn.user.content, 'private user');
+  const restored = await turnList([turn]).html();
+  assert.ok(restored.indexOf('private user') < restored.indexOf('private answer'));
+  assert.ok(restored.indexOf('private answer') < restored.indexOf('public answer'));
+  const allHidden = await turnList([turn], false, ['u', 'a', 'b']).html();
+  assert.doesNotMatch(allHidden, /class="turn-block"|assistant-message-meta|private|public answer/);
 });

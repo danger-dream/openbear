@@ -1,7 +1,7 @@
 <template>
   <img
     class="bear-logo"
-    src="/assets/brand/openbear-d32cdfb09c17.png"
+    src="/assets/brand/openbear-transparent-4dd91a4222f8.png"
     width="512"
     height="512"
     alt="OpenBear"
@@ -16,6 +16,6 @@
   height: 100%;
   object-fit: contain;
   border-radius: 22%;
-  filter: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.35));
+  /* The small UI asset is transparent; the preview retains the original. */
 }
 </style>

@@ -26,7 +26,7 @@ class MCPToolCallError(MCPError):
     """MCP tools/call failed."""
 
 
-class MCPTimeoutError(MCPError):
+class MCPTimeoutError(MCPError, TimeoutError):
     """MCP operation timed out."""
 
 

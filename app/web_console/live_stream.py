@@ -545,16 +545,21 @@ class _WebStreamRenderer:
             return
         event = self._pending_delta
         now_ms = int(time.monotonic() * 1000)
+        # WebSocket sends only durable _webFrames; broadcast-only deltas do not
+        # reach the browser. Keep active reasoning at the existing 50 ms UI
+        # cadence, rather than silently reducing its preview to four updates/s.
+        # Ordinary Markdown output retains its existing persistence cadence.
+        persist_interval_ms = 50 if event.get("reasoning") and not event.get("text") else 250
         persist = (
             force_persist
             or not self._last_delta_persist_ms
-            or now_ms - self._last_delta_persist_ms >= 250
+            or now_ms - self._last_delta_persist_ms >= persist_interval_ms
         )
         await self._emit_now(event, persist=persist)
         if persist:
-            # A broadcast-only repaint is not a durable flush. Keep its latest
-            # snapshot pending so the next tool/status boundary can force it
-            # into the operation log before the live draft is cleared.
+            # Non-durable updates are only in-memory live snapshots. Keep the
+            # latest pending so a tool/status boundary can force it into the
+            # operation log before the live draft is cleared.
             if self._pending_delta is event:
                 self._pending_delta = None
             self._last_delta_persist_ms = now_ms

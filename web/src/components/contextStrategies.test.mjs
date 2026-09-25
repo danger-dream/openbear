@@ -8,17 +8,18 @@ import {renderToString} from "vue/server-renderer";
 import {parse, compileTemplate} from "@vue/compiler-sfc";
 import {normalizedRunDefaults, sparseRunDefaults, updateRunDefault, runDefaultOption} from "./folderRunDefaults.js";
 import {contextCompactionView, compactAgentStepActivityLines} from "../views/consoleView/agentPlanPresentation.js";
+import {scrollModelListAbove} from "./modelDragAutoScroll.js";
 
 const read = file => fs.readFileSync(new URL(file, import.meta.url), "utf8");
 
 function picker(t) {
   const source = parse(read("./ModelOrderPicker.vue")).descriptor.scriptSetup.content.replace(/^import .*?;\n/gm, "");
-  const props = reactive({modelValue: [], disabled: false, models: [
+  const props = reactive({modelValue: [], disabled: false, label: "摘要模型", emptyLabel: "使用当前执行模型", footerText: "", models: [
     {key: "one/a", label: "A model", provider: "one"}, {key: "two/b", label: "B model", provider: "two"},
     {key: "one/c", label: "C model", provider: "one"},
   ]});
   const emitted = [];
-  const context = vm.createContext({computed, ref, nextTick, watch: (...args) => {
+  const context = vm.createContext({computed, ref, nextTick, scrollModelListAbove, onBeforeUnmount: fn => t?.after(fn), watch: (...args) => {
       const stop = watch(...args);
       t?.after(stop);
       return stop;
@@ -113,7 +114,7 @@ test("picker template keeps choices and reorder list in the real body-teleported
     harness.props.modelValue = ["one/a", "two/b"];
     harness.run(`open.value = ${isOpen}`);
     const app = createSSRApp({render: compile(descriptor.template.content),
-      setup: () => harness.run("({props, trigger, floating, open, query, input, byKey, selected, triggerLabel, groups, toggle, move, closePicker, toggleOpen})"),
+      setup: () => harness.run("({props, trigger, floating, orderScrollContainer, open, query, input, byKey, selected, triggerLabel, groups, toggle, move, closePicker, toggleOpen, startOrderScroll, finishOrderScroll})"),
       components: {FloatingPanel, draggable}});
     const context = {};
     const html = await renderToString(app, context);
@@ -137,6 +138,39 @@ test("picker template keeps choices and reorder list in the real body-teleported
   assert.match(style, /\.picker-chevron\s*\{[^}]*display: block;[^}]*flex: 0 0 14px/);
   assert.match(style, /\.model-picker-content\s*\{[^}]*min-height: 0;[^}]*overflow-y: auto/);
   assert.doesNotMatch(descriptor.template.content, /⌄|model-picker-fallback/);
+});
+
+test("model picker drag scrolls its actual clipped panel content even if the pointer is over a row or header", async t => {
+  const harness = picker(t);
+  harness.props.modelValue = ["one/a", "two/b", "one/c"];
+  harness.run("open.value = true");
+  const {descriptor} = parse(read("./ModelOrderPicker.vue"));
+  const options = [];
+  const Probe = {
+    setup(_props, {attrs}) { options.push(attrs); return () => h("div"); },
+  };
+  const Panel = {props: ["open", "anchor", "placement", "width", "label"], emits: ["close"],
+    render() { return this.open ? this.$slots.default() : null; }};
+  const render = async () => {
+    const app = createSSRApp({render: compile(descriptor.template.content),
+      setup: () => harness.run("({props, trigger, floating, orderScrollContainer, open, query, input, byKey, selected, triggerLabel, groups, toggle, move, closePicker, toggleOpen, startOrderScroll, finishOrderScroll})"),
+      components: {FloatingPanel: Panel, draggable: Probe}});
+    await renderToString(app);
+    return options.at(-1);
+  };
+  const initial = await render();
+  assert.equal(initial.scroll, true, "before the panel DOM ref mounts, Sortable can discover an ancestor");
+  assert.equal(typeof initial.onStart, "function");
+  assert.equal(typeof initial.onEnd, "function");
+  harness.run("var scrollTarget = {scrollTop: 650, scrollHeight: 1500, clientHeight: 280}; orderScrollContainer.value = scrollTarget");
+  assert.deepEqual(plain((await render()).scroll), plain(harness.run("scrollTarget")), "Sortable must target the panel's scrollable content, not the dragged list or page");
+  assert.equal(initial["force-auto-scroll-fallback"], true, "run Sortable auto-scroll even in native desktop DnD");
+  assert.equal(initial["bubble-scroll"], false, "do not scroll the page behind the floating panel");
+  assert.ok(initial["scroll-sensitivity"] >= 60);
+  assert.ok(initial["scroll-speed"] > 10);
+  const style = descriptor.styles[0].content;
+  assert.match(style, /\.model-picker-content\s*\{[^}]*overflow-y: auto/);
+  assert.match(descriptor.template.content, /ref="orderScrollContainer" class="model-picker-content"/);
 });
 
 test("strategy inheritance is sparse and an explicit child override wins", () => {
@@ -170,7 +204,8 @@ test("window and summary cards separate estimated next input from actual summary
   assert.equal(window.cardTitle, "上下文压缩");
   assert.equal(window.summaryChars, 0);
   assert.equal(window.summaryRef, "");
-  assert.match(window.output, /移出 10 组/);
+  assert.equal(window.cardPreview, "200k → 32k · 0.0s");
+  assert.doesNotMatch(window.output, /移出|保留 .*组/);
   assert.match(window.output, /估算/);
   assert.match(window.output, /待下一次请求实测/);
   assert.doesNotMatch(window.output, /摘要正文|旧记录/);
@@ -210,11 +245,12 @@ test("Agent activity's actual Vue template renders strategy facts and summary on
     app.component("ToolArgumentsView", {render: () => h("span")});
     app.component("ConsoleMarkdown", {props: ["text"], render() { return h("article", this.text); }});
     const html = await renderToString(app);
-    assert.match(html, /上下文估算/);
+    assert.match(html, /估算/);
     assert.match(html, /待下一次请求实测/);
     assert.match(html, /耗时/);
     if (strategy === "sliding_window") {
-      assert.match(html, /移出 10 组/);
+      assert.match(html, /200,000 → 30,000/);
+      assert.doesNotMatch(html, /移出|保留 .*组/);
       assert.doesNotMatch(html, /Saved summary body|摘要正文|未持久化压缩摘要|<article/);
     } else {
       assert.match(html, /provider\/model/);

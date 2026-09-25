@@ -107,6 +107,8 @@ def test_root_retry_wait_maps_each_attempt_to_stable_model_retry_operation():
             "maxRetries": 10,
             "delayMs": 5000,
             "retryAtMs": 123456,
+            "waitId": "current-wait-2",
+            "cancelable": True,
             "reason": "rate_limit",
             "summary": "请求频率过高，请稍后重试",
             "error": "busy",
@@ -140,6 +142,8 @@ def test_root_retry_wait_maps_each_attempt_to_stable_model_retry_operation():
     assert start_spec["run_id"] == end_spec["run_id"] == "run-1"
     assert start_spec["turn_uuid"] == end_spec["turn_uuid"] == "turn-1"
     assert start_spec["payload"]["attempt"] == 2
+    assert start_spec["payload"]["waitId"] == "current-wait-2"
+    assert start_spec["payload"]["cancelable"] is True
     assert start_spec["payload"]["maxRetries"] == 10
     assert start_spec["payload"]["delayMs"] == 5000
     assert start_spec["payload"]["reason"] == "rate_limit"

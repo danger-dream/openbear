@@ -915,14 +915,8 @@ class InteractionTelegram:
         return last
 
     async def _deliver_terminal(self, delivery: InteractionDelivery, item: dict[str, Any] | None) -> int:
-        status = _status(item) or "interrupted"
-        labels = {
-            "answered": "✅ 已处理",
-            "cancelled": "⏹ 已放弃",
-            "timeout": "⌛ 已超时",
-            "interrupted": "⏹ 已中断，请重新发起",
-        }
-        body = f"<b>{labels.get(status, '⏹ 已结束')}</b>\n\n该交互已不能再通过此消息作答。"
+        # Every registered prompt belongs to this interaction, including older
+        # questionnaire questions. A completed interaction must leave no TG panel.
         cur = await self.db.conn.execute(
             "SELECT telegram_message_id FROM interaction_tg_messages WHERE interaction_id=? ORDER BY id",
             (delivery.interaction_id,),
@@ -931,10 +925,10 @@ class InteractionTelegram:
         for row in await cur.fetchall():
             message_id = int(row["telegram_message_id"] or 0)
             try:
-                await edit_rich(self.bot, delivery.owner_chat_id, message_id, body, reply_markup=None)
+                await self.bot.delete_message(delivery.owner_chat_id, message_id)
             except (TelegramBadRequest, TelegramForbiddenError):
-                # The prompt may have been deleted by the user. Continue removing
-                # controls from every other known prompt.
+                # Already deleted or no longer deletable: continue cleaning the
+                # other messages. Transient failures escape for outbox retry.
                 continue
             last = message_id
         return last

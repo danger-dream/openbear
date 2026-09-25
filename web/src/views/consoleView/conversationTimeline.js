@@ -16,14 +16,14 @@ function isFailedAgentEvent(event = {}) {
 }
 
 export function isConversationTimelineEvent(event, _primaryToolName = "", agentEvent = false) {
-	if (event?.kind === "answer") return Boolean(String(event?.message?.content || "").trim());
+	if (event?.kind === "answer") return Boolean(String(event?.message?.content || "").trim() || String(event?.message?.reasoning || "").trim());
 	if (event?.kind === "live_status") return Boolean(event?.persistentRunIndicator || event?.interruption);
 	if (event?.kind === "model_retry") return true;
 	if (event?.kind === "live_agent") return !isFailedAgentEvent(event);
 	if (isUserInteractionEvent(event)) return true;
-	return event?.kind === "tool" && (
-		agentEvent ? !isFailedAgentEvent(event) : isContextCompactionOperation(event?.operation)
-	);
+	if (event?.operation?.internal) return isContextCompactionOperation(event.operation);
+	if (event?.kind === 'live_tool' || event?.kind === 'tool_group') return true;
+	return event?.kind === "tool" && (!agentEvent || !isFailedAgentEvent(event));
 }
 
 function isTextAnswer(event) {
@@ -38,6 +38,10 @@ export function shouldRenderAssistantDivider(entries = [], index = 0) {
 
 export function conversationTimelineEntries(events = [], primaryToolNameForEvent = () => "", isAgentEventForEvent = () => false) {
 	return (Array.isArray(events) ? events : [])
-		.map((event, index) => ({event, index}))
+		.flatMap((event, index) => {
+			if (event?.kind !== 'answer' || !String(event.message?.reasoning || '').trim()) return [{event, index}];
+			const reasoning = {event, index, part: 'reasoning'};
+			return String(event.message?.content || '').trim() ? [reasoning, {event, index, part: 'answer'}] : [reasoning];
+		})
 		.filter(({event}) => isConversationTimelineEvent(event, primaryToolNameForEvent(event), isAgentEventForEvent(event)));
 }

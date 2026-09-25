@@ -3,6 +3,7 @@ import {computed, markRaw, nextTick, onBeforeUnmount, onMounted, provide, ref, w
 import {ElMessage, ElMessageBox} from "element-plus";
 import {
 	ChatLineRound,
+	Hide,
 	Loading,
 	Lock,
 	Unlock,
@@ -11,13 +12,17 @@ import ConsoleComposer from "./ConsoleComposer.vue";
 import {referenceErrorText, referenceDisplayText, referencesInText} from "../../references/codec.js";
 import {referenceCatalog, acceptActivityReadReceipt} from "../../references/catalog.js";
 import {createActivityReadTracker, withActivityReadVersion} from "../../conversationActivity.js";
+import {initialConversationTitle} from "../../conversationTitle.js";
 import ConsoleHeader from "./ConsoleHeader.vue";
 import MobileConversationTools from "./MobileConversationTools.vue";
 import TurnList from "./TurnList.vue";
+import {WORK_MOTION} from './conversationWork.js';
+import HiddenMessagesDrawer from "./HiddenMessagesDrawer.vue";
+import MessageVisibilityBar from "./MessageVisibilityBar.vue";
+import MessageVisibilityMobileMenu from "./MessageVisibilityMobileMenu.vue";
+import {createMessageVisibility, MESSAGE_VISIBILITY} from "./messageVisibility.js";
 import TurnMinimap from "./TurnMinimap.vue";
 import TaskMemoryDrawer from "./TaskMemoryDrawer.vue";
-import TurnWorkDetailPanel from "./TurnWorkDetailPanel.vue";
-import WorkDetailIcon from "./WorkDetailIcon.vue";
 import {chooseActiveTurnIndex} from "./activeTurn.js";
 import {
 	decideAgentAutoOpen,
@@ -71,6 +76,7 @@ import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
 	deriveOperationRunState,
+	isRootRunTerminalFrame,
 	isTerminalOperationFrame,
 	normalizeOperations,
 	projectOperationMessages as projectOperationMessagesFromOperations,
@@ -125,6 +131,8 @@ const INITIAL_TIMELINE_LIMIT = 200;
 const LOAD_EARLIER_SCROLL_THRESHOLD = 180;
 const props = defineProps({
 	conversationUuid: {type: String, default: ""},
+	canonicalTitle: {type: String, default: ""},
+	conversationPath: {type: String, default: ""},
 	navigationObscured: {type: Boolean, default: false},
 	// Immutable ownership for the current local draft. App changes it only after
 	// an explicit reassignment confirmation; persisted conversations use it as the
@@ -170,10 +178,7 @@ const scroller = ref(null);
 const autoScrollLocked = ref(true);
 const scrollerOverflow = ref(false);
 const activeTurnIndex = ref(0);
-const workDetailOpen = ref(false);
 const taskMemoryDrawer = ref(null);
-const workDetailTooltip = ref(null);
-const workDetailTooltipSuppressed = ref(false);
 const composer = ref(null);
 const composerHeight = ref(135);
 const pendingAttachments = ref([]);
@@ -212,7 +217,7 @@ provide(TOOL_DETAIL_CACHE_KEY, toolDetailCache);
 const hasMoreBefore = ref(false);
 const nextBeforeDisplaySeq = ref(null);
 const timelinePageInFlight = ref(null);
-const retryCancelPending = ref(false);
+const retryActionPending = ref({});
 const deletingTurnUuid = ref("");
 let ws = null;
 let wsConversationUuid = "";
@@ -228,7 +233,6 @@ let loadRequestGeneration = 0;
 let scrollFrame = 0;
 let activeTurnScrollFrame = 0;
 let activeTurnScrollTimer = 0;
-let workDetailTooltipReleaseTimer = 0;
 let lastActiveTurnScrollUpdateAt = 0;
 let streamFlushTimer = 0;
 let streamFlushFrame = 0;
@@ -281,18 +285,23 @@ const quickPrompts = [
 
 const displayMessages = computed(() => [...messages.value]);
 
-async function cancelActiveRetry(event = {}) {
+async function controlActiveRetry(event = {}, action = "cancel") {
 	const retry = event?.retry && typeof event.retry === "object" ? event.retry : event;
-	if (!activeConversationUuid.value || !retry?.active || retryCancelPending.value) return;
-	retryCancelPending.value = true;
+	const waitId = String(retry?.waitId || "");
+	if (!activeConversationUuid.value || !retry?.active || !waitId || retryActionPending.value.waitId === waitId) return;
+	retryActionPending.value = {waitId, action};
 	try {
-		const data = await Api.conversationCancelRetry(activeConversationUuid.value, String(retry.taskUuid || ""));
-		if (!data?.accepted) throw new Error("当前重试等待已结束");
-		ElMessage.success("已请求取消模型重试；之前完成的进度会保留");
+		const taskUuid = String(retry.taskUuid || "");
+		const data = action === "retry"
+			? await Api.conversationRetryNow(activeConversationUuid.value, waitId, taskUuid)
+			: await Api.conversationCancelRetry(activeConversationUuid.value, waitId, taskUuid);
+		if (!data?.accepted) throw new Error("当前重试等待已结束或已收到操作");
+		ElMessage.success(action === "retry"
+			? "已请求立即重试"
+			: taskUuid ? "已请求取消 Agent 重试；子任务会结束，主会话可能继续" : "已请求取消重试；本轮进度和统计会保留");
 	} catch (error) {
+		if (retryActionPending.value.waitId === waitId) retryActionPending.value = {};
 		ElMessage.error(apiError(error));
-	} finally {
-		retryCancelPending.value = false;
 	}
 }
 
@@ -335,10 +344,6 @@ const usage = computed(() => {
 		cost_usd: Number(base.cost_usd || 0),
 	};
 });
-const sessionShort = computed(() => {
-	const uuid = chatState.value?.sessionUuid || "";
-	return uuid ? uuid.slice(0, 8) : "新会话";
-});
 const serverContextUsage = computed(() => {
 	const value = chatState.value?.contextUsage;
 	return value && typeof value.known === "boolean" ? value : null;
@@ -357,21 +362,23 @@ const modelCallRows = computed(() => Array.isArray(chatState.value?.modelCalls) 
 const toolCallRows = computed(() => Array.isArray(chatState.value?.toolCalls) ? chatState.value.toolCalls : []);
 const turns = computed(() => withTransientIdleThinking(attachTurnStats(buildTurns(displayMessages.value), modelCallRows.value, toolCallRows.value)));
 const activeTurn = computed(() => turns.value[Math.min(Math.max(0, activeTurnIndex.value), Math.max(0, turns.value.length - 1))] || null);
-const activeTurnWorking = computed(() => {
-	const events = Array.isArray(activeTurn.value?.events) ? activeTurn.value.events : [];
-	// Use the same projected persistent indicator that drives the three dots in the
-	// conversation. This keeps both affordances on exactly the same lifecycle.
-	return events.some((event) => event?.kind === "live_status" && event?.persistentRunIndicator);
-});
-const activeTurnHasWork = computed(() => {
-	const events = Array.isArray(activeTurn.value?.events) ? activeTurn.value.events : [];
-	return events.some((event) => {
-		if (event?.kind === "answer") return Boolean(String(event?.message?.reasoning || "").trim());
-		return !(event?.kind === "live_status" && event?.persistentRunIndicator && !event?.preview);
-	});
-});
 const activeConversationUuid = computed(() => props.conversationUuid || chatState.value?.conversationUuid || "");
+const messageVisibility = createMessageVisibility({
+	conversationUuid: activeConversationUuid, operations: operationsById, api: Api,
+	preserveSelectionPosition: () => window.matchMedia('(max-width: 760px)').matches,
+	beforeChange: () => ({uuid: activeConversationUuid.value, anchor: captureScrollAnchor()}),
+	afterChange: async saved => { await nextTick(); if (saved?.uuid === activeConversationUuid.value) applyReadingAnchor(saved.anchor); },
+	onError: error => ElMessage.error(apiError(error)),
+});
+const hiddenMessageCount = computed(() => messageVisibility.items.value.length);
+provide(MESSAGE_VISIBILITY, messageVisibility);
+provide(WORK_MOTION, {capture: captureWorkMotion, restore: restoreWorkMotion, finish: finishWorkMotion});
 const isLocalConversation = computed(() => String(props.conversationUuid || "").startsWith("local:"));
+const modelMutationCounts = ref(new Map());
+function modelMutationKey(conversationUuid = activeConversationUuid.value, folderId = props.folderId) {
+	return `${String(conversationUuid || "")}\u0000${String(folderId || "")}`;
+}
+const modelMutating = computed(() => Number(modelMutationCounts.value.get(modelMutationKey()) || 0) > 0);
 let runConfigInteractionGeneration = 0;
 const runConfigSaves = createRunConfigSaveQueue({
 	captureScope: () => runConfigInteractionGeneration,
@@ -386,6 +393,8 @@ const displayedRunConfig = computed(() => runConfigForDisplay(
 	activeConversationUuid.value,
 ));
 const conversationTitle = computed(() => {
+	const canonical = String(props.canonicalTitle || "").trim();
+	if (canonical) return canonical;
 	const title = String(chatState.value?.conversation?.title || "").trim();
 	if (title) return title;
 	return isLocalConversation.value ? "新会话" : "会话";
@@ -471,7 +480,9 @@ const contextDisplay = computed(() => {
 });
 const sessionLedgerUsage = computed(() => normalizeLedgerUsageBaseline(chatState.value?.usage || {}));
 const totalTokenParts = computed(() => ledgerTokenParts(sessionLedgerUsage.value));
-const totalTokensDisplay = computed(() => tokenLine(totalTokenParts.value));
+const totalTokens = computed(() => totalTokenParts.value.input + totalTokenParts.value.output);
+const totalTokensDisplay = computed(() => fmtTokens(totalTokens.value));
+const totalTokensDetail = computed(() => `${totalTokens.value.toLocaleString("en-US")} Tokens（输入 + 输出，缓存已包含在输入中）\n${tokenLine(totalTokenParts.value)}`);
 const totalDurationMs = computed(() => {
 	const liveMs = latestStatsPayload.value?.durationMs || lastStats.value?.durationMs || 0;
 	return totalSessionDurationMs({
@@ -490,7 +501,7 @@ const totalDurationDisplay = computed(() => fmtMs(totalDurationMs.value));
 const totalCostUsd = computed(() => Number(sessionLedgerUsage.value.cost_usd || 0));
 const totalCostDisplay = computed(() => fmtCost(totalCostUsd.value));
 const canSend = computed(() => {
-	if (sendPending.value || compacting.value || attachmentRestoring.value) return false;
+	if (sendPending.value || modelMutating.value || compacting.value || attachmentRestoring.value) return false;
 	if (running.value) return Boolean(draft.value.trim()) && pendingAttachments.value.length === 0;
 	return Boolean(draft.value.trim() || pendingAttachments.value.length);
 });
@@ -828,6 +839,27 @@ function resetOperationStore(conversationUuid = "") {
 	stateStatsByOpId.clear();
 	lastFrameSeq.value = 0;
 	resetTimelinePagination(conversationUuid);
+}
+
+function applyCommittedTurnDeletion(conversationUuid, deletedRootTurns = []) {
+	const deleted = new Set((Array.isArray(deletedRootTurns) ? deletedRootTurns : []).map(String));
+	const survivors = deleted.size ? orderedOperationsList().filter((op) => (
+		!deleted.has(String(op.turnId || op.turnUuid || ""))
+		&& !deleted.has(String(op.runRootTurnId || op.runRootTurnUuid || ""))
+	)) : [];
+	closeWs();
+	loadRequestGeneration += 1;
+	resetOperationStore(conversationUuid);
+	replaceOperationSnapshots(survivors);
+	messages.value = projectOperationMessages(survivors);
+	chatState.value = {...(chatState.value || {}), operations: survivors, running: false, backgroundRunning: false};
+	running.value = false;
+	foregroundRunning.value = false;
+	rootTurnRunning.value = false;
+	clearActiveRun();
+	lastStats.value = null;
+	runStartedAt.value = 0;
+	status.value = "就绪";
 }
 
 function clearUiCaches() {
@@ -1331,20 +1363,6 @@ function closeComposerMenus() {
 	modelMenuOpen.value = false;
 }
 
-async function toggleWorkDetailPanel() {
-	workDetailTooltipSuppressed.value = true;
-	workDetailTooltip.value?.hide?.();
-	if (workDetailTooltipReleaseTimer) window.clearTimeout(workDetailTooltipReleaseTimer);
-	// Let Element Plus remove the teleported Popper before the reference button
-	// moves with the 240 ms work-detail layout transition.
-	await nextTick();
-	workDetailOpen.value = !workDetailOpen.value;
-	workDetailTooltipReleaseTimer = window.setTimeout(() => {
-		workDetailTooltipReleaseTimer = 0;
-		workDetailTooltipSuppressed.value = false;
-	}, 300);
-}
-
 async function onConsoleClick(event) {
 	const target = event?.target;
 	const button = target?.closest?.(".md-code-copy");
@@ -1420,6 +1438,20 @@ function isRunConfigInteractionCurrent(conversationUuid, localAtRequest) {
 	);
 }
 
+function beginModelMutation() {
+	const key = modelMutationKey();
+	const pending = modelMutationCounts.value;
+	let finished = false;
+	pending.set(key, Number(pending.get(key) || 0) + 1);
+	return () => {
+		if (finished) return;
+		finished = true;
+		const remaining = Math.max(0, Number(pending.get(key) || 0) - 1);
+		if (remaining) pending.set(key, remaining);
+		else pending.delete(key);
+	};
+}
+
 async function selectContextStrategy(strategy) {
 	if (strategySaving.value || !["sliding_window", "model_summary"].includes(strategy)) return;
 	const uuid = String(activeConversationUuid.value || "");
@@ -1453,6 +1485,7 @@ async function selectModel(model) {
 	const wasRunning = running.value;
 	const conversationUuid = String(activeConversationUuid.value || "");
 	const localAtRequest = isLocalConversation.value;
+	const finishMutation = beginModelMutation();
 	const switchNow = async () => {
 		let applied = true;
 		if (localAtRequest) {
@@ -1500,6 +1533,8 @@ async function selectModel(model) {
 		}
 		if (code === "run_is_active") ElMessage.warning("当前有运行中的任务，结束后再切换模型");
 		else ElMessage.error(code);
+	} finally {
+		finishMutation();
 	}
 }
 
@@ -1877,7 +1912,9 @@ function attachTurnStats(turnList, modelRows, toolRows) {
 		const stats = turn.localStats || statsForTurn(turn, modelBuckets[idx] || [], toolBuckets[idx] || []);
 		return {
 			...turn,
-			stats: reconcileStatsWithAgentCards(turn, stats),
+			// No assistant content was produced: retain the user turn and stop state,
+			// without projecting a duration-only assistant reply.
+			stats: turn.events.length ? reconcileStatsWithAgentCards(turn, stats) : null,
 		};
 	});
 	return withStats.map((turn, idx) => shouldCombineControllerStats(turn, withStats[idx - 1])
@@ -2397,9 +2434,11 @@ function applyOperationFrameMessage(frame, options = {}) {
 	const scrollImpact = operationScrollImpact(frame, appliedOperation, {visibleChanged: changed});
 	pendingProjectionOps = orderedOperationsList();
 	pendingScrollImpact = mergeScrollImpact(pendingScrollImpact, scrollImpact);
-	if (!options?.resyncing && isTerminalOperationFrame(frame)) {
+	if (!options?.resyncing && isRootRunTerminalFrame(frame)) {
 		pendingTerminalFrame = {frame: operationDebugRow(appliedOperation), frameSeq: Number(frame.frameSeq || 0) || 0};
 	}
+	// Every terminal operation remains an immediate projection boundary, but only
+	// the root controller run is an authoritative full-state calibration boundary.
 	scheduleProjectedMessagesFlush({force: isTerminalOperationFrame(frame)});
 	debugFrames("frame-after-apply", {changed, scrollImpact, applied: operationDebugRow(appliedOperation)});
 	return {applied: true, scrollImpact, visibleChanged: changed};
@@ -2551,6 +2590,39 @@ function scrollerTurnBoxes(el) {
 		return {node, index: Number(node.dataset.turnIndex || 0), top: rect.top, bottom: rect.bottom};
 	});
 	return {scrollerRect, rows};
+}
+
+// Height animation preserves either the reading character or, when that
+// character is being folded, the disclosure's stationary header.
+function captureWorkMotion(element) {
+	const scroll = scroller.value;
+	if (!scroll) return null;
+	const anchor = captureScrollAnchor();
+	const marker = anchor?.content?.node && element.contains(anchor.content.node)
+		? element.previousElementSibling : null;
+	const saved = {uuid: activeConversationUuid.value, generation: loadRequestGeneration,
+		anchor, marker, markerTop: marker?.getBoundingClientRect().top,
+		follow: autoScrollLocked.value, scroll, cancelled: false};
+	saved.cancel = () => { saved.cancelled = true; };
+	scroll.addEventListener('wheel', saved.cancel, {passive: true});
+	scroll.addEventListener('touchstart', saved.cancel, {passive: true});
+	return saved;
+}
+function restoreWorkMotion(saved) {
+	if (!saved || saved.cancelled || saved.uuid !== activeConversationUuid.value || saved.generation !== loadRequestGeneration) return;
+	if (saved.follow && autoScrollLocked.value) {
+		runProgrammaticScroll(() => { saved.scroll.scrollTop = saved.scroll.scrollHeight; }, 120);
+	} else if (!saved.follow && !autoScrollLocked.value) {
+		if (saved.marker?.isConnected) runProgrammaticScroll(() => {
+			saved.scroll.scrollTop += saved.marker.getBoundingClientRect().top - saved.markerTop;
+		}, 120);
+		else applyReadingAnchor(saved.anchor);
+	}
+}
+function finishWorkMotion(saved) {
+	if (!saved) return;
+	saved.scroll.removeEventListener('wheel', saved.cancel);
+	saved.scroll.removeEventListener('touchstart', saved.cancel);
 }
 
 function captureScrollAnchor() {
@@ -3073,7 +3145,12 @@ function handleWsMessage(raw, source = {}) {
 		if (event) taskMemoryChangedEvent.value = event;
 		return;
 	}
+	if (data.type === "message_visibility.changed") {
+		messageVisibility.apply(data.visibility);
+		return;
+	}
 	if (data.type === "bootstrap") {
+		messageVisibility.apply(data.messageVisibility);
 		updatePendingConfirmations(data.pendingConfirmations || []);
 		updatePendingSteering(data.pendingSteering || []);
 		return;
@@ -3086,6 +3163,7 @@ function handleWsMessage(raw, source = {}) {
 	if (data.type === "state") {
 		debugFrames("ws-state", {state: data.state});
 		const state = data.state || {};
+		messageVisibility.apply(state.messageVisibility, false);
 		const beforeSignature = visibleEventSignatureForMessages(messages.value);
 		const preserveAnchor = !autoScrollLocked.value ? captureScrollAnchor() : null;
 		const ops = loadOperationsFromState(state);
@@ -3117,10 +3195,7 @@ function handleWsMessage(raw, source = {}) {
 		return;
 	}
 	if (data.type === "conversation_reset") {
-		lastFrameSeq.value = 0;
-		conversationStateRequests.invalidate();
-		operationFrameBuffer.reset();
-		closeWs();
+		applyCommittedTurnDeletion(activeConversationUuid.value, data.deletedRootTurns);
 		void load({scrollMode: "preserve", replaceOperations: true});
 		return;
 	}
@@ -3264,7 +3339,7 @@ async function ensureServerConversationForSend(firstText, pending) {
 	if (!isLocalConversation.value) return activeConversationUuid.value;
 	await ensureLocalRunDefaults();
 	if (!outboundSends.isCurrent(pending)) return "";
-	const title = referenceDisplayText(firstText || "新会话").replace(/\s+/g, " ").trim().slice(0, 36) || "新会话";
+	const title = initialConversationTitle(referenceDisplayText(firstText || "新会话"));
 	const created = await Api.createConversation({title, runConfig: completeLocalRunConfig(), folderId: props.folderId || ""});
 	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
@@ -3281,6 +3356,7 @@ async function ensureServerConversationForSend(firstText, pending) {
 }
 
 function applyLoadedConversationState(data, conversationUuid, {replaceOperations = false, runConfigVersionAtRequest = null} = {}) {
+	messageVisibility.apply(data.messageVisibility, false);
 	const mergeExisting = !replaceOperations
 		&& timelinePageConversationUuid === String(conversationUuid || "")
 		&& operationsById.value.size > 0;
@@ -3467,9 +3543,9 @@ async function deleteTurnSuffix(turn) {
 	try {
 		const result = await Api.deleteConversationTurnSuffix(conversationUuid, turnUuid);
 		if (!stillHere()) { emit("conversations-refresh"); return; }
-		lastFrameSeq.value = 0;
-		closeWs();
-		toolDetailCache.reset(conversationUuid);
+		// DELETE committed: remove only server-confirmed roots immediately. Keep
+		// surviving turns visible even when the fresh HTTP request is still pending.
+		applyCommittedTurnDeletion(conversationUuid, result?.deletedRootTurns);
 		await load({scrollMode: "bottom", replaceOperations: true});
 		emit("conversations-refresh");
 		if (!stillHere()) return;
@@ -3496,8 +3572,9 @@ async function deleteTurnSuffix(turn) {
 
 
 async function send() {
-	// Enter and click must share the same single-flight guard.
-	if (sendPending.value || outboundSends.current || attachmentRestoring.value) return;
+	// Enter and click must share the same single-flight guard. A model-source save
+	// must commit before WebSocket send refreshes and freezes the next run model.
+	if (sendPending.value || outboundSends.current || modelMutating.value || attachmentRestoring.value) return;
 	const text = draft.value.trim();
 	const referenceOrder = composer.value?.getReferenceOrder?.() || [];
 	if (!text && !pendingAttachments.value.length) return;
@@ -3515,7 +3592,7 @@ async function send() {
 	const files = attachments.map((item) => item.file);
 	const sentPreviewUrls = Object.values(attachmentPreviews.value).filter(Boolean);
 	const optimisticAttachments = localAttachmentPayload(attachments);
-	const finalText = text || (files.length ? "请根据我上传的附件回答。" : "");
+	const finalText = text || (files.length ? "请根据我发送的附件内容回答。" : "");
 	const pending = outboundSends.begin({
 		requestId,
 		conversationUuid: activeConversationUuid.value,
@@ -3795,7 +3872,6 @@ onBeforeUnmount(() => {
 	componentMounted = false;
 	conversationStateRequests.invalidate();
 	operationFrameBuffer.reset();
-	if (workDetailTooltipReleaseTimer) window.clearTimeout(workDetailTooltipReleaseTimer);
 	toolDetailCache.reset("");
 	terminalStateRefreshScheduler.dispose();
 	window.removeEventListener("openbear:console-refresh", handleExternalRefresh);
@@ -3813,17 +3889,19 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-	<section class="console-page h-full min-h-0 flex bg-white text-[#111827]" :class="{'work-detail-open': workDetailOpen}" :style="{'--console-composer-height': `${composerHeight}px`}" @click="onConsoleClick">
+	<section class="console-page h-full min-h-0 flex bg-ob-bg text-ob-text" :class="{'visibility-overlay-active': messageVisibility.selecting.value || messageVisibility.undoIds.value.length}" :style="{'--console-composer-height': `${composerHeight}px`}" @click="onConsoleClick">
 		<div class="console-main min-w-0 flex flex-1 flex-col">
 			<ConsoleHeader
 				:title="conversationTitle"
-				:subtitle="`${currentModel || '—'} · ${thinkingLabel(effectiveThinking)} · ${sessionShort}`"
+				:title-identity="activeConversationUuid"
+				:conversation-path="props.conversationPath"
 				:running="running"
 				:run-started-at="runStartedAt"
 				:status="status"
 				:context-display="contextDisplay"
 				:tokens-text="totalTokensDisplay"
-				:duration-text="totalDurationDisplay"
+				:tokens-detail="totalTokensDetail"
+				:duration-ms="totalDurationMs"
 				:cost-text="totalCostDisplay"
 			>
 				<template #mobile-navigation><slot name="mobile-navigation"/></template>
@@ -3835,11 +3913,10 @@ onBeforeUnmount(() => {
 						:cost-text="totalCostDisplay"
 						:turns="turns"
 						:active-turn-index="activeTurnIndex"
-						:can-open-work="activeTurnHasWork || workDetailOpen"
-						:work-open="workDetailOpen"
 						:auto-scroll-locked="autoScrollLocked"
+						:hidden-count="hiddenMessageCount"
+						@open-hidden="messageVisibility.managing.value = true"
 						@open-memory="taskMemoryDrawer?.open()"
-						@toggle-work="toggleWorkDetailPanel"
 						@toggle-scroll-lock="toggleAutoScrollLock"
 						@scroll-to-turn="scrollToTurnIndex"
 					/>
@@ -3866,7 +3943,7 @@ onBeforeUnmount(() => {
 			     @touchend.passive="handleScrollerTouchEnd"
 			     @touchcancel.passive="handleScrollerTouchEnd"
 			     @pointerdown="handleScrollerPointerDown">
-				<div v-if="loading && !messages.length" class="grid h-full place-items-center text-sm text-[#6b7280]">
+				<div v-if="loading && !messages.length" class="grid h-full place-items-center text-sm text-ob-subtle">
 					正在读取会话…
 				</div>
 				
@@ -3876,7 +3953,7 @@ onBeforeUnmount(() => {
 						<ChatLineRound/>
 					</div>
 					<h2 class="mt-5 text-2xl font-semibold tracking-tight">今天想让 OpenBear 做什么？</h2>
-					<p class="mt-2 max-w-lg text-sm leading-6 text-[#6b7280]">浏览器负责长对话、富文本和过程可视化；Telegram
+					<p class="mt-2 max-w-lg text-sm leading-6 text-ob-subtle">浏览器负责长对话、富文本和过程可视化；Telegram
 						继续保留熟悉的模型、思考、工具和本轮统计交互语义。</p>
 					<div class="mt-5 grid w-full max-w-2xl gap-2 sm:grid-cols-3">
 						<button v-for="prompt in quickPrompts" :key="prompt" type="button" class="quick-prompt"
@@ -3892,39 +3969,28 @@ onBeforeUnmount(() => {
 						:running="running"
 						:deleting-turn-uuid="deletingTurnUuid"
 						:auto-scroll-locked="autoScrollLocked"
-						:retry-cancel-pending="retryCancelPending"
+						:retry-action-pending="retryActionPending"
 						:detail-key="detailKey"
 						:is-detail-open="isDetailOpen"
 						:active-tool-result-index="activeToolResultIndex"
 						@details-toggle="onDetailsToggle"
 						@reasoning-toggle="onReasoningDetailsToggle"
 						@select-tool-result="selectToolResult"
-						@cancel-retry="cancelActiveRetry"
+						@cancel-retry="controlActiveRetry($event, 'cancel')"
+						@retry-now="controlActiveRetry($event, 'retry')"
 						@delete-suffix="deleteTurnSuffix"
 					/>
 				</div>
 			</div>
 			
+			<MessageVisibilityBar/>
 			<aside class="console-controls" aria-label="会话工具与导航">
-				<TaskMemoryDrawer ref="taskMemoryDrawer" :conversation-uuid="activeConversationUuid"/>
-				<el-tooltip
-					v-if="activeTurnHasWork || workDetailOpen"
-					ref="workDetailTooltip"
-					:content="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
-					placement="left"
-					:show-after="260"
-					:disabled="workDetailTooltipSuppressed"
-					:popper-style="workDetailTooltipSuppressed ? {display: 'none'} : undefined"
-				>
-					<button
-						type="button"
-						class="work-detail-toggle"
-						:class="{ active: workDetailOpen, working: activeTurnWorking }"
-						:aria-label="activeTurnWorking ? '当前轮次正在工作，点击查看详情' : (workDetailOpen ? '关闭当前轮次工作详情' : '查看当前轮次工作详情')"
-						:aria-expanded="workDetailOpen ? 'true' : 'false'"
-						@click.stop="toggleWorkDetailPanel"
-					><WorkDetailIcon/></button>
+				<el-tooltip v-if="!isLocalConversation" :content="hiddenMessageCount ? `隐藏内容 · ${hiddenMessageCount} 条` : '隐藏内容'" placement="left" :show-after="260">
+					<button type="button" class="hidden-content-toggle" :class="{populated: hiddenMessageCount > 0}" :aria-label="`管理隐藏内容，${hiddenMessageCount} 条`" @click="messageVisibility.managing.value = true">
+						<Hide/><span v-if="hiddenMessageCount" class="hidden-content-count">{{ hiddenMessageCount > 99 ? '99+' : hiddenMessageCount }}</span>
+					</button>
 				</el-tooltip>
+				<TaskMemoryDrawer ref="taskMemoryDrawer" :conversation-uuid="activeConversationUuid"/>
 			<TurnMinimap
 				:turns="turns"
 				:active-turn-index="activeTurnIndex"
@@ -3987,6 +4053,9 @@ onBeforeUnmount(() => {
 				:can-compact="canCompact"
 				:compacting="compacting"
 				:context-display="contextDisplay"
+				:context-usage="contextUsage"
+				:context-window-tokens="contextWindow"
+				:context-threshold-tokens="rolloverTriggerTokens"
 				:context-used-display="contextUsedDisplay"
 				:context-threshold-display="contextThresholdDisplay"
 				:context-window-display="contextWindowDisplay"
@@ -4012,46 +4081,39 @@ onBeforeUnmount(() => {
 				@height-change="onComposerHeightChange"
 			/>
 				</div>
-				<TurnWorkDetailPanel
-					:open="workDetailOpen"
-					:turn="activeTurn"
-					:turn-index="activeTurnIndex"
-					:conversation-uuid="activeConversationUuid"
-					:auto-scroll-locked="autoScrollLocked"
-					:retry-cancel-pending="retryCancelPending"
-					:working="activeTurnWorking"
-					:detail-key="detailKey"
-					:is-detail-open="isDetailOpen"
-					:active-tool-result-index="activeToolResultIndex"
-					@close="workDetailOpen = false"
-					@details-toggle="onDetailsToggle"
-					@reasoning-toggle="onReasoningDetailsToggle"
-					@select-tool-result="selectToolResult"
-					@cancel-retry="cancelActiveRetry"
-				/>
 			</div>
 		</div>
+		<MessageVisibilityMobileMenu/>
+		<HiddenMessagesDrawer :conversation-uuid="activeConversationUuid"/>
 	</section>
 </template>
 
 <style scoped>
+.hidden-content-toggle {
+	position: fixed; right: var(--console-float-rail-right); top: calc(var(--console-float-rail-top) - var(--console-float-control-size) - var(--console-float-control-gap));
+	z-index: 32; display: grid; place-items: center; width: var(--console-float-control-size); height: var(--console-float-control-size);
+	border: 1px solid transparent; border-radius: 7px; background: var(--ob-chat-bg); color: var(--ob-chat-subtle);
+	box-shadow: none; cursor: pointer; transition: color .15s ease, border-color .15s ease, right .24s ease;
+}
+.hidden-content-toggle:hover, .hidden-content-toggle.populated { color: var(--ob-chat-text); border-color: var(--ob-chat-line); background: var(--ob-chat-selected); }
+.hidden-content-toggle:focus-visible { outline: 2px solid var(--ob-chat-subtle); outline-offset: 3px; }
+.hidden-content-toggle > svg { width: 17px; height: 17px; }
+.hidden-content-count { position: absolute; right: -5px; top: -5px; display: grid; place-items: center; min-width: 16px; height: 16px; padding: 0 3px; border: 2px solid var(--el-bg-color); border-radius: 8px; background: var(--el-fill-color); color: var(--el-text-color-secondary); font-size: 9px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .console-page {
-	--bear-accent: #2563eb;
-	--bear-accent-soft: #eff6ff;
-	--bear-ink: #18181b;
-	--bear-muted: #71717a;
-	--bear-paper: #ffffff;
-	--bear-line: rgba(15, 23, 42, .10);
+	--bear-accent: var(--ob-blue);
+	--bear-accent-soft: var(--ob-blue-soft);
+	--bear-ink: var(--ob-text);
+	--bear-muted: var(--ob-text-subtle);
+	--bear-paper: var(--ob-surface);
+	--bear-line: var(--ob-border);
 	--console-content-max-width: 56rem;
 	--console-content-gutter: 1rem;
 	--console-float-rail-right: 1.15rem;
 	--console-float-rail-top: calc(48% - 3.25rem);
-	--console-float-control-size: 2.15rem;
-	--console-float-control-gap: .75rem;
+	--console-float-control-size: 30px;
+	--console-float-control-gap: 8px;
 	--console-float-minimap-top: calc(
 		var(--console-float-rail-top)
-		+ var(--console-float-control-size)
-		+ var(--console-float-control-gap)
 		+ var(--console-float-control-size)
 		+ var(--console-float-control-gap)
 	);
@@ -4061,7 +4123,7 @@ onBeforeUnmount(() => {
 
 .console-main {
 	position: relative;
-	background: #fff;
+	background: var(--ob-chat-bg);
 }
 
 .console-workspace {
@@ -4079,78 +4141,12 @@ onBeforeUnmount(() => {
 	min-height: 0;
 	flex: 1 1 auto;
 	flex-direction: column;
-	background: #fff;
+	background: var(--ob-chat-bg);
 	transition: width .24s cubic-bezier(.22, 1, .36, 1);
 }
 
-.work-detail-toggle {
-	position: absolute;
-	top: .85rem;
-	right: 1rem;
-	z-index: 19;
-	display: grid;
-	width: 2.15rem;
-	height: 2.15rem;
-	place-items: center;
-	border: 1px solid rgba(15, 23, 42, .1);
-	border-radius: 999px;
-	background: rgba(255, 255, 255, .92);
-	color: #64748b;
-	box-shadow: 0 12px 30px rgba(15, 23, 42, .12), inset 0 1px 0 rgba(255, 255, 255, .9);
-	backdrop-filter: blur(10px);
-	cursor: pointer;
-	transition: transform .16s ease, border-color .16s ease, background .16s ease, color .16s ease;
-}
-
-.work-detail-toggle:hover {
-	transform: translateY(-1px);
-	border-color: rgba(37, 99, 235, .28);
-	color: #2563eb;
-}
-
-.work-detail-toggle.active {
-	border-color: rgba(37, 99, 235, .25);
-	background: #eff6ff;
-	color: #1d4ed8;
-}
-
-.work-detail-toggle.working {
-	border-color: rgba(37, 99, 235, .2);
-	background: rgba(239, 246, 255, .96);
-	color: #2563eb;
-}
-
-.work-detail-toggle.working::before {
-	content: "";
-	position: absolute;
-	inset: 2px;
-	border: 2px solid transparent;
-	border-top-color: #2563eb;
-	border-right-color: rgba(37, 99, 235, .42);
-	border-radius: inherit;
-	animation: work-detail-button-spin .9s linear infinite;
-}
-
-.work-detail-toggle.working svg {
-	animation: work-detail-icon-breathe 1.25s ease-in-out infinite;
-}
-
-@keyframes work-detail-button-spin {
-	to { transform: rotate(360deg); }
-}
-
-@keyframes work-detail-icon-breathe {
-	0%, 100% { opacity: .62; transform: scale(.94); }
-	50% { opacity: 1; transform: scale(1.03); }
-}
-
-.work-detail-toggle svg {
-	width: 1.08rem;
-	height: 1.08rem;
-}
-
 .console-scroll {
-	background: #fff;
+	background: var(--ob-chat-bg);
 	overflow-x: hidden;
 }
 
@@ -4164,20 +4160,20 @@ onBeforeUnmount(() => {
 	gap: .45rem;
 	transform: translateX(-50%);
 	pointer-events: none;
-	border: 1px solid rgba(37, 99, 235, .16);
+	border: 1px solid rgb(var(--ob-blue-rgb) / 0.16);
 	border-radius: 999px;
-	background: rgba(255, 255, 255, .94);
+	background: var(--ob-surface-raised);
 	padding: .48rem .78rem;
-	color: #475569;
+	color: var(--ob-text);
 	font-size: 12px;
 	line-height: 1;
 	white-space: nowrap;
-	box-shadow: 0 12px 30px rgba(15, 23, 42, .12), inset 0 1px 0 rgba(255, 255, 255, .9);
+	box-shadow: var(--ob-shadow-panel);
 	backdrop-filter: blur(10px);
 }
 
 .timeline-page-loading-icon {
-	color: #2563eb;
+	color: var(--ob-blue);
 	animation: timeline-page-loading-spin .9s linear infinite;
 }
 
@@ -4200,25 +4196,25 @@ onBeforeUnmount(() => {
 	width: var(--console-float-control-size);
 	height: var(--console-float-control-size);
 	place-items: center;
-	border: 1px solid rgba(15, 23, 42, .1);
-	border-radius: 999px;
-	background: rgba(255, 255, 255, .92);
-	color: #64748b;
-	box-shadow: 0 14px 34px rgba(15, 23, 42, .14), inset 0 1px 0 rgba(255, 255, 255, .92);
-	backdrop-filter: blur(10px);
+	border: 1px solid transparent;
+	border-radius: 7px;
+	background: var(--ob-chat-bg);
+	color: var(--ob-chat-subtle);
+	box-shadow: none;
 	transition: bottom .18s ease, transform .16s ease, border-color .16s ease, color .16s ease, background .16s ease;
 }
 
 .scroll-lock-toggle:hover {
 	transform: translateY(-1px);
-	border-color: rgba(37, 99, 235, .26);
-	color: #2563eb;
+	border-color: var(--ob-chat-line);
+	background: var(--ob-chat-hover);
+	color: var(--ob-chat-text);
 }
 
 .scroll-lock-toggle.locked {
-	background: rgba(16, 185, 129, .12);
-	border-color: rgba(16, 185, 129, .28);
-	color: #047857;
+	background: var(--ob-chat-selected);
+	border-color: var(--ob-chat-line);
+	color: var(--ob-chat-text);
 }
 
 .scroll-lock-toggle svg {
@@ -4227,22 +4223,22 @@ onBeforeUnmount(() => {
 }
 
 .quick-prompt {
-	border: 1px solid rgba(15, 23, 42, .08);
+	border: 1px solid var(--ob-border);
 	border-radius: 1rem;
-	background: rgba(255, 255, 255, .82);
+	background: rgb(var(--ob-surface-rgb) / 0.82);
 	padding: .72rem .82rem;
-	color: #475569;
+	color: var(--ob-text);
 	font-size: 12px;
 	line-height: 1.55;
 	text-align: left;
-	box-shadow: 0 12px 28px rgba(15, 23, 42, .06);
+	box-shadow: var(--ob-shadow-panel);
 	transition: transform .16s ease, border-color .16s ease;
 }
 
 .quick-prompt:hover {
 	transform: translateY(-1px);
-	border-color: rgba(37, 99, 235, .24);
-	color: #1e40af;
+	border-color: rgb(var(--ob-blue-rgb) / 0.24);
+	color: var(--ob-blue);
 }
 
 .empty-mark {
@@ -4250,11 +4246,11 @@ onBeforeUnmount(() => {
 	width: 3.3rem;
 	height: 3.3rem;
 	place-items: center;
-	border: 1px solid #e5e7eb;
+	border: 1px solid var(--ob-border);
 	border-radius: 1rem;
-	background: linear-gradient(145deg, #ffffff, #f4f4f5);
-	color: #334155;
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 18px 48px rgba(15, 23, 42, .08);
+	background: linear-gradient(145deg, var(--ob-surface), var(--ob-surface-soft));
+	color: var(--ob-text);
+	box-shadow: var(--ob-shadow-panel);
 }
 
 .empty-mark svg {
@@ -4263,115 +4259,21 @@ onBeforeUnmount(() => {
 }
 
 @media (min-width: 761px) {
-	.work-detail-toggle {
-		position: fixed;
-		top: calc(var(--console-float-rail-top) + var(--console-float-control-size) + var(--console-float-control-gap));
-		right: var(--console-float-rail-right);
-		z-index: 32;
-	}
-}
-
-@media (min-width: 1281px) {
-	.console-page.work-detail-open {
-		--console-content-max-width: 52rem;
-		--console-content-gutter: 2rem;
-		--console-float-rail-right: calc(clamp(24rem, 32vw, 32rem) + 1rem);
-	}
+	/* A fixed narrow gutter keeps hover controls and selection off the text,
+	   without rewrapping messages when selection mode starts. */
+	.conversation-timeline-shell { width: min(var(--console-content-max-width), calc(100% - max(2rem, var(--console-content-gutter)) - max(2rem, var(--console-content-gutter)))); }
 }
 
 @media (max-width: 760px) {
 	.console-page { --console-content-gutter: 1rem; }
+	/* Selection adds scroll clearance; a scrollbar must not rewrap the text. */
+	.console-scroll { scrollbar-gutter: stable; }
+	.console-page.visibility-overlay-active .conversation-timeline-shell { padding-bottom: 96px; }
 	/* Phone tools are available on demand in the header, never beside or over
 	   the transcript. Keep the existing drawer mounted for its scoped state. */
 	.console-controls { display: none; }
 }
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
 	.console-page { --console-float-control-size: 44px; }
-	.work-detail-toggle { width: 44px; height: 44px; }
 }
-</style>
-
-<style>
-/* OpenBear system dark theme */
-html.dark .console-page {
-		--bear-accent: #60a5fa;
-		--bear-accent-soft: #1d2d45;
-		--bear-ink: #e4e4e7;
-		--bear-muted: #a1a1aa;
-		--bear-paper: #1c1d21;
-		--bear-line: rgba(255, 255, 255, .12);
-	}
-html.dark .console-main {
-		background: #1d1e22;
-	}
-html.dark .conversation-column {
-		background: #1d1e22;
-	}
-html.dark .work-detail-toggle {
-		border: 1px solid rgba(255, 255, 255, 0.145);
-		background: rgba(29, 30, 34, 0.92);
-		color: #c6c6cd;
-		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-html.dark .work-detail-toggle:hover {
-		border-color: rgba(96, 165, 250, 0.28);
-		color: #60a5fa;
-	}
-html.dark .work-detail-toggle.active {
-		border-color: rgba(96, 165, 250, 0.25);
-		background: #202125;
-		color: #60a5fa;
-	}
-html.dark .work-detail-toggle.working {
-		border-color: rgba(96, 165, 250, 0.2);
-		background: rgba(32, 33, 37, 0.96);
-		color: #60a5fa;
-	}
-html.dark .work-detail-toggle.working::before {
-		border-top-color: rgba(96, 165, 250, 0.52);
-		border-right-color: rgba(96, 165, 250, 0.42);
-	}
-html.dark .console-scroll {
-		background: #1d1e22;
-	}
-html.dark .timeline-page-loading {
-		border: 1px solid rgba(96, 165, 250, 0.16);
-		background: rgba(29, 30, 34, 0.94);
-		color: #c6c6cd;
-		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-html.dark .timeline-page-loading-icon {
-		color: #60a5fa;
-	}
-html.dark .scroll-lock-toggle {
-		border: 1px solid rgba(255, 255, 255, 0.145);
-		background: rgba(29, 30, 34, 0.92);
-		color: #c6c6cd;
-		box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-html.dark .scroll-lock-toggle:hover {
-		border-color: rgba(96, 165, 250, 0.26);
-		color: #60a5fa;
-	}
-html.dark .scroll-lock-toggle.locked {
-		background: rgba(16, 185, 129, 0.12);
-		border-color: rgba(110, 231, 162, 0.28);
-		color: #6ee7a2;
-	}
-html.dark .quick-prompt {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.82);
-		color: #c6c6cd;
-		box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
-	}
-html.dark .quick-prompt:hover {
-		border-color: rgba(96, 165, 250, 0.24);
-		color: #60a5fa;
-	}
-html.dark .empty-mark {
-		border: 1px solid #3d3e46;
-		background: linear-gradient(145deg, #1d1e22, #202125);
-		color: #dedee1;
-		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11), 0 18px 48px rgba(0, 0, 0, 0.16);
-	}
 </style>

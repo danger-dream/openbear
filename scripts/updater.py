@@ -723,6 +723,13 @@ class Updater:
                 shutil.copy2(src, dest)
 
     def _sync_deps(self) -> None:
+        # app/ is replaced during update; verify bundled browser resources without npm.
+        browser_installer = self.install_root / "scripts/install_browser_worker.py"
+        if browser_installer.is_file():
+            python = self.install_root / ".venv/bin/python"
+            subprocess.run([str(python) if python.is_file() else sys.executable,
+                            str(browser_installer), "--if-enabled", "--root", str(self.install_root)],
+                           cwd=self.install_root, env=with_tool_path(), check=True, timeout=330)
         changed = set(self.classification.get("changed") or [])
         version_only = set(self.classification.get("versionOnly") or [])
         material = changed - version_only

@@ -34,6 +34,6 @@ defineExpose({position});
 </script>
 <template><Teleport to="body"><section v-if="open" ref="panel" class="reference-floating-panel" :style="style" :aria-label="label" @pointerenter="emit('enter')" @pointerleave="emit('leave')" @click.stop @keydown="emit('keydown',$event)"><slot/></section></Teleport></template>
 <style>
-.reference-floating-panel{z-index:3100;display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(80,89,106,.18);border-radius:11px;background:rgba(252,252,253,.98);box-shadow:0 12px 35px rgba(25,37,55,.14),0 2px 6px rgba(25,37,55,.08);color:#303846;font-family:inherit;font-size:12px;line-height:1.5;backdrop-filter:blur(16px)}
-html.dark .reference-floating-panel{background:rgba(35,38,45,.98);border-color:rgba(190,202,221,.2);color:#dde2e9;box-shadow:0 12px 35px rgba(0,0,0,.4),0 2px 6px rgba(0,0,0,.2)}
+.reference-floating-panel{z-index:3100;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--ob-border);border-radius:11px;background:var(--ob-surface-raised);box-shadow:var(--ob-shadow-popover);color:var(--ob-text);font-family:inherit;font-size:12px;line-height:1.5;backdrop-filter:blur(16px)}
+
 </style>

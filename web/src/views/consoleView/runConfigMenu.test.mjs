@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
+import {themeValues, themeColor, contrast} from '../../testHelpers/theme.mjs';
 import {compile, computed, createSSRApp, h, proxyRefs, ref, shallowReactive, watch} from "vue";
 import {renderToString} from "vue/server-renderer";
 import {parse} from "@vue/compiler-sfc";
@@ -206,7 +207,7 @@ test('collapsed model button exposes the shared compression mode without losing 
   assert.deepEqual(h.calls, [], 'rendering the selected strategy never changes configuration');
 });
 
-test('collapsed button restores original typography and uses explicit inline compression text without a badge or second line', async () => {
+test('collapsed button keeps quiet model typography and explicit compression metadata without a badge', async () => {
   const h = harness({currentModelInfo: null, supportsThinking: false, contextDisplay: '—'});
   const html = await h.renderChip();
   assert.match(html, /class="run-config-chip-model">模型</);
@@ -220,34 +221,24 @@ test('collapsed button restores original typography and uses explicit inline com
   assert.match(strategyCss, /flex: 0 0 auto/);
   assert.doesNotMatch(strategyCss, /background:|border:|padding:|font-size:/);
   assert.match(source, /\.run-config-chip-model\s*\{[^}]*text-overflow: ellipsis/);
-  assert.match(source, /\.run-config-chip-meta\s*\{[^}]*display: none/); // Original mobile behavior remains unchanged.
+  assert.match(source, /\.run-config-chip-meta\s*\{[^}]*display: none/); // Phone toolbar shows only the model; details remain in settings.
   const css = source.slice(source.indexOf('.run-config-chip {'), source.indexOf('.chip-caret {'));
   const sizes = [...css.matchAll(/font-size:\s*([\d.]+)px/g)].map(match => Number(match[1]));
   assert.deepEqual(sizes, [11.2]); // The chip retains its restored size independently of the popup's 13/12px scale.
   assert.match(css, /height: 1\.78rem/);
   assert.match(css, /gap: 0\.34rem/);
   assert.match(css, /padding: 0 0\.34rem 0 0\.48rem/);
-  assert.match(css, /\.run-config-chip-model\s*\{[^}]*font-weight: 640/);
-  assert.match(css, /\.run-config-chip-meta\s*\{[^}]*color: #94a3b8;[^}]*font-weight: 520/);
+  assert.match(css, /\.run-config-chip-model\s*\{[^}]*font-weight: 500/);
+  assert.match(css, /\.run-config-chip-meta\s*\{[^}]*color: var\(--ob-text-muted\);[^}]*font-weight: 520/);
 });
-
-function contrast(first, second) {
-  function luminance(hex) {
-    const value = hex.slice(1);
-    const channels = (value.length === 3 ? [...value].map(c => c + c) : value.match(/../g))
-      .map(channel => parseInt(channel, 16) / 255)
-      .map(channel => channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4);
-    return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
-  }
-  const values = [luminance(first), luminance(second)].sort((a, b) => b - a);
-  return (values[0] + .05) / (values[1] + .05);
-}
 
 for (const theme of ['light', 'dark']) {
   test(`${theme} model details contrast strongly with both their text and the model list`, () => {
-    const selector = theme === 'dark' ? /html\.dark \.run-config-popover\s*\{([^}]*)\}/ : /\.run-config-popover\s*\{([^}]*)\}/;
-    const css = source.match(selector)[1];
-    const color = name => css.match(new RegExp(`--rc-${name}:\\s*(#[a-fA-F0-9]+)`))[1];
+    const css = source.match(/\.run-config-popover\s*\{([^}]*)\}/)[1];
+    const values = themeValues(theme === 'dark');
+    for (const [, name, value] of css.matchAll(/(--rc-[\w-]+):\s*([^;]+);/g)) values.set(name, value);
+    const backdrop = themeColor('var(--ob-surface-raised)', values);
+    const color = name => themeColor(`var(--rc-${name})`, values, backdrop);
     assert.ok(contrast(color('detail-bg'), color('detail-text')) >= 10, 'readable tooltip text');
     assert.ok(contrast(color('detail-bg'), color('hover')) >= 7, 'visually separates the floating detail from rows');
     assert.ok(contrast(color('detail-bg'), color('selected')) >= 7, 'visually separates it from selected rows too');
@@ -262,7 +253,7 @@ test("popup typography and surfaces are unified, and short viewports keep every 
   assert.match(css, /\.model-group-title[^}]*font-size: 12px/);
   assert.match(css, /\.model-tag[^}]*font-size: 12px/);
   assert.doesNotMatch(css, /font-weight:\s*[6-9]\d\d|linear-gradient|text-transform:\s*uppercase/);
-  assert.match(source, /html\.dark \.run-config-popover\s*\{[^}]*--rc-text:[^}]*--rc-accent:/);
+  assert.match(source, /\.run-config-popover\s*\{[^}]*--rc-text: var\(--ob-text\);[^}]*--rc-accent: var\(--ob-blue\);/);
   assert.match(css, /@media \(max-height: 620px\)[\s\S]*?overflow-y: auto/);
   assert.match(css, /\.model-row-name[^}]*text-overflow: ellipsis/);
   assert.match(css, /\.thinking-segments[^}]*flex-wrap: wrap/);

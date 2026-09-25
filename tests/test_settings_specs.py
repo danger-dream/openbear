@@ -2,7 +2,27 @@ from __future__ import annotations
 
 import pytest
 
+from app.conversation_titles import DEFAULT_NAMING_PROMPT
 from app.settings.specs import GROUPS, SPECS, WEB_DOMAINS, get_spec, group_specs
+
+
+def test_browser_units_preserve_storage_and_telegram_input():
+    from app.admin.settings import parse_setting_value, serialize_spec
+    from app.bot.admin import _fmt_value, _input_hint
+
+    spec = get_spec("browser.maxBodyBytes")
+    assert spec is not None
+    assert serialize_spec(spec)["displayScale"] == 1024 * 1024
+    assert spec.display_value(2097152) == 2
+    assert spec.parse_display("1.5") == 1572864
+    assert parse_setting_value(spec.path, 1572864) == 1572864
+    assert _fmt_value(2097152, spec) == "2MB"
+    assert "单位：MB" in _input_hint(spec, 2097152)
+    with pytest.raises(ValueError, match="16 MB"):
+        spec.parse_display("17")
+    for invalid in ("nan", "inf", "", "-1"):
+        with pytest.raises(ValueError):
+            spec.parse_display(invalid)
 
 
 def test_bool_setting_parse_chinese_values():
@@ -61,7 +81,15 @@ def test_agent_and_tool_sections_are_available():
     assert [s.title for s in group_specs("agent")] == [
         "单轮最长运行时间",
         "连续无进展轮数",
+        "命名模型",
+        "命名单次超时",
+        "命名失败重试次数",
+        "命名会话最大获取轮数",
+        "命名会话最大获取字符数",
+        "会话命名提示词",
     ]
+    assert "不计首次请求" in get_spec("agent.namingMaxRetries").desc
+    assert get_spec("agent.namingPrompt").default_value == DEFAULT_NAMING_PROMPT
     assert [s.title for s in group_specs("retry")] == [
         "模型调用失败重试次数",
         "重试基础等待",

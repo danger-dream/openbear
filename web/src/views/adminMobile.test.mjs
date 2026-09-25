@@ -73,7 +73,7 @@ test('320–760px controls stay outside a bounded list scroller; summary tiles a
     assert.equal(css('.admin-page', width).overflow, 'hidden');
     assert.equal(css('.admin-page .admin-list', width)['overflow-y'], 'auto');
     assert.equal(css('.admin-page .admin-list', width).flex, '1 1 0%');
-    assert.equal(css('.admin-page > header', width).flex, 'none');
+    assert.equal(css('.admin-page > header:not(.admin-page-header)', width).flex, 'none');
     assert.equal(css('.admin-summary > summary', width)['min-height'], '28px');
     assert.equal(css('.admin-page .admin-batch', width)['flex-wrap'], 'nowrap');
     assert.equal(css('.admin-page .admin-filters', width).flex, 'none');
@@ -87,7 +87,7 @@ test('320–760px controls stay outside a bounded list scroller; summary tiles a
   for (const name of names.filter(n => !['Settings', 'Template'].includes(n))) {
     const root = findClass(name, 'admin-page'), list = findClass(name, 'admin-list');
     assert.ok(root.children.some(n => hasClass(n, 'admin-list')), name);
-    for (const control of nodes(name).filter(n => ['header'].includes(n.tag) || hasClass(n, 'admin-filters') || hasClass(n, 'memory-categories'))) assert.ok(!walk(list.children).some(n => n.loc?.start.offset === control.loc.start.offset), `${name} control must not scroll with the list`);
+    for (const control of nodes(name).filter(n => ['header', 'AdminPageHeader'].includes(n.tag) || hasClass(n, 'admin-filters') || hasClass(n, 'memory-categories'))) assert.ok(!walk(list.children).some(n => n.loc?.start.offset === control.loc.start.offset), `${name} control must not scroll with the list`);
   }
 });
 

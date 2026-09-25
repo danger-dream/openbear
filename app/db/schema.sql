@@ -69,6 +69,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_turn
   ON messages(chat_id, turn_uuid, id);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_root_turn
   ON messages(chat_id, run_root_turn_uuid, id);
+-- Statistics reads only external user turns and must be able to stop at the
+-- selected time range instead of walking a conversation's complete history.
+CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time
+  ON messages(chat_id, created_at)
+  WHERE role='user' AND COALESCE(task_uuid,'')='';
 CREATE INDEX IF NOT EXISTS idx_messages_task
   ON messages(task_uuid, id);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_turn
@@ -153,6 +158,12 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   -- 用户在各自置顶/非置顶组内调整的持久展示顺序；NULL 回退到创建时间排序。
   display_order         REAL,
   archived_at           INTEGER DEFAULT 0,
+  -- 真实可见交互与默认会话选择的轻量投影。NULL 仅表示旧库尚未惰性回填；
+  -- 0 表示已知没有对应交互，不能把两者混为一谈。
+  last_interaction_at_ms INTEGER,
+  last_conversation_at  INTEGER,
+  -- 只在可见 user/assistant 正文快照变化时递增，供引用目录按会话失效。
+  reference_revision    INTEGER NOT NULL DEFAULT 0,
   -- 空值属于“临时会话”；归档只改变状态，不清除目录归属。
   folder_uuid           TEXT NOT NULL DEFAULT ''
 );
@@ -166,6 +177,55 @@ CREATE INDEX IF NOT EXISTS idx_web_conversations_internal_chat
   ON web_conversations(internal_chat_id);
 CREATE INDEX IF NOT EXISTS idx_web_conversations_folder_order
   ON web_conversations(owner_chat_id, folder_uuid, archived_at, pinned_at DESC, display_order, id);
+CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_recent
+  ON web_conversations(owner_chat_id, archived_at, last_interaction_at_ms DESC, conversation_uuid ASC);
+CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_default
+  ON web_conversations(owner_chat_id, archived_at, last_conversation_at DESC, created_at DESC, id DESC);
+
+-- New conversations initialize last_conversation_at to 0. Legacy rows remain NULL
+-- until their one-time owner-scoped backfill. Maintain the exact historical
+-- default-selection definition without rescanning messages on each bootstrap.
+CREATE TRIGGER IF NOT EXISTS web_conversation_last_message_insert
+AFTER INSERT ON messages
+WHEN COALESCE(NEW.task_uuid,'')=''
+ AND (NEW.role='user' OR (NEW.role='assistant' AND TRIM(COALESCE(NEW.content,''))<>''))
+BEGIN
+  UPDATE web_conversations
+  SET last_conversation_at=MAX(last_conversation_at,COALESCE(NEW.created_at,0))
+  WHERE internal_chat_id=NEW.chat_id AND last_conversation_at IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS web_conversation_last_message_delete
+AFTER DELETE ON messages
+WHEN COALESCE(OLD.task_uuid,'')=''
+ AND (OLD.role='user' OR (OLD.role='assistant' AND TRIM(COALESCE(OLD.content,''))<>''))
+BEGIN
+  UPDATE web_conversations
+  SET last_conversation_at=COALESCE((
+    SELECT MAX(m.created_at) FROM messages m
+    WHERE m.chat_id=OLD.chat_id AND COALESCE(m.task_uuid,'')=''
+      AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))
+  ),0)
+  WHERE internal_chat_id=OLD.chat_id AND last_conversation_at IS NOT NULL
+    AND COALESCE(OLD.created_at,0)>=last_conversation_at;
+END;
+CREATE TRIGGER IF NOT EXISTS web_conversation_last_message_update
+AFTER UPDATE OF chat_id,role,content,created_at,task_uuid ON messages
+BEGIN
+  UPDATE web_conversations
+  SET last_conversation_at=COALESCE((
+    SELECT MAX(m.created_at) FROM messages m
+    WHERE m.chat_id=OLD.chat_id AND COALESCE(m.task_uuid,'')=''
+      AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))
+  ),0)
+  WHERE internal_chat_id=OLD.chat_id AND last_conversation_at IS NOT NULL;
+  UPDATE web_conversations
+  SET last_conversation_at=COALESCE((
+    SELECT MAX(m.created_at) FROM messages m
+    WHERE m.chat_id=NEW.chat_id AND COALESCE(m.task_uuid,'')=''
+      AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))
+  ),0)
+  WHERE internal_chat_id=NEW.chat_id AND last_conversation_at IS NOT NULL;
+END;
 
 -- Task Memory is intentionally isolated from global memory_entries/secrets/docs.
 -- task_uuid is empty for conversation scope and mandatory for agent_task scope.
@@ -315,8 +375,43 @@ CREATE TABLE IF NOT EXISTS web_operations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_web_operations_conv_op
   ON web_operations(conversation_uuid, op_id);
+-- Presentation preferences are separate from the immutable model/UI facts.
+CREATE TABLE IF NOT EXISTS web_visibility_state (
+  conversation_uuid TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS web_hidden_operations (
+  conversation_uuid TEXT NOT NULL,
+  op_id TEXT NOT NULL,
+  hidden_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (conversation_uuid, op_id)
+);
+CREATE TRIGGER IF NOT EXISTS web_hidden_operations_insert
+AFTER INSERT ON web_hidden_operations BEGIN
+  INSERT INTO web_visibility_state(conversation_uuid, revision) VALUES(NEW.conversation_uuid, 1)
+  ON CONFLICT(conversation_uuid) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS web_hidden_operations_delete
+AFTER DELETE ON web_hidden_operations BEGIN
+  INSERT INTO web_visibility_state(conversation_uuid, revision) VALUES(OLD.conversation_uuid, 1)
+  ON CONFLICT(conversation_uuid) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS web_operation_visibility_cleanup
+AFTER DELETE ON web_operations BEGIN
+  DELETE FROM web_hidden_operations WHERE conversation_uuid=OLD.conversation_uuid AND op_id=OLD.op_id;
+END;
+CREATE TRIGGER IF NOT EXISTS web_conversation_visibility_cleanup
+AFTER DELETE ON web_conversations BEGIN
+  DELETE FROM web_hidden_operations WHERE conversation_uuid=OLD.conversation_uuid;
+  DELETE FROM web_visibility_state WHERE conversation_uuid=OLD.conversation_uuid;
+END;
 CREATE INDEX IF NOT EXISTS idx_web_operations_conv_display
   ON web_operations(conversation_uuid, display_seq, id);
+-- The dashboard extracts reasoningMs only from stats snapshots in a bounded
+-- range; keep this partial index small as tool/answer operations accumulate.
+CREATE INDEX IF NOT EXISTS idx_web_operations_stats_conversation_time
+  ON web_operations(conversation_uuid, created_at_ms)
+  WHERE op_type='stats';
 CREATE INDEX IF NOT EXISTS idx_web_operations_conv_turn_display
   ON web_operations(conversation_uuid, turn_uuid, display_seq);
 CREATE INDEX IF NOT EXISTS idx_web_operations_conv_target_display
@@ -327,6 +422,35 @@ CREATE INDEX IF NOT EXISTS idx_web_operations_run_display
   ON web_operations(run_id, display_seq);
 CREATE INDEX IF NOT EXISTS idx_web_operations_internal_status
   ON web_operations(internal_chat_id, status, updated_at_ms DESC);
+-- Tree runtime truth only needs non-notice live snapshots. The partial index
+-- remains tiny after terminal history grows and covers its complete aggregation.
+CREATE INDEX IF NOT EXISTS idx_web_operations_active_conversation
+  ON web_operations(conversation_uuid, lifecycle, op_type, created_at_ms)
+  WHERE op_type!='notice' AND lifecycle IN ('active','paused','waiting_control');
+-- Any writer, including imports/recovery tools outside the Web publisher, must
+-- advance the lightweight reference invalidation token transactionally.
+CREATE TRIGGER IF NOT EXISTS web_operation_reference_insert
+AFTER INSERT ON web_operations
+WHEN NEW.op_type IN ('user_message','assistant_message')
+BEGIN
+  UPDATE web_conversations SET reference_revision=reference_revision+1
+  WHERE conversation_uuid=NEW.conversation_uuid;
+END;
+CREATE TRIGGER IF NOT EXISTS web_operation_reference_update
+AFTER UPDATE OF op_type,turn_uuid,display_seq,internal,payload_json ON web_operations
+WHEN OLD.op_type IN ('user_message','assistant_message')
+  OR NEW.op_type IN ('user_message','assistant_message')
+BEGIN
+  UPDATE web_conversations SET reference_revision=reference_revision+1
+  WHERE conversation_uuid IN (OLD.conversation_uuid,NEW.conversation_uuid);
+END;
+CREATE TRIGGER IF NOT EXISTS web_operation_reference_delete
+AFTER DELETE ON web_operations
+WHEN OLD.op_type IN ('user_message','assistant_message')
+BEGIN
+  UPDATE web_conversations SET reference_revision=reference_revision+1
+  WHERE conversation_uuid=OLD.conversation_uuid;
+END;
 
 -- Normalized many-to-many source of truth between durable UI operations and
 -- model transcript rows. The JSON list on web_operations remains a denormalized

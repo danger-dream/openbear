@@ -9,7 +9,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.interaction_data import redact_result
@@ -138,6 +138,8 @@ class ToolRuntimeContext:
     turn_uuid: str = ""
     run_root_turn_uuid: str = ""
     tool_call_id: str = ""
+    # Transient structured media; never serialize base64 into tool text/audit/history.
+    tool_images: list[dict[str, Any]] = field(default_factory=list)
     # Set only by the trusted interaction callback when a user submitted text.
     # A denied shared approval must not truncate that text with ordinary output.
     preserve_user_answer: bool = False

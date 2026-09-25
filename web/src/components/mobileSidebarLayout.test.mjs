@@ -19,7 +19,7 @@ function phoneRules(selector){const out={};appCSS.walkRules(rule=>{if(rule.paren
 
 test('mobile sidebar devotes the flex remainder to the same conversation tree, rather than six management rows',()=>{
   assert.equal(phoneRules('.app-sidebar .sidebar-desktop-nav').display,'none');
-  assert.equal(phoneRules('.app-sidebar .sidebar-caption').display,'none');
+  assert.equal(phoneRules('.app-sidebar .sidebar-caption').display,'block');
   for(const selector of ['.app-sidebar .sidebar-heading','.app-sidebar .sidebar-new-session'])assert.equal(phoneRules(selector).flex,'0 0 44px');
   const treeArea=appNodes.find(n=>hasClass(n,'sidebar-conversations'));
   const classes=treeArea.props.find(p=>p.name==='class').value.content;
@@ -50,10 +50,33 @@ test('desktop navigation/source order, new-conversation ownership, theme and ver
   const newButton=appNodes.find(n=>hasClass(n,'sidebar-new-session'));
   assert.match(newButton.loc.source,/@click="startConsoleNewSession"/);
   assert.match(app,/@command="chooseThemeMode"/);assert.match(app,/@click="openVersionDialog"/);
-  assert.match(app,/<MobileSidebarResources :items="nav" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf\(\); selectNav\(\$event\)"\/>/);
+  assert.match(app,/<MobileSidebarResources :items="nav\.filter\(item => !item\.headerOnly\)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf\(\); selectNav\(\$event\)">/);
+  assert.match(app,/<template #footer>[\s\S]*?class="sidebar-mobile-status"/);
+  const closeButton=appNodes.find(n=>hasClass(n,'sidebar-close'));
+  assert.match(closeButton.loc.source,/@click="closeSidebar"/);
+  assert.match(app,/data-testid="statistics-entry"[\s\S]*@click="selectNav\('statistics'\)"/);
   for(const selector of ['.app-sidebar .sidebar-desktop-nav','.app-sidebar .sidebar-heading','.app-sidebar .sidebar-new-session']){
     appCSS.walkRules(rule=>{if(rule.selectors.includes(selector))assert.equal(rule.parent.params,'(max-width: 760px)','new overrides cannot affect desktop');});
   }
+});
+
+test('desktop footer status contains only the version, leaving mobile channel status and version action intact', async()=>{
+  const desktop=appNodes.find(n=>hasClass(n,'sidebar-footer-status'));
+  assert.doesNotMatch(desktop.loc.source,/channelStatsText|status-indicator/);
+  let clicked=0,tree;
+  const scope={appVersion:'0.7.0',versionInfo:{updateAvailable:true},openVersionDialog:()=>clicked++};
+  const draw=compile(desktop.loc.source);
+  const ssr=createSSRApp({render(){tree=draw.call(this,scope,[]);return tree;}});
+  const html=await renderToString(ssr);
+  assert.match(html,/v0\.7\.0/);
+  assert.match(html,/version-dot/);
+  const buttons=walk([tree]).filter(n=>n.type==='button');
+  assert.equal(buttons.length,1);
+  buttons[0].props.onClick();assert.equal(clicked,1);
+  const mobile=appNodes.find(n=>hasClass(n,'sidebar-mobile-status'));
+  assert.match(mobile.loc.source,/channelStatsText/);
+  assert.match(mobile.loc.source,/status-indicator-dot/);
+  assert.match(mobile.loc.source,/@click="openVersionDialog"/);
 });
 
 function baseGridRules(selector) {
@@ -75,8 +98,8 @@ test('both resource surfaces share three columns, quiet vertical tiles, inherite
   assert.equal(tile.background,'transparent');
   assert.equal(tile.border,'0');
   assert.equal(tile['box-shadow'],undefined);
-  assert.equal(baseGridRules(".sidebar-resource-grid > .sidebar-resource-tile[aria-current='page']").background,'var(--el-fill-color-darker)');
-  assert.equal(baseGridRules('.sidebar-resource-grid > .sidebar-resource-tile:focus-visible').outline,'2px solid var(--el-color-primary)');
+  assert.equal(baseGridRules(".sidebar-resource-grid > .sidebar-resource-tile[aria-current='page']").background,'var(--ob-chat-selected)');
+  assert.equal(baseGridRules('.sidebar-resource-grid > .sidebar-resource-tile:focus-visible').outline,'2px solid var(--ob-chat-subtle)');
   assert.match(component,/sidebar-resources-grid sidebar-resource-grid/);
   assert.match(component,/font-size: 13px/);
   assert.match(app,/sidebar-desktop-nav sidebar-resource-grid text-sm/);
@@ -91,7 +114,7 @@ test('desktop six-grid renders native buttons in original order, marks the activ
   const r=runtime(),calls=[];
   assert.deepEqual(Array.from(r.props.items,item=>item.key),['memory','secrets','docs','skills','mcp','settings']);
   const markup=appNodes.find(n=>hasClass(n,'sidebar-desktop-nav')).loc.source;
-  const scope={nav:r.props.items,active:'docs',closeReferenceShelf:()=>calls.push(['close']),selectNav:key=>calls.push(['select',key]),
+  const scope={desktopNav:r.props.items.filter(item=>item.key!=='settings'),active:'docs',closeReferenceShelf:()=>calls.push(['close']),selectNav:key=>calls.push(['select',key]),
     showReferenceShelf:(event,key)=>calls.push(['hover',key,event]),leaveReferenceShelf:()=>calls.push(['leave']),referenceNavKey:(event,key)=>calls.push(['key',key,event])};
   const compiled=compile(markup);let tree;
   const ssr=createSSRApp({render(){tree=compiled.call(this,scope,[]);return tree;}});
@@ -145,15 +168,15 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
 });
 
 function runtime(){
-  const items=vm.runInNewContext(app.slice(app.indexOf('const nav = ['),app.indexOf('const pageToPath =')).replace('const nav =','result ='),{MemoryView:null,SecretsView:null,DocsView:null,SkillsView:null,McpView:null,SettingsHubView:null});
-  const props={items,active:'docs',sidebarOpen:true},calls=[],mount=[],unmount=[],watchers=[];
+  const nav=vm.runInNewContext(app.slice(app.indexOf('const nav = ['),app.indexOf('const pageToPath =')).replace('const nav =','result ='),{MemoryView:null,SecretsView:null,DocsView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null});
+  const props={items:nav.filter(item=>!item.headerOnly),active:'docs',sidebarOpen:true},calls=[],mount=[],unmount=[],watchers=[];
   const media={matches:true,addEventListener(){},removeEventListener(){}};
   const context=vm.createContext({defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),ref,onMounted:fn=>mount.push(fn),onBeforeUnmount:fn=>unmount.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media}});
   vm.runInContext(descriptor.scriptSetup.content.replace(/^import .*;\n/gm,''),context);mount.forEach(fn=>fn());
   return{props,calls,context,media,watchers,unmount};
 }
 async function render(r){
-  const binding=vm.runInContext('({props,phone:phone.value,menuOpen:menuOpen.value,selectPage})',r.context),slots=[];
+  const binding=vm.runInContext('({props,phone:phone.value,menuOpen:menuOpen.value,selectPage,$slots:{}})',r.context),slots=[];
   const compiled=compile(descriptor.template.content);let tree;
   const app=createSSRApp({render(){tree=compiled.call(this,binding,[]);return tree;}});
   app.component('ElPopover',{inheritAttrs:false,props:['visible'],render(){const nodes=[...(this.$slots.reference?.()||[]),...(this.visible?(this.$slots.default?.()||[]):[])];slots.push(...nodes);return nodes;}});

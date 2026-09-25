@@ -11,16 +11,22 @@ const folder = (folderId, parentId = '') => ({ kind: 'folder', folderId, id: fol
 const conversation = (id, folderId = 'a', extra = {}) => ({ kind: 'conversation', id, conversationUuid: id, folderId, title: id, ...extra });
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 function harness(Api = {}) {
-  const errors = [];
+  const errors = [], notifications = [];
+  let closedNotices = 0;
   const context = vm.createContext({ computed, nextTick, reactive, ref, rowId, treeItemParent, compareTreeItems, resolveTreeDrop, Api, apiError: String, referenceCatalog: { connected: false, ready: false },
     // Imports are seams in this loader-only fixture; lazy UI rendering is exercised in lazyView.test.mjs.
     defineLazyView: () => ({}),
     defineProps: () => ({ activeConversationUuid: '', draftConversation: null }), defineEmits: () => () => {}, defineExpose() {},
-    watch() {}, onMounted() {}, onBeforeUnmount() {}, ElMessage: { error(value) { errors.push(value); }, warning() {} }, document: { querySelector: () => null }, CSS: { escape: s => s },
+    watch() {}, onMounted() {}, onBeforeUnmount() {}, ElMessage: {
+      error(value) { errors.push(value); }, warning(value) { notifications.push(value); },
+      info(value) { notifications.push(value?.message || value); return { close() { closedNotices += 1; } }; },
+      success(value) { notifications.push(value); },
+    }, document: { querySelector: () => null }, CSS: { escape: s => s },
   });
-  vm.runInContext(script + '\nglobalThis.tree = { visibleRows, rootFolders, stateFor, setExpanded, rowLoading, loadChildren, invalidateBranch, loading, initialized, refreshTree, refreshStatus, forgetConversation, forgetFolder, moveTreeItem, movingRowId };', context);
+  vm.runInContext(script + '\nglobalThis.tree = { visibleRows, rootFolders, stateFor, setExpanded, rowLoading, loadChildren, invalidateBranch, loading, initialized, refreshTree, refreshStatus, forgetConversation, forgetFolder, moveTreeItem, movingRowId, generateConversationTitle, isTitleGenerating, titleGenerating };', context);
   const tree = context.tree;
   tree.errors = errors;
+  tree.noticeState = { notifications, get closed() { return closedNotices; } };
   tree.rootFolders.value = [folder('a'), folder('b')];
   tree.setExpanded('a', true);
   tree.initialized.value = true;
@@ -142,15 +148,35 @@ test('cancelling a pending branch clears its indicator and late completion canno
   tree.invalidateBranch('a');assert.equal(tree.rowLoading(folder('a')),false);
   gate.resolve({items:[]});await pending;assert.equal(tree.rowLoading(folder('a')),false);
 });
+test('manual title generation owns a visible row state and suppresses duplicate requests', async () => {
+  const gate = deferred(); let calls = 0;
+  const tree = harness({ generateConversationTitle: () => { calls += 1; return gate.promise; } });
+  const row = conversation('c', 'a', { lastInteractionAtMs: 1 });
+  const previousState = tree.titleGenerating.value;
+  const pending = tree.generateConversationTitle(row);
+  assert.equal(calls, 1);
+  assert.notEqual(tree.titleGenerating.value, previousState);
+  assert.equal(tree.isTitleGenerating(row), true);
+  assert.deepEqual(tree.noticeState.notifications, ['正在生成会话名称…']);
+  await tree.generateConversationTitle(row);
+  assert.equal(calls, 1);
+  gate.resolve({ changed: false });
+  await pending;
+  assert.equal(tree.isTitleGenerating(row), false);
+  assert.equal(tree.noticeState.closed, 1);
+  assert.deepEqual(tree.noticeState.notifications, ['正在生成会话名称…', '会话名称无需更新']);
+});
 test('search loading belongs to search control rather than all result row icons', () => {
   const body=source.slice(source.indexOf('function rowLoading('),source.indexOf('function withDraft('));
   assert.doesNotMatch(body,/searchLoading|loading\.value|treeItemParent/);
   assert.match(source,/:is="searchLoading \? Loading : Search"/);
 });
 test('both node icon types use the same fixed icon slot; loading rows are absent and pagination remains guarded', () => {
-  assert.equal((source.match(/class="node-icon" :class="\{ 'is-spinning': rowLoading\(row\)(?:, 'is-working': running\(row\) && !rowLoading\(row\))? \}"/g) || []).length, 2);
-  assert.match(source, /'is-working': running\(row\) && !rowLoading\(row\)/);
+  assert.match(source, /class="node-icon" :class="\{ 'is-spinning': rowLoading\(row\) \}"/);
+  assert.match(source, /'is-spinning': rowLoading\(row\) \|\| isTitleGenerating\(row\)/);
+  assert.match(source, /'is-working': running\(row\) && !rowLoading\(row\) && !isTitleGenerating\(row\)/);
   assert.doesNotMatch(source, /kind: "loading"|row\.kind === 'loading'/);
-  assert.match(source, /:aria-busy="rowLoading\(row\)"/);
+  assert.match(source, /:aria-busy="rowLoading\(row\) \|\| isTitleGenerating\(row\)"/);
+  assert.match(source, /class="title-generating-state" role="status" aria-live="polite">命名中/);
   assert.match(source, /:disabled="stateFor\(row\.parentId \|\| '', row\.systemNode \|\| ''\)\.loading"/);
 });

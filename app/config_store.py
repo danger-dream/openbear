@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.browser.connection import validate_config_change as validate_browser_change
 from app.config import Config, config_path
 from app.context.configuration import RETIRED_AGENT_CONTEXT_KEYS, migrate_context_config
 
@@ -75,9 +76,11 @@ class ConfigStore:
         async with self._lock:
             raw = self._load_raw_unlocked()
             old = _get_path(raw, dotted_path)
+            previous_browser = copy.deepcopy(raw.get("browser") or {})
             _set_path(raw, dotted_path, value)
             try:
                 cfg = _validate_config(raw)
+                await validate_browser_change(previous_browser, cfg.browser)
             except Exception:
                 if old is _MISSING:
                     _del_path(raw, dotted_path)
@@ -100,6 +103,7 @@ class ConfigStore:
             after = copy.deepcopy(before)
             mutator(after)
             cfg = _validate_config(after)
+            await validate_browser_change(before.get("browser") or {}, cfg.browser)
             self._write_atomic(after)
             self._revision += 1
             return ConfigMutationSnapshot(

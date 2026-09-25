@@ -9,6 +9,7 @@ import {
   eventStartedAtMs,
   eventUpdatedAtMs,
   isContextCompactionOperation,
+  isRootRunTerminalFrame,
   isTerminalOperationFrame,
   projectOperationMessages,
   shouldApplyOperationFrame,
@@ -60,6 +61,27 @@ test("context compaction operations project as visible ContextCompaction tool ca
   assert.equal(event.operation.payload.summaryId, 119);
   assert.equal(event.operation.payload.name, "ContextCompaction");
   assert.equal(event.live, false);
+});
+
+test("stopping a first request before any output leaves only the user turn", () => {
+  const root = "first-request";
+  const user = {opId: `msg:${root}`, opType: "user_message", turnUuid: root, runRootTurnId: root,
+    displaySeq: 1, revision: 1, payload: {text: "question"}, createdAtMs: 1000};
+  const run = {opId: `run:${root}`, opType: "run", turnUuid: root, runRootTurnId: root,
+    displaySeq: 2, revision: 2, status: "cancelled", lifecycle: "terminal",
+    payload: {status: "cancelled"}, createdAtMs: 1100};
+  const emptyAnswer = {opId: `assistant:${root}`, opType: "assistant_message", turnUuid: root,
+    runRootTurnId: root, displaySeq: 3, revision: 2, status: "cancelled", lifecycle: "terminal",
+    payload: {text: "", complete: true}, createdAtMs: 1200};
+  const stats = {opId: `stats:${root}`, opType: "stats", turnUuid: root, runRootTurnId: root,
+    displaySeq: 4, revision: 1, payload: {durationMs: 1900, modelCalls: 1}, createdAtMs: 2900};
+  const stopped = [user, run, emptyAnswer, stats];
+  assert.equal(deriveOperationRunState(stopped).running, false);
+  assert.deepEqual(projectOperationMessages(stopped).map((message) => message.role), ["user"]);
+  const withOutput = [{...emptyAnswer, payload: {text: "partial answer", complete: true}}, ...stopped.filter((op) => op !== emptyAnswer)];
+  const projected = projectOperationMessages(withOutput);
+  assert.equal(projected.find((message) => message.role === "assistant")?.localTimeline[0]?.message?.content, "partial answer");
+  assert.equal(projected.find((message) => message.role === "assistant")?.localStats?.durationMs, 1900);
 });
 
 test("operation-only turns mark their empty user anchor as a hidden synthetic placeholder", () => {
@@ -1266,6 +1288,52 @@ test("merged agent placeholder cancel is not a task terminal refresh boundary", 
   }), true);
 });
 
+test("only terminal root run frames are full-state calibration boundaries", () => {
+  const ordinaryTypes = ["tool", "assistant_message", "agent", "stats", "context_compaction"];
+  for (let index = 0; index < 1322; index += 1) {
+    const opType = ordinaryTypes[index % ordinaryTypes.length];
+    const frame = {
+      opId: `${opType}:${index}`,
+      opType,
+      action: "end",
+      targetType: opType === "agent" ? "task" : "run",
+      taskUuid: opType === "agent" ? `task-${index}` : "",
+      turnUuid: "root-turn",
+      runRootTurnId: "root-turn",
+      payload: {status: "completed"},
+    };
+    assert.equal(isTerminalOperationFrame(frame), true);
+    assert.equal(isRootRunTerminalFrame(frame), false);
+  }
+
+  for (const [action, status] of [
+    ["end", "completed"],
+    ["error", "failed"],
+    ["cancel", "cancelled"],
+    ["patch", "stopped"],
+  ]) {
+    assert.equal(isRootRunTerminalFrame({
+      opId: `run:${status}`,
+      opType: "run",
+      action,
+      targetType: "run",
+      turnUuid: "root-turn",
+      runRootTurnId: "root-turn",
+      payload: {runId: `run-${status}`, status},
+    }), true, status);
+  }
+
+  assert.equal(isRootRunTerminalFrame({
+    opType: "run", action: "end", targetType: "task", taskUuid: "task-child",
+    turnUuid: "child-turn", parentTurnId: "root-turn", runRootTurnId: "root-turn",
+    payload: {status: "completed"},
+  }), false);
+  assert.equal(isRootRunTerminalFrame({
+    opType: "run", action: "end", targetType: "run",
+    turnUuid: "child-turn", runRootTurnId: "root-turn", payload: {status: "completed"},
+  }), false);
+});
+
 
 test("operation frame reducer preserves target fields from live frames", () => {
   const store = { operationsById: new Map(), orderedOpIds: [], revisionByOpId: new Map(), lastFrameSeq: 0 };
@@ -1295,7 +1363,7 @@ test("model_retry projects at its first display sequence between partial assista
   const operations = [
     {opId: "user:root", opType: "user_message", turnId: "turn-root", runRootTurnId: "turn-root", displaySeq: 10, revision: 1, lifecycle: "terminal", status: "completed", payload: {text: "开始"}, createdAtMs: 1000, updatedAtMs: 1000},
     {opId: "assistant:partial", opType: "assistant_message", turnId: "turn-root", runRootTurnId: "turn-root", displaySeq: 20, revision: 1, lifecycle: "active", status: "running", payload: {text: "第一段", complete: false}, createdAtMs: 2000, updatedAtMs: 2000},
-    {opId: "model-retry:run-1:2", opType: "model_retry", turnId: "turn-root", runRootTurnId: "turn-root", displaySeq: 30, revision: 1, lifecycle: "active", status: "running", source: "model_retry", payload: {retry: {attempt: 2, max_retries: 5, wait_ms: 1200, reason: "rate_limit", summary: "当前账户请求过于频繁，请稍后再试", transportStatus: 503, upstreamStatus: 429, rootCause: {status: 429, classification: "rate_limit"}, attempts: [{status: 429}], details: {summary: "当前账户请求过于频繁，请稍后再试"}, active: true}, cancel_supported: true}, createdAtMs: 3000, updatedAtMs: 3000},
+    {opId: "model-retry:run-1:2", opType: "model_retry", turnId: "turn-root", runRootTurnId: "turn-root", displaySeq: 30, revision: 1, lifecycle: "active", status: "running", source: "model_retry", payload: {retry: {attempt: 2, max_retries: 5, wait_ms: 1200, waitId: "waiting-2", reason: "rate_limit", summary: "当前账户请求过于频繁，请稍后再试", transportStatus: 503, upstreamStatus: 429, rootCause: {status: 429, classification: "rate_limit"}, attempts: [{status: 429}], details: {summary: "当前账户请求过于频繁，请稍后再试"}, active: true}, cancel_supported: true}, createdAtMs: 3000, updatedAtMs: 3000},
     {opId: "model-retry:child:1", opType: "model_retry", turnId: "turn-root", runRootTurnId: "turn-root", taskUuid: "task-child", displaySeq: 35, revision: 1, lifecycle: "active", status: "running", payload: {attempt: 1, maxAttempts: 3, active: true}, createdAtMs: 3500, updatedAtMs: 3500},
     {opId: "assistant:final", opType: "assistant_message", turnId: "turn-root", runRootTurnId: "turn-root", displaySeq: 40, revision: 1, lifecycle: "terminal", status: "completed", payload: {text: "第二段", complete: true}, createdAtMs: 4000, updatedAtMs: 4000},
   ];
@@ -1311,6 +1379,7 @@ test("model_retry projects at its first display sequence between partial assista
     maxAttempts: 5,
     waitMs: 1200,
     retryAtMs: 0,
+    waitId: "waiting-2",
     reason: "rate_limit",
     summary: "当前账户请求过于频繁，请稍后再试",
     error: "",
@@ -1593,6 +1662,47 @@ test("duplicate terminal ACK scheduling is debounced and only the latest token r
   await second();
 
   assert.deepEqual(reasons, [2]);
+});
+
+test("ordinary terminal operations schedule no state request while each root run terminal still calibrates once", async () => {
+  const refreshes = [];
+  const harness = terminalRefreshHarness(async ({reason}) => { refreshes.push(reason.status); });
+  const scheduleFrame = (frame) => {
+    if (isRootRunTerminalFrame(frame)) harness.scheduler.schedule({status: frame.payload.status});
+  };
+
+  for (let index = 0; index < 1322; index += 1) {
+    scheduleFrame({
+      opId: `tool:${index}`,
+      opType: "tool",
+      action: "end",
+      targetType: "run",
+      turnUuid: "root-turn",
+      runRootTurnId: "root-turn",
+      payload: {status: "completed"},
+    });
+  }
+  assert.equal(harness.timers.size, 0);
+
+  for (const [action, status] of [
+    ["end", "completed"],
+    ["error", "failed"],
+    ["cancel", "cancelled"],
+    ["patch", "stopped"],
+  ]) {
+    scheduleFrame({
+      opId: `run:${status}`,
+      opType: "run",
+      action,
+      targetType: "run",
+      turnUuid: "root-turn",
+      runRootTurnId: "root-turn",
+      payload: {status},
+    });
+    await harness.latestTimer()();
+  }
+
+  assert.deepEqual(refreshes, ["completed", "failed", "cancelled", "stopped"]);
 });
 
 test("tool summary projects a collapsed card without materializing lazy result detail", () => {

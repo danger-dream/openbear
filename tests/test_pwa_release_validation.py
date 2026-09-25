@@ -38,7 +38,9 @@ def add_pwa(release):
     shutil.copy2(ROOT / "web/public/manifest.webmanifest", dist)
     shutil.copytree(ROOT / "web/public/icons", dist / "icons")
     shutil.copytree(ROOT / "web/public/assets/brand", dist / "assets/brand")
+    shutil.copy2(ROOT / "web/src/theme-tokens.css", dist / "assets/theme-tokens.css")
     html = (ROOT / "web/index.html").read_text().replace('/src/main.js', '/assets/index.js')
+    html = html.replace('/src/theme-tokens.css', '/assets/theme-tokens.css')
     (dist / "index.html").write_text(html)
     return dist
 
@@ -60,13 +62,13 @@ def test_new_pwa_tree_includes_real_icons_and_preserves_version_checks(release):
     add_pwa(release)
     report = validator.validate_release_tree(release, "v1.2.3")
     assert report["ok"]
-    assert report["frontend"] == {"indexReferences": 5, "checkedResources": 7}
+    assert report["frontend"] == {"indexReferences": 6, "checkedResources": 8}
     with pytest.raises(validator.ReleaseValidationError, match="版本不一致"):
         validator.validate_release_tree(release, "1.2.4")
 
 
 @pytest.mark.parametrize("filename", [
-    "manifest.webmanifest", "icons/openbear-192.png", "icons/openbear-512.png", "icons/apple-touch-icon.png",
+    "manifest.webmanifest", "icons/openbear-192.png", "icons/openbear-512.png", "icons/apple-touch-icon.png", "assets/theme-tokens.css",
     *[f"assets/brand/{path.name}" for path in sorted((ROOT / "web/public/assets/brand").glob("favicon-*"))],
 ])
 def test_new_pwa_tree_rejects_missing_files_even_manifest_only_indirect_512(release, filename):

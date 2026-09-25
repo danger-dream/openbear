@@ -11,6 +11,14 @@ import {
 } from "../../timelineProjection.js";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import TurnEvent from "./TurnEvent.vue";
+import ConversationWorkBlock from './ConversationWorkBlock.vue';
+import ConversationProcessEvent from './ConversationProcessEvent.vue';
+import ConversationRetryEvent from './ConversationRetryEvent.vue';
+import {isInlineProcess} from './conversationWork.js';
+import MessageVisibilityAction from './MessageVisibilityAction.vue';
+import {vMessageLongPress} from './messageLongPress.js';
+import {useMessageVisibility, visibilitySelectionClasses, selectVisibilityRow} from './messageVisibility.js';
+const visibility = useMessageVisibility();
 import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conversationTimeline.js";
 import {eventPrimaryToolName, isAgentEvent, tokenLine, tokenPartsFromStats} from "./display.js";
 
@@ -20,12 +28,12 @@ const props = defineProps({
 	running: {type: Boolean, default: false},
 	deletingTurnUuid: {type: String, default: ""},
 	autoScrollLocked: {type: Boolean, default: false},
-	retryCancelPending: {type: Boolean, default: false},
+	retryActionPending: {type: Object, default: () => ({})},
 	detailKey: {type: Function, required: true},
 	isDetailOpen: {type: Function, required: true},
 	activeToolResultIndex: {type: Function, required: true},
 });
-const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "delete-suffix", "cancel-retry"]);
+const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "delete-suffix", "cancel-retry", "retry-now"]);
 
 function displayEvents(turn) {
 	return Array.isArray(turn?.events) ? turn.events : [];
@@ -53,7 +61,23 @@ function turnView(turn) {
 }
 
 function conversationEvents(turn) {
-	return turnView(turn).entries;
+	const view = turnView(turn);
+	const hidden = visibility.hiddenIds.value;
+	if (!hidden.size) return view.entries;
+	if (view.hiddenIds !== hidden) {
+		view.hiddenIds = hidden;
+		view.visibleEntries = view.entries.filter(({event}) => !visibility.isHidden(event));
+	}
+	return view.visibleEntries;
+}
+
+function useProcessRow(entry) {
+	return isInlineProcess(entry) && !isAgentEvent(entry.event);
+}
+
+function turnWorking(turn, turnIndex) {
+	return Boolean((props.running && turnIndex === props.turns.length - 1) || turn?.stats?.live
+		|| displayEvents(turn).some(event => event?.persistentRunIndicator) || turnView(turn).liveAnswer);
 }
 
 function hasAssistantContent(turn) {
@@ -230,13 +254,14 @@ let copiedMessageTimer = 0;
 
 function assistantTurnRawContent(turn) {
 	return conversationEvents(turn)
-		.filter(({event}) => event?.kind === "answer")
+		.filter(({event, part}) => event?.kind === "answer" && part !== 'reasoning')
 		.map(({event}) => String(event?.message?.content || "").trim())
 		.filter(Boolean)
 		.join("\n\n");
 }
 
 function assistantMetaVisible(turn, turnIndex) {
+	if (!hasAssistantContent(turn) && displayEvents(turn).some(visibility.isHidden)) return false;
 	if (props.running && turnIndex === props.turns.length - 1) return false;
 	if (turn?.stats?.live) return false;
 	if (turnView(turn).liveAnswer) return false;
@@ -270,8 +295,9 @@ async function copyMessage(content, key) {
 </script>
 
 <template>
-	<section v-for="(turn, turnIndex) in props.turns" :key="turn.id" class="turn-block" :data-turn-index="turnIndex">
-		<div v-if="turn.user && !turn.user.syntheticPlaceholder" class="timed-row timed-row-user">
+	<template v-for="(turn, turnIndex) in props.turns" :key="turn.id">
+	<section v-if="(turn.user && !turn.user.syntheticPlaceholder && !visibility.isHidden(turn.user)) || hasAssistantContent(turn) || assistantMetaVisible(turn, turnIndex)" class="turn-block" :data-turn-index="turnIndex">
+		<div v-if="turn.user && !turn.user.syntheticPlaceholder && !visibility.isHidden(turn.user)" class="timed-row timed-row-user visibility-hover-surface" v-message-long-press="{target: turn.user, turn, visibility}" :class="[visibilitySelectionClasses(turn.user, visibility), {'visibility-target': visibility.canTarget(turn.user)}]" @click.capture="selectVisibilityRow($event, turn.user, visibility)">
 			<div class="user-row">
 				<div class="user-message-group">
 					<article class="message-user">
@@ -295,6 +321,7 @@ async function copyMessage(content, key) {
 					</div>
 				</article>
 				<div class="user-message-meta">
+					<MessageVisibilityAction :target="turn.user" desktop-placement="footer" :turn="turn" mobile-long-press/>
 					<el-tooltip v-if="turn.user.content" content="复制消息" placement="bottom" :show-after="350">
 						<button type="button" class="message-icon-action" aria-label="复制消息"
 						        @click="copyMessage(turn.user.content, `user-${turn.user.turnUuid || turn.id}`)">
@@ -321,18 +348,21 @@ async function copyMessage(content, key) {
 
 		<div v-if="hasAssistantContent(turn) || assistantMetaVisible(turn, turnIndex)" class="assistant-row">
 			<article class="assistant-card">
-				<template v-for="(entry, conversationIndex) in conversationEvents(turn)" :key="entry.event.id || entry.event.eventKey || entry.event.message?.id || entry.event.operation?.opId || `${turn.id}-${entry.index}`">
-					<ConsoleMarkdown v-if="showAssistantDivider(turn, conversationIndex)" class="assistant-update-divider" text="----"/>
-					<div class="timed-row timed-row-assistant">
+				<ConversationWorkBlock :turn="turn" :entries="conversationEvents(turn)" :running="turnWorking(turn, turnIndex)" :duration-ms="assistantDurationMs(turn)">
+				<template #default="{entry, conversationIndex}">
+					<div class="timed-row timed-row-assistant visibility-hover-surface" v-message-long-press="{target: entry.event, turn, visibility}" :class="[visibilitySelectionClasses(entry.event, visibility), {'visibility-target': visibility.canTarget(entry.event)}]" @click.capture="selectVisibilityRow($event, entry.event, visibility)">
 						<span v-if="eventTimeMs(entry.event) && showEventTimeBadge(turn, turnIndex, conversationIndex)" class="time-float time-float-left" :title="formatFullTime(eventTimeMs(entry.event))">{{ timeBadge(eventTimeMs(entry.event), durationMsForEvent(entry.event)) }}</span>
-						<TurnEvent
+						<ConversationRetryEvent v-if="entry.event.kind === 'model_retry'" :event="entry.event" :retry-action-pending="props.retryActionPending" @cancel-retry="emit('cancel-retry', $event)" @retry-now="emit('retry-now', $event)"/>
+						<ConversationProcessEvent v-else-if="useProcessRow(entry)" :event="entry.event" :part="entry.part || ''" :conversation-uuid="props.conversationUuid" :active-index="props.activeToolResultIndex(entry.event)" @select-tab="emitSelectToolResult(entry.event, $event)"/>
+						<TurnEvent v-else
+						process-row
 						:event="entry.event"
 						:conversation-uuid="props.conversationUuid"
 						:turn-id="turn.id"
 						:index="entry.index"
 						:auto-scroll-locked="props.autoScrollLocked"
 						:reasoning-autoscroll="Boolean(entry.event.reasoningActive) && props.autoScrollLocked"
-						:retry-cancel-pending="props.retryCancelPending"
+						:retry-action-pending="props.retryActionPending"
 						:live-text-target="liveTextTargetForEvent(turn, entry.index)"
 						:detail-key="props.detailKey"
 						:is-detail-open="props.isDetailOpen"
@@ -342,9 +372,12 @@ async function copyMessage(content, key) {
 						@reasoning-toggle="emitReasoningToggle"
 						@select-tool-result="emitSelectToolResult"
 						@cancel-retry="emit('cancel-retry', $event)"
+						@retry-now="emit('retry-now', $event)"
 					/>
+					<MessageVisibilityAction :target="entry.event" desktop-placement="gutter" :turn="turn" mobile-long-press/>
 					</div>
 				</template>
+				</ConversationWorkBlock>
 				<div v-if="assistantMetaVisible(turn, turnIndex)" class="assistant-message-meta">
 					<time v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-message-time" :title="formatFullTime(assistantTimeMs(turn))">{{ timeBadge(assistantTimeMs(turn), assistantDurationMs(turn)) }}</time>
 					<span v-if="hasTurnTokens(turn)" class="turn-token-usage" :title="`本轮 Tokens：${turnTokenLine(turn)}`">{{ assistantTimeMs(turn) || assistantDurationMs(turn) ? '· ' : '' }}{{ turnTokenLine(turn) }}</span>
@@ -358,6 +391,7 @@ async function copyMessage(content, key) {
 			</article>
 		</div>
 	</section>
+	</template>
 </template>
 
 <style scoped>
@@ -375,6 +409,8 @@ async function copyMessage(content, key) {
 	margin-top: 0.16rem;
 }
 
+.conversation-work .timed-row + .timed-row { margin-top: 0; }
+
 .time-float {
 	position: absolute;
 	top: 0.18rem;
@@ -383,15 +419,15 @@ async function copyMessage(content, key) {
 	align-items: center;
 	height: 1.35rem;
 	padding: 0 .5rem;
-	border: 1px solid rgba(15, 23, 42, .08);
+	border: 1px solid var(--ob-border);
 	border-radius: 999px;
-	background: rgba(255, 255, 255, .92);
-	color: #94a3b8;
+	background: var(--ob-surface-raised);
+	color: var(--ob-text-muted);
 	font-size: 10.5px;
 	font-variant-numeric: tabular-nums;
 	line-height: 1;
 	white-space: nowrap;
-	box-shadow: 0 12px 26px rgba(15, 23, 42, .08);
+	box-shadow: var(--ob-shadow-popover);
 	opacity: 0;
 	transform: translateY(2px);
 	pointer-events: none;
@@ -413,6 +449,7 @@ async function copyMessage(content, key) {
 
 .user-row {
 	display: flex;
+	width: 100%;
 	justify-content: flex-end;
 	margin-bottom: 0.95rem;
 }
@@ -432,7 +469,7 @@ async function copyMessage(content, key) {
 	justify-content: flex-end;
 	gap: .34rem;
 	padding: .22rem .18rem 0;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 	font-size: 10.5px;
 	font-variant-numeric: tabular-nums;
 	line-height: 1;
@@ -440,7 +477,7 @@ async function copyMessage(content, key) {
 }
 
 .user-message-time {
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .message-icon-action {
@@ -452,7 +489,7 @@ async function copyMessage(content, key) {
 	border: 0;
 	border-radius: 6px;
 	background: transparent;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 	cursor: pointer;
 	transition: color .14s ease, background .14s ease;
 }
@@ -463,30 +500,31 @@ async function copyMessage(content, key) {
 
 .message-icon-action:hover:not(:disabled),
 .message-icon-action:focus-visible:not(:disabled) {
-	background: #f4f4f5;
-	color: #52525b;
+	background: var(--ob-hover);
+	color: var(--ob-text-disabled);
 	outline: none;
 }
 
 .message-icon-action.restart-action:hover:not(:disabled),
 .message-icon-action.restart-action:focus-visible:not(:disabled) {
-	background: #fff5f4;
-	color: #b42318;
+	background: var(--ob-danger-soft);
+	color: var(--ob-danger);
 }
 
 .message-icon-action:disabled {
 	cursor: not-allowed;
-	color: #d4d4d8;
+	color: var(--ob-text-disabled);
 }
 
 .message-user {
+	min-width: 0;
 	max-width: 100%;
-	border-radius: 18px;
-	background: #f4f4f4;
-	padding: 0.65rem 0.9rem;
-	color: #111827;
-	font-size: 14px;
-	line-height: 1.72;
+	border-radius: 13px;
+	background: var(--ob-chat-bubble);
+	padding: 0.85rem 1.1rem;
+	color: var(--ob-chat-text);
+	font-size: 13px;
+	line-height: 1.85;
 }
 
 .user-attachments {
@@ -506,12 +544,12 @@ async function copyMessage(content, key) {
 	place-items: center;
 	min-height: 88px;
 	overflow: hidden;
-	border: 1px solid rgba(15, 23, 42, 0.08);
+	border: 1px solid var(--ob-border);
 	border-radius: 14px;
-	background: rgba(255, 255, 255, 0.76);
-	box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+	background: rgb(var(--ob-surface-rgb) / 0.76);
+	box-shadow: var(--ob-shadow-panel);
 	text-decoration: none;
-	color: #334155;
+	color: var(--ob-text);
 }
 
 .user-attachment.image {
@@ -551,7 +589,7 @@ async function copyMessage(content, key) {
 	justify-content: flex-start;
 	gap: .34rem;
 	padding: .22rem .18rem 0;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 	font-size: 10.5px;
 	font-variant-numeric: tabular-nums;
 	line-height: 1;
@@ -560,16 +598,21 @@ async function copyMessage(content, key) {
 
 .assistant-message-time,
 .turn-token-usage {
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .assistant-card {
 	min-width: 0;
 	flex: 1;
 	max-width: 100%;
-	font-size: 14px;
-	line-height: 1.72;
-	color: #111827;
+	font-size: 13px;
+	line-height: 1.85;
+	color: var(--ob-chat-text);
+}
+
+@media (max-width: 760px) {
+	.message-user { font-size: 14px; padding: 13px 15px; border-radius: 14px; }
+	.assistant-card { font-size: 14px; line-height: 1.95; }
 }
 
 /* Only the standalone separator between answer entries, not rules inside a message. */
@@ -600,64 +643,46 @@ async function copyMessage(content, key) {
 	}
 }
 
+@media (min-width: 761px) {
+	/* Keep hover active while the pointer crosses into the outside action gutter. */
+	.visibility-hover-surface::before { content: ''; position: absolute; left: -32px; top: 0; bottom: 0; width: 32px; }
+	.visibility-selectable { cursor: pointer; }
+	/* Selection lives in the gutter: keep the original message surface untouched. */
+	.visibility-selected::after { content: ''; position: absolute; left: -19px; top: 29px; bottom: 4px; width: 2px; border-radius: 2px; background: var(--ob-text-muted); pointer-events: none; }
+	.visibility-selectable > .time-float { display: none; }
+	/* Leave the message-action gutter clear of the existing hover timestamp. */
+	.time-float-left { right: calc(100% + 42px); }
+}
+@media (min-width: 761px) and (hover: hover) and (pointer: fine) {
+	.visibility-hover-surface:hover :deep(.message-visibility-action),
+	.visibility-hover-surface:focus-within :deep(.message-visibility-action) { opacity: 1; pointer-events: auto; }
+}
+
+@media (max-width: 760px) {
+	/* Identify the long-pressed row without changing its width or flow. */
+	.visibility-menu-target { border-radius: 10px; background: rgb(var(--ob-surface-soft-rgb) / 0.08); box-shadow: 0 0 0 1px rgb(var(--ob-shadow-rgb) / 0.14); }
+	/* Normal reading uses the full width; the check rail exists only in multi-select. */
+	.timed-row.visibility-selectable { box-sizing: border-box; padding-left: 32px; }
+	.visibility-target { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+	.visibility-target :deep(a), .visibility-target :deep(input), .visibility-target :deep(textarea) { -webkit-touch-callout: default; -webkit-user-select: text; user-select: text; }
+	/* Compact retry summaries have their own line height: align both controls in
+	   the same centered row instead of reusing the prose baseline offset. */
+	.timed-row-assistant.visibility-selectable:has(> .retry-inline-event) { display: flex; align-items: center; min-height: 44px; }
+	.timed-row-assistant.visibility-selectable:has(> .retry-inline-event) > :deep(.message-visibility-action) { top: 50%; transform: translateY(-50%); }
+	.timed-row-assistant.visibility-selectable > :deep(.retry-inline-event) { width: 100%; min-width: 0; }
+	.visibility-selected::after { content: ''; position: absolute; left: 9px; top: 34px; bottom: 4px; width: 2px; border-radius: 2px; background: var(--el-border-color); pointer-events: none; }
+	.visibility-selectable { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+}
+
 /* Touch browsers can retain :hover after a tap; never insert a time badge
    above the message on mobile. Persistent footer metadata is unchanged. */
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
+	.user-message-group {
+		max-width: 100%;
+	}
 	.time-float,
 	.timed-row:hover > .time-float {
 		display: none;
 	}
 }
-</style>
-
-<style>
-/* OpenBear system dark theme */
-html.dark .time-float {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.92);
-		color: #a1a1a8;
-		box-shadow: 0 12px 26px rgba(0, 0, 0, 0.16);
-	}
-html.dark .user-message-meta {
-		color: #a1a1a8;
-	}
-html.dark .user-message-time {
-		color: #a1a1a8;
-	}
-html.dark .message-icon-action {
-		color: #a1a1a8;
-	}
-html.dark .message-icon-action:hover:not(:disabled),
-html.dark .message-icon-action:focus-visible:not(:disabled) {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .message-icon-action.restart-action:hover:not(:disabled),
-html.dark .message-icon-action.restart-action:focus-visible:not(:disabled) {
-		background: #1d1e22;
-		color: #fb8585;
-	}
-html.dark .message-icon-action:disabled {
-		color: #7b7b82;
-	}
-html.dark .message-user {
-		background: #202125;
-		color: #efeff2;
-	}
-html.dark .user-attachment {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.76);
-		box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
-		color: #dedee1;
-	}
-html.dark .assistant-message-meta {
-		color: #a1a1a8;
-	}
-html.dark .assistant-message-time,
-html.dark .turn-token-usage {
-		color: #a1a1a8;
-	}
-html.dark .assistant-card {
-		color: #efeff2;
-	}
 </style>

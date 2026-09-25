@@ -1,11 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import vm from "node:vm";
 import {
   createRunConfigSaveQueue,
   mayRetireRunConfigOverride,
   runConfigForDisplay,
   runConfigFromResponse,
 } from "./runConfigState.js";
+
+const consoleSource = fs.readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
+function sourceBetween(start, end) {
+  const from = consoleSource.indexOf(start);
+  const to = consoleSource.indexOf(end, from + start.length);
+  assert.ok(from >= 0 && to > from, `${start}..${end}`);
+  return consoleSource.slice(from, to);
+}
 
 function config(conversationUuid, model, overrides = {}) {
   return {
@@ -46,6 +56,53 @@ function deferred() {
   });
   return {promise, resolve, reject};
 }
+
+test("the actual model selector marks its HTTP save pending until commit", async () => {
+  const gate = deferred();
+  const messages = [];
+  const context = vm.createContext({
+    modelMutationCounts: {value: new Map()},
+    modelMutationKey: () => "conv-a\u0000",
+    running: {value: false},
+    activeConversationUuid: {value: "conv-a"},
+    isLocalConversation: {value: false},
+    modelQuery: {value: "sol"},
+    props: {conversationUuid: "conv-a", folderId: ""},
+    patchLocalRunDefaults: async () => {},
+    runConfigSaves: {
+      enqueue: async (_uuid, request) => ({response: await request(), applied: true}),
+    },
+    Api: {
+      conversationSetModel: async () => gate.promise,
+    },
+    isRunConfigInteractionCurrent: () => true,
+    ElMessage: {
+      success: (message) => messages.push(["success", message]),
+      warning: (message) => messages.push(["warning", message]),
+      error: (message) => messages.push(["error", message]),
+    },
+    ElMessageBox: {confirm: async () => { throw new Error("unexpected_confirm"); }},
+    apiError: (error) => String(error?.message || error),
+    modelDefaultThinking: () => "",
+    emit: () => {},
+    load: async () => {},
+    window: {dispatchEvent: () => {}},
+    CustomEvent: class {},
+  });
+  vm.runInContext([
+    sourceBetween("function beginModelMutation(", "async function selectContextStrategy("),
+    sourceBetween("async function selectModel(", "async function selectThinking("),
+  ].join("\n"), context);
+
+  const selecting = vm.runInContext("selectModel({key: 'source-b/gpt-5.6-sol'})", context);
+  assert.equal(context.modelMutationCounts.value.get("conv-a\u0000"), 1);
+  assert.deepEqual(messages, []);
+  gate.resolve({ok: true});
+  await selecting;
+  assert.equal(context.modelMutationCounts.value.has("conv-a\u0000"), false);
+  assert.equal(context.modelQuery.value, "");
+  assert.match(messages[0][1], /source-b\/gpt-5\.6-sol/);
+});
 
 test("save responses must contain a complete config for the requested conversation", () => {
   const valid = response("conv-a", "openai/gpt");

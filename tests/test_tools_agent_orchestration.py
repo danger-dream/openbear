@@ -484,7 +484,7 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     }
     canonical_tools = sorted(AGENT_DELEGATION_TOOL_NAMES)
     assert set(canonical_tools) == {
-        "Bash", "Edit", "Process", "Read", "TaskMemory", "Write",
+        "Bash", "Browser", "Edit", "Process", "Read", "TaskMemory", "Write",
     }
     main_schemas = {item["name"]: item for item in reg.schemas(scope="main")}
     agent_schemas = {item["name"]: item for item in reg.schemas(scope="agent")}

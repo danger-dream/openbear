@@ -232,11 +232,13 @@ async def test_web_admin_public_exports_and_route_baseline(web_env):
 
     routes = {(route.method, route.resource.canonical) for route in web_env.server.make_app().router.routes()}
     assert ("GET", "/health") in routes
+    assert ("GET", "/statistics") in routes
     assert ("POST", "/api/auth/login/start") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/ws") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/state") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/operations/{operation_id}/detail") in routes
     assert ("PATCH", "/api/conversations/{conversation_uuid}") in routes
+    assert ("POST", "/api/conversations/{conversation_uuid}/title/generate") in routes
     assert ("POST", "/api/conversations/{conversation_uuid}/duplicate") in routes
     assert ("POST", "/api/conversations/{conversation_uuid}/reorder") in routes
     assert ("POST", "/api/conversations/{conversation_uuid}/pin") in routes
@@ -262,6 +264,28 @@ async def _login_cookie(web_env) -> dict[str, str]:
     return {"openbear_web_session": approved.cookies["openbear_web_session"].value}
 
 
+async def test_statistics_response_is_not_reused_by_browser_cache(web_env):
+    cookie = await _login_cookie(web_env)
+    response = await web_env.client.get(
+        "/api/statistics?days=7",
+        cookies={"openbear_web_session": cookie},
+    )
+
+    assert response.status == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert (await response.json())["period"]["days"] == 7
+
+    today = await web_env.client.get(
+        "/api/statistics?days=1",
+        cookies={"openbear_web_session": cookie},
+    )
+    assert today.status == 200
+    today_payload = await today.json()
+    assert today_payload["period"]["days"] == 1
+    assert today_payload["period"]["bucketHours"] == 1
+    assert len(today_payload["timeline"]) == 24
+
+
 async def test_web_artifacts_rewrite_and_auth_scoped_content(web_env, tmp_path):
     cookie = await _login_cookie(web_env)
     web_env.client.session.cookie_jar.clear()
@@ -285,6 +309,9 @@ async def test_web_artifacts_rewrite_and_auth_scoped_content(web_env, tmp_path):
     artifact = dict(await cur.fetchone())
     assert artifact["owner_chat_id"] == 123
     assert artifact["internal_chat_id"] == row["internal_chat_id"]
+    assert web_env.server._web_artifact_public(artifact, row["conversation_uuid"])["workspacePath"] == (
+        "workspace/artifacts/openbear-web-artifact-test/hello.txt"
+    )
 
     unauth = await web_env.client.get(
         f"/api/conversations/{row['conversation_uuid']}/artifacts/{artifact['artifact_uuid']}/content"
@@ -308,6 +335,46 @@ async def test_web_artifacts_rewrite_and_auth_scoped_content(web_env, tmp_path):
     assert download.status == 200
     assert download.headers["Content-Type"] == "text/plain; charset=utf-8"
     assert download.headers["Content-Disposition"].startswith("attachment;")
+
+
+async def test_web_artifact_metadata_only_shares_valid_existing_workspace_paths(web_env, tmp_path):
+    cookies = {"openbear_web_session": await _login_cookie(web_env)}
+    row_a = await web_env.server._create_web_conversation(123, title="A")
+    row_b = await web_env.server._create_web_conversation(123, title="B")
+    workspace = tmp_path / "workspace"
+    web_env.server.workspace_dir = str(workspace)
+    source = workspace / "artifacts" / "report folder" / "图.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"picture")
+    item = await web_env.server._register_web_artifact_from_path(source, conversation=row_a)
+    assert item["workspacePath"] == "workspace/artifacts/report folder/图.png"
+    assert str(source) not in str(item)  # never expose the physical workspace/blob location
+    assert web_env.server._web_artifact_source_from_ref(item["workspacePath"]) == source.resolve()
+    assert await web_env.server._register_web_artifact_from_path(source, conversation=row_b)
+
+    meta = await web_env.client.get(
+        f"/api/conversations/{row_a['conversation_uuid']}/artifacts/{item['artifactUuid']}",
+        cookies=cookies,
+    )
+    assert (await meta.json())["artifact"]["workspacePath"] == item["workspacePath"]
+    listing = await web_env.client.get(f"/api/conversations/{row_a['conversation_uuid']}/artifacts", cookies=cookies)
+    assert any(found.get("workspacePath") == item["workspacePath"] for found in (await listing.json())["items"])
+
+    public = web_env.server._web_artifact_public
+    media = tmp_path / "inbound" / "image.png"
+    media.parent.mkdir()
+    media.write_bytes(b"upload")
+    assert "workspacePath" not in public({"source_path": str(media), "file_name": "image.png"}, row_a["conversation_uuid"])
+    outside_link = workspace / "artifacts" / "outside.png"
+    outside_link.symlink_to(media)
+    assert "workspacePath" not in public({"source_path": str(outside_link)}, row_a["conversation_uuid"])
+    assert "workspacePath" not in public({"source_path": str(tmp_path / "web_artifacts" / "blobs" / "stored")}, row_a["conversation_uuid"])
+    source.unlink()
+    assert "workspacePath" not in public({"source_path": str(source)}, row_a["conversation_uuid"])
+    stale = await web_env.client.get(
+        f"/api/conversations/{row_a['conversation_uuid']}/artifacts/{item['artifactUuid']}", cookies=cookies,
+    )
+    assert "workspacePath" not in (await stale.json())["artifact"]
 
 
 async def test_web_assistant_workspace_image_link_rewritten_before_display(web_env, tmp_path):
@@ -394,7 +461,6 @@ async def test_web_conversation_context_actions_rename_pin_duplicate(web_env):
     rename = await web_env.client.patch(f"/api/conversations/{row['conversation_uuid']}", cookies=cookie, json={"title": "renamed"})
     assert rename.status == 200
     assert (await rename.json())["conversation"]["title"] == "renamed"
-
     pin = await web_env.client.post(f"/api/conversations/{row['conversation_uuid']}/pin", cookies=cookie)
     assert pin.status == 200
     assert (await pin.json())["conversation"]["pinned"] is True
@@ -417,6 +483,139 @@ async def test_web_conversation_context_actions_rename_pin_duplicate(web_env):
     ops = await web_env.server._web_operations(copied_uuid)
     assert ops and ops[0]["conversationUuid"] == copied_uuid
     assert ops[0]["internalChatId"] == copied_chat_id
+
+    long_title = "手动重命名 zcode parrot claude " + "详细需求" * 100
+    renamed_long = await web_env.client.patch(
+        f"/api/conversations/{row['conversation_uuid']}",
+        cookies=cookie,
+        json={"title": f"  {long_title}  "},
+    )
+    assert renamed_long.status == 200
+    assert (await renamed_long.json())["conversation"]["title"] == long_title
+    cur = await web_env.db.conn.execute(
+        "SELECT title FROM web_conversations WHERE conversation_uuid=?", (row["conversation_uuid"],),
+    )
+    assert (await cur.fetchone())["title"] == long_title
+
+
+async def test_web_conversation_title_generation_uses_clean_turns_and_usage_ledger(web_env):
+    from app.conversation_titles import DEFAULT_NAMING_PROMPT
+
+    row = await web_env.server._create_web_conversation(
+        123, title="调查会话命名问题", model="openai/gpt",
+    )
+    chat_id = int(row["internal_chat_id"])
+    conversation_uuid = str(row["conversation_uuid"])
+    messages = MessageDAO(web_env.db)
+    for role, content in (("user", "调查会话命名问题"), ("assistant", "当前标题只是首条问题截断，需要语义总结。")):
+        await web_env.server._persist_web_transcript_message(
+            messages,
+            chat_id,
+            role,
+            content,
+            conversation_uuid=conversation_uuid,
+            turn_uuid="turn-title",
+            run_root_turn_uuid="turn-title",
+        )
+    factory = FakeMemoryFactory('标题："会话智能命名"')
+    web_env.server.llm_factory = factory
+    web_env.server.config.agent.naming_max_retries = 0
+    before_updated = int(row["updated_at"])
+
+    result = await web_env.server._generate_conversation_title(
+        row,
+        expected_title="调查会话命名问题",
+        automatic=True,
+    )
+
+    assert result == {"ok": True, "changed": True, "title": "会话智能命名", "superseded": False}
+    assert factory.requested == ["openai/gpt"]
+    assert factory.backend.calls[0]["max_tokens"] == 1024
+    assert factory.backend.calls[0]["system"] == DEFAULT_NAMING_PROMPT
+    assert factory.backend.calls[0]["messages"] == [{
+        "role": "user",
+        "content": "第 1 轮\n用户：调查会话命名问题\n助手：当前标题只是首条问题截断，需要语义总结。",
+    }]
+    cur = await web_env.db.conn.execute(
+        "SELECT title,updated_at FROM web_conversations WHERE conversation_uuid=?",
+        (conversation_uuid,),
+    )
+    stored = await cur.fetchone()
+    assert stored["title"] == "会话智能命名"
+    assert int(stored["updated_at"]) == before_updated
+    assert (await messages.recent_model_calls(chat_id))[0].call_kind == "conversation_title"
+
+
+@pytest.mark.parametrize("term,model_title", [
+    ("zcode", "zcode 使用说明"),
+    ("parrot", "parrot 项目分析"),
+    ("claude", "claude 使用说明"),
+    ("parrot", "鹦鹉项目分析"),  # Cleaning must not infer or inject names omitted by the model.
+])
+async def test_web_auto_title_uses_default_prompt_without_rewriting_model_output(web_env, term, model_title):
+    from app.conversation_titles import DEFAULT_NAMING_PROMPT, initial_conversation_title
+
+    question = f"如何配置和使用 {term} 的工具功能？"
+    placeholder = initial_conversation_title(question)
+    row = await web_env.server._create_web_conversation(123, title=placeholder, model="openai/gpt")
+    messages = MessageDAO(web_env.db)
+    for role, text in (("user", question), ("assistant", "先介绍使用方式。")):
+        await web_env.server._persist_web_transcript_message(
+            messages, int(row["internal_chat_id"]), role, text,
+            conversation_uuid=row["conversation_uuid"], turn_uuid="turn-names", run_root_turn_uuid="turn-names",
+        )
+    factory = FakeMemoryFactory(model_title)
+    web_env.server.llm_factory = factory
+    web_env.server.config.agent.naming_max_retries = 0
+
+    result = await web_env.server._generate_conversation_title(row, expected_title=placeholder, automatic=True)
+
+    assert result["ok"] and result["title"] == model_title
+    assert factory.backend.calls[0]["system"] == DEFAULT_NAMING_PROMPT
+    assert term in factory.backend.calls[0]["messages"][0]["content"]
+    cur = await web_env.db.conn.execute(
+        "SELECT title FROM web_conversations WHERE conversation_uuid=?", (row["conversation_uuid"],),
+    )
+    assert (await cur.fetchone())["title"] == model_title
+
+
+async def test_web_conversation_title_generation_never_overwrites_a_concurrent_manual_name(web_env):
+    row = await web_env.server._create_web_conversation(
+        123, title="调查命名竞态", model="openai/gpt",
+    )
+    chat_id = int(row["internal_chat_id"])
+    conversation_uuid = str(row["conversation_uuid"])
+    messages = MessageDAO(web_env.db)
+    for role, content in (("user", "调查命名竞态"), ("assistant", "需要保护用户手动修改。")):
+        await web_env.server._persist_web_transcript_message(
+            messages,
+            chat_id,
+            role,
+            content,
+            conversation_uuid=conversation_uuid,
+            turn_uuid="turn-race",
+            run_root_turn_uuid="turn-race",
+        )
+    await web_env.db.conn.execute(
+        "UPDATE web_conversations SET title=? WHERE conversation_uuid=?",
+        ("用户手动名称", conversation_uuid),
+    )
+    await web_env.db.conn.commit()
+    web_env.server.llm_factory = FakeMemoryFactory("模型生成名称")
+    web_env.server.config.agent.naming_max_retries = 0
+
+    result = await web_env.server._generate_conversation_title(
+        row,
+        expected_title="调查命名竞态",
+        automatic=True,
+    )
+
+    assert result == {"ok": True, "changed": False, "title": "用户手动名称", "superseded": True}
+    cur = await web_env.db.conn.execute(
+        "SELECT title FROM web_conversations WHERE conversation_uuid=?",
+        (conversation_uuid,),
+    )
+    assert (await cur.fetchone())["title"] == "用户手动名称"
 
 
 async def test_web_conversation_archive_only_filters_sidebar_listing(web_env):
@@ -1411,6 +1610,78 @@ async def test_web_controller_physical_retry_keeps_task_memory_state_prefix(web_
     assert backend.seen_tools[0] == backend.seen_tools[1]
 
 
+@pytest.mark.parametrize("action", ["cancel", "now"])
+async def test_web_manual_retry_control_keeps_usage_and_finishes_cleanly(web_env, monkeypatch, action):
+    async def _fake_system_prompt():
+        return "retry test"
+
+    monkeypatch.setattr(web_env.server, "_build_system_prompt_for_chat", _fake_system_prompt)
+    web_env.server.config.agent.retry_backoff_s = 60
+    web_env.server.control_actions = ControlActionQueue()
+    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
+    web_env.server.tools = ToolRegistry()
+    backend = FakeStreamBackend([
+        [StreamEvent(kind="content", text="已完成部分"),
+         StreamEvent(kind="usage", usage=Usage(input_tokens=13, output_tokens=4)),
+         StreamEvent(kind="error", error="temporary", retryable=True, status=503)],
+        [StreamEvent(kind="content", text="修复后完成"), StreamEvent(kind="finish", finish_reason="stop")],
+    ])
+    web_env.server.llm_factory = FakeRunFactory(backend, context_window=128000)
+    row = await web_env.server._create_web_conversation(123, title="retry control", model="openai/gpt")
+    chat_id = int(row["internal_chat_id"])
+    conv_uuid = str(row["conversation_uuid"])
+    live = web_env.server._live_for(row)
+    events = live.subscribe()
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    await live.publish({"type": "accepted", "turnUuid": "retry-control-turn", "runUuid": "retry-control-run"})
+    run = asyncio.create_task(web_env.server._run_web_turn(
+        chat_id, "继续任务", _WebStreamRenderer(live), conversation=row, root_turn_uuid="retry-control-turn",
+    ))
+    try:
+        while True:
+            event = await asyncio.wait_for(events.get(), timeout=3)
+            if event.get("type") == "retry_wait" and event.get("retry", {}).get("active"):
+                break
+        wait_id = event["retry"]["waitId"]
+        url = f"/api/conversations/{conv_uuid}/retry/{action}"
+        stale = await web_env.client.post(url, json={"waitId": "other-wait"}, cookies=cookie)
+        assert (await stale.json())["accepted"] is False
+        response = await web_env.client.post(url, json={"waitId": wait_id}, cookies=cookie)
+        assert response.status == 200 and (await response.json())["accepted"] is True
+        duplicate = await web_env.client.post(url, json={"waitId": wait_id}, cookies=cookie)
+        assert (await duplicate.json())["accepted"] is False
+        assert await asyncio.wait_for(run, timeout=4) is (action == "now")
+        assert backend.calls == (1 if action == "cancel" else 2)
+        stats = live.last_stats
+        assert stats["modelCalls"] == backend.calls
+        assert stats["durationMs"] > 0
+        assert stats["usage"]["inputTokens"] >= 13
+        assert stats["usage"]["outputTokens"] >= 4
+        ledger = await MessageDAO(web_env.db).recent_model_calls(chat_id)
+        assert len(ledger) == backend.calls
+        assert ledger[-1].status == "error"
+        assert ledger[-1].input_tokens == 13
+        if action == "cancel":
+            assert stats["haltedReason"] == "retry_cancelled"
+            assert stats["modelFail"] == 1
+            assert stats["modelRetry"] == 0  # no second physical request was sent
+            assert live.status == "idle"
+            transcript = await MessageDAO(web_env.db).recent(chat_id)
+            assert any(row.role == "assistant" and "已完成部分" in row.content for row in transcript)
+            cursor = await web_env.db.conn.execute(
+                "SELECT status FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,),
+            )
+            assert (await cursor.fetchone())["status"] == "idle"
+        else:
+            assert stats["modelFail"] == 0
+            assert stats["modelRetry"] == 1
+            assert stats["haltedReason"] == ""
+    finally:
+        live.unsubscribe(events)
+        if not run.done():
+            run.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run
 
 
 async def test_web_run_restores_anchored_private_context_after_existing_summary(web_env, monkeypatch):
@@ -1732,6 +2003,80 @@ async def _login_cookie(web_env) -> str:
     await web_env.server.decide_login_request(req_uuid, approved=True, decided_by=123)
     approved = await web_env.client.post(f"/api/auth/login/consume/{req_uuid}")
     return approved.cookies["openbear_web_session"].value
+
+
+async def test_web_sessions_can_be_listed_and_revoked_individually(web_env):
+    current_cookie = await _login_cookie(web_env)
+    other_cookie = await _login_cookie(web_env)
+
+    listed = await web_env.client.get(
+        "/api/auth/sessions",
+        cookies={"openbear_web_session": current_cookie},
+    )
+    assert listed.status == 200
+    assert listed.headers["Cache-Control"] == "no-store"
+    data = await listed.json()
+    assert data["total"] == 2
+    assert data["items"][0]["current"] is True
+    assert sum(1 for item in data["items"] if item["current"]) == 1
+    assert all("session_token_hash" not in item for item in data["items"])
+
+    other = next(item for item in data["items"] if not item["current"])
+    revoked = await web_env.client.delete(
+        f"/api/auth/sessions/{other['id']}",
+        cookies={"openbear_web_session": current_cookie},
+    )
+    assert revoked.status == 200
+    assert (await revoked.json()) == {"ok": True, "sessionId": other["id"], "current": False}
+    assert (await web_env.client.get(
+        "/api/auth/session", cookies={"openbear_web_session": other_cookie}
+    )).status == 401
+    assert (await web_env.client.get(
+        "/api/auth/session", cookies={"openbear_web_session": current_cookie}
+    )).status == 200
+
+    refreshed = await web_env.client.get(
+        "/api/auth/sessions", cookies={"openbear_web_session": current_cookie}
+    )
+    assert (await refreshed.json())["total"] == 1
+
+
+async def test_web_session_revoke_is_owner_scoped_and_current_logout_clears_cookie(web_env):
+    current_cookie = await _login_cookie(web_env)
+    ts = now_ts()
+    cur = await web_env.db.conn.execute(
+        """INSERT INTO web_sessions
+           (session_token_hash, chat_id, created_at, expires_at, last_seen_at, ip, user_agent)
+           VALUES (?,?,?,?,?,?,?)""",
+        (_sha256("owner-456-session"), 456, ts, ts + 3600, ts, "203.0.113.9", "Other browser"),
+    )
+    await web_env.db.conn.commit()
+    other_owner_id = int(cur.lastrowid)
+
+    hidden = await web_env.client.delete(
+        f"/api/auth/sessions/{other_owner_id}",
+        cookies={"openbear_web_session": current_cookie},
+    )
+    assert hidden.status == 404
+    other_row = await (await web_env.db.conn.execute(
+        "SELECT revoked_at FROM web_sessions WHERE id=?", (other_owner_id,)
+    )).fetchone()
+    assert int(other_row["revoked_at"] or 0) == 0
+
+    listed = await web_env.client.get(
+        "/api/auth/sessions", cookies={"openbear_web_session": current_cookie}
+    )
+    current = next(item for item in (await listed.json())["items"] if item["current"])
+    revoked = await web_env.client.delete(
+        f"/api/auth/sessions/{current['id']}",
+        cookies={"openbear_web_session": current_cookie},
+    )
+    assert revoked.status == 200
+    assert (await revoked.json())["current"] is True
+    assert "openbear_web_session" in revoked.cookies
+    assert (await web_env.client.get(
+        "/api/auth/session", cookies={"openbear_web_session": current_cookie}
+    )).status == 401
 
 
 async def test_web_write_api_rejects_cross_origin_when_header_present(web_env):
@@ -4383,6 +4728,50 @@ async def test_live_stats_duration_ticks_broadcast_without_persisting_frames(web
         live.unsubscribe(subscriber)
 
 
+async def test_reasoning_ui_cadence_reaches_real_websocket_without_waiting_for_text_persistence(web_env, monkeypatch):
+    from app.web_console import live_stream as stream_module
+
+    cookie = await _login_cookie(web_env)
+    row = await web_env.server._create_web_conversation(123, title="reasoning websocket cadence")
+    live = web_env.server._live_for(row)
+    renderer = _WebStreamRenderer(live)
+    await live.publish({"type": "accepted", "turnUuid": "reasoning-cadence"})
+    ws = await web_env.client.ws_connect(
+        f"/api/conversations/{row['conversation_uuid']}/ws",
+        headers={"Cookie": f"openbear_web_session={cookie}"},
+    )
+    # Advance only the renderer's clock, never asyncio's event-loop clock.
+    clock = [1000.0]
+    monkeypatch.setattr(stream_module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], time=stream_module.time.time,
+    ))
+    try:
+        assert (await ws.receive_json(timeout=2))["type"] == "state"
+        text = ""
+        previous_seq = 0
+        for index in range(8):
+            clock[0] = 1000.0 + index * .06
+            chunk = f"思考{index} "
+            text += chunk
+            await renderer.on_delta("", text)
+            packet = await ws.receive_json(timeout=2)
+            assert packet["type"] == "frame"
+            frame = packet["frame"]
+            assert frame["opType"] == "reasoning"
+            assert frame["payload"]["delta"] == chunk
+            assert frame["frameSeq"] > previous_seq
+            previous_seq = frame["frameSeq"]
+        await renderer.finalize("", text)
+        final = (await ws.receive_json(timeout=2))["frame"]
+        assert final["action"] == "end"
+        assert final["payload"]["complete"] is True
+        operation = next(op for op in await web_env.server._web_operations(row["conversation_uuid"]) if op["opType"] == "reasoning")
+        assert operation["payload"]["text"] == text
+        assert operation["lifecycle"] == "terminal"
+    finally:
+        await ws.close()
+
+
 async def test_live_delta_frames_are_throttled_but_forced_boundary_is_durable(web_env):
     row = await web_env.server._create_web_conversation(123, title="throttled stream frames")
     conv_uuid = str(row["conversation_uuid"])
@@ -4780,6 +5169,36 @@ async def test_agent_message_updates_do_not_move_or_rename_root_agent_card(web_e
     assert internal_assistant["internal"] is True
     assert internal_assistant["payload"]["internal"] is True
     assert internal_assistant["payload"]["hidden"] is True
+
+
+async def test_web_state_reuses_existing_session_snapshot_without_ensure_writes(web_env, monkeypatch):
+    row = await web_env.server._create_web_conversation(123, title="state session snapshot", model="openai/gpt")
+    chat_id = int(row["internal_chat_id"])
+    await web_env.db.conn.execute(
+        "UPDATE sessions SET thinking_level='high', fast_mode=1, show_thinking=0, "
+        "usage_input_tokens=23, usage_output_tokens=5 WHERE chat_id=?",
+        (chat_id,),
+    )
+    await web_env.db.conn.commit()
+    ensure_calls = []
+    original_ensure = MessageDAO.ensure_session
+
+    async def counted_ensure(self, target_chat_id, *, commit=True):
+        ensure_calls.append((target_chat_id, commit))
+        await original_ensure(self, target_chat_id, commit=commit)
+
+    monkeypatch.setattr(MessageDAO, "ensure_session", counted_ensure)
+    state = await web_env.server._chat_payload(chat_id, row)
+
+    assert ensure_calls == []
+    assert state["sessionUuid"] == row["conversation_uuid"]
+    assert state["thinkingLevel"] == "high"
+    assert state["effectiveThinkingLevel"] == "high"
+    assert state["fastRequested"] is True
+    assert state["fastMode"] is True
+    assert state["showThinking"] is False
+    assert state["usage"]["input_tokens"] == 23
+    assert state["usage"]["output_tokens"] == 5
 
 
 async def test_web_state_reconciles_terminal_agent_even_when_conversation_row_still_running(web_env):
@@ -6682,6 +7101,48 @@ async def test_websocket_send_refreshes_model_after_http_change(web_env, monkeyp
         assert seen_models == ["openai/cheap"]
     finally:
         await ws.close()
+
+
+async def test_message_visibility_real_http_ws_and_reconnect(web_env):
+    cookie = await _login_cookie(web_env)
+    cookies = {"openbear_web_session": cookie}
+    headers = {"Cookie": f"openbear_web_session={cookie}"}
+    row = await web_env.server._create_web_conversation(123, title="visibility")
+    conv = row["conversation_uuid"]
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": "hide-turn"})
+    await live.publish({"type": "user", "turnUuid": "hide-turn", "messageUuid": "hide-user", "text": "private input"})
+    await live.publish({"type": "final", "turnUuid": "hide-turn", "text": "public answer"})
+    await live.publish({"type": "done", "turnUuid": "hide-turn"})
+    ws1 = await web_env.client.ws_connect(f"/api/conversations/{conv}/ws", headers=headers)
+    ws2 = await web_env.client.ws_connect(f"/api/conversations/{conv}/ws", headers=headers)
+    try:
+        baseline = (await ws1.receive_json(timeout=2))["state"]
+        await ws2.receive_json(timeout=2)
+        frame_seq = baseline["frameSeq"]
+        response = await web_env.client.put(f"/api/conversations/{conv}/message-visibility", cookies=cookies,
+                                            json={"opIds": ["msg:hide-user"], "hidden": True})
+        assert response.status == 200
+        expected = (await response.json())["visibility"]
+        for ws in (ws1, ws2):
+            packet = await ws.receive_json(timeout=2)
+            assert packet["type"] == "message_visibility.changed"
+            assert packet["visibility"] == expected
+        state = await (await web_env.client.get(f"/api/conversations/{conv}/state?timelineLimit=1", cookies=cookies)).json()
+        assert state["messageVisibility"] == expected
+        assert state["frameSeq"] == frame_seq  # no new execution fact
+        await ws2.close()
+        ws2 = await web_env.client.ws_connect(f"/api/conversations/{conv}/ws?afterFrameSeq={frame_seq}&bootstrap=incremental", headers=headers)
+        packet = await ws2.receive_json(timeout=2)
+        assert packet["type"] == "bootstrap" and packet["messageVisibility"] == expected
+        response = await web_env.client.put(f"/api/conversations/{conv}/message-visibility", cookies=cookies,
+                                            json={"restoreAll": True})
+        assert response.status == 200
+        for ws in (ws1, ws2):
+            assert (await ws.receive_json(timeout=2))["visibility"]["hiddenIds"] == []
+    finally:
+        await ws1.close()
+        await ws2.close()
 
 
 async def test_websocket_state_suppresses_stale_frame_replay_after_frame_seq(web_env):

@@ -15,7 +15,6 @@ import {
 } from "./timelinePagination.js";
 
 const consoleSource = readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
-const workDetailSource = readFileSync(new URL("./TurnWorkDetailPanel.vue", import.meta.url), "utf8");
 
 test("operation pages prepend in displaySeq order without stale revision overwrite or duplicates", () => {
   const current = [
@@ -120,7 +119,7 @@ test("earlier-page loading is observable, accessible, and outside scroll layout 
   assert.match(consoleSource, /finally\s*\{\s*timelinePageInFlight\.value = settleTimelinePageRequest/);
 });
 
-test("prepend remaps the work-detail turn by UUID, then id, without remounting the panel", () => {
+test("prepend preserves the active navigation turn by UUID, then id", () => {
   const selected = {turnUuid: "stable-turn", id: "old-render-id"};
   const identity = stableTurnIdentity(selected);
   const afterPrepend = [
@@ -143,10 +142,4 @@ test("prepend remaps the work-detail turn by UUID, then id, without remounting t
   assert.ok(pageLoader.indexOf("stableTurnIdentity(activeTurn.value)") < pageLoader.indexOf("messages.value = projectOperationMessages(merged)"));
   assert.ok(pageLoader.indexOf("activeTurnIndex.value = remappedActiveTurnIndex") < pageLoader.indexOf("await nextTick()"));
 
-  const panelMarkup = consoleSource.match(/<TurnWorkDetailPanel[\s\S]*?\/>/)?.[0] || "";
-  assert.ok(panelMarkup);
-  assert.doesNotMatch(panelMarkup, /\bv-if=|(?::|\s)key=/);
-  assert.equal((consoleSource.match(/<TurnWorkDetailPanel\b/g) || []).length, 1);
-  assert.match(workDetailSource, /transition:\s*flex-basis \.24s[^;]*;?/);
-  assert.match(workDetailSource, /transition:\s*transform \.24s[^;]*;?/);
 });

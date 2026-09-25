@@ -209,19 +209,6 @@ class SkillsWebAdminServer(WebAdminServer):
             return web.json_response({"ok": False, "error": "skill_not_found"}, status=404)
         if len(matches) != 1:
             return web.json_response({"ok": False, "error": "skill_name_ambiguous", "name": name}, status=409)
-        running = await self._restart_running_json()
-        if running.get("busy"):
-            return web.json_response({
-                "ok": False,
-                "error": "skill_uninstall_busy",
-                "running": {
-                    "openbearRuns": int(running.get("openbearRuns") or 0),
-                    "rathTasks": int(running.get("rathTasks") or 0),
-                    "childProcesses": int(running.get("childProcesses") or 0),
-                    "operations": int(running.get("operations") or 0),
-                },
-            }, status=409)
-
         lock = getattr(self, "_skill_uninstall_lock", None)
         if lock is None:
             lock = asyncio.Lock()
@@ -235,6 +222,31 @@ class SkillsWebAdminServer(WebAdminServer):
             if len(matches) != 1:
                 return web.json_response({"ok": False, "error": "skill_name_ambiguous", "name": name}, status=409)
             skill = matches[0]
+            running = await self._restart_running_json()
+            disabled = name in set(self.config.tools.disabled_skills or [])
+            # Restart's busy flag also includes memory-maintenance operations. Such
+            # operations cannot execute a Skill; only exempt these known kinds for
+            # a disabled Skill when no agent run or blocking child can use its files.
+            operations = running.get("operationItems") or []
+            memory_only = (
+                bool(operations)
+                and len(operations) < 8  # restart snapshot is limited to 8 rows; fail closed if truncated
+                and int(running.get("operations") or 0) == len(operations)
+                and all(op.get("kind") in {"memory_import", "memory_candidates_apply"} for op in operations)
+            )
+            active_execution = (
+                any(int(running.get(key) or 0) for key in ("openbearRuns", "rathTasks", "childProcesses"))
+                or any(self._web_starting_turns.values())
+            )
+            if (running.get("busy") or active_execution) and not (disabled and not active_execution and memory_only):
+                return web.json_response({
+                    "ok": False,
+                    "error": "skill_uninstall_busy",
+                    "running": {
+                        key: int(running.get(key) or 0)
+                        for key in ("openbearRuns", "rathTasks", "childProcesses", "operations")
+                    },
+                }, status=409)
             try:
                 root = Path(self.config.tools.skills_dir).expanduser().resolve(strict=True)
                 source = Path(skill.base_dir).resolve(strict=True)

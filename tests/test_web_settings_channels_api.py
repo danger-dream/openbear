@@ -156,13 +156,49 @@ async def test_web_task_notification_test_uses_logged_in_telegram_owner(admin_en
     assert called == [123]
 
 
+async def test_web_settings_provider_count_is_config_only(admin_env, monkeypatch):
+    async def ledger_aggregation_forbidden(*args, **kwargs):
+        raise AssertionError("config-only provider count must not aggregate model_calls")
+
+    monkeypatch.setattr(MessageDAO, "channel_call_summaries", ledger_aggregation_forbidden)
+    monkeypatch.setattr(MessageDAO, "provider_call_summary", ledger_aggregation_forbidden)
+    monkeypatch.setattr(MessageDAO, "model_detail_summary", ledger_aggregation_forbidden)
+    response = await admin_env.client.get("/api/settings", cookies=admin_env.cookie)
+    assert response.status == 200
+    assert (await response.json())["providerCount"] == 2
+
+
+async def test_browser_settings_use_existing_http_save_and_validation(admin_env):
+    response = await admin_env.client.get("/api/settings/specs", cookies=admin_env.cookie)
+    payload = await response.json()
+    domain = next(x for x in payload["domains"] if x["key"] == "browser")
+    assert [x["key"] for x in domain["sections"]] == ["browser_connection", "browser_limits", "browser_recovery"]
+    assert "browser.legacyMcpServer" not in payload["specs"]
+    size_spec = payload["specs"]["browser.maxBodyBytes"]
+    assert size_spec["displayScale"] == 1024 * 1024
+    assert size_spec["unit"] == "MB"
+    for path, value in (("browser.actionTimeoutS", 17), ("browser.snapshotMaxChars", 4000), ("browser.mainEndpoint", "http://localhost:9222"), ("browser.maxBodyBytes", 1572864)):
+        response = await admin_env.client.patch("/api/settings/" + path, cookies=admin_env.cookie, json={"value": value})
+        assert response.status == 200
+        assert (await response.json())["value"] == value
+    assert admin_env.server.config.browser.action_timeout_s == 17
+    saved = json.loads(admin_env.cfg_path.read_text())
+    assert saved["browser"]["snapshotMaxChars"] == 4000
+    assert saved["browser"]["mainEndpoint"] == "http://localhost:9222"
+    assert saved["browser"]["maxBodyBytes"] == 1572864
+    rejected = await admin_env.client.patch("/api/settings/browser.defaultMode", cookies=admin_env.cookie, json={"value": "invalid-mode"})
+    assert rejected.status == 400
+    assert "browser.defaultMode" not in payload["specs"]
+    assert "defaultMode" not in saved["browser"]
+
+
 async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env):
     specs = await admin_env.client.get("/api/settings/specs", cookies=admin_env.cookie)
     assert specs.status == 200
     specs_data = await specs.json()
     assert "memory" in [g["key"] for g in specs_data["groups"]]
     assert [domain["key"] for domain in specs_data["domains"]] == [
-        "agent", "tools", "memory", "media", "web", "interface",
+        "agent", "tools", "browser", "memory", "media", "web", "interface",
     ]
     agent_sections = next(domain for domain in specs_data["domains"] if domain["key"] == "agent")["sections"]
     assert [section["key"] for section in agent_sections] == [
@@ -177,6 +213,7 @@ async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env
     current = await admin_env.client.get("/api/settings", cookies=admin_env.cookie)
     assert current.status == 200
     data = await current.json()
+    assert data["providerCount"] == 2
     assert data["values"]["memory.accessKey"] == "memory-secret"
     assert data["masked"]["memory.accessKey"] is False
     assert data["usingBuiltin"]["rath.planDraftPrompt"] is True
@@ -377,7 +414,20 @@ async def test_web_mcp_server_uninstall_refuses_active_call(admin_env):
     assert "playwright" in json.loads(admin_env.cfg_path.read_text(encoding="utf-8"))["mcp"]["servers"]
 
 
-async def test_web_channels_list_detail_and_primary_switch(admin_env):
+async def test_web_channels_list_detail_and_primary_switch(admin_env, monkeypatch):
+    summary_calls: list[str | None] = []
+    original_summary = MessageDAO.channel_call_summaries
+
+    async def tracked_summary(self, chat_id, *, provider_name=None):
+        summary_calls.append(provider_name)
+        return await original_summary(self, chat_id, provider_name=provider_name)
+
+    async def repeated_aggregation_forbidden(*args, **kwargs):
+        raise AssertionError("channels handlers must use the combined model/provider aggregation")
+
+    monkeypatch.setattr(MessageDAO, "channel_call_summaries", tracked_summary)
+    monkeypatch.setattr(MessageDAO, "provider_call_summary", repeated_aggregation_forbidden)
+    monkeypatch.setattr(MessageDAO, "model_detail_summary", repeated_aggregation_forbidden)
     conv = await admin_env.server._create_web_conversation(123, title="stats", model="openai/gpt")
     await MessageDAO(admin_env.db).add_model_call(
         int(conv["internal_chat_id"]), model="openai/gpt", status="ok", model_call_count=2, model_ok_count=2,
@@ -397,6 +447,8 @@ async def test_web_channels_list_detail_and_primary_switch(admin_env):
     openai = next(p for p in data["providers"] if p["name"] == "openai")
     assert openai["apiKeyMasked"] != "sk-openai-secret"
     assert openai["modelCount"] == 2
+    assert [model["id"] for model in openai["models"]] == ["gpt", "mini"]
+    assert next(model for model in openai["models"] if model["id"] == "gpt")["stats"]["calls"] == 2
     assert openai["stats"]["calls"] == 2
     anthropic = next(p for p in data["providers"] if p["name"] == "anthropic")
     assert anthropic["stats"]["calls"] == 1
@@ -412,6 +464,7 @@ async def test_web_channels_list_detail_and_primary_switch(admin_env):
     assert overview["stats"]["avg_tps"] == pytest.approx(25 / 3)
     assert overview["stats"]["peak_tps"] == pytest.approx(15)
     assert "topModels" not in overview
+    assert summary_calls == [None]
 
     detail = await admin_env.client.get("/api/channels/openai", cookies=admin_env.cookie)
     assert detail.status == 200
@@ -420,6 +473,7 @@ async def test_web_channels_list_detail_and_primary_switch(admin_env):
     provider = detail_data["provider"]
     assert [m["id"] for m in provider["models"]] == ["gpt", "mini"]
     assert next(m for m in provider["models"] if m["id"] == "gpt")["stats"]["calls"] == 2
+    assert summary_calls == [None, "openai"]
 
     switch = await admin_env.client.post("/api/channels/primary", cookies=admin_env.cookie, json={"model": "openai/mini"})
     assert switch.status == 200

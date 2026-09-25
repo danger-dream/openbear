@@ -21,13 +21,14 @@ const event = (extra = {}) => ({ prevented: 0, stopped: 0, preventDefault() { th
 function harness({ mobile = true, row = saved } = {}) {
   const opened = [], moved = [], emitted = [];
   const ctx = vm.createContext({ ref, nextTick, rowId, MOBILE_VIEWPORT_QUERY, REFERENCE_MIME, referenceToken,
-    ...Object.fromEntries(['Loading', 'ArrowDown', 'ArrowRight', 'Box', 'ChatLineRound', 'FolderOpened', 'Folder', 'Star', 'StarFilled', 'RefreshLeft'].map(name => [name, 'svg'])),
+    ...Object.fromEntries(['Loading', 'MagicStick', 'ArrowDown', 'ArrowRight', 'Box', 'ChatLineRound', 'FolderOpened', 'Folder', 'Star', 'StarFilled', 'RefreshLeft'].map(name => [name, 'svg'])),
     menu: ref({ open: false, x: 0, y: 0, row: null }), drag: ref({ row: null, target: null, zone: '' }),
     displayRows: ref([row]), moveInFlight: ref(false), query: ref(''), activeConversationUuid: ref(''), selectedFolderId: ref(''),
     moveMode: ref(''), moveRow: ref(null), moveFolderId: ref(''), moveFolderQuery: ref(''), moveUnarchive: ref(false), moveUpdateSnapshots: ref(false), moveDialog: ref(false),
     window: { innerWidth: 1200, innerHeight: 900, matchMedia: () => ({ matches: mobile }), visualViewport: { width: 390, height: 430, offsetLeft: 0, offsetTop: 35 } },
     document: { querySelector: () => ({ getBoundingClientRect: () => ({ width: 194, height: 330 }) }) },
     closeOverview() {}, enterOverview() {}, leaveOverview() {}, running: row => Boolean(row?.running), activityLabel: () => '', rowLoading: () => false,
+    liveConversationTitle: row => row.title || '新会话', hasConversationMessages: () => true, isTitleGenerating: () => false,
     rowLabel: row => row.title || row.name, indentation: () => '0px', isExpanded: () => false, toggleRow() {},
     activateRow: row => opened.push(row.id), locateAndOpen: row => opened.push(row.id), dragOver() {}, drop() {}, clearDrag() {},
     selectFolder() {}, emit: (...args) => emitted.push(args), loadAllFolders: async () => moved.push('folders'),
@@ -40,7 +41,8 @@ function harness({ mobile = true, row = saved } = {}) {
     let tree;
     const app = createSSRApp({ render() { tree = (menu ? renderMenu : renderRow).call(this, bindings, []); return tree; } });
     app.component('ElIcon', { render() { return h('i', this.$slots.default?.()); } });
-    for (const icon of ['MoreFilled', 'StarFilled', 'FolderOpened', 'EditPen', 'DocumentCopy', 'Refresh', 'Box', 'Delete', 'Star', 'Check', 'InfoFilled', 'FolderAdd', 'ChatLineRound']) app.component(icon, { render: () => h('svg') });
+    app.component('AnimatedConversationTitle', { props: ['text'], render() { return h('span', this.text); } });
+    for (const icon of ['MoreFilled', 'StarFilled', 'FolderOpened', 'EditPen', 'DocumentCopy', 'Refresh', 'Box', 'Delete', 'Star', 'Check', 'InfoFilled', 'FolderAdd', 'ChatLineRound', 'MagicStick']) app.component(icon, { render: () => h('svg') });
     const html = await renderToString(app);
     return { html, nodes: walk([tree]) };
   } };

@@ -1,8 +1,19 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.conversation_titles import (
+    DEFAULT_NAMING_PROMPT,
+    clean_generated_title,
+    initial_conversation_title,
+    naming_attempt_models,
+    render_naming_transcript,
+    select_naming_turns,
+)
+from app.llm.events import Usage
+from app.model_cost import usage_cost_usd
 from app.task_memory import TaskMemoryDAO
 from app.tools.agents import _render_agent_task_notification, _task_status_label
+from app.utils import estimate_tokens
 from app.web_console.activity import activity_fields
 from app.web_console.core import *
 from app.web_console.live_stream import *
@@ -242,13 +253,15 @@ class WebAdminConversationsMixin:
                             INSERT INTO web_conversations (
                               conversation_uuid, owner_chat_id, internal_chat_id, title, model,
                               agent_model, agent_think_level, agent_fast_mode,
-                              status, current_status, created_at, updated_at, display_order, folder_uuid, context_strategy
-                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              status, current_status, created_at, updated_at, display_order, folder_uuid, context_strategy,
+                              last_interaction_at_ms, last_conversation_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 conv_uuid, owner_chat_id, internal, title or "新对话", model_label,
                                 agent_model, agent_thinking, agent_fast,
                                 "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""), context_strategy,
+                                0, 0,
                             ),
                         )
                         await conn.execute(
@@ -1655,7 +1668,7 @@ class WebAdminConversationsMixin:
         return await self._latest_visible_root_turn_uuid(conv_uuid)
 
     async def _should_suppress_web_task_notification(self, conversation_uuid: str, payload: dict[str, Any]) -> bool:
-        task_uuid = str(payload.get("taskUuid") or "").strip()
+        task_uuid = str(payload.get("taskUuid") or payload.get("jobId") or "").strip()
         status = str(payload.get("status") or "").strip()
         if status in {"cancelled", "interrupted"}:
             return True
@@ -1675,6 +1688,17 @@ class WebAdminConversationsMixin:
             return True
         if task_uuid and task_uuid in self._web_stopped_task_uuids.get(conv_uuid, set()):
             return True
+        # Suffix deletion removes both the task and its root operation. Never
+        # reassign a late callback with an explicit deleted root to the latest
+        # surviving turn (or let it synthesize a new assistant answer).
+        root = str(payload.get("runRootTurnUuid") or payload.get("rootTurnUuid") or payload.get("turnUuid") or "").strip()
+        if root and task_uuid and task is None:
+            cur = await self.db.conn.execute(
+                "SELECT 1 FROM web_operations WHERE conversation_uuid=? AND op_type='user_message' AND turn_uuid=? LIMIT 1",
+                (conv_uuid, root),
+            )
+            if await cur.fetchone() is None:
+                return True
         return False
 
     @staticmethod
@@ -2974,21 +2998,272 @@ class WebAdminConversationsMixin:
             tuple(params),
         )
         await self.db.conn.commit()
+        invalidate = getattr(self, "_invalidate_tree_status", None)
+        if invalidate is not None:
+            invalidate()
 
     async def _maybe_title_web_conversation(self, row: dict[str, Any], text: str) -> None:
+        """Replace only a placeholder with the bounded first-message title."""
         title = str(row.get("title") or "").strip()
-        if title and title not in {"新对话", "当前对话"}:
+        if title and title not in {"新对话", "当前对话", "新会话"}:
             return
         from app.references import reference_display_text
-        clean = re.sub(r"\s+", " ", reference_display_text(text)).strip()
-        if not clean:
-            return
-        new_title = clean[:36] + ("…" if len(clean) > 36 else "")
+        new_title = initial_conversation_title(reference_display_text(text))
         await self.db.conn.execute(
-            "UPDATE web_conversations SET title=?, updated_at=? WHERE conversation_uuid=?",
-            (new_title, now_ts(), str(row.get("conversation_uuid") or "")),
+            "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=?",
+            (new_title, str(row.get("conversation_uuid") or ""), title),
         )
         await self.db.conn.commit()
         row["title"] = new_title
+
+    async def _conversation_title_turns(self, conversation_uuid: str) -> list[dict[str, str]]:
+        """Return completed human/controller turns without tools or reasoning."""
+        cur = await self.db.conn.execute(
+            """
+            SELECT id, role, content, turn_uuid, run_root_turn_uuid
+            FROM messages
+            WHERE conversation_uuid=?
+              AND role IN ('user','assistant')
+              AND COALESCE(task_uuid,'')=''
+              AND COALESCE(agent_session_uuid,'')=''
+            ORDER BY id
+            """,
+            (str(conversation_uuid or ""),),
+        )
+        rows = await cur.fetchall()
+        from app.references import reference_display_text
+        turns: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for message in rows:
+            role = str(message["role"] or "")
+            root = str(message["run_root_turn_uuid"] or message["turn_uuid"] or "")
+            if role == "user":
+                key = root or f"message:{int(message['id'])}"
+                if key not in turns:
+                    turns[key] = {"user": [], "assistant": []}
+                    order.append(key)
+                text = reference_display_text(str(message["content"] or "")).strip()
+                if text:
+                    turns[key]["user"].append(text)
+            elif root in turns:
+                text = reference_display_text(str(message["content"] or "")).strip()
+                if text and text != "⏹ 已停止":
+                    turns[root]["assistant"].append(text)
+        completed: list[dict[str, str]] = []
+        for key in order:
+            user = "\n\n".join(turns[key]["user"]).strip()
+            assistant = "\n\n".join(turns[key]["assistant"]).strip()
+            if user and assistant:
+                completed.append({"user": user, "assistant": assistant})
+        return completed
+
+    def _conversation_title_candidates(
+        self,
+        config: Any,
+        row: dict[str, Any],
+        *,
+        prompt: str,
+        transcript: str,
+    ) -> list[str]:
+        configured = list(config.models.naming_models or [])
+
+        def usable(label: str) -> bool:
+            resolved = config.models.resolve(str(label or ""))
+            return bool(resolved and "text" in (resolved[1].input or ["text"]))
+
+        if configured:
+            return list(dict.fromkeys(label for label in configured if usable(label)))
+
+        estimated = Usage(
+            input_tokens=max(1, estimate_tokens(prompt) + estimate_tokens(transcript)),
+            output_tokens=64,
+        )
+        priced: list[tuple[float, int, str]] = []
+        position = 0
+        for provider_key, provider in config.models.providers.items():
+            if not provider.enabled:
+                continue
+            for model in provider.models:
+                label = f"{provider_key}/{model.id}"
+                if "text" not in (model.input or ["text"]):
+                    position += 1
+                    continue
+                cost = usage_cost_usd(model.cost, estimated)
+                if cost > 0:
+                    priced.append((cost, position, label))
+                position += 1
+        if priced:
+            return [min(priced, key=lambda item: (item[0], item[1]))[2]]
+        for fallback in (
+            str(row.get("model") or ""),
+            str(getattr(self.model_selection, "current", "") or ""),
+            str(config.models.primary or ""),
+        ):
+            if usable(fallback):
+                return [fallback]
+        return []
+
+    async def _generate_conversation_title(
+        self,
+        row: dict[str, Any],
+        *,
+        expected_title: str,
+        automatic: bool,
+    ) -> dict[str, Any]:
+        conv_uuid = str(row.get("conversation_uuid") or "")
+        turns = await self._conversation_title_turns(conv_uuid)
+        if not turns:
+            return {"ok": False, "error": "conversation_has_no_completed_turns"}
+        if automatic:
+            if initial_conversation_title(turns[0]["user"]) != expected_title:
+                return {"ok": False, "error": "automatic_title_changed"}
+            # A second turn may finish before this background task gets CPU. The
+            # automatic title still belongs to the first completed turn only.
+            turns = turns[:1]
+
+        # Freeze all user-editable naming settings for this generation.
+        config = self.config
+        naming = config.agent
+        selected = select_naming_turns(
+            turns,
+            max_turns=int(naming.naming_max_turns or 0),
+            max_chars=int(naming.naming_max_chars or 0),
+        )
+        transcript = render_naming_transcript(selected)
+        if not transcript:
+            return {"ok": False, "error": "conversation_has_no_completed_turns"}
+        prompt = str(naming.naming_prompt or "").strip() or DEFAULT_NAMING_PROMPT
+        candidates = self._conversation_title_candidates(config, row, prompt=prompt, transcript=transcript)
+        if not candidates or self.llm_factory is None:
+            return {"ok": False, "error": "naming_model_unavailable"}
+        prepared: dict[str, tuple[Any, Any, Any, str]] = {}
+        for label in candidates:
+            resolved = config.models.resolve(label)
+            if resolved is None or "text" not in (resolved[1].input or ["text"]):
+                continue
+            try:
+                backend, model, _maximum = self.llm_factory.backend_for(label)
+            except Exception:
+                continue
+            prepared[label] = (resolved[0], resolved[1], backend, model)
+        if not prepared:
+            return {"ok": False, "error": "naming_model_unavailable"}
+
+        timeout_s = float(naming.naming_timeout_s or 30.0)
+        attempt_models = naming_attempt_models(list(prepared), int(naming.naming_max_retries or 0))
+        chat_id = int(row.get("internal_chat_id") or 0)
+        messages = MessageDAO(self.db)
+        session_uuid = await messages.get_or_create_session_uuid(chat_id)
+        for attempt, label in enumerate(attempt_models):
+            _provider, model_definition, backend, model = prepared[label]
+            title_output_tokens = min(
+                max(1, int(model_definition.max_tokens or 1)),
+                1024 if (model_definition.reasoning or model_definition.thinking_levels) else 64,
+            )
+            started = time.monotonic()
+            call: dict[str, Any]
+            response = None
+            try:
+                async with asyncio.timeout(timeout_s):
+                    response = await backend.complete(
+                        [{"role": "user", "content": transcript}],
+                        model=model,
+                        system=prompt,
+                        max_tokens=title_output_tokens,
+                        read_timeout_s=timeout_s,
+                    )
+                call = {
+                    "status": "ok",
+                    "usage": response.usage,
+                    "totalTimeMs": int((time.monotonic() - started) * 1000),
+                    "outputTokens": int(response.usage.output_tokens or 0),
+                    "serviceTier": response.service_tier,
+                    "providerCostUsd": response.provider_cost_usd,
+                    "retry": attempt > 0,
+                }
+            except Exception as exc:
+                call = {
+                    "status": "error",
+                    "totalTimeMs": int((time.monotonic() - started) * 1000),
+                    "errorType": type(exc).__name__,
+                    "serviceTier": getattr(exc, "service_tier", ""),
+                    "providerCostUsd": getattr(exc, "provider_cost_usd", None),
+                    "retry": attempt > 0,
+                }
+            await self._persist_web_model_call_delta(
+                messages,
+                chat_id,
+                session_uuid=session_uuid,
+                call=call,
+                model_cost=model_definition.cost,
+                model_label=label,
+                protocol=str(getattr(backend, "protocol", "")),
+                think_level="off",
+                call_kind="conversation_title",
+            )
+            if response is None:
+                continue
+            title = clean_generated_title(response.text)
+            if not title:
+                continue
+            changed = False
+            if title != expected_title:
+                cursor = await self.db.conn.execute(
+                    "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=?",
+                    (title, conv_uuid, expected_title),
+                )
+                await self.db.conn.commit()
+                changed = int(cursor.rowcount or 0) > 0
+            if changed:
+                return {"ok": True, "changed": True, "title": title, "superseded": False}
+            cursor = await self.db.conn.execute(
+                "SELECT title FROM web_conversations WHERE conversation_uuid=?",
+                (conv_uuid,),
+            )
+            current = await cursor.fetchone()
+            current_title = str(current["title"] or "") if current is not None else expected_title
+            return {
+                "ok": True,
+                "changed": False,
+                "title": current_title,
+                "superseded": current_title != expected_title,
+            }
+        return {"ok": False, "error": "conversation_title_generation_failed"}
+
+    def _start_conversation_title_task(
+        self,
+        row: dict[str, Any],
+        *,
+        automatic: bool,
+    ) -> asyncio.Task | None:
+        conv_uuid = str(row.get("conversation_uuid") or "")
+        current = self._web_conversation_title_tasks.get(conv_uuid)
+        if not conv_uuid or (current is not None and not current.done()):
+            return None
+        snapshot = dict(row)
+        expected_title = str(snapshot.get("title") or "").strip()
+        task = asyncio.create_task(
+            self._generate_conversation_title(
+                snapshot,
+                expected_title=expected_title,
+                automatic=automatic,
+            ),
+            name=f"web-conversation-title-{conv_uuid[:8]}",
+        )
+        self._web_conversation_title_tasks[conv_uuid] = task
+
+        def _done(finished: asyncio.Task) -> None:
+            if self._web_conversation_title_tasks.get(conv_uuid) is finished:
+                self._web_conversation_title_tasks.pop(conv_uuid, None)
+            if automatic and not finished.cancelled():
+                try:
+                    result = finished.result()
+                    if not result.get("ok") and result.get("error") != "automatic_title_changed":
+                        log.info("自动生成会话名称未生效", 会话=conv_uuid, 原因=result.get("error"))
+                except Exception:
+                    log.exception("自动生成会话名称失败", 会话=conv_uuid)
+
+        task.add_done_callback(_done)
+        return task
 
 __all__ = [name for name in globals() if not name.startswith("__")]

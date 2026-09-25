@@ -36,6 +36,15 @@ CREATE TRIGGER IF NOT EXISTS reference_bundle_conversation_deleted
 AFTER DELETE ON web_conversations BEGIN
     DELETE FROM web_reference_bundles WHERE conversation_uuid=OLD.conversation_uuid;
 END;
+-- Visible transcript changes are deliberately separate from chat organization
+-- changes. Global realtime can refresh reference sizes immediately without
+-- rebuilding tree runtime state for each streamed assistant delta.
+CREATE TRIGGER IF NOT EXISTS catalog_web_conversation_content_update
+AFTER UPDATE OF reference_revision ON web_conversations
+WHEN OLD.reference_revision IS NOT NEW.reference_revision BEGIN
+    INSERT INTO web_catalog_changes(kind, entity_id, owner_chat_id)
+    VALUES('chat-content', CAST(NEW.conversation_uuid AS TEXT), NEW.owner_chat_id);
+END;
 """
     ]
     sources = [

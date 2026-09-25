@@ -4,6 +4,8 @@ import {ArrowRight, Close, MagicStick} from "@element-plus/icons-vue";
 import {eventDisplayTimeMs} from "../../timelineProjection.js";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import TurnEvent from "./TurnEvent.vue";
+import {useMessageVisibility} from './messageVisibility.js';
+const visibility = useMessageVisibility();
 import WorkDetailIcon from "./WorkDetailIcon.vue";
 
 const props = defineProps({
@@ -12,19 +14,20 @@ const props = defineProps({
 	turnIndex: {type: Number, default: 0},
 	conversationUuid: {type: String, default: ""},
 	autoScrollLocked: {type: Boolean, default: false},
-	retryCancelPending: {type: Boolean, default: false},
+	retryActionPending: {type: Object, default: () => ({})},
 	working: {type: Boolean, default: false},
 	detailKey: {type: Function, required: true},
 	isDetailOpen: {type: Function, required: true},
 	activeToolResultIndex: {type: Function, required: true},
 });
 
-const emit = defineEmits(["close", "details-toggle", "reasoning-toggle", "select-tool-result", "cancel-retry"]);
+const emit = defineEmits(["close", "details-toggle", "reasoning-toggle", "select-tool-result", "cancel-retry", "retry-now"]);
 
 const sourceEvents = computed(() => Array.isArray(props.turn?.events) ? props.turn.events : []);
 const workEntries = computed(() => {
 	const rows = [];
 	for (const [index, event] of sourceEvents.value.entries()) {
+		if (visibility.isHidden(event)) continue;
 		if (event?.kind === "answer") {
 			const reasoning = String(event?.message?.reasoning || "").trim();
 			if (reasoning) rows.push({kind: "reasoning", event, index, reasoning, timeMs: eventDisplayTimeMs(event)});
@@ -38,7 +41,7 @@ const workEntries = computed(() => {
 });
 
 const turnLabel = computed(() => `第 ${Math.max(1, props.turnIndex + 1)} 轮`);
-const userPreview = computed(() => String(props.turn?.user?.content || "").replace(/\s+/g, " ").trim().slice(0, 72));
+const userPreview = computed(() => visibility.userContent(props.turn).replace(/\s+/g, " ").trim().slice(0, 72));
 
 function reasoningKey(entry) {
 	return props.detailKey(props.turn?.id || props.turnIndex, "work_reasoning", entry.index);
@@ -85,13 +88,13 @@ function entryTimeDateTime(timeMs) {
 				<div class="work-detail-heading">
 					<span class="work-detail-kicker" :class="{working: props.working}"><WorkDetailIcon/> 工作详情</span>
 					<h2>{{ turnLabel }}</h2>
-					<p v-if="userPreview" :title="String(props.turn?.user?.content || '')">{{ userPreview }}</p>
+					<p v-if="userPreview" :title="visibility.userContent(props.turn)">{{ userPreview }}</p>
 				</div>
 				<button type="button" class="work-detail-close" aria-label="关闭工作详情" @click="emit('close')"><Close/></button>
 			</header>
 
 			<div class="work-detail-body" tabindex="0" aria-label="工作详情内容，可滚动">
-				<p v-if="userPreview" class="work-detail-turn-preview" :title="String(props.turn?.user?.content || '')">{{ userPreview }}</p>
+				<p v-if="userPreview" class="work-detail-turn-preview" :title="visibility.userContent(props.turn)">{{ userPreview }}</p>
 				<div v-if="!workEntries.length" class="work-detail-empty">
 					<WorkDetailIcon/>
 					<strong>这一轮没有工作详情</strong>
@@ -125,7 +128,7 @@ function entryTimeDateTime(timeMs) {
 							:index="entry.index"
 							:auto-scroll-locked="props.autoScrollLocked"
 							:reasoning-autoscroll="Boolean(entry.event.reasoningActive) && props.autoScrollLocked"
-							:retry-cancel-pending="props.retryCancelPending"
+							:retry-action-pending="props.retryActionPending"
 							:agent-preview-only="true"
 							:compact="true"
 							:detail-key="props.detailKey"
@@ -135,6 +138,7 @@ function entryTimeDateTime(timeMs) {
 							@reasoning-toggle="relayReasoningToggle"
 							@select-tool-result="relayToolResult"
 							@cancel-retry="emit('cancel-retry', $event)"
+							@retry-now="emit('retry-now', $event)"
 						/>
 					</div>
 				</template>
@@ -157,14 +161,14 @@ function entryTimeDateTime(timeMs) {
 	height: 100%;
 	overflow: hidden;
 	border-left: 1px solid transparent;
-	background: #fff;
+	background: var(--ob-surface);
 	opacity: 0;
 	transition: flex-basis .24s cubic-bezier(.22, 1, .36, 1), width .24s cubic-bezier(.22, 1, .36, 1), opacity .15s ease, border-color .2s ease;
 }
 .work-detail.open {
 	flex-basis: clamp(24rem, 32vw, 32rem);
 	width: clamp(24rem, 32vw, 32rem);
-	border-left-color: rgba(15, 23, 42, .1);
+	border-left-color: var(--ob-border);
 	opacity: 1;
 }
 .work-detail-surface {
@@ -175,7 +179,7 @@ function entryTimeDateTime(timeMs) {
 	min-height: 0;
 	height: 100%;
 	flex-direction: column;
-	background: rgba(250, 250, 250, .98);
+	background: var(--ob-surface);
 }
 .work-detail-header {
 	box-sizing: border-box;
@@ -186,56 +190,56 @@ function entryTimeDateTime(timeMs) {
 	justify-content: space-between;
 	gap: 1rem;
 	padding: 1rem 1rem .9rem 1.15rem;
-	border-bottom: 1px solid rgba(15, 23, 42, .09);
-	background: rgba(255, 255, 255, .96);
+	border-bottom: 1px solid var(--ob-border);
+	background: var(--ob-header);
 }
 .work-detail-heading { min-width: 0; }
-.work-detail-kicker { display: flex; align-items: center; gap: .38rem; color: #64748b; font-size: 11px; font-weight: 750; letter-spacing: .08em; }
+.work-detail-kicker { display: flex; align-items: center; gap: .38rem; color: var(--ob-text-subtle); font-size: 11px; font-weight: 750; letter-spacing: .08em; }
 .work-detail-kicker svg { width: .85rem; height: .85rem; }
-.work-detail-kicker.working svg { color: #2563eb; animation: work-kicker-breathe 1.25s ease-in-out infinite; }
+.work-detail-kicker.working svg { color: var(--ob-blue); animation: work-kicker-breathe 1.25s ease-in-out infinite; }
 @keyframes work-kicker-breathe { 0%, 100% { opacity: .48; transform: scale(.9); } 50% { opacity: 1; transform: scale(1.06); } }
-.work-detail-heading h2 { margin: .38rem 0 0; color: #18181b; font-size: 19px; font-weight: 720; letter-spacing: -.025em; }
-.work-detail-heading p { max-width: 27rem; margin: .3rem 0 0; overflow: hidden; color: #71717a; font-size: 12px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
-.work-detail-close { display: grid; width: 2rem; height: 2rem; flex: 0 0 auto; place-items: center; border: 0; border-radius: .65rem; background: transparent; color: #71717a; cursor: pointer; transition: background .14s ease, color .14s ease; }
-.work-detail-close:hover { background: #f4f4f5; color: #18181b; }
+.work-detail-heading h2 { margin: .38rem 0 0; color: var(--ob-text-strong); font-size: 19px; font-weight: 720; letter-spacing: -.025em; }
+.work-detail-heading p { max-width: 27rem; margin: .3rem 0 0; overflow: hidden; color: var(--ob-text-subtle); font-size: 12px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.work-detail-close { display: grid; width: 2rem; height: 2rem; flex: 0 0 auto; place-items: center; border: 0; border-radius: .65rem; background: transparent; color: var(--ob-text-subtle); cursor: pointer; transition: background .14s ease, color .14s ease; }
+.work-detail-close:hover { background: var(--ob-hover); color: var(--ob-text-strong); }
 .work-detail-close svg { width: .92rem; height: .92rem; }
 .work-detail-body { box-sizing: border-box; display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; overflow: auto; padding: .85rem .9rem 1.4rem; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
 .work-detail-body > * { flex: 0 0 auto; }
 .work-detail-turn-preview { display: none; }
 .work-detail-running { display: flex; min-height: 2rem; flex: 0 0 auto; align-items: center; margin-top: .58rem; padding: .8rem .2rem .1rem; }
 .work-running-dots { position: relative; display: inline-flex; width: max-content; min-width: 1.74rem; height: 1.05rem; align-items: center; gap: .22rem; overflow: hidden; border-radius: 999px; padding: 0 .2rem; isolation: isolate; }
-.work-running-dots::after { content: ""; position: absolute; inset: -45% -70%; z-index: -1; background: linear-gradient(105deg, transparent 28%, rgba(255, 255, 255, .88) 43%, rgba(148, 163, 184, .18) 50%, transparent 66%); transform: translateX(-46%); animation: work-sun-sweep 2.05s ease-in-out infinite; }
-.work-running-dots span { display: block; width: .34rem; height: .34rem; border-radius: 999px; background: #a1a1aa; box-shadow: 0 0 0 0 rgba(161, 161, 170, .20), 0 0 10px rgba(148, 163, 184, .18); animation: work-dot-breathe 1.18s ease-in-out infinite; }
+.work-running-dots::after { content: ""; position: absolute; inset: -45% -70%; z-index: -1; background: linear-gradient(105deg, transparent 28%, rgb(var(--ob-surface-rgb) / 0.88) 43%, rgb(var(--ob-text-muted-rgb) / 0.18) 50%, transparent 66%); transform: translateX(-46%); animation: work-sun-sweep 2.05s ease-in-out infinite; }
+.work-running-dots span { display: block; width: .34rem; height: .34rem; border-radius: 999px; background: var(--ob-text-muted); box-shadow: 0 0 0 0 rgb(var(--ob-shadow-rgb) / 0.14), 0 0 10px rgb(var(--ob-shadow-rgb) / 0.14); animation: work-dot-breathe 1.18s ease-in-out infinite; }
 .work-running-dots span:nth-child(2) { animation-delay: .16s; }
 .work-running-dots span:nth-child(3) { animation-delay: .32s; }
-@keyframes work-dot-breathe { 0%, 100% { opacity: .38; transform: translateY(.02rem) scale(.72); box-shadow: 0 0 0 0 rgba(161, 161, 170, .10), 0 0 6px rgba(148, 163, 184, .12); } 42% { opacity: .96; transform: translateY(-.02rem) scale(1.04); box-shadow: 0 0 0 4px rgba(161, 161, 170, .10), 0 0 14px rgba(148, 163, 184, .32); } }
+@keyframes work-dot-breathe { 0%, 100% { opacity: .38; transform: translateY(.02rem) scale(.72); box-shadow: 0 0 0 0 rgb(var(--ob-shadow-rgb) / 0.1), 0 0 6px rgb(var(--ob-shadow-rgb) / 0.12); } 42% { opacity: .96; transform: translateY(-.02rem) scale(1.04); box-shadow: 0 0 0 4px rgb(var(--ob-shadow-rgb) / 0.1), 0 0 14px rgb(var(--ob-shadow-rgb) / 0.14); } }
 @keyframes work-sun-sweep { 0% { transform: translateX(-48%); opacity: 0; } 28% { opacity: .75; } 58% { transform: translateX(50%); opacity: .5; } 100% { transform: translateX(50%); opacity: 0; } }
 .work-detail-entry { display: flex; align-items: center; gap: .4rem; min-width: 0; }
 .work-detail-entry + .work-detail-entry { margin-top: .6rem; }
-.work-entry-time { display: inline-flex; height: 1.45rem; flex: 0 0 auto; align-self: flex-start; align-items: center; margin-top: .16rem; padding: 0; color: #a1a1aa; font-size: 10.5px; font-variant-numeric: tabular-nums; line-height: 1; white-space: nowrap; }
+.work-entry-time { display: inline-flex; height: 1.45rem; flex: 0 0 auto; align-self: flex-start; align-items: center; margin-top: .16rem; padding: 0; color: var(--ob-text-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; line-height: 1; white-space: nowrap; }
 .work-detail-entry > .work-event, .work-detail-entry > .work-reasoning { min-width: 0; flex: 1 1 0%; }
-.work-detail-empty { display: flex; min-height: 17rem; align-items: center; justify-content: center; flex-direction: column; color: #a1a1aa; text-align: center; }
+.work-detail-empty { display: flex; min-height: 17rem; align-items: center; justify-content: center; flex-direction: column; color: var(--ob-text-muted); text-align: center; }
 .work-detail-empty > svg { width: 1.5rem; height: 1.5rem; margin-bottom: .7rem; }
-.work-detail-empty strong { color: #52525b; font-size: 14px; }
+.work-detail-empty strong { color: var(--ob-text); font-size: 14px; }
 .work-detail-empty p { margin: .35rem 0 0; font-size: 12px; }
-.work-reasoning { margin: .16rem 0; color: #71717a; font-size: 11.5px; }
-.work-reasoning summary { display: grid; grid-template-columns: auto minmax(0, auto) auto minmax(4rem, 1fr); align-items: center; gap: .34rem; min-width: 0; min-height: 1.45rem; padding: .04rem 0; color: #71717a; cursor: pointer; list-style: none; }
+.work-reasoning { margin: .16rem 0; color: var(--ob-text-subtle); font-size: 11.5px; }
+.work-reasoning summary { display: grid; grid-template-columns: auto minmax(0, auto) auto minmax(4rem, 1fr); align-items: center; gap: .34rem; min-width: 0; min-height: 1.45rem; padding: .04rem 0; color: var(--ob-text-subtle); cursor: pointer; list-style: none; }
 .work-reasoning summary::-webkit-details-marker { display: none; }
-.work-reasoning-icon { display: grid; width: .92rem; height: .92rem; place-items: center; color: #a1a1aa; }
+.work-reasoning-icon { display: grid; width: .92rem; height: .92rem; place-items: center; color: var(--ob-text-muted); }
 .work-reasoning-icon svg { width: .78rem; height: .78rem; }
-.work-reasoning-name { min-width: 0; overflow: hidden; color: #64748b; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
-.work-disclosure { display: none; width: 1rem; height: 1rem; place-items: center; color: #64748b; }
+.work-reasoning-name { min-width: 0; overflow: hidden; color: var(--ob-text-subtle); font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
+.work-disclosure { display: none; width: 1rem; height: 1rem; place-items: center; color: var(--ob-text-subtle); }
 .work-disclosure svg { width: .72rem; height: .72rem; transition: transform .14s ease; }
 .work-reasoning summary:hover > .work-disclosure, .work-reasoning summary:focus-visible > .work-disclosure, .work-reasoning[open] > summary > .work-disclosure { display: grid; }
-.work-reasoning[open] > summary > .work-disclosure { color: #4338ca; }
+.work-reasoning[open] > summary > .work-disclosure { color: var(--ob-violet); }
 .work-reasoning[open] > summary > .work-disclosure svg { transform: rotate(90deg); }
-.work-reasoning-detail { margin: .16rem 0 .28rem; border: 1px solid #eceff3; border-radius: 9px; background: #fff; padding: .54rem .62rem; }
-.work-reasoning-body { max-height: min(340px, 48vh); overflow: auto; color: #52525b; font-size: 12px; line-height: 1.55; overscroll-behavior: contain; scrollbar-width: thin; }
+.work-reasoning-detail { margin: .16rem 0 .28rem; border: 1px solid var(--ob-border); border-radius: 9px; background: var(--ob-code-bg); padding: .54rem .62rem; }
+.work-reasoning-body { max-height: min(340px, 48vh); overflow: auto; color: var(--ob-text); font-size: 12px; line-height: 1.55; overscroll-behavior: contain; scrollbar-width: thin; }
 @media (max-width: 1280px) {
 	/* This overlay shares the workspace with the composer (z-index 40).
 	   End above its observed height instead of letting content scroll behind it. */
 	.work-detail { position: absolute; inset: 0 0 var(--console-composer-height, 135px) auto; height: auto; z-index: 24; box-shadow: none; transform: translateX(100%); transition: transform .24s cubic-bezier(.22, 1, .36, 1), opacity .15s ease; }
-	.work-detail.open { width: min(32rem, 88%); flex-basis: 0; transform: translateX(0); box-shadow: -20px 0 54px rgba(15, 23, 42, .16); }
+	.work-detail.open { width: min(32rem, 88%); flex-basis: 0; transform: translateX(0); box-shadow: var(--ob-shadow-popover); }
 }
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
 	/* Keep the close row touch-sized even with the keyboard open; the turn
@@ -244,7 +248,7 @@ function entryTimeDateTime(timeMs) {
 	.work-detail-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: .2rem .5rem; }
 	.work-detail-heading h2 { margin: 0; }
 	.work-detail-heading p { display: none; }
-	.work-detail-turn-preview { display: block; margin: 0 0 .5rem; color: #71717a; font-size: 12px; overflow-wrap: anywhere; }
+	.work-detail-turn-preview { display: block; margin: 0 0 .5rem; color: var(--ob-text-subtle); font-size: 12px; overflow-wrap: anywhere; }
 	.work-detail-close { width: 44px; height: 44px; }
 	.work-detail-body { padding: .5rem .75rem 1rem; }
 	.work-detail-entry { display: block; }
@@ -264,111 +268,5 @@ function entryTimeDateTime(timeMs) {
 @media (prefers-reduced-motion: reduce) {
 	.work-detail, .work-disclosure { transition: none; }
 	.work-detail-kicker.working svg { animation: none; opacity: .72; }
-}
-</style>
-
-<style>
-/* OpenBear system dark theme */
-html.dark .work-detail {
-		background: #1d1e22;
-	}
-
-html.dark .work-detail.open {
-		border-left-color: rgba(255, 255, 255, 0.145);
-	}
-
-html.dark .work-detail-surface {
-		background: rgba(29, 30, 34, 0.98);
-	}
-
-html.dark .work-detail-header {
-		border-bottom: 1px solid rgba(255, 255, 255, 0.131);
-		background: rgba(29, 30, 34, 0.96);
-	}
-
-html.dark .work-detail-kicker {
-		color: #c6c6cd;
-	}
-
-html.dark .work-detail-kicker.working svg {
-		color: #60a5fa;
-	}
-
-html.dark .work-detail-heading h2 {
-		color: #efeff2;
-	}
-
-html.dark .work-detail-turn-preview,
-html.dark .work-detail-heading p {
-		color: #c6c6cd;
-	}
-
-html.dark .work-detail-close {
-		color: #c6c6cd;
-	}
-
-html.dark .work-detail-close:hover {
-		background: #202125;
-		color: #efeff2;
-	}
-
-html.dark .work-running-dots::after {
-		background: linear-gradient(105deg, transparent 28%, rgba(29, 30, 34, 0.88) 43%, rgba(49, 50, 54, 0.18) 50%, transparent 66%);
-	}
-
-html.dark .work-running-dots span {
-		background: #313236;
-		box-shadow: 0 0 0 0 rgba(161, 161, 170, 0.2), 0 0 10px rgba(148, 163, 184, 0.18);
-	}
-
-html.dark .work-entry-time {
-		color: #a1a1a8;
-	}
-
-html.dark .work-detail-empty {
-		color: #a1a1a8;
-	}
-
-html.dark .work-detail-empty strong {
-		color: #c6c6cd;
-	}
-
-html.dark .work-reasoning {
-		color: #c6c6cd;
-	}
-
-html.dark .work-reasoning summary {
-		color: #c6c6cd;
-	}
-
-html.dark .work-reasoning-icon {
-		color: #a1a1a8;
-	}
-
-html.dark .work-reasoning-name {
-		color: #c6c6cd;
-	}
-
-html.dark .work-disclosure {
-		color: #c6c6cd;
-	}
-
-html.dark .work-reasoning[open] > summary > .work-disclosure {
-		color: #60a5fa;
-	}
-
-html.dark .work-reasoning-detail {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-
-html.dark .work-reasoning-body {
-		color: #c6c6cd;
-	}
-
-@media (max-width: 1280px) {
-	html.dark .work-detail.open {
-		box-shadow: -20px 0 54px rgba(0, 0, 0, 0.16);
-	}
 }
 </style>

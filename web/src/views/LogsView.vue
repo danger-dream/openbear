@@ -72,7 +72,7 @@ function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catc
 
 <template>
   <div class="admin-page logs-page h-full flex flex-col">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
+    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-ob-surface/70 backdrop-blur">
       <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">系统日志</h1>
         <span class="text-xs text-macsub">提示词渲染记录 + Web 审计日志</span>
@@ -160,10 +160,10 @@ function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catc
         </div>
         <el-tabs v-model="detailTab" class="flex-1 min-h-0 flex flex-col mac-detail-tabs">
           <el-tab-pane label="组装输出 (完整提示词)" name="output" class="h-full">
-            <pre class="h-full overflow-auto m-0 p-3 text-xs leading-relaxed whitespace-pre-wrap break-words font-mono bg-black/[0.02] rounded-lg">{{ detail.output || '(此条日志无输出)' }}</pre>
+            <pre class="h-full overflow-auto m-0 p-3 text-xs leading-relaxed whitespace-pre-wrap break-words font-mono bg-ob-soft rounded-lg">{{ detail.output || '(此条日志无输出)' }}</pre>
           </el-tab-pane>
           <el-tab-pane label="输入参数" name="params" class="h-full">
-            <pre class="h-full overflow-auto m-0 p-3 text-xs leading-relaxed whitespace-pre-wrap break-words font-mono bg-black/[0.02] rounded-lg">{{ prettyParams(detail.params_json) }}</pre>
+            <pre class="h-full overflow-auto m-0 p-3 text-xs leading-relaxed whitespace-pre-wrap break-words font-mono bg-ob-soft rounded-lg">{{ prettyParams(detail.params_json) }}</pre>
           </el-tab-pane>
         </el-tabs>
       </div>

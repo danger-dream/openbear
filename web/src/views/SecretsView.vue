@@ -3,8 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import draggable from "vuedraggable";
-import { assetTimeLine } from "../utils/assetTime";
+import { assetTimeLine, formatAssetTime } from "../utils/assetTime";
 import { dragAutoScrollOptions } from "../utils/dragScroll";
+import AdminPageHeader from "../components/AdminPageHeader.vue";
+import MobileAssetRow from "../components/MobileAssetRow.vue";
+import MobileAssetSheet from "../components/MobileAssetSheet.vue";
+import { useMobileAssets } from "../components/useMobileAssets";
+
+const emit = defineEmits(["mobile-header-ready"]);
 
 const secrets = ref([]);
 const loading = ref(false);
@@ -191,58 +197,82 @@ async function persistGroups() {
     await load();
   }
 }
+const { isAdminPhone, mobileMode, mobileOpen, mobileView, mobileItem, mobileDetail, mobileLoading, mobileError, mobileBusy,
+  openMobileAsset, setMobileMode, runMobileAction, reloadMobileDetail } = useMobileAssets({
+  items: shownSecrets, loadDetail: id => Api.secret(id), isSelected, setSelected, clearSelection,
+  actions: { edit: openEdit, enabled: toggleEnabled, archive: toggleArchived, remove },
+});
+const mobileEnabledCount = computed(() => shownSecrets.value.filter(row => row.enabled && !row.archived).length);
+function mobileUpdated(row) {
+  const value = row.updatedAt ?? row.updated_at;
+  return value ? formatAssetTime(value).slice(5, 10) + " 更新" : "时间未知";
+}
 </script>
 
 <template>
-  <div class="admin-page secrets-page h-full flex flex-col">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="admin-heading flex items-center gap-2">
-        <h1 class="text-base font-semibold">凭证库</h1>
-        <span class="text-xs text-macsub">拖手柄排序 · 点卡片编辑 · 审计日志不记录 value 明文</span>
-      </div>
-      <div class="flex items-center gap-3">
+  <div class="admin-page secrets-page mobile-assets-page h-full flex flex-col" :class="{ 'is-sorting-assets': mobileMode === 'sort' }">
+    <AdminPageHeader
+      title="凭证库"
+      subtitle="拖手柄排序 · 点卡片编辑 · 审计日志不记录 value 明文"
+      description="轻点查看详情 · 在列表管理中选择或排序 · 审计日志不记录 value 明文"
+      @mobile-header-ready="emit('mobile-header-ready', $event)"
+    >
+      <template #mobile-navigation><slot name="mobile-navigation" /></template>
+      <template #actions>
+        <template v-if="isAdminPhone">
+          <el-button :icon="'Select'" @click="setMobileMode('select')">选择条目</el-button>
+          <el-button :icon="'Rank'" @click="setMobileMode('sort')">整理顺序</el-button>
+        </template>
         <el-checkbox v-model="showArchived" size="small" @change="load(); clearSelection()">显示归档</el-checkbox>
         <el-switch v-model="showSecretValues" size="small" active-text="显示明文" inactive-text="隐藏明文" />
-        <el-button :icon="'Refresh'" circle @click="refresh" title="刷新" />
-        <el-button type="primary" :icon="'Plus'" @click="openEdit(null)" round>新建凭证</el-button>
-      </div>
-    </header>
+        <el-button :icon="'Refresh'" @click="refresh" title="刷新">刷新</el-button>
+      </template>
+      <template #primary><el-button :icon="'Plus'" @click="openEdit(null)">新建凭证</el-button></template>
+    </AdminPageHeader>
 
-    <div v-if="selectedIds.length" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="isAdminPhone" class="mobile-asset-overview">
+      <span>{{ mobileMode === 'browse' ? `共 ${shownSecrets.length} 条 · 启用 ${mobileEnabledCount} 条` : mobileMode === 'sort' ? '拖动手柄调整分组与条目顺序' : `已选 ${selectedIds.length} 条` }}</span>
+      <button type="button" @click="setMobileMode(mobileMode === 'browse' ? 'select' : 'browse')">{{ mobileMode === 'browse' ? '选择' : '完成' }}</button>
+    </div>
+
+    <div v-if="selectedIds.length || (isAdminPhone && mobileMode === 'select')" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 条</span>
-      <el-button size="small" :icon="'Box'" @click="batchUpdateSecrets({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
-      <el-button size="small" :icon="'RefreshLeft'" @click="batchUpdateSecrets({ archived: 0 }, '已批量恢复')">恢复</el-button>
-      <el-button size="small" :icon="'Unlock'" @click="batchUpdateSecrets({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
-      <el-button size="small" :icon="'Lock'" @click="batchUpdateSecrets({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
-      <el-button size="small" type="danger" :icon="'Delete'" @click="batchDeleteSecrets">删除</el-button>
-      <el-button size="small" text @click="clearSelection">取消选择</el-button>
+      <el-button size="small" :icon="'Box'" :disabled="!selectedIds.length" @click="batchUpdateSecrets({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
+      <el-button size="small" :icon="'RefreshLeft'" :disabled="!selectedIds.length" @click="batchUpdateSecrets({ archived: 0 }, '已批量恢复')">恢复</el-button>
+      <el-button size="small" :icon="'Unlock'" :disabled="!selectedIds.length" @click="batchUpdateSecrets({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
+      <el-button size="small" :icon="'Lock'" :disabled="!selectedIds.length" @click="batchUpdateSecrets({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
+      <el-button size="small" type="danger" :icon="'Delete'" :disabled="!selectedIds.length" @click="batchDeleteSecrets">删除</el-button>
+      <el-button size="small" text @click="isAdminPhone ? setMobileMode('browse') : clearSelection()">取消选择</el-button>
     </div>
 
     <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
       <div v-if="!shownSecrets.length" class="text-center text-macsub py-16 text-sm">暂无凭证</div>
       <draggable v-model="groups" item-key="name" handle=".group-handle" :animation="180"
-        v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
+        v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
         @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag">
         <template #item="{ element: g }">
-          <section class="mb-5">
-            <div class="text-xs font-semibold text-macsub mb-2 flex items-center gap-2">
-              <el-icon class="group-handle cursor-move select-none text-gray-300 hover:text-macsub" :size="14"><Rank /></el-icon>
-              <span class="w-1 h-3.5 bg-macblue rounded"></span>{{ g.name || '未分组' }}
+          <section class="asset-group-section mb-5">
+            <div class="asset-group-heading text-xs font-semibold text-macsub mb-2 flex items-center gap-2">
+              <el-icon class="group-handle cursor-move select-none text-ob-muted hover:text-macsub" :size="14"><Rank /></el-icon>
+              <span class="w-1 h-3.5 bg-macblue rounded"></span><span class="asset-group-label">{{ g.name || '未分组' }}</span>
               <span class="opacity-50">({{ g.items.length }})</span>
             </div>
             <draggable v-model="g.items" item-key="id" handle=".drag-handle" :animation="180"
-              v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
+              v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
               :group="{ name: 'secret-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag"
-              class="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3 min-h-6">
+              class="mobile-asset-group grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3 min-h-6">
               <template #item="{ element: s }">
-                <div v-if="showArchived || !s.archived" @click="openEdit(s)"
+                <MobileAssetRow v-if="isAdminPhone && (showArchived || !s.archived)" :title="s.name" :summary="`${(s.kv || []).length} 个字段${s.note ? ' · ' + s.note : ''}`" :reference="'@secret/' + s.name" :meta="mobileUpdated(s)"
+                  :enabled="!!s.enabled" :archived="!!s.archived" :selected="isSelected(s.id)" :mode="mobileMode"
+                  @select="setSelected(s.id, $event)" @open="openMobileAsset(s)" @more="openMobileAsset(s, 'actions')" />
+                <div v-else-if="!isAdminPhone && (showArchived || !s.archived)" @click="openEdit(s)"
             class="secret-card mac-panel mac-shadow p-4 flex flex-col gap-2 cursor-pointer hover:border-macblue/50 transition-colors"
             :class="{ 'opacity-50 border-dashed': s.archived || !s.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(s.id) }">
             <div class="flex items-center justify-between gap-2">
               <div class="flex items-center gap-2 min-w-0">
                 <div @click.stop><el-checkbox :model-value="isSelected(s.id)" @change="(v) => setSelected(s.id, v)" /></div>
-                <el-icon class="drag-handle cursor-move select-none text-gray-300 hover:text-macsub shrink-0" :size="16" @click.stop><Rank /></el-icon>
+                <el-icon class="drag-handle cursor-move select-none text-ob-muted hover:text-macsub shrink-0" :size="16" @click.stop><Rank /></el-icon>
                 <div class="min-w-0">
                   <div class="font-medium text-sm truncate flex items-center gap-1">
                     <span>{{ s.name }}</span>
@@ -272,6 +302,9 @@ async function persistGroups() {
         </template>
       </draggable>
     </div>
+
+    <MobileAssetSheet v-if="isAdminPhone && mobileItem" v-model="mobileOpen" v-model:secret-values="showSecretValues" kind="secrets" :item="mobileItem" :detail="mobileDetail" :view="mobileView"
+      :loading="mobileLoading" :busy="mobileBusy" :error="mobileError" @retry="reloadMobileDetail" @action="runMobileAction" />
 
     <el-dialog append-to-body class="admin-dialog secrets-dialog" v-model="dialogOpen" :title="editing?.id ? '编辑凭证' : '新建凭证'" width="860px" top="6vh" :close-on-click-modal="true" :before-close="tryClose">
       <div v-if="editing" class="flex flex-col gap-4">

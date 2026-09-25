@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.browser.config import BrowserConfig
 from app.context.configuration import migrate_context_config
 from app.models.thinking import (
     configured_default_think_level,
@@ -249,17 +250,18 @@ class ProviderDef(BaseModel):
 class ModelsConfig(BaseModel):
     providers: dict[str, ProviderDef]
     primary: str
-    # Stored at the original path; edited only in system context settings.
+    # Stored at their original path; edited only in system settings.
     compression_models: list[str] = Field(default_factory=list, alias="compressionModels")
+    naming_models: list[str] = Field(default_factory=list, alias="namingModels")
 
     model_config = {"populate_by_name": True}
 
-    @field_validator("compression_models", mode="before")
+    @field_validator("compression_models", "naming_models", mode="before")
     @classmethod
     def _normalize_compression_models(cls, value: Any) -> list[str]:
         items = re.split(r"[,;\n]+", value) if isinstance(value, str) else value or []
         if not isinstance(items, (list, tuple)):
-            raise ValueError("compressionModels 必须是模型列表")
+            raise ValueError("模型候选必须是列表")
         return list(dict.fromkeys(str(item).strip() for item in items if str(item or "").strip()))
 
     def compression_model_candidates(self, fallback: str = "") -> list[str]:
@@ -396,6 +398,12 @@ class AgentConfig(BaseModel):
     compact_max_tokens: int = Field(default=32768, alias="compactMaxTokens", ge=512)
     compact_max_retries: int = Field(default=1, alias="compactMaxRetries", ge=0)
     compact_timeout_s: float = Field(default=1800.0, alias="compactTimeoutS", ge=1.0, le=86400.0)
+    naming_prompt: str = Field(default="", alias="namingPrompt")
+    naming_timeout_s: float = Field(default=30.0, alias="namingTimeoutS", ge=1.0, le=600.0)
+    # Retry count follows the application-wide convention: it excludes the first request.
+    naming_max_retries: int = Field(default=3, alias="namingMaxRetries", ge=0, le=50)
+    naming_max_turns: int = Field(default=8, alias="namingMaxTurns", ge=0)
+    naming_max_chars: int = Field(default=50_000, alias="namingMaxChars", ge=1000, le=100_000)
     # Deprecated compatibility input; queue/steering control now owns new-message behavior.
     interrupt_on_new: bool = Field(default=False, alias="interruptOnNew", exclude=True)
     # 错误分类决定是否重试；次数不含首次请求，等待采用整数阶梯。
@@ -475,6 +483,9 @@ class MCPServerConfig(BaseModel):
     # auto keeps backward compatibility with newline-json servers and retries framed
     # once if initialize fails; set framed/newline explicitly to avoid retry delay.
     stdio_mode: Literal["auto", "framed", "newline"] = Field(default="auto", alias="stdioMode")
+
+    # Both newline and Content-Length stdio messages are bounded.
+    max_message_bytes: int = Field(default=16 * 1024 * 1024, alias="maxMessageBytes", ge=65536, le=128 * 1024 * 1024)
 
     # streamable_http
     url: str = ""
@@ -663,6 +674,7 @@ class Config(BaseModel):
     ui: UIConfig = Field(default_factory=UIConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
     log_level: str = Field(default="INFO", alias="logLevel")
 
     model_config = {"populate_by_name": True}

@@ -33,11 +33,11 @@ test("main conversation keeps durable interruptions, model retries, and context 
 	];
 	const entries = conversationTimelineEntries(events, (event) => event.toolName || "");
 
-	assert.deepEqual(entries.map(({index}) => index), [0, 3, 4, 5, 7]);
+	assert.deepEqual(entries.map(({index}) => index), [0, 3, 4, 5, 6, 7]);
 	assert.equal(entries[2].event.preview, "先停一下");
 });
 
-test("Agent events keep their source positions while ordinary tools remain filtered", () => {
+test("Agent and ordinary tools keep their source positions in the working timeline", () => {
 	const events = [
 		{kind: "answer", id: "answer-before", message: {content: "开始"}},
 		{kind: "tool", id: "ordinary-read", toolName: "Read"},
@@ -52,9 +52,9 @@ test("Agent events keep their source positions while ordinary tools remain filte
 	];
 	const entries = conversationTimelineEntries(events, (event) => event.toolName || "", isAgentFixture);
 
-	assert.deepEqual(entries.map(({index}) => index), [0, 2, 3, 4, 5, 6, 8, 9]);
+	assert.deepEqual(entries.map(({index}) => index), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 	assert.deepEqual(entries.map(({event}) => event.id), [
-		"answer-before", "agent-live", "compaction", "agent-start", "retry", "agent-message", "agent-stop", "answer-after",
+		"answer-before", "ordinary-read", "agent-live", "compaction", "agent-start", "retry", "agent-message", "ordinary-bash", "agent-stop", "answer-after",
 	]);
 	assert.match(turnListSource, /conversationTimelineEntries\(displayEvents\(turn\), eventPrimaryToolName, isAgentEvent\)/);
 });
@@ -75,19 +75,19 @@ test("failed Agent stays out of the main conversation but remains available to w
 	assert.match(workDetailPanelSource, /sourceEvents = computed\(\(\) => Array\.isArray\(props\.turn\?\.events\) \? props\.turn\.events : \[\]\)/);
 });
 
-test("typed and legacy UserInteraction remain in the main timeline while ordinary tools stay filtered", () => {
+test("typed and legacy UserInteraction remain alongside ordinary work events", () => {
 	const events = [
 		{kind: "user_interaction", id: "typed", operation: {opType: "user_interaction", opId: "tool:ui-1", payload: {interaction: {title: "保留卡片"}}}},
 		{kind: "tool", id: "legacy", toolName: "UserInteraction", operation: {opType: "tool", opId: "tool:ui-old", payload: {name: "UserInteraction"}}},
 		{kind: "tool", id: "ordinary", toolName: "Read", operation: {opType: "tool", opId: "tool:read"}},
 	];
 	const entries = conversationTimelineEntries(events, (event) => event.toolName || "");
-	assert.deepEqual(entries.map(({event}) => event.id), ["typed", "legacy"]);
+	assert.deepEqual(entries.map(({event}) => event.id), ["typed", "legacy", "ordinary"]);
 	assert.equal(isConversationTimelineEvent(events[0]), true);
 	assert.equal(isConversationTimelineEvent(events[1]), true);
 });
 
-test("ordinary transient status and ordinary tools stay out of the main conversation", () => {
+test("unrelated transient status and internal tools stay out of the main conversation", () => {
 	assert.equal(isConversationTimelineEvent({kind: "live_status", status: "处理中"}), false);
 	assert.equal(isConversationTimelineEvent({kind: "tool", toolName: "Bash", operation: {
 		opId: "tool:bash-1", opType: "tool", internal: true, payload: {toolName: "Bash"},
@@ -107,12 +107,10 @@ test("assistant progress adds a divider between adjacent visible answer entries"
 		{kind: "answer", id: "update-3", message: {content: "实时输出", live: true}},
 	]);
 
-	assert.deepEqual(entries.map(({index}) => index), [0, 2, 3, 4]);
-	assert.equal(entries[1].event.message.content, "进度二");
-	assert.equal(shouldRenderAssistantDivider(entries, 0), false);
-	assert.equal(shouldRenderAssistantDivider(entries, 1), true);
-	assert.equal(shouldRenderAssistantDivider(entries, 2), false);
-	assert.equal(shouldRenderAssistantDivider(entries, 3), false);
+	assert.deepEqual(entries.map(({index}) => index), [0, 1, 2, 3, 4]);
+	assert.equal(entries[2].event.message.content, "进度二");
+	for (let i = 0; i < entries.length; i++) assert.equal(shouldRenderAssistantDivider(entries, i), false);
+	assert.equal(shouldRenderAssistantDivider([entries[0], entries[2]], 1), true);
 });
 
 test("only intermediate conversation rows retain hover time and duration badges", () => {

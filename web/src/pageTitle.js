@@ -7,6 +7,7 @@ const PAGE_TITLES = Object.freeze({
   docs: "文档库",
   skills: "Skills",
   mcp: "MCP 管理",
+  statistics: "数据统计",
 });
 
 const SETTINGS_SECTION_TITLES = Object.freeze({
@@ -14,6 +15,7 @@ const SETTINGS_SECTION_TITLES = Object.freeze({
   templates: "提示词模板",
   agents: "Agent Presets",
   "system-settings": "系统设置",
+  sessions: "登录设备",
   logs: "系统日志",
 });
 

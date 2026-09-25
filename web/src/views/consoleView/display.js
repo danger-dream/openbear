@@ -20,7 +20,6 @@ import {
 import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import {plainText} from "./markdown.js";
 import {contextCompactionView} from "./agentPlanPresentation.js";
-import {taskMemoryToolPreview} from "./taskMemoryPresentation.js";
 import {toolArgumentsSummary} from "./toolArgumentsPresentation.js";
 
 const TOOL_ARGUMENT_PREVIEW_CHARS = 5000;
@@ -113,6 +112,27 @@ export function fmtLiveElapsedMs(ms) {
 	const m = Math.floor(n / 60000);
 	const s = Math.floor((n % 60000) / 1000);
 	return `${m}m${String(s).padStart(2, "0")}s`;
+}
+
+export function fmtElapsedClockMs(ms) {
+	const seconds = Math.floor(Math.max(0, Number(ms) || 0) / 1000);
+	const minutes = Math.floor(seconds / 60);
+	return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+export function conversationPathText(path) {
+	const text = String(path || "").trim().replaceAll(" / ", "/");
+	return text ? (text.startsWith("/") ? text : `/${text}`) : "—";
+}
+
+export function headerDurationParts(ms) {
+	const value = Math.max(0, Number(ms) || 0);
+	if (!value) return [{value: "—", unit: ""}];
+	if (value < 1000) return [{value: String(Math.round(value)), unit: "ms"}];
+	if (value < 10000) return [{value: (value / 1000).toFixed(1), unit: "秒"}];
+	const seconds = Math.round(value / 1000);
+	if (seconds < 60) return [{value: String(seconds), unit: "秒"}];
+	return [{value: String(Math.floor(seconds / 60)), unit: "分"}, {value: String(seconds % 60), unit: "秒"}];
 }
 
 export function fmtElapsedFromStart(startAt) {
@@ -298,9 +318,7 @@ function toolPreviewFromCall(call, rawResult = "") {
 	const value = toolName === "ContextCompaction" && summaryPreview
 		? shortText(rendererLineContent(summaryPreview, toolName), 110)
 		: sourceArguments
-			? (toolName === "TaskMemory"
-				? taskMemoryToolPreview(sourceArguments, resultText)
-				: toolPreviewFromArgs(sourceArguments))
+			? (toolArgumentsSummary(toolName, sourceArguments, resultText) || toolPreviewFromArgs(sourceArguments))
 			: shortText(rendererLineContent(summaryPreview, toolName), 110);
 	toolCallPreviewMemo.set(call, {argsText, previewArguments, summaryPreview, resultText, value});
 	return value;

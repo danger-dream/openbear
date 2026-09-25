@@ -22,7 +22,7 @@ onBeforeUnmount(() => flow.dispose());
   <div class="login-screen min-h-screen flex items-center justify-center bg-macbg px-4 text-mactext">
     <section class="w-full max-w-md mac-panel mac-shadow p-7 space-y-5">
       <div class="text-center space-y-2">
-        <div class="mx-auto w-14 h-14 rounded-3xl bg-white border border-macborder shadow-sm flex items-center justify-center"><BearLogo /></div>
+        <div class="mx-auto w-14 h-14 rounded-3xl bg-ob-surface border border-macborder shadow-sm flex items-center justify-center"><BearLogo /></div>
         <h1 class="text-xl font-semibold">OpenBear 管理台登录</h1>
         <p class="text-sm text-macsub">输入 Web Secret Key 后，需要在 Telegram 中二次确认。</p>
       </div>
@@ -42,12 +42,12 @@ onBeforeUnmount(() => flow.dispose());
         </el-button>
       </el-form>
 
-      <div v-if="requestUuid" class="rounded-2xl bg-white/70 border border-macborder p-4 text-sm space-y-2">
+      <div v-if="requestUuid" class="rounded-2xl bg-ob-surface/70 border border-macborder p-4 text-sm space-y-2">
         <div class="font-medium">📲 {{ status === 'verifying' ? '正在确认登录会话' : '等待 Telegram 确认' }}</div>
         <div class="text-macsub break-all">请求：<span class="font-mono">{{ requestUuid }}</span></div>
         <div v-if="notice" class="text-macsub" role="status" aria-live="polite">{{ notice }}</div>
       </div>
-      <div v-if="retryAfter" class="rounded-2xl bg-red-50 text-red-700 border border-red-100 p-4 text-sm">
+      <div v-if="retryAfter" class="rounded-2xl bg-[var(--ob-danger-soft)] text-ob-danger border border-ob-danger/25 p-4 text-sm">
         登录请求过于频繁，服务要求等待 {{ retryAfter }} 秒后再试。
       </div>
     </section>

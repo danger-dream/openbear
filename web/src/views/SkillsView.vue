@@ -1,9 +1,11 @@
 <script setup>
 import MobileAdminSummary from "../components/MobileAdminSummary.vue";
+import AdminPageHeader from "../components/AdminPageHeader.vue";
 import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 
+const emit = defineEmits(["mobile-header-ready"]);
 const loading = ref(false);
 const reloading = ref(false);
 const items = ref([]);
@@ -11,7 +13,7 @@ const stats = ref({ total: 0, enabled: 0, disabled: 0, dependencyMissing: 0, dir
 const skillsDir = ref("");
 const query = ref("");
 const statusFilter = ref("all");
-const showDisabled = ref(true);
+const showDisabled = ref(false);
 const detailOpen = ref(false);
 const detailLoading = ref(false);
 const detail = ref(null);
@@ -134,7 +136,7 @@ async function uninstallSkill(row) {
   if (!name) return;
   try {
     await ElMessageBox.prompt(
-      `Skill 会从运行目录移到隐藏归档，不会删除它额外安装的依赖。当前有运行中任务时后端会拒绝操作。请输入完整名称「${name}」确认。`,
+      `Skill 会从运行目录移到隐藏归档，不会删除它额外安装的依赖。运行中的 Agent 或子进程可能仍在使用 Skill；仅不相关的记忆维护任务不阻止卸载已停用 Skill。请输入完整名称「${name}」确认。`,
       `卸载 Skill · ${name}`,
       {
         type: "error",
@@ -199,16 +201,16 @@ onMounted(load);
 
 <template>
   <div class="admin-page skills-page h-full flex flex-col" v-loading="loading">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="admin-heading min-w-0 flex items-center gap-2">
-        <h1 class="text-base font-semibold">Skills</h1>
-        <span class="truncate text-xs text-macsub">任务技能管理 · 启用后下一轮对话生效</span>
-      </div>
-      <div class="flex items-center gap-2">
-        <el-button plain round :icon="'InfoFilled'" @click="installOpen = true">安装说明</el-button>
-        <el-button round :icon="'Refresh'" :loading="reloading" @click="reloadSkills">重新加载</el-button>
-      </div>
-    </header>
+    <AdminPageHeader
+      title="Skills"
+      subtitle="任务技能管理 · 启用后下一轮对话生效"
+      description="任务技能管理 · 启用后下一轮对话生效"
+      @mobile-header-ready="emit('mobile-header-ready', $event)"
+    >
+      <template #mobile-navigation><slot name="mobile-navigation" /></template>
+      <template #actions><el-button :icon="'InfoFilled'" @click="installOpen = true">安装说明</el-button></template>
+      <template #primary><el-button :icon="'Refresh'" :loading="reloading" @click="reloadSkills">重新加载</el-button></template>
+    </AdminPageHeader>
 
     <div class="admin-desktop-only admin-stats grid grid-cols-1 gap-3 px-6 pt-5 shrink-0 md:grid-cols-4">
       <div class="mac-panel px-4 py-3">
@@ -217,11 +219,11 @@ onMounted(load);
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">已注入 / 启用</div>
-        <div class="text-lg font-semibold text-emerald-700">{{ stats.enabled || 0 }}</div>
+        <div class="text-lg font-semibold text-ob-success">{{ stats.enabled || 0 }}</div>
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">依赖缺失</div>
-        <div class="text-lg font-semibold" :class="stats.dependencyMissing ? 'text-amber-700' : ''">{{ stats.dependencyMissing || 0 }}</div>
+        <div class="text-lg font-semibold" :class="stats.dependencyMissing ? 'text-ob-warning' : ''">{{ stats.dependencyMissing || 0 }}</div>
       </div>
       <div class="mac-panel min-w-0 px-4 py-3">
         <div class="text-[11px] text-macsub">Skills 目录</div>
@@ -231,7 +233,7 @@ onMounted(load);
 
     <MobileAdminSummary :items="[{ label: 'Skill 总数', value: stats.total }, { label: '已注入 / 启用', value: stats.enabled }, { label: '依赖缺失', value: stats.dependencyMissing }, { label: 'Skills 目录', value: skillsDir || stats.directory }, { label: '当前匹配', value: filteredItems.length }]">共 {{ stats.total || 0 }} · 启用 {{ stats.enabled || 0 }} · 缺依赖 {{ stats.dependencyMissing || 0 }}</MobileAdminSummary>
 
-    <section class="admin-filters mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-white/70 p-3 backdrop-blur">
+    <section class="admin-filters mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-ob-surface/70 p-3 backdrop-blur">
       <div class="flex flex-col gap-3 lg:flex-row lg:items-center">
         <el-input v-model="query" clearable :prefix-icon="'Search'" placeholder="搜索 name / description / path / reason" class="lg:max-w-md" />
         <el-select v-model="statusFilter" class="w-full lg:w-44">
@@ -256,14 +258,14 @@ onMounted(load);
               <p class="mt-2 line-clamp-2 text-sm leading-6 text-mactext/80">{{ row.description || '暂无描述' }}</p>
 
               <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-macsub">
-                <span v-if="reqList(row, 'bins').length" class="rounded-full bg-black/[0.04] px-2 py-0.5">bin: {{ reqList(row, 'bins').join(', ') }}</span>
-                <span v-if="reqList(row, 'env').length" class="rounded-full bg-black/[0.04] px-2 py-0.5">env: {{ reqList(row, 'env').join(', ') }}</span>
-                <span v-if="primaryEnvText(row)" class="rounded-full bg-black/[0.04] px-2 py-0.5">primaryEnv: {{ primaryEnvText(row) }}</span>
-                <span v-if="row.always" class="rounded-full bg-emerald-50 px-2 py-0.5 text-emerald-700">always</span>
-                <span class="max-w-full truncate rounded-full bg-black/[0.04] px-2 py-0.5 font-mono" :title="row.location">{{ shortPath(row.location) }}</span>
+                <span v-if="reqList(row, 'bins').length" class="rounded-full bg-ob-soft px-2 py-0.5">bin: {{ reqList(row, 'bins').join(', ') }}</span>
+                <span v-if="reqList(row, 'env').length" class="rounded-full bg-ob-soft px-2 py-0.5">env: {{ reqList(row, 'env').join(', ') }}</span>
+                <span v-if="primaryEnvText(row)" class="rounded-full bg-ob-soft px-2 py-0.5">primaryEnv: {{ primaryEnvText(row) }}</span>
+                <span v-if="row.always" class="rounded-full bg-[var(--ob-success-soft)] px-2 py-0.5 text-ob-success">always</span>
+                <span class="max-w-full truncate rounded-full bg-ob-soft px-2 py-0.5 font-mono" :title="row.location">{{ shortPath(row.location) }}</span>
               </div>
 
-              <div v-if="row.reason" class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+              <div v-if="row.reason" class="mt-3 rounded-xl border border-ob-warning/25 bg-[var(--ob-warning-soft)] px-3 py-2 text-xs leading-5 text-ob-warning">
                 {{ row.reason }}
               </div>
             </div>
@@ -318,7 +320,7 @@ onMounted(load);
           </div>
         </section>
 
-        <section v-if="detail.reason" class="mac-panel mt-4 border-amber-200 bg-amber-50/70 p-4 text-sm leading-6 text-amber-900">
+        <section v-if="detail.reason" class="mac-panel mt-4 border-ob-warning/25 bg-[var(--ob-warning-soft)] p-4 text-sm leading-6 text-ob-warning">
           <h3 class="mb-1 text-sm font-semibold">过滤原因</h3>
           {{ detail.reason }}
         </section>
@@ -334,10 +336,10 @@ onMounted(load);
     </el-drawer>
 
     <el-dialog append-to-body class="admin-dialog" v-model="installOpen" title="安装 Skill 的推荐方式" width="620px">
-      <div class="space-y-3 text-sm leading-6 text-zinc-700">
+      <div class="space-y-3 text-sm leading-6 text-ob-text">
         <p>Web 管理界面负责浏览、启停、可恢复卸载和重新加载，不提供上传 ZIP、Git clone、在线编辑或新增安装功能。</p>
         <p>推荐在对话里让 OpenBear 人工处理安装：说明 Skill 来源、用途和安全边界，由 OpenBear 检查目录结构、依赖和 <code>SKILL.md</code> 后放入 Skills 目录。</p>
-        <div class="rounded-2xl border border-macborder bg-zinc-50 p-3">
+        <div class="rounded-2xl border border-macborder bg-ob-surface p-3">
           <div class="text-xs text-macsub">当前 Skills 目录</div>
           <code class="break-all text-xs">{{ skillsDir || stats.directory || '—' }}</code>
         </div>
@@ -355,23 +357,23 @@ onMounted(load);
   max-height: 56vh;
   overflow: auto;
   border-radius: 14px;
-  border: 1px solid rgba(24, 24, 27, 0.08);
-  background: rgba(250, 250, 250, 0.9);
+  border: 1px solid rgb(var(--ob-border-rgb) / 0.08);
+  background: rgb(var(--ob-surface-rgb) / 0.9);
   padding: 14px;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
   line-height: 1.65;
-  color: #27272a;
+  color: var(--ob-text);
 }
 </style>
 
 <style>
 /* OpenBear system dark theme */
 html.dark .skill-content {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.9);
-		color: #efeff2;
+		border: 1px solid rgb(var(--ob-border-rgb) / 0.116);
+		background: rgb(var(--ob-surface-soft-rgb) / 0.9);
+		color: var(--ob-text-strong);
 	}
 </style>

@@ -35,6 +35,15 @@ export function artifactFromUrl(value, origin = globalThis.location?.origin) {
 	} catch { return null; }
 }
 
+// Only the server-validated workspace path is shareable with another conversation.
+// In particular, never copy a content URL or a blob storage path as a substitute.
+export function artifactSharedPath(metadata) {
+	const path = metadata?.workspacePath;
+	if (typeof path !== "string" || !path.startsWith("workspace/artifacts/")) return "";
+	const parts = path.slice("workspace/artifacts/".length).split("/");
+	return parts.every(part => part && part !== "." && part !== ".." && !/[\\\x00-\x1f\x7f]/.test(part)) ? path : "";
+}
+
 export function artifactFormat(metadata = {}) {
 	metadata = metadata || {};
 	const name = String(metadata.fileName || "").toLowerCase();

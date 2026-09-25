@@ -291,7 +291,7 @@ onMounted(load);
 
 <template>
   <div class="admin-page agents-page h-full flex flex-col" v-loading="loading">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
+    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-ob-surface/70 backdrop-blur">
       <div class="admin-heading flex items-center gap-2">
         <h1 class="text-base font-semibold">Agent Presets</h1>
         <span class="text-xs text-macsub">system prompt 与适用场景</span>
@@ -325,10 +325,10 @@ onMounted(load);
               </div>
               <p class="mt-2 text-sm text-mactext/80 line-clamp-2">{{ row.description || '暂无描述' }}</p>
               <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-macsub">
-                <span class="px-2 py-0.5 rounded-full bg-black/[0.04]">🤖 {{ modelLabel(row.model) }}</span>
-                <span class="px-2 py-0.5 rounded-full bg-black/[0.04]">🧠 {{ row.think_level || '模型默认' }}</span>
-                <span class="px-2 py-0.5 rounded-full bg-black/[0.04]">🛠 {{ toolText(row) }}</span>
-                <span class="px-2 py-0.5 rounded-full bg-black/[0.04]">{{ fmtTime(row.updated_at) }}</span>
+                <span class="px-2 py-0.5 rounded-full bg-ob-soft">🤖 {{ modelLabel(row.model) }}</span>
+                <span class="px-2 py-0.5 rounded-full bg-ob-soft">🧠 {{ row.think_level || '模型默认' }}</span>
+                <span class="px-2 py-0.5 rounded-full bg-ob-soft">🛠 {{ toolText(row) }}</span>
+                <span class="px-2 py-0.5 rounded-full bg-ob-soft">{{ fmtTime(row.updated_at) }}</span>
               </div>
             </div>
             <div class="admin-card-actions flex gap-1 shrink-0">
@@ -367,7 +367,7 @@ onMounted(load);
                   <el-option v-for="name in unavailableSelected" :key="name" :label="`${name}（当前不可用 · 已保留）`" :value="name" disabled />
                 </el-option-group>
               </el-select>
-              <div v-if="unavailableSelected.length" class="mt-2 space-y-1 text-xs text-amber-700">
+              <div v-if="unavailableSelected.length" class="mt-2 space-y-1 text-xs text-ob-warning">
                 <div v-for="name in unavailableSelected" :key="name" class="flex items-start gap-2">
                   <span class="break-all">{{ name }} · 当前不可用，恢复后按已选设置处理</span>
                   <el-button text size="small" :disabled="saving" @click="editing.toolAllowlist = editing.toolAllowlist.filter(item => item !== name)">移除</el-button>

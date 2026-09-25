@@ -13,6 +13,7 @@ from aiogram import Bot
 
 from app.admin.skills_web import SkillsWebAdminServer
 from app.agent.runs import RunRegistry
+from app.browser.service import BrowserService
 from app.config import Config, config_path, load_config
 from app.config_store import ConfigStore
 from app.context.builder import ContextBuilder
@@ -37,6 +38,7 @@ from app.tools.agents import register_agent_tools
 from app.tools.allowlist import refresh_agent_tool_enums
 from app.tools.base import ToolRegistry
 from app.tools.bash import register_bash_tool
+from app.tools.browser import register_browser_tool
 from app.tools.file_state import FileStateStore
 from app.tools.files import register_file_tools
 from app.tools.history import register_history_tools
@@ -84,6 +86,8 @@ class Services:
         self.workspace_dir = str(Path(os.getcwd(), "workspace").resolve())
         Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
         self.interactions = UserInteractionManager(bot)
+        self.browser = BrowserService(config, self.workspace_dir)
+        self._browser_validation_task: asyncio.Task[Any] | None = None
         self.mcp = MCPManager(
             config,
             interactions=self.interactions,
@@ -140,6 +144,7 @@ class Services:
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
+        register_browser_tool(self.tools, self.browser)
         register_agent_tools(
             self.tools,
             config=config,
@@ -205,6 +210,11 @@ class Services:
             log.warning("启动时同步终结未完成 Web 运行操作", 数量=reconciled_runtime)
         if self.config.rath.enabled:
             await ensure_builtin_workflows(self.rath_dao)
+        if self.config.browser.enabled:
+            result = await self.browser.validate_connection()
+            if not result["ok"]:
+                log.warning("浏览器连接未通过验证，浏览器工具保持停用", 原因=result.get("code", ""))
+            self._rebuild_tools_and_context(include_mcp=False, preserve_file_state=True)
         if self.config.mcp.enabled:
             try:
                 await self.mcp.start()
@@ -630,6 +640,7 @@ class Services:
         currently-live MCP tools or deliberately hide them for disable/failure paths.
         """
         config = self.config
+        self.browser.configure(config)
         if not preserve_file_state:
             self.file_state = FileStateStore(config.tools.file_state_max_entries)
         self.tools = ToolRegistry()
@@ -654,6 +665,7 @@ class Services:
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
+        register_browser_tool(self.tools, self.browser)
         register_agent_tools(
             self.tools,
             config=config,
@@ -887,6 +899,28 @@ class Services:
             self._rebuild_tools_and_context(include_mcp=True)
             log.info("MCP 热重载完成", 启用=config.mcp.enabled, 工具数=len(self.mcp.available_tools()))
 
+    def _schedule_browser_validation(self) -> None:
+        previous = self._browser_validation_task
+        if previous and not previous.done():
+            previous.cancel()
+        self._browser_validation_task = None
+        if (not self.config.browser.enabled or self.browser.available) and not previous:
+            return
+
+        async def validate():
+            if previous:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await previous
+            if not self.config.browser.enabled or self.browser.available:
+                return
+            result = await self.browser.validate_connection()
+            if result.get("applied"):
+                self._rebuild_tools_and_context(include_mcp=bool(self.mcp.available_tools()), preserve_file_state=True)
+                if not result["ok"]:
+                    log.warning("浏览器连接未通过验证，浏览器工具保持停用", 原因=result.get("code", ""))
+
+        self._browser_validation_task = asyncio.create_task(validate(), name="browser-connection-validation")
+
     def apply_config(self, config: Config) -> None:
         """应用运行期配置快照。
 
@@ -924,6 +958,7 @@ class Services:
         if not self.mcp._started or self.mcp._closed:
             include_current_mcp = False
         self._rebuild_tools_and_context(include_mcp=include_current_mcp)
+        self._schedule_browser_validation()
         if mcp_changed:
             log.info("MCP 配置已变更，开始热重载", 启用=config.mcp.enabled)
             self._schedule_mcp_hot_reload(config)
@@ -931,9 +966,14 @@ class Services:
                  工具数=len(self.tools.names()), skills=len(self.skills), MCP热重载=mcp_changed)
 
     async def shutdown(self) -> None:
+        if self._browser_validation_task:
+            self._browser_validation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._browser_validation_task
         await self.update.stop()
         await self.web_admin.stop()
         await self.models_dev_catalog.stop()
+        await self.browser.close()
         await self.mcp.close()
         await self.control_actions.shutdown()
         await self.db.close()

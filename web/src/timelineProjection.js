@@ -93,12 +93,19 @@ function mergeAnswerEvent(events, next) {
   else events.push(next);
 }
 
-function finishActiveReasoning(turn) {
+function finishActiveReasoning(turn, boundaryAtMs = 0) {
   if (!turn || !Array.isArray(turn.events)) return;
   turn.events = turn.events.map((item) => {
-    if (!item || item.kind !== "answer" || !item.reasoningActive) return item;
+    if (item?.kind !== "answer" || !item.message?.reasoning) return item;
+    // Reasoning operations can keep receiving snapshots until the whole model
+    // response ends. The next visible phase's creation time is a stable cutoff,
+    // even on reload or after a later terminal snapshot replaces updatedAtMs.
+    const start = eventStartedAtMs(item);
+    const ends = [item.reasoningEndedAtMs, item.operation?.terminalAtMs, item.terminalAtMs, boundaryAtMs]
+      .map(Number).filter(value => value > 0 && value >= start);
     return {
       ...item,
+      ...(ends.length ? {reasoningEndedAtMs: Math.min(...ends)} : {}),
       reasoningActive: false,
       message: { ...(item.message || {}), live: false },
     };
@@ -314,6 +321,19 @@ export function isTerminalOperationFrame(frame = {}) {
     || ["completed", "failed", "cancelled", "stopped"].includes(status);
 }
 
+export function isRootRunTerminalFrame(frame = {}) {
+  if (!isTerminalOperationFrame(frame)) return false;
+  if (String(frame?.opType || frame?.op_type || "") !== "run") return false;
+  if (operationTaskUuid(frame)) return false;
+  const targetType = String(frame?.targetType || frame?.target_type || "").trim();
+  if (targetType && targetType !== "run") return false;
+  const parentTurnId = String(frame?.parentTurnId || frame?.parentTurnUuid || frame?.parent_turn_uuid || "").trim();
+  if (parentTurnId) return false;
+  const turnId = String(frame?.turnId || frame?.turnUuid || frame?.turn_uuid || "").trim();
+  const runRootTurnId = String(frame?.runRootTurnId || frame?.runRootTurnUuid || frame?.run_root_turn_uuid || "").trim();
+  return !(turnId && runRootTurnId && turnId !== runRootTurnId);
+}
+
 export function shouldApplyOperationFrame(frame, store = {}) {
   if (!frame || typeof frame !== "object" || !frame.opId) return false;
   const frameSeq = Number(frame.frameSeq || 0) || 0;
@@ -474,6 +494,7 @@ export function normalizeModelRetryOperation(op = {}) {
     maxAttempts: Number(firstOperationValue(sources, ["maxAttempts", "max_attempts", "maxRetries", "max_retries", "retryMax", "retry_max"]) || 0) || 0,
     waitMs: Number(waitMsValue || 0) || (Number(waitSecondsValue || 0) * 1000) || 0,
     retryAtMs: Number(firstOperationValue(sources, ["retryAtMs", "retry_at_ms", "resumeAtMs", "resume_at_ms"]) || 0) || 0,
+    waitId: String(firstOperationValue(sources, ["waitId", "wait_id"]) || ""),
     reason: String(firstOperationValue(sources, ["reason", "retryReason", "retry_reason"]) || "").trim(),
     summary: String(firstOperationValue(sources, ["summary", "errorSummary", "error_summary"]) || "").trim(),
     error: String(firstOperationValue(sources, ["error", "errorMessage", "error_message", "message"]) || "").trim(),
@@ -484,7 +505,7 @@ export function normalizeModelRetryOperation(op = {}) {
     details: isPlainObject(detailsValue) ? {...detailsValue} : {},
     active,
     status: status || (active ? "running" : "resumed"),
-    cancellable: Boolean(firstOperationValue(sources, ["cancellable", "cancelSupported", "cancel_supported", "canCancel", "can_cancel"])),
+    cancellable: Boolean(firstOperationValue(sources, ["cancelable", "cancellable", "cancelSupported", "cancel_supported", "canCancel", "can_cancel"])),
     taskUuid: operationTaskUuid(op),
   };
 }
@@ -968,7 +989,7 @@ export function projectOperationMessages(operations = [], options = {}) {
     }
     if (opType === "model_retry") {
       const retry = normalizeModelRetryOperation(op);
-      finishActiveReasoning(turn);
+      finishActiveReasoning(turn, Number(op.createdAtMs || 0));
       turn.events.push({
         kind: "model_retry",
         id: op.opId,
@@ -986,6 +1007,7 @@ export function projectOperationMessages(operations = [], options = {}) {
     if (opType === "reasoning") {
       const text = operationPayloadText(payload);
       if (text) {
+        const active = !payload.complete && !OP_TERMINAL_STATUSES.has(String(op.status || "")) && op.lifecycle !== "terminal";
         mergeAnswerEvent(turn.events, {
           kind: "answer",
           id: op.opId,
@@ -993,9 +1015,9 @@ export function projectOperationMessages(operations = [], options = {}) {
           turnUuid: turn.turnUuid,
           ts: opTsMs(op),
           startedAt: opStartedAtMs(op),
-          reasoningActive: !payload.complete,
+          reasoningActive: active,
           operation: op,
-          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: "", reasoning: text, live: !payload.complete },
+          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: "", reasoning: text, live: active },
         });
       }
       continue;
@@ -1009,7 +1031,7 @@ export function projectOperationMessages(operations = [], options = {}) {
       // for display.
       const isFailure = payload.error === true;
       if (text || isError) {
-        finishActiveReasoning(turn);
+        finishActiveReasoning(turn, Number(op.createdAtMs || 0));
         mergeAnswerEvent(turn.events, {
           kind: "answer",
           id: op.opId,
@@ -1036,7 +1058,7 @@ export function projectOperationMessages(operations = [], options = {}) {
         // lets genuinely new/resumed work produce its own terminal status.
         turn.agentTerminalSupervisionSeen = false;
       }
-      finishActiveReasoning(turn);
+      finishActiveReasoning(turn, Number(op.createdAtMs || 0));
       const mergedRootCall = opType === "agent" ? agentRootCallsByTarget.get(String(op.opId || "")) : null;
       const projectedOp = isVisibleContextCompaction
         ? contextCompactionProjectionOperation(op, payload)
@@ -1121,7 +1143,9 @@ export function projectOperationMessages(operations = [], options = {}) {
     if (turn.internal && !turn.events.length && !turn.localStats) continue;
     if (turn.user) out.push({ ...turn.user, queuedSteering: Boolean(turn.queuedSteering || turn.user.queuedSteering) });
     else if (!turn.internal && (turn.events.length || turn.localStats)) out.push({ id: `op-user-${turn.turnUuid}`, role: "user", content: "", syntheticPlaceholder: true, createdAt: turn.startedAt || turn.lastAt || Math.floor(Date.now() / 1000) });
-    if (turn.events.length || turn.localStats) {
+    // Completion stats are still retained in the operations/header, but a
+    // stopped first request with no model output is not an assistant reply.
+    if (turn.events.length) {
       out.push({
         id: `op-assistant-${turn.turnUuid}`,
         role: "assistant",

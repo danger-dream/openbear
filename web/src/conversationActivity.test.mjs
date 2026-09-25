@@ -115,13 +115,14 @@ test("real recent folder renders one compact list and keeps just-read selected r
   const source = read("./components/ConversationActivityFolder.vue");
   const {descriptor} = parse(source);
   assert.deepEqual(compileTemplate({source: descriptor.template.content, filename: "activity.vue", id: "activity"}).errors, []);
-  const props = reactive({items: [row("completed", {activityAtMs: Date.now() - 180000}), row("working", {running: true, activityUnread: false})], activeConversationUuid: "completed", readVersions: new Map(), busy: false});
+  const props = reactive({items: [row("completed", {activityAtMs: Date.now() - 180000}), row("working", {running: true, activityUnread: false})], activeConversationUuid: "completed", readVersions: new Map(), titleGenerating: new Set(), busy: false});
   const ctx = vm.createContext({computed, ref, onMounted() {}, onBeforeUnmount() {}, watch: (...args) => {const stop = watch(...args); t.after(stop); return stop;}, activityLabel, activityState, groupActivityItems,
-    defineProps: () => props, defineEmits: () => () => {}});
+    referenceItem: () => null, defineProps: () => props, defineEmits: () => () => {}});
   vm.runInContext(descriptor.scriptSetup.content.replace(/^import .*?;\n/gm, ""), ctx);
-  for (const icon of ["ArrowRight", "Folder", "FolderOpened", "Check"]) ctx[icon] = {render: () => h("svg")};
+  for (const icon of ["ArrowRight", "Folder", "FolderOpened", "Check", "MoreFilled"]) ctx[icon] = {render: () => h("svg")};
+  ctx.AnimatedConversationTitle = {props: ["text"], render() {return h("span", this.text);}};
   // New SSR app per render, keeping the component's actual reactive state.
-  const renderFolder = () => renderToString(createSSRApp({components: {ArrowRight: ctx.ArrowRight, Check: ctx.Check}, render: compile(descriptor.template.content), setup: () => vm.runInContext("({...props, props, emit, expanded, rows, unreadCount, waitingCount, rowState, rowLabel, rowTitle, ArrowRight, Folder, FolderOpened, Check})", ctx)}));
+  const renderFolder = () => renderToString(createSSRApp({components: {ArrowRight: ctx.ArrowRight, Check: ctx.Check, MoreFilled: ctx.MoreFilled, AnimatedConversationTitle: ctx.AnimatedConversationTitle}, render: compile(descriptor.template.content), setup: () => vm.runInContext("({...props, props, emit, expanded, rows, unreadCount, waitingCount, rowState, rowLabel, rowTitle, liveTitle, isTitleGenerating, ArrowRight, Folder, FolderOpened, Check, MoreFilled, AnimatedConversationTitle})", ctx)}));
   let html = await renderFolder();
   assert.match(html, /最近会话/); assert.match(html, /完成待查看/); assert.match(html, /全部标为已读/);
   assert.doesNotMatch(html, /运行与未读|<h5|data-activity-group/);
@@ -131,6 +132,9 @@ test("real recent folder renders one compact list and keeps just-read selected r
   const unreadRow = html.match(/data-activity-id="completed"[\s\S]*?<\/div>/)[0];
   assert.ok(unreadRow.indexOf('class="activity-row-read"') < unreadRow.indexOf('class="activity-row-status activity-row-status-desktop"'), "the actual action is before the right-aligned status, never a blank column after it");
   assert.equal((html.match(/class="activity-row-read"/g) || []).length, 1, "only unread rows have an actual action, no invisible button for running rows");
+  props.titleGenerating = new Set(["working"]); await nextTick();
+  html = await renderFolder(); assert.match(html, /data-activity-id="working"[^>]*aria-busy="true"/); assert.match(html, /正在生成名称/);
+  props.titleGenerating = new Set();
   props.readVersions = new Map([["completed", 1]]); props.items = [row("working", {running: true})]; await nextTick();
   html = await renderFolder(); assert.match(html, /3 分钟前/); assert.match(html, /data-activity-id="completed"/);
   const justRead = html.match(/data-activity-id="completed"[\s\S]*?<\/div>/)[0];

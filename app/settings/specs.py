@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal
 
+from app.browser.settings import build_specs as _browser_specs
 from app.context.summary_prompt import DEFAULT_SUMMARY_PROMPT
+from app.conversation_titles import DEFAULT_NAMING_PROMPT
 from app.rath.prompts import PROMPT_SPECS
 
 SettingKind = Literal["bool", "int", "float", "str", "multi"]
@@ -27,6 +30,26 @@ class SettingSpec:
     editor: Literal["default", "prompt"] = "default"
     variables: tuple[str, ...] = ()
     default_value: str = ""
+    # API/config values stay in storage units; editors apply this display-only scale.
+    display_scale: int = 1
+
+    def display_value(self, value):
+        return value / self.display_scale if value is not None and self.display_scale != 1 else value
+
+    def parse_display(self, raw: str):
+        if self.display_scale == 1:
+            return self.parse(raw)
+        try:
+            number = float(raw)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"请输入数字（{self.unit}）") from exc
+        if not isfinite(number):
+            raise ValueError(f"请输入数字（{self.unit}）")
+        if self.min_value is not None and number < self.min_value / self.display_scale:
+            raise ValueError(f"不能小于 {self.min_value / self.display_scale:g} {self.unit}")
+        if self.max_value is not None and number > self.max_value / self.display_scale:
+            raise ValueError(f"不能大于 {self.max_value / self.display_scale:g} {self.unit}")
+        return round(number * self.display_scale)
 
     def parse(self, raw: str) -> bool | int | float | str | list[str]:
         text = (raw or "").strip()
@@ -63,7 +86,7 @@ class SettingSpec:
             item = str(value or "").strip()
             if not item:
                 continue
-            if item not in allowed and self.path != "models.compressionModels":
+            if item not in allowed and self.path not in {"models.compressionModels", "models.namingModels"}:
                 raise ValueError(f"不支持的选项：{item}")
             if item not in out:
                 out.append(item)
@@ -101,6 +124,36 @@ SPECS: dict[str, SettingSpec] = {
         "下一轮生效",
         min_value=1,
         max_value=50,
+    ),
+    "models.namingModels": _s(
+        "models.namingModels", "命名模型",
+        "按顺序循环用于生成会话名称；留空时自动选择预计费用最低的可用计费模型，无计费模型时回退当前会话主模型。",
+        "multi", "agent", "立即生效",
+    ),
+    "agent.namingTimeoutS": _s(
+        "agent.namingTimeoutS", "命名单次超时",
+        "每次会话命名模型请求的独立等待上限。", "float", "agent", "立即生效",
+        min_value=1, max_value=600, unit="秒",
+    ),
+    "agent.namingMaxRetries": _s(
+        "agent.namingMaxRetries", "命名失败重试次数",
+        "失败后允许的额外调用次数，不计首次请求；候选模型按配置顺序循环。默认 3 次，因此最多调用 4 次。",
+        "int", "agent", "立即生效", min_value=0, max_value=50,
+    ),
+    "agent.namingMaxTurns": _s(
+        "agent.namingMaxTurns", "命名会话最大获取轮数",
+        "生成名称时读取最近多少轮真实用户对话；0 表示读取全部轮次。",
+        "int", "agent", "立即生效", min_value=0,
+    ),
+    "agent.namingMaxChars": _s(
+        "agent.namingMaxChars", "命名会话最大获取字符数",
+        "轮数筛选后的正文目标上限；优先均衡裁剪助手输出，用户输入始终完整保留，因此极端情况下实际字符数可能超过该值。",
+        "int", "agent", "立即生效", min_value=1000, max_value=100000, unit="字符",
+    ),
+    "agent.namingPrompt": _s(
+        "agent.namingPrompt", "会话命名提示词",
+        "会话命名模型使用的系统提示词；留空使用内置模板，会话正文始终作为单独的用户消息提供。",
+        "str", "agent", "立即生效", editor="prompt", default_value=DEFAULT_NAMING_PROMPT,
     ),
     "agent.maxRetries": _s(
         "agent.maxRetries",
@@ -715,14 +768,27 @@ SPECS: dict[str, SettingSpec] = {
     ),
 }
 
+SPECS.update(_browser_specs(_s))
+
 # GROUPS 是设置路径唯一归属清单；Web 二级导航和 Telegram 设置入口都从这里读取。
 # 每个 SPECS 项必须恰好出现一次，测试会阻止“后端有定义、前端看不见”的漂移。
 GROUPS: dict[str, tuple[str, list[str]]] = {
+    **{key: (title, [p for p, spec in SPECS.items() if spec.group == key]) for key, title in (
+        ("browser_connection", "浏览器连接"),
+        ("browser_limits", "等待时间与用量"),
+        ("browser_recovery", "恢复与权限"),
+    )},
     "agent": (
         "运行与会话",
         [
         "agent.maxRunWallSeconds",
         "agent.noProgressRounds",
+        "models.namingModels",
+        "agent.namingTimeoutS",
+        "agent.namingMaxRetries",
+        "agent.namingMaxTurns",
+        "agent.namingMaxChars",
+        "agent.namingPrompt",
         ],
     ),
     "retry": (
@@ -875,6 +941,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
             "mcp",
         ],
     ),
+    "browser": ("浏览器", "网页操作、等待时间与文件大小", ["browser_connection", "browser_limits", "browser_recovery"]),
     "memory": ("记忆", "内置记忆与外部 prompt-memory 连接", ["memory"]),
     "media": ("附件与媒体", "入站媒体处理、体积限制与缓存", ["media"]),
     "web": (

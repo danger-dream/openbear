@@ -159,6 +159,18 @@ class WebAdminArtifactsMixin:
         disposition = "inline" if inline else "attachment"
         return f"{disposition}; filename=\"{ascii_name.replace(chr(34), '_')}\"; filename*=UTF-8''{quote(safe)}"
 
+    def _web_artifact_workspace_path(self, source_path: str) -> str | None:
+        if not source_path:
+            return None
+        try:
+            source = Path(source_path).expanduser().resolve()
+            relative = source.relative_to(self._web_artifact_source_roots()[0])
+        except (OSError, ValueError):
+            return None
+        if not relative.parts or not self._web_artifact_source_allowed(source):
+            return None
+        return (Path("workspace/artifacts") / relative).as_posix()
+
     def _web_artifact_public(self, row: dict[str, Any] | Any, conversation_uuid: str) -> dict[str, Any]:
         data = dict(row)
         artifact_uuid = str(data.get("artifact_uuid") or data.get("artifactUuid") or "")
@@ -166,6 +178,7 @@ class WebAdminArtifactsMixin:
         mime_type = str(data.get("mime_type") or data.get("mimeType") or "application/octet-stream")
         base = f"/api/conversations/{conversation_uuid}/artifacts/{artifact_uuid}/content"
         inline = self._web_artifact_inline_allowed(file_name, mime_type)
+        workspace_path = self._web_artifact_workspace_path(str(data.get("source_path") or ""))
         return {
             "artifactUuid": artifact_uuid,
             "conversationUuid": conversation_uuid,
@@ -178,6 +191,7 @@ class WebAdminArtifactsMixin:
             "contentUrl": base,
             "previewUrl": f"{base}?preview=1",
             "downloadUrl": f"{base}?download=1",
+            **({"workspacePath": workspace_path} if workspace_path else {}),
         }
 
     @staticmethod
@@ -280,6 +294,7 @@ class WebAdminArtifactsMixin:
                     "size_bytes": size,
                     "sha256": sha256_value,
                     "created_at": now_ts(),
+                    "source_path": str(source),
                 },
                 conv_uuid,
             )

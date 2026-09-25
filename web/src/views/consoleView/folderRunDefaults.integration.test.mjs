@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
+import {initialConversationTitle} from "../../conversationTitle.js";
 
 const source = fs.readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
 const display = fs.readFileSync(new URL("./display.js", import.meta.url), "utf8");
@@ -42,7 +43,7 @@ function harness({folderId = "project", getDefaults} = {}) {
     migrateAttachmentDraft: (from, to) => migrations.push([from, to]),
     loadOptions: async () => {}, nextTick: async () => {},
     resetLocalConversationState: uuid => resets.push(uuid),
-    referenceDisplayText: text => text,
+    referenceDisplayText: text => text, initialConversationTitle,
     outboundSends: {current: null, isCurrent: pending => !pending.cancelled},
     leavePendingSend() {if (state.outboundSends.current) state.outboundSends.current.cancelled = true; state.outboundSends.current = null;},
     watch(_get, callback) {state.folderChanged = callback;},

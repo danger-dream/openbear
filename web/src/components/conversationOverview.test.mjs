@@ -86,10 +86,9 @@ test('overview hides scrollbar chrome without disabling overflow and omits the r
  assert.match(source,/role="status"/);
  assert.match(source,/if\(error\.value\)return error\.value/);
 });
-test('running icon ring reuses work-detail border colors/speed and does not change icon geometry',()=>{
- const detail=fs.readFileSync(new URL('../views/consoleView/ConsoleView.vue',import.meta.url),'utf8');
- assert.match(detail,/border-top-color: #2563eb/);assert.match(treeSource,/border-top-color:#2563eb/);
- assert.match(treeSource,/border-right-color:rgba\(37,99,235,.42\)/);assert.match(treeSource,/tree-work-border-spin .9s linear infinite/);
+test('tree running rings retain speed and icon geometry',()=>{
+ assert.match(treeSource,/border-top-color:var\(--ob-blue\)/);
+ assert.match(treeSource,/border-right-color:rgb\(var\(--ob-blue-rgb\) \/ .42\)/);assert.match(treeSource,/tree-work-border-spin .9s linear infinite/);
  assert.match(treeSource,/position:absolute; inset:-3px/);assert.match(treeSource,/'is-working': running\(row\) && !rowLoading\(row\)/);
  assert.match(treeSource,/@media \(prefers-reduced-motion: reduce\) \{ \.is-spinning,\.running-leaf \{ animation:none; \} \}/);
  assert.doesNotMatch(treeSource,/<el-popover/i);

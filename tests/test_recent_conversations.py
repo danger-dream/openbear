@@ -206,9 +206,9 @@ async def test_recent_calibration_pushes_user_and_reply_and_reconnect_matches_ht
         clock.ms = BASE + 2000
         await publish(env, row, clock, "user", turnUuid="realtime-user", messageUuid="realtime-user", text="private realtime input")
         cur = await env.db.conn.execute("SELECT COALESCE(MAX(seq),0) FROM web_catalog_changes")
-        assert (await cur.fetchone())[0] == cursor
-        # Keep the existing ~2s tree calibration (plus scheduling/debounce),
-        # rather than requesting a full tree aggregation for every commit.
+        assert (await cur.fetchone())[0] > cursor
+        # Reference sizes are event-driven, while tree status keeps its bounded
+        # calibration instead of aggregating runtime state for every stream delta.
         async with asyncio.timeout(5):
             while True:
                 patch = await ws.receive_json()

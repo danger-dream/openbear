@@ -10,7 +10,12 @@ import sqlite3
 import time
 from pathlib import Path
 
-from app.tools.history import _group_turns, _render_turns, _resolve_conversation, _visible_history_items
+from app.tools.history import (
+    _group_turns,
+    _render_turns,
+    _resolve_conversation,
+    _visible_history_items,
+)
 
 CONVERSATION_CONTENT_LIMIT = 20_000
 CONVERSATION_KINDS = {"chat", "turn", "message"}
@@ -44,17 +49,15 @@ def history_sizes(conn, conversation_uuid):
             "turns": turns, "messages": messages}
 
 
-def catalog_history_sizes(conn, conversation_uuid, cache=None):
-    # Reuse the existing metadata hub cadence. A stream may update its revision
-    # every frame; count its bodies at most once per two seconds, not per frame.
+def catalog_history_sizes(conn, conversation_uuid, cache=None, *, revision=0):
+    # The operation writer maintains a monotonic per-conversation content
+    # revision. A stream may advance it every frame; materialize at most once per
+    # two seconds, then scan only that changed conversation—not every history.
     now = time.monotonic()
     previous = (cache or {}).get(conversation_uuid)
     if previous and now - previous[0] < 2:
         return previous[2]
-    signature = tuple(conn.execute(
-        "SELECT COUNT(*),COALESCE(SUM(revision),0),COALESCE(MAX(id),0),COALESCE(MAX(updated_at_ms),0) FROM web_operations WHERE conversation_uuid=?",
-        (conversation_uuid,),
-    ).fetchone())
+    signature = int(revision or 0)
     value = previous[2] if previous and previous[1] == signature else history_sizes(conn, conversation_uuid)
     if cache is not None:
         cache[conversation_uuid] = (now, signature, value)

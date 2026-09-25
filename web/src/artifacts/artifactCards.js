@@ -1,9 +1,11 @@
 import {createVNode, render} from "vue";
 import ArtifactCard from "./ArtifactCard.vue";
+import ArtifactImagePath from "./ArtifactImagePath.vue";
 import {artifactFromUrl} from "./artifactFiles.js";
 
 const mountedRoots = new WeakMap();
 const SLOT = "[data-artifact-slot]";
+const IMAGE_PATH_SLOT = "[data-artifact-image-path]";
 
 // Split phrasing ancestors rather than inserting a block inside <p>/<strong>/<h2>.
 // List items and blockquotes remain the card's container, preserving their order.
@@ -47,25 +49,40 @@ export function prepareArtifactCards(target) {
 		link.replaceWith(slot);
 		liftCard(slot, target);
 	}
+	const imageOccurrences = new Map();
+	for (const image of Array.from(target.querySelectorAll("img[src]"))) {
+		// Linked images and tables retain their original markup and interactions.
+		if (image.closest("a, pre, code, table")) continue;
+		const identity = artifactFromUrl(image.getAttribute("src"));
+		if (!identity) continue;
+		const occurrence = imageOccurrences.get(identity.key) || 0;
+		imageOccurrences.set(identity.key, occurrence + 1);
+		const slot = target.ownerDocument.createElement("span");
+		slot.dataset.artifactImagePath = `${identity.key}:${occurrence}`;
+		slot.dataset.artifactHref = identity.contentUrl;
+		image.after(slot);
+	}
 }
 
 export function indexArtifactCards(root, keys) {
 	for (const slot of root.querySelectorAll(SLOT)) keys.set(slot, `artifact:${slot.dataset.artifactSlot}`);
+	for (const slot of root.querySelectorAll(IMAGE_PATH_SLOT)) keys.set(slot, `artifact-image:${slot.dataset.artifactImagePath}`);
 }
-export function isArtifactSlot(node) { return node.nodeType === 1 && node.hasAttribute("data-artifact-slot"); }
+export function isArtifactSlot(node) { return node.nodeType === 1 && (node.hasAttribute("data-artifact-slot") || node.hasAttribute("data-artifact-image-path")); }
 
 export function syncArtifactCards(root, appContext) {
 	const mounted = mountedRoots.get(root) || new Map();
-	const slots = new Set(root.querySelectorAll(SLOT));
+	const slots = new Set(root.querySelectorAll(`${SLOT}, ${IMAGE_PATH_SLOT}`));
 	for (const slot of mounted.keys()) if (!slots.has(slot)) { render(null, slot); mounted.delete(slot); }
 	for (const slot of slots) {
 		const href = slot.dataset.artifactHref, label = slot.dataset.artifactLabel;
+		const image = slot.hasAttribute("data-artifact-image-path");
 		const previous = mounted.get(slot);
-		if (previous?.href === href && previous?.label === label) continue;
-		const vnode = createVNode(ArtifactCard, {href, label});
+		if (previous?.href === href && previous?.label === label && previous?.image === image) continue;
+		const vnode = image ? createVNode(ArtifactImagePath, {href}) : createVNode(ArtifactCard, {href, label});
 		if (appContext) vnode.appContext = appContext;
 		render(vnode, slot);
-		mounted.set(slot, {href, label});
+		mounted.set(slot, {href, label, image});
 	}
 	mountedRoots.set(root, mounted);
 }

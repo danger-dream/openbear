@@ -1,5 +1,6 @@
 import {contextCompactionSourceLabel} from "./agentPlanPresentation.js";
 import {taskMemoryToolPreview} from "./taskMemoryPresentation.js";
+import {toolActionSummary} from "./toolCallPresentation.js";
 
 const HAS = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
 
@@ -659,7 +660,8 @@ export function buildToolArgumentsView(toolName, rawArguments) {
 	};
 }
 
-export function toolArgumentsSummary(toolName, rawArguments) {
-	if (String(toolName || "") === "TaskMemory") return taskMemoryToolPreview(rawArguments);
-	return buildToolArgumentsView(toolName, rawArguments).summary;
+export function toolArgumentsSummary(toolName, rawArguments, rawResult = "") {
+	if (String(toolName || "") === "TaskMemory") return taskMemoryToolPreview(rawArguments, rawResult);
+	const {data} = parseArguments(rawArguments);
+	return toolActionSummary(String(toolName || ""), data) || buildToolArgumentsView(toolName, rawArguments).summary;
 }

@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import * as monaco from "monaco-editor";
 import { isDarkTheme, subscribeTheme } from "../theme.js";
+import { editorTheme } from "../editorTheme.js";
 // 注:Monaco worker 配置在 main.js 第一个 import 的 ./monaco-worker.js 里(必须早于 monaco-editor 求值)
 
 const props = defineProps({
@@ -23,8 +24,15 @@ let editor = null;
 let suppress = false;
 let stopThemeSubscription = null;
 
+function registerEditorTheme(dark = isDarkTheme()) {
+  const name = dark ? 'openbear-dark' : 'openbear-light';
+  const rootStyle = getComputedStyle(document.documentElement);
+  monaco.editor.defineTheme(name, editorTheme(dark, key => rootStyle.getPropertyValue(key)));
+  return name;
+}
+
 function syncEditorTheme(state) {
-  monaco.editor.setTheme((state?.dark ?? isDarkTheme()) ? "vs-dark" : "vs");
+  monaco.editor.setTheme(registerEditorTheme(state?.dark ?? isDarkTheme()));
 }
 
 if (typeof window !== "undefined") {
@@ -305,7 +313,7 @@ onMounted(() => {
   editor = monaco.editor.create(el.value, {
     value: props.modelValue,
     language: props.language,
-    theme: isDarkTheme() ? "vs-dark" : "vs",
+    theme: registerEditorTheme(),
     fontSize: 13,
     lineHeight: 22,
     minimap: { enabled: false },

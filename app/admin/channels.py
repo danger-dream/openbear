@@ -238,9 +238,12 @@ def providers_payload(
     models: ModelsConfig,
     provider_stats: list[dict[str, Any]] | None = None,
     *,
+    model_stats: list[dict[str, Any]] | None = None,
+    include_models: bool = False,
     models_dev_catalog: Any = None,
 ) -> dict[str, Any]:
     stats = {str(row.get("provider") or ""): dict(row) for row in (provider_stats or [])}
+    model_stats_by_name = {str(row.get("model") or ""): dict(row) for row in (model_stats or [])}
     return {
         "primaryModel": models.primary,
         "providers": [
@@ -248,8 +251,9 @@ def providers_payload(
                 name,
                 provider,
                 stats=stats.get(name, {}),
+                model_stats=model_stats_by_name,
                 primary=models.primary,
-                include_models=False,
+                include_models=include_models,
                 models_dev_catalog=models_dev_catalog,
             )
             for name, provider in models.providers.items()
@@ -313,8 +317,8 @@ def _rewrite_model_prefix(value: str, old_prefix: str, new_prefix: str) -> str:
 
 
 def _rewrite_compression_references(models_root: dict[str, Any], old: str, new: str, *, prefix: bool = False) -> None:
-    """Keep ordered summary candidates in the same rename transaction."""
-    for key in ("compressionModels", "compression_models"):
+    """Keep ordered summary and naming candidates in the same rename transaction."""
+    for key in ("compressionModels", "compression_models", "namingModels", "naming_models"):
         if key not in models_root:
             continue
         candidates = ModelsConfig._normalize_compression_models(models_root[key])

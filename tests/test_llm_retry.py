@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from app.llm.retry import RetryCancelledError, RetryPolicy, retry_wait_payload, wait_for_retry
+from app.control_actions import ControlActionQueue
 
 
 def test_retry_policy_integer_staircase_preserves_count_and_retry_after():
@@ -88,3 +89,35 @@ async def test_retry_wait_publishes_deadline_and_can_be_cancelled():
     assert updates[0]["attempts"] == [{"status": 429}]
     assert updates[-1]["active"] is False
     assert updates[-1]["retryAtMs"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["retry", "cancel"])
+async def test_manual_retry_control_targets_only_one_wait_and_keeps_final_state(action):
+    queue = ControlActionQueue()
+    state = retry_wait_payload(
+        retry_number=1, max_retries=10, delay_s=600, reason="upstream_error", error="busy",
+    )
+    other = retry_wait_payload(
+        retry_number=2, max_retries=10, delay_s=600, reason="upstream_error", error="busy",
+    )
+    assert state["waitId"] != other["waitId"]
+    assert queue.request_retry_action(1, state["waitId"], action)
+    assert not queue.request_retry_action(1, state["waitId"], "retry")
+    assert queue.consume_retry_action(1, other["waitId"]) == ""
+    updates = []
+    waiter = wait_for_retry(
+        600, state=state, on_update=updates.append,
+        control_check=lambda wait_id: queue.consume_retry_action(1, wait_id),
+    )
+    if action == "cancel":
+        with pytest.raises(RetryCancelledError):
+            await asyncio.wait_for(waiter, 1)
+        assert updates[-1]["status"] == "cancelled"
+    else:
+        await asyncio.wait_for(waiter, 1)
+        assert updates[-1]["status"] == "resumed"
+        assert updates[-1]["resumeSource"] == "manual"
+    assert updates[-1]["active"] is False
+    assert queue.request_retry_action(1, state["waitId"], action)  # late click from completed wait
+    assert queue.consume_retry_action(1, other["waitId"]) == ""

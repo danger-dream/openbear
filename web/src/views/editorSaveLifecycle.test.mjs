@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import * as Vue from 'vue';
 import {parse} from '@vue/compiler-sfc';
 import {parse as parseJs} from '@babel/parser';
+import {mobileAssetsRuntime} from '../testHelpers/mobileAssets.mjs';
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; };
@@ -31,6 +32,7 @@ function editor(name, overrides = {}) {
   const context = vm.createContext({...Vue,
     onMounted: () => {}, onBeforeUnmount: fn => unmount.push(fn),
     defineProps: () => ({activeType: 'memory'}), defineEmits: () => () => {},
+    useMobileAssets: mobileAssetsRuntime({onBeforeUnmount: fn => unmount.push(fn)}).useMobileAssets,
     Api: api, apiError: error => error.message || String(error),
     ElMessage: Object.fromEntries(['success', 'warning', 'error', 'info'].map(kind => [kind, text => notices.push({kind, text})])),
     ElMessageBox: {confirm: (...args) => { confirms++; return confirmation(...args); }},

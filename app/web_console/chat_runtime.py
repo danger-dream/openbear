@@ -494,6 +494,11 @@ class WebAdminChatRunMixin:
                 }
 
             async def _task_notification_cb(payload: dict[str, Any]) -> None:
+                payload = dict(payload or {})
+                # Preserve ownership before the operation/task rows can be removed
+                # by a later suffix deletion; never infer a new surviving root.
+                if root_turn_uuid and not (payload.get("runRootTurnUuid") or payload.get("rootTurnUuid") or payload.get("turnUuid")):
+                    payload["rootTurnUuid"] = root_turn_uuid
                 # Persist first, then offer the durable fact to the live same-root
                 # controller.  The post-turn worker remains a fallback, but it must
                 # never be the only path while AgentWait is holding the root run.
@@ -946,6 +951,10 @@ class WebAdminChatRunMixin:
                     (lambda: self.control_actions.consume_retry_cancel(chat_id))
                     if self.control_actions is not None else None
                 ),
+                retry_control_check=(
+                    (lambda wait_id: self.control_actions.consume_retry_action(chat_id, wait_id))
+                    if self.control_actions is not None else None
+                ),
                 tool_context=ToolRuntimeContext(
                     chat_id=chat_id,
                     session_uuid=session_id,
@@ -1001,14 +1010,17 @@ class WebAdminChatRunMixin:
             if conversation_uuid:
                 if result.model_fail > 0:
                     live_error = str(getattr(renderer.live, "last_error", "") or "") if renderer.live else ""
+                    cancelled_retry = result.halted_reason == "retry_cancelled"
                     await self._touch_web_conversation(
                         conversation_uuid,
-                        status="error",
-                        current_status="出错 · 可发送消息继续" if task_notification or controller_notification_ids else "出错",
-                        last_error=live_error or result.halted_reason or "模型调用失败",
+                        status="idle" if cancelled_retry else "error",
+                        current_status="重试已取消" if cancelled_retry else "出错 · 可发送消息继续" if task_notification or controller_notification_ids else "出错",
+                        last_error="" if cancelled_retry else live_error or result.halted_reason or "模型调用失败",
                     )
                 else:
                     await self._touch_web_conversation(conversation_uuid, status="idle", current_status="就绪", last_error="")
+                    if turn_succeeded and conversation and not task_notification:
+                        self._start_conversation_title_task(conversation, automatic=True)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await messages.repair_dangling_tool_calls(chat_id)

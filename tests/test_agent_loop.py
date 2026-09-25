@@ -1508,6 +1508,8 @@ async def test_retry_wait_can_be_cancelled_without_reissuing_request():
     )
     assert backend.attempts == 1
     assert result.halted_reason == "retry_cancelled"
+    assert result.model_retry == 0  # cancelled before the scheduled physical retry
+    assert result.model_calls == result.model_fail == 1
     assert "已取消模型重试" in rec.final
 
 

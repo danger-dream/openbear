@@ -38,7 +38,7 @@ test('folder properties use scoped readable typography and compact inherited pre
 
 test('property sheet owns its macOS styling without changing other Element Plus controls', () => {
   assert.match(source, /import "\.\/conversationTreeProperties\.css"/);
-  assert.match(style, /--fp-surface:#f5f5f7/);
+  assert.match(style, /--fp-surface:var\(--ob-surface-raised\)/);
   assert.match(style, /property-segmented button\[aria-selected="true"\] \{ background:var\(--fp-selected\)/);
   assert.match(style, /folder-properties-popover\.el-popper/);
   assert.equal((source.match(/popper-class="folder-properties-popover" :show-arrow="false"/g) || []).length, 6);

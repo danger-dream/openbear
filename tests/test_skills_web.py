@@ -186,9 +186,85 @@ async def test_skill_uninstall_rejects_symlink_archive_directory(skills_admin_en
     assert list(outside.iterdir()) == []
 
 
-async def test_skill_uninstall_refuses_while_openbear_run_is_active(skills_admin_env):
+async def _running_operation(env, kind: str) -> None:
+    await env.server.db.conn.execute(
+        "INSERT INTO operations (operation_uuid, chat_id, kind, status, detail_json, started_at) "
+        "VALUES (?, ?, ?, 'running', '{}', ?)",
+        (f"test-{kind}", 123, kind, 1),
+    )
+    await env.server.db.conn.commit()
+
+
+async def test_disabled_skill_uninstall_ignores_unrelated_memory_maintenance(skills_admin_env):
     env = skills_admin_env
-    env.server.runs = SimpleNamespace(count=lambda: 1)
+    await _running_operation(env, "memory_import")
+    running = await env.server._restart_running_json()
+    assert running["busy"] is True
+    assert running["operations"] == 1
+    assert running["openbearRuns"] == running["rathTasks"] == running["childProcesses"] == 0
+
+    response = await env.client.post(
+        "/api/skills/demo/uninstall", cookies=env.cookie,
+        json={"confirm": True, "name": "demo"},
+    )
+    assert response.status == 200
+    assert not env.skill_dir.exists()
+
+
+@pytest.mark.parametrize("kind", ["skill_use", "memory_import", "starting_turn"])
+async def test_skill_uninstall_keeps_busy_boundary_for_active_work(skills_admin_env, kind):
+    env = skills_admin_env
+    await _running_operation(env, "memory_import" if kind == "starting_turn" else kind)
+    if kind == "starting_turn":
+        env.server._web_starting_turns["conv"] = {"turn"}
+    if kind == "memory_import":
+        response = await env.client.patch(
+            "/api/skills/demo/enabled", cookies=env.cookie, json={"enabled": True},
+        )
+        assert response.status == 200
+    response = await env.client.post(
+        "/api/skills/demo/uninstall", cookies=env.cookie,
+        json={"confirm": True, "name": "demo"},
+    )
+    assert response.status == 409
+    assert (await response.json())["error"] == "skill_uninstall_busy"
+    assert env.skill_dir.is_dir()
+
+
+async def test_skill_uninstall_fails_closed_when_running_operations_are_truncated(skills_admin_env):
+    env = skills_admin_env
+    for i in range(8):
+        await env.server.db.conn.execute(
+            "INSERT INTO operations (operation_uuid, chat_id, kind, status, detail_json, started_at) "
+            "VALUES (?, ?, 'memory_import', 'running', '{}', ?)",
+            (f"memory-{i}", 123, i),
+        )
+    await env.server.db.conn.execute(
+        "INSERT INTO operations (operation_uuid, chat_id, kind, status, detail_json, started_at) "
+        "VALUES ('unseen', 123, 'unknown', 'running', '{}', 9)"
+    )
+    await env.server.db.conn.commit()
+    response = await env.client.post(
+        "/api/skills/demo/uninstall", cookies=env.cookie,
+        json={"confirm": True, "name": "demo"},
+    )
+    assert response.status == 409
+    assert (await response.json())["error"] == "skill_uninstall_busy"
+    assert env.skill_dir.is_dir()
+
+
+@pytest.mark.parametrize("active_kind", ["openbear", "rath", "child"])
+async def test_skill_uninstall_refuses_while_execution_is_active(skills_admin_env, monkeypatch, active_kind):
+    env = skills_admin_env
+    if active_kind == "openbear":
+        env.server.runs = SimpleNamespace(count=lambda: 1)
+    elif active_kind == "rath":
+        env.server.rath = SimpleNamespace(count=lambda: 1)
+    else:
+        monkeypatch.setattr(
+            "app.web_console.system_mcp_api.processes.active",
+            lambda: [SimpleNamespace(pid=7, command="test", cwd="", started_at=1, blocks_restart=True)],
+        )
 
     response = await env.client.post(
         "/api/skills/demo/uninstall",

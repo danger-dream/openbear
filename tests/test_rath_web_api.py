@@ -83,6 +83,37 @@ async def web_env(tmp_path):
         await db.close()
 
 
+@pytest.mark.parametrize("action", ["cancel", "now"])
+async def test_agent_retry_action_targets_current_task_wait(web_env, action):
+    row = await web_env.server._create_web_conversation(123, title="agent retry")
+    chat_id = int(row["internal_chat_id"])
+    conv_uuid = str(row["conversation_uuid"])
+    workflow = await web_env.server.rath_dao.workflow_by_slug("single-agent")
+    task_uuid = await web_env.server.rath_dao.create_task(
+        chat_id=chat_id, workflow_uuid=workflow.workflow_uuid, title="agent retry", status="running",
+        parent_session_uuid=conv_uuid,
+    )
+    await web_env.server.rath_dao.update_task(
+        task_uuid, output={"retry": {"active": True, "waitId": "wait-1"}},
+    )
+    running = asyncio.create_task(asyncio.Event().wait())
+    web_env.server.rath.register(task_uuid, chat_id, running)
+    try:
+        url = f"/api/conversations/{conv_uuid}/retry/{action}"
+        stale = await web_env.client.post(url, json={"taskUuid": task_uuid, "waitId": "wait-old"}, cookies=web_env.cookie)
+        assert (await stale.json())["accepted"] is False
+        accepted = await web_env.client.post(url, json={"taskUuid": task_uuid, "waitId": "wait-1"}, cookies=web_env.cookie)
+        assert (await accepted.json())["accepted"] is True
+        duplicate = await web_env.client.post(url, json={"taskUuid": task_uuid, "waitId": "wait-1"}, cookies=web_env.cookie)
+        assert (await duplicate.json())["accepted"] is False
+        assert web_env.server.rath.consume_retry_action(task_uuid, "wait-old") == ""
+        assert web_env.server.rath.consume_retry_action(task_uuid, "wait-1") == ("retry" if action == "now" else "cancel")
+    finally:
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+
 async def test_rath_web_options(web_env):
     resp = await web_env.client.get("/api/rath/options", cookies=web_env.cookie)
     assert resp.status == 200

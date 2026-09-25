@@ -2,19 +2,19 @@
    teleported choice menu; other Element Plus dialogs keep their own styling. */
 .folder-properties-dialog.el-dialog,
 .folder-properties-popover.el-popper {
-  --fp-surface:#f5f5f7;
-  --fp-group:#fff;
-  --fp-text:#252528;
-  --fp-secondary:#6c6c73;
-  --fp-line:rgba(60,60,67,.12);
-  --fp-control-line:rgba(60,60,67,.18);
-  --fp-control-bottom:#fafafa;
-  --fp-track:rgba(118,118,128,.12);
-  --fp-selected:#fff;
-  --fp-accent:#087ef0;
-  --fp-accent-bottom:#0068db;
-  --fp-focus:rgba(0,122,255,.28);
-  --fp-warning:#986313;
+  --fp-surface:var(--ob-surface-raised);
+  --fp-group:var(--ob-surface);
+  --fp-text:var(--ob-text);
+  --fp-secondary:var(--ob-text-subtle);
+  --fp-line:var(--ob-border);
+  --fp-control-line:var(--ob-border-strong);
+  --fp-control-bottom:var(--ob-surface);
+  --fp-track:var(--ob-hover);
+  --fp-selected:var(--ob-surface-raised);
+  --fp-accent:var(--ob-blue);
+  --fp-accent-bottom:var(--ob-blue);
+  --fp-focus:rgb(var(--ob-blue-rgb) / .28);
+  --fp-warning:var(--ob-warning);
   --el-color-primary:var(--fp-accent);
   --el-text-color-primary:var(--fp-text);
   --el-text-color-regular:var(--fp-text);
@@ -27,7 +27,7 @@
   --el-dialog-padding-primary:0;
   display:flex; flex-direction:column; max-height:90vh; max-height:90dvh; margin:5vh auto; margin:5dvh auto; padding:0;
   overflow:hidden; border:1px solid var(--fp-control-line); border-radius:16px; background:var(--fp-surface);
-  line-height:1.5; box-shadow:0 24px 80px rgba(0,0,0,.2),0 2px 8px rgba(0,0,0,.08),inset 0 1px 0 rgba(255,255,255,.65);
+  line-height:1.5; box-shadow:0 24px 80px rgb(var(--ob-shadow-rgb) / .2),0 2px 8px rgb(var(--ob-shadow-rgb) / .08),var(--ob-shadow-inset);
 }
 .folder-properties-dialog .el-dialog__header { flex:none; margin:0; padding:20px 24px 19px; text-align:center; }
 .folder-properties-dialog .el-dialog__headerbtn { top:16px; right:16px; display:grid; place-items:center; width:28px; height:28px; border-radius:50%; background:var(--fp-track); color:var(--fp-secondary); transition:background .15s; }
@@ -38,10 +38,10 @@
 .folder-properties-dialog .folder-properties-heading h2 { margin:0; font-size:17px; font-weight:600; line-height:1.4; letter-spacing:-.2px; overflow-wrap:anywhere; }
 .folder-properties-dialog .folder-properties-heading p { display:flex; align-items:center; justify-content:center; gap:6px; margin:5px 0 0; overflow:hidden; color:var(--fp-secondary); font-size:13px; line-height:1.5; text-overflow:ellipsis; white-space:nowrap; }
 .folder-properties-dialog .folder-properties-heading p .el-icon { flex:none; }
-.folder-properties-dialog .property-segmented { display:inline-flex; max-width:100%; gap:2px; margin-top:18px; padding:3px; border-radius:9px; background:var(--fp-track); box-shadow:inset 0 0 0 1px rgba(60,60,67,.04); }
+.folder-properties-dialog .property-segmented { display:inline-flex; max-width:100%; gap:2px; margin-top:18px; padding:3px; border-radius:9px; background:var(--fp-track); box-shadow:inset 0 0 0 1px rgb(var(--ob-shadow-rgb) / .04); }
 .folder-properties-dialog .property-segmented button { min-width:136px; min-height:30px; padding:4px 18px; border:0; border-radius:6px; background:transparent; color:var(--fp-secondary); font:inherit; font-size:14px; font-weight:500; line-height:22px; cursor:pointer; transition:background .15s,color .15s,box-shadow .15s; }
 .folder-properties-dialog .property-segmented button:hover { color:var(--fp-text); }
-.folder-properties-dialog .property-segmented button[aria-selected="true"] { background:var(--fp-selected); color:var(--fp-text); box-shadow:0 1px 3px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.035); }
+.folder-properties-dialog .property-segmented button[aria-selected="true"] { background:var(--fp-selected); color:var(--fp-text); box-shadow:0 1px 3px rgb(var(--ob-shadow-rgb) / .12),0 0 0 1px rgb(var(--ob-shadow-rgb) / .035); }
 .folder-properties-dialog .property-segmented button:focus-visible { outline:3px solid var(--fp-focus); outline-offset:1px; }
 .folder-properties-dialog .el-dialog__body { min-height:0; padding:0 20px 18px; overflow:auto; overscroll-behavior:contain; }
 .folder-properties-dialog .property-form,.folder-properties-dialog .property-panels { min-width:0; }
@@ -51,7 +51,7 @@
 .folder-properties-dialog .property-field > span { display:block; margin-bottom:10px; color:var(--fp-text); font-size:14px; font-weight:550; line-height:1.5; }
 .folder-properties-dialog .property-field em { display:block; margin-top:2px; color:var(--fp-secondary); font-size:13px; font-style:normal; font-weight:400; }
 .folder-properties-dialog .el-input,.folder-properties-dialog .el-select { font-family:inherit; font-size:14px; }
-.folder-properties-dialog .el-input__wrapper { min-height:36px; border-radius:7px; background:var(--fp-group); box-shadow:inset 0 1px 2px rgba(0,0,0,.035),0 0 0 1px var(--fp-control-line); }
+.folder-properties-dialog .el-input__wrapper { min-height:36px; border-radius:7px; background:var(--fp-group); box-shadow:inset 0 1px 2px rgb(var(--ob-shadow-rgb) / .035),0 0 0 1px var(--fp-control-line); }
 .folder-properties-dialog .el-input__wrapper.is-focus { box-shadow:0 0 0 3px var(--fp-focus),0 0 0 1px var(--fp-accent); }
 .folder-properties-dialog .el-input__inner,.folder-properties-dialog .el-select__selected-item { font-family:inherit; font-size:14px; color:var(--fp-text); }
 .folder-properties-dialog .folder-prompt-editor { height:220px; min-height:160px; }
@@ -76,7 +76,7 @@
 .folder-properties-dialog .run-setting-row > h4 { margin:8px 0 0; color:var(--fp-text); font-size:14px; font-weight:400; line-height:1.5; }
 .folder-properties-dialog .run-default-cell { display:flex; min-width:0; flex-direction:column; gap:5px; }
 .folder-properties-dialog .run-default-cell .el-select { width:100%; min-width:0; }
-.folder-properties-dialog .run-default-cell .el-select__wrapper { min-height:36px; padding:6px 10px; border:1px solid var(--fp-control-line); border-radius:7px; background:linear-gradient(var(--fp-group),var(--fp-control-bottom)); box-shadow:0 1px 2px rgba(0,0,0,.045); transition:border-color .15s,box-shadow .15s; }
+.folder-properties-dialog .run-default-cell .el-select__wrapper { min-height:36px; padding:6px 10px; border:1px solid var(--fp-control-line); border-radius:7px; background:linear-gradient(var(--fp-group),var(--fp-control-bottom)); box-shadow:0 1px 2px rgb(var(--ob-shadow-rgb) / .045); transition:border-color .15s,box-shadow .15s; }
 .folder-properties-dialog .run-default-cell .el-select__wrapper:hover:not(.is-disabled) { border-color:var(--fp-secondary); }
 .folder-properties-dialog .run-default-cell .el-select__wrapper.is-focused { border-color:var(--fp-accent); box-shadow:0 0 0 3px var(--fp-focus); }
 .folder-properties-dialog .run-default-cell .el-select__wrapper.is-disabled { opacity:.5; cursor:not-allowed; box-shadow:none; }
@@ -96,11 +96,11 @@
 .folder-properties-dialog .property-footer { display:flex; align-items:center; justify-content:space-between; gap:16px; }
 .folder-properties-dialog .property-footer-meta { display:flex; min-width:0; align-items:center; gap:15px; }
 .folder-properties-dialog .property-footer-note { display:flex; align-items:center; gap:6px; color:var(--fp-secondary); font-size:13px; white-space:nowrap; }
-.folder-properties-dialog .el-button { min-width:76px; min-height:32px; padding:6px 16px; border:1px solid var(--fp-control-line); border-radius:7px; background:linear-gradient(var(--fp-group),var(--fp-control-bottom)); box-shadow:0 1px 2px rgba(0,0,0,.06); color:var(--fp-text); font-family:inherit; font-size:14px; font-weight:500; }
+.folder-properties-dialog .el-button { min-width:76px; min-height:32px; padding:6px 16px; border:1px solid var(--fp-control-line); border-radius:7px; background:linear-gradient(var(--fp-group),var(--fp-control-bottom)); box-shadow:0 1px 2px rgb(var(--ob-shadow-rgb) / .06); color:var(--fp-text); font-family:inherit; font-size:14px; font-weight:500; }
 .folder-properties-dialog .el-button:hover:not(:disabled) { border-color:var(--fp-secondary); background:var(--fp-group); color:var(--fp-text); }
 .folder-properties-dialog .el-button:focus-visible { outline:3px solid var(--fp-focus); outline-offset:2px; }
-.folder-properties-dialog .el-button--primary { border-color:var(--fp-accent-bottom); background:linear-gradient(var(--fp-accent),var(--fp-accent-bottom)); box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 1px 2px rgba(0,90,200,.12); color:#fff; }
-.folder-properties-dialog .el-button--primary:hover:not(:disabled) { border-color:var(--fp-accent-bottom); background:var(--fp-accent-bottom); color:#fff; }
+.folder-properties-dialog .el-button--primary { border-color:var(--fp-accent-bottom); background:linear-gradient(var(--fp-accent),var(--fp-accent-bottom)); box-shadow:var(--ob-shadow-inset),0 1px 2px rgb(var(--ob-blue-rgb) / .12); color:var(--ob-text-inverse); }
+.folder-properties-dialog .el-button--primary:hover:not(:disabled) { border-color:var(--fp-accent-bottom); background:var(--fp-accent-bottom); color:var(--ob-text-inverse); }
 .folder-properties-dialog .el-button.is-disabled { opacity:.45; }
 .folder-properties-dialog .property-footer .el-button.is-link { min-width:0; min-height:0; padding:0; border:0; background:transparent; box-shadow:none; color:var(--fp-secondary); font-size:14px; font-weight:400; }
 .folder-properties-dialog .property-footer .el-button.is-link:hover:not(:disabled) { color:var(--fp-text); }
@@ -109,22 +109,16 @@
 .folder-properties-dialog .el-alert { --el-alert-padding:9px 12px; border:1px solid var(--fp-line); border-radius:9px; background:var(--fp-group); color:var(--fp-warning); }
 .folder-properties-dialog .el-alert__title { font-size:13px; line-height:1.45; }
 .folder-properties-dialog .el-dialog__body,.folder-properties-dialog .effective-disclosure pre { scrollbar-width:thin; scrollbar-color:var(--fp-control-line) transparent; }
-.folder-properties-popover.el-popper { padding:4px; max-width:calc(100vw - 24px); border:1px solid var(--fp-control-line); border-radius:10px; background:color-mix(in srgb,var(--fp-surface) 96%,transparent); box-shadow:0 14px 36px rgba(0,0,0,.17),0 1px 4px rgba(0,0,0,.08); backdrop-filter:blur(20px) saturate(1.4); }
+.folder-properties-popover.el-popper { padding:4px; max-width:calc(100vw - 24px); border:1px solid var(--fp-control-line); border-radius:10px; background:color-mix(in srgb,var(--fp-surface) 96%,transparent); box-shadow:0 14px 36px rgb(var(--ob-shadow-rgb) / .17),0 1px 4px rgb(var(--ob-shadow-rgb) / .08); backdrop-filter:blur(20px) saturate(1.4); }
 .folder-properties-popover .el-select-dropdown__list { padding:0; }
 .folder-properties-popover .el-select-dropdown__item { position:relative; height:auto; min-height:32px; padding:5px 12px 5px 28px; border-radius:6px; color:var(--fp-text); font:inherit; font-size:14px; line-height:22px; }
 .folder-properties-popover .el-select-dropdown__item.is-selected { color:var(--fp-text); font-weight:500; }
 .folder-properties-popover .el-select-dropdown__item.is-selected::before { content:"✓"; position:absolute; left:9px; color:var(--fp-accent); }
-.folder-properties-popover .el-select-dropdown__item.is-hovering:not(.is-disabled),.folder-properties-popover .el-select-dropdown__item:hover:not(.is-disabled) { background:var(--fp-accent); color:#fff; }
+.folder-properties-popover .el-select-dropdown__item.is-hovering:not(.is-disabled),.folder-properties-popover .el-select-dropdown__item:hover:not(.is-disabled) { background:var(--fp-accent); color:var(--ob-text-inverse); }
 .folder-properties-popover .el-select-dropdown__item.is-hovering::before,.folder-properties-popover .el-select-dropdown__item:hover::before { color:inherit; }
 .folder-properties-popover .el-select-dropdown__item.is-disabled { color:var(--fp-secondary); opacity:.5; }
-html.dark .folder-properties-dialog.el-dialog,
-html.dark .folder-properties-popover.el-popper {
-  --fp-surface:#29292c; --fp-group:#343437; --fp-text:#f0f0f2; --fp-secondary:#b1b1b9;
-  --fp-line:rgba(255,255,255,.09); --fp-control-line:rgba(255,255,255,.15);
-  --fp-control-bottom:#3b3b3f; --fp-track:rgba(0,0,0,.18); --fp-selected:#55555a;
-  --fp-accent:#1689fa; --fp-accent-bottom:#0871db; --fp-warning:#e1b36b;
-}
-html.dark .folder-properties-dialog.el-dialog { box-shadow:0 24px 80px rgba(0,0,0,.46),0 0 0 1px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.06); }
+
+
 @media (max-width:620px) {
   .folder-properties-dialog.el-dialog { max-height:calc(100vh - 24px); max-height:calc(100dvh - 24px); margin:12px auto; }
   .folder-properties-dialog .el-dialog__header { padding:17px 14px 16px; }

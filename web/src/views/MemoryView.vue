@@ -4,6 +4,10 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import MdEditor from "../components/AdaptiveMdEditor.vue";
 import MobileAdminSummary from "../components/MobileAdminSummary.vue";
+import AdminPageHeader from "../components/AdminPageHeader.vue";
+import MobileAssetRow from "../components/MobileAssetRow.vue";
+import MobileAssetSheet from "../components/MobileAssetSheet.vue";
+import { useMobileAssets } from "../components/useMobileAssets";
 import draggable from "vuedraggable";
 import { encode } from "gpt-tokenizer";
 import { pinyin } from "pinyin-pro";
@@ -11,7 +15,7 @@ import { assetTimeLine } from "../utils/assetTime";
 import { dragAutoScrollOptions } from "../utils/dragScroll";
 
 const props = defineProps({ activeType: { type: String, default: "" } });
-const emit = defineEmits(["type-changed"]);
+const emit = defineEmits(["type-changed", "mobile-header-ready"]);
 
 function toKey(name) {
   if (!name) return "";
@@ -294,6 +298,12 @@ async function toggleEnabled(e) {
   await loadEntries();
   await loadRefData();
 }
+async function toggleExpanded(e) {
+  const r = await Api.updateEntry(e.id, entryPayload(e, { expanded: !e.expanded }));
+  if (r?.ok === false) throw new Error(r.error || "更新失败");
+  await loadEntries();
+  await loadRefData();
+}
 async function toggleArchived(e) {
   const next = e.archived ? 0 : 1;
   const r = await Api.updateEntry(e.id, entryPayload(e, { archived: next, enabled: next ? 0 : e.enabled }));
@@ -351,41 +361,57 @@ function finishDrag() {
   dragging.value = false;
   persistFromGroups(groups.value);
 }
+const { isAdminPhone, mobileMode, mobileOpen, mobileView, mobileItem, mobileDetail, mobileLoading, mobileError, mobileBusy,
+  openMobileAsset, setMobileMode, runMobileAction, reloadMobileDetail } = useMobileAssets({
+  items: entries, loadDetail: id => Api.entry(id), isSelected, setSelected, clearSelection,
+  actions: { edit: openEdit, enabled: toggleEnabled, expanded: toggleExpanded, archive: toggleArchived, remove: removeEntry },
+});
+watch(activeCat, () => setMobileMode("browse"));
 </script>
 
 <template>
-  <div class="admin-page memory-page h-full flex flex-col">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="admin-heading flex items-center gap-2">
-        <h1 class="text-base font-semibold">记忆管理</h1>
-        <span class="text-xs text-macsub">正文为本体 · 启用 {{ enabledCount }} 条 · 展开 {{ expandedEntries.length }} 条 / ~{{ expandedTokens.toLocaleString() }} tk · 总计 ~{{ totalTokens.toLocaleString() }} tk</span>
-      </div>
-      <div class="flex items-center gap-3">
+  <div class="admin-page memory-page mobile-assets-page h-full flex flex-col" :class="{ 'is-sorting-assets': mobileMode === 'sort' }">
+    <AdminPageHeader
+      title="记忆管理"
+      :subtitle="`正文为本体 · 启用 ${enabledCount} 条 · 展开 ${expandedEntries.length} 条 / ~${expandedTokens.toLocaleString()} tk · 总计 ~${totalTokens.toLocaleString()} tk`"
+      @mobile-header-ready="emit('mobile-header-ready', $event)"
+    >
+      <template #mobile-navigation><slot name="mobile-navigation" /></template>
+      <template #actions>
+        <template v-if="isAdminPhone">
+          <el-button :icon="'Select'" @click="setMobileMode('select')">选择条目</el-button>
+          <el-button :icon="'Rank'" @click="setMobileMode('sort')">整理顺序</el-button>
+        </template>
         <el-checkbox v-model="showArchived" size="small">显示归档 <span v-if="archivedCount">({{ archivedCount }})</span></el-checkbox>
-        <el-button :icon="'Refresh'" circle @click="refresh" title="刷新" />
-        <el-button type="primary" :icon="'Plus'" @click="openEdit(null)" round>新建条目</el-button>
-      </div>
-    </header>
+        <el-button :icon="'Refresh'" @click="refresh" title="刷新">刷新</el-button>
+      </template>
+      <template #primary><el-button :icon="'Plus'" @click="openEdit(null)">新建条目</el-button></template>
+    </AdminPageHeader>
 
-    <MobileAdminSummary :items="[{ label: '启用条目', value: enabledCount }, { label: '展开条目', value: expandedEntries.length }, { label: '展开 tokens', value: expandedTokens.toLocaleString() }, { label: '总 tokens', value: totalTokens.toLocaleString() }]">启用 {{ enabledCount }} · 展开 {{ expandedEntries.length }} · ~{{ expandedTokens.toLocaleString() }} tk</MobileAdminSummary>
+    <div v-if="isAdminPhone" class="mobile-asset-overview">
+      <MobileAdminSummary v-if="mobileMode === 'browse'" :items="[{ label: '启用条目', value: enabledCount }, { label: '展开条目', value: expandedEntries.length }, { label: '展开 tokens', value: expandedTokens.toLocaleString() }, { label: '总 tokens', value: totalTokens.toLocaleString() }]">共 {{ entries.length }} · 启用 {{ enabledCount }} · 展开 ~{{ expandedTokens.toLocaleString() }} tk</MobileAdminSummary>
+      <span v-else>{{ mobileMode === 'sort' ? '拖动手柄排序 · 拖入展开组可开启展开' : `已选 ${selectedIds.length} 条` }}</span>
+      <button type="button" @click="setMobileMode(mobileMode === 'browse' ? 'select' : 'browse')">{{ mobileMode === 'browse' ? '选择' : '完成' }}</button>
+    </div>
 
     <div class="memory-categories px-6 pt-4 pb-3 flex gap-2 flex-wrap shrink-0">
       <button v-for="c in categories" :key="c.key" @click="activeCat = c.key"
         class="px-3.5 py-1.5 rounded-full text-sm transition-all border flex items-center gap-1"
-        :class="activeCat === c.key ? 'bg-mactext text-white border-mactext' : 'bg-white text-mactext border-macborder hover:border-gray-400'">
-        <span>{{ c.icon || '🧠' }}</span>{{ c.name }}
+        :aria-pressed="activeCat === c.key"
+        :class="activeCat === c.key ? 'bg-mactext text-ob-inverse border-mactext' : 'bg-ob-surface text-mactext border-macborder hover:border-ob-border-strong'">
+        <span class="memory-category-icon">{{ c.icon || '🧠' }}</span>{{ c.name }}
       </button>
     </div>
 
-    <div v-if="selectedIds.length" class="admin-batch mx-6 mb-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="selectedIds.length || (isAdminPhone && mobileMode === 'select')" class="admin-batch mx-6 mb-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 条</span>
-      <el-button size="small" :icon="'Box'" @click="batchUpdateEntries({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
-      <el-button size="small" :icon="'RefreshLeft'" @click="batchUpdateEntries({ archived: 0 }, '已批量恢复')">恢复</el-button>
-      <el-button size="small" :icon="'Unlock'" @click="batchUpdateEntries({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
-      <el-button size="small" :icon="'Lock'" @click="batchUpdateEntries({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
-      <el-button size="small" type="danger" :icon="'Delete'" @click="batchDeleteEntries">删除</el-button>
-      <el-button size="small" text @click="clearSelection">取消选择</el-button>
+      <el-button size="small" :icon="'Box'" :disabled="!selectedIds.length" @click="batchUpdateEntries({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
+      <el-button size="small" :icon="'RefreshLeft'" :disabled="!selectedIds.length" @click="batchUpdateEntries({ archived: 0 }, '已批量恢复')">恢复</el-button>
+      <el-button size="small" :icon="'Unlock'" :disabled="!selectedIds.length" @click="batchUpdateEntries({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
+      <el-button size="small" :icon="'Lock'" :disabled="!selectedIds.length" @click="batchUpdateEntries({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
+      <el-button size="small" type="danger" :icon="'Delete'" :disabled="!selectedIds.length" @click="batchDeleteEntries">删除</el-button>
+      <el-button size="small" text @click="isAdminPhone ? setMobileMode('browse') : clearSelection()">取消选择</el-button>
     </div>
 
     <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto px-6 pb-6" :class="{ 'select-none': dragging }" v-loading="loading">
@@ -395,28 +421,32 @@ function finishDrag() {
 
       <draggable v-model="groups" item-key="key" handle=".group-handle" :animation="180"
         v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
-        @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" :disabled="!hasGroups">
+        @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" :disabled="!hasGroups || (isAdminPhone && mobileMode !== 'sort')">
         <template #item="{ element: g }">
-          <div class="mb-4" :class="g.expanded ? 'rounded-2xl border border-amber-300/70 bg-amber-50/45 p-3' : ''">
+          <div class="asset-group-section mb-4" :class="g.expanded ? 'rounded-2xl border border-ob-warning/30 bg-[var(--ob-warning-soft)] p-3' : ''">
             <div class="asset-group-heading text-xs font-semibold text-macsub mb-1.5 flex items-center gap-2 group/grp">
-              <el-icon v-if="!g.expanded" class="group-handle cursor-move select-none text-gray-300 hover:text-macsub" :size="14"><Rank /></el-icon>
-              <span v-else class="w-[14px] text-center select-none">📌</span>
-              <span class="w-1 h-3.5 rounded" :class="g.expanded ? 'bg-amber-500' : 'bg-macblue'"></span>{{ g.expanded ? '提示词展开' : (g.name || '未分组') }}
+              <el-icon v-if="!g.expanded" class="group-handle cursor-move select-none text-ob-muted hover:text-macsub" :size="14"><Rank /></el-icon>
+              <span v-else class="asset-group-pin w-[14px] text-center select-none">📌</span>
+              <span class="w-1 h-3.5 rounded" :class="g.expanded ? 'bg-ob-warning' : 'bg-macblue'"></span><span class="asset-group-label">{{ g.expanded ? '提示词展开' : (g.name || '未分组') }}</span>
               <span class="opacity-50">({{ g.items.length }}<template v-if="g.expanded"> 条 · 每轮约 {{ expandedTokens.toLocaleString() }} tk</template>)</span>
-              <span v-if="g.expanded" class="font-normal opacity-60">拖入开启，拖出关闭</span>
+              <span v-if="g.expanded" class="asset-group-hint font-normal opacity-60">拖入开启，拖出关闭</span>
             </div>
             <draggable v-model="g.items" item-key="id" handle=".drag-handle" :animation="180"
               v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
+              :disabled="isAdminPhone && mobileMode !== 'sort'"
               :group="{ name: 'memory-entry-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag"
-              class="space-y-2 min-h-8" :class="g.expanded && !g.items.length ? 'rounded-xl border border-dashed border-amber-300/70' : ''">
+              class="mobile-asset-group space-y-2 min-h-8" :class="g.expanded && !g.items.length ? 'rounded-xl border border-dashed border-ob-warning/30' : ''">
               <template #item="{ element: e }">
-                <div @click="openEdit(e)"
+                <MobileAssetRow v-if="isAdminPhone" :title="e.title" :summary="snippet(e.body)" :reference="e.ref ? '@mem/' + e.ref : ''" :meta="`${tokenCount(e.body).toLocaleString()} tk`"
+                  :enabled="!!e.enabled" :archived="!!e.archived" :expanded="!!e.expanded" :selected="isSelected(e.id)" :mode="mobileMode"
+                  @select="setSelected(e.id, $event)" @open="openMobileAsset(e)" @more="openMobileAsset(e, 'actions')" />
+                <div v-else @click="openEdit(e)"
                   class="memory-card mac-panel px-3.5 py-3 grid grid-cols-[28px_20px_40px_minmax(0,1fr)_auto] items-stretch gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
                   :class="{ 'opacity-45': !e.enabled || e.archived, 'border-dashed': e.archived, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(e.id) }">
                   <div class="self-stretch flex items-center justify-center" @click.stop>
                     <el-checkbox :model-value="isSelected(e.id)" @change="(v) => setSelected(e.id, v)" />
                   </div>
-                  <div class="drag-handle cursor-move select-none self-stretch flex items-center justify-center text-gray-300 hover:text-macsub" @click.stop>
+                  <div class="drag-handle cursor-move select-none self-stretch flex items-center justify-center text-ob-muted hover:text-macsub" @click.stop>
                     <el-icon :size="16"><Rank /></el-icon>
                   </div>
                   <span class="memory-sort text-[11px] text-macsub text-right tabular-nums self-stretch flex items-center justify-end">{{ e.sort }}</span>
@@ -444,6 +474,10 @@ function finishDrag() {
         </template>
       </draggable>
     </div>
+
+    <MobileAssetSheet v-if="isAdminPhone && mobileItem" v-model="mobileOpen" kind="memory" :item="mobileItem" :detail="mobileDetail" :view="mobileView"
+      :tokens="tokenCount(mobileDetail?.body || mobileItem.body)" :loading="mobileLoading" :busy="mobileBusy" :error="mobileError"
+      @retry="reloadMobileDetail" @action="runMobileAction" />
 
     <el-dialog append-to-body v-model="dialogOpen" :title="editing?.id ? '编辑条目' : '新建条目'" width="900px" top="4vh"
       :close-on-click-modal="true" :before-close="tryClose" class="admin-dialog memory-dialog mac-edit-dialog">
@@ -500,7 +534,7 @@ function finishDrag() {
       </div>
       <template #footer>
         <span v-if="editing?.id" class="asset-footer-time text-[11px] text-macsub mr-auto">{{ assetTimeLine(editing) }}</span>
-        <span v-if="dirty" class="text-xs text-orange-500 mr-3">● 有未保存修改</span>
+        <span v-if="dirty" class="text-xs text-ob-orange mr-3">● 有未保存修改</span>
         <el-button @click="tryClose()">取消</el-button>
         <el-button type="primary" :loading="saving" :disabled="saving" @click="save">保存</el-button>
       </template>

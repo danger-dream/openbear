@@ -1,0 +1,30 @@
+/* Only the three asset lists opt in. Desktop cards and all editors stay intact. */
+@media (max-width: 760px) {
+  .mobile-assets-page { background: var(--ob-chat-bg); color: var(--ob-chat-text); }
+  .mobile-assets-page .admin-list { padding: 0 12px 24px; }
+  .mobile-assets-page .mobile-asset-overview { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 10px; height: 35px; padding: 0 17px; color: var(--ob-chat-subtle); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .mobile-asset-overview > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .mobile-asset-overview > button { flex: none; min-width: 36px; height: 35px; padding: 0; border: 0; background: transparent; color: var(--ob-chat-subtle); font-size: 11px; }
+  .mobile-assets-page .mobile-asset-overview .admin-summary { flex: 1; min-width: 0; padding: 0; background: transparent; color: inherit; font-size: 10px; }
+  .mobile-asset-overview .admin-summary > summary { min-height: 35px; gap: 6px; }
+  .mobile-asset-overview .admin-summary-details { left: 0; right: 0; }
+  .mobile-assets-page .asset-group-section { margin: 0 0 16px; padding: 0; border: 0; border-radius: 0; background: transparent; }
+  .mobile-assets-page .asset-group-heading { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-height: 31px; margin: 0; padding: 0 7px; color: var(--ob-chat-subtle); font-size: 11px; font-weight: 500; }
+  .mobile-assets-page .asset-group-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-assets-page .asset-group-heading > .opacity-50 { flex: none; margin-left: auto; color: var(--ob-chat-muted); opacity: 1; font-size: 9.5px; font-weight: 400; }
+  .mobile-assets-page .asset-group-heading > .w-1,
+  .mobile-assets-page .asset-group-pin,
+  .mobile-assets-page .asset-group-hint,
+  .mobile-assets-page:not(.is-sorting-assets) .group-handle { display: none; }
+  .mobile-assets-page.is-sorting-assets .group-handle { width: 24px; height: 31px; color: var(--ob-chat-muted); }
+  .mobile-assets-page .mobile-asset-group { display: block; overflow: hidden; gap: 0; min-height: 32px; border-radius: 12px; background: var(--ob-chat-panel); }
+  .mobile-assets-page .mobile-asset-group > .mobile-asset-row { margin-top: 0; margin-bottom: 0; }
+  .mobile-assets-page .memory-categories { gap: 4px; padding: 2px 12px 8px; border: 0; }
+  .mobile-assets-page .memory-categories button { min-height: 28px; padding: 3px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ob-chat-subtle); font-size: 11px; }
+  .mobile-assets-page .memory-categories button[aria-pressed='true'] { background: var(--ob-chat-selected); color: var(--ob-chat-text); }
+  .mobile-assets-page .memory-category-icon { display: none; }
+  .mobile-assets-page .admin-batch { order: 2; gap: 8px; margin: 0; padding: 8px 12px; border: 0; border-top: 1px solid var(--ob-chat-line); border-radius: 0; background: var(--ob-chat-panel); color: var(--ob-chat-subtle); }
+  .mobile-assets-page .admin-batch .el-button { height: 32px; border: 0; border-radius: 6px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-size: 11px; }
+  .mobile-assets-page .admin-batch .el-button--danger { color: var(--ob-danger); }
+  .mobile-assets-page .admin-batch .el-checkbox__label { font-size: 11px; color: var(--ob-chat-subtle); }
+}

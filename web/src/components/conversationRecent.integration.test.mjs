@@ -30,7 +30,7 @@ function treeHarness(t) {
     window: {matchMedia: () => ({matches: true})}, document: {querySelector: () => null}, CSS: {escape: value => value},
     setTimeout(fn, delay) {timers.set(++serial, {fn, at: time + delay}); return serial;}, clearTimeout(id) {timers.delete(id);},
   });
-  scope.run(() => vm.runInContext(strip(treeSource) + '\nglobalThis.tree={props,activityItems,recentItems,activityReadBusy,referenceCatalog,applyStatus,knownConversationRows,forgetConversation,withDraft,rootFolders,stateFor,expanded,selectedFolderId,openActivityConversation,markActivityRead,overview,enterOverview,leaveOverview,closeOverview,keepOverview};', ctx));
+  scope.run(() => vm.runInContext(strip(treeSource) + '\nglobalThis.tree={props,activityItems,recentItems,activityReadBusy,titleGenerating,referenceCatalog,applyStatus,knownConversationRows,forgetConversation,withDraft,rootFolders,stateFor,expanded,selectedFolderId,openActivityConversation,markActivityRead,overview,enterOverview,leaveOverview,closeOverview,keepOverview,menu,openMoreMenu};', ctx));
   const tree = ctx.tree;
   return {tree, props, catalog, emitted, run: text => vm.runInContext(text, ctx),
     tick(ms) {time += ms; for (const [id, timer] of [...timers]) if (timer.at <= time) {timers.delete(id); timer.fn();}},
@@ -40,7 +40,7 @@ function treeHarness(t) {
       const renderer = compile(activityTemplate);
       const app = createSSRApp({render() {vnode = renderer.call(this, bindings, []); return vnode;}});
       let delivered;
-      app.component('ConversationActivityFolder', {props: ['items', 'recentItems', 'activeConversationUuid', 'readVersions', 'busy'], setup(props, {attrs}) {delivered = {...props, ...attrs}; return () => h('div');}});
+      app.component('ConversationActivityFolder', {props: ['items', 'recentItems', 'activeConversationUuid', 'readVersions', 'busy', 'titleGenerating'], setup(props, {attrs}) {delivered = {...props, ...attrs}; return () => h('div');}});
       await renderToString(app);
       return delivered;
     },
@@ -51,18 +51,20 @@ function folderHarness(t, props, dispatch = () => {}) {
   const scope = effectScope(); t.after(() => scope.stop());
   const emitted = [], mounted = [], unmounted = [], intervals = new Map(); let serial = 0;
   const ctx = vm.createContext({computed, ref, watch, activityLabel, activityState, groupActivityItems,
+    referenceItem: () => null,
     defineProps: () => props, defineEmits: () => (...args) => {emitted.push(args); dispatch(...args);},
     onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn),
     setInterval: fn => {intervals.set(++serial, fn); return serial;}, clearInterval: id => intervals.delete(id),
   });
   scope.run(() => vm.runInContext(strip(folderSource), ctx));
-  for (const icon of ['ArrowRight', 'Folder', 'FolderOpened', 'Check']) ctx[icon] = {render: () => h('svg')};
+  for (const icon of ['ArrowRight', 'Folder', 'FolderOpened', 'Check', 'MoreFilled']) ctx[icon] = {render: () => h('svg')};
+  ctx.AnimatedConversationTitle = {props: ['text'], render() {return h('span', this.text);}};
   t.after(() => unmounted.forEach(fn => fn()));
   const renderer = compile(folderSource.template.content);
   return {emitted, mounted, unmounted, intervals, run: text => vm.runInContext(text, ctx), async render() {
     let vnode;
-    const bindings = proxyRefs(vm.runInContext('({...props,props,emit,expanded,rows,unreadCount,waitingCount,rowState,rowLabel,rowTitle,ArrowRight,Folder,FolderOpened,Check})', ctx));
-    const app = createSSRApp({components: {ArrowRight: ctx.ArrowRight, Check: ctx.Check}, render() {vnode = renderer.call(this, bindings, []); return vnode;}});
+    const bindings = proxyRefs(vm.runInContext('({...props,props,emit,expanded,rows,unreadCount,waitingCount,rowState,rowLabel,rowTitle,liveTitle,isTitleGenerating,ArrowRight,Folder,FolderOpened,Check,MoreFilled,AnimatedConversationTitle})', ctx));
+    const app = createSSRApp({components: {ArrowRight: ctx.ArrowRight, Check: ctx.Check, MoreFilled: ctx.MoreFilled, AnimatedConversationTitle: ctx.AnimatedConversationTitle}, render() {vnode = renderer.call(this, bindings, []); return vnode;}});
     const html = await renderToString(app);
     return {html, vnode, nodes: walk([vnode])};
   }};
@@ -210,6 +212,26 @@ test('compiled activity/recent row pointer events open the same desktop overview
   rows[0].props.onPointerenter(event); h.tick(280);
   view.nodes.find(node => hasClass(node, 'activity-folder-toggle')).props.onClick();
   assert.equal(h.tree.overview.value.open, false);
+});
+
+test('right-clicking a recent row opens the ordinary conversation menu at the pointer', async t => {
+  const h = treeHarness(t), item = row('recent-menu', 2000);
+  h.tree.applyStatus({items: [], recentItems: [item]});
+  const bindings = await h.folderBindings();
+  const folder = folderHarness(t, reactive({items: [], recentItems: bindings.recentItems, activeConversationUuid: '', readVersions: new Map(), busy: false}),
+    (type, ...args) => {if (type === 'more') bindings.onMore(...args);});
+  const view = await folder.render();
+  const recentRow = groupRows(recentGroup(view))[0];
+  let prevented = 0, stopped = 0;
+  recentRow.props.onContextmenu({
+    type: 'contextmenu', clientX: 123, clientY: 77,
+    preventDefault() {prevented++;}, stopPropagation() {stopped++;},
+  });
+  await nextTick();
+  assert.ok(prevented >= 1); assert.ok(stopped >= 1);
+  assert.equal(h.tree.menu.value.open, true);
+  assert.equal(h.tree.menu.value.row.conversationUuid, 'recent-menu');
+  assert.equal(h.tree.menu.value.x, 123); assert.equal(h.tree.menu.value.y, 77);
 });
 
 test('the same conversation reanchors when moving between the tree and its recent alias', t => {

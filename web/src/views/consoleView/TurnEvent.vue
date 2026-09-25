@@ -20,16 +20,17 @@ const props = defineProps({
 	// never follow (every historical event) keep a constant prop and are skipped
 	// by Vue when the lock toggles.
 	reasoningAutoscroll: {type: Boolean, default: false},
-	retryCancelPending: {type: Boolean, default: false},
+	retryActionPending: {type: Object, default: () => ({})},
 	liveTextTarget: {type: String, default: ""},
 	detailKey: {type: Function, required: true},
 	isDetailOpen: {type: Function, required: true},
 	activeToolResultIndex: {type: Function, required: true},
 	agentPreviewOnly: {type: Boolean, default: false},
+	processRow: {type: Boolean, default: false},
 	compact: {type: Boolean, default: false},
 	showReasoning: {type: Boolean, default: true},
 });
-const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "cancel-retry"]);
+const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "cancel-retry", "retry-now"]);
 
 function scrollReasoningBodyToEnd(el, active) {
 	if (!active || !el) return;
@@ -166,13 +167,16 @@ function isFailureAnswer(event = {}) {
 			</span>
 			<span class="tool-preview">{{ [retryReasonLabel(), retryWaitLabel()].filter(Boolean).join(' · ') || retryStatusLabel() }}</span>
 			<span class="retry-inline-state">{{ retryStatusLabel() }}</span>
-			<button
-				v-if="props.event.retry?.active && props.event.retry?.cancellable"
-				type="button"
-				class="retry-inline-cancel"
-				:disabled="props.retryCancelPending"
-				@click.stop="emit('cancel-retry', props.event)"
-			>{{ props.retryCancelPending ? '取消中…' : '取消重试' }}</button>
+			<span v-if="props.event.retry?.active && props.event.retry?.cancellable && props.event.retry?.waitId" class="retry-inline-actions">
+				<button type="button" class="retry-inline-cancel retry-inline-now"
+					:disabled="props.retryActionPending?.waitId === props.event.retry.waitId"
+					@click.stop="emit('retry-now', props.event)"
+				>{{ props.retryActionPending?.waitId === props.event.retry.waitId && props.retryActionPending?.action === 'retry' ? '请求中…' : '立即重试' }}</button>
+				<button type="button" class="retry-inline-cancel"
+					:disabled="props.retryActionPending?.waitId === props.event.retry.waitId"
+					@click.stop="emit('cancel-retry', props.event)"
+				>{{ props.retryActionPending?.waitId === props.event.retry.waitId && props.retryActionPending?.action === 'cancel' ? '取消中…' : '取消重试' }}</button>
+			</span>
 		</div>
 	</div>
 
@@ -216,6 +220,10 @@ function isFailureAnswer(event = {}) {
 		:is-detail-open="props.isDetailOpen"
 		:on-details-toggle="onAgentDetailsToggle"
 		:preview-only="props.agentPreviewOnly"
+		:process-row="props.processRow"
+		:retry-action-pending="props.retryActionPending"
+		@retry-now="emit('retry-now', $event)"
+		@cancel-retry="emit('cancel-retry', $event)"
 	/>
 	
 	<details
@@ -264,6 +272,10 @@ function isFailureAnswer(event = {}) {
 		:is-detail-open="props.isDetailOpen"
 		:on-details-toggle="onAgentDetailsToggle"
 		:preview-only="props.agentPreviewOnly"
+		:process-row="props.processRow"
+		:retry-action-pending="props.retryActionPending"
+		@retry-now="emit('retry-now', $event)"
+		@cancel-retry="emit('cancel-retry', $event)"
 	/>
 	
 	<ConsoleToolEvent
@@ -293,7 +305,7 @@ function isFailureAnswer(event = {}) {
 	height: 1rem;
 	flex: 0 0 auto;
 	place-items: center;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 }
 
 summary:hover > .disclosure-icon,
@@ -313,7 +325,7 @@ details[open] > summary > .disclosure-icon svg {
 }
 
 details[open] > summary > .disclosure-icon {
-	color: #4338ca;
+	color: var(--ob-violet);
 }
 
 .answer-block + .answer-block {
@@ -323,7 +335,7 @@ details[open] > summary > .disclosure-icon {
 /* A failed run keeps its partial text, so the failure needs its own visible
    anchor instead of blending into the preceding streamed sentences. */
 .answer-is-error {
-	border-left: 2px solid #fecaca;
+	border-left: 2px solid rgb(var(--ob-danger-rgb) / 0.23);
 	padding-left: .6rem;
 }
 
@@ -331,7 +343,7 @@ details[open] > summary > .disclosure-icon {
 	display: flex;
 	align-items: center;
 	margin: .12rem 0 .3rem;
-	color: #b42318;
+	color: var(--ob-danger);
 	font-size: 12px;
 	font-weight: 600;
 }
@@ -371,7 +383,7 @@ details[open] > summary > .disclosure-icon {
 
 .reasoning-card {
 	margin: .16rem 0;
-	color: #71717a;
+	color: var(--ob-text-subtle);
 	font-size: 12px;
 }
 
@@ -380,7 +392,7 @@ details[open] > summary > .disclosure-icon {
 	align-items: center;
 	width: auto;
 	gap: .32rem;
-	color: #71717a;
+	color: var(--ob-text-subtle);
 	font-weight: 500;
 	cursor: pointer;
 	user-select: none;
@@ -397,7 +409,7 @@ details[open] > summary > .disclosure-icon {
 .reasoning-card summary .inline-icon {
 	width: .78rem;
 	height: .78rem;
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 }
 
 .reasoning-body {
@@ -406,7 +418,7 @@ details[open] > summary > .disclosure-icon {
 	border-radius: 0;
 	background: transparent;
 	padding: 0;
-	color: #52525b;
+	color: var(--ob-text);
 	max-height: min(42vh, 360px);
 	overflow: auto;
 	overscroll-behavior: contain;
@@ -421,7 +433,7 @@ details[open] > summary > .disclosure-icon {
 
 .reasoning-body::-webkit-scrollbar-thumb {
 	border-radius: 999px;
-	background: #cbd5e1;
+	background: var(--ob-scrollbar);
 }
 
 .reasoning-body::-webkit-scrollbar-track {
@@ -434,7 +446,7 @@ details[open] > summary > .disclosure-icon {
 	height: .38rem;
 	flex: 0 0 auto;
 	border-radius: 999px;
-	background: #a1a1aa;
+	background: var(--ob-text-muted);
 	box-shadow: none;
 }
 
@@ -447,7 +459,7 @@ details[open] > summary > .disclosure-icon {
 	min-width: 0;
 	min-height: 1.45rem;
 	padding: .04rem 0 .04rem .08rem;
-	color: #71717a;
+	color: var(--ob-text-subtle);
 	font-family: inherit;
 	font-size: 12px;
 	line-height: 1.45;
@@ -471,7 +483,7 @@ details[open] > summary > .disclosure-icon {
 	width: .92rem;
 	height: .92rem;
 	place-items: center;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .live-process-summary .tool-icon svg {
@@ -480,11 +492,11 @@ details[open] > summary > .disclosure-icon {
 }
 
 .live-process-summary .notification-icon {
-	color: #16a34a;
+	color: var(--ob-success);
 }
 
 .live-process-summary .agent-notice-icon {
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .live-process-summary .agent-notice-icon svg {
@@ -497,7 +509,7 @@ details[open] > summary > .disclosure-icon {
 	min-width: 0;
 	max-width: 100%;
 	overflow: hidden;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 	font-size: inherit;
 	font-weight: 520;
 	letter-spacing: 0;
@@ -509,7 +521,7 @@ details[open] > summary > .disclosure-icon {
 	display: block;
 	min-width: 0;
 	overflow: hidden;
-	color: #9ca3af;
+	color: var(--ob-text-muted);
 	font-size: inherit;
 	line-height: inherit;
 	text-overflow: ellipsis;
@@ -532,7 +544,7 @@ details[open] > summary > .disclosure-icon {
 }
 
 .retry-inline-attempt {
-	color: #64748b;
+	color: var(--ob-text-subtle);
 }
 
 .retry-outcome-icon {
@@ -550,51 +562,56 @@ details[open] > summary > .disclosure-icon {
 }
 
 .retry-outcome-icon.is-waiting {
-	color: #d97706;
+	color: var(--ob-warning);
 }
 
 .retry-outcome-icon.is-success {
-	color: #16a34a;
+	color: var(--ob-success);
 }
 
 .retry-outcome-icon.is-cancelled {
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 }
 
 .retry-outcome-icon.is-failed {
-	color: #dc2626;
+	color: var(--ob-danger);
 }
 
 .retry-inline-state {
 	border-radius: 999px;
-	background: #f1f5f9;
+	background: var(--ob-surface-soft);
 	padding: .1rem .42rem;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 	font-size: 10px;
 	font-weight: 600;
 	white-space: nowrap;
 }
 
 .process-live .retry-inline-state {
-	background: #fff7ed;
-	color: #c2410c;
+	background: var(--ob-orange-soft);
+	color: var(--ob-orange);
 }
+
+.retry-inline-actions { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: .1rem; }
 
 .retry-inline-cancel {
 	border: 0;
 	border-radius: 6px;
 	background: transparent;
 	padding: .15rem .38rem;
-	color: #b45309;
+	color: var(--ob-warning);
 	font-family: inherit;
 	font-size: 10.5px;
 	cursor: pointer;
 	white-space: nowrap;
 }
 
+.retry-inline-cancel.retry-inline-now { color: var(--ob-blue); }
+.retry-inline-cancel.retry-inline-now:hover:not(:disabled) { background: var(--ob-blue-soft); color: var(--ob-blue); }
+
 .retry-inline-cancel:hover:not(:disabled) {
-	background: #fff7ed;
-	color: #9a3412;
+	background: var(--ob-orange-soft);
+	color: var(--ob-orange);
 }
 
 .retry-inline-cancel:disabled {
@@ -621,7 +638,7 @@ details[open] > summary > .disclosure-icon {
 	position: absolute;
 	inset: -45% -70%;
 	z-index: -1;
-	background: linear-gradient(105deg, transparent 28%, rgba(255, 255, 255, .88) 43%, rgba(148, 163, 184, .18) 50%, transparent 66%);
+	background: linear-gradient(105deg, transparent 28%, rgb(var(--ob-surface-rgb) / 0.88) 43%, rgb(var(--ob-text-muted-rgb) / 0.18) 50%, transparent 66%);
 	transform: translateX(-46%);
 	animation: thinkingSunSweep 2.05s ease-in-out infinite;
 }
@@ -631,8 +648,8 @@ details[open] > summary > .disclosure-icon {
 	width: .34rem;
 	height: .34rem;
 	border-radius: 999px;
-	background: #a1a1aa;
-	box-shadow: 0 0 0 0 rgba(161, 161, 170, .20), 0 0 10px rgba(148, 163, 184, .18);
+	background: var(--ob-text-muted);
+	box-shadow: 0 0 0 0 rgb(var(--ob-shadow-rgb) / 0.14), 0 0 10px rgb(var(--ob-shadow-rgb) / 0.14);
 	animation: thinkingDotBreathe 1.18s ease-in-out infinite;
 }
 
@@ -654,7 +671,7 @@ details[open] > summary > .disclosure-icon {
 	gap: .34rem;
 	width: auto;
 	padding: .04rem 0;
-	color: #71717a;
+	color: var(--ob-text-subtle);
 	cursor: pointer;
 	list-style: none;
 }
@@ -664,7 +681,7 @@ details[open] > summary > .disclosure-icon {
 	width: .92rem;
 	height: .92rem;
 	place-items: center;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .tool-group-event > summary .tool-group-icon svg {
@@ -674,7 +691,7 @@ details[open] > summary > .disclosure-icon {
 }
 
 .tool-group-event > summary strong {
-	color: #64748b;
+	color: var(--ob-text-subtle);
 	font-size: 11.5px;
 	font-weight: 520;
 	white-space: nowrap;
@@ -684,7 +701,7 @@ details[open] > summary > .disclosure-icon {
 	border: 0;
 	background: transparent;
 	padding: 0;
-	color: #9ca3af;
+	color: var(--ob-text-muted);
 	font-size: 10.5px;
 	font-style: normal;
 	font-weight: 500;
@@ -693,9 +710,9 @@ details[open] > summary > .disclosure-icon {
 
 .tool-group-stack {
 	margin: .16rem 0 .28rem 0;
-	border: 1px solid #eceff3;
+	border: 1px solid var(--ob-border);
 	border-radius: 9px;
-	background: #fff;
+	background: var(--ob-surface);
 	padding: .54rem .62rem;
 }
 
@@ -706,11 +723,11 @@ details[open] > summary > .disclosure-icon {
 .process-live .live-process-summary .tool-name,
 .process-live.tool-group-event:not([open]) > summary strong,
 .process-live.reasoning-card > summary > span:nth-of-type(1) {
-	color: #52525b;
+	color: var(--ob-text);
 }
 
 .process-live .live-process-summary .tool-preview {
-	color: #9ca3af;
+	color: var(--ob-text-muted);
 }
 
 .process-live .live-process-summary .live-tool-dot,
@@ -737,12 +754,12 @@ details[open] > summary > .disclosure-icon {
 	0%, 100% {
 		opacity: .38;
 		transform: translateY(.02rem) scale(.72);
-		box-shadow: 0 0 0 0 rgba(161, 161, 170, .10), 0 0 6px rgba(148, 163, 184, .12);
+		box-shadow: 0 0 0 0 rgb(var(--ob-shadow-rgb) / 0.1), 0 0 6px rgb(var(--ob-shadow-rgb) / 0.12);
 	}
 	42% {
 		opacity: .96;
 		transform: translateY(-.02rem) scale(1.04);
-		box-shadow: 0 0 0 4px rgba(161, 161, 170, .10), 0 0 14px rgba(148, 163, 184, .32);
+		box-shadow: 0 0 0 4px rgb(var(--ob-shadow-rgb) / 0.1), 0 0 14px rgb(var(--ob-shadow-rgb) / 0.14);
 	}
 }
 
@@ -767,113 +784,7 @@ details[open] > summary > .disclosure-icon {
 
 <style>
 /* OpenBear system dark theme */
-html.dark .disclosure-icon {
-		color: #c6c6cd;
-	}
 html.dark .answer-is-error {
-		border-left-color: rgba(251, 133, 133, 0.52);
-	}
-html.dark .answer-error-banner {
-		color: #fb8585;
-	}
-html.dark details[open] > summary > .disclosure-icon {
-		color: #60a5fa;
-	}
-html.dark .reasoning-card {
-		color: #c6c6cd;
-	}
-html.dark .reasoning-card summary {
-		color: #c6c6cd;
-	}
-html.dark .reasoning-card summary .inline-icon {
-		color: #a1a1a8;
-	}
-html.dark .reasoning-body {
-		color: #c6c6cd;
-	}
-html.dark .reasoning-body::-webkit-scrollbar-thumb {
-		background: #2b2c30;
-	}
-html.dark .live-tool-dot {
-		background: #313236;
-	}
-html.dark .live-process-summary {
-		color: #c6c6cd;
-	}
-html.dark .live-process-summary .tool-icon {
-		color: #a1a1a8;
-	}
-html.dark .live-process-summary .notification-icon {
-		color: #6ee7a2;
-	}
-html.dark .live-process-summary .agent-notice-icon {
-		color: #a1a1a8;
-	}
-html.dark .live-process-summary .tool-name {
-		color: #c6c6cd;
-	}
-html.dark .live-process-summary .tool-preview {
-		color: #a1a1a8;
-	}
-html.dark .retry-inline-attempt {
-		color: #c6c6cd;
-	}
-html.dark .retry-outcome-icon.is-waiting {
-		color: #fbad66;
-	}
-html.dark .retry-outcome-icon.is-success {
-		color: #6ee7a2;
-	}
-html.dark .retry-outcome-icon.is-cancelled {
-		color: #a1a1a8;
-	}
-html.dark .retry-outcome-icon.is-failed {
-		color: #fb8585;
-	}
-html.dark .retry-inline-state {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .process-live .retry-inline-state {
-		background: #202125;
-		color: #fb8585;
-	}
-html.dark .retry-inline-cancel {
-		color: #fbad66;
-	}
-html.dark .retry-inline-cancel:hover:not(:disabled) {
-		background: #202125;
-		color: #fb8585;
-	}
-html.dark .thinking-dots::after {
-		background: linear-gradient(105deg, transparent 28%, rgba(29, 30, 34, 0.88) 43%, rgba(49, 50, 54, 0.18) 50%, transparent 66%);
-	}
-html.dark .thinking-dots span {
-		background: #313236;
-		box-shadow: 0 0 0 0 rgba(161, 161, 170, 0.2), 0 0 10px rgba(148, 163, 184, 0.18);
-	}
-html.dark .tool-group-event > summary {
-		color: #c6c6cd;
-	}
-html.dark .tool-group-event > summary > .tool-group-icon {
-		color: #a1a1a8;
-	}
-html.dark .tool-group-event > summary strong {
-		color: #c6c6cd;
-	}
-html.dark .tool-group-event > summary em {
-		color: #a1a1a8;
-	}
-html.dark .tool-group-stack {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-html.dark .process-live .live-process-summary .tool-name,
-html.dark .process-live.tool-group-event:not([open]) > summary strong,
-html.dark .process-live.reasoning-card > summary > span:nth-of-type(1) {
-		color: #c6c6cd;
-	}
-html.dark .process-live .live-process-summary .tool-preview {
-		color: #a1a1a8;
+		border-left-color: rgb(var(--ob-danger-rgb) / 0.52);
 	}
 </style>

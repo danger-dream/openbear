@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   Box, ArrowDown, ArrowRight, ChatLineRound, Check, Delete, DocumentCopy,
-  EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading, MoreFilled,
+  EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading, MagicStick, MoreFilled,
   Plus, Refresh, RefreshLeft, Search, Star, StarFilled,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -16,8 +16,9 @@ import ConversationOverview from "./ConversationOverview.vue";
 import ConversationActivityFolder from "./ConversationActivityFolder.vue";
 import {activityReadRequests, activityLabel} from "../conversationActivity.js";
 import { treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop } from "./conversationTreeInteractions.js";
-import { referenceCatalog, acceptActivityReadReceipt } from "../references/catalog.js";
+import { referenceCatalog, referenceItem, acceptActivityReadReceipt } from "../references/catalog.js";
 import { REFERENCE_MIME, referenceToken } from "../references/codec.js";
+import AnimatedConversationTitle from "./AnimatedConversationTitle.vue";
 import { modelDefaultThinking, modelThinkingLevels, thinkingLabel } from "../views/consoleView/display.js";
 import {
   RUN_DEFAULT_INHERIT, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
@@ -39,6 +40,10 @@ defineExpose({
   openRootMenu,
   revealDraft,
   forgetConversation,
+  conversationPath: (conversationUuid) => {
+    const row = knownConversationRows().find((item) => item.conversationUuid === conversationUuid);
+    return row ? String(row.path || (row.folderId ? folderPath(row.folderId) : "临时会话")) : "";
+  },
 });
 
 const activityItems = ref([]);
@@ -65,6 +70,7 @@ const menu = ref({ open: false, x: 0, y: 0, row: null });
 const drag = ref({ row: null, target: null, zone: "", busy: false });
 const moveInFlight = ref(false);
 const movingRowId = ref("");
+const titleGenerating = ref(new Set());
 const rootDropTarget = { kind: "root", id: "__root" };
 const promptDialog = ref(false);
 const promptRow = ref(null);
@@ -143,7 +149,20 @@ function setExpanded(id, value) {
 }
 function running(row) { return Boolean(row?.running || row?.status === "running"); }
 function hasFolderChildren(row) { return Number(row?.childFolderCount || 0) + Number(row?.conversationCount || 0) > 0; }
-function rowLabel(row) { return row?.kind === "folder" ? row.name : row?.title || "新会话"; }
+function liveConversationTitle(row) {
+  if (!row || row.local) return row?.title || "新会话";
+  return referenceItem({kind: "chat", id: row.conversationUuid})?.label || row.title || "新会话";
+}
+function rowLabel(row) { return row?.kind === "folder" ? row.name : liveConversationTitle(row); }
+function hasConversationMessages(row) { return Number(row?.lastConversationAt || row?.lastInteractionAtMs || 0) > 0; }
+function isTitleGenerating(row) { return titleGenerating.value.has(String(row?.conversationUuid || "")); }
+function setTitleGenerating(conversationUuid, generating) {
+  const uuid = String(conversationUuid || "");
+  if (!uuid) return;
+  const next = new Set(titleGenerating.value);
+  if (generating) next.add(uuid); else next.delete(uuid);
+  titleGenerating.value = next;
+}
 function nodePath(row) { return String(row?.path || (row?.folderId ? "" : "临时会话")); }
 function indentation(depth) { return `${Math.min(7, Math.max(0, Number(depth || 0))) * 14}px`; }
 function rowLoading(row) {
@@ -306,6 +325,131 @@ function cacheLocatedConversation(raw) {
   const system = row.archived ? "archive" : parentId ? "" : "temporary";
   const branch = stateFor(parentId, system);
   branch.items = mergeTreeRows(branch.items, [row]);
+}
+function mapKnownRows(transform) {
+  rootFolders.value = rootFolders.value.map(transform).sort(compareTreeRows);
+  for (const branch of Object.values(branchState)) branch.items = (branch.items || []).map(transform).sort(compareTreeRows);
+  searchRows.value = searchRows.value.map(transform);
+  activityItems.value = activityItems.value.map(transform);
+  recentItems.value = recentItems.value.map(transform);
+}
+function rebaseKnownPaths(oldPath, newPath) {
+  const before = String(oldPath || ""), after = String(newPath || "");
+  if (!before || before === after) return;
+  mapKnownRows(item => {
+    const path = String(item?.path || "");
+    if (path !== before && !path.startsWith(`${before} / `)) return item;
+    return { ...item, path: `${after}${path.slice(before.length)}` };
+  });
+}
+function adoptStatusConversation(raw) {
+  const uuid = String(raw?.conversationUuid || "");
+  if (!latestStatusState || !uuid) return;
+  const organization = {};
+  for (const key of ["title", "folderId", "parentId", "path", "pinned", "pinnedAt", "displayOrder", "archived", "archivedAt"]) {
+    if (Object.hasOwn(raw, key)) organization[key] = raw[key];
+  }
+  for (const map of [latestStatusState.lookup, latestStatusState.activityLookup]) {
+    if (map.has(uuid)) map.set(uuid, { ...map.get(uuid), ...organization });
+  }
+  for (const key of ["items", "activityItems", "recentItems"]) {
+    if (!Array.isArray(latestStatusState.raw?.[key])) continue;
+    latestStatusState.raw[key] = latestStatusState.raw[key].map(item =>
+      item.conversationUuid === uuid ? { ...item, ...organization } : item);
+  }
+}
+function applyMutationRow(original, raw) {
+  if (!original || !raw) return;
+  const id = rowId(original);
+  const oldPath = String(original.path || "");
+  const patch = original.kind === "folder"
+    ? { ...raw, kind: "folder", id: original.folderId, folderId: original.folderId }
+    : { ...raw, kind: "conversation", id: original.conversationUuid,
+        conversationUuid: original.conversationUuid, parentId: String(raw.folderId ?? original.folderId ?? ""),
+        path: String(original.path || (raw.folderId ? folderPath(raw.folderId) : "临时会话")) };
+  if (original.kind === "conversation") adoptStatusConversation(patch);
+  mapKnownRows(item => rowId(item) === id ? statusAdjustedRow({ ...item, ...patch }) : item);
+  if (original.kind === "folder") rebaseKnownPaths(oldPath, String(raw.path || oldPath));
+  emitRows();
+}
+function removeKnownTreeItem(row) {
+  const id = rowId(row);
+  rootFolders.value = rootFolders.value.filter(item => rowId(item) !== id);
+  for (const branch of Object.values(branchState)) branch.items = (branch.items || []).filter(item => rowId(item) !== id);
+}
+function applyTargetOrder(kind, ids = []) {
+  const order = new Map(ids.map((id, index) => [String(id), (index + 1) * 1024]));
+  if (!order.size) return;
+  mapKnownRows(item => {
+    if (item.kind !== kind) return item;
+    const id = kind === "folder" ? item.folderId : item.conversationUuid;
+    return order.has(String(id)) ? { ...item, displayOrder: order.get(String(id)) } : item;
+  });
+}
+function adoptOrganizationCounts(rows = []) {
+  if (!latestStatusState) return;
+  for (const row of rows) {
+    if (row?.kind !== "folder" || !row.folderId || !Number.isFinite(Number(row.conversationCount))) continue;
+    latestStatusState.folderConversationCounts[row.folderId] = Number(row.conversationCount);
+    if (latestStatusState.raw?.folderConversationCounts) {
+      latestStatusState.raw.folderConversationCounts[row.folderId] = Number(row.conversationCount);
+    }
+  }
+}
+function knownFolderIdPath(folderId, extraRows = []) {
+  const byId = new Map();
+  for (const row of [...everyKnownNode(), ...extraRows]) {
+    if (row?.kind === "folder" && row.folderId) byId.set(String(row.folderId), row);
+  }
+  const path = [], seen = new Set();
+  let current = String(folderId || "");
+  while (current && byId.has(current) && !seen.has(current)) {
+    seen.add(current); path.unshift(current); current = String(byId.get(current)?.parentId || "");
+  }
+  return path;
+}
+function adjustRunningFolderCounts(ids, delta) {
+  if (!latestStatusState || !delta) return;
+  for (const id of ids) {
+    const next = Math.max(0, Number(latestStatusState.folderRunningCounts[id] || 0) + delta);
+    latestStatusState.folderRunningCounts[id] = next;
+    if (latestStatusState.raw?.folderRunningCounts) latestStatusState.raw.folderRunningCounts[id] = next;
+  }
+}
+function applyMoveOrganization(original, targetFolderId, organization = {}) {
+  const oldPath = String(original.path || "");
+  const folderRows = organization.folderItems || [];
+  const oldFolderIds = knownFolderIdPath(original.folderId);
+  const newFolderIds = Array.isArray(organization.folderPath) ? organization.folderPath.map(String) : [];
+  const runningDelta = original.kind === "folder"
+    ? Number(original.runningDescendantCount || 0) : (running(original) ? 1 : 0);
+  const oldAncestors = original.kind === "folder" ? oldFolderIds.filter(id => id !== original.folderId) : oldFolderIds;
+  const newAncestors = original.kind === "folder" ? newFolderIds.filter(id => id !== original.folderId) : newFolderIds;
+  adjustRunningFolderCounts(oldAncestors, -runningDelta);
+  adjustRunningFolderCounts(newAncestors, runningDelta);
+  removeKnownTreeItem(original);
+  adoptOrganizationCounts(folderRows);
+  mergeLocatedFolders(folderRows);
+  const moved = organization.item;
+  if (moved?.kind === "folder") mergeLocatedFolders([moved]);
+  else if (moved?.conversationUuid) {
+    adoptStatusConversation(moved);
+    cacheLocatedConversation(moved);
+  }
+  if (original.kind === "folder" && moved) rebaseKnownPaths(oldPath, String(moved.path || oldPath));
+  applyTargetOrder(original.kind, organization.targetOrder || []);
+  if (original.kind === "conversation") {
+    const oldParent = String(original.folderId || ""), nextParent = String(targetFolderId || "");
+    if (!original.archived && oldParent !== nextParent) {
+      if (!oldParent) temporaryCount.value = Math.max(0, temporaryCount.value - 1);
+      if (!nextParent) temporaryCount.value += 1;
+    }
+    if (original.archived && moved && !moved.archived) {
+      archivedCount.value = Math.max(0, archivedCount.value - 1);
+      activeCount.value += 1;
+    }
+  }
+  emitRows();
 }
 // Rebuild a branch only when at least one row actually changed, so a status
 // refresh with no real change reuses every existing reference.
@@ -650,7 +794,7 @@ async function runSearch({ append = false } = {}) {
   try {
     const data = await Api.conversationTreeSearch({ q: text, limit: 50, ...(append && searchCursor.value ? { cursor: searchCursor.value } : {}), ...(searchArchived.value && archiveUnlocked.value ? { archiveUnlocked: 1 } : {}) });
     if (generation !== searchGeneration || query.value.trim() !== text) return;
-    const incoming = (data.items || []).map(row => row.kind === "folder" ? statusAdjustedRow(row) : row);
+    const incoming = (data.items || []).map(statusAdjustedRow);
     searchRows.value = append ? [...searchRows.value, ...incoming] : incoming;
     searchCursor.value = String(data.nextCursor || "");
     searchHasMore.value = Boolean(data.hasMore);
@@ -696,6 +840,7 @@ function moreMenuKeydown(event) {
   if (event.key === "Enter" || event.key === " ") event.stopPropagation();
 }
 function openMoreMenu(event, row) {
+  if (event?.type === "contextmenu") return openMenu(event, row);
   const rect = event.currentTarget.getBoundingClientRect();
   return openMenu({
     preventDefault: () => event.preventDefault(),
@@ -719,16 +864,51 @@ async function promptFolder(parentId = "") {
 }
 async function renameRow(row) {
   try {
-    const { value } = await ElMessageBox.prompt("", row.kind === "folder" ? "重命名目录" : "重命名会话", { inputValue: rowLabel(row), inputValidator: (v) => String(v || "").trim() ? true : "名称不能为空", confirmButtonText: "保存", cancelButtonText: "取消" });
-    if (row.kind === "folder") await Api.updateConversationFolder(row.folderId, { name: String(value).trim() });
-    else await Api.updateConversation(row.conversationUuid, { title: String(value).trim() });
-    await refreshAffected(row);
+    const { value } = await ElMessageBox.prompt("", row.kind === "folder" ? "重命名目录" : "重命名会话", { inputValue: rowLabel(row), inputValidator: (v) => {
+      const title = String(v || "").trim();
+      if (!title) return "名称不能为空";
+      return true;
+    }, confirmButtonText: "保存", cancelButtonText: "取消" });
+    const result = row.kind === "folder"
+      ? await Api.updateConversationFolder(row.folderId, { name: String(value).trim() })
+      : await Api.updateConversation(row.conversationUuid, { title: String(value).trim() });
+    applyMutationRow(row, row.kind === "folder" ? result.folder : result.conversation);
+    if (query.value.trim()) await runSearch();
   } catch (error) { if (!['cancel', 'close'].includes(error)) ElMessage.error(apiError(error)); }
 }
 async function togglePin(row) {
-  if (row.kind === "folder") await Api.updateConversationFolder(row.folderId, { pinned: !row.pinned });
-  else if (row.pinned) await Api.unpinConversation(row.conversationUuid); else await Api.pinConversation(row.conversationUuid);
-  await refreshAffected(row);
+  let result;
+  if (row.kind === "folder") result = await Api.updateConversationFolder(row.folderId, { pinned: !row.pinned });
+  else if (row.pinned) result = await Api.unpinConversation(row.conversationUuid); else result = await Api.pinConversation(row.conversationUuid);
+  applyMutationRow(row, row.kind === "folder" ? result.folder : result.conversation);
+  if (query.value.trim()) await runSearch();
+}
+function setConversationTitleLocally(conversationUuid, title) {
+  const uuid = String(conversationUuid || "");
+  for (const branch of Object.values(branchState)) {
+    for (const item of branch.items || []) if (item.conversationUuid === uuid) item.title = title;
+  }
+  for (const list of [searchRows.value, activityItems.value, recentItems.value]) {
+    for (const item of list) if (item.conversationUuid === uuid) item.title = title;
+  }
+  emitRows();
+}
+async function generateConversationTitle(row) {
+  const uuid = String(row?.conversationUuid || "");
+  if (!uuid || row.local || isTitleGenerating(row)) return;
+  if (running(row)) return ElMessage.warning("当前轮完成后再生成");
+  if (!hasConversationMessages(row)) return ElMessage.warning("会话还没有可用于命名的内容");
+  setTitleGenerating(uuid, true);
+  const pendingMessage = ElMessage.info({ message: "正在生成会话名称…", duration: 0 });
+  let result;
+  try {
+    result = await Api.generateConversationTitle(uuid);
+    if (result?.title) setConversationTitleLocally(uuid, result.title);
+  } finally {
+    setTitleGenerating(uuid, false);
+    pendingMessage?.close?.();
+  }
+  ElMessage.success(result?.changed ? "会话名称已生成" : "会话名称无需更新");
 }
 async function duplicateConversation(row) {
   if (running(row)) return ElMessage.warning("运行中的会话暂不能复制");
@@ -1073,8 +1253,12 @@ async function saveProperties() {
     window.dispatchEvent(new CustomEvent("openbear:folder-properties-changed", { detail: { folderId } }));
     if (request === propertiesRequestGeneration) propertiesDialog.value = false;
     if (!temporary) {
-      const located = await Api.locateConversationFolderInTree(folderId);
-      mergeLocatedFolders(located.folderItems || []);
+      if (result.folder) mergeLocatedFolders([result.folder]);
+      else {
+        // Compatibility with an older server during rolling upgrades.
+        const located = await Api.locateConversationFolderInTree(folderId);
+        mergeLocatedFolders(located.folderItems || []);
+      }
       emitRows();
     }
     const skipped = Number(result.skippedRunningCount || 0);
@@ -1129,18 +1313,11 @@ async function submitMove() {
       const archivedMove = row.kind === "conversation" && row.archived;
       const options = archivedMove ? { unarchive: moveUnarchive.value, updateSnapshots: moveUpdateSnapshots.value } : null;
       if (!await moveTreeItem(row, moveFolderId.value, "", "", options)) return;
-      if (archivedMove) {
-        // Archive is a separate cached branch, not the conversation's folderId.
-        const archive = invalidateBranch("", "archive");
-        archive.items = archive.items.filter(item => item.conversationUuid !== row.conversationUuid);
-        if (isExpanded("__archive")) await loadChildren("", "archive", { force: true, indicate: false });
-      }
     }
     moveDialog.value = false;
-    await invalidateAndRefresh(
-      treeItemParent(row), moveFolderId.value,
-      moveMode.value === "delete" ? null : row,
-    );
+    if (moveMode.value === "delete") {
+      await invalidateAndRefresh(treeItemParent(row), moveFolderId.value, null);
+    }
   } catch (error) { if (!['cancel', 'close'].includes(error)) ElMessage.error(apiError(error)); }
   finally { moveBusy.value = false; }
 }
@@ -1163,7 +1340,9 @@ async function moveTreeItem(row, targetFolderId, beforeId = "", afterId = "", op
       updateSnapshots = choice === true;
     }
     const result = await Api.moveConversationTreeItem({ ...request, updateSnapshots });
+    applyMoveOrganization(row, targetFolderId, result.organization || {});
     if (row.kind === "conversation" && row.conversationUuid === props.activeConversationUuid) selectFolder(String(targetFolderId || ""));
+    if (query.value.trim()) await runSearch();
     if (result.skippedRunningCount) ElMessage.warning(`已移动；${result.skippedRunningCount} 个运行中会话的快照本次跳过，不会延后更新`);
     return true;
   } finally { moveInFlight.value = false; movingRowId.value = ""; }
@@ -1208,6 +1387,7 @@ async function runMenuAction(action) {
       emit("new-conversation", folderId);
     }
     else if (action === "new-folder") await promptFolder(row.kind === "folder" ? row.folderId : "");
+    else if (action === "generate-title") await generateConversationTitle(row);
     else if (action === "rename") await renameRow(row);
     else if (action === "pin") await togglePin(row);
     else if (action === "move") await showMove(row);
@@ -1289,9 +1469,7 @@ async function drop(event, target) {
   clearDropTarget();
   drag.value.busy = true;
   try {
-    if (await moveTreeItem(source, intent.targetFolderId, intent.beforeId, intent.afterId)) {
-      await invalidateAndRefresh(treeItemParent(source), intent.targetFolderId, source);
-    }
+    await moveTreeItem(source, intent.targetFolderId, intent.beforeId, intent.afterId);
   } catch (error) { ElMessage.error(apiError(error)); }
   finally { clearDrag(); }
 }
@@ -1357,9 +1535,9 @@ onBeforeUnmount(() => {
       <button v-if="query" type="button" title="清空搜索" @click="query = ''">×</button>
     </div>
 
-    <ConversationActivityFolder :items="activityItems" :recent-items="recentItems" :active-conversation-uuid="activeConversationUuid" :read-versions="referenceCatalog.activityReadVersions" :busy="activityReadBusy"
+    <ConversationActivityFolder :items="activityItems" :recent-items="recentItems" :active-conversation-uuid="activeConversationUuid" :read-versions="referenceCatalog.activityReadVersions" :busy="activityReadBusy" :title-generating="titleGenerating"
       @open="openActivityConversation" @read="markActivityRead([$event])" @read-all="markActivityRead(activityItems)"
-      @overview-enter="enterOverview" @overview-leave="leaveOverview" @overview-close="closeOverview" />
+      @more="openMoreMenu($event.event, $event.row)" @overview-enter="enterOverview" @overview-leave="leaveOverview" @overview-close="closeOverview" />
 
     <div ref="listRef" class="tree-list" :class="{ 'drop-root': drag.target?.kind === 'root' }" role="tree" aria-label="会话和目录"
       @contextmenu.prevent.stop="openRootMenu" @dragover.self="dragOver($event, rootDropTarget)" @drop.self="drop($event, rootDropTarget)"
@@ -1371,7 +1549,7 @@ onBeforeUnmount(() => {
           :data-tree-id="row.id || rowId(row)" :data-kind="row.kind"
           class="tree-row-wrap" :class="[`kind-${row.kind}`, { 'drop-inside': drag.target && rowId(drag.target) === rowId(row) && drag.zone === 'inside', 'drop-before': drag.target && rowId(drag.target) === rowId(row) && drag.zone === 'before', 'drop-after': drag.target && rowId(drag.target) === rowId(row) && drag.zone === 'after' }]"
           :style="{ '--indent': indentation(row.depth) }"
-          role="treeitem" :aria-level="Number(row.depth || 0) + 1" :aria-busy="rowLoading(row)"
+          role="treeitem" :aria-level="Number(row.depth || 0) + 1" :aria-busy="rowLoading(row) || isTitleGenerating(row)"
           :aria-expanded="['folder','system'].includes(row.kind) ? String(isExpanded(row.kind === 'system' ? row.id : row.folderId)) : undefined"
           :tabindex="['folder','conversation','system'].includes(row.kind) ? 0 : -1"
           :draggable="!row.local && !moveInFlight && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
@@ -1386,7 +1564,6 @@ onBeforeUnmount(() => {
             <button class="tree-node-main" type="button" :class="{ 'is-folder-target': (row.kind === 'folder' && selectedFolderId === row.folderId) || (row.kind === 'system' && row.systemNode === 'temporary' && selectedFolderId === '') }" :title="row.path || row.name" @click="activateRow(row)" @contextmenu="openMenu($event, row)">
               <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) }"><component :is="rowLoading(row) ? Loading : row.kind === 'system' ? (row.systemNode === 'archive' ? Box : ChatLineRound) : (isExpanded(row.folderId) ? FolderOpened : Folder)" /></el-icon>
               <span class="node-label">{{ row.name }}</span>
-              <span v-if="row.hasLocalWorkspace || row.hasLocalPrompt" class="property-dot" :title="`${row.hasLocalWorkspace ? '本节点设置工作目录' : ''}${row.hasLocalWorkspace && row.hasLocalPrompt ? '；' : ''}${row.hasLocalPrompt ? '本节点设置提示词' : ''}`"><el-icon><InfoFilled /></el-icon></span>
               <span v-if="row.pinned" class="node-star" title="同级置顶"><el-icon><StarFilled /></el-icon></span>
               <span class="node-count" :aria-label="`${row.kind === 'system' ? row.count : Number(row.conversationCount || 0)} 个会话`">{{ row.kind === 'system' ? row.count : Number(row.conversationCount || 0) }}</span>
             </button>
@@ -1394,11 +1571,12 @@ onBeforeUnmount(() => {
 
           <template v-else-if="row.kind === 'conversation'">
             <span class="tree-leaf-spacer"></span>
-            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationUuid === row.conversationUuid }" :title="row.local ? row.title : undefined" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
-              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row), 'is-working': running(row) && !rowLoading(row) }"><component :is="rowLoading(row) ? Loading : ChatLineRound" /></el-icon>
-              <span class="node-copy"><span class="node-label">{{ row.title }}</span><small v-if="row.search">{{ row.path }}</small></span>
+            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationUuid === row.conversationUuid, 'is-title-generating': isTitleGenerating(row) }" :title="isTitleGenerating(row) ? '正在生成会话名称' : (row.local ? row.title : undefined)" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
+              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) || isTitleGenerating(row), 'is-working': running(row) && !rowLoading(row) && !isTitleGenerating(row) }"><component :is="rowLoading(row) || isTitleGenerating(row) ? Loading : ChatLineRound" /></el-icon>
+              <span class="node-copy"><span class="node-label"><AnimatedConversationTitle :text="liveConversationTitle(row)" :identity="row.conversationUuid" /></span><small v-if="row.search">{{ row.path }}</small></span>
               <span v-if="row.pinned" class="node-star"><el-icon><StarFilled /></el-icon></span>
-              <span v-if="running(row)" class="running-leaf" role="img" :aria-label="`${activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`" :title="`${row.currentStatus || activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`"></span>
+              <span v-if="isTitleGenerating(row)" class="title-generating-state" role="status" aria-live="polite">命名中</span>
+              <span v-else-if="running(row)" class="running-leaf" role="img" :aria-label="`${activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`" :title="`${row.currentStatus || activityLabel(row)}${row.activityUnread ? ' · 未读' : ''}`"></span>
               <span v-else-if="row.activityUnread" class="conversation-unread-dot" aria-label="未读" :title="`${activityLabel(row)} · 未读`"></span>
             </button>
           </template>
@@ -1444,6 +1622,7 @@ onBeforeUnmount(() => {
           </template>
           <template v-else>
             <button v-if="menu.row?.activityUnread" role="menuitem" :disabled="activityReadBusy" @click="markActivityRead([menu.row]); closeMenu()"><el-icon><Check /></el-icon><span>标为已读</span></button>
+            <button role="menuitem" :disabled="menu.row?.local || running(menu.row) || !hasConversationMessages(menu.row) || isTitleGenerating(menu.row)" @click="runMenuAction('generate-title')"><el-icon :class="{'is-spinning': isTitleGenerating(menu.row)}"><component :is="isTitleGenerating(menu.row) ? Loading : MagicStick" /></el-icon><span>{{ isTitleGenerating(menu.row) ? '正在生成…' : '生成会话名称' }}</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('rename')"><el-icon><EditPen /></el-icon><span>重命名</span></button>
             <button role="menuitem" :disabled="menu.row?.local || running(menu.row)" @click="runMenuAction('duplicate')"><el-icon><DocumentCopy /></el-icon><span>复制会话</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('pin')"><el-icon><component :is="menu.row?.pinned ? Star : StarFilled" /></el-icon><span>{{ menu.row?.pinned ? '取消置顶' : '置顶' }}</span></button>
@@ -1646,62 +1825,64 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.folder-context-strategy { padding: 16px; margin-top: 16px; background: #f5f6f8; border: 1px solid #e3e6eb; border-radius: 12px; }
+.folder-context-strategy { padding: 16px; margin-top: 16px; background: var(--ob-surface-soft); border: 1px solid var(--ob-border); border-radius: 12px; }
 .folder-context-strategy-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
 .folder-context-strategy-head strong { font-size:14px; font-weight:500; }
-.folder-context-strategy-head span { font-size:13px; color:#87909d; }
-:global(html.dark) .folder-context-strategy { background:#2b3038; border-color:#454d59; }
-.conversation-tree { display:flex; min-height:0; flex:1; flex-direction:column; color:#3f3f46; font-family:inherit; }
+.folder-context-strategy-head span { font-size:13px; color:var(--ob-text-subtle); }
+
+.conversation-tree { display:flex; min-height:0; flex:1; flex-direction:column; color:var(--ob-chat-text); font-family:inherit; }
 .conversation-tree button,.conversation-tree input { font-family:inherit; }
-.tree-list.drop-root { background:rgba(37,99,235,.045); outline:1px dashed rgba(37,99,235,.4); outline-offset:-3px; }
+.tree-list.drop-root { background:rgb(var(--ob-blue-rgb) / .045); outline:1px dashed rgb(var(--ob-blue-rgb) / .4); outline-offset:-3px; }
 .tree-toolbar { display:flex; align-items:center; justify-content:space-between; padding:0 11px 6px 13px; }
-.tree-title { display:flex; align-items:baseline; gap:6px; font-size:12px; color:#52525b; }
+.tree-title { display:flex; align-items:baseline; gap:6px; font-size:12px; color:var(--ob-text-subtle); }
 .tree-title > .el-icon { align-self:center; }
-.tree-title span { font-size:10px; font-weight:500; color:#a1a1aa; }
+.tree-title span { font-size:10px; font-weight:500; color:var(--ob-text-muted); }
 .tree-tools { display:flex; gap:3px; }
-.tree-tool { display:grid; width:27px; height:27px; place-items:center; border:0; border-radius:8px; background:transparent; color:#71717a; cursor:pointer; }
-.tree-tool:hover,.tree-tool:focus-visible { background:#e4e4e7; color:#18181b; outline:none; }
-.tree-tool.primary { color:#2563eb; }
-.tree-search { display:flex; align-items:center; gap:6px; margin:0 10px 7px; padding:0 9px; height:31px; border:1px solid #dedee3; border-radius:9px; background:rgba(255,255,255,.78); color:#a1a1aa; }
-.tree-search input { min-width:0; flex:1; border:0; outline:0; background:transparent; color:#27272a; font-size:12px; }
-.tree-search button { display:grid; place-items:center; width:20px; height:20px; padding:0; border:0; border-radius:5px; background:transparent; color:#a1a1aa; cursor:pointer; }
-.tree-search button:hover,.tree-search button.active { background:#e4e4e7; color:#2563eb; }
+.tree-tool { display:grid; width:27px; height:27px; place-items:center; border:0; border-radius:8px; background:transparent; color:var(--ob-text-subtle); cursor:pointer; }
+.tree-tool:hover,.tree-tool:focus-visible { background:var(--ob-surface-soft); color:var(--ob-text-strong); outline:none; }
+.tree-tool.primary { color:var(--ob-chat-subtle); }
+.tree-search { display:flex; align-items:center; gap:6px; margin:0 10px 7px; padding:0 9px; height:31px; border:1px solid var(--ob-border-soft); border-radius:9px; background:var(--ob-chat-hover); color:var(--ob-chat-muted); }
+.tree-search:focus-within { border-color:var(--ob-border-strong); }
+.tree-search input { min-width:0; flex:1; border:0; outline:0; background:transparent; color:var(--ob-text); font-size:12px; }
+.tree-search button { display:grid; place-items:center; width:20px; height:20px; padding:0; border:0; border-radius:5px; background:transparent; color:var(--ob-text-muted); cursor:pointer; }
+.tree-search button:hover,.tree-search button.active { background:var(--ob-surface-soft); color:var(--ob-blue); }
 .tree-list { min-height:0; flex:1; overflow:auto; padding:0 7px 10px; scrollbar-width:thin; overscroll-behavior:contain; }
 .tree-row-wrap { position:relative; display:flex; width:100%; min-height:30px; align-items:center; padding-left:var(--indent); border-radius:8px; outline:none; }
-.tree-row-wrap:focus-visible { box-shadow:inset 0 0 0 2px rgba(37,99,235,.45); }
-.tree-row-wrap.drop-inside { background:rgba(37,99,235,.13); box-shadow:inset 0 0 0 1px rgba(37,99,235,.48); }
-.tree-row-wrap.drop-before::before,.tree-row-wrap.drop-after::after { content:""; position:absolute; z-index:2; left:calc(var(--indent) + 7px); right:7px; height:2px; border-radius:2px; background:#2563eb; }
+.tree-row-wrap:focus-visible { box-shadow:inset 0 0 0 2px rgb(var(--ob-blue-rgb) / .45); }
+.tree-row-wrap.drop-inside { background:rgb(var(--ob-blue-rgb) / .13); box-shadow:inset 0 0 0 1px rgb(var(--ob-blue-rgb) / .48); }
+.tree-row-wrap.drop-before::before,.tree-row-wrap.drop-after::after { content:""; position:absolute; z-index:2; left:calc(var(--indent) + 7px); right:7px; height:2px; border-radius:2px; background:var(--ob-blue); }
 .tree-row-wrap.drop-before::before { top:-1px; }.tree-row-wrap.drop-after::after { bottom:-1px; }
-.tree-chevron { display:grid; width:24px; height:27px; place-items:center; border:0; border-radius:7px; background:transparent; color:#a1a1aa; cursor:pointer; }
+.tree-chevron { display:grid; width:24px; height:27px; place-items:center; border:0; border-radius:7px; background:transparent; color:var(--ob-text-muted); cursor:pointer; }
 .tree-chevron { flex:0 0 auto; }
-.tree-chevron:hover { background:rgba(161,161,170,.18); color:#52525b; }
+.tree-chevron:hover { background:var(--ob-hover); color:var(--ob-text-subtle); }
 .tree-node-main { display:flex; width:100%; min-width:0; height:29px; flex:1 1 auto; align-items:center; gap:6px; padding:0 5px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
-.tree-node-main:hover { background:rgba(228,228,231,.58); }
-.tree-node-main.is-folder-target { background:rgba(24,24,27,.055); color:#27272a; }
-.tree-node-main.is-chat-active { background:rgba(37,99,235,.075); color:#1d4ed8; }
-.tree-node-main:focus-visible,.tree-chevron:focus-visible { outline:2px solid rgba(37,99,235,.5); outline-offset:-2px; }
-.node-icon { flex:0 0 auto; color:#71717a; }
+.tree-node-main:hover { background:var(--ob-chat-hover); }
+.tree-node-main.conversation { color:var(--ob-chat-subtle); }
+.tree-node-main.is-folder-target { background:var(--ob-hover); color:var(--ob-text); }
+.tree-node-main.is-chat-active { background:var(--ob-chat-selected); color:var(--ob-chat-text); }
+.tree-node-main:focus-visible,.tree-chevron:focus-visible { outline:2px solid var(--ob-chat-subtle); outline-offset:-2px; }
+.node-icon { flex:0 0 auto; color:var(--ob-text-subtle); }
 /* Same rotating top/right border as the work-detail button; the glyph itself
    stays still and the absolute ring does not alter row/icon geometry. */
-.node-icon.is-working { position:relative; color:#2563eb; }
-.node-icon.is-working::before { content:""; pointer-events:none; position:absolute; inset:-3px; border:1.5px solid transparent; border-top-color:#2563eb; border-right-color:rgba(37,99,235,.42); border-radius:50%; animation:tree-work-border-spin .9s linear infinite; }
+.node-icon.is-working { position:relative; color:var(--ob-blue); }
+.node-icon.is-working::before { content:""; pointer-events:none; position:absolute; inset:-3px; border:1.5px solid transparent; border-top-color:var(--ob-blue); border-right-color:rgb(var(--ob-blue-rgb) / .42); border-radius:50%; animation:tree-work-border-spin .9s linear infinite; }
 @keyframes tree-work-border-spin { to { transform:rotate(360deg); } }
-html.dark .node-icon.is-working { color:#93b9f7; }
-html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right-color:rgba(147,185,247,.42); }
-.node-label { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:500; line-height:1.4; }
+
+.node-label { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:400; line-height:1.4; }
 .node-copy { display:flex; min-width:0; flex:1; flex-direction:column; line-height:1.4; }
-.node-copy small { overflow:hidden; margin-top:2px; color:#a1a1aa; font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
-.node-star { display:grid; color:#d97706; font-size:11px; }
-.node-count { color:#a1a1aa; font-size:10px; }
-.property-dot { display:grid; color:#0f766e; font-size:11px; }
-.running-leaf { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:#3b82f6; box-shadow:0 0 0 3px rgba(59,130,246,.12); animation:tree-pulse 1.8s ease-in-out infinite; }
-:global(html.dark) .running-leaf { background:#60a5fa; box-shadow:0 0 0 3px rgba(96,165,250,.15); }
-.conversation-unread-dot { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:#3b82f6; }
+.node-copy small { overflow:hidden; margin-top:2px; color:var(--ob-text-muted); font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
+.node-star { display:grid; color:var(--ob-warning); font-size:11px; }
+.node-count { color:var(--ob-text-muted); font-size:10px; }
+.title-generating-state { flex:0 0 auto; padding:1px 5px; border-radius:5px; background:rgb(var(--ob-blue-rgb) / .1); color:var(--ob-blue); font-size:10px; font-weight:600; line-height:16px; white-space:nowrap; }
+
+.running-leaf { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:var(--ob-blue); box-shadow:0 0 0 3px rgb(var(--ob-blue-rgb) / .12); animation:tree-pulse 1.8s ease-in-out infinite; }
+
+.conversation-unread-dot { width:6px; height:6px; flex:0 0 6px; margin-right:2px; border-radius:50%; background:var(--ob-blue); }
 .tree-leaf-spacer { width:24px; flex:0 0 auto; }
-.tree-inline-action,.search-more { margin-left:28px; border:0; background:transparent; color:#2563eb; font-size:11px; cursor:pointer; }
-.tree-inline-action.error { color:#dc2626; }.tree-muted { display:flex; align-items:center; gap:5px; padding-left:6px; color:#a1a1aa; font-size:11px; }
-.tree-placeholder { margin:8px; padding:14px 8px; border-radius:9px; background:rgba(228,228,231,.45); color:#a1a1aa; font-size:11px; text-align:center; }
-.search-more { width:calc(100% - 24px); margin:7px 12px; padding:7px; border-radius:8px; background:rgba(37,99,235,.08); }
+.tree-inline-action,.search-more { margin-left:28px; border:0; background:transparent; color:var(--ob-blue); font-size:11px; cursor:pointer; }
+.tree-inline-action.error { color:var(--ob-danger); }.tree-muted { display:flex; align-items:center; gap:5px; padding-left:6px; color:var(--ob-text-muted); font-size:11px; }
+.tree-placeholder { margin:8px; padding:14px 8px; border-radius:9px; background:var(--ob-surface-soft); color:var(--ob-text-muted); font-size:11px; text-align:center; }
+.search-more { width:calc(100% - 24px); margin:7px 12px; padding:7px; border-radius:8px; background:rgb(var(--ob-blue-rgb) / .08); }
 .is-spinning { animation:tree-spin .8s linear infinite; }
 @keyframes tree-spin { to { transform:rotate(360deg); } } @keyframes tree-pulse { 50% { opacity:.35; transform:scale(.8); } }
 /* Keep the running ring: it is an operational status indicator, not decoration. */
@@ -1712,26 +1893,26 @@ html.dark .node-icon.is-working::before { border-top-color:#93b9f7; border-right
   .tree-row-wrap { min-height:44px; }
   .tree-node-main { min-height:44px; }
   .tree-touch-more { display:grid; width:44px; height:44px; flex:0 0 44px; place-items:center; border:0; border-radius:8px; background:transparent; color:inherit; font-size:14px; }
-  .tree-touch-more:focus-visible { outline:2px solid #007aff; outline-offset:-3px; }
-  .tree-touch-more:active { background:rgba(127,127,127,.12); }
+  .tree-touch-more:focus-visible { outline:2px solid var(--ob-blue); outline-offset:-3px; }
+  .tree-touch-more:active { background:var(--ob-selected); }
 }
 </style>
 
 <style>
 .tree-menu-shield { position:fixed; inset:0; z-index:3200; background:transparent; }
-.tree-context-menu { font-family:inherit; font-size:12px; font-weight:400; line-height:1.4; position:fixed; width:min(194px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:auto; padding:5px; border:1px solid rgba(0,0,0,.11); border-radius:10px; background:rgba(250,250,250,.97); color:#27272a; box-shadow:0 16px 42px rgba(15,23,42,.2),0 4px 12px rgba(15,23,42,.08); backdrop-filter:blur(18px) saturate(1.3); }
+.tree-context-menu { font-family:inherit; font-size:12px; font-weight:400; line-height:1.4; position:fixed; width:min(194px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:auto; padding:5px; border:1px solid rgb(var(--ob-border-rgb) / .11); border-radius:10px; background:rgb(var(--ob-surface-raised-rgb) / .97); color:var(--ob-text); box-shadow:var(--ob-shadow-popover); backdrop-filter:blur(18px) saturate(1.3); }
 .tree-context-menu button { font:inherit; display:grid; grid-template-columns:16px 1fr; align-items:center; gap:7px; width:100%; min-height:28px; padding:4px 8px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 @media (max-width:760px), (hover:none) and (pointer:coarse) {
   .tree-context-menu { max-height:calc(var(--mobile-viewport-height, 100dvh) - 16px); }
   .tree-context-menu button { min-height:44px; }
 }
-.tree-context-menu button:hover:not(:disabled) { background:#2563eb; color:white; }.tree-context-menu button:disabled { opacity:.38; cursor:not-allowed; }.tree-context-menu button.danger { color:#dc2626; }.tree-context-menu button.danger:hover:not(:disabled) { background:#dc2626; color:white; }
-.tree-context-menu hr { height:1px; margin:5px 7px; border:0; background:rgba(161,161,170,.28); }
+.tree-context-menu button:hover:not(:disabled) { background:var(--ob-blue); color:var(--ob-text-inverse); }.tree-context-menu button:disabled { opacity:.38; cursor:not-allowed; }.tree-context-menu button.danger { color:var(--ob-danger); }.tree-context-menu button.danger:hover:not(:disabled) { background:var(--ob-danger); color:var(--ob-text-inverse); }
+.tree-context-menu hr { height:1px; margin:5px 7px; border:0; background:var(--ob-hover); }
 .impact-copy { color:var(--el-text-color-secondary); font-size:12px; line-height:1.65; }
 .move-archive-options { display:grid; gap:10px; margin-top:16px; padding-top:14px; border-top:1px solid var(--el-border-color-lighter); }
 .move-archive-options .el-checkbox { height:auto; font-family:inherit; }
 .move-archive-options .el-checkbox__label { font-size:13px; line-height:1.6; font-weight:500; }
 .move-archive-options p { margin:2px 0 0 22px; font-size:12px; line-height:1.6; color:var(--el-text-color-secondary); }
 .folder-picker { max-height:330px; overflow:auto; margin-top:10px; padding:5px; border:1px solid var(--el-border-color-light); border-radius:9px; }.folder-picker button { display:flex; width:100%; align-items:center; gap:7px; padding:7px 9px; border:0; border-radius:7px; background:transparent; color:var(--el-text-color-primary); text-align:left; cursor:pointer; }.folder-picker button:hover:not(:disabled),.folder-picker button.selected { background:var(--el-color-primary-light-9); color:var(--el-color-primary); }.folder-picker button:disabled { opacity:.35; cursor:not-allowed; }.folder-picker span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
-html.dark .conversation-tree { color:#d4d4d8; } html.dark .tree-tool:hover,html.dark .tree-tool:focus-visible,html.dark .tree-node-main:hover { background:rgba(63,63,70,.58); color:#fafafa; } html.dark .tree-search { border-color:#3f3f46; background:rgba(24,24,27,.8); } html.dark .tree-search input { color:#f4f4f5; } html.dark .tree-node-main.is-folder-target { background:rgba(161,161,170,.13); color:#f4f4f5; } html.dark .tree-node-main.is-chat-active { background:rgba(59,130,246,.14); color:#bfdbfe; } html.dark .tree-placeholder { background:rgba(63,63,70,.42); } html.dark .tree-context-menu { border-color:rgba(255,255,255,.12); background:rgba(39,39,42,.97); color:#f4f4f5; }
+
 </style>

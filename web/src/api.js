@@ -20,6 +20,8 @@ function unwrap(response) {
 
 export const Api = {
   authSession: () => api.get("/auth/session").then(unwrap),
+  authSessions: () => api.get("/auth/sessions").then(unwrap),
+  revokeAuthSession: (sessionId) => api.delete(`/auth/sessions/${encodeURIComponent(sessionId)}`).then(unwrap),
   loginStart: (secret) => api.post("/auth/login/start", { secret }).then(unwrap),
   loginStatus: (requestUuid) => api.get(`/auth/login/status/${requestUuid}`).then(unwrap),
   consumeLogin: (requestUuid) => api.post(`/auth/login/consume/${requestUuid}`).then(unwrap),
@@ -30,6 +32,7 @@ export const Api = {
   updateConversationDefaults: (data = {}) => api.patch("/conversations/defaults", data).then(unwrap),
   createConversation: (data = {}) => api.post("/conversations", data).then(unwrap),
   updateConversation: (uuid, data = {}) => api.patch(`/conversations/${encodeURIComponent(uuid)}`, data).then(unwrap),
+  generateConversationTitle: (uuid) => api.post(`/conversations/${encodeURIComponent(uuid)}/title/generate`, {}, { timeout: 0 }).then(unwrap),
   setConversationArchived: (uuid, archived) => api.patch(`/conversations/${encodeURIComponent(uuid)}`, { archived: Boolean(archived) }).then(unwrap),
   reorderConversation: (uuid, data = {}) => api.post(`/conversations/${encodeURIComponent(uuid)}/reorder`, data).then(unwrap),
   duplicateConversation: (uuid, data = {}) => api.post(`/conversations/${encodeURIComponent(uuid)}/duplicate`, data, { timeout: 120000 }).then(unwrap),
@@ -58,6 +61,9 @@ export const Api = {
   deleteConversationTurnSuffix: (uuid, turnUuid) => api.delete(`/conversations/${encodeURIComponent(uuid)}/turns/${encodeURIComponent(turnUuid)}/suffix`).then(unwrap),
   uploadConversationFiles: (uuid, files, options = {}) => uploadFilesViaHttp(api, uuid, files, options),
   conversationState: (uuid, params = {}, options = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/state`, { params, signal: options.signal }).then(unwrap),
+  messageVisibility: (uuid) => api.get(`/conversations/${encodeURIComponent(uuid)}/message-visibility`).then(unwrap),
+  updateMessageVisibility: (uuid, data) => api.put(`/conversations/${encodeURIComponent(uuid)}/message-visibility`, data).then(unwrap),
+  hiddenMessagePreview: (uuid, opId) => api.get(`/conversations/${encodeURIComponent(uuid)}/hidden-messages/${encodeURIComponent(opId)}`).then(unwrap),
   conversationOperations: (uuid, params = {}) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations`, { params }).then(unwrap),
   conversationOperationDetail: (uuid, operationId) => api.get(`/conversations/${encodeURIComponent(uuid)}/operations/${encodeURIComponent(operationId)}/detail`).then(unwrap),
   conversationCompaction: (uuid, summaryId) => api.get(`/conversations/${encodeURIComponent(uuid)}/compactions/${encodeURIComponent(summaryId)}`).then(unwrap),
@@ -65,7 +71,8 @@ export const Api = {
   conversationSystemPromptPreview: (uuid) => api.post(`/conversations/${encodeURIComponent(uuid)}/system-prompt/preview`).then(unwrap),
   updateConversationSystemPrompt: (uuid, data) => api.put(`/conversations/${encodeURIComponent(uuid)}/system-prompt`, data).then(unwrap),
   conversationStop: (uuid) => api.post(`/conversations/${encodeURIComponent(uuid)}/stop`).then(unwrap),
-  conversationCancelRetry: (uuid, taskUuid = "") => api.post(`/conversations/${encodeURIComponent(uuid)}/retry/cancel`, taskUuid ? { taskUuid } : {}).then(unwrap),
+  conversationCancelRetry: (uuid, waitId, taskUuid = "") => api.post(`/conversations/${encodeURIComponent(uuid)}/retry/cancel`, { waitId, ...(taskUuid ? {taskUuid} : {}) }).then(unwrap),
+  conversationRetryNow: (uuid, waitId, taskUuid = "") => api.post(`/conversations/${encodeURIComponent(uuid)}/retry/now`, { waitId, ...(taskUuid ? {taskUuid} : {}) }).then(unwrap),
   answerConversationConfirmation: (uuid, confirmationId, answer = {}) => api.post(`/conversations/${encodeURIComponent(uuid)}/confirmations/${encodeURIComponent(confirmationId)}/answer`, answer).then(unwrap),
   conversationSetContextStrategy: (uuid, strategy) => api.post(`/conversations/${encodeURIComponent(uuid)}/context-strategy`, { strategy }).then(unwrap),
   conversationCompact: (uuid) => api.post(`/conversations/${encodeURIComponent(uuid)}/compact`, {}, {timeout: 0}).then(unwrap),
@@ -110,6 +117,7 @@ export const Api = {
   renderLogs: (params = {}) => api.get("/memory/render-logs", { params }).then(unwrap),
   renderLog: (id) => api.get(`/memory/render-logs/${id}`).then(unwrap),
   auditLogs: (params = {}) => api.get("/audit-logs", { params }).then(unwrap),
+  statistics: (params = {}) => api.get("/statistics", { params }).then(unwrap),
 
   systemRestart: (data = {}) => api.post("/system/restart", data).then(unwrap),
   systemVersion: () => api.get("/system/version").then(unwrap),
@@ -133,9 +141,10 @@ export const Api = {
 
   settingsSpecs: () => api.get("/settings/specs").then(unwrap),
   settings: () => api.get("/settings").then(unwrap),
-  updateSetting: (path, value) => api.patch(`/settings/${encodeURIComponent(path)}`, { value }).then(unwrap),
+  updateSetting: (path, value) => api.patch(`/settings/${encodeURIComponent(path)}`, { value }, { timeout: path.startsWith('browser.') ? 130000 : undefined }).then(unwrap),
   previewSettingPrompt: (path, value, variables = {}) => api.post("/settings/prompt-preview", { path, value, variables }).then(unwrap),
   testWebTaskNotification: () => api.post("/settings/web-task-notifications/test").then(unwrap),
+  testBrowserConnection: (endpoint) => api.post("/settings/browser/test", { endpoint }, { timeout: 130000 }).then(unwrap),
 
   channels: () => api.get("/channels").then(unwrap),
   channel: (name) => api.get(`/channels/${encodeURIComponent(name)}`).then(unwrap),

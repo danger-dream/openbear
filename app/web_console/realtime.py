@@ -13,8 +13,8 @@ from typing import Any
 
 from aiohttp import WSMsgType, web
 
-from app.web_console.core import _WEB_SESSION_KEY
 from app.reference_policy import CONVERSATION_CONTENT_LIMIT, catalog_history_sizes
+from app.web_console.core import _WEB_SESSION_KEY
 
 
 def catalog_preview(value: str) -> str:
@@ -45,12 +45,13 @@ def read_catalog(
         seq = int(
             conn.execute("SELECT COALESCE(MAX(seq),0) FROM web_catalog_changes").fetchone()[0]
         )
-        revisions = {
-            f"{r['kind']}:{r['entity_id']}": int(r["revision"])
-            for r in conn.execute(
-                "SELECT kind,entity_id,MAX(seq) AS revision FROM web_catalog_changes GROUP BY kind,entity_id"
-            )
-        }
+        revisions: dict[str, int] = {}
+        for row in conn.execute(
+            "SELECT kind,entity_id,MAX(seq) AS revision FROM web_catalog_changes GROUP BY kind,entity_id"
+        ):
+            kind = "chat" if str(row["kind"]) == "chat-content" else str(row["kind"])
+            key = f"{kind}:{row['entity_id']}"
+            revisions[key] = max(revisions.get(key, 0), int(row["revision"]))
         items: dict[str, dict] = {}
         for kind, table, name, title in [
             ("mem", "memory_entries", "ref", "title"),
@@ -116,14 +117,17 @@ def read_catalog(
         # SQLite function; re-registering while a statement is active fails once
         # the catalog has at least three conversations. Keep the same snapshot.
         for row in conn.execute(
-            """SELECT conversation_uuid,title,folder_uuid,archived_at,updated_at
+            """SELECT conversation_uuid,title,folder_uuid,archived_at,updated_at,reference_revision
                 FROM web_conversations WHERE owner_chat_id=? ORDER BY id DESC""",
             (owner,),
         ).fetchall():
             if row["archived_at"] and not include_archived:
                 continue
             key = "chat:" + row["conversation_uuid"]
-            sizes = catalog_history_sizes(conn, row["conversation_uuid"], length_cache)
+            sizes = catalog_history_sizes(
+                conn, row["conversation_uuid"], length_cache,
+                revision=int(row["reference_revision"] or 0),
+            )
             items[key] = {
                 "bodyChars": sizes["bodyChars"],
                 "recentTurnChars": sizes["recentTurnChars"],
@@ -314,7 +318,7 @@ class GlobalRealtime:
         while not self._stopping:
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             # Python 3.11 wait_for can swallow cancellation when Event.wait
             # completes at the same time. The stop state remains authoritative.
@@ -349,6 +353,14 @@ class GlobalRealtime:
             calibration = time.monotonic() - self.last_calibration >= 2
             if latest == self.last_cursor and not calibration:
                 return
+            tree_changed = calibration or self.last_cursor < 0
+            if latest != self.last_cursor and not tree_changed:
+                cur = await self.owner.db.conn.execute(
+                    """SELECT 1 FROM web_catalog_changes
+                       WHERE seq>? AND kind IN ('chat','folder') LIMIT 1""",
+                    (self.last_cursor,),
+                )
+                tree_changed = await cur.fetchone() is not None
             self.last_cursor, self.last_calibration = latest, time.monotonic()
             version = await self.version()
             catalogs, statuses = {}, {}
@@ -367,9 +379,9 @@ class GlobalRealtime:
                     ]
                     removed = [key for key in state["items"] if key not in current]
                     state["items"], state["cursor"] = current, cursor
-                if owner not in statuses:
+                if tree_changed and owner not in statuses:
                     statuses[owner] = await self.owner._tree_running_state(owner)
-                status = statuses[owner]
+                status = statuses.get(owner, state["status"])
                 # The status endpoint's timestamp is diagnostic, not a change.
                 same_status = {
                     k: v
@@ -433,7 +445,7 @@ class WebAdminRealtimeMixin:
                     return
                 try:
                     packet = await asyncio.wait_for(queue.get(), 20)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     packet = {"type": "ping"}
                 await ws.send_json(packet)
                 if packet.get("type") == "reconnect":

@@ -1,14 +1,14 @@
-.reference-chip{display:inline-flex;align-items:baseline;gap:4px;max-width:min(310px,90vw);padding:1px 6px;border:1px solid rgba(74,105,143,.22);border-radius:6px;background:rgba(78,116,165,.075);color:#365a83;font-family:inherit;font-size:.91em;font-weight:500;line-height:1.45;vertical-align:baseline;white-space:nowrap;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+.reference-chip{display:inline-flex;align-items:baseline;gap:4px;max-width:min(310px,90vw);padding:1px 6px;border:1px solid rgb(var(--ob-blue-rgb) / .22);border-radius:6px;background:var(--ob-blue-soft);color:var(--ob-blue);font-family:inherit;font-size:.91em;font-weight:500;line-height:1.45;vertical-align:baseline;white-space:nowrap;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .reference-chip__icon{align-self:center;flex:none;width:13px;height:13px}
 .reference-chip__label{display:inline-block;overflow:hidden;text-overflow:ellipsis;max-width:240px;vertical-align:bottom}
 .reference-chip__scope{font-size:.83em;font-weight:400;opacity:.75}
-.reference-chip:hover{background:rgba(78,116,165,.13)}
-.reference-chip:focus-visible{outline:2px solid rgba(59,130,246,.5);outline-offset:2px}
-.reference-chip--secret{color:#966323;border-color:rgba(165,115,45,.28);background:rgba(184,132,56,.07)}
-.reference-capsule.is-invalid .reference-chip{color:#b45353;border-color:rgba(180,83,83,.4);text-decoration:line-through}
-.reference-editor .ProseMirror-selectednode .reference-chip{outline:2px solid rgba(59,130,246,.55);outline-offset:1px}
-html.dark .reference-chip{color:#afc8e8;border-color:rgba(147,179,218,.28);background:rgba(133,174,228,.11)}
-html.dark .reference-chip:hover{background:rgba(133,174,228,.18)}
-html.dark .reference-chip--secret{color:#e0bb78;border-color:rgba(214,172,97,.32);background:rgba(184,132,56,.11)}
-html.dark .reference-capsule.is-invalid .reference-chip{color:#e69a9a}
+.reference-chip:hover{background:rgb(var(--ob-blue-rgb) / .13)}
+.reference-chip:focus-visible{outline:2px solid rgb(var(--ob-blue-rgb) / .5);outline-offset:2px}
+.reference-chip--secret{color:var(--ob-warning);border-color:rgb(var(--ob-warning-rgb) / .28);background:rgb(var(--ob-warning-rgb) / .07)}
+.reference-capsule.is-invalid .reference-chip{color:var(--ob-danger);border-color:rgb(var(--ob-danger-rgb) / .4);text-decoration:line-through}
+.reference-editor .ProseMirror-selectednode .reference-chip{outline:2px solid rgb(var(--ob-blue-rgb) / .55);outline-offset:1px}
+
+
+
+
 @media(max-width:640px){.reference-chip{max-width:calc(100vw - 76px)}.reference-chip__label{max-width:190px}}

@@ -27,9 +27,10 @@ test("shared logo renders the approved raster artwork with accessible name and u
   assert.match(html, /alt="OpenBear"/);
   assert.match(html, /draggable="false"/);
   const src = html.match(/src="([^"]+)"/)[1];
-  assert.match(src, /^\/assets\/brand\/openbear-[a-f0-9]{12}\.png$/);
+  assert.match(src, /^\/assets\/brand\/openbear-transparent-[a-f0-9]{12}\.png$/);
   assertPngSize(asset(src), 512);
-  assert.deepEqual(asset(src), asset("/icons/openbear-512.png"), "web and installed app use identical artwork");
+  assert.equal(asset(src)[25], 6, "the UI logo is RGBA so its surroundings can follow the theme");
+  assert.deepEqual(asset("/assets/brand/openbear-d32cdfb09c17.png"), asset("/icons/openbear-512.png"), "the original and installed-app artwork remain unchanged");
   assert.match(descriptor.styles[0].content, /object-fit:\s*contain/);
   assert.doesNotMatch(source, /<svg|🐻/);
 });

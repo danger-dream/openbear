@@ -6,6 +6,7 @@ import {createOutboundSendTracker, probeSocket, restoreOutboundDraft, waitForSoc
 import {referenceDisplayText, referenceErrorText, referenceToken, referenceKey, referencesInText} from "../../references/codec.js";
 import {createOperationFrameBuffer} from './operationFrameBuffer.js';
 import {createAttachmentDraftStorage} from './attachmentDraftStorage.js';
+import {initialConversationTitle} from '../../conversationTitle.js';
 import {createMemoryAttachmentDraftDriver} from './attachmentDraftMemoryDriver.mjs';
 
 // Run the actual ConsoleView submission/recovery functions, not a second model
@@ -72,10 +73,10 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     createOutboundSendTracker: (options) => createOutboundSendTracker({...options, ...timer}),
     probeSocket: (socket) => probeSocket(socket, timer),
     waitForSocketOpen: (socket) => waitForSocketOpen(socket, timer),
-    restoreOutboundDraft, referenceDisplayText, referenceErrorText, referencesInText, referenceCatalog: {ready:true,connected:true},
+    restoreOutboundDraft, referenceDisplayText, referenceErrorText, referencesInText, initialConversationTitle, referenceCatalog: {ready:true,connected:true},
     props, composer: {value: null},
     attachmentRestoring: {value: false},
-    compacting: {value: false}, sendPending: {value: false}, running: {value: false},
+    compacting: {value: false}, modelMutating: {value: false}, sendPending: {value: false}, running: {value: false},
     draft: {value: "original message"}, pendingAttachments: {value: []}, attachmentPreviews: {value: {}},
     messages: {value: []}, lastStats: {value: null}, foregroundRunning: {value: false}, rootTurnRunning: {value: false},
     runStartedAt: {value: 0}, status: {value: "就绪"}, lastFrameSeq: {value: 10},
@@ -125,6 +126,19 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     },
   };
 }
+
+test('an in-flight model source save blocks the next send until the saved source is authoritative',async()=>{
+  const h=harness();
+  h.context.modelMutating.value=true;
+  assert.equal(h.run('canSend.value'),false);
+  await h.run('send()');
+  assert.equal(h.sends().length,0);
+  assert.equal(h.context.draft.value,'original message');
+  h.context.modelMutating.value=false;
+  assert.equal(h.run('canSend.value'),true);
+  await h.run('send()');
+  assert.equal(h.sends().length,1);
+});
 
 test('one accepted send uses only one parent directory-refresh path, never component plus global notification',async()=>{
   const h=harness(),componentEvents=[],globalEvents=[];
@@ -239,7 +253,7 @@ test("actual duplicate Enter/click is blocked while a request awaits ACK", async
   assert.equal(h.context.draft.value, "second");
   const events = [];
   const enterContext = vm.createContext({props: {canSend: false}, emit: (event) => events.push(event)});
-  vm.runInContext(between("function handleKeydown(", "onMounted(", composer), enterContext);
+  vm.runInContext(between("function handleKeydown(", "function onComposerKeydownCapture(", composer), enterContext);
   vm.runInContext("handleKeydown({key:'Enter',preventDefault(){}})", enterContext);
   assert.deepEqual(events, []);
   enterContext.props.canSend = true;

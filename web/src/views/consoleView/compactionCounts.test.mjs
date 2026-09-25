@@ -10,7 +10,12 @@ for (const status of ["running", "failed", "completed"]) {
     assert.equal(view.removedBatches, null);
     assert.equal(view.retainedBatches, null);
     assert.doesNotMatch(view.output, /移出|保留 \d+ 组/);
-    assert.doesNotMatch(view.cardPreview, /移出|上下文估算/);
+    assert.doesNotMatch(view.cardPreview, /移出|保留 \d+ 组/);
+    if (status === "completed") assert.equal(view.cardPreview, "23.79k → 未记录");
+    else {
+      assert.match(view.cardPreview, /23,792/);
+      assert.match(view.cardPreview, /估算/);
+    }
     assert.match(view.output, /23,792/);
   });
 }
@@ -25,7 +30,8 @@ test("failed selection never describes candidate counts as committed removal", (
 
 test("completed selection distinguishes measured zero from missing or malformed counts", () => {
   const valid = contextCompactionView({...base, status: "completed", removedBatches: 0, retainedBatches: 5});
-  assert.match(valid.output, /移出 0 组 · 保留 5 组完整记录/);
+  assert.doesNotMatch(valid.output, /移出|保留 \d+ 组/);
+  assert.match(valid.cardPreview, /未记录 → 未记录/);
   assert.equal(valid.removedBatches, 0);
   assert.equal(valid.retainedBatches, 5);
   for (const value of [undefined, null, "", "not-a-count", -1, 1.5, false]) {
@@ -33,6 +39,27 @@ test("completed selection distinguishes measured zero from missing or malformed 
     assert.equal(view.removedBatches, null);
     assert.doesNotMatch(view.output, /移出|保留 \d+ 组/);
   }
+});
+
+test("window preview distinguishes known zero from missing tokens and never presents failed candidates as applied", () => {
+  const complete = contextCompactionView({...base, status:"completed", beforeEstimateTokens:1000, afterEstimateTokens:0});
+  assert.equal(complete.cardPreview, "1k → 0");
+  const roundTrip = contextCompactionView({...complete, name:"ContextCompaction"});
+  assert.equal(roundTrip.cardPreview,complete.cardPreview);
+  const running = contextCompactionView({...base,status:"running",beforeEstimateTokens:1000});
+  assert.match(running.cardPreview,/1,000 → 处理中/);
+  const failed = contextCompactionView({...base,status:"failed",beforeEstimateTokens:1000,afterEstimateTokens:42});
+  assert.match(failed.cardPreview,/原上下文估算：1,000 Tokens/);
+  assert.doesNotMatch(failed.cardPreview,/→|42/);
+});
+
+test("completed window preview uses compact tokens while details retain exact estimates", () => {
+  const view = contextCompactionView({...base, status:"completed", beforeEstimateTokens:270071, afterEstimateTokens:38056, durationMs:600});
+  assert.equal(view.cardPreview, "270.07k → 38.06k · 0.6s");
+  assert.doesNotMatch(view.cardPreview, /滑动窗口|Tokens|估算/);
+  assert.match(view.output, /Tokens（估算）：270,071 → 38,056/);
+  assert.equal(view.afterEstimateTokens, 38056);
+  assert.equal(contextCompactionView({...base, beforeEstimateTokens:3800, afterEstimateTokens:999}).cardPreview, "3.8k → 999");
 });
 
 test("Agent compression failure replaces running card without fake zero counts", () => {

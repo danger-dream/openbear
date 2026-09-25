@@ -302,6 +302,7 @@ async def test_resending_after_artifact_deletion_still_provides_a_live_url(web_e
     await web_env.db.conn.commit()
     public = await web_env.server._web_media_attachments_public(row, media, turn_uuid="resend")
     assert public[0]["artifactUuid"] != original_id
+    assert "workspacePath" not in public[0]  # uploads have a download URL, not a shared workspace path
     assert (await web_env.client.get(public[0]["downloadUrl"])).status == 200
 
 

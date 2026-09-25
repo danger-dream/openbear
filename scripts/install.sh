@@ -798,6 +798,9 @@ prepare_release_dependencies() {
         PYTHONPATH="$stage" "$stage/.venv/bin/python" -c \
             'import aiogram, aiohttp, aiosqlite, httpx, pydantic, yaml'
     ) || return 1
+    if [[ -f "$stage/scripts/install_browser_worker.py" ]]; then
+        python3 "$stage/scripts/install_browser_worker.py" --if-enabled --root "$stage" --config "$INSTALL_DIR/openbear.json" || return 1
+    fi
     # venv 会整体搬到正式 .venv；修正 console script/activate 中的绝对 staging 路径。
     _OB_STAGE_VENV="$stage/.venv" _OB_FINAL_VENV="$INSTALL_DIR/.venv" python3 - <<'PY' || return 1
 import os
@@ -1491,6 +1494,9 @@ main() {
         return 0
     fi
     sync_python
+    if [[ -n "${INSTALL_DIR:-}" && -f "${INSTALL_DIR:-}/scripts/install_browser_worker.py" ]]; then
+        python3 "$INSTALL_DIR/scripts/install_browser_worker.py" --if-enabled --root "$INSTALL_DIR" || die "浏览器 Python worker 资源校验失败"
+    fi
     build_web
     write_runtime
     write_service

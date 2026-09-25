@@ -240,7 +240,7 @@ function onMarkdownClick(event) {
 .bear-md :deep(h3),
 .bear-md :deep(h4) {
 	margin: 0.9rem 0 0.45rem;
-	color: #111827;
+	color: var(--ob-text-strong);
 	font-weight: 760;
 	line-height: 1.35;
 }
@@ -264,6 +264,8 @@ function onMarkdownClick(event) {
 .bear-md {
 	min-width: 0;
 	max-width: 100%;
+	/* A long URL has no natural breakpoints; keep it inside the message bubble. */
+	overflow-wrap: anywhere;
 }
 
 .bear-md :deep(.md-live-caret) {
@@ -304,7 +306,7 @@ function onMarkdownClick(event) {
 	margin: 0.7rem 0;
 	border-radius: 14px;
 	object-fit: contain;
-	box-shadow: 0 14px 34px rgba(15, 23, 42, 0.12);
+	box-shadow: var(--ob-shadow-panel);
 	cursor: zoom-in;
 }
 
@@ -327,37 +329,37 @@ function onMarkdownClick(event) {
 
 .bear-md :deep(th),
 .bear-md :deep(td) {
-	border: 1px solid #e5e7eb;
+	border: 1px solid var(--ob-border);
 	padding: 0.42rem 0.55rem;
 	vertical-align: top;
 	line-height: 1.55;
 }
 
 .bear-md :deep(th) {
-	background: #f8fafc;
-	color: #334155;
+	background: var(--ob-surface-soft);
+	color: var(--ob-text);
 	font-weight: 740;
 	white-space: nowrap;
 }
 
 .bear-md :deep(td) {
-	background: #fff;
-	color: #374151;
+	background: var(--ob-surface);
+	color: var(--ob-text);
 }
 
 .bear-md :deep(tr:nth-child(even) td) {
-	background: #fcfcfd;
+	background: var(--ob-bg);
 }
 
 .bear-md :deep(hr) {
 	margin: 0.95rem 0;
 	border: 0;
-	border-top: 1px solid #e5e7eb;
+	border-top: 1px solid var(--ob-border);
 }
 
 .bear-md :deep(.hljs) {
 	background: transparent;
-	color: #24292f;
+	color: var(--ob-text);
 	padding: 0;
 }
 
@@ -378,10 +380,10 @@ function onMarkdownClick(event) {
 	max-width: none;
 	overflow: auto;
 	border-radius: 9px;
-	background: #f8fafc;
+	background: var(--ob-code-bg);
 	padding: 0.85rem;
-	border: 1px solid #eef2f7;
-	color: #24292f;
+	border: 1px solid var(--ob-border);
+	color: var(--ob-text);
 	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 	font-size: 13.5px;
 	line-height: 1.62;
@@ -390,9 +392,9 @@ function onMarkdownClick(event) {
 
 .bear-md :deep(code) {
 	border-radius: 5px;
-	background: #f3f4f6;
+	background: var(--ob-code-bg);
 	padding: 0.1rem 0.3rem;
-	color: #24292f;
+	color: var(--ob-text);
 	font-size: 0.9em;
 }
 
@@ -409,9 +411,9 @@ function onMarkdownClick(event) {
 	position: relative;
 	margin: 0.75rem 0;
 	overflow: hidden;
-	border: 1px solid #eef2f7;
+	border: 1px solid var(--ob-border);
 	border-radius: 9px;
-	background: #f8fafc;
+	background: var(--ob-code-bg);
 }
 
 .bear-md :deep(.md-code-head) {
@@ -421,7 +423,7 @@ function onMarkdownClick(event) {
 	gap: .75rem;
 	background: transparent;
 	padding: .32rem .5rem .18rem;
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 	font-size: 10px;
 	font-weight: 560;
 }
@@ -431,7 +433,7 @@ function onMarkdownClick(event) {
 	border-radius: 6px;
 	background: transparent;
 	padding: .1rem .3rem;
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 	font-size: 10px;
 	font-weight: 560;
 	cursor: pointer;
@@ -440,14 +442,14 @@ function onMarkdownClick(event) {
 }
 
 .bear-md :deep(.md-code-copy:hover) {
-	background: #eef2f7;
-	color: #475569;
+	background: var(--ob-hover);
+	color: var(--ob-text);
 	opacity: 1;
 }
 
 .bear-md :deep(.md-code-copy.copied) {
-	background: #f0fdf4;
-	color: #15803d;
+	background: var(--ob-success-soft);
+	color: var(--ob-success);
 	opacity: 1;
 }
 
@@ -455,12 +457,12 @@ function onMarkdownClick(event) {
 	margin: 0;
 	border: 0;
 	border-radius: 0;
-	background: #f8fafc;
+	background: var(--ob-code-bg);
 	padding-top: .45rem;
 }
 
 .bear-md :deep(a) {
-	color: #2563eb;
+	color: var(--ob-blue);
 	text-decoration: underline;
 	text-underline-offset: 3px;
 }
@@ -497,9 +499,9 @@ function onMarkdownClick(event) {
 
 .bear-md :deep(blockquote) {
 	margin: 0.75rem 0;
-	border-left: 3px solid #d1d5db;
+	border-left: 3px solid var(--ob-border);
 	padding-left: 0.8rem;
-	color: #4b5563;
+	color: var(--ob-text);
 }
 
 .bear-md :deep(pre::-webkit-scrollbar) {
@@ -514,12 +516,12 @@ function onMarkdownClick(event) {
 
 .bear-md :deep(pre::-webkit-scrollbar-thumb) {
 	border-radius: 999px;
-	background: #cbd5e1;
+	background: var(--ob-scrollbar);
 }
 
 .bear-md :deep(.md-table-scroll::-webkit-scrollbar-thumb) {
 	border-radius: 999px;
-	background: #cbd5e1;
+	background: var(--ob-scrollbar);
 }
 
 .bear-md :deep(pre::-webkit-scrollbar-track) {
@@ -529,81 +531,4 @@ function onMarkdownClick(event) {
 .bear-md :deep(.md-table-scroll::-webkit-scrollbar-track) {
 	background: transparent;
 }
-</style>
-
-<style>
-/* OpenBear system dark theme */
-html.dark .bear-md h1,
-html.dark .bear-md h2,
-html.dark .bear-md h3,
-html.dark .bear-md h4 {
-		color: #efeff2;
-	}
-html.dark .bear-md img {
-		box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16);
-	}
-html.dark .bear-md th,
-html.dark .bear-md td {
-		border: 1px solid #3d3e46;
-	}
-html.dark .bear-md th {
-		background: #1d1e22;
-		color: #dedee1;
-	}
-html.dark .bear-md td {
-		background: #1d1e22;
-		color: #dedee1;
-	}
-html.dark .bear-md :deep(tr:nth-child(even) td) {
-		background: #1d1e22;
-	}
-html.dark .bear-md hr {
-		border-top: 1px solid #3d3e46;
-	}
-html.dark .bear-md .hljs {
-		color: #dedee1;
-	}
-html.dark .bear-md pre {
-		background: #1d1e22;
-		border: 1px solid #3d3e46;
-		color: #dedee1;
-	}
-html.dark .bear-md code {
-		background: #202125;
-		color: #dedee1;
-	}
-html.dark .bear-md .md-code-block {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-html.dark .bear-md .md-code-head {
-		color: #a1a1a8;
-	}
-html.dark .bear-md .md-code-copy {
-		color: #a1a1a8;
-	}
-html.dark .bear-md .md-code-copy:hover {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .bear-md .md-code-copy.copied {
-		background: #202125;
-		color: #6ee7a2;
-	}
-html.dark .bear-md .md-code-block pre {
-		background: #1d1e22;
-	}
-html.dark .bear-md a {
-		color: #60a5fa;
-	}
-html.dark .bear-md blockquote {
-		border-left: 3px solid #3d3e46;
-		color: #c6c6cd;
-	}
-html.dark .bear-md pre::-webkit-scrollbar-thumb {
-		background: #2b2c30;
-	}
-html.dark .bear-md .md-table-scroll::-webkit-scrollbar-thumb {
-		background: #2b2c30;
-	}
 </style>

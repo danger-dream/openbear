@@ -17,15 +17,13 @@ defineEmits(["retry"]);
 </template>
 
 <style scoped>
-.lazy-view-state { display: grid; flex: 1; min-height: 140px; min-width: 0; place-items: center; padding: 24px; color: #71717a; }
-.lazy-view-card { width: min(100%, 380px); padding: 22px; border: 1px solid #e5e5ea; border-radius: 12px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
-strong { color: #3f3f46; font-size: 14px; font-weight: 600; }
+.lazy-view-state { display: grid; flex: 1; min-height: 140px; min-width: 0; place-items: center; padding: 24px; color: var(--ob-text-subtle); }
+.lazy-view-card { width: min(100%, 380px); padding: 22px; border: 1px solid var(--ob-border); border-radius: 12px; background: var(--ob-surface); box-shadow: 0 1px 3px rgb(var(--ob-shadow-rgb) / .04); }
+strong { color: var(--ob-text-strong); font-size: 14px; font-weight: 600; }
 p { margin: 8px 0 0; font-size: 13px; line-height: 1.65; }
-button { margin-top: 16px; min-height: 36px; border: 1px solid #d4d4d8; border-radius: 8px; padding: 6px 14px; background: #fafafa; color: #3f3f46; font-size: 13px; }
-button:hover { background: #f4f4f5; }
-button:focus-visible { outline: 2px solid #007aff; outline-offset: 3px; }
-:global(html.dark) .lazy-view-card { border-color: #36363b; background: #232326; }
-:global(html.dark) strong, :global(html.dark) button { color: #e4e4e7; }
-:global(html.dark) button { border-color: #52525b; background: #303034; }
+button { margin-top: 16px; min-height: 36px; border: 1px solid var(--ob-border); border-radius: 8px; padding: 6px 14px; background: var(--ob-surface); color: var(--ob-text); font-size: 13px; }
+button:hover { background: var(--ob-surface-soft); }
+button:focus-visible { outline: 2px solid var(--ob-blue); outline-offset: 3px; }
+
 @media (max-width: 760px), (hover: none) and (pointer: coarse) { button { min-height: 44px; } }
 </style>

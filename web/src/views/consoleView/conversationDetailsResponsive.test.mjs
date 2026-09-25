@@ -108,9 +108,10 @@ test('full long tool arguments/results survive both conversation TurnEvent and w
   const codes = walk(root).filter(n => n.type === 'code' && n.props.innerHTML);
   assert.equal(codes[0].props.innerHTML, escapeHtmlText(JSON.stringify(JSON.parse(args), null, 2)));
   assert.equal(codes[1].props.innerHTML, escapeHtmlText(long('RESULT')));
-  assert.equal(walk(root).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
+  assert.equal(walk(find(root, 'tool-detail')).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
   const work = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, open: true, turnIndex: 0, turn: {id: 'turn', events: [event]}});
   assert.ok(text(work).includes('ARGS-END')); assert.ok(text(work).includes('RESULT-END'));
+  assert.equal(walk(find(work, 'tool-detail')).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
   assert.ok(find(work, 'work-detail-close'));
   assert.equal(find(work, 'work-detail-body').props.tabindex, '0');
   assert.match(sources['TurnList.vue'], /<TurnEvent[\s\S]*?:event="entry\.event"/);
@@ -170,8 +171,28 @@ test('compaction uses full supplied summary, never manufactures absent output', 
   const event = toolEvent(args, '', 'ContextCompaction');
   const root = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, open: true, turn: {events: [event]}});
   assert.ok(text(root).includes('COMPACTION-END'));
+  const detail = find(root, 'tool-detail');
+  assert.equal(walk(detail).filter(n => hasClass(n, 'tool-payload-code')).length, 1, 'compaction output uses the same detail/code frame');
+  assert.equal(find(detail, 'context-detail-section').props['aria-label'], '返回结果');
   const missing = mount(t, 'ConsoleToolEvent.vue', {event: toolEvent('{"strategy":"model_summary","scope":"root"}', '', 'ContextCompaction'), open: true});
   assert.ok(text(missing).includes('摘要正文未记录'));
+});
+
+test('AgentInfo keeps the read-only task list and both full payloads inside the same tool detail', t => {
+  const tasks = Array.from({length: 36}, (_, i) => ({
+    taskUuid: `task-${i}`, agentId: 'agent-fixture', sessionKind: 'independent',
+    title: `指派 ${i}`, status: 'completed',
+  }));
+  const event = toolEvent('{"to":"agent-fixture"}', JSON.stringify({
+    ok: true, agentSession: {agentId: 'agent-fixture', sessionKind: 'independent'}, tasks,
+    extra: long('INFO-RESULT'),
+  }), 'AgentInfo');
+  const root = mount(t, 'ConsoleToolEvent.vue', {event, open: true});
+  const detail = find(root, 'tool-detail');
+  assert.ok(find(detail, 'agent-info-readonly'));
+  assert.equal(walk(find(detail, 'agent-info-tasks')).filter(n => n.type === 'strong').length, tasks.length);
+  assert.equal(walk(detail).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
+  assert.ok(text(detail).includes('INFO-RESULT-END'));
 });
 
 test('opening a referenced compaction replaces its preview with the complete loaded summary', async t => {
@@ -287,7 +308,7 @@ test('phone timeline gives width back to prose and only hides a full-description
   assert.equal(css('AgentActivityList.vue', '.activity-row', desktop)['grid-template-columns'], '48px 12px minmax(0, 1fr)');
 });
 
-test('whole mobile Agent/tool cards and each payload have viewport-aware bounded scroll, including keyboard and landscape', () => {
+test('phone tool detail owns vertical scrolling while Agent cards and other payloads retain their scroll, including keyboard and landscape', () => {
   for (const env of [phone, {...phone, width: 320, mobileHeight: 320}, {...phone, width: 430, mobileHeight: 280}, {...phone, width: 844, mobileHeight: 280}]) {
     for (const [f, sel] of [['AgentEventCard.vue', '.agent-tool-detail'], ['ConsoleToolEvent.vue', '.tool-detail']]) {
       const s = css(f, sel, env); assert.equal(s.overflow, f === 'AgentEventCard.vue' ? 'hidden' : 'auto'); assert.equal(s['box-sizing'], 'border-box');
@@ -305,10 +326,21 @@ test('whole mobile Agent/tool cards and each payload have viewport-aware bounded
     assert.equal(css('AgentEventCard.vue', '.instance-assignment-list', env).overflow, 'visible');
     assert.equal(css('AgentEventCard.vue', '.agent-mobile-toolbar', env).flex, '0 0 auto');
     assert.equal(css('AgentPlanWorkspace.vue', '.plan-state-empty', env).overflow, 'auto');
-    for (const [f, sel] of [['ConsoleToolEvent.vue', '.tool-payload-code'], ['ToolArgumentsView.vue', '.tool-argument-block pre'], ['AgentActivityList.vue', '.activity-compaction-body']]) {
+    const payload = css('ConsoleToolEvent.vue', '.tool-payload-code', env);
+    assert.equal(payload['max-height'], 'none'); assert.equal(payload.overflow, 'visible', 'both axes must stop scrolling, not merely hide scrollbars');
+    assert.equal(css('ConsoleToolEvent.vue', '.tool-payload-code pre', env)['white-space'], 'pre-wrap');
+    assert.equal(css('ConsoleToolEvent.vue', '.tool-payload-code code.hljs', env)['overflow-wrap'], 'anywhere');
+    const tasks = css('ConsoleToolEvent.vue', '.agent-info-tasks', env);
+    assert.equal(tasks['max-height'], 'none'); assert.equal(tasks['overflow-x'], 'visible'); assert.equal(tasks['overflow-y'], 'visible');
+    for (const [f, sel] of [['ToolArgumentsView.vue', '.tool-argument-block pre'], ['AgentActivityList.vue', '.activity-compaction-body']]) {
       const s = css(f, sel, env); assert.equal(s.overflow, 'auto'); assert.ok(px(s['max-height'], env) <= env.mobileHeight * .35 + .01);
     }
   }
+  const desktopCode = css('ConsoleToolEvent.vue', '.tool-payload-code', desktop);
+  assert.equal(desktopCode.overflow, 'auto'); assert.equal(desktopCode['max-height'], 'min(280px, 34vh)');
+  const desktopTasks = css('ConsoleToolEvent.vue', '.agent-info-tasks', desktop);
+  assert.equal(desktopTasks['max-height'], 'min(220px, 28vh)');
+  assert.equal(desktopTasks['overflow-x'], 'hidden'); assert.equal(desktopTasks['overflow-y'], 'auto');
   assert.equal(css('AgentEventCard.vue', '.agent-tab-panel', desktop).height, '450px');
   assert.equal(css('AgentEventCard.vue', '.agent-tool-detail', desktop)['max-height'], undefined);
   assert.equal(css('AgentEventCard.vue', '.agent-tool-detail', desktop).padding, '14px');
@@ -336,6 +368,7 @@ test('work surface follows its parent; phone covers composer, narrow desktop res
       assert.equal(pane.height, 'auto'); assert.equal(pane.inset, '0'); assert.equal(opened.width, '100%');
       assert.equal(pane['z-index'], '50');
       assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-entry', env).display, 'block');
+      assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-entry > .work-event', env).width, '100%', 'work card retains its original full-width reading layout');
     } else if (env.width <= 1280) {assert.equal(pane.height, 'auto'); assert.equal(pane.inset, '0 0 var(--console-composer-height, 135px) auto');}
     const body = css('TurnWorkDetailPanel.vue', '.work-detail-body', env); assert.equal(body.overflow, 'auto'); assert.equal(body['min-height'], '0');
     assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-header', env).flex, '0 0 auto');

@@ -20,6 +20,7 @@ AGENT_DELEGATION_TOOL_NAMES = frozenset({
     "Bash",
     "Process",
     "TaskMemory",
+    "Browser",
 })
 
 # EditBatch is a distinct model-visible tool contract, but it does not grant a

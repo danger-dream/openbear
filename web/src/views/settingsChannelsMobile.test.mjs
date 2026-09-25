@@ -11,6 +11,7 @@ import {parse as parseScript} from '@babel/parser';
 import postcss from 'postcss';
 import draggable from 'vuedraggable';
 import {ElButton} from 'element-plus';
+import {scrollModelListAbove} from '../components/modelDragAutoScroll.js';
 
 const files = ['SettingsHubView.vue', 'ChannelsView.vue'];
 const source = Object.fromEntries(files.map(f => [f, fs.readFileSync(new URL(f, import.meta.url), 'utf8')]));
@@ -40,7 +41,7 @@ function runtime(f, overrides = {}) {
   const script = sfc[f].scriptSetup.content;
   const names = parseScript(script, {sourceType: 'module'}).program.body.flatMap(n => n.type === 'VariableDeclaration' ? n.declarations.map(d => d.id.name) : n.type === 'FunctionDeclaration' ? [n.id.name] : []);
   const props = Vue.reactive({section: 'channels'}), events = [], mounted = [], unmounted = [];
-  const ctx = vm.createContext({ ...Vue, draggable,
+  const ctx = vm.createContext({ ...Vue, draggable, scrollModelListAbove,
     defineProps: () => props, defineEmits: () => (...args) => events.push(args),
     defineLazyView: (_loader, label) => ({name: label, render: () => Vue.h('div', label)}),
     onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn), mobileSlots: {},
@@ -73,13 +74,13 @@ test('settings merges navigation only after its lazy header is ready, preserving
   const appNodes = walk(baseParse(appSfc.template.content).children);
   const shell = appNodes.find(n => hasClass(n, 'app-shell'));
   const expression = shell.props.find(p => p.name === 'bind' && p.arg?.content === 'class').exp.content;
-  const classes = new Function('active', 'settingsHeaderReady', `return (${expression})`);
+  const classes = new Function('active', 'pageHeaderReady', `return (${expression})`);
   assert.equal(classes('settings', false)['is-settings'], false, 'navigation stays available while loading or failed');
   assert.equal(classes('settings', true)['is-settings'], true);
   assert.equal(classes('logs', true)['is-settings'], false);
   const outlet = appNodes.find(n => n.tag === 'component' && n.props.some(p => p.name === 'bind' && p.arg?.content === 'is' && p.exp?.content === 'activeView'));
   const Forwarder = {render() {return Vue.h('div', this.$slots['mobile-navigation']?.());}};
-  const scope = Vue.reactive({active:'settings', activeView:Vue.markRaw(Forwarder), sidebarOpen:false, settingsSection:'channels', settingsHeaderReady:false, handleSettingsSectionChanged(){}});
+  const scope = Vue.reactive({active:'settings', activeView:Vue.markRaw(Forwarder), sidebarOpen:false, settingsSection:'channels', pageHeaderReady:false, handleSettingsSectionChanged(){}});
   const compiled = Vue.compile(outlet.loc.source.replace(/\s+v-else(?=\s)/, ''));
   let tree;
   const rerender = async () => {
@@ -89,7 +90,7 @@ test('settings merges navigation only after its lazy header is ready, preserving
   let rendered = await rerender();
   const navigation = rendered.find(n => n.type === 'button' && classHas(n, 'mobile-sidebar-toggle'));
   assert.ok(navigation); navigation.props.onClick(); assert.equal(scope.sidebarOpen, true);
-  tree.props.onMobileHeaderReady(true); assert.equal(scope.settingsHeaderReady, true);
+  tree.props.onMobileHeaderReady(true); assert.equal(scope.pageHeaderReady, true);
   rendered = await rerender();
   assert.equal(rendered.find(n => n.type === 'button').props['aria-expanded'], true);
   const r = runtime(settings, {mobileSlots:{'mobile-navigation':() => [Vue.h('button', {'aria-label':'导航测试'}, '导航')]}});
@@ -192,13 +193,13 @@ test('drag handle owns a nonoverlapping touch cell and real Sortable registers t
   } finally { if (oldDocument) Object.defineProperty(globalThis, 'document', oldDocument); else delete globalThis.document; }
 });
 
-test('compiled native section picker exposes all six existing sections and uses existing route synchronization', async () => {
+test('compiled native section picker exposes every settings section and uses existing route synchronization', async () => {
   const r = runtime(settings);
   let view = await render(settings, r);
   const select = view.nodes.find(n => n.type === 'select');
   assert.equal(select.props['aria-label'], '切换设置分区');
   const options = view.nodes.filter(n => n.type === 'option');
-  assert.deepEqual(options.map(n => n.props.value), ['channels', 'templates', 'agents', 'system-settings', 'logs', 'install-app']);
+  assert.deepEqual(options.map(n => n.props.value), ['channels', 'templates', 'agents', 'system-settings', 'sessions', 'logs', 'install-app']);
   assert.ok(view.html.includes('安装应用 (PWA)'));
   for (const option of options) {
     select.props.onChange({target: {value: option.props.value}}); await Vue.nextTick();
@@ -397,7 +398,20 @@ test('actual Vue + vuedraggable SSR renders every model/card/action in original 
   const {html, nodes} = await render(channels, r);
   const list = nodes.find(n => n.type === draggable && classHas(n, 'model-list-scroll'));
   assert.ok(list); assert.equal(list.props.handle, '.model-drag'); assert.equal(list.props.disabled, false);
+  assert.equal(typeof list.props.onStart, 'function'); assert.equal(typeof list.props.onEnd, 'function');
+  assert.equal(list.props.scroll, true, 'use ancestor discovery until the DOM scroller mounts');
+  assert.equal(list.props['force-auto-scroll-fallback'], true, 'desktop native DnD must use Sortable auto-scroll');
+  assert.equal(list.props['bubble-scroll'], false, 'do not scroll the page behind the model grid');
+  assert.ok(list.props['scroll-sensitivity'] >= 60);
+  assert.ok(list.props['scroll-speed'] > 10);
   assert.equal(list.props.list, r.run('selectedProvider.value.models'));
+  const scrollTarget = {$el: {scrollTop: 620, scrollHeight: 1800, clientHeight: 360}};
+  r.ctx.scrollTarget = scrollTarget;
+  r.run('modelScrollList.value = scrollTarget');
+  const withScroller = await render(channels, r);
+  assert.deepEqual({...withScroller.nodes.find(n => n.type === draggable && classHas(n, 'model-list-scroll')).props.scroll}, scrollTarget.$el,
+    'the draggable grid itself, not the header/window, is the scroll target');
+  assert.equal(css(channels, '.model-list-scroll', 1440)['overflow-y'], 'auto');
   const cards = nodes.filter(n => n.type === 'article' && classHas(n, 'model-card'));
   assert.equal(cards.length, 40);
   assert.deepEqual(cards.map(n => n.key), Array.from({length: 40}, (_, i) => `model-${i}`));

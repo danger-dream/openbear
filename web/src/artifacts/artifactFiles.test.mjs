@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, {afterEach} from "node:test";
-import {artifactFromUrl, artifactFormat, formatFileSize, extractArtifactSummary, decodeArtifactText, artifactRecord, loadArtifactMetadata, loadArtifactText, loadArtifactCard, clearArtifactCache, readingState, SUMMARY_LIMIT, TEXT_PREVIEW_LIMIT} from "./artifactFiles.js";
+import {artifactFromUrl, artifactSharedPath, artifactFormat, formatFileSize, extractArtifactSummary, decodeArtifactText, artifactRecord, loadArtifactMetadata, loadArtifactText, loadArtifactCard, clearArtifactCache, readingState, SUMMARY_LIMIT, TEXT_PREVIEW_LIMIT} from "./artifactFiles.js";
 
 const origin = "https://openbear.test";
 const conversationUuid = "39a541d4-4d9c-4a58-87d6-1b276779954a", artifactUuid = "adfead18-e6d1-40df-8475-391e1245aa0d";
@@ -28,6 +28,19 @@ for (const [fileName, mimeType, kind, language] of [
 	["方案.MD", "text/plain", "markdown", "markdown"], ["log.txt", "text/plain", "text", ""], ["data.json", "application/json", "code", "json"], ["a.yaml", "application/octet-stream", "code", "yaml"], ["script.py", "text/x-python", "code", "python"],
 	["picture.png", "image/png", "image", ""], ["page.html", "text/html", "html", "xml"], ["page.HTM", "application/octet-stream", "html", "xml"], ["mislabeled.png", "text/html", "html", "xml"], ["page.html", "image/png", "html", "xml"], ["picture.svg", "image/png", "code", "xml"], ["innocent.png", "image/svg+xml", "code", "xml"], ["not-a-picture.md", "image/png", "unsupported", ""], ["archive.zip", "application/zip", "unsupported", ""], ["doc.pdf", "application/pdf", "unsupported", ""],
 ]) test(`file classification: ${fileName} / ${mimeType}`, () => assert.deepEqual([artifactFormat({fileName, mimeType}).kind, artifactFormat({fileName, mimeType}).language], [kind, language]));
+
+test("copyable path comes only from validated shared workspace metadata, never the content URL", async () => {
+	const path = "workspace/artifacts/report folder/图.png";
+	assert.equal(artifactSharedPath(metadata({workspacePath: path})), path);
+	for (const unsafe of [undefined, href, "/api/conversations/a/artifacts/b/content", "/data/web_artifacts/blobs/a", "/opt/workspace/artifacts/a", "workspace/artifacts/../private", "workspace/artifacts//x", "workspace/artifacts/a\\b", "workspace/artifacts/x\nsecret"]) {
+		assert.equal(artifactSharedPath(metadata({workspacePath: unsafe})), "", String(unsafe));
+	}
+	const calls = fakeFetch(metadata({fileName: "图.png", mimeType: "image/png", workspacePath: path}));
+	const record = artifactRecord(identity);
+	await loadArtifactCard(record);
+	assert.equal(artifactSharedPath(record.metadata), path);
+	assert.deepEqual(calls.map(call => call.url), [identity.metadataUrl]);
+});
 
 test("missing metadata is a valid loading/error state", () => {
 	assert.equal(artifactFormat(null).kind, "unsupported"); assert.equal(artifactFormat().kind, "unsupported");

@@ -13,9 +13,11 @@ const text = html => html.replace(/<[^>]*>/g, '').trim();
 async function rowHtml(row) {
   const render = new Function('Vue', compile(buttons[row.kind === 'conversation' ? 1 : 0], {mode: 'function', prefixIdentifiers: true}).code)(Vue);
   const icon = {render() { return Vue.h('i', this.$slots.default?.()); }};
-  return renderToString(Vue.createSSRApp({render, components: {ElIcon: icon, InfoFilled: icon, StarFilled: icon},
+  const animated = {props: ['text'], render() {return Vue.h('span', this.text);}};
+  return renderToString(Vue.createSSRApp({render, components: {ElIcon: icon, InfoFilled: icon, StarFilled: icon, AnimatedConversationTitle: animated},
     setup: () => ({row, activeConversationUuid: 'active', selectedFolderId: 'project',
-      running: row => Boolean(row.running || row.status === 'running'), rowLoading: () => false, isExpanded: () => true,
+      running: row => Boolean(row.running || row.status === 'running'), rowLoading: () => false, isTitleGenerating: () => false, isExpanded: () => true,
+      liveConversationTitle: row => row.title || '新会话',
       activityLabel, activateRow() {}, openMenu() {}, locateAndOpen() {},
       ChatLineRound: 'chat-icon', Loading: 'loading-icon', Box: 'box-icon', FolderOpened: 'folder-icon', Folder: 'folder-icon'}),
   }));
@@ -39,21 +41,21 @@ test('completed unread row retains its unread dot without the running animation 
   assert.doesNotMatch(html, /running-leaf|is-working/);
 });
 
-test('ordinary folder has no running badge but keeps count, pin and property indicators', async () => {
+test('configured folder keeps count and pin without running or property badges', async () => {
   const html = await rowHtml({kind: 'folder', folderId: 'project', name: 'Project', runningDescendantCount: 3,
-    conversationCount: 10, pinned: true, hasLocalWorkspace: true});
+    conversationCount: 10, pinned: true, hasLocalWorkspace: true, hasLocalPrompt: true});
   assert.doesNotMatch(html, /running-count|运行中/);
   assert.match(html, /node-count[^>]*>10<\/span>/);
   assert.match(html, /node-star/);
-  assert.match(html, /property-dot/);
+  assert.doesNotMatch(html, /property-dot/);
 });
 
 test('running dot is compact, blue in both themes and breathes without changing geometry', () => {
   const dot = source.match(/^\.running-leaf \{([^}]+)\}/m)[1];
   assert.match(dot, /width:6px; height:6px; flex:0 0 6px/);
-  assert.match(dot, /background:#3b82f6/);
+  assert.match(dot, /background:var\(--ob-blue\)/);
   assert.match(dot, /animation:tree-pulse 1\.8s ease-in-out infinite/);
-  assert.match(source, /:global\(html\.dark\) \.running-leaf \{ background:#60a5fa/);
+  assert.doesNotMatch(source, /html\.dark[^{}]*\.running-leaf/);
   assert.match(source, /@keyframes tree-pulse \{ 50% \{ opacity:\.35; transform:scale\(\.8\);/);
   assert.match(source, /prefers-reduced-motion: reduce\) \{ \.is-spinning,\.running-leaf \{ animation:none/);
   assert.doesNotMatch(source, /\.running-count|\.running-leaf i|\.running-leaf\.is-waiting/);

@@ -50,6 +50,7 @@ def serialize_spec(spec: SettingSpec) -> dict[str, Any]:
         "min": spec.min_value,
         "max": spec.max_value,
         "unit": spec.unit,
+        "displayScale": spec.display_scale,
         "choices": [{"value": value, "label": label} for value, label in spec.choices],
         "sensitive": is_sensitive_path(spec.path),
         "editor": spec.editor,

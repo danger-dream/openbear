@@ -1665,6 +1665,7 @@ class AgentTools(AgentContinuationTools):
             "retry_max_delay_s": float(getattr(agent_cfg, "retry_max_delay_s", 600.0) or 0.0),
             "retry_jitter_ratio": float(getattr(agent_cfg, "retry_jitter_ratio", 0.0) or 0.0),
             "retry_cancel_check": lambda: self.manager.consume_retry_cancel(task_uuid),
+            "retry_control_check": lambda wait_id: self.manager.consume_retry_action(task_uuid, wait_id),
         }
 
     def _context_window_kwargs(self, model_name: str) -> dict[str, Any]:

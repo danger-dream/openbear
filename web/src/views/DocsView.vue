@@ -6,6 +6,12 @@ import MdEditor from "../components/AdaptiveMdEditor.vue";
 import draggable from "vuedraggable";
 import { assetTimeLine } from "../utils/assetTime";
 import { dragAutoScrollOptions } from "../utils/dragScroll";
+import AdminPageHeader from "../components/AdminPageHeader.vue";
+import MobileAssetRow from "../components/MobileAssetRow.vue";
+import MobileAssetSheet from "../components/MobileAssetSheet.vue";
+import { useMobileAssets } from "../components/useMobileAssets";
+
+const emit = defineEmits(["mobile-header-ready"]);
 
 const docs = ref([]);
 const loading = ref(false);
@@ -206,54 +212,74 @@ async function persistGroups() {
   }
 }
 const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
+const { isAdminPhone, mobileMode, mobileOpen, mobileView, mobileItem, mobileDetail, mobileLoading, mobileError, mobileBusy,
+  openMobileAsset, setMobileMode, runMobileAction, reloadMobileDetail } = useMobileAssets({
+  items: shownDocs, loadDetail: id => Api.doc(id), isSelected, setSelected, clearSelection,
+  actions: { edit: openEdit, enabled: toggleEnabled, archive: toggleArchive, remove },
+});
+const mobileEnabledCount = computed(() => shownDocs.value.filter(row => row.enabled && !row.archived).length);
 </script>
 
 <template>
-  <div class="admin-page docs-page h-full flex flex-col">
-    <header class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
-      <div class="admin-heading flex items-center gap-2">
-        <h1 class="text-base font-semibold">文档库</h1>
-        <span class="text-xs text-macsub">点卡片编辑 · Memory(resource=doc) 按需取全文</span>
-      </div>
-      <div class="flex items-center gap-3">
+  <div class="admin-page docs-page mobile-assets-page h-full flex flex-col" :class="{ 'is-sorting-assets': mobileMode === 'sort' }">
+    <AdminPageHeader
+      title="文档库"
+      subtitle="点卡片编辑 · Memory(resource=doc) 按需取全文"
+      description="轻点查看详情 · 编辑入口与完整元信息保留在详情中"
+      @mobile-header-ready="emit('mobile-header-ready', $event)"
+    >
+      <template #mobile-navigation><slot name="mobile-navigation" /></template>
+      <template #actions>
+        <template v-if="isAdminPhone">
+          <el-button :icon="'Select'" @click="setMobileMode('select')">选择条目</el-button>
+          <el-button :icon="'Rank'" @click="setMobileMode('sort')">整理顺序</el-button>
+        </template>
         <el-checkbox v-model="showArchived" size="small" @change="load(); clearSelection()">显示归档</el-checkbox>
-        <el-button :icon="'Refresh'" circle @click="refresh" title="刷新" />
-        <el-button type="primary" :icon="'Plus'" @click="openEdit(null)" round>新建文档</el-button>
-      </div>
-    </header>
+        <el-button :icon="'Refresh'" @click="refresh" title="刷新">刷新</el-button>
+      </template>
+      <template #primary><el-button :icon="'Plus'" @click="openEdit(null)">新建文档</el-button></template>
+    </AdminPageHeader>
 
-    <div v-if="selectedIds.length" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
+    <div v-if="isAdminPhone" class="mobile-asset-overview">
+      <span>{{ mobileMode === 'browse' ? `共 ${shownDocs.length} 篇 · 启用 ${mobileEnabledCount} 篇` : mobileMode === 'sort' ? '拖动手柄调整分组与条目顺序' : `已选 ${selectedIds.length} 篇` }}</span>
+      <button type="button" @click="setMobileMode(mobileMode === 'browse' ? 'select' : 'browse')">{{ mobileMode === 'browse' ? '选择' : '完成' }}</button>
+    </div>
+
+    <div v-if="selectedIds.length || (isAdminPhone && mobileMode === 'select')" class="admin-batch mx-6 mt-3 px-3 py-2 rounded-2xl border border-macblue/20 bg-macblue/5 flex items-center gap-2 shrink-0">
       <el-checkbox :model-value="allShownSelected" @change="toggleSelectAllShown">全选当前列表</el-checkbox>
       <span class="text-xs text-macsub mr-2">已选 {{ selectedIds.length }} 篇</span>
-      <el-button size="small" :icon="'Box'" @click="batchUpdateDocs({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
-      <el-button size="small" :icon="'RefreshLeft'" @click="batchUpdateDocs({ archived: 0 }, '已批量恢复')">恢复</el-button>
-      <el-button size="small" :icon="'Unlock'" @click="batchUpdateDocs({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
-      <el-button size="small" :icon="'Lock'" @click="batchUpdateDocs({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
-      <el-button size="small" type="danger" :icon="'Delete'" @click="batchDeleteDocs">删除</el-button>
-      <el-button size="small" text @click="clearSelection">取消选择</el-button>
+      <el-button size="small" :icon="'Box'" :disabled="!selectedIds.length" @click="batchUpdateDocs({ archived: 1, enabled: 0 }, '已批量归档')">批量归档</el-button>
+      <el-button size="small" :icon="'RefreshLeft'" :disabled="!selectedIds.length" @click="batchUpdateDocs({ archived: 0 }, '已批量恢复')">恢复</el-button>
+      <el-button size="small" :icon="'Unlock'" :disabled="!selectedIds.length" @click="batchUpdateDocs({ enabled: 1, archived: 0 }, '已批量启用注入')">启用注入</el-button>
+      <el-button size="small" :icon="'Lock'" :disabled="!selectedIds.length" @click="batchUpdateDocs({ enabled: 0 }, '已批量禁用注入')">禁用注入</el-button>
+      <el-button size="small" type="danger" :icon="'Delete'" :disabled="!selectedIds.length" @click="batchDeleteDocs">删除</el-button>
+      <el-button size="small" text @click="isAdminPhone ? setMobileMode('browse') : clearSelection()">取消选择</el-button>
     </div>
 
     <div ref="scrollContainer" class="admin-list flex-1 min-h-0 overflow-y-auto p-6" :class="{ 'select-none': dragging }" v-loading="loading">
       <div v-if="!shownDocs.length" class="text-center text-macsub py-16 text-sm">暂无文档</div>
       <draggable v-model="groups" item-key="name" handle=".group-handle" :animation="180"
-        v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
+        v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
         @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag">
         <template #item="{ element: g }">
-          <section class="mb-5">
-            <div class="text-xs font-semibold text-macsub mb-2 flex items-center gap-2">
-              <el-icon class="group-handle cursor-move select-none text-gray-300 hover:text-macsub" :size="14"><Rank /></el-icon>
-              <span class="w-1 h-3.5 bg-macblue rounded"></span>{{ g.name || '未分组' }}
+          <section class="asset-group-section mb-5">
+            <div class="asset-group-heading text-xs font-semibold text-macsub mb-2 flex items-center gap-2">
+              <el-icon class="group-handle cursor-move select-none text-ob-muted hover:text-macsub" :size="14"><Rank /></el-icon>
+              <span class="w-1 h-3.5 bg-macblue rounded"></span><span class="asset-group-label">{{ g.name || '未分组' }}</span>
               <span class="opacity-50">({{ g.items.length }})</span>
             </div>
             <draggable v-model="g.items" item-key="id" handle=".drag-handle" :animation="180"
-              v-bind="dragAutoScrollOptions" :scroll="scrollContainer"
-              :group="{ name: 'doc-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" class="space-y-2 min-h-6">
+              v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
+              :group="{ name: 'doc-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" class="mobile-asset-group space-y-2 min-h-6">
               <template #item="{ element: d }">
-                <div @click="openEdit(d)"
+                <MobileAssetRow v-if="isAdminPhone" :title="d.title || d.name" :summary="d.summary" :reference="'@doc/' + d.name" :meta="`P${d.importance ?? '—'}${d.project ? ' · ' + splitList(d.project).join(' · ') : ''}`"
+                  :enabled="!!d.enabled" :archived="!!d.archived" :selected="isSelected(d.id)" :mode="mobileMode"
+                  @select="setSelected(d.id, $event)" @open="openMobileAsset(d)" @more="openMobileAsset(d, 'actions')" />
+                <div v-else @click="openEdit(d)"
                   class="doc-card mac-panel mac-shadow p-4 flex items-start gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
           :class="{ 'opacity-50 border-dashed': d.archived || !d.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(d.id) }">
                   <div class="pt-0.5" @click.stop><el-checkbox :model-value="isSelected(d.id)" @change="(v) => setSelected(d.id, v)" /></div>
-                  <el-icon class="drag-handle cursor-move select-none text-gray-300 hover:text-macsub mt-0.5" :size="18" @click.stop><Rank /></el-icon>
+                  <el-icon class="drag-handle cursor-move select-none text-ob-muted hover:text-macsub mt-0.5" :size="18" @click.stop><Rank /></el-icon>
                   <el-icon :size="18" class="text-macsub mt-0.5"><Document /></el-icon>
           <div class="doc-copy flex-1 min-w-0">
             <div class="flex items-center gap-2 min-w-0">
@@ -283,6 +309,9 @@ const impColor = (n) => ["", "info", "info", "", "warning", "danger"][n] || "";
         </template>
       </draggable>
     </div>
+
+    <MobileAssetSheet v-if="isAdminPhone && mobileItem" v-model="mobileOpen" kind="docs" :item="mobileItem" :detail="mobileDetail" :view="mobileView"
+      :loading="mobileLoading" :busy="mobileBusy" :error="mobileError" @retry="reloadMobileDetail" @action="runMobileAction" />
 
     <el-dialog append-to-body class="admin-dialog docs-dialog" v-model="dialogOpen" :title="editing?.id ? '编辑文档' : '新建文档'" width="980px" top="4vh" :close-on-click-modal="true" :before-close="tryClose">
       <div v-if="editing" class="asset-edit-body flex flex-col gap-3" style="height: 72vh;">

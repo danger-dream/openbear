@@ -76,6 +76,9 @@ class StdioJSONRPCTransport(MCPTransport):
         self._stderr_task: asyncio.Task | None = None
         self._stderr_tail = ""
         self._closed = False
+        self.fatal_error = ""
+        self._max_message_bytes = int(config.max_message_bytes)
+        self._write_lock = asyncio.Lock()
         self._stdio_mode = str(getattr(config, "stdio_mode", "auto") or "auto").strip().lower()
         if self._stdio_mode not in {"auto", "framed", "newline"}:
             self._stdio_mode = "auto"
@@ -97,6 +100,7 @@ class StdioJSONRPCTransport(MCPTransport):
                 cwd=cwd,
                 env=env,
                 start_new_session=True,
+                limit=self._max_message_bytes,
             )
         except Exception as exc:
             raise MCPConnectionError(f"failed to start stdio MCP server {self.server_key}: {type(exc).__name__}: {exc}") from exc
@@ -134,22 +138,29 @@ class StdioJSONRPCTransport(MCPTransport):
                 else:
                     fut.set_result(msg.get("result"))
         except Exception as exc:
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    fut.set_exception(MCPConnectionError(f"stdio read failed: {type(exc).__name__}: {exc}"))
-            self._pending.clear()
+            self._fail(f"stdio read failed: {type(exc).__name__}: {exc}")
         finally:
-            rc = self.proc.returncode if self.proc is not None else None
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    fut.set_exception(MCPServerExited(f"MCP server {self.server_key} exited" + (f" rc={rc}" if rc is not None else "")))
-            self._pending.clear()
+            if not self._closed and not self.fatal_error:
+                self._fail("stdio reader stopped (EOF)")
+            if self.fatal_error and self.proc and self.proc.returncode is None:
+                await self._terminate_process(self.proc)
+
+    def _fail(self, reason: str) -> None:
+        if not self.fatal_error:
+            self.fatal_error = reason
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(MCPConnectionError(self.fatal_error))
+        self._pending.clear()
+        self._dispatch_notification("openbear/transport_failed", {"error": self.fatal_error})
 
     async def _read_stdio_message(self) -> dict[str, Any] | None:
         assert self.proc is not None and self.proc.stdout is not None
         first = await self.proc.stdout.readline()
         if not first:
             return None
+        if len(first) > self._max_message_bytes:
+            raise MCPConnectionError("message_too_large")
         text = first.decode("utf-8", "replace")
         if text.lower().startswith("content-length:"):
             self._write_framed = True
@@ -169,6 +180,8 @@ class StdioJSONRPCTransport(MCPTransport):
                     # Some broken servers may repeat the header; use the last one.
                     with contextlib.suppress(ValueError):
                         length = int(htext.split(":", 1)[1].strip())
+            if length < 0 or length > self._max_message_bytes:
+                raise MCPConnectionError("message_too_large: invalid Content-Length")
             body = await self.proc.stdout.readexactly(length)
             try:
                 parsed = json.loads(body.decode("utf-8", "replace"))
@@ -177,9 +190,8 @@ class StdioJSONRPCTransport(MCPTransport):
             return parsed if isinstance(parsed, dict) else {}
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            log.warning("mcp.stdio.invalid_json", server=self.server_key, preview=redact_text_secrets(text[:200]))
-            return {}
+        except json.JSONDecodeError as exc:
+            raise MCPConnectionError("invalid newline stdio JSON-RPC message") from exc
         return parsed if isinstance(parsed, dict) else {}
 
     async def _read_stderr(self) -> None:
@@ -193,6 +205,8 @@ class StdioJSONRPCTransport(MCPTransport):
                 self._stderr_tail = (self._stderr_tail + text)[-_STDERR_LIMIT:]
 
     async def request(self, method: str, params: dict[str, Any] | None = None, *, timeout_s: float) -> Any:
+        if self._closed or self.fatal_error:
+            raise MCPConnectionError(self.fatal_error or "transport_closed")
         if self.proc is None or self.proc.stdin is None:
             raise MCPConnectionError(f"MCP server {self.server_key} is not connected")
         if self.proc.returncode is not None:
@@ -204,10 +218,13 @@ class StdioJSONRPCTransport(MCPTransport):
         self._pending[mid] = fut
         payload = {"jsonrpc": _JSONRPC_VERSION, "id": mid, "method": method, "params": params or {}}
         try:
-            self.proc.stdin.write(self._encode_stdio_payload(payload))
-            await self.proc.stdin.drain()
-            return await asyncio.wait_for(fut, timeout=max(1.0, float(timeout_s or 1)))
+            async with asyncio.timeout(max(0.01, float(timeout_s))):
+                async with self._write_lock:
+                    self.proc.stdin.write(self._encode_stdio_payload(payload))
+                    await self.proc.stdin.drain()
+                return await fut
         except TimeoutError as exc:
+            await self._cancel_request(mid, "deadline_exceeded")
             self._pending.pop(mid, None)
             if self._stdio_mode == "auto" and not self._write_framed and method == "initialize":
                 # Some MCP servers are strict about Content-Length from the very
@@ -218,17 +235,30 @@ class StdioJSONRPCTransport(MCPTransport):
                 log.info("mcp.stdio.retry_framed", server=self.server_key)
                 return await self.request(method, params, timeout_s=timeout_s)
             raise MCPTimeoutError(f"MCP {self.server_key} {method} timeout after {timeout_s}s") from exc
+        except asyncio.CancelledError:
+            await self._cancel_request(mid, "caller_cancelled")
+            raise
         except (BrokenPipeError, ConnectionResetError) as exc:
+            self._fail(f"MCP server {self.server_key} pipe closed")
+            raise MCPServerExited(self.fatal_error) from exc
+        finally:
             self._pending.pop(mid, None)
-            raise MCPServerExited(f"MCP server {self.server_key} pipe closed: {self._stderr_preview()}") from exc
+            if not fut.done():
+                fut.cancel()
+
+    async def _cancel_request(self, mid: int, reason: str) -> None:
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(0.25):
+                await self.notify("notifications/cancelled", {"requestId": mid, "reason": reason})
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         if self.proc is None or self.proc.stdin is None or self.proc.returncode is not None:
             return
         payload = {"jsonrpc": _JSONRPC_VERSION, "method": method, "params": params or {}}
         with contextlib.suppress(Exception):
-            self.proc.stdin.write(self._encode_stdio_payload(payload))
-            await self.proc.stdin.drain()
+            async with self._write_lock:
+                self.proc.stdin.write(self._encode_stdio_payload(payload))
+                await self.proc.stdin.drain()
 
     def _encode_stdio_payload(self, payload: dict[str, Any]) -> bytes:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

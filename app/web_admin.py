@@ -62,12 +62,14 @@ from app.web_console.live_stream import (
     _WebStreamRenderer,
 )
 from app.web_console.memory_api import WebAdminMemoryMixin
+from app.web_console.message_visibility import WebAdminMessageVisibilityMixin
 from app.web_console.operation_store import WebAdminOperationsMixin
 from app.web_console.rath_api import WebAdminRathMixin
 from app.web_console.realtime import WebAdminRealtimeMixin
 from app.web_console.reference_api import WebAdminReferenceMixin
 from app.web_console.routing import WebAdminAppMixin
 from app.web_console.system_mcp_api import WebAdminSystemMcpMixin
+from app.web_console.statistics_api import WebAdminStatisticsMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.update_api import WebAdminUpdateMixin
 from app.web_console.uploads import WebAdminUploadsMixin
@@ -86,8 +88,10 @@ class WebAdminServer(
     WebAdminConversationOverviewMixin,
     WebAdminConversationPromptMixin,
     WebAdminOperationsMixin,
+    WebAdminMessageVisibilityMixin,
     WebAdminRathMixin,
     WebAdminSystemMcpMixin,
+    WebAdminStatisticsMixin,
     WebAdminUpdateMixin,
     WebAdminSettingsChannelsMixin,
     WebAdminUploadsMixin,
@@ -138,6 +142,11 @@ class WebAdminServer(
         self._mcp_reload_hook = mcp_reload_hook
         self._mcp_agent_access_hook = mcp_agent_access_hook
         self.skills_prompt = ""
+        # Short-lived owner/range aggregates keep repeat dashboard visits instant
+        # without turning the statistics view into a stale materialized ledger.
+        self._statistics_cache: dict[tuple[int, int, str], tuple[float, dict[str, Any]]] = {}
+        self._statistics_inflight: dict[tuple[int, int, str], asyncio.Task[dict[str, Any]]] = {}
+        self._statistics_cache_lock = asyncio.Lock()
         self.skills_count = 0
         self.workspace_dir = str((Path.cwd() / "workspace").resolve())
         self._memory_operation_lock = asyncio.Lock()
@@ -157,6 +166,7 @@ class WebAdminServer(
         self._web_task_notification_pending: dict[str, list[dict[str, Any]]] = {}
         self._web_task_notification_deferred: dict[str, list[dict[str, Any]]] = {}
         self._web_task_notification_workers: set[str] = set()
+        self._web_conversation_title_tasks: dict[str, asyncio.Task[Any]] = {}
         self._web_frame_prune_task: asyncio.Task[Any] | None = None
         self._web_notification_recovery_task: asyncio.Task[Any] | None = None
         # One event/queue per Web conversation keeps the original controller run
@@ -271,6 +281,12 @@ class WebAdminServer(
         await self.interactions.stop()
         await self.interaction_telegram.stop()
         await self.web_task_telegram.stop()
+        title_tasks = [task for task in self._web_conversation_title_tasks.values() if not task.done()]
+        for task in title_tasks:
+            task.cancel()
+        if title_tasks:
+            await asyncio.gather(*title_tasks, return_exceptions=True)
+        self._web_conversation_title_tasks.clear()
         workers = [
             task for task in asyncio.all_tasks()
             if task is not asyncio.current_task()

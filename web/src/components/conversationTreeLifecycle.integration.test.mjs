@@ -111,3 +111,10 @@ test('removal invalidates old branch/search responses and releases search loadin
 test('local draft submitted while removal confirmation is open is not deleted as a server conversation',async()=>{
  const pending=defer();const h=harness({confirm:()=>pending.promise});const job=h.remove(local());h.ctx.conversations.value=[conv('persisted')];h.ctx.activeConversationUuid.value='persisted';pending.resolve();await job;assert.deepEqual(h.calls.deletes,[]);assert.deepEqual(h.calls.clears,[]);assert.equal(h.ctx.activeConversationUuid.value,'persisted');
 });
+test('rename, pin and move consume mutation rows without a bootstrap/locate round trip',()=>{
+ const rename=between(tree,'async function renameRow(','function setConversationTitleLocally(');
+ assert.match(rename,/applyMutationRow/);assert.doesNotMatch(rename,/refreshAffected|refreshTree|locateConversation/);
+ const move=between(tree,'async function moveTreeItem(','async function mergeLocatedItem(');
+ assert.match(move,/applyMoveOrganization/);assert.doesNotMatch(move,/refreshTree|locateConversation/);
+ assert.match(between(tree,'async function runSearch(','watch\(query,'),/\.map\(statusAdjustedRow\)/);
+});

@@ -1,5 +1,8 @@
 <script setup>
+import {computed, nextTick, ref, watch} from "vue";
 import {shortText} from "./display.js";
+import {useMessageVisibility} from './messageVisibility.js';
+const visibility = useMessageVisibility();
 
 const props = defineProps({
 	turns: {type: Array, default: () => []},
@@ -7,16 +10,26 @@ const props = defineProps({
 	running: {type: Boolean, default: false},
 });
 const emit = defineEmits(["scroll-to-turn"]);
+const rail = ref(null);
+const filter = ref("");
+const filteredTurns = computed(() => props.turns
+	.map((turn, index) => ({turn, index}))
+	.filter(({turn, index}) => !filter.value.trim() || `${index + 1} ${visibility.userContent(turn)}`.toLowerCase().includes(filter.value.trim().toLowerCase())));
+
+watch(() => [props.activeTurnIndex, props.turns.length], async () => {
+	await nextTick();
+	rail.value?.querySelector(".turn-minimap-dot.active")?.scrollIntoView({block: "nearest"});
+}, {immediate: true, flush: "post"});
 
 function turnNavLabel(turn, index = 0) {
-	const text = shortText(turn?.user?.content || "", 40);
+	const text = shortText(visibility.userContent(turn), 40);
 	return text || `第 ${index + 1} 轮对话`;
 }
 </script>
 
 <template>
 	<nav v-if="props.turns.length >= 3" class="turn-minimap" aria-label="对话快速导航">
-		<div class="turn-minimap-rail">
+		<div ref="rail" class="turn-minimap-rail">
 			<el-tooltip
 				v-for="(turn, idx) in props.turns"
 				:key="`rail-${turn.id}`"
@@ -34,8 +47,10 @@ function turnNavLabel(turn, index = 0) {
 			</el-tooltip>
 		</div>
 		<div class="turn-minimap-popover">
+			<input v-if="props.turns.length > 8" v-model="filter" class="turn-nav-filter" type="search" placeholder="筛选轮次" aria-label="筛选对话轮次"/>
+			<div v-if="!filteredTurns.length" class="turn-nav-empty">没有匹配的轮次</div>
 			<button
-				v-for="(turn, idx) in props.turns"
+				v-for="{turn, index: idx} in filteredTurns"
 				:key="`nav-${turn.id}`"
 				type="button"
 				class="turn-nav-row"
@@ -65,12 +80,21 @@ function turnNavLabel(turn, index = 0) {
 
 .turn-minimap-rail {
 	display: grid;
+	grid-auto-rows: .42rem;
 	gap: .22rem;
-	border-radius: 999px;
-	background: rgba(255, 255, 255, .62);
+	max-height: calc(8 * .42rem + 7 * .22rem + .84rem);
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: none;
+	border-radius: 0;
+	background: transparent;
 	padding: .42rem .3rem;
-	backdrop-filter: blur(14px);
-	box-shadow: 0 8px 24px rgba(15, 23, 42, .06);
+	backdrop-filter: none;
+	box-shadow: none;
+}
+
+.turn-minimap-rail::-webkit-scrollbar {
+	display: none;
 }
 
 .turn-minimap-dot {
@@ -89,24 +113,24 @@ function turnNavLabel(turn, index = 0) {
 	width: .86rem;
 	height: 2px;
 	border-radius: 999px;
-	background: #d4d4d8;
+	background: var(--ob-text-muted);
 	transition: width .15s ease, height .15s ease, background .15s ease;
 }
 
 .turn-minimap-dot:hover span {
 	width: 1.05rem;
-	background: #a1a1aa;
+	background: var(--ob-text-muted);
 }
 
 .turn-minimap-dot.active span {
 	width: 1.16rem;
 	height: 3px;
-	background: #18181b;
+	background: var(--ob-text-muted);
 }
 
 .turn-minimap-dot.running span {
-	background: #2563eb;
-	box-shadow: 0 0 0 3px rgba(37, 99, 235, .10);
+	background: var(--ob-blue);
+	box-shadow: 0 0 0 3px rgb(var(--ob-blue-rgb) / 0.1);
 }
 
 .turn-minimap-popover {
@@ -118,11 +142,11 @@ function turnNavLabel(turn, index = 0) {
 	overflow-y: auto;
 	transform: translate(4px, -50%) scale(.98);
 	transform-origin: right center;
-	border: 1px solid rgba(15, 23, 42, .10);
+	border: 1px solid var(--ob-border);
 	border-radius: 1rem;
-	background: rgba(255, 255, 255, .94);
+	background: var(--ob-surface-raised);
 	padding: .42rem;
-	box-shadow: 0 18px 52px rgba(15, 23, 42, .15);
+	box-shadow: var(--ob-shadow-popover);
 	opacity: 0;
 	pointer-events: none;
 	backdrop-filter: blur(20px);
@@ -136,6 +160,28 @@ function turnNavLabel(turn, index = 0) {
 	transform: translate(0, -50%) scale(1);
 }
 
+.turn-nav-filter {
+	width: 100%;
+	border: 1px solid var(--ob-border);
+	border-radius: .65rem;
+	background: transparent;
+	padding: .48rem .65rem;
+	color: inherit;
+	font: inherit;
+	font-size: 12px;
+}
+
+.turn-nav-filter:focus-visible {
+	outline: 2px solid var(--ob-blue);
+	outline-offset: 1px;
+}
+
+.turn-nav-empty {
+	padding: .7rem;
+	font-size: 12px;
+	color: var(--ob-text-subtle);
+}
+
 .turn-nav-row {
 	display: grid;
 	grid-template-columns: 1.55rem minmax(0, 1fr);
@@ -146,23 +192,23 @@ function turnNavLabel(turn, index = 0) {
 	border-radius: .72rem;
 	background: transparent;
 	padding: .46rem .52rem;
-	color: #52525b;
+	color: var(--ob-text);
 	text-align: left;
 	cursor: pointer;
 }
 
 .turn-nav-row:hover {
-	background: #f4f4f5;
-	color: #18181b;
+	background: var(--ob-hover);
+	color: var(--ob-text-strong);
 }
 
 .turn-nav-row.active {
-	background: #18181b;
-	color: #fff;
+	background: var(--ob-text-strong);
+	color: var(--ob-text-inverse);
 }
 
 .turn-nav-row.running:not(.active) {
-	color: #1d4ed8;
+	color: var(--ob-blue);
 }
 
 .turn-nav-index {
@@ -171,15 +217,15 @@ function turnNavLabel(turn, index = 0) {
 	height: 1.28rem;
 	place-items: center;
 	border-radius: 999px;
-	background: #f4f4f5;
-	color: #71717a;
+	background: var(--ob-surface-soft);
+	color: var(--ob-text-subtle);
 	font-size: 10px;
 	font-weight: 780;
 }
 
 .turn-nav-row.active .turn-nav-index {
-	background: rgba(255, 255, 255, .18);
-	color: #fff;
+	background: var(--ob-text-strong);
+	color: var(--ob-text-inverse);
 }
 
 .turn-nav-title {
@@ -200,47 +246,7 @@ function turnNavLabel(turn, index = 0) {
 
 <style>
 /* OpenBear system dark theme */
-html.dark .turn-minimap-rail {
-		background: rgba(29, 30, 34, 0.62);
-		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
-	}
-html.dark .turn-minimap-dot span {
-		background: #2b2c30;
-	}
-html.dark .turn-minimap-dot:hover span {
-		background: #313236;
-	}
-html.dark .turn-minimap-dot.active span {
-		background: #232428;
-	}
-html.dark .turn-minimap-dot.running span {
-		box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
-	}
-html.dark .turn-minimap-popover {
-		border: 1px solid rgba(255, 255, 255, 0.145);
-		background: rgba(29, 30, 34, 0.94);
-		box-shadow: 0 18px 52px rgba(0, 0, 0, 0.16);
-	}
-html.dark .turn-nav-row {
-		color: #c6c6cd;
-	}
-html.dark .turn-nav-row:hover {
-		background: #202125;
-		color: #efeff2;
-	}
-html.dark .turn-nav-row.active {
-		background: #232428;
-		color: #ffffff;
-	}
-html.dark .turn-nav-row.running:not(.active) {
-		color: #60a5fa;
-	}
-html.dark .turn-nav-index {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .turn-nav-row.active .turn-nav-index {
-		background: rgba(29, 30, 34, 0.18);
-		color: #ffffff;
+html.dark .turn-nav-filter {
+		border-color: var(--ob-border);
 	}
 </style>

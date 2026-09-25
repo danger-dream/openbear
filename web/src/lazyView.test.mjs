@@ -9,7 +9,26 @@ const stateSource = parse(fs.readFileSync(new URL('./components/LazyViewState.vu
 let stateProps, stateEmits;
 vm.runInNewContext(stateSource.scriptSetup.content, { defineProps: value => { stateProps = value; }, defineEmits: value => { stateEmits = value; }, String, Boolean });
 const LazyViewState = Vue.defineComponent({ props: stateProps, emits: stateEmits, render: Vue.compile(stateSource.template.content) });
-const context = vm.createContext({ ...Vue, LazyViewState });
+let timerClock = 0, nextTimerId = 0;
+const timers = new Map();
+function fakeSetTimeout(callback, delay) {
+  const id = ++nextTimerId;
+  timers.set(id, { callback, at: timerClock + delay });
+  return id;
+}
+function fakeClearTimeout(id) { timers.delete(id); }
+function advanceTimers(ms) {
+  timerClock += ms;
+  while (true) {
+    const due = [...timers.entries()].filter(([, timer]) => timer.at <= timerClock).sort((a, b) => a[1].at - b[1].at);
+    if (!due.length) return;
+    for (const [id, timer] of due) {
+      timers.delete(id);
+      timer.callback();
+    }
+  }
+}
+const context = vm.createContext({ ...Vue, LazyViewState, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout });
 vm.runInContext(source.replace(/^import .*;\n/gm, '').replace('export function ', 'function '), context);
 const { defineLazyView } = context;
 
@@ -33,7 +52,15 @@ function mount(component) {
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); await Vue.nextTick(); };
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 
-test('lazy definitions do not load on chat; first navigation shows actual mac placeholder then preserves child identity, attrs and events', async () => {
+test('fast lazy loads render directly without flashing a delayed loading state', async () => {
+  const View = defineLazyView(() => Promise.resolve({ default: { render: () => Vue.h('p', 'system settings ready') } }), '系统设置');
+  const h = mount({ render: () => Vue.h(View) });
+  await flush(); assert.match(h.text(), /system settings ready/); assert.doesNotMatch(h.text(), /正在加载系统设置/);
+  advanceTimers(300); await flush(); assert.match(h.text(), /system settings ready/); assert.doesNotMatch(h.text(), /正在加载系统设置/);
+  h.app.unmount();
+});
+
+test('lazy definitions do not load on chat; first navigation delays the mac placeholder then preserves child identity, attrs and events', async () => {
   const request = deferred(), page = Vue.ref('chat'), section = Vue.ref('channels'), calls = [];
   let requests = 0, mounts = 0, unmounts = 0;
   const Settings = defineLazyView(() => { requests++; return request.promise; }, '设置');
@@ -43,7 +70,9 @@ test('lazy definitions do not load on chat; first navigation shows actual mac pl
   } };
   const h = mount({ setup: () => () => page.value === 'chat' ? Vue.h('p', 'chat draft') : Vue.h(Settings, { section: section.value, onSectionChanged: value => calls.push(value) }) });
   await flush(); assert.equal(requests, 0); assert.match(h.text(), /chat draft/);
-  page.value = 'settings'; await flush(); assert.equal(requests, 1); assert.match(h.text(), /正在加载设置/);
+  page.value = 'settings'; await flush(); assert.equal(requests, 1); assert.doesNotMatch(h.text(), /正在加载设置/);
+  advanceTimers(299); await flush(); assert.doesNotMatch(h.text(), /正在加载设置/);
+  advanceTimers(1); await flush(); assert.match(h.text(), /正在加载设置/);
   request.resolve({ default: Child }); await flush(); assert.equal(mounts, 1); assert.match(h.text(), /channels:未保存/);
   section.value = 'models'; await flush(); assert.match(h.text(), /models:未保存/); assert.equal(mounts, 1); assert.equal(unmounts, 0);
   h.buttons()[0].props.onClick(); assert.deepEqual(calls, ['models']);
@@ -59,7 +88,9 @@ test('failed chunk displays actual old-resource warning; retry is explicit, dedu
   assert.match(h.text(), /文档库加载失败/); assert.match(h.text(), /旧资源/); assert.match(h.text(), /保存草稿和未提交设置/);
   assert.equal(h.nodes().some(node => node.props.role === 'alert'), true); assert.equal(h.buttons().length, 1);
   const retry = h.buttons()[0].props.onClick; retry(); retry(); await flush();
-  assert.equal(attempts, 2); assert.match(h.text(), /正在加载文档库/);
+  assert.equal(attempts, 2); assert.doesNotMatch(h.text(), /正在加载文档库/);
+  advanceTimers(299); await flush(); assert.doesNotMatch(h.text(), /正在加载文档库/);
+  advanceTimers(1); await flush(); assert.match(h.text(), /正在加载文档库/);
   request.resolve({ default: { render: () => Vue.h('p', 'loaded') } }); await flush(); assert.match(h.text(), /loaded/);
   h.app.unmount();
   // The VM intentionally has no window/location/history; failed loads and retry

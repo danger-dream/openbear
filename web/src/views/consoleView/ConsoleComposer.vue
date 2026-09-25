@@ -5,6 +5,7 @@ import ReferencePlainText from "../../references/ReferencePlainText.vue";
 import InteractionMarkdown from "./InteractionMarkdown.vue";
 import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import ModelFeatureIcon from "./ModelFeatureIcon.vue";
+import ContextUsageMeter from './ContextUsageMeter.vue';
 import {
 	ArrowDown,
 	CircleCheck,
@@ -14,7 +15,6 @@ import {
 	Plus,
 	Promotion,
 	Search,
-	SemiSelect,
 	Timer,
 	Warning,
 } from "@element-plus/icons-vue";
@@ -83,6 +83,9 @@ const props = defineProps({
 	canCompact: {type: Boolean, default: false},
 	compacting: {type: Boolean, default: false},
 	contextDisplay: {type: String, default: "—"},
+	contextUsage: {type: Object, default: () => ({known: false})},
+	contextWindowTokens: {type: Number, default: 0},
+	contextThresholdTokens: {type: Number, default: 0},
 	contextUsedDisplay: {type: String, default: "—"},
 	contextThresholdDisplay: {type: String, default: "—"},
 	contextWindowDisplay: {type: String, default: "—"},
@@ -115,7 +118,9 @@ const emit = defineEmits([
 const fileInput = ref(null);
 const composerShell = ref(null);
 const composerTextarea = ref(null);
+const runConfigPopover = ref(null);
 let composerResizeObserver = null;
+let runConfigPositionFrame = 0;
 const interactionDrafts = ref({});
 const interactionErrors = ref({});
 const questionnaireDrafts = ref({});
@@ -557,6 +562,47 @@ function handleKeydown(event) {
 	emit("send");
 }
 
+function onComposerKeydownCapture(event) {
+	// ReferenceEditor normally sends on Enter. Intercept only touch-keyboard Enter
+	// before its ProseMirror handler; keep desktop shortcuts and IME untouched.
+	if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey ||
+		event.isComposing || event.keyCode === 229 ||
+		!window.matchMedia?.("(hover: none) and (pointer: coarse)")?.matches) return;
+	const editor = composerTextarea.value?.editor;
+	if (!editor || editor.view?.composing || !event.target?.closest?.(".reference-editor-content")) return;
+	// Let the editor handle Enter when choosing an inline reference suggestion.
+	if (document.querySelector('.reference-floating-panel[aria-label="选择引用内容"]')) return;
+	event.preventDefault();
+	event.stopPropagation();
+	editor.commands.insertContent({type: "hardBreak"});
+}
+
+function scheduleRunConfigPosition() {
+	if (!props.modelMenuOpen || runConfigPositionFrame) return;
+	runConfigPositionFrame = window.requestAnimationFrame(() => {
+		runConfigPositionFrame = 0;
+		if (props.modelMenuOpen) runConfigPopover.value?.popperRef?.popperInstanceRef?.update?.();
+	});
+}
+
+watch(() => props.modelMenuOpen, (open, _, onCleanup) => {
+	if (!open || typeof window === "undefined") return;
+	const viewport = window.visualViewport;
+	for (const target of [window, viewport]) {
+		target?.addEventListener("resize", scheduleRunConfigPosition);
+		target?.addEventListener("scroll", scheduleRunConfigPosition);
+	}
+	nextTick(scheduleRunConfigPosition);
+	onCleanup(() => {
+		for (const target of [window, viewport]) {
+			target?.removeEventListener("resize", scheduleRunConfigPosition);
+			target?.removeEventListener("scroll", scheduleRunConfigPosition);
+		}
+		if (runConfigPositionFrame) window.cancelAnimationFrame(runConfigPositionFrame);
+		runConfigPositionFrame = 0;
+	});
+}, {flush: "post", immediate: true});
+
 onMounted(() => {
 	interactionNowMs.value = Date.now();
 	interactionClockTimer = window.setInterval(() => {
@@ -564,7 +610,10 @@ onMounted(() => {
 	}, 1000);
 	const el = composerShell.value;
 	if (!el) return;
-	const notifyHeight = () => emit("height-change", Math.ceil(el.getBoundingClientRect().height));
+	const notifyHeight = () => {
+		emit("height-change", Math.ceil(el.getBoundingClientRect().height));
+		scheduleRunConfigPosition();
+	};
 	notifyHeight();
 	if (typeof ResizeObserver !== "undefined") {
 		composerResizeObserver = new ResizeObserver(notifyHeight);
@@ -597,7 +646,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 </script>
 
 <template>
-	<footer ref="composerShell" class="composer-shell shrink-0 bg-gradient-to-t from-white via-white/95 to-transparent pb-4 pt-8">
+	<footer ref="composerShell" class="composer-shell shrink-0 pb-3 pt-5">
 		<div class="composer-content pointer-events-auto relative mx-auto">
 			<div v-if="props.pendingSteering.length" class="steering-queue-card">
 				<div class="steering-queue-title">
@@ -787,8 +836,11 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 					ref="composerTextarea"
 					:model-value="props.draft"
 					:current-conversation="props.conversationUuid"
+					placeholder="在这里输入消息"
 					@update:model-value="emit('update:draft', $event)"
 					@send="props.canSend && emit('send')"
+					@keydown.capture="onComposerKeydownCapture"
+					@focusout="scheduleRunConfigPosition"
 					@paste="onPaste"
 				/>
 				<div class="composer-toolbar">
@@ -817,7 +869,8 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 						</el-tooltip>
 					</div>
 					<div class="composer-status">
-						<el-popover v-model:visible="runConfigPopoverVisible"
+						<ContextUsageMeter :usage="props.contextUsage" :context-window="props.contextWindowTokens" :threshold="props.contextThresholdTokens" :strategy="props.contextStrategy" :conversation-uuid="props.conversationUuid"/>
+						<el-popover ref="runConfigPopover" v-model:visible="runConfigPopoverVisible"
 						            popper-class="composer-menu-popper run-config-menu-popper"
 						            placement="top-end"
 						            trigger="click"
@@ -843,7 +896,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								<el-tooltip v-if="!isAgentTab" :content="contextDetailText" placement="top" :show-after="400">
 									<div class="run-config-context" :aria-label="contextDetailText">
 										<div class="context-meter-row">
-											<span class="config-label"><ModelFeatureIcon name="context"/>上下文</span>
+											<span class="config-label"><ModelFeatureIcon name="context"/>压缩阈值占用</span>
 											<span class="context-meter-values"><span>{{ props.contextUsedDisplay }} <span class="context-meter-limit">/ {{ props.contextThresholdDisplay }}</span></span><span class="context-percent">{{ props.contextPercentDisplay }}</span></span>
 										</div>
 										<div class="context-meter" aria-hidden="true"><span :style="contextMeterStyle"></span></div>
@@ -929,7 +982,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 						</el-popover>
 						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260">
 							<button type="button" class="send-button stop-button" aria-label="停止生成" @click="emit('stop')">
-								<SemiSelect/>
+								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>
 							</button>
 						</el-tooltip>
 						<el-tooltip v-else content="发送消息（Enter）" placement="top" :show-after="260">
@@ -941,7 +994,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 					</div>
 				</div>
 			</div>
-			<div class="composer-hints mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[11px] text-[#8b949e]">
+			<div class="composer-hints mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[11px] text-ob-muted">
 				<span>Enter 发送 · Ctrl/⌘+Enter 也可发送</span>
 				<span>图片/文本附件会随本轮发送</span>
 			</div>
@@ -957,6 +1010,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 .composer-shell {
 	pointer-events: none;
+	background: linear-gradient(to top, var(--ob-chat-bg) 85%, transparent);
 	padding-right: var(--console-content-gutter, 1rem);
 	padding-left: var(--console-content-gutter, 1rem);
 }
@@ -973,10 +1027,10 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	display: grid;
 	gap: 0.55rem;
 	margin-bottom: 0.75rem;
-	border: 1px solid rgba(37, 99, 235, 0.22);
+	border: 1px solid rgb(var(--ob-blue-rgb) / 0.22);
 	border-radius: 1rem;
-	background: linear-gradient(180deg, rgba(239, 246, 255, 0.98), rgba(255, 255, 255, 0.96));
-	box-shadow: 0 16px 40px rgba(37, 99, 235, 0.10);
+	background: linear-gradient(180deg, var(--ob-blue-soft), rgb(var(--ob-surface-rgb) / 0.96));
+	box-shadow: 0 16px 40px rgb(var(--ob-blue-rgb) / 0.1);
 	padding: 0.85rem;
 }
 
@@ -986,7 +1040,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	gap: 0.45rem;
 	font-size: 0.82rem;
 	font-weight: 800;
-	color: #1d4ed8;
+	color: var(--ob-blue);
 }
 
 .steering-queue-title svg {
@@ -997,7 +1051,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 .steering-queue-hint {
 	font-size: 0.73rem;
 	line-height: 1.45;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 }
 
 .steering-queue-items {
@@ -1007,13 +1061,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 .steering-queue-item {
 	white-space: pre-wrap;
-	border: 1px solid rgba(37, 99, 235, 0.16);
+	border: 1px solid rgb(var(--ob-blue-rgb) / 0.16);
 	border-radius: 0.78rem;
-	background: rgba(255, 255, 255, 0.82);
+	background: rgb(var(--ob-surface-rgb) / 0.82);
 	padding: 0.55rem 0.65rem;
 	font-size: 0.8rem;
 	line-height: 1.45;
-	color: #1e293b;
+	color: var(--ob-text);
 }
 
 .web-confirm-stack {
@@ -1122,13 +1176,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 .interaction-card-meta > span + span::before {
 	margin-right: 0.35rem;
-	color: #b5c0cd;
+	color: var(--ob-text-muted);
 	content: "·";
 }
 
 .interaction-expiry.is-expired {
 	font-weight: 750;
-	color: #a33f3f;
+	color: var(--ob-danger);
 }
 
 .interaction-risk {
@@ -1136,23 +1190,23 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .interaction-risk.warning {
-	color: #8b6524;
+	color: var(--ob-warning);
 }
 
 .interaction-risk.danger {
-	color: #a33f3f;
+	color: var(--ob-danger);
 }
 
 .interaction-expired-notice,
 .interaction-submit-error {
 	margin-top: 0.65rem;
-	border: 1px solid #fecaca;
+	border: 1px solid rgb(var(--ob-danger-rgb) / 0.23);
 	border-radius: 0.7rem;
-	background: #fef2f2;
+	background: var(--ob-danger-soft);
 	padding: 0.55rem 0.65rem;
 	font-size: 0.74rem;
 	line-height: 1.45;
-	color: #991b1b;
+	color: var(--ob-danger);
 }
 
 .web-confirm-body {
@@ -1219,13 +1273,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	margin-top: 0.62rem;
 	font-size: 0.72rem;
 	font-weight: 650;
-	color: #475569;
+	color: var(--ob-text);
 }
 
 .web-interaction-input textarea {
 	width: 100%;
 	resize: vertical;
-	border: 1px solid #ced9e5;
+	border: 1px solid var(--ob-border);
 	border-radius: 0.68rem;
 	background: var(--ob-interaction-surface-strong);
 	padding: 0.58rem 0.65rem;
@@ -1276,14 +1330,14 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .web-confirm-btn.reject {
-	border-color: #c8d2de;
-	background: #eef2f6;
-	color: #475569;
+	border-color: var(--ob-border);
+	background: var(--ob-surface-soft);
+	color: var(--ob-text);
 }
 
 .web-confirm-btn.confirm {
 	background: var(--ob-interaction-accent);
-	color: #fff;
+	color: var(--ob-text-inverse);
 }
 
 .web-confirm-btn:disabled,
@@ -1328,14 +1382,14 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 .questionnaire-question {
 	min-width: 0;
 	margin: 0;
-	border: 1px solid #dbe4ee;
+	border: 1px solid var(--ob-border);
 	border-radius: 0.85rem;
-	background: rgba(255, 255, 255, 0.9);
+	background: rgb(var(--ob-surface-rgb) / 0.9);
 	padding: 0.72rem;
 }
 
 .questionnaire-question.has-error {
-	border-color: #dc2626;
+	border-color: var(--ob-danger);
 }
 
 .questionnaire-question legend {
@@ -1347,7 +1401,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	font-size: 0.82rem;
 	font-weight: 750;
 	line-height: 1.45;
-	color: #1e293b;
+	color: var(--ob-text);
 }
 
 .question-number {
@@ -1357,9 +1411,9 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	height: 1.35rem;
 	place-items: center;
 	border-radius: 50%;
-	background: #e8eef7;
+	background: var(--ob-blue-soft);
 	font-size: 0.7rem;
-	color: #334155;
+	color: var(--ob-text);
 }
 
 .required-mark,
@@ -1373,13 +1427,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .required-mark {
-	background: #fee2e2;
-	color: #991b1b;
+	background: var(--ob-danger-soft);
+	color: var(--ob-danger);
 }
 
 .optional-mark {
-	background: #f1f5f9;
-	color: #64748b;
+	background: var(--ob-surface-soft);
+	color: var(--ob-text-subtle);
 }
 
 .question-description {
@@ -1403,22 +1457,22 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	min-width: 0;
 	align-items: flex-start;
 	gap: 0.5rem;
-	border: 1px solid #dbe4ee;
+	border: 1px solid var(--ob-border);
 	border-radius: 0.72rem;
-	background: #fff;
+	background: var(--ob-surface);
 	padding: 0.55rem 0.62rem;
 	cursor: pointer;
 }
 
 .question-choice-option.is-selected {
-	border-color: #7896bd;
-	background: #f2f6fb;
+	border-color: var(--ob-blue);
+	background: var(--ob-blue-soft);
 }
 
 .question-choice-option input {
 	flex: 0 0 auto;
 	margin-top: 0.17rem;
-	accent-color: #46678f;
+	accent-color: var(--ob-blue);
 }
 
 .question-choice-copy {
@@ -1427,14 +1481,14 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	gap: 0.15rem;
 	font-size: 0.78rem;
 	line-height: 1.4;
-	color: #263548;
+	color: var(--ob-text);
 }
 
 .question-choice-copy > small {
 	font-size: 0.7rem;
 	font-weight: 400;
 	line-height: 1.4;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 	white-space: normal;
 }
 
@@ -1446,24 +1500,24 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .recommendation-badge {
-	border: 1px solid #b8c7da;
-	background: #edf3fa;
-	color: #345477;
+	border: 1px solid rgb(var(--ob-blue-rgb) / 0.23);
+	background: var(--ob-blue-soft);
+	color: var(--ob-blue);
 }
 
 .recommendation-reason {
 	margin-top: 0.45rem;
-	border-left: 2px solid #8ba4c3;
+	border-left: 2px solid var(--ob-blue);
 	padding-left: 0.55rem;
 	font-size: 0.71rem;
 	line-height: 1.45;
-	color: #526274;
+	color: var(--ob-text-subtle);
 	white-space: pre-wrap;
 }
 
 .recommendation-reason strong {
 	margin-right: 0.35rem;
-	color: #345477;
+	color: var(--ob-blue);
 }
 
 .clear-question-choice {
@@ -1472,7 +1526,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	background: transparent;
 	padding: 0.15rem 0;
 	font-size: 0.7rem;
-	color: #526f91;
+	color: var(--ob-blue);
 	text-decoration: underline;
 	text-underline-offset: 2px;
 	cursor: pointer;
@@ -1484,34 +1538,34 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	margin-top: 0.55rem;
 	font-size: 0.72rem;
 	font-weight: 650;
-	color: #475569;
+	color: var(--ob-text);
 }
 
 .question-free-text textarea {
 	width: 100%;
 	resize: vertical;
-	border: 1px solid #ced9e5;
+	border: 1px solid var(--ob-border);
 	border-radius: 0.68rem;
-	background: #fff;
+	background: var(--ob-surface);
 	padding: 0.55rem 0.62rem;
 	font: inherit;
 	font-size: 0.78rem;
 	font-weight: 400;
 	line-height: 1.45;
-	color: #1f2937;
+	color: var(--ob-text);
 	outline: none;
 }
 
 .question-free-text textarea:focus {
-	border-color: #6585aa;
-	box-shadow: 0 0 0 3px rgba(70, 103, 143, 0.12);
+	border-color: var(--ob-blue);
+	box-shadow: 0 0 0 3px rgb(var(--ob-blue-rgb) / 0.12);
 }
 
 .question-hint {
 	margin-top: 0.35rem;
 	font-size: 0.68rem;
 	line-height: 1.4;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 }
 
 .question-error {
@@ -1519,7 +1573,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	margin-top: 0.22rem;
 	font-size: 0.7rem;
 	font-weight: 650;
-	color: #b91c1c;
+	color: var(--ob-danger);
 }
 
 .question-error:empty {
@@ -1528,8 +1582,8 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 .questionnaire-actions {
 	margin: 0.75rem -0.85rem -0.85rem;
-	border-top: 1px solid #e2e8f0;
-	background: rgba(248, 250, 252, 0.97);
+	border-top: 1px solid var(--ob-border);
+	background: rgb(var(--ob-surface-rgb) / 0.97);
 	padding: 0.65rem 0.85rem;
 }
 
@@ -1560,16 +1614,16 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 .composer-box {
 	position: relative;
 	z-index: 40;
-	border: 1px solid #d6d6d8;
-	border-radius: 22px;
-	background: #fff;
+	border: 1px solid var(--ob-chat-border);
+	border-radius: 13px;
+	background: var(--ob-chat-panel);
 	padding: 0.5rem;
-	box-shadow: 0 10px 34px rgba(0, 0, 0, .10);
+	box-shadow: var(--ob-shadow-panel);
 }
 
 .composer-box:focus-within {
-	border-color: #b9b9bd;
-	box-shadow: 0 14px 42px rgba(0, 0, 0, .12);
+	border-color: var(--ob-border-strong);
+	box-shadow: var(--ob-shadow-panel);
 }
 
 .attachment-strip {
@@ -1586,10 +1640,10 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	width: 82px;
 	height: 82px;
 	overflow: hidden;
-	border: 1px solid rgba(15, 23, 42, 0.10);
+	border: 1px solid var(--ob-border);
 	border-radius: 18px;
-	background: linear-gradient(180deg, #fff, #f8fafc);
-	box-shadow: 0 12px 32px rgba(15, 23, 42, 0.10);
+	background: linear-gradient(180deg, var(--ob-surface), var(--ob-surface));
+	box-shadow: var(--ob-shadow-panel);
 }
 
 .attachment-thumb {
@@ -1611,7 +1665,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	place-items: center;
 	padding: 0.45rem;
 	text-align: center;
-	color: #475569;
+	color: var(--ob-text);
 	font-size: 10px;
 	line-height: 1.2;
 }
@@ -1627,7 +1681,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .attachment-file-tile small {
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 }
 
 .attachment-remove {
@@ -1640,8 +1694,8 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	place-items: center;
 	border: 0;
 	border-radius: 999px;
-	background: rgba(15, 23, 42, 0.76);
-	color: white;
+	background: rgb(var(--ob-text-strong-rgb) / 0.76);
+	color: var(--ob-text-inverse);
 	cursor: pointer;
 	opacity: 0;
 	transform: scale(0.88);
@@ -1655,7 +1709,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .attachment-remove:hover {
-	background: rgba(220, 38, 38, 0.92);
+	background: rgb(var(--ob-danger-rgb) / 0.92);
 }
 
 .attachment-remove svg {
@@ -1666,7 +1720,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 .file-preview-icon {
 	width: 1.45rem;
 	height: 1.45rem;
-	color: #64748b;
+	color: var(--ob-text-subtle);
 }
 
 .composer-textarea {
@@ -1680,13 +1734,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	outline: 0;
 	background: transparent;
 	padding: 0.45rem 0.75rem;
-	color: #111827;
+	color: var(--ob-text-strong);
 	font-size: 14px;
 	line-height: 1.65;
 }
 
 .composer-textarea::placeholder {
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 }
 
 .composer-toolbar {
@@ -1705,7 +1759,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	border: 0;
 	border-radius: 999px;
 	background: transparent;
-	color: #5f6b66;
+	color: var(--ob-text-subtle);
 	cursor: pointer;
 }
 
@@ -1715,12 +1769,12 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .tool-btn-accent {
-	color: var(--bear-accent);
+	color: var(--ob-chat-subtle);
 }
 
 .tool-btn:hover, .tool-btn-active {
-	background: #f4f4f5;
-	color: #111827;
+	background: var(--ob-hover);
+	color: var(--ob-text-strong);
 }
 
 .tool-btn:disabled {
@@ -1730,6 +1784,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 .composer-status {
 	display: flex;
+	min-width: 0;
 	align-items: center;
 	gap: 0.35rem;
 }
@@ -1747,7 +1802,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	border-radius: 999px;
 	background: transparent;
 	padding: 0 0.5rem;
-	color: #52525b;
+	color: var(--ob-text);
 	font-size: 12px;
 }
 
@@ -1758,19 +1813,21 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 }
 
 .run-config-chip {
-	max-width: min(30rem, 54vw);
+	max-width: min(24rem, 38vw);
+	min-width: 0;
+	flex: 0 1 auto;
 	height: 1.78rem;
 	gap: 0.34rem;
 	background: transparent;
 	padding: 0 0.34rem 0 0.48rem;
-	color: #71717a;
+	color: var(--ob-text-subtle);
 	font-size: 11.2px;
 }
 
 .run-config-chip:hover,
 .run-config-chip.status-chip-active {
-	background: #f4f4f5;
-	color: #27272a;
+	background: var(--ob-hover);
+	color: var(--ob-text);
 }
 
 .run-config-chip-main {
@@ -1786,13 +1843,13 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	font-weight: 640;
+	font-weight: 500;
 }
 
 .run-config-chip-strategy {
 	flex: 0 0 auto;
 	white-space: nowrap;
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 	font-weight: 520;
 }
 
@@ -1801,31 +1858,31 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	color: #94a3b8;
+	color: var(--ob-text-muted);
 	font-weight: 520;
 }
 
 .run-config-chip-meta::before, .run-config-chip-strategy::before {
 	content: "·";
 	margin-right: 0.28rem;
-	color: #d4d4d8;
+	color: var(--ob-text-muted);
 }
 
 .chip-caret {
 	width: 0.72rem;
 	height: 0.72rem;
 	flex: 0 0 auto;
-	color: #a1a1aa;
+	color: var(--ob-text-muted);
 	transition: transform .14s ease, color .14s ease;
 }
 
 .run-config-chip.status-chip-active .chip-caret {
 	transform: rotate(180deg);
-	color: #71717a;
+	color: var(--ob-text-subtle);
 }
 
 .status-chip strong {
-	color: #334155;
+	color: var(--ob-text);
 	font-weight: 650;
 }
 
@@ -1834,25 +1891,25 @@ button.status-chip {
 }
 
 button.status-chip:hover, .status-chip-active {
-	background: #f4f4f5;
-	color: #111827;
+	background: var(--ob-hover);
+	color: var(--ob-text-strong);
 }
 
 /* Model picker: quiet macOS surfaces, one accent, two readable type sizes. */
 .popover-menu-content { overflow: hidden; border-radius: 12px; }
 .run-config-popover {
-	--rc-text: #2c3038;
-	--rc-muted: #787e8b;
-	--rc-line: #e5e7eb;
-	--rc-surface: #f3f4f6;
-	--rc-hover: #f5f6f8;
-	--rc-selected: #edf2fc;
-	--rc-control: #ffffff;
-	--rc-accent: #3578df;
-	--rc-track: #d8dbe2;
-	--rc-detail-bg: #30343b;
-	--rc-detail-text: #f8fafc;
-	--rc-detail-line: #484e58;
+	--rc-text: var(--ob-text);
+	--rc-muted: var(--ob-text-subtle);
+	--rc-line: var(--ob-border);
+	--rc-surface: var(--ob-surface-soft);
+	--rc-hover: var(--ob-hover);
+	--rc-selected: var(--ob-selected);
+	--rc-control: var(--ob-surface);
+	--rc-accent: var(--ob-blue);
+	--rc-track: var(--ob-scrollbar);
+	--rc-detail-bg: var(--ob-text-strong);
+	--rc-detail-text: var(--ob-text-inverse);
+	--rc-detail-line: var(--ob-border);
 	position: relative;
 	display: flex;
 	flex-direction: column;
@@ -1891,7 +1948,7 @@ button.status-chip:hover, .status-chip-active {
 .run-config-tabs button.is-active {
 	background: var(--rc-control);
 	color: var(--rc-text);
-	box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 0.5px 1px rgba(15, 23, 42, 0.04);
+	box-shadow: var(--ob-shadow-panel);
 }
 .run-config-context {
 	flex: 0 0 auto;
@@ -1905,8 +1962,7 @@ button.status-chip:hover, .status-chip-active {
 .context-meter-values { display: flex; align-items: baseline; gap: 8px; font-variant-numeric: tabular-nums; font-size: 12px; white-space: nowrap; }
 .context-meter-limit { color: var(--rc-muted); }
 .context-percent { font-weight: 500; color: var(--rc-text); }
-.context-meter { height: 5px; margin-top: 6px; overflow: hidden; border-radius: 5px; background: rgba(0, 0, 0, 0.06); }
-html.dark .context-meter { background: rgba(255, 255, 255, 0.08); }
+.context-meter { height: 5px; margin-top: 6px; overflow: hidden; border-radius: 5px; background: rgb(var(--ob-text-muted-rgb) / 0.06); }
 .context-meter span { display: block; height: 100%; border-radius: inherit; background: var(--rc-accent); transition: width .2s ease; }
 .run-config-notice { margin: 0 4px; color: var(--rc-muted); font-size: 12px; }
 .model-search {
@@ -1924,7 +1980,7 @@ html.dark .context-meter { background: rgba(255, 255, 255, 0.08); }
 }
 .model-search:focus-within {
 	border-color: var(--rc-accent);
-	box-shadow: 0 0 0 2px rgba(53, 120, 223, 0.15);
+	box-shadow: 0 0 0 2px rgb(var(--ob-blue-rgb) / 0.15);
 }
 .model-search svg { width: 14px; height: 14px; flex: 0 0 auto; color: var(--rc-muted); }
 .model-search input { min-width: 0; width: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--rc-text); font-size: 13px; line-height: 20px; }
@@ -1960,10 +2016,7 @@ html.dark .context-meter { background: rgba(255, 255, 255, 0.08); }
 .model-row:hover { background: var(--rc-hover); }
 .model-row.is-selected {
 	background: var(--rc-selected);
-	border-color: rgba(53, 120, 223, 0.2);
-}
-html.dark .model-row.is-selected {
-	border-color: rgba(106, 157, 241, 0.28);
+	border-color: rgb(var(--ob-blue-rgb) / 0.2);
 }
 .model-select {
 	display: flex;
@@ -2026,11 +2079,7 @@ html.dark .model-row.is-selected {
 }
 .model-tag-feature {
 	color: var(--rc-text);
-	background: rgba(53, 120, 223, 0.08);
-}
-html.dark .model-tag-feature {
-	background: rgba(106, 157, 241, 0.12);
-	color: var(--rc-text);
+	background: rgb(var(--ob-blue-rgb) / 0.08);
 }
 .model-tag .model-feature-icon {
 	width: 12px;
@@ -2087,7 +2136,7 @@ html.dark .model-tag-feature {
 .thinking-segments button.is-active {
 	color: var(--rc-text);
 	background: var(--rc-control);
-	box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 0.5px 1px rgba(15, 23, 42, 0.04);
+	box-shadow: var(--ob-shadow-panel);
 }
 .thinking-segments button:disabled { opacity: .4; cursor: not-allowed; }
 .fast-control {
@@ -2115,8 +2164,8 @@ html.dark .model-tag-feature {
 	width: 18px;
 	height: 18px;
 	border-radius: 50%;
-	background: #fff;
-	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+	background: var(--ob-switch-thumb);
+	box-shadow: var(--ob-shadow-panel);
 	transition: transform .18s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .fast-switch.is-on { background: var(--rc-accent); }
@@ -2140,12 +2189,12 @@ html.dark .model-tag-feature {
 	display: grid;
 	place-items: center;
 	border: 0;
-	border-radius: 999px;
-	background: #18181b;
-	color: white;
+	border-radius: 8px;
+	background: var(--ob-chat-button);
+	color: var(--ob-chat-button-text);
 	line-height: 1;
 	cursor: pointer;
-	box-shadow: 0 8px 18px rgba(15, 23, 42, .18);
+	box-shadow: var(--ob-shadow-panel);
 }
 
 .send-button svg {
@@ -2154,18 +2203,26 @@ html.dark .model-tag-feature {
 }
 
 .stop-button {
-	background: #dc2626;
-	box-shadow: 0 8px 18px rgba(220, 38, 38, .18);
+	background: var(--ob-danger);
+	box-shadow: 0 8px 18px rgb(var(--ob-danger-rgb) / 0.18);
 }
 
 .send-button:disabled {
-	background: #d1d5db;
+	background: var(--ob-text-disabled);
 	cursor: not-allowed;
 }
 
+@media (min-width: 761px) {
+	/* Desktop already includes usage in the model/configuration button. */
+	.composer-status :deep(.context-usage-trigger) { display: none; }
+}
+
 @media (max-width: 760px) {
-	.composer-shell { padding: .5rem .75rem; }
-	.composer-box { padding: .375rem; border-radius: 20px; }
+	.composer-shell { padding: .5rem .75rem max(8px, env(safe-area-inset-bottom, 0px)); }
+	.composer-box { padding: 7px; border-radius: 15px; margin-bottom: 32px; }
+	/* One live usage owner, placed beneath the input without squeezing its actions. */
+	.composer-toolbar :deep(.context-usage-trigger) { position: absolute; left: 50%; bottom: -34px; transform: translateX(-50%); }
+	.composer-status .run-config-chip-strategy { display: none; }
 	.composer-toolbar {
 		display: flex;
 		flex-wrap: nowrap;
@@ -2198,8 +2255,24 @@ html.dark .model-tag-feature {
 	.composer-toolbar button.run-config-chip:focus-visible { outline: 2px solid var(--bear-accent); outline-offset: -2px; }
 	.run-config-chip-meta { display: none; }
 	.composer-hints { display: none; }
-	:deep(.reference-editor-content) { min-height: min(4.5rem, calc(var(--mobile-viewport-height, 100dvh) * .22)); padding: .65rem .5rem; }
+	:deep(.reference-editor-content) { min-height: min(3rem, calc(var(--mobile-viewport-height, 100dvh) * .22)); padding: .55rem .5rem; }
 	:deep(.reference-editor-placeholder) { padding: .65rem .5rem; }
+}
+
+/* The extra usage control must not squeeze the model name away on small
+   phones. Only the narrowest toolbar uses two tracks; all actions stay visible. */
+@media (max-width: 360px) {
+	.composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 44px; }
+	.composer-status { display: contents; }
+	.composer-actions { grid-row: 2; grid-column: 1; }
+	.composer-toolbar button.run-config-chip { grid-row: 1; grid-column: 1; justify-self: start; max-width: 100%; }
+	.composer-toolbar :deep(.context-usage-trigger) { grid-row: auto; grid-column: auto; }
+	.composer-toolbar .send-button { grid-row: 2; grid-column: 2; }
+}
+@media (min-width: 761px) and (max-width: 1120px) {
+	.composer-toolbar { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+	.composer-status { justify-content: flex-end; }
+	.run-config-chip { max-width: min(20rem, 38vw); }
 }
 
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
@@ -2221,13 +2294,7 @@ html.dark .model-tag-feature {
 		opacity: 1;
 		transform: none;
 		/* Keep the small macOS remove badge inside its 44px tap target. */
-		background: radial-gradient(circle, rgba(15, 23, 42, .8) 0 12px, transparent 13px);
-	}
-	:global(html.dark) .attachment-remove {
-		background: radial-gradient(circle, rgba(15, 23, 42, .8) 0 12px, transparent 13px);
-	}
-	.attachment-remove:hover, :global(html.dark) .attachment-remove:hover {
-		background: radial-gradient(circle, rgba(220, 38, 38, .92) 0 12px, transparent 13px);
+		background: radial-gradient(circle, rgb(var(--ob-text-strong-rgb) / 0.8) 0 12px, transparent 13px);
 	}
 	:deep(.reference-editor-content) { max-height: min(13.5rem, calc(var(--mobile-viewport-height, 100dvh) * .28)); }
 }
@@ -2236,232 +2303,25 @@ html.dark .model-tag-feature {
 <style>
 .run-config-menu-popper.el-popper {
 	padding: 10px;
-	border: 1px solid rgba(226, 228, 233, 0.9);
+	border: 1px solid var(--ob-border);
 	border-radius: 16px;
-	background: rgba(255, 255, 255, 0.98);
-	box-shadow: 0 16px 40px -6px rgba(15, 23, 42, 0.14), 0 0 1px 1px rgba(15, 23, 42, 0.05);
+	background: var(--ob-surface-raised);
+	box-shadow: var(--ob-shadow-popover);
 	backdrop-filter: blur(24px) saturate(180%);
 	-webkit-backdrop-filter: blur(24px) saturate(180%);
 }
 html.dark .run-config-menu-popper.el-popper {
-	border-color: rgba(62, 65, 74, 0.85);
-	background: rgba(25, 26, 30, 0.96);
-	box-shadow: 0 20px 48px -8px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.08);
+	border-color: var(--ob-border);
 }
 /* OpenBear system dark theme */
-html.dark .steering-queue-card {
-		border: 1px solid rgba(96, 165, 250, 0.22);
-		background: linear-gradient(180deg, rgba(32, 33, 37, 0.98), rgba(29, 30, 34, 0.96));
-		box-shadow: 0 16px 40px rgba(37, 99, 235, 0.1);
-	}
-html.dark .steering-queue-title {
-		color: #60a5fa;
-	}
-html.dark .steering-queue-hint {
-		color: #c6c6cd;
-	}
-html.dark .steering-queue-item {
-		border: 1px solid rgba(96, 165, 250, 0.16);
-		background: rgba(29, 30, 34, 0.82);
-		color: #dedee1;
-	}
-html.dark .interaction-card-meta > span + span::before {
-		color: #7b7b82;
-	}
-html.dark .interaction-expiry.is-expired {
-		color: #fb8585;
-	}
-html.dark .interaction-risk.warning {
-		color: #fbad66;
-	}
-html.dark .interaction-risk.danger {
-		color: #fb8585;
-	}
 html.dark .interaction-expired-notice,
 html.dark .interaction-submit-error {
-		border: 1px solid rgba(251, 133, 133, 0.52);
-		background: #1d1e22;
-		color: #fb8585;
-	}
-html.dark .web-interaction-input {
-		color: #c6c6cd;
-	}
-html.dark .web-interaction-input textarea {
-		border: 1px solid #3d3e46;
-	}
-html.dark .web-confirm-btn.reject {
-		border-color: #3d3e46;
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .web-confirm-btn.confirm {
-		color: #ffffff;
-	}
-html.dark .questionnaire-question {
-		border: 1px solid #3d3e46;
-		background: rgba(29, 30, 34, 0.9);
-	}
-html.dark .questionnaire-question.has-error {
-		border-color: rgba(251, 133, 133, 0.52);
-	}
-html.dark .questionnaire-question legend {
-		color: #dedee1;
-	}
-html.dark .question-number {
-		background: #202125;
-		color: #dedee1;
-	}
-html.dark .required-mark {
-		background: #202125;
-		color: #fb8585;
-	}
-html.dark .optional-mark {
-		background: #202125;
-		color: #c6c6cd;
-	}
-html.dark .question-choice-option {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-	}
-html.dark .question-choice-option.is-selected {
-		border-color: rgba(96, 165, 250, 0.52);
-		background: #202125;
-	}
-html.dark .question-choice-copy {
-		color: #dedee1;
-	}
-html.dark .question-choice-copy > small {
-		color: #c6c6cd;
+		border: 1px solid rgb(var(--ob-danger-rgb) / 0.52);
 	}
 html.dark .recommendation-badge {
-		border: 1px solid #3d3e46;
-		background: #202125;
-		color: #60a5fa;
+		border: 1px solid var(--ob-border);
 	}
 html.dark .recommendation-reason {
-		border-left: 2px solid rgba(96, 165, 250, 0.52);
-		color: #c6c6cd;
-	}
-html.dark .recommendation-reason strong {
-		color: #60a5fa;
-	}
-html.dark .clear-question-choice {
-		color: #60a5fa;
-	}
-html.dark .question-free-text {
-		color: #c6c6cd;
-	}
-html.dark .question-free-text textarea {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-		color: #dedee1;
-	}
-html.dark .question-free-text textarea:focus {
-		border-color: rgba(96, 165, 250, 0.52);
-	}
-html.dark .question-hint {
-		color: #c6c6cd;
-	}
-html.dark .question-error {
-		color: #fb8585;
-	}
-html.dark .questionnaire-actions {
-		border-top: 1px solid #3d3e46;
-		background: rgba(29, 30, 34, 0.97);
-	}
-html.dark .composer-box {
-		border: 1px solid #3d3e46;
-		background: #1d1e22;
-		box-shadow: 0 10px 34px rgba(0, 0, 0, 0.16);
-	}
-html.dark .composer-box:focus-within {
-		border-color: #3d3e46;
-		box-shadow: 0 14px 42px rgba(0, 0, 0, 0.16);
-	}
-html.dark .attachment-card {
-		border: 1px solid rgba(255, 255, 255, 0.145);
-		background: linear-gradient(180deg, #1d1e22, #1d1e22);
-		box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
-	}
-html.dark .attachment-file-tile {
-		color: #c6c6cd;
-	}
-html.dark .attachment-file-tile small {
-		color: #a1a1a8;
-	}
-html.dark .attachment-remove {
-		background: rgba(255, 255, 255, 0.34);
-	}
-html.dark .file-preview-icon {
-		color: #c6c6cd;
-	}
-html.dark .composer-textarea {
-		color: #efeff2;
-	}
-html.dark .composer-textarea::placeholder {
-		color: #a1a1a8;
-	}
-html.dark .tool-btn {
-		color: #c6c6cd;
-	}
-html.dark .tool-btn:hover,
-html.dark .tool-btn-active {
-		background: #202125;
-		color: #efeff2;
-	}
-html.dark .status-chip {
-		color: #c6c6cd;
-	}
-html.dark .run-config-chip {
-		color: #c6c6cd;
-	}
-html.dark .run-config-chip:hover,
-html.dark .run-config-chip.status-chip-active {
-		background: #202125;
-		color: #efeff2;
-	}
-html.dark .run-config-chip-meta, html.dark .run-config-chip-strategy {
-		color: #a1a1a8;
-	}
-html.dark .run-config-chip-meta::before, html.dark .run-config-chip-strategy::before {
-		color: #7b7b82;
-	}
-html.dark .chip-caret {
-		color: #a1a1a8;
-	}
-html.dark .run-config-chip.status-chip-active .chip-caret {
-		color: #c6c6cd;
-	}
-html.dark .status-chip strong {
-		color: #dedee1;
-	}
-html.dark button.status-chip:hover,
-html.dark .status-chip-active {
-		background: #202125;
-		color: #efeff2;
-	}
-html.dark .run-config-popover {
-	--rc-text: #e5e6e9;
-	--rc-muted: #a3a7af;
-	--rc-line: #3a3d43;
-	--rc-surface: #282b31;
-	--rc-hover: #2e3138;
-	--rc-selected: #363941;
-	--rc-control: #41454e;
-	--rc-accent: #6a9df1;
-	--rc-track: #535963;
-	--rc-detail-bg: #e5e7eb;
-	--rc-detail-text: #242831;
-	--rc-detail-line: #f3f4f6;
-}
-html.dark .send-button {
-		background: #232428;
-		box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
-	}
-html.dark .stop-button {
-		box-shadow: 0 8px 18px rgba(220, 38, 38, 0.18);
-	}
-html.dark .send-button:disabled {
-		background: #2b2c30;
+		border-left: 2px solid rgb(var(--ob-blue-rgb) / 0.52);
 	}
 </style>

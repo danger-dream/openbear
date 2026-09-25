@@ -267,6 +267,79 @@ class WebAdminAuthMixin:
             headers={"Cache-Control": "no-store"},
         )
 
+    async def handle_api_auth_sessions(self, request: web.Request) -> web.Response:
+        session: WebSession = request[_WEB_SESSION_KEY]
+        token = request.cookies.get(_COOKIE, "")
+        current_hash = _sha256(token) if token else ""
+        ts = now_ts()
+        cur = await self.db.conn.execute(
+            """
+            SELECT id, session_token_hash, created_at, expires_at, last_seen_at, ip, user_agent
+            FROM web_sessions
+            WHERE chat_id=? AND revoked_at=0 AND expires_at>?
+            ORDER BY CASE WHEN session_token_hash=? THEN 0 ELSE 1 END,
+                     last_seen_at DESC, created_at DESC, id DESC
+            LIMIT 100
+            """,
+            (session.chat_id, ts, current_hash),
+        )
+        items = []
+        for row in await cur.fetchall():
+            items.append({
+                "id": int(row["id"]),
+                "createdAt": int(row["created_at"] or 0),
+                "expiresAt": int(row["expires_at"] or 0),
+                "lastSeenAt": int(row["last_seen_at"] or 0),
+                "ip": str(row["ip"] or ""),
+                "userAgent": str(row["user_agent"] or ""),
+                "current": bool(current_hash and secrets.compare_digest(str(row["session_token_hash"]), current_hash)),
+            })
+        return web.json_response(
+            {"ok": True, "items": items, "total": len(items)},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def handle_api_auth_session_revoke(self, request: web.Request) -> web.Response:
+        session: WebSession = request[_WEB_SESSION_KEY]
+        target_id = int(request.match_info["session_id"])
+        token = request.cookies.get(_COOKIE, "")
+        current_hash = _sha256(token) if token else ""
+        ts = now_ts()
+        cur = await self.db.conn.execute(
+            """
+            SELECT session_token_hash FROM web_sessions
+            WHERE id=? AND chat_id=? AND revoked_at=0 AND expires_at>?
+            """,
+            (target_id, session.chat_id, ts),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return web.json_response({"ok": False, "error": "session_not_found"}, status=404)
+        is_current = bool(
+            current_hash and secrets.compare_digest(str(row["session_token_hash"] or ""), current_hash)
+        )
+        changed = await self.db.conn.execute(
+            """
+            UPDATE web_sessions SET revoked_at=?
+            WHERE id=? AND chat_id=? AND revoked_at=0 AND expires_at>?
+            """,
+            (ts, target_id, session.chat_id, ts),
+        )
+        await self.db.conn.commit()
+        if int(changed.rowcount or 0) != 1:
+            return web.json_response({"ok": False, "error": "session_not_found"}, status=404)
+        await self.audit(
+            "web.session.revoked",
+            actor="web",
+            chat_id=session.chat_id,
+            ip=request.remote or "",
+            detail={"sessionId": target_id, "current": is_current},
+        )
+        response = web.json_response({"ok": True, "sessionId": target_id, "current": is_current})
+        if is_current:
+            response.del_cookie(_COOKIE)
+        return response
+
     def _audit_query(self, request: web.Request, *, export: bool = False) -> tuple[str, list[Any], int, int]:
         page = max(1, int(request.query.get("page", "1") or 1))
         page_size = min(10000 if export else 200, max(1, int(request.query.get("pageSize", "100") or 100)))

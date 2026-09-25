@@ -8,6 +8,25 @@ from app.web_console.notification_delivery import bind_notification_receipts
 
 
 class WebAdminOperationsMixin:
+    @staticmethod
+    def _visible_interaction_at_ms(
+        *, op_type: str, internal: int, lifecycle: str, status: str,
+        payload: dict[str, Any], created_at_ms: int,
+    ) -> int:
+        if internal or payload.get("internal") or payload.get("hidden"):
+            return 0
+        text = str(payload.get("text") or "")
+        if op_type == "user_message":
+            attachments = payload.get("attachments")
+            if text.strip() or (isinstance(attachments, list) and attachments):
+                return int(created_at_ms or 0)
+        if (
+            op_type == "assistant_message" and lifecycle == "terminal" and status == "completed"
+            and not payload.get("error") and text.strip()
+        ):
+            return int(payload.get("terminalAtMs") or created_at_ms or 0)
+        return 0
+
     async def _prune_web_event_frames(
         self,
         conversation_uuid: str = "",
@@ -98,7 +117,7 @@ class WebAdminOperationsMixin:
             return None
         if conn is None:
             async with self.db.web_operation_transaction() as transaction_conn:
-                return await self._publish_operation(
+                result = await self._publish_operation(
                     conv_uuid,
                     internal_chat_id=internal_chat_id,
                     owner_chat_id=owner_chat_id,
@@ -118,6 +137,10 @@ class WebAdminOperationsMixin:
                     skip_if_missing=skip_if_missing,
                     conn=transaction_conn,
                 )
+            invalidate = getattr(self, "_invalidate_tree_status", None)
+            if invalidate is not None:
+                invalidate(int(owner_chat_id or 0))
+            return result
 
         cur = await conn.execute(
             "SELECT * FROM web_operations WHERE conversation_uuid=? AND op_id=? LIMIT 1",
@@ -376,6 +399,54 @@ class WebAdminOperationsMixin:
                     op_id,
                 ),
             )
+        old_interaction_at = self._visible_interaction_at_ms(
+            op_type=str(existing["op_type"] or "") if existing is not None else op_type,
+            internal=int(existing["internal"] or 0) if existing is not None else 0,
+            lifecycle=str(existing["lifecycle"] or "") if existing is not None else "",
+            status=str(existing["status"] or "") if existing is not None else "",
+            payload=old_payload,
+            created_at_ms=int(existing["created_at_ms"] or 0) if existing is not None else 0,
+        )
+        new_interaction_at = self._visible_interaction_at_ms(
+            op_type=op_type, internal=internal_value, lifecycle=lifecycle_value,
+            status=status_value, payload=snapshot_payload, created_at_ms=created_at_ms,
+        )
+        if new_interaction_at != old_interaction_at:
+            if new_interaction_at >= old_interaction_at:
+                await conn.execute(
+                    """UPDATE web_conversations
+                       SET last_interaction_at_ms=MAX(last_interaction_at_ms,?)
+                       WHERE conversation_uuid=? AND last_interaction_at_ms IS NOT NULL""",
+                    (new_interaction_at, conv_uuid),
+                )
+            else:
+                # Visibility/timestamp rewrites are exceptional. Rebuild only this
+                # conversation rather than allowing a stale maximum to survive.
+                cur = await conn.execute(
+                    """
+                    SELECT MAX(CASE WHEN op_type='user_message' THEN created_at_ms ELSE
+                        COALESCE(NULLIF(CAST(json_extract(payload_json,'$.terminalAtMs') AS INTEGER),0),created_at_ms)
+                    END) AS value
+                    FROM web_operations
+                    WHERE conversation_uuid=? AND op_type IN ('user_message','assistant_message')
+                      AND COALESCE(internal,0)=0
+                      AND COALESCE(json_extract(payload_json,'$.internal'),0)=0
+                      AND COALESCE(json_extract(payload_json,'$.hidden'),0)=0
+                      AND ((op_type='user_message' AND
+                            (LENGTH(TRIM(COALESCE(json_extract(payload_json,'$.text'),'')))>0
+                             OR COALESCE(json_array_length(payload_json,'$.attachments'),0)>0))
+                           OR (op_type='assistant_message' AND lifecycle='terminal' AND status='completed'
+                               AND COALESCE(json_extract(payload_json,'$.error'),0)=0
+                               AND LENGTH(TRIM(COALESCE(json_extract(payload_json,'$.text'),'')))>0))
+                    """,
+                    (conv_uuid,),
+                )
+                projected = await cur.fetchone()
+                await conn.execute(
+                    "UPDATE web_conversations SET last_interaction_at_ms=? WHERE conversation_uuid=? AND last_interaction_at_ms IS NOT NULL",
+                    (int(projected["value"] or 0) if projected else 0, conv_uuid),
+                )
+
         await conn.execute(
             """
             INSERT INTO web_event_frames (

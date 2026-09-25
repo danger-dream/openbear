@@ -130,6 +130,7 @@ class ControlActionQueue:
         self._after_turn: dict[int, list[QueuedControlAction]] = {}
         self._soft_stop: dict[int, str] = {}
         self._retry_cancel: set[int] = set()
+        self._retry_actions: dict[int, tuple[str, str]] = {}
 
     def enqueue_after_turn(
         self,
@@ -174,6 +175,25 @@ class ControlActionQueue:
 
     def clear_retry_cancel(self, chat_id: int) -> None:
         self._retry_cancel.discard(int(chat_id))
+        self._retry_actions.pop(int(chat_id), None)
+
+    def request_retry_action(self, chat_id: int, wait_id: str, action: str) -> bool:
+        if not wait_id or action not in {"retry", "cancel"}:
+            return False
+        cid = int(chat_id)
+        pending = self._retry_actions.get(cid)
+        if pending and pending[0] == wait_id:
+            return False
+        self._retry_actions[cid] = (wait_id, action)
+        return True
+
+    def consume_retry_action(self, chat_id: int, wait_id: str) -> str:
+        cid = int(chat_id)
+        pending = self._retry_actions.get(cid)
+        if pending is None or pending[0] != wait_id:
+            return ""
+        self._retry_actions.pop(cid, None)
+        return pending[1]
 
     async def drain_after_turn(self, svc: Any, chat_id: int) -> list[str]:
         """执行当前 chat 的 post-turn 动作；返回执行摘要。"""

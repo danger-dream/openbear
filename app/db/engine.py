@@ -146,6 +146,13 @@ class DB:
         await self._add_column_if_missing("web_conversations", "pinned_at", "pinned_at INTEGER DEFAULT 0")
         await self._add_column_if_missing("web_conversations", "display_order", "display_order REAL")
         await self._add_column_if_missing("web_conversations", "folder_uuid", "folder_uuid TEXT NOT NULL DEFAULT ''")
+        # NULL is an intentional legacy-backfill marker. Adding either timestamp
+        # with DEFAULT 0 would silently classify unknown historical rows as empty.
+        await self._add_column_if_missing("web_conversations", "last_interaction_at_ms", "last_interaction_at_ms INTEGER")
+        await self._add_column_if_missing("web_conversations", "last_conversation_at", "last_conversation_at INTEGER")
+        await self._add_column_if_missing(
+            "web_conversations", "reference_revision", "reference_revision INTEGER NOT NULL DEFAULT 0"
+        )
         if has_web_conversations and not had_display_order:
             await self._backfill_web_conversation_display_order()
         await self._add_column_if_missing("web_conversations", "context_strategy", "context_strategy TEXT NOT NULL DEFAULT 'sliding_window'")

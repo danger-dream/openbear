@@ -74,6 +74,7 @@ class RathTaskManager:
         self.dao = dao
         self._runs: dict[str, asyncio.Task] = {}
         self._retry_cancel: set[str] = set()
+        self._retry_actions: dict[str, tuple[str, str]] = {}
         # Route-active tasks occupy a chat/internal_chat_id: new user input is
         # steered to that Rath task instead of starting a normal OpenBear turn.
         # Not every running Rath task should do this. Detached Agent tool tasks
@@ -155,6 +156,7 @@ class RathTaskManager:
         if self._runs.get(task_uuid) is task:
             self._runs.pop(task_uuid, None)
         self._retry_cancel.discard(task_uuid)
+        self._retry_actions.pop(task_uuid, None)
         active = self._chat_active.get(chat_id)
         if active and task_uuid in active:
             active.remove(task_uuid)
@@ -179,6 +181,22 @@ class RathTaskManager:
             return False
         self._retry_cancel.discard(task_uuid)
         return True
+
+    def request_retry_action(self, task_uuid: str, wait_id: str, action: str) -> bool:
+        if not wait_id or action not in {"retry", "cancel"} or not self.is_running(task_uuid):
+            return False
+        pending = self._retry_actions.get(task_uuid)
+        if pending and pending[0] == wait_id:
+            return False
+        self._retry_actions[task_uuid] = (wait_id, action)
+        return True
+
+    def consume_retry_action(self, task_uuid: str, wait_id: str) -> str:
+        pending = self._retry_actions.get(task_uuid)
+        if pending is None or pending[0] != wait_id:
+            return ""
+        self._retry_actions.pop(task_uuid, None)
+        return pending[1]
 
     async def _finalize_stale_active_task(self, task: RathTask) -> None:
         """Clear an active DB row that no in-memory runner can ever finish.

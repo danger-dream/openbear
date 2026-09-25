@@ -1,9 +1,11 @@
 <script setup>
 import MobileAdminSummary from "../components/MobileAdminSummary.vue";
+import AdminPageHeader from "../components/AdminPageHeader.vue";
 import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 
+const emit = defineEmits(["mobile-header-ready"]);
 const TOOL_PREVIEW_LIMIT = 3;
 
 const loading = ref(false);
@@ -12,6 +14,7 @@ const mcpToggling = ref(false);
 const serverTogglingKeys = ref(new Set());
 const status = ref({ ok: true, enabled: false, summary: {}, servers: [], tools: [], prompts: [], note: "" });
 const query = ref("");
+const showDisabled = ref(false);
 const drawerOpen = ref(false);
 const drawerKind = ref("");
 const drawerItem = ref(null);
@@ -538,8 +541,10 @@ const summary = computed(() => {
     promptCount: numberValue(s.promptCount ?? prompts.value.length),
   };
 });
-const filteredServerCards = computed(() => serverCards.value.filter((card) => cardMatchesQuery(card)));
-const settingsEntryAvailable = computed(() => Boolean(status.value?.settingsAvailable || mcpSettingsAvailable.value));
+const filteredServerCards = computed(() => serverCards.value.filter((card) =>
+  (showDisabled.value || card.enabled) && cardMatchesQuery(card)));
+const settingsEntryAvailable = computed(() => mcpSettingsAvailable.value);
+const settingsHref = computed(() => `/settings?section=system-settings&setting=${encodeURIComponent(mcpSettingPaths.value[0] || "")}`);
 const drawerTitle = computed(() => {
   if (drawerKind.value === "server") return `MCP 详情 · ${serverName(drawerItem.value)}`;
   if (drawerKind.value === "tool") return `接口详情 · ${toolName(drawerItem.value)}`;
@@ -794,22 +799,19 @@ onMounted(load);
 
 <template>
   <div class="admin-page mcp-page h-full flex flex-col bg-macbg" v-loading="loading || reloading">
-    <header class="shrink-0 border-b border-macborder bg-white/70 px-6 py-4 backdrop-blur">
-      <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div class="admin-heading min-w-0">
-          <h1 class="text-base font-semibold">MCP 管理</h1>
-          <p class="mt-1 text-sm leading-6 text-macsub">
-            MCP 是 OpenBear 接入外部工具服务的方式；本页每张卡就是一个 MCP，卡内「接口」就是 OpenBear 可以调用的外部能力。这里展示连接状态、接口说明、参数摘要，以及风险与审批策略。
-          </p>
-        </div>
-        <div class="mcp-toolbar-actions flex shrink-0 flex-wrap items-center gap-2">
-          <el-switch class="admin-mobile-only mcp-global-switch" :model-value="summary.enabled" :loading="mcpToggling" size="small" aria-label="全局 MCP 开关" title="全局 MCP 开关" @change="setMcpEnabled" />
-          <a v-if="settingsEntryAvailable" href="/settings" class="settings-link" :title="mcpSettingPaths.length ? `已发现 ${mcpSettingPaths.length} 个 MCP 设置项` : '打开设置页'"><span class="admin-desktop-only">打开 MCP </span>设置</a>
-          <el-button round type="primary" :loading="reloading" @click="reloadMcp"><span class="admin-desktop-only">重新加载配置</span><span class="admin-mobile-only">重新加载</span></el-button>
-          <el-button round :icon="'Refresh'" :loading="loading" @click="load"><span class="admin-desktop-only">刷新状态</span><span class="admin-mobile-only">刷新</span></el-button>
-        </div>
-      </div>
-    </header>
+    <AdminPageHeader
+      title="MCP 管理"
+      subtitle="外部工具服务 · 连接状态、接口与审批策略"
+      @mobile-header-ready="emit('mobile-header-ready', $event)"
+    >
+      <template #mobile-navigation><slot name="mobile-navigation" /></template>
+      <template #actions>
+        <el-switch class="admin-mobile-only mcp-global-switch" :model-value="summary.enabled" :loading="mcpToggling" size="small" active-text="全局 MCP 开关" aria-label="全局 MCP 开关" title="全局 MCP 开关" @change="setMcpEnabled" />
+        <a v-if="settingsEntryAvailable" :href="settingsHref" class="admin-header-link" :title="mcpSettingPaths.length ? `已发现 ${mcpSettingPaths.length} 个 MCP 设置项` : '打开设置页'">打开 MCP 设置</a>
+        <el-button :icon="'Refresh'" :loading="loading" @click="load">刷新状态</el-button>
+      </template>
+      <template #primary><el-button :loading="reloading" @click="reloadMcp"><span class="admin-desktop-only">重新加载配置</span><span class="admin-mobile-only">重新加载</span></el-button></template>
+    </AdminPageHeader>
 
     <section class="admin-desktop-only admin-stats grid grid-cols-1 gap-3 px-6 pt-5 shrink-0 md:grid-cols-6">
       <div class="mac-panel px-4 py-3">
@@ -821,7 +823,7 @@ onMounted(load);
             active-text="启用"
             inactive-text="禁用"
             inline-prompt
-            style="--el-switch-on-color: #10b981; --el-switch-off-color: #94a3b8"
+            style="--el-switch-on-color: var(--ob-success); --el-switch-off-color: var(--ob-text-disabled)"
             @change="setMcpEnabled"
           />
           <el-tag :type="summary.enabled ? 'success' : 'info'" round>{{ enabledText(summary.enabled) }}</el-tag>
@@ -833,7 +835,7 @@ onMounted(load);
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">已连接数</div>
-        <div class="mt-1 text-lg font-semibold text-emerald-700">{{ summary.connectedCount }}</div>
+        <div class="mt-1 text-lg font-semibold text-ob-success">{{ summary.connectedCount }}</div>
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">可用接口数</div>
@@ -841,33 +843,35 @@ onMounted(load);
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">过滤接口数</div>
-        <div class="mt-1 text-lg font-semibold" :class="summary.filteredTools ? 'text-amber-700' : ''">{{ summary.filteredTools }}</div>
+        <div class="mt-1 text-lg font-semibold" :class="summary.filteredTools ? 'text-ob-warning' : ''">{{ summary.filteredTools }}</div>
       </div>
       <div class="mac-panel px-4 py-3">
         <div class="text-[11px] text-macsub">提示词数</div>
-        <div class="mt-1 text-lg font-semibold text-indigo-700">{{ summary.promptCount }}</div>
+        <div class="mt-1 text-lg font-semibold text-ob-violet">{{ summary.promptCount }}</div>
       </div>
     </section>
 
     <MobileAdminSummary :items="[{ label: '全局开关', value: enabledText(summary.enabled) }, { label: '已配置 MCP', value: summary.serverCount }, { label: '已连接', value: summary.connectedCount }, { label: '可用接口', value: summary.visibleTools }, { label: '过滤接口', value: summary.filteredTools }, { label: '提示词', value: summary.promptCount }]">连接 {{ summary.connectedCount }}/{{ summary.serverCount }} · 接口 {{ summary.visibleTools }} · 过滤 {{ summary.filteredTools }}</MobileAdminSummary>
 
-    <section class="admin-filters mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-white/75 p-3 backdrop-blur">
+    <section class="admin-filters mx-6 mt-4 shrink-0 rounded-2xl border border-macborder bg-ob-surface/75 p-3 backdrop-blur">
       <div class="flex flex-col gap-3 lg:flex-row lg:items-center">
         <el-input v-model="query" clearable :prefix-icon="'Search'" placeholder="搜索 MCP 名称、接口名、说明或参数" class="lg:max-w-lg" />
+        <el-checkbox v-model="showDisabled">显示停用</el-checkbox>
         <div class="ml-auto text-xs text-macsub">当前显示 {{ filteredServerCards.length }} / {{ serverCards.length }} 个 MCP</div>
       </div>
-      <div class="admin-desktop-only mt-3 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs leading-5 text-amber-900">
+      <div class="admin-desktop-only mt-3 rounded-xl border border-ob-warning/25 bg-[var(--ob-warning-soft)] px-3 py-2 text-xs leading-5 text-ob-warning">
         敏感连接配置已隐藏：启动命令、环境变量、请求头、令牌和接口密钥不会从本页返回；卸载仅移除 OpenBear 注册，不会卸载外部软件或关闭远程服务。
       </div>
       <div v-if="!settingsEntryAvailable" class="admin-desktop-only mt-2 text-xs text-macsub">
-        当前未发现 Web 设置页里的 MCP 详细配置入口；可手动编辑配置文件后点击「重新加载配置」热应用。
+        当前未发现 Web 设置页里的 MCP 配置项；可手动编辑配置文件后点击「重新加载配置」热应用。
       </div>
     </section>
 
     <main class="admin-list min-h-0 flex-1 overflow-y-auto p-6">
-      <details class="admin-mobile-only admin-inline-help">
+      <details class="mcp-help admin-inline-help">
         <summary>关于 MCP 与安全配置</summary>
-        <p>MCP 为 OpenBear 接入外部工具服务，每张卡中的接口是可调用的外部能力。启动命令、环境变量、请求头、令牌、密钥与错误明文已隐藏；卸载只移除 OpenBear 注册，不卸载外部软件或关闭远程服务。</p>
+        <p>MCP 是 OpenBear 接入外部工具服务的方式；本页每张卡就是一个 MCP，卡内「接口」就是 OpenBear 可以调用的外部能力。这里展示连接状态、接口说明、参数摘要，以及风险与审批策略。</p>
+        <p>启动命令、环境变量、请求头、令牌、密钥与错误明文已隐藏；卸载只移除 OpenBear 注册，不卸载外部软件或关闭远程服务。</p>
         <p v-if="!settingsEntryAvailable">未发现详细配置入口；可手动编辑配置文件后重新加载配置。</p>
       </details>
       <el-empty v-if="!serverCards.length" description="尚未配置 MCP" class="mac-panel py-12">
@@ -875,7 +879,7 @@ onMounted(load);
           配置 MCP 后，OpenBear 才能接入外部工具服务。本页会按「一个 MCP 一张卡」展示连接状态、接口数量、审批策略和可用接口列表。
         </p>
         <template #extra>
-          <a v-if="settingsEntryAvailable" href="/settings" class="settings-link">去设置页配置 MCP</a>
+          <a v-if="settingsEntryAvailable" :href="settingsHref" class="settings-link">去设置页配置 MCP</a>
           <span v-else class="text-xs text-macsub">请在配置文件中添加 MCP 配置，然后回到本页重新加载。</span>
         </template>
       </el-empty>
@@ -919,7 +923,7 @@ onMounted(load);
                 inactive-text="关"
                 aria-label="启用此 MCP"
                 title="启用此 MCP"
-                style="--el-switch-on-color: #10b981; --el-switch-off-color: #94a3b8"
+                style="--el-switch-on-color: var(--ob-success); --el-switch-off-color: var(--ob-text-disabled)"
                 @change="(value) => setServerEnabled(card, value)"
               />
             </div>
@@ -948,7 +952,7 @@ onMounted(load);
 
           <div class="mcp-tool-preview">
             <div class="flex items-center justify-between gap-3">
-              <span class="text-xs font-semibold text-zinc-700">接口预览</span>
+              <span class="text-xs font-semibold text-ob-text">接口预览</span>
               <span class="text-[11px] text-macsub">{{ card.visibleTools }} 个可用</span>
             </div>
             <div v-if="card.tools.length" class="mt-2 flex flex-wrap gap-2">
@@ -985,7 +989,7 @@ onMounted(load);
 
     <el-drawer append-to-body class="admin-drawer mcp-drawer" v-model="drawerOpen" :before-close="closeDrawer" size="44%" :title="drawerTitle" direction="rtl">
       <div v-if="drawerItem" class="space-y-4 text-sm">
-        <section class="rounded-2xl border border-macborder bg-zinc-50/80 p-4 text-xs leading-6 text-zinc-700">
+        <section class="rounded-2xl border border-macborder bg-ob-surface/80 p-4 text-xs leading-6 text-ob-text">
           连接信息为安全摘要，Agent 访问设置可在下方修改。敏感连接配置与错误明文不会在详情中展示；如需修改连接参数，请到配置文件或设置入口处理后重新加载。
         </section>
 
@@ -1004,7 +1008,7 @@ onMounted(load);
                   inline-prompt
                   active-text="启用"
                   inactive-text="禁用"
-                  style="--el-switch-on-color: #10b981; --el-switch-off-color: #94a3b8"
+                  style="--el-switch-on-color: var(--ob-success); --el-switch-off-color: var(--ob-text-disabled)"
                   @change="(value) => setServerEnabled(drawerItem, value)"
                 />
                 <el-tag :type="drawerItem.enabled ? 'success' : 'info'" effect="plain" round>{{ enabledText(drawerItem.enabled) }}</el-tag>
@@ -1018,7 +1022,7 @@ onMounted(load);
             <el-descriptions-item label="错误明文">{{ drawerItem.errorPresent ? '已隐藏' : '无' }}</el-descriptions-item>
           </el-descriptions>
 
-          <section class="rounded-2xl border border-macborder bg-white p-4" aria-label="允许 Agent 访问">
+          <section class="rounded-2xl border border-macborder bg-ob-surface p-4" aria-label="允许 Agent 访问">
             <h3 class="mb-2 text-sm font-semibold">允许 Agent 访问</h3>
             <p class="mb-3 text-xs leading-5 text-macsub">仅设置此 MCP 可向 Agent 开放的工具范围，不影响主控访问，也不会替代 Agent 预设、本轮工具授权或调用审批。</p>
             <fieldset :disabled="isServerToggling(drawerItem) || !status.agentAccessAvailable" class="space-y-3 min-w-0">
@@ -1027,26 +1031,26 @@ onMounted(load);
                 <el-radio value="all">全部工具</el-radio>
                 <el-radio value="selected">指定工具</el-radio>
               </el-radio-group>
-              <p v-if="accessDraft.mode === 'all'" class="text-xs leading-5 text-amber-700">当前及未来新增工具都会进入开放范围。如只希望开放当前这些工具，请选择“指定工具”并全选当前工具。</p>
+              <p v-if="accessDraft.mode === 'all'" class="text-xs leading-5 text-ob-warning">当前及未来新增工具都会进入开放范围。如只希望开放当前这些工具，请选择“指定工具”并全选当前工具。</p>
               <template v-if="accessDraft.mode === 'selected'">
                 <div class="flex gap-3 text-xs">
                   <button type="button" class="text-macblue" @click="accessDraft.tools = [...new Set([...accessDraft.tools, ...asArray(drawerItem.tools).map(t => t.originalToolName)])]">全选当前工具</button>
                   <button type="button" class="text-macsub" @click="accessDraft.tools = []">清空选择</button>
                 </div>
-                <p v-if="drawerItem.status !== 'connected'" class="text-xs text-amber-700">服务未连接，暂无法确认工具列表；已选项已保留。</p>
+                <p v-if="drawerItem.status !== 'connected'" class="text-xs text-ob-warning">服务未连接，暂无法确认工具列表；已选项已保留。</p>
                 <label v-for="choice in accessChoices" :key="choice.name" class="flex items-start gap-2 rounded-xl border border-macborder p-2">
                   <input type="checkbox" v-model="accessDraft.tools" :value="choice.name" class="mt-1 shrink-0" />
                   <span class="min-w-0 break-all text-xs leading-5"><code>{{ choice.name }}</code>
-                    <span v-if="!choice.tool" class="text-amber-700"> · 当前未发现 · 已保留</span>
-                    <span v-else-if="choice.tool.filtered" class="text-amber-700"> · {{ filterReasonText(choice.tool.filterReason) }}</span>
-                    <span v-else-if="choice.tool.approval === 'deny'" class="text-amber-700"> · 审批禁止调用</span>
+                    <span v-if="!choice.tool" class="text-ob-warning"> · 当前未发现 · 已保留</span>
+                    <span v-else-if="choice.tool.filtered" class="text-ob-warning"> · {{ filterReasonText(choice.tool.filterReason) }}</span>
+                    <span v-else-if="choice.tool.approval === 'deny'" class="text-ob-warning"> · 审批禁止调用</span>
                     <span v-if="choice.tool?.description" class="block text-macsub">{{ choice.tool.description }}</span>
                   </span>
                 </label>
                 <p class="text-xs text-macsub">已选 {{ accessDraft.tools.length }} 项；已保存设置当前可委派 {{ drawerItem.agentDelegatableTools || 0 }} 项</p>
-                <p v-if="!accessDraft.tools.length" class="text-xs text-amber-700">尚未选择工具；保存后 Agent 无法访问此服务的工具。</p>
+                <p v-if="!accessDraft.tools.length" class="text-xs text-ob-warning">尚未选择工具；保存后 Agent 无法访问此服务的工具。</p>
               </template>
-              <p v-if="drawerItem.agentAccessApplied === false" class="text-xs text-amber-700">已保存策略尚未应用，请重新加载配置。</p>
+              <p v-if="drawerItem.agentAccessApplied === false" class="text-xs text-ob-warning">已保存策略尚未应用，请重新加载配置。</p>
               <div class="flex flex-wrap justify-end gap-2">
                 <el-button :disabled="isServerToggling(drawerItem)" @click="resetAccessDraft()">取消 / 重新载入设置</el-button>
                 <el-button type="primary" :loading="isServerToggling(drawerItem)" :disabled="!accessDirty || isServerToggling(drawerItem) || !status.agentAccessAvailable" @click="saveAgentAccess">保存 Agent 访问设置</el-button>
@@ -1057,22 +1061,22 @@ onMounted(load);
             <el-button :loading="isServerToggling(drawerItem)" :disabled="drawerItem.status !== 'connected' || isServerToggling(drawerItem)" @click="refreshServerTools(drawerItem)">刷新工具</el-button>
           </div>
 
-          <div class="rounded-2xl border border-macborder bg-white p-4">
+          <div class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-2 text-sm font-semibold">简介</h3>
-            <p class="text-sm leading-6 text-zinc-700">{{ serverIntro(drawerItem) }}</p>
+            <p class="text-sm leading-6 text-ob-text">{{ serverIntro(drawerItem) }}</p>
           </div>
 
-          <div class="rounded-2xl border border-red-200 bg-red-50/50 p-4">
+          <div class="rounded-2xl border border-ob-danger/25 bg-[var(--ob-danger-soft)] p-4">
             <div class="flex items-center justify-between gap-4">
               <div>
-                <h3 class="text-sm font-semibold text-red-800">卸载此 MCP</h3>
-                <p class="mt-1 text-xs leading-5 text-red-700">移除 OpenBear 注册和当前连接，不删除外部软件或远程服务。</p>
+                <h3 class="text-sm font-semibold text-ob-danger">卸载此 MCP</h3>
+                <p class="mt-1 text-xs leading-5 text-ob-danger">移除 OpenBear 注册和当前连接，不删除外部软件或远程服务。</p>
               </div>
               <el-button type="danger" plain round :loading="isServerToggling(drawerItem)" @click="uninstallServer(drawerItem)">卸载</el-button>
             </div>
           </div>
 
-          <div class="rounded-2xl border border-macborder bg-white p-4">
+          <div class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-2 text-sm font-semibold">风险与审批分布</h3>
             <div class="flex flex-wrap gap-2">
               <el-tag v-for="item in riskCountItems(drawerItem)" :key="item.key" :type="riskType(item.key)" effect="plain">{{ item.label }}：{{ item.count }}</el-tag>
@@ -1084,7 +1088,7 @@ onMounted(load);
             </div>
           </div>
 
-          <div class="rounded-2xl border border-macborder bg-white p-4">
+          <div class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-3 text-sm font-semibold">接口清单</h3>
             <el-empty v-if="!drawerItem.tools?.length" description="此 MCP 暂无接口" :image-size="72" />
             <div v-else class="space-y-2">
@@ -1096,22 +1100,22 @@ onMounted(load);
                     <el-tag :type="approvalType(tool.approval)" effect="plain" round>{{ approvalText(tool.approval) }}</el-tag>
                     <el-tag :type="toolAvailabilityType(tool)" effect="plain" round>{{ toolAvailabilityText(tool) }}</el-tag>
                   </div>
-                  <p class="mt-2 text-xs leading-5 text-zinc-700">{{ tool.description || '暂无说明' }}</p>
+                  <p class="mt-2 text-xs leading-5 text-ob-text">{{ tool.description || '暂无说明' }}</p>
                   <p class="mt-1 text-xs leading-5 text-macsub">参数：{{ toolParameterSummary(tool) }}</p>
                 </div>
               </button>
             </div>
           </div>
 
-          <div v-if="drawerItem.prompts?.length" class="rounded-2xl border border-macborder bg-white p-4">
+          <div v-if="drawerItem.prompts?.length" class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-3 text-sm font-semibold">提示词清单</h3>
             <div class="space-y-2">
-              <div v-for="prompt in drawerItem.prompts" :key="prompt.name" class="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2">
+              <div v-for="prompt in drawerItem.prompts" :key="prompt.name" class="rounded-xl border border-ob-violet/25 bg-[var(--ob-violet-soft)] px-3 py-2">
                 <div class="flex flex-wrap items-center gap-2">
                   <code class="break-all text-xs">{{ prompt.name }}</code>
                   <el-tag v-if="prompt.title" size="small" effect="plain">{{ prompt.title }}</el-tag>
                 </div>
-                <p class="mt-2 text-xs leading-5 text-zinc-700">{{ prompt.description || '暂无说明' }}</p>
+                <p class="mt-2 text-xs leading-5 text-ob-text">{{ prompt.description || '暂无说明' }}</p>
                 <p class="mt-1 text-xs text-macsub">参数：{{ promptArgumentSummary(prompt) }}</p>
               </div>
             </div>
@@ -1130,11 +1134,11 @@ onMounted(load);
             <el-descriptions-item label="Agent 访问">{{ !drawerItem.agentAccessAllowed ? '未开放' : drawerItem.agentDelegatable ? '已开放' : '已开放但当前不可用' }}</el-descriptions-item>
             <el-descriptions-item label="过滤原因">{{ drawerItem.filtered ? filterReasonText(drawerItem.filterReason) : '—' }}</el-descriptions-item>
           </el-descriptions>
-          <div class="rounded-2xl border border-macborder bg-white p-4">
+          <div class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-2 text-sm font-semibold">接口说明</h3>
-            <p class="whitespace-pre-wrap text-sm leading-6 text-zinc-700">{{ drawerItem.description || '暂无说明' }}</p>
+            <p class="whitespace-pre-wrap text-sm leading-6 text-ob-text">{{ drawerItem.description || '暂无说明' }}</p>
           </div>
-          <div class="rounded-2xl border border-macborder bg-white p-4">
+          <div class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-3 text-sm font-semibold">参数</h3>
             <div v-if="toolParameters(drawerItem).length" class="space-y-2">
               <div v-for="param in toolParameters(drawerItem)" :key="param.name" class="parameter-row">
@@ -1143,13 +1147,13 @@ onMounted(load);
                   <el-tag size="small" effect="plain">类型：{{ schemaTypeText(param.rawType) }}</el-tag>
                   <el-tag size="small" :type="param.required ? 'danger' : 'info'" effect="plain">{{ param.required ? '必填' : '可选' }}</el-tag>
                 </div>
-                <p class="mt-1 text-xs leading-5 text-zinc-700">{{ param.description || '暂无说明' }}</p>
+                <p class="mt-1 text-xs leading-5 text-ob-text">{{ param.description || '暂无说明' }}</p>
                 <p v-if="param.enum?.length" class="mt-1 text-xs text-macsub">可选值：{{ param.enum.join('、') }}</p>
               </div>
             </div>
             <p v-else class="text-sm text-macsub">{{ noParameterText(drawerItem) }}</p>
           </div>
-          <div v-if="annotationItems(drawerItem).length" class="rounded-2xl border border-macborder bg-white p-4">
+          <div v-if="annotationItems(drawerItem).length" class="rounded-2xl border border-macborder bg-ob-surface p-4">
             <h3 class="mb-2 text-sm font-semibold">接口只读信息</h3>
             <div class="flex flex-wrap gap-2">
               <el-tag v-for="item in annotationItems(drawerItem)" :key="item.key" effect="plain">{{ item.label }}：{{ item.value }}</el-tag>
@@ -1167,26 +1171,29 @@ onMounted(load);
 </template>
 
 <style scoped>
+.mcp-help { margin-bottom: 12px; color: var(--ob-text-subtle); font-size: 12px; }
+.mcp-help summary { cursor: pointer; min-height: 28px; line-height: 28px; }
+.mcp-help p { max-width: 80ch; padding: 6px 0; line-height: 1.7; }
 .settings-link {
   display: inline-flex;
   align-items: center;
   height: 32px;
   padding: 0 12px;
-  border: 1px solid rgba(0, 122, 255, 0.28);
+  border: 1px solid rgb(var(--ob-blue-rgb) / 0.28);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.88);
-  color: #007aff;
+  background: rgb(var(--ob-surface-rgb) / 0.88);
+  color: var(--ob-blue);
   font-size: 12px;
   font-weight: 500;
 }
 .settings-link:hover {
-  background: rgba(0, 122, 255, 0.08);
+  background: rgb(var(--ob-blue-rgb) / 0.08);
 }
 .mcp-card {
   transition: border-color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
 }
 .mcp-card:hover {
-  border-color: rgba(0, 122, 255, 0.18);
+  border-color: rgb(var(--ob-blue-rgb) / 0.18);
   transform: translateY(-1px);
 }
 .mcp-mark {
@@ -1196,8 +1203,8 @@ onMounted(load);
   height: 24px;
   min-width: 42px;
   border-radius: 999px;
-  background: rgba(0, 122, 255, 0.1);
-  color: #007aff;
+  background: rgb(var(--ob-blue-rgb) / 0.1);
+  color: var(--ob-blue);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;
@@ -1219,18 +1226,18 @@ onMounted(load);
 }
 .mcp-facts > span {
   border-radius: 999px;
-  background: rgba(24, 24, 27, 0.045);
+  background: rgb(var(--ob-border-rgb) / 0.045);
   padding: 4px 9px;
-  color: #52525b;
+  color: var(--ob-text);
   font-size: 11px;
   line-height: 1.35;
 }
 .mcp-facts > span.is-warning {
-  background: rgba(245, 158, 11, 0.11);
-  color: #a16207;
+  background: rgb(var(--ob-orange-rgb) / 0.11);
+  color: var(--ob-warning);
 }
 .mcp-facts strong {
-  color: #18181b;
+  color: var(--ob-text-strong);
   font-weight: 700;
 }
 .mcp-health {
@@ -1239,7 +1246,7 @@ onMounted(load);
   align-items: center;
   gap: 7px;
   margin-top: 11px;
-  color: #71717a;
+  color: var(--ob-text-subtle);
   font-size: 11px;
 }
 .status-dot {
@@ -1247,29 +1254,29 @@ onMounted(load);
   height: 7px;
   flex: 0 0 auto;
   border-radius: 999px;
-  background: #a1a1aa;
+  background: var(--ob-text-muted);
 }
 .status-dot.is-online {
-  background: #10b981;
-  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.11);
+  background: var(--ob-success);
+  box-shadow: 0 0 0 3px rgb(var(--ob-success-rgb) / 0.11);
 }
 .failure-text {
   margin-left: auto;
-  color: #b91c1c;
+  color: var(--ob-danger);
 }
 .mcp-error-line {
   margin-top: 9px;
   border-radius: 9px;
-  background: rgba(254, 226, 226, 0.72);
+  background: rgb(var(--ob-surface-rgb) / 0.72);
   padding: 6px 9px;
-  color: #991b1b;
+  color: var(--ob-danger);
   font-size: 11px;
 }
 .mcp-intro {
   display: -webkit-box;
   overflow: hidden;
   margin-top: 12px;
-  color: #52525b;
+  color: var(--ob-text);
   font-size: 12px;
   line-height: 1.55;
   -webkit-box-orient: vertical;
@@ -1277,17 +1284,17 @@ onMounted(load);
 }
 .mcp-tool-preview {
   margin-top: 12px;
-  border-top: 1px solid rgba(24, 24, 27, 0.07);
+  border-top: 1px solid rgb(var(--ob-border-rgb) / 0.07);
   padding-top: 11px;
 }
 .tool-chip {
   max-width: min(100%, 220px);
   overflow: hidden;
-  border: 1px solid rgba(24, 24, 27, 0.09);
+  border: 1px solid rgb(var(--ob-border-rgb) / 0.09);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.78);
+  background: rgb(var(--ob-surface-rgb) / 0.78);
   padding: 5px 9px;
-  color: #3f3f46;
+  color: var(--ob-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 11px;
   line-height: 1.25;
@@ -1296,17 +1303,17 @@ onMounted(load);
   transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
 }
 .tool-chip:hover {
-  border-color: rgba(0, 122, 255, 0.25);
-  background: rgba(0, 122, 255, 0.055);
-  color: #0066d6;
+  border-color: rgb(var(--ob-blue-rgb) / 0.25);
+  background: rgb(var(--ob-blue-rgb) / 0.055);
+  color: var(--ob-blue);
 }
 .tool-chip.risk-destructive,
 .tool-chip.risk-secret {
-  border-color: rgba(239, 68, 68, 0.16);
+  border-color: rgb(var(--ob-danger-rgb) / 0.16);
 }
 .tool-chip.more-tools {
   border-style: dashed;
-  color: #007aff;
+  color: var(--ob-blue);
   font-family: inherit;
   font-weight: 650;
 }
@@ -1316,7 +1323,7 @@ onMounted(load);
   justify-content: space-between;
   gap: 12px;
   margin-top: 10px;
-  border-top: 1px solid rgba(24, 24, 27, 0.06);
+  border-top: 1px solid rgb(var(--ob-border-rgb) / 0.06);
   padding-top: 5px;
 }
 .tool-row {
@@ -1325,29 +1332,29 @@ onMounted(load);
   align-items: center;
   gap: 12px;
   border-radius: 14px;
-  border: 1px solid rgba(24, 24, 27, 0.08);
-  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgb(var(--ob-border-rgb) / 0.08);
+  background: rgb(var(--ob-surface-rgb) / 0.82);
   padding: 10px 12px;
   text-align: left;
   transition: background 0.16s ease, border-color 0.16s ease;
 }
 .tool-row:hover {
-  border-color: rgba(0, 122, 255, 0.2);
-  background: rgba(0, 122, 255, 0.045);
+  border-color: rgb(var(--ob-blue-rgb) / 0.2);
+  background: rgb(var(--ob-blue-rgb) / 0.045);
 }
 .parameter-row {
   border-radius: 14px;
-  border: 1px solid rgba(24, 24, 27, 0.08);
-  background: rgba(24, 24, 27, 0.025);
+  border: 1px solid rgb(var(--ob-border-rgb) / 0.08);
+  background: rgb(var(--ob-border-rgb) / 0.025);
   padding: 10px 12px;
 }
 .schema-preview {
   max-height: 320px;
   overflow: auto;
   border-radius: 12px;
-  background: rgba(24, 24, 27, 0.04);
+  background: rgb(var(--ob-border-rgb) / 0.04);
   padding: 12px;
-  color: #3f3f46;
+  color: var(--ob-text);
   font-size: 12px;
   line-height: 1.65;
   white-space: pre-wrap;
@@ -1355,9 +1362,9 @@ onMounted(load);
 }
 code {
   border-radius: 6px;
-  background: rgba(24, 24, 27, 0.05);
+  background: rgb(var(--ob-border-rgb) / 0.05);
   padding: 1px 5px;
-  color: #27272a;
+  color: var(--ob-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 </style>
@@ -1365,81 +1372,82 @@ code {
 <style>
 /* OpenBear system dark theme */
 html.dark .settings-link {
-		border: 1px solid rgba(96, 165, 250, 0.28);
-		background: rgba(29, 30, 34, 0.88);
-		color: #60a5fa;
+		border: 1px solid rgb(var(--ob-blue-rgb) / 0.28);
+		background: rgb(var(--ob-surface-soft-rgb) / 0.88);
+		color: var(--ob-blue);
 	}
 html.dark .mcp-card:hover {
-		border-color: rgba(96, 165, 250, 0.18);
+		border-color: rgb(var(--ob-blue-rgb) / 0.18);
 	}
 html.dark .mcp-mark {
-		color: #60a5fa;
+		color: var(--ob-blue);
 	}
 html.dark .mcp-facts > span {
-		background: rgba(255, 255, 255, 0.056);
-		color: #c6c6cd;
+		background: rgb(var(--ob-surface-rgb) / 0.056);
+		color: var(--ob-text);
 	}
 html.dark .mcp-facts > span.is-warning {
-		color: #fbad66;
+		color: var(--ob-warning);
 	}
 html.dark .mcp-facts strong {
-		color: #efeff2;
+		color: var(--ob-text-strong);
 	}
 html.dark .mcp-health {
-		color: #c6c6cd;
+		color: var(--ob-text);
 	}
 html.dark .status-dot {
-		background: #313236;
+		background: var(--ob-surface-soft);
 	}
 html.dark .failure-text {
-		color: #fb8585;
+		color: var(--ob-danger);
 	}
 html.dark .mcp-error-line {
-		background: rgba(32, 33, 37, 0.72);
-		color: #fb8585;
+		background: rgb(var(--ob-surface-soft-rgb) / 0.72);
+		color: var(--ob-danger);
 	}
 html.dark .mcp-intro {
-		color: #c6c6cd;
+		color: var(--ob-text);
 	}
 html.dark .mcp-tool-preview {
-		border-top: 1px solid rgba(255, 255, 255, 0.102);
+		border-top: 1px solid rgb(var(--ob-border-rgb) / 0.102);
 	}
 html.dark .tool-chip {
-		border: 1px solid rgba(255, 255, 255, 0.131);
-		background: rgba(29, 30, 34, 0.78);
-		color: #dedee1;
+		border: 1px solid rgb(var(--ob-border-rgb) / 0.131);
+		background: rgb(var(--ob-surface-soft-rgb) / 0.78);
+		color: var(--ob-text);
 	}
 html.dark .tool-chip:hover {
-		border-color: rgba(96, 165, 250, 0.25);
-		color: #60a5fa;
+		border-color: rgb(var(--ob-blue-rgb) / 0.25);
+		color: var(--ob-blue);
 	}
 html.dark .tool-chip.risk-destructive,
 html.dark .tool-chip.risk-secret {
-		border-color: rgba(251, 133, 133, 0.16);
+		border-color: rgb(var(--ob-danger-rgb) / 0.16);
 	}
 html.dark .tool-chip.more-tools {
-		color: #60a5fa;
+		color: var(--ob-blue);
 	}
 html.dark .mcp-card-footer {
-		border-top: 1px solid rgba(255, 255, 255, 0.087);
+		border-top: 1px solid rgb(var(--ob-border-rgb) / 0.087);
 	}
 html.dark .tool-row {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.82);
+		border: 1px solid rgb(var(--ob-border-rgb) / 0.116);
+		background: rgb(var(--ob-surface-soft-rgb) / 0.82);
 	}
 html.dark .tool-row:hover {
-		border-color: rgba(96, 165, 250, 0.2);
+		border-color: rgb(var(--ob-blue-rgb) / 0.2);
 	}
 html.dark .parameter-row {
-		border: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(255, 255, 255, 0.035);
+		border: 1px solid rgb(var(--ob-border-rgb) / 0.116);
+		background: rgb(var(--ob-surface-rgb) / 0.035);
 	}
 html.dark .schema-preview {
-		background: rgba(255, 255, 255, 0.05);
-		color: #dedee1;
+		background: rgb(var(--ob-surface-rgb) / 0.05);
+		color: var(--ob-text);
 	}
-html.dark code {
-		background: rgba(255, 255, 255, 0.063);
-		color: #efeff2;
+html.dark .mcp-page code,
+html.dark .mcp-drawer code {
+		background: var(--ob-code-bg);
+		color: var(--ob-text-strong);
 	}
 </style>

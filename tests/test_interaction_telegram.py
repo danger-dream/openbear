@@ -94,8 +94,11 @@ class TelegramCapture:
         self.next_id = 100
         self.sent: list[dict[str, Any]] = []
         self.edited: list[dict[str, Any]] = []
+        self.deleted: list[tuple[int, int]] = []
         self.fail_sends = 0
         self.fail_edits = 0
+        self.fail_deletes = 0
+        self.bot = SimpleNamespace(delete_message=self.delete)
 
     async def send(self, bot: Any, chat_id: int, body: str, **kwargs: Any) -> Any:
         if self.fail_sends:
@@ -116,6 +119,13 @@ class TelegramCapture:
             self.fail_edits -= 1
             raise RuntimeError("temporary edit failure")
         self.edited.append({"chat_id": chat_id, "message_id": message_id, "body": body, **kwargs})
+        return True
+
+    async def delete(self, chat_id: int, message_id: int) -> bool:
+        if self.fail_deletes:
+            self.fail_deletes -= 1
+            raise RuntimeError("temporary delete failure")
+        self.deleted.append((chat_id, message_id))
         return True
 
 
@@ -243,7 +253,7 @@ async def click(
 async def test_created_is_immediate_and_network_failure_retries_without_touching_interaction(db, config, capture):
     current = item("immediate", "confirm")
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     capture.fail_sends = 1
 
     before = int(time.time())
@@ -272,7 +282,7 @@ async def test_created_is_immediate_and_network_failure_retries_without_touching
 async def test_confirm_text_is_feedback_and_never_boolean_authorization(db, config, capture):
     current = item("confirm-1", "confirm")
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "confirm-1")
@@ -317,7 +327,7 @@ async def test_authorization_select_keeps_choice_and_text_and_labels_submit_as_f
         options=[{"label": "允许一次", "value": "once"}, {"label": "拒绝", "value": "deny"}],
     )
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "select-auth")
@@ -348,7 +358,7 @@ async def test_authorization_select_keeps_choice_and_text_and_labels_submit_as_f
 async def test_prompt_reply_is_saved_then_explicitly_submitted(db, config, capture):
     current = item("prompt-1", "prompt")
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "prompt-1")
@@ -399,7 +409,7 @@ async def test_questionnaire_uses_distinct_prompts_supports_text_and_return_edit
         ],
     )
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "survey-1")
@@ -486,6 +496,12 @@ async def test_questionnaire_uses_distinct_prompts_supports_text_and_return_edit
             {"questionId": "q2", "selectedValues": [], "text": "第二题原文"},
         ],
     }
+    await drain(transport)
+    prompt_rows = await (await db.conn.execute(
+        "SELECT telegram_message_id FROM interaction_tg_messages WHERE interaction_id='survey-1'"
+    )).fetchall()
+    prompt_ids = {int(row["telegram_message_id"]) for row in prompt_rows}
+    assert {message_id for chat_id, message_id in capture.deleted if chat_id == OWNER} == prompt_ids
 
 
 @pytest.mark.asyncio
@@ -502,7 +518,7 @@ async def test_sensitive_notification_contains_no_payload_and_rejects_reply(db, 
         defaultValue=secret,
     )
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
 
@@ -531,7 +547,7 @@ async def test_sensitive_notification_contains_no_payload_and_rejects_reply(db, 
 async def test_identity_expiry_concurrency_and_reply_isolation(db, config, capture):
     current = item("race-1", "confirm")
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "race-1")
@@ -620,7 +636,7 @@ async def test_concurrent_multi_select_and_reply_merge_without_lost_draft(db, co
         options=[{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
     )
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     draft, root = await root_context(transport, "draft-race")
@@ -643,16 +659,16 @@ async def test_concurrent_multi_select_and_reply_merge_without_lost_draft(db, co
 
 
 @pytest.mark.asyncio
-async def test_restart_invalidates_interrupted_draft_and_edits_old_buttons(db, config, capture):
+async def test_restart_invalidates_interrupted_draft_and_deletes_old_prompts(db, config, capture):
     current = item("restart-1", "prompt")
     interactions = FakeInteractions(current)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), interactions)
+    transport = InteractionTelegram(config, db, capture.bot, interactions)
     await transport.on_interaction("created", current)
     await drain(transport)
     _draft, root = await root_context(transport, "restart-1")
 
     interactions.items["restart-1"]["status"] = "interrupted"
-    capture.fail_edits = 1
+    capture.fail_deletes = 1
     await transport._reconcile_startup()
     draft = await transport._draft("restart-1")
     assert draft and draft["active"] == 0
@@ -672,7 +688,8 @@ async def test_restart_invalidates_interrupted_draft_and_edits_old_buttons(db, c
     )
     await db.conn.commit()
     await drain(transport)
-    assert any(edit["message_id"] == root["telegram_message_id"] and "已中断" in edit["body"] for edit in capture.edited)
+    assert (OWNER, root["telegram_message_id"]) in capture.deleted
+    assert not any("该交互已不能再通过此消息作答" in edit["body"] for edit in capture.edited)
 
     old = FakeIncoming(transport.bot, text="停机后的迟到回复", message_id=700, reply_to=root["telegram_message_id"])
     record = await transport.match_reply(old)
@@ -687,7 +704,7 @@ async def test_restart_invalidates_interrupted_draft_and_edits_old_buttons(db, c
 @pytest.mark.asyncio
 async def test_real_service_select_wakes_request_with_lossless_telegram_answer(db, config, capture):
     service = InteractionService(db)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), service)
+    transport = InteractionTelegram(config, db, capture.bot, service)
     service.add_listener(transport.on_interaction)
     await service.start()
     request_task = asyncio.create_task(service.request(
@@ -734,13 +751,15 @@ async def test_real_service_select_wakes_request_with_lossless_telegram_answer(d
     assert result["answerMode"] == "options_with_text"
     stored = await service.get(interaction_id, owner_chat_id=OWNER)
     assert stored and stored["status"] == "answered" and stored["revision"] == 2
+    await drain(transport)
+    assert (OWNER, root["telegram_message_id"]) in capture.deleted
     await service.stop()
 
 
 @pytest.mark.asyncio
 async def test_real_service_text_only_confirm_is_valid_feedback_without_null_choice(db, config, capture):
     service = InteractionService(db)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), service)
+    transport = InteractionTelegram(config, db, capture.bot, service)
     service.add_listener(transport.on_interaction)
     await service.start()
     request_task = asyncio.create_task(service.request(
@@ -780,7 +799,7 @@ async def test_real_service_text_only_confirm_is_valid_feedback_without_null_cho
 @pytest.mark.asyncio
 async def test_real_service_web_wins_and_stale_telegram_inputs_cannot_overwrite(db, config, capture):
     service = InteractionService(db)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), service)
+    transport = InteractionTelegram(config, db, capture.bot, service)
     service.add_listener(transport.on_interaction)
     await service.start()
     request_task = asyncio.create_task(service.request(
@@ -807,6 +826,8 @@ async def test_real_service_web_wins_and_stale_telegram_inputs_cannot_overwrite(
     assert web_response["ok"] is True
     web_result = await asyncio.wait_for(request_task, timeout=1)
     assert web_result["source"] == "web" and web_result["confirmed"] is True
+    await drain(transport)
+    assert (OWNER, root["telegram_message_id"]) in capture.deleted
 
     stale_click = await click(
         transport,
@@ -837,7 +858,7 @@ async def test_real_service_web_wins_and_stale_telegram_inputs_cannot_overwrite(
 @pytest.mark.asyncio
 async def test_real_service_questionnaire_validates_text_and_options_with_text(db, config, capture):
     service = InteractionService(db)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), service)
+    transport = InteractionTelegram(config, db, capture.bot, service)
     service.add_listener(transport.on_interaction)
     await service.start()
     request_task = asyncio.create_task(service.request(
@@ -961,7 +982,7 @@ async def test_real_service_questionnaire_validates_text_and_options_with_text(d
 @pytest.mark.asyncio
 async def test_real_service_identity_expiry_and_sensitive_projection_keep_notifications_safe(db, config, capture):
     service = InteractionService(db)
-    transport = InteractionTelegram(config, db, SimpleNamespace(), service)
+    transport = InteractionTelegram(config, db, capture.bot, service)
     service.add_listener(transport.on_interaction)
     await service.start()
     secret = "REAL-SENSITIVE-VALUE"
@@ -999,6 +1020,8 @@ async def test_real_service_identity_expiry_and_sensitive_projection_keep_notifi
     await service.terminate(sensitive_id, "cancelled")
     sensitive_result = await asyncio.wait_for(sensitive_task, timeout=1)
     assert sensitive_result["status"] == "cancelled"
+    await drain(transport)
+    assert (OWNER, capture.sent[0]["message"].message_id) in capture.deleted
 
     expiring_task = asyncio.create_task(service.request(
         {
@@ -1027,4 +1050,6 @@ async def test_real_service_identity_expiry_and_sensitive_projection_keep_notifi
     assert stale.answers[-1][1] is True
     stored = await service.get(expiring_id, owner_chat_id=OWNER)
     assert stored and stored["status"] == "timeout" and stored["revision"] == 2
+    await drain(transport)
+    assert (OWNER, expiring_root["telegram_message_id"]) in capture.deleted
     await service.stop()

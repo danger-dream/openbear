@@ -147,13 +147,12 @@ defineExpose({focus,adjustHeight,insertText,insertReference,editor,getReferenceO
 </template>
 <style>
 .reference-editor{position:relative;min-width:0;width:100%;color:inherit;border-radius:0;background:transparent}
-.reference-editor-content{box-sizing:border-box;min-height:3.4rem;max-height:13.5rem;overflow-y:auto;outline:none!important;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.65;font-family:inherit;font-size:14px;padding:0.45rem 0.75rem;border:0;background:transparent;color:#111827;scrollbar-width:thin}
+.reference-editor-content{box-sizing:border-box;min-height:3.4rem;max-height:13.5rem;overflow-y:auto;outline:none!important;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.65;font-family:inherit;font-size:14px;padding:0.45rem 0.75rem;border:0;background:transparent;color:var(--ob-text-strong);scrollbar-width:thin}
 .reference-editor-content p{margin:0!important;line-height:inherit;min-height:1.6em}
-.reference-editor-placeholder{position:absolute;inset:0;padding:0.45rem 0.75rem;pointer-events:none;color:#a1a1aa;font-size:14px;line-height:1.65}
-.reference-editor.is-drag-over{outline:1px dashed rgba(70,125,195,.65);outline-offset:5px}
+.reference-editor-placeholder{position:absolute;inset:0;padding:0.45rem 0.75rem;pointer-events:none;color:var(--ob-text-muted);font-size:14px;line-height:1.65}
+.reference-editor.is-drag-over{outline:1px dashed rgb(var(--ob-blue-rgb) / .65);outline-offset:5px}
 .reference-inline-node{display:inline;vertical-align:baseline;white-space:normal}
-.reference-editor-size-warning{color:#aa804a;font-size:10px;line-height:1.4;padding-top:3px}
-.reference-editor-error{color:#ad6565;font-size:10px;line-height:1.4;padding-top:3px}
-html.dark .reference-editor-placeholder{color:#71717a}
-html.dark .reference-editor-content{color:#e5e7eb}
+.reference-editor-size-warning{color:var(--ob-warning);font-size:10px;line-height:1.4;padding-top:3px}
+.reference-editor-error{color:var(--ob-danger);font-size:10px;line-height:1.4;padding-top:3px}
+
 </style>

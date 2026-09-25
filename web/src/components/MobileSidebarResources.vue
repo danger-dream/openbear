@@ -43,11 +43,12 @@ onBeforeUnmount(() => media?.removeEventListener("change", updateMedia));
         </button>
       </nav>
     </el-popover>
+    <slot name="footer"/>
   </footer>
 </template>
 
 <style scoped>
-.mobile-sidebar-resources { flex: 0 0 auto; margin-top: 6px; padding-top: 4px; border-top: 1px solid var(--el-border-color-lighter); }
+.mobile-sidebar-resources { flex: 0 0 auto; margin-top: 6px; padding-top: 4px; border-top: 1px solid var(--ob-chat-line); }
 .sidebar-resources-entry { display: flex; align-items: center; gap: 10px; width: 100%; height: 44px; padding: 0 8px; border: 0; border-radius: 9px; background: transparent; color: var(--el-text-color-regular); font-size: 13px; cursor: pointer; }
 .sidebar-resources-entry svg { flex: none; width: 17px; height: 17px; color: var(--el-text-color-secondary); }
 .sidebar-resources-entry .resources-caret { width: 12px; height: 12px; margin-left: auto; transition: transform .15s ease; }
@@ -59,5 +60,5 @@ button:focus-visible { outline: 2px solid var(--el-color-primary); outline-offse
 </style>
 
 <style>
-.sidebar-resources-popper.el-popper { padding: 6px; border-radius: 14px; max-width: calc(100vw - 24px); }
+.sidebar-resources-popper.el-popper { padding: 6px; border: 1px solid var(--ob-chat-border); border-radius: 14px; max-width: calc(100vw - 24px); background: var(--ob-chat-panel); }
 </style>

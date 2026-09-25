@@ -305,6 +305,24 @@ class MessageDAO:
         if commit:
             await self._conn.commit()
 
+    async def session_snapshot(self, chat_id: int) -> dict[str, Any]:
+        """Read one reusable session row, creating defaults only when absent.
+
+        Existing sessions stay on a read-only path.  Callers that need several
+        preferences/stat fields can reuse this snapshot instead of making every
+        getter run ``INSERT OR IGNORE`` and ``commit`` independently.
+        """
+        cur = await self._conn.execute(
+            "SELECT * FROM sessions WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        if row is not None:
+            return dict(row)
+        await self.ensure_session(chat_id)
+        cur = await self._conn.execute(
+            "SELECT * FROM sessions WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        return dict(row) if row is not None else {}
+
     async def current_session_uuid(self, chat_id: int) -> str:
         """只读取当前 session_uuid；不存在时不创建新会话/新 UUID。"""
         cur = await self._conn.execute(
@@ -871,6 +889,108 @@ class MessageDAO:
         placeholders = ",".join("?" for _ in ids)
         return f"chat_id IN ({placeholders})", tuple(ids)
 
+    async def channel_call_summaries(
+        self,
+        chat_id: int | Iterable[int],
+        *,
+        provider_name: str | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Aggregate the channel ledger once at model granularity.
+
+        Provider totals are derived from those rows with the same sums and
+        weighted averages as ``provider_call_summary``.  The optional provider
+        filter keeps the detail endpoint narrow without performing a second
+        all-history provider aggregation.
+        """
+        chat_filter, params = self._chat_id_filter(chat_id)
+        provider_clause = ""
+        query_params: tuple[Any, ...] = params
+        if provider_name is not None:
+            provider = str(provider_name)
+            prefix = provider + "/"
+            provider_clause = " AND (model=? OR substr(model, 1, ?)=?)"
+            query_params = (*params, provider, len(prefix), prefix)
+        cur = await self._conn.execute(
+            f"""
+            SELECT model,
+                   COUNT(*) AS runs,
+                   SUM(COALESCE(model_call_count, 1)) AS calls,
+                   SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)) AS ok_count,
+                   SUM(COALESCE(model_fail_count, CASE WHEN status!='ok' THEN 1 ELSE 0 END)) AS fail_count,
+                   SUM(COALESCE(model_retry_count, 0)) AS retry_count,
+                   SUM(input_tokens) AS input_tokens,
+                   SUM(output_tokens) AS output_tokens,
+                   SUM(cache_read_tokens) AS cache_read_tokens,
+                   SUM(cache_write_tokens) AS cache_write_tokens,
+                   SUM(cost_usd) AS cost_usd,
+                   SUM(total_time_ms) AS total_time_ms,
+                   SUM(total_time_ms) * 1.0 / NULLIF(SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)), 0) AS avg_total_ms,
+                   SUM(connect_ms) * 1.0 / NULLIF(SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)), 0) AS avg_connect_ms,
+                   SUM(first_token_ms) * 1.0 / NULLIF(SUM(COALESCE(model_ok_count, CASE WHEN status='ok' THEN 1 ELSE 0 END)), 0) AS avg_first_ms,
+                   SUM(output_tokens) * 1000.0 / NULLIF(SUM(total_time_ms), 0) AS avg_tps,
+                   MAX(peak_tps) AS peak_tps,
+                   MIN(CASE WHEN min_tps > 0 THEN min_tps END) AS min_tps,
+                   SUM(connect_ms) AS _connect_ms,
+                   SUM(first_token_ms) AS _first_token_ms
+            FROM model_calls
+            WHERE {chat_filter} AND model!=''{provider_clause}
+            GROUP BY model
+            """,
+            query_params,
+        )
+        aggregate_rows = [dict(row) for row in await cur.fetchall()]
+        model_rows = [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in aggregate_rows
+        ]
+
+        summed_fields = (
+            "runs", "calls", "ok_count", "fail_count", "retry_count",
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+            "cost_usd", "total_time_ms",
+        )
+        providers: dict[str, dict[str, Any]] = {}
+        for row in aggregate_rows:
+            model = str(row.get("model") or "")
+            provider = model.split("/", 1)[0]
+            summary = providers.setdefault(
+                provider,
+                {
+                    "provider": provider,
+                    **{key: None for key in summed_fields},
+                    "peak_tps": None,
+                    "min_tps": None,
+                    "_connect_ms": None,
+                    "_first_token_ms": None,
+                },
+            )
+            for key in (*summed_fields, "_connect_ms", "_first_token_ms"):
+                value = row.get(key)
+                if value is not None:
+                    summary[key] = (summary[key] or 0) + value
+            peak_tps = row.get("peak_tps")
+            if peak_tps is not None and (summary["peak_tps"] is None or peak_tps > summary["peak_tps"]):
+                summary["peak_tps"] = peak_tps
+            min_tps = row.get("min_tps")
+            if min_tps is not None and (summary["min_tps"] is None or min_tps < summary["min_tps"]):
+                summary["min_tps"] = min_tps
+
+        provider_rows: list[dict[str, Any]] = []
+        for summary in providers.values():
+            ok_count = summary.get("ok_count") or 0
+            total_time_ms = summary.get("total_time_ms")
+            output_tokens = summary.get("output_tokens")
+            connect_ms = summary["_connect_ms"]
+            first_token_ms = summary["_first_token_ms"]
+            summary["avg_total_ms"] = total_time_ms / ok_count if ok_count and total_time_ms is not None else None
+            summary["avg_connect_ms"] = connect_ms / ok_count if ok_count and connect_ms is not None else None
+            summary["avg_first_ms"] = first_token_ms / ok_count if ok_count and first_token_ms is not None else None
+            summary["avg_tps"] = output_tokens * 1000.0 / total_time_ms if total_time_ms and output_tokens is not None else None
+            summary.pop("_connect_ms")
+            summary.pop("_first_token_ms")
+            provider_rows.append(summary)
+        return provider_rows, model_rows
+
     async def provider_call_summary(self, chat_id: int | Iterable[int]) -> list[dict[str, Any]]:
         chat_filter, params = self._chat_id_filter(chat_id)
         cur = await self._conn.execute(
@@ -1223,63 +1343,52 @@ class MessageDAO:
         )
         await self._conn.commit()
 
+    @staticmethod
+    def usage_totals_from_session(session: dict[str, Any] | None) -> UsageTotals:
+        row = session or {}
+        return UsageTotals(
+            input_tokens=row.get("usage_input_tokens") or 0,
+            output_tokens=row.get("usage_output_tokens") or 0,
+            cache_read_tokens=row.get("usage_cache_read_tokens") or 0,
+            cache_write_tokens=row.get("usage_cache_write_tokens") or 0,
+            cost_usd=row.get("usage_cost_usd") or 0.0,
+            last_input_tokens=row.get("last_input_tokens") or 0,
+            last_output_tokens=row.get("last_output_tokens") or 0,
+            last_cache_read_tokens=row.get("last_cache_read_tokens") or 0,
+            last_cache_write_tokens=row.get("last_cache_write_tokens") or 0,
+            last_cost_usd=row.get("last_cost_usd") or 0.0,
+            last_connect_ms=row.get("last_connect_ms") or 0,
+            last_first_token_ms=row.get("last_first_token_ms") or 0,
+            last_total_time_ms=row.get("last_total_time_ms") or 0,
+            last_run_cost_usd=row.get("last_run_cost_usd") or 0.0,
+            last_run_total_time_ms=row.get("last_run_total_time_ms") or 0,
+            last_run_model_calls=row.get("last_run_model_calls") or 0,
+            last_run_tool_calls=row.get("last_run_tool_calls") or 0,
+            last_model=row.get("last_model") or "",
+            last_protocol=row.get("last_protocol") or "",
+            last_think_level=row.get("last_think_level") or "",
+            last_created_at=row.get("last_created_at") or 0,
+            turn_started_at=row.get("turn_started_at") or 0,
+            stat_user_turns=row.get("stat_user_turns") or 0,
+            stat_tool_calls=row.get("stat_tool_calls") or 0,
+            stat_model_calls=row.get("stat_model_calls") or 0,
+            stat_model_ok=row.get("stat_model_ok") or 0,
+            stat_model_retry=row.get("stat_model_retry") or 0,
+            stat_model_fail=row.get("stat_model_fail") or 0,
+            stat_connect_ms_sum=row.get("stat_connect_ms_sum") or 0,
+            stat_first_token_ms_sum=row.get("stat_first_token_ms_sum") or 0,
+            stat_total_time_ms_sum=row.get("stat_total_time_ms_sum") or 0,
+            stat_output_tokens_sum=row.get("stat_output_tokens_sum") or 0,
+        )
+
     async def usage_totals(self, chat_id: int) -> UsageTotals:
+        # Preserve the established standalone getter semantics: callers outside
+        # GET /state still ensure/commit the sessions row before reading it.
         await self.ensure_session(chat_id)
         cur = await self._conn.execute(
-            """
-            SELECT usage_input_tokens, usage_output_tokens,
-                   usage_cache_read_tokens, usage_cache_write_tokens, usage_cost_usd,
-                   last_input_tokens, last_output_tokens, last_cache_read_tokens,
-                   last_cache_write_tokens, last_cost_usd, last_connect_ms,
-                   last_first_token_ms, last_total_time_ms,
-                   last_run_cost_usd, last_run_total_time_ms,
-                   last_run_model_calls, last_run_tool_calls,
-                   last_model, last_protocol,
-                   last_think_level, last_created_at,
-                   turn_started_at, stat_user_turns, stat_tool_calls, stat_model_calls,
-                   stat_model_ok, stat_model_retry, stat_model_fail,
-                   stat_connect_ms_sum, stat_first_token_ms_sum, stat_total_time_ms_sum,
-                   stat_output_tokens_sum
-            FROM sessions WHERE chat_id=?
-            """,
-            (chat_id,))
+            "SELECT * FROM sessions WHERE chat_id=?", (chat_id,))
         row = await cur.fetchone()
-        if not row:
-            return UsageTotals()
-        return UsageTotals(
-            input_tokens=row["usage_input_tokens"] or 0,
-            output_tokens=row["usage_output_tokens"] or 0,
-            cache_read_tokens=row["usage_cache_read_tokens"] or 0,
-            cache_write_tokens=row["usage_cache_write_tokens"] or 0,
-            cost_usd=row["usage_cost_usd"] or 0.0,
-            last_input_tokens=row["last_input_tokens"] or 0,
-            last_output_tokens=row["last_output_tokens"] or 0,
-            last_cache_read_tokens=row["last_cache_read_tokens"] or 0,
-            last_cache_write_tokens=row["last_cache_write_tokens"] or 0,
-            last_cost_usd=row["last_cost_usd"] or 0.0,
-            last_connect_ms=row["last_connect_ms"] or 0,
-            last_first_token_ms=row["last_first_token_ms"] or 0,
-            last_total_time_ms=row["last_total_time_ms"] or 0,
-            last_run_cost_usd=row["last_run_cost_usd"] or 0.0,
-            last_run_total_time_ms=row["last_run_total_time_ms"] or 0,
-            last_run_model_calls=row["last_run_model_calls"] or 0,
-            last_run_tool_calls=row["last_run_tool_calls"] or 0,
-            last_model=row["last_model"] or "",
-            last_protocol=row["last_protocol"] or "",
-            last_think_level=row["last_think_level"] or "",
-            last_created_at=row["last_created_at"] or 0,
-            turn_started_at=row["turn_started_at"] or 0,
-            stat_user_turns=row["stat_user_turns"] or 0,
-            stat_tool_calls=row["stat_tool_calls"] or 0,
-            stat_model_calls=row["stat_model_calls"] or 0,
-            stat_model_ok=row["stat_model_ok"] or 0,
-            stat_model_retry=row["stat_model_retry"] or 0,
-            stat_model_fail=row["stat_model_fail"] or 0,
-            stat_connect_ms_sum=row["stat_connect_ms_sum"] or 0,
-            stat_first_token_ms_sum=row["stat_first_token_ms_sum"] or 0,
-            stat_total_time_ms_sum=row["stat_total_time_ms_sum"] or 0,
-            stat_output_tokens_sum=row["stat_output_tokens_sum"] or 0,
-        )
+        return self.usage_totals_from_session(dict(row) if row is not None else None)
 
     async def add(self, chat_id: int, role: str, content: str = "", *,
                   reasoning: str = "", signature: str = "",

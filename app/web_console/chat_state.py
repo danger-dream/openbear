@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import inspect
 
+from app.web_console.message_visibility import visibility_snapshot
+
 from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 from app.rath.controller_projection import project_history_message_for_controller
 from app.tools.base import current_tool_context
@@ -110,12 +112,19 @@ class WebAdminChatStateMixin:
             "window_retain_ratio": policy.retain_ratio,
         }
 
-    async def _effective_thinking_level(self, chat_id: int, model_label: str) -> str:
-        messages = MessageDAO(self.db)
+    async def _effective_thinking_level(
+        self,
+        chat_id: int,
+        model_label: str,
+        *,
+        stored_level: str | None = None,
+    ) -> str:
         levels = self._model_thinking_levels(model_label)
         if not levels:
             return "off"
-        stored = normalize_think_level(await messages.get_thinking_level(chat_id))
+        if stored_level is None:
+            stored_level = await MessageDAO(self.db).get_thinking_level(chat_id)
+        stored = normalize_think_level(stored_level)
         if stored and stored in levels:
             return stored
         return self._model_default_thinking_level(model_label)
@@ -327,12 +336,16 @@ class WebAdminChatStateMixin:
         before_display_seq: int | None = None,
     ) -> dict[str, Any]:
         messages = MessageDAO(self.db)
-        usage = await messages.usage_totals(chat_id)
+        # One sessions read supplies usage and all display preferences. Existing
+        # conversations must keep GET /state read-only; only a genuinely absent
+        # sessions row retains the historical auto-create/default semantics.
+        session_config = await messages.session_snapshot(chat_id)
+        usage = messages.usage_totals_from_session(session_config)
         # sessions/model_calls receives every controller and child-Agent request
         # at its completion boundary; rath_tasks is progress metadata for those
         # same Agent calls and must not be added again.
         usage_dict = asdict(usage)
-        session_uuid = await messages.current_session_uuid(chat_id)
+        session_uuid = str(session_config.get("session_uuid") or "")
         ledger_revision = 0
         if session_uuid:
             cur = await self.db.conn.execute(
@@ -448,8 +461,15 @@ class WebAdminChatStateMixin:
             "latestActiveUpdatedAtMs": max([int(op.get("updatedAtMs") or 0) for op in active_ops] or [0]),
         }
         thinking_levels = self._model_thinking_levels(model_label)
-        fast_requested = await messages.get_fast_mode(chat_id)
+        stored_thinking_level = str(session_config.get("thinking_level") or "")
+        fast_requested = bool(int(session_config.get("fast_mode") or 0))
         fast_supported = self._model_supports_fast(model_label)
+        show_thinking_override = session_config.get("show_thinking")
+        show_thinking = (
+            self.config.ui.show_thinking
+            if show_thinking_override is None or int(show_thinking_override) < 0
+            else bool(int(show_thinking_override))
+        )
         agent_runtime = resolve_agent_runtime_config(
             None,
             config=self.config,
@@ -529,6 +549,7 @@ class WebAdminChatStateMixin:
             "live": live_snapshot,
             "operations": operations,
             "operationSource": operation_source,
+            "messageVisibility": await visibility_snapshot(self.db, conv_uuid),
             "frameSeq": frame_seq,
             "timelineTotalDurationMs": timeline_total_duration_ms,
             "hasMoreBefore": bool(operation_page.get("hasMoreBefore")),
@@ -544,8 +565,10 @@ class WebAdminChatStateMixin:
             },
             "conversation": self._web_conversation_json({**conversation, "cost_usd": usage_dict["cost_usd"]}, live=live, operation_facts=operation_facts) if conversation else None,
             "model": model_label,
-            "thinkingLevel": await messages.get_thinking_level(chat_id),
-            "effectiveThinkingLevel": await self._effective_thinking_level(chat_id, model_label),
+            "thinkingLevel": stored_thinking_level,
+            "effectiveThinkingLevel": await self._effective_thinking_level(
+                chat_id, model_label, stored_level=stored_thinking_level,
+            ),
             "thinkingLevels": thinking_levels,
             "defaultThinkingLevel": self._model_default_thinking_level(model_label) if thinking_levels else "",
             "supportsThinking": bool(thinking_levels),
@@ -558,7 +581,7 @@ class WebAdminChatStateMixin:
             "agentRunConfig": agent_run_config,
             "rolloverTriggerTokens": self._model_rollover_trigger_tokens(model_label),
             "windowTriggerRatio": float(self.config.agent.compact_ratio or 0.7),
-            "showThinking": await messages.get_show_thinking(chat_id, default=self.config.ui.show_thinking),
+            "showThinking": show_thinking,
             "messages": [self._message_json(r) for r in message_rows],
             "modelCalls": await self._chat_model_calls(chat_id, session_uuid),
             "toolCalls": await self._chat_tool_calls(chat_id, session_uuid),

@@ -10,11 +10,13 @@ import asyncio
 import inspect
 import math
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 CancelCheck = Callable[[], bool | Awaitable[bool]]
+RetryControlCheck = Callable[[str], str | Awaitable[str]]
 RetryUpdate = Callable[[dict[str, Any]], None | Awaitable[None]]
 
 
@@ -80,6 +82,7 @@ def retry_wait_payload(
         "active": True,
         "scope": scope,
         "taskUuid": task_uuid,
+        "waitId": uuid.uuid4().hex,
         "attempt": max(1, int(retry_number)),
         "maxRetries": max(0, int(max_retries)),
         "delayMs": delay_ms,
@@ -110,6 +113,7 @@ async def wait_for_retry(
     *,
     state: dict[str, Any],
     cancel_check: CancelCheck | None = None,
+    control_check: RetryControlCheck | None = None,
     on_update: RetryUpdate | None = None,
     poll_interval_s: float = 0.25,
 ) -> None:
@@ -121,10 +125,15 @@ async def wait_for_retry(
     await _call_optional(on_update, dict(state))
     deadline = time.monotonic() + max(0.0, float(delay_s))
     terminal_status = "resumed"
+    resume_source = "automatic"
     try:
         while True:
-            if bool(await _call_optional(cancel_check)):
+            control = str(await _call_optional(control_check, str(state.get("waitId") or "")) or "")
+            if control == "cancel" or bool(await _call_optional(cancel_check)):
                 raise RetryCancelledError("model retry cancelled by user")
+            if control == "retry":
+                resume_source = "manual"
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -143,6 +152,7 @@ async def wait_for_retry(
             "retryAtMs": 0,
             "delayMs": 0,
             "status": terminal_status,
+            "resumeSource": resume_source if terminal_status == "resumed" else "",
             "terminal": True,
         })
         await _call_optional(on_update, cleared)

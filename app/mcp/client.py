@@ -4,7 +4,13 @@ from __future__ import annotations
 from typing import Any
 
 from app.config import MCPServerConfig
-from app.mcp.errors import MCPInitializeError, MCPToolCallError, MCPToolListError
+from app.mcp.errors import (
+    MCPConnectionError,
+    MCPInitializeError,
+    MCPTimeoutError,
+    MCPToolCallError,
+    MCPToolListError,
+)
 from app.mcp.transports import MCPTransport, NotificationHandler, make_transport
 from app.mcp.types import MCPRawResult, MCPRawTool
 
@@ -96,6 +102,8 @@ class MCPClient:
                 {"name": name, "arguments": arguments or {}},
                 timeout_s=float(self.config.tool_call_timeout_s or 120),
             )
+        except (MCPTimeoutError, MCPConnectionError):
+            raise
         except Exception as exc:
             raise MCPToolCallError(f"MCP server {self.server_key} tool {name} failed: {type(exc).__name__}: {exc}") from exc
         if isinstance(result, dict):

@@ -131,12 +131,12 @@ test("shared tool and model rows use the original timeline dot with status-only 
   assert.match(activityListSource, /denied: "已拒绝 ×"/);
   assert.match(activityListSource, /running: "调用中"/);
   assert.match(activityListSource, /failed: "调用失败 ×"/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-active \{ color: #2563eb; \}/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-success \{ color: #357047; \}/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-danger \{ color: #b42318; \}/);
+  assert.match(activityListSource, /\.activity-process-status\.tone-active \{ color: var\(--ob-blue\); \}/);
+  assert.match(activityListSource, /\.activity-process-status\.tone-success \{ color: var\(--ob-success\); \}/);
+  assert.match(activityListSource, /\.activity-process-status\.tone-danger \{ color: var\(--ob-danger\); \}/);
 
   assert.doesNotMatch(activityListSource, /\.activity-row\.tone-(?:active|success|danger) \.activity-tool-call > summary/);
-  assert.match(activityListSource, /\.activity-tool-call > summary, \.activity-model-call \{[^}]*color: #52525b/);
+  assert.match(activityListSource, /\.activity-tool-call > summary, \.activity-model-call \{[^}]*color: var\(--ob-text-subtle\)/);
   assert.match(activityListSource, /\.activity-tool-call, \.activity-model-call \{[^}]*grid-column: 3/);
   assert.match(activityListSource, /\.activity-tool-description \{[^}]*text-overflow: ellipsis/, 'collapsed tool descriptions remain summaries');
   assert.match(activityListSource, /\.activity-model-description \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);

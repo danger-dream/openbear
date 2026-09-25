@@ -40,12 +40,12 @@
   white-space: nowrap;
 }
 .sidebar-resource-grid > .sidebar-resource-tile[aria-current='page'] {
-  background: var(--el-fill-color-darker);
+  background: var(--ob-chat-selected);
   color: var(--el-text-color-primary);
   font-weight: 500;
 }
 .sidebar-resource-tile[aria-current='page'] > .sidebar-resource-icon {
-  color: var(--el-color-primary);
+  color: var(--ob-chat-text);
 }
 @media (hover: hover) and (pointer: fine) {
   .sidebar-resource-grid > .sidebar-resource-tile:hover:not([aria-current='page']) {
@@ -54,10 +54,10 @@
   }
 }
 .sidebar-resource-grid > .sidebar-resource-tile:active {
-  background: var(--el-fill-color-darker);
+  background: var(--ob-chat-selected);
 }
 .sidebar-resource-grid > .sidebar-resource-tile:focus-visible {
-  outline: 2px solid var(--el-color-primary);
+  outline: 2px solid var(--ob-chat-subtle);
   outline-offset: -2px;
 }
 @media (prefers-reduced-motion: reduce) {
@@ -78,8 +78,8 @@
 .sidebar-desktop-nav > .sidebar-resource-tile {
   min-height: 46px;
   padding: 4px 2px;
-  gap: 3px;
-  border-radius: 8px;
+  gap: 7px;
+  border-radius: 6px;
   font-size: 11px;
 }
 .sidebar-desktop-nav > .sidebar-resource-tile .sidebar-resource-icon {
@@ -87,26 +87,18 @@
   height: 16px;
 }
 .sidebar-desktop-nav > .sidebar-resource-tile:hover:not([aria-current='page']) {
-  background: rgba(255, 255, 255, 0.85);
-  color: var(--el-text-color-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  background: var(--ob-chat-hover);
+  color: var(--ob-chat-text);
 }
-html.dark .sidebar-desktop-nav > .sidebar-resource-tile:hover:not([aria-current='page']) {
-  background: rgba(255, 255, 255, 0.1);
-  box-shadow: none;
-}
+
 .sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] {
-  background: #ffffff;
-  color: var(--el-color-primary);
-  font-weight: 600;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  background: var(--ob-chat-selected);
+  color: var(--ob-chat-text);
+  font-weight: 500;
 }
-html.dark .sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] {
-  background: rgba(255, 255, 255, 0.16);
-  box-shadow: none;
-}
+
 .sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] > .sidebar-resource-icon {
-  color: var(--el-color-primary);
+  color: var(--ob-chat-text);
 }
 
 /* =========================================================================
@@ -118,14 +110,11 @@ html.dark .sidebar-desktop-nav > .sidebar-resource-tile[aria-current='page'] {
   justify-content: space-between;
   margin: 6px -12px -12px;
   padding: 8px 12px;
-  border-top: 1px solid var(--el-border-color-lighter, #e4e4e7);
-  background: rgba(0, 0, 0, 0.015);
+  border-top: 1px solid var(--el-border-color-lighter, var(--ob-border));
+  background: rgb(var(--ob-surface-soft-rgb) / 0.015);
   flex: 0 0 auto;
 }
-html.dark .sidebar-desktop-footer {
-  border-top-color: var(--el-border-color-darker, #27272a);
-  background: rgba(255, 255, 255, 0.02);
-}
+
 
 .sidebar-footer-settings {
   display: inline-flex;
@@ -136,7 +125,7 @@ html.dark .sidebar-desktop-footer {
   border: 0;
   background: transparent;
   color: var(--el-text-color-regular);
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
   transition: all .15s ease;
 }
@@ -146,8 +135,8 @@ html.dark .sidebar-desktop-footer {
 }
 .sidebar-footer-settings.is-active,
 .sidebar-footer-settings[aria-current='page'] {
-  background: var(--el-fill-color-darker);
-  color: var(--el-color-primary);
+  background: var(--ob-chat-selected);
+  color: var(--ob-chat-text);
   font-weight: 600;
 }
 
@@ -157,15 +146,15 @@ html.dark .sidebar-desktop-footer {
   gap: 5px;
   padding: 3px 6px;
   border-radius: 6px;
-  font-size: 11px;
-  color: var(--el-text-color-secondary);
+  font-size: 10px;
+  color: var(--ob-chat-muted);
   user-select: none;
 }
 .status-indicator-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #10b981;
+  background: var(--ob-success);
   display: inline-block;
 }
 

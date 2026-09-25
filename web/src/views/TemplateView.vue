@@ -347,7 +347,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 <template>
 	<div class="admin-page template-page h-full flex flex-col">
 		<header
-			class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-white/70 backdrop-blur">
+			class="h-14 shrink-0 flex items-center justify-between px-6 border-b border-macborder bg-ob-surface/70 backdrop-blur">
 			<div class="admin-heading flex items-center gap-2 min-w-0">
 				<h1 class="text-base font-semibold shrink-0">提示词模板</h1>
 				<span class="text-xs text-macsub truncate">选择模板 · 编辑 · 自动补全 · 实时预览</span>
@@ -376,7 +376,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 		</header>
 		
-		<div v-if="editing" class="template-meta h-14 shrink-0 px-4 border-b border-macborder bg-white/55 flex items-center gap-3">
+		<div v-if="editing" class="template-meta h-14 shrink-0 px-4 border-b border-macborder bg-ob-surface/55 flex items-center gap-3">
 			<div class="flex items-center gap-2 min-w-0">
 				<span class="text-xs text-macsub shrink-0">模板</span>
 				<el-select v-model="activeId" :disabled="changingTemplate" @change="selectById" filterable class="!w-72" aria-label="选择模板" placeholder="选择模板">
@@ -388,25 +388,25 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 			
 			<div class="template-status flex items-center gap-2 text-xs shrink-0">
-				<span v-if="editing.is_active" class="text-green-600">● 当前激活</span>
+				<span v-if="editing.is_active" class="text-ob-success">● 当前激活</span>
 				<span v-else class="text-macsub">激活: {{ activeTemplateName }}</span>
-				<span v-if="editing.is_agent_active" class="text-emerald-600">● Agent提示词</span>
+				<span v-if="editing.is_agent_active" class="text-ob-success">● Agent提示词</span>
 				<span v-else class="text-macsub">Agent: {{ agentActiveTemplateName }}</span>
-				<span v-if="dirty()" class="text-orange-500">● 未保存</span>
+				<span v-if="dirty()" class="text-ob-orange">● 未保存</span>
 			</div>
 			
 			<div class="template-counters ml-auto flex items-center gap-2 shrink-0">
-				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-black/[0.04]">模板 {{
+				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-ob-soft">模板 {{
 						formatNum(templateChars)
 					}} 字 / {{ formatNum(templateTokens) }} tk</span>
-				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-black/[0.04]">输出 {{
+				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-ob-soft">输出 {{
 						formatNum(outputChars)
 					}} 字 / {{ formatNum(outputTokens) }} tk</span>
 				<el-button size="small" text type="danger" :icon="'Delete'" @click="removeCurrent">删除</el-button>
 			</div>
 		</div>
 		
-		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-orange-500">· 未保存</span></MobileAdminSummary>
+		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-ob-orange">· 未保存</span></MobileAdminSummary>
 		<div v-if="editing" class="admin-mobile-only template-pane-switch" role="group" aria-label="模板工作区">
 			<button type="button" :aria-pressed="mobilePane === 'edit'" aria-controls="template-editor-pane" @click="mobilePane = 'edit'">编辑模板</button>
 			<button type="button" :aria-pressed="mobilePane === 'preview'" aria-controls="template-preview-pane" @click="mobilePane = 'preview'">实时预览</button>
@@ -419,12 +419,12 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					</div>
 				</section>
 				
-				<aside id="template-preview-pane" class="template-preview-pane flex-[0.92] min-w-[420px] max-w-[820px] flex flex-col bg-[#fbfbfd]">
+				<aside id="template-preview-pane" class="template-preview-pane flex-[0.92] min-w-[420px] max-w-[820px] flex flex-col bg-ob-bg">
 					<div
-						class="template-preview-toolbar h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between bg-white/80 backdrop-blur">
+						class="template-preview-toolbar h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between bg-ob-surface/80 backdrop-blur">
 						<div class="flex items-center gap-2">
 							<div class="w-2 h-2 rounded-full"
-							     :class="previewError ? 'bg-red-500' : previewResult ? 'bg-green-500' : 'bg-gray-300'"></div>
+							     :class="previewError ? 'bg-ob-danger' : previewResult ? 'bg-ob-success' : 'bg-ob-soft'"></div>
 							<div>
 								<div class="text-sm font-semibold">实时预览</div>
 								<div class="text-[11px] text-macsub">未保存内容也参与渲染</div>
@@ -443,7 +443,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 						</div>
 					</div>
 					
-					<div class="admin-desktop-only grid grid-cols-3 gap-2 p-3 shrink-0 border-b border-macborder bg-white/55">
+					<div class="admin-desktop-only grid grid-cols-3 gap-2 p-3 shrink-0 border-b border-macborder bg-ob-surface/55">
 						<div class="mac-panel px-3 py-2">
 							<div class="text-[10px] text-macsub">输出 tokens</div>
 							<div class="text-base font-semibold">{{ formatNum(outputTokens) }}</div>
@@ -459,7 +459,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					</div>
 					
 					<div v-if="previewError"
-					     class="mx-3 mt-3 p-3 rounded-xl border border-red-200 bg-red-50 text-red-700 text-xs whitespace-pre-wrap">
+					     class="mx-3 mt-3 p-3 rounded-xl border border-ob-danger/25 bg-[var(--ob-danger-soft)] text-ob-danger text-xs whitespace-pre-wrap">
 						{{ previewError }}
 					</div>
 					
@@ -500,7 +500,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 						<span class="mt-0.5 block text-xs font-normal text-macsub">当前版本附带的 Agent 基础模板</span>
 					</el-checkbox>
 				</el-checkbox-group>
-				<div class="mt-4 rounded-xl border border-[#d8e1ec] bg-[#f3f6fa] px-3 py-2.5 text-xs text-[#526579]">
+				<div class="mt-4 rounded-xl border border-ob-border bg-ob-soft px-3 py-2.5 text-xs text-ob-subtle">
 					导入不会自动激活，也不改变已有会话提示词。相同版本内容已存在时不会重复创建。
 				</div>
 			</div>
@@ -531,7 +531,7 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					<code>[[</code> 会补变量/函数，输入 <code>@</code> 会补模板指令。</p>
 				<div>
 					<div class="font-semibold mb-1">变量插值</div>
-					<pre class="bg-black/[0.04] p-2 rounded text-xs font-mono">[[ runtimeInfo.host ]]          运行时信息
+					<pre class="bg-ob-soft p-2 rounded text-xs font-mono">[[ runtimeInfo.host ]]          运行时信息
 [[ workspaceDir ]]             工作目录
 [[ helpers.toolLines(builtinToolNames, builtinToolSummaries) ]]  内置工具清单
 [[ helpers.toolLines(mcpToolNames, mcpToolSummaries) ]]  MCP 工具清单（Agent 仅含本轮授权）
@@ -541,7 +541,7 @@ availableAgents / agents.available  当前可用 Agent 数组</pre>
 				<div>
 					<div class="font-semibold mb-1">条件 / 循环 / 块</div>
                     <p class="text-xs text-macsub">Agent 模板的 MCP 名单与服务说明仅来自授权工具，不包含未授权服务；服务说明不扩大权限。</p>
-					<pre class="bg-black/[0.04] p-2 rounded text-xs font-mono">@if helpers.has(toolNames,'gateway')
+					<pre class="bg-ob-soft p-2 rounded text-xs font-mono">@if helpers.has(toolNames,'gateway')
   ...内容...
 @endif
 
@@ -557,7 +557,7 @@ availableAgents / agents.available  当前可用 Agent 数组</pre>
 				</div>
 				<div>
 					<div class="font-semibold mb-1">记忆数据(模板可用)</div>
-					<pre class="bg-black/[0.04] p-2 rounded text-xs font-mono">memory.expandedEntries  每轮展开的完整记忆条目
+					<pre class="bg-ob-soft p-2 rounded text-xs font-mono">memory.expandedEntries  每轮展开的完整记忆条目
 memory.byCat.memory     长期记忆条目列表
 memory.byCat.tools      工具说明条目列表
 memory.groupsByCat.memory  长期记忆分组
@@ -606,7 +606,7 @@ memory.docNames         文档名称索引</pre>
 	font-weight: 700;
 	margin: 1rem 0 .45rem;
 	padding-bottom: .25rem;
-	border-bottom: 1px solid #e5e5ea;
+	border-bottom: 1px solid var(--ob-border);
 }
 
 .pm-md-preview h3 {
@@ -637,21 +637,21 @@ memory.docNames         文档名称索引</pre>
 .pm-md-preview code {
 	font-family: "SF Mono", Menlo, Consolas, monospace;
 	font-size: .88em;
-	background: rgba(0, 0, 0, .055);
+	background: rgb(var(--ob-border-rgb) / .055);
 	border-radius: 5px;
 	padding: 1px 4px;
 }
 
 .pm-md-preview pre {
-	background: rgba(0, 0, 0, .045);
-	border: 1px solid #e5e5ea;
+	background: rgb(var(--ob-border-rgb) / .045);
+	border: 1px solid var(--ob-border);
 	border-radius: 10px;
 	padding: 10px;
 	overflow: auto;
 }
 
 .pm-md-preview pre.hljs {
-	background: #f6f8fa;
+	background: var(--ob-surface-soft);
 }
 
 .pm-md-preview pre code {
@@ -669,31 +669,31 @@ memory.docNames         文档名称索引</pre>
 }
 
 .pm-md-preview th, .pm-md-preview td {
-	border: 1px solid #dfe3ea;
+	border: 1px solid var(--ob-border);
 	padding: 6px 9px;
 	vertical-align: top;
 }
 
 .pm-md-preview th {
-	background: #f6f8fa;
+	background: var(--ob-surface-soft);
 	font-weight: 650;
 }
 
 .pm-md-preview tr:nth-child(even) td {
-	background: rgba(0, 0, 0, .018);
+	background: rgb(var(--ob-border-rgb) / .018);
 }
 
 .pm-md-preview blockquote {
 	margin: .6rem 0;
 	padding: .35rem .8rem;
-	border-left: 3px solid #b9c0cc;
-	color: #4b5563;
-	background: rgba(0, 0, 0, .025);
+	border-left: 3px solid var(--ob-border-strong);
+	color: var(--ob-text);
+	background: rgb(var(--ob-border-rgb) / .025);
 	border-radius: 0 8px 8px 0;
 }
 
 .pm-md-preview a {
-	color: #0066cc;
+	color: var(--ob-blue);
 	text-decoration: none;
 }
 
@@ -703,34 +703,34 @@ memory.docNames         文档名称索引</pre>
 
 /* OpenBear system dark theme */
 html.dark .pm-md-preview h2 {
-		border-bottom: 1px solid #3d3e46;
+		border-bottom: 1px solid var(--ob-border);
 	}
 html.dark .pm-md-preview code {
-		background: rgba(255, 255, 255, 0.069);
+		background: rgb(var(--ob-surface-rgb) / 0.069);
 	}
 html.dark .pm-md-preview pre {
-		background: rgba(255, 255, 255, 0.056);
-		border: 1px solid #3d3e46;
+		background: rgb(var(--ob-surface-rgb) / 0.056);
+		border: 1px solid var(--ob-border);
 	}
 html.dark .pm-md-preview pre.hljs {
-		background: #1d1e22;
+		background: var(--ob-surface);
 	}
 html.dark .pm-md-preview th,
 html.dark .pm-md-preview td {
-		border: 1px solid #3d3e46;
+		border: 1px solid var(--ob-border);
 	}
 html.dark .pm-md-preview th {
-		background: #1d1e22;
+		background: var(--ob-surface);
 	}
 html.dark .pm-md-preview tr:nth-child(even) td {
-		background: rgba(255, 255, 255, 0.035);
+		background: rgb(var(--ob-surface-rgb) / 0.035);
 	}
 html.dark .pm-md-preview blockquote {
-		border-left: 3px solid #3d3e46;
-		color: #c6c6cd;
-		background: rgba(255, 255, 255, 0.035);
+		border-left: 3px solid var(--ob-border);
+		color: var(--ob-text);
+		background: rgb(var(--ob-surface-rgb) / 0.035);
 	}
 html.dark .pm-md-preview a {
-		color: #60a5fa;
+		color: var(--ob-blue);
 	}
 </style>

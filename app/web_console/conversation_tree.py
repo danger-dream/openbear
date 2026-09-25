@@ -6,6 +6,7 @@ read only by the dedicated properties endpoint.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -223,8 +224,143 @@ class WebAdminConversationTreeMixin:
         wanted.discard("")
         return wanted
 
+    def _invalidate_tree_status(self, owner_chat_id: int = 0) -> None:
+        """Detach in-flight reuse after an authoritative local mutation."""
+        tasks = getattr(self, "_tree_status_tasks", None)
+        if tasks is None:
+            return
+        owner = int(owner_chat_id or 0)
+        if owner:
+            tasks.pop(owner, None)
+        else:
+            tasks.clear()
+
+    async def _tree_ensure_interaction_projection(self, owner_chat_id: int) -> None:
+        """Lazily backfill only legacy NULL rows; 0 remains a known empty value."""
+        owner = int(owner_chat_id)
+        ready = getattr(self, "_tree_projection_ready", None)
+        if ready is None:
+            self._tree_projection_ready = ready = set()
+        if owner in ready:
+            return
+        tasks = getattr(self, "_tree_projection_tasks", None)
+        if tasks is None:
+            self._tree_projection_tasks = tasks = {}
+        task = tasks.get(owner)
+        if task is None:
+            async def backfill() -> None:
+                async with self.db.conn.transaction(label="conversation-tree-interaction-projection") as conn:
+                    cur = await conn.execute(
+                        """
+                        SELECT o.conversation_uuid,
+                               MAX(CASE WHEN o.op_type='user_message' THEN o.created_at_ms ELSE
+                                   COALESCE(NULLIF(CAST(json_extract(o.payload_json,'$.terminalAtMs') AS INTEGER),0),
+                                            o.created_at_ms)
+                               END) AS value
+                        FROM web_conversations c JOIN web_operations o ON o.conversation_uuid=c.conversation_uuid
+                        WHERE c.owner_chat_id=? AND COALESCE(c.archived_at,0)=0
+                          AND c.last_interaction_at_ms IS NULL
+                          AND o.op_type IN ('user_message','assistant_message')
+                          AND COALESCE(o.internal,0)=0
+                          AND COALESCE(json_extract(o.payload_json,'$.internal'),0)=0
+                          AND COALESCE(json_extract(o.payload_json,'$.hidden'),0)=0
+                          AND ((o.op_type='user_message' AND
+                                (LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0
+                                 OR COALESCE(json_array_length(o.payload_json,'$.attachments'),0)>0))
+                               OR (o.op_type='assistant_message' AND o.lifecycle='terminal' AND o.status='completed'
+                                   AND COALESCE(json_extract(o.payload_json,'$.error'),0)=0
+                                   AND LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0))
+                        GROUP BY o.conversation_uuid
+                        """,
+                        (owner,),
+                    )
+                    interaction_values = [(int(row["value"] or 0), str(row["conversation_uuid"])) for row in await cur.fetchall()]
+                    cur = await conn.execute(
+                        """
+                        SELECT c.conversation_uuid,MAX(m.created_at) AS value
+                        FROM web_conversations c LEFT JOIN messages m
+                          ON m.chat_id=c.internal_chat_id AND COALESCE(m.task_uuid,'')=''
+                         AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))
+                        WHERE c.owner_chat_id=? AND COALESCE(c.archived_at,0)=0
+                          AND c.last_conversation_at IS NULL
+                        GROUP BY c.conversation_uuid
+                        """,
+                        (owner,),
+                    )
+                    message_values = [(int(row["value"] or 0), str(row["conversation_uuid"])) for row in await cur.fetchall()]
+                    await conn.execute(
+                        """UPDATE web_conversations SET last_interaction_at_ms=0
+                           WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0 AND last_interaction_at_ms IS NULL""",
+                        (owner,),
+                    )
+                    if interaction_values:
+                        await conn.executemany(
+                            "UPDATE web_conversations SET last_interaction_at_ms=? WHERE conversation_uuid=?",
+                            interaction_values,
+                        )
+                    if message_values:
+                        await conn.executemany(
+                            "UPDATE web_conversations SET last_conversation_at=? WHERE conversation_uuid=? AND last_conversation_at IS NULL",
+                            message_values,
+                        )
+                ready.add(owner)
+
+            task = asyncio.create_task(backfill(), name=f"tree-interaction-projection:{owner}")
+            tasks[owner] = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done() and tasks.get(owner) is task:
+                tasks.pop(owner, None)
+
+    async def _tree_active_operation_facts(self, conversation_uuids: list[str]) -> dict[str, dict[str, int]]:
+        ids = [str(value) for value in conversation_uuids if str(value)]
+        if not ids:
+            return {}
+        cur = await self.db.conn.execute(
+            f"""
+            SELECT conversation_uuid,COUNT(*) AS active_count,
+                   SUM(CASE WHEN lifecycle='paused' THEN 1 ELSE 0 END) AS paused_count,
+                   SUM(CASE WHEN lifecycle='waiting_control' THEN 1 ELSE 0 END) AS waiting_control_count,
+                   SUM(CASE WHEN op_type='user_interaction' AND lifecycle='active' THEN 1 ELSE 0 END) AS pending_interaction_count,
+                   MAX(CASE WHEN op_type IN ('run','agent','user_interaction') THEN created_at_ms ELSE 0 END) AS active_started_at_ms
+            FROM web_operations
+            WHERE conversation_uuid IN ({','.join('?' for _ in ids)})
+              AND op_type!='notice' AND lifecycle IN ('active','paused','waiting_control')
+            GROUP BY conversation_uuid
+            """,
+            tuple(ids),
+        )
+        return {
+            str(row["conversation_uuid"]): {
+                "activeCount": int(row["active_count"] or 0),
+                "pausedCount": int(row["paused_count"] or 0),
+                "waitingControlCount": int(row["waiting_control_count"] or 0),
+                "pendingInteractionCount": int(row["pending_interaction_count"] or 0),
+                "activeStartedAtMs": int(row["active_started_at_ms"] or 0),
+            }
+            for row in await cur.fetchall()
+        }
+
     async def _tree_running_state(self, owner_chat_id: int) -> dict[str, Any]:
+        """Single-flight concurrent bootstrap/WS work without retaining stale state."""
+        owner = int(owner_chat_id)
+        tasks = getattr(self, "_tree_status_tasks", None)
+        if tasks is None:
+            self._tree_status_tasks = tasks = {}
+        task = tasks.get(owner)
+        if task is None:
+            task = asyncio.create_task(self._tree_running_state_uncached(owner), name=f"tree-status:{owner}")
+            tasks[owner] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and tasks.get(owner) is task:
+                tasks.pop(owner, None)
+
+    async def _tree_running_state_uncached(self, owner_chat_id: int) -> dict[str, Any]:
         """Return runtime truth and recent interaction metadata, never message bodies."""
+        await self._tree_ensure_interaction_projection(owner_chat_id)
         cur = await self.db.conn.execute(
             """
             SELECT conversation_uuid, internal_chat_id, folder_uuid, title, pinned_at,
@@ -236,67 +372,43 @@ class WebAdminConversationTreeMixin:
             (int(owner_chat_id),),
         )
         rows = [dict(row) for row in await cur.fetchall()]
-        # Creation is stable for user/queued input; assistant activity advances
-        # only at a completed visible response, not each streaming append. The
-        # terminal snapshot survives frame retention; old rows may use the first
-        # durable end frame. Never use conversation/operation updated_at here.
+        # The one-time legacy backfill above preserves the exact historical
+        # definition; steady-state selection is now an indexed five-row lookup.
         cur = await self.db.conn.execute(
             """
-            SELECT o.conversation_uuid,
-                   MAX(CASE WHEN o.op_type='user_message' THEN o.created_at_ms ELSE
-                       COALESCE(NULLIF(CAST(json_extract(o.payload_json,'$.terminalAtMs') AS INTEGER),0),
-                           (SELECT MIN(f.created_at_ms) FROM web_event_frames f
-                            WHERE f.conversation_uuid=o.conversation_uuid AND f.op_id=o.op_id AND f.action='end'),
-                           o.created_at_ms)
-                   END) AS last_interaction_at_ms
-            FROM web_conversations c JOIN web_operations o ON o.conversation_uuid=c.conversation_uuid
-            WHERE c.owner_chat_id=? AND COALESCE(c.archived_at,0)=0
-              AND o.op_type IN ('user_message','assistant_message')
-              AND COALESCE(o.internal,0)=0
-              AND COALESCE(json_extract(o.payload_json,'$.internal'),0)=0
-              AND COALESCE(json_extract(o.payload_json,'$.hidden'),0)=0
-              AND (
-                  (o.op_type='user_message' AND
-                      (LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0
-                       OR COALESCE(json_array_length(o.payload_json,'$.attachments'),0)>0))
-                  OR (o.op_type='assistant_message' AND o.lifecycle='terminal' AND o.status='completed'
-                      AND COALESCE(json_extract(o.payload_json,'$.error'),0)=0
-                      AND LENGTH(TRIM(COALESCE(json_extract(o.payload_json,'$.text'),'')))>0)
-              )
-            GROUP BY o.conversation_uuid
-            HAVING last_interaction_at_ms>0
-            ORDER BY last_interaction_at_ms DESC, o.conversation_uuid ASC
+            SELECT conversation_uuid,last_interaction_at_ms
+            FROM web_conversations
+            WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
+              AND last_interaction_at_ms>0
+            ORDER BY last_interaction_at_ms DESC,conversation_uuid ASC
             LIMIT 5
             """,
             (int(owner_chat_id),),
         )
-        recent_times = {str(row["conversation_uuid"]): int(row["last_interaction_at_ms"]) for row in await cur.fetchall()}
+        recent_times = {
+            str(row["conversation_uuid"]): int(row["last_interaction_at_ms"])
+            for row in await cur.fetchall()
+        }
         uuids = [str(row.get("conversation_uuid") or "") for row in rows]
-        if uuids:
-            placeholders = ",".join("?" for _ in uuids)
-            cur = await self.db.conn.execute(
-                f"""SELECT DISTINCT conversation_uuid FROM web_operations
-                    WHERE conversation_uuid IN ({placeholders})
-                      AND op_type!='notice'
-                      AND COALESCE(lifecycle,'') IN ('active','paused','waiting_control')""",
-                tuple(uuids),
-            )
-            operation_candidates = {str(row["conversation_uuid"] or "") for row in await cur.fetchall()}
-            for row in rows:
-                conv_uuid = str(row.get("conversation_uuid") or "")
-                if str(row.get("status") or "idle") in {"running", "stopping", "error"} or conv_uuid in operation_candidates:
-                    reconciled = await self._reconcile_inactive_web_conversation_operations(
-                        row, source="conversation_tree_status_reconcile"
+        operation_facts = await self._tree_active_operation_facts(uuids)
+        repaired = False
+        for row in rows:
+            conv_uuid = str(row.get("conversation_uuid") or "")
+            if str(row.get("status") or "idle") in {"running", "stopping", "error"} or conv_uuid in operation_facts:
+                reconciled = await self._reconcile_inactive_web_conversation_operations(
+                    row, source="conversation_tree_status_reconcile"
+                )
+                if reconciled:
+                    repaired = True
+                    cur = await self.db.conn.execute(
+                        "SELECT activity_version,activity_read_version,activity_result_json,status,current_status,last_error FROM web_conversations WHERE conversation_uuid=?",
+                        (conv_uuid,),
                     )
-                    if reconciled:
-                        cur = await self.db.conn.execute(
-                            "SELECT activity_version,activity_read_version,activity_result_json,status,current_status,last_error FROM web_conversations WHERE conversation_uuid=?",
-                            (conv_uuid,),
-                        )
-                        fresh = await cur.fetchone()
-                        if fresh is not None:
-                            row.update(dict(fresh))
-        operation_facts = await self._web_operation_facts_for_conversations(uuids)
+                    fresh = await cur.fetchone()
+                    if fresh is not None:
+                        row.update(dict(fresh))
+        if repaired:
+            operation_facts = await self._tree_active_operation_facts(uuids)
         # Use canonical live requests, not tool names or browser-local cards.
         # Only navigation metadata is exposed here, never titles/questions/answers.
         pending_interactions: dict[str, list[dict[str, Any]]] = {}
@@ -456,6 +568,7 @@ class WebAdminConversationTreeMixin:
                 )
                 row = await cur.fetchone()
                 receipts.append({"conversationUuid": conv_uuid, "activityReadVersion": int(row["activity_read_version"])})
+        self._invalidate_tree_status(owner)
         return web.json_response({"ok": True, "items": receipts})
 
     @classmethod
@@ -554,12 +667,19 @@ class WebAdminConversationTreeMixin:
             "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话",
         }
 
-    async def _tree_direct_folder_nodes(self, owner_chat_id: int, parent_uuid: str = "") -> list[dict[str, Any]]:
-        folders = await self._tree_folders(owner_chat_id)
-        direct, active, archived = await self._tree_counts(owner_chat_id, folders)
-        running_state = await self._tree_running_state(owner_chat_id)
-        running_counts = dict(running_state["folderRunningCounts"])
-        rows = [row for row in folders.values() if str(row.get("parent_uuid") or "") == str(parent_uuid or "")]
+    async def _tree_direct_folder_nodes(
+        self,
+        owner_chat_id: int,
+        parent_uuid: str = "",
+        *,
+        folders: dict[str, dict[str, Any]] | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        folder_map = folders if folders is not None else await self._tree_folders(owner_chat_id)
+        direct, active, archived = await self._tree_counts(owner_chat_id, folder_map)
+        running_state = status if status is not None else await self._tree_running_state(owner_chat_id)
+        running_counts = dict(running_state.get("folderRunningCounts") or {})
+        rows = [row for row in folder_map.values() if str(row.get("parent_uuid") or "") == str(parent_uuid or "")]
         rows.sort(key=lambda row: (
             0 if int(row.get("pinned_at") or 0) > 0 else 1,
             1 if row.get("display_order") is None else 0,
@@ -567,7 +687,7 @@ class WebAdminConversationTreeMixin:
             -int(row.get("created_at") or 0),
             -int(row.get("id") or 0),
         ))
-        return [self._tree_folder_json(row, folders, direct, active, archived, running_counts) for row in rows]
+        return [self._tree_folder_json(row, folder_map, direct, active, archived, running_counts) for row in rows]
 
     async def _tree_folder_items_for_path(
         self,
@@ -602,11 +722,7 @@ class WebAdminConversationTreeMixin:
             return None
         cur = await self.db.conn.execute(
             """
-            SELECT wc.*,
-                   COALESCE((SELECT MAX(m.created_at) FROM messages m
-                             WHERE m.chat_id=wc.internal_chat_id
-                               AND COALESCE(m.task_uuid,'')=''
-                               AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) AS last_conversation_at
+            SELECT wc.*,COALESCE(wc.last_conversation_at,0) AS last_conversation_at
             FROM web_conversations wc
             WHERE wc.owner_chat_id=? AND wc.conversation_uuid=? LIMIT 1
             """,
@@ -616,11 +732,9 @@ class WebAdminConversationTreeMixin:
         if row is None:
             return None
         folder_map = folders if folders is not None else await self._tree_folders(owner_chat_id)
-        running_state = status
-        if running_state is None:
-            # Archived conversations themselves never run, but their folder path can
-            # still contain active descendants whose aggregate marker must stay true.
-            running_state = await self._tree_running_state(owner_chat_id)
+        # Locate is an organization endpoint. Runtime truth is overlaid by the
+        # global status channel; bootstrap explicitly passes its shared snapshot.
+        running_state = status if status is not None else {"items": [], "folderRunningCounts": {}}
         lookup = {str(item["conversationUuid"]): item for item in running_state.get("items") or []}
         item = self._tree_conversation_json(dict(row), folder_map, lookup)
         folder_path = self._tree_folder_path(str(row["folder_uuid"] or ""), folder_map)
@@ -634,8 +748,8 @@ class WebAdminConversationTreeMixin:
         owner = int(session.chat_id)
         explicit_uuid = str(request.query.get("conversationUuid") or "").strip()
         folders = await self._tree_folders(owner)
-        roots = await self._tree_direct_folder_nodes(owner, "")
         status = await self._tree_running_state(owner)
+        roots = await self._tree_direct_folder_nodes(owner, "", folders=folders, status=status)
         selected = await self._tree_locate_conversation(
             owner, explicit_uuid, folders=folders, status=status
         ) if explicit_uuid else None
@@ -645,10 +759,7 @@ class WebAdminConversationTreeMixin:
                 SELECT wc.conversation_uuid
                 FROM web_conversations wc
                 WHERE wc.owner_chat_id=? AND COALESCE(wc.archived_at,0)=0
-                ORDER BY COALESCE((SELECT MAX(m.created_at) FROM messages m
-                                   WHERE m.chat_id=wc.internal_chat_id
-                                     AND COALESCE(m.task_uuid,'')=''
-                                     AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) DESC,
+                ORDER BY wc.last_conversation_at DESC,
                          COALESCE(wc.created_at,0) DESC, wc.id DESC
                 LIMIT 1
                 """,
@@ -726,12 +837,19 @@ class WebAdminConversationTreeMixin:
         except (TypeError, ValueError):
             return web.json_response({"ok": False, "error": "invalid_cursor"}, status=400)
 
+        await self._tree_ensure_interaction_projection(owner)
         folders = await self._tree_folders(owner)
-        status = await self._tree_running_state(owner) if system_node != "archive" else {"items": [], "folderRunningCounts": {}}
-        running_lookup = {str(item["conversationUuid"]): item for item in status.get("items") or []}
+        # Bootstrap/status already supplies the complete runtime snapshot and the
+        # client applies it to every lazily loaded row. Folder expansion only needs
+        # organization metadata; recalculating global runtime state here used to
+        # scan all historical operations twice for an ordinary folder.
+        status: dict[str, Any] = {"items": [], "folderRunningCounts": {}}
+        running_lookup: dict[str, dict[str, Any]] = {}
         folder_nodes: list[dict[str, Any]] = []
         if system_node == "":
-            folder_nodes.extend(await self._tree_direct_folder_nodes(owner, parent))
+            folder_nodes.extend(await self._tree_direct_folder_nodes(
+                owner, parent, folders=folders, status=status
+            ))
         archive_clause = "COALESCE(wc.archived_at,0)>0" if system_node == "archive" else "COALESCE(wc.archived_at,0)=0"
         folder_clause = "" if system_node == "archive" else "AND COALESCE(wc.folder_uuid,'')=?"
         params: tuple[Any, ...] = (owner,) if system_node == "archive" else (owner, parent)
@@ -760,11 +878,7 @@ class WebAdminConversationTreeMixin:
         if conv_limit > 0:
             cur = await self.db.conn.execute(
                 f"""
-                SELECT w.*,
-                       COALESCE((SELECT MAX(m.created_at) FROM messages m
-                                 WHERE m.chat_id=w.internal_chat_id
-                                   AND COALESCE(m.task_uuid,'')=''
-                                   AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) AS last_conversation_at
+                SELECT w.*,COALESCE(w.last_conversation_at,0) AS last_conversation_at
                 FROM (SELECT wc.* FROM web_conversations wc WHERE {conv_where} {conv_order} LIMIT ? OFFSET ?) w
                 """,
                 (*params, conv_limit, conv_offset),
@@ -826,9 +940,10 @@ class WebAdminConversationTreeMixin:
             return web.json_response({"ok": True, "items": [], "nextCursor": "", "hasMore": False})
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
+        await self._tree_ensure_interaction_projection(owner)
         folders = await self._tree_folders(owner)
-        status = await self._tree_running_state(owner)
-        running_lookup = {str(item["conversationUuid"]): item for item in status.get("items") or []}
+        _direct, active_counts, _archived = await self._tree_counts(owner, folders)
+        running_lookup: dict[str, dict[str, Any]] = {}
         results: list[dict[str, Any]] = []
         for row in folders.values():
             if query.casefold() in str(row.get("name") or "").casefold():
@@ -840,25 +955,17 @@ class WebAdminConversationTreeMixin:
                     "name": str(row.get("name") or ""),
                     "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders),
                     "pinned": int(row.get("pinned_at") or 0) > 0,
-                    "conversationCount": int(status.get("folderConversationCounts", {}).get(str(row.get("folder_uuid") or ""), 0)),
-                    "runningDescendantCount": int(status.get("folderRunningCounts", {}).get(str(row.get("folder_uuid") or ""), 0)),
+                    "conversationCount": int(active_counts.get(str(row.get("folder_uuid") or ""), 0)),
+                    "runningDescendantCount": 0,
                 }
                 results.append(result)
         archive_clause = "" if archive_unlocked else "AND COALESCE(wc.archived_at,0)=0"
         cur = await self.db.conn.execute(
             f"""
-            SELECT wc.*,
-                   COALESCE((SELECT MAX(m.created_at) FROM messages m
-                             WHERE m.chat_id=wc.internal_chat_id
-                               AND COALESCE(m.task_uuid,'')=''
-                               AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) AS last_conversation_at
+            SELECT wc.*,COALESCE(wc.last_conversation_at,0) AS last_conversation_at
             FROM web_conversations wc
             WHERE wc.owner_chat_id=? {archive_clause} AND wc.title LIKE ? ESCAPE '\\'
-            ORDER BY COALESCE((SELECT MAX(m.created_at) FROM messages m
-                               WHERE m.chat_id=wc.internal_chat_id
-                               AND COALESCE(m.task_uuid,'')=''
-                               AND (m.role='user' OR (m.role='assistant' AND TRIM(COALESCE(m.content,''))<>''))),0) DESC,
-                     wc.id DESC
+            ORDER BY wc.last_conversation_at DESC,wc.id DESC
             """,
             (owner, pattern),
         )
@@ -874,8 +981,11 @@ class WebAdminConversationTreeMixin:
 
     async def handle_api_conversation_tree_locate(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
+        owner = int(session.chat_id)
+        await self._tree_ensure_interaction_projection(owner)
         located = await self._tree_locate_conversation(
-            int(session.chat_id), str(request.match_info.get("conversation_uuid") or "")
+            owner, str(request.match_info.get("conversation_uuid") or ""),
+            status={"items": [], "folderRunningCounts": {}},
         )
         if located is None:
             return web.json_response({"ok": False, "error": "conversation_not_found"}, status=404)
@@ -889,12 +999,12 @@ class WebAdminConversationTreeMixin:
         if folder_id not in folders:
             return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
         folder_path = self._tree_folder_path(folder_id, folders)
-        status = await self._tree_running_state(owner)
         return web.json_response({
             "ok": True,
             "folderPath": folder_path,
             "folderItems": await self._tree_folder_items_for_path(
-                owner, folder_path, folders=folders, status=status
+                owner, folder_path, folders=folders,
+                status={"items": [], "folderRunningCounts": {}},
             ),
         })
 
@@ -946,6 +1056,7 @@ class WebAdminConversationTreeMixin:
         folders = await self._tree_folders(owner)
         direct, active, archived = await self._tree_counts(owner, folders)
         data = self._tree_folder_json(folders[folder_id], folders, direct, active, archived, {})
+        self._invalidate_tree_status(owner)
         await self.audit("web.conversation_folder.create", actor="web", chat_id=owner, ip=request.remote or "", detail={"folderId": folder_id, "parentId": parent})
         return web.json_response({"ok": True, "folder": data})
 
@@ -980,7 +1091,12 @@ class WebAdminConversationTreeMixin:
                 tuple(params),
             )
             await self.db.conn.commit()
-        nodes = await self._tree_direct_folder_nodes(owner, str((await self._tree_folders(owner))[folder_id].get("parent_uuid") or ""))
+        folders = await self._tree_folders(owner)
+        nodes = await self._tree_direct_folder_nodes(
+            owner, str(folders[folder_id].get("parent_uuid") or ""), folders=folders,
+            status={"items": [], "folderRunningCounts": {}},
+        )
+        self._invalidate_tree_status(owner)
         return web.json_response({"ok": True, "folder": next(item for item in nodes if item["folderId"] == folder_id)})
 
     async def handle_api_conversation_folder_properties(self, request: web.Request) -> web.Response:
@@ -1022,12 +1138,28 @@ class WebAdminConversationTreeMixin:
             },
         })
 
-    async def _tree_conversation_rows(self, owner_chat_id: int) -> list[dict[str, Any]]:
+    async def _tree_conversation_rows(
+        self,
+        owner_chat_id: int,
+        *,
+        conversation_uuid: str = "",
+        folder_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        where = ["owner_chat_id=?"]
+        params: list[Any] = [int(owner_chat_id)]
+        if conversation_uuid:
+            where.append("conversation_uuid=?")
+            params.append(str(conversation_uuid))
+        elif folder_ids is not None:
+            # One JSON parameter keeps arbitrary-depth trees below SQLite's bind
+            # limit while still restricting rows before any Python processing.
+            where.append("COALESCE(folder_uuid,'') IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(sorted(folder_ids)))
         cur = await self.db.conn.execute(
-            """SELECT wc.*, COALESCE(s.system_snapshot,'') AS system_snapshot
-               FROM web_conversations wc LEFT JOIN sessions s ON s.chat_id=wc.internal_chat_id
-               WHERE wc.owner_chat_id=?""",
-            (int(owner_chat_id),),
+            f"""SELECT conversation_uuid,owner_chat_id,internal_chat_id,folder_uuid,
+                       archived_at,status,current_status,last_error
+                FROM web_conversations WHERE {' AND '.join(where)}""",
+            tuple(params),
         )
         return [dict(row) for row in await cur.fetchall()]
 
@@ -1064,13 +1196,13 @@ class WebAdminConversationTreeMixin:
         changed: list[dict[str, Any]] = []
         archived = 0
         running = 0
-        for row in await self._tree_conversation_rows(owner_chat_id):
-            conv_uuid = str(row.get("conversation_uuid") or "")
+        candidate_rows = await self._tree_conversation_rows(
+            owner_chat_id,
+            conversation_uuid=item_id if kind == "conversation" else "",
+            folder_ids=candidates if kind in {"properties", "folder"} else None,
+        )
+        for row in candidate_rows:
             folder_id = str(row.get("folder_uuid") or "")
-            if kind == "conversation" and conv_uuid != item_id:
-                continue
-            if kind in {"properties", "folder"} and folder_id not in candidates:
-                continue
             old_values = self._tree_effective_from_map(folder_id, folders_before, str(getattr(self, "workspace_dir", "") or ""))[:2]
             new_folder = target_folder_id if kind == "conversation" else folder_id
             new_values = self._tree_effective_from_map(new_folder, folders_after, str(getattr(self, "workspace_dir", "") or ""))[:2]
@@ -1209,8 +1341,17 @@ class WebAdminConversationTreeMixin:
             result = await self._tree_apply_snapshot_updates_locked(
                 impact, update_snapshots=update_snapshots, mutate=mutate
             )
+        folder_item = None
+        if folder_id != _TEMPORARY_PROPERTIES_ID:
+            folders = await self._tree_folders(owner)
+            path_items = await self._tree_folder_items_for_path(
+                owner, [folder_id], folders=folders,
+                status={"items": [], "folderRunningCounts": {}},
+            )
+            folder_item = path_items[0] if path_items else None
+        self._invalidate_tree_status(owner)
         await self.audit("web.conversation_folder.properties", actor="web", chat_id=owner, ip=request.remote or "", detail={"folderId": folder_id, **result})
-        return web.json_response({"ok": True, **self._tree_public_impact(impact), **result})
+        return web.json_response({"ok": True, **self._tree_public_impact(impact), **result, "folder": folder_item})
 
     async def _tree_validate_move_target(
         self,
@@ -1244,6 +1385,67 @@ class WebAdminConversationTreeMixin:
         await self._tree_validate_move_target(owner, kind, item_id, target)
         impact = await self._tree_change_impact(owner, kind=kind, item_id=item_id, target_folder_id=target)
         return web.json_response({"ok": True, **self._tree_public_impact(impact)})
+
+    async def _tree_move_organization(
+        self,
+        owner: int,
+        *,
+        kind: str,
+        item_id: str,
+        target_folder: str,
+        old_folder_path: list[str],
+    ) -> dict[str, Any]:
+        """Return only the organization rows/order affected by one committed move."""
+        folders = await self._tree_folders(owner)
+        if kind == "folder":
+            new_folder_path = self._tree_folder_path(item_id, folders)
+            item_path = new_folder_path
+        else:
+            new_folder_path = self._tree_folder_path(target_folder, folders)
+            item_path = new_folder_path
+        folder_ids = list(dict.fromkeys([*old_folder_path, *new_folder_path]))
+        folder_items = await self._tree_folder_items_for_path(
+            owner, folder_ids, folders=folders,
+            status={"items": [], "folderRunningCounts": {}},
+        )
+        item: dict[str, Any] | None
+        if kind == "folder":
+            item = next((row for row in folder_items if row.get("folderId") == item_id), None)
+        else:
+            located = await self._tree_locate_conversation(
+                owner, item_id, folders=folders,
+                status={"items": [], "folderRunningCounts": {}},
+            )
+            item = dict((located or {}).get("item") or {}) or None
+        table = "web_conversation_folders" if kind == "folder" else "web_conversations"
+        id_column = "folder_uuid" if kind == "folder" else "conversation_uuid"
+        parent_column = "parent_uuid" if kind == "folder" else "folder_uuid"
+        archived_projection = "archived_at" if kind == "conversation" else "0 AS archived_at"
+        cur = await self.db.conn.execute(
+            f"SELECT pinned_at,{archived_projection} FROM {table} WHERE owner_chat_id=? AND {id_column}=?",
+            (owner, item_id),
+        )
+        moved = await cur.fetchone()
+        target_order: list[str] = []
+        if moved is not None:
+            pin_clause = "COALESCE(pinned_at,0)>0" if int(moved["pinned_at"] or 0) > 0 else "COALESCE(pinned_at,0)=0"
+            archive_clause = ""
+            if kind == "conversation":
+                archive_clause = "AND COALESCE(archived_at,0)>0" if int(moved["archived_at"] or 0) > 0 else "AND COALESCE(archived_at,0)=0"
+            cur = await self.db.conn.execute(
+                f"""SELECT {id_column} AS item_id FROM {table}
+                    WHERE owner_chat_id=? AND COALESCE({parent_column},'')=? AND {pin_clause} {archive_clause}
+                    ORDER BY CASE WHEN display_order IS NULL THEN 1 ELSE 0 END,
+                             display_order ASC,COALESCE(created_at,0) DESC,id DESC""",
+                (owner, target_folder),
+            )
+            target_order = [str(row["item_id"]) for row in await cur.fetchall()]
+        return {
+            "item": item,
+            "folderPath": item_path,
+            "folderItems": folder_items,
+            "targetOrder": target_order,
+        }
 
     async def _tree_archive_successor(self, owner: int, item_id: str) -> dict[str, Any] | None:
         """Find the next visible sibling (or previous at the end), across pages."""
@@ -1354,8 +1556,9 @@ class WebAdminConversationTreeMixin:
         if before_id and after_id and before_id == after_id:
             return web.json_response({"ok": False, "error": "invalid_move_neighbors"}, status=400)
         async with self._conversation_tree_lock:
-            row, _folders = await self._tree_validate_move_target(owner, kind, item_id, target)
+            row, folders_before = await self._tree_validate_move_target(owner, kind, item_id, target)
             current_parent = str(row.get("parent_uuid" if kind == "folder" else "folder_uuid") or "")
+            old_folder_path = self._tree_folder_path(item_id if kind == "folder" else current_parent, folders_before)
             archived_conversation = kind == "conversation" and int(row.get("archived_at") or 0) > 0
             unarchive = archived_conversation and body.get("unarchive") is True
             refresh_snapshot = archived_conversation and body.get("updateSnapshots") is True
@@ -1384,8 +1587,13 @@ class WebAdminConversationTreeMixin:
                 mutate=mutate,
             )
         result["unarchived"] = unarchive
+        organization = await self._tree_move_organization(
+            owner, kind=kind, item_id=item_id, target_folder=target,
+            old_folder_path=old_folder_path,
+        )
+        self._invalidate_tree_status(owner)
         await self.audit("web.conversation_tree.move", actor="web", chat_id=owner, ip=request.remote or "", detail={"kind": kind, "id": item_id, "targetFolderId": target, **result})
-        return web.json_response({"ok": True, **self._tree_public_impact(impact), **result})
+        return web.json_response({"ok": True, **self._tree_public_impact(impact), **result, "organization": organization})
 
     async def handle_api_conversation_folder_delete(self, request: web.Request) -> web.Response:
         """Delete only the classification node; content is always migrated, never deleted."""
@@ -1411,7 +1619,8 @@ class WebAdminConversationTreeMixin:
         folders_after = {key: dict(value) for key, value in folders.items()}
         for child in direct_children:
             folders_after[child]["parent_uuid"] = target
-        for conv in await self._tree_conversation_rows(owner):
+        candidate_folder_ids = self._tree_descendants(folder_id, folders)
+        for conv in await self._tree_conversation_rows(owner, folder_ids=candidate_folder_ids):
             conv_folder = str(conv.get("folder_uuid") or "")
             if conv_folder == folder_id:
                 new_folder = target
@@ -1455,5 +1664,6 @@ class WebAdminConversationTreeMixin:
             result = await self._tree_apply_snapshot_updates_locked(
                 impact, update_snapshots=body.get("updateSnapshots") is True, mutate=mutate
             )
+        self._invalidate_tree_status(owner)
         await self.audit("web.conversation_folder.delete", actor="web", chat_id=owner, ip=request.remote or "", detail={"folderId": folder_id, "targetFolderId": target, **result})
         return web.json_response({"ok": True, **self._tree_public_impact(impact), **result})

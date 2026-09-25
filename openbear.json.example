@@ -32,7 +32,8 @@
       }
     },
     "primary": "default/your-model",
-    "compressionModels": []
+    "compressionModels": [],
+    "namingModels": []
   },
   "memory": {
     "provider": "builtin",
@@ -51,6 +52,11 @@
     "compactMaxTokens": 32768,
     "compactMaxRetries": 1,
     "compactTimeoutS": 1800,
+    "namingPrompt": "",
+    "namingTimeoutS": 30,
+    "namingMaxRetries": 3,
+    "namingMaxTurns": 8,
+    "namingMaxChars": 50000,
     "maxRetries": 10,
     "retryBackoffS": 0.5,
     "retryMaxDelayS": 32,
@@ -143,6 +149,17 @@
     "downloadDir": "data/media/inbound",
     "maxMediaPerMessage": 10,
     "mediaGroupFlushMs": 1000
+  },
+  "browser": {
+    "enabled": false,
+    "mainEndpoint": "",
+    "mainDownloadHostPath": "",
+    "mainDownloadBrowserPath": "",
+    "actionTimeoutS": 20,
+    "navigationTimeoutS": 45,
+    "snapshotMaxChars": 12000,
+    "autoReconnect": true,
+    "agentAccess": false
   },
   "logLevel": "INFO",
   "contextManagement": {

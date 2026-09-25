@@ -23,7 +23,7 @@ function page(name, overrides = {}) {
     requests.push({method, args: clone(args)});
     return method in target ? target[method](...args) : Promise.resolve({ok: true, items: [], groups: []});
   }; }});
-  const context = vm.createContext({...Vue, onMounted: () => {}, Api: api,
+  const context = vm.createContext({...Vue, onMounted: () => {}, defineEmits: () => () => {}, Api: api,
     apiError: e => e.message, ElMessage: Object.fromEntries(['success', 'warning', 'error'].map(kind => [kind, text => notices.push({kind, text})])),
     ElMessageBox: {confirm: async () => {}, prompt: async () => ({})}});
   vm.runInContext(code, context);

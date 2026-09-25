@@ -28,26 +28,15 @@ test("phone memory and other tools are in the header menu, not a permanent rail"
   assert.match(source, /async function openDrawer\(\) \{\s*if \(!usableConversationUuid\.value\) return;/);
 });
 
-test("desktop floating rail keeps task memory, work details, and quick navigation separate", () => {
-  assert.match(consoleSource, /--console-float-minimap-top:\s*calc\(\s*var\(--console-float-rail-top\)\s*\+ var\(--console-float-control-size\)\s*\+ var\(--console-float-control-gap\)\s*\+ var\(--console-float-control-size\)\s*\+ var\(--console-float-control-gap\)\s*\)/);
-  assert.match(consoleSource, /@media \(min-width: 761px\) \{[\s\S]*?\.work-detail-toggle\s*\{[\s\S]*?top:\s*calc\(var\(--console-float-rail-top\) \+ var\(--console-float-control-size\) \+ var\(--console-float-control-gap\)\)/);
+test("desktop quick navigation follows task memory without an unused work-detail slot", () => {
+  assert.match(consoleSource, /--console-float-minimap-top:\s*calc\(\s*var\(--console-float-rail-top\)\s*\+ var\(--console-float-control-size\)\s*\+ var\(--console-float-control-gap\)\s*\)/);
   assert.match(minimapSource, /top:\s*var\(--console-float-minimap-top/);
-
-  const rem = 16;
-  const size = 2.15 * rem;
-  const gap = 0.75 * rem;
-  const memoryTop = 0;
-  const workTop = memoryTop + size + gap;
-  const minimapTop = workTop + size + gap;
-  assert.equal(workTop - (memoryTop + size), gap, "work-detail button follows task memory with the rail gap");
-  assert.equal(minimapTop - (workTop + size), gap, "quick navigation follows work details without overlap");
 });
 
 test("floating and composer controls use Element Plus tooltips instead of native titles", () => {
   assert.match(source, /<el-tooltip content="任务记忆" placement="left"/);
-  assert.match(consoleSource, /<el-tooltip[\s\S]*?:content="activeTurnWorking \? '当前轮次正在工作，点击查看详情'/);
   assert.match(consoleSource, /<el-tooltip[\s\S]*?:content="autoScrollLocked \? '滚动已锁定到底部，点击解锁'/);
-  assert.doesNotMatch(consoleSource, /:title="(?:activeTurnWorking|autoScrollLocked)/);
+  assert.doesNotMatch(consoleSource, /:title="autoScrollLocked/);
   assert.match(minimapSource, /<el-tooltip[\s\S]*?:content="turnNavLabel\(turn, idx\)"[\s\S]*?placement="left"/);
   assert.doesNotMatch(minimapSource, /:title=/);
   assert.doesNotMatch(composerSource, /\btitle=/);
@@ -55,22 +44,6 @@ test("floating and composer controls use Element Plus tooltips instead of native
     assert.ok(composerSource.includes(`content="${label}"`), `missing Element Plus tooltip: ${label}`);
   }
   assert.match(composerSource, /aria-label="运行配置"/);
-});
-
-test("work-detail tooltip closes before the reference moves with the panel transition", () => {
-  const tooltipMarkup = consoleSource.match(/<el-tooltip[\s\S]*?ref="workDetailTooltip"[\s\S]*?<\/el-tooltip>/)?.[0] || "";
-  assert.match(tooltipMarkup, /:disabled="workDetailTooltipSuppressed"/);
-  assert.match(tooltipMarkup, /:popper-style="workDetailTooltipSuppressed \? \{display: 'none'\} : undefined"/);
-  assert.match(tooltipMarkup, /@click\.stop="toggleWorkDetailPanel"/);
-
-  const toggleBody = consoleSource.match(/async function toggleWorkDetailPanel\(\) \{[\s\S]*?\n\}/)?.[0] || "";
-  const suppressedAt = toggleBody.indexOf("workDetailTooltipSuppressed.value = true");
-  const hideAt = toggleBody.indexOf("workDetailTooltip.value?.hide?.()");
-  const flushAt = toggleBody.indexOf("await nextTick()");
-  const layoutAt = toggleBody.indexOf("workDetailOpen.value = !workDetailOpen.value");
-  assert.ok(suppressedAt >= 0 && suppressedAt < hideAt && hideAt < flushAt && flushAt < layoutAt);
-  assert.match(toggleBody, /window\.setTimeout\([\s\S]*?workDetailTooltipSuppressed\.value = false;[\s\S]*?, 300\)/);
-  assert.match(consoleSource, /onBeforeUnmount\(\(\) => \{[\s\S]*?window\.clearTimeout\(workDetailTooltipReleaseTimer\)/);
 });
 
 test("drawer keeps both scopes and actual catalog while separating reading from technical metadata", () => {

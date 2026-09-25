@@ -141,7 +141,7 @@ def _fmt_value(value: Any, spec: SettingSpec) -> str:
         return "内置模式" if str(value or "builtin") == "builtin" else "外部模式"
     if value is None:
         return "未设置"
-    text = f"{value}"
+    text = f"{spec.display_value(value):g}" if spec.display_scale != 1 else f"{value}"
     if spec.unit:
         text += spec.unit
     return text
@@ -154,7 +154,8 @@ def _input_hint(spec: SettingSpec, current_value: Any) -> str:
     if spec.kind == "bool":
         return "请输入：开 / 关"
     if spec.kind in {"int", "float"}:
-        kind = "整数" if spec.kind == "int" else "数字"
+        example = spec.display_value(example)
+        kind = "整数" if spec.kind == "int" and spec.display_scale == 1 else "数字"
         if spec.unit:
             return f"请输入纯{kind}，例如：{example}（单位：{spec.unit}，不要带“{spec.unit}”）"
         return f"请输入{kind}，例如：{example}"
@@ -763,7 +764,7 @@ async def on_admin_setting_input(message: Message, svc: Services) -> None:
         return
     raw = (message.text or message.caption or "").strip()
     try:
-        value = spec.parse(raw)
+        value = spec.parse_display(raw)
     except ValueError as exc:
         tg_ui.set_pending(message.chat.id, action="admin_setting_edit", message_id=pending.message_id, data={"path": path, "panel": panel})
         await answer_rich(

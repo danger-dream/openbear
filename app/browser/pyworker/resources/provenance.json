@@ -1,0 +1,7 @@
+{
+  "sourcePackage": "playwright-core",
+  "version": "1.64.0-alpha-1789764292000",
+  "source": "lib/coreBundle.js generated injectedScriptSource.ts",
+  "sha256": "0effbac6881c3fbe168b74557fd64e59e108f8aa28ca51e168298ef597eb0f93",
+  "extraction": "Python ast.literal_eval of bundled string; no Node executed"
+}

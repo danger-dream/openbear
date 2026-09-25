@@ -286,8 +286,14 @@ function strategyCompactionView(event, records, strategy) {
   const status = text(get(["status"]), "completed");
   const active = ["queued", "running"].includes(status);
   const failed = status === "failed" || text(event.kind).includes("failed");
-  const before = number(get(["beforeEstimateTokens"]));
-  const after = number(get(["afterEstimateTokens"]));
+  const estimate = (value) => ["number", "string"].includes(typeof value) && String(value).trim() !== "" && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null;
+  const before = estimate(get(["beforeEstimateTokens"]));
+  const after = estimate(get(["afterEstimateTokens"]));
+  const estimateText = (value) => value === null ? "未记录" : value.toLocaleString();
+  const compactEstimateText = (value) => value === null ? "未记录" : value >= 1000 ? `${Number((value / 1000).toFixed(2))}k` : String(value);
+  const windowTokens = failed
+    ? `原上下文估算：${estimateText(before)} Tokens`
+    : `Tokens（估算）：${estimateText(before)} → ${active ? "处理中" : estimateText(after)}`;
   const duration = number(get(["durationMs"]));
   const summary = window ? "" : text(get(["compactedOutput", "compacted_output", "summary", "output"]));
   const summaryChars = window ? 0 : number(get(["summaryChars"])) || summary.length;
@@ -300,19 +306,23 @@ function strategyCompactionView(event, records, strategy) {
     value => ["number", "string"].includes(typeof value) && value !== "" && Number.isInteger(Number(value)) && Number(value) >= 0,
   );
   const facts = [`策略：${label}`];
-  if (hasWindowCounts) facts.push(`移出 ${number(removed)} 组 · 保留 ${number(retained)} 组完整记录`);
-  else if (!window && model) facts.push(`摘要模型：${model}`);
-  if (before || after) facts.push(`上下文估算：${compactionFactNumber(before) || "—"} → ${compactionFactNumber(after) || "—"} tokens`);
-  if (after) facts.push("压缩后的执行输入待下一次请求实测");
+  if (!window && model) facts.push(`摘要模型：${model}`);
+  if (window) facts.push(windowTokens);
+  else if (before || after) facts.push(`上下文估算：${compactionFactNumber(before) || "—"} → ${compactionFactNumber(after) || "—"} tokens`);
+  if (after !== null && !active && !failed) facts.push("压缩后的执行输入待下一次请求实测");
   if (!window && Object.keys(usage).length) facts.push(`摘要调用实测：输入 ${compactionFactNumber(number(usage.inputTokens) + number(usage.cacheReadTokens) + number(usage.cacheWriteTokens)) || "0"} · 输出 ${compactionFactNumber(usage.outputTokens) || "0"} tokens`);
   if (duration) facts.push(`耗时：${(duration / 1000).toFixed(1)} 秒`);
   if (failed) facts.push(`压缩失败：${reason || "原上下文已保留"}`);
   const output = window ? facts.join("\n") : summary;
+  const previewFacts = window && !active && !failed
+    ? [`${compactEstimateText(before)} → ${compactEstimateText(after)}`]
+    : [label, active ? "正在处理" : failed ? "失败" : (summaryChars ? `摘要 ${compactionFactNumber(summaryChars)} 字` : "完成"), window ? windowTokens : ""];
+  if (duration) previewFacts.push(`${(duration / 1000).toFixed(1)}s`);
   return {
     isCompaction: true, strategy, kind: text(event.kind || event.type), scope: text(get(["scope"])),
     compactionId: text(get(["compactionId"])), summaryId: text(get(["summaryId"])), summaryRef: text(get(["summaryRef"])),
     source: text(get(["source"])), sourceLabel: label, status, active, failed, reason,
-    cardTitle: "上下文压缩", cardPreview: [label, active ? "正在处理" : failed ? "失败" : window ? (hasWindowCounts ? facts[1] : "完成") : (summaryChars ? `摘要 ${compactionFactNumber(summaryChars)} 字` : "完成"), duration ? `${(duration / 1000).toFixed(1)}s` : ""].filter(Boolean).join(" · "),
+    cardTitle: "上下文压缩", cardPreview: previewFacts.filter(Boolean).join(" · "),
     message: `上下文压缩${active ? "中" : failed ? "失败" : "完成"} · ${label}`,
     detailFacts: facts, beforeEstimateTokens: before, afterEstimateTokens: after, beforeTokens: 0, afterTokens: 0,
     removedBatches: hasWindowCounts ? number(removed) : null, retainedBatches: hasWindowCounts ? number(retained) : null, durationMs: duration,

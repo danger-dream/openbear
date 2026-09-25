@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {applyOperationFrame,normalizeOperations,shouldApplyOperationFrame} from '../../timelineProjection.js';
+import {applyOperationFrame,isRootRunTerminalFrame,isTerminalOperationFrame,normalizeOperations,shouldApplyOperationFrame} from '../../timelineProjection.js';
 import {mergeOperationSnapshots} from './timelinePagination.js';
 import {createOperationFrameBuffer} from './operationFrameBuffer.js';
 
@@ -15,13 +15,14 @@ function between(start,end){
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};
 const tick=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 function harness(){
-  const requests=[],loads=[],connections=[],timers=new Map();let nextTimer=0;
+  const requests=[],loads=[],connections=[],flushes=[],timers=new Map();let nextTimer=0;
   const props={conversationUuid:'A'};
   const snapshot=deferred();
   const context=vm.createContext({
     Map,props,console:{warn(){}},applyOperationFrame,normalizeOperations,mergeOperationSnapshots,shouldApplyOperationFrame,
     stateStatsByOpId:new Map(),chatState:{value:null},
-    mergeLedgerUsageIntoState(){},operationScrollImpact:()=> 'none',mergeScrollImpact:()=> 'none',isTerminalOperationFrame:()=>false,scheduleProjectedMessagesFlush(){},
+    mergeLedgerUsageIntoState(){},operationScrollImpact:()=> 'none',mergeScrollImpact:()=> 'none',
+    isRootRunTerminalFrame,isTerminalOperationFrame,scheduleProjectedMessagesFlush:options=>flushes.push(options),
     operationFrameBuffer:createOperationFrameBuffer(),conversationStateRequests:{pending:false},
     document:{visibilityState:'visible'},
     window:{setTimeout:fn=>{timers.set(++nextTimer,fn);return nextTimer;},clearTimeout:id=>timers.delete(id)},
@@ -49,7 +50,7 @@ function harness(){
     ${between('function checkConnectionOnResume()', 'async function ensureServerConversationForSend(')}
   `,context);
   const run=code=>vm.runInContext(code,context);
-  return {context,props,requests,loads,connections,timers,snapshot,run};
+  return {context,props,requests,loads,connections,flushes,timers,snapshot,run};
 }
 const missingFrames=()=>Array.from({length:1000},(_,i)=>({opId:`retained-tool-${i}`,opType:'tool',action:'end',revision:2,frameSeq:i+11,displaySeq:i+60,payload:{status:'completed'}}));
 
@@ -64,6 +65,25 @@ test('terminal frame arriving before its HTTP base is retained, then replayed wi
   assert.equal(h.context.lastFrameSeq.value,40002);assert.equal(h.context.operationFrameBuffer.blocked,false);
   h.snapshot.resolve({applied:true});await recovering;
   assert.equal(h.loads.length,1);assert.equal(h.timers.size,0);
+});
+
+test('ordinary terminal frames still flush projection immediately without becoming state refresh boundaries',()=>{
+  const h=harness();
+  h.context.frames=Array.from({length:1322},(_,index)=>({
+    opId:`tool:${index}`,opType:'tool',action:'end',revision:1,frameSeq:40001+index,
+    displaySeq:index+1,targetType:'run',turnUuid:'root-turn',runRootTurnId:'root-turn',payload:{status:'completed'},
+  }));
+  h.run('for(const frame of frames)applyOperationFrameMessage(frame)');
+  assert.equal(h.flushes.length,1322);
+  assert.equal(h.flushes.every(options=>options.force===true),true);
+  assert.equal(h.run('pendingTerminalFrame'),null);
+
+  h.run(`applyOperationFrameMessage({
+    opId:'run:root',opType:'run',action:'end',revision:1,frameSeq:50000,displaySeq:2000,
+    targetType:'run',turnUuid:'root-turn',runRootTurnId:'root-turn',payload:{status:'completed'}
+  })`);
+  assert.equal(h.flushes.at(-1).force,true);
+  assert.equal(h.run('pendingTerminalFrame.frame.opType'),'run');
 });
 
 test('failed snapshot leaves buffered data recoverable but does not start a zero-delay retry loop',async()=>{

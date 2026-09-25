@@ -1,63 +1,66 @@
 <script setup>
-import {DataAnalysis, Money, Stopwatch, Timer} from "@element-plus/icons-vue";
-import BearLogo from "../../components/BearLogo.vue";
-import {fmtElapsedFromStart} from "./display.js";
+import {computed} from "vue";
+import AnimatedConversationTitle from "../../components/AnimatedConversationTitle.vue";
+import {conversationPathText, fmtElapsedClockMs, headerDurationParts} from "./display.js";
 import {vElapsed} from "./elapsedDirective.js";
 
 const props = defineProps({
 	title: {type: String, default: ""},
-	subtitle: {type: String, default: ""},
+	titleIdentity: {type: String, default: ""},
+	conversationPath: {type: String, default: ""},
 	running: {type: Boolean, default: false},
 	runStartedAt: {type: Number, default: 0},
 	status: {type: String, default: "就绪"},
 	contextDisplay: {type: String, default: "—"},
 	tokensText: {type: String, default: "0"},
-	durationText: {type: String, default: "0s"},
+	tokensDetail: {type: String, default: ""},
+	durationMs: {type: Number, default: 0},
 	costText: {type: String, default: "$0.0000"},
 });
+const pathText = computed(() => conversationPathText(props.conversationPath));
+const tokenValue = computed(() => props.tokensText.replace(/[KM]$/, ""));
+const tokenUnit = computed(() => props.tokensText.match(/[KM]$/)?.[0] || "");
+const durationParts = computed(() => headerDurationParts(props.durationMs));
 </script>
 
 <template>
 	<header class="console-header">
 		<div class="header-mobile-navigation"><slot name="mobile-navigation"/></div>
-		<div class="min-w-0 flex flex-1 items-center gap-3 overflow-hidden">
-			<div class="header-orb">
-				<BearLogo/>
-			</div>
+		<div class="header-identity min-w-0 flex flex-1 items-center gap-3 overflow-hidden">
 			<div class="min-w-0 flex-1 overflow-hidden leading-tight">
+				<div class="header-subtitle truncate" :title="pathText" :aria-label="`所在目录 ${pathText}`">{{ pathText }}</div>
 				<div class="flex min-w-0 items-center gap-2">
-					<h1 class="block max-w-full truncate text-base font-semibold" :title="props.title">
-						{{ props.title }}
+					<h1 class="header-title block max-w-full truncate" :title="props.title">
+						<AnimatedConversationTitle :text="props.title" :identity="props.titleIdentity" />
 					</h1>
 				</div>
-				<div class="header-subtitle mt-0.5 truncate text-[11px] text-[#6b7280]">{{ props.subtitle }}</div>
 			</div>
 		</div>
-		<div class="header-metrics">
-			<div class="header-chip" :class="props.running ? 'header-chip-live' : ''">
-				<Stopwatch/>
-				<span class="chip-label">运行状态</span>
-				<strong v-if="props.running" v-elapsed="{ startAt: props.runStartedAt, active: props.running }">
-					{{ fmtElapsedFromStart(props.runStartedAt) }}
-				</strong>
-				<strong v-else>{{ props.status }}</strong>
+		<dl class="header-metrics" aria-label="会话运行及累计统计">
+			<div class="header-metric">
+				<dt>运行状态</dt>
+				<dd>
+					<span class="header-status" :class="{'is-running': props.running}" role="status">
+						<i aria-hidden="true"></i>{{ props.running ? '运行中' : props.status }}
+					</span>
+					<span v-if="props.running" class="header-run-clock" title="本次运行耗时" v-elapsed="{ startAt: props.runStartedAt, active: props.running, format: 'clock', fallback: '00:00' }">
+						{{ props.runStartedAt ? fmtElapsedClockMs(Date.now() - props.runStartedAt) : '00:00' }}
+					</span>
+				</dd>
 			</div>
-			<div class="header-chip">
-				<DataAnalysis/>
-				<span class="chip-label">总 Tokens</span>
-				<strong>{{ props.tokensText }}</strong>
+			<div class="header-metric" :title="props.tokensDetail">
+				<dt>总 Tokens</dt>
+				<dd><span class="header-number">{{ tokenValue }}<span class="header-unit">{{ tokenUnit }}</span></span></dd>
 			</div>
-			<div class="header-chip">
-				<Timer/>
-				<span class="chip-label">总耗时</span>
-				<strong>{{ props.durationText }}</strong>
+			<div class="header-metric">
+				<dt>总耗时</dt>
+				<dd><span v-for="(part, index) in durationParts" :key="index" class="header-number">{{ part.value }}<span class="header-unit">{{ part.unit }}</span></span></dd>
 			</div>
-			<div class="header-chip">
-				<Money/>
-				<span class="chip-label">总花费</span>
-				<strong>{{ props.costText }}</strong>
+			<div class="header-metric">
+				<dt>总花费</dt>
+				<dd><span class="header-number">{{ props.costText }}</span></dd>
 			</div>
-		</div>
+		</dl>
 		<span v-if="props.running" class="header-mobile-running" role="status" aria-label="运行中"><i aria-hidden="true"></i><span>运行中</span></span>
 		<div class="header-mobile-actions"><slot name="mobile-actions"/></div>
 	</header>
@@ -70,174 +73,111 @@ const props = defineProps({
 
 .console-header {
 	display: flex;
-	min-height: 4rem;
+	min-height: 66px;
 	flex-shrink: 0;
 	align-items: center;
 	justify-content: space-between;
-	gap: 1rem;
-	border-bottom: 1px solid rgba(15, 23, 42, .08);
-	background: rgba(255, 255, 255, .86);
-	padding: .72rem 1rem;
-	backdrop-filter: blur(18px);
+	gap: 28px;
+	border-bottom: 1px solid var(--ob-chat-line);
+	background: var(--ob-chat-bg);
+	color: var(--ob-chat-text);
+	padding: 12px 25px;
 }
 
-.header-orb {
-	display: grid;
-	width: 2.15rem;
-	height: 2.15rem;
-	place-items: center;
-	border: 1px solid #e5e7eb;
-	border-radius: .9rem;
-	background: linear-gradient(145deg, #fffaf1, #ffffff);
-	padding: .36rem;
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, .95), 0 10px 26px rgba(91, 58, 34, .10);
+.header-subtitle {
+	color: var(--ob-chat-muted);
+	font-size: 10.5px;
+	font-weight: 400;
+	line-height: 16px;
 }
 
-.header-chip {
-	display: inline-flex;
-	align-items: center;
-	white-space: nowrap;
-}
+.header-title { margin: 3px 0 0; font-size: 13px; font-weight: 500; line-height: 20px; }
 
 .header-metrics {
 	display: flex;
-	flex: 0 1 auto;
-	min-width: 18rem;
-	max-width: min(64%, 54rem);
-	flex-wrap: nowrap;
+	flex: none;
 	align-items: center;
-	justify-content: flex-end;
-	gap: .25rem;
-	overflow-x: auto;
-	overflow-y: hidden;
-	border: 1px solid rgba(15, 23, 42, .06);
-	border-radius: 1.05rem;
-	background: rgba(248, 250, 252, .72);
-	padding: .16rem;
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, .86);
-	scrollbar-width: none;
+	gap: 16px;
+	margin: 0;
 }
 
-.header-metrics::-webkit-scrollbar {
-	display: none;
+.header-metric {
+	min-width: 0;
+	padding-left: 16px;
+	border-left: 1px solid var(--ob-chat-line);
 }
 
-.header-chip {
-	height: 1.72rem;
-	gap: .26rem;
-	border-radius: .86rem;
-	padding: 0 .46rem;
-	color: #71717a;
-	font-size: 10.5px;
-	letter-spacing: -.01em;
-	transition: background .16s ease, color .16s ease;
+.header-metric:first-child { border-left: 0; padding-left: 0; }
+
+.header-metric dt {
+	margin: 0 0 3px;
+	color: var(--ob-chat-muted);
+	font-size: 9.5px;
+	font-weight: 400;
+	line-height: 15px;
+	white-space: nowrap;
 }
 
-.header-chip svg {
-	width: .76rem;
-	height: .76rem;
-	flex: 0 0 auto;
-	color: #a1a1aa;
-	stroke-width: 1.8;
+.header-metric dd {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	margin: 0;
+	color: var(--ob-chat-text);
+	font-size: 12px;
+	font-weight: 400;
+	line-height: 19px;
+	font-variant-numeric: tabular-nums lining-nums;
+	white-space: nowrap;
+	letter-spacing: .01em;
 }
 
-.header-chip .chip-label {
-	color: #a1a1aa;
-	font-size: 10px;
-	font-weight: 520;
-}
+.header-number { font-size: 12px; letter-spacing: 0; }
+.header-unit { margin-left: 1px; color: var(--ob-chat-muted); font-size: 10.5px; font-weight: 400; }
 
-.header-chip strong {
-	color: #52525b;
-	font-size: 10.8px;
-	font-weight: 680;
-	letter-spacing: -.015em;
+.header-status {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border-radius: 5px;
+	color: var(--ob-chat-muted);
+	font-size: 11.5px;
+	font-weight: 500;
+	line-height: 24px;
 }
+.header-status i { width: 5px; height: 5px; flex: none; border-radius: 50%; background: currentColor; }
+.header-status.is-running { padding: 0 7px; color: var(--ob-success); background: rgb(var(--ob-success-rgb) / .09); }
+.header-run-clock { color: var(--ob-chat-muted); font-size: 11px; font-weight: 400; letter-spacing: 0; }
 
-.header-chip-live {
-	background: rgba(16, 185, 129, .09);
-	color: #047857;
-}
-
-.header-chip-live svg,
-.header-chip-live .chip-label {
-	color: #10b981;
-}
-
-.header-chip-live strong {
-	color: #047857;
-	font-weight: 720;
-}
-
-@media (max-width: 1120px) {
-	.console-header {
-		padding-inline: .8rem;
-	}
+@media (min-width: 761px) and (max-width: 1120px) {
+	.console-header { gap: 20px; padding-inline: 18px; }
+	.header-metrics { gap: 12px; }
+	.header-metric { padding-left: 12px; }
+	.header-metric:first-child { padding-left: 0; }
 }
 
 @media (max-width: 760px) {
 	.console-header {
 		box-sizing: border-box;
-		height: calc(48px + env(safe-area-inset-top, 0px));
-		min-height: calc(48px + env(safe-area-inset-top, 0px));
-		gap: .5rem;
+		height: calc(60px + env(safe-area-inset-top, 0px));
+		min-height: calc(60px + env(safe-area-inset-top, 0px));
+		gap: 5px;
 		padding: env(safe-area-inset-top, 0px) .5rem 0;
+		border-bottom-color: var(--ob-chat-line);
 	}
 
 	.header-mobile-navigation,
 	.header-mobile-actions { display: flex; flex: 0 0 44px; }
-	.header-subtitle { display: none; }
-	.header-mobile-running { display: inline-flex; flex: none; align-items: center; gap: 5px; height: 22px; padding: 0 7px; border: 1px solid rgba(16, 185, 129, .18); border-radius: 7px; background: rgba(16, 185, 129, .09); color: #047857; font-size: 11px; font-weight: 500; line-height: 1; white-space: nowrap; }
+	.header-subtitle { display: block; font-size: 10px; line-height: 17px; }
+	.header-title { margin-top: 0; }
+	.header-mobile-running { display: inline-flex; flex: none; align-items: center; gap: 5px; height: 22px; padding: 0 7px; border: 1px solid rgb(var(--ob-success-rgb) / 0.18); border-radius: 7px; background: rgb(var(--ob-success-rgb) / 0.09); color: var(--ob-success); font-size: 11px; font-weight: 500; line-height: 1; white-space: nowrap; }
 	.header-mobile-running i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
-
-	.header-orb {
-		display: none;
-	}
-
 	.header-metrics { display: none; }
 }
 </style>
 
 <style>
-/* OpenBear system dark theme */
 @media (max-width: 760px) {
-	html.dark .header-mobile-running { color: #6ee7a2; border-color: rgba(110, 231, 162, .2); }
+	html.dark .header-mobile-running { border-color: rgb(var(--ob-success-rgb) / 0.2); }
 }
-html.dark .console-header {
-		border-bottom: 1px solid rgba(255, 255, 255, 0.116);
-		background: rgba(29, 30, 34, 0.86);
-	}
-html.dark .header-orb {
-		border: 1px solid #3d3e46;
-		background: linear-gradient(145deg, #1d1e22, #1d1e22);
-		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11), 0 10px 26px rgba(91, 58, 34, 0.1);
-	}
-html.dark .header-metrics {
-		border: 1px solid rgba(255, 255, 255, 0.087);
-		background: rgba(29, 30, 34, 0.72);
-		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.11);
-	}
-html.dark .header-chip {
-		color: #c6c6cd;
-	}
-html.dark .header-chip svg {
-		color: #a1a1a8;
-	}
-html.dark .header-chip .chip-label {
-		color: #a1a1a8;
-	}
-html.dark .header-chip strong {
-		color: #c6c6cd;
-	}
-html.dark .header-chip-live {
-		background: rgba(16, 185, 129, 0.09);
-		color: #6ee7a2;
-	}
-html.dark .header-chip-live svg,
-html.dark .header-chip-live .chip-label {
-		color: #6ee7a2;
-	}
-html.dark .header-chip-live strong {
-		color: #6ee7a2;
-	}
 </style>

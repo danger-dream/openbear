@@ -523,6 +523,7 @@ class WebAdminRathMixin:
                 retry_max_delay_s=self.config.agent.retry_max_delay_s,
                 retry_jitter_ratio=self.config.agent.retry_jitter_ratio,
                 retry_cancel_check=lambda: self.rath.consume_retry_cancel(task_uuid),
+                retry_control_check=lambda wait_id: self.rath.consume_retry_action(task_uuid, wait_id),
                 model_call_limit=int(getattr(self.config.rath, "agent_model_call_limit", 20) or 0),
                 tool_call_limit=int(getattr(self.config.rath, "agent_tool_call_limit", 40) or 0),
                 plan_control_call_limit=int(getattr(self.config.rath, "plan_control_call_limit", 200) or 200),

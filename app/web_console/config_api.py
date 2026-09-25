@@ -1,6 +1,8 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.browser.config import BrowserConfig
+from app.browser.connection import probe_connection
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -45,6 +47,7 @@ class WebAdminSettingsChannelsMixin:
         return web.json_response({
             "ok": True,
             **settings_admin.safe_settings_payload(data),
+            "providerCount": len(self.config.models.providers),
             "revision": int(getattr(self.config_store, "revision", 0) or 0),
         })
 
@@ -75,10 +78,16 @@ class WebAdminSettingsChannelsMixin:
                 new_cfg = self.config
             else:
                 value = settings_admin.parse_setting_value(path, body.get("value"))
-                if path == "models.compressionModels":
+                if path in {"models.compressionModels", "models.namingModels"}:
+                    existing = (
+                        self.config.models.compression_models
+                        if path == "models.compressionModels"
+                        else self.config.models.naming_models
+                    )
+                    label_name = "摘要模型" if path == "models.compressionModels" else "命名模型"
                     for label in value:
-                        if not self.config.models.resolve(label) and label not in self.config.models.compression_models:
-                            raise ValueError(f"摘要模型不可用：{label}")
+                        if not self.config.models.resolve(label) and label not in existing:
+                            raise ValueError(f"{label_name}不可用：{label}")
                 new_cfg = await self.config_store.update_path(path, value)
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
@@ -98,6 +107,19 @@ class WebAdminSettingsChannelsMixin:
             "value": settings_admin.safe_settings_payload(data)["values"].get(path),
             "revision": int(getattr(self.config_store, "revision", 0) or 0),
         })
+
+    async def handle_api_browser_connection_test(self, request: web.Request) -> web.Response:
+        body = await self._json_body(request)
+        try:
+            candidate = BrowserConfig.model_validate({
+                "mainEndpoint": body.get("endpoint", self.config.browser.main_endpoint),
+                "connectTimeoutS": self.config.browser.connect_timeout_s,
+            })
+        except (ValueError, TypeError):
+            return web.json_response({"ok": False, "code": "browser_endpoint_invalid", "error": "请输入有效的 http(s) 或 ws(s) 浏览器 CDP 连接地址"}, status=400)
+        # Independent read-only connection: do not save settings, enable tools,
+        # start a worker, or touch the user's already-open pages.
+        return web.json_response(await probe_connection(candidate))
 
     async def handle_api_web_task_notification_test(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
@@ -359,12 +381,18 @@ class WebAdminSettingsChannelsMixin:
         session: WebSession = request[_WEB_SESSION_KEY]
         chat_ids = await self._stats_chat_ids_for_web_session(session.chat_id)
         messages = MessageDAO(self.db)
-        stats = await messages.provider_call_summary(chat_ids)
+        provider_stats, model_stats = await messages.channel_call_summaries(chat_ids)
         catalog = getattr(self, "models_dev_catalog", None)
         return web.json_response({
             "ok": True,
-            **channel_admin.providers_payload(self.config.models, stats, models_dev_catalog=catalog),
-            "overview": channel_admin.channels_overview_payload(stats),
+            **channel_admin.providers_payload(
+                self.config.models,
+                provider_stats,
+                model_stats=model_stats,
+                include_models=True,
+                models_dev_catalog=catalog,
+            ),
+            "overview": channel_admin.channels_overview_payload(provider_stats),
             "modelsDev": catalog.status() if catalog is not None else {"available": False, "lastError": "catalog_unavailable"},
         })
 
@@ -374,8 +402,10 @@ class WebAdminSettingsChannelsMixin:
         if name not in self.config.models.providers:
             return web.json_response({"ok": False, "error": "channel_not_found"}, status=404)
         chat_ids = await self._stats_chat_ids_for_web_session(session.chat_id)
-        provider_stats = await MessageDAO(self.db).provider_call_summary(chat_ids)
-        model_stats = await MessageDAO(self.db).model_detail_summary(chat_ids, name)
+        provider_stats, model_stats = await MessageDAO(self.db).channel_call_summaries(
+            chat_ids,
+            provider_name=name,
+        )
         catalog = getattr(self, "models_dev_catalog", None)
         return web.json_response({
             "ok": True,
@@ -413,8 +443,10 @@ class WebAdminSettingsChannelsMixin:
         name = str(body.get("name") or "")
         if name in self.config.models.providers:
             chat_ids = await self._stats_chat_ids_for_web_session(request[_WEB_SESSION_KEY].chat_id)
-            provider_stats = await MessageDAO(self.db).provider_call_summary(chat_ids)
-            model_stats = await MessageDAO(self.db).model_detail_summary(chat_ids, name)
+            provider_stats, model_stats = await MessageDAO(self.db).channel_call_summaries(
+                chat_ids,
+                provider_name=name,
+            )
             payload = channel_admin.provider_detail_payload(
                 self.config.models,
                 name,

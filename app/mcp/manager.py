@@ -104,7 +104,9 @@ class MCPManager:
             approval=_server_approval(self.mcp_config, server_config),
         )
         log.info("mcp.server.starting", server=server_key, transport=server_config.transport, required=server_config.required)
-        client = MCPClient(server_key, server_config)
+        client = MCPClient(server_key, server_config.model_copy(update={
+            "tool_call_timeout_s": server_config.tool_call_timeout_s or self.mcp_config.tool_call_timeout_s,
+        }))
         client.set_notification_handler(
             lambda method, params, key=server_key: self._handle_server_notification(key, method, params)
         )
@@ -444,6 +446,11 @@ class MCPManager:
         from the config keys first and append only unexpected runtime states after.
         """
         states = dict(self._states)
+        for key, client in self._clients.items():
+            fatal = getattr(getattr(client, "transport", None), "fatal_error", "")
+            if fatal and key in states:
+                states[key].status = "failed"
+                states[key].error = str(fatal)
         ordered: list[MCPServerState] = []
         configured_keys: set[str] = set()
         for key, cfg in self.mcp_config.servers.items():
@@ -579,7 +586,8 @@ class MCPManager:
             log.info("mcp.tool.called", server=meta.server_key, tool=meta.original_tool_name, public=meta.public_name, risk=meta.risk)
             raw_result = await asyncio.wait_for(
                 self._send_tool(client, meta, arguments, context),
-                timeout=timeout_s,
+                # Transport owns the deadline; this is only a stuck-client watchdog.
+                timeout=timeout_s + 1,
             )
             rendered = format_mcp_result(raw_result, meta, self.mcp_config)
             await record_audit(self.db, "mcp.tool.called", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "risk": meta.risk, "resultChars": len(rendered)})
@@ -591,7 +599,7 @@ class MCPManager:
         except TimeoutError:
             log.warning("mcp.tool.timeout", server=meta.server_key, tool=meta.original_tool_name)
             await record_audit(self.db, "mcp.tool.failed", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "error": "timeout"})
-            return _json({"status": "error", "error": "mcp_tool_timeout", "server": meta.server_key, "tool": meta.original_tool_name})
+            return _json({"status": "error", "error": "mcp_tool_timeout", "outcome": "unknown", "server": meta.server_key, "tool": meta.original_tool_name})
         except Exception as exc:
             err = _short_error(exc)
             log.warning("mcp.tool.failed", server=meta.server_key, tool=meta.original_tool_name, error=err)

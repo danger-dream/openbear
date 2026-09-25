@@ -18,6 +18,8 @@ test("SettingsHub keeps section order/default/events and loads only the selected
     LazyViewState: { name: "loading-state" },
     defineProps: () => props,
     defineEmits: () => (...args) => emitted.push(args),
+    setTimeout,
+    clearTimeout,
     loadView: async (path) => { loads.push(path); return { default: { name: path } }; },
   });
   vm.runInContext(helper.replace(/^import .*;\n/gm, "").replace("export function ", "function "), context);
@@ -27,7 +29,7 @@ test("SettingsHub keeps section order/default/events and loads only the selected
   const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); await Vue.nextTick(); };
   try {
     assert.equal(loads.length, 0, "definitions alone must not request modules");
-    assert.deepEqual(Array.from(run("sections.map(item => item.key)")), ["channels", "templates", "agents", "system-settings", "logs", "install-app"]);
+    assert.deepEqual(Array.from(run("sections.map(item => item.key)")), ["channels", "templates", "agents", "system-settings", "sessions", "logs", "install-app"]);
     const first = run("activeComponent.value");
     const view = first.setup({}, { attrs: {}, slots: {} });
     await flush();

@@ -210,6 +210,111 @@ async def test_running_leaf_and_every_ancestor_increment_then_clear_without_load
     assert finished["folderRunningCounts"] == {}
 
 
+async def test_tree_status_single_flights_concurrent_bootstrap_and_global_reads(tree_harness, monkeypatch):
+    h = tree_harness
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def uncached(owner):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return {"owner": owner, "items": [], "activityItems": [], "recentItems": [],
+                "folderRunningCounts": {}, "folderConversationCounts": {}, "revision": 1}
+
+    monkeypatch.setattr(h, "_tree_running_state_uncached", uncached)
+    first = asyncio.create_task(h._tree_running_state(7))
+    await entered.wait()
+    second = asyncio.create_task(h._tree_running_state(7))
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    one, two = await asyncio.gather(first, second)
+    assert one is two
+
+
+async def test_organization_endpoints_do_not_rebuild_global_runtime(tree_harness, monkeypatch):
+    h = tree_harness
+    await _folder(h, "a", "", "Project")
+    uuid, _chat = await _conversation(h, 1, "a")
+    await h.db.conn.commit()
+    await h._tree_ensure_interaction_projection(7)
+
+    async def forbidden(_owner):
+        raise AssertionError("organization endpoint rebuilt global runtime")
+
+    monkeypatch.setattr(h, "_tree_running_state", forbidden)
+    search = json.loads((await h.handle_api_conversation_tree_search(_Request(query={"q": "Project"}))).text)
+    locate = json.loads((await h.handle_api_conversation_tree_locate(_Request(
+        match_info={"conversation_uuid": uuid},
+    ))).text)
+    folder = json.loads((await h.handle_api_conversation_tree_folder_locate(_Request(
+        match_info={"folder_uuid": "a"},
+    ))).text)
+    patched = json.loads((await h.handle_api_conversation_folder_patch(_Request(
+        match_info={"folder_uuid": "a"}, body={"name": "Renamed"},
+    ))).text)
+    assert search["items"][0]["runningDescendantCount"] == 0
+    assert locate["item"]["running"] is False
+    assert folder["folderItems"][0]["folderId"] == "a"
+    assert patched["folder"]["name"] == "Renamed"
+
+
+async def test_impact_candidates_are_sql_scoped_and_never_load_session_snapshots(tree_harness, monkeypatch):
+    h = tree_harness
+    await _folder(h, "a", "", "A", "/a", "a")
+    await _folder(h, "b", "", "B", "/b", "b")
+    first, _ = await _conversation(h, 1, "a")
+    await _conversation(h, 2, "b")
+    await h.db.conn.execute("UPDATE sessions SET system_snapshot=?", ("x" * 100_000,))
+    await h.db.conn.commit()
+
+    calls = []
+    original = h._tree_conversation_rows
+
+    async def observed(owner, **kwargs):
+        calls.append(kwargs)
+        rows = await original(owner, **kwargs)
+        assert all("system_snapshot" not in row for row in rows)
+        return rows
+
+    monkeypatch.setattr(h, "_tree_conversation_rows", observed)
+    await h._tree_change_impact(7, kind="conversation", item_id=first, target_folder_id="b")
+    await h._tree_change_impact(7, kind="properties", item_id="a", workspace_dir="/next", prompt_markdown="a")
+    assert calls == [
+        {"conversation_uuid": first, "folder_ids": None},
+        {"conversation_uuid": "", "folder_ids": {"a"}},
+    ]
+
+
+async def test_bootstrap_reuses_one_runtime_snapshot_and_children_skip_global_recalculation(tree_harness, monkeypatch):
+    h = tree_harness
+    await _folder(h, "a", "", "A")
+    uuid, _chat = await _conversation(h, 1, "a")
+    await h.db.conn.commit()
+    h._web_starting_turns[uuid] = {"turn-running"}
+
+    calls = 0
+    original = h._tree_running_state
+
+    async def counted(owner_chat_id):
+        nonlocal calls
+        calls += 1
+        return await original(owner_chat_id)
+
+    monkeypatch.setattr(h, "_tree_running_state", counted)
+    bootstrap = json.loads((await h.handle_api_conversation_tree_bootstrap(_Request())).text)
+    assert calls == 1
+    assert bootstrap["rootFolders"][0]["runningDescendantCount"] == 1
+    assert bootstrap["running"]["items"][0]["conversationUuid"] == uuid
+
+    children = json.loads((await h.handle_api_conversation_tree_children(_Request(query={"parentId": "a"}))).text)
+    assert [item["conversationUuid"] for item in children["items"]] == [uuid]
+    assert calls == 1
+
+
 async def test_children_are_paginated_all_reachable_and_archive_is_opt_in(tree_harness):
     h = tree_harness
     await _folder(h, "a", "", "A", "/secret/path", "LONG SECRET PROMPT")

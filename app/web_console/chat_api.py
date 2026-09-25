@@ -6,6 +6,7 @@ from app.interaction_data import canonical_questionnaire_answers as _canonical_q
 from app.interaction_data import redact_result
 from app.references import ReferenceError, effective_reference_text
 from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
+from app.web_console.message_visibility import visibility_snapshot
 from app.web_console.activity import clear_deleted_completion
 from app.web_console.core import *
 from app.web_console.live_stream import *
@@ -740,10 +741,19 @@ class WebAdminChatHandlersMixin:
         return web.json_response(result, status=200 if result.get("ok") else 409)
 
     async def handle_api_conversation_retry_cancel(self, request: web.Request) -> web.Response:
+        return await self._handle_api_conversation_retry_action(request, "cancel")
+
+    async def handle_api_conversation_retry_now(self, request: web.Request) -> web.Response:
+        return await self._handle_api_conversation_retry_action(request, "retry")
+
+    async def _handle_api_conversation_retry_action(self, request: web.Request, action: str) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         row = await self._conversation_from_request(request)
         body = await self._json_body(request)
         task_uuid = str(body.get("taskUuid") or "").strip()
+        wait_id = str(body.get("waitId") or "").strip()
+        if not wait_id and action != "cancel":
+            return web.json_response({"ok": False, "error": "retry_wait_id_required"}, status=400)
         internal_chat_id = int(row.get("internal_chat_id") or 0)
         accepted = False
         scope = "main"
@@ -754,15 +764,20 @@ class WebAdminChatHandlersMixin:
                 return web.json_response({"ok": False, "error": "retry_task_not_found"}, status=404)
             retry_state = task.output.get("retry") if isinstance(task.output, dict) else None
             if isinstance(retry_state, dict) and retry_state.get("active"):
-                accepted = bool(self.rath is not None and self.rath.request_retry_cancel(task_uuid))
+                if not wait_id and action == "cancel":
+                    wait_id = str(retry_state.get("waitId") or "")
+                if retry_state.get("waitId") == wait_id:
+                    accepted = bool(self.rath is not None and self.rath.request_retry_action(task_uuid, wait_id, action))
         elif self.control_actions is not None:
             live = self._live_for(row)
             retry_state = getattr(live, "active_retry", {})
-            if isinstance(retry_state, dict) and retry_state.get("active"):
-                self.control_actions.request_retry_cancel(internal_chat_id)
-                accepted = True
+            if getattr(live, "status", "") == "running" and isinstance(retry_state, dict) and retry_state.get("active"):
+                if not wait_id and action == "cancel":
+                    wait_id = str(retry_state.get("waitId") or "")
+                if retry_state.get("waitId") == wait_id:
+                    accepted = self.control_actions.request_retry_action(internal_chat_id, wait_id, action)
         await self.audit(
-            "web.conversation.retry.cancel",
+            f"web.conversation.retry.{action}",
             actor="web",
             chat_id=session.chat_id,
             ip=request.remote or "",
@@ -789,6 +804,33 @@ class WebAdminChatHandlersMixin:
             )
         return web.json_response({"confirmationId": confirmation_id, "action": item["action"], **response}, status=status_code)
 
+    async def handle_api_conversation_title_generate(self, request: web.Request) -> web.Response:
+        session: WebSession = request[_WEB_SESSION_KEY]
+        row = await self._conversation_from_request(request)
+        conv_uuid = str(row.get("conversation_uuid") or "")
+        if self._web_starting_turns.get(conv_uuid) or await self._web_conversation_has_active_runtime(row):
+            return web.json_response({"ok": False, "error": "run_is_active", "message": "当前轮完成后再生成"}, status=409)
+        if not await self._conversation_title_turns(conv_uuid):
+            return web.json_response({"ok": False, "error": "conversation_has_no_completed_turns"}, status=409)
+        task = self._start_conversation_title_task(row, automatic=False)
+        if task is None:
+            return web.json_response({"ok": False, "error": "conversation_title_generation_in_progress"}, status=409)
+        result = await asyncio.shield(task)
+        if not result.get("ok"):
+            return web.json_response({
+                "ok": False,
+                "error": str(result.get("error") or "conversation_title_generation_failed"),
+                "message": "名称生成失败，已保留原名称",
+            }, status=502)
+        await self.audit(
+            "web.conversation.title.generate",
+            actor="web",
+            chat_id=session.chat_id,
+            ip=request.remote or "",
+            detail={"conversationUuid": conv_uuid, "changed": bool(result.get("changed"))},
+        )
+        return web.json_response({"ok": True, **result})
+
     async def handle_api_conversation_patch(self, request: web.Request) -> web.Response:
         session: WebSession = request[_WEB_SESSION_KEY]
         row = await self._conversation_from_request(request)
@@ -803,7 +845,6 @@ class WebAdminChatHandlersMixin:
             title = str(body.get("title")).strip()
             if not title:
                 return web.json_response({"ok": False, "error": "title_required"}, status=400)
-            title = title[:120]
 
         archived_at = 0
         if has_archived:
@@ -829,6 +870,9 @@ class WebAdminChatHandlersMixin:
             tuple(params),
         )
         await self.db.conn.commit()
+        self._invalidate_tree_status(int(session.chat_id))
+        if has_archived:
+            getattr(self, "_tree_projection_ready", set()).discard(int(session.chat_id))
         if has_title:
             row["title"] = title
             row["updated_at"] = ts
@@ -930,6 +974,7 @@ class WebAdminChatHandlersMixin:
             (ts, ts, str(row.get("conversation_uuid") or ""), session.chat_id),
         )
         await self.db.conn.commit()
+        self._invalidate_tree_status(int(session.chat_id))
         row["pinned_at"] = ts
         row["updated_at"] = ts
         await self.audit("web.conversation.pin", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row.get("conversation_uuid")})
@@ -944,6 +989,7 @@ class WebAdminChatHandlersMixin:
             (ts, str(row.get("conversation_uuid") or ""), session.chat_id),
         )
         await self.db.conn.commit()
+        self._invalidate_tree_status(int(session.chat_id))
         row["pinned_at"] = 0
         row["updated_at"] = ts
         await self.audit("web.conversation.unpin", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row.get("conversation_uuid")})
@@ -1210,7 +1256,10 @@ class WebAdminChatHandlersMixin:
             clear_read_file_state(internal_chat_id, agent_session_uuid=sid, store=cache)
         for tid in deleted_task_uuids:
             clear_read_file_state(internal_chat_id, task_uuid=tid, store=cache)
+        # A late callback from a deleted Agent must not start a new controller
+        # turn. Keep unrelated pending notifications from surviving turns intact.
         self._web_task_notification_deferred.pop(conv_uuid, None)
+        self._web_stopped_task_uuids.setdefault(conv_uuid, set()).update(deleted_task_uuids)
         await self.interactions.cancel_conversation(conv_uuid)
         live = self._web_live_streams.get(conv_uuid)
         if live is not None:
@@ -1228,6 +1277,7 @@ class WebAdminChatHandlersMixin:
                     "type": "conversation_reset",
                     "reason": "turn_suffix_deleted",
                     "deletedTurnUuid": turn_uuid,
+                    "deletedRootTurns": deleted_roots,
                 }, persist=False)
         await self.audit(
             "web.conversation.turn_suffix.delete",
@@ -2034,6 +2084,8 @@ class WebAdminChatHandlersMixin:
                         public_event = task_memory_changed_public_event(event)
                         if public_event is not None:
                             await _send_json(public_event)
+                    elif event_type == "message_visibility.changed":
+                        await _send_json({"type": event_type, "visibility": event.get("visibility")})
                     elif event_type == "web_confirmation":
                         await _send_json({
                             "type": "web_confirmation",
@@ -2119,6 +2171,7 @@ class WebAdminChatHandlersMixin:
                 await _send_incremental_bootstrap()
                 await _send_json({
                     "type": "bootstrap",
+                    "messageVisibility": await visibility_snapshot(self.db, conv_uuid_for_log),
                     "frameSeq": last_sent_frame_seq,
                     "pendingConfirmations": self._pending_web_confirmations(conv_uuid_for_log),
                     "pendingSteering": steering.pending_items(internal_chat_id_for_log),

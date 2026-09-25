@@ -453,6 +453,9 @@ async def test_model_and_tool_call_logs(db):
     assert totals["conversation_count"] == 3
     assert totals["model_call_count"] == 3
     provider_summary = await dao.provider_call_summary(1)
+    combined_provider_summary, combined_model_summary = await dao.channel_call_summaries(1)
+    assert combined_provider_summary == provider_summary
+    assert combined_model_summary == await dao.model_detail_summary(1, "openai")
     assert provider_summary[0]["peak_tps"] == pytest.approx(42.5)
     assert provider_summary[0]["min_tps"] == pytest.approx(12.25)
     assert int(provider_summary[0]["avg_total_ms"]) == 1111
@@ -468,6 +471,9 @@ async def test_model_and_tool_call_logs(db):
     assert sum(int(row["calls"] or 0) for row in multi_provider_summary if row["provider"] == "openai") == 5
     multi_detail_summary = await dao.model_detail_summary([1, 2], "openai")
     assert {row["model"] for row in multi_detail_summary} == {"openai/gpt", "openai/mini"}
+    combined_providers, combined_models = await dao.channel_call_summaries([1, 2], provider_name="openai")
+    assert combined_providers == multi_provider_summary
+    assert combined_models == multi_detail_summary
 
 
 async def test_recent_errors_combines_model_and_tool_logs(db):
@@ -486,6 +492,34 @@ async def test_session_thinking_level(db):
     assert await dao.get_thinking_level(42) == "max"
     await dao.set_thinking_level(42, "off")
     assert await dao.get_thinking_level(42) == "off"
+
+
+async def test_session_snapshot_reads_existing_without_ensure_and_creates_missing_defaults(db, monkeypatch):
+    dao = MessageDAO(db)
+    await dao.ensure_session(43)
+    await db.conn.execute(
+        "UPDATE sessions SET thinking_level='max', fast_mode=1, show_thinking=0, "
+        "usage_input_tokens=17 WHERE chat_id=43",
+    )
+    await db.conn.commit()
+    ensure_calls = []
+    original_ensure = dao.ensure_session
+
+    async def counted_ensure(chat_id, *, commit=True):
+        ensure_calls.append((chat_id, commit))
+        await original_ensure(chat_id, commit=commit)
+
+    monkeypatch.setattr(dao, "ensure_session", counted_ensure)
+    existing = await dao.session_snapshot(43)
+    assert ensure_calls == []
+    assert (existing["thinking_level"], existing["fast_mode"], existing["show_thinking"]) == ("max", 1, 0)
+    assert dao.usage_totals_from_session(existing).input_tokens == 17
+
+    missing = await dao.session_snapshot(44)
+    assert ensure_calls == [(44, True)]
+    assert (missing["thinking_level"], missing["fast_mode"], missing["show_thinking"]) == ("", 0, -1)
+    cur = await db.conn.execute("SELECT COUNT(*) AS n FROM sessions WHERE chat_id=44")
+    assert int((await cur.fetchone())["n"]) == 1
 
 
 async def test_session_show_thinking_override(db):

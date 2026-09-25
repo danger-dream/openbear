@@ -397,6 +397,38 @@ async def test_deleted_agent_rounds_cannot_reenter_continue(web_env, monkeypatch
         assert "FUTURE_NOTE_conversation" in str(sent)
 
 
+async def test_deleted_agent_callback_cannot_revive_removed_turn(web_env, monkeypatch):
+    env = web_env
+    await configure_web(env, monkeypatch)
+    row = await env.server._create_web_conversation(123, model="openai/gpt")
+    conv = row["conversation_uuid"]
+    await seed_turn(env, row, "survivor", "keep", answer="kept answer")
+    await seed_turn(env, row, "future-1", "delete", answer="deleted answer")
+    task_uuid = await env.server.rath_dao.create_task(
+        chat_id=row["internal_chat_id"], parent_session_uuid=conv, workflow_uuid="wf-delete",
+        title="deleted agent", status="completed", turn_uuid="future-1",
+        parent_turn_uuid="future-1", run_root_turn_uuid="future-1",
+    )
+    late = {"taskUuid": task_uuid, "rootTurnUuid": "future-1", "status": "completed",
+            "summary": "late result", "content": "DELETED_AGENT_REPLY"}
+    await truncate(env, row)
+    assert await env.server.rath_dao.get_task(task_uuid) is None
+    assert task_uuid in env.server._web_stopped_task_uuids[conv]
+    assert await env.server._persist_web_task_notification(row, late) is None
+    # A later user request clears transient stop markers; the durable absence
+    # of the deleted root must still reject the old callback after that point.
+    env.server._web_stopped_task_uuids.pop(conv, None)
+    assert await env.server._should_suppress_web_task_notification(conv, late)
+    assert await env.server._persist_web_task_notification(row, late) is None
+    assert not await env.server._should_suppress_web_task_notification(
+        conv, {**late, "rootTurnUuid": "survivor"})
+    assert not await sql_rows(env, "SELECT * FROM web_task_notifications WHERE conversation_uuid=?", (conv,))
+    operations = await sql_rows(env, "SELECT op_type,payload_json FROM web_operations WHERE conversation_uuid=?", (conv,))
+    assert "DELETED_AGENT_REPLY" not in str(operations)
+    assert "deleted answer" not in str(operations)
+    assert "kept answer" in str(operations)
+
+
 async def test_suffix_does_not_rollback_conversation_preferences(web_env, monkeypatch):
     env = web_env
     backend = await configure_web(env, monkeypatch)
