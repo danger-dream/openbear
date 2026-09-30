@@ -330,6 +330,9 @@ test('mobile search removes the outer scroll and minimum panel height, with a fi
   }
   assert.equal(css(channels, '.channels-view.is-model-search .channel-detail-stack', 1280)['overflow-y'], undefined);
   assert.equal(css(channels, '.channel-model-search input', 1280)['font-size'], undefined, 'desktop input size is unchanged');
+  assert.equal(css(channels, '.channel-model-search .mac-input', 1280)['padding-left'], '1.75rem', 'desktop icon gutter is not overridden by generic input padding');
+  assert.equal(css(channels, '.channel-model-search .mac-input', 1280)['padding-right'], '1.5rem');
+  for (const width of [320, 390, 760]) assert.deepEqual(css(channels, '.channel-model-search .mac-input', width), {}, 'phone search keeps its existing padding rule');
 });
 
 test('mobile model list scrolls normally and short viewports scroll the stack without squeezing the channel card', () => {
