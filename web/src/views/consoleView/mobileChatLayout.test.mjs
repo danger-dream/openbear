@@ -90,6 +90,7 @@ test('editor has primary vertical space and model is an unboxed secondary text e
     assert.equal(css(f,'.run-config-chip-model',env)['font-weight'],'500');
     assert.equal(css(f,'.run-config-chip-meta',env).display,'none','phone model entry must not repeat thinking/context metadata');
     assert.equal(css(f,'.composer-status .run-config-chip-strategy',env).display,'inline');
+    assert.equal(css(f,'.composer-toolbar button.run-config-chip .chip-caret',env).display,'none','phone caret space goes to the model/status text');
     assert.equal(css(f,'.run-config-chip-status',env).display,'inline-flex','phone shows active thinking/Fast beside the model');
     assert.equal(css(f,'.run-config-chip-status',env)['font-size'],'10px','status matches the compression label size');
     assert.equal(css(f,'.composer-actions',env)['margin-left'],'-9px','move the whole action group and keep the first icon position');
@@ -103,6 +104,7 @@ test('editor has primary vertical space and model is an unboxed secondary text e
     assert.deepEqual([css(f,'.send-button',env).width,css(f,'.send-button',env).height],['38px','38px'],'send button is modestly smaller on touch/phone');
   }
   assert.equal(css(f,'.composer-actions',desktop)['margin-left'],undefined,'desktop action geometry stays unchanged');
+  assert.equal(css(f,'.composer-toolbar button.run-config-chip .chip-caret',desktop).display,undefined,'desktop menu caret stays visible');
   assert.equal(css(f,'.composer-actions .tool-btn',desktop).width,undefined);
   assert.deepEqual([css(f,'.send-button',desktop).width,css(f,'.send-button',desktop).height],['2rem','2rem'],'desktop send button stays unchanged');
   assert.equal(css(f,'.composer-toolbar',{...phone,width:360})['grid-template-columns'],'minmax(0, 1fr) 38px','narrow phone reserves the resized send column');
