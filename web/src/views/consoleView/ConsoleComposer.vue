@@ -170,7 +170,7 @@ const runConfigModelText = computed(() => props.currentModelInfo ? modelShortLab
 const runConfigStrategyText = computed(() => props.contextStrategy === 'model_summary' ? '模型摘要' : '滑动窗口');
 const runConfigMetaText = computed(() => {
 	const parts = [];
-	if (props.supportsThinking) parts.push(thinkingLabel(props.effectiveThinking));
+	if (props.supportsThinking) parts.push(compactThinkingLabel(props.effectiveThinking));
 	if (props.currentFast) parts.push("Fast");
 	if (props.contextDisplay && props.contextDisplay !== "—") parts.push(props.contextDisplay);
 	return parts.join(" · ");

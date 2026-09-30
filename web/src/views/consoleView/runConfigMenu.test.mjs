@@ -198,7 +198,7 @@ test('collapsed model button exposes the shared compression mode without losing 
   const button = html.match(/^<button[^>]*>/)[0];
   assert.match(button, /aria-label="运行配置"/);
   assert.match(button, /aria-description="上下文压缩：滑动窗口，思考强度：极高，Fast 模式已开启"/);
-  assert.match(html, /class="run-config-chip-meta">[^<]*xhigh · Fast · 216K \/ 300K</);
+  assert.match(html, /class="run-config-chip-meta">[^<]*极高 · Fast · 216K \/ 300K</);
   assert.match(html, /class="run-config-chip-status" aria-hidden="true"/);
   assert.doesNotMatch(html, /run-config-chip-status" role="img"/);
   assert.match(html, /class="run-config-status-thinking">极高</, 'thinking shows only the level, without an icon');
