@@ -168,13 +168,14 @@ const runConfigPopoverVisible = computed({
 });
 const runConfigModelText = computed(() => props.currentModelInfo ? modelShortLabel(props.currentModelInfo) : "模型");
 const runConfigStrategyText = computed(() => props.contextStrategy === 'model_summary' ? '模型摘要' : '滑动窗口');
-const runConfigMetaText = computed(() => {
+const runConfigMetaParts = computed(() => {
 	const parts = [];
-	if (props.supportsThinking) parts.push(compactThinkingLabel(props.effectiveThinking));
-	if (props.currentFast) parts.push("Fast");
-	if (props.contextDisplay && props.contextDisplay !== "—") parts.push(props.contextDisplay);
-	return parts.join(" · ");
+	if (props.supportsThinking) parts.push({key: 'thinking', text: compactThinkingLabel(props.effectiveThinking)});
+	if (props.currentFast) parts.push({key: 'fast', text: 'Fast'});
+	if (props.contextDisplay && props.contextDisplay !== "—") parts.push({key: 'context', text: props.contextDisplay});
+	return parts;
 });
+const runConfigMetaText = computed(() => runConfigMetaParts.value.map(part => part.text).join(" · "));
 const currentDefaultThinkingLabel = computed(() => {
 	const level = modelDefaultThinking(props.currentModelInfo);
 	return level ? thinkingLabel(level) : "无";
@@ -985,7 +986,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 											<span v-if="runConfigThinkingBadge" class="run-config-status-thinking">{{ runConfigThinkingBadge }}</span>
 											<span v-if="props.currentFast" class="run-config-status-fast"><ModelFeatureIcon name="zap"/></span>
 										</span>
-										<span v-if="runConfigMetaText" class="run-config-chip-meta">{{ runConfigMetaText }}</span>
+										<span v-if="runConfigMetaParts.length" class="run-config-chip-meta"><span v-for="part in runConfigMetaParts" :key="part.key" class="run-config-meta-part" :class="part.key === 'fast' ? 'run-config-meta-fast' : ''" :title="part.key === 'fast' ? 'Fast 模式' : undefined"><ModelFeatureIcon v-if="part.key === 'fast'" name="zap"/><template v-else>{{ part.text }}</template></span></span>
 									</span>
 									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}`">{{ props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩' }}</span>
 									<ArrowDown class="chip-caret"/>
@@ -2026,6 +2027,17 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	white-space: nowrap;
 	color: var(--ob-text-muted);
 	font-weight: 520;
+}
+
+.run-config-meta-part + .run-config-meta-part::before {
+	content: " · ";
+	color: var(--ob-text-muted);
+}
+
+.run-config-meta-fast .model-feature-icon {
+	width: 1.15em;
+	height: 1.15em;
+	vertical-align: -0.2em;
 }
 
 .run-config-chip-meta::before, .run-config-chip-strategy::before {
