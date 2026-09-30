@@ -62,6 +62,22 @@ test('phone safe top is reserved once by main/bar, bottom by shell, and fixed fl
   assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport] .app-shell.is-console', landscapeTouch).background, 'var(--ob-chat-bg)');
 });
 
+test('keyboard-only phone footer removes bottom slack without hiding totals or changing desktop', () => {
+  const prefix = 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console ';
+  for (const width of [320,360,390,402,430,760]) {
+    const env = {...phone,width};
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', env), {'padding-bottom':'0'});
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-usage-summary', env), {'min-height':'28px','padding-top':'0'});
+    assert.deepEqual(declarations('./style.css', prefix + '.context-usage-trigger', env), {height:'28px'});
+    assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-shell', env).padding, '.5rem .75rem 8px', 'normal footer still keeps its original padding');
+    assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-usage-summary', env)['flex-wrap'], 'wrap');
+  }
+  for (const selector of ['.composer-shell','.composer-usage-summary','.context-usage-trigger']) {
+    assert.deepEqual(declarations('./style.css', prefix + selector, desktop), {});
+    assert.deepEqual(declarations('./style.css', prefix + selector, {...phone,width:844}), {});
+  }
+});
+
 test('mobile recents keep title and status on one 44px row and reserve more height for the tree without changing desktop', () => {
   const path = './components/ConversationActivityFolder.vue';
   for (const env of [phone, {...phone, width: 320}, {...phone, width: 844, height: 390}]) {

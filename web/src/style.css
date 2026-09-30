@@ -75,6 +75,20 @@ body {
     padding-bottom: 0;
   }
 }
+@media (max-width: 760px) {
+  /* Compact only the chat footer while the software keyboard is present.
+     Keep all totals visible and wrapping in normal flow; no negative offsets. */
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
+    padding-bottom: 0;
+  }
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-usage-summary {
+    min-height: 28px;
+    padding-top: 0;
+  }
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .context-usage-trigger {
+    height: 28px;
+  }
+}
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
    is added in that layout. Only its safe area needs reserving. */
 @media (min-width: 761px) and (hover: none) and (pointer: coarse) {
