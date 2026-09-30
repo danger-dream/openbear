@@ -77,9 +77,11 @@ body {
 }
 @media (max-width: 760px) {
   /* Compact only the chat footer while the software keyboard is present.
-     Keep all totals visible and wrapping in normal flow; no negative offsets. */
+     The 8px visual trial offset leaves all control sizes/layout measurements
+     unchanged; real iOS accessory-bar clearance still needs device acceptance. */
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
     padding-bottom: 0;
+    transform: translateY(8px);
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-usage-summary {
     min-height: 24px;

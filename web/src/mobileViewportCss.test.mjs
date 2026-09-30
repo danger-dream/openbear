@@ -62,11 +62,11 @@ test('phone safe top is reserved once by main/bar, bottom by shell, and fixed fl
   assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport] .app-shell.is-console', landscapeTouch).background, 'var(--ob-chat-bg)');
 });
 
-test('keyboard-only phone footer removes bottom slack without hiding totals or changing desktop', () => {
+test('keyboard-only phone footer trials an 8px shift without changing control sizes or desktop', () => {
   const prefix = 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console ';
   for (const width of [320,360,390,402,430,760]) {
     const env = {...phone,width};
-    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', env), {'padding-bottom':'0'});
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', env), {'padding-bottom':'0',transform:'translateY(8px)'});
     assert.deepEqual(declarations('./style.css', prefix + '.composer-usage-summary', env), {'min-height':'24px','padding-top':'0'});
     assert.deepEqual(declarations('./style.css', prefix + '.context-usage-trigger', env), {height:'24px'});
     assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-shell', env).padding, '.5rem .75rem 8px', 'normal footer still keeps its original padding');
