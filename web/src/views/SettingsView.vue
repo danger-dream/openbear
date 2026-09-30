@@ -1367,9 +1367,10 @@ onMounted(load);
   }
   .settings-sidebar {
     flex: none;
+    margin-top: 8px;
     margin-bottom: 6px;
-    padding: 6px 0;
-    border-radius: 0;
+    padding: 6px 10px;
+    border-radius: 14px;
     box-shadow: none;
   }
   .settings-sidebar__eyebrow,
