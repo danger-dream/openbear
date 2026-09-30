@@ -4,6 +4,19 @@ export const MOBILE_VIEWPORT_QUERY = "(max-width: 760px), (hover: none) and (poi
 const ATTRIBUTE = "data-openbear-mobile-viewport";
 const HEIGHT = "--mobile-viewport-height";
 const TOP = "--mobile-viewport-top";
+const KEYBOARD = "data-openbear-keyboard";
+// Browser toolbars can change the visual height by roughly 100px; a software
+// keyboard is materially larger. Requiring focus avoids treating toolbar motion
+// as an open keyboard.
+const KEYBOARD_MIN_SHRINK = 150;
+
+function editableFocused(win) {
+  const el = win.document?.activeElement;
+  if (!el || el === win.document?.body) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  return el.isContentEditable === true || tag === "textarea" || tag === "select"
+    || (tag === "input" && !/^(button|checkbox|radio|range|file|submit|reset|image|color)$/i.test(el.type || "text"));
+}
 
 export function installMobileViewport({ window: win = globalThis.window, root = win?.document?.documentElement, beforeChange, afterChange } = {}) {
   if (!win?.matchMedia || !root) return () => {};
@@ -14,6 +27,8 @@ export function installMobileViewport({ window: win = globalThis.window, root = 
   let snapshot = null;
   let disposed = false;
   let frame = null;
+  let baseline = 0;
+  let baselineWidth = 0;
   function listen(target, event, handler) {
     if (target?.addEventListener) {
       target.addEventListener(event, handler);
@@ -29,6 +44,8 @@ export function installMobileViewport({ window: win = globalThis.window, root = 
       if (value) root.style.setProperty(key, value, priority);
       else root.style.removeProperty(key);
     }
+    root.removeAttribute(KEYBOARD);
+    baseline = 0;
     if (snapshot.attribute === null) root.removeAttribute(ATTRIBUTE);
     else root.setAttribute(ATTRIBUTE, snapshot.attribute);
     snapshot = null;
@@ -49,6 +66,11 @@ export function installMobileViewport({ window: win = globalThis.window, root = 
     if (viewport && Math.abs(Number(viewport.scale || 1) - 1) > 0.01) return;
     const height = Number(viewport?.height || win.innerHeight);
     if (!Number.isFinite(height) || height <= 0) return;
+    const width = Number(viewport?.width || win.innerWidth);
+    if (width !== baselineWidth) { baselineWidth = width; baseline = 0; }
+    if (!editableFocused(win)) baseline = Math.max(baseline, height, Number(win.innerHeight) || 0);
+    else baseline = Math.max(baseline, height);
+    const keyboardOpen = editableFocused(win) && baseline - height >= KEYBOARD_MIN_SHRINK;
     const anchor = beforeChange?.();
     if (!snapshot) snapshot = {
       attribute: root.getAttribute(ATTRIBUTE),
@@ -57,6 +79,10 @@ export function installMobileViewport({ window: win = globalThis.window, root = 
     root.style.setProperty(HEIGHT, `${height}px`);
     root.style.setProperty(TOP, `${Math.max(0, Number(viewport?.offsetTop) || 0)}px`);
     root.setAttribute(ATTRIBUTE, "");
+    // While the keyboard covers the bottom edge, the home-indicator safe area is
+    // no longer between the app and the screen edge; CSS drops that reservation.
+    if (keyboardOpen) root.setAttribute(KEYBOARD, "");
+    else root.removeAttribute(KEYBOARD);
     // Also run for unchanged dimensions: env(safe-area-inset-*) can change on
     // rotation/standalone transitions independently of the visual viewport.
     afterChange?.(anchor);
@@ -68,6 +94,7 @@ export function installMobileViewport({ window: win = globalThis.window, root = 
   listen(media, "change", schedule);
   listen(standalone, "change", schedule);
   for (const event of ["resize", "orientationchange", "pageshow"]) listen(win, event, schedule);
+  for (const event of ["focusin", "focusout"]) listen(win.document, event, schedule);
   for (const event of ["resize", "scroll"]) listen(viewport, event, schedule);
   sync();
   return () => {

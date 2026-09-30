@@ -62,6 +62,33 @@ test('phone safe top is reserved once by main/bar, bottom by shell, and fixed fl
   assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport] .app-shell.is-console', landscapeTouch).background, 'var(--ob-chat-bg)');
 });
 
+test('keyboard footer keeps browser geometry unshifted and limits the 6px offset to standalone', () => {
+  const prefix = 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console ';
+  for (const width of [320,360,390,402,430,760]) {
+    const env = {...phone,width};
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', {...env,'display-mode':'browser'}), {'padding-bottom':'0'}, 'browser keyboard must not push the footer below the viewport');
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', {...env,'display-mode':'standalone'}), {'padding-bottom':'0',transform:'translateY(6px)'}, 'only standalone retains the requested visual trial');
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-usage-summary', env), {'min-height':'24px','padding-top':'0'});
+    assert.deepEqual(declarations('./style.css', prefix + '.context-usage-trigger', env), {height:'24px'});
+    assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-shell', env).padding, '.5rem .75rem 8px', 'normal footer still keeps its original padding');
+    assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-usage-summary', env)['flex-wrap'], 'wrap');
+  }
+  for (const selector of ['.composer-shell','.composer-usage-summary','.context-usage-trigger']) {
+    assert.deepEqual(declarations('./style.css', prefix + selector, desktop), {});
+    assert.deepEqual(declarations('./style.css', prefix + selector, {...phone,width:844}), {});
+  }
+});
+
+test('standalone chat with keyboard hidden uses only 16px of the bottom safe area without changing browser or keyboard rules', () => {
+  const selector = 'html[data-openbear-mobile-viewport]:not([data-openbear-keyboard]) .app-shell.is-console';
+  for (const width of [320,360,390,402,430,760]) {
+    assert.deepEqual(declarations('./style.css', selector, {...phone,width,'display-mode':'standalone'}), {'padding-bottom':'max(0px, calc(env(safe-area-inset-bottom, 0px) - 16px))'});
+    assert.deepEqual(declarations('./style.css', selector, {...phone,width,'display-mode':'browser'}), {});
+  }
+  assert.deepEqual(declarations('./style.css', selector, {...desktop,'display-mode':'standalone'}), {});
+  assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell', phone)['padding-bottom'], '0');
+});
+
 test('mobile recents keep title and status on one 44px row and reserve more height for the tree without changing desktop', () => {
   const path = './components/ConversationActivityFolder.vue';
   for (const env of [phone, {...phone, width: 320}, {...phone, width: 844, height: 390}]) {

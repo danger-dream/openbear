@@ -69,6 +69,38 @@ body {
     min-height: 0;
     overflow: hidden;
   }
+  /* The software keyboard replaces the bottom edge, so the home-indicator
+     reservation would otherwise leave a blank band above it. */
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell {
+    padding-bottom: 0;
+  }
+}
+@media (max-width: 760px) {
+  /* Compact only the chat footer while the software keyboard is present. */
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
+    padding-bottom: 0;
+  }
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-usage-summary {
+    min-height: 24px;
+    padding-top: 0;
+  }
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .context-usage-trigger {
+    height: 24px;
+  }
+}
+/* Limit the home-screen keyboard offset to 6px to keep statistics icons clear.
+   Safari's
+   browser accessory/address bars must not receive this extra downward offset. */
+@media (max-width: 760px) and (display-mode: standalone) {
+  /* With the keyboard hidden, use the upper 16px of the home-indicator safe
+     area for chat while retaining the remainder. Zero-inset devices stay zero.
+     Other pages and the browser retain their full original safe-area geometry. */
+  html[data-openbear-mobile-viewport]:not([data-openbear-keyboard]) .app-shell.is-console {
+    padding-bottom: max(0px, calc(env(safe-area-inset-bottom, 0px) - 16px));
+  }
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
+    transform: translateY(6px);
+  }
 }
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
    is added in that layout. Only its safe area needs reserving. */
