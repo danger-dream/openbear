@@ -82,11 +82,11 @@ body {
     padding-bottom: 0;
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-usage-summary {
-    min-height: 28px;
+    min-height: 24px;
     padding-top: 0;
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .context-usage-trigger {
-    height: 28px;
+    height: 24px;
   }
 }
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
