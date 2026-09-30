@@ -99,10 +99,13 @@ test('editor has primary vertical space and model is an unboxed secondary text e
     assert.equal(css(f,':deep(.reference-editor-content)',env)['min-height'],'min(3rem, calc(var(--mobile-viewport-height, 100dvh) * .22))');
     assert.equal(css(f,':deep(.reference-editor-content)',env)['font-size'],undefined);
     assert.equal(css(f,'.composer-clear:disabled',env).display,'none');
-    for(const s of ['.tool-btn','.send-button'])assert.equal(css(f,s,env).height,'44px');
+    assert.equal(css(f,'.tool-btn',env).height,'44px');
+    assert.deepEqual([css(f,'.send-button',env).width,css(f,'.send-button',env).height],['38px','38px'],'send button is modestly smaller on touch/phone');
   }
   assert.equal(css(f,'.composer-actions',desktop)['margin-left'],undefined,'desktop action geometry stays unchanged');
   assert.equal(css(f,'.composer-actions .tool-btn',desktop).width,undefined);
+  assert.deepEqual([css(f,'.send-button',desktop).width,css(f,'.send-button',desktop).height],['2rem','2rem'],'desktop send button stays unchanged');
+  assert.equal(css(f,'.composer-toolbar',{...phone,width:360})['grid-template-columns'],'minmax(0, 1fr) 38px','narrow phone reserves the resized send column');
   assert.equal(css(f,'.tool-btn:hover',desktop).background,'var(--ob-hover)','desktop feedback stays unchanged');
   assert.equal(css(f,'.composer-actions .tool-btn:hover',desktop).background,undefined);
   // The theme leakage that produced the outlined model pill has lower specificity

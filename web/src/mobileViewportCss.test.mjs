@@ -90,9 +90,10 @@ test('mobile recents keep title and status on one 44px row and reserve more heig
 test('touch targets are 44px with persistent remove/More visibility, zoom-safe input sizes and unchanged small icons', () => {
   for (const env of [phone, { ...phone, width: 1024 }, { ...desktop, width: 600 }]) {
     const composer = './views/consoleView/ConsoleComposer.vue';
-    for (const selector of ['.tool-btn', '.send-button', '.attachment-remove']) {
+    for (const selector of ['.tool-btn', '.attachment-remove']) {
       const value = declarations(composer, selector, env); assert.equal(value.width, '44px'); assert.equal(value.height, '44px');
     }
+    const send = declarations(composer, '.send-button', env); assert.equal(send.width, '38px'); assert.equal(send.height, '38px');
     assert.equal(declarations(composer, '.attachment-remove', env).opacity, '1');
     assert.equal(declarations(composer, '.attachment-remove svg', env).width, '0.82rem');
     for (const selector of ['.reference-editor-content', '.reference-editor-placeholder']) {

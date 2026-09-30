@@ -2467,7 +2467,7 @@ button.status-chip:hover, .status-chip-active {
 /* The extra usage control must not squeeze the model name away on small
    phones. Only the narrowest toolbar uses two tracks; all actions stay visible. */
 @media (max-width: 360px) {
-	.composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 44px; }
+	.composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 38px; }
 	.composer-status { display: contents; }
 	.composer-actions { grid-row: 2; grid-column: 1; }
 	.composer-toolbar button.run-config-chip { grid-row: 1; grid-column: 1; justify-self: start; max-width: 100%; }
@@ -2490,6 +2490,9 @@ button.status-chip:hover, .status-chip-active {
 		height: 44px;
 		flex: 0 0 auto;
 	}
+	/* Keep the tool controls at 44px height, but make the primary send button a
+	   little smaller so more of the row can be used by the model name. */
+	.send-button { width: 38px; height: 38px; }
 	.run-config-chip { min-height: 44px; }
 	.attachment-remove {
 		top: 0;
