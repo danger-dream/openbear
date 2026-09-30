@@ -76,12 +76,9 @@ body {
   }
 }
 @media (max-width: 760px) {
-  /* Compact only the chat footer while the software keyboard is present.
-     The 8px visual trial offset leaves all control sizes/layout measurements
-     unchanged; real iOS accessory-bar clearance still needs device acceptance. */
+  /* Compact only the chat footer while the software keyboard is present. */
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
     padding-bottom: 0;
-    transform: translateY(8px);
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-usage-summary {
     min-height: 24px;
@@ -89,6 +86,13 @@ body {
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .context-usage-trigger {
     height: 24px;
+  }
+}
+/* The user-requested 8px trial is for the home-screen app only. Safari's
+   browser accessory/address bars must not receive this extra downward offset. */
+@media (max-width: 760px) and (display-mode: standalone) {
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
+    transform: translateY(8px);
   }
 }
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
