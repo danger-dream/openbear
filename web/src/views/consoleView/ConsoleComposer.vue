@@ -2456,6 +2456,9 @@ button.status-chip:hover, .status-chip-active {
 	}
 	.run-config-chip-model { font-weight: 500; }
 	.run-config-chip-status { display: inline-flex; font-size: 10px; }
+	/* Phone uses the text itself as the menu affordance; the caret space is
+	   returned to the right-aligned model/status group. */
+	.composer-toolbar button.run-config-chip .chip-caret { display: none; }
 	.composer-clear:disabled { display: none; }
 	.composer-toolbar button.run-config-chip:focus-visible { outline: 2px solid var(--bear-accent); outline-offset: -2px; }
 	.run-config-chip-meta { display: none; }
