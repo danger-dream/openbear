@@ -2048,6 +2048,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .field-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .mac-input, .mac-textarea, .price-grid input { width: 100%; border: 1px solid var(--ob-border-strong); border-radius: 12px; background: rgb(var(--ob-surface-rgb) / .72); color: var(--ob-text); outline: none; }
 .mac-input { height: 34px; padding: 0 10px; }
+/* Desktop only: keep the search icon in its own gutter; the generic .mac-input
+   padding is later in the cascade than this input's Tailwind utility classes. */
+@media (min-width: 761px) {
+  .channel-model-search .mac-input { padding-left: 1.75rem; padding-right: 1.5rem; }
+}
 .mac-textarea { padding: 9px 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
 .mac-input:focus, .mac-textarea:focus, .price-grid input:focus { border-color: rgb(var(--ob-blue-rgb) / .38); background: var(--ob-surface); box-shadow: 0 0 0 3px rgb(var(--ob-blue-rgb) / .08); }
 .mac-checkbox, .capability-row label { display: inline-flex; align-items: center; gap: 8px; color: var(--ob-text); font-size: 12px; }
