@@ -50,7 +50,7 @@ test('mobile footer keeps context, then icon-only Tokens/cache, cost and duratio
 test('model link retains compression strategy immediately after the model name for both strategies', async () => {
   const template=ast.find(node=>node.type===1 && node.tag==='button' && node.props.some(prop=>prop.name==='class' && prop.value?.content.includes('run-config-chip')));
   for(const [contextStrategy,label] of [['sliding_window','滑窗压缩'],['model_summary','摘要压缩']]) {
-    const {html}=await render(template,{props:{contextStrategy},runConfigStrategyText:label,runConfigModelText:'GPT-6 Astra',runConfigMetaText:'',runConfigStatusLabel:'',runConfigThinkingBadge:''});
+    const {html}=await render(template,{props:{contextStrategy},runConfigStrategyText:label,runConfigModelText:'GPT-6 Astra',runConfigMetaText:'',runConfigMetaParts:[],runConfigStatusLabel:'',runConfigThinkingBadge:''});
     assert.ok(html.indexOf('GPT-6 Astra')<html.indexOf(`>${label}</span>`));
   }
 });

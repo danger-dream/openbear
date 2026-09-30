@@ -48,7 +48,7 @@ function harness(overrides = {}, tab = "main") {
   vm.runInContext(script, context);
   vm.runInContext(`runConfigTab.value = ${JSON.stringify(tab)}`, context);
   const bindings = proxyRefs(vm.runInContext(`({props, emit, runConfigTab, isAgentTab, contextDetailText, contextMeterStyle,
-    runConfigModelText, runConfigMetaText, runConfigStrategyText, runConfigThinkingBadge, runConfigStatusLabel, menuSelectedModel, menuThinkingLevels, menuSupportsThinking, menuThinkingLevel, menuDefaultThinking,
+    runConfigModelText, runConfigMetaText, runConfigMetaParts, runConfigStrategyText, runConfigThinkingBadge, runConfigStatusLabel, menuSelectedModel, menuThinkingLevels, menuSupportsThinking, menuThinkingLevel, menuDefaultThinking,
     agentFastTriState, fmtTokens, modelLabel, modelTags, modelFeatures, rolloverTriggerForModel, compactThinkingLabel, selectMenuModel, selectMenuThinking,
     activeModelDetail, modelDetailId, showModelFeature, clearModelDetail, runConfigPopoverVisible,
     runConfigContent, runConfigSearchInput, runConfigCompact, runConfigSettingsOpen, runConfigSettingsSummary, toggleRunConfigSettings, finishRunConfigSearch})`, context));
@@ -198,7 +198,9 @@ test('collapsed model button exposes the shared compression mode without losing 
   const button = html.match(/^<button[^>]*>/)[0];
   assert.match(button, /aria-label="运行配置"/);
   assert.match(button, /aria-description="上下文压缩：滑动窗口，思考强度：极高，Fast 模式已开启"/);
-  assert.match(html, /class="run-config-chip-meta">[^<]*极高 · Fast · 216K \/ 300K</);
+  assert.match(html, /class="run-config-chip-meta"><!--\[--><span class="run-config-meta-part"><!--\[-->极高<!--\]--><\/span><span class="run-config-meta-part run-config-meta-fast" title="Fast 模式"><span data-icon="zap"><\/span><\/span><span class="run-config-meta-part"><!--\[-->216K \/ 300K<!--\]--><\/span><!--\]--><\/span>/);
+  assert.equal((html.match(/class="run-config-chip-meta"[\s\S]*?<\/span><\/span>/)?.[0].match(/Fast(?! 模式)/g) || []).length, 0, 'desktop metadata uses the icon instead of Fast text');
+  assert.equal(h.bindings.runConfigMetaText, '极高 · Fast · 216K / 300K');
   assert.match(html, /class="run-config-chip-status" aria-hidden="true"/);
   assert.doesNotMatch(html, /run-config-chip-status" role="img"/);
   assert.match(html, /class="run-config-status-thinking">极高</, 'thinking shows only the level, without an icon');
