@@ -88,7 +88,7 @@ body {
     height: 24px;
   }
 }
-/* Limit the home-screen keyboard offset to 4px to keep statistics icons clear.
+/* Limit the home-screen keyboard offset to 6px to keep statistics icons clear.
    Safari's
    browser accessory/address bars must not receive this extra downward offset. */
 @media (max-width: 760px) and (display-mode: standalone) {
@@ -99,7 +99,7 @@ body {
     padding-bottom: max(0px, calc(env(safe-area-inset-bottom, 0px) - 16px));
   }
   html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console .composer-shell {
-    transform: translateY(4px);
+    transform: translateY(6px);
   }
 }
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar

@@ -62,12 +62,12 @@ test('phone safe top is reserved once by main/bar, bottom by shell, and fixed fl
   assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport] .app-shell.is-console', landscapeTouch).background, 'var(--ob-chat-bg)');
 });
 
-test('keyboard footer keeps browser geometry unshifted and limits the 4px offset to standalone', () => {
+test('keyboard footer keeps browser geometry unshifted and limits the 6px offset to standalone', () => {
   const prefix = 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell.is-console ';
   for (const width of [320,360,390,402,430,760]) {
     const env = {...phone,width};
     assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', {...env,'display-mode':'browser'}), {'padding-bottom':'0'}, 'browser keyboard must not push the footer below the viewport');
-    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', {...env,'display-mode':'standalone'}), {'padding-bottom':'0',transform:'translateY(4px)'}, 'only standalone retains the requested visual trial');
+    assert.deepEqual(declarations('./style.css', prefix + '.composer-shell', {...env,'display-mode':'standalone'}), {'padding-bottom':'0',transform:'translateY(6px)'}, 'only standalone retains the requested visual trial');
     assert.deepEqual(declarations('./style.css', prefix + '.composer-usage-summary', env), {'min-height':'24px','padding-top':'0'});
     assert.deepEqual(declarations('./style.css', prefix + '.context-usage-trigger', env), {height:'24px'});
     assert.equal(declarations('./views/consoleView/ConsoleComposer.vue', '.composer-shell', env).padding, '.5rem .75rem 8px', 'normal footer still keeps its original padding');
