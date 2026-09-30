@@ -966,7 +966,10 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
             op_id=f"status:{execution_run_uuid or turn_uuid or 'current'}", op_type="status", action="patch", turn_uuid=turn_uuid,
             run_root_turn_uuid=run_root_turn_uuid,
             run_id=execution_run_uuid,
-            payload={"statusText": str(event.get("status") or "运行中"), "active": True, "updatedAtMs": ts, "runId": execution_run_uuid},
+            payload={"statusText": str(event.get("status") or "运行中"), "active": True, "updatedAtMs": ts, "runId": execution_run_uuid,
+                     # null means "retain detail" in both snapshot reducers;
+                     # false explicitly clears this display-only activity field.
+                     "modelOutput": dict(event["modelOutput"]) if isinstance(event.get("modelOutput"), dict) else False},
             status="running", source="system",
         ))
         return specs

@@ -51,6 +51,7 @@ class StreamEvent:
       - "content"    正文增量（text）
       - "reasoning"  思考增量（text）；anthropic 还可带 signature
       - "encrypted_reasoning" 加密思考展示（text，整段替换）；不作为可读思考聚合或回灌
+      - "tool_input" 参数生成活动（details，仅工具名/字节数/时间，不含参数，不可执行）
       - "tool_call"  完整工具调用集合（tool_calls）
       - "usage"      用量（usage）
       - "finish"     结束（finish_reason: stop|tool_calls|length|...）

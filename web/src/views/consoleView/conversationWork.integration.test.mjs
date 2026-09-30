@@ -10,7 +10,7 @@ import {projectOperationMessages} from '../../timelineProjection.js';
 import {contextMeter, conversationWorkChunks, isInlineProcess, lastAnswerIndex, reasoningDuration, workDurationLabel, WORK_MOTION} from './conversationWork.js';
 
 // Execute the real Vue components in memory, without a browser/layout engine.
-const files = ['ConversationWorkBlock.vue', 'ConversationProcessEvent.vue', 'ConversationRetryEvent.vue', 'WorkDisclosure.vue', 'ContextUsageMeter.vue', 'ConsoleToolEvent.vue', 'TurnList.vue', 'TurnEvent.vue'];
+const files = ['ConversationWorkBlock.vue', 'ConversationProcessEvent.vue', 'ConversationRetryEvent.vue', 'WorkDisclosure.vue', 'ContextUsageMeter.vue', 'ConsoleToolEvent.vue', 'TurnList.vue', 'TurnEvent.vue', 'ModelOutputProgress.vue'];
 const sources = Object.fromEntries(files.map(f => [f, fs.readFileSync(new URL(f, import.meta.url), 'utf8')]));
 const descriptors = Object.fromEntries(files.map(f => [f, parse(sources[f], {filename: f}).descriptor]));
 const compiled = Object.fromEntries(files.map(f => [f, compileScript(descriptors[f], {id: f, inlineTemplate: true}).content]));
@@ -172,6 +172,34 @@ test('running indicator in the real TurnList retains the original three-dot anim
   assert.equal(dots.props['aria-label'],'正在思考');
   assert.equal(dots.children.filter(n => n.type === 'span').length,3);
   assert.equal(find(root,'process-waiting'),undefined);
+});
+
+test('real TurnList displays streaming tool-input activity and restores dots when it ends', async t => {
+  const now = Date.now();
+  const event = {kind:'live_status',id:'running',persistentRunIndicator:true,active:true,
+    modelOutput:{toolNames:['Write'],receivedBytes:12010,startedAtMs:now-201000,updatedAtMs:now,elapsedMs:201000,phase:'generating'}};
+  const props = reactive({turns:[{id:'turn',events:[event]}],running:true,detailKey:()=>'',isDetailOpen:()=>false,activeToolResultIndex:()=>0});
+  const root = mount(t,'TurnList.vue',props);
+  assert.match(text(root),/正在生成文件内容/);
+  assert.match(text(root),/12.01 kB/);
+  assert.match(text(root),/3分21秒/);
+  assert.equal(find(root,'thinking-dots'),undefined);
+  const line = find(root,'model-output-progress');
+  assert.ok(hasClass(line,'conversation-process'),'uses the existing compact tool-row shell');
+  assert.equal(find(root,'tool-event'),undefined,'must not wrap the generation row in the old tool card');
+  assert.equal(find(root,'model-output-track'),undefined,'no independent activity bar');
+  assert.equal(find(root,'model-output-tool'),undefined,'no separate tool-name badge');
+  assert.match(line.props['aria-label'],/尚未执行工具/);
+  assert.ok(walk(line).some(n=>hasClass(n,'work-status-sweep')),'uses existing tool text sweep');
+  assert.equal(find(line,'process-icon').props['stroke-width'],1.75);
+  props.turns[0].events[0].modelOutput.updatedAtMs = now-30000;
+  await nextTick();
+  assert.match(text(root),/30秒未收到新参数/);
+  assert.equal(walk(line).some(n=>hasClass(n,'work-status-sweep')),false);
+  props.turns[0].events[0].modelOutput = null;
+  await nextTick();
+  assert.equal(find(root,'model-output-progress'),undefined);
+  assert.ok(find(root,'thinking-dots'));
 });
 
 test('new tool disclosure defers detail rendering and preserves complete existing result and native detail behavior', async t => {

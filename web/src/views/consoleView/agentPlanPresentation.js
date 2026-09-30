@@ -1,3 +1,5 @@
+import {modelOutputView} from './modelOutputPresentation.js';
+
 const PHASE_META = {
   drafting: { label: "正在制定计划", tone: "active", description: "Agent 正在把任务拆成可检查的执行步骤。" },
   awaiting_plan_decision: { label: "等待计划确认", tone: "waiting", description: "执行计划已提交，正在等待主控确认。" },
@@ -875,7 +877,10 @@ export function compactAgentStepActivityLines(events = [], options = {}) {
       const chars = number(detail.textChars || detail.text_chars);
       updateModel(item, (label) => {
         const retry = modelState?.attempt && modelState?.maximum ? `重试 ${modelState.attempt}/${modelState.maximum}` : "";
-        const statusText = `流式输出中${chars ? ` · ${chars} 字` : ""}`;
+        const input = detail.toolInput ? modelOutputView(detail.toolInput, detail.toolInput.updatedAtMs) : null;
+        const statusText = input
+          ? `${input.label}${input.tools ? ` · ${input.tools}` : ''} · 已接收 ${input.bytes} · ${input.elapsed}`
+          : `流式输出中${chars ? ` · ${chars} 字` : ""}`;
         return {
           message: `模型调用：${label}${retry ? ` · ${retry}` : ""} · ${statusText}`,
           description: retry,

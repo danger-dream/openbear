@@ -23,6 +23,7 @@ from app.llm.client import HTTPClient
 from app.llm.error_payloads import error_event, read_error
 from app.llm.events import StreamEvent, ToolCall, Usage
 from app.llm.multimodal import text_from_content, to_openai_chat_content
+from app.llm.tool_input import ToolInputTracker
 from app.logging import get_logger
 from app.models.thinking import api_effort, normalize_think_level
 
@@ -186,6 +187,7 @@ class OpenAIChatBackend(LLMBackend):
         )
 
         pending: dict[int, ToolCall] = {}
+        tool_input = ToolInputTracker()
         finish_reason = ""
         provider_billing: dict[str, Any] = {}
         url = f"{self._base}/chat/completions"
@@ -240,6 +242,9 @@ class OpenAIChatBackend(LLMBackend):
                         slot.name = fn["name"]
                     if fn.get("arguments"):
                         slot.arguments += fn["arguments"]
+                    progress = tool_input.update(str(idx), name=slot.name, delta=fn.get("arguments") or "")
+                    if progress is not None:
+                        yield progress
                 fr = choice.get("finish_reason")
                 if fr:
                     finish_reason = fr
@@ -253,6 +258,10 @@ class OpenAIChatBackend(LLMBackend):
             # Compatible relays sometimes report stop on a complete tool turn.
             # Preserve that recovery, never override length/content_filter.
             calls = [pending[i] for i in sorted(pending)]
+            for i in sorted(pending):
+                progress = tool_input.update(str(i), name=pending[i].name, arguments=pending[i].arguments, done=True)
+                if progress is not None:
+                    yield progress
             yield StreamEvent(kind="tool_call", tool_calls=calls)
             finish_reason = "tool_calls"
         yield StreamEvent(

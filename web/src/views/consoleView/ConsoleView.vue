@@ -160,6 +160,7 @@ const running = ref(false);
 const sendPending = ref(false);
 const foregroundRunning = ref(false);
 const rootTurnRunning = ref(false);
+const modelOutputProgress = ref(null);
 const activeRunTurnUuid = ref("");
 const messages = ref([]);
 const draftByConversation = ref(loadDraftStore());
@@ -2107,6 +2108,7 @@ function projectOperationMessages(operations = orderedOperationsList()) {
 }
 
 function clearActiveRun() {
+	modelOutputProgress.value = null;
 	activeRunTurnUuid.value = "";
 }
 
@@ -2213,6 +2215,7 @@ function syncRunStateFromOperations(operations = orderedOperationsList(), stateF
 	running.value = Boolean(derived.running || stateBackgroundRunning || stateForegroundRunning);
 	foregroundRunning.value = hasForeground;
 	rootTurnRunning.value = Boolean(derived.rootTurnRunning);
+	modelOutputProgress.value = derived.modelOutput || null;
 	activeRunTurnUuid.value = derived.activeRootTurnId || "";
 	runStartedAt.value = Number(derived.activeStartedAtMs || 0)
 		|| (stateForegroundRunning ? Number(stateFacts?.live?.startedAtMs || 0) : 0)
@@ -2570,6 +2573,7 @@ function withTransientIdleThinking(turnList = []) {
 	}, {
 		startedAtMs: runStartedAt.value,
 		lastVisibleOutputAtMs: lastVisibleOutputAt,
+		modelOutput: modelOutputProgress.value,
 	});
 }
 

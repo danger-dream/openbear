@@ -33,6 +33,7 @@ from app.llm.client import HTTPClient
 from app.llm.error_payloads import error_event, read_error
 from app.llm.events import StreamEvent, ToolCall, Usage
 from app.llm.multimodal import to_openai_responses_content
+from app.llm.tool_input import ToolInputTracker
 from app.logging import get_logger
 from app.models.thinking import api_effort, normalize_think_level
 
@@ -289,6 +290,7 @@ class OpenAIResponsesBackend(LLMBackend):
         url = f"{self._base}/responses"
 
         calls: list[ToolCall] = []
+        tool_input = ToolInputTracker()
         indexed_items: dict[int, dict[str, Any]] = {}
         unindexed_items: dict[str, dict[str, Any]] = {}
         item_indices: dict[str, int] = {}
@@ -381,6 +383,16 @@ class OpenAIResponsesBackend(LLMBackend):
                                 yield StreamEvent(kind="content", text=tail)
             elif t == "response.reasoning_summary_text.delta":
                 yield StreamEvent(kind="reasoning", text=data.get("delta", ""))
+            elif t in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
+                oi = data.get("output_index")
+                key = str(data.get("item_id") or index_ids.get(oi) or f"index:{oi}")
+                progress = tool_input.update(
+                    key, delta=str(data.get("delta") or ""),
+                    arguments=data.get("arguments") if t.endswith(".done") else None,
+                    done=t.endswith(".done"),
+                )
+                if progress is not None:
+                    yield progress
             elif t in {"response.output_item.added", "response.output_item.done"}:
                 item = data.get("item") or {}
                 if isinstance(item, dict) and item:
@@ -392,6 +404,14 @@ class OpenAIResponsesBackend(LLMBackend):
                             index_ids[output_index] = item_id
                     else:
                         output_index = item_indices.get(item_id)
+                    if item.get("type") == "function_call":
+                        progress = tool_input.update(
+                            item_id or f"index:{output_index}", name=str(item.get("name") or ""),
+                            arguments=item.get("arguments") if isinstance(item.get("arguments"), str) else None,
+                            done=t == "response.output_item.done",
+                        )
+                        if progress is not None:
+                            yield progress
                     encrypted = item.get("encrypted_content")
                     if item.get("type") == "reasoning" and isinstance(encrypted, str) and encrypted:
                         # Added/done carry complete opaque values, not deltas.

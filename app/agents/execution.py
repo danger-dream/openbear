@@ -42,6 +42,7 @@ from app.llm.base import (
     OpenBearLLMError,
 )
 from app.llm.events import ToolCall, Usage
+from app.llm.tool_input import tool_input_status
 from app.llm.retry import (
     RetryCancelledError,
     RetryPolicy,
@@ -2018,6 +2019,13 @@ class AgentExecutor(AgentTaskContext):
             partial = logical_partial
             if event.kind in {"content", "reasoning"}:
                 await persist_partial()
+            elif event.kind == "tool_input":
+                progress = {**event.details, "attemptId": outcome.attempt_id}
+                summary = tool_input_status(progress)
+                await self.dao.update_task(self.task_uuid, current_status=summary)
+                await self.emit("model_stream_progress", agent_key=self.agent.agent_key,
+                    summary=summary, detail={"round": round_no, "attempt": max(0, attempt_no - 1),
+                                            "toolInput": progress})
 
         async def settle(outcome):
             usage = outcome.response.usage

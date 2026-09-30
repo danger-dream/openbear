@@ -401,6 +401,10 @@ export function deriveOperationRunState(operations = []) {
   const foregroundRunning = !supervisionWaiting && (rootTurnRunning || (activeTools.length > 0 && activeAgents.length === 0));
   const backgroundRunning = supervisionWaiting || (!foregroundRunning && activeAgents.length > 0);
   const activeRootRun = activeRootRuns.at(-1) || null;
+  const outputStatus = active.filter((op) => op.opType === "status"
+    && String(op.runRootTurnId || op.turnId || "") === String(activeRootRun?.runRootTurnId || activeRootRun?.turnId || "")).at(-1);
+  const modelOutput = foregroundRunning && !activeTools.length && isPlainObject(outputStatus?.payload?.modelOutput)
+    ? outputStatus.payload.modelOutput : null;
   const activeTurn = activeRootRun || activeTools.at(-1) || null;
   const activeAgent = activeAgents.at(-1) || null;
   const activeSupervisor = activeSupervision.at(-1) || null;
@@ -415,7 +419,8 @@ export function deriveOperationRunState(operations = []) {
     foregroundRunning,
     backgroundRunning,
     running: foregroundRunning || backgroundRunning,
-    statusLabel,
+    statusLabel: modelOutput ? (outputStatus.payload.statusText || statusLabel) : statusLabel,
+    modelOutput,
     activeTurnId: activeTurn?.turnId || activeTurn?.turnUuid || "",
     activeStartedAtMs: startedAt,
     activeOperationIds: active.map((op) => op.opId).filter(Boolean),
@@ -441,8 +446,9 @@ export function withTransientIdleThinking(turnList = [], runState = {}, options 
       events: [...events, {
         kind: "live_status",
         id: "transient-run-thinking",
-        status: "正在思考 …",
-        startedAt: Number(options.startedAtMs || options.lastVisibleOutputAtMs || Date.now()) || Date.now(),
+        status: options.modelOutput ? "正在生成工具参数" : "正在思考 …",
+        modelOutput: options.modelOutput || null,
+        startedAt: Number(options.modelOutput?.startedAtMs || options.startedAtMs || options.lastVisibleOutputAtMs || Date.now()) || Date.now(),
         active: true,
         transient: true,
         persistentRunIndicator: true,

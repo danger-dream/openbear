@@ -3,6 +3,7 @@ import {ArrowRight, Bell, CircleCheck, CircleClose, MagicStick, Refresh, Tools} 
 import AgentEventCard from "./AgentEventCard.vue";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import ConsoleToolEvent from "./ConsoleToolEvent.vue";
+import ModelOutputProgress from "./ModelOutputProgress.vue";
 import ConsoleUserInteractionEvent from "./ConsoleUserInteractionEvent.vue";
 import {isAgentEvent, modelRetryReasonLabel, toolResultKey, toolStatus} from "./display.js";
 import {answerContent, hasMeaningfulAnswerText} from "./markdown.js";
@@ -179,6 +180,8 @@ function isFailureAnswer(event = {}) {
 			</span>
 		</div>
 	</div>
+
+	<ModelOutputProgress v-else-if="props.event.kind === 'live_status' && props.event.modelOutput" :progress="props.event.modelOutput"/>
 
 	<div v-else-if="props.event.kind === 'live_status'" class="tool-event live-status-event"
 	     :class="{ 'process-live': props.event.active !== false && !props.event.queued, 'agent-notice-event': props.event.agentNotice, 'thinking-only-event': props.event.persistentRunIndicator }">

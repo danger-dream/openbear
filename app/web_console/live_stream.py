@@ -5,6 +5,7 @@ import inspect
 
 from app.agent.native_continuation import serialize_messages, validate_model_context
 from app.context.window import mark_source, neutral_context, source_of
+from app.llm.tool_input import tool_input_status
 from app.task_memory import without_task_memory_runtime_messages
 from app.web_console.core import *
 from app.web_operations import AGENT_TOOL_NAMES
@@ -647,6 +648,15 @@ class _WebStreamRenderer:
 
     async def on_status(self, status: str) -> None:
         await self.emit({"type": "status", "status": status})
+
+    async def on_model_output_progress(self, progress: dict[str, Any] | None) -> None:
+        if self.live is not None and self.live.status != "running":
+            return  # An external stop has already closed this run; never reopen its status.
+        await self.emit({
+            "type": "status",
+            "status": tool_input_status(progress) if progress else "模型参数输出已结束",
+            "modelOutput": dict(progress) if progress else None,
+        })
 
     async def on_retry_state(self, state: dict[str, Any]) -> None:
         await self.emit({"type": "retry_wait", "retry": dict(state)})

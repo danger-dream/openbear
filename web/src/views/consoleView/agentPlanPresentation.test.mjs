@@ -90,6 +90,18 @@ test("step activity falls back to persisted step times when the recent page star
   assert.deepEqual(lines.map((item) => item.seq), [201, 202, 203, 204]);
 });
 
+test('Agent model row shows parameter generation rather than pretending a tool is running', () => {
+  const rows = compactAgentStepActivityLines([
+    {seq:1,kind:'model_call_started',detail:{modelLabel:'OpenAI/gpt'}},
+    {seq:2,kind:'model_stream_progress',detail:{toolInput:{toolNames:['Write'],receivedBytes:12010,updatedAtMs:202000,elapsedMs:201000,phase:'generating'}}},
+  ]);
+  assert.equal(rows.length,1);
+  assert.match(rows[0].message,/正在生成文件内容/);
+  assert.match(rows[0].message,/12.01 kB/);
+  assert.match(rows[0].message,/3分21秒/);
+  assert.doesNotMatch(rows[0].message,/调用工具 Write/);
+});
+
 test("step activity compacts model streaming and tool lifecycle into logical rows", () => {
   const events = [
     {key: "m1", seq: 1, kind: "model_call_started", timeLabel: "11:37:13", detail: {modelLabel: "OpenAI/gpt-5.6-sol", thinkLevel: "xhigh"}},

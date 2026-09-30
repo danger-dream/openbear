@@ -55,7 +55,7 @@ class ObserverProxy:
 
     _presentation_methods = frozenset({
         "on_status", "on_delta", "on_tool", "on_tool_start", "on_tool_result",
-        "on_tool_update", "on_tool_progress", "on_retry_state", "set_footer",
+        "on_tool_update", "on_tool_progress", "on_model_output_progress", "on_retry_state", "set_footer",
         "cut", "finalize", "finalize_notice", "fail",
     })
 

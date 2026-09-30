@@ -666,6 +666,8 @@ class Agent:
                 native_output_items = []
                 native_round_replayable = True
                 attempts_started = 0
+                tool_input_active = False
+                input_progress = getattr(renderer, "on_model_output_progress", None)
 
                 async def prepare(retry_tail):
                     nonlocal convo
@@ -693,12 +695,15 @@ class Agent:
                     result.model_calls += 1
 
                 async def observe(event, partial, outcome):
-                    nonlocal full_text, reasoning_text, open_rendered, encrypted_reasoning_text
+                    nonlocal full_text, reasoning_text, open_rendered, encrypted_reasoning_text, tool_input_active
                     full_text, reasoning_text = partial.text, partial.reasoning
                     if event.kind == "encrypted_reasoning":
                         encrypted_reasoning_text = event.text
                     if event.kind in {"content", "reasoning", "tool_call"} and not result.first_token_ms:
                         result.first_token_ms = max(1, int((time.monotonic() - t0) * 1000))
+                    if event.kind == "tool_input" and input_progress is not None:
+                        tool_input_active = True
+                        await input_progress({**event.details, "attemptId": outcome.attempt_id})
                     if event.kind == "content":
                         open_rendered = True
                         await renderer.on_delta(full_text, _reasoning_for_display())
@@ -706,6 +711,10 @@ class Agent:
                         await renderer.on_delta(full_text, _reasoning_for_display())
 
                 async def settle(outcome):
+                    nonlocal tool_input_active
+                    if tool_input_active and input_progress is not None:
+                        await input_progress(None)
+                        tool_input_active = False
                     response = outcome.response
                     usage = response.usage
                     result.usage.merge(usage)

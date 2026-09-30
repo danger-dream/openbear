@@ -26,6 +26,7 @@ from app.llm.client import HTTPClient
 from app.llm.error_payloads import error_event, read_error
 from app.llm.events import StreamEvent, ToolCall, Usage
 from app.llm.multimodal import text_from_content, to_anthropic_content
+from app.llm.tool_input import ToolInputTracker
 from app.logging import get_logger
 from app.models.thinking import api_effort, normalize_think_level
 
@@ -334,6 +335,7 @@ class AnthropicBackend(LLMBackend):
 
         # content_block 索引 → 累积状态
         blocks: dict[int, dict[str, Any]] = {}
+        tool_input = ToolInputTracker()
         in_usage = Usage()
         stop_reason = ""
         message_stopped = False
@@ -366,6 +368,10 @@ class AnthropicBackend(LLMBackend):
                 blocks[idx] = {"type": cb.get("type"), "id": cb.get("id", ""),
                                "name": cb.get("name", ""), "args": "",
                                "native": dict(cb) if cb.get("type") in {"thinking", "redacted_thinking", "text", "tool_use"} else None}
+                if cb.get("type") == "tool_use":
+                    progress = tool_input.update(str(idx), name=cb.get("name") or "")
+                    if progress is not None:
+                        yield progress
             elif t == "content_block_delta":
                 idx = data.get("index", 0)
                 d = data.get("delta") or {}
@@ -392,10 +398,17 @@ class AnthropicBackend(LLMBackend):
                 elif dt == "input_json_delta":
                     blocks.setdefault(idx, {"args": ""})
                     blocks[idx]["args"] = blocks[idx].get("args", "") + d.get("partial_json", "")
+                    progress = tool_input.update(str(idx), delta=d.get("partial_json") or "")
+                    if progress is not None:
+                        yield progress
             elif t == "content_block_stop":
                 idx = data.get("index", 0)
                 blk = blocks.get(idx) or {}
                 blk["closed"] = True
+                if blk.get("type") == "tool_use":
+                    progress = tool_input.update(str(idx), arguments=blk.get("args") or "", done=True)
+                    if progress is not None:
+                        yield progress
                 native = blk.get("native")
                 if native is not None:
                     if native.get("type") == "tool_use":
