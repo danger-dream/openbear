@@ -69,6 +69,11 @@ body {
     min-height: 0;
     overflow: hidden;
   }
+  /* The software keyboard replaces the bottom edge, so the home-indicator
+     reservation would otherwise leave a blank band above it. */
+  html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell {
+    padding-bottom: 0;
+  }
 }
 /* A landscape phone/tablet can retain the existing wide sidebar; no 48px bar
    is added in that layout. Only its safe area needs reserving. */

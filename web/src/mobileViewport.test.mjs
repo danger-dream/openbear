@@ -37,6 +37,9 @@ function environment({ mobile = true, visual = true } = {}) {
     cancelAnimationFrame(id) { frames.delete(id); },
     scrollTo() { assert.fail('must not force document scroll'); },
   });
+  win.document.activeElement = null;
+  win.document.addEventListener = win.addEventListener; win.document.removeEventListener = win.removeEventListener;
+  win.document.emit = win.emit;
   return { win, root, media, standalone, viewport, writes, styles, attributes, frames,
     flush() { const batch = [...frames.values()]; frames.clear(); batch.forEach(fn => fn()); },
     value: key => root.style.getPropertyValue(`--mobile-viewport-${key}`),
@@ -102,6 +105,26 @@ test('phone keyboard resize, viewport offset/scroll, keyboard dismissal and rota
   h.standalone.emit('change'); h.flush(); h.win.emit('pageshow'); h.flush();
   assert.deepEqual(calls, Array.from({ length: 7 }, () => ['before', 'anchor']).flat());
   stop(); assert.equal(h.attributes.size, 0); assert.equal(h.styles.size, 0);
+});
+
+test('software keyboard drops the bottom safe-area reservation only while an editor is focused and the visual viewport shrinks', () => {
+  const h = environment(), attr = 'data-openbear-keyboard', editor = { tagName: 'TEXTAREA' };
+  const stop = installMobileViewport({ window: h.win });
+  assert.equal(h.attributes.has(attr), false);
+  h.win.document.activeElement = editor; h.viewport.height = 430; h.viewport.emit('resize'); h.flush();
+  assert.equal(h.attributes.has(attr), true, 'focused editor plus a large shrink is a keyboard');
+  h.viewport.height = 800; h.win.document.activeElement = null; h.win.document.emit('focusout'); h.flush();
+  assert.equal(h.attributes.has(attr), false, 'dismissal restores the reservation');
+  h.win.document.activeElement = editor; h.viewport.height = 430; h.viewport.emit('resize'); h.flush();
+  h.viewport.height = 800; h.viewport.emit('resize'); h.flush();
+  assert.equal(h.attributes.has(attr), false, 'keyboard hide while focus remains also restores it');
+  h.win.document.activeElement = { tagName: 'BUTTON' }; h.viewport.height = 430; h.viewport.emit('resize'); h.flush();
+  assert.equal(h.attributes.has(attr), false, 'browser/toolbar-like shrink without a text editor is ignored');
+  h.win.document.activeElement = { tagName: 'INPUT', type: 'text' }; h.viewport.height = 700; h.viewport.emit('resize'); h.flush();
+  assert.equal(h.attributes.has(attr), false, 'small toolbar-sized changes are ignored');
+  h.viewport.height = 430; h.viewport.emit('resize'); h.flush();
+  assert.equal(h.attributes.has(attr), true);
+  stop(); assert.equal(h.attributes.size, 0);
 });
 
 test('fallback without VisualViewport, desktop transition and teardown restore previous values/priorities exactly', () => {
