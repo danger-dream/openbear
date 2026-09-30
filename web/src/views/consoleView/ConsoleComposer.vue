@@ -2427,7 +2427,10 @@ button.status-chip:hover, .status-chip-active {
 	/* Move the complete controls (including their hit areas and feedback)
 	   left, and give the reclaimed 12px to the model instead of just painting
 	   translated icons. The 44px controls remain separate and reachable. */
-	.composer-actions { flex: 0 0 auto; gap: 0; margin-left: -12px; }
+	.composer-actions { flex: 0 0 auto; gap: 0; margin-left: -9px; }
+	/* Tighten the icon pitch without shrinking the 44px touch height. The 3px
+	   group offset difference keeps the first icon at its current position. */
+	.composer-actions .tool-btn { width: 38px; }
 	.composer-actions .tool-btn:hover, .composer-actions .tool-btn-active {
 		background: radial-gradient(circle at center, var(--ob-hover) 0 16px, transparent 16.5px);
 	}
