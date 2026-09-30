@@ -92,13 +92,17 @@ test('editor has primary vertical space and model is an unboxed secondary text e
     assert.equal(css(f,'.composer-status .run-config-chip-strategy',env).display,'inline');
     assert.equal(css(f,'.run-config-chip-status',env).display,'inline-flex','phone shows active thinking/Fast beside the model');
     assert.equal(css(f,'.run-config-chip-status',env)['font-size'],'10px','status matches the compression label size');
-    assert.equal(css(f,'.composer-actions .tool-btn',env).transform,undefined,'status display does not move the tool buttons');
-    assert.equal(css(f,'.tool-btn:hover',env).background,'var(--ob-hover)','status display does not restyle tool feedback');
+    assert.equal(css(f,'.composer-actions',env)['margin-left'],'-12px','move the whole action group and reclaim real model space');
+    assert.equal(css(f,'.composer-actions .tool-btn',env).transform,undefined,'icons are not translated independently of their controls');
+    assert.equal(css(f,'.composer-actions .tool-btn:hover',env).background,'radial-gradient(circle at center, var(--ob-hover) 0 16px, transparent 16.5px)','phone feedback is a centered 32px circle inside the 44px target');
     assert.equal(css(f,':deep(.reference-editor-content)',env)['min-height'],'min(3rem, calc(var(--mobile-viewport-height, 100dvh) * .22))');
     assert.equal(css(f,':deep(.reference-editor-content)',env)['font-size'],undefined);
     assert.equal(css(f,'.composer-clear:disabled',env).display,'none');
     for(const s of ['.tool-btn','.send-button'])assert.equal(css(f,s,env).height,'44px');
   }
+  assert.equal(css(f,'.composer-actions',desktop)['margin-left'],undefined,'desktop action geometry stays unchanged');
+  assert.equal(css(f,'.tool-btn:hover',desktop).background,'var(--ob-hover)','desktop feedback stays unchanged');
+  assert.equal(css(f,'.composer-actions .tool-btn:hover',desktop).background,undefined);
   // The theme leakage that produced the outlined model pill has lower specificity
   // than this mobile scoped selector, independently of bundle load order.
   const compiled=compileStyle({source:descriptors[f].styles[0].content,filename:f,id:'data-v-composer',scoped:true}).code;

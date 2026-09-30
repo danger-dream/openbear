@@ -2424,7 +2424,13 @@ button.status-chip:hover, .status-chip-active {
 		gap: 0;
 		padding: 0;
 	}
-	.composer-actions { flex: 0 0 auto; gap: 0; }
+	/* Move the complete controls (including their hit areas and feedback)
+	   left, and give the reclaimed 12px to the model instead of just painting
+	   translated icons. The 44px controls remain separate and reachable. */
+	.composer-actions { flex: 0 0 auto; gap: 0; margin-left: -12px; }
+	.composer-actions .tool-btn:hover, .composer-actions .tool-btn-active {
+		background: radial-gradient(circle at center, var(--ob-hover) 0 16px, transparent 16.5px);
+	}
 	.composer-status {
 		flex: 1 1 0;
 		min-width: 0;
