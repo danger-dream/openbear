@@ -79,6 +79,16 @@ test('keyboard footer keeps browser geometry unshifted and limits the 8px trial 
   }
 });
 
+test('standalone chat with keyboard hidden uses only 16px of the bottom safe area without changing browser or keyboard rules', () => {
+  const selector = 'html[data-openbear-mobile-viewport]:not([data-openbear-keyboard]) .app-shell.is-console';
+  for (const width of [320,360,390,402,430,760]) {
+    assert.deepEqual(declarations('./style.css', selector, {...phone,width,'display-mode':'standalone'}), {'padding-bottom':'max(0px, calc(env(safe-area-inset-bottom, 0px) - 16px))'});
+    assert.deepEqual(declarations('./style.css', selector, {...phone,width,'display-mode':'browser'}), {});
+  }
+  assert.deepEqual(declarations('./style.css', selector, {...desktop,'display-mode':'standalone'}), {});
+  assert.equal(declarations('./style.css', 'html[data-openbear-mobile-viewport][data-openbear-keyboard] .app-shell', phone)['padding-bottom'], '0');
+});
+
 test('mobile recents keep title and status on one 44px row and reserve more height for the tree without changing desktop', () => {
   const path = './components/ConversationActivityFolder.vue';
   for (const env of [phone, {...phone, width: 320}, {...phone, width: 844, height: 390}]) {
