@@ -349,7 +349,7 @@ test('Agent unset thinking is presented as following the main conversation, not 
   const {html} = await h.render();
   const tooltips = h.tooltips;
   assert.match(html, />跟随</);
-  assert.match(html, /跟随 · 低/);
+  assert.match(html, /跟随：低/);
   assert.doesNotMatch(html, /<button[^>]*>默认<\/button>/);
   assert.ok(tooltips.includes('跟随主会话思考强度，当前为低'));
   assert.match(h.bindings.runConfigSettingsSummary, /^思考 跟随/);
