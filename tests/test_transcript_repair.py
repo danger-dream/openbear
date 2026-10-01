@@ -312,3 +312,14 @@ def test_alternation_tool_to_user_inserts_anthropic_safe_append_only_bridge():
 
 def test_alternation_empty_input():
     assert repair_role_alternation([]) == []
+
+
+def test_is_role_alternation_bridge_matches_only_exact_marker():
+    from app.agent.transcript_repair import is_role_alternation_bridge
+
+    assert is_role_alternation_bridge("[protocol: role-alternation bridge]")
+    assert is_role_alternation_bridge("  [protocol: role-alternation bridge]\n")
+    assert not is_role_alternation_bridge("说明 [protocol: role-alternation bridge]")
+    assert not is_role_alternation_bridge("")
+    assert not is_role_alternation_bridge(None)
+    assert not is_role_alternation_bridge([{"type": "text"}])

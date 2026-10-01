@@ -25,7 +25,11 @@ from app.runtime.lifecycle import RunSession, ObserverProxy
 from app.runtime.tool_result import ToolOutcome
 from app.context.window import source_of
 from app.agent.tool_call_hooks import normalize_tool_calls
-from app.agent.transcript_repair import MISSING_TOOL_RESULT_TEXT, repair_role_alternation
+from app.agent.transcript_repair import (
+    MISSING_TOOL_RESULT_TEXT,
+    is_role_alternation_bridge,
+    repair_role_alternation,
+)
 from app.context.request_view import expanded_request_view
 from app.context.runtime import WindowRuntime
 from app.context.store import ControllerMessagesAppended, StaleWindow, merge_controller_additions
@@ -1107,6 +1111,10 @@ class Agent:
                 # on_message 已经把新消息排入 steering 队列且不再另起 run，就会形成静默吞消息。
                 # 所以在定稿前最后 drain 一次：先把当前 assistant 作为上一段落库/回灌，
                 # 软分段后把插话作为 user 注入，再继续请求模型。
+                bridge_echo = is_role_alternation_bridge(full_text)
+                if bridge_echo:
+                    log.warning("模型只复述了协议桥接标记，按空响应处理", 轮次=round_no)
+                    full_text = ""
                 final_steers = _drain_steers()
                 if final_steers:
                     if full_text or reasoning_text:
