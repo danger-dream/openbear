@@ -1877,6 +1877,47 @@ async def test_empty_response_retry_then_succeed():
         f"补救重试制造了连续 user: {roles}"
 
 
+async def test_bridge_marker_echo_is_treated_as_empty_response_then_retries():
+    """模型整条回复只复述协议桥接标记时，不能当作最终回答，应走空响应补救。"""
+    marker = "[protocol: role-alternation bridge]"
+    backend = FakeBackend([
+        [StreamEvent(kind="content", text=marker),
+         StreamEvent(kind="finish", finish_reason="stop")],
+        [StreamEvent(kind="content", text="这是真正的回答"),
+         StreamEvent(kind="finish", finish_reason="stop")],
+    ])
+    agent = Agent(backend, _echo_registry(), empty_response_retry_limit=1)
+    rec = RecordRenderer()
+    r = await agent.run([{"role": "user", "content": "hi"}], rec, model="m")
+    assert r.text == "这是真正的回答"
+    assert r.model_retry >= 1
+    assert marker not in rec.final
+
+
+async def test_bridge_marker_echo_at_limit_is_not_delivered_as_final_text():
+    """补救次数用完后仍只有桥接标记：收尾为空，不把标记当作回复内容。"""
+    marker = "[protocol: role-alternation bridge]"
+    backend = FakeBackend([[StreamEvent(kind="content", text=marker),
+                            StreamEvent(kind="finish", finish_reason="stop")]])
+    agent = Agent(backend, _echo_registry(), empty_response_retry_limit=1)
+    rec = RecordRenderer()
+    r = await agent.run([{"role": "user", "content": "hi"}], rec, model="m")
+    assert r.text == ""
+    assert r.model_calls == 2
+    assert marker not in rec.final
+
+
+async def test_text_that_merely_mentions_bridge_marker_is_kept():
+    """只有“整条回复恰好等于标记”才被拦截，正常讨论该标记的回答不受影响。"""
+    answer = "这条 [protocol: role-alternation bridge] 是框架插入的占位。"
+    backend = FakeBackend([[StreamEvent(kind="content", text=answer),
+                            StreamEvent(kind="finish", finish_reason="stop")]])
+    agent = Agent(backend, _echo_registry(), empty_response_retry_limit=1)
+    r = await agent.run([{"role": "user", "content": "hi"}], RecordRenderer(), model="m")
+    assert r.text == answer
+    assert r.model_retry == 0
+
+
 async def test_reasoning_only_retry_then_succeed():
     """模型只吐 reasoning 无正文 → 走 reasoning_only 补救重试 → 次轮出正文。"""
     backend = FakeBackend([
