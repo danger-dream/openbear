@@ -477,6 +477,11 @@ class WebAdminChatStateMixin:
             conversation=conversation,
             main_model=model_label,
             main_fast_requested=bool(fast_requested),
+            main_think_level=await self._effective_thinking_level(
+                chat_id,
+                model_label,
+                stored_level=stored_thinking_level,
+            ),
         )
         agent_run_config = agent_run_config_public(agent_runtime)
         active_rath_tasks = []

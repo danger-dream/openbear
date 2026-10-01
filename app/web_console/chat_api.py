@@ -1588,6 +1588,7 @@ class WebAdminChatHandlersMixin:
             conversation=conversation,
             main_model=model,
             main_fast_requested=fast_requested,
+            main_think_level=effective_thinking,
         )
         return {
             "conversationUuid": str(conversation.get("conversation_uuid") or ""),

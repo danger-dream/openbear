@@ -214,7 +214,7 @@ function selectMenuThinking(level) {
 
 const runConfigSettingsSummary = computed(() => {
 	const thinking = menuSupportsThinking.value
-		? `思考 ${isAgentTab.value && !props.agentThinkLevel ? '默认' : compactThinkingLabel(menuThinkingLevel.value)}`
+		? `思考 ${isAgentTab.value && !props.agentThinkLevel ? '跟随' : compactThinkingLabel(menuThinkingLevel.value)}`
 		: '思考未声明';
 	const fast = isAgentTab.value
 		? `Fast ${{follow: '跟随', on: '开', off: '关'}[agentFastTriState.value]}`
@@ -1049,10 +1049,10 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								</div>
 								<div v-show="!runConfigCompact || runConfigSettingsOpen" class="run-config-controls">
 									<div class="thinking-control">
-										<div class="run-config-control-head"><span class="config-label"><ModelFeatureIcon name="brain"/>思考强度</span><span class="config-hint">{{ menuSupportsThinking ? `默认 ${menuDefaultThinking}` : '未声明支持' }}</span></div>
+										<div class="run-config-control-head"><span class="config-label"><ModelFeatureIcon name="brain"/>思考强度</span><span class="config-hint">{{ menuSupportsThinking ? (isAgentTab ? (props.agentThinkLevel ? '未跟随主会话' : `跟随：${compactThinkingLabel(props.agentEffectiveThinking)}`) : `默认 ${menuDefaultThinking}`) : '未声明支持' }}</span></div>
 										<div v-if="menuSupportsThinking || isAgentTab" class="thinking-segments" role="group" aria-label="思考强度">
-											<el-tooltip v-if="isAgentTab" :content="`使用模型默认思考强度：${props.agentDefaultThinkingLabel}`" placement="top" :show-after="400">
-												<button type="button" :class="!props.agentThinkLevel ? 'is-active' : ''" :aria-pressed="!props.agentThinkLevel" @click="selectMenuThinking('')">默认</button>
+											<el-tooltip v-if="isAgentTab" :content="`跟随主会话思考强度，当前为${compactThinkingLabel(props.agentEffectiveThinking)}`" placement="top" :show-after="400">
+												<button type="button" :class="!props.agentThinkLevel ? 'is-active' : ''" :aria-pressed="!props.agentThinkLevel" @click="selectMenuThinking('')">跟随</button>
 											</el-tooltip>
 											<el-tooltip v-for="level in menuThinkingLevels" :key="level" :content="`思考强度：${level}`" placement="top" :show-after="400">
 												<button type="button" :class="menuThinkingLevel === level ? 'is-active' : ''" :aria-pressed="menuThinkingLevel === level" @click="selectMenuThinking(level)">{{ compactThinkingLabel(level) }}</button>
@@ -2312,7 +2312,7 @@ button.status-chip:hover, .status-chip-active {
 }
 .config-value { display: flex; align-items: center; gap: 9px; }
 .agent-fast-segments { flex: 0 0 auto; }
-.agent-fast-segments button { min-width: 30px; padding: 2px 8px; font-size: 12px; }
+.agent-fast-segments button { flex: 0 0 auto; min-width: 30px; padding: 2px 10px; font-size: 12px; text-align: center; }
 .fast-switch {
 	position: relative;
 	width: 36px;

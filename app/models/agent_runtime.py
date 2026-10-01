@@ -71,7 +71,7 @@ def agent_preset_fields(snapshot: dict[str, Any]) -> dict[str, str]:
             "" if model_source in {"main", "conversation"} else str(snapshot.get("model") or "").strip()
         ),
         "think_level": str(snapshot.get("presetThinkLevel") or "").strip() if "presetThinkLevel" in snapshot else (
-            "" if think_source in {"model_default", "conversation"} else str(snapshot.get("thinkLevel") or "").strip()
+            "" if think_source in {"model_default", "conversation", "main"} else str(snapshot.get("thinkLevel") or "").strip()
         ),
     }
 
@@ -84,6 +84,7 @@ def resolve_agent_runtime_config(
     conversation: dict[str, Any] | None = None,
     main_model: str = "",
     main_fast_requested: bool = False,
+    main_think_level: str = "",
     frozen: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve a new round, or restore an unfinished task via frozen."""
@@ -145,12 +146,19 @@ def resolve_agent_runtime_config(
         think_source = "model_default"
         preset_think = normalize_think_level(str(agent.think_level or ""))
         conv_think = normalize_think_level(str(defaults.get("thinkLevel") or ""))
+        main_think = normalize_think_level(str(main_think_level or ""))
         if preset_think:
             think_requested = preset_think
             think_source = "preset"
         elif conv_think:
             think_requested = conv_think
             think_source = "conversation"
+        elif main_think:
+            # Unset Agent thinking follows the main conversation's effective
+            # level. If the Agent model lacks that level, the existing fallback
+            # below uses that model's own default.
+            think_requested = main_think
+            think_source = "main"
 
         agent_fast = _int_or(defaults.get("fastMode"), -1)
         if agent_fast == 1:

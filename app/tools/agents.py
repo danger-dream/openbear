@@ -25,6 +25,11 @@ from app.llm.factory import BackendFactory
 from app.memory.client import MemoryClient
 from app.models.agent_runtime import agent_preset_fields, resolve_agent_runtime_config
 from app.models.selection import ModelSelection
+from app.models.thinking import (
+    configured_default_think_level,
+    normalize_think_level,
+    normalize_think_levels,
+)
 from app.agents.agent_prompt import render_agent_base_system_prompt
 from app.agents.profiles import SINGLE_AGENT_WORKFLOW_SLUG, ensure_builtin_workflows
 from app.agents.continuity import agent_session_public
@@ -438,9 +443,12 @@ class AgentTools(AgentContinuationTools):
         conv = conversation if conversation is not None else await self._conversation_for_chat_id(chat_id)
         main_model = str((conv or {}).get("model") or "") or self.model_selection.current or self.config.models.primary
         main_fast = False
+        main_think = ""
         if chat_id:
             with contextlib.suppress(Exception):
                 main_fast = bool(await self.messages.get_fast_mode(int(chat_id)))
+            with contextlib.suppress(Exception):
+                main_think = await self._main_effective_thinking_level(int(chat_id), main_model)
         return resolve_agent_runtime_config(
             agent,
             config=self.config,
@@ -448,8 +456,19 @@ class AgentTools(AgentContinuationTools):
             conversation=conv,
             main_model=main_model,
             main_fast_requested=main_fast,
+            main_think_level=main_think,
             frozen=frozen,
         )
+
+    async def _main_effective_thinking_level(self, chat_id: int, model_label: str) -> str:
+        meta = self.config.models.resolve(model_label)
+        if not meta:
+            return ""
+        levels = list(normalize_think_levels(meta[1].thinking_levels))
+        if not levels:
+            return "off"
+        stored = normalize_think_level(str(await self.messages.get_thinking_level(int(chat_id)) or ""))
+        return stored if stored in levels else configured_default_think_level(levels, meta[1].default_thinking_level)
 
     async def _persist_agent_model_call(
         self,
