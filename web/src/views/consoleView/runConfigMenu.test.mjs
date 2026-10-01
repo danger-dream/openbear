@@ -108,7 +108,7 @@ test("main thinking labels stay compact while events retain raw metadata values,
   assert.deepEqual(h.calls.shift(), ["update:modelQuery", "sol"]);
 });
 
-test("Agent tab preserves independent model selection, model-default thinking and nullable Fast inheritance", async () => {
+test("Agent tab preserves independent model selection, main-following thinking and nullable Fast inheritance", async () => {
   const h = harness({agentModel: "", agentThinkLevel: "", agentFastMode: null}, "agent");
   const {html, buttons} = await h.render();
   assert.doesNotMatch(html, /72\.0%/); // Never present Controller usage as Agent usage.
@@ -118,7 +118,7 @@ test("Agent tab preserves independent model selection, model-default thinking an
   assert.deepEqual(h.calls.shift(), ["select-agent-model", ""]);
   buttons.find(node => hasClass(node, "model-select")).props.onClick(uiEvent({type: 'click'}));
   assert.deepEqual(h.calls.shift(), ["select-agent-model", "OpenAI/astra"]);
-  buttons.find(node => node.children === "默认").props.onClick();
+  buttons.find(node => node.children === "跟随" && !node.props["aria-label"]).props.onClick();
   assert.deepEqual(h.calls.shift(), ["select-agent-thinking", ""]);
   buttons.find(node => node.children === "高").props.onClick();
   assert.deepEqual(h.calls.shift(), ["select-agent-thinking", "high"]);
@@ -342,4 +342,22 @@ test("popup typography and surfaces are unified, and short viewports keep every 
   assert.match(css, /@media \(max-height: 620px\)[\s\S]*?overflow-y: auto/);
   assert.match(css, /\.model-row-name[^}]*text-overflow: ellipsis/);
   assert.match(css, /\.thinking-segments[^}]*flex-wrap: wrap/);
+});
+
+test('Agent unset thinking is presented as following the main conversation, not the model default', async () => {
+  const h = harness({agentThinkLevel: '', agentEffectiveThinking: 'low', agentDefaultThinkingLabel: 'xhigh'}, 'agent');
+  const {html} = await h.render();
+  const tooltips = h.tooltips;
+  assert.match(html, />跟随</);
+  assert.match(html, /跟随 低/);
+  assert.doesNotMatch(html, /<button[^>]*>默认<\/button>/);
+  assert.ok(tooltips.includes('跟随主会话思考强度，当前为低'));
+  assert.match(h.bindings.runConfigSettingsSummary, /^思考 跟随/);
+});
+
+test('main tab keeps model-default wording for main thinking', async () => {
+  const h = harness({}, 'main');
+  const {html} = await h.render();
+  assert.match(html, /默认 极高/);
+  assert.doesNotMatch(html, /跟随主会话思考强度/);
 });

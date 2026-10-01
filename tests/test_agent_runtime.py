@@ -79,6 +79,66 @@ def test_resolve_falls_back_to_main_model_and_default_think():
     assert resolved["source"]["fastMode"] == "main"
 
 
+def test_resolve_follows_main_thinking_when_agent_thinking_unset():
+    resolved = resolve_agent_runtime_config(
+        _agent(),
+        config=_Config(),
+        conversation={"model": "openai/main", "agent_model": "", "agent_think_level": "", "agent_fast_mode": -1},
+        main_model="openai/main",
+        main_think_level="low",
+    )
+    assert resolved["thinkLevel"] == "low"
+    assert resolved["source"]["thinkLevel"] == "main"
+    assert agent_run_config_public(resolved)["thinkLevel"] == ""
+
+
+def test_resolve_main_thinking_falls_back_to_agent_model_default_when_unsupported():
+    resolved = resolve_agent_runtime_config(
+        _agent(),
+        config=_Config(),
+        conversation={"model": "openai/main", "agent_model": "openai/cheap", "agent_think_level": "", "agent_fast_mode": -1},
+        main_model="openai/main",
+        main_think_level="high",
+    )
+    assert resolved["model"] == "openai/cheap"
+    assert resolved["thinkLevel"] == "low"
+    assert resolved["source"]["thinkLevel"] == "model_default"
+
+
+def test_resolve_explicit_agent_thinking_overrides_main_thinking():
+    preset = resolve_agent_runtime_config(
+        _agent(think_level="high"),
+        config=_Config(),
+        conversation={"model": "openai/main", "agent_think_level": "low"},
+        main_model="openai/main",
+        main_think_level="low",
+    )
+    conversation = resolve_agent_runtime_config(
+        _agent(),
+        config=_Config(),
+        conversation={"model": "openai/main", "agent_think_level": "high"},
+        main_model="openai/main",
+        main_think_level="low",
+    )
+    assert (preset["thinkLevel"], preset["source"]["thinkLevel"]) == ("high", "preset")
+    assert (conversation["thinkLevel"], conversation["source"]["thinkLevel"]) == ("high", "conversation")
+
+
+def test_main_thinking_snapshot_restores_as_inherited_not_preset():
+    from app.models.agent_runtime import agent_preset_fields
+
+    resolved = resolve_agent_runtime_config(
+        _agent(),
+        config=_Config(),
+        conversation={"model": "openai/main"},
+        main_model="openai/main",
+        main_think_level="low",
+    )
+    snapshot = agent_runtime_snapshot_fields(resolved)
+    assert snapshot["thinkSource"] == "main"
+    assert agent_preset_fields(snapshot)["think_level"] == ""
+
+
 def test_resolve_prefers_conversation_defaults_over_main():
     resolved = resolve_agent_runtime_config(
         _agent(),

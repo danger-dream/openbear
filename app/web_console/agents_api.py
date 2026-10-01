@@ -418,16 +418,20 @@ class WebAdminAgentsMixin:
             row = await cur.fetchone()
             conv = dict(row) if row else None
         main_fast = False
+        main_think = ""
+        main_model_label = str((conv or {}).get("model") or "") or (getattr(self.model_selection, "current", "") if self.model_selection else "") or self.config.models.primary
         with contextlib.suppress(Exception):
             fast_chat_id = int((conv or {}).get("internal_chat_id") or 0) or int(session.chat_id or 0)
             main_fast = bool(await MessageDAO(self.db).get_fast_mode(fast_chat_id))
+            main_think = await self._effective_thinking_level(fast_chat_id, main_model_label)
         runtime = resolve_agent_runtime_config(
             agent,
             config=self.config,
             model_selection_current=str(getattr(self.model_selection, "current", "") or "") if self.model_selection else "",
             conversation=conv,
-            main_model=str((conv or {}).get("model") or "") or (getattr(self.model_selection, "current", "") if self.model_selection else "") or self.config.models.primary,
+            main_model=main_model_label,
             main_fast_requested=main_fast,
+            main_think_level=main_think,
         )
         task_uuid = await self.agents.create_task(
             chat_id=session.chat_id,
