@@ -2324,7 +2324,7 @@ button.status-chip:hover, .status-chip-active {
 }
 .config-value { display: flex; align-items: center; gap: 9px; }
 .agent-fast-segments { flex: 0 0 auto; }
-.agent-fast-segments button { min-width: 30px; padding: 2px 8px; font-size: 12px; }
+.agent-fast-segments button { flex: 0 0 auto; min-width: 30px; padding: 2px 10px; font-size: 12px; text-align: center; }
 .fast-switch {
 	position: relative;
 	width: 36px;
