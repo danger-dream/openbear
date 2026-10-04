@@ -2587,7 +2587,7 @@ button.status-chip:hover, .status-chip-active {
 	}
 	/* Keep the tool controls at 44px height, but make the primary send button a
 	   little smaller so more of the row can be used by the model name. */
-	.send-button { width: 38px; height: 38px; }
+	.send-button { width: 34px; height: 34px; }
 	.run-config-chip { min-height: 44px; }
 	.attachment-remove {
 		top: 0;
@@ -2635,6 +2635,6 @@ html.dark .recommendation-reason {
 .send-button.is-original[aria-disabled="true"] { background: var(--ob-text-disabled); }
 .stop-button.is-original { background: var(--ob-danger); box-shadow: 0 8px 18px rgb(var(--ob-danger-rgb) / 0.18); }
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
- .send-button.is-original { width: 38px; height: 38px; }
+ .send-button.is-original { width: 34px; height: 34px; }
 }
 </style>

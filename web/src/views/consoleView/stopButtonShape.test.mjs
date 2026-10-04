@@ -27,7 +27,7 @@ test('context menu after timer toggles only once and missing storage is safe',()
  h.run('window.localStorage.getItem=()=>{throw Error()};window.localStorage.setItem=()=>{throw Error()};toggleSendStyle()');assert.equal(h.run('readSendStyle()'),'original');
 });
 test('both reference and original styles retain their colors, icons and dimensions',()=>{
- for(const s of ['width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
+ for(const s of ['width: 34px; height: 34px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
  assert.match(source,/@click="emit\('stop'\)"/);
 });
 

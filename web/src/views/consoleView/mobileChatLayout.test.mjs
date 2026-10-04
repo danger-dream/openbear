@@ -101,7 +101,7 @@ test('editor has primary vertical space and model is an unboxed secondary text e
     assert.equal(css(f,':deep(.reference-editor-content)',env)['font-size'],undefined);
     assert.equal(css(f,'.composer-clear:disabled',env).display,'none');
     assert.equal(css(f,'.tool-btn',env).height,'44px');
-    assert.deepEqual([css(f,'.send-button',env).width,css(f,'.send-button',env).height],['38px','38px'],'send button is modestly smaller on touch/phone');
+    assert.deepEqual([css(f,'.send-button',env).width,css(f,'.send-button',env).height],['34px','34px'],'send button is modestly smaller on touch/phone');
   }
   assert.equal(css(f,'.composer-actions',desktop)['margin-left'],undefined,'desktop action geometry stays unchanged');
   assert.equal(css(f,'.composer-toolbar button.run-config-chip .chip-caret',desktop).display,undefined,'desktop menu caret stays visible');
