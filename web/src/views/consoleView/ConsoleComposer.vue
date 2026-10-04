@@ -2398,8 +2398,8 @@ button.status-chip:hover, .status-chip-active {
 }
 
 .send-button {
-	width: 2rem;
-	height: 2rem;
+	width: 30px;
+	height: 30px;
 	flex: 0 0 auto;
 	display: grid;
 	place-items: center;
@@ -2527,7 +2527,7 @@ button.status-chip:hover, .status-chip-active {
 	}
 	/* Keep the tool controls at 44px height, but make the primary send button a
 	   little smaller so more of the row can be used by the model name. */
-	.send-button { width: 38px; height: 38px; }
+	.send-button { width: 34px; height: 34px; }
 	.run-config-chip { min-height: 44px; }
 	.attachment-remove {
 		top: 0;
