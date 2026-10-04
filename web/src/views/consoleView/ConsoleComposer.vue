@@ -736,6 +736,11 @@ function readSendStyle() {
 }
 const sendButtonStyle = ref(readSendStyle());
 const sendStylePressActive = ref(false);
+const buttonTooltipMedia = window.matchMedia?.('(max-width: 760px), (hover: none) and (pointer: coarse)');
+const hideButtonTooltip = ref(Boolean(buttonTooltipMedia?.matches));
+function updateButtonTooltipMedia(event) { hideButtonTooltip.value = event.matches; }
+buttonTooltipMedia?.addEventListener?.('change', updateButtonTooltipMedia);
+onBeforeUnmount(() => buttonTooltipMedia?.removeEventListener?.('change', updateButtonTooltipMedia));
 let sendStyleTimer = null;
 let sendStylePress = null;
 let suppressSendClick = false;
@@ -1152,12 +1157,12 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								</div>
 							</div>
 						</el-popover>
-						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260">
+						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260" :disabled="hideButtonTooltip" :visible="hideButtonTooltip ? false : undefined">
 							<button type="button" class="send-button stop-button" :class="{'is-original': sendButtonStyle === 'original'}" aria-label="停止生成" @click="emit('stop')">
 								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect :x="sendButtonStyle === 'original' ? 4 : 5" :y="sendButtonStyle === 'original' ? 4 : 5" :width="sendButtonStyle === 'original' ? 16 : 14" :height="sendButtonStyle === 'original' ? 16 : 14" :rx="sendButtonStyle === 'original' ? 3 : 1.5"/></svg>
 							</button>
 						</el-tooltip>
-						<el-tooltip v-else content="发送消息（Enter；触屏可用 Ctrl/⌘+Enter）" placement="top" :show-after="260" :disabled="sendStylePressActive" :visible="sendStylePressActive ? false : undefined">
+						<el-tooltip v-else content="发送消息（Enter；长按切换按钮样式）" placement="top" :show-after="260" :disabled="hideButtonTooltip || sendStylePressActive" :visible="hideButtonTooltip || sendStylePressActive ? false : undefined">
 							<button type="button" class="send-button" :class="{'is-original': sendButtonStyle === 'original'}" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :aria-disabled="!props.canSend" aria-description="长按切换圆形上箭头与原版方形纸飞机样式"
                                 @click="clickSendButton" @pointerdown="startSendStylePress" @pointermove="moveSendStylePress" @pointerup="cancelSendStylePress" @pointercancel="cancelSendStylePress" @pointerleave="cancelSendStylePress" @contextmenu.prevent="sendStyleContextMenu">
 								<Promotion v-if="sendButtonStyle === 'original'"/>

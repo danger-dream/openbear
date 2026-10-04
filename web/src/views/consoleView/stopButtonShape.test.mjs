@@ -7,7 +7,7 @@ const source=fs.readFileSync(new URL('./ConsoleComposer.vue',import.meta.url),'u
 const code=source.slice(source.indexOf('const SEND_STYLE_KEY'),source.indexOf('function focusInteraction'));
 function harness(saved='round',canSend=true){
  let timer;const events=[];const storage=new Map([['openbear.console.sendButtonStyle.v1',saved]]);
- const c=vm.createContext({ref,props:{canSend},emit:e=>events.push(e),watch(){},window:{localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},setTimeout:f=>(timer=f,1),clearTimeout:()=>timer=null}});
+ const c=vm.createContext({ref,props:{canSend},emit:e=>events.push(e),watch(){},onBeforeUnmount(){},window:{localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},setTimeout:f=>(timer=f,1),clearTimeout:()=>timer=null}});
  vm.runInContext(code,c);return {c,events,storage,tick(){timer?.();},run(s){return vm.runInContext(s,c);}};
 }
 test('long press switches full styles, persists and suppresses send; next short click sends',()=>{
@@ -32,7 +32,8 @@ test('both reference and original styles retain their colors, icons and dimensio
 });
 
 test('press hides the send tooltip and circle matches original dimensions',()=>{
- assert.match(source,/:disabled="sendStylePressActive" :visible="sendStylePressActive \? false : undefined"/);
+ assert.ok(source.includes(':disabled="hideButtonTooltip || sendStylePressActive"'));
+ assert.ok(source.includes('长按切换按钮样式'));
  assert.match(source,/sendStylePressActive.value = true/);
  assert.match(source,/sendStylePressActive.value = false/);
  assert.match(source,/\.send-button \{\s*width: 2rem;\s*height: 2rem;/);
