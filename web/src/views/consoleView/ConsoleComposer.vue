@@ -2458,8 +2458,8 @@ button.status-chip:hover, .status-chip-active {
 	place-items: center;
 	border: 0;
 	border-radius: 50%;
-	background: #fff;
-	color: #202020;
+	background: var(--ob-chat-button);
+	color: var(--ob-chat-button-text);
 	line-height: 1;
 	cursor: pointer;
 	-webkit-touch-callout: none;
@@ -2473,16 +2473,16 @@ button.status-chip:hover, .status-chip-active {
 }
 
 .stop-button {
-	background: #ff5058;
-	color: #202020;
+	background: var(--ob-danger);
+	color: var(--ob-chat-button-text);
 	box-shadow: none;
 	-webkit-touch-callout: none;
 	user-select: none;
 }
 
 .send-button[aria-disabled="true"] {
-	background: #414141;
-	color: #202020;
+	background: var(--ob-text-disabled);
+	color: var(--ob-chat-button-text);
 	opacity: 1;
 	cursor: not-allowed;
 }

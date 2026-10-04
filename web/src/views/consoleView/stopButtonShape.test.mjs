@@ -27,7 +27,7 @@ test('context menu after timer toggles only once and missing storage is safe',()
  h.run('window.localStorage.getItem=()=>{throw Error()};window.localStorage.setItem=()=>{throw Error()};toggleSendStyle()');assert.equal(h.run('readSendStyle()'),'original');
 });
 test('both reference and original styles retain their colors, icons and dimensions',()=>{
- for(const s of ['background: #fff','background: #ff5058','background: #414141','width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
+ for(const s of ['width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
  assert.match(source,/@click="emit\('stop'\)"/);
 });
 
@@ -42,4 +42,11 @@ test("new browsers default to original square while explicit round stays saved",
  assert.equal(harness(null).run("sendButtonStyle.value"),"original");
  assert.equal(harness("bad").run("sendButtonStyle.value"),"original");
  assert.equal(harness("round").run("sendButtonStyle.value"),"round");
+});
+
+test('round and square share theme palettes in both light and dark modes',()=>{
+ assert.match(source,/\.send-button \{[^}]*background: var\(--ob-chat-button\);[^}]*color: var\(--ob-chat-button-text\);/);
+ assert.match(source,/\.send-button\[aria-disabled="true"\] \{[^}]*background: var\(--ob-text-disabled\);/);
+ assert.match(source,/\.stop-button \{[^}]*background: var\(--ob-danger\);/);
+ assert.doesNotMatch(source,/#ff5058|#414141/);
 });
