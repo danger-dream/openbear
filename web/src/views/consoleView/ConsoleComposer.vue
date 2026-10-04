@@ -15,7 +15,6 @@ import {
 	Document,
 	Paperclip,
 	Plus,
-	Promotion,
 	Search,
 	Timer,
 	Warning,
@@ -721,73 +720,12 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-	cancelStopShapePress();
 	if (interactionClockTimer) window.clearInterval(interactionClockTimer);
 	interactionClockTimer = null;
 	composerResizeObserver?.disconnect();
 	composerResizeObserver = null;
 });
 
-const STOP_BUTTON_SHAPE_KEY = 'openbear.console.stopButtonShape.v1';
-function readStopButtonShape() {
-	try { return window.localStorage.getItem(STOP_BUTTON_SHAPE_KEY) === 'circle' ? 'circle' : 'square'; }
-	catch { return 'square'; }
-}
-// Read before the first render; send and stop share the same persisted shape,
-// including the idle frame before the conversation's running state is restored.
-const stopButtonShape = ref(readStopButtonShape());
-let stopShapePress = null;
-let stopShapeTimer = null;
-let suppressStopClick = false;
-function toggleStopButtonShape() {
-	stopButtonShape.value = stopButtonShape.value === 'circle' ? 'square' : 'circle';
-	try { window.localStorage.setItem(STOP_BUTTON_SHAPE_KEY, stopButtonShape.value); } catch { /* Private-mode storage can be unavailable. */ }
-}
-function cancelStopShapePress() {
-	if (stopShapeTimer !== null) window.clearTimeout(stopShapeTimer);
-	stopShapeTimer = null;
-	stopShapePress = null;
-}
-function startStopShapePress(event) {
-	cancelStopShapePress();
-	suppressStopClick = false;
-	if (event.pointerType !== 'touch' || event.isPrimary === false || event.button > 0) return;
-	stopShapePress = {id: event.pointerId, x: event.clientX, y: event.clientY};
-	stopShapeTimer = window.setTimeout(() => {
-		stopShapeTimer = null;
-		if (!stopShapePress || suppressStopClick) return;
-		suppressStopClick = true;
-		toggleStopButtonShape();
-	}, 550);
-}
-function moveStopShapePress(event) {
-	if (!stopShapePress || stopShapePress.id !== event.pointerId) return;
-	if (Math.hypot(event.clientX - stopShapePress.x, event.clientY - stopShapePress.y) > 10) {
-		suppressStopClick = true;
-		cancelStopShapePress();
-	}
-}
-function endStopShapePress(event) {
-	if (stopShapePress && stopShapePress.id !== event.pointerId) return;
-	cancelStopShapePress();
-}
-function stopButtonContextMenu() {
-	// Some touch browsers dispatch contextmenu before or after our long-press
-	// timer. Whichever arrives first owns the single toggle, never a stop.
-	if (!suppressStopClick) toggleStopButtonShape();
-	suppressStopClick = true;
-	cancelStopShapePress();
-}
-function clickStopButton(event) {
-	if (suppressStopClick && (event.detail !== 0 || event.pointerType === 'touch')) {
-		suppressStopClick = false;
-		event.preventDefault();
-		return;
-	}
-	suppressStopClick = false;
-	emit('stop');
-}
-watch(() => [props.conversationUuid, props.running, Boolean(props.draft.trim())], cancelStopShapePress);
 
 function focusInteraction(interactionId) {
 	const pending = props.pendingConfirmations.find(item => item.confirmationId === interactionId);
@@ -1162,15 +1100,15 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								</div>
 							</div>
 						</el-popover>
-						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成（右键或长按切换按钮形状）" placement="top" :show-after="260">
-							<button type="button" class="send-button stop-button" :class="{'is-round': stopButtonShape === 'circle'}" aria-label="停止生成" aria-description="右键单击或长按切换方形与圆形，偏好保存在当前浏览器" @click="clickStopButton" @contextmenu.prevent="stopButtonContextMenu" @pointerdown="startStopShapePress" @pointermove="moveStopShapePress" @pointerup="endStopShapePress" @pointercancel="cancelStopShapePress" @pointerleave="cancelStopShapePress">
-								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>
+						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260">
+							<button type="button" class="send-button stop-button" aria-label="停止生成" @click="emit('stop')">
+								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
 							</button>
 						</el-tooltip>
 						<el-tooltip v-else content="发送消息（Enter；触屏可用 Ctrl/⌘+Enter）" placement="top" :show-after="260">
-							<button type="button" class="send-button" :class="{'is-round': stopButtonShape === 'circle'}" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :disabled="!props.canSend"
+							<button type="button" class="send-button" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :disabled="!props.canSend"
 							        @click="emit('send')">
-								<Promotion/>
+								<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V4M5 11l7-7 7 7"/></svg>
 							</button>
 						</el-tooltip>
 					</div>
@@ -2466,29 +2404,31 @@ button.status-chip:hover, .status-chip-active {
 	display: grid;
 	place-items: center;
 	border: 0;
-	border-radius: 8px;
-	background: var(--ob-chat-button);
-	color: var(--ob-chat-button-text);
+	border-radius: 50%;
+	background: #fff;
+	color: #202020;
 	line-height: 1;
 	cursor: pointer;
-	box-shadow: var(--ob-shadow-panel);
+	box-shadow: none;
 }
 
 .send-button svg {
-	width: 1rem;
-	height: 1rem;
+	width: 60%;
+	height: 60%;
 }
 
 .stop-button {
-	background: var(--ob-danger);
-	box-shadow: 0 8px 18px rgb(var(--ob-danger-rgb) / 0.18);
+	background: #ff5058;
+	color: #202020;
+	box-shadow: none;
 	-webkit-touch-callout: none;
 	user-select: none;
 }
-.send-button.is-round { border-radius: 50%; }
 
 .send-button:disabled {
-	background: var(--ob-text-disabled);
+	background: #414141;
+	color: #202020;
+	opacity: 1;
 	cursor: not-allowed;
 }
 

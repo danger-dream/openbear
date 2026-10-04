@@ -1,144 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import vm from 'node:vm';
-import {compile, createSSRApp, h, nextTick, proxyRefs, reactive, ref, watch} from 'vue';
-import {renderToString} from 'vue/server-renderer';
 import {parse} from '@vue/compiler-sfc';
-import {baseParse} from '@vue/compiler-dom';
+import {compile, createSSRApp} from 'vue';
+import {renderToString} from 'vue/server-renderer';
 import postcss from 'postcss';
 const source=fs.readFileSync(new URL('./ConsoleComposer.vue',import.meta.url),'utf8');
 const descriptor=parse(source).descriptor;
-const script=descriptor.scriptSetup.content;
-const actual=script.slice(script.indexOf("const STOP_BUTTON_SHAPE_KEY ="),script.indexOf('function getReferenceOrder('));
-const walk=nodes=>(nodes||[]).flatMap(n=>[n,...walk(Array.isArray(n.children)?n.children:[])]);
-const templateNodes=walk(baseParse(descriptor.template.content).children);
-const button=templateNodes.find(n=>n.type===1&&n.tag==='button'&&n.props.some(p=>p.name==='class'&&p.value?.content==='send-button stop-button'));
-const sendButton=templateNodes.find(n=>n.type===1&&n.tag==='button'&&n.props.some(p=>p.name==='class'&&p.value?.content==='send-button'));
-const stopBranch=templateNodes.find(n=>n.type===1&&n.tag==='el-tooltip'&&n.children.includes(button));
-const sendBranch=templateNodes.find(n=>n.type===1&&n.tag==='el-tooltip'&&n.children.includes(sendButton));
-const renderControl=compile(`${stopBranch.loc.source}\n${sendBranch.loc.source}`);
-const render=compile(button.loc.source);
-function harness(storage=new Map(), initialProps={}){
-  const timers=new Map(), emitted=[], stops=[];let sequence=0;
-  const props=reactive({conversationUuid:'a',running:true,draft:'',canSend:false,...initialProps});
-  const context=vm.createContext({props,ref,watch:(...args)=>{const stop=watch(...args);stops.push(stop);return stop;},emit:(...args)=>emitted.push(args),
-    window:{localStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)},setTimeout:(fn,ms)=>{timers.set(++sequence,{fn,ms});return sequence;},clearTimeout:id=>timers.delete(id)}});
-  vm.runInContext(actual,context);
-  const bindings=proxyRefs(vm.runInContext('({props,emit,stopButtonShape,clickStopButton,stopButtonContextMenu,startStopShapePress,moveStopShapePress,endStopShapePress,cancelStopShapePress})',context));
-  return {props,storage,timers,emitted,bindings,tick(){for(const [id,item] of [...timers]){timers.delete(id);assert.equal(item.ms,550);item.fn();}},dispose(){bindings.cancelStopShapePress();stops.forEach(stop=>stop());},
-    async render(){let tree;const app=createSSRApp({render(){tree=render.call(this,bindings,[]);return tree;}});const html=await renderToString(app);return {html,events:tree.props};},
-    async renderControl(){
-      let nodes=[];
-      const app=createSSRApp({render(){return renderControl.call(this,bindings,[]);}});
-      app.component('ElTooltip',{inheritAttrs:false,render(){nodes=this.$slots.default?.()||[];return nodes;}});
-      app.component('Promotion',{render:()=>h('svg',{'data-icon':'send'})});
-      const html=await renderToString(app);
-      return {html,events:walk(nodes).find(n=>n.type==='button').props};
-    }};
-}
-const pointer=(extra={})=>({pointerType:'touch',pointerId:1,isPrimary:true,button:0,clientX:20,clientY:20,...extra});
-const click=(extra={})=>({detail:1,preventDefault(){this.prevented=true;},...extra});
-
-test('default square; right-click changes only the shape, persists across mounts and toggles back',async()=>{
-  const storage=new Map();const h=harness(storage);
-  try{
-    let view=await h.render();assert.doesNotMatch(view.html,/is-round/);
-    view.events.onPointerdown(pointer({pointerType:'mouse',button:2}));
-    const event=click();view.events.onContextmenu(event);assert.ok(event.prevented);
-    view=await h.render();assert.match(view.html,/is-round/);assert.deepEqual(h.emitted,[]);
-    const next=harness(storage);try{assert.match((await next.render()).html,/is-round/);}finally{next.dispose();}
-    view.events.onPointerdown(pointer({pointerType:'mouse',button:2}));view.events.onContextmenu(click());
-    assert.doesNotMatch((await h.render()).html,/is-round/);assert.equal(storage.values().next().value,'square');
-  }finally{h.dispose();}
+const template=descriptor.template.content;
+const css=postcss.parse(descriptor.styles.map(s=>s.content).join('\n'));
+const button=(stop)=>template.match(stop? /<button type="button" class="send-button stop-button"[\s\S]*?<\/button>/ : /<button type="button" class="send-button"[\s\S]*?<\/button>/)[0];
+function declarations(selector){let result={};css.walkRules(selector,r=>r.walkDecls(d=>result[d.prop]=d.value));return result;}
+test('send and stop are circular with the reference three state colors',()=>{
+ assert.equal(declarations('.send-button')['border-radius'],'50%');
+ assert.equal(declarations('.send-button').background,'#fff');
+ assert.equal(declarations('.send-button:disabled').background,'#414141');
+ assert.equal(declarations('.stop-button').background,'#ff5058');
+ assert.equal(declarations('.stop-button').color,'#202020');
+ assert.match(button(false),/M12 20V4M5 11l7-7 7 7/);
+ assert.match(button(true),/<rect x="5" y="5" width="14" height="14" rx="1.5"/);
+ assert.doesNotMatch(source,/toggleStopButtonShape|startStopShapePress|<Promotion/);
 });
-
-for(const contextFirst of [false,true])test(`touch long-press toggles once and never stops (contextmenu ${contextFirst?'first':'last'})`,async()=>{
-  const h=harness();try{
-    const {events}=await h.render();events.onPointerdown(pointer());
-    if(contextFirst)events.onContextmenu(click());
-    h.tick();
-    if(!contextFirst)events.onContextmenu(click());
-    events.onPointerup(pointer());const e=click({pointerType:'touch'});events.onClick(e);
-    assert.ok(e.prevented);assert.equal(h.bindings.stopButtonShape,'circle');assert.deepEqual(h.emitted,[]);
-    // The next intentional short tap still stops normally.
-    events.onPointerdown(pointer());events.onPointerup(pointer());events.onClick(click({pointerType:'touch'}));
-    assert.deepEqual(h.emitted,[['stop']]);assert.equal(h.timers.size,0);
-  }finally{h.dispose();}
-});
-
-test('ordinary click, short touch and keyboard activation preserve the original stop action',async()=>{
-  const h=harness();try{
-    const {events}=await h.render();
-    events.onPointerdown(pointer({pointerType:'mouse'}));events.onClick(click());
-    events.onPointerdown(pointer());events.onPointerup(pointer());events.onClick(click({pointerType:'touch'}));
-    events.onClick(click({detail:0}));
-    assert.deepEqual(h.emitted,[['stop'],['stop'],['stop']]);assert.equal(h.bindings.stopButtonShape,'square');assert.equal(h.storage.size,0);
-  }finally{h.dispose();}
-});
-
-test('dragging, cancellation, navigation and disappearing stop buttons cancel pending long-press timers',async()=>{
-  const h=harness();try{
-    const {events}=await h.render();events.onPointerdown(pointer());events.onPointermove(pointer({clientX:45}));h.tick();
-    events.onClick(click({pointerType:'touch'}));assert.deepEqual(h.emitted,[]);assert.equal(h.bindings.stopButtonShape,'square');
-    for(const type of ['onPointercancel','onPointerleave']){events.onPointerdown(pointer());events[type](pointer());h.tick();assert.equal(h.bindings.stopButtonShape,'square');}
-    for(const [key,value] of [['conversationUuid','b'],['draft','new input'],['running',false]]){
-      events.onPointerdown(pointer());h.props[key]=value;await nextTick();h.tick();assert.equal(h.timers.size,0);assert.equal(h.bindings.stopButtonShape,'square');
-    }
-    events.onPointerdown(pointer());h.dispose();h.tick();assert.equal(h.bindings.stopButtonShape,'square');
-  }finally{h.dispose();}
-});
-
-test('invalid or unavailable localStorage does not break stop or local shape switching',async()=>{
-  for(const storage of [new Map([['openbear.console.stopButtonShape.v1','bad']]),{get(){throw new Error('blocked');},set(){throw new Error('blocked');}}]){
-    const h=harness(storage);try{
-      assert.equal(h.bindings.stopButtonShape,'square');const {events}=await h.render();events.onContextmenu(click());assert.equal(h.bindings.stopButtonShape,'circle');
-      events.onPointerdown(pointer({pointerType:'mouse'}));events.onClick(click());assert.deepEqual(h.emitted,[['stop']]);
-    }finally{h.dispose();}
-  }
-});
-
-test('saved shape applies on the first idle render and throughout send/stop branch changes',async()=>{
-  const states=[
-    {running:false,draft:'',canSend:false},
-    {running:false,draft:'待发送',canSend:true},
-    {running:true,draft:'',canSend:false},
-    {running:true,draft:'补充内容',canSend:true},
-    {running:true,draft:'  ',canSend:false},
-    {running:false,draft:'',canSend:false},
-  ];
-  for(const shape of ['circle','square']){
-    const storage=new Map([['openbear.console.stopButtonShape.v1',shape]]);
-    // Every possible entry state gets a fresh setup, as on a page reload.
-    for(const initialProps of states){
-      const instance=harness(storage,initialProps);
-      try{
-        assert.equal(instance.bindings.stopButtonShape,shape,'preference is available synchronously, before first render');
-        for(const state of [initialProps,...states]){
-          Object.assign(instance.props,state);
-          const {html,events}=await instance.renderControl();
-          const stopping=state.running&&!state.draft.trim();
-          assert.equal(/is-round/.test(html),shape==='circle',JSON.stringify(state));
-          assert.equal(/stop-button/.test(html),stopping);
-          if(stopping){assert.match(html,/<rect /);events.onClick(click());}
-          else{
-            assert.match(html,/data-icon="send"/);
-            assert.equal(events.disabled,!state.canSend);
-            if(state.canSend)events.onClick(click());
-          }
-        }
-        assert.ok(instance.emitted.some(([action])=>action==='send'));
-        assert.ok(instance.emitted.some(([action])=>action==='stop'));
-        assert.equal(storage.get('openbear.console.stopButtonShape.v1'),shape);
-      }finally{instance.dispose();}
-    }
-  }
-});
-
-test('circle preference changes the shared send/stop border radius, not its icon or dimensions',()=>{
-  const css=postcss.parse(descriptor.styles.map(s=>s.content).join('\n'));const matches=[];
-  css.walkRules('.send-button.is-round',rule=>matches.push(rule));assert.equal(matches.length,1);
-  assert.deepEqual(matches[0].nodes.map(n=>[n.prop,n.value]),[['border-radius','50%']]);
-  assert.match(button.loc.source,/<rect x="4" y="4" width="16" height="16" rx="3"/);
-  assert.match(script,/onBeforeUnmount\(\(\) => \{\s*cancelStopShapePress\(\)/);
+test('send respects canSend and stop preserves its action',async()=>{
+ for(const canSend of [true,false]){
+  const events=[];
+  const render=compile(button(false));
+  let vnode;
+  const app=createSSRApp({render(){vnode=render.call(this,{props:{canSend},emit:e=>events.push(e)},[]);return vnode;}});
+  const html=await renderToString(app);
+  assert.equal(vnode.props.disabled,!canSend);
+  assert.equal(/disabled/.test(html),!canSend);
+  if(canSend){vnode.props.onClick();assert.deepEqual(events,['send']);}
+ }
+ const events=[];const render=compile(button(true));let vnode;
+ await renderToString(createSSRApp({render(){vnode=render.call(this,{emit:e=>events.push(e)},[]);return vnode;}}));
+ vnode.props.onClick();assert.deepEqual(events,['stop']);
 });
