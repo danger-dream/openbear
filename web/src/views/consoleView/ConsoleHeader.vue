@@ -30,13 +30,13 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 	<header class="console-header">
 		<div class="header-mobile-navigation"><slot name="mobile-navigation"/></div>
 		<div class="header-identity min-w-0 flex flex-1 items-center gap-3 overflow-hidden">
-			<div class="min-w-0 flex-1 overflow-hidden leading-tight">
+			<div class="header-title-stack min-w-0 flex-1 overflow-hidden leading-tight">
 				<div class="header-subtitle truncate" :title="pathText" :aria-label="`所在目录 ${pathText}`">{{ pathText }}</div>
 				<div class="flex min-w-0 items-center gap-2">
 					<h1 class="header-title block max-w-full truncate" :title="props.title">
 						<AnimatedConversationTitle :text="props.title" :identity="props.titleIdentity" />
 					</h1>
-					<el-dropdown trigger="click" @command="emit('properties')">
+					<el-dropdown class="header-properties-dropdown" trigger="click" @command="emit('properties')">
 						<button type="button" class="header-properties-menu" aria-label="会话菜单" aria-haspopup="menu"><el-icon><MoreFilled /></el-icon></button>
 						<template #dropdown><el-dropdown-menu><el-dropdown-item command="properties">会话属性</el-dropdown-item></el-dropdown-menu></template>
 					</el-dropdown>
@@ -185,6 +185,10 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 	.header-mobile-actions { display: flex; flex: 0 0 88px; }
 	.header-subtitle { display: block; font-size: 10px; line-height: 17px; }
 	.header-title { margin-top: 0; }
+	/* Keep the title row at its original 20px, without shrinking the menu hit area. */
+	.header-identity, .header-title-stack { overflow: visible; }
+	.header-properties-dropdown { position: relative; flex: 0 0 44px; width: 44px; height: 20px; }
+	.header-properties-menu { position: absolute; top: 50%; left: 0; width: 44px; height: 44px; transform: translateY(-50%); }
 	.header-mobile-running { display: inline-flex; flex: none; align-items: center; gap: 5px; height: 22px; padding: 0 7px; border: 1px solid rgb(var(--ob-success-rgb) / 0.18); border-radius: 7px; background: rgb(var(--ob-success-rgb) / 0.09); color: var(--ob-success); font-size: 11px; font-weight: 500; line-height: 1; white-space: nowrap; }
 	.header-mobile-running i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 	.header-metrics { display: none; }

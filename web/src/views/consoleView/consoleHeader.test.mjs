@@ -119,3 +119,11 @@ test('compact total includes full input plus output once, retaining input/cache 
   assert.equal(vm.runInContext('totalTokensDisplay.value',ctx),'155');
   assert.match(vm.runInContext('totalTokensDetail.value',ctx),/155 Tokens.*\n135\/20\/30/);
 });
+
+test('mobile properties menu keeps a 44px hit area without stretching the title row', () => {
+  const css = header.styles.map(s => s.content).join('\n');
+  assert.match(header.template.content, /el-dropdown class="header-properties-dropdown"/);
+  assert.match(css, /\.header-properties-dropdown\s*\{[^}]*height: 20px/);
+  assert.match(css, /\.header-properties-menu\s*\{[^}]*position: absolute[^}]*width: 44px[^}]*height: 44px/);
+  assert.match(css, /\.header-identity, \.header-title-stack\s*\{ overflow: visible; \}/);
+});
