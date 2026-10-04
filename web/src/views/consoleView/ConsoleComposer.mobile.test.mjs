@@ -16,7 +16,7 @@ const attachmentTemplate = ast.find(node => node.type === 1 && node.props.some(p
 const editorTemplate = ast.find(node => node.type === 1 && node.tag === 'ReferenceEditor');
 const sendTemplate = ast.find(node => node.type === 1 && node.props.some(prop => prop.name === 'class' && prop.value?.content === 'send-button'));
 async function render(template, bindings) {
-  bindings = {stopButtonShape: 'square', ...bindings};
+  bindings = {sendButtonStyle: 'round', clickSendButton() {}, startSendStylePress() {}, moveSendStylePress() {}, cancelSendStylePress() {}, sendStyleContextMenu() {}, ...bindings};
   let tree; const slotTrees = [];
   const compiled = compile(template.loc.source), app = createSSRApp({ render() { tree = compiled.call(this, bindings, []); return tree; } });
   for (const name of ['Close', 'Document', 'Promotion', 'Layers', 'Coins', 'Clock3', 'ArrowDown']) app.component(name, { render: () => h('svg') });
@@ -68,10 +68,10 @@ test('actual attachment remove button has a filename, stops preview bubbling and
 test('actual send entry retains disabled state and ReferenceEditor canSend guard, without altering input content', async () => {
   const calls = [], props = { canSend: false, draft: '未提交引用和输入', conversationUuid: 'A' };
   const bindings = { props, emit: (...args) => calls.push(args), composerTextarea: null, onPaste() {}, onComposerKeydownCapture() {}, scheduleRunConfigPosition() {} };
-  let rendered = await render(sendTemplate, bindings); assert.equal(rendered.nodes.find(node => node.type === 'button').props.disabled, true);
+  let rendered = await render(sendTemplate, bindings); assert.equal(rendered.nodes.find(node => node.type === 'button').props['aria-disabled'], true);
   rendered = await render(editorTemplate, bindings); rendered.nodes[0].props.onSend(); assert.deepEqual(calls, []);
   props.canSend = true; rendered.nodes[0].props.onSend(); assert.deepEqual(calls, [['send']]); assert.equal(props.draft, '未提交引用和输入');
-  rendered = await render(sendTemplate, bindings); assert.equal(rendered.nodes[0].props.disabled, false);
+  rendered = await render(sendTemplate, bindings); assert.equal(rendered.nodes[0].props['aria-disabled'], false);
 });
 
 test('actual composer paste and file chooser retain files, mixed text and focus semantics; rejected files warn', async () => {

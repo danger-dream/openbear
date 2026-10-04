@@ -1,38 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {parse} from '@vue/compiler-sfc';
-import {compile, createSSRApp} from 'vue';
-import {renderToString} from 'vue/server-renderer';
-import postcss from 'postcss';
+import vm from 'node:vm';
+import {ref} from 'vue';
 const source=fs.readFileSync(new URL('./ConsoleComposer.vue',import.meta.url),'utf8');
-const descriptor=parse(source).descriptor;
-const template=descriptor.template.content;
-const css=postcss.parse(descriptor.styles.map(s=>s.content).join('\n'));
-const button=(stop)=>template.match(stop? /<button type="button" class="send-button stop-button"[\s\S]*?<\/button>/ : /<button type="button" class="send-button"[\s\S]*?<\/button>/)[0];
-function declarations(selector){let result={};css.walkRules(selector,r=>r.walkDecls(d=>result[d.prop]=d.value));return result;}
-test('send and stop are circular with the reference three state colors',()=>{
- assert.equal(declarations('.send-button')['border-radius'],'50%');
- assert.equal(declarations('.send-button').background,'#fff');
- assert.equal(declarations('.send-button:disabled').background,'#414141');
- assert.equal(declarations('.stop-button').background,'#ff5058');
- assert.equal(declarations('.stop-button').color,'#202020');
- assert.match(button(false),/M12 20V4M5 11l7-7 7 7/);
- assert.match(button(true),/<rect x="5" y="5" width="14" height="14" rx="1.5"/);
- assert.doesNotMatch(source,/toggleStopButtonShape|startStopShapePress|<Promotion/);
+const code=source.slice(source.indexOf('const SEND_STYLE_KEY'),source.indexOf('function focusInteraction'));
+function harness(saved='round',canSend=true){
+ let timer;const events=[];const storage=new Map([['openbear.console.sendButtonStyle.v1',saved]]);
+ const c=vm.createContext({ref,props:{canSend},emit:e=>events.push(e),watch(){},window:{localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},setTimeout:f=>(timer=f,1),clearTimeout:()=>timer=null}});
+ vm.runInContext(code,c);return {c,events,storage,tick(){timer?.();},run(s){return vm.runInContext(s,c);}};
+}
+test('long press switches full styles, persists and suppresses send; next short click sends',()=>{
+ const h=harness();h.run('startSendStylePress({button:0,isPrimary:true,pointerId:1,clientX:0,clientY:0})');h.tick();
+ assert.equal(h.run('sendButtonStyle.value'),'original');assert.equal(h.storage.values().next().value,'original');
+ h.run('cancelSendStylePress();clickSendButton({detail:1,preventDefault(){}})');assert.deepEqual(h.events,[]);
+ h.run('startSendStylePress({button:0,pointerId:2,clientX:0,clientY:0});cancelSendStylePress();clickSendButton({detail:1})');assert.deepEqual(h.events,['send']);
+ assert.equal(harness('original').run('sendButtonStyle.value'),'original');
 });
-test('send respects canSend and stop preserves its action',async()=>{
- for(const canSend of [true,false]){
-  const events=[];
-  const render=compile(button(false));
-  let vnode;
-  const app=createSSRApp({render(){vnode=render.call(this,{props:{canSend},emit:e=>events.push(e)},[]);return vnode;}});
-  const html=await renderToString(app);
-  assert.equal(vnode.props.disabled,!canSend);
-  assert.equal(/disabled/.test(html),!canSend);
-  if(canSend){vnode.props.onClick();assert.deepEqual(events,['send']);}
- }
- const events=[];const render=compile(button(true));let vnode;
- await renderToString(createSSRApp({render(){vnode=render.call(this,{emit:e=>events.push(e)},[]);return vnode;}}));
- vnode.props.onClick();assert.deepEqual(events,['stop']);
+test('empty input can toggle but cannot send; drag and cancellation cancel long press',()=>{
+ const h=harness('round',false);h.run('startSendStylePress({button:0,pointerId:1,clientX:0,clientY:0})');h.tick();h.run('clickSendButton({detail:1,preventDefault(){}});clickSendButton({detail:0})');assert.deepEqual(h.events,[]);
+ h.run('startSendStylePress({button:0,pointerId:2,clientX:0,clientY:0});moveSendStylePress({pointerId:2,clientX:20,clientY:0})');h.tick();assert.equal(h.run('sendButtonStyle.value'),'original');
+ h.run('startSendStylePress({button:0,pointerId:3,clientX:0,clientY:0});cancelSendStylePress()');h.tick();assert.equal(h.run('sendButtonStyle.value'),'original');
+});
+test('context menu after timer toggles only once and missing storage is safe',()=>{
+ const h=harness();h.run('startSendStylePress({button:0,pointerId:1,clientX:0,clientY:0})');h.tick();h.run('sendStyleContextMenu();clickSendButton({detail:1,preventDefault(){}})');assert.equal(h.run('sendButtonStyle.value'),'original');assert.deepEqual(h.events,[]);
+ h.run('window.localStorage.getItem=()=>{throw Error()};window.localStorage.setItem=()=>{throw Error()};toggleSendStyle()');assert.equal(h.run('readSendStyle()'),'round');
+});
+test('both reference and original styles retain their colors, icons and dimensions',()=>{
+ for(const s of ['background: #fff','background: #ff5058','background: #414141','width: 34px; height: 34px','width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
+ assert.match(source,/@click="emit\('stop'\)"/);
 });

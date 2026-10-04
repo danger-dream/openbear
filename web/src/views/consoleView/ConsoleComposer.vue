@@ -15,6 +15,7 @@ import {
 	Document,
 	Paperclip,
 	Plus,
+	Promotion,
 	Search,
 	Timer,
 	Warning,
@@ -720,12 +721,60 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+	cancelSendStylePress();
 	if (interactionClockTimer) window.clearInterval(interactionClockTimer);
 	interactionClockTimer = null;
 	composerResizeObserver?.disconnect();
 	composerResizeObserver = null;
 });
 
+
+const SEND_STYLE_KEY = 'openbear.console.sendButtonStyle.v1';
+function readSendStyle() {
+ try { return window.localStorage.getItem(SEND_STYLE_KEY) === 'original' ? 'original' : 'round'; }
+ catch { return 'round'; }
+}
+const sendButtonStyle = ref(readSendStyle());
+let sendStyleTimer = null;
+let sendStylePress = null;
+let suppressSendClick = false;
+function cancelSendStylePress() {
+ if (sendStyleTimer !== null) window.clearTimeout(sendStyleTimer);
+ sendStyleTimer = null;
+ sendStylePress = null;
+}
+function toggleSendStyle() {
+ sendButtonStyle.value = sendButtonStyle.value === 'round' ? 'original' : 'round';
+ try { window.localStorage.setItem(SEND_STYLE_KEY, sendButtonStyle.value); } catch {}
+}
+function startSendStylePress(event) {
+ cancelSendStylePress(); suppressSendClick = false;
+ if (event.isPrimary === false || event.button > 0) return;
+ sendStylePress = {id: event.pointerId, x: event.clientX, y: event.clientY};
+ sendStyleTimer = window.setTimeout(() => {
+  sendStyleTimer = null;
+  if (!sendStylePress || suppressSendClick) return;
+  suppressSendClick = true; toggleSendStyle();
+ }, 550);
+}
+function moveSendStylePress(event) {
+ if (!sendStylePress || event.pointerId !== sendStylePress.id) return;
+ if (Math.hypot(event.clientX-sendStylePress.x,event.clientY-sendStylePress.y)>10) {
+  suppressSendClick = true; cancelSendStylePress();
+ }
+}
+function sendStyleContextMenu() {
+ if (!suppressSendClick) toggleSendStyle();
+ suppressSendClick = true; cancelSendStylePress();
+}
+function clickSendButton(event) {
+ if (suppressSendClick && event.detail !== 0) {
+  suppressSendClick = false; event.preventDefault(); return;
+ }
+ suppressSendClick = false;
+ if (props.canSend) emit('send');
+}
+watch(() => [props.conversationUuid, props.running], cancelSendStylePress);
 
 function focusInteraction(interactionId) {
 	const pending = props.pendingConfirmations.find(item => item.confirmationId === interactionId);
@@ -1101,14 +1150,15 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 							</div>
 						</el-popover>
 						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成" placement="top" :show-after="260">
-							<button type="button" class="send-button stop-button" aria-label="停止生成" @click="emit('stop')">
-								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+							<button type="button" class="send-button stop-button" :class="{'is-original': sendButtonStyle === 'original'}" aria-label="停止生成" @click="emit('stop')">
+								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect :x="sendButtonStyle === 'original' ? 4 : 5" :y="sendButtonStyle === 'original' ? 4 : 5" :width="sendButtonStyle === 'original' ? 16 : 14" :height="sendButtonStyle === 'original' ? 16 : 14" :rx="sendButtonStyle === 'original' ? 3 : 1.5"/></svg>
 							</button>
 						</el-tooltip>
 						<el-tooltip v-else content="发送消息（Enter；触屏可用 Ctrl/⌘+Enter）" placement="top" :show-after="260">
-							<button type="button" class="send-button" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :disabled="!props.canSend"
-							        @click="emit('send')">
-								<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V4M5 11l7-7 7 7"/></svg>
+							<button type="button" class="send-button" :class="{'is-original': sendButtonStyle === 'original'}" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :aria-disabled="!props.canSend" aria-description="长按切换圆形上箭头与原版方形纸飞机样式"
+                                @click="clickSendButton" @pointerdown="startSendStylePress" @pointermove="moveSendStylePress" @pointerup="cancelSendStylePress" @pointercancel="cancelSendStylePress" @pointerleave="cancelSendStylePress" @contextmenu.prevent="sendStyleContextMenu">
+								<Promotion v-if="sendButtonStyle === 'original'"/>
+                                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V4M5 11l7-7 7 7"/></svg>
 							</button>
 						</el-tooltip>
 					</div>
@@ -2409,6 +2459,8 @@ button.status-chip:hover, .status-chip-active {
 	color: #202020;
 	line-height: 1;
 	cursor: pointer;
+	-webkit-touch-callout: none;
+	user-select: none;
 	box-shadow: none;
 }
 
@@ -2425,7 +2477,7 @@ button.status-chip:hover, .status-chip-active {
 	user-select: none;
 }
 
-.send-button:disabled {
+.send-button[aria-disabled="true"] {
 	background: #414141;
 	color: #202020;
 	opacity: 1;
@@ -2567,4 +2619,14 @@ html.dark .recommendation-badge {
 html.dark .recommendation-reason {
 		border-left: 2px solid rgb(var(--ob-blue-rgb) / 0.52);
 	}
+</style>
+
+<style scoped>
+.send-button.is-original { width: 2rem; height: 2rem; border-radius: 8px; background: var(--ob-chat-button); color: var(--ob-chat-button-text); box-shadow: var(--ob-shadow-panel); }
+.send-button.is-original svg { width: 1rem; height: 1rem; }
+.send-button.is-original[aria-disabled="true"] { background: var(--ob-text-disabled); }
+.stop-button.is-original { background: var(--ob-danger); box-shadow: 0 8px 18px rgb(var(--ob-danger-rgb) / 0.18); }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+ .send-button.is-original { width: 38px; height: 38px; }
+}
 </style>
