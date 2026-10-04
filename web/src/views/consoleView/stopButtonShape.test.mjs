@@ -24,9 +24,22 @@ test('empty input can toggle but cannot send; drag and cancellation cancel long 
 });
 test('context menu after timer toggles only once and missing storage is safe',()=>{
  const h=harness();h.run('startSendStylePress({button:0,pointerId:1,clientX:0,clientY:0})');h.tick();h.run('sendStyleContextMenu();clickSendButton({detail:1,preventDefault(){}})');assert.equal(h.run('sendButtonStyle.value'),'original');assert.deepEqual(h.events,[]);
- h.run('window.localStorage.getItem=()=>{throw Error()};window.localStorage.setItem=()=>{throw Error()};toggleSendStyle()');assert.equal(h.run('readSendStyle()'),'round');
+ h.run('window.localStorage.getItem=()=>{throw Error()};window.localStorage.setItem=()=>{throw Error()};toggleSendStyle()');assert.equal(h.run('readSendStyle()'),'original');
 });
 test('both reference and original styles retain their colors, icons and dimensions',()=>{
- for(const s of ['background: #fff','background: #ff5058','background: #414141','width: 34px; height: 34px','width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
+ for(const s of ['background: #fff','background: #ff5058','background: #414141','width: 38px; height: 38px','background: var(--ob-chat-button)','background: var(--ob-danger)','<Promotion v-if','M12 20V4M5 11l7-7 7 7'])assert.ok(source.includes(s),s);
  assert.match(source,/@click="emit\('stop'\)"/);
+});
+
+test('press hides the send tooltip and circle matches original dimensions',()=>{
+ assert.match(source,/:disabled="sendStylePressActive" :visible="sendStylePressActive \? false : undefined"/);
+ assert.match(source,/sendStylePressActive.value = true/);
+ assert.match(source,/sendStylePressActive.value = false/);
+ assert.match(source,/\.send-button \{\s*width: 2rem;\s*height: 2rem;/);
+});
+
+test("new browsers default to original square while explicit round stays saved",()=>{
+ assert.equal(harness(null).run("sendButtonStyle.value"),"original");
+ assert.equal(harness("bad").run("sendButtonStyle.value"),"original");
+ assert.equal(harness("round").run("sendButtonStyle.value"),"round");
 });

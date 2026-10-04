@@ -731,14 +731,16 @@ onBeforeUnmount(() => {
 
 const SEND_STYLE_KEY = 'openbear.console.sendButtonStyle.v1';
 function readSendStyle() {
- try { return window.localStorage.getItem(SEND_STYLE_KEY) === 'original' ? 'original' : 'round'; }
- catch { return 'round'; }
+ try { return window.localStorage.getItem(SEND_STYLE_KEY) === 'round' ? 'round' : 'original'; }
+ catch { return 'original'; }
 }
 const sendButtonStyle = ref(readSendStyle());
+const sendStylePressActive = ref(false);
 let sendStyleTimer = null;
 let sendStylePress = null;
 let suppressSendClick = false;
 function cancelSendStylePress() {
+ sendStylePressActive.value = false;
  if (sendStyleTimer !== null) window.clearTimeout(sendStyleTimer);
  sendStyleTimer = null;
  sendStylePress = null;
@@ -750,6 +752,7 @@ function toggleSendStyle() {
 function startSendStylePress(event) {
  cancelSendStylePress(); suppressSendClick = false;
  if (event.isPrimary === false || event.button > 0) return;
+ sendStylePressActive.value = true;
  sendStylePress = {id: event.pointerId, x: event.clientX, y: event.clientY};
  sendStyleTimer = window.setTimeout(() => {
   sendStyleTimer = null;
@@ -1154,7 +1157,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect :x="sendButtonStyle === 'original' ? 4 : 5" :y="sendButtonStyle === 'original' ? 4 : 5" :width="sendButtonStyle === 'original' ? 16 : 14" :height="sendButtonStyle === 'original' ? 16 : 14" :rx="sendButtonStyle === 'original' ? 3 : 1.5"/></svg>
 							</button>
 						</el-tooltip>
-						<el-tooltip v-else content="发送消息（Enter；触屏可用 Ctrl/⌘+Enter）" placement="top" :show-after="260">
+						<el-tooltip v-else content="发送消息（Enter；触屏可用 Ctrl/⌘+Enter）" placement="top" :show-after="260" :disabled="sendStylePressActive" :visible="sendStylePressActive ? false : undefined">
 							<button type="button" class="send-button" :class="{'is-original': sendButtonStyle === 'original'}" aria-label="发送消息（桌面 Enter；触屏 Ctrl 或 Command 加 Enter）" :aria-disabled="!props.canSend" aria-description="长按切换圆形上箭头与原版方形纸飞机样式"
                                 @click="clickSendButton" @pointerdown="startSendStylePress" @pointermove="moveSendStylePress" @pointerup="cancelSendStylePress" @pointercancel="cancelSendStylePress" @pointerleave="cancelSendStylePress" @contextmenu.prevent="sendStyleContextMenu">
 								<Promotion v-if="sendButtonStyle === 'original'"/>
@@ -2448,8 +2451,8 @@ button.status-chip:hover, .status-chip-active {
 }
 
 .send-button {
-	width: 30px;
-	height: 30px;
+	width: 2rem;
+	height: 2rem;
 	flex: 0 0 auto;
 	display: grid;
 	place-items: center;
@@ -2579,7 +2582,7 @@ button.status-chip:hover, .status-chip-active {
 	}
 	/* Keep the tool controls at 44px height, but make the primary send button a
 	   little smaller so more of the row can be used by the model name. */
-	.send-button { width: 34px; height: 34px; }
+	.send-button { width: 38px; height: 38px; }
 	.run-config-chip { min-height: 44px; }
 	.attachment-remove {
 		top: 0;
