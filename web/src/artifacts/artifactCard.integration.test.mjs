@@ -2,6 +2,7 @@ import test, {after, afterEach} from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import {register} from "node:module";
+import vm from "node:vm";
 import {compileScript, compileStyle, compileTemplate, parse} from "@vue/compiler-sfc";
 import {createRenderer, h, nextTick} from "vue";
 import {artifactFromUrl, artifactRecord, clearArtifactCache} from "./artifactFiles.js";
@@ -49,13 +50,13 @@ const text = n => [n.type === "#comment" ? "" : n.text, ...n.children.map(text)]
 const href = "/api/conversations/39a541d4-4d9c-4a58-87d6-1b276779954a/artifacts/adfead18-e6d1-40df-8475-391e1245aa0d/content";
 const identity = artifactFromUrl(href);
 const metadata = extra => ({conversationUuid: identity.conversationUuid, artifactUuid: identity.artifactUuid, fileName: "report.md", mimeType: "text/markdown", sizeBytes: 2048, workspacePath: "workspace/artifacts/report.md", ...extra});
-function mount(t, meta, summary = {title: "", excerpt: ""}) {
+function mount(t, meta, summary = {title: "", excerpt: ""}, linkHref = href) {
  const record = artifactRecord(identity);
  record.metadata = meta; record.summary = summary; record.checkedAt = Date.now();
- const root = node("root"), app = renderer.createApp({render: () => h(Component, {href, label: "测试附件"})});
+ const root = node("root"), app = renderer.createApp({render: () => h(Component, {href: linkHref, label: "测试附件"})});
  app.mount(root); t.after(() => app.unmount()); return {root, record};
 }
-function click(target) { let stopped = false; target.props.onClick({currentTarget: target, stopPropagation() { stopped = true; }}); return stopped; }
+function click(target) { let stopped = false; target.props.onClick({currentTarget: target, preventDefault() {}, stopPropagation() { stopped = true; }}); return stopped; }
 
 test("real attachment template and theme CSS compile", () => {
  assert.deepEqual(compileTemplate({source: descriptor.template.content, filename, id: filename}).errors, []);
@@ -90,16 +91,62 @@ test("real file-card download keeps desktop native click but routes iPhone home-
  } finally { delete nav.userAgent; delete nav.standalone; delete window.navigator; }
 });
 
-test("image card uses canonical lazy thumbnail, opens only one viewer, and remains usable on image failure", async t => {
- const {root} = mount(t, metadata({fileName: "photo.png", mimeType: "image/png", contentUrl: "https://unrelated.test/file"}));
- assert.ok(find(root, "artifact-card--image"));
- const img = walk(root).find(n => n.type === "img");
- assert.equal(img.props.src, href); assert.equal(img.props.loading, "lazy");
- const before = dispatched.length; assert.equal(click(find(root, "artifact-card-open")), true); assert.equal(dispatched.length, before + 1);
- img.props.onError(); await nextTick();
- assert.equal(walk(root).some(n => n.type === "img"), false); assert.match(text(root), /缩略图未能加载/);
- assert.ok(find(root, "artifact-card-download")); assert.ok(find(root, "artifact-card-copy-path"));
- click(find(root, "artifact-card-open")); assert.equal(dispatched.at(-1).detail.href, href);
+function assertCompactImage(root) {
+ assert.ok(find(root, "artifact-image-link"));
+ assert.equal(find(root, "artifact-card"), undefined, "all images lose the card, not just duplicates");
+ assert.equal(walk(root).some(n => n.type === "img"), false, "a file link never creates another inline image");
+ assert.equal(find(root, "artifact-image-open").props.href, href);
+ assert.equal(find(root, "artifact-image-download").props.href, `${href}?download=1`);
+ assert.equal(find(root, "artifact-image-download").props.download, "");
+}
+for (const [fileName, mimeType] of [["photo.PNG", "image/png"], ["photo.jpg", "image/jpeg"], ["photo.webp", "image/webp"], ["photo.gif", "image/gif"], ["photo.avif", "application/octet-stream"], ["无后缀图片", "image/png"]]) test(`image attachment ${fileName} is a compact link, never a thumbnail card`, async t => {
+ const {root} = mount(t, metadata({fileName, mimeType, contentUrl: "https://unrelated.test/file"}), undefined, `${href}?filename=${encodeURIComponent(fileName)}`);
+ assertCompactImage(root);
+ const before = dispatched.length; assert.equal(click(find(root, "artifact-image-open")), true);
+ assert.equal(dispatched.length, before + 1); assert.equal(dispatched.at(-1).detail.href, href);
+ assert.equal(click(walk(root).find(n => n.type === "button")), true); await nextTick();
+ assert.equal(copied.at(-1), "workspace/artifacts/report.md");
+});
+
+test("asynchronous extensionless image metadata and streaming slot refresh never bring image cards back", async t => {
+ const slot = node("div"); slot.dataset = {artifactSlot: `${identity.key}:0`, artifactHref: href, artifactLabel: "无后缀链接"};
+ slot.hasAttribute = () => false;
+ let currentSlot = slot, renders = 0, fetches = 0;
+ const root = {querySelectorAll: () => [currentSlot]};
+ const context = {ArtifactCard: Component, ArtifactImagePath: {}, createVNode: h, render(vnode, container) { renders++; renderer.render(vnode, container); }};
+ const source = readFileSync(new URL("./artifactCards.js", import.meta.url), "utf8").replace(/^import .*;\n/gm, "").replace(/^export /gm, "");
+ vm.runInNewContext(`${source}\nthis.sync = syncArtifactCards; this.unmount = unmountArtifactCards;`, context);
+ context.sync(root); t.after(() => context.unmount(root));
+ const instance = slot._vnode.component;
+ assert.ok(find(slot, "artifact-card--file"), "unknown attachments retain the existing lazy placeholder");
+ globalThis.fetch = async url => { fetches++; assert.equal(url, identity.metadataUrl); return Response.json({artifact: metadata({fileName: "无后缀图片", mimeType: "image/png"})}); };
+ observer.callback([{isIntersecting: true}]);
+ await new Promise(resolve => setImmediate(resolve)); await nextTick();
+ assertCompactImage(slot); assert.equal(fetches, 1, "classification fetches metadata, never image bytes");
+ const link = find(slot, "artifact-image-open");
+ for (let i = 0; i < 5; i++) context.sync(root);
+ assert.equal(renders, 1); assert.equal(slot._vnode.component, instance); assert.equal(find(slot, "artifact-image-open"), link);
+ slot.dataset.artifactLabel = "流式更新后的图片链接"; context.sync(root); await nextTick();
+ assertCompactImage(slot); assert.equal(slot._vnode.component, instance);
+ currentSlot = node("div"); currentSlot.dataset = {...slot.dataset}; currentSlot.hasAttribute = () => false;
+ context.sync(root); await nextTick();
+ assertCompactImage(currentSlot); assert.equal(fetches, 1, "even a new slot reuses metadata and stays compact");
+});
+
+test("compact image download keeps native desktop behavior and the mobile original-file save flow", t => {
+ const {root} = mount(t, metadata({fileName: "photo.png", mimeType: "image/png", workspacePath: undefined}));
+ const link = find(root, "artifact-image-download");
+ assertCompactImage(root); assert.equal(walk(root).some(n => n.type === "button"), false);
+ const nav = globalThis.navigator; window.navigator = nav;
+ const event = () => ({stopPropagation() {}, preventDefault() { this.prevented = true; }});
+ try {
+  const desktop = event(); link.props.onClick(desktop); assert.equal(desktop.prevented, undefined);
+  for (const userAgent of ["iPhone", "Android"]) {
+   nav.userAgent = userAgent; nav.standalone = true;
+   const tap = event(); link.props.onClick(tap); assert.equal(tap.prevented, true);
+   assert.equal(dispatched.at(-1).type, "openbear:download-artifact"); assert.equal(dispatched.at(-1).detail.href, href);
+  }
+ } finally { delete nav.userAgent; delete nav.standalone; delete window.navigator; }
 });
 
 for (const [ext, category] of [["pdf", "pdf"], ["docx", "document"], ["xlsx", "spreadsheet"], ["pptx", "presentation"], ["zip", "archive"], ["mp3", "audio"], ["mp4", "video"], ["woff2", "font"], ["bin", "file"]]) test(`${ext} renders distinct type and honest download-only capability`, t => {

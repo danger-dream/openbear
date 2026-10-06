@@ -1,7 +1,7 @@
 <script setup>
 import {computed, onBeforeUnmount, onMounted, ref} from "vue";
 import {ElMessage} from "element-plus";
-import {Globe, Image, FileText, FileCode, FileArchive, FileSpreadsheet, Presentation, FileAudio, FileVideo, File, Braces, Type, ArrowUpRight, Maximize2, Copy, Download} from "@lucide/vue";
+import {Globe, FileText, FileCode, FileArchive, FileSpreadsheet, Presentation, FileAudio, FileVideo, File, Braces, Type, ArrowUpRight, Copy, Download} from "@lucide/vue";
 import {artifactPresentation} from "./artifactPresentation.js";
 import {onArtifactDownload} from "./artifactDownload.js";
 import {copyTextToClipboard} from "../utils/clipboard.js";
@@ -12,8 +12,7 @@ const identity = artifactFromUrl(props.href);
 const record = identity ? artifactRecord(identity) : null;
 const root = ref(null);
 const presentation = computed(() => artifactPresentation(record?.metadata));
-const icons = {html: Globe, image: Image, markdown: FileText, pdf: FileText, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, archive: FileArchive, audio: FileAudio, video: FileVideo, font: Type, code: FileCode, data: Braces, text: FileText, file: File};
-const imageFailed = ref(false);
+const icons = {html: Globe, markdown: FileText, pdf: FileText, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, archive: FileArchive, audio: FileAudio, video: FileVideo, font: Type, code: FileCode, data: Braces, text: FileText, file: File};
 const sharedPath = computed(() => artifactSharedPath(record?.metadata));
 const title = computed(() => record?.summary?.title || props.label || record?.metadata?.fileName || "附件");
 const excerpt = computed(() => {
@@ -39,14 +38,17 @@ onBeforeUnmount(() => observer?.disconnect());
 </script>
 
 <template>
-	<div ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
+	<!-- Classify from shared metadata, including MIME-only extensionless images.
+	     The stable Markdown slot stays mounted during streaming; images never
+	     acquire a second thumbnail, even when metadata arrives asynchronously. -->
+	<span v-if="presentation.category === 'image'" ref="root" class="artifact-image-link" :data-artifact-id="identity?.artifactUuid">
+		<a class="artifact-image-open" :href="identity?.contentUrl || href" :title="record?.metadata?.fileName || title" :aria-label="`查看图片：${title}`" @click.stop.prevent="open">{{ title }}</a>
+		<a class="artifact-image-download" :href="identity?.downloadUrl || href" download title="下载原图" :aria-label="`下载原图：${record?.metadata?.fileName || title}`" @click.stop="onArtifactDownload($event, identity)">下载</a>
+		<button v-if="sharedPath" type="button" :aria-label="`复制工作区路径：${sharedPath}`" title="复制工作区路径" @click.stop="copyPath">复制路径</button>
+	</span>
+	<div v-else ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
 		<button type="button" class="artifact-card-open" :aria-label="openLabel" @click.stop="open">
-			<span v-if="presentation.category === 'image'" class="artifact-card-thumbnail" :class="{'is-failed': imageFailed}" aria-hidden="true">
-				<img v-if="!imageFailed" :src="identity?.contentUrl" alt="" loading="lazy" decoding="async" @error="imageFailed = true"/>
-				<template v-else><Image :stroke-width="1.5"/><span>缩略图未能加载 · 点击重试查看</span></template>
-				<span v-if="!imageFailed" class="artifact-card-image-hint"><Maximize2 :size="14"/>查看大图</span>
-			</span>
-			<span v-else class="artifact-card-icon" aria-hidden="true">
+			<span class="artifact-card-icon" aria-hidden="true">
 				<component :is="icons[presentation.category]" :size="23" :stroke-width="1.6"/>
 				<span class="artifact-card-extension">{{ presentation.badge }}</span>
 			</span>
@@ -65,6 +67,11 @@ onBeforeUnmount(() => observer?.disconnect());
 </template>
 
 <style>
+.artifact-image-link { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.artifact-image-link .artifact-image-open { min-width: 0; }
+.artifact-image-link .artifact-image-download, .artifact-image-link button { padding: 5px 8px; border: 1px solid var(--ob-border-soft); border-radius: 7px; background: var(--ob-surface); color: var(--ob-text-subtle); text-decoration: none; font: inherit; cursor: pointer; }
+.artifact-image-link .artifact-image-download:hover, .artifact-image-link button:hover { color: var(--ob-blue); background: var(--ob-surface-soft); }
+.artifact-image-link a:focus-visible, .artifact-image-link button:focus-visible { outline: 2px solid var(--ob-blue); outline-offset: 2px; }
 .md-artifact-slot { margin: 10px 0; max-width: 620px; min-width: 0; }
 .artifact-card { --artifact-accent: var(--ob-text-subtle); --artifact-tint: var(--ob-surface-soft); position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; width: 100%; overflow: hidden; border: 1px solid var(--ob-border); border-radius: 12px; background: var(--ob-surface); color: var(--ob-text); transition: border-color .15s; }
 .artifact-card--html, .artifact-card--document { --artifact-accent: var(--ob-blue); --artifact-tint: var(--ob-blue-soft); }
@@ -90,16 +97,6 @@ onBeforeUnmount(() => observer?.disconnect());
 .artifact-card-copy-path:hover, .artifact-card-download:hover { background: var(--ob-surface-soft); color: var(--ob-text-strong); }
 .artifact-card-open:focus-visible, .artifact-card-copy-path:focus-visible, .artifact-card-download:focus-visible { outline: 2px solid var(--ob-blue); outline-offset: -3px; }
 .artifact-card.is-unavailable .artifact-card-excerpt { color: var(--ob-text-muted); }
-.artifact-card--image { display: block; }
-.artifact-card--image .artifact-card-open { display: block; padding: 0; }
-.artifact-card--image .artifact-card-copy { padding: 12px 54px 12px 14px; }
-.artifact-card--image.has-shared-path .artifact-card-copy { padding-right: 86px; }
-.artifact-card--image .artifact-card-actions { position: absolute; bottom: 12px; right: 10px; padding: 0; }
-.artifact-card-thumbnail { position: relative; display: flex; align-items: center; justify-content: center; height: 180px; padding: 10px; overflow: hidden; border-bottom: 1px solid var(--ob-border-soft); background: var(--ob-surface-soft); }
-.artifact-card.artifact-card--image .artifact-card-thumbnail img { display: block; width: 100%; height: 100%; max-width: 100%; max-height: 100%; margin: 0; border-radius: 0; box-shadow: none; object-fit: contain; cursor: zoom-in; }
-.artifact-card-image-hint { position: absolute; bottom: 10px; right: 10px; display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid var(--ob-border-soft); border-radius: 6px; background: var(--ob-surface); color: var(--ob-text-subtle); font-size: 11px; line-height: 1.4; }
-.artifact-card-thumbnail.is-failed { flex-direction: column; gap: 10px; color: var(--ob-text-muted); font-size: 12px; }
-.artifact-card-thumbnail.is-failed > svg { width: 28px; height: 28px; }
-@media (max-width: 600px) { .artifact-card-open { padding: 12px 10px; gap: 9px; grid-template-columns: 40px minmax(0, 1fr); } .artifact-card-icon { width: 40px; min-height: 52px; } .artifact-card-title { font-size: 13px; } .artifact-card-actions { padding: 10px 6px 0 0; gap: 0; } .artifact-card-intent { margin-left: 0; } .artifact-card-thumbnail { height: 150px; } }
+@media (max-width: 600px) { .artifact-card-open { padding: 12px 10px; gap: 9px; grid-template-columns: 40px minmax(0, 1fr); } .artifact-card-icon { width: 40px; min-height: 52px; } .artifact-card-title { font-size: 13px; } .artifact-card-actions { padding: 10px 6px 0 0; gap: 0; } .artifact-card-intent { margin-left: 0; } }
 @media (prefers-reduced-motion: reduce) { .artifact-card { transition: none; } }
 </style>

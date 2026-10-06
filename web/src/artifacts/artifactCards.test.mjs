@@ -19,6 +19,24 @@ function image(src, parent = "") {
 	return {getAttribute: () => src, closest: () => parent || null, after(slot) { this.slot = slot; }};
 }
 
+test("named and extensionless artifact links use stable metadata-driven slots, never auto-insert images", () => {
+ const links = [href, `${href}&filename=photo.png`, "https://remote.test/photo.png", "/api/uploads/photo.png"].map((url, index) => ({
+  textContent: index === 1 ? "photo.png" : "附件", getAttribute: () => url,
+  closest: () => null, querySelector: () => null, hasAttribute: () => false,
+  replaceWith(slot) { this.slot = slot; slot.parentElement = root; },
+ }));
+ const created = [];
+ const root = {ownerDocument: {createElement(tag) { created.push(tag); return {dataset: {}}; }}, querySelectorAll: selector => selector === "a[href]" ? links : []};
+ context.prepare(root);
+ assert.ok(links[0].slot && links[1].slot);
+ assert.equal(links[0].slot.dataset.artifactHref, href.replace("?preview=1", ""));
+ assert.equal(links[1].slot.dataset.artifactLabel, "photo.png");
+ assert.equal(links[0].slot.dataset.artifactSlot, `${artifactFromUrl(href, "https://openbear.test").key}:0`);
+ assert.equal(links[1].slot.dataset.artifactSlot, `${artifactFromUrl(href, "https://openbear.test").key}:1`);
+ assert.equal(links[2].slot, undefined); assert.equal(links[3].slot, undefined);
+ assert.deepEqual(created, ["div", "div"], "only slots are inserted; metadata decides compact image links vs non-image cards");
+});
+
 test("only model artifact images gain path/download actions; uploads and linked images keep their old behavior", () => {
 	rendered.length = 0;
 	const model = image(href), other = image("/api/uploads/123/content"), linked = image(href, "a");
