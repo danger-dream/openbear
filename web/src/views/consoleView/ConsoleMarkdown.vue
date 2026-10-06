@@ -24,6 +24,7 @@ const displayedText = ref(String(props.text || ""));
 const imageViewerOpen = ref(false);
 const imageViewerUrls = ref([]);
 const imageViewerIndex = ref(0);
+const imageViewerArtifact = computed(() => artifactFromUrl(imageViewerUrls.value[imageViewerIndex.value]));
 let liveTimer = 0;
 let liveFrame = 0;
 let lastLivePaintAt = 0;
@@ -233,10 +234,45 @@ function onMarkdownClick(event) {
 	                 :url-list="imageViewerUrls"
 	                 :initial-index="imageViewerIndex"
 	                 hide-on-click-modal
-	                 @close="imageViewerOpen = false"/>
+	                 @switch="imageViewerIndex = $event"
+	                 @close="imageViewerOpen = false">
+		<!-- The toolbar slot replaces the native controls; extend via the default
+		     slot instead to retain native transforms, navigation and keyboard handling. -->
+		<a v-if="imageViewerArtifact" class="markdown-image-download"
+		   :href="imageViewerArtifact.downloadUrl" download
+		   title="下载原图" aria-label="下载原图"
+		   @click.stop="onArtifactDownload($event, imageViewerArtifact)">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/></svg>
+			<span>下载原图</span>
+		</a>
+	</el-image-viewer>
 </template>
 
 <style scoped>
+.markdown-image-download {
+	position: absolute;
+	z-index: 1;
+	bottom: 86px;
+	left: 50%;
+	transform: translateX(-50%);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	min-height: 44px;
+	padding: 0 16px;
+	border-radius: 22px;
+	background: var(--el-text-color-regular);
+	color: #fff;
+	font-size: 14px;
+	text-decoration: none;
+	white-space: nowrap;
+	touch-action: manipulation;
+}
+.markdown-image-download svg { width: 20px; height: 20px; }
+.markdown-image-download:hover { background: var(--el-color-primary); }
+.markdown-image-download:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+
 .bear-md :deep(h1),
 .bear-md :deep(h2),
 .bear-md :deep(h3),
