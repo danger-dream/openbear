@@ -22,6 +22,13 @@ function liftCard(slot, target) {
 }
 
 export function prepareArtifactCards(target) {
+	// Inspect only this message's renderer-produced body, before cards mount.
+	// Recompute on every paint so adding/removing an inline image updates dedup.
+	const inlineImages = new Set();
+	for (const image of target.querySelectorAll("img[src]")) {
+		const identity = artifactFromUrl(image.getAttribute("src"));
+		if (identity) inlineImages.add(identity.key);
+	}
 	const occurrences = new Map();
 	for (const link of Array.from(target.querySelectorAll("a[href]"))) {
 		// Keep tables, examples, linked images and explicit download links intact.
@@ -35,6 +42,7 @@ export function prepareArtifactCards(target) {
 		slot.dataset.artifactSlot = `${identity.key}:${occurrence}`;
 		slot.dataset.artifactHref = identity.contentUrl;
 		slot.dataset.artifactLabel = link.textContent.trim();
+		slot.dataset.artifactInlineImage = String(inlineImages.has(identity.key));
 		// Preserve the existing compact layout of emoji + standalone file links.
 		const paragraph = link.closest("p");
 		if (paragraph && !paragraph.querySelector("img") && paragraph.querySelectorAll("a").length === 1) {
@@ -77,12 +85,13 @@ export function syncArtifactCards(root, appContext) {
 	for (const slot of slots) {
 		const href = slot.dataset.artifactHref, label = slot.dataset.artifactLabel;
 		const image = slot.hasAttribute("data-artifact-image-path");
+		const inlineImage = slot.dataset.artifactInlineImage === "true";
 		const previous = mounted.get(slot);
-		if (previous?.href === href && previous?.label === label && previous?.image === image) continue;
-		const vnode = image ? createVNode(ArtifactImagePath, {href}) : createVNode(ArtifactCard, {href, label});
+		if (previous?.href === href && previous?.label === label && previous?.image === image && previous?.inlineImage === inlineImage) continue;
+		const vnode = image ? createVNode(ArtifactImagePath, {href}) : createVNode(ArtifactCard, {href, label, inlineImage});
 		if (appContext) vnode.appContext = appContext;
 		render(vnode, slot);
-		mounted.set(slot, {href, label, image});
+		mounted.set(slot, {href, label, image, inlineImage});
 	}
 	mountedRoots.set(root, mounted);
 }

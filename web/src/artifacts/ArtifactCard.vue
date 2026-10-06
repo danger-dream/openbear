@@ -1,18 +1,18 @@
 <script setup>
 import {computed, onBeforeUnmount, onMounted, ref} from "vue";
 import {ElMessage} from "element-plus";
-import {Globe, FileText, FileCode, FileArchive, FileSpreadsheet, Presentation, FileAudio, FileVideo, File, Braces, Type, ArrowUpRight, Copy, Download} from "@lucide/vue";
+import {Globe, Image, FileText, FileCode, FileArchive, FileSpreadsheet, Presentation, FileAudio, FileVideo, File, Braces, Type, ArrowUpRight, Copy, Download} from "@lucide/vue";
 import {artifactPresentation} from "./artifactPresentation.js";
 import {onArtifactDownload} from "./artifactDownload.js";
 import {copyTextToClipboard} from "../utils/clipboard.js";
 import {artifactFromUrl, artifactRecord, artifactSharedPath, formatFileSize, loadArtifactCard, openArtifactPreview} from "./artifactFiles.js";
 
-const props = defineProps({href: {type: String, required: true}, label: {type: String, default: ""}});
+const props = defineProps({href: {type: String, required: true}, label: {type: String, default: ""}, inlineImage: {type: Boolean, default: false}});
 const identity = artifactFromUrl(props.href);
 const record = identity ? artifactRecord(identity) : null;
 const root = ref(null);
 const presentation = computed(() => artifactPresentation(record?.metadata));
-const icons = {html: Globe, markdown: FileText, pdf: FileText, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, archive: FileArchive, audio: FileAudio, video: FileVideo, font: Type, code: FileCode, data: Braces, text: FileText, file: File};
+const icons = {html: Globe, image: Image, markdown: FileText, pdf: FileText, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, archive: FileArchive, audio: FileAudio, video: FileVideo, font: Type, code: FileCode, data: Braces, text: FileText, file: File};
 const sharedPath = computed(() => artifactSharedPath(record?.metadata));
 const title = computed(() => record?.summary?.title || props.label || record?.metadata?.fileName || "附件");
 const excerpt = computed(() => {
@@ -30,7 +30,7 @@ async function copyPath() {
 	catch { ElMessage.error("复制失败，请手动选择路径"); }
 }
 onMounted(() => {
-	// Already-confirmed images have no attachment row or observable element.
+	// Already-confirmed duplicate images have no row or observable element.
 	if (!root.value) return;
 	if (typeof IntersectionObserver === "undefined") return load();
 	observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) load(); }, {rootMargin: "160px"});
@@ -40,9 +40,9 @@ onBeforeUnmount(() => observer?.disconnect());
 </script>
 
 <template>
-	<!-- Only confirmed images lose their attachment row. Keep unknown/failed
-	     metadata visible and the component mounted for stable streaming updates. -->
-	<div v-if="presentation.category !== 'image'" ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
+	<!-- Hide only confirmed duplicates of an image in this message's body.
+	     Link-only images and unknown/failed metadata keep their access controls. -->
+	<div v-if="presentation.category !== 'image' || !inlineImage" ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
 		<button type="button" class="artifact-card-open" :aria-label="openLabel" @click.stop="open">
 			<span class="artifact-card-icon" aria-hidden="true">
 				<component :is="icons[presentation.category]" :size="23" :stroke-width="1.6"/>

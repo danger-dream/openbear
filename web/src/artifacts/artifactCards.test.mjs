@@ -34,7 +34,28 @@ test("named and extensionless artifact links use stable metadata-driven slots, n
  assert.equal(links[0].slot.dataset.artifactSlot, `${artifactFromUrl(href, "https://openbear.test").key}:0`);
  assert.equal(links[1].slot.dataset.artifactSlot, `${artifactFromUrl(href, "https://openbear.test").key}:1`);
  assert.equal(links[2].slot, undefined); assert.equal(links[3].slot, undefined);
- assert.deepEqual(created, ["div", "div"], "only slots are inserted; metadata decides compact image links vs non-image cards");
+ assert.equal(links[0].slot.dataset.artifactInlineImage, "false");
+ assert.equal(links[1].slot.dataset.artifactInlineImage, "false");
+ assert.deepEqual(created, ["div", "div"], "link-only images retain cards rather than inventing inline images");
+});
+
+test("only a matching canonical image in this message marks an attachment as duplicated", () => {
+ const otherArtifact = href.replace("adfead18", "bdfead18");
+ const otherConversation = href.replace("39a541d4", "49a541d4");
+ for (const [imageUrls, duplicate] of [
+  [[href], true], [[`https://openbear.test${href}&filename=photo.png`], true],
+  [[otherArtifact], false], [[otherConversation], false], [[`https://remote.test${href}`], false],
+  [["/api/uploads/photo.png"], false], [[], false],
+ ]) {
+  const links = [href, `${href}&filename=无后缀图片`].map(url => ({
+   textContent: "图片", getAttribute: () => url, closest: () => null, querySelector: () => null, hasAttribute: () => false,
+   replaceWith(slot) { this.slot = slot; slot.parentElement = root; },
+  }));
+  const images = imageUrls.map(src => image(src));
+  const root = {ownerDocument: {createElement: () => ({dataset: {}})}, querySelectorAll: selector => selector === "a[href]" ? links : images};
+  context.prepare(root);
+  for (const link of links) assert.equal(link.slot.dataset.artifactInlineImage, String(duplicate), JSON.stringify(imageUrls));
+ }
 });
 
 test("only model artifact images gain path/download actions; uploads and linked images keep their old behavior", () => {
