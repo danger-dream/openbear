@@ -61,15 +61,15 @@ async def deliveries(db):
 @pytest.mark.parametrize("seconds,expected", [(0, "不到1秒"), (9, "9秒"), (192, "3分12秒"), (3723, "1小时02分03秒")])
 def test_payload_identifies_task_and_formats_known_elapsed(seconds, expected):
     payload = BrowserPush.payload("completed", "conv", "run:one", task_title="  优化通知\n样式  ", elapsed_seconds=seconds)
-    assert payload["body"] == f"优化通知 样式\n任务已完成 · 耗时 {expected}"
-    assert payload["title"] == "OpenBear" and payload["conversationUuid"] == "conv"
+    assert payload["body"] == f"任务已完成 · 耗时 {expected}"
+    assert payload["title"] == "优化通知 样式" and payload["conversationUuid"] == "conv"
     assert payload["tag"] == "openbear:run:one"
 
 
 @pytest.mark.parametrize("seconds", [None, -1])
 def test_payload_never_invents_unknown_elapsed_and_bounds_long_title(seconds):
     payload = BrowserPush.payload("failed", "conv", "one", task_title="长" * 150, elapsed_seconds=seconds)
-    assert payload["body"].splitlines()[0] == "长" * 79 + "…"
+    assert payload["title"] == "长" * 79 + "…"
     assert payload["body"].endswith("任务执行失败") and "耗时" not in payload["body"]
     assert BrowserPush.payload("test", "", "test")["body"] == "本设备的通知测试"
 
@@ -91,7 +91,8 @@ async def test_terminal_uses_latest_owned_title_and_durable_start_not_delivery_t
     rows = await deliveries(db)
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload_json"])
-    assert payload["body"] == f"优化通知样式\n{label} · 耗时 3分12秒"
+    assert payload["title"] == "优化通知样式"
+    assert payload["body"] == f"{label} · 耗时 3分12秒"
     assert "private" not in rows[0]["payload_json"]
     push.send = AsyncMock(return_value=503)
     await push.deliver_one()
@@ -110,7 +111,8 @@ async def test_interaction_identifies_conversation_without_exposing_question(db)
     await add_interaction(db)
     await BrowserPush(db).on_interaction("created", {"interactionId": "question", "ownerChatId": 123, "conversationUuid": "conv", "sensitive": True, "title": "secret question", "body": "secret body"})
     payload = json.loads((await deliveries(db))[0]["payload_json"])
-    assert payload["body"] == "上线通知改进\n有一项操作需要你确认"
+    assert payload["title"] == "上线通知改进"
+    assert payload["body"] == "有一项操作需要你确认"
     assert "secret" not in str(payload) and "耗时" not in payload["body"]
 
 
@@ -123,7 +125,9 @@ async def test_title_lookup_respects_owner_and_unnamed_fallback(db):
     await push.enqueue(123, "empty", "empty", "completed")
     rows = await deliveries(db)
     assert json.loads(rows[0]["payload_json"])["body"] == "任务已完成"
-    assert json.loads(rows[1]["payload_json"])["body"] == "未命名会话\n任务已完成"
+    assert json.loads(rows[0]["payload_json"])["title"] == "OpenBear"
+    assert json.loads(rows[1]["payload_json"])["title"] == "未命名会话"
+    assert json.loads(rows[1]["payload_json"])["body"] == "任务已完成"
 
 
 @pytest.mark.parametrize("status,label", [("completed", "任务已完成"), ("interrupted", "任务已中断")])
@@ -147,7 +151,8 @@ async def test_webhook_push_uses_chain_end_not_notification_retry_time(db, statu
     await deliver(service, notice)
     rows = await deliveries(db)
     assert len(rows) == 1
-    assert json.loads(rows[0]['payload_json'])['body'] == f'处理外部消息\n{label} · 耗时 3分12秒'
+    assert json.loads(rows[0]['payload_json'])['title'] == '处理外部消息'
+    assert json.loads(rows[0]['payload_json'])['body'] == f'{label} · 耗时 3分12秒'
     assert 'private' not in rows[0]['payload_json']
 
 

@@ -14,7 +14,8 @@ self.addEventListener("push", event => {
     // Push subscriptions are userVisibleOnly: do not silently consume pushes in
     // the worker (notably iOS may revoke such subscriptions). Foreground quieting
     // happens on the server BEFORE sending, using a short-lived device presence.
-    await self.registration.showNotification("OpenBear", {
+    const title = typeof data.title === "string" ? data.title.trim() : "";
+    await self.registration.showNotification(title || "OpenBear", {
       body: typeof data.body === "string" ? data.body : "有新的任务动态，请打开查看",
       icon: "/icons/openbear-192.png",
       badge: "/icons/openbear-192.png",

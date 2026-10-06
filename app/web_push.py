@@ -113,8 +113,7 @@ class BrowserPush:
             duration = (f"{hours}小时{minutes:02d}分{secs:02d}秒" if hours else
                         f"{minutes}分{secs:02d}秒" if minutes else f"{secs}秒" if secs else "不到1秒")
             detail += " · 耗时 " + duration
-        body = f"{title}\n{detail}" if title else detail
-        return {"title": "OpenBear", "body": body, "conversationUuid": conversation,
+        return {"title": title or "OpenBear", "body": detail, "conversationUuid": conversation,
                 "tag": "openbear:" + key, "kind": kind, "createdAt": int(time.time())}
 
     async def enqueue(self, owner: int, conversation: str, key: str, kind: str, *, conn=None,

@@ -288,14 +288,31 @@ test('push worker displays user-visible notification and never intercepts fetch/
   assert.equal(w.notices[0].options.body, '任务已完成');
 });
 
-test('existing push worker displays the task title and elapsed body unchanged without an application update', async () => {
+test('push worker uses conversation title and status body without duplicating the title', async () => {
   const w = serviceWorker();
-  const body = '优化通知样式\n任务已完成 · 耗时 3分12秒';
-  await w.event('push', {data: {json: () => ({title: 'OpenBear', body, conversationUuid: 'task-conversation', tag: 'openbear:run:one'})}});
-  assert.equal(w.notices[0].title, 'OpenBear');
+  const body = '任务已完成 · 耗时 3分12秒';
+  await w.event('push', {data: {json: () => ({title: '优化通知样式', body, conversationUuid: 'task-conversation', tag: 'openbear:run:one'})}});
+  assert.equal(w.notices[0].title, '优化通知样式');
   assert.equal(w.notices[0].options.body, body);
   assert.equal(w.notices[0].options.data.url, '/chat?id=task-conversation');
   assert.equal(w.notices[0].options.tag, 'openbear:run:one');
+});
+
+test('push worker falls back to OpenBear for missing, blank or invalid titles', async () => {
+  for (const title of [undefined, null, '', '  ', 42, {}]) {
+    const w = serviceWorker();
+    await w.event('push', {data: {json: () => ({title, body: '本设备的通知测试'})}});
+    assert.equal(w.notices[0].title, 'OpenBear');
+    assert.equal(w.notices[0].options.body, '本设备的通知测试');
+  }
+});
+
+test('push worker remains compatible with old title/body payloads', async () => {
+  const w = serviceWorker();
+  const body = '日常\n任务已完成';
+  await w.event('push', {data: {json: () => ({title: 'OpenBear', body})}});
+  assert.equal(w.notices[0].title, 'OpenBear');
+  assert.equal(w.notices[0].options.body, body);
 });
 
 test('notification click reuses the current app without navigating/reloading away from drafts', async () => {
