@@ -193,6 +193,10 @@ class WebAdminContextEditorMixin:
                                         'context_strategy': row.get('context_strategy', 'sliding_window')},
                             folder_uuid=str(row.get('folder_uuid') or ''), create_lock_held=True)
                         bid, chat = branch['conversation_uuid'], int(branch['internal_chat_id'])
+                        # A user-chosen branch title or inherited manual title
+                        # keeps the same protection as a renamed conversation.
+                        branch['title_manual'] = 1 if body.get('title') or int(row.get('title_manual') or 0) else 0
+                        await conn.execute('UPDATE web_conversations SET title_manual=? WHERE conversation_uuid=?', (branch['title_manual'], bid))
                         dao = MessageDAO(self.db)
                         sid = await dao.get_or_create_session_uuid(chat)
                         await conn.execute('UPDATE sessions SET system_snapshot=? WHERE chat_id=?', (doc['system'], chat))

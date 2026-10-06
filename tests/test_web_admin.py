@@ -620,6 +620,176 @@ async def test_web_conversation_title_generation_never_overwrites_a_concurrent_m
     assert (await cur.fetchone())["title"] == "用户手动名称"
 
 
+async def _title_row_with_turn(web_env, title, user="调查标题锁"):
+    row = await web_env.server._create_web_conversation(123, title=title, model="openai/gpt")
+    messages = MessageDAO(web_env.db)
+    for role, content in (("user", user), ("assistant", "已处理。")):
+        await web_env.server._persist_web_transcript_message(
+            messages, int(row["internal_chat_id"]), role, content,
+            conversation_uuid=row["conversation_uuid"], turn_uuid="turn-lock", run_root_turn_uuid="turn-lock",
+        )
+    return row
+
+
+async def _title_state(web_env, conversation_uuid):
+    cur = await web_env.db.conn.execute(
+        "SELECT title,title_manual FROM web_conversations WHERE conversation_uuid=?", (conversation_uuid,),
+    )
+    row = await cur.fetchone()
+    return row["title"], int(row["title_manual"])
+
+
+async def test_manual_rename_persists_lock_and_blocks_automatic_titles_before_model_call(web_env):
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    row = await _title_row_with_turn(web_env, "调查标题锁")
+    uuid = str(row["conversation_uuid"])
+    assert await _title_state(web_env, uuid) == ("调查标题锁", 0)
+    web_env.server.llm_factory = FakeMemoryFactory("管理VPS")
+
+    response = await web_env.client.patch(f"/api/conversations/{uuid}", cookies=cookie, json={"title": " vps 管理 "})
+    assert response.status == 200
+    assert (await response.json())["conversation"]["titleManual"] is True
+    assert await _title_state(web_env, uuid) == ("vps 管理", 1)
+    empty = await web_env.client.patch(f"/api/conversations/{uuid}", cookies=cookie, json={"title": "  "})
+    assert empty.status == 400 and (await empty.json())["error"] == "title_required"
+
+    # Same-titled repeated manual renames and every later turn stay locked.
+    again = await web_env.client.patch(f"/api/conversations/{uuid}", cookies=cookie, json={"title": "vps 管理"})
+    assert again.status == 200
+    for expected in ("调查标题锁", "vps 管理"):
+        result = await web_env.server._generate_conversation_title(row, expected_title=expected, automatic=True)
+        assert result == {"ok": False, "error": "automatic_title_changed"}
+    assert web_env.server.llm_factory.requested == []
+    task = web_env.server._start_conversation_title_task(await web_env.server._conversation_row(123, uuid), automatic=True)
+    assert task is None
+    assert web_env.server.llm_factory.requested == []
+    assert await _title_state(web_env, uuid) == ("vps 管理", 1)
+
+    # Placeholder initial titling and list/tree projections honour the same state.
+    placeholder = await web_env.server._create_web_conversation(123, title="新对话")
+    await web_env.db.conn.execute("UPDATE web_conversations SET title_manual=1 WHERE conversation_uuid=?", (placeholder["conversation_uuid"],))
+    await web_env.db.conn.commit()
+    placeholder["title_manual"] = 1
+    await web_env.server._maybe_title_web_conversation(placeholder, "不应覆盖")
+    assert await _title_state(web_env, placeholder["conversation_uuid"]) == ("新对话", 1)
+    assert placeholder["title"] == "新对话"
+    stale = {**placeholder, "title_manual": 0}
+    await web_env.server._maybe_title_web_conversation(stale, "不应覆盖")
+    assert stale["title"] == "新对话"
+    listed = await web_env.client.get("/api/conversations", cookies=cookie)
+    by_id = {item["conversationUuid"]: item for item in (await listed.json())["items"]}
+    assert by_id[uuid]["titleManual"] is True
+
+
+@pytest.mark.parametrize("manual_title", ["调查竞态锁", "vps 管理"])
+async def test_in_flight_automatic_title_cannot_overwrite_manual_lock_even_when_title_text_matches(web_env, manual_title):
+    await _title_row_with_turn(web_env, "调查竞态锁", "调查竞态锁")
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    cur = await web_env.db.conn.execute("SELECT * FROM web_conversations WHERE title='调查竞态锁'")
+    row = dict(await cur.fetchone())
+    uuid = str(row["conversation_uuid"])
+
+    async def rename():
+        response = await web_env.client.patch(f"/api/conversations/{uuid}", cookies=cookie, json={"title": manual_title})
+        assert response.status == 200
+
+    factory = FakeMemoryFactory("管理VPS")
+    original = factory.backend.complete
+    async def complete(*args, **kwargs):
+        response = await original(*args, **kwargs)
+        await rename()
+        return response
+    factory.backend.complete = complete
+    web_env.server.llm_factory = factory
+    web_env.server.config.agent.naming_max_retries = 0
+
+    result = await web_env.server._generate_conversation_title(row, expected_title="调查竞态锁", automatic=True)
+
+    assert result == {"ok": True, "changed": False, "title": manual_title, "superseded": manual_title != "调查竞态锁"}
+    assert factory.requested == ["openai/gpt"]
+    assert await _title_state(web_env, uuid) == (manual_title, 1)
+
+
+async def test_automatic_title_retries_stop_when_user_renames_after_failed_model_call(web_env):
+    row = await _title_row_with_turn(web_env, "调查重试锁", "调查重试锁")
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    factory = FakeMemoryFactory("不应执行")
+    calls = []
+    async def complete(*args, **kwargs):
+        calls.append(1)
+        response = await web_env.client.patch(
+            f"/api/conversations/{row['conversation_uuid']}", cookies=cookie, json={"title": "手动名称"},
+        )
+        assert response.status == 200
+        raise RuntimeError("first naming call failed")
+    factory.backend.complete = complete
+    web_env.server.llm_factory = factory
+    web_env.server.config.agent.naming_max_retries = 2
+    result = await web_env.server._generate_conversation_title(row, expected_title="调查重试锁", automatic=True)
+    assert result == {"ok": False, "error": "automatic_title_changed"}
+    assert calls == [1]
+    assert await _title_state(web_env, row["conversation_uuid"]) == ("手动名称", 1)
+
+
+async def test_explicit_generate_may_replace_manual_title_and_keeps_lock(web_env):
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    row = await _title_row_with_turn(web_env, "调查显式生成", "调查显式生成")
+    uuid = str(row["conversation_uuid"])
+    await web_env.client.patch(f"/api/conversations/{uuid}", cookies=cookie, json={"title": "vps 管理"})
+    row = await web_env.server._conversation_row(123, uuid, require=True)
+    web_env.server.llm_factory = FakeMemoryFactory("重新生成名称")
+    web_env.server.config.agent.naming_max_retries = 0
+
+    response = await web_env.client.post(f"/api/conversations/{uuid}/title/generate", cookies=cookie)
+    assert response.status == 200, await response.text()
+    result = await response.json()
+
+    assert result == {"ok": True, "changed": True, "title": "重新生成名称", "superseded": False}
+    assert await _title_state(web_env, uuid) == ("重新生成名称", 1)
+    auto = await web_env.server._generate_conversation_title(row, expected_title="重新生成名称", automatic=True)
+    assert auto == {"ok": False, "error": "automatic_title_changed"}
+
+
+async def test_duplicate_preserves_manual_title_lock_without_forcing_default_titles_manual(web_env):
+    cookie = {"openbear_web_session": await _login_cookie(web_env)}
+    manual = await _title_row_with_turn(web_env, "调查复制锁", "调查复制锁")
+    automatic = await _title_row_with_turn(web_env, "调查复制自动", "调查复制自动")
+    await web_env.client.patch(f"/api/conversations/{manual['conversation_uuid']}", cookies=cookie, json={"title": "手动名"})
+    for source, locked in ((manual, 1), (automatic, 0)):
+        response = await web_env.client.post(f"/api/conversations/{source['conversation_uuid']}/duplicate", cookies=cookie)
+        assert response.status == 200, await response.text()
+        copied = (await response.json())["conversation"]
+        assert (await _title_state(web_env, copied["conversationUuid"]))[1] == locked
+        assert copied["titleManual"] is bool(locked)
+
+
+async def test_title_manual_migration_on_database_copy_preserves_titles_and_integrity(tmp_path):
+    import shutil
+    import sqlite3
+    legacy = tmp_path / "legacy.db"
+    raw = sqlite3.connect(legacy)
+    raw.execute("CREATE TABLE web_conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_uuid TEXT NOT NULL UNIQUE, owner_chat_id INTEGER NOT NULL, internal_chat_id INTEGER NOT NULL UNIQUE, title TEXT DEFAULT '', model TEXT DEFAULT '', status TEXT DEFAULT 'idle', current_status TEXT DEFAULT '', last_error TEXT DEFAULT '', created_at INTEGER, updated_at INTEGER, archived_at INTEGER DEFAULT 0)")
+    raw.executemany("INSERT INTO web_conversations(conversation_uuid,owner_chat_id,internal_chat_id,title,created_at,updated_at) VALUES (?,?,?,?,?,?)", [("a", 1, -1, "vps 管理", 1, 2), ("b", 1, -2, "", 1, 2)])
+    raw.commit(); raw.close()
+    copy = tmp_path / "copy.db"
+    shutil.copy2(legacy, copy)
+    db = DB(str(copy))
+    await db.connect()
+    try:
+        rows = [tuple(r) for r in await (await db.conn.execute("SELECT conversation_uuid,title,title_manual FROM web_conversations ORDER BY id")).fetchall()]
+        assert rows == [("a", "vps 管理", 0), ("b", "", 0)]
+        assert [r[0] for r in await (await db.conn.execute("PRAGMA integrity_check")).fetchall()] == ["ok"]
+        await db.conn.execute("UPDATE web_conversations SET title_manual=1 WHERE conversation_uuid='a'")
+        await db.conn.commit()
+        await db.close()
+        db = DB(str(copy)); await db.connect()
+        rows = [tuple(r) for r in await (await db.conn.execute("SELECT conversation_uuid,title,title_manual FROM web_conversations ORDER BY id")).fetchall()]
+        assert rows == [("a", "vps 管理", 1), ("b", "", 0)]
+        assert [r[0] for r in await (await db.conn.execute("PRAGMA quick_check")).fetchall()] == ["ok"]
+    finally:
+        await db.close()
+
+
 async def test_web_conversation_archive_only_filters_sidebar_listing(web_env):
     cookie = {"openbear_web_session": await _login_cookie(web_env)}
     row = await web_env.server._create_web_conversation(123, title="archive-only-field")

@@ -87,6 +87,7 @@ class WebAdminConversationsMixin:
             "ownerChatId": int(data.get("owner_chat_id") or 0),
             "internalChatId": int(data.get("internal_chat_id") or 0),
             "title": str(data.get("title") or "新对话"),
+            "titleManual": bool(int(data.get("title_manual") or 0)),
             "model": str(data.get("model") or ""),
             **activity_fields(data),
             "agentModel": str(data.get("agent_model") or ""),
@@ -609,13 +610,14 @@ class WebAdminConversationsMixin:
         await self.db.conn.execute(
             """
             UPDATE web_conversations
-            SET agent_model=?, agent_think_level=?, agent_fast_mode=?, updated_at=?
+            SET agent_model=?, agent_think_level=?, agent_fast_mode=?, title_manual=?, updated_at=?
             WHERE conversation_uuid=?
             """,
             (
                 str(source.get("agent_model") or ""),
                 str(source.get("agent_think_level") or ""),
                 agent_fast_mode,
+                1 if int(source.get("title_manual") or 0) else 0,
                 now_ts(),
                 new_uuid,
             ),
@@ -623,6 +625,7 @@ class WebAdminConversationsMixin:
         new_row["agent_model"] = str(source.get("agent_model") or "")
         new_row["agent_think_level"] = str(source.get("agent_think_level") or "")
         new_row["agent_fast_mode"] = agent_fast_mode
+        new_row["title_manual"] = 1 if int(source.get("title_manual") or 0) else 0
 
         try:
             old_task_uuids = list((await self._uuid_map_for_rows("rath_tasks", "task_uuid", "chat_id=?", (old_internal,))).keys())
@@ -3023,16 +3026,17 @@ class WebAdminConversationsMixin:
     async def _maybe_title_web_conversation(self, row: dict[str, Any], text: str) -> None:
         """Replace only a placeholder with the bounded first-message title."""
         title = str(row.get("title") or "").strip()
-        if title and title not in {"新对话", "当前对话", "新会话"}:
+        if int(row.get("title_manual") or 0) or (title and title not in {"新对话", "当前对话", "新会话"}):
             return
         from app.references import reference_display_text
         new_title = initial_conversation_title(reference_display_text(text))
-        await self.db.conn.execute(
-            "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=?",
+        cursor = await self.db.conn.execute(
+            "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=? AND title_manual=0",
             (new_title, str(row.get("conversation_uuid") or ""), title),
         )
         await self.db.conn.commit()
-        row["title"] = new_title
+        if int(cursor.rowcount or 0) > 0:
+            row["title"] = new_title
 
     async def _conversation_title_turns(self, conversation_uuid: str) -> list[dict[str, str]]:
         """Return completed human/controller turns without tools or reasoning."""
@@ -3121,6 +3125,13 @@ class WebAdminConversationsMixin:
                 return [fallback]
         return []
 
+    async def _conversation_title_is_manual(self, conv_uuid: str) -> bool:
+        cursor = await self.db.conn.execute(
+            "SELECT title_manual FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,)
+        )
+        row = await cursor.fetchone()
+        return bool(row and int(row["title_manual"] or 0))
+
     async def _generate_conversation_title(
         self,
         row: dict[str, Any],
@@ -3129,6 +3140,9 @@ class WebAdminConversationsMixin:
         automatic: bool,
     ) -> dict[str, Any]:
         conv_uuid = str(row.get("conversation_uuid") or "")
+        if automatic and await self._conversation_title_is_manual(conv_uuid):
+            # Do not spend a model call on a title the user has already chosen.
+            return {"ok": False, "error": "automatic_title_changed"}
         turns = await self._conversation_title_turns(conv_uuid)
         if not turns:
             return {"ok": False, "error": "conversation_has_no_completed_turns"}
@@ -3173,6 +3187,8 @@ class WebAdminConversationsMixin:
         messages = MessageDAO(self.db)
         session_uuid = await messages.get_or_create_session_uuid(chat_id)
         for attempt, label in enumerate(attempt_models):
+            if automatic and await self._conversation_title_is_manual(conv_uuid):
+                return {"ok": False, "error": "automatic_title_changed"}
             _provider, model_definition, backend, model = prepared[label]
             title_output_tokens = min(
                 max(1, int(model_definition.max_tokens or 1)),
@@ -3226,8 +3242,12 @@ class WebAdminConversationsMixin:
                 continue
             changed = False
             if title != expected_title:
+                # One conditional UPDATE is the race barrier with manual rename.
+                # An explicit generate request may replace a manual title and
+                # leaves the lock unchanged, so automatic runs stay locked out.
                 cursor = await self.db.conn.execute(
-                    "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=?",
+                    "UPDATE web_conversations SET title=? WHERE conversation_uuid=? AND title=?"
+                    + (" AND title_manual=0" if automatic else ""),
                     (title, conv_uuid, expected_title),
                 )
                 await self.db.conn.commit()
@@ -3257,6 +3277,8 @@ class WebAdminConversationsMixin:
         conv_uuid = str(row.get("conversation_uuid") or "")
         current = self._web_conversation_title_tasks.get(conv_uuid)
         if not conv_uuid or (current is not None and not current.done()):
+            return None
+        if automatic and int(row.get("title_manual") or 0):
             return None
         snapshot = dict(row)
         expected_title = str(snapshot.get("title") or "").strip()

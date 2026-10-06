@@ -294,3 +294,18 @@ async def test_task_memory_snapshot_token_stable_and_frozen_in_branch(web_env):
     assert await env.server._run_web_turn(branch['internal_chat_id'], 'continue', _WebStreamRenderer(live), conversation=branch, root_turn_uuid='frozen-memory')
     assert 'original preference' not in str(backend.seen_convos[-1])
     assert 'do not silently inject this' not in str(backend.seen_convos[-1])
+
+
+@pytest.mark.parametrize('inherited,explicit', [(False, False), (True, False), (False, True)])
+async def test_context_branch_preserves_or_explicitly_establishes_title_lock(web_env, inherited, explicit):
+    source, url, body, _backend, _executed = await setup(web_env)
+    await web_env.db.conn.execute('UPDATE web_conversations SET title_manual=? WHERE conversation_uuid=?', (int(inherited), source['conversation_uuid']))
+    await web_env.db.conn.commit()
+    if explicit:
+        body['title'] = '用户选择的分支名称'
+    response = await web_env.client.post(url + '/branch', json=body)
+    assert response.status == 200, await response.text()
+    public = (await response.json())['conversation']
+    branch = await web_env.server._conversation_row(123, public['conversationUuid'])
+    assert bool(branch['title_manual']) is (inherited or explicit)
+    assert public['titleManual'] is (inherited or explicit)

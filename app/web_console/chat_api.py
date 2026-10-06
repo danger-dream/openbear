@@ -992,7 +992,7 @@ class WebAdminChatHandlersMixin:
         params: list[Any] = []
         if has_title:
             ts = now_ts()
-            assignments.extend(["title=?", "updated_at=?"])
+            assignments.extend(["title=?", "title_manual=1", "updated_at=?"])
             params.extend([title, ts])
         if has_archived:
             # Archive is deliberately a visibility field only: it does not touch
@@ -1011,6 +1011,7 @@ class WebAdminChatHandlersMixin:
             getattr(self, "_tree_projection_ready", set()).discard(int(session.chat_id))
         if has_title:
             row["title"] = title
+            row["title_manual"] = 1
             row["updated_at"] = ts
             await self.audit("web.conversation.rename", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": conv_uuid, "title": title})
         if has_archived:

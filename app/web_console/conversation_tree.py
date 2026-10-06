@@ -388,7 +388,7 @@ class WebAdminConversationTreeMixin:
         await self._tree_ensure_interaction_projection(owner_chat_id)
         cur = await self.db.conn.execute(
             """
-            SELECT conversation_uuid, internal_chat_id, folder_uuid, title, pinned_at,
+            SELECT conversation_uuid, internal_chat_id, folder_uuid, title, title_manual, pinned_at,
                    display_order, created_at, updated_at, status, current_status, last_error,
                    activity_version, activity_read_version, activity_result_json
             FROM web_conversations
@@ -529,6 +529,7 @@ class WebAdminConversationTreeMixin:
                 "folderId": str(row.get("folder_uuid") or ""),
                 "parentId": str(row.get("folder_uuid") or ""),
                 "title": str(row.get("title") or "新会话"),
+                "titleManual": bool(int(row.get("title_manual") or 0)),
                 "pinned": int(row.get("pinned_at") or 0) > 0,
                 "pinnedAt": int(row.get("pinned_at") or 0),
                 "displayOrder": float(row["display_order"]) if row.get("display_order") is not None else None,
@@ -679,6 +680,7 @@ class WebAdminConversationTreeMixin:
             "folderId": str(row.get("folder_uuid") or ""),
             "parentId": str(row.get("folder_uuid") or ""),
             "title": str(row.get("title") or "新会话"),
+            "titleManual": bool(int(row.get("title_manual") or 0)),
             "pinned": int(row.get("pinned_at") or 0) > 0,
             "pinnedAt": int(row.get("pinned_at") or 0),
             "displayOrder": float(row["display_order"]) if row.get("display_order") is not None else None,

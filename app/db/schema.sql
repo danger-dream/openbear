@@ -171,7 +171,9 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   -- 只在可见 user/assistant 正文快照变化时递增，供引用目录按会话失效。
   reference_revision    INTEGER NOT NULL DEFAULT 0,
   -- 空值属于“临时会话”；归档只改变状态，不清除目录归属。
-  folder_uuid           TEXT NOT NULL DEFAULT ''
+  folder_uuid           TEXT NOT NULL DEFAULT '',
+  -- 1 = 用户明确命名过该会话；自动命名不得再生成或覆盖。旧库默认 0，不改变现有标题。
+  title_manual          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_time
   ON web_conversations(owner_chat_id, archived_at, pinned_at DESC, updated_at DESC, id DESC);
