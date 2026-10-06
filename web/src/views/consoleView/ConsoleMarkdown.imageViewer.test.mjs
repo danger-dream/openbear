@@ -87,6 +87,23 @@ test("real template/styles compile and download has a 44px touch target with foc
  assert.match(descriptor.styles[0].content, /min-height: 44px/);
  assert.match(descriptor.styles[0].content, /touch-action: manipulation/);
  assert.match(descriptor.styles[0].content, /:focus-visible/);
+ assert.doesNotMatch(descriptor.styles[0].content.split(".bear-md")[0], /position:\s*absolute|bottom:\s*86px/);
+});
+
+test("toolbar layout stays within desktop and mobile viewports using actual viewer padding", () => {
+ const native = readFileSync(new URL("../../../node_modules/element-plus/theme-chalk/el-image-viewer.css", import.meta.url), "utf8");
+ const outer = Number(native.match(/\.el-image-viewer__actions\{[^}]*padding:0 (\d+)px/)[1]) * 2;
+ const inner = Number(native.match(/\.el-image-viewer__actions__inner\{[^}]*padding:0 (\d+)px/)[1]) * 2;
+ const styles = descriptor.styles[0].content;
+ const caps = [...styles.matchAll(/width: min\((\d+)px, calc\(100vw - (\d+)px\)\)/g)].map(m => [Number(m[1]), Number(m[2])]);
+ assert.deepEqual(caps, [[220, 74], [264, 74]]);
+ for (const viewport of [280, 320, 360, 375, 390, 768, 1280]) {
+  for (const [cap, reserve] of caps) {
+   const total = Math.min(cap, viewport - reserve) + outer + inner;
+   assert.ok(total <= viewport - 16, `toolbar ${total}px must fit ${viewport}px viewport`);
+  }
+ }
+ assert.match(styles, /flex: 1/); assert.match(styles, /min-width: 0/);
 });
 
 test("multi-image navigation downloads current original, hides remote entry, wraps and reopens at clicked index", async t => {
@@ -113,15 +130,32 @@ test("multi-image navigation downloads current original, hides remote entry, wra
 
 test("native zoom, rotation, mode toggle, keyboard switching and Escape survive the added download", async t => {
  const {root, open} = mount(t); await open(0);
- const actions = find(root, "el-image-viewer__actions__inner").children.filter(n => n.props.onClick);
- assert.equal(actions.length, 5, "all five native toolbar controls remain");
- actions[1].props.onClick(); await tick(); assert.match(image(root).props.style.transform, /scale\(1\.2\)/);
- actions[4].props.onClick(); await tick(); assert.match(image(root).props.style.transform, /rotate\(90deg\)/);
- actions[3].props.onClick(); await tick(); assert.match(image(root).props.style.transform, /rotate\(0deg\)/);
- actions[0].props.onClick(); await tick(); assert.match(image(root).props.style.transform, /scale\(1\)/);
+ const toolbar = find(root, "markdown-image-toolbar");
+ const actions = toolbar.children.filter(n => n.type === "button");
+ assert.equal(actions.length, 5, "all five native actions are wired through the toolbar slot");
+ assert.ok(walk(find(root, "el-image-viewer__actions__inner")).includes(download(root)), "download belongs to the same native bottom toolbar");
+ assert.equal(toolbar.props.role, "toolbar");
+ assert.equal(download(root).children.filter(n => n.type === "svg").length, 1);
+ assert.equal(download(root).children.some(n => n.type === "span"), false, "no floating text pill");
+ assert.equal(download(root).props.title, "下载原图");
+ assert.deepEqual(actions.map(n => n.props["aria-label"]), ["缩小", "放大", "切换适应/原始尺寸", "向左旋转", "向右旋转"]);
+ actions[1].props.onClick(event()); await tick(); assert.match(image(root).props.style.transform, /scale\(1\.2\)/);
+ actions[4].props.onClick(event()); await tick(); assert.match(image(root).props.style.transform, /rotate\(90deg\)/);
+ actions[3].props.onClick(event()); await tick(); assert.match(image(root).props.style.transform, /rotate\(0deg\)/);
+ actions[0].props.onClick(event()); await tick(); assert.match(image(root).props.style.transform, /scale\(1\)/);
  const originalLink = download(root).props.href;
- actions[2].props.onClick(); await tick(); assert.equal(image(root).props.style.maxWidth, undefined);
+ actions[2].props.onClick(event()); await tick(); assert.equal(image(root).props.style.maxWidth, undefined);
  assert.equal(download(root).props.href, originalLink, "transforms never substitute a rendered image for the original");
+ await key("Space"); assert.equal(image(root).props.style.maxWidth, "100%", "container Space still invokes native fit/original toggle");
+ // Focused controls activate once with Space, not once natively plus another
+ // global mode toggle. Other keys still bubble to native navigation/Escape.
+ actions[1].click = () => actions[1].props.onClick(event());
+ const space = event({key: " ", target: {closest: () => actions[1]}});
+ toolbar.props.onKeydown(space); await tick();
+ assert.equal(space.stopped, true); assert.equal(space.defaultPrevented, true);
+ assert.equal(image(root).props.style.maxWidth, "100%");
+ assert.match(image(root).props.style.transform, /scale\(1\.2\)/);
+ actions[0].props.onClick(event()); await tick();
  await key("ArrowUp"); assert.match(image(root).props.style.transform, /scale\(1\.2\)/);
  await key("ArrowRight"); assert.equal(download(root).props.href, `${second}?download=1`);
  await key("ArrowLeft"); assert.equal(download(root).props.href, `${first}?download=1`);

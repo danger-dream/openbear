@@ -1,5 +1,6 @@
 <script setup>
 import {computed, onBeforeUnmount, ref, watch} from "vue";
+import {Download, FullScreen, RefreshLeft, RefreshRight, ZoomIn, ZoomOut} from "@element-plus/icons-vue";
 import {renderMarkdown} from "./markdown.js";
 import {vMarkdownHtml} from "./markdownDom.js";
 import {artifactFromUrl, openArtifactPreview} from "../../artifacts/artifactFiles.js";
@@ -236,42 +237,55 @@ function onMarkdownClick(event) {
 	                 hide-on-click-modal
 	                 @switch="imageViewerIndex = $event"
 	                 @close="imageViewerOpen = false">
-		<!-- The toolbar slot replaces the native controls; extend via the default
-		     slot instead to retain native transforms, navigation and keyboard handling. -->
-		<a v-if="imageViewerArtifact" class="markdown-image-download"
-		   :href="imageViewerArtifact.downloadUrl" download
-		   title="下载原图" aria-label="下载原图"
-		   @click.stop="onArtifactDownload($event, imageViewerArtifact)">
-			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/></svg>
-			<span>下载原图</span>
-		</a>
+		<template #toolbar="{actions, reset}">
+			<!-- Keep transforms in the viewer: reset is its native fit/original toggle. -->
+			<div class="markdown-image-toolbar" :class="{'has-download': imageViewerArtifact}"
+			     role="toolbar" aria-label="图片预览操作"
+			     @keydown.space.prevent.stop="$event.target.closest('button, a')?.click()">
+				<button class="markdown-image-control" type="button" title="缩小" aria-label="缩小" @click.stop="actions('zoomOut')"><ZoomOut aria-hidden="true"/></button>
+				<button class="markdown-image-control" type="button" title="放大" aria-label="放大" @click.stop="actions('zoomIn')"><ZoomIn aria-hidden="true"/></button>
+				<button class="markdown-image-control" type="button" title="切换适应/原始尺寸" aria-label="切换适应/原始尺寸" @click.stop="reset"><FullScreen aria-hidden="true"/></button>
+				<button class="markdown-image-control" type="button" title="向左旋转" aria-label="向左旋转" @click.stop="actions('anticlockwise')"><RefreshLeft aria-hidden="true"/></button>
+				<button class="markdown-image-control" type="button" title="向右旋转" aria-label="向右旋转" @click.stop="actions('clockwise')"><RefreshRight aria-hidden="true"/></button>
+				<a v-if="imageViewerArtifact" class="markdown-image-control markdown-image-download"
+				   :href="imageViewerArtifact.downloadUrl" download
+				   title="下载原图" aria-label="下载原图"
+				   @click.stop="onArtifactDownload($event, imageViewerArtifact)"><Download aria-hidden="true"/></a>
+			</div>
+		</template>
 	</el-image-viewer>
 </template>
 
 <style scoped>
-.markdown-image-download {
-	position: absolute;
-	z-index: 1;
-	bottom: 86px;
-	left: 50%;
-	transform: translateX(-50%);
+.markdown-image-toolbar {
+	display: flex;
+	align-items: center;
+	/* Native outer/inner horizontal padding totals 58px; leave 16px viewport
+	   clearance without widening or replacing the viewer's toolbar shell. */
+	width: min(220px, calc(100vw - 74px));
+	height: 44px;
+}
+.markdown-image-toolbar.has-download { width: min(264px, calc(100vw - 74px)); }
+.markdown-image-control {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	gap: 6px;
+	flex: 1;
+	min-width: 0;
 	min-height: 44px;
-	padding: 0 16px;
-	border-radius: 22px;
-	background: var(--el-text-color-regular);
-	color: #fff;
-	font-size: 14px;
+	padding: 0;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: inherit;
+	font: inherit;
 	text-decoration: none;
-	white-space: nowrap;
+	cursor: pointer;
 	touch-action: manipulation;
 }
-.markdown-image-download svg { width: 20px; height: 20px; }
-.markdown-image-download:hover { background: var(--el-color-primary); }
-.markdown-image-download:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+.markdown-image-control svg { width: 1em; height: 1em; }
+.markdown-image-control:hover { background: rgba(255, 255, 255, 0.12); }
+.markdown-image-control:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
 
 .bear-md :deep(h1),
 .bear-md :deep(h2),
