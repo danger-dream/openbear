@@ -1236,12 +1236,17 @@ onMounted(load);
 }
 .mac-toggle {
   position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  line-height: 1;
   width: 46px;
   height: 26px;
   padding: 2px;
   border: 1px solid var(--ob-border);
   border-radius: 999px;
-  background: linear-gradient(180deg, var(--ob-text), var(--ob-border));
+  background: var(--ob-surface-soft);
   box-shadow: inset 0 1px 2px rgb(var(--ob-shadow-rgb) / 0.16), inset 0 1px 0 var(--ob-border);
   transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
@@ -1256,6 +1261,7 @@ onMounted(load);
 }
 .mac-toggle__knob {
   display: grid;
+  flex-shrink: 0;
   width: 20px;
   height: 20px;
   place-items: center;
@@ -1691,11 +1697,12 @@ html.dark .mac-icon-action--primary:disabled {
 	}
 html.dark .mac-toggle {
 		border: 1px solid var(--ob-border);
-		background: linear-gradient(180deg, var(--ob-text-strong), var(--ob-surface-raised));
+		background: var(--ob-surface-soft);
 		box-shadow: inset 0 1px 2px rgb(var(--ob-shadow-rgb) / 0.16), inset 0 1px 0 rgb(var(--ob-border-rgb) / 0.11);
 	}
 html.dark .mac-toggle.is-on {
 		border-color: rgb(var(--ob-success-rgb) / 0.52);
+		background: linear-gradient(180deg, var(--ob-success), var(--ob-success));
 		box-shadow: inset 0 1px 0 rgb(var(--ob-border-rgb) / 0.11), 0 3px 10px rgb(var(--ob-success-rgb) / 0.18);
 	}
 html.dark .mac-toggle__knob {
