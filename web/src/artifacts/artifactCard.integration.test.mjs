@@ -10,19 +10,23 @@ import {artifactFromUrl, artifactRecord, clearArtifactCache} from "./artifactFil
 const filename = "ArtifactCard.vue";
 const {descriptor} = parse(readFileSync(new URL(filename, import.meta.url), "utf8"), {filename});
 const source = compileScript(descriptor, {id: filename, inlineTemplate: true}).content;
+const imagePathName = "ArtifactImagePath.vue";
+const imagePathDescriptor = parse(readFileSync(new URL(imagePathName, import.meta.url), "utf8"), {filename: imagePathName}).descriptor;
+const imagePathSource = compileScript(imagePathDescriptor, {id: imagePathName, inlineTemplate: true}).content;
 register(`data:text/javascript,${encodeURIComponent(`
- let component;
- export function initialize(source) { component = source; }
+ let components;
+ export function initialize(sources) { components = sources; }
  export function resolve(specifier, context, next) {
   if (specifier === 'element-plus') return {url:'data:text/javascript,export const ElMessage = {success(){}, error(){}};',shortCircuit:true};
   return next(specifier, context);
  }
  export function load(url, context, next) {
-  if (url.endsWith('/ArtifactCard.vue')) return {format:'module', source:component,shortCircuit:true};
+  for (const [name, source] of Object.entries(components)) if (url.endsWith('/' + name)) return {format:'module', source,shortCircuit:true};
   return next(url, context);
  }
-`)}`, {parentURL: import.meta.url, data: source});
+`)}`, {parentURL: import.meta.url, data: {[filename]: source, [imagePathName]: imagePathSource}});
 const Component = (await import("./ArtifactCard.vue")).default;
+const ImagePath = (await import("./ArtifactImagePath.vue")).default;
 
 const originals = Object.fromEntries(["location", "window", "IntersectionObserver", "navigator", "isSecureContext", "fetch"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 after(() => { for (const [key, descriptor] of Object.entries(originals)) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; } });
@@ -33,7 +37,7 @@ Object.defineProperty(globalThis, "location", {configurable: true, value: {origi
 Object.defineProperty(globalThis, "window", {configurable: true, value: {dispatchEvent: event => { dispatched.push(event); }}});
 Object.defineProperty(globalThis, "navigator", {configurable: true, value: {clipboard: {writeText: async text => { copied.push(text); }}}});
 Object.defineProperty(globalThis, "isSecureContext", {configurable: true, value: true});
-Object.defineProperty(globalThis, "IntersectionObserver", {configurable: true, value: class { constructor(callback) { this.callback = callback; observer = this; } observe() {} disconnect() { this.disconnected = true; } }});
+Object.defineProperty(globalThis, "IntersectionObserver", {configurable: true, value: class { constructor(callback) { this.callback = callback; observer = this; } observe(element) { assert.ok(element, 'never observe a missing root for a hidden image'); } disconnect() { this.disconnected = true; } }});
 
 const node = (type, text = "") => ({type, text, props: {}, children: [], parent: null});
 const renderer = createRenderer({
@@ -91,24 +95,19 @@ test("real file-card download keeps desktop native click but routes iPhone home-
  } finally { delete nav.userAgent; delete nav.standalone; delete window.navigator; }
 });
 
-function assertCompactImage(root) {
- assert.ok(find(root, "artifact-image-link"));
- assert.equal(find(root, "artifact-card"), undefined, "all images lose the card, not just duplicates");
- assert.equal(walk(root).some(n => n.type === "img"), false, "a file link never creates another inline image");
- assert.equal(find(root, "artifact-image-open").props.href, href);
- assert.equal(find(root, "artifact-image-download").props.href, `${href}?download=1`);
- assert.equal(find(root, "artifact-image-download").props.download, "");
+function assertImageRowAbsent(root) {
+ assert.equal(find(root, "artifact-card"), undefined);
+ assert.equal(find(root, "artifact-image-link"), undefined);
+ assert.equal(walk(root).slice(1).some(n => ["a", "button", "img", "span", "div"].includes(n.type)), false, "the entire lower image row is absent, including link-only images");
+ assert.equal(text(root), "");
+ assert.match(descriptor.styles[0].content, /\.md-artifact-slot:empty\s*\{\s*display: none;/, "comment-only slot has no leftover spacing");
 }
-for (const [fileName, mimeType] of [["photo.PNG", "image/png"], ["photo.jpg", "image/jpeg"], ["photo.webp", "image/webp"], ["photo.gif", "image/gif"], ["photo.avif", "application/octet-stream"], ["无后缀图片", "image/png"]]) test(`image attachment ${fileName} is a compact link, never a thumbnail card`, async t => {
+for (const [fileName, mimeType] of [["photo.PNG", "image/png"], ["photo.jpg", "image/jpeg"], ["photo.webp", "image/webp"], ["photo.gif", "image/gif"], ["photo.avif", "application/octet-stream"], ["无后缀图片", "image/png"]]) test(`confirmed image attachment ${fileName} renders no lower row`, t => {
  const {root} = mount(t, metadata({fileName, mimeType, contentUrl: "https://unrelated.test/file"}), undefined, `${href}?filename=${encodeURIComponent(fileName)}`);
- assertCompactImage(root);
- const before = dispatched.length; assert.equal(click(find(root, "artifact-image-open")), true);
- assert.equal(dispatched.length, before + 1); assert.equal(dispatched.at(-1).detail.href, href);
- assert.equal(click(walk(root).find(n => n.type === "button")), true); await nextTick();
- assert.equal(copied.at(-1), "workspace/artifacts/report.md");
+ assertImageRowAbsent(root);
 });
 
-test("asynchronous extensionless image metadata and streaming slot refresh never bring image cards back", async t => {
+test("asynchronous extensionless image metadata and streaming updates never bring the lower row back", async t => {
  const slot = node("div"); slot.dataset = {artifactSlot: `${identity.key}:0`, artifactHref: href, artifactLabel: "无后缀链接"};
  slot.hasAttribute = () => false;
  let currentSlot = slot, renders = 0, fetches = 0;
@@ -122,21 +121,26 @@ test("asynchronous extensionless image metadata and streaming slot refresh never
  globalThis.fetch = async url => { fetches++; assert.equal(url, identity.metadataUrl); return Response.json({artifact: metadata({fileName: "无后缀图片", mimeType: "image/png"})}); };
  observer.callback([{isIntersecting: true}]);
  await new Promise(resolve => setImmediate(resolve)); await nextTick();
- assertCompactImage(slot); assert.equal(fetches, 1, "classification fetches metadata, never image bytes");
- const link = find(slot, "artifact-image-open");
+ assertImageRowAbsent(slot); assert.equal(fetches, 1, "classification fetches metadata, never image bytes");
  for (let i = 0; i < 5; i++) context.sync(root);
- assert.equal(renders, 1); assert.equal(slot._vnode.component, instance); assert.equal(find(slot, "artifact-image-open"), link);
+ assert.equal(renders, 1); assert.equal(slot._vnode.component, instance); assertImageRowAbsent(slot);
  slot.dataset.artifactLabel = "流式更新后的图片链接"; context.sync(root); await nextTick();
- assertCompactImage(slot); assert.equal(slot._vnode.component, instance);
+ assertImageRowAbsent(slot); assert.equal(slot._vnode.component, instance);
  currentSlot = node("div"); currentSlot.dataset = {...slot.dataset}; currentSlot.hasAttribute = () => false;
  context.sync(root); await nextTick();
- assertCompactImage(currentSlot); assert.equal(fetches, 1, "even a new slot reuses metadata and stays compact");
+ assertImageRowAbsent(currentSlot); assert.equal(fetches, 1, "even a new slot reuses metadata and stays hidden");
 });
 
-test("compact image download keeps native desktop behavior and the mobile original-file save flow", t => {
- const {root} = mount(t, metadata({fileName: "photo.png", mimeType: "image/png", workspacePath: undefined}));
- const link = find(root, "artifact-image-download");
- assertCompactImage(root); assert.equal(walk(root).some(n => n.type === "button"), false);
+test("upper inline-image download/copy controls survive suppression of the entire lower attachment row", async t => {
+ const {root} = mount(t, metadata({fileName: "photo.png", mimeType: "image/png"}));
+ assertImageRowAbsent(root);
+ const upper = node("upper"), app = renderer.createApp({render: () => h(ImagePath, {href})});
+ app.mount(upper); t.after(() => app.unmount());
+ assert.ok(find(upper, "artifact-image-actions"));
+ const controls = walk(upper).filter(n => ["a", "button"].includes(n.type));
+ assert.equal(controls.length, 2); assert.equal(text(controls[0]), "下载"); assert.equal(text(controls[1]), "复制路径");
+ const link = controls[0]; assert.equal(link.props.href, `${href}?download=1`); assert.equal(link.props.download, "");
+ assert.equal(click(controls[1]), true); await nextTick(); assert.equal(copied.at(-1), "workspace/artifacts/report.md");
  const nav = globalThis.navigator; window.navigator = nav;
  const event = () => ({stopPropagation() {}, preventDefault() { this.prevented = true; }});
  try {
@@ -171,6 +175,17 @@ test("offscreen cards stay lazy; metadata arrival updates the real type without 
  observer.callback([{isIntersecting: true}]);
  await new Promise(resolve => setImmediate(resolve)); await nextTick();
  assert.equal(calls, 1); assert.ok(find(root, "artifact-card--presentation")); assert.equal(observer.disconnected, true);
+});
+
+test("failed asynchronous metadata keeps the unconfirmed attachment and its download visible", async t => {
+ const {root} = mount(t, null, undefined, `${href}?filename=photo.png`);
+ assert.ok(find(root, "artifact-card--file"));
+ globalThis.fetch = async () => new Response("unavailable", {status: 404});
+ observer.callback([{isIntersecting: true}]);
+ await new Promise(resolve => setImmediate(resolve)); await nextTick();
+ assert.ok(find(root, "artifact-card")); assert.ok(find(root, "is-unavailable"));
+ assert.equal(find(root, "artifact-card-download").props.href, `${href}?download=1`);
+ assert.ok(find(root, "artifact-card-open"), "a filename hint alone cannot delete an unknown attachment");
 });
 
 test("unavailable metadata still exposes the original download and details retry path", async t => {

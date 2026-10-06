@@ -30,6 +30,8 @@ async function copyPath() {
 	catch { ElMessage.error("复制失败，请手动选择路径"); }
 }
 onMounted(() => {
+	// Already-confirmed images have no attachment row or observable element.
+	if (!root.value) return;
 	if (typeof IntersectionObserver === "undefined") return load();
 	observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) load(); }, {rootMargin: "160px"});
 	observer.observe(root.value);
@@ -38,15 +40,9 @@ onBeforeUnmount(() => observer?.disconnect());
 </script>
 
 <template>
-	<!-- Classify from shared metadata, including MIME-only extensionless images.
-	     The stable Markdown slot stays mounted during streaming; images never
-	     acquire a second thumbnail, even when metadata arrives asynchronously. -->
-	<span v-if="presentation.category === 'image'" ref="root" class="artifact-image-link" :data-artifact-id="identity?.artifactUuid">
-		<a class="artifact-image-open" :href="identity?.contentUrl || href" :title="record?.metadata?.fileName || title" :aria-label="`查看图片：${title}`" @click.stop.prevent="open">{{ title }}</a>
-		<a class="artifact-image-download" :href="identity?.downloadUrl || href" download title="下载原图" :aria-label="`下载原图：${record?.metadata?.fileName || title}`" @click.stop="onArtifactDownload($event, identity)">下载</a>
-		<button v-if="sharedPath" type="button" :aria-label="`复制工作区路径：${sharedPath}`" title="复制工作区路径" @click.stop="copyPath">复制路径</button>
-	</span>
-	<div v-else ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
+	<!-- Only confirmed images lose their attachment row. Keep unknown/failed
+	     metadata visible and the component mounted for stable streaming updates. -->
+	<div v-if="presentation.category !== 'image'" ref="root" class="artifact-card" :class="[`artifact-card--${presentation.category}`, {'is-unavailable': record?.metadataError, 'has-shared-path': sharedPath}]" :data-artifact-id="identity?.artifactUuid">
 		<button type="button" class="artifact-card-open" :aria-label="openLabel" @click.stop="open">
 			<span class="artifact-card-icon" aria-hidden="true">
 				<component :is="icons[presentation.category]" :size="23" :stroke-width="1.6"/>
@@ -67,12 +63,9 @@ onBeforeUnmount(() => observer?.disconnect());
 </template>
 
 <style>
-.artifact-image-link { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; overflow-wrap: anywhere; }
-.artifact-image-link .artifact-image-open { min-width: 0; }
-.artifact-image-link .artifact-image-download, .artifact-image-link button { padding: 5px 8px; border: 1px solid var(--ob-border-soft); border-radius: 7px; background: var(--ob-surface); color: var(--ob-text-subtle); text-decoration: none; font: inherit; cursor: pointer; }
-.artifact-image-link .artifact-image-download:hover, .artifact-image-link button:hover { color: var(--ob-blue); background: var(--ob-surface-soft); }
-.artifact-image-link a:focus-visible, .artifact-image-link button:focus-visible { outline: 2px solid var(--ob-blue); outline-offset: 2px; }
 .md-artifact-slot { margin: 10px 0; max-width: 620px; min-width: 0; }
+/* Vue's v-if comment does not prevent :empty; remove the hidden row's spacing. */
+.md-artifact-slot:empty { display: none; }
 .artifact-card { --artifact-accent: var(--ob-text-subtle); --artifact-tint: var(--ob-surface-soft); position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; width: 100%; overflow: hidden; border: 1px solid var(--ob-border); border-radius: 12px; background: var(--ob-surface); color: var(--ob-text); transition: border-color .15s; }
 .artifact-card--html, .artifact-card--document { --artifact-accent: var(--ob-blue); --artifact-tint: var(--ob-blue-soft); }
 .artifact-card--pdf { --artifact-accent: var(--ob-danger); --artifact-tint: var(--ob-danger-soft); }
