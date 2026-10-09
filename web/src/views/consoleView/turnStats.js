@@ -94,9 +94,14 @@ export function combineTimingStats(left = {}, right = {}) {
 	for (const [average, samples] of TIMING_FIELDS) {
 		let count = 0, sum = 0;
 		for (const stats of [left, right]) {
-			// Old aggregate payloads do not identify the measured population.
-			// Preserve them elsewhere, but do not guess their weight in a merge.
-			const n = nonNegative(stats[samples]);
+			// An explicit sample count is authoritative. Without it, only an
+			// explicitly single successful controller request (no children) has
+			// a known population. A positive stage value proves that one sample;
+			// multi-call/child aggregates and absent stages remain unknown.
+			const singleLegacyCall = Number(stats.modelCalls) === 1
+				&& Number(stats.modelOk) === 1
+				&& stats.expertModelCalls != null && Number(stats.expertModelCalls) === 0;
+			const n = stats[samples] != null ? nonNegative(stats[samples]) : singleLegacyCall ? 1 : 0;
 			if (n && Number(stats[average]) > 0) {
 				count += n;
 				sum += Number(stats[average]) * n;

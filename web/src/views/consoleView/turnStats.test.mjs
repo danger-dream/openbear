@@ -94,3 +94,43 @@ test("latency stage copy describes client observations rather than provider comp
 	assert.ok(!source.includes('label: "建立连接"'));
 	assert.ok(!source.includes('label: "生成回答"'));
 });
+
+
+const singleLegacyTiming = {modelCalls: 1, modelOk: 1, expertModelCalls: 0,
+	avgConnectMs: 10, avgFirstTokenMs: 20, avgTotalMs: 100};
+const singleCurrentTiming = {modelCalls: 1, modelOk: 1, expertModelCalls: 0,
+	avgConnectMs: 30, connectSamples: 1, avgFirstTokenMs: 40, firstTokenSamples: 1,
+	avgTotalMs: 300, totalTimeSamples: 1};
+
+test("one explicitly successful legacy controller request merges with measured samples", () => {
+	const expected = {connectSamples: 2, avgConnectMs: 20, firstTokenSamples: 2,
+		avgFirstTokenMs: 30, totalTimeSamples: 2, avgTotalMs: 200};
+	assert.deepEqual(combineTimingStats(singleLegacyTiming, singleCurrentTiming), expected);
+	assert.deepEqual(combineTimingStats(singleCurrentTiming, singleLegacyTiming), expected);
+});
+
+test("two unambiguous old single-request stats retain their timing observations", () => {
+	assert.deepEqual(combineTimingStats(singleLegacyTiming, singleLegacyTiming), {
+		connectSamples: 2, avgConnectMs: 10, firstTokenSamples: 2,
+		avgFirstTokenMs: 20, totalTimeSamples: 2, avgTotalMs: 100,
+	});
+});
+
+test("legacy missing stages and uncertain populations remain unknown", () => {
+	for (const uncertain of [
+		{...singleLegacyTiming, modelCalls: 2, modelOk: 2},
+		{...singleLegacyTiming, expertModelCalls: 1},
+		{...singleLegacyTiming, expertModelCalls: undefined},
+		{...singleLegacyTiming, modelCalls: undefined},
+		{...singleLegacyTiming, modelOk: 0},
+		{...singleLegacyTiming, modelOk: undefined},
+	]) {
+		assert.equal(combineTimingStats(uncertain, {}).avgTotalMs, null);
+		assert.equal(combineTimingStats(uncertain, singleCurrentTiming).avgTotalMs, 300);
+	}
+	const missingStage = {...singleLegacyTiming, avgConnectMs: 0, avgFirstTokenMs: null};
+	assert.deepEqual(combineTimingStats(missingStage, {}), {connectSamples: 0, avgConnectMs: null,
+		firstTokenSamples: 0, avgFirstTokenMs: null, totalTimeSamples: 1, avgTotalMs: 100});
+	// A new explicit zero sample count is authoritative, even with a stale value.
+	assert.equal(combineTimingStats({...singleLegacyTiming, totalTimeSamples: 0}, {}).avgTotalMs, null);
+});

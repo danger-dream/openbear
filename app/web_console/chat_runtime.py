@@ -490,8 +490,13 @@ class WebAdminChatRunMixin:
                     protocol=str(call.get("protocol") or ""), think_level="off", call_kind="context_compaction",
                 )
                 result.controller_cost_usd += committed
-                result.call_time_ms_sum += int(call.get("totalTimeMs") or 0)
-                result.output_tokens_sum += int(call.get("outputTokens") or 0)
+                # Match the main-call producer: averages/throughput describe
+                # successful physical calls, while every attempt remains billed.
+                if call.get("status") == "ok":
+                    duration_ms = max(0, int(call.get("totalTimeMs") or 0))
+                    result.call_time_ms_sum += duration_ms
+                    result.call_time_samples += int(duration_ms > 0)
+                    result.output_tokens_sum += int(call.get("outputTokens") or 0)
                 if isinstance(call.get("usage"), Usage):
                     result.usage.merge(call["usage"])
                 result.model_calls += 1
