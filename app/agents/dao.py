@@ -1293,6 +1293,47 @@ class AgentDAO(AgentContinuityDAO):
             )
         return [self._event_from_row(r) for r in await cur.fetchall() if r is not None]
 
+    async def supervision_events(
+        self, task_uuid: str, *, after_seq: int = 0, limit: int = 50,
+    ) -> dict[str, Any]:
+        """A lossless review page plus current facts, independent of page backlog.
+
+        Keep the ordinary events() tail/polling contract unchanged. All queries
+        below share an event high-water mark; later appends belong to next review.
+        """
+        latest = await self.events(task_uuid, limit=1)
+        high_water = latest[-1].seq if latest else 0
+        limit = max(1, min(200, int(limit)))
+        cur = await self._db.conn.execute(
+            """SELECT * FROM rath_task_events
+               WHERE task_uuid=? AND seq>? AND seq<=? ORDER BY seq ASC LIMIT ?""",
+            (task_uuid, after_seq, high_water, limit + 1),
+        )
+        rows = await cur.fetchall()
+        page = [self._event_from_row(row) for row in rows[:limit]]
+        kinds = (
+            "model_call_started", "model_call_finished", "model_stream_interrupted",
+            "model_stream_progress", "tool_call_started", "tool_call_finished",
+            "model_call_retry_wait", "model_call_retry_resumed",
+            "pause_applied", "needs_openbear_control",
+            "plan_submitted", "plan_replan_submitted",
+        )
+        placeholders = ",".join("?" for _ in kinds)
+        cur = await self._db.conn.execute(
+            f"""SELECT * FROM rath_task_events WHERE task_uuid=? AND seq IN (
+                SELECT MAX(seq) FROM rath_task_events
+                WHERE task_uuid=? AND seq<=? AND kind IN ({placeholders}) GROUP BY kind
+            ) ORDER BY seq""",
+            (task_uuid, task_uuid, high_water, *kinds),
+        )
+        current = [self._event_from_row(row) for row in await cur.fetchall()]
+        return {
+            "events": page, "latest": latest[-1] if latest else None,
+            "current": current, "highWater": high_water,
+            "hasMore": len(rows) > limit,
+            "nextAfter": page[-1].seq if page else after_seq,
+        }
+
     async def events_before(
         self,
         task_uuid: str,

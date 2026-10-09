@@ -88,6 +88,7 @@ async def test_complete_compat_explicit_override_and_request_snapshot():
     complete = FakeComplete(AgentResult(text="done", usage=Usage(output_tokens=4)))
     out = await execute_attempt(req(complete))
     assert out.status == "ok" and out.response.text == "done"
+    assert out.connect_ms == out.first_token_ms == 0
     assert out.usage_reported and not out.prompt_usage_reported and complete.calls == 1
     hybrid = FakeStream([])
     hybrid.complete = complete.complete

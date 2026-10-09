@@ -80,3 +80,53 @@ export function reconcileAgentTaskUsage(stats, tasks = []) {
 		agentUsageReconciled: true,
 	};
 }
+
+// Keep each average paired with its own observed sample population. Child task
+// counts and missing legacy stage timings are not zero-latency observations.
+const TIMING_FIELDS = [
+	["avgConnectMs", "connectSamples", "connect_ms"],
+	["avgFirstTokenMs", "firstTokenSamples", "first_token_ms"],
+	["avgTotalMs", "totalTimeSamples", "total_time_ms"],
+];
+
+export function combineTimingStats(left = {}, right = {}) {
+	const result = {};
+	for (const [average, samples] of TIMING_FIELDS) {
+		let count = 0, sum = 0;
+		for (const stats of [left, right]) {
+			// An explicit sample count is authoritative. Without it, only an
+			// explicitly single successful controller request (no children) has
+			// a known population. A positive stage value proves that one sample;
+			// multi-call/child aggregates and absent stages remain unknown.
+			const singleLegacyCall = Number(stats.modelCalls) === 1
+				&& Number(stats.modelOk) === 1
+				&& stats.expertModelCalls != null && Number(stats.expertModelCalls) === 0;
+			const n = stats[samples] != null ? nonNegative(stats[samples]) : singleLegacyCall ? 1 : 0;
+			if (n && Number(stats[average]) > 0) {
+				count += n;
+				sum += Number(stats[average]) * n;
+			}
+		}
+		result[samples] = count;
+		result[average] = count ? sum / count : null;
+	}
+	return result;
+}
+
+export function timingStatsFromRows(rows = []) {
+	const result = {};
+	for (const [average, samples, field] of TIMING_FIELDS) {
+		let count = 0, sum = 0;
+		for (const row of rows) {
+			// Only single physical requests have an unambiguous sample count.
+			// Legacy multi-call sums cannot reveal how many stages were observed.
+			const calls = Number(row.model_call_count ?? 1);
+			if (calls !== 1 || row.status !== "ok" || !(Number(row[field]) > 0)) continue;
+			count += 1;
+			sum += Number(row[field]);
+		}
+		result[samples] = count;
+		result[average] = count ? sum / count : null;
+	}
+	return result;
+}

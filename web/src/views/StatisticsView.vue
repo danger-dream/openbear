@@ -518,9 +518,9 @@ const latencyStages = computed(() => {
 const latencyStageItems = computed(() => {
   const total = Number(latency.value.avgTimedTotalMs || 0);
   return [
-    { key: "connect", index: "01", label: "建立连接", description: "请求发出 → 上游连接就绪", color: "var(--stat-cyan)", value: latencyStages.value.connect },
-    { key: "wait", index: "02", label: "等待首字", description: "连接就绪 → 收到首个 Token", color: "var(--stat-violet)", value: latencyStages.value.wait },
-    { key: "generate", index: "03", label: "生成回答", description: "首字出现 → 流式响应结束", color: "var(--stat-blue)", value: latencyStages.value.generate },
+    { key: "connect", index: "01", label: "等待响应头", description: "客户端请求发出 → 响应头可用", color: "var(--stat-cyan)", value: latencyStages.value.connect },
+    { key: "wait", index: "02", label: "等待可识别输出", description: "响应头可用 → 首个可识别输出（正文、思考或工具参数）", color: "var(--stat-violet)", value: latencyStages.value.wait },
+    { key: "generate", index: "03", label: "后续接收", description: "首个可识别输出 → 客户端请求结束", color: "var(--stat-blue)", value: latencyStages.value.generate },
   ].map((item) => ({ ...item, share: item.value == null || !total ? null : Math.max(0, Number(item.value)) / total * 100 }));
 });
 const latencyBuckets = computed(() => {
@@ -713,12 +713,12 @@ watch([data, trendMetric, hiddenTrendSeries, selectedModels, selectedMetrics], c
           <div class="panel-head"><div class="panel-title"><h2>一次模型请求的时间花在哪</h2><p>从调用模型到流式响应结束；不含后续工具和再次调用</p></div><div class="segmented"><button v-for="item in [{key:'all',label:'全部'},{key:'main',label:'主会话'},{key:'agent',label:'Agent'}]" :key="item.key" type="button" :class="{active:latencySource===item.key}" @click="latencySource=item.key">{{ item.label }}</button></div></div>
           <div class="latency-stages">
             <div class="latency-overview">
-              <div class="latency-overview-copy"><span><i aria-hidden="true"></i>{{ latency.timingSamples ? '完整计时样本平均耗时' : '平均单次模型请求耗时' }}</span><p>{{ latency.timingSamples ? '端到端时间被拆成三个连续阶段' : '当前来源缺少可拆分的完整阶段样本' }}</p></div>
+              <div class="latency-overview-copy"><span><i aria-hidden="true"></i>{{ latency.timingSamples ? '完整计时样本平均耗时' : '平均单次模型请求耗时' }}</span><p>{{ latency.timingSamples ? '客户端观测的三个连续时间区间' : '当前来源缺少可拆分的完整阶段样本' }}</p></div>
               <div class="latency-overview-value"><strong>{{ formatDuration(latency.timingSamples ? latency.avgTimedTotalMs : latency.avgTotalMs) }}</strong><small v-if="latency.timingSamples">{{ formatNumber(latency.timingSamples) }} / {{ formatNumber(latency.calls) }} 次完整样本</small><small v-else>{{ formatNumber(latency.calls) }} 次请求</small></div>
             </div>
             <div v-if="latency.timingSamples" class="latency-composition" aria-label="平均耗时阶段占比"><span v-for="item in latencyStageItems" :key="item.key" :style="{'--stage-color':item.color,width:`${item.share || 0}%`}" :title="`${item.label} ${formatDecimal(item.share || 0,1)}%`"><i></i></span></div>
             <div class="latency-steps"><div v-for="item in latencyStageItems" :key="item.key" class="latency-step" :style="{'--stage-color':item.color}"><div class="stage-meta"><span>{{ item.index }}</span><em>{{ item.share == null ? '暂无占比' : `${formatDecimal(item.share,1)}%` }}</em></div><div class="stage-name"><i aria-hidden="true"></i><span>{{ item.label }}</span></div><strong>{{ formatDuration(item.value) }}</strong><small>{{ item.description }}</small></div></div>
-            <p v-if="latency.timingSamples" class="latency-note"><i aria-hidden="true"></i><span>总耗时与三个阶段均来自同一组完整计时样本，阶段占比可以直接相加。</span></p><p v-else class="latency-note"><i aria-hidden="true"></i><span>该来源没有完整的连接与首字阶段样本，只显示总耗时分布。</span></p>
+            <p v-if="latency.timingSamples" class="latency-note"><i aria-hidden="true"></i><span>三个区间来自同一组完整计时样本；可能包含传输、缓冲及本地处理，不能据此区分服务端排队或纯生成耗时。</span></p><p v-else class="latency-note"><i aria-hidden="true"></i><span>该来源没有完整的响应头与首个可识别输出计时，未知阶段不记为零，只显示总耗时分布。</span></p>
           </div>
           <div class="latency-percentiles"><div v-for="group in latencyPercentiles" :key="group.label" class="percentile-group"><div><strong>{{ group.label }}</strong><span>{{ formatNumber(group.data.samples) }} 条逐请求样本</span></div><dl><div><dt title="50% 的请求不超过该耗时">P50</dt><dd>{{ formatDuration(group.data.p50Ms) }}</dd></div><div><dt title="90% 的请求不超过该耗时">P90</dt><dd>{{ formatDuration(group.data.p90Ms) }}</dd></div><div><dt title="95% 的请求不超过该耗时">P95</dt><dd>{{ formatDuration(group.data.p95Ms) }}</dd></div><div><dt title="99% 的请求不超过该耗时">P99</dt><dd>{{ formatDuration(group.data.p99Ms) }}</dd></div><div><dt>最大</dt><dd>{{ formatDuration(group.data.maxMs) }}</dd></div></dl></div><p class="percentile-explanation"><b>P99 口径：</b>99% 的逐请求样本不超过该耗时；长尾请求会让它明显高于 P50。当前 {{ formatDecimal(latencyBuckets[5]?.percent,1) }}% 的请求超过 2 分钟。</p></div>
           <div class="speed-head"><strong>{{ formatNumber(latency.calls) }} 次模型请求分别用了多久</strong><span>每次请求只计入一个区间</span></div>
@@ -748,7 +748,7 @@ watch([data, trendMetric, hiddenTrendSeries, selectedModels, selectedMetrics], c
 
         <article class="panel table-panel">
           <div class="panel-head"><div class="panel-title"><h2>每日明细</h2><p>同一北京时间桶内的会话、请求、Token、缓存、成本和性能口径</p></div><span class="panel-unit">北京时间 · 完成时间归属</span></div>
-          <div class="table-scroll"><table><thead><tr><th>日期</th><th>活跃会话</th><th>用户对话</th><th>模型请求</th><th>成功率</th><th>输入</th><th>缓存率</th><th>输出</th><th>账本花费</th><th>首个 Token</th><th>平均耗时</th></tr></thead><tbody><tr v-for="row in dailyRows" :key="row.date"><td><strong>{{ shortDate(row.date) }}</strong></td><td>{{ formatNumber(row.activeConversations) }}</td><td>{{ formatNumber(row.userTurns) }}</td><td>{{ formatNumber(row.modelCalls) }}</td><td><span class="status-pill" :class="{muted:row.successRate==null}">{{ successRate(row) }}</span></td><td>{{ formatCompact(inputTokenTotal(row)) }}</td><td>{{ row.cacheRate==null?'—':`${formatDecimal(row.cacheRate,1)}%` }}</td><td>{{ formatCompact(row.outputTokens) }}</td><td><strong>{{ formatMoney(row.costUsd) }}</strong></td><td>{{ formatDuration(row.avgFirstTokenMs) }}</td><td>{{ formatDuration(row.avgTotalMs) }}</td></tr></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>日期</th><th>活跃会话</th><th>用户对话</th><th>模型请求</th><th>成功率</th><th>输入</th><th>缓存率</th><th>输出</th><th>账本花费</th><th>首个可识别输出</th><th>平均耗时</th></tr></thead><tbody><tr v-for="row in dailyRows" :key="row.date"><td><strong>{{ shortDate(row.date) }}</strong></td><td>{{ formatNumber(row.activeConversations) }}</td><td>{{ formatNumber(row.userTurns) }}</td><td>{{ formatNumber(row.modelCalls) }}</td><td><span class="status-pill" :class="{muted:row.successRate==null}">{{ successRate(row) }}</span></td><td>{{ formatCompact(inputTokenTotal(row)) }}</td><td>{{ row.cacheRate==null?'—':`${formatDecimal(row.cacheRate,1)}%` }}</td><td>{{ formatCompact(row.outputTokens) }}</td><td><strong>{{ formatMoney(row.costUsd) }}</strong></td><td>{{ formatDuration(row.avgFirstTokenMs) }}</td><td>{{ formatDuration(row.avgTotalMs) }}</td></tr></tbody></table></div>
         </article>
       </section>
     </div>

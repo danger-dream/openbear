@@ -371,3 +371,55 @@ async def test_web_login_consume_requires_browser_nonce(web_env):
     assert good.status == 200
 
 
+
+
+@pytest.mark.parametrize("mode", ["text", "failure", "cancel", "unknown", "complete"])
+async def test_web_trial_persists_physical_agent_timings(web_env, mode):
+    from app.llm.base import OpenBearLLMError
+    from app.llm.events import StreamEvent
+
+    class Backend:
+        protocol = "chat"
+
+        async def stream(self, *args, **kwargs):
+            if mode == "unknown":
+                raise OpenBearLLMError("before headers", retryable=False)
+            yield StreamEvent("metrics", connect_ms=9)
+            yield StreamEvent("content", text="done")
+            yield StreamEvent("usage", usage=Usage(input_tokens=11, output_tokens=7))
+            if mode == "failure":
+                raise OpenBearLLMError("after output", retryable=False)
+            if mode == "cancel":
+                raise asyncio.CancelledError()
+            yield StreamEvent("finish", finish_reason="stop")
+
+    class Factory:
+        def backend_for(self, _model):
+            return FakeBackend() if mode == "complete" else Backend(), "gpt", 1024
+
+    web_env.server.llm_factory = Factory()
+    web_env.server.model_selection = SimpleNamespace(current="openai/gpt")
+    web_env.server.config.agents.agent_plan_enabled = False
+    web_env.server.config.agent.max_retries = 0
+    agent_id = await web_env.server.agent_dao.create_agent(
+        agent_key="timed-trial", name="Timed", model="openai/gpt", think_level="off", tool_allowlist=[], enabled=True)
+    response = await web_env.client.post(f"/api/rath/agents/{agent_id}/trial",
+        json={"instruction": "timed trial"}, cookies=web_env.cookie)
+    assert response.status == 200
+    task_uuid = (await response.json())["taskUuid"]
+    for _ in range(200):
+        task = await web_env.server.agent_dao.get_task(task_uuid)
+        if task and task.status in {"completed", "failed", "cancelled"}:
+            break
+        await asyncio.sleep(0.01)
+    assert task.status == {"failure": "failed", "unknown": "failed", "cancel": "cancelled"}.get(mode, "completed")
+    cur = await web_env.db.conn.execute("SELECT * FROM model_calls WHERE call_kind='agent_request'")
+    rows = await cur.fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["attempt_id"]
+    assert row["connect_ms"] == (0 if mode in {"complete", "unknown"} else 9)
+    assert (row["first_token_ms"] > 0) == (mode not in {"complete", "unknown"})
+    assert row["status"] == {"failure": "error", "unknown": "error", "cancel": "cancelled"}.get(mode, "ok")
+    cur = await web_env.db.conn.execute("SELECT COUNT(*) FROM runtime_actions WHERE action_id=?", (row["attempt_id"],))
+    assert (await cur.fetchone())[0] == 1

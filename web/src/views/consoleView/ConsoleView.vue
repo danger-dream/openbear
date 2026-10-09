@@ -75,7 +75,7 @@ import {
 	mergeStatsContextUsage,
 	resolveContextUsage,
 } from "./contextUsage.js";
-import {reconcileAgentTaskUsage} from "./turnStats.js";
+import {combineTimingStats, reconcileAgentTaskUsage, timingStatsFromRows} from "./turnStats.js";
 import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
@@ -1944,12 +1944,6 @@ function usageSum(a = {}, b = {}) {
 	};
 }
 
-function weightedAvg(aValue, aWeight, bValue, bWeight) {
-	const total = Number(aWeight || 0) + Number(bWeight || 0);
-	if (!total) return Number(bValue || aValue || 0);
-	return (Number(aValue || 0) * Number(aWeight || 0) + Number(bValue || 0) * Number(bWeight || 0)) / total;
-}
-
 function taskWallDurationMs(task = {}) {
 	const direct = Number(task?.durationMs || task?.duration_ms || 0);
 	if (direct > 0) return direct;
@@ -1987,8 +1981,6 @@ function reconcileStatsWithAgentCards(turn, stats) {
 
 function combineControllerAndAgentStats(controller, current) {
 	if (!controller || !current) return current || controller || null;
-	const leftOk = Number(controller.modelOk || controller.modelCalls || 0);
-	const rightOk = Number(current.modelOk || current.modelCalls || 0);
 	const totalDuration = Number(controller.durationMs || 0) + Number(current.durationMs || 0);
 	const usage = usageSum(controller.usage, current.usage);
 	const expertUsage = usageSum(controller.expertUsage, current.expertUsage);
@@ -2012,9 +2004,7 @@ function combineControllerAndAgentStats(controller, current) {
 		usage,
 		expertUsage,
 		costUsd: Number(controller.costUsd || 0) + Number(current.costUsd || 0),
-		avgConnectMs: weightedAvg(controller.avgConnectMs, leftOk, current.avgConnectMs, rightOk),
-		avgFirstTokenMs: weightedAvg(controller.avgFirstTokenMs, leftOk, current.avgFirstTokenMs, rightOk),
-		avgTotalMs: weightedAvg(controller.avgTotalMs, leftOk, current.avgTotalMs, rightOk),
+		...combineTimingStats(controller, current),
 		avgTps: totalDuration > 0 ? outputForTps * 1000 / totalDuration : Number(current.avgTps || controller.avgTps || 0),
 		peakTps: Math.max(Number(controller.peakTps || 0), Number(current.peakTps || 0)),
 		minTps: positiveMin.length ? Math.min(...positiveMin) : 0,
@@ -2104,7 +2094,6 @@ function statsForTurn(turn, modelRows, toolRows) {
 	const totalMs = models.reduce((sum, row) => sum + Number(row.total_time_ms || 0), 0);
 	const positiveMinTps = models.map((row) => Number(row.min_tps || 0)).filter((n) => n > 0);
 	const expertToolCalls = models.reduce((sum, row) => sum + Number(row.expert_tool_calls || 0), 0);
-	const okDen = modelOk || modelCalls;
 	const lastContext = Number(last.last_input_tokens || 0) + Number(last.last_cache_read_tokens || 0) + Number(last.last_cache_write_tokens || 0)
 		|| (Number(last.model_call_count || 0) <= 1 ? Number(last.input_tokens || 0) + Number(last.cache_read_tokens || 0) + Number(last.cache_write_tokens || 0) : 0);
 	const model = last.model || chatState.value?.model || "";
@@ -2121,9 +2110,7 @@ function statsForTurn(turn, modelRows, toolRows) {
 		toolCalls: tools.length + expertToolCalls,
 		contextTokens: lastContext,
 		contextWindow: Number(meta?.contextWindow || 0),
-		avgConnectMs: okDen ? models.reduce((sum, row) => sum + Number(row.connect_ms || 0), 0) / okDen : 0,
-		avgFirstTokenMs: okDen ? models.reduce((sum, row) => sum + Number(row.first_token_ms || 0), 0) / okDen : 0,
-		avgTotalMs: okDen ? totalMs / okDen : 0,
+		...timingStatsFromRows(models),
 		avgTps: totalMs > 0 ? usageRows.outputTokens * 1000 / totalMs : 0,
 		peakTps: Math.max(0, ...models.map((row) => Number(row.peak_tps || 0))),
 		minTps: positiveMinTps.length ? Math.min(...positiveMinTps) : 0,

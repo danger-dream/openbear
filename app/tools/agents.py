@@ -490,6 +490,8 @@ class AgentTools(AgentContinuationTools):
         effective_protocol = str(detail.get("protocol") or protocol)
         cost = max(0.0, float(detail.get("costUsd") or 0.0))
         duration_ms = max(0, int(detail.get("durationMs") or 0))
+        connect_ms = max(0, int(detail.get("connectMs") or 0))
+        first_token_ms = max(0, int(detail.get("firstTokenMs") or 0))
         status = str(detail.get("status") or "ok")
         ledger_usage: dict[str, Any]
         async with self.dao.db.accounting_transaction() as connection:
@@ -501,6 +503,8 @@ class AgentTools(AgentContinuationTools):
                 commit=False,
                 last_usage=usage,
                 last_cost_usd=cost,
+                connect_ms=connect_ms,
+                first_token_ms=first_token_ms,
                 total_time_ms=duration_ms,
                 run_total_time_ms=duration_ms,
                 run_model_calls=1,
@@ -514,6 +518,8 @@ class AgentTools(AgentContinuationTools):
                 model_calls=1,
                 model_ok=1 if status == "ok" else 0,
                 model_fail=0 if status == "ok" else 1,
+                connect_ms_sum=connect_ms,
+                first_token_ms_sum=first_token_ms,
                 total_time_ms_sum=duration_ms,
                 output_tokens_sum=usage.output_tokens,
             )
@@ -533,6 +539,8 @@ class AgentTools(AgentContinuationTools):
                 usage=usage,
                 last_usage=usage,
                 cost_usd=call_cost,
+                connect_ms=connect_ms,
+                first_token_ms=first_token_ms,
                 total_time_ms=duration_ms,
                 peak_tps=max(0.0, float(detail.get("tps") or 0.0)),
                 min_tps=max(0.0, float(detail.get("tps") or 0.0)),

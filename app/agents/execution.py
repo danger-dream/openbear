@@ -2051,6 +2051,7 @@ class AgentExecutor(AgentTaskContext):
             detail = {
                 **_usage_detail(usage, cost), "model": self.model, "modelLabel": self.model_label,
                 "thinkLevel": self.think_level, "durationMs": outcome.total_time_ms,
+                "connectMs": outcome.connect_ms, "firstTokenMs": outcome.first_token_ms,
                 "tps": usage.output_tokens * 1000 / outcome.total_time_ms if outcome.total_time_ms > 0 else 0.0,
                 "status": outcome.status, "errorType": outcome.error.reason if outcome.error else "",
                 "taskUuid": self.task_uuid, "serviceTier": outcome.response.service_tier,
@@ -2078,6 +2079,7 @@ class AgentExecutor(AgentTaskContext):
                         "round": round_no, "attempt": max(0, attempt_no - 1),
                         "attemptId": outcome.attempt_id, "status": outcome.status,
                         "reason": detail["errorType"], "durationMs": outcome.total_time_ms,
+                        "connectMs": outcome.connect_ms, "firstTokenMs": outcome.first_token_ms,
                         "textChars": len(partial.text), "toolCallCount": len(outcome.response.tool_calls),
                     })
             else:

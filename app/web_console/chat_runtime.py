@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
+from app.agents.supervision import review_observation
 from app.context.configuration import conversation_strategy
 from app.context.editor import branch_settings, EditedToolRegistry
 from app.context.prompts import effective_context_prompt
@@ -489,8 +490,13 @@ class WebAdminChatRunMixin:
                     protocol=str(call.get("protocol") or ""), think_level="off", call_kind="context_compaction",
                 )
                 result.controller_cost_usd += committed
-                result.call_time_ms_sum += int(call.get("totalTimeMs") or 0)
-                result.output_tokens_sum += int(call.get("outputTokens") or 0)
+                # Match the main-call producer: averages/throughput describe
+                # successful physical calls, while every attempt remains billed.
+                if call.get("status") == "ok":
+                    duration_ms = max(0, int(call.get("totalTimeMs") or 0))
+                    result.call_time_ms_sum += duration_ms
+                    result.call_time_samples += int(duration_ms > 0)
+                    result.output_tokens_sum += int(call.get("outputTokens") or 0)
                 if isinstance(call.get("usage"), Usage):
                     result.usage.merge(call["usage"])
                 result.model_calls += 1
@@ -648,12 +654,8 @@ class WebAdminChatRunMixin:
                     self._merge_agent_task_stats(result, task, status=status, task_uuid=task_uuid)
                     previous = last_agent_review.get(task_uuid, {})
                     after_seq = int(previous.get("lastEventSeq") or 0)
-                    events = await self.agent_dao.events(task_uuid, after_seq=after_seq, limit=50)
-                    if not events and after_seq <= 0:
-                        events = await self.agent_dao.events(task_uuid, limit=8)
-                    last_event_seq = max([int(getattr(event, "seq", 0) or 0) for event in events] + [after_seq])
-                    previous_status = str(previous.get("status") or "")
-                    previous_current = str(previous.get("currentStatus") or "")
+                    review_events = await self.agent_dao.supervision_events(task_uuid, after_seq=after_seq, limit=50)
+                    events = review_events["events"]
                     if status == "needs_openbear_control":
                         counts["waitingControl"] += 1
                     elif status in terminal_statuses:
@@ -754,17 +756,16 @@ class WebAdminChatRunMixin:
                             if isinstance(step, dict)
                             and step_status.get(str(step.get("id") or ""), "pending") != "completed"
                         )
+                    observation, next_state = review_observation(
+                        task, review_events, plan_runtime, previous, now_ms=int(time.time() * 1000),
+                    )
                     snapshots.append({
+                        **observation,
                         "taskUuid": task_uuid,
                         "title": getattr(task, "title", "") or "",
                         "status": status,
                         "currentStatus": getattr(task, "current_status", "") or "",
                         "updatedAt": int(getattr(task, "updated_at", 0) or 0),
-                        "hasMeaningfulProgress": bool(
-                            events
-                            or status != previous_status
-                            or str(getattr(task, "current_status", "") or "") != previous_current
-                        ),
                         "planRuntime": plan_runtime,
                         # Full terminal/control output is carried exactly once by
                         # the newly claimed notification payload below. Keeping it
@@ -788,11 +789,7 @@ class WebAdminChatRunMixin:
                             for event in events
                         ],
                     })
-                    next_review_state[task_uuid] = {
-                        "lastEventSeq": last_event_seq,
-                        "status": status,
-                        "currentStatus": str(getattr(task, "current_status", "") or ""),
-                    }
+                    next_review_state[task_uuid] = next_state
                 last_agent_review.clear()
                 last_agent_review.update(next_review_state)
                 deduped_notifications = self._dedupe_web_task_notifications(notifications)

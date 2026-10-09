@@ -62,6 +62,26 @@ async def test_summary_fallback_preserves_actual_turn_status_and_failure_ledger(
         main.complete = fail_fallback
     factory.backend_for = route
     server.llm_factory = factory
+    # Keep real summary/main execution and settlement, but give physical calls
+    # deterministic durations. This exercises the production nested callback,
+    # including a failed candidate followed by successful fallback.
+    from app.context import strategies
+    from app.runtime import model_call
+
+    execute_attempt = model_call.execute_attempt
+
+    async def timed_attempt(request, **kwargs):
+        settle = kwargs.pop("settle", None)
+
+        async def timed_settle(outcome):
+            outcome.total_time_ms = 300 if kwargs.get("mode") == "complete" else 100
+            if settle is not None:
+                await settle(outcome)
+
+        return await execute_attempt(request, settle=timed_settle, **kwargs)
+
+    monkeypatch.setattr(model_call, "execute_attempt", timed_attempt)
+    monkeypatch.setattr(strategies, "execute_attempt", timed_attempt)
     dao = MessageDAO(web_env.db)
     sid = await dao.get_or_create_session_uuid(row["internal_chat_id"])
     store = WindowStore(web_env.db, ContextOwner.controller(chat_id=row["internal_chat_id"], session_uuid=sid,
@@ -92,6 +112,15 @@ async def test_summary_fallback_preserves_actual_turn_status_and_failure_ledger(
         stats = [op["payload"] for op in ops if op["opType"] == "stats"][-1]
         assert stats["modelFail"] == len(errors)
         assert stats["modelCalls"] == 3
+        expected_times = [call.total_time_ms for call in calls if call.status == "ok" and call.total_time_ms > 0]
+        assert stats["totalTimeSamples"] == len(expected_times)
+        assert stats["avgTotalMs"] == sum(expected_times) / len(expected_times)
+        assert stats["avgTotalMs"] == (300 if case == "execution_failure" else 200)
+        # Complete-mode summary requests have no observed header/first-output
+        # stages; they must not dilute the main request's first-output sample.
+        assert stats["connectSamples"] == 0
+        assert stats.get("avgConnectMs") is None  # Operation patches omit None values.
+        assert stats["firstTokenSamples"] == (0 if case == "execution_failure" else 1)
     if failed:
         # Actual terminal failures must remain paused even through worker recovery.
         await server._recover_web_task_notifications(reset_processing=True)
