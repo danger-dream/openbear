@@ -52,7 +52,12 @@ class RunResult:
     model_retry: int = 0            # 重试次数
     model_fail: int = 0             # 终态失败次数；不能计入已被候选回退恢复的摘要调用
     summary_model_fail: int = 0     # 摘要物理调用失败次数，仅用于统计，不决定回合终态
-    # —— 每次成功调用的指标累加（求会话平均用，分母 = model_ok）——
+    # —— 每次成功调用的指标累加（时延平均按各自有效样本计数）——
+    # Positive observed timings only; zero is the existing unknown sentinel.
+    # Child task counts never enter these controller-only sample populations.
+    connect_samples: int = 0
+    first_token_samples: int = 0
+    call_time_samples: int = 0
     connect_ms_sum: int = 0
     first_token_ms_sum: int = 0
     call_time_ms_sum: int = 0       # 单次调用耗时累加（注意：非整轮 total_time_ms）

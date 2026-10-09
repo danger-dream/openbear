@@ -771,9 +771,11 @@ class WebAdminChatStateMixin:
         if live and duration_ms <= 0 and result.start_monotonic > 0:
             duration_ms = int((time.monotonic() - result.start_monotonic) * 1000)
         model_ok = max(0, result.model_ok + result.expert_model_calls)
-        avg_connect = result.connect_ms_sum / model_ok if model_ok else 0
-        avg_first = result.first_token_ms_sum / model_ok if model_ok else 0
-        avg_total = result.call_time_ms_sum / model_ok if model_ok else 0
+        # These sums contain successful controller attempts, not child task usage.
+        # Non-stream/absent stages remain unknown, not zero-latency samples.
+        avg_connect = result.connect_ms_sum / result.connect_samples if result.connect_samples else None
+        avg_first = result.first_token_ms_sum / result.first_token_samples if result.first_token_samples else None
+        avg_total = result.call_time_ms_sum / result.call_time_samples if result.call_time_samples else None
         avg_tps = (
             result.output_tokens_sum / (result.call_time_ms_sum / 1000)
             if result.call_time_ms_sum > 0 else 0.0
@@ -811,6 +813,9 @@ class WebAdminChatStateMixin:
             },
             "lastUsage": _usage_json(result.last_usage),
             "expertUsage": _usage_json(result.expert_usage),
+            "connectSamples": result.connect_samples,
+            "firstTokenSamples": result.first_token_samples,
+            "totalTimeSamples": result.call_time_samples,
             "avgConnectMs": avg_connect,
             "avgFirstTokenMs": avg_first,
             "avgTotalMs": avg_total,

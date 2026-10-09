@@ -793,6 +793,9 @@ class Agent:
                         result.last_usage = usage
                     if outcome.status == "ok":
                         result.model_ok += 1
+                        result.connect_samples += int(outcome.connect_ms > 0)
+                        result.first_token_samples += int(outcome.first_token_ms > 0)
+                        result.call_time_samples += int(outcome.total_time_ms > 0)
                         result.connect_ms_sum += outcome.connect_ms
                         result.first_token_ms_sum += outcome.first_token_ms
                         result.call_time_ms_sum += outcome.total_time_ms

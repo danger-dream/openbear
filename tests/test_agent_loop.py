@@ -2128,3 +2128,18 @@ async def test_reasoning_only_stop_still_retries_when_not_truncated():
     r = await agent.run([{"role": "user", "content": "hi"}], RecordRenderer(), model="m")
     assert r.text == "想好了"
     assert r.model_calls == 2
+
+
+async def test_timing_sample_counts_track_only_observed_successful_controller_stages():
+    backend = FakeBackend([
+        [StreamEvent("metrics", connect_ms=12),
+         StreamEvent("tool_call", tool_calls=[ToolCall(id="e", name="echo", arguments='{"text":"hi"}')]),
+         StreamEvent("finish", finish_reason="tool_calls")],
+        [StreamEvent("content", text="done"), StreamEvent("finish", finish_reason="stop")],
+    ])
+    result = await Agent(backend, _echo_registry()).run(
+        [{"role": "user", "content": "test"}], RecordRenderer(), model="fake")
+    assert result.model_ok == 2
+    assert result.connect_samples == 1
+    assert result.first_token_samples == 2
+    assert result.connect_ms_sum == 12

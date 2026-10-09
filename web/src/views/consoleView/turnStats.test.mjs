@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {reconcileAgentTaskUsage} from "./turnStats.js";
+import {combineTimingStats, reconcileAgentTaskUsage, timingStatsFromRows} from "./turnStats.js";
 
 const taskA = {
 	taskUuid: "agent-a",
@@ -59,4 +59,38 @@ test("running Agent cards are excluded until they reach a stable accounting boun
 	const stats = {expertUsage: {}, expertTaskUuids: []};
 	const result = reconcileAgentTaskUsage(stats, [{...taskA, status: "running"}]);
 	assert.equal(result, stats);
+});
+
+
+test("timing averages use observed per-stage samples, never child counts", () => {
+	const left = {modelOk: 81, expertModelCalls: 80, avgConnectMs: 10, connectSamples: 1,
+		avgFirstTokenMs: 40, firstTokenSamples: 2, avgTotalMs: 100, totalTimeSamples: 3};
+	const right = {modelOk: 90, avgConnectMs: null, connectSamples: 0,
+		avgFirstTokenMs: 100, firstTokenSamples: 1, avgTotalMs: 500, totalTimeSamples: 1};
+	assert.deepEqual(combineTimingStats(left, right), {avgConnectMs: 10, connectSamples: 1,
+		avgFirstTokenMs: 60, firstTokenSamples: 3, avgTotalMs: 200, totalTimeSamples: 4});
+	assert.equal(combineTimingStats({modelOk: 90, avgConnectMs: 1}, {}).avgConnectMs, null);
+});
+
+test("historical missing stages and failed requests do not dilute successful samples", () => {
+	const result = timingStatsFromRows([
+		{status: "ok", connect_ms: 10, first_token_ms: 40, total_time_ms: 100},
+		{status: "ok", connect_ms: 0, first_token_ms: 0, total_time_ms: 300},
+		{status: "error", connect_ms: 800, first_token_ms: 900, total_time_ms: 1000},
+		{status: "ok", model_call_count: 10, connect_ms: 1000, first_token_ms: 5000, total_time_ms: 10000},
+	]);
+	assert.deepEqual(result, {avgConnectMs: 10, connectSamples: 1, avgFirstTokenMs: 40,
+		firstTokenSamples: 1, avgTotalMs: 200, totalTimeSamples: 2});
+	assert.equal(timingStatsFromRows([{status: "ok", connect_ms: 0}]).avgConnectMs, null);
+});
+
+
+test("latency stage copy describes client observations rather than provider computation", async () => {
+	const {readFile} = await import("node:fs/promises");
+	const source = await readFile(new URL("../StatisticsView.vue", import.meta.url), "utf8");
+	for (const label of ["等待响应头", "等待可识别输出", "后续接收", "未知阶段不记为零", "不能据此区分服务端排队或纯生成耗时"]) {
+		assert.ok(source.includes(label), label);
+	}
+	assert.ok(!source.includes('label: "建立连接"'));
+	assert.ok(!source.includes('label: "生成回答"'));
 });

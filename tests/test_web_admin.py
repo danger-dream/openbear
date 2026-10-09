@@ -5687,6 +5687,10 @@ async def test_agent_wait_plan_notification_wakes_immediately_and_requeues_if_un
         "runRootTurnUuid": root_turn_uuid,
     })
     assert queued is not None and second_queued is not None
+    # Dense streaming must not hide the authoritative Plan or either notification.
+    for index in range(75):
+        await web_env.server.agent_dao.append_event(task_uuid, "model_stream_progress",
+            detail={"textChars": index + 1})
     web_env.server._web_controller_notifications[row["conversation_uuid"]] = [queued, second_queued]
     web_env.server._web_task_notification_pending[row["conversation_uuid"]] = [queued, second_queued]
 
@@ -5712,7 +5716,12 @@ async def test_agent_wait_plan_notification_wakes_immediately_and_requeues_if_un
     assert len(payload["notifications"]) == 2
     assert all(item["kind"] == "plan-approval-required" for item in payload["notifications"])
     assert len(payload["agents"]) == 2
-    plan_runtime = payload["agents"][0]["planRuntime"]
+    observed = payload["agents"][0]
+    assert observed["eventPage"]["hasMore"] is True
+    assert observed["deliveryEvidence"]["known"] is True
+    assert observed["deliveryEvidence"]["changedSinceReview"] is None
+    assert observed["hasMeaningfulProgress"] == observed["hasActivity"]
+    plan_runtime = observed["planRuntime"]
     assert plan_runtime["pendingPlanVersion"] == 1
     assert plan_runtime["plan"]["objective"] == "Wake AgentWait immediately"
     assert plan_runtime["steps"][0]["criteria"][0]["id"] == "c1"
@@ -5890,6 +5899,11 @@ async def test_agent_wait_event_only_wakes_when_last_sibling_terminal_notificati
             run_root_turn_uuid=root_turn_uuid,
         ))
 
+    for task_uuid in task_uuids:
+        for index in range(75):
+            await web_env.server.agent_dao.append_event(task_uuid, "model_stream_progress",
+                detail={"textChars": index + 1})
+
     live = web_env.server._live_for(row)
     renderer = _WebStreamRenderer(live)
     await live.publish({"type": "accepted", "turnUuid": root_turn_uuid})
@@ -5950,6 +5964,9 @@ async def test_agent_wait_event_only_wakes_when_last_sibling_terminal_notificati
     payload = json.loads(str(wait_result["content"]))
     assert payload["wakeReason"] == "task_notification"
     assert payload["summary"] == {"running": 0, "waitingControl": 0, "terminal": 2, "total": 2}
+    assert all(item["eventPage"]["hasMore"] for item in payload["agents"])
+    assert all(item["currentExecution"]["phase"] == "completed" for item in payload["agents"])
+    assert all(item["deliveryEvidence"]["known"] is False for item in payload["agents"])
     assert {item["taskUuid"] for item in payload["notifications"]} == set(task_uuids)
     assert web_env.server._web_task_notification_pending.get(conversation_uuid) in (None, [])
 

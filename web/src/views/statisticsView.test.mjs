@@ -74,7 +74,7 @@ test('latency uses a proportional three-stage journey and explains backend-provi
   assert.match(template,/class="latency-composition"[\s\S]*v-for="item in latencyStageItems"/);
   assert.match(template,/class="latency-step"[\s\S]*item\.share[\s\S]*item\.description/);
   assert.match(script,/const latencyStageItems = computed/);
-  assert.match(script,/建立连接[\s\S]*等待首字[\s\S]*生成回答/);
+  assert.match(script,/等待响应头[\s\S]*等待可识别输出[\s\S]*后续接收/);
   assert.match(script,/Math\.max\(0, Number\(item\.value\)\) \/ total \* 100/);
   assert.match(template,/class="latency-percentiles"/);
   assert.match(template,/P50[\s\S]*P90[\s\S]*P95[\s\S]*P99[\s\S]*最大/);
