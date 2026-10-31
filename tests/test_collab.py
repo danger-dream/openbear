@@ -362,10 +362,62 @@ async def test_stop_sender_cancels_receiver_and_late_result_does_not_wake(env):
     assert len([c for c in env.backend.calls if c[0] == "lead"]) == len(lead_calls)
 
 
+def record_statuses(env, conversation):
+    statuses = []
+    original = env.server._touch_web_conversation
+
+    async def touch(conversation_uuid, **kw):
+        if conversation_uuid == conversation["conversation_uuid"] and kw.get("current_status"):
+            statuses.append(kw["current_status"])
+        return await original(conversation_uuid, **kw)
+    env.server._touch_web_conversation = touch
+    return statuses
+
+
+async def test_review_wait_names_the_conversation_it_waits_on(env):
+    a = await env.server._create_web_conversation(123, title="A")
+    b = await env.server._create_web_conversation(123, title="B")
+    statuses = record_statuses(env, a)
+    release = asyncio.Event()
+
+    async def lead(step, messages, tools, system):
+        if step == 1:
+            return tool("ConversationRequest", {"action": "send", "to": b["conversation_uuid"], "title": "q", "body": "b"}, "s1")
+        if step == 2:
+            return tool("AgentWait", {"mode": "review_after", "reviewAfterSeconds": 1}, "w1")
+        if step == 3:
+            release.set()
+            return tool("AgentWait", {"mode": "event_only"}, "w2")
+        return say("好")
+
+    async def answer(step, messages, tools, system):
+        await release.wait()
+        return say("答案")
+
+    env.backend.handlers.update(lead=lead, B=answer)
+    await start(env, a, f"问 openbear://ref/chat/{b['conversation_uuid']}")
+    await eventually(lambda: idle(env, a))
+    assert "等待「B」，计划 1 秒后统一复查" in statuses
+    assert "等待「B」" in statuses
+    texts = [op["payload"]["statusText"] for op in await env.server._web_operations(a["conversation_uuid"])
+             if op["opType"] == "agent_supervision"]
+    assert texts[0] == "统一复查时间已到"
+    assert not [text for text in [*statuses, *texts] if "Agent" in text]
+
+
+def test_returned_results_name_their_source():
+    source = WebAdminServer._task_notification_source
+    assert source([{"kind": "task-notification"}]) == "Agent "
+    assert source([{"kind": "task-notification-collab"}]) == "会话请求"
+    assert source([{"kind": "tool-notification"}]) == "后台任务"
+    assert source([{"kind": "task-notification-collab"}, {}]) == "Agent、会话请求"
+
+
 async def test_result_survives_sender_turn_end(env):
     """An interrupted sender turn (not a human stop) still receives the result in a new turn."""
     a = await env.server._create_web_conversation(123, title="A")
     b = await env.server._create_web_conversation(123, title="B")
+    statuses = record_statuses(env, a)
     release = asyncio.Event()
 
     async def lead(step, messages, tools, system):
@@ -395,3 +447,4 @@ async def test_result_survives_sender_turn_end(env):
     await eventually(answered)
     assert await final_assistant(env, a) == "收到回复：42"
     assert (await one(env.db.conn, "SELECT state FROM collab_requests"))["state"] == "completed"
+    assert "会话请求结果汇总中" in statuses and "Agent 结果汇总中" not in statuses

@@ -115,7 +115,7 @@ async function preview(){
   validation.value=result;acceptReferenceSizes(result.bindings||result.items,result.conversationContentLimit);instance?.storage.reference.invalid.clear();
   if(snapshot&&instance){const tr=applyPreviewBindings(instance.state,snapshot,result.bindings||[]);if(tr)instance.view.dispatch(tr);}
  }}
- catch(error){if(generation===previewGeneration){validation.value=error?.response?.data||{ok:false,error:'引用目录暂时不可用'};const detail=validation.value.referenceError;if(detail?.code==='reference_unavailable'&&detail.key)editor.value?.storage.reference.invalid.add(detail.key);}}
+ catch(error){if(generation===previewGeneration){validation.value=error?.response?.data||{ok:false,error:'引用目录暂时不可用'};const detail=validation.value.referenceError;if(['reference_unavailable','servers_feature_disabled'].includes(detail?.code)&&detail.key)editor.value?.storage.reference.invalid.add(detail.key);}}
  finally{if(generation===previewGeneration)checking.value=false;}
 }
 watch(publicPreviewKey,()=>{clearTimeout(previewTimer);previewTimer=setTimeout(preview,250);});

@@ -1,0 +1,54 @@
+diff --git a/ip.sh b/ip.sh
+--- a/ip.sh
++++ b/ip.sh
+@@ -376,6 +376,7 @@
+ esac
+ }
+ countRunTimes(){
++[[ -n $OB_BENCH_DIR ]]&&{ stail[stoday]="";stail[stotal]="";stail[thanks]="${stail[thanks]#。}";stail[thanks]="${stail[thanks]#. }";return; }
+ local RunTimes=$(curl $CurlARG -s --max-time 10 "https://hits.xykt.de/ip?action=hit" 2>&1)
+ stail[today]=$(echo "$RunTimes"|jq '.daily')
+ stail[total]=$(echo "$RunTimes"|jq '.total')
+@@ -522,9 +523,11 @@
+ http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" "$url" 2>/dev/null)
+ if [[ $http_code == "204" ]];then
+ rawgithub="https://github.com/xykt/IPQuality/raw/"
++[[ -n $OB_BENCH_DIR ]]&&{ ob_google=1;rawgithub="file://$OB_BENCH_DIR/"; }
+ return 0
+ else
+ rawgithub="https://testingcf.jsdelivr.net/gh/xykt/IPQuality@"
++[[ -n $OB_BENCH_DIR ]]&&rawgithub="file://$OB_BENCH_DIR/"
+ return 1
+ fi
+ }
+@@ -2249,6 +2252,7 @@
+ exit 0
+ }
+ show_ad(){
++[[ -n $OB_BENCH_DIR ]]&&{ ADLines=0;return; }
+ RANDOM=$(date +%s)
+ local -a ads=()
+ local i=1
+@@ -2598,8 +2602,8 @@
+ show_tail)
+ fi
+ local report_link=""
+-[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 ]]&&save_json
+-[[ $mode_lite -eq 0 && mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s -X POST https://upload.check.place -d "type=ip" --data-urlencode "json=$ipjson" --data-urlencode "content=$ip_report")
++[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 || -n $OB_BENCH_OUT ]]&&save_json
++[[ $mode_lite -eq 0 && mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s --connect-timeout 10 --max-time 60 -X POST https://upload.check.place -d "type=ip" --data-urlencode "json=$ipjson" --data-urlencode "content=$ip_report")
+ [[ mode_json -eq 0 ]]&&echo -ne "\r$ip_report\n"
+ [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
+ [[ mode_json -eq 1 ]]&&echo -ne "\r$ipjson\n"
+@@ -2612,6 +2616,11 @@
+ ;;
+ *)echo -e "$ip_report"|sed 's/\x1b\[[0-9;]*[mGKHF]//g' >>"$outputfile" 2>/dev/null
+ esac
++fi
++if [[ -n $OB_BENCH_OUT ]];then
++echo "$ip_report" >"$OB_BENCH_OUT/report-$2.ansi"
++echo "$ipjson" >"$OB_BENCH_OUT/result-$2.json"
++[[ -n $report_link ]]&&echo "$report_link" >"$OB_BENCH_OUT/link-$2.txt"
+ fi
+ }
+ generate_random_user_agent

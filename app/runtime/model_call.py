@@ -11,13 +11,14 @@ import copy
 import inspect
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from app.llm.base import AgentResult, Message, OpenBearLLMError, apply_provider_billing
 from app.llm.events import StreamEvent, Usage
 from app.llm.retry import RetryPolicy, retry_wait_payload, wait_for_retry
-from app.runtime.lifecycle import current_session, _consume_cleanup_result
+from app.runtime.lifecycle import _consume_cleanup_result, current_session
 from app.runtime.thinking_recovery import is_anthropic_prefix_mismatch
 
 
@@ -255,6 +256,8 @@ async def execute_attempt(
                 elif event.kind == "finish":
                     result.finish_reason = event.finish_reason
                     partial.finish_reason = event.finish_reason
+                    result.finish_details = copy.deepcopy(event.details.get("stopDetails") or {})
+                    partial.finish_details = copy.deepcopy(result.finish_details)
                 if on_event is not None:
                     try:
                         await _invoke(on_event, event, partial, outcome)
@@ -281,14 +284,31 @@ async def execute_attempt(
             partial.reasoning += result.reasoning
             partial.tool_calls = copy.deepcopy(result.tool_calls)
             partial.finish_reason = result.finish_reason
+            partial.finish_details = copy.deepcopy(result.finish_details)
         if outcome.error is None and outcome.response.finish_reason == "refusal":
             message = ("上游拒绝生成（refusal），本轮未完成。已保留返回的正文，未自动重试。"
                        if outcome.response.text.strip() else
                        "上游拒绝生成（refusal），未返回正文，本轮未完成。未自动重试。")
+            from app.llm.error_sanitize import sanitize_user_facing_text
+
+            details = outcome.response.finish_details
+            category = details.get("category")
+            explanation = details.get("explanation")
+            public = {}
+            if isinstance(category, str) and category.strip():
+                category = sanitize_user_facing_text(category, max_len=80)
+                public["category"] = category
+                label = {"cyber": "网络安全"}.get(category, category)
+                message += f" 拒绝分类：{label}" + (f"（{category}）。" if label != category else "。")
+            if isinstance(explanation, str) and explanation.strip():
+                explanation = sanitize_user_facing_text(explanation, max_len=900)
+                public["explanation"] = explanation
+                message += f" 上游说明：{explanation}"
             outcome.status = "error"
             outcome.error = OpenBearLLMError(
                 message, summary=message, reason="refusal", retryable=False,
                 protocol=str(getattr(request.backend, "protocol", "") or ""),
+                details={"stopDetails": public} if public else None,
             )
     except asyncio.CancelledError as exc:
         outcome.status = "cancelled"
@@ -478,6 +498,7 @@ class ModelCallDriver:
                 upstream_status=error.upstream_status or error.status,
                 root_cause=error.root_cause, attempts=error.attempts,
                 details=error.details, scope=retry_scope, task_uuid=task_uuid,
+                quiet=self.retry_policy.quiet(normal_retries, delay),
             )
             await wait_for_retry(delay, state=state, cancel_check=cancel_check,
                                  control_check=control_check, on_update=on_retry)

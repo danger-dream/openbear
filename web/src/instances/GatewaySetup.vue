@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { Api } from '../api.js';
 import ServerSelect from './ServerSelect.vue';
-import { defaultAccessUrl, needsMapping, ok, safeError } from './instanceHelpers.js';
+import { defaultAccessUrl, needsMapping, nodeReady, ok, safeError } from './instanceHelpers.js';
 
 const props = defineProps({servers: {type: Array, required: true}, gateway: {type: Object, default: null}});
 const emit = defineEmits(['done', 'cancel', 'servers-changed']);
@@ -52,7 +52,7 @@ onMounted(refresh);
       <div class="ob-field"><span>运行位置</span>
         <div class="ob-ctl">
           <ServerSelect v-model="form.serverId" :servers="servers" @added="emit('servers-changed')" />
-          <small>作为独立服务运行，主控重启不影响登录和使用。</small>
+          <small>作为独立服务运行，主控重启不影响登录和使用。网关放在主控本机最安全。</small>
         </div>
       </div>
       <div class="ob-field"><span>端口</span>
@@ -65,7 +65,7 @@ onMounted(refresh);
             <small v-else-if="check.state === 'invalid'" class="ob-bad">✗ 请输入 1–65535 之间的端口</small>
             <small v-else-if="check.state === 'error'" class="ob-bad">✗ {{ check.message }}</small>
           </div>
-          <small>网关只占用这一个端口，浏览器访问和主控管理共用。</small>
+          <small>{{ server?.local || nodeReady(server) ? '浏览器从这个端口访问；主控管理网关另用一个只在服务器本机监听的端口。' : '这台服务器没有在线节点，浏览器访问和主控管理共用这一个端口。' }}</small>
         </div>
       </div>
       <div class="ob-field"><span>访问地址</span>
@@ -78,7 +78,7 @@ onMounted(refresh);
     </div>
     <p v-if="error" role="alert" class="instance-error">{{ error }}</p>
     <div class="instance-form-footer">
-      <span class="ob-hint">{{ server?.local ? `将在本机安装并启动网关服务，监听 ${form.port} 端口。` : `将通过 SSH 在${server?.name || '所选服务器'}上安装并启动网关，监听 ${form.port} 端口。` }}</span>
+      <span class="ob-hint">{{ server?.local ? `将在本机安装并启动网关服务，监听 ${form.port} 端口。` : `将通过${nodeReady(server) ? '服务器节点' : ' SSH '}在${server?.name || '所选服务器'}上安装并启动网关，监听 ${form.port} 端口。` }}</span>
       <el-button :disabled="busy" @click="emit('cancel')">取消</el-button>
       <el-button type="primary" native-type="submit" :loading="busy" :disabled="!ready">{{ current ? '保存' : '启用' }}</el-button>
     </div>

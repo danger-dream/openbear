@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 from app.stream.tool_progress import (
-    format_agent_batch_progress_card,
     format_tool_line,
     format_tool_result_line,
     format_tool_running_status_line,
@@ -41,32 +40,6 @@ def test_agent_card_escapes_dynamic_text():
     assert "&lt;b&gt;坏专家&lt;/b&gt;" in line
     assert "&lt;/blockquote&gt;" in line
     assert "<b>坏专家</b>" not in line
-
-
-def test_agent_progress_card_includes_three_recent_child_events():
-    card = format_agent_batch_progress_card([
-        {
-            "agent": "项目开发专家",
-            "title": "只读梳理 OpenBear 代码设计",
-            "status": "running",
-            "currentStatus": "模型调用中",
-            "durationMs": 185_000,
-            "task": {"modelCalls": 1, "toolCalls": 2},
-            "recentEvents": [
-                {"kind": "task_started", "summary": "项目开发专家 已启动", "elapsedMs": 1000},
-                {"kind": "tool_call_started", "summary": "调用工具 Read", "detail": {"name": "Read", "arguments": "{\"path\":\"app/tools/agents.py\"}"}, "elapsedMs": 10_000},
-                {"kind": "tool_call_finished", "summary": "工具 Read 调用完成", "detail": {"name": "Read", "durationMs": 1200}, "elapsedMs": 12_000},
-                {"kind": "model_call_started", "summary": "模型调用开始", "detail": {"modelLabel": "openai/gpt"}, "elapsedMs": 20_000},
-            ],
-        }
-    ], duration_ms=185_000)
-
-    assert "↳ 当前：模型调用中" in card
-    assert "项目开发专家 已启动" not in card
-    assert "✅ 工具完成：Read · 1.2s" in card
-    assert "🔄 模型调用开始：openai/gpt · 已 2m45s" in card
-    assert card.count("↳") == 4  # 当前状态 + 最近 3 条动态
-
 
 
 def test_agent_result_line_includes_usage():

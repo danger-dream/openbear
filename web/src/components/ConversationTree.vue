@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   Aim, Box, ArrowDown, ArrowRight, ChatLineRound, Check, Clock, Connection, Delete, DocumentCopy,
-  EditPen, Folder, FolderAdd, FolderOpened, InfoFilled, Loading, MagicStick, MoreFilled,
+  EditPen, Finished, Folder, FolderAdd, FolderOpened, InfoFilled, Loading, MagicStick, MoreFilled,
   Plus, Refresh, RefreshLeft, Search, Star, StarFilled, Timer, SetUp, Tools, UserFilled, User,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -25,6 +25,8 @@ import { treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop 
 import { referenceCatalog, referenceItem, acceptActivityReadReceipt } from "../references/catalog.js";
 import { REFERENCE_MIME, referenceToken } from "../references/codec.js";
 import AnimatedConversationTitle from "./AnimatedConversationTitle.vue";
+import ConversationSelectionBar from "./ConversationSelectionBar.vue";
+import { automaticRow, batchMessage, rangeSelection, selectableRow } from "./conversationTreeSelection.js";
 import { modelDefaultThinking, modelThinkingLevels } from "../views/consoleView/display.js";
 import {
   RUN_DEFAULT_FIELDS, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
@@ -38,7 +40,7 @@ const props = defineProps({
   // Off while a page that must keep its own route (e.g. instances) is shown.
   autoOpenSelected: { type: Boolean, default: true },
 });
-const emit = defineEmits(["open", "new-conversation", "rows", "selected-folder", "refresh-list", "delete-conversation", "folder-removed", "conversation-properties", "activity-status", "show-pending"]);
+const emit = defineEmits(["open", "new-conversation", "rows", "selected-folder", "refresh-list", "delete-conversation", "conversations-deleted", "folder-removed", "conversation-properties", "activity-status", "show-pending"]);
 
 defineExpose({
   refresh: (options = {}) => refreshTree({ preserve: true, ...options }),
@@ -57,6 +59,7 @@ defineExpose({
 
 const activityItems = ref([]);
 const recentItems = ref([]);
+const hiddenConversationIds = ref([]);
 const collabGroups = ref({});
 const activityReadBusy = ref(false);
 function savedSidebarView() {
@@ -71,18 +74,20 @@ let recentClockTimer;
 const {rows: recentRowsRaw} = useRecentConversationRows({
   get items() { return activityItems.value; },
   get recentItems() { return recentItems.value; },
+  get hiddenConversationIds() { return hiddenConversationIds.value; },
   get activeConversationUuid() { return props.activeConversationUuid; },
   get readVersions() { return referenceCatalog.activityReadVersions || new Map(); },
 });
 const recentConversationRows = computed(() => recentRowsRaw.value.map(row => ({...row, ...leadGroupStatus(collabGroups.value[row.conversationUuid])})));
 // Match the unread marker's visibility without consuming in-progress results.
-const recentUnreadRows = computed(() => recentConversationRows.value.filter(row =>
+const activitySummaryRows = computed(() => [...new Map([...recentConversationRows.value, ...activityItems.value].map(row => [row.conversationUuid, row])).values()]);
+const recentUnreadRows = computed(() => activitySummaryRows.value.filter(row =>
   row.activityUnread && !running(row) && !isTitleGenerating(row)
 ));
 const recentUnreadCount = computed(() => recentUnreadRows.value.length);
 const pendingRows = ref([]);
 const recentWaitingCount = computed(() => pendingRows.value.length);
-const recentRunningCount = computed(() => recentConversationRows.value.filter(row => !isTitleGenerating(row) && !row.activityPending?.length && activityState(row) === 'running').length);
+const recentRunningCount = computed(() => activitySummaryRows.value.filter(row => !isTitleGenerating(row) && !row.activityPending?.length && activityState(row) === 'running').length);
 function recentLabel(row) {
   const state = row.activityPending?.length ? 'waiting' : activityState({...row, readWhileSelected: false});
   const label = activityLabel({...row, activityState: state, readWhileSelected: false});
@@ -131,7 +136,7 @@ const webhookVisited = ref(false);
 const propertyModelOptions = ref([]);
 const propertiesRunDefaultsBaseline = ref({});
 const propertiesForm = reactive({
-  folderId: "", parentId: "", name: "", path: "", temporary: false, workspaceDir: "", promptMarkdown: "",
+  folderId: "", parentId: "", name: "", path: "", temporary: false, workspaceDir: "", promptMarkdown: "", hideFromRecent: false, hiddenFromRecentByAncestor: false,
   promptPolicy: promptPolicyFlags(), inheritedPromptPolicy: normalizePromptPolicy(), inheritedPromptSourcePath: "",
   runDefaults: {}, runInherited: {}, runFallback: {}, runResolved: {},
 });
@@ -456,7 +461,8 @@ function mergeLocatedFolders(rows = []) {
   }
 }
 function cacheLocatedConversation(raw) {
-  if (!raw?.conversationUuid) return;
+  // Active group members are listed only under their group node, never as folder siblings.
+  if (!raw?.conversationUuid || (raw.origin === "collab" && !raw.archived)) return;
   const row = statusAdjustedRow(raw);
   const parentId = String(row.folderId || "");
   const system = row.archived ? "archive" : parentId ? "" : "temporary";
@@ -814,6 +820,7 @@ function applyStatus(data = {}) {
   const revision = Number(data.revision || 0);
   if (revision) statusServerRevision = Math.max(statusServerRevision, revision);
   const adjust = withLocalRead;
+  hiddenConversationIds.value = data.hiddenConversationIds || [];
   activityItems.value = (data.activityItems || data.items || []).map(adjust).filter(item => !item.archived && (item.running || item.activityUnread || isActivityWaiting(item)));
   // Every running conversation, including automatic ones, plus user-visible unread results.
   folderActivity.value = folderActivityCounts([...(data.items || []).map(adjust), ...activityItems.value]);
@@ -848,6 +855,137 @@ async function markActivityRead(items) {
     if (latestStatusState) applyStatus(latestStatusState.raw);
   } catch (error) { ElMessage.error(apiError(error)); }
   finally { activityReadBusy.value = false; }
+}
+const selecting = ref(false);
+const selection = ref(new Map());
+const selectionBusy = ref(false);
+let selectionAnchor = "";
+const selectedRows = computed(() => {
+  const known = new Map(knownConversationRows().map(row => [row.conversationUuid, row]));
+  return [...selection.value.values()].map(row => known.get(row.conversationUuid) || row);
+});
+const selectionScope = computed(() => sidebarView.value === "folders" && !query.value.trim() ? selectedFolderId.value : null);
+const selectionUnarchive = computed(() => selectedRows.value.length > 0 && selectedRows.value.every(row => row.archived));
+function isSelected(row) { return selection.value.has(row?.conversationUuid); }
+function enterSelection(row = null) {
+  closeMenu(); closeOverview();
+  selecting.value = true;
+  if (selectableRow(row)) { selection.value = new Map([[row.conversationUuid, row]]); selectionAnchor = row.conversationUuid; }
+}
+function exitSelection() { selecting.value = false; selection.value = new Map(); selectionAnchor = ""; }
+function dropSelection(uuids) {
+  const next = new Map(selection.value);
+  for (const uuid of uuids) next.delete(uuid);
+  selection.value = next;
+}
+function toggleSelected(row, event) {
+  if (!selectableRow(row)) return;
+  const next = new Map(selection.value);
+  if (event?.shiftKey && selectionAnchor) {
+    const lookup = new Map(displayRows.value.filter(selectableRow).map(item => [item.conversationUuid, item]));
+    for (const uuid of rangeSelection(displayRows.value, selectionAnchor, row.conversationUuid)) next.set(uuid, lookup.get(uuid) || row);
+  } else {
+    if (next.has(row.conversationUuid)) next.delete(row.conversationUuid); else next.set(row.conversationUuid, row);
+    selectionAnchor = row.conversationUuid;
+  }
+  selection.value = next;
+}
+function clickConversation(event, row) {
+  if (!selecting.value && (event?.metaKey || event?.ctrlKey) && selectableRow(row)) return enterSelection(row);
+  if (selecting.value) return toggleSelected(row, event);
+  return row.search ? locateAndOpen(row) : activateRow(row);
+}
+async function selectScope(automatic = false) {
+  const folderId = selectionScope.value;
+  if (folderId === null || selectionBusy.value) return;
+  const systemNode = folderId ? "" : "temporary";
+  selectionBusy.value = true;
+  try {
+    const rows = [];
+    let cursor = "";
+    do {
+      const data = await Api.conversationTreeChildren({ ...(folderId ? { parentId: folderId } : { systemNode }), limit: 100, ...(cursor ? { cursor } : {}) });
+      rows.push(...(data.items || []).filter(item => item.kind === "conversation").map(statusAdjustedRow));
+      const next = data.hasMore ? String(data.nextCursor || "") : "";
+      if (!next || next === cursor) break;
+      cursor = next;
+    } while (cursor);
+    const chosen = rows.filter(row => selectableRow(row) && (!automatic || automaticRow(row)));
+    if (!chosen.length) { ElMessage.info(automatic ? "本目录没有自动创建的会话" : "本目录没有会话"); return; }
+    const next = new Map(selection.value);
+    for (const row of chosen) next.set(row.conversationUuid, row);
+    selection.value = next;
+    // Show every selected row so individual ones can still be unticked.
+    setExpanded(folderId || "__temporary", true);
+    let branch = stateFor(folderId, systemNode);
+    if (!branch.loaded) await loadChildren(folderId, systemNode);
+    while (branch.hasMore && !branch.error) {
+      await loadChildren(folderId, systemNode, { append: true });
+      branch = stateFor(folderId, systemNode);
+    }
+  } catch (error) { ElMessage.error(apiError(error)); }
+  finally { selectionBusy.value = false; }
+}
+function showBatchResult(verb, result) {
+  const message = batchMessage(verb, result);
+  ElMessage({ type: message.type, message: message.text });
+}
+async function batchDelete() {
+  const ids = [...selection.value.keys()];
+  if (!ids.length || selectionBusy.value) return;
+  try {
+    await ElMessageBox.confirm(`确定删除选中的 ${ids.length} 个会话吗？所有消息和历史记录将被清除，不可恢复。`, "批量删除会话", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+  } catch { return; }
+  selectionBusy.value = true;
+  try {
+    const result = await Api.batchConversations({ action: "delete", conversationIds: ids });
+    const deleted = (result.results || []).filter(item => item.ok).map(item => item.conversationUuid);
+    for (const uuid of deleted) forgetConversation(uuid);
+    dropSelection(deleted);
+    if (deleted.length) emit("conversations-deleted", deleted);
+    await refreshTree({ preserve: true, trackActive: false });
+    showBatchResult("删除", result);
+  } catch (error) { ElMessage.error(apiError(error)); }
+  finally { selectionBusy.value = false; }
+}
+async function batchArchive() {
+  const ids = [...selection.value.keys()];
+  if (!ids.length || selectionBusy.value) return;
+  const archiving = !selectionUnarchive.value;
+  const activeRow = selectedRows.value.find(row => row.conversationUuid === props.activeConversationUuid);
+  selectionBusy.value = true;
+  try {
+    const result = await Api.batchConversations({ action: archiving ? "archive" : "unarchive", conversationIds: ids });
+    const changed = new Set((result.results || []).filter(item => item.ok && !item.unchanged).map(item => item.conversationUuid));
+    for (const branch of Object.values(branchState)) {
+      branch.items = (branch.items || []).filter(item => item.kind !== "conversation" || !changed.has(item.conversationUuid));
+    }
+    emitRows();
+    dropSelection((result.results || []).filter(item => item.ok).map(item => item.conversationUuid));
+    if (archiving && activeRow && changed.has(activeRow.conversationUuid)) {
+      selectFolder(String(activeRow.folderId || ""));
+      emit("new-conversation", String(activeRow.folderId || ""));
+    }
+    await refreshTree({ preserve: true, trackActive: false });
+    if (!archiving && isExpanded("__archive")) await loadChildren("", "archive", { force: true });
+    showBatchResult(archiving ? "归档" : "取消归档", result);
+  } catch (error) { ElMessage.error(apiError(error)); }
+  finally { selectionBusy.value = false; }
+}
+async function batchMove(targetFolderId) {
+  const ids = [...selection.value.keys()];
+  const parents = new Set(selectedRows.value.map(row => String(row.folderId || "")));
+  const impact = await Api.batchConversations({ action: "move", conversationIds: ids, targetFolderId, impactOnly: true });
+  const choice = await chooseImpact("移动", impact);
+  if (choice === null) return false;
+  const result = await Api.batchConversations({ action: "move", conversationIds: ids, targetFolderId, updateSnapshots: choice === true });
+  const moved = (result.results || []).filter(item => item.ok).map(item => item.conversationUuid);
+  dropSelection(moved);
+  if (moved.includes(props.activeConversationUuid)) selectFolder(String(targetFolderId || ""));
+  for (const parent of parents) await invalidateAndRefresh(parent, targetFolderId);
+  showBatchResult("移动", result);
+  if (result.skippedRunningCount) ElMessage.warning(`${result.skippedRunningCount} 个运行中会话的快照本次跳过，不会延后更新`);
+  return true;
 }
 function openActivityConversation(row) {
   // Opening the virtual alias does not expand/move/select its original folder.
@@ -1190,6 +1328,7 @@ async function showProperties(row, initialTab = 'context') {
     }
     Object.assign(propertiesForm, {
       folderId, parentId: String(row.parentId || ""), name: data.name, path: data.path,
+      hideFromRecent: !!data.hideFromRecent, hiddenFromRecentByAncestor: !!data.hiddenFromRecentByAncestor,
       workspaceDir: data.workspace?.local || "", promptMarkdown: data.promptPolicy?.local?.text ?? data.prompt?.local ?? "",
       promptPolicy: promptPolicyFlags(data.promptPolicy?.local),
       inheritedPromptPolicy: normalizePromptPolicy(data.promptPolicy?.inherited || {text: data.prompt?.inherited}),
@@ -1322,7 +1461,7 @@ function resetPropertiesForm(row) {
     folderId: row.systemNode === "temporary" ? "__temporary" : String(row.folderId || ""),
     temporary: row.systemNode === "temporary",
     parentId: String(row.parentId || ""), name: String(row.name || ""), path: String(row.path || ""),
-    workspaceDir: "", promptMarkdown: "",
+    workspaceDir: "", promptMarkdown: "", hideFromRecent: false, hiddenFromRecentByAncestor: false,
     promptPolicy: promptPolicyFlags(), inheritedPromptPolicy: normalizePromptPolicy(), inheritedPromptSourcePath: "",
     runDefaults: {}, runInherited: {}, runFallback: {}, runResolved: {},
   });
@@ -1378,7 +1517,7 @@ async function saveProperties() {
   const temporary = propertiesForm.temporary;
   propertiesSaving.value = true;
   const payload = {
-    ...(!temporary ? { workspaceDir: propertiesForm.workspaceDir } : {}),
+    ...(!temporary ? { workspaceDir: propertiesForm.workspaceDir, hideFromRecent: propertiesForm.hideFromRecent } : {}),
     promptMarkdown: propertiesForm.promptMarkdown,
     promptPolicy: promptPolicyFlags(propertiesForm.promptPolicy),
     ...(saveRunDefaults ? { runDefaults: sparseRunDefaults(propertiesForm.runDefaults) } : {}),
@@ -1404,6 +1543,7 @@ async function saveProperties() {
         mergeLocatedFolders(located.folderItems || []);
       }
       emitRows();
+      await refreshStatus();
     }
     const skipped = Number(result.skippedRunningCount || 0);
     const later = request === propertiesRequestGeneration && JSON.stringify(propertiesForm) !== draftAtSubmit;
@@ -1443,6 +1583,10 @@ async function submitMove() {
   if (!row) return;
   moveBusy.value = true;
   try {
+    if (moveMode.value === "batch") {
+      if (await batchMove(moveFolderId.value)) moveDialog.value = false;
+      return;
+    }
     if (moveMode.value === "delete") {
       const impact = await Api.deleteConversationFolder(row.folderId, { targetFolderId: moveFolderId.value, impactOnly: true });
       await ElMessageBox.confirm("目录中的子目录与会话会迁移到所选位置；聊天内容不会删除。", `删除目录「${row.name}」`, { type: "warning", confirmButtonText: "迁移并删除", cancelButtonText: "取消" });
@@ -1515,6 +1659,7 @@ async function invalidateAndRefresh(oldParent, newParent, locatedRow = null) {
     if (shouldReload) await loadChildren(parent, systemNode, { force: true });
   }
   await refreshTree({ preserve: true, refreshLoaded: false });
+  await refreshStatus();
   await mergeLocatedItem(locatedRow);
   if (query.value.trim()) await runSearch();
 }
@@ -1556,7 +1701,15 @@ async function runMenuAction(action) {
     else if (action === "duplicate") await duplicateConversation(row);
     else if (action === "archive") await archiveConversation(row);
     else if (action === "delete-conversation") await removeConversation(row);
+    else if (action === "select") {
+      if (row.kind === "folder") selectFolder(row.folderId);
+      else if (row.kind === "system") selectFolder("");
+      enterSelection(row);
+    }
   } catch (error) { if (!['cancel', 'close'].includes(error)) ElMessage.error(apiError(error)); }
+}
+async function openBatchMove() {
+  if (selection.value.size) await showMove({ kind: "conversation", batch: true, folderId: selectedFolderId.value }, "batch");
 }
 
 function dragStart(event, row) {
@@ -1636,6 +1789,8 @@ function clearDrag() {
   drag.value = { row: null, target: null, zone: "", busy: false };
 }
 function rowKeydown(event, row) {
+  if (selecting.value && selectableRow(row) && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggleSelected(row, event); return; }
+  if (selecting.value && event.key === "Escape" && !menu.value.open) { exitSelection(); return; }
   if (!row.recentAlias && row.expandId && (event.key === "ArrowRight" || event.key === "ArrowLeft") && (event.key === "ArrowRight") !== isExpanded(row.expandId)) { event.preventDefault(); void toggleRow(row); return; }
   if (event.key === "Enter") { event.preventDefault(); void (row.search ? locateAndOpen(row) : activateRow(row)); }
   else if (event.key === "ArrowRight" && ["folder", "system"].includes(row.kind) && !isExpanded(row.kind === "system" ? row.id : row.folderId)) { event.preventDefault(); void toggleRow(row); }
@@ -1691,6 +1846,7 @@ onBeforeUnmount(() => {
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <button class="tree-tool" :class="{ active: selecting }" type="button" :title="selecting ? '退出多选' : '多选会话'" :aria-label="selecting ? '退出多选' : '多选会话'" :aria-pressed="selecting" @click="selecting ? exitSelection() : enterSelection()"><el-icon><Finished /></el-icon></button>
         <button class="tree-tool" type="button" title="刷新目录树" :disabled="loading" @click="refreshTree({ preserve: true })"><el-icon :class="loading && 'is-spinning'"><Refresh /></el-icon></button>
       </div>
     </header>
@@ -1727,7 +1883,7 @@ onBeforeUnmount(() => {
           :role="isDirectoryView ? 'treeitem' : 'listitem'" :aria-level="isDirectoryView ? Number(row.depth || 0) + 1 : undefined" :aria-busy="rowLoading(row) || isTitleGenerating(row)"
           :aria-expanded="['folder','system'].includes(row.kind) ? String(isExpanded(row.kind === 'system' ? row.id : row.folderId)) : !row.recentAlias && row.expandId ? String(isExpanded(row.expandId)) : undefined"
           :tabindex="['folder','conversation','system','group'].includes(row.kind) ? 0 : -1"
-          :draggable="!row.local && !moveInFlight && !row.groupMember && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
+          :draggable="!selecting && !row.local && !moveInFlight && !row.groupMember && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
           @keydown="rowKeydown($event, row)" @contextmenu="openMenu($event, row)"
           @pointerenter="enterOverview($event, row)" @pointerleave="leaveOverview"
           @dragstart="dragStart($event, row)" @dragover="dragOver($event, row)" @drop="drop($event, row)" @dragend="clearDrag"
@@ -1760,11 +1916,12 @@ onBeforeUnmount(() => {
           </template>
 
           <template v-else-if="row.kind === 'conversation'">
+            <button v-if="selecting && selectableRow(row)" class="tree-check" :class="{ checked: isSelected(row) }" type="button" role="checkbox" :aria-checked="String(isSelected(row))" :aria-label="`选择 ${liveConversationTitle(row)}`" tabindex="-1" @click.stop="toggleSelected(row, $event)"><span><el-icon v-if="isSelected(row)"><Check /></el-icon></span></button>
             <button v-if="row.groupCount && !row.recentAlias && !row.search" class="tree-chevron" type="button" :aria-label="isExpanded(row.expandId) ? '收起小组' : '展开小组'" @click.stop="toggleRow(row)">
               <el-icon><component :is="isExpanded(row.expandId) ? ArrowDown : ArrowRight" /></el-icon>
             </button>
-            <span v-else-if="!row.recentAlias" class="tree-leaf-spacer"></span>
-            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationRow === row, 'is-title-generating': isTitleGenerating(row) }" :title="isTitleGenerating(row) ? '正在生成会话名称' : (row.local ? row.title : undefined)" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
+            <span v-else-if="!row.recentAlias && !(selecting && selectableRow(row))" class="tree-leaf-spacer"></span>
+            <button class="tree-node-main conversation" type="button" :class="{ 'is-chat-active': activeConversationRow === row, 'is-title-generating': isTitleGenerating(row) }" :title="isTitleGenerating(row) ? '正在生成会话名称' : (row.local ? row.title : undefined)" @click="clickConversation($event, row)" @contextmenu="openMenu($event, row)">
               <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) || isTitleGenerating(row), 'is-working': running(row) && !isActivityWaiting(row) && !rowLoading(row) && !isTitleGenerating(row) }" :title="conversationOrigin(row).label" :aria-label="conversationOrigin(row).label"><component :is="rowLoading(row) || isTitleGenerating(row) ? Loading : conversationOrigin(row).icon" /></el-icon>
               <span class="node-copy"><span class="node-label"><AnimatedConversationTitle :text="liveConversationTitle(row)" :identity="row.conversationUuid" /></span><small v-if="row.search || row.recentAlias">{{ nodePath(row) }}</small></span>
               <span v-if="row.pinned" class="node-star"><el-icon><StarFilled /></el-icon></span>
@@ -1780,7 +1937,7 @@ onBeforeUnmount(() => {
           <button v-else-if="row.kind === 'more'" class="tree-inline-action" type="button" :disabled="stateFor(row.parentId || '', row.systemNode || '').loading" @click="loadChildren(row.parentId || '', row.systemNode || '', { append: true })">加载更多</button>
           <button v-else-if="row.kind === 'error'" class="tree-inline-action error" type="button" @click="loadChildren(row.parentId || '', row.systemNode || '', { force: true })">加载失败，点击重试</button>
           <span v-else class="tree-muted">此目录为空</span>
-          <button v-if="['folder', 'conversation', 'system', 'group'].includes(row.kind)"
+          <button v-if="!selecting && ['folder', 'conversation', 'system', 'group'].includes(row.kind)"
             class="tree-touch-more" type="button" :aria-label="`${row.name || rowLabel(row)}：更多操作`"
             aria-haspopup="menu" :aria-expanded="menu.open && rowId(menu.row) === rowId(row)"
             @pointerdown.stop @keydown="moreMenuKeydown" @dragstart.prevent.stop @click.stop="openMoreMenu($event, row)">
@@ -1793,6 +1950,9 @@ onBeforeUnmount(() => {
       </template>
     </div>
     </div>
+    <ConversationSelectionBar v-if="selecting" :count="selection.size" :unread-count="selectedRows.filter(row => row.activityUnread).length" :scope-label="selectionScope === null ? '' : selectedTargetLabel" :unarchive="selectionUnarchive" :busy="selectionBusy || activityReadBusy"
+      @select-scope="selectScope()" @select-automatic="selectScope(true)" @clear="selection = new Map()" @done="exitSelection"
+      @read="markActivityRead(selectedRows.filter(row => row.activityUnread))" @move="openBatchMove" @archive="batchArchive" @delete="batchDelete" />
 
     <ConversationOverview :open="overview.open" :row="overview.row" :anchor="overview.anchor" @close="closeOverview" @enter="keepOverview" @leave="leaveOverview"/>
 
@@ -1807,6 +1967,7 @@ onBeforeUnmount(() => {
             <button role="menuitem" @click="runMenuAction('rename')"><el-icon><EditPen /></el-icon><span>重命名</span></button>
             <button role="menuitem" @click="runMenuAction('pin')"><el-icon><component :is="menu.row?.pinned ? Star : StarFilled" /></el-icon><span>{{ menu.row?.pinned ? '取消置顶' : '置顶' }}</span></button>
             <button role="menuitem" @click="runMenuAction('move')"><el-icon><FolderOpened /></el-icon><span>移动到…</span></button>
+            <button role="menuitem" @click="runMenuAction('select')"><el-icon><Finished /></el-icon><span>多选会话</span></button>
             <button role="menuitem" @click="runMenuAction('cron')"><el-icon><Timer /></el-icon><span>定时任务</span></button>
             <button role="menuitem" @click="runMenuAction('properties')"><el-icon><InfoFilled /></el-icon><span>目录属性</span></button>
             <hr />
@@ -1815,6 +1976,7 @@ onBeforeUnmount(() => {
           <template v-else-if="['system', 'root'].includes(menu.row?.kind)">
             <button v-if="menu.row?.systemNode === 'temporary' || menu.row?.kind === 'root'" role="menuitem" @click="runMenuAction('new-conversation')"><el-icon><ChatLineRound /></el-icon><span>新建临时会话</span></button>
             <button role="menuitem" @click="runMenuAction('new-folder')"><el-icon><FolderAdd /></el-icon><span>新建根级目录</span></button>
+            <button v-if="menu.row?.systemNode === 'temporary'" role="menuitem" @click="runMenuAction('select')"><el-icon><Finished /></el-icon><span>多选会话</span></button>
             <template v-if="menu.row?.systemNode === 'temporary'">
               <hr />
               <button role="menuitem" @click="runMenuAction('properties')"><el-icon><InfoFilled /></el-icon><span>临时会话属性</span></button>
@@ -1831,6 +1993,7 @@ onBeforeUnmount(() => {
             <button role="menuitem" :disabled="menu.row?.local || running(menu.row)" @click="runMenuAction('duplicate')"><el-icon><DocumentCopy /></el-icon><span>复制会话</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('pin')"><el-icon><component :is="menu.row?.pinned ? Star : StarFilled" /></el-icon><span>{{ menu.row?.pinned ? '取消置顶' : '置顶' }}</span></button>
             <hr />
+            <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('select')"><el-icon><Finished /></el-icon><span>多选</span></button>
             <button v-if="menu.recent" role="menuitem" :disabled="locatingConversation" @click="runMenuAction('locate')"><el-icon><Aim /></el-icon><span>在目录中定位</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('move')"><el-icon><FolderOpened /></el-icon><span>移动到…</span></button>
             <button role="menuitem" :disabled="menu.row?.local || running(menu.row)" @click="runMenuAction('refresh-prompt')"><el-icon><Refresh /></el-icon><span>更新系统提示词…</span></button>
@@ -1860,6 +2023,13 @@ onBeforeUnmount(() => {
         <div class="property-panels">
           <section v-show="propertiesTab === 'context'" id="folder-properties-panel-context" role="tabpanel" aria-labelledby="folder-properties-tab-context">
             <div class="property-tab-panel context-properties">
+              <section v-if="!propertiesForm.temporary" class="property-section">
+                <label class="property-field">
+                  <span>不显示在最近会话</span>
+                  <el-switch v-model="propertiesForm.hideFromRecent" aria-label="不显示在最近会话" :disabled="propertiesSaving" />
+                  <small>此目录及其子目录的会话不显示在最近会话，运行和未读状态不受影响。<template v-if="propertiesForm.hiddenFromRecentByAncestor">上级目录已启用隐藏。</template></small>
+                </label>
+              </section>
               <section v-if="!propertiesForm.temporary" class="property-section" aria-labelledby="folder-workspace-label">
                 <label class="property-field">
                   <span id="folder-workspace-label">本节点工作目录 <em>清空即继承</em></span>
@@ -1895,7 +2065,7 @@ onBeforeUnmount(() => {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="moveDialog" class="mobile-viewport-dialog" width="min(560px, calc(100vw - 24px))" append-to-body :title="moveMode === 'delete' ? '迁移目录内容后删除' : '移动到…'" :close-on-click-modal="false">
+    <el-dialog v-model="moveDialog" class="mobile-viewport-dialog" width="min(560px, calc(100vw - 24px))" append-to-body :title="moveMode === 'delete' ? '迁移目录内容后删除' : moveMode === 'batch' ? `移动 ${selection.size} 个会话到…` : '移动到…'" :close-on-click-modal="false">
       <el-input v-model="moveFolderQuery" clearable placeholder="搜索完整目录路径" :prefix-icon="Search" />
       <div class="folder-picker" role="listbox">
         <button type="button" :class="{ selected: moveFolderId === '' }" @click="moveFolderId = ''"><el-icon><Folder /></el-icon><span>{{ moveRow?.kind === 'conversation' ? '临时会话' : '根级目录' }}</span></button>
@@ -1903,7 +2073,7 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="moveMode === 'move' && moveRow?.kind === 'conversation' && moveRow?.archived" class="move-archive-options">
         <div><el-checkbox v-model="moveUnarchive">取消归档</el-checkbox><p>移动后恢复为普通会话。</p></div>
-        <div><el-checkbox v-model="moveUpdateSnapshots">更新系统提示词</el-checkbox><p>按目标目录和当前模板重新组装，现有提示词缓存将失效；运行中的会话跳过更新。</p></div>
+        <div><el-checkbox v-model="moveUpdateSnapshots">更新系统提示词</el-checkbox><p>按目标目录和当前模板重新组装，工具定义同步为当前版本，现有提示词缓存将失效；运行中的会话跳过更新。</p></div>
       </div>
       <template #footer><el-button @click="moveDialog = false">取消</el-button><el-button type="primary" :loading="moveBusy" @click="submitMove">{{ moveMode === 'delete' ? '下一步' : '移动' }}</el-button></template>
     </el-dialog>
@@ -1931,6 +2101,10 @@ onBeforeUnmount(() => {
 .tree-tool { display:grid; width:27px; height:27px; place-items:center; border:0; border-radius:8px; background:transparent; color:var(--ob-text-subtle); cursor:pointer; }
 .tree-tool:hover,.tree-tool:focus-visible { background:var(--ob-surface-soft); color:var(--ob-text-strong); outline:none; }
 .tree-tool.primary { color:var(--ob-chat-subtle); }
+.tree-tool.active { background:var(--ob-hover); color:var(--ob-text-strong); }
+.tree-check { display:grid; width:24px; height:27px; flex:0 0 auto; place-items:center; padding:0; border:0; background:transparent; cursor:pointer; }
+.tree-check > span { display:grid; width:14px; height:14px; place-items:center; border:1.5px solid var(--ob-border-strong); border-radius:4px; color:var(--ob-text-inverse); font-size:10px; }
+.tree-check.checked > span { border-color:var(--ob-blue); background:var(--ob-blue); }
 .sidebar-tabs { display:flex; flex:none; gap:3px; margin:0 10px 8px; padding:3px; border-radius:8px; background:var(--ob-hover); }
 .sidebar-tabs button { flex:1; min-width:0; min-height:28px; padding:3px 8px; border:0; border-radius:6px; background:transparent; color:var(--ob-text-muted); font-size:12px; cursor:pointer; }
 .sidebar-tabs button[aria-selected="true"] { background:var(--ob-surface-raised); color:var(--ob-text); box-shadow:0 1px 3px rgb(0 0 0 / .06); }
@@ -2019,6 +2193,8 @@ button.activity-cell,.sidebar-unread-count { padding:3px 6px; cursor:pointer; }
 }
 @media (max-width:760px) {
   .tree-chevron { height:44px; }
+  .tree-check { width:32px; height:44px; }
+  .tree-check > span { width:18px; height:18px; font-size:12px; }
 }
 </style>
 

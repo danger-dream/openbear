@@ -337,6 +337,41 @@ SPECS: dict[str, SettingSpec] = {
         "仅实际压缩时，把超过阈值的普通工具结果完整保存为文件，上下文保留路径和头尾预览，可用 Read 分段读取全文；包括最新未读结果。滑动窗口和模型摘要共用。默认 16000 token，0 关闭；用户要求、确认决策和 Agent 编排结论不落盘，未授权 Read 时保持原文。",
         "int", "compaction", "下一轮生效", min_value=0, unit="token",
     ),
+    "workItems.titleChars": _s(
+        "workItems.titleChars", "标题长度", "任务和每一项的标题最多保留的字数，超出部分截掉。",
+        "int", "work_items", "下一轮生效", min_value=50, max_value=2000, unit="字",
+    ),
+    "workItems.quoteChars": _s(
+        "workItems.quoteChars", "原话长度",
+        "提出、决策、纠正时存下的用户原话，以及问卷补充文字，最多保留的字数。记决策没给原话时，存下整条消息，也按这个长度截断。",
+        "int", "work_items", "下一轮生效", min_value=200, max_value=20_000, unit="字",
+    ),
+    "workItems.maxCriteria": _s(
+        "workItems.maxCriteria", "完成标准条数", "每一项最多能写几条完成标准，超出时拒绝保存。",
+        "int", "work_items", "下一轮生效", min_value=1, max_value=100, unit="条",
+    ),
+    "workItems.maxEvidence": _s(
+        "workItems.maxEvidence", "证据条数", "标记完成时每一项最多保留几条证据，多出的不保存。",
+        "int", "work_items", "下一轮生效", min_value=1, max_value=200, unit="条",
+    ),
+    "workItems.outlineChars": _s(
+        "workItems.outlineChars", "大纲长度",
+        "每次请求带给模型的任务大纲最多多少字。超出时先省略未完成项，并注明省了几项，模型需要时再按编号查看。",
+        "int", "work_items", "下一轮生效", min_value=1000, max_value=50_000, unit="字",
+    ),
+    "workItems.briefingChars": _s(
+        "workItems.briefingChars", "开工交底长度",
+        "开始做某个范围时，交给模型的完成标准、用户原话和决策原文最多多少字，超出部分截断。",
+        "int", "work_items", "下一轮生效", min_value=2000, max_value=200_000, unit="字",
+    ),
+    "workItems.recentEdits": _s(
+        "workItems.recentEdits", "大纲里的最近改动条数", "大纲末尾列出你在任务面板上最近几次修改，0 不列。",
+        "int", "work_items", "下一轮生效", min_value=0, max_value=50, unit="条",
+    ),
+    "workItems.recentEditDays": _s(
+        "workItems.recentEditDays", "最近改动保留天数", "超过这个天数的面板修改不再列进大纲。",
+        "int", "work_items", "下一轮生效", min_value=1, max_value=90, unit="天",
+    ),
     "models.compressionModels": _s(
         "models.compressionModels", "摘要模型", "按顺序尝试，最后回退当前执行模型；留空仅使用执行模型。仅模型摘要使用。",
         "multi", "compaction", "下一轮生效",
@@ -738,6 +773,26 @@ SPECS: dict[str, SettingSpec] = {
         "interface",
         "下一轮生效",
     ),
+    "features.instances": _s(
+        "features.instances", "启用实例",
+        "显示“实例”菜单，并把 InstanceControl 工具开放给模型。这个工具的说明较长，开启后每轮对话会多占用一些 token。关闭只隐藏菜单和工具，已有实例的守护与通知照常运行。",
+        "bool", "features", "下一轮生效",
+    ),
+    "features.servers": _s(
+        "features.servers", "启用主机",
+        "显示“主机”菜单，并把 Servers 工具和节点浏览器开放给模型。这个工具的说明较长，开启后每轮对话会多占用一些 token。关闭只隐藏菜单和工具，节点连接、组网和到期提醒照常运行。",
+        "bool", "features", "下一轮生效",
+    ),
+    "updates.prerelease": _s(
+        "updates.prerelease", "接收测试版",
+        "除正式版外，也接收 beta 和 rc 测试版：OpenBear 的版本更新和主控给服务器节点挑选的节点版本都按这一项决定。关闭时只用正式版。",
+        "bool", "updates", "立即生效",
+    ),
+    "updates.autoUpdateNodes": _s(
+        "updates.autoUpdateNodes", "自动更新节点",
+        "有可用的新节点版本时，自动把服务器节点更新过去，离线的节点上线后补上；中转节点放在最后逐台更新。关闭时只提醒，由你在服务器页点「全部更新」。只在开启主机功能时生效，关闭了命令执行的节点仍需在服务器上重新安装。",
+        "bool", "updates", "立即生效",
+    ),
     "web.host": _s("web.host", "Web 绑定地址", "Web 管理台监听地址。", "str", "web", "需要重启"),
     "web.port": _s(
         "web.port",
@@ -912,6 +967,19 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "上下文压缩",
         ['contextManagement.defaultStrategy', 'agent.compactRatio', 'contextManagement.retainTokens', 'contextManagement.dialogueTokens', 'contextManagement.toolResultArtifactTokens', 'models.compressionModels', 'agent.keepRecentMessages', 'agent.compactMaxTokens', 'agent.compactMaxRetries', 'agent.compactTimeoutS', 'agent.manualCompactMinPercent', 'agent.compactPrompt'],
     ),
+    "work_items": (
+        "任务",
+        [
+        "workItems.titleChars",
+        "workItems.quoteChars",
+        "workItems.maxCriteria",
+        "workItems.maxEvidence",
+        "workItems.outlineChars",
+        "workItems.briefingChars",
+        "workItems.recentEdits",
+        "workItems.recentEditDays",
+        ],
+    ),
     "rath": (
         "子 Agent",
         [
@@ -1015,6 +1083,20 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "ui.showTurnStats",
         ],
     ),
+    "features": (
+        "按需开启",
+        [
+        "features.instances",
+        "features.servers",
+        ],
+    ),
+    "updates": (
+        "版本更新",
+        [
+        "updates.prerelease",
+        "updates.autoUpdateNodes",
+        ],
+    ),
 }
 
 
@@ -1044,6 +1126,9 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
             "mcp",
         ],
     ),
+    "work_items": ("任务", "会话任务记录的长度、条数和模型看到的内容", ["work_items"]),
+    "features": ("可选功能", "实例、主机等按需开启的菜单和工具", ["features"]),
+    "updates": ("版本更新", "是否接收测试版，以及服务器节点的自动更新", ["updates"]),
     "browser": ("浏览器", "网页操作、等待时间与文件大小", ["browser_connection", "browser_limits", "browser_recovery"]),
     "memory": ("记忆", "内置记忆与外部 prompt-memory 连接", ["memory"]),
     "media": ("附件与媒体", "入站媒体处理、体积限制与缓存", ["media"]),

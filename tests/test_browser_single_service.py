@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -238,3 +239,24 @@ def test_public_tool_describes_single_service_and_private_prepare_is_not_callabl
     assert "browser's network" in spec["description"]
     with pytest.raises(ValidationError):
         Request.model_validate({"action": "prepare", "page": "p1"})
+
+
+async def test_server_node_browsers_are_described_only_on_a_controller(service):
+    """A managed instance has no server nodes, so neither the tool nor describe mentions them."""
+    def spec():
+        registry = ToolRegistry()
+        register_browser_tool(registry, service)
+        return registry.schemas()[0]
+
+    instance = spec()
+    assert "node" not in instance["parameters"]["properties"]["params"]["properties"]
+    assert "server node" not in instance["description"]
+    described = json.dumps(await service.call({"action": "describe"}, ctx()))
+    assert "node?" not in described and "server node" not in described
+
+    service.nodes = SimpleNamespace(any_browser=False)
+    controller = spec()
+    assert "node" in controller["parameters"]["properties"]["params"]["properties"]
+    assert "server node's browser" in controller["description"]
+    page = (await service.call({"action": "describe", "params": {"action": "page"}}, ctx()))["actions"]["page"]
+    assert "node? = a server name or id" in page

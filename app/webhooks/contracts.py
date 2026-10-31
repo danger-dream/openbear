@@ -49,6 +49,12 @@ class Model(BaseModel):
         return self.model_dump(by_alias=True)
 
 
+# Shared by Cron tasks and Webhook endpoints: the per-task opt-in the Servers and InstanceControl tools check.
+SERVER_CHANGES = ('Default false: runs of this task may only read servers and instances (Servers and InstanceControl read actions). '
+                  'true lets its unattended runs change them as well (commands, file writes, node and instance operations). '
+                  'Set it only when the user explicitly asks; the user turns it on in the page knowing the risk.')
+
+
 class Ingress(Model):
     max_body_bytes: int = Field(1048576, ge=1024, le=16777216)
     requests_per_minute: int = Field(6000, ge=1, le=600000)
@@ -143,15 +149,28 @@ class TargetRunConfig(Model):
     main_fast_mode: bool | None = Field(None, strict=True)
 
 
+class ConversationRetention(Model):
+    """Created conversations beyond either limit are deleted automatically; unset keeps them all."""
+    keep_last: int | None = Field(None, ge=1, le=10000, strict=True)
+    keep_days: int | None = Field(None, ge=1, le=3650, strict=True)
+
+    @property
+    def active(self):
+        return self.keep_last is not None or self.keep_days is not None
+
+
 class Target(Model):
     mode: Literal['newConversation', 'fixedConversation'] = 'newConversation'
     conversation_id: str | None = None
     run_config: TargetRunConfig = Field(default_factory=TargetRunConfig)
+    conversation_retention: ConversationRetention = Field(default_factory=ConversationRetention)
 
     @model_validator(mode='after')
     def validate_run_config(self):
         if self.mode=='fixedConversation' and any(v is not None for v in self.run_config.wire().values()):
             raise ValueError('fixedConversation does not override conversation runConfig')
+        if self.mode=='fixedConversation' and self.conversation_retention.active:
+            raise ValueError('fixedConversation does not create conversations to retain')
         return self
 
 
@@ -160,6 +179,7 @@ class Processing(Model):
     event_template: str | None = None
     result_schema: dict | None = None
     script_scheduling: Literal['independent', 'serial'] = 'independent'
+    allow_server_changes: bool = Field(False, strict=True, description=SERVER_CHANGES)
 
 
 class Identity(Model):

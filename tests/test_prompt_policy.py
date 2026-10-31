@@ -246,3 +246,71 @@ async def test_preview_tool_variables_unknown_tool_retention_and_invalid_templat
     bad = await e.client.put(f'/api/conversations/{cid}/properties', json={'contextText': '[[ unknown.value ]]', 'overrideSystemPrompt': True})
     assert bad.status == 422
     assert (await e.server._resolved_prompt_policy(cid))['text'] == 'CUSTOM 2'
+
+
+PROMPT_HASH_KEYS = ('beforeHash', 'afterHash', 'toolsBeforeHash', 'toolsAfterHash')
+
+
+async def edited_branch(e, row, tools):
+    cid = row['conversation_uuid']
+    system = await MessageDAO(e.db).get_system_snapshot(row['internal_chat_id'])
+    await e.db.conn.execute('INSERT INTO context_editor_branches VALUES(?,?,?,?,?)',
+        (cid, cid, json.dumps({'system': system, 'tools': tools, 'frozen': True}), '{}', 1))
+    await e.db.conn.commit()
+
+
+def stale_tools():
+    schema = {'type': 'object', 'properties': {}}
+    return [{'name': 'echo', 'description': 'Old echo', 'parameters': schema},
+            {'name': 'retired', 'description': 'Removed since the edit', 'parameters': schema}]
+
+
+async def branch_tools(e, row):
+    cur = await e.db.conn.execute('SELECT settings_json FROM context_editor_branches WHERE conversation_uuid=?', (row['conversation_uuid'],))
+    return json.loads((await cur.fetchone())['settings_json'])['tools']
+
+
+async def test_prompt_refresh_replaces_edited_branch_tools_with_current_definitions(env):
+    e = env
+    row = await create(e)
+    await run(e, row)
+    await edited_branch(e, row, stale_tools())
+    assert [t['name'] for t in (await run(e, row, turn='turn-2')).seen_tools[0]] == ['echo', 'retired']
+    url = f"/api/conversations/{row['conversation_uuid']}/system-prompt"
+    preview = await request(e, 'post', url + '/preview')
+    assert preview['changed'] and preview['toolsChanged'] and preview['toolsFrozen'] and not preview['systemChanged']
+    assert (preview['toolsBefore'], preview['toolsAfter']) == (2, 2)
+    assert preview['toolChanges'] == {'added': ['other'], 'removed': ['retired'], 'changed': ['echo'], 'reordered': False}
+
+    result = await request(e, 'put', url, {'confirmed': True, **{key: preview[key] for key in PROMPT_HASH_KEYS}})
+    assert result['updated'] is True
+    seen = (await run(e, row, turn='turn-3')).seen_tools[0]
+    assert [t['name'] for t in seen] == ['echo', 'other']
+    assert seen[0]['description'] == 'Echo tool'
+    assert not (await request(e, 'post', url + '/preview'))['changed']
+
+
+async def test_prompt_refresh_rejects_tools_changed_after_review(env):
+    e = env
+    row = await create(e)
+    await run(e, row)
+    await edited_branch(e, row, stale_tools())
+    url = f"/api/conversations/{row['conversation_uuid']}/system-prompt"
+    preview = await request(e, 'post', url + '/preview')
+
+    async def third(args):
+        return 'third done'
+    e.server.tools.add('third', 'Unreviewed tool', {'type': 'object', 'properties': {}}, third)
+    response = await e.client.put(url, json={'confirmed': True, **{key: preview[key] for key in PROMPT_HASH_KEYS}})
+    assert response.status == 409 and (await response.json())['error'] == 'prompt_preview_changed'
+    assert await branch_tools(e, row) == stale_tools()
+
+
+async def test_property_snapshot_update_also_refreshes_edited_branch_tools(env):
+    e = env
+    row = await create(e)
+    await run(e, row)
+    await edited_branch(e, row, stale_tools())
+    await save(e, row, 'CUSTOM', overrideSystemPrompt=True, toolsEnabled=True, toolNames=['echo'], updateSnapshots=True)
+    seen = (await run(e, row, turn='turn-2')).seen_tools[0]
+    assert [(t['name'], t['description']) for t in seen] == [('echo', 'Echo tool')]

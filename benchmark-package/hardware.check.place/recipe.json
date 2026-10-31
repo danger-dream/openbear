@@ -1,0 +1,9 @@
+{
+  "name": "Hardware.Check.Place",
+  "repo": "https://github.com/xykt/HardwareQuality",
+  "license": "AGPL-3.0",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "hardware.sh",
+  "files": {"hardware.sh": "hardware.sh"},
+  "keep": ["LICENSE"]
+}

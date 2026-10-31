@@ -5,27 +5,40 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import secrets
+import shlex
 import time
 import uuid
+from pathlib import Path
 
 import aiohttp
 
 from app.instances import network
-from app.instances.contracts import Form, InstanceError, origin
+from app.instances.contracts import Form, InstanceError, check_workspace, origin
 from app.instances.schema import migrate
 from app.instances.security import Scrubber, Vault, secret_values
 from app.lifecycle import wait_for_startup
+from app.notice_names import quoted
 from app.webhooks.repository import many, one
 
 FOLDER_NAME = '实例部署'
 FOLDER_PROMPT = ('这里是 OpenBear 实例的部署与维护会话。每个会话已绑定一个实例和本次操作，'
                  '通过 InstanceControl 读取目标、执行命令并报告结果。')
 FIRST_PORT = 18970
+# Key rotation retries while an instance's server cannot be reached.
+ROTATION_RETRY_MS = 30000
+ROTATION_RETRY_MAX_MS = 600000
 
 
 def now():
     return int(time.time() * 1000)
+
+
+OPERATION_KINDS = {'deployment': '部署', 'maintenance': '维护'}
+# How an operation ended, as its notice says it.
+OPERATION_ENDS = {'completed': '已完成。', 'needs_verification': '结束了，但没能确认结果：请到实例页点「立即检查」，或在会话里看过程。',
+                  'failed': '失败了，原因见会话。', 'interrupted': '中断了，可以在会话里继续。'}
 
 
 def uid():
@@ -87,12 +100,12 @@ class InstanceService:
 
     async def close(self):
         self.closing = True
-        background = [t for t in (self.recovery_task, self.monitor_task) if t]
+        background = [t for t in (self.recovery_task, self.monitor_task, self.gateway.update_task) if t]
         for task in background:
             task.cancel()
         if background:
             await asyncio.gather(*background, return_exceptions=True)
-        self.recovery_task = self.monitor_task = None
+        self.recovery_task = self.monitor_task = self.gateway.update_task = None
         if self.worker:
             self.worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -120,26 +133,32 @@ class InstanceService:
         item = json.loads(row['public_json'])
         item.pop('lastHealthAtMs', None)
         item.pop('deploymentAccepted', None)
+        item.pop('noticeWindow', None)
         item['authMode'] = row['auth_mode']
         item['status'], item['activeOperationId'] = row['status'], row['active_operation'] or None
         return item
 
     async def list(self, owner):
         self.require_controller()
-        return {'ok': True, 'items': [self.public(r) for r in await many(self.db.conn, 'SELECT * FROM managed_instances WHERE owner=? ORDER BY rowid DESC', (owner,))]}
+        rows = await many(self.db.conn, 'SELECT * FROM managed_instances WHERE owner=? ORDER BY rowid DESC', (owner,))
+        return {'ok': True, 'items': [{**self.public(r), 'networkMigration': await self._migration_or_none(owner, r)} for r in rows]}
 
     async def get(self, owner, identity):
-        return {'ok': True, 'item': self.public(await self.row(owner, identity, active=False))}
+        row = await self.row(owner, identity, active=False)
+        return {'ok': True, 'item': {**self.public(row), 'networkMigration': await self._migration_or_none(owner, row)}}
 
     async def _models_config(self, models):
-        """Copy the controller's enabled providers (with keys) into the instance."""
+        """Copy the chosen enabled controller providers (with keys) into the instance;
+        without a choice only the primary model's provider."""
         if models['mode'] != 'copy':
             return {}
         raw = self.host.config.model_dump(by_alias=True)['models']
-        wanted = models.get('providers')
-        providers = {name: value for name, value in raw['providers'].items()
-                     if value.get('enabled', True) and (wanted is None or name in wanted)}
         primary = models.get('primary') or raw.get('primary', '')
+        wanted = models.get('providers')
+        if wanted is None:
+            wanted = [primary.split('/', 1)[0]]
+        providers = {name: value for name, value in raw['providers'].items()
+                     if value.get('enabled', True) and name in wanted}
         if primary.split('/', 1)[0] not in providers:
             raise InstanceError('instance_primary_model_not_copied')
         return {'models': {'providers': providers, 'primary': primary}}
@@ -156,9 +175,9 @@ class InstanceService:
             item = json.loads(row['public_json'])
             if item.get('serverId') == server_id and item.get('port'):
                 taken.add(item['port'])
-        value, _ = await self.gateway.config()
+        value, private = await self.gateway.config()
         if value['enabled'] and value['serverId'] == server_id:
-            taken.add(value['port'])
+            taken.update(p for p in (value['port'], private.get('controlPort')) if p)
         for port in range(FIRST_PORT, FIRST_PORT + 200):
             if port in taken:
                 continue
@@ -166,8 +185,58 @@ class InstanceService:
                 return port
         raise InstanceError('no_free_port', 409)
 
+    async def _placement(self, owner, server_id, port):
+        """(address the gateway uses, network) of a new instance. On the local machine, or a server
+        whose node carries the controller's HTTP, the port listens on loopback only, plus the mesh
+        address when the gateway runs on another server: then both must be mesh members. Other
+        servers keep server address + port, network None."""
+        if server_id != 'local' and not await self.servers.http_ready(owner, server_id):
+            return await self._address(owner, server_id, port), None
+        gateway, _ = await self.gateway.config()
+        gateway_server = gateway['serverId'] or 'local'
+        if gateway_server == server_id:
+            return origin(f'http://127.0.0.1:{port}'), {'bind': ['127.0.0.1']}
+        mine, theirs = await self.servers.mesh_address(owner, server_id), await self.servers.mesh_address(owner, gateway_server)
+        if not mine or not theirs:
+            raise InstanceError('instance_mesh_required', 409)
+        return origin(f'http://{mine}:{port}'), {'bind': ['127.0.0.1', mine]}
+
+    def _mesh_changed(self, owner=None):
+        """Instances listening on a mesh address are let through by the mesh's automatic rules: a
+        change to one (placed, moved, another port, archived) or to the gateway (owner None: every
+        owner) brings the mesh configs up to date."""
+        mesh = getattr(getattr(self.host, 'servers', None), 'mesh', None)
+        if mesh is not None:
+            mesh.instances_changed(owner)
+
+    async def check_placement(self, owner, item):
+        """A mesh-bound instance deploys only while both servers are still where it was placed."""
+        from app.instances.remote import mesh_bind
+        address = mesh_bind(item)
+        if not address:
+            return
+        gateway, _ = await self.gateway.config()
+        if (await self.servers.mesh_address(owner, item['serverId']) != address
+                or not await self.servers.mesh_address(owner, gateway['serverId'] or 'local')):
+            raise InstanceError('instance_mesh_required', 409)
+
+    def _controller_directories(self):
+        from app.instances.remote import ROOT
+        directories = {ROOT, ROOT / 'data', Path(self.host.config.storage.db_path).resolve().parent}
+        if getattr(self.host, 'workspace_dir', ''):
+            directories.add(Path(self.host.workspace_dir).resolve())
+        return [str(d) for d in directories]
+
+    def _check_workspace(self, form):
+        local = form['serverId'] == 'local'
+        protected = self._controller_directories() if local else ()
+        check_workspace(form['workspacePath'], protected)
+        if local:
+            check_workspace(os.path.realpath(form['workspacePath']), protected)
+
     async def _address(self, owner, server_id, port):
-        """Where both the controller and the gateway reach the instance."""
+        """Server address + port, where both the controller and the gateway reach an
+        instance that is not placed on loopback/mesh."""
         if server_id == 'local':
             gateway, _ = await self.gateway.config()
             if gateway['serverId'] in {'', 'local'}:
@@ -176,7 +245,10 @@ class InstanceService:
             if not host:
                 raise InstanceError('instance_address_required', 409)
         else:
-            host = (await self.servers.get(owner, server_id))['host']
+            server = await self.servers.get(owner, server_id)
+            host = server['host'] or (server.get('node') or {}).get('address', '')
+            if not host:
+                raise InstanceError('instance_address_required', 409)
         return origin(f'http://[{host}]:{port}' if ':' in host else f'http://{host}:{port}')
 
     async def save(self, owner, data, identity=None, *, adopt=None):
@@ -199,28 +271,54 @@ class InstanceService:
             form_data = dict(prior.get('form', {}))
             for key, value in data.items():
                 form_data[key] = merge_profile(form_data.get(key, {}), value) if key in {'account', 'notifications', 'models'} and isinstance(value, dict) else value
+            chosen = bool(form_data.get('workspacePath'))
             form = Form.model_validate(form_data).model_dump()
             if creating and not form['account']['password']:
                 raise InstanceError('initial_gateway_password_required')
             server = await self.servers.get(owner, form['serverId'])
             if old and form['serverId'] != prior['form']['serverId']:
                 raise InstanceError('instance_server_immutable', 409)
+            # Only a new or moved data directory meets the current rules.
+            if creating or form['workspacePath'] != prior['form'].get('workspacePath'):
+                await self._own_workspace(form, identity, chosen)
+                self._check_workspace(form)
             if creating and not form['port']:
                 form['port'] = await self._allocate_port(owner, form['serverId'], ())
             elif creating:
                 check = await self.servers.port(owner, form['serverId'], form['port'])
                 if check.get('free') is False:
                     raise InstanceError('instance_port_in_use', 409)
-            address = form['managementUrl'] or await self._address(owner, form['serverId'], form['port'])
+            previous = json.loads(old['public_json']) if old else {}
+            # A placed instance keeps the port it was deployed with: the record and, on the mesh, the rule
+            # opening it to the gateway would follow a new one, the running instance would not.
+            if previous.get('network') and form['port'] != prior['form'].get('port'):
+                from app.instances.remote import mesh_bind
+                raise InstanceError('instance_port_fixed_on_mesh' if mesh_bind(previous) else 'instance_port_fixed', 409)
+            if form['managementUrl']:
+                address, placed = form['managementUrl'], None
+            elif creating:
+                address, placed = await self._placement(owner, form['serverId'], form['port'])
+            elif previous.get('network'):
+                # Where it was placed, until migrate_network moves it.
+                address, placed = previous['managementUrl'], previous['network']
+            else:
+                address, placed = await self._address(owner, form['serverId'], form['port']), None
             protected = {**prior, 'form': {**form, 'account': {'username': form['account']['username']}}}
             if creating:
                 protected.update(managementKey=(adopt or {}).get('managementKey') or secrets.token_urlsafe(48),
                                  initialConfig=await self._models_config(form['models']))
                 if adopt and adopt.get('businessKey'):
                     protected['businessKey'] = adopt['businessKey']
-            item = json.loads(old['public_json']) if old else {}
+            item = previous
             previous_account = item.get('account', {}).copy()
-            item.update({k: form[k] for k in ('name', 'serverId', 'port', 'image', 'workspacePath', 'notifications')})
+            item.update({k: form[k] for k in ('name', 'serverId', 'port', 'workspacePath', 'memoryLimitMb', 'notifications')})
+            # The record keeps the image delivered; an empty form image only asks for the controller's version.
+            if form['image'] or not item.get('image'):
+                item['image'] = form['image']
+            if placed:
+                item['network'] = placed
+            else:
+                item.pop('network', None)
             item.update(id=identity, mode='managed', managementUrl=address, serverName=server['name'],
                         account={'username': form['account']['username']}, healthStatus=item.get('healthStatus', 'unknown'),
                         lastSeenAtMs=item.get('lastSeenAtMs'), lastError=item.get('lastError', ''), createdAtMs=item.get('createdAtMs', now()), updatedAtMs=now(),
@@ -245,6 +343,7 @@ class InstanceService:
                     await conn.execute('INSERT INTO managed_instances(id,owner,public_json,protected,report_hash,authority,auth_mode) VALUES(?,?,?,?,?,?,?)',
                         (identity, owner, dumps(item), self.vault.seal(protected), hashlib.sha256(identity.encode()).hexdigest(), address, 'gateway'))
                 saved = await one(conn, 'SELECT * FROM managed_instances WHERE id=?', (identity,))
+        self._mesh_changed(owner)
         # Accounts reach the gateway now, so the user's login works as soon as
         # the instance is up; a failure stays pending and is retried.
         await self.gateway.sync(owner, identity)
@@ -290,15 +389,25 @@ class InstanceService:
                 from app.instances.gateway import prepare
                 item, protected = json.loads(row['public_json']), self.vault.open(row['protected'])
                 if not item.get('archivePending'):
-                    item['archivePending'] = True
                     prepare(item, protected, enabled=False)
-                    await self.gateway.persist(row, item, protected)
-                pending = True
+                # A stopped gateway lets no one in: archived now, its account disabled there when it
+                # is enabled again (every instance is synced then).
+                stopped = not (await self.gateway.config())[0]['enabled']
+                if stopped:
+                    item.pop('archivePending', None)
+                else:
+                    item['archivePending'] = True
+                await self.gateway.persist(row, item, protected, archived=stopped)
+                if stopped:
+                    async with self.db.write_transaction(label='instance-archive-notifications') as conn:
+                        await conn.execute("UPDATE instance_notifications SET status='suppressed',updated_ms=? WHERE instance_id=? AND status='pending'", (now(), identity))
+                pending = not stopped
             else:
                 pending = False
                 async with self.db.write_transaction(label='instance-archive') as conn:
                     await conn.execute("UPDATE managed_instances SET status='archived',revision=revision+1 WHERE id=?", (identity,))
                     await conn.execute("UPDATE instance_notifications SET status='suppressed',updated_ms=? WHERE instance_id=? AND status='pending'", (now(), identity))
+                self._mesh_changed(owner)
         if pending:
             return await self.gateway.sync(owner, identity)
         return await self.get(owner, identity)
@@ -318,6 +427,12 @@ class InstanceService:
             row = await self.row(owner, identity)
             check = await network.probe(self, row)
             await self._verified(row, check)
+            if check['ok'] and row['active_operation']:
+                # The owner's check settles an operation left unverified (no report, interrupted):
+                # a restart does not take it for one still open.
+                async with self.db.write_transaction(label='instance-verified-operation') as conn:
+                    await conn.execute("UPDATE instance_operations SET status='completed',error='',verification_json=?,updated_ms=? "
+                                       "WHERE id=? AND status IN ('needs_verification','interrupted')", (dumps(check), now(), row['active_operation']))
         return {**await self.get(owner, identity), 'verification': check}
 
     async def _verified(self, row, check, *, status=None):
@@ -343,7 +458,8 @@ class InstanceService:
             await conn.execute('UPDATE managed_instances SET status=?,public_json=? WHERE id=? AND revision=? AND status!=?',
                                (state, dumps(item), row['id'], row['revision'], 'archived'))
 
-    async def start_operation(self, owner, identity, kind, data, *, expected_revision=None):
+    async def start_operation(self, owner, identity, kind, data, *, expected_revision=None, origin=('', '')):
+        """origin: (conversation, root turn) of the turn that asked for it, so the operation's turn keeps that turn's origin."""
         if kind not in {'deployment', 'maintenance'} or set(data) - {'instructions', 'model'}:
             raise InstanceError('invalid_operation')
         instructions, model = data.get('instructions', ''), data.get('model', '')
@@ -374,8 +490,10 @@ class InstanceService:
                         'constraints': '仅此目标上的 Docker 子实例；/workspace 是唯一持久卷；不得挂载 Docker socket、主控密钥或其他租户目录。密钥真实且已授权传给模型，不要回显/复制进普通工具参数或日志，使用 InstanceControl deliver 受控交付。'}
             bundle = await self.vault.bundle(material, conv_id, op_id)
             async with self.db.write_transaction(label='instance-operation') as conn:
-                await conn.execute('INSERT INTO instance_operations(id,instance_id,owner,kind,status,conversation_uuid,chat_id,root,bundle,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-                                   (op_id, identity, owner, kind, 'pending', conv_id, conversation['internal_chat_id'], root, bundle, now(), now()))
+                await conn.execute('INSERT INTO instance_operations(id,instance_id,owner,kind,status,conversation_uuid,chat_id,root,bundle,'
+                                   'origin_conversation,origin_root,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                   (op_id, identity, owner, kind, 'pending', conv_id, conversation['internal_chat_id'], root, bundle,
+                                    *origin, now(), now()))
                 item.update(conversationUuid=conv_id, updatedAtMs=now())
                 await conn.execute("UPDATE managed_instances SET active_operation=?,status='deploying',public_json=?,revision=revision+1 WHERE id=?", (op_id, dumps(item), identity))
                 op = await one(conn, 'SELECT * FROM instance_operations WHERE id=?', (op_id,))
@@ -406,12 +524,28 @@ class InstanceService:
             if op['status'] == 'running':
                 raise InstanceError('operation_running', 409)
             bundle = await self.vault.refresh(row, op) if op['revision'] else op['bundle']
+            # A question after it completed changes nothing until the turn acts (acted()).
+            resumed = op['status'] == 'completed'
             async with self.db.write_transaction(label='instance-bind') as conn:
-                await conn.execute("UPDATE instance_operations SET revision=revision+1,status='running',root=?,run_id='',report_json=NULL,verification_json=NULL,error='',bundle=?,updated_ms=? WHERE id=?", (root, bundle, now(), op['id']))
-                await conn.execute("UPDATE managed_instances SET status='deploying' WHERE id=?", (row['id'],))
+                await conn.execute("UPDATE instance_operations SET revision=revision+1,status='running',root=?,run_id='',report_json=NULL,"
+                                   "verification_json=CASE WHEN ? THEN verification_json END,error='',bundle=?,resumed=?,updated_ms=? WHERE id=?",
+                                   (root, resumed, bundle, 'completed' if resumed else '', now(), op['id']))
+                if not resumed:
+                    await conn.execute("UPDATE managed_instances SET status='deploying' WHERE id=?", (row['id'],))
                 # The read connection may not see this commit yet.
                 op = await one(conn, 'SELECT * FROM instance_operations WHERE id=?', (op['id'],))
             return {**op, 'scrub': Scrubber(secret_values(self.vault.open(row['protected'])))}
+
+    async def acted(self, op):
+        """The turn of a resumed operation does something on the server: the operation is open again
+        and has to report like any other."""
+        if not op.get('resumed'):
+            return
+        async with self.db.write_transaction(label='instance-resume') as conn:
+            cursor = await conn.execute("UPDATE instance_operations SET resumed='',verification_json=NULL WHERE id=? AND resumed!=''", (op['id'],))
+            if cursor.rowcount:
+                await conn.execute("UPDATE managed_instances SET status='deploying' WHERE id=?", (op['instance_id'],))
+        op['resumed'] = ''
 
     async def bind_run(self, binding, run_id):
         async with self.db.write_transaction(label='instance-run') as conn:
@@ -465,12 +599,28 @@ class InstanceService:
             row = await self.row(op['owner'], op['instance_id'], active=False)
             if row['active_operation'] != identity or row['status'] == 'archived':
                 return
+            report = json.loads(op['report_json'] or 'null')
+            if op['resumed'] and not report and op['status'] in {'pending', 'running'}:
+                # Only talked to: it is completed as it was, nothing sent.
+                async with self.db.write_transaction(label='instance-resumed-done') as conn:
+                    await conn.execute("UPDATE instance_operations SET status='completed',error='',resumed='',updated_ms=? WHERE id=? AND revision=?",
+                                       (now(), identity, revision))
+                return
+            # Terminal first: whatever the probe below meets, the operation no longer
+            # holds the instance (archive, revocation and new operations wait for it).
             if recovering and op['status'] in {'pending', 'running'}:
                 async with self.db.write_transaction(label='instance-recovery-interrupted') as conn:
                     await conn.execute("UPDATE instance_operations SET status='interrupted',error='run_interrupted',updated_ms=? WHERE id=? AND revision=?", (now(), identity, revision))
+            elif not recovering:
+                interim = 'interrupted' if reason != 'completed' else 'failed' if report and report['outcome'] == 'failed' else 'needs_verification'
+                async with self.db.write_transaction(label='instance-terminal-interim') as conn:
+                    await conn.execute('UPDATE instance_operations SET status=?,error=?,updated_ms=? WHERE id=? AND revision=?',
+                                       (interim, 'run_'+reason if reason != 'completed' else 'verification_pending', now(), identity, revision))
             # Always recheck; a report is evidence, never readiness authority.
-            check = await network.probe(self, row)
-            report = json.loads(op['report_json'] or 'null')
+            try:
+                check = await network.probe(self, row)
+            except Exception:
+                check = network.failed_check('verification_failed')
             success = bool(report and report['outcome'] == 'completed' and check['ok'] and reason == 'completed')
             status = 'completed' if success else 'interrupted' if reason != 'completed' else 'failed' if report and report['outcome'] == 'failed' else 'needs_verification'
             # A recovered *reported* result may complete verification, not execution.
@@ -483,12 +633,245 @@ class InstanceService:
                 await conn.execute('UPDATE instance_operations SET status=?,verification_json=?,error=?,updated_ms=? WHERE id=? AND revision=?', (status, dumps(check), error, now(), identity, revision))
                 if not recovering or op['status'] in {'pending', 'running'} or status != op['status']:
                     suffix = ':recovery:'+status if recovering and op['status'] in {'needs_verification', 'interrupted'} else ''
-                    await self._enqueue(conn, f'operation:{identity}:{revision}'+suffix, row, f'实例「{self.public(row)["name"]}」{op["kind"]}：{status}', op['conversation_uuid'])
+                    await self._enqueue(conn, f'operation:{identity}:{revision}'+suffix, row,
+                                        f'实例{quoted(self.public(row)["name"])}的{OPERATION_KINDS.get(op["kind"], op["kind"])}{OPERATION_ENDS.get(status, status)}',
+                                        op['conversation_uuid'])
             await self._verified(row, check, status='ready' if status == 'completed' else 'needs_verification')
+
+    # ----- key rotation and network migration -----
+    async def _persist(self, row, item, protected):
+        async with self.db.write_transaction(label='instance-keys') as conn:
+            await conn.execute('UPDATE managed_instances SET public_json=?,protected=?,revision=revision+1 WHERE id=?',
+                               (dumps(item), self.vault.seal(protected), row['id']))
+
+    async def _own_workspace(self, form, identity, chosen):
+        """A data directory, and the container named after it, no other instance on the server has.
+        The default one (named after the account, 'instance' for one in other scripts) takes a
+        suffix of this instance's id when taken, also by an archived instance, whose data is still
+        there; a chosen directory must not overlap any other instance's data."""
+        from app.instances.remote import container_name
+        taken = set()
+        for row in await many(self.db.conn, 'SELECT id,status,public_json FROM managed_instances WHERE id!=?', (identity,)):
+            other = json.loads(row['public_json'])
+            if other.get('serverId') == form['serverId'] and other.get('workspacePath'):
+                taken |= {('path', other['workspacePath']), ('name', container_name(other))}
+
+        def resolved(path):
+            return Path(os.path.realpath(path) if form['serverId'] == 'local' else os.path.normpath(path))
+
+        def clash(path):
+            candidate = resolved(path)
+            return (any(candidate == resolved(other) or candidate in resolved(other).parents or resolved(other) in candidate.parents
+                        for kind, other in taken if kind == 'path')
+                    or ('name', container_name({'workspacePath': path})) in taken)
+        if not clash(form['workspacePath']):
+            return
+        if chosen:
+            raise InstanceError('instance_workspace_in_use', 409)
+        form['workspacePath'] = f"{form['workspacePath']}-{identity.replace('-', '')[:6]}"
+        if clash(form['workspacePath']):
+            raise InstanceError('instance_workspace_in_use', 409)
+
+    async def _delivered_image(self, owner, row, item):
+        """The image the instance was delivered with, '' when it was not delivered. A record a form
+        save emptied (before saves kept it) takes it back from the compose.json on its server."""
+        if item.get('image') or row['status'] == 'draft':
+            return item.get('image') or ''
+        from app.instances.remote import deploy_directory
+        target = await self.servers.target(owner, item['serverId'], nodes=True)
+        path = deploy_directory(item) + '/compose.json'
+        result = await self.servers.run(target, f'cat {shlex.quote(path)} 2>/dev/null || true', timeout=30)
+        try:
+            image = json.loads(result.get('stdout') or '{}')['services']['openbear']['image']
+        except (ValueError, KeyError, TypeError):
+            image = ''
+        if isinstance(image, str) and image:
+            item['image'] = image
+            return image
+        if (item.get('deploymentAccepted') or item.get('lastSeenAtMs') or row['status'] in {'ready', 'unreachable'}
+                or (item.get('verification') or {}).get('identity')):
+            raise InstanceError('instance_image_unknown', 409)
+        return ''
+
+    async def _idle(self, row):
+        op = await one(self.db.conn, 'SELECT status FROM instance_operations WHERE id=?', (row['active_operation'],))
+        return not (op and op['status'] in {'pending', 'running'})
+
+    async def rotate_keys(self, owner, identity, *, queue_if_busy=False):
+        """New business and management keys. The new pair is stored first, then set on the
+        instance's volume (offline set-auth, which also revokes its sessions) and in its
+        container, then sent to the gateway, which drops the instance's login sessions on a
+        changed key. An instance that cannot be reached keeps working with the old pair and
+        is retried (rotation_upkeep) until it takes the new one."""
+        async with self.lock(identity):
+            row = await self.row(owner, identity)
+            if row['auth_mode'] != 'gateway':
+                raise InstanceError('instance_gateway_auth_required', 409)
+            if not queue_if_busy and not await self._idle(row):
+                raise InstanceError('operation_running', 409)
+            item, protected = json.loads(row['public_json']), self.vault.open(row['protected'])
+            # A pending pair may already be on the volume: it is finished, not replaced.
+            if not protected.get('rotation'):
+                protected['rotation'] = {'businessKey': secrets.token_urlsafe(48), 'managementKey': secrets.token_urlsafe(48)}
+                item['rotation'] = {'status': 'pending', 'requestedAtMs': now(), 'attempts': 0, 'nextAtMs': 0, 'error': ''}
+                await self._persist(row, item, protected)
+        return await self.apply_rotation(owner, identity)
+
+    async def apply_rotation(self, owner, identity):
+        async with self.lock(identity):
+            row = await self.row(owner, identity, active=False)
+            item, protected = json.loads(row['public_json']), self.vault.open(row['protected'])
+            keys = protected.get('rotation')
+            if not keys or row['status'] == 'archived':
+                return {**await self.get(owner, identity), 'rotated': False}
+            from app.instances.gateway import prepare
+            from app.instances.remote import reconfigure
+            error = ''
+            # One key per step, each a single write on the volume that any deployed image's
+            # maintenance accepts; a step repeated after a lost result changes nothing.
+            steps = (('businessKey', 'set-auth', {'authMode': 'gateway', 'gatewayKey': keys['businessKey']}),
+                     ('managementKey', 'rotate-identity', {'managementKey': keys['managementKey']}))
+            for field, action, payload in steps:
+                if protected[field] == keys[field]:
+                    continue
+                if not await self._idle(row):
+                    error = 'operation_running'
+                    break
+                try:
+                    delivered = await self._delivered_image(owner, row, item)
+                except InstanceError as exc:
+                    error = exc.error
+                    break
+                if delivered:
+                    # Delivered: volume and container take the key. Otherwise the first
+                    # deployment simply starts with it.
+                    command, stdin = reconfigure(row, {**protected, field: keys[field]}, item, maintenance=[(action, payload)])
+                    try:
+                        target = await self.servers.target(owner, item['serverId'], nodes=True)
+                        result = await self.servers.run(target, command, stdin=stdin, timeout=300)
+                        error = '' if result['ok'] else 'instance_rotation_failed'
+                    except InstanceError as exc:
+                        error = exc.error
+                    if error:
+                        break
+                protected[field] = keys[field]
+                if field == 'businessKey':
+                    # The gateway follows (sync below), dropping this instance's login sessions.
+                    prepare(item, protected, enabled=not item.get('archivePending', False))
+                await self._persist(row, item, protected)
+            if error:
+                state = item.get('rotation') or {}
+                attempts = int(state.get('attempts', 0)) + 1
+                item['rotation'] = {**state, 'status': 'pending', 'attempts': attempts, 'error': error,
+                                    'nextAtMs': now() + min(ROTATION_RETRY_MAX_MS, ROTATION_RETRY_MS * 2 ** min(attempts, 10))}
+            else:
+                protected.pop('rotation')
+                item.pop('rotation', None)
+                item['keysRotatedAtMs'] = now()
+            await self._persist(row, item, protected)
+        synced = await self.gateway.sync(owner, identity)
+        return {**synced, 'rotated': not error, **({'error': error} if error else {})}
+
+    async def rotation_upkeep(self):
+        """Retry pending rotations whose instance may be back."""
+        for row in await many(self.db.conn, "SELECT id,owner,public_json FROM managed_instances WHERE status!='archived'"):
+            state = json.loads(row['public_json']).get('rotation')
+            if state and state.get('status') == 'pending' and state.get('nextAtMs', 0) <= now():
+                with contextlib.suppress(Exception):
+                    await self.apply_rotation(row['owner'], row['id'])
+
+    async def network_migration(self, owner, row):
+        """Whether migrate_network applies to this instance: None when it does not (already placed,
+        archived, a fixed address, a port that is not open to all, or an SSH-only server, which
+        keeps server address + port), else {'blockers': [...]}, empty when it can run now, else
+        what must change first."""
+        from app.instances.remote import binds, mesh_bind
+        item = json.loads(row['public_json'])
+        placed = item.get('network')
+        if row['status'] == 'archived':
+            return None
+        moved = False
+        if placed and not placed.get('pending'):
+            # Placed on a mesh address its server no longer has (a new prefix, another address).
+            bound = mesh_bind(item)
+            if not bound or await self.servers.mesh_address(owner, item['serverId']) == bound:
+                return None
+            moved = True
+        elif placed:
+            return {'pending': True, 'blockers': []}
+        elif '0.0.0.0' not in binds(item) or self.vault.open(row['protected'])['form'].get('managementUrl'):
+            return None
+        blockers = []
+        if item['serverId'] != 'local':
+            reason = await self.servers.http_blocker(owner, item['serverId'])
+            if reason == 'node_missing':
+                return None
+            if reason:
+                blockers.append(reason)
+        gateway, _ = await self.gateway.config()
+        gateway_server = gateway['serverId'] or 'local'
+        if gateway_server != item['serverId']:
+            # The same rule as _placement, said per server.
+            if not await self.servers.mesh_address(owner, item['serverId']):
+                blockers.append('server_mesh_required')
+            if not await self.servers.mesh_address(owner, gateway_server):
+                blockers.append('gateway_mesh_required')
+        return {'pending': False, 'blockers': blockers, **({'moved': True} if moved else {})}
+
+    async def _migration_or_none(self, owner, row):
+        # A display hint: unreadable protected storage must not break listing the instances.
+        try:
+            return await self.network_migration(owner, row)
+        except InstanceError:
+            return None
+
+    async def migrate_network(self, owner, identity):
+        """Maintenance for an instance deployed before loopback placement: its port listens on
+        loopback (plus the mesh address when the gateway is on another server), the controller
+        reaches it through the node and the gateway at its new address. The record moves first:
+        the old 0.0.0.0 binding also answers there until the container is recreated."""
+        async with self.lock(identity):
+            row = await self.row(owner, identity)
+            if not await self._idle(row):
+                raise InstanceError('operation_running', 409)
+            item, protected = json.loads(row['public_json']), self.vault.open(row['protected'])
+            from app.instances.gateway import prepare
+            from app.instances.remote import boot_unit, mesh_bind, reconfigure
+            # Placed on a mesh address its server no longer has: placed again, at the one it has now.
+            moved = bool(item.get('network') and not item['network'].get('pending') and mesh_bind(item)
+                         and await self.servers.mesh_address(owner, item['serverId']) != mesh_bind(item))
+            if item.get('network') and not item['network'].get('pending') and not moved:
+                return {**await self.get(owner, identity), 'migrated': False}
+            if not item.get('network') or moved:
+                if protected['form'].get('managementUrl') and not moved:
+                    raise InstanceError('instance_address_fixed', 409)
+                address, placed = await self._placement(owner, item['serverId'], item['port'])
+                if not placed:
+                    raise InstanceError('node_http_required', 409)
+                # pending until the container listens there; running this again finishes it.
+                item.update(managementUrl=address, network={**placed, 'pending': True}, updatedAtMs=now())
+                prepare(item, protected, enabled=not item.get('archivePending', False))
+                await self._persist(row, item, protected)
+                # The gateway reaches it on the mesh address once the container is recreated.
+                self._mesh_changed(owner)
+            if await self._delivered_image(owner, row, item):
+                target = await self.servers.target(owner, item['serverId'], nodes=True)
+                if mesh_bind(item):
+                    _, install, text = boot_unit(item)
+                    if not (await self.servers.run(target, install, stdin=text, timeout=60, root=True))['ok']:
+                        raise InstanceError('instance_boot_unit_failed', 502)
+                command, stdin = reconfigure(row, protected, item)
+                if not (await self.servers.run(target, command, stdin=stdin, timeout=300))['ok']:
+                    raise InstanceError('instance_reconfigure_failed', 502)
+            item['network'].pop('pending', None)
+            await self._persist(row, item, protected)
+        return {**await self.gateway.sync(owner, identity), 'migrated': True}
 
     async def _target_summary(self, owner, item):
         server = await self.servers.get(owner, item['serverId'])
         return {'server': server['name'], 'local': server.get('local', False), 'host': server.get('host', ''),
+                # Node first, SSH while the node is offline; each command result names the channel used.
+                **await self.servers.channel(owner, item['serverId']),
                 'port': item['port'], 'managementUrl': item['managementUrl'], 'workspacePath': item['workspacePath'],
                 'image': item.get('image') or '与主控同版本（按需在目标上从源码构建）'}
 

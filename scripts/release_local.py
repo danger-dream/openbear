@@ -21,8 +21,14 @@ import sys
 import tempfile
 from typing import Callable
 
-_VERSION = re.compile(r"\d+\.\d+\.\d+")
-_RUN_ID = re.compile(r"\d+\.\d+\.\d+-[0-9a-f]{12}")
+# What release.py publishes: X.Y.Z, X.Y.Z-rc.N or X.Y.Z-beta.N (never a -dev.N).
+_VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:beta|rc)\.[1-9]\d*)?")
+_RUN_ID = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:dev|beta|rc)\.[1-9]\d*)?-[0-9a-f]{12}")
+
+
+def _run_of(run_id: str, version: str) -> bool:
+    """run_id belongs to exactly this version (a 1.2.0-beta.1 run is not a 1.2.0 run)."""
+    return re.fullmatch(re.escape(version) + r"-[0-9a-f]{12}", run_id) is not None
 
 
 def _json(value: dict) -> str:
@@ -147,11 +153,11 @@ class LocalRelease:
             else:
                 version = str(args.get("version") or "")
                 if not _VERSION.fullmatch(version):
-                    raise ValueError("version must be a stable x.y.z version")
+                    raise ValueError("version must be X.Y.Z, X.Y.Z-rc.N or X.Y.Z-beta.N")
                 if not isinstance(args.get("notes"), str) or not args["notes"].strip():
                     raise ValueError("notes must contain user-facing release notes")
                 # An uncertain start is inspected, never automatically replayed.
-                for existing in self.root.glob(version + "-*/state.json"):
+                for existing in (p for p in self.root.glob(version + "-*/state.json") if _run_of(p.parent.name, version)):
                     self._state(existing.parent.name)
                     return {**await self._summary(existing.parent.name), "startNotRepeated": True}
             files = args.get("files", [] if action == "resume" else None)
@@ -174,7 +180,7 @@ class LocalRelease:
                     nonlocal run_id
                     if line.startswith("Release run: "):
                         found = line.removeprefix("Release run: ").strip()
-                        if not _RUN_ID.fullmatch(found) or not found.startswith(version + "-"):
+                        if not _RUN_ID.fullmatch(found) or not _run_of(found, version):
                             raise ValueError("Release returned an invalid run identity")
                         self._state(found)
                         run_id = found

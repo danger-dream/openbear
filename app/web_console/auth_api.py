@@ -1,6 +1,7 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+import re
 from urllib.parse import urlencode, urlsplit
 
 from app.db.connection_router import SQLiteWriterTimeout
@@ -16,6 +17,14 @@ PWA_PUBLIC_FILES = {
     "/icons/openbear-512.png": ("icons/openbear-512.png", "image/png"),
     "/icons/apple-touch-icon.png": ("icons/apple-touch-icon.png", "image/png"),
 }
+
+# Build output names carry a content hash, so such a file never changes under
+# its name; anything else under /assets keeps revalidating.
+_HASHED_ASSET = re.compile(r"-(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
+_IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
+# Root asset attributes of the built index.html; compiled JS/CSS resolve their
+# own assets relative to themselves.
+_INDEX_ASSET_REF = re.compile(r'(\s(?:src|href)=")/assets/')
 
 
 def _notification_return_target(value: str) -> str:
@@ -45,8 +54,9 @@ class WebAdminAuthMixin:
             return web.json_response({"ok": False, "error": "service_not_ready"}, status=503,
                                      headers={"Cache-Control": "no-store", "Retry-After": "1"})
         managed = bool(getattr(getattr(self.config, "managed", None), "enabled", False))
+        from app.servers.http import PUBLIC_ROUTES as SERVER_NODE_ROUTES
         from app.webhooks.http import PUBLIC_ROUTES
-        if request.match_info.route.name in PUBLIC_ROUTES:
+        if request.match_info.route.name in PUBLIC_ROUTES or request.match_info.route.name in SERVER_NODE_ROUTES:
             return await handler(request)
         if path == "/api/auth/mode" and request.method in {"GET", "HEAD"}:
             return await handler(request)
@@ -224,12 +234,25 @@ class WebAdminAuthMixin:
         runtime = getattr(self, "managed_runtime", None)
         return "gateway" if runtime and runtime.settings.auth_mode == "gateway" else "managed"
 
+    def _asset_base(self, request: web.Request) -> str:
+        # Only a gateway that routes /_i/<instance>/ announces it; behind an
+        # older gateway the page keeps root asset URLs.
+        if self._auth_mode() != "gateway":
+            return "/"
+        base = f"/_i/{self.managed_runtime.settings.instance_id}/"
+        return base if request.headers.get("X-OpenBear-Gateway-Assets") == base else "/"
+
     async def handle_index(self, request: web.Request) -> web.Response:
         index = self._web_index_path()
         if not index.is_file():
             raise web.HTTPInternalServerError(text="web/dist/index.html not found; run web build first")
         # The page carries its login mode, so loading it needs no extra request.
         text = index.read_text(encoding="utf-8").replace('"[[controller]]"', json.dumps(self._auth_mode()), 1)
+        base = self._asset_base(request)
+        if base != "/":
+            # Same-origin instances must not share long-lived asset cache entries.
+            text = text.replace('"[[asset-base]]"', json.dumps(base), 1)
+            text = _INDEX_ASSET_REF.sub(lambda match: match[1] + base + "assets/", text)
         return web.Response(text=text, content_type="text/html", headers={"Cache-Control": "no-store"})
 
     async def handle_asset(self, request: web.Request) -> web.Response:
@@ -244,7 +267,7 @@ class WebAdminAuthMixin:
             raise web.HTTPNotFound(text="asset not found") from None
         if not candidate.is_file():
             raise web.HTTPNotFound(text="asset not found")
-        return web.FileResponse(candidate)
+        return web.FileResponse(candidate, headers=_IMMUTABLE if _HASHED_ASSET.search(candidate.name) else None)
 
     async def handle_pwa_asset(self, request: web.Request) -> web.Response:
         resource = PWA_PUBLIC_FILES.get(request.path)

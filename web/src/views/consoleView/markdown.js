@@ -11,6 +11,8 @@ import { referenceFromUrl, referenceKey, boundReference, preserveReferenceDestin
 import { referenceChipOpen, referenceChipClose, escapeReferenceHtml } from "../../references/presentation.js";
 
 const MAX_HIGHLIGHT_CHARS = 8000;
+// The server rewrites these to artifact URLs only once a segment is complete.
+const PENDING_ARTIFACT_PATH_RE = /^(?:\.\/)?workspace\/artifacts\//;
 const MARKDOWN_CACHE_LIMIT = 220;
 const MARKDOWN_CACHE_MAX_SOURCE_CHARS = 120000;
 const PLAIN_TEXT_CACHE_LIMIT = 500;
@@ -28,11 +30,11 @@ export function escapeHtmlText(value) {
 		.replace(/'/g, "&#039;");
 }
 
-export function highlightCodeHtml(code, lang = "") {
+export function highlightCodeHtml(code, lang = "", {maxChars = MAX_HIGHLIGHT_CHARS} = {}) {
 	const source = String(code ?? "");
 	const language = String(lang || "").trim().split(/\s+/)[0];
 	try {
-		if (language && hljs.getLanguage(language) && source.length <= MAX_HIGHLIGHT_CHARS) {
+		if (language && hljs.getLanguage(language) && source.length <= maxChars) {
 			return hljs.highlight(source, {language}).value;
 		}
 	} catch {
@@ -91,6 +93,14 @@ function createMarkdownRenderer({highlightCode = true} = {}) {
 	renderer.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 		const token = tokens[idx];
 		const href = token.attrGet("href") || "";
+		if (env.streaming && PENDING_ARTIFACT_PATH_RE.test(href)) {
+			let end = idx + 1;
+			while (end < tokens.length && tokens[end].type !== "link_close") end++;
+			if (end < tokens.length) {
+				tokens[end].meta = {...(tokens[end].meta || {}), pendingArtifact: true};
+				return `<span class="md-artifact-pending" title="本段输出完成后可打开">`;
+			}
+		}
 		if (href.startsWith("openbear://ref/")) {
 			let end = idx + 1;
 			while (end < tokens.length && tokens[end].type !== "link_close") end++;
@@ -115,11 +125,15 @@ function createMarkdownRenderer({highlightCode = true} = {}) {
 	};
 	const imageRule = renderer.renderer.rules.image;
 	renderer.renderer.rules.image = (tokens, idx, options, env, self) => {
+		if (env.streaming && PENDING_ARTIFACT_PATH_RE.test(tokens[idx].attrGet('src') || '')) {
+			const alt = self.renderInlineAsText(tokens[idx].children || [], options, env).trim();
+			return `<span class="md-artifact-pending is-image">图片准备中${alt ? `：${renderer.utils.escapeHtml(alt)}` : ""}</span>`;
+		}
 		tokens[idx].attrSet('src', contextResourceUrl(tokens[idx].attrGet('src')));
 		tokens[idx].attrSet('referrerpolicy', 'no-referrer');
 		return imageRule(tokens, idx, options, env, self);
 	};
-	renderer.renderer.rules.link_close = (tokens, idx, options, _env, self) => tokens[idx].meta?.referenceConsumed ? "" : self.renderToken(tokens, idx, options);
+	renderer.renderer.rules.link_close = (tokens, idx, options, _env, self) => tokens[idx].meta?.referenceConsumed ? "" : tokens[idx].meta?.pendingArtifact ? "</span>" : self.renderToken(tokens, idx, options);
 	renderer.renderer.rules.table_open = () => `<div class="md-table-scroll"><table>`;
 	renderer.renderer.rules.table_close = () => `</table></div>`;
 	return renderer;
@@ -214,7 +228,7 @@ export function normalizeLegacyMathBlocks(text) {
 export function renderMarkdownRaw(text, options = {}) {
 	const renderer = options?.live || options?.highlight === false ? liveMd : md;
 	const source = preserveReferenceDestinations(text, richHtmlToMarkdown);
-	return renderer.render(normalizeLegacyMathBlocks(source), {referenceBindings: options.references, referenceIndex: 0});
+	return renderer.render(normalizeLegacyMathBlocks(source), {referenceBindings: options.references, referenceIndex: 0, streaming: Boolean(options.streaming)});
 }
 
 export function renderMarkdown(text, options = {}) {
@@ -222,7 +236,8 @@ export function renderMarkdown(text, options = {}) {
 	if (!source) return "";
 	const live = Boolean(options?.live || options?.disableCache || options?.highlight === false);
 	// A source-only cache key cannot represent different frozen bindings.
-	if (live || options.references?.length || source.length > MARKDOWN_CACHE_MAX_SOURCE_CHARS) return renderMarkdownRaw(source, {...options, live, highlight: live ? false : options?.highlight});
+	// Server capsules also show whether the server still exists, which is not a property of the source.
+	if (live || options.references?.length || source.length > MARKDOWN_CACHE_MAX_SOURCE_CHARS || source.includes("openbear://ref/server/")) return renderMarkdownRaw(source, {...options, live, streaming: Boolean(options?.live), highlight: live ? false : options?.highlight});
 	const cached = markdownCache.get(source);
 	if (cached !== undefined) return touchCache(markdownCache, source, cached, MARKDOWN_CACHE_LIMIT);
 	return touchCache(markdownCache, source, renderMarkdownRaw(source, options), MARKDOWN_CACHE_LIMIT);

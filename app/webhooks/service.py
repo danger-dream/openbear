@@ -273,7 +273,9 @@ class WebhookService:
             await conn.execute('UPDATE webhook_endpoints SET current_revision=current_revision+1,enabled=?,control_version=control_version+?,updated_at_ms=? WHERE endpoint_id=?',(int(enabled),int(enabled!=bool(e['enabled'])),self.clock(),eid))
             result={'endpoint':await self.public(conn,eid,owner)}
             await self.record_operation(conn,owner,request,'update',eid,fp,result)
-        self.wake.set(); return result
+        self.wake.set()
+        if hasattr(self.host,'_schedule_conversation_retention'): self.host._schedule_conversation_retention()
+        return result
 
     async def authenticate(self,conn,eid,key):
         if not key: raise WebhookError('credential_required',status=401)

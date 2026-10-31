@@ -867,6 +867,11 @@ class WebAdminConversationsMixin:
                 memory_uuid_map=memory_uuid_map,
                 conn=self.db.conn,
             )
+            from app.work_items import WorkItemsDAO
+            await WorkItemsDAO(self.db).duplicate_conversation(
+                old_uuid, new_uuid, conn=self.db.conn,
+                rewrite_text=lambda value: self._rewrite_duplicate_text_refs(value, pairs),
+            )
             await self._suppress_duplicate_task_notifications(
                 conversation_uuid=new_uuid,
                 internal_chat_id=new_internal,
@@ -2639,6 +2644,19 @@ class WebAdminConversationsMixin:
         return fallback, 1
 
     @staticmethod
+    def _task_notification_source(items: list[dict[str, Any]]) -> str:
+        """Who returned these results, worded for a status prefix such as "Agent "/"会话请求"."""
+        kinds = {str(item.get("kind") or "task-notification") for item in items if isinstance(item, dict)}
+        parts = [name for name, present in (
+            ("Agent", any(k != "task-notification-collab" and not k.startswith("tool-notification") for k in kinds)),
+            ("会话请求", "task-notification-collab" in kinds),
+            ("后台任务", any(k.startswith("tool-notification") for k in kinds)),
+        ) if present]
+        if not parts or parts == ["Agent"]:
+            return "Agent "
+        return "、".join(parts)
+
+    @staticmethod
     def _batch_task_notification_summary(statuses: list[str], total: int) -> str:
         completed = len([status for status in statuses if status == "completed"])
         failed = len([status for status in statuses if status == "failed"])
@@ -2806,6 +2824,7 @@ class WebAdminConversationsMixin:
                             "status": str(current_payload.get("status") or ""),
                             "summary": notification_text,
                             "text": notification_text,
+                            "statusText": f"{self._task_notification_source(filtered_current or combined_notifications)}结果已回传",
                             "hidden": True,
                             "internal": True,
                             "deferredUntilRelatedTasksTerminal": True,
@@ -2859,10 +2878,11 @@ class WebAdminConversationsMixin:
                                         int(batch_payload.get("batchCount") or len(filtered)),
                                     )
                                 waiting_control = status == "needs_openbear_control" or any(self._is_waiting_control_notification(item) for item in filtered)
+                                source = self._task_notification_source(filtered)
                                 current_status = (
                                     "Agent 等待 OpenBear 裁决"
                                     if waiting_control else (
-                                        f"后台 {tool_name} 结果汇总中" if kind == "tool-notification" and tool_name else ("后台任务结果汇总中" if kind.startswith("tool-notification") else "Agent 结果汇总中")
+                                        f"后台 {tool_name} 结果汇总中" if kind == "tool-notification" and tool_name else ("后台任务结果汇总中" if kind.startswith("tool-notification") else f"{source}结果汇总中")
                                     )
                                 )
                                 summary = str(batch_payload.get("summary") or default_summary).strip()
@@ -2895,6 +2915,7 @@ class WebAdminConversationsMixin:
                                     "title": title,
                                     "batchCount": int(batch_payload.get("batchCount") or 0),
                                     "text": summary,
+                                    "statusText": f"{source}结果已回传",
                                     "hidden": False,
                                 })
                                 for item in filtered:

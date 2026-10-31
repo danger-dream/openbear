@@ -4,6 +4,10 @@ Choose a one-time execution, a fixed interval, or a calendar-based schedule acco
 
 Cron tasks belong to a real directory, and each execution creates a new conversation there. Task instructions should independently explain what to do, which materials to use, the authorized scope and the expected result. They must not depend on temporary assumptions from the current conversation that were never included in the task configuration.
 
+Runs are unattended. By default a run may only read servers and instances (Servers and InstanceControl read actions); `allowServerChanges` lets it change them too. Leave it false unless the user explicitly asks for scheduled changes to servers or instances, and tell the user the risk: nobody watches the run, and content returned by a server can mislead it into a change. The permission follows where a turn came from: turns that continue a run (results of its Agents and background tasks, ConversationRequests and instance operations it started) have the run's permission, never more. A scheduled or Webhook run, including those turns, cannot turn it on, and cannot change, enable or run a task or endpoint that already has it.
+
+Frequent schedules accumulate many run conversations. `conversationRetention` (`keepLast`, `keepDays`) deletes this task's run conversations once they exceed either limit; pinned, archived, moved and human-continued conversations are kept. Deletion is permanent, so mention the option for frequent tasks but set it only when the user agrees that older run conversations need not be kept.
+
 When designing a task, also identify fixed steps that would benefit from pre- and post-execution scripts:
 - Pre-execution scripts can prepare directories and files, download or organize materials, initialize the working environment, and perform routine data processing so the model starts with the necessary conditions already in place.
 - Post-execution scripts can organize or archive outputs, write back results in a predetermined format, remove temporary files, shut down environments created for the task, and perform other routine cleanup.

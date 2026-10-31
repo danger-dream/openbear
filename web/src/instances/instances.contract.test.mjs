@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import axios from 'axios';
 import { canManageInstances } from '../authMode.js';
 import { injectedMode } from '../sessionBoundary.js';
-import { childClient, defaultAccessUrl, displayStatus, errorText, generatePassword, needsMapping, passwordHint, publicLink, relativeTime, safeError, serverLabel, statusLabel } from './instanceHelpers.js';
+import { childClient, defaultAccessUrl, displayStatus, errorText, generatePassword, needsMapping, passwordHint, publicLink, relativeTime, safeError, serverChannel, serverLabel, serverUnavailable, serverUse, statusLabel, withServerPage } from './instanceHelpers.js';
 
 // Exercise the production axios client with a transport adapter (not a parallel
 // reimplementation of URLs). The adapter sees exactly the outgoing wire payload.
@@ -15,7 +15,7 @@ test('controller HTTP contract uses exact methods, paths and payloads', async ()
     await wire.instanceGateway();
     await wire.enableInstanceGateway({serverId: 'local', port: 18962, publicUrl: 'http://203.0.113.10:18962'});
     await wire.setInstanceGatewayUrl('https://bear.example.com');
-    await wire.setInstanceGatewayProxies(['10.0.0.1']);
+    await wire.setInstanceGatewayProxies(['192.0.2.10']);
     await wire.disableInstanceGateway();
     await wire.checkInstanceGatewayPort('srv/1', 18962);
     await wire.instanceServers(); await wire.createInstanceServer({name: 's'}); await wire.updateInstanceServer('srv/1', {name: 't'});
@@ -23,6 +23,7 @@ test('controller HTTP contract uses exact methods, paths and payloads', async ()
     await wire.createInstance({name: 'child'}); await wire.updateInstance('child/1', {account: {password: 'x'}});
     await wire.maintainInstance('child/1', {instructions: 'repair only'}); await wire.syncInstanceGateway('child/1');
     await wire.instanceRequest('child/1', {method: 'PATCH', path: '/api/settings/agent.maxTurns', body: {value: 30}});
+    await wire.rotateInstanceGatewayKeys(); await wire.rotateInstanceKeys('child/1'); await wire.migrateInstanceNetwork('child/1');
     assert.deepEqual(calls.map(c => [c.method, c.url]), [
       ['get', '/api/instance-gateway'], ['post', '/api/instance-gateway/enable'], ['put', '/api/instance-gateway/public-url'],
       ['put', '/api/instance-gateway/client-ip'], ['post', '/api/instance-gateway/disable'], ['get', '/api/instance-gateway/port'],
@@ -30,10 +31,11 @@ test('controller HTTP contract uses exact methods, paths and payloads', async ()
       ['post', '/api/instance-servers/srv%2F1/check'], ['delete', '/api/instance-servers/srv%2F1'], ['get', '/api/instance-servers/ssh-keys'],
       ['post', '/api/instances'], ['patch', '/api/instances/child%2F1'], ['post', '/api/instances/child%2F1/maintenance'],
       ['post', '/api/instances/child%2F1/gateway-sync'], ['post', '/api/instances/child%2F1/request'],
+      ['post', '/api/instance-gateway/rotate-keys'], ['post', '/api/instances/child%2F1/rotate-keys'], ['post', '/api/instances/child%2F1/migrate-network'],
     ]);
     assert.deepEqual(calls[1].data, {serverId: 'local', port: 18962, publicUrl: 'http://203.0.113.10:18962'});
     assert.deepEqual(calls[2].data, {publicUrl: 'https://bear.example.com'});
-    assert.deepEqual(calls[3].data, {trustedProxies: ['10.0.0.1']});
+    assert.deepEqual(calls[3].data, {trustedProxies: ['192.0.2.10']});
     assert.deepEqual(calls[5].params, {serverId: 'srv/1', port: 18962});
     assert.ok(!calls.some(c => c.url === '/api/auth/mode'));
   } finally { axios.defaults.adapter = before; }
@@ -71,7 +73,20 @@ test('labels, errors, generated passwords and address helpers', () => {
   assert.equal(needsMapping('https://bear.example.com', '203.0.113.10', 18962), true);
   assert.equal(needsMapping('http://203.0.113.10:80', '203.0.113.10', 18962), true);
   assert.equal(serverLabel({local: true}), '本机（主控所在服务器）');
-  assert.equal(serverLabel({name: '东京', host: '10.0.0.2', status: 'unreachable'}), '东京 · 10.0.0.2（无法连接）');
+  assert.equal(serverLabel({name: '东京', host: '192.0.2.12', status: 'unreachable'}), '东京 · 192.0.2.12（无法连接）');
+  // An online node with command execution carries instance commands, SSH or not.
+  assert.equal(serverLabel({name: '东京', host: '192.0.2.12', auth: 'password', node: {online: true, exec: true}}), '东京 · 节点通道');
+  assert.equal(serverLabel({name: '东京', host: '192.0.2.12', auth: 'password', node: {online: false, exec: true}}), '东京 · 192.0.2.12');
+  assert.equal(serverLabel({name: '大阪', host: '', auth: 'none', node: {online: false, exec: true}}), '大阪 · 节点离线');
+  assert.equal(serverLabel({name: '大阪', host: '', auth: 'none', node: {online: true, exec: false}}), '大阪 · 节点未开启命令执行');
+  assert.deepEqual(serverUse({usedBy: ['访问网关', '实例甲', '实例乙']}), {gateway: true, instances: ['实例甲', '实例乙']});
+  assert.equal(serverUnavailable({auth: 'none', node: {online: false, exec: true}}), '节点离线');
+  assert.equal(serverUnavailable({auth: 'password', node: {online: false, exec: true}}), '');
+  assert.equal(serverChannel({auth: 'password', status: 'unreachable'}), 'SSH 无法连接');
+  assert.equal(serverChannel({auth: 'password', node: {online: true, exec: true}}), '节点');
+  // The servers page supplies the host's own name, regions and the order; unknown servers go last.
+  assert.deepEqual(withServerPage([{id: 'local', name: '本机', local: true}, {id: 'b'}, {id: 'x'}], [{id: 'b', name: 'B', region: 'JP'}, {id: 'local', name: 'Edge-SG', region: 'SG'}])
+    .map(s => [s.id, s.name, s.region]), [['b', 'B', 'JP'], ['local', 'Edge-SG', 'SG'], ['x', undefined, undefined]]);
   assert.equal(relativeTime(1000, 1000 + 5 * 60000), '5 分钟前');
   // Advice only, never a block.
   assert.equal(passwordHint(''), '');

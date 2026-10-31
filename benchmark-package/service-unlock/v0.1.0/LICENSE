@@ -1,0 +1,13 @@
+Service Unlock v0.5.4 licensing notice (2026-10-18)
+
+This distribution is not MIT-only. Native translations of selected probes from
+lmc999/RegionRestrictionCheck commit b6d4a6f9a87fc6eae6d3e62d0092ececcec8e844,
+including internal/extra and their integration into the unified executable,
+are distributed under GNU Affero General Public License version 3.
+See LICENSES/AGPL-3.0.txt for the complete license. The combined executable
+must be conveyed consistently with AGPL-3.0 and its Corresponding Source duties.
+
+Original service-unlock/geocheck code retains the MIT License and copyright
+(c) 2026 Remnawave; the complete original license is in LICENSES/MIT.txt.
+Third-party renderer notices remain in internal/render/THIRD_PARTY_LICENSES.txt.
+See NOTICE.md for source provenance, modifications and source availability.

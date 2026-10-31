@@ -601,3 +601,79 @@ async def test_archive_successor_is_same_level_and_reaches_next_page(tree_harnes
     # Empty source folder does not pick an archived item or another folder.
     await h.db.conn.execute("UPDATE web_conversations SET archived_at=100 WHERE folder_uuid='a'")
     assert await h._tree_archive_successor(7,"conversation-50") is None
+
+
+async def test_archive_successor_skips_group_members(tree_harness):
+    h = tree_harness
+    await _folder(h,"a","","A")
+    for index in range(1,5):
+        await _conversation(h,index,"a")
+    for index in (2,3):
+        await h.db.conn.execute(
+            "INSERT INTO collab_members(conversation_uuid,group_uuid,member_key,name,created_at,updated_at) VALUES (?,?,?,?,1,1)",
+            (f"conversation-{index}","group-1",f"m{index}",f"Member {index}"),
+        )
+    await h.db.conn.execute("UPDATE web_conversations SET archived_at=100 WHERE conversation_uuid='conversation-1'")
+    await h.db.conn.commit()
+    assert (await h._tree_archive_successor(7,"conversation-1"))["conversationUuid"] == "conversation-4"
+    await h.db.conn.execute("UPDATE web_conversations SET archived_at=100 WHERE conversation_uuid='conversation-4'")
+    assert await h._tree_archive_successor(7,"conversation-1") is None
+
+
+async def test_hidden_recent_inheritance_limit_status_and_moves(tree_harness):
+    h = tree_harness
+    await _folder(h, 'hidden', '', 'Hidden')
+    await _folder(h, 'child', 'hidden', 'Child')
+    await _folder(h, 'visible', '', 'Visible')
+    for i in range(1, 19):
+        await _conversation(h, i, 'child' if i <= 3 else 'visible')
+        await h.db.conn.execute('UPDATE web_conversations SET last_interaction_at_ms=?, activity_version=?, activity_read_version=0 WHERE conversation_uuid=?',
+                                (1000-i, 1 if i == 2 else 0, f'conversation-{i}'))
+    await h.db.conn.commit()
+    async def defaults(_owner):
+        return {}, {}
+    h._web_run_defaults_candidate = defaults
+    h._apply_folder_run_defaults = lambda fallback, effective: {**fallback, **effective}
+    # Prevent legacy backfill from replacing the controlled projection.
+    h._tree_projection_ready = {7}
+    h._web_starting_turns['conversation-1'] = {'turn'}
+    req = lambda value: _Request(match_info={'folder_uuid': 'hidden'}, body={'workspaceDir': '', 'promptMarkdown': '', 'hideFromRecent': value})
+    assert json.loads((await h.handle_api_conversation_folder_properties(_Request(match_info={'folder_uuid': 'hidden'}))).text)['hideFromRecent'] is False
+    await h.handle_api_conversation_folder_properties_update(req(True))
+    properties = json.loads((await h.handle_api_conversation_folder_properties(_Request(match_info={'folder_uuid': 'child'}))).text)
+    assert properties['hideFromRecent'] is False and properties['hiddenFromRecentByAncestor'] is True
+    state = await h._tree_running_state(7)
+    assert len(state['recentItems']) == 15
+    assert not any(item['conversationUuid'] in {'conversation-1', 'conversation-2', 'conversation-3'} for item in state['recentItems'])
+    assert {'conversation-1', 'conversation-2', 'conversation-3'} <= set(state['hiddenConversationIds'])
+    assert {item['conversationUuid'] for item in state['activityItems']} >= {'conversation-1', 'conversation-2'}
+    assert all(item['hiddenFromRecent'] for item in state['activityItems'] if item['conversationUuid'] in {'conversation-1', 'conversation-2'})
+    assert any(item['conversationUuid'] == 'conversation-1' for item in state['items'])
+    assert state['folderRunningCounts']['hidden'] == 1
+    await h.handle_api_conversation_tree_move(_Request(body={'kind': 'folder', 'id': 'child', 'targetFolderId': 'visible', 'updateSnapshots': False}))
+    state = await h._tree_running_state(7)
+    assert state['recentItems'][0]['conversationUuid'] == 'conversation-1'
+    assert 'conversation-2' not in state['hiddenConversationIds']
+    await h.handle_api_conversation_tree_move(_Request(body={'kind': 'conversation', 'id': 'conversation-2', 'targetFolderId': 'hidden', 'updateSnapshots': False}))
+    assert 'conversation-2' in (await h._tree_running_state(7))['hiddenConversationIds']
+    await h.handle_api_conversation_folder_properties_update(req(False))
+    state = await h._tree_running_state(7)
+    assert 'conversation-2' not in state['hiddenConversationIds']
+    assert any(item['conversationUuid'] == 'conversation-2' for item in state['recentItems'])
+
+
+async def test_hidden_recent_migrates_existing_folders_default_off(tmp_path):
+    path = str(tmp_path / 'old.db')
+    db = DB(path)
+    await db.connect()
+    await db.conn.execute("INSERT INTO web_conversation_folders(folder_uuid, owner_chat_id, name) VALUES ('old', 7, 'Old')")
+    await db.conn.execute('ALTER TABLE web_conversation_folders DROP COLUMN hide_from_recent')
+    await db.conn.commit()
+    await db.close()
+    db = DB(path)
+    await db.connect()
+    try:
+        row = await (await db.conn.execute("SELECT hide_from_recent FROM web_conversation_folders WHERE folder_uuid='old'")).fetchone()
+        assert row['hide_from_recent'] == 0
+    finally:
+        await db.close()

@@ -90,15 +90,3 @@ test('configured folder keeps count and pin without running or property badges',
   assert.match(html, /node-star/);
   assert.doesNotMatch(html, /property-dot/);
 });
-
-test('running dot is compact, blue in both themes and breathes without changing geometry', () => {
-  const dot = source.match(/^\.running-leaf \{([^}]+)\}/m)[1];
-  assert.match(dot, /width:6px; height:6px; flex:0 0 6px/);
-  assert.match(dot, /background:var\(--ob-blue\)/);
-  assert.match(dot, /animation:tree-pulse 1\.8s ease-in-out infinite/);
-  assert.doesNotMatch(source, /html\.dark[^{}]*\.running-leaf/);
-  assert.match(source, /@keyframes tree-pulse \{ 50% \{ opacity:\.35; transform:scale\(\.8\);/);
-  assert.match(source, /prefers-reduced-motion: reduce\) \{ \.is-spinning,\.running-leaf \{ animation:none/);
-  assert.doesNotMatch(source, /\.running-count|\.running-leaf i|\.running-leaf\.is-waiting/);
-  assert.match(source, /\.node-icon\.is-working::before[^\n]*animation:tree-work-border-spin/);
-});

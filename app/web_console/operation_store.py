@@ -1492,7 +1492,7 @@ class WebAdminOperationsMixin:
         owner_chat_id = int(conv_row["owner_chat_id"] or 0) if conv_row else 0
         internal_chat_id = int(conv_row["internal_chat_id"] or payload.get("chatId") or payload.get("chat_id") or 0) if conv_row else int(payload.get("chatId") or payload.get("chat_id") or 0)
         kind = str(payload.get("type") or payload.get("kind") or "event")
-        if kind in {"final", "notice"} and hasattr(self, "_rewrite_web_artifact_links"):
+        if kind in {"final", "notice", "cut"} and hasattr(self, "_rewrite_web_artifact_links"):
             old_text = str(payload.get("text") or "")
             rewritten_text = await self._rewrite_web_artifact_links(
                 old_text,

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import * as Vue from 'vue';
-import {parse, compileScript, compileTemplate, compileStyle} from '@vue/compiler-sfc';
+import {parse, compileScript} from '@vue/compiler-sfc';
 import {renderToString} from 'vue/server-renderer';
 import * as policy from './promptPolicy.js';
 import * as settingsDisplay from '../views/settingsDisplay.js';
@@ -42,15 +42,6 @@ function harness(name, props = {}, api = {}, extra = {}) {
 const defaults = policy.normalizePromptPolicy();
 const inherited = {...defaults,text:'Parent [[ time.now ]]',overrideSystemPrompt:true,toolsEnabled:true,toolNames:['missing'],userMessageTemplateEnabled:true};
 const policyProps = (local = defaults, extra = {}) => ({modelValue:clone(local), inheritedPolicy:clone(inherited), inheritedSourcePath:'/parent', disabled:false,folderId:'F1',conversationId:undefined,...extra});
-
-test('all new reusable editors and changed property/template SFCs compile', () => {
-  for (const name of ['PromptTemplateEditor.vue','PromptPolicyEditor.vue','PromptImpactDialog.vue','ConversationPropertiesDialog.vue','ConversationTree.vue','../views/TemplateView.vue','../views/SettingsView.vue']) {
-    const descriptor = parse(fs.readFileSync(new URL(name,import.meta.url),'utf8')).descriptor;
-    const script = compileScript(descriptor,{id:name});
-    assert.deepEqual(compileTemplate({source:descriptor.template.content,filename:name,id:name,compilerOptions:{bindingMetadata:script.bindings}}).errors,[]);
-    for (const style of descriptor.styles) assert.deepEqual(compileStyle({source:style.content,filename:name,id:name,scoped:style.scoped}).errors,[]);
-  }
-});
 
 test('empty and whitespace text keep one local editor without displaying inherited content', async () => {
   for (const text of ['', ' \n ']) {

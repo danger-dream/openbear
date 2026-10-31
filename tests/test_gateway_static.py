@@ -47,8 +47,11 @@ async def test_gateway_page_allowlists_follow_frontend_and_installed_routes(node
     assert incoming and outgoing, 'frontend route tables not found'
     paths = set(re.findall(r'''["'](/[^"']*)["']\s*:''', incoming[1]))
     links = set(re.findall(r''':\s*["'](/[^"']*)["']''', outgoing[1]))
-    assert paths == links | {'/'}
-    expected = paths - {'/instances'}
+    # /ddns is an incoming alias only: it opens the servers page on its 动态域名 tab.
+    assert paths == links | {'/', '/ddns'}
+    # Controller-only pages are never exposed through the access gateway.
+    controller_only = {'/instances', '/servers', '/ddns'}
+    expected = paths - controller_only
     assert GATEWAY_APP_PAGES == expected
     go = (root / 'gateway/frontend.go').read_text()
     table = re.search(r'var pagePaths\s*=\s*map\[string\]bool\{(.*?)\}', go, re.S)
@@ -57,7 +60,7 @@ async def test_gateway_page_allowlists_follow_frontend_and_installed_routes(node
     host = node.svc.web_admin
     installed = {route.resource.canonical for route in node.client.server.app.router.routes()
                  if route.method == 'GET' and route.handler == host.handle_index}
-    assert installed - {'/login', '/instances'} == expected
+    assert installed - {'/login'} - controller_only == expected
 
 
 @pytest.mark.parametrize('method', ['GET', 'HEAD'])
@@ -163,3 +166,43 @@ async def test_legacy_local_login_assets_stay_public(runtime, monkeypatch):  # n
     assert (await r.client.get('/', allow_redirects=False)).status == 302
     for path in ('/login', '/assets/app.js', '/manifest.webmanifest'):
         assert (await r.client.get(path, allow_redirects=False)).status == 200
+
+
+INDEX_WITH_ASSETS = (
+    '<link rel="manifest" href="/manifest.webmanifest" />'
+    '<link rel="icon" type="image/x-icon" href="/assets/brand/favicon-2888ecac0deb.ico" />'
+    '<script>window.__OPENBEAR_AUTH_MODE__ = "[[controller]]";\n'
+    'window.__OPENBEAR_ASSET_BASE__ = "[[asset-base]]";</script>'
+    '<script type="module" crossorigin src="/assets/index-yI1fbXhm.js"></script>'
+    '<link rel="modulepreload" crossorigin href="/assets/vendor-CvLKSbGU.js">'
+    '<link rel="stylesheet" crossorigin href="/assets/index-BUDn83CX.css">')
+
+
+async def test_gateway_page_loads_its_build_below_its_own_prefix(node):
+    r = node
+    base = f"/_i/{r.values['OPENBEAR_INSTANCE_ID']}/"
+    (r.dist / 'index.html').write_text(INDEX_WITH_ASSETS)
+    page = await (await r.client.get('/chat', headers={**r.auth, 'X-OpenBear-Gateway-Assets': base})).text()
+    assert f'window.__OPENBEAR_ASSET_BASE__ = "{base}";' in page and '"/assets/' not in page
+    assert page.count(f'="{base}assets/') == 4 and 'href="/manifest.webmanifest"' in page
+    assert 'window.__OPENBEAR_AUTH_MODE__ = "gateway"' in page
+    # A gateway that does not route prefixes (older release), or a prefix other
+    # than this instance's own, keeps the root-relative page.
+    for headers in (r.auth, {**r.auth, 'X-OpenBear-Gateway-Assets': '/_i/other-instance/'}):
+        page = await (await r.client.get('/chat', headers=headers)).text()
+        assert page == INDEX_WITH_ASSETS.replace('"[[controller]]"', '"gateway"')
+
+
+async def test_local_page_ignores_asset_prefix_announcement(runtime, monkeypatch):  # noqa: F811
+    r = runtime
+    dist = r.root / 'local-dist'
+    dist.mkdir()
+    (dist / 'index.html').write_text(INDEX_WITH_ASSETS)
+    monkeypatch.setattr(r.svc.web_admin, '_web_dist_dir', lambda: dist)
+    page = await (await r.client.get('/login', headers={'X-OpenBear-Gateway-Assets': '/_i/x/'})).text()
+    assert page == INDEX_WITH_ASSETS.replace('"[[controller]]"', '"managed"')
+
+
+def test_gateway_notification_worker_is_the_frontend_worker():
+    root = Path(__file__).resolve().parents[1]
+    assert (root / 'gateway/openbear-push-sw.js').read_bytes() == (root / 'web/public/openbear-push-sw.js').read_bytes()

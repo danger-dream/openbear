@@ -15,10 +15,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import aiohttp
+import pytest
 
 from app.config import Config
 from app.db import engine
 from app.services import Services
+
+# These test migrations, so every database here is built the real way.
+pytestmark = pytest.mark.real_db
 
 SCHEMA = Path(__file__).parent / "fixtures/upgrade_v092.sql"
 

@@ -27,6 +27,14 @@ from app.task_memory import (
 )
 from app.tools.file_state import clear_read_file_state
 from app.web_console.conversation_prompt import system_prompt_sha256
+from app.work_items import (
+    WorkItemsDAO,
+    WorkItemsRuntime,
+    bind_work_items_finish,
+    reset_work_items_runtime_epoch,
+    without_work_items_runtime_messages,
+    work_items_runtime_epoch,
+)
 from app.web_console.core import *
 from app.web_console.live_stream import *
 from app.web_console.notification_delivery import (
@@ -353,6 +361,8 @@ class WebAdminChatRunMixin:
             convo = history + [user_msg]
             task_memory_dao = TaskMemoryDAO(self.db)
             task_memory_epoch = task_memory_runtime_epoch(history)
+            work_items_runtime = WorkItemsRuntime(WorkItemsDAO(self.db), conversation_uuid, root_turn_uuid) if conversation_uuid and root_turn_uuid else None
+            work_items_epoch = work_items_runtime_epoch(history)
 
             async def _refresh_task_memory_request(request_messages: list[Message]) -> list[Message]:
                 collab_service = getattr(self, "collab", None)
@@ -364,15 +374,18 @@ class WebAdminChatRunMixin:
                             {"role": "user", "content": notes_message(notes)}, kind="control",
                             source_id=f"collab-notes:{notes[-1]['id']}", turn_uuid=root_turn_uuid, run_root_turn_uuid=root_turn_uuid)]
                 if active_policy['overrideSystemPrompt']:
-                    return [m for m in request_messages if not is_task_memory_runtime_message(m)]
+                    return without_work_items_runtime_messages([m for m in request_messages if not is_task_memory_runtime_message(m)])
                 if not inject_memories:
                     return request_messages
-                return await reconcile_task_memory_runtime_state(
+                request_messages = await reconcile_task_memory_runtime_state(
                     request_messages,
                     task_memory_dao,
                     conversation_uuid=conversation_uuid,
                     epoch=task_memory_epoch,
                 )
+                if work_items_runtime is not None:
+                    request_messages = await work_items_runtime.reconcile(request_messages, epoch=work_items_epoch)
+                return request_messages
 
             async def _reference_request_overlay(request_messages: list[Message]) -> list[Message]:
                 # The shared selector accounts for expanded material before deciding
@@ -428,10 +441,13 @@ class WebAdminChatRunMixin:
             if conversation:
                 if not task_notification and not collab_request_id:
                     await self._maybe_title_web_conversation(conversation, visible_user_text)
+                batched_results = (task_notification_payload or {}).get("results")
+                notification_source = self._task_notification_source(
+                    batched_results if isinstance(batched_results, list) else [task_notification_payload or {}])
                 await self._touch_web_conversation(
                     conversation_uuid,
                     status="running",
-                    current_status="Agent 结果汇总中" if task_notification else ("后台 Agent 控制中" if background_control_payload else "处理会话请求" if collab_request_id else "运行中"),
+                    current_status=f"{notification_source}结果汇总中" if task_notification else ("后台 Agent 控制中" if background_control_payload else "处理会话请求" if collab_request_id else "运行中"),
                     last_error="",
                 )
                 await self._clear_prompt_suggestions(conversation_uuid)
@@ -524,13 +540,16 @@ class WebAdminChatRunMixin:
             )
 
             async def _refresh_window_request(request_messages: list[Message]) -> list[Message]:
-                nonlocal task_memory_epoch
+                nonlocal task_memory_epoch, work_items_epoch
                 if edited_context:
                     return request_messages
                 # The manager supplies a replacement copy. Drop obsolete catalog
                 # snapshots only at this boundary, not from the live/cache prefix.
                 task_memory_epoch = reset_task_memory_runtime_epoch(
                     request_messages, current_epoch=task_memory_epoch,
+                )
+                work_items_epoch = reset_work_items_runtime_epoch(
+                    request_messages, current_epoch=work_items_epoch,
                 )
                 return await _refresh_task_memory_request(request_messages)
 
@@ -933,9 +952,12 @@ class WebAdminChatRunMixin:
                 wait_cycle_uuid = str(uuid.uuid4())
                 planned_review_at_ms = int((time.time() + review_after_s) * 1000) if mode == "review_after" and review_after_s > 0 else 0
                 status_text = "等待 Agent 事件" if mode == "event_only" else f"计划 {int(review_after_s)} 秒后统一复查 Agent"
-                if collab_waiting and mode == "event_only":
+                agents_waiting = len(active) - len(collab_waiting)
+                if collab_waiting:
                     from app.collab.runtime import wait_status_text
-                    status_text = await wait_status_text(self, collab_waiting, agents_running=len(active) - len(collab_waiting)) or status_text
+                    collab_text = await wait_status_text(self, collab_waiting, agents_running=agents_waiting)
+                    if collab_text:
+                        status_text = collab_text if mode == "event_only" else f"{collab_text}，计划 {int(review_after_s)} 秒后统一复查"
                 await renderer.emit({
                     "type": "agent_supervision",
                     "runRootTurnUuid": root_turn_uuid,
@@ -1005,7 +1027,8 @@ class WebAdminChatRunMixin:
                     snapshot["summary"]["running"] = int(snapshot["summary"].get("running") or 0) + collab_now["waiting"]
                 summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), dict) else {}
                 if int(summary.get("running") or 0) == 0 and int(summary.get("waitingControl") or 0) == 0:
-                    status_text = "全部会话请求已有结果" if collab_waiting and not snapshot.get("agents") else "全部 Agent 已完成"
+                    status_text = ("全部 Agent 已完成" if not collab_waiting
+                                   else "全部 Agent 与会话请求已有结果" if agents_waiting else "全部会话请求已有结果")
                     status_value = "completed"
                     active_value = False
                 elif wake_reason == "user_interruption":
@@ -1013,11 +1036,15 @@ class WebAdminChatRunMixin:
                     status_value = "completed"
                     active_value = False
                 elif wake_reason == "review_due":
-                    status_text = "Agent 统一复查时间已到"
+                    status_text = "统一复查时间已到" if collab_waiting else "Agent 统一复查时间已到"
                     status_value = "completed"
                     active_value = False
                 elif any(str(item.get("kind") or "") == "task-notification-collab" for item in notifications):
                     status_text = "会话请求有新进展"
+                    status_value = "completed"
+                    active_value = False
+                elif wake_reason == "collab_note":
+                    status_text = "小组有新动态，已唤醒主控"
                     status_value = "completed"
                     active_value = False
                 else:
@@ -1125,6 +1152,8 @@ class WebAdminChatRunMixin:
                     collab_request_id=collab_request_id, human_text=visible_user_text if not task_notification else "",
                     user_source=user_message_source if not (webhook_assignment_id or cron_run_id or collab_request_id) else "system")
                 bind_collab_finish(self, runtime_tool_context, collab_request_id=collab_request_id)
+            if work_items_runtime is not None and inject_memories:
+                bind_work_items_finish(runtime_tool_context, work_items_runtime, on_status=renderer.on_status)
             mark_stage("turnSetupMs")
             log.info("web.turn.prepared", conversation_uuid=conversation_uuid, messages=len(convo),
                      native=restored_controller_anchor is not None,

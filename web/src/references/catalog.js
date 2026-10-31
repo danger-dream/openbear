@@ -4,6 +4,7 @@ import Fuse from 'fuse.js';
 import { pinyin } from 'pinyin-pro';
 import { catalogKey, referenceKey } from './codec.js';
 import { applyActivityReadVersions } from '../conversationActivity.js';
+import { serverDirectory, serverItem, serverReferencesOffered } from './servers.js';
 
 export const referenceCatalog = shallowReactive({items:[],ready:false,connected:false,stale:false,includeArchived:false,epoch:'',seq:0,version:null,treeStatus:null,activityReadVersions:new Map(),conversationContentLimit:0,referenceSizes:new Map()});
 const records = new Map();
@@ -42,7 +43,7 @@ export function searchableItem(item) {
   const label = String(item.label || item.name || '');
   const syllables = pinyin(label,{toneType:'none',type:'array',nonZh:'consecutive'});
   const initials = (label.match(/[\p{Script=Han}]+|[^\p{Script=Han}]+/gu)||[]).map(part=>/\p{Script=Han}/u.test(part)?pinyin(part,{toneType:'none',type:'array'}).map(word=>word[0]).join(''):part).join('');
-  return {...item,normalized:normalizeQuery(label+' '+(item.name || '')),pinyin:normalizeQuery(syllables.join('')).replace(/\s/g,''),initials:normalizeQuery(initials).replace(/\s/g,''),pathText:normalizeQuery(item.group)};
+  return {...item,normalized:normalizeQuery(label+' '+(item.name || '')+(item.searchText ? ' '+item.searchText : '')),pinyin:normalizeQuery(syllables.join('')).replace(/\s/g,''),initials:normalizeQuery(initials).replace(/\s/g,''),pathText:normalizeQuery(item.group)};
 }
 function rebuild() {
   referenceCatalog.items = [...records.values()];
@@ -95,7 +96,18 @@ export function acceptActivityReadReceipt(receipt = {}) {
   referenceCatalog.activityReadVersions = versions;
   if (referenceCatalog.treeStatus) referenceCatalog.treeStatus = applyActivityReadVersions(referenceCatalog.treeStatus, versions);
 }
-export function referenceItem(ref) { void referenceCatalog.seq; return records.get(catalogKey(ref)); }
+export function referenceItem(ref) { if (ref?.kind === 'server') return serverItem(ref.id); void referenceCatalog.seq; return records.get(catalogKey(ref)); }
+// Server rows join the default (non-history) candidates only while offered.
+let serverSource = null, serverSearchable = [], serverIndex = null;
+function serverCandidates() {
+  if (!serverReferencesOffered()) return [];
+  if (serverSource !== serverDirectory.items) {
+    serverSource = serverDirectory.items;
+    serverSearchable = serverSource.map(searchableItem);
+    serverIndex = serverSearchable.length ? new Fuse(serverSearchable,{includeScore:true,threshold:0.3,ignoreLocation:true,keys:['normalized','pinyin','initials']}) : null;
+  }
+  return serverSearchable;
+}
 // Ordered substrings give '*' its literal glob meaning without regex injection
 // or fuzzy fallback admitting candidates that do not satisfy the wildcard.
 function wildcardMatch(value, pattern) {
@@ -112,7 +124,8 @@ export function searchReferences(query='', {kind='',currentConversation='',limit
   const q = normalizeQuery(query), compact = q.replace(/[\s._-]/g,'');
   const wildcard = q.includes('*');
   const queryForms = /\p{Script=Han}/u.test(q) ? searchableItem({label:q}) : null;
-  const candidates = items ? items.map(searchableItem) : referenceCatalog.items;
+  const servers = items || (kind && kind !== 'server') ? [] : serverCandidates();
+  const candidates = items ? items.map(searchableItem) : servers.length ? [...referenceCatalog.items, ...servers] : referenceCatalog.items;
   const matches = new Map();
   for (const item of candidates) {
     if (kind && item.kind !== kind) continue;
@@ -135,13 +148,13 @@ export function searchReferences(query='', {kind='',currentConversation='',limit
     if (Number.isFinite(score)) matches.set(item.key,{item,score});
   }
   if (q.length > 1 && !wildcard) {
-    const engine = items ? new Fuse(candidates,{includeScore:true,threshold:0.3,ignoreLocation:true,keys:['normalized','pinyin','initials']}) : searchIndex;
-    for (const {item,score} of engine.search(compact,{limit:limit*3})) {
+    const engines = items ? [new Fuse(candidates,{includeScore:true,threshold:0.3,ignoreLocation:true,keys:['normalized','pinyin','initials']})] : [searchIndex, ...(servers.length && serverIndex ? [serverIndex] : [])];
+    for (const engine of engines) for (const {item,score} of engine.search(compact,{limit:limit*3})) {
       if ((kind && item.kind!==kind) || (item.kind==='chat' && item.id===currentConversation)) continue;
       if (!matches.has(item.key)) matches.set(item.key,{item,score:6+(score || 0)});
     }
   }
-  return [...matches.values()].sort((a,b)=>a.score-b.score || Number(b.item.updatedAt || 0)-Number(a.item.updatedAt || 0) || a.item.label.localeCompare(b.item.label,'zh-CN')).slice(0,limit).map(x=>x.item);
+  return [...matches.values()].sort((a,b)=>a.score-b.score || Number(b.item.updatedAt || 0)-Number(a.item.updatedAt || 0) || Number(a.item.order || 0)-Number(b.item.order || 0) || a.item.label.localeCompare(b.item.label,'zh-CN')).slice(0,limit).map(x=>x.item);
 }
 function sendScope() {
   if (socket?.readyState !== 1 || scopeSync) return;

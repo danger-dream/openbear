@@ -239,6 +239,8 @@ class CronService:
             result = {'job': await self.public(conn, await self.row(conn, owner, job_id))}
             await self.record(conn, owner, request, fp, result)
         self.wake.set()
+        if hasattr(self.host, '_schedule_conversation_retention'):
+            self.host._schedule_conversation_retention()
         return result
 
     async def set_enabled(self, owner, job_id, request):

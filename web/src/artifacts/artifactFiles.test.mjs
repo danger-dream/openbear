@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, {afterEach} from "node:test";
-import {artifactFromUrl, artifactSharedPath, artifactFormat, formatFileSize, extractArtifactSummary, decodeArtifactText, artifactRecord, loadArtifactMetadata, loadArtifactText, loadArtifactCard, clearArtifactCache, readingState, SUMMARY_LIMIT, TEXT_PREVIEW_LIMIT} from "./artifactFiles.js";
+import {artifactFromUrl, toolFileIdentity, artifactSharedPath, artifactFormat, formatFileSize, extractArtifactSummary, decodeArtifactText, artifactRecord, loadArtifactMetadata, loadArtifactText, loadArtifactCard, clearArtifactCache, readingState, SUMMARY_LIMIT, TEXT_PREVIEW_LIMIT} from "./artifactFiles.js";
 
 const origin = "https://openbear.test";
 const conversationUuid = "39a541d4-4d9c-4a58-87d6-1b276779954a", artifactUuid = "adfead18-e6d1-40df-8475-391e1245aa0d";
@@ -130,4 +130,24 @@ test("text cache is bounded and reading states are separate per file/version", a
 	for (let i = 0; i < 10; i++) { record.metadata = metadata({sizeBytes: 1024 * 1024, sha256: `version-${i}`}); record.checkedAt = Date.now(); await loadArtifactText(record); }
 	assert.equal(calls.length, 10);
 	record.metadata = {...record.metadata, sha256: "version-0"}; await loadArtifactText(record); assert.equal(calls.length, 11);
+});
+
+test("a recorded tool call's file opens through its operation, keeping the colon in the id", async () => {
+	const toolHref = `/api/conversations/${conversationUuid}/operations/tool%3Acall-1/file/content`;
+	const tool = toolFileIdentity(conversationUuid, "tool:call-1");
+	assert.equal(tool.contentUrl, toolHref);
+	assert.equal(tool.metadataUrl, toolHref.slice(0, -8));
+	assert.equal(tool.downloadUrl, toolHref + "?download=1");
+	assert.equal(tool.toolFile, true);
+	assert.deepEqual(artifactFromUrl(origin + toolHref, origin), tool);
+	assert.notEqual(tool.key, identity.key);
+	for (const value of ["https://other.test" + toolHref, `/api/conversations/x/operations/tool%3Acall-1/file/content`, toolHref.replace("/content", "/raw"), `/api/conversations/${conversationUuid}/operations/a/b/file/content`, `/api/conversations/${conversationUuid}/operations/%E0%A4%A/file/content`]) assert.equal(artifactFromUrl(value, origin), null, value);
+
+	const calls = fakeFetch(metadata({artifactUuid: "tool:call-1", fileName: "app.py", mimeType: "text/x-python", source: "tool-file"}), "print(1)\n");
+	const record = artifactRecord(tool);
+	assert.equal(await loadArtifactText(record), "print(1)\n");
+	assert.deepEqual(calls.map(call => call.url), [tool.metadataUrl, tool.contentUrl]);
+	globalThis.fetch = async () => new Response("", {status: 404});
+	await assert.rejects(loadArtifactMetadata(record, {force: true}), /文件已经不存在/);
+	await assert.rejects(loadArtifactMetadata(artifactRecord(identity), {force: true}), /附件不存在/);
 });

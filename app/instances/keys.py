@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -38,10 +39,10 @@ def normalize(value):
     return '\n'.join([f'-----BEGIN {kind}-----', *head, *wrapped, f'-----END {kind}-----', ''])
 
 
-async def _keygen(*args, stdin=None):
+async def _keygen(*args, stdin=None, env=None):
     try:
         process = await asyncio.create_subprocess_exec('ssh-keygen', *args, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent'})
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', **(env or {})})
     except OSError:
         raise InstanceError('ssh_client_unavailable', 503) from None
     out, err = await asyncio.wait_for(process.communicate(stdin), 20)
@@ -55,7 +56,21 @@ async def inspect(pem, passphrase=''):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as handle:
             handle.write(pem)
-        code, public, err = await _keygen('-y', '-P', passphrase, '-f', str(path))
+        if passphrase:
+            # Not on the command line, where every local user could read it: ssh-keygen asks the
+            # askpass program, which reads it from a file only this user can open.
+            secret = Path(directory) / 'passphrase'
+            fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(passphrase)
+            askpass = Path(directory) / 'askpass'
+            fd = os.open(askpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(f'#!/bin/sh\nexec cat {shlex.quote(str(secret))}\n')
+            code, public, err = await _keygen('-y', '-f', str(path), env={'SSH_ASKPASS': str(askpass), 'SSH_ASKPASS_REQUIRE': 'force',
+                                                                       'DISPLAY': 'none'})
+        else:
+            code, public, err = await _keygen('-y', '-P', '', '-f', str(path))
         if code != 0:
             if 'passphrase' in err.lower():
                 return {'usable': True, 'encrypted': True, 'unlocked': False}

@@ -6,7 +6,7 @@ import './contextEditor/style.css';
 import {assertDocument, callImpact, clone, deleteCall, deleteEntries, deleteReasoning, diffDocument, exportPackage, importPackage, isClaudeNative, localIssues, nativeCall, reasoningImpact, reconcileMessage, relations} from './contextEditor/operations.js';
 import {canMoveBlock, messageSequence, moveBlock, replaceBlock} from './contextEditor/sequence.js';
 const props = defineProps({conversationUuid: {type: String, default: ''}, busy: {type: Boolean, default: false}});
-const emit = defineEmits(['created', 'open-change']);
+const emit = defineEmits(['created', 'saved', 'open-change']);
 const CodeEditor = defineAsyncComponent(() => import('./contextEditor/CodeEditor.vue'));
 const entityEditor = ref(null), entityError = ref(''), toolSearch = ref(''), diffId = ref('');
 const opened = ref(false), state = shallowRef(null), loading = ref(false), pending = ref(''), error = ref(''), notice = ref('');
@@ -40,8 +40,11 @@ const hints = computed(() => doc.value ? localIssues(doc.value) : []);
 const pairs = computed(() => doc.value ? relations(doc.value).pairs : []);
 const filtered = computed(() => (doc.value?.entries || []).filter(e => !search.value || JSON.stringify(e).toLowerCase().includes(search.value.toLowerCase())));
 const previewReady = computed(() => Boolean(state.value?.preview && state.value.previewEpoch === state.value.epoch));
+const savingContext = computed(() => ['create', 'apply'].includes(pending.value));
+const saveReady = computed(() => !pending.value && !loading.value && !props.busy && state.value?.mode === 'compatible' && previewReady.value && state.value.preview.payload != null && !serverErrors.value.length && !hints.value.some(i => i.severity === 'error') && !state.value.latestSource);
 const serverIssues = computed(() => previewReady.value ? state.value.preview.issues || [] : []);
 const serverErrors = computed(() => serverIssues.value.filter(i => i.severity === 'error'));
+const automaticRepair = computed(() => serverIssues.value.find(i => i.code === 'reasoning_cleanup'));
 const payloadText = computed(() => previewReady.value && state.value.preview.payload != null ? JSON.stringify(state.value.preview.payload, null, 2) : '服务器未返回可预览的 payload');
 const rawObject = computed(() => selected.value === 'system' ? {system: doc.value?.system} : selected.value === 'tools' ? doc.value?.tools : entry.value?.message);
 const label = computed(() => selected.value === 'system' ? '系统提示词' : selected.value === 'tools' ? '工具定义' : `${entry.value?.message.role || '消息'} · 第 ${entryIndex.value + 1} 条`);
@@ -52,7 +55,7 @@ const extraFields = computed(() => ['reasoning', 'signature', 'native_output_ite
 const sequence = computed(() => messageSequence(entry.value?.message || {}));
 const targetProtocol = computed(() => state.value?.models.find(m => m.model === state.value.targetModel)?.protocol || '');
 const orderNote = computed(() => sequence.value.ordered
-  ? `从上到下是已保存的原生块顺序，可逐块上移或下移。${targetProtocol.value === 'responses' || (['claude', 'anthropic'].includes(targetProtocol.value) && isClaudeNative(entry.value?.message.native_output_items)) ? '调整会写入实际请求；' : '切换协议不保证保留此顺序；'}签名、密文是否允许续接以服务端校验为准。`
+  ? `从上到下是已保存的原生块顺序，可逐块上移或下移。${targetProtocol.value === 'responses' || (['claude', 'anthropic'].includes(targetProtocol.value) && isClaudeNative(entry.value?.message.native_output_items)) ? '调整会写入实际请求；' : '切换协议不保证保留此顺序；'}编辑影响的历史思考、签名和密文会由框架自动处理。`
   : '此消息只保存了独立字段，未记录完整交错顺序；以下不是生成时间线。只能调整同一数组内的顺序，不能跨正文、思考、调用字段移动。');
 const activeDiff = computed(() => changes.value.find(item => item.id === diffId.value) || changes.value[0]);
 function snippet(message) {
@@ -90,9 +93,12 @@ function editorState(result, draft = null) {
     models: result.models || [], epoch: 0, savedEpoch: 0, preview: null, previewEpoch: -1, undo: [], redo: [],
     latestSource: snapshotToken !== result.snapshotToken ? result : null};
 }
+function showCached(key) {
+  state.value = cache.get(key) || null; error.value = ''; notice.value = ''; pending.value = ''; dialog.value = null; entityEditor.value = null;
+}
 async function load() {
   const key = uuid.value, stamp = ++generation;
-  state.value = cache.get(key) || null; error.value = ''; notice.value = ''; pending.value = ''; dialog.value = null; entityEditor.value = null;
+  showCached(key);
   if (!key) { loading.value = false; resetSelection(); return; }
   loading.value = true;
   try {
@@ -124,14 +130,16 @@ function useLatestSource() {
   setState(editorState(result)); resetSelection(); error.value = ''; notice.value = '已载入最新上下文；原会话及服务器旧草稿未改动';
 }
 
-watch(uuid, () => { opened.value = false; load(); });
+// A read assembles the whole context on the server; only an opened editor needs it.
+// Retire the previous conversation's read so opening this one starts its own.
+watch(uuid, () => { opened.value = false; generation++; loading.value = false; showCached(uuid.value); resetSelection(); });
 watch(opened, value => emit('open-change', value), {flush: 'sync'});
 onBeforeUnmount(() => { disposed = true; generation++; emit('open-change', false); });
 function open() { if (!uuid.value) return; if (props.busy) { notice.value = '运行中无法编辑上下文'; return; } opened.value = true; if (!loading.value) load(); }
 function close() { if (!applyPendingRaw()) return; opened.value = false; dialog.value = null; entityEditor.value = null; }
 defineExpose({open, close});
 function change(next) {
-  if (pending.value === 'create') throw Error('创建分支进行中，暂不能继续改动');
+  if (savingContext.value) throw Error('上下文保存中，暂不能继续改动');
   assertDocument(next);
   const s = state.value;
   setState({...s, working: next, undo: [...s.undo, clone(s.working)], redo: [], epoch: s.epoch + 1, preview: null, previewEpoch: -1});
@@ -146,8 +154,8 @@ function commitText({scope, id, field, value}) {
   else if (doc.value.entries.some(e => e.entryId === id) && doc.value.entries.find(e => e.entryId === id).message[field] !== value) editMessage(m => { m[field] = value; }, id);
 }
 function setField(key, value) { selected.value === 'system' ? mutate(d => { d.system = value; }) : editMessage(m => { m[key] = value; }); }
-function setting(key, value) { const s = state.value; if (pending.value === 'create') return; if (s && s[key] !== value) setState({...s, [key]: value, epoch: s.epoch + 1, preview: null, previewEpoch: -1}); }
-function history(direction) { if (!applyPendingRaw()) return; const s = state.value; if (pending.value === 'create' || !s?.[direction].length) return; const other = direction === 'undo' ? 'redo' : 'undo'; setState({...s, [direction]: s[direction].slice(0,-1), [other]: [...s[other], clone(s.working)], working: clone(s[direction].at(-1)), epoch: s.epoch + 1, preview: null, previewEpoch: -1}); if (!['system','tools'].includes(selected.value) && !doc.value.entries.some(e => e.entryId === selected.value)) selected.value = 'system'; checked.value = checked.value.filter(id => doc.value.entries.some(e => e.entryId === id)); refreshRaw(); }
+function setting(key, value) { const s = state.value; if (savingContext.value) return; if (s && s[key] !== value) setState({...s, [key]: value, epoch: s.epoch + 1, preview: null, previewEpoch: -1}); }
+function history(direction) { if (!applyPendingRaw()) return; const s = state.value; if (savingContext.value || !s?.[direction].length) return; const other = direction === 'undo' ? 'redo' : 'undo'; setState({...s, [direction]: s[direction].slice(0,-1), [other]: [...s[other], clone(s.working)], working: clone(s[direction].at(-1)), epoch: s.epoch + 1, preview: null, previewEpoch: -1}); if (!['system','tools'].includes(selected.value) && !doc.value.entries.some(e => e.entryId === selected.value)) selected.value = 'system'; checked.value = checked.value.filter(id => doc.value.entries.some(e => e.entryId === id)); refreshRaw(); }
 function addEntry(role) { if (!applyPendingRaw()) return; const id = `edited-${randomUuid()}`; if (mutate(d => { const i = d.entries.findIndex(e => e.entryId === selected.value); d.entries.splice(i < 0 ? d.entries.length : i + 1, 0, {entryId: id, message: role === 'tool' ? {role, content: '', name: '', tool_call_id: ''} : {role, content: ''}}); })) choose(id); }
 function addTool() { openEntity('tool', -1); }
 function addCall() { openEntity('call', -1); }
@@ -157,6 +165,7 @@ function askThinking() { const impact = reasoningImpact(doc.value, selected.valu
 function askEntries(ids) { if (!applyPendingRaw()) return; const affected = new Set(ids), impact = []; for (const p of pairs.value) { if (affected.has(p.entryId)) p.results.forEach(id => affected.add(id)); else if (p.results.some(id => affected.has(id))) impact.push(`${p.entryId}.tool_calls[${p.call.id}]`); } dialog.value = {kind: 'entries', ids, impact: [...affected].map(id => `${id}.message`).concat(impact)}; }
 function confirmDelete() {
   const action = dialog.value;
+  if (action.kind === 'apply') { dialog.value = null; return saveOriginal(); }
   if (action.kind === 'refresh') useLatestSource();
   else if (action.kind === 'call') { mutate(d => { d.entries = deleteCall(d, action.id, action.callId, deleteMode.value === 'only').entries; }); if (deleteMode.value === 'only') setting('mode', 'raw'); }
   else if (action.kind === 'thinking') mutate(d => { d.entries = deleteReasoning(d, action.id, thinkingScope.value === 'suffix').entries; });
@@ -164,7 +173,7 @@ function confirmDelete() {
   else if (action.kind === 'tool') mutate(d => { d.tools.splice(action.index, 1); });
   dialog.value = null;
 }
-function saveRaw() { try { if (pending.value === 'create') throw Error('分支创建中，暂不能修改'); const parsed = JSON.parse(raw.value), next = clone(doc.value); if (selected.value === 'system') { if (typeof parsed?.system !== 'string') throw Error('system 必须是字符串'); next.system = parsed.system; } else if (selected.value === 'tools') next.tools = parsed; else next.entries.find(e => e.entryId === selected.value).message = reconcileMessage(entry.value.message, parsed); assertDocument(next); change(next); refreshRaw(); return true; } catch (e) { rawError.value = e.message; return false; } }
+function saveRaw() { try { if (savingContext.value) throw Error('上下文保存中，暂不能修改'); const parsed = JSON.parse(raw.value), next = clone(doc.value); if (selected.value === 'system') { if (typeof parsed?.system !== 'string') throw Error('system 必须是字符串'); next.system = parsed.system; } else if (selected.value === 'tools') next.tools = parsed; else next.entries.find(e => e.entryId === selected.value).message = reconcileMessage(entry.value.message, parsed); assertDocument(next); change(next); refreshRaw(); return true; } catch (e) { rawError.value = e.message; return false; } }
 function restore(changeItem) { mutate(d => { const b = state.value.baseline; if (!changeItem) { Object.assign(d, clone(b)); return; } const id = changeItem.id; if (id === 'system' || id === 'tools') d[id] = clone(b[id]); else if (id === 'order') { const order = new Map(b.entries.map((e,i) => [e.entryId,i])); d.entries.sort((a,c) => (order.get(a.entryId) ?? Infinity) - (order.get(c.entryId) ?? Infinity)); } else { const i = d.entries.findIndex(e => e.entryId === id), original = b.entries.find(e => e.entryId === id); if (i >= 0) d.entries.splice(i, 1); if (original) d.entries.splice(Math.min(b.entries.indexOf(original), d.entries.length), 0, clone(original)); } }); }
 function requestData(s) { return {baseline: clone(s.baseline), working: clone(s.working), mode: s.mode, targetModel: s.targetModel}; }
 async function preview() {
@@ -198,6 +207,39 @@ async function saveDraft() {
   } catch (e) { if (stamp === generation && uuid.value === key) error.value = failure(e); }
   finally { if (stamp === generation) pending.value = ''; }
 }
+function validateOriginalSave() {
+  if (!applyPendingRaw() || !state.value || pending.value) return false;
+  if (props.busy) { error.value = '会话运行中不能保存到原会话；草稿保留'; return false; }
+  if (state.value.latestSource) { error.value = '源会话已有新内容，请先加载最新上下文；当前编辑稿可保存或导出'; return false; }
+  if (state.value.mode !== 'compatible') { error.value = '原始实验稿只可保存草稿或导出，不可应用到会话'; return false; }
+  if (!previewReady.value) { error.value = '编辑或目标变化后须重新运行服务器预览'; return false; }
+  if (state.value.preview.payload == null || serverErrors.value.length || hints.value.some(i => i.severity === 'error')) { error.value = '请先处理结构错误并生成实际请求载荷'; return false; }
+  return true;
+}
+function askSaveOriginal() {
+  if (validateOriginalSave()) dialog.value = {kind: 'apply', impact: []};
+}
+async function saveOriginal() {
+  if (!validateOriginalSave()) return;
+  const key = uuid.value, stamp = generation, s = state.value;
+  pending.value = 'apply'; error.value = '';
+  try {
+    const result = await Api.saveContextEditor(key, {...requestData(s), snapshotToken: s.snapshotToken, revision: s.revision});
+    if (disposed) return;
+    if (!result?.ok || !result.baseline || !result.snapshotToken) throw Error('服务器未返回已保存的上下文');
+    const next = editorState({...result, models: s.models});
+    if (stamp !== generation || uuid.value !== key) {
+      const current = cache.get(key);
+      if (current?.snapshotToken === s.snapshotToken && current.epoch === s.epoch) cache.set(key, next);
+      else if (current) cache.set(key, {...current, latestSource: {...result, models: s.models}, preview: null, previewEpoch: -1});
+      return;
+    }
+    setState(next); resetSelection();
+    notice.value = '已保存到原会话，下一次消息使用新上下文；原始聊天与执行记录未改动';
+    emit('saved', result.conversation);
+  } catch (e) { if (stamp === generation && uuid.value === key) error.value = failure(e); }
+  finally { if (stamp === generation) pending.value = ''; }
+}
 async function createBranch() {
   if (!applyPendingRaw()) return;
   const key = uuid.value, stamp = generation, s = state.value;
@@ -221,10 +263,10 @@ function download() { if (!state.value || !applyPendingRaw()) return; const blob
 async function upload(event) {
   const file = event.target.files?.[0], key = uuid.value, stamp = generation;
   event.target.value = '';
-  if (!file || pending.value === 'create') return;
+  if (!file || savingContext.value) return;
   try {
     const pkg = importPackage(JSON.parse(await file.text()));
-    if (disposed || stamp !== generation || uuid.value !== key || pending.value === 'create') return;
+    if (disposed || stamp !== generation || uuid.value !== key || savingContext.value) return;
     const s = state.value; if (!s) throw Error('请先载入会话快照');
     setState({...s, baseline: pkg.baseline, working: pkg.working, mode: pkg.mode, targetModel: pkg.targetModel || s.targetModel, epoch: s.epoch + 1, preview: null, previewEpoch: -1, undo: [], redo: []});
     resetSelection(); error.value = ''; notice.value = '完整基线和编辑稿已导入；源快照仍由服务器检查';
@@ -331,7 +373,7 @@ function saveEntity() {
     </nav>
     <div class="ce-content">
     <header class="ce-heading">
-      <div><h2>上下文编辑</h2><small>只编辑新分支，不改原始对话</small></div>
+      <div><h2>上下文编辑</h2><small>可保存副本或应用到原会话，不改原始聊天记录</small></div>
       <div class="ce-actions"><button type="button" @click="close">← 返回对话</button><button type="button" @click="importInput?.click()">导入</button><button type="button" :disabled="!doc" @click="download">导出完整包</button><input ref="importInput" type="file" accept=".json,application/json" hidden @change="upload"></div>
     </header>
     <div v-if="loading" class="ce-placeholder">正在读取会话上下文…</div>
@@ -341,7 +383,7 @@ function saveEntity() {
       <div class="ce-request">
         <label>目标模型 <select :value="state.targetModel" @change="setting('targetModel', $event.target.value)"><option v-for="model in state.models" :key="model.model" :value="model.model">{{ model.label }} · {{ model.protocol }}</option></select></label>
         <label>模式 <select :value="state.mode" @change="setting('mode', $event.target.value)"><option value="compatible">兼容续聊</option><option value="raw">原始实验（只保存）</option></select></label>
-        <details class="ce-snapshot-summary"><summary>冻结快照 · {{ doc.entries.length }} 条消息</summary><p>分支冻结系统提示、工具定义及已有记忆；不会自动注入新的任务记忆；仍遵循会话压缩设置</p></details>
+        <details class="ce-snapshot-summary"><summary>冻结快照 · {{ doc.entries.length }} 条消息</summary><p>保存到会话后冻结系统提示、工具定义及已有记忆；不会自动注入新的任务记忆；仍遵循会话压缩设置</p></details>
       </div>
       <div class="ce-workspace">
         <aside class="ce-outline" :class="{'has-selection': checked.length > 0}" aria-label="上下文结构">
@@ -424,16 +466,17 @@ function saveEntity() {
             <template v-else>
               <div class="ce-toolbar"><span>实际请求 · 只读，不发送模型</span><button type="button" :disabled="!!pending" @click="preview">{{ pending === 'preview' ? '正在生成…' : '生成预览' }}</button></div>
               <details v-if="hints.length || serverIssues.length" class="ce-preview-validation" :open="!!serverErrors.length || hints.some(i => i.severity === 'error')"><summary>校验提示 · {{ hints.length + serverIssues.length }} 项 <small v-if="serverErrors.length">存在阻止创建的错误</small></summary><section aria-label="预览校验详情"><article v-for="(issue,i) in serverIssues" :key="`server-${i}`" class="ce-issue" :class="issue.severity"><span>{{ issue.text }}</span><small v-if="issue.path">{{ issue.path }}</small><button v-if="issueTarget(issue)" type="button" @click="inspectIssue(issue)">定位编辑 →</button></article><article v-for="(issue,i) in hints" :key="`local-${i}`" class="ce-issue" :class="issue.severity"><span>{{ issue.text }}</span><button v-if="issueTarget(issue)" type="button" @click="inspectIssue(issue)">定位编辑 →</button></article></section></details>
+              <p v-if="automaticRepair" class="ce-help" role="status">{{ automaticRepair.text }}</p>
               <div v-if="previewReady && state.preview.payload != null" class="ce-editor-fill"><CodeEditor :model-value="payloadText" readonly label="实际请求预览 JSON" /></div>
               <div v-else class="ce-empty ce-preview-empty"><strong>{{ previewReady ? '未生成可用请求' : '尚未生成当前编辑稿的预览' }}</strong><p>{{ previewReady ? '请根据校验提示定位并修正内容。' : '生成服务端实际请求后，可在这里检查 JSON；不会调用模型。' }}</p></div>
-              <small v-if="previewReady" class="ce-help">服务端校验不代表厂商验签通过；编译结果不会覆盖编辑稿。</small>
+              <small v-if="previewReady" class="ce-help">兼容续聊会自动处理受影响的历史思考和签名；预览与保存使用相同结果，不改原始编辑稿。</small>
             </template>
           </div>
         </main>
       </div>
       <footer class="ce-footer">
         <div class="ce-actions"><button type="button" :disabled="!state.undo.length" @click="history('undo')">撤销</button><button type="button" :disabled="!state.redo.length" @click="history('redo')">重做</button><small>{{ changes.length }} 项改动 · {{ state.savedEpoch === state.epoch ? '已保存 / 未改动' : '未保存' }}</small></div>
-        <div class="ce-actions ce-submit"><button type="button" :disabled="!!pending" @click="saveDraft">{{ pending === 'save' ? '保存中…' : '保存草稿' }}</button><button type="button" :disabled="!!pending" @click="preview">校验并预览</button><input v-model="branchTitle" aria-label="新分支标题" placeholder="新分支标题"><button type="button" class="ce-primary" :disabled="!!pending || state.mode !== 'compatible' || !previewReady || state.preview?.payload == null || !!serverErrors.length || hints.some(i => i.severity === 'error') || !!state.latestSource || busy" @click="createBranch">{{ pending === 'create' ? '创建中…' : '创建独立分支' }}</button></div>
+        <div class="ce-actions ce-submit"><button type="button" :disabled="!!pending" @click="saveDraft">{{ pending === 'save' ? '保存中…' : '保存草稿' }}</button><button type="button" :disabled="!!pending" @click="preview">校验并预览</button><input v-model="branchTitle" aria-label="副本标题" placeholder="副本标题"><button type="button" :disabled="!saveReady" @click="createBranch">{{ pending === 'create' ? '保存中…' : '保存副本' }}</button><button type="button" class="ce-primary ce-save-original" :disabled="!saveReady" @click="askSaveOriginal">{{ pending === 'apply' ? '保存中…' : '保存到原会话' }}</button></div>
       </footer>
     </template>
     </div>
@@ -454,13 +497,13 @@ function saveEntity() {
       </template>
       <template #footer><div class="ce-actions"><small>保存前不会改动编辑稿</small><button type="button" @click="entityEditor = null">取消</button><button type="button" class="ce-primary" @click="saveEntity">保存修改</button></div></template>
     </el-dialog>
-    <el-dialog :model-value="!!dialog" class="ce-dialog ce-delete-dialog ce-surface mobile-viewport-dialog" width="min(560px, calc(100vw - 32px))" top="16px" :title="dialog?.kind === 'refresh' ? '加载最新上下文' : '确认删除'" append-to-body destroy-on-close :close-on-click-modal="false" @update:model-value="value => { if (!value) dialog = null; }">
+    <el-dialog :model-value="!!dialog" class="ce-dialog ce-delete-dialog ce-surface mobile-viewport-dialog" width="min(560px, calc(100vw - 32px))" top="16px" :title="dialog?.kind === 'refresh' ? '加载最新上下文' : dialog?.kind === 'apply' ? '保存到原会话' : '确认删除'" append-to-body destroy-on-close :close-on-click-modal="false" @update:model-value="value => { if (!value) dialog = null; }">
       <template v-if="dialog">
-        <p v-if="dialog.kind === 'refresh'">这会放弃当前页的编辑并载入源会话最新上下文。原会话和已保存的服务器草稿不会被删除；只有再次保存新稿时才会替换服务器草稿。</p><p v-else-if="dialog.kind === 'call'">按本批次 call ID 关联，保留其余并行调用。历史工具不会重新执行。</p><p v-else-if="dialog.kind === 'thinking'">删除整组思考，不伪造或重签。当前工具回合原样回放限制仍由服务器校验。</p><p v-else-if="dialog.kind === 'tool'">仅从编辑稿移除此工具定义，不卸载工具，也不删除历史调用。</p><p v-else>以下关联项将联动删除，不补造工具结果。可通过撤销恢复。</p>
+        <p v-if="dialog.kind === 'apply'">将当前 {{ doc.entries.length }} 条消息、系统提示词和工具定义保存到原会话，目标模型为 {{ state.targetModel }}。下一次消息会使用此上下文；原始聊天和工具执行记录不变，不会重新执行历史工具。保存后沿用冻结快照规则，不自动注入新的任务记忆。</p><p v-else-if="dialog.kind === 'refresh'">这会放弃当前页的编辑并载入源会话最新上下文。原会话和已保存的服务器草稿不会被删除；只有再次保存新稿时才会替换服务器草稿。</p><p v-else-if="dialog.kind === 'call'">按本批次 call ID 关联，保留其余并行调用。历史工具不会重新执行。</p><p v-else-if="dialog.kind === 'thinking'">删除整组思考，不伪造或重签。当前工具回合原样回放限制仍由服务器校验。</p><p v-else-if="dialog.kind === 'tool'">仅从编辑稿移除此工具定义，不卸载工具，也不删除历史调用。</p><p v-else>以下关联项将联动删除，不补造工具结果。可通过撤销恢复。</p>
         <label v-if="dialog.kind === 'call'"><input v-model="deleteMode" type="radio" value="paired"> 删除调用及关联返回</label><label v-if="dialog.kind === 'call'"><input v-model="deleteMode" type="radio" value="only"> 仅删调用，保留返回（自动转原始实验模式）</label><label v-if="dialog.kind === 'thinking'"><input v-model="thinkingScope" type="radio" value="suffix" @change="dialog.impact = reasoningImpact(doc,dialog.id,true)"> 本条及之后思考</label><label v-if="dialog.kind === 'thinking'"><input v-model="thinkingScope" type="radio" value="one" @change="dialog.impact = reasoningImpact(doc,dialog.id,false)"> 仅本条（后续签名需另行核对）</label>
-        <div v-if="dialog.kind !== 'refresh'" class="ce-impact"><div v-for="path in dialog.kind === 'call' && deleteMode === 'only' ? dialog.impact.remove.filter(p => !dialog.impact.pair.results.some(id => p === `${id}.message`)) : dialog.kind === 'call' ? dialog.impact.remove : dialog.impact" :key="path">删除 · <code>{{ path }}</code></div><template v-if="dialog.kind === 'call'"><div v-for="id in dialog.impact.retain" :key="id">保留并行调用 · <code>{{ id }}</code></div><template v-if="deleteMode === 'only'"><div v-for="id in dialog.impact.pair.results" :key="id">保留孤儿结果 · <code>{{ id }}</code></div></template></template></div>
+        <div v-if="!['refresh', 'apply'].includes(dialog.kind)" class="ce-impact"><div v-for="path in dialog.kind === 'call' && deleteMode === 'only' ? dialog.impact.remove.filter(p => !dialog.impact.pair.results.some(id => p === `${id}.message`)) : dialog.kind === 'call' ? dialog.impact.remove : dialog.impact" :key="path">删除 · <code>{{ path }}</code></div><template v-if="dialog.kind === 'call'"><div v-for="id in dialog.impact.retain" :key="id">保留并行调用 · <code>{{ id }}</code></div><template v-if="deleteMode === 'only'"><div v-for="id in dialog.impact.pair.results" :key="id">保留孤儿结果 · <code>{{ id }}</code></div></template></template></div>
       </template>
-      <template #footer><div class="ce-actions"><button type="button" @click="dialog = null">取消</button><button type="button" class="ce-primary" @click="confirmDelete">{{ dialog?.kind === 'refresh' ? '放弃本页编辑并加载' : '确认删除' }}</button></div></template>
+      <template #footer><div class="ce-actions"><button type="button" @click="dialog = null">取消</button><button type="button" class="ce-primary" @click="confirmDelete">{{ dialog?.kind === 'refresh' ? '放弃本页编辑并加载' : dialog?.kind === 'apply' ? '保存到原会话' : '确认删除' }}</button></div></template>
     </el-dialog>
   </section>
 </template>

@@ -1,0 +1,109 @@
+diff --git a/hardware.sh b/hardware.sh
+--- a/hardware.sh
++++ b/hardware.sh
+@@ -1,5 +1,11 @@
+ #!/bin/bash
+ script_version="v2026-05-21"
++if [[ -n ${OB_BENCH_DIR:-} ]];then
++geekbench5(){
++"$OB_BENCH_DIR/bin/geekbench/geekbench5" "$@" 2>&1|awk '{gsub(/\/claim\?key=[^[:space:]]+/, ""); print; fflush()}'
++return "${PIPESTATUS[0]}"
++}
++fi
+ check_bash(){
+ current_bash_version=$(bash --version|head -n 1|awk -F ' ' '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {print $i; exit}}'|cut -d . -f 1)
+ if [ "$current_bash_version" = "0" ]||[ "$current_bash_version" = "1" ]||[ "$current_bash_version" = "2" ]||[ "$current_bash_version" = "3" ];then
+@@ -487,6 +493,7 @@
+ esac
+ }
+ countRunTimes(){
++[[ -n $OB_BENCH_DIR ]]&&{ stail[stoday]="";stail[stotal]="";stail[thanks]="${stail[thanks]#。}";stail[thanks]="${stail[thanks]#. }";return; }
+ local RunTimes=$(curl $CurlARG -s --max-time 10 "https://hits.xykt.de/hardware?action=hit" 2>&1)
+ stail[today]=$(echo "$RunTimes"|jq '.daily')
+ stail[total]=$(echo "$RunTimes"|jq '.total')
+@@ -656,6 +663,7 @@
+ esac
+ }
+ install_geekbench5(){
++[[ -n ${OB_BENCH_DIR:-} ]]&&{ echo "OpenBear Geekbench 5 package is missing" >&2;return 1; }
+ local GB_VER="5.5.1"
+ local GB_BASE_URL="https://cdn.geekbench.com"
+ local tmpdir arch pkg url
+@@ -701,7 +709,7 @@
+ trap cleanup_local RETURN
+ trap on_int INT
+ trap on_term TERM
+-if ! curl -L --fail -o "$tmpdir/$pkg" "$url";then
++if ! curl -L --fail --connect-timeout 10 --max-time 600 -o "$tmpdir/$pkg" "$url";then
+ echo "Failed to download Geekbench5."
+ return 1
+ fi
+@@ -759,9 +767,11 @@
+ http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" "$url" 2>/dev/null)
+ if [[ $http_code == "204" ]];then
+ rawgithub="https://github.com/xykt/HardwareQuality/raw/"
++[[ -n $OB_BENCH_DIR ]]&&{ ob_google=1;rawgithub="file://$OB_BENCH_DIR/"; }
+ return 0
+ else
+ rawgithub="https://testingcf.jsdelivr.net/gh/xykt/HardwareQuality@"
++[[ -n $OB_BENCH_DIR ]]&&rawgithub="file://$OB_BENCH_DIR/"
+ return 1
+ fi
+ }
+@@ -1523,7 +1533,7 @@
+ if command -v curl-impersonate >/dev/null 2>&1;then
+ local attempt
+ for ((attempt=1; attempt<=5; attempt++));do
+-tmpresu="$(curl-impersonate -s --compressed --impersonate "chrome146" "$url")"
++tmpresu="$(curl-impersonate -s --connect-timeout 10 --max-time 30 --compressed --impersonate "chrome146" "$url")"
+ if [[ -n $tmpresu ]]&&grep -q "<div class='score'>" <<<"$tmpresu";then
+ break
+ fi
+@@ -1816,7 +1826,7 @@
+ if command -v curl-impersonate >/dev/null 2>&1;then
+ local attempt
+ for ((attempt=1; attempt<=5; attempt++));do
+-tmpresu="$(curl-impersonate -s --compressed --impersonate "chrome146" "$url")"
++tmpresu="$(curl-impersonate -s --connect-timeout 10 --max-time 30 --compressed --impersonate "chrome146" "$url")"
+ if [[ -n $tmpresu ]]&&grep -q "<div class='score'>" <<<"$tmpresu";then
+ break
+ fi
+@@ -2979,6 +2989,7 @@
+ done
+ payload+="}"
+ local resp
++[[ -n $OB_BENCH_DIR && $mode_privacy -eq 1 ]]&&return
+ resp=$(curl -fsS --max-time 10 -H "Content-Type: application/json" -d "$payload" https://mark.check.place 2>/dev/null)||return
+ for k in cpu gpu mem disk total;do
+ if [[ -n ${markinfo[$k]} ]];then
+@@ -4316,6 +4327,7 @@
+ exit 0
+ }
+ show_ad(){
++[[ -n $OB_BENCH_DIR ]]&&{ ADLines=0;return; }
+ RANDOM=$(date +%s)
+ local -a ads=()
+ local i=1
+@@ -5192,8 +5204,8 @@
+ [[ $mode_skip != *"7"* && $mode_fast != 1 && ($mode_skip != *3* || $mode_skip != *4* || $mode_skip != *5* || $mode_skip != *6*) ]]&&show_mark
+ show_tail)
+ local report_link=""
+-[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 ]]&&save_json
+-[[ mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s -X POST http://upload.check.place -d "type=hardware" --data-urlencode "json=$hwjson" --data-urlencode "content=$hw_report")
++[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 || -n $OB_BENCH_OUT ]]&&save_json
++[[ mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s --connect-timeout 10 --max-time 60 -X POST https://upload.check.place -d "type=hardware" --data-urlencode "json=$hwjson" --data-urlencode "content=$hw_report")
+ [[ mode_json -eq 0 ]]&&echo -ne "\r$hw_report\n"
+ [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
+ [[ mode_json -eq 1 ]]&&echo -ne "\r$hwjson\n"
+@@ -5206,6 +5218,11 @@
+ ;;
+ *)echo -e "$hw_report"|sed 's/\x1b\[[0-9;]*[mGKHF]//g' >>"$outputfile" 2>/dev/null
+ esac
++fi
++if [[ -n $OB_BENCH_OUT ]];then
++echo "$hw_report" >"$OB_BENCH_OUT/report-$2.ansi"
++echo "$hwjson" >"$OB_BENCH_OUT/result-$2.json"
++[[ -n $report_link ]]&&echo "$report_link" >"$OB_BENCH_OUT/link-$2.txt"
+ fi
+ }
+ adaptoslocale

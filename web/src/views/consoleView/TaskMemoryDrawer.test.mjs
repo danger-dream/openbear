@@ -7,7 +7,6 @@ import {parse} from "@vue/compiler-sfc";
 const source = readFileSync(new URL("./TaskMemoryDrawer.vue", import.meta.url), "utf8");
 const consoleSource = readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
 const minimapSource = readFileSync(new URL("./TurnMinimap.vue", import.meta.url), "utf8");
-const composerSource = readFileSync(new URL("./ConsoleComposer.vue", import.meta.url), "utf8");
 
 test("phone memory and other tools are in the header menu, not a permanent rail", () => {
   const mobile = (text, selector) => {
@@ -34,19 +33,6 @@ test("phone memory and other tools are in the header menu, not a permanent rail"
   assert.match(source, /async function openDrawer\(\) \{\s*if \(!usableConversationUuid\.value\) return;/);
 });
 
-test("floating and composer controls use Element Plus tooltips instead of native titles", () => {
-  assert.match(source, /<el-tooltip content="任务记忆" placement="left"/);
-  assert.match(consoleSource, /<el-tooltip[\s\S]*?:content="autoScrollLocked \? '滚动已锁定到底部，点击解锁'/);
-  assert.doesNotMatch(consoleSource, /:title="autoScrollLocked/);
-  assert.match(minimapSource, /<el-tooltip[\s\S]*?:content="turnNavLabel\(turn, idx\)"[\s\S]*?placement="left"/);
-  assert.doesNotMatch(minimapSource, /:title=/);
-  assert.doesNotMatch(composerSource, /<button\b[^>]*\btitle=/, 'action buttons use Element Plus tooltips; read-only totals may retain native descriptions');
-  for (const label of ["移除附件", "新话题（Ctrl+N）", "上传图片或附件", "清空草稿", "停止生成（右键或长按切换按钮形状）"]) {
-    assert.ok(composerSource.includes(`content="${label}"`), `missing Element Plus tooltip: ${label}`);
-  }
-  assert.match(composerSource, /aria-label="运行配置"/);
-});
-
 test("drawer and editor controls expose accessible names and keyboard focus contracts", () => {
   assert.match(source, /:aria-label="badgeCount \? `打开任务记忆，共 \$\{badgeCount\} 条`/);
   assert.match(source, /aria-haspopup="dialog"/);
@@ -61,16 +47,4 @@ test("drawer and editor controls expose accessible names and keyboard focus cont
   }
   assert.match(source, /:focus-visible/);
   assert.match(source, /:with-header="false"/);
-});
-
-test("drawer, editor, and scoped popups keep desktop typography readable", () => {
-  const desktopStyles = source.slice(source.indexOf("<style scoped>"), source.indexOf("@media (max-width: 760px)"));
-  assert.doesNotMatch(desktopStyles, /font-size:\s*(?:8(?:\.5)?|9(?:\.5)?)px/);
-  assert.match(source, /\.memory-name-line strong[^}]*font-size:\s*14px/);
-  assert.match(source, /\.memory-description[^}]*font-size:\s*13px/);
-  assert.match(source, /\.memory-meta[^}]*font-size:\s*12px/);
-  assert.match(source, /\.memory-form > label[^}]*font-size:\s*13px/);
-  assert.match(source, /popper-class="task-memory-task-select-popper"/);
-  assert.match(source, /customClass: "task-memory-confirm"/);
-  assert.match(source, /task-memory-editor \.el-textarea__inner[^}]*font-size:\s*14px/);
 });

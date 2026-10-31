@@ -10,7 +10,7 @@ from app.config_store import ConfigConflictError, ConfigStore
 
 def _sample_config() -> dict:
     return {
-        "telegram": {"botToken": "123:abc", "whitelistIds": [5352767013]},
+        "telegram": {"botToken": "123:abc", "whitelistIds": [424242424]},
         "models": {
             "providers": {
                 "openai": {

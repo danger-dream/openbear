@@ -66,6 +66,11 @@ class WebAdminAppMixin:
         if getattr(self, "instances", None) is not None:
             from app.instances.http import install as install_instances
             install_instances(app, self, self.instances)
+        if getattr(self, "servers", None) is not None:
+            from app.servers.http import install as install_servers
+            install_servers(app, self, self.servers)
+            from app.ddns.http import install as install_ddns
+            install_ddns(app, self, self.servers)
         app.cleanup_ctx.append(self._realtime_context)
         app.cleanup_ctx.append(self._web_push_context)
         app.on_shutdown.append(self._realtime_shutdown)
@@ -83,6 +88,8 @@ class WebAdminAppMixin:
             web.get("/webhooks", self.handle_index),
             web.get("/cron", self.handle_index),
             web.get("/instances", self.handle_index),
+            web.get("/servers", self.handle_index),
+            web.get("/ddns", self.handle_index),
             web.get("/assets/{path:.*}", self.handle_asset),
             *(web.get(path, self.handle_pwa_asset) for path in PWA_PUBLIC_FILES),
             web.get("/api/auth/mode", self.handle_api_auth_mode),
@@ -112,12 +119,14 @@ class WebAdminAppMixin:
             web.get("/api/conversation-tree/locate/{conversation_uuid}", self.handle_api_conversation_tree_locate),
             web.post("/api/conversation-tree/move/impact", self.handle_api_conversation_tree_move_impact),
             web.post("/api/conversation-tree/move", self.handle_api_conversation_tree_move),
+            web.post("/api/conversation-retention/preview", self.handle_api_conversation_retention_preview),
             web.post("/api/conversation-folders", self.handle_api_conversation_folder_create),
             web.patch("/api/conversation-folders/{folder_uuid}", self.handle_api_conversation_folder_patch),
             web.get("/api/conversation-folders/{folder_uuid}/properties", self.handle_api_conversation_folder_properties),
             web.post("/api/conversation-folders/{folder_uuid}/properties/impact", self.handle_api_conversation_folder_properties_impact),
             web.put("/api/conversation-folders/{folder_uuid}/properties", self.handle_api_conversation_folder_properties_update),
             web.post("/api/conversation-folders/{folder_uuid}/delete", self.handle_api_conversation_folder_delete),
+            web.post("/api/conversations/batch", self.handle_api_conversation_batch),
             web.get("/api/conversations/defaults", self.handle_api_conversation_defaults),
             web.patch("/api/conversations/defaults", self.handle_api_conversation_defaults_patch),
             web.get("/api/conversations/{conversation_uuid}/properties", self.handle_api_conversation_properties),
@@ -137,6 +146,8 @@ class WebAdminAppMixin:
             web.get("/api/conversations/{conversation_uuid}/state", self.handle_api_conversation_state),
             web.get("/api/conversations/{conversation_uuid}/operations", self.handle_api_conversation_operations),
             web.get("/api/conversations/{conversation_uuid}/operations/{operation_id}/detail", self.handle_api_conversation_operation_detail),
+            web.get("/api/conversations/{conversation_uuid}/operations/{operation_id}/file", self.handle_api_conversation_tool_file),
+            web.get("/api/conversations/{conversation_uuid}/operations/{operation_id}/file/content", self.handle_api_conversation_tool_file_content),
             web.get("/api/conversations/{conversation_uuid}/search", self.handle_api_conversation_search),
             web.get("/api/conversations/{conversation_uuid}/operations/{operation_id}/window", self.handle_api_conversation_operation_window),
             web.get("/api/conversations/{conversation_uuid}/compactions/{summary_id:\\d+}", self.handle_api_conversation_compaction),
@@ -153,8 +164,10 @@ class WebAdminAppMixin:
             web.get("/api/reference-catalog", self.handle_api_reference_catalog),
             web.post("/api/references/preview", self.handle_api_reference_preview),
             web.post("/api/references/inspect", self.handle_api_reference_inspect),
+            web.get("/api/references/servers", self.handle_api_reference_servers),
             web.get("/api/reference-history/{conversation_uuid}", self.handle_api_reference_history),
             web.get("/api/conversations/{conversation_uuid}/context-editor", self.handle_api_context_editor),
+            web.put("/api/conversations/{conversation_uuid}/context-editor", self.handle_api_context_editor_save),
             web.post("/api/conversations/{conversation_uuid}/context-editor/preview", self.handle_api_context_editor_preview),
             web.put("/api/conversations/{conversation_uuid}/context-editor/draft", self.handle_api_context_editor_draft),
             web.post("/api/conversations/{conversation_uuid}/context-editor/branch", self.handle_api_context_editor_branch),
@@ -176,6 +189,16 @@ class WebAdminAppMixin:
             web.patch("/api/conversations/{conversation_uuid}/task-memories/{memory_uuid}", self.handle_api_task_memory_update),
             web.delete("/api/conversations/{conversation_uuid}/task-memories/{memory_uuid}", self.handle_api_task_memory_delete),
             web.post("/api/conversations/{conversation_uuid}/task-memories/{memory_uuid}/restore", self.handle_api_task_memory_restore),
+            web.get("/api/conversations/{conversation_uuid}/work-items", self.handle_api_work_items),
+            web.get("/api/conversations/{conversation_uuid}/work-items/{number}", self.handle_api_work_item_detail),
+            web.patch("/api/conversations/{conversation_uuid}/work-items/{number}", self.handle_api_work_item_update),
+            web.delete("/api/conversations/{conversation_uuid}/work-items/{number}", self.handle_api_work_item_delete),
+            web.post("/api/conversations/{conversation_uuid}/work-items/{number}/children", self.handle_api_work_item_add),
+            web.post("/api/conversations/{conversation_uuid}/work-items/{number}/drop", self.handle_api_work_item_drop),
+            web.post("/api/conversations/{conversation_uuid}/work-items/{number}/reopen", self.handle_api_work_item_reopen),
+            web.get("/api/conversations/{conversation_uuid}/work-items/{number}/file", self.handle_api_work_item_file),
+            web.get("/api/conversations/{conversation_uuid}/work-items/{number}/file/content", self.handle_api_work_item_file_content),
+            web.get("/api/conversations/{conversation_uuid}/work-items/{number}/file/diff", self.handle_api_work_item_file_diff),
             web.post("/api/conversations/{conversation_uuid}/duplicate", self.handle_api_conversation_duplicate),
             web.post("/api/conversations/{conversation_uuid}/reorder", self.handle_api_conversation_reorder),
             web.post("/api/conversations/{conversation_uuid}/pin", self.handle_api_conversation_pin),

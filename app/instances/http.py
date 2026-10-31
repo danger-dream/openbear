@@ -70,6 +70,8 @@ def install(app, host, service):
     async def relay(r, o): return await service.request(o, r.match_info['id'], await body(r))
     async def archive(r, o): return await service.archive(o, r.match_info['id'])
     async def gateway_sync(r, o): return await service.gateway.sync(o, r.match_info['id'])
+    async def rotate_keys(r, o): return await service.rotate_keys(o, r.match_info['id'])
+    async def migrate_network(r, o): return await service.migrate_network(o, r.match_info['id'])
     async def folder(r, o): return await service.folder(o)
     async def model_options(r, o): return service.model_options()
     async def gateway_get(r, o): return await service.gateway.get()
@@ -77,6 +79,9 @@ def install(app, host, service):
     async def gateway_disable(r, o): return await service.gateway.disable(o)
     async def gateway_url(r, o): return await service.gateway.set_public_url(o, (await body(r)).get('publicUrl'))
     async def gateway_ip(r, o): return await service.gateway.set_client_ip(await body(r))
+    async def gateway_rotate(r, o): return await service.gateway.rotate_all(o)
+    async def gateway_update(r, o): return await service.gateway.update(o)
+    async def gateway_auto_update(r, o): return await service.gateway.set_auto_update(await body(r))
     async def gateway_port(r, o): return await service.gateway.check_port(o, r.query.get('serverId', ''), port(r))
     async def gateway_suggest(r, o): return await service.gateway.suggest(o, r.query.get('serverId', ''), port(r))
     async def servers(r, o): return await service.servers.list(o)
@@ -97,7 +102,8 @@ def install(app, host, service):
         ('GET', '/api/instance-gateway', gateway_get), ('POST', '/api/instance-gateway/enable', gateway_enable),
         ('POST', '/api/instance-gateway/disable', gateway_disable), ('PUT', '/api/instance-gateway/public-url', gateway_url),
         ('PUT', '/api/instance-gateway/client-ip', gateway_ip), ('GET', '/api/instance-gateway/port', gateway_port),
-        ('GET', '/api/instance-gateway/suggest', gateway_suggest),
+        ('GET', '/api/instance-gateway/suggest', gateway_suggest), ('POST', '/api/instance-gateway/rotate-keys', gateway_rotate),
+        ('POST', '/api/instance-gateway/update', gateway_update), ('PUT', '/api/instance-gateway/auto-update', gateway_auto_update),
         ('GET', '/api/instance-servers', servers), ('POST', '/api/instance-servers', server_create),
         ('POST', '/api/instance-servers/test', server_test), ('GET', '/api/instance-servers/ssh-keys', ssh_keys),
         ('PATCH', '/api/instance-servers/{id}', server_update), ('DELETE', '/api/instance-servers/{id}', server_delete),
@@ -110,5 +116,6 @@ def install(app, host, service):
         ('POST', '/{id}/deploy', deploy), ('POST', '/{id}/maintenance', maintenance), ('POST', '/{id}/gateway-sync', gateway_sync),
         ('POST', '/{id}/verify', verify), ('GET', '/{id}/operations', operations), ('GET', '/{id}/events', events),
         ('POST', '/{id}/request', relay), ('POST', '/{id}/archive', archive),
+        ('POST', '/{id}/rotate-keys', rotate_keys), ('POST', '/{id}/migrate-network', migrate_network),
     ]:
         app.router.add_route(method, '/api/instances'+path, wrap(fn))

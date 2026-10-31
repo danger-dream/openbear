@@ -22,6 +22,7 @@ const pathText = computed(() => conversationPathText(props.conversationPath));
 const tokenValue = computed(() => props.tokensText.replace(/[KM]$/, ""));
 const tokenUnit = computed(() => props.tokensText.match(/[KM]$/)?.[0] || "");
 const durationParts = computed(() => headerDurationParts(props.durationMs));
+const runStatusText = computed(() => props.status && props.status !== "就绪" ? props.status : "运行中");
 </script>
 
 <template>
@@ -35,7 +36,14 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 						<AnimatedConversationTitle :text="props.title" :identity="props.titleIdentity" />
 					</h1>
 				</div>
-				<span v-if="props.running" class="header-mobile-running" role="status" aria-label="运行中" title="运行中"><i aria-hidden="true"></i></span>
+				<Transition name="header-mobile-run">
+					<div v-if="props.running" class="header-mobile-run">
+						<i aria-hidden="true"></i>
+						<span class="header-mobile-run-clock" title="本次运行耗时" v-elapsed="{ startAt: props.runStartedAt, active: props.running, format: 'hours-clock', fallback: '00:00' }">00:00</span>
+						<span class="header-mobile-run-sep" aria-hidden="true">·</span>
+						<span class="header-mobile-run-status" role="status">{{ runStatusText }}</span>
+					</div>
+				</Transition>
 			</div>
 		</div>
 		<dl class="header-metrics" aria-label="会话运行及累计统计">
@@ -74,7 +82,7 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 <style scoped>
 .header-mobile-navigation,
 .header-mobile-actions,
-.header-mobile-running { display: none; }
+.header-mobile-run { display: none; }
 
 .console-header {
 	position: relative;
@@ -193,8 +201,36 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 	.header-subtitle { display: none; }
 	.header-title-row { flex: 1; overflow: hidden; }
 	.header-title { margin-top: 0; }
-	.header-mobile-running { display: inline-flex; position: absolute; right: 0; top: 50%; transform: translateY(-50%); width: 6px; height: 6px; color: var(--ob-success); }
-	.header-mobile-running i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+	/* Clock first: phase labels change length, the clock must not move with them. */
+	.header-mobile-run {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		max-height: 15px;
+		margin-top: 1px;
+		overflow: hidden;
+		color: var(--ob-chat-muted);
+		font-size: 10.5px;
+		line-height: 15px;
+		font-variant-numeric: tabular-nums lining-nums;
+		white-space: nowrap;
+	}
+	.header-mobile-run i { width: 5px; height: 5px; flex: none; border-radius: 50%; background: var(--ob-success); animation: header-run-pulse 1.6s ease-in-out infinite; }
+	.header-mobile-run-clock { flex: none; color: var(--ob-success); font-weight: 500; }
+	.header-mobile-run-sep { flex: none; }
+	.header-mobile-run-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+	.header-mobile-run-enter-active,
+	.header-mobile-run-leave-active { transition: max-height .18s ease, margin-top .18s ease, opacity .18s ease; }
+	.header-mobile-run-enter-from,
+	.header-mobile-run-leave-to { max-height: 0; margin-top: 0; opacity: 0; }
 	.header-metrics { display: none; }
+}
+
+@keyframes header-run-pulse { 50% { opacity: .35; } }
+
+@media (prefers-reduced-motion: reduce) {
+	.header-mobile-run i { animation: none; }
+	.header-mobile-run-enter-active,
+	.header-mobile-run-leave-active { transition: none; }
 }
 </style>

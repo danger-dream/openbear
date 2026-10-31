@@ -1,0 +1,74 @@
+{
+  "tool": "net.check.place",
+  "version": "v0.1.0",
+  "name": "Net.Check.Place",
+  "upstream": {
+    "repo": "https://github.com/xykt/NetQuality",
+    "commit": "d5b99484d51286374d24b892c1b54235dc282148",
+    "date": "2026-09-01",
+    "license": "AGPL-3.0"
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "net.sh",
+  "files": {
+    "net.sh": "7c816639af75acf6baa3b34282ac45ffb572eda47a0227dfe2643630a4a2735e",
+    "main/ref/iso3166.json": "e1434e42786484b1841082a0a16cf27208691443dc6440d125ad81d49007ea42",
+    "main/ref/province.json": "a2b8fd700adc16a95dfc9d1671dfca6c1bb0ea3d8f94bf11e8fce2a7c15807e1",
+    "main/ref/AS_Mapping.txt": "18596092c50e95ba23a6e997dc1ed823e4b01401034ffa2068a69e3a05c3cc50",
+    "main/ref/iperf.json": "83170b97007fd9f3792934943d2120cd0c6650b6499ac56c67056f9d20c43298",
+    "main/ref/speedtest_cn.json": "ec153fa9b0db16abbb0c93e6eacba6494ce56fc9427d3ea0afe21a9126279d87"
+  },
+  "binaries": [
+    {
+      "platform": "linux/amd64",
+      "dest": "bin/nexttrace",
+      "url": "https://github.com/nxtrace/NTrace-core/releases/download/v1.7.5/nexttrace_linux_amd64",
+      "sha256": "7d7fa3bdd967494d1c051766696dea753bc6f4a1d95c2016fdfa078cf1894ff6",
+      "size": 11501672
+    },
+    {
+      "platform": "linux/arm64",
+      "dest": "bin/nexttrace",
+      "url": "https://github.com/nxtrace/NTrace-core/releases/download/v1.7.5/nexttrace_linux_arm64",
+      "sha256": "820a736c60aca52683b5a4c7fa256d7a4248db37f28f2c16ff6daf76a8b0ee87",
+      "size": 9938524
+    },
+    {
+      "platform": "linux/amd64",
+      "dest": "bin/speedtest",
+      "url": "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz",
+      "unpack": "tar",
+      "member": "speedtest",
+      "sha256": "5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7",
+      "size": 1106829
+    },
+    {
+      "platform": "linux/arm64",
+      "dest": "bin/speedtest",
+      "url": "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz",
+      "unpack": "tar",
+      "member": "speedtest",
+      "sha256": "3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3",
+      "size": 1082287
+    },
+    {
+      "platform": "linux/amd64",
+      "dest": "bin/stun",
+      "url": "https://github.com/xykt/NetQuality/raw/d5b99484d51286374d24b892c1b54235dc282148/ref/stun/stun_amd64",
+      "sha256": "ab83fd14b770185c2d45df714175774ae4b60e089f6dc9baaff582beea301d5f",
+      "size": 55816
+    },
+    {
+      "platform": "linux/arm64",
+      "dest": "bin/stun",
+      "url": "https://github.com/xykt/NetQuality/raw/d5b99484d51286374d24b892c1b54235dc282148/ref/stun/stun_arm64",
+      "sha256": "dfa68621268777f9bf3369644295cceef5cac6cbacb3e563dfc7d4fa8371fc41",
+      "size": 55776
+    }
+  ],
+  "patch": "openbear.patch",
+  "built": "2026-10-31"
+}

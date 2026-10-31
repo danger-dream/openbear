@@ -37,7 +37,7 @@ function runtime() {
   const script = source.split('<script setup>')[1].split('</script>')[0].replace(/^import .*;\n/gm, '');
   const calls = [], errors = [], success = [];
   let stored = 2 * MB;
-  const ctx = vm.createContext({...Vue, authMode: Vue.ref('controller'), onMounted:()=>{},
+  const ctx = vm.createContext({...Vue, authMode: Vue.ref('controller'), onMounted:()=>{}, applyFeatureSettings:()=>{},
     settingDisplayValue, settingStorageValue, settingRangeLabel,
     Api:{updateSetting:async (path, value)=>{calls.push({path,value});stored=value;return {ok:true};},
       settings:async()=>({ok:true, values:{[body.path]:stored}})},

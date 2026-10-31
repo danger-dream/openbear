@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from app.cron.contracts import CronError, JobConfig
 from app.runtime.tool_result import ToolOutcome
 from app.tools.base import current_tool_context
+from app.tools.servers import automatic_turn
 from app.webhooks.contracts import WebhookError, dumps
 from app.webhooks.repository import one
 
@@ -45,6 +46,14 @@ async def dispatch(s, action, params, ctx):
     if action in ('update', 'delete', 'set_enabled', 'run') and (not isinstance(job_id, str) or not job_id.strip()):
         raise CronError('job_id_required')
     body = {k: v for k, v in params.items() if k not in ('jobId', 'runId')}
+    if action in ('create', 'update', 'set_enabled', 'run') and await automatic_turn(s.db.conn, ctx):
+        # An unattended run never grants a task the right to change servers and instances, and never rewrites, enables
+        # or starts a task that has it: that would run whatever it wrote with the permission. Disabling stays allowed.
+        disabling = action == 'set_enabled' and body.get('enabled') is False
+        if action != 'create' and not disabling and (await s.get(owner, job_id))['job']['config'].get('allowServerChanges'):
+            raise CronError('automatic_privileged_task_forbidden', '自动执行的对话不能修改、启用或运行已允许改动服务器和实例的定时任务', status=403)
+        if action in ('create', 'update') and grants_server_changes(body.get('config')):
+            raise CronError('automatic_permission_forbidden', '自动执行的对话不能开启“允许改动服务器和实例”', status=403)
     if action == 'create': return await s.save(owner, body)
     if action == 'update': return await s.save(owner, body, job_id)
     if action == 'set_enabled': return await s.set_enabled(owner, job_id, body)
@@ -64,6 +73,10 @@ async def dispatch(s, action, params, ctx):
             return {'cancelled': True, 'userFeedback': answer}
         return await s.delete(owner, job_id, {'confirmationToken': prepared['confirmationToken'], 'requestId': body.get('requestId')}, tool_request=body)
     raise CronError('invalid_action')
+
+
+def grants_server_changes(config):
+    return isinstance(config, dict) and (config.get('allowServerChanges') is True or config.get('allow_server_changes') is True)
 
 
 def register_cron_tool(registry, service):

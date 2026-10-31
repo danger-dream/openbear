@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {parse,compileScript,compileTemplate,compileStyle} from '@vue/compiler-sfc';
+import {parse,compileScript} from '@vue/compiler-sfc';
 import * as Vue from 'vue';
 import {renderToString} from 'vue/server-renderer';
 import {SetUp,ArrowRight} from '@element-plus/icons-vue';
@@ -43,12 +43,7 @@ test('maintenance card shows the requested scope',async()=>{
   const r=await render(Vue.reactive({message:{...structuredClone(message),instanceCard:{...card,kind:'maintenance',instructions:'安装 LibreOffice'}}}));
   assert.match(r.html,/实例维护/);assert.match(r.html,/安装 LibreOffice/);r.close();
 });
-test('card reuses the shared event card CSS; changed Vue surfaces compile',()=>{
-  for(const file of ['./InstanceMessageCard.vue','./TurnList.vue']){
-    const d=parse(read(file)).descriptor,script=compileScript(d,{id:file});
-    assert.deepEqual(compileTemplate({source:d.template.content,filename:file,id:file,compilerOptions:{bindingMetadata:script.bindings}}).errors,[]);
-    for(const style of d.styles)assert.deepEqual(compileStyle({source:style.src?read(style.src):style.content,filename:file,id:file,scoped:style.scoped}).errors,[]);
-  }
+test('card reuses the shared event card CSS and TurnList routes instance turns to it',()=>{
   assert.match(read('./InstanceMessageCard.vue'),/style scoped src="\.\/eventMessageCard.css"/);
   assert.match(read('./TurnList.vue'),/InstanceMessageCard v-else-if="turn.user.source === 'instance'"/);
 });

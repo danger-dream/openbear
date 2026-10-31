@@ -1,0 +1,24 @@
+{
+  "name": "Net.Check.Place",
+  "repo": "https://github.com/xykt/NetQuality",
+  "license": "AGPL-3.0",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "net.sh",
+  "files": {
+    "net.sh": "net.sh",
+    "main/ref/iso3166.json": "ref/iso3166.json",
+    "main/ref/province.json": "ref/province.json",
+    "main/ref/AS_Mapping.txt": "ref/AS_Mapping.txt",
+    "main/ref/iperf.json": "ref/iperf.json",
+    "main/ref/speedtest_cn.json": "ref/speedtest_cn.json"
+  },
+  "keep": ["LICENSE"],
+  "binaries": [
+    {"platform": "linux/amd64", "dest": "bin/nexttrace", "url": "https://github.com/nxtrace/NTrace-core/releases/download/v1.7.5/nexttrace_linux_amd64"},
+    {"platform": "linux/arm64", "dest": "bin/nexttrace", "url": "https://github.com/nxtrace/NTrace-core/releases/download/v1.7.5/nexttrace_linux_arm64"},
+    {"platform": "linux/amd64", "dest": "bin/speedtest", "url": "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz", "unpack": "tar", "member": "speedtest"},
+    {"platform": "linux/arm64", "dest": "bin/speedtest", "url": "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz", "unpack": "tar", "member": "speedtest"},
+    {"platform": "linux/amd64", "dest": "bin/stun", "url": "https://github.com/xykt/NetQuality/raw/d5b99484d51286374d24b892c1b54235dc282148/ref/stun/stun_amd64"},
+    {"platform": "linux/arm64", "dest": "bin/stun", "url": "https://github.com/xykt/NetQuality/raw/d5b99484d51286374d24b892c1b54235dc282148/ref/stun/stun_arm64"}
+  ]
+}

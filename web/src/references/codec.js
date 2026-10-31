@@ -1,8 +1,10 @@
 import MarkdownIt from 'markdown-it';
 
 export const REFERENCE_MIME = 'application/x-openbear-reference+json';
-export const REFERENCE_KINDS = ['mem', 'doc', 'secret', 'chat', 'turn', 'message'];
-export const KIND_LABELS = {mem: '记忆', doc: '文档', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息'};
+export const REFERENCE_KINDS = ['mem', 'doc', 'secret', 'chat', 'turn', 'message', 'server'];
+export const KIND_LABELS = {mem: '记忆', doc: '文档', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息', server: '服务器'};
+// Same allow-list as app/reference_servers.py SERVER_ID ('local' or a registry UUID).
+export const SERVER_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const referencePattern = /\[((?:\\.|[^\[\]\\\n])*)\]\((openbear:\/\/ref\/[^\s)]+)\)/g;
 // Keep this syntax-only preset aligned with app/references.py.
 const referenceMarkdown = new MarkdownIt('default', {html:false,linkify:false});
@@ -13,6 +15,7 @@ export function normalizeReference(input) {
   const id = String(input.id || input.conversationUuid || '');
   if (!id || id.length > 160 || /[\r\n\0]/.test(id)) return null;
   if (['mem','doc','secret'].includes(input.kind) && (!/^[1-9]\d*$/.test(id) || BigInt(id) > 9223372036854775807n)) return null;
+  if (input.kind === 'server' && !SERVER_ID_PATTERN.test(id)) return null;
   const ref = {kind: input.kind, id, label: String(input.label || input.title || input.name || id).slice(0,300), scope: input.scope === 'recent' ? 'recent' : 'full'};
   if (input.mode === 'mention') {
     ref.mode = 'mention';
@@ -147,5 +150,5 @@ export function documentToText(doc) {
 }
 export function referenceErrorText(error) {
   const code = typeof error === 'string' ? error : error?.code || error?.error || '';
-  return ({invalid_reference_mode:'引用模式无效，请重新选择引用内容或仅提及',reference_unavailable:'引用对象已删除、停用或无法访问，请检查胶囊',history_output_limit:'引用内容超过 History 单次输出上限，请缩小会话范围',reference_budget_exceeded:'引用材料超出当前模型输入预算，请缩小范围或移除部分引用',too_many_references:'单条消息最多引用 30 个不同对象',protected_storage_unavailable:'凭证保护存储不可用，请先检查服务端配置'})[code] || code || '引用内容暂时无法读取';
+  return ({invalid_reference_mode:'引用模式无效，请重新选择引用内容或仅提及',reference_unavailable:'引用对象已删除、停用或无法访问，请检查胶囊',history_output_limit:'引用内容超过 History 单次输出上限，请缩小会话范围',reference_budget_exceeded:'引用材料超出当前模型输入预算，请缩小范围或移除部分引用',too_many_references:'单条消息最多引用 30 个不同对象',protected_storage_unavailable:'凭证保护存储不可用，请先检查服务端配置',servers_feature_disabled:'主机功能已关闭，不能引用服务器；请在系统设置中开启或移除服务器胶囊',servers_unavailable:'服务器列表暂时无法读取，请稍后重试'})[code] || code || '引用内容暂时无法读取';
 }

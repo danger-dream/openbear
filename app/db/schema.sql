@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS web_conversation_folders (
   prompt_markdown       TEXT NOT NULL DEFAULT '',
   -- Sparse per-field overrides; missing keys inherit, false/null remain explicit.
   run_defaults_json     TEXT NOT NULL DEFAULT '{}',
+  hide_from_recent      INTEGER NOT NULL DEFAULT 0,
   pinned_at             INTEGER NOT NULL DEFAULT 0,
   display_order         REAL,
   created_at            INTEGER NOT NULL DEFAULT 0,

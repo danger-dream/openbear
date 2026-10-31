@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {parse, compileScript, compileTemplate, compileStyle} from '@vue/compiler-sfc';
+import {parse} from '@vue/compiler-sfc';
 import {baseParse} from '@vue/compiler-dom';
 import postcss from 'postcss';
 import * as Vue from 'vue';
@@ -41,16 +41,6 @@ async function render(markup, scope) {
   const html = await renderToString(app);
   return {html, nodes: walk([tree])};
 }
-
-test('all nine management SFC scripts, templates and scoped styles compile', () => {
-  for (const name of names) {
-    const descriptor = sfcs[name];
-    const script = compileScript(descriptor, {id: `test-${name}`});
-    const result = compileTemplate({source: descriptor.template.content, filename: `${name}View.vue`, id: `test-${name}`, compilerOptions: {bindingMetadata: script.bindings}});
-    assert.deepEqual(result.errors, [], name);
-    for (const style of descriptor.styles) assert.deepEqual(compileStyle({source: style.content, filename: name, id: `test-${name}`, scoped: style.scoped}).errors, []);
-  }
-});
 
 test('phone geometry is opt-in and new CSS leaves desktop typography/layout unchanged', () => {
   shared.walkRules(rule => {

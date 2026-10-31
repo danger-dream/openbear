@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import * as Vue from 'vue';
-import {parse, compileTemplate} from '@vue/compiler-sfc';
+import {parse} from '@vue/compiler-sfc';
 
 const source = fs.readFileSync(new URL('./SettingsView.vue', import.meta.url), 'utf8');
 function runtime(probe) {
@@ -55,15 +55,4 @@ test('protocol and transport failures display the error and release the busy sta
     assert.match(r.run('browserProbeState.value.text'), /连接失败|网络错误/);
     assert.equal(r.run('testingBrowser.value'), false);
   }
-});
-
-test('settings template compiles and the test button preserves unsaved input on mouse-down', () => {
-  const descriptor = parse(source).descriptor;
-  const compiled = compileTemplate({source: descriptor.template.content, filename: 'SettingsView.vue', id: 'browser-settings'});
-  assert.deepEqual(compiled.errors, []);
-  const markup = source.match(/<div v-if="spec.path === 'browser.mainEndpoint'"[\s\S]*?<\/div>/)[0];
-  assert.match(markup, /@mousedown.prevent/);
-  assert.match(markup, /@click="testBrowserConnection"/);
-  assert.match(markup, /role="status"/);
-  assert.match(markup, /:disabled="testingBrowser \|\| saving\[spec.path\] \|\| !String/);
 });

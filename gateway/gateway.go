@@ -33,6 +33,7 @@ type Gateway struct {
 	limits       limiter
 	kdfSlots     chan struct{}
 	dummy        passwordHash
+	build        string // sha256 of the running program, reported in status
 }
 
 func New(c Config) (*Gateway, error) {
@@ -65,7 +66,7 @@ func New(c Config) (*Gateway, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	u, _ := parseURL(c.PublicURL, true)
 	tr := &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 128, MaxIdleConnsPerHost: 16, MaxConnsPerHost: 128, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second, DisableCompression: true}
-	g := &Gateway{cfg: c, state: s, lock: lock, publicOrigin: origin(u), secureCookie: u.Scheme == "https", transport: tr, ctx: ctx, cancel: cancel, active: map[string]map[uint64]context.CancelFunc{}, kdfSlots: make(chan struct{}, 4), dummy: hashPassword(randomToken())}
+	g := &Gateway{cfg: c, state: s, lock: lock, publicOrigin: origin(u), secureCookie: u.Scheme == "https", transport: tr, ctx: ctx, cancel: cancel, active: map[string]map[uint64]context.CancelFunc{}, kdfSlots: make(chan struct{}, 4), dummy: hashPassword(randomToken()), build: executableBuild()}
 	g.ipPolicy.Store(compileClientIP(policy))
 	g.client = &http.Client{Transport: tr, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return g, nil
@@ -175,9 +176,20 @@ func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "invalid_path")
 		return
 	}
+	if serviceWorkerScript(r) {
+		fail(w, 403, "route_forbidden")
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/control/") || r.URL.Path == "/api/gateway/probe" {
+		// With its own (loopback) control listener the public port has no control
+		// API at all. A single-port configuration shares it, authenticated by the
+		// control key; it is never a browser route.
+		if g.cfg.ControlListen != "" {
+			fail(w, 404, "not_found")
+			return
+		}
+	}
 	if strings.HasPrefix(r.URL.Path, "/control/") {
-		// One port: the control API is authenticated by its own strong key and
-		// is never a browser route, so it shares the public listener.
 		g.serveControl(w, r)
 		return
 	}

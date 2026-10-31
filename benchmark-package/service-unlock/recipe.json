@@ -1,0 +1,13 @@
+{
+  "name": "Service Unlock",
+  "repo": "https://github.com/shui1iao/service-unlock",
+  "license": "AGPL-3.0-only (combined; original portions MIT)",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "bin/service-unlock",
+  "files": {},
+  "keep": ["LICENSE", "NOTICE.md"],
+  "binaries": [
+    {"platform": "linux/amd64", "dest": "bin/service-unlock", "url": "https://github.com/shui1iao/service-unlock/releases/download/v0.5.4/service-unlock_linux_amd64"},
+    {"platform": "linux/arm64", "dest": "bin/service-unlock", "url": "https://github.com/shui1iao/service-unlock/releases/download/v0.5.4/service-unlock_linux_arm64"}
+  ]
+}

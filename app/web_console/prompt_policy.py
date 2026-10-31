@@ -17,6 +17,18 @@ def folder_policy_key(owner, folder_id):
     return f'folder_prompt_policy:{owner}:{folder_id}'
 
 
+def tool_schema_name(schema):
+    return schema.get('name', schema.get('function', {}).get('name'))
+
+
+def effective_prompt_tools(schemas, value):
+    """Schemas a conversation advertises under its frozen prompt policy."""
+    if not value['overrideSystemPrompt']:
+        return list(schemas)
+    allowed = set(policy_tool_names(value))
+    return [s for s in schemas if tool_schema_name(s) in allowed]
+
+
 class PromptPolicyMixin:
     async def _local_conversation_prompt_policy(self, conversation_uuid):
         return conversation_policy(await read_json(self.db.conn, 'conversation_context:' + conversation_uuid))
@@ -120,6 +132,9 @@ class PromptPolicyMixin:
         stored = await read_json(self.db.conn, snapshot_key(conversation_uuid))
         return policy(stored)
 
+    def _live_main_tool_schemas(self):
+        return self.tools.schemas(scope='main') if self.tools else []
+
     async def _write_prompt_snapshot_policy(self, conn, row, value, rendered):
         await write_json(conn, snapshot_key(row['conversation_uuid']), value)
         cur = await conn.execute('SELECT settings_json FROM context_editor_branches WHERE conversation_uuid=?', (row['conversation_uuid'],))
@@ -127,10 +142,9 @@ class PromptPolicyMixin:
         if branch:
             settings = json.loads(branch['settings_json'])
             settings['system'] = rendered
-            # Preserve manually edited schemas unless the new policy restricts them.
-            if value['overrideSystemPrompt']:
-                allowed = set(policy_tool_names(value))
-                settings['tools'] = [s for s in settings.get('tools', []) if s.get('name', s.get('function', {}).get('name')) in allowed]
+            # An edited branch advertises frozen schemas; a refresh replaces them
+            # with the current definitions, just as it replaces the edited system.
+            settings['tools'] = effective_prompt_tools(self._live_main_tool_schemas(), value)
             await conn.execute('UPDATE context_editor_branches SET settings_json=? WHERE conversation_uuid=?',
                                (json.dumps(settings, ensure_ascii=False), row['conversation_uuid']))
 

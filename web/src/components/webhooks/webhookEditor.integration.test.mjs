@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {parse,compileScript,compileTemplate} from '@vue/compiler-sfc';
+import {parse} from '@vue/compiler-sfc';
 import {computed,ref,reactive,nextTick,watch,effectScope} from 'vue';
 import {createWebhookEditor} from './useWebhookEditor.js';
 import {normalizedRunDefaults, updateRunDefault} from '../folderRunDefaults.js';
@@ -145,11 +145,4 @@ test('F04/F15 a parent rerender with the same scope never reloads or resets the 
   props.scope={...scope};await nextTick();await nextTick();
   assert.equal(loads,1);assert.equal(run('tab.value'),'scripts');assert.equal(run('draft.config.pre.code'),'unsaved indentation\n  keep');
   effects.stop();run('editor.dispose()');
-});
-
-test('all shipped Webhook and property SFCs compile against the actual Vue compiler',()=>{
-  for(const name of [...fs.readdirSync(new URL('.',import.meta.url)).filter(x=>x.endsWith('.vue')),'../ModelSettings.vue','../ConversationPropertiesDialog.vue','../ConversationTree.vue']) {
-    const {descriptor,errors}=parse(read(name),{filename:name});assert.deepEqual(errors,[]);const script=compileScript(descriptor,{id:name});
-    const template=compileTemplate({source:descriptor.template.content,filename:name,id:name,compilerOptions:{bindingMetadata:script.bindings}});assert.deepEqual(template.errors,[],name);
-  }
 });

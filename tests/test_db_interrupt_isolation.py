@@ -41,6 +41,56 @@ async def test_cancelled_query_leaves_other_cursors_and_later_queries_working(tm
         await conn.close()
 
 
+async def _router_with_rows(path, count: int) -> DB:
+    db = DB(str(path))
+    await db.connect()
+    await db.conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+    await db.conn.commit()
+    async with db.write_transaction(label="seed") as conn:
+        await conn.executemany("INSERT INTO t VALUES (?, 'old')", [(i,) for i in range(count)])
+    return db
+
+
+async def test_a_read_not_yet_fetched_does_not_hide_later_commits(tmp_path):
+    db = await _router_with_rows(tmp_path / "router.db", 2)
+    try:
+        # One task has run a read and is suspended before fetching it.
+        waiting = await db.conn.execute("SELECT v FROM t ORDER BY id")
+        async with db.write_transaction(label="update") as conn:
+            await conn.execute("UPDATE t SET v='new'")
+        later = await db.conn.execute("SELECT v FROM t ORDER BY id")
+        assert [row[0] for row in await later.fetchall()] == ["new", "new"]
+        assert [row[0] for row in await waiting.fetchall()] == ["old", "old"]
+    finally:
+        await db.close()
+
+
+async def test_a_cancelled_read_whose_cursor_stays_reachable_does_not_hide_later_commits(tmp_path):
+    db = await _router_with_rows(tmp_path / "router.db", 50)
+    kept, parked = [], asyncio.Event()
+
+    async def reading():
+        cursor = await db.conn.execute("SELECT v FROM t ORDER BY id")
+        # As when the cancelled frame sits in a reference cycle no collection has freed yet.
+        kept.append(cursor)
+        await cursor.fetchone()
+        parked.set()
+        await asyncio.Event().wait()
+
+    try:
+        task = asyncio.create_task(reading())
+        await asyncio.wait_for(parked.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with db.write_transaction(label="update") as conn:
+            await conn.execute("UPDATE t SET v='new'")
+        later = await db.conn.execute("SELECT DISTINCT v FROM t")
+        assert [row[0] for row in await later.fetchall()] == ["new"]
+    finally:
+        await db.close()
+
+
 async def test_router_reads_rows_in_one_call_and_still_routes_owner_writes(tmp_path):
     db = DB(str(tmp_path / "router.db"))
     await db.connect()

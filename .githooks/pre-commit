@@ -70,6 +70,11 @@ while IFS= read -r -d '' f; do
     if ! git show ":$f" >"$blob" 2>/dev/null; then
         fail "无法读取 $f 的暂存内容，未完成凭证检查"
     fi
+    # 上游公开探测资源仅按固定路径及完整摘要豁免，变过字节仍走凭证扫描。
+    if [ "$f" = 'benchmark-package/ip.check.place/v0.1.0/main/ref/cookies.txt' ] &&
+       [ "$(sha256sum "$blob" | cut -d ' ' -f 1)" = '8d05deb991fd5a094b4971b389bdd24c1c86c462dfb45dd3aa4befe77b34616f' ]; then
+        continue
+    fi
     # read 的空 delimiter 表示 NUL：找到 NUL 才成功，普通文本到 EOF 返回非零。
     if IFS= read -r -d '' binary_probe <"$blob"; then
         unset binary_probe

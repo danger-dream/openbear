@@ -19,7 +19,7 @@ const script = descriptor.scriptSetup.content.replace(/^import[\s\S]*?;\n/gm, ""
   + "\nfunction hasMeaningfulAnswerText(text) { return Boolean(String(text || '').trim()); }"
   + "\nfunction answerContent(text) { return String(text || ''); }\n";
 const render = compile(descriptor.template.content);
-const setupNames = [...script.matchAll(/^(?:async )?function (\w+)\(/gm)].map((match) => match[1]);
+const setupNames = [...script.matchAll(/^(?:async )?function (\w+)\(/gm)].map((match) => match[1]).concat("agentLocator", "waitingAgents");
 const slot = {inheritAttrs: false, setup: (_, {slots}) => () => slots.default?.()};
 
 function turnEvent(event) {
@@ -28,6 +28,8 @@ function turnEvent(event) {
     ref,
     defineProps: () => props,
     defineEmits: () => () => {},
+    inject: () => null,
+    AGENT_LOCATOR: Symbol("agent-locator"),
     isAgentEvent: () => false,
     modelRetryReasonLabel: () => "",
     toolResultKey: () => "",

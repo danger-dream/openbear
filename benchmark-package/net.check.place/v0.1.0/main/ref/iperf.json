@@ -1,0 +1,102 @@
+[
+  {
+    "code": 11,
+    "server": "speedtest.hkg12.hk.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "HK",
+    "city": "HongKong",
+    "cityzh": "香港"
+  },
+  {
+    "code": 12,
+    "server": "speedtest.tyo11.jp.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "JP",
+    "city": "Tokyo",
+    "cityzh": "东京"
+  },
+  {
+    "code": 13,
+    "server": "speedtest.sin1.sg.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "SG",
+    "city": "Singapore",
+    "cityzh": "新加坡"
+  },
+  {
+    "code": 21,
+    "server": "speedtest.syd12.au.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "AU",
+    "city": "Sydney",
+    "cityzh": "悉尼"
+  },
+  {
+    "code": 31,
+    "server": "speedtest.lax12.us.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "US",
+    "city": "LosAngeles",
+    "cityzh": "洛杉矶"
+  },
+  {
+    "code": 32,
+    "server": "nyc.speedtest.clouvider.net",
+    "portl": 5200,
+    "portu": 5209,
+    "provider": "Clouvider",
+    "countrycode": "US",
+    "city": "NewYork",
+    "cityzh": "纽约"
+  },
+  {
+    "code": 41,
+    "server": "fra.speedtest.clouvider.net",
+    "portl": 5200,
+    "portu": 5209,
+    "provider": "Clouvider",
+    "countrycode": "DE",
+    "city": "Frankfurk",
+    "cityzh": "法兰克福"
+  },
+  {
+    "code": 42,
+    "server": "speedtest.lon1.uk.leaseweb.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Leaseweb",
+    "countrycode": "GB",
+    "city": "London",
+    "cityzh": "伦敦"
+  },
+  {
+    "code": 43,
+    "server": "iperf-ams-nl.eranium.net",
+    "portl": 5201,
+    "portu": 5210,
+    "provider": "Eranium",
+    "countrycode": "NL",
+    "city": "Armsterdam",
+    "cityzh": "阿姆斯特丹"
+  },
+  {
+    "code": 51,
+    "server": "speedtest.sao1.edgoo.net",
+    "portl": 9205,
+    "portu": 9240,
+    "provider": "Edgoo",
+    "countrycode": "BR",
+    "city": "SãoPaulo",
+    "cityzh": "圣保罗"
+  }
+]

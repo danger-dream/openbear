@@ -42,7 +42,7 @@ test("Bash renders highlighted command and translated compatibility metadata", (
 	const view = buildToolArgumentsView("Bash", JSON.stringify({
 		command: "uv run pytest -q",
 		description: "运行后端测试",
-		cwd: "/opt/src-space/openbear",
+		cwd: "/srv/openbear",
 		timeout: 120,
 		run_in_background: true,
 	}));

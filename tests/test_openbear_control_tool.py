@@ -288,7 +288,7 @@ async def test_openbear_control_restart_drain_maps_web_internal_chat_to_owner(tm
 
     class _Cursor:
         async def fetchone(self):
-            return {"owner_chat_id": 5352767013}
+            return {"owner_chat_id": 424242424}
 
     class _Conn:
         async def execute(self, sql, params=()):
@@ -315,7 +315,7 @@ async def test_openbear_control_restart_drain_maps_web_internal_chat_to_owner(tm
 
     await svc.control_actions.drain_after_turn(svc, -21)
     raw = json.loads(restart_notification_path(svc.config).read_text(encoding="utf-8"))
-    assert raw[0]["chatId"] == 5352767013
+    assert raw[0]["chatId"] == 424242424
     assert raw[0]["reason"] == "Web 重启"
 
 
@@ -339,7 +339,7 @@ async def test_schedule_openbear_restart_raises_on_systemd_run_failure(monkeypat
 async def test_resolve_restart_completion_chat_id_maps_internal_chat_to_owner():
     class _Cursor:
         async def fetchone(self):
-            return {"owner_chat_id": 5352767013}
+            return {"owner_chat_id": 424242424}
 
     class _Conn:
         async def execute(self, sql, params=()):
@@ -347,7 +347,7 @@ async def test_resolve_restart_completion_chat_id_maps_internal_chat_to_owner():
             return _Cursor()
 
     svc = SimpleNamespace(db=SimpleNamespace(conn=_Conn()))
-    assert await resolve_restart_completion_chat_id(svc, -13) == 5352767013
+    assert await resolve_restart_completion_chat_id(svc, -13) == 424242424
 
 
 async def test_openbear_control_denied_from_agent_context():

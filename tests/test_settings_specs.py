@@ -56,6 +56,16 @@ def test_notifications_have_a_dedicated_web_domain_without_changing_settings():
     assert domains['notifications']['sections'][0]['paths'] == GROUPS['web_notifications'][1]
 
 
+def test_browser_settings_mention_server_nodes_only_on_a_controller():
+    from app.admin.settings import settings_specs_payload
+    controller, managed = settings_specs_payload()['specs'], settings_specs_payload(managed=True)['specs']
+    for path in ('browser.enabled', 'browser.agentAccess'):
+        assert '服务器节点的浏览器' in controller[path]['desc'] and '服务器节点' not in managed[path]['desc']
+        assert controller[path]['desc'].startswith(managed[path]['desc'])
+    assert set(controller) - set(managed) == {'features.instances', 'features.servers', 'updates.prerelease', 'updates.autoUpdateNodes'}
+    assert {p for p in managed if controller[p] != managed[p]} == {'browser.enabled', 'browser.agentAccess'}
+
+
 def test_bool_setting_parse_chinese_values():
     spec = get_spec("rath.enabled")
     assert spec is not None
@@ -155,3 +165,15 @@ def test_agent_and_tool_sections_are_available():
     assert [s.title for s in group_specs("interface")] == [
         "显示本轮统计",
     ]
+
+
+def test_update_switches_default_off_and_are_controller_settings():
+    from app.admin.settings import parse_setting_value, settings_specs_payload
+    from app.config import UpdatesConfig
+    assert UpdatesConfig().prerelease is False and UpdatesConfig().auto_update_nodes is False
+    assert UpdatesConfig.model_validate({'prerelease': True, 'autoUpdateNodes': True}).model_dump(by_alias=True) == {'prerelease': True, 'autoUpdateNodes': True}
+    assert get_spec('updates.prerelease').title == '接收测试版' and get_spec('updates.autoUpdateNodes').kind == 'bool'
+    assert parse_setting_value('updates.prerelease', '开启') is True
+    domains = {d['key']: d for d in settings_specs_payload()['domains']}
+    assert [s['key'] for s in domains['updates']['sections']] == ['updates']
+    assert 'updates' not in {d['key'] for d in settings_specs_payload(managed=True)['domains']}

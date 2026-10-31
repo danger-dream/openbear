@@ -13,8 +13,10 @@ import (
 	"time"
 )
 
-// Source "auto" trusts loopback/private peers and Cloudflare's published edge
-// ranges as proxies; "header" adds explicitly configured proxies to those.
+// Source "auto" trusts loopback peers as proxies, and Cloudflare's published
+// edge ranges for CF-Connecting-IP only: Cloudflare overwrites that header, so
+// a client cannot choose it. Any other proxy, including one on the same private
+// network, is trusted only once configured: "header" adds those to auto's.
 // Header is accepted only for compatibility with earlier policies: every known
 // forwarding header is read in a fixed order from a trusted proxy.
 type ClientIPConfig struct {
@@ -130,13 +132,8 @@ func (p *clientIPPolicy) trusts(addr netip.Addr) bool {
 	if p.Config.Source == "socket" {
 		return false
 	}
-	if addr.IsLoopback() || addr.IsPrivate() {
+	if addr.IsLoopback() {
 		return true
-	}
-	for _, prefix := range cloudflareRanges {
-		if prefix.Contains(addr) {
-			return true
-		}
 	}
 	for _, prefix := range p.Trusted {
 		candidate := addr
@@ -144,6 +141,22 @@ func (p *clientIPPolicy) trusts(addr netip.Addr) bool {
 			candidate = netip.AddrFrom16(addr.As16())
 		}
 		if prefix.Contains(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// reads reports whether the real client IP may come from this peer's header.
+func (p *clientIPPolicy) reads(peer netip.Addr, header string) bool {
+	if p.trusts(peer) {
+		return true
+	}
+	if p.Config.Source == "socket" || header != "CF-Connecting-IP" {
+		return false
+	}
+	for _, prefix := range cloudflareRanges {
+		if prefix.Contains(peer) {
 			return true
 		}
 	}
@@ -170,7 +183,7 @@ func (g *Gateway) clientIP(r *http.Request) string {
 		return "unknown"
 	}
 	p := g.ipPolicy.Load()
-	if p == nil || !p.trusts(peer) {
+	if p == nil || p.Config.Source == "socket" {
 		return peer.String()
 	}
 	for _, name := range forwardingHeaders {
@@ -178,7 +191,15 @@ func (g *Gateway) clientIP(r *http.Request) string {
 		if len(values) == 0 {
 			continue
 		}
-		g.observe(peer, name)
+		if !p.reads(peer, name) {
+			// A private-network peer sending forwarding headers is reported for
+			// the owner to confirm; it never chooses its own client identity.
+			if peer.IsPrivate() {
+				g.observe(peer, name, false)
+			}
+			return peer.String()
+		}
+		g.observe(peer, name, true)
 		if ip, ok := p.fromHeader(name, values); ok {
 			return ip.String()
 		}
@@ -225,15 +246,18 @@ func (p *clientIPPolicy) fromHeader(name string, values []string) (netip.Addr, b
 }
 
 // What the gateway actually sees, so the controller can explain detection
-// instead of asking the user to choose a header.
+// instead of asking the user to choose a header. Trusted is false for a proxy
+// whose header was ignored; earlier gateways reported only trusted proxies and
+// omit the field.
 type proxyObservation struct {
-	Peer   string `json:"peer"`
-	Header string `json:"header"`
-	AtMS   int64  `json:"atMs"`
+	Peer    string `json:"peer"`
+	Header  string `json:"header"`
+	AtMS    int64  `json:"atMs"`
+	Trusted bool   `json:"trusted"`
 }
 
-func (g *Gateway) observe(peer netip.Addr, header string) {
-	g.observed.Store(&proxyObservation{peer.String(), header, time.Now().UnixMilli()})
+func (g *Gateway) observe(peer netip.Addr, header string, trusted bool) {
+	g.observed.Store(&proxyObservation{peer.String(), header, time.Now().UnixMilli(), trusted})
 }
 func (g *Gateway) observedProxy() *proxyObservation { return g.observed.Load() }
 
@@ -389,6 +413,14 @@ func (g *Gateway) putClientIP(w http.ResponseWriter, r *http.Request) {
 		}
 		g.ipPolicy.Store(compiled)
 		g.limits.Entries = nil // Old source identities must not share new-source debt.
+		// A just-confirmed proxy must not keep showing as untrusted.
+		if o := g.observed.Load(); o != nil {
+			if peer, e := netip.ParseAddr(o.Peer); e == nil {
+				next := *o
+				next.Trusted = compiled.reads(peer, o.Header)
+				g.observed.CompareAndSwap(o, &next)
+			}
+		}
 	}
-	jsonResponse(w, 200, map[string]any{"ok": true, "clientIp": g.ipPolicy.Load().Config})
+	jsonResponse(w, 200, map[string]any{"ok": true, "clientIp": g.ipPolicy.Load().Config, "clientIpObserved": g.observedProxy()})
 }

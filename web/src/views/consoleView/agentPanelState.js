@@ -1,4 +1,6 @@
 const AGENT_PANEL_PREFIX = "agent-panel:";
+// Provided by the console: {request: Ref<{key, seq}>, locate(key)}; key is agentEventIdentity.
+export const AGENT_LOCATOR = Symbol("agent-locator");
 const AGENT_PANEL_INTENTS = new Set(["auto", "open", "closed"]);
 const AGENT_EXECUTION_TOOLS = new Set(["Agent", "AgentContinue", "AgentMessage", "AgentStop"]);
 

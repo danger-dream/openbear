@@ -13,7 +13,9 @@ import * as codec from './codec.js';
 import {conversationMessages} from './conversationMessages.js';
 import {searchReferences,acceptReferenceSizes,referencePolicyOptions} from './catalog.js';
 import * as sizePolicy from './sizePolicy.js';
-import {referenceIconHtml,referenceCandidateDetail,referenceScopeLabel,referenceTitle} from './presentation.js';
+import {referenceLeadHtml,referenceCandidateDetail,referenceScopeLabel,referenceTitle} from './presentation.js';
+import * as servers from './servers.js';
+servers.setServerDirectoryLoader(async()=>({ok:true,enabled:true,items:[]}));
 const read=name=>readFileSync(new URL(name,import.meta.url),'utf8');
 const plain=value=>JSON.parse(JSON.stringify(value));
 const settled=async()=>{await new Promise(setImmediate);await nextTick();};
@@ -32,7 +34,7 @@ function picker(t,options={}){
  const context=vm.createContext({computed,ref,nextTick,watch:(...args)=>{const stop=watch(...args);t.after(stop);return stop;},
   defineProps:()=>props,defineEmits:()=>(...args)=>emitted.push(args),defineExpose:()=>{},
   referenceCatalog:catalog,searchReferences:(q,opts)=>searchReferences(q,{...opts,items:opts.items||catalog.items}),includeArchivedReferences:value=>catalog.includeArchived=value,
-  ...codec,...sizePolicy,acceptReferenceSizes,referencePolicyOptions,referenceIconHtml,referenceCandidateDetail,conversationMessages,
+  ...codec,...sizePolicy,...servers,acceptReferenceSizes,referencePolicyOptions,referenceLeadHtml,referenceCandidateDetail,conversationMessages,
   Api:{referenceHistory:async(...args)=>{requests.push(args);return options.history?options.history(...args):{items:historyDirectory,hasMore:false,nextOffset:9};}},
  });
  vm.runInContext(pickerSource.scriptSetup.content.replace(/^import .*?;\n/gm,''),context);
@@ -101,7 +103,7 @@ test('original history tab keeps individual message choices and drag preserves m
  assert.equal(JSON.parse(data[codec.REFERENCE_MIME]).mode,'mention');assert.match(data['text/plain'],/mode=mention/);
 });
 test('real picker template exposes manual mode, visible @chat drilldown, multi-select checks and explicit insert action',async t=>{
- const p=picker(t);const names='props,emit,list,searchInput,searchOpen,toggleSearch,localQuery,filter,selected,mode,child,childQuery,checked,queryText,results,groups,tabs,historyMode,historyError,historyBusy,historyMore,selectionError,referenceCatalog,KIND_LABELS,referenceIconHtml,referenceCandidateDetail,includeArchivedReferences,key,back,changeTab,choose,clickItem,toggle,inspectHistory,loadHistory,dragStart,dragEnd,dragging,chooseTurn,candidateState,candidateWarning,policyReasonTitle';
+ const p=picker(t);const names='props,emit,list,searchInput,searchOpen,toggleSearch,localQuery,filter,selected,mode,child,childQuery,checked,queryText,results,groups,tabs,historyMode,historyError,historyBusy,historyMore,selectionError,referenceCatalog,KIND_LABELS,referenceLeadHtml,referenceCandidateDetail,includeArchivedReferences,key,back,changeTab,choose,clickItem,toggle,inspectHistory,loadHistory,dragStart,dragEnd,dragging,chooseTurn,candidateState,candidateWarning,policyReasonTitle,multiSelect,serverMode,serverDirectory,loadServerDirectory';
  const render=async()=>renderToString(createSSRApp({render:compile(pickerSource.template.content),setup:()=>({...p.props,...p.run(`({${names}})`)}),components:{FloatingPanel:{render(){return h('section',{},this.$slots.default?.());}}}}));
  let html=await render();assert.doesNotMatch(html,/<input[^>]+class="reference-picker-search-input"/);assert.doesNotMatch(html,/class="reference-picker-(?:mode|breadcrumb|selection|search)"/);assert.match(html,/aria-label="引用模式"/);assert.match(html,/aria-pressed="true"[^>]*>引用内容/);assert.match(html,/aria-pressed="false"[^>]*>仅提及/);assert.equal(p.run('mode.value'),'content');assert.doesNotMatch(pickerSource.template.content,/<select/);assert.match(html,/消息 ›/);assert.match(html,/height="430"/);assert.match(html,/Enter \/ Tab/);
  p.key('ArrowRight');await settled();p.key(' ');html=await render();assert.match(html,/aria-multiselectable="true"/);assert.match(html,/已选 1 条/);assert.match(html,/用户输入/);assert.match(html,/模型输出/);assert.match(html,/第0轮模型结果/);assert.match(html,/height="430"/);assert.match(html,/aria-selected="true"/);assert.match(html,/返回会话候选/);assert.doesNotMatch(html,/<input[^>]+class="reference-picker-search-input"/);assert.doesNotMatch(html,/class="reference-picker-(?:mode|breadcrumb|selection|search)"/);assert.equal((html.match(/class="reference-picker-footer"/g)||[]).length,1);

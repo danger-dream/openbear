@@ -4,26 +4,32 @@ import FloatingPanel from './FloatingPanel.vue';
 import {referenceCatalog,searchReferences,includeArchivedReferences,acceptReferenceSizes,referencePolicyOptions} from './catalog.js';
 import {applyConversationPolicy,policyReasonText,policyReasonTitle} from './sizePolicy.js';
 import {REFERENCE_MIME,KIND_LABELS,normalizeReference,referenceToken} from './codec.js';
-import {referenceIconHtml,referenceCandidateDetail} from './presentation.js';
+import {referenceLeadHtml,referenceCandidateDetail} from './presentation.js';
 import {Api} from '../api.js';
 import {conversationMessages} from './conversationMessages.js';
+import {serverDirectory,loadServerDirectory,serverReferencesOffered} from './servers.js';
 const props=defineProps({open:Boolean,anchor:{default:null},placement:{type:String,default:'top-start'},kind:{type:String,default:''},query:{type:String,default:''},searchable:Boolean,currentConversation:{type:String,default:''},selectedReferences:{type:Array,default:()=>[]},allowDrag:Boolean});
 const emit=defineEmits(['select','close','enter','leave']);
 const list=ref(null),searchInput=ref(null),searchOpen=ref(false),localQuery=ref(''),filter=ref(''),selected=ref(0),mode=ref('content');
 const child=ref(null),childQuery=ref(''),checked=ref(new Set()),selectionError=ref('');
 const historyConversation=ref(''),historyRows=ref([]),historyItems=ref([]),historyMore=ref(false),historyOffset=ref(0),historyBusy=ref(false),historyError=ref('');
 let historyGeneration=0,dragging=false,parentSelected=0,parentSearchOpen=false;
-const tabs=[['','全部'],['mem','记忆'],['doc','文档'],['secret','凭证'],['chat','会话'],['history','历史']];
+const baseTabs=[['','全部'],['mem','记忆'],['doc','文档'],['secret','凭证'],['chat','会话'],['history','历史']];
+const tabs=computed(()=>serverReferencesOffered()?[...baseTabs.slice(0,5),['server','服务器'],baseTabs[5]]:baseTabs);
 const queryText=computed({get:()=>child.value?childQuery.value:localQuery.value,set:value=>{if(child.value)childQuery.value=value;else localQuery.value=value;selected.value=0;}});
 const activeKind=computed(()=>props.kind||filter.value);
 const historyMode=computed(()=>Boolean(child.value)||activeKind.value==='history');
+// Servers are picked several at a time: rows toggle, Enter/the footer inserts all checked.
+const serverMode=computed(()=>!child.value&&activeKind.value==='server');
+const multiSelect=computed(()=>Boolean(child.value)||serverMode.value);
 const results=computed(()=>child.value
  ? (childQuery.value?searchReferences(childQuery.value,{items:historyItems.value,limit:historyItems.value.length}):historyItems.value)
- : searchReferences(queryText.value,{kind:historyMode.value?'':activeKind.value,currentConversation:props.currentConversation,items:historyMode.value?historyItems.value:null,limit:40}));
+ : searchReferences(queryText.value,{kind:historyMode.value?'':activeKind.value,currentConversation:props.currentConversation,items:historyMode.value?historyItems.value:null,limit:serverMode.value?200:40}));
 const groups=computed(()=>{const values=[];let group=null;for(const [index,item] of results.value.entries()){const name=item.group||KIND_LABELS[item.kind],key=item.groupKey||name;if(group?.key!==key){group={key,name,turn:item.turnReference,rows:[]};values.push(group);}group.rows.push({item,index});}return values;});
 watch(()=>props.open,open=>{
  historyGeneration++;historyBusy.value=false;
- if(open){searchOpen.value=props.searchable;localQuery.value=props.query;filter.value=props.kind||'';selected.value=0;mode.value='content';child.value=null;childQuery.value='';checked.value=new Set();selectionError.value='';historyRows.value=[];historyItems.value=[];historyMore.value=false;historyError.value='';historyConversation.value=props.currentConversation;}
+ if(open){searchOpen.value=props.searchable;localQuery.value=props.query;filter.value=props.kind||'';selected.value=0;mode.value='content';child.value=null;childQuery.value='';checked.value=new Set();selectionError.value='';historyRows.value=[];historyItems.value=[];historyMore.value=false;historyError.value='';historyConversation.value=props.currentConversation;
+  if(serverReferencesOffered()&&(!props.kind||props.kind==='server'))void loadServerDirectory({force:props.kind==='server'});}
 },{immediate:true});
 watch(()=>props.query,value=>{localQuery.value=value;if(child.value)back();selected.value=0;});
 watch(results,()=>{selected.value=Math.min(selected.value,Math.max(0,results.value.length-1));});
@@ -37,7 +43,8 @@ async function loadHistory(append=false){
 }
 function withMode(item){return normalizeReference({...item,...(item.roleLabel?{label:`${item.roleLabel} · ${item.label}`} : {}),mode:mode.value});}
 function choose(item=results.value[selected.value]){
- const items=child.value&&checked.value.size?historyItems.value.filter(row=>checked.value.has(row.key)):[item];
+ const items=child.value&&checked.value.size?historyItems.value.filter(row=>checked.value.has(row.key))
+  :serverMode.value&&checked.value.size?[...checked.value].map(key=>serverDirectory.items.find(row=>row.key===key)).filter(Boolean):[item];
  const values=applyPolicy(items.filter(Boolean));
  if(values.length)emit('select',values.length===1?values[0]:values);
 }
@@ -57,12 +64,12 @@ function move(direction){
  }
  selected.value=(selected.value+direction+Math.max(1,count))%Math.max(1,count);scrollSelected();
 }
-function clickItem(item,index){selected.value=index;if(child.value){toggle(item);list.value?.focus({preventScroll:true});}else choose(item);}
+function clickItem(item,index){selected.value=index;if(child.value){toggle(item);list.value?.focus({preventScroll:true});}else if(serverMode.value)toggle(item);else choose(item);}
 function toggle(item=results.value[selected.value]){
- if(!child.value||!item)return;
+ if(!multiSelect.value||!item)return;
  const next=new Set(checked.value);
  if(next.has(item.key))next.delete(item.key);
- else if(next.size>=30){selectionError.value='一次最多选择 30 条消息';return;}
+ else if(next.size>=30){selectionError.value=serverMode.value?'一次最多选择 30 台服务器':'一次最多选择 30 条消息';return;}
  else next.add(item.key);
  checked.value=next;selectionError.value='';
 }
@@ -91,7 +98,8 @@ function key(event){
  else if(event.key==='ArrowDown'||event.key==='ArrowUp'){move(event.key==='ArrowDown'?1:-1);if(child.value&&input)list.value?.focus({preventScroll:true});}
  else if(event.key==='ArrowRight'&&!child.value&&results.value[selected.value]?.kind==='chat')inspectHistory(results.value[selected.value]);
  else if(event.key==='ArrowLeft'&&child.value&&!input)back();
- else if(event.key===' '&&child.value&&!input)toggle();
+ // In the editor itself Space stays a space; in the list it checks the row.
+ else if(event.key===' '&&multiSelect.value&&!input&&(child.value||!event.target?.isContentEditable))toggle();
  else if(event.key==='Tab'){
   // Only forward Tab in the editor/list accepts a candidate. Inputs and
   // native controls retain focus navigation, including all Shift+Tab paths.
@@ -111,6 +119,7 @@ function inspectHistory(item){
 function changeTab(value){
  historyGeneration++;historyBusy.value=false;child.value=null;checked.value=new Set();filter.value=value;selected.value=0;historyRows.value=[];historyItems.value=[];historyMore.value=false;historyError.value='';
  if(value==='history')void loadHistory();
+ if(value==='server')void loadServerDirectory({force:true});
 }
 function dragStart(event,item){dragging=true;const value=applyPolicy([item])[0];event.dataTransfer.effectAllowed='copy';event.dataTransfer.setData(REFERENCE_MIME,JSON.stringify(value));event.dataTransfer.setData('text/plain',referenceToken(value));}
 function dragEnd(){dragging=false;emit('close');}
@@ -128,19 +137,21 @@ defineExpose({move,choose,key,results});
    <button type="button" class="reference-picker-icon-button" aria-label="关闭引用选择器" title="关闭（Esc）" @mousedown.prevent @click="emit('close')"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8"/></svg></button>
   </div>
   <div v-if="!kind&&!child" class="reference-picker-tabs"><button v-for="[value,label] in tabs" :key="value" type="button" :class="{'is-active':filter===value}" @mousedown.prevent @click="changeTab(value)">{{label}}</button></div>
-  <div ref="list" class="reference-picker-list" role="listbox" aria-label="引用候选" :aria-multiselectable="child?'true':undefined" tabindex="-1">
+  <div ref="list" class="reference-picker-list" role="listbox" aria-label="引用候选" :aria-multiselectable="multiSelect?'true':undefined" tabindex="-1">
    <template v-for="(group,groupIndex) in groups" :key="`${group.name}:${groupIndex}`"><div class="reference-picker-group" :class="{'has-turn-action':child&&group.turn}"><span>{{group.name}}</span><button v-if="child&&group.turn" type="button" class="reference-picker-range" :aria-label="(candidateState(group.turn)?.mode==='mention'?'提及整轮：':'引用整轮：')+group.name" :title="policyReasonTitle(candidateState(group.turn))||'选择本轮全部输入与输出；不包含其他轮次'" @mousedown.prevent @click.stop="chooseTurn(group.turn)">{{candidateState(group.turn)?.mode==='mention'?'提及整轮':'引用整轮'}}</button></div>
-    <div v-for="{item,index} in group.rows" :key="item.key" class="reference-picker-option" :class="{'is-selected':index===selected,'is-checked':child&&checked.has(item.key)}" role="option" :aria-selected="child?checked.has(item.key):index===selected" :draggable="allowDrag&&!child" @dragstart="dragStart($event,item)" @dragend="dragEnd" @mousedown="(!allowDrag||child) && $event.preventDefault()" @pointermove="selected=index" @click="clickItem(item,index)">
-     <span v-if="child" class="reference-picker-check" aria-hidden="true">{{checked.has(item.key)?'✓':''}}</span><span v-else class="reference-picker-icon" v-html="referenceIconHtml(item.kind)"></span><span class="reference-picker-copy" :class="{'is-message':child}"><small v-if="child" class="reference-picker-role" :class="{'is-output':item.role==='assistant'}">{{item.roleLabel}}</small><strong :title="item.label">{{item.label}}</strong><small v-if="!child||candidateWarning(item)" :class="{'reference-picker-size-warning':candidateWarning(item)}" :title="candidateWarning(item)?policyReasonTitle(candidateState(item)):referenceCandidateDetail(item)"><template v-if="candidateWarning(item)"><span class="reference-picker-warning-icon" aria-hidden="true">⚠</span><span class="reference-picker-warning-text">{{candidateWarning(item)}}</span></template><template v-else>{{referenceCandidateDetail(item)}}</template></small></span>
+    <div v-for="{item,index} in group.rows" :key="item.key" class="reference-picker-option" :class="{'is-selected':index===selected,'is-checked':multiSelect&&checked.has(item.key)}" role="option" :aria-selected="multiSelect?checked.has(item.key):index===selected" :draggable="allowDrag&&!child" @dragstart="dragStart($event,item)" @dragend="dragEnd" @mousedown="(!allowDrag||child) && $event.preventDefault()" @pointermove="selected=index" @click="clickItem(item,index)">
+     <span v-if="multiSelect" class="reference-picker-check" aria-hidden="true">{{checked.has(item.key)?'✓':''}}</span><span v-if="!multiSelect||item.kind==='server'" class="reference-picker-icon" v-html="referenceLeadHtml(item)"></span><span class="reference-picker-copy" :class="{'is-message':child}"><small v-if="child" class="reference-picker-role" :class="{'is-output':item.role==='assistant'}">{{item.roleLabel}}</small><strong :title="item.label">{{item.label}}</strong><small v-if="!child||candidateWarning(item)" :class="{'reference-picker-size-warning':candidateWarning(item)}" :title="candidateWarning(item)?policyReasonTitle(candidateState(item)):referenceCandidateDetail(item)"><template v-if="candidateWarning(item)"><span class="reference-picker-warning-icon" aria-hidden="true">⚠</span><span class="reference-picker-warning-text">{{candidateWarning(item)}}</span></template><template v-else><i v-if="item.kind==='server'" class="reference-picker-status" :class="{'is-online':item.online}" aria-hidden="true"></i>{{referenceCandidateDetail(item)}}</template></small></span>
      <button v-if="item.kind==='chat'" type="button" class="reference-picker-range" title="选择该会话中的输入或输出（→）" @mousedown.prevent @click.stop="inspectHistory(item)">消息 ›</button>
     </div>
    </template>
-   <div v-if="!results.length" class="reference-picker-empty">{{historyError||(historyBusy?'正在读取历史…':historyMode?'没有匹配消息':!referenceCatalog.ready?'正在同步目录…':'没有匹配内容')}}</div>
+   <div v-if="!results.length" class="reference-picker-empty">{{serverMode?(serverDirectory.error||(serverDirectory.loading||!serverDirectory.ready?'正在读取服务器…':'没有匹配的服务器')):historyError||(historyBusy?'正在读取历史…':historyMode?'没有匹配消息':!referenceCatalog.ready?'正在同步目录…':'没有匹配内容')}}</div>
+   <button v-if="serverMode&&serverDirectory.error" type="button" class="reference-picker-more" @click="loadServerDirectory({force:true})">重试</button>
    <button v-if="historyMode&&historyMore" type="button" class="reference-picker-more" :disabled="historyBusy" @click="loadHistory(true)">{{historyBusy?'加载中…':'更多历史'}}</button>
    <button v-else-if="historyError" type="button" class="reference-picker-more" @click="loadHistory()">重试</button>
   </div>
   <div class="reference-picker-footer">
-   <template v-if="child"><span class="reference-picker-selection-count" role="status" :title="selectionError||'↑↓ 移动，空格多选；未勾选时插入高亮消息；Esc 返回'">{{selectionError||(checked.size?'已选 '+checked.size+' 条':'↑↓ 移动 · 空格多选')}}</span><button type="button" class="reference-picker-insert" :disabled="!checked.size&&!results.length" title="Enter / Tab 插入；未勾选时插入当前高亮消息" @mousedown.prevent @click="choose()">{{mode==='mention'?'提及':'引用'}}<kbd>↵ / Tab</kbd></button></template>
+   <template v-if="serverMode"><span class="reference-picker-selection-count" role="status" :title="selectionError||'点选或空格勾选多台；未勾选时插入高亮的服务器'">{{selectionError||(checked.size?'已选 '+checked.size+' 台':'点选可多选')}}</span><button type="button" class="reference-picker-insert" :disabled="!checked.size&&!results.length" title="Enter / Tab 插入；未勾选时插入高亮的服务器" @mousedown.prevent @click="choose()">{{mode==='mention'?'提及':'引用'}}{{checked.size>1?' '+checked.size+' 台':''}}<kbd>↵ / Tab</kbd></button></template>
+   <template v-else-if="child"><span class="reference-picker-selection-count" role="status" :title="selectionError||'↑↓ 移动，空格多选；未勾选时插入高亮消息；Esc 返回'">{{selectionError||(checked.size?'已选 '+checked.size+' 条':'↑↓ 移动 · 空格多选')}}</span><button type="button" class="reference-picker-insert" :disabled="!checked.size&&!results.length" title="Enter / Tab 插入；未勾选时插入当前高亮消息" @mousedown.prevent @click="choose()">{{mode==='mention'?'提及':'引用'}}<kbd>↵ / Tab</kbd></button></template>
    <template v-else><label><input type="checkbox" :checked="referenceCatalog.includeArchived" @change="includeArchivedReferences($event.target.checked)"/>包含已归档</label><span class="reference-picker-key-hint" title="↑↓ 选择，→ 展开会话消息，Enter / Tab 插入，Esc 关闭">↑↓ · → 展开 · ↵ / Tab</span></template>
   </div>
  </FloatingPanel>
@@ -169,7 +180,7 @@ defineExpose({move,choose,key,results});
 .reference-picker-group.has-turn-action{display:flex;align-items:center;gap:8px}.reference-picker-group.has-turn-action>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}.reference-picker-group .reference-picker-range{flex:none;cursor:pointer}
 .reference-picker-option{display:flex;align-items:center;gap:8px;padding:7px;border-radius:6px;cursor:pointer;user-select:none;min-height:41px}
 .reference-picker-option.is-selected{background:rgb(var(--ob-blue-rgb) / .12)}
-.reference-picker-icon{flex:none;color:var(--ob-text-subtle)}.reference-picker-icon svg{width:16px;height:16px}
+.reference-picker-icon{flex:none;color:var(--ob-text-subtle)}.reference-picker-icon svg{width:16px;height:16px}.reference-picker-icon .reference-chip__flag{display:block;width:16px;font-size:15px;text-align:center}
 .reference-picker-check{display:flex;flex:none;align-items:center;justify-content:center;width:13px;height:13px;border:1px solid var(--ob-border-strong);border-radius:3px;font-size:10px}
 .is-checked .reference-picker-check{background:var(--ob-blue);border-color:var(--ob-blue);color:var(--ob-text-inverse)}
 .reference-picker-copy{min-width:0;display:flex;flex:1;flex-direction:column;gap:2px}
@@ -181,6 +192,7 @@ defineExpose({move,choose,key,results});
 .reference-picker-copy small.reference-picker-role{font-size:10px;line-height:18px;color:var(--ob-text-subtle)}
 .reference-picker-copy small.reference-picker-role.is-output{color:var(--ob-blue)}
 .reference-picker-range{border:0;border-radius:4px;background:var(--ob-hover);padding:3px 5px;color:inherit;font-size:10px}
+.reference-picker-status{display:inline-block;flex:none;width:6px;height:6px;margin-right:5px;border-radius:50%;background:var(--ob-text-muted);opacity:.55;vertical-align:1px}.reference-picker-status.is-online{background:var(--ob-success,#16a34a);opacity:1}
 .reference-picker-empty{padding:22px 14px;text-align:center;color:var(--ob-text-muted);font-size:12px}
 .reference-picker-more{display:block;width:100%;padding:8px;border:0;background:none;color:inherit;font-size:11px}
 .reference-picker-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:30px;padding:3px 10px;box-sizing:border-box;border-top:1px solid var(--ob-border-soft);font-size:10px;color:var(--ob-text-subtle)}

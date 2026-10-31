@@ -17,6 +17,9 @@ from app.web_operations import (
     web_event_operation_specs,
 )
 
+# These test migrations, so every database here is built the real way.
+pytestmark = pytest.mark.real_db
+
 
 class _OperationStore(WebAdminOperationsMixin):
     def __init__(self, db: DB) -> None:

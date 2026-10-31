@@ -1,9 +1,10 @@
 <script setup>
-import {computed, ref, watch} from 'vue';
+import {computed, inject, ref, watch} from 'vue';
 import {ChevronRight} from '@lucide/vue';
 import WorkDisclosure from './WorkDisclosure.vue';
 import {conversationWorkChunks, lastAnswerIndex, workDurationLabel} from './conversationWork.js';
 import {collabStatusLabel, collabToolCall, useCollabRequests} from './collabRequests.js';
+import {AGENT_LOCATOR, agentEventIdentity} from './agentPanelState.js';
 import './conversationWork.css';
 
 const props = defineProps({
@@ -18,6 +19,11 @@ const open = ref(props.running || resultIndex.value < 0);
 watch(() => props.running, running => {
 	open.value = running || resultIndex.value < 0;
 }, {immediate: true});
+const agentLocator = inject(AGENT_LOCATOR, null);
+watch(() => agentLocator?.request.value.seq, () => {
+	const key = agentLocator?.request.value.key;
+	if (key && chunks.value.some(chunk => chunk.kind === 'work' && chunk.entries.some(entry => agentEventIdentity(entry.event) === key))) open.value = true;
+});
 const label = computed(() => `已工作${workDurationLabel(props.durationMs) ? ` ${workDurationLabel(props.durationMs)}` : ''}`);
 // A folded block must not hide how requests to other conversations ended.
 const collabStore = useCollabRequests();

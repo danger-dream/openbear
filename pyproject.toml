@@ -1,6 +1,6 @@
 [project]
 name = "openbear"
-version = "0.13.1"
+version = "0.15.0"
 description = "单人自用 Agent Web 控制台：多协议接入 Parrot（anthropic/chat/responses）+ 工具 + skills + Web 记忆系统"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
     "pywebpush>=2.3,<3",
     "markdown-it-py>=4.0,<5",
     "pillow>=12.0,<13",
+    "dnspython>=2.6",
 ]
 
 [project.scripts]
@@ -27,6 +28,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-xdist>=3.8",
+    "pytest-testmon>=2.2",
     "ruff>=0.6",
 ]
 
@@ -48,9 +50,14 @@ known-first-party = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A full run leaves several GB under /tmp, which is RAM here; keep only what failed, last run only.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 markers = [
-    "live: 打真实 Parrot 上游的集成冒烟测试（默认跳过，需 --run-live）",
+    "live: 依赖真实外部环境的测试，如真实 Parrot 上游、真节点以 nobody 启动 Chrome（默认跳过，需 --run-live）",
     "prompt_suggestions: 允许 Web 轮次结束后真正启动下一句推荐的后台请求",
+    "host_commands: 测试有意在本机用 shell 跑只读的真实脚本（如安装脚本的检查阶段），不受本机改动防护拦截",
+    "real_db: 新建的数据库也走真实的建库迁移，不从测试进程里迁移好的模板复制",
 ]
 
 [tool.setuptools]

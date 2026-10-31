@@ -1,10 +1,14 @@
 .reference-chip{display:inline-flex;align-items:baseline;gap:4px;max-width:min(310px,90vw);padding:1px 6px;border:1px solid rgb(var(--ob-blue-rgb) / .22);border-radius:6px;background:var(--ob-blue-soft);color:var(--ob-blue);font-family:inherit;font-size:.91em;font-weight:500;line-height:1.45;vertical-align:baseline;white-space:nowrap;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .reference-chip__icon{align-self:center;flex:none;width:13px;height:13px}
+.reference-chip__flag{align-self:center;flex:none;font-family:'Twemoji Country Flags','Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif;font-size:13px;font-weight:400;line-height:1}
 .reference-chip__label{display:inline-block;overflow:hidden;text-overflow:ellipsis;max-width:240px;vertical-align:bottom}
 .reference-chip__scope{font-size:.83em;font-weight:400;opacity:.75}
 .reference-chip:hover{background:rgb(var(--ob-blue-rgb) / .13)}
 .reference-chip:focus-visible{outline:2px solid rgb(var(--ob-blue-rgb) / .5);outline-offset:2px}
 .reference-chip--secret{color:var(--ob-warning);border-color:rgb(var(--ob-warning-rgb) / .28);background:rgb(var(--ob-warning-rgb) / .07)}
+.reference-chip.is-missing{color:var(--ob-text-subtle);border-color:var(--ob-border);border-style:dashed;background:transparent}
+.reference-chip.is-missing .reference-chip__label{text-decoration:line-through;text-decoration-color:rgb(var(--ob-danger-rgb) / .55)}
+.reference-chip.is-missing .reference-chip__scope{color:var(--ob-danger);opacity:.85}
 .reference-capsule.is-invalid .reference-chip{color:var(--ob-danger);border-color:rgb(var(--ob-danger-rgb) / .4);text-decoration:line-through}
 .reference-editor .ProseMirror-selectednode .reference-chip{outline:2px solid rgb(var(--ob-blue-rgb) / .55);outline-offset:1px}
 

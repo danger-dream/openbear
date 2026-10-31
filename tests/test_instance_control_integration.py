@@ -7,7 +7,7 @@ import secrets
 from types import SimpleNamespace
 
 import pytest
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from app.config import Config, load_config
 from app.services import Services
@@ -36,7 +36,9 @@ async def linked_instances(monkeypatch, tmp_path):
     try:
         await parent.db.connect()
         await parent.instances.start()
-        await parent.instances.gateway.store({"enabled": True, "publicUrl": g.public, "serverId": "local", "port": 18962, "status": "connected"},
+        await parent.instances.gateway.store({"enabled": True, "publicUrl": g.public, "serverId": "local", "port": 18962, "status": "connected",
+                                               # Never reinstall a real gateway on this host from a test.
+                                               "autoUpdate": False},
                                               {"controlKey": g.key, "controlUrl": g.url})
         parent_client = TestClient(TestServer(parent.web_admin.make_app()))
         await parent_client.start_server()
@@ -134,5 +136,5 @@ async def test_controller_page_carries_login_mode(linked_instances, tmp_path, mo
         monkeypatch.setattr(server, "_web_dist_dir", lambda: dist)
     parent_page = await (await e.parent_client.get("/chat")).text()
     assert '"[[controller]]"' not in parent_page and '"controller"' in parent_page
-    child_page = await e.child.web_admin.handle_index(None)
+    child_page = await e.child.web_admin.handle_index(make_mocked_request("GET", "/chat"))
     assert '"gateway"' in child_page.text

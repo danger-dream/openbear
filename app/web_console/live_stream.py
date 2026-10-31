@@ -353,7 +353,7 @@ class _WebLiveStream:
             self.current_status = str(event.get("status") or "已追加到当前运行")
             self.status_started_at_ms = event_ts
         elif typ == "task_notification":
-            self.current_status = "Agent 结果已回传"
+            self.current_status = str(event.get("statusText") or "Agent 结果已回传")
             self.status_started_at_ms = event_ts
         elif typ == "agent_supervision":
             self.current_status = str(event.get("statusText") or "等待 Agent")
@@ -479,6 +479,13 @@ class _WebLiveStream:
             self._latest_user_turn_uuid = ""
 
 
+# Only a link whose closing parenthesis has streamed is a complete target.
+_STREAMED_MARKDOWN_LINK_RE = re.compile(
+    r"!?\[[^\]\n]{0,300}\]\((?:<[^>\n]+>|[^)\s\n]+)(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'))?\)"
+)
+_STREAMED_LINK_SKIP_PREFIXES = ("http://", "https://", "/api/", "#", "mailto:", "openbear://", "data:")
+
+
 class _WebStreamRenderer:
     """Browser renderer for the Agent loop.
 
@@ -507,6 +514,8 @@ class _WebStreamRenderer:
         self._output_phase = ""
         self._snapshot_text = self._snapshot_reasoning = ""
         self._text_prefix = self._reasoning_prefix = ""
+        # Per model call: a later call may follow a tool that rewrote the file.
+        self._streamed_links: dict[str, str] = {}
 
     @staticmethod
     def _delta_size(event: dict[str, Any]) -> int:
@@ -528,13 +537,13 @@ class _WebStreamRenderer:
         The model is instructed to use workspace-relative Markdown links such as
         ``![label](workspace/artifacts/x.png)`` as an internal handoff.  The Web UI
         must receive the private ``/api/conversations/.../artifacts/...`` URL, not
-        the local path.  Do this only on terminal snapshots to avoid rewriting
-        partially streamed Markdown links.
+        the local path.  Do this only on complete segment snapshots (including
+        the pre-tool `cut`) to avoid rewriting partially streamed Markdown links.
         """
         if self._artifact_rewriter is None:
             return event
         typ = str(event.get("type") or "")
-        if typ not in {"final", "notice"}:
+        if typ not in {"final", "notice", "cut"}:
             return event
         text = str(event.get("text") or "")
         if not text:
@@ -545,6 +554,43 @@ class _WebStreamRenderer:
         event = dict(event)
         event["text"] = rewritten
         return event
+
+    async def _rewrite_streamed_links(self, text: str) -> str:
+        """Rewrite each completed artifact link while its segment is streaming.
+
+        The URL equals the one the segment-boundary rewrite will produce, so
+        the browser keeps the already loaded image or card.
+        """
+        if self._artifact_rewriter is None or "](" not in text:
+            return text
+        out: list[str] = []
+        last = 0
+        for match in _STREAMED_MARKDOWN_LINK_RE.finditer(text):
+            link = match.group(0)
+            rewritten = self._streamed_links.get(link)
+            if rewritten is None:
+                target = link[link.index("](") + 2:].lstrip("<")
+                if target.startswith(_STREAMED_LINK_SKIP_PREFIXES):
+                    continue
+                try:
+                    rewritten = await self._artifact_rewriter(link)
+                except Exception as exc:  # noqa: BLE001
+                    # A preview must never fail the model call; the segment
+                    # boundary rewrite remains authoritative.
+                    log.warning("流式制品链接预解析失败", 错误=type(exc).__name__)
+                    rewritten = link
+                # Unresolved links are remembered too: without a tool running
+                # inside this call, every later flush would repeat the lookup.
+                self._streamed_links[link] = rewritten
+            if rewritten == link:
+                continue
+            out.append(text[last:match.start()])
+            out.append(rewritten)
+            last = match.end()
+        if not out:
+            return text
+        out.append(text[last:])
+        return "".join(out)
 
     async def _flush_delta(self, *, force_persist: bool = False) -> None:
         if not self._pending_delta:
@@ -561,7 +607,9 @@ class _WebStreamRenderer:
             or not self._last_delta_persist_ms
             or now_ms - self._last_delta_persist_ms >= persist_interval_ms
         )
-        await self._emit_now(event, persist=persist)
+        text = str(event.get("text") or "")
+        streamed_text = await self._rewrite_streamed_links(text)
+        await self._emit_now(event if streamed_text == text else {**event, "text": streamed_text}, persist=persist)
         if persist:
             # Skipped updates are only in this stream's draft. Keep the latest
             # pending so a tool/status boundary can force it into the
@@ -656,6 +704,7 @@ class _WebStreamRenderer:
 
     async def on_model_start(self, *, retry: bool = False) -> None:
         await self._finish_output_phase()
+        self._streamed_links = {}
         if not retry:
             self._snapshot_text = self._snapshot_reasoning = ""
             self._text_prefix = self._reasoning_prefix = ""
@@ -684,7 +733,8 @@ class _WebStreamRenderer:
     async def on_retry_state(self, state: dict[str, Any]) -> None:
         if state.get("active"):
             await self._finish_output_phase()
-        await self.emit({"type": "retry_wait", "retry": dict(state)})
+        if not state.get("quiet"):
+            await self.emit({"type": "retry_wait", "retry": dict(state)})
 
     async def on_tool(self, tool_line: str) -> None:
         await self.emit({"type": "tool", "line": tool_line})

@@ -1,5 +1,7 @@
 <script setup>
+import {computed, inject} from "vue";
 import {ArrowRight, Bell, CircleCheck, CircleClose, MagicStick, Refresh, Tools} from "@element-plus/icons-vue";
+import {AGENT_LOCATOR} from "./agentPanelState.js";
 import AgentEventCard from "./AgentEventCard.vue";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import ConsoleToolEvent from "./ConsoleToolEvent.vue";
@@ -34,6 +36,8 @@ const props = defineProps({
 	showReasoning: {type: Boolean, default: true},
 });
 const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "cancel-retry", "retry-now"]);
+const agentLocator = inject(AGENT_LOCATOR, null);
+const waitingAgents = computed(() => Array.isArray(props.event?.waitingAgents) ? props.event.waitingAgents : []);
 
 function scrollReasoningBodyToEnd(el, active) {
 	if (!active || !el) return;
@@ -195,7 +199,15 @@ function isFailureAnswer(event = {}) {
 	     :class="{ 'process-live': props.event.active !== false && !props.event.queued, 'agent-notice-event': props.event.agentNotice, 'thinking-only-event': props.event.persistentRunIndicator }">
 		<div class="live-process-summary" :class="{ 'thinking-only-summary': props.event.persistentRunIndicator }">
 			<template v-if="props.event.persistentRunIndicator">
-				<span v-if="props.event.waitingLabel" class="run-waiting-label work-status-sweep" role="status">{{ props.event.waitingLabel }}</span>
+				<span v-if="props.event.waitingLabel" class="run-waiting-label work-status-sweep" :class="{'has-agents': waitingAgents.length}" role="status">{{ props.event.waitingLabel }}</span>
+				<span v-if="props.event.waitingLabel && waitingAgents.length" class="run-waiting-agents">
+					<span class="run-waiting-sep" aria-hidden="true">·</span>
+					<template v-for="(agent, agentIndex) in waitingAgents.slice(0, 2)" :key="agent.key">
+						<span v-if="agentIndex" class="run-waiting-sep" aria-hidden="true">、</span>
+						<button type="button" class="run-waiting-agent" :title="`查看 Agent：${agent.title}`" @click.stop="agentLocator?.locate(agent.key)">{{ agent.title }}</button>
+					</template>
+					<span v-if="waitingAgents.length > 2" class="run-waiting-more">等 {{ waitingAgents.length }} 个</span>
+				</span>
 				<span class="thinking-dots" :aria-label="props.event.waitingLabel || '正在思考'">
 					<span></span><span></span><span></span>
 				</span>
@@ -482,6 +494,71 @@ details[open] > summary > .disclosure-icon {
 	margin-right: .45rem;
 	font-size: 14px;
 	line-height: 1.65;
+}
+
+.run-waiting-label.has-agents {
+	flex: none;
+	max-width: 60%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.run-waiting-agents {
+	display: inline-flex;
+	align-items: baseline;
+	min-width: 0;
+	margin: 0 .55rem 0 -.1rem;
+	color: var(--ob-text-muted);
+	font-size: 14px;
+	line-height: 1.65;
+}
+
+.run-waiting-sep {
+	flex: none;
+	margin-right: .35rem;
+}
+
+.run-waiting-agent + .run-waiting-sep {
+	margin-right: 0;
+}
+
+.run-waiting-agent {
+	min-width: 2em;
+	max-width: 32em;
+	overflow: hidden;
+	border: 0;
+	background: transparent;
+	padding: 0;
+	color: var(--ob-text);
+	font: inherit;
+	text-align: left;
+	text-decoration: underline;
+	text-decoration-color: var(--ob-border-strong, var(--ob-text-muted));
+	text-underline-offset: 3px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.run-waiting-agent:hover {
+	text-decoration-color: currentColor;
+}
+
+.run-waiting-agent:focus-visible {
+	outline: 2px solid var(--bear-accent, var(--ob-focus));
+	outline-offset: 2px;
+	border-radius: 4px;
+}
+
+.run-waiting-more {
+	flex: none;
+	margin-left: .35rem;
+	font-size: 12px;
+}
+
+@media (hover: none) {
+	.run-waiting-agent { min-height: 32px; }
 }
 
 .live-process-summary.thinking-only-summary {

@@ -222,7 +222,8 @@ async def test_append_event_ignores_a_pinned_shared_reader_snapshot(db):
     await dao.append_event(task_uuid, "event_2")
     await dao.append_event(task_uuid, "event_3")
 
-    held_cursor = await db.conn.execute(
+    # Router reads finish before they return; pin the shared reader directly.
+    held_cursor = await db._router()._reader.execute(
         "SELECT seq FROM rath_task_events WHERE task_uuid=? ORDER BY seq",
         (task_uuid,),
     )

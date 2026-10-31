@@ -30,6 +30,8 @@ from app.web_console.prompt_suggestions import WebAdminPromptSuggestionsMixin
 from app.web_console.config_api import WebAdminSettingsChannelsMixin
 from app.web_console.conversation_overview import WebAdminConversationOverviewMixin
 from app.web_console.conversation_prompt import WebAdminConversationPromptMixin
+from app.web_console.conversation_batch import WebAdminConversationBatchMixin
+from app.web_console.conversation_retention import WebAdminConversationRetentionMixin
 from app.web_console.prompt_policy import PromptPolicyMixin
 from app.web_console.context_editor import WebAdminContextEditorMixin
 from app.web_console.conversation_tree import WebAdminConversationTreeMixin
@@ -76,6 +78,7 @@ from app.web_console.routing import WebAdminAppMixin
 from app.web_console.system_mcp_api import WebAdminSystemMcpMixin
 from app.web_console.statistics_api import WebAdminStatisticsMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
+from app.web_console.work_items_api import WebAdminWorkItemsMixin
 from app.web_console.update_api import WebAdminUpdateMixin
 from app.web_console.uploads import WebAdminUploadsMixin
 from app.web_console.webhooks_api import WebhookPropertiesMixin
@@ -97,6 +100,8 @@ class WebAdminServer(
     WebAdminArtifactsMixin,
     WebAdminConversationsMixin,
     WebAdminConversationTreeMixin,
+    WebAdminConversationRetentionMixin,
+    WebAdminConversationBatchMixin,
     WebAdminConversationOverviewMixin,
     WebAdminConversationPromptMixin,
     WebAdminContextEditorMixin,
@@ -113,6 +118,7 @@ class WebAdminServer(
     WebAdminPromptSuggestionsMixin,
     WebAdminChatHandlersMixin,
     WebAdminTaskMemoryMixin,
+    WebAdminWorkItemsMixin,
     WebAdminMemoryMixin,
 ):
     def __init__(
@@ -192,6 +198,7 @@ class WebAdminServer(
         self._web_conversation_title_tasks: dict[str, asyncio.Task[Any]] = {}
         self._web_prompt_suggestion_tasks: dict[str, asyncio.Task[Any]] = {}
         self._web_frame_prune_task: asyncio.Task[Any] | None = None
+        self._conversation_retention_task: asyncio.Task[Any] | None = None
         self._web_notification_recovery_task: asyncio.Task[Any] | None = None
         # One event/queue per Web conversation keeps the original controller run
         # asleep (not exited) while its detached Agents work. User interruptions
@@ -304,6 +311,10 @@ class WebAdminServer(
             _frame_retention_loop(),
             name="web-event-frame-retention",
         )
+        self._conversation_retention_task = asyncio.create_task(
+            self._conversation_retention_loop(),
+            name="web-conversation-retention",
+        )
         log.info("Web 管理服务已启动", host=self.config.web.host, port=self.config.web.port)
 
     async def stop(self) -> None:
@@ -327,6 +338,11 @@ class WebAdminServer(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._web_frame_prune_task
             self._web_frame_prune_task = None
+        if self._conversation_retention_task is not None:
+            self._conversation_retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._conversation_retention_task
+            self._conversation_retention_task = None
         # Stop accepting browser work first, then let every registered controller
         # unwind while SQLite and the live operation sink are still available.
         # Closing DB before these tasks receive CancelledError leaves active Web

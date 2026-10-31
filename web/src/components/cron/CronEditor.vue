@@ -31,8 +31,22 @@ function setIntervalUnit(value){const amount=intervalAmount.value;intervalUnit.v
 watch(loaded,ready=>{if(ready)intervalUnit.value=intervalUnitFor(draft.config.schedule.everySeconds);},{flush:'sync'});
 function setModel(field,selection){draft.config.runConfig=changeModel(draft.config.runConfig,field,selection);}
 async function navigateTabs(event){tab.value=tabKey(event,tab.value);await nextTick();if(['ArrowLeft','ArrowRight','Home','End'].includes(event.key))root.value?.querySelector(`[data-tab="${tab.value}"]`)?.focus();}
+function retentionNeedsPreview(id,next){
+  const saved=job.value?.config?.conversationRetention || {};
+  const values=[next.keepLast,next.keepDays];
+  if(!id || values.every(value=>value==null) || values.some(value=>value!=null && !(Number.isInteger(value) && value>0)))return false;
+  return next.keepLast!==(saved.keepLast ?? null) || next.keepDays!==(saved.keepDays ?? null);
+}
+async function confirmRetention({id,config}){
+  const next=config.conversationRetention || {};
+  if(!retentionNeedsPreview(id,next))return true;
+  const {count}=await Api.previewConversationRetention({kind:'cron',id,retention:{keepLast:next.keepLast ?? null,keepDays:next.keepDays ?? null}});
+  if(!count)return true;
+  try{await ElMessageBox.confirm(`保存后会立即删除这个任务创建的 ${count} 个旧会话，删除后不可恢复。`,'确认会话保留',{type:'warning',confirmButtonText:'保存并清理',cancelButtonText:'取消',closeOnClickModal:false});return true;}
+  catch{return false;}
+}
 async function save(){
-  if(await editor.save()){ElMessage.success('定时任务已保存');emit('saved',job.value);return true;}
+  if(await editor.save({confirm:confirmRetention})){ElMessage.success('定时任务已保存');emit('saved',job.value);return true;}
   if(errors.value.length){
     const first=errors.value[0];tab.value=first.tab;if(tab.value==='scripts')phase.value=first.path.split('.')[0];
     await nextTick();root.value?.querySelector(`[data-field="${first.path}"] input`)?.focus();
@@ -86,6 +100,11 @@ defineExpose({canLeave,saving});
               <Field label="通知范围"><el-checkbox v-model="draft.config.notifications.errorsOnly" :disabled="disabled || draft.config.notifications.mode==='silent'">仅异常通知</el-checkbox></Field>
             </div>
             <p class="cron-note">后置结束后通知；所选渠道须已在系统中配置。</p>
+            <div class="cron-grid">
+              <Field v-model="draft.config.conversationRetention.keepLast" path="conversationRetention.keepLast" label="会话保留最近" type="number" nullable :step="1" :min="1" unit="个" :disabled="disabled" :error="errorFor('conversationRetention.keepLast')" />
+              <Field v-model="draft.config.conversationRetention.keepDays" path="conversationRetention.keepDays" label="会话保留天数" type="number" nullable :step="1" :min="1" unit="天" :disabled="disabled" :error="errorFor('conversationRetention.keepDays')" />
+            </div>
+            <p class="cron-note">超过任一条件的旧会话会自动删除，不可恢复；留空不清理。置顶、归档、移出本目录或你发过消息的会话会保留。</p>
           </section>
           <section v-show="tab==='schedule'" id="cron-panel-schedule" role="tabpanel" aria-labelledby="cron-tab-schedule" class="cron-section">
             <div class="cron-grid"><Field v-model="draft.config.schedule.kind" label="时间规则" :disabled="disabled" :options="[{value:'at',label:'一次性'},{value:'every',label:'固定间隔'},{value:'cron',label:'Cron 表达式'}]" /><Field v-model="draft.config.schedule.timezone" path="schedule.timezone" label="规则时区" filterable :options="timezones" :disabled="disabled" placeholder="搜索并选择时区" :error="errorFor('schedule.timezone')" @blur="editor.validateField('schedule.timezone')" @update:model-value="editor.validateField('schedule.timezone')" /></div>
@@ -118,6 +137,7 @@ defineExpose({canLeave,saving});
           <section v-show="tab==='instructions'" id="cron-panel-instructions" role="tabpanel" aria-labelledby="cron-tab-instructions" class="cron-section cron-section-instructions">
             <p class="cron-note">填写本次执行的目标、范围与授权；会话同时继承目录上下文。</p>
             <div class="cron-code cron-instructions"><AdaptiveMdEditor v-model="draft.config.instructions" :read-only="disabled" language="markdown" completion-mode="none" /></div>
+            <div class="cron-server-changes" data-field="allowServerChanges"><el-checkbox v-model="draft.config.allowServerChanges" :disabled="disabled">允许改动服务器和实例</el-checkbox><p :class="draft.config.allowServerChanges ? 'cron-alert' : 'cron-note'">{{ draft.config.allowServerChanges ? '定时任务无人值守，可能被服务器返回的内容误导而执行改动（运行命令、写文件、操作节点和实例）。只在任务确实需要时开启。' : '未勾选时，执行中只能查看服务器和实例。' }}</p></div>
           </section>
           <section v-show="tab==='scripts'" id="cron-panel-scripts" role="tabpanel" aria-labelledby="cron-tab-scripts" class="cron-section"><el-radio-group v-model="phase" aria-label="脚本阶段"><el-radio-button value="pre">前置脚本</el-radio-button><el-radio-button value="post">后置脚本</el-radio-button></el-radio-group><CronScriptEditor :key="phase" :script="draft.config[phase]" :phase="phase" :environment="environment" :errors="errors" :disabled="disabled" /></section>
         </template>

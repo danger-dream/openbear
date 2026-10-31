@@ -24,7 +24,7 @@ log = get_logger("db.engine")
 
 _SCHEMA = "\n".join(
     (Path(__file__).parent / name).read_text(encoding="utf-8")
-    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql", "collab.sql")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql", "collab.sql", "work_items.sql")
 )
 
 
@@ -244,6 +244,9 @@ class DB:
     async def _pre_migrate_existing_web_schema(self) -> None:
         await self._add_column_if_missing(
             "web_conversation_folders", "run_defaults_json", "run_defaults_json TEXT NOT NULL DEFAULT '{}'"
+        )
+        await self._add_column_if_missing(
+            "web_conversation_folders", "hide_from_recent", "hide_from_recent INTEGER NOT NULL DEFAULT 0"
         )
         has_web_conversations = await self._table_exists("web_conversations")
         had_display_order = has_web_conversations and "display_order" in await self._columns("web_conversations")

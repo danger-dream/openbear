@@ -6,12 +6,46 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 //go:embed login.html
 var loginHTML string
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
+
+// A service worker controls every instance on this origin, so the gateway
+// serves its own copy of web/public/openbear-push-sw.js instead of a node's.
+//
+//go:embed openbear-push-sw.js
+var pushWorker []byte
+
+const pushWorkerPath = "/openbear-push-sw.js"
+
+// The browser marks every service worker script fetch with this header.
+func serviceWorkerScript(r *http.Request) bool {
+	return len(r.Header.Values("Service-Worker")) > 0 && r.URL.Path != pushWorkerPath
+}
+
+// Each instance page loads its build below /_i/<instance>/, so long-lived
+// browser cache entries of one instance never answer another on this origin.
+const assetPrefixHeader = "X-OpenBear-Gateway-Assets"
+
+func assetPrefix(id string) string { return "/_i/" + id + "/" }
+
+// instanceAsset splits /_i/<instance>/assets/... into the instance and the
+// path of that file on the node.
+func instanceAsset(p string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(p, "/_i/")
+	if !ok {
+		return "", "", false
+	}
+	id, path, ok := strings.Cut(rest, "/")
+	if !ok || !validID(id) || !strings.HasPrefix(path, "assets/") {
+		return "", "", false
+	}
+	return id, "/" + path, true
+}
 
 // Keep these in sync with app/managed/http.py:GATEWAY_APP_PAGES and
 // app/web_console/auth_api.py:PWA_PUBLIC_FILES. No generic root/static fallback.
@@ -27,14 +61,18 @@ func bootstrapPath(r *http.Request) bool {
 			return false
 		}
 	}
-	return pagePaths[r.URL.Path] || pwaPaths[r.URL.Path] || strings.HasPrefix(r.URL.Path, "/assets/")
+	_, _, prefixed := instanceAsset(r.URL.Path)
+	return pagePaths[r.URL.Path] || pwaPaths[r.URL.Path] || strings.HasPrefix(r.URL.Path, "/assets/") || prefixed
 }
 
 var assetHash = regexp.MustCompile(`-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$`)
 
+// Unprefixed /assets/ come from nodes that predate instance prefixes; their
+// cache entries would be shared by every instance, so they are never cached.
 func immutableAsset(r *http.Request) bool {
+	_, path, prefixed := instanceAsset(r.URL.Path)
 	return (r.Method == "GET" || r.Method == "HEAD") && cleanPath(r.URL.Path) &&
-		strings.HasPrefix(r.URL.Path, "/assets/") && assetHash.MatchString(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+		prefixed && assetHash.MatchString(path[strings.LastIndex(path, "/")+1:])
 }
 
 func hasPageContext(r *http.Request) bool {
@@ -91,11 +129,28 @@ func (g *Gateway) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
-	// Only content-hashed build assets can share a cached response across nodes.
+	if r.URL.Path == pushWorkerPath {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Length", strconv.Itoa(len(pushWorker)))
+		if r.Method != "HEAD" {
+			_, _ = w.Write(pushWorker)
+		}
+		return
+	}
+	upstreamPath := ""
+	if id, path, prefixed := instanceAsset(r.URL.Path); prefixed {
+		if !equal(id, i.ID) {
+			fail(w, 409, "session_context_changed")
+			return
+		}
+		upstreamPath = path
+	}
+	// Only an instance's own content-hashed assets may revalidate a cache entry.
 	if !immutableAsset(r) {
 		r = r.Clone(r.Context())
 		r.Header.Del("If-None-Match")
 		r.Header.Del("If-Modified-Since")
 	}
-	g.proxy(w, r, i, &s, "")
+	g.proxy(w, r, i, &s, upstreamPath)
 }

@@ -106,6 +106,20 @@ function naturalBoundary(target, from, rawStep, {backlog, inCode} = {}) {
 	return to;
 }
 
+// Reveal a link destination at once: a typed-out URL is noise, and a partial
+// one would be requested or shown as raw text before it is complete.
+const LINK_DESTINATION_RE = /[^\s)]*/y;
+function linkDestinationBoundary(target, from, to) {
+	const open = target.lastIndexOf("](", to - 1);
+	if (open < 0 || open + 2 > to) return to;
+	LINK_DESTINATION_RE.lastIndex = open + 2;
+	const destEnd = open + 2 + LINK_DESTINATION_RE.exec(target)[0].length;
+	if (destEnd < to) return to;
+	if (target[destEnd] === ")") return destEnd + 1;
+	if (destEnd === target.length) return Math.max(from, open + 2);
+	return to;
+}
+
 function pauseForSlice(text, target) {
 	const backlog = target.length - text.length;
 	if (backlog > 180 || codeFenceOpenAt(target, text.length)) return 0;
@@ -124,7 +138,7 @@ function nextLiveSlice(current, target) {
 	if (backlog <= 0) return current;
 	const inCode = codeFenceOpenAt(target, current.length);
 	const rawStep = stepForBacklog(backlog, inCode);
-	const to = naturalBoundary(target, current.length, rawStep, {backlog, inCode});
+	const to = linkDestinationBoundary(target, current.length, naturalBoundary(target, current.length, rawStep, {backlog, inCode}));
 	return target.slice(0, to);
 }
 
@@ -141,9 +155,12 @@ function paintLiveText() {
 		displayedText.value = target;
 		return;
 	}
-	const next = nextLiveSlice(displayedText.value, target);
+	const current = displayedText.value;
+	const next = nextLiveSlice(current, target);
 	displayedText.value = next;
-	if (next !== target) {
+	// No progress means an unfinished link destination holds the slice; only
+	// more text can release it, and the text watcher reschedules then.
+	if (next !== target && next !== current) {
 		livePauseUntil = now + pauseForSlice(next, target);
 		scheduleLivePaint(Math.max(0, livePauseUntil - now));
 	}
@@ -310,6 +327,23 @@ function onMarkdownClick(event) {
 	object-fit: contain;
 	box-shadow: var(--ob-shadow-panel);
 	cursor: zoom-in;
+}
+
+.bear-md :deep(.md-artifact-pending) {
+	display: inline-block;
+	max-width: 100%;
+	padding: 0 0.45em;
+	border: 1px dashed var(--ob-border);
+	border-radius: 6px;
+	color: var(--ob-text-muted);
+	font-size: 0.92em;
+	vertical-align: baseline;
+}
+
+.bear-md :deep(.md-artifact-pending.is-image) {
+	margin: 0.35rem 0;
+	padding: 0.3rem 0.65rem;
+	border-radius: 10px;
 }
 
 .bear-md :deep(.md-table-scroll) {

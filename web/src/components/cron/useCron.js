@@ -67,15 +67,20 @@ export function createCronEditor(api, {requestId} = {}) {
     const issues = validateDraft(draft,{models:models.value,folder:folder.value,environment:environment.value});
     errors.value = [...errors.value.filter(item => item.path !== path), ...issues.filter(item => item.path === path)];
   }
-  async function save() {
+  async function save({confirm} = {}) {
     if (!loaded.value || saving.value || loading.value || inheritanceLoading.value || inheritanceError.value) return false;
     errors.value=validateDraft(draft,{models:models.value,folder:folder.value,environment:environment.value});
     if (errors.value.length || (conflict.value && !conflict.value.mergeReady)) return false;
     const id=job.value?.id, current=generation, submitted=JSON.stringify(draft);
     const config=clone(draft.config);config.schedule=schedulePayload(config.schedule);config.totalTokensBudget=parseTokenBudget(config.totalTokensBudget);
+    if (config.allowServerChanges === false) delete config.allowServerChanges;
+    // An unset retention is omitted so the payload stays valid for a backend without the field.
+    if (config.conversationRetention.keepLast == null && config.conversationRetention.keepDays == null) delete config.conversationRetention;
     const body=intents.body('save',{name:draft.name.trim(),description:draft.description,enabled:draft.enabled,config,...(id ? {expectedRevision:job.value.revision} : {folderId:draft.folderId})});
     saving.value=true;error.value='';
     try {
+      if (confirm && !await confirm({id,config:clone(config)})) return false;
+      if (disposed || current !== generation) return false;
       const data = id ? await api.updateCronJob(id,body) : await api.createCronJob(body);
       if (disposed || current !== generation) return false;
       const later=JSON.stringify(draft) !== submitted ? clone(draft) : null;

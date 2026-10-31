@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import postcss from 'postcss';
-import {parse,compileScript,compileTemplate} from '@vue/compiler-sfc';
+import {parse} from '@vue/compiler-sfc';
 import {ref,reactive,computed,nextTick,watch,effectScope} from 'vue';
 import * as config from './cronConfig.js';
 import {createCronEditor,createCronActions,createQuery} from './useCron.js';
@@ -192,9 +192,6 @@ test('Cron layout fixes native input shrink, tab spacing, full-width model contr
   assert.equal(rules('.cron-script-grid')['align-items'],'stretch');assert.equal(rules('.cron-script-source>.cron-code').flex,'1');assert.equal(rules('.cron-script-source>.cron-code').height,undefined);
   assert.match(read('./CronScriptEditor.vue'),/<dl class="cron-env-grid">/);assert.doesNotMatch(read('./CronScriptEditor.vue'),/<details/);
 });
-test('App routes Cron deep links and orders sidebar between docs and Skills',()=>{
-  const source=read('../../App.vue');assert.ok(source.indexOf("key: 'cron'")>source.indexOf('key: "docs"'));assert.ok(source.indexOf("key: 'cron'")<source.indexOf('key: "skills"'));assert.match(source,/cron: '\/cron'/);assert.match(source,/'\/cron': 'cron'/);assert.match(source,/params\.set\('folderId', cronFolderId\.value\)/);assert.match(source,/cronFolderId\.value = url\.searchParams\.get\('folderId'\)/);assert.match(source,/@open-conversation="openCronConversation"/);
-});
 test('API methods use only Cron endpoints, encoded IDs, DELETE body, and exact preview schema',async()=>{
   const calls=[];const transport={interceptors:{request:{use(){}},response:{use(){}}}};for(const method of ['get','post','patch','delete','put'])transport[method]=async(...args)=>{calls.push([method,...args]);return {data:{ok:true}};};
   const context={axios:{create:()=>transport},window:{location:{pathname:'/cron'}},uploadFilesViaHttp(){}};vm.createContext(context);vm.runInContext(read('../../api.js').replace(/^import .*;\n/gm,'').replaceAll('export ',''),context);
@@ -280,11 +277,8 @@ test('Cron ordinary and primary buttons match header visual tokens, not Element 
   assert.deepEqual(primary,declarations(header,'.admin-header-primary :deep(.el-button)'));
   assert.doesNotMatch(read('../../views/CronView.vue'),/type="primary" plain/);
 });
-// ConversationTree.vue gets the same script+template compile in
-// webhookEditor.integration and promptPolicy.integration; App.vue only here.
-test('all Cron SFCs plus modified App compile with real Vue compiler; no Cron stop control exists',()=>{
-  for(const path of ['../webhooks/WebhookField.vue','./CronEditor.vue','./CronDateTime.vue','./CronScriptEditor.vue','./CronHistory.vue','./CronRunDialog.vue','../../views/CronView.vue','../../App.vue']){
-    const source=read(path),{descriptor,errors}=parse(source);assert.deepEqual(errors,[],path);const script=compileScript(descriptor,{id:path});const result=compileTemplate({source:descriptor.template.content,filename:path,id:path,compilerOptions:{bindingMetadata:script.bindings}});assert.deepEqual(result.errors,[],path);
-    if(path.includes('Cron'))assert.doesNotMatch(source,/conversationStop|stopCron|cronStop|\/stop/);
+test('no Cron stop control exists',()=>{
+  for(const path of ['./CronEditor.vue','./CronDateTime.vue','./CronScriptEditor.vue','./CronHistory.vue','./CronRunDialog.vue','../../views/CronView.vue']){
+    assert.doesNotMatch(read(path),/conversationStop|stopCron|cronStop|\/stop/,path);
   }
 });

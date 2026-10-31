@@ -12,6 +12,9 @@ import pytest
 
 from app.db.engine import DB
 
+# These test migrations, so every database here is built the real way.
+pytestmark = pytest.mark.real_db
+
 _CHILD = r'''
 import asyncio
 import json

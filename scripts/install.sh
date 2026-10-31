@@ -35,6 +35,12 @@ DEFAULT_DIR="/opt/openbear"
 DEFAULT_PORT="18961"
 DEFAULT_NAME="老大"
 NODE_VERSION="${OPENBEAR_NODE_VERSION:-v20.19.4}"
+# Same pinned uv as scripts/updater.py. Without a system uv it lives in
+# $INSTALL_DIR/.tools/uv; the system is never changed.
+UV_VERSION="0.11.6"
+UV_SHA256_X86_64="aa342a53abe42364093506d7704214d2cdca30b916843e520bc67759a5d20132"
+UV_SHA256_AARCH64="d14ebd6f200047264152daaf97b8bd36c7885a5033e9e8bba8366cb0049c0d00"
+UV_TEMP_DIR=""
 RELEASE_UPGRADE_PENDING=0
 RELEASE_TXN=""
 RELEASE_TXN_OWNER=""
@@ -549,20 +555,74 @@ ensure_apt_packages() {
 }
 
 ensure_uv() {
-    export PATH="${HOME}/.local/bin:/root/.local/bin:/usr/local/bin:${PATH}"
+    export PATH="${HOME}/.local/bin:/root/.local/bin:${HOME}/.cargo/bin:/root/.cargo/bin:/usr/local/bin:${PATH}"
+    if ! command -v uv >/dev/null 2>&1 && [[ -x "$INSTALL_DIR/.tools/uv/uv" ]]; then
+        export PATH="$INSTALL_DIR/.tools/uv:${PATH}"
+    fi
     if ! command -v uv >/dev/null 2>&1; then
-        info "安装 uv..."
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        export PATH="${HOME}/.local/bin:/root/.local/bin:/usr/local/bin:${PATH}"
-        command -v uv >/dev/null 2>&1 || die "uv 安装失败"
+        download_uv || die "uv 安装失败"
     fi
-    # systemd-run 默认 PATH 不含 ~/.local/bin，界面更新会找不到 uv。
-    local uv_bin
-    uv_bin="$(command -v uv)"
-    if [[ -n "$uv_bin" && "$uv_bin" != "/usr/local/bin/uv" && -d /usr/local/bin && ! -e /usr/local/bin/uv ]]; then
-        ln -sfn "$uv_bin" /usr/local/bin/uv || warn "无法把 uv 链到 /usr/local/bin，界面更新可能找不到 uv"
+    local version
+    version="$(uv --version)" || die "uv 无法运行: $(command -v uv)"
+    ok "uv: $version"
+}
+
+download_uv() {
+    local build sha dir
+    case "$(uname -m)" in
+        x86_64|amd64) build="uv-x86_64-unknown-linux-musl"; sha="$UV_SHA256_X86_64" ;;
+        aarch64|arm64) build="uv-aarch64-unknown-linux-musl"; sha="$UV_SHA256_AARCH64" ;;
+        *) err "不支持的 CPU 架构: $(uname -m)，请先自行安装 uv"; return 1 ;;
+    esac
+    info "安装 uv $UV_VERSION..."
+    if [[ "$MODE" == "fresh" ]]; then
+        # The install directory must stay empty until sync_code, and /tmp is
+        # often noexec: wait next to it; persist_uv moves uv in afterwards.
+        mkdir -p "$(dirname "$INSTALL_DIR")" || return 1
+        UV_TEMP_DIR="$(mktemp -d "$(dirname "$INSTALL_DIR")/.openbear-uv.XXXXXX")" || return 1
+        trap 'rm -rf "$UV_TEMP_DIR"' EXIT
+        dir="$UV_TEMP_DIR"
+    else
+        dir="$INSTALL_DIR/.tools/uv"
+        mkdir -p "$dir" && ignore_tools || return 1
     fi
-    ok "uv: $(uv --version)"
+    local url="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$build.tar.gz"
+    # Failures leave nothing behind: no partial archive, and never a uv that
+    # later runs would pick up but cannot execute.
+    if ! curl -fL --retry 3 -A "OpenBear-Install" -o "$dir/uv.tar.gz.part" "$url"; then
+        rm -f "$dir/uv.tar.gz.part"
+        err "无法下载 uv: $url；无法访问 GitHub 时请先自行安装 uv 并加入 PATH"
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$sha" "$dir/uv.tar.gz.part" | sha256sum -c --quiet - >/dev/null 2>&1; then
+        rm -f "$dir/uv.tar.gz.part"
+        err "uv 下载校验和不匹配"
+        return 1
+    fi
+    if ! tar -xzf "$dir/uv.tar.gz.part" -C "$dir" "$build/uv" || ! chmod 755 "$dir/$build/uv" \
+        || ! "$dir/$build/uv" --version >/dev/null 2>&1 || ! mv "$dir/$build/uv" "$dir/uv"; then
+        rm -rf "$dir/uv.tar.gz.part" "${dir:?}/$build"
+        err "下载的 uv 无法解压或运行: $dir"
+        return 1
+    fi
+    rm -rf "$dir/uv.tar.gz.part" "${dir:?}/$build"
+    export PATH="$dir:${PATH}"
+}
+
+# Older git checkouts do not ignore .tools; a dirty tree would block upgrades.
+ignore_tools() {
+    printf '*\n' > "$INSTALL_DIR/.tools/.gitignore"
+}
+
+persist_uv() {
+    [[ -n "$UV_TEMP_DIR" ]] || return 0
+    local own="$INSTALL_DIR/.tools/uv"
+    mkdir -p "$own" && ignore_tools && mv "$UV_TEMP_DIR/uv" "$own/uv" || die "无法把 uv 保存到 $own"
+    rm -rf "$UV_TEMP_DIR"
+    trap - EXIT
+    UV_TEMP_DIR=""
+    export PATH="$own:${PATH}"
+    ok "uv 已安装到 $own"
 }
 
 ensure_node() {
@@ -1288,7 +1348,8 @@ build_web() {
     else
         npm install
     fi
-    npm run build
+    # 安装不是开发构建：开发版号保持原样（见 web/scripts/bump-dev-version.mjs）
+    OPENBEAR_SKIP_DEV_BUMP=1 npm run build
     [[ -f "$INSTALL_DIR/web/dist/index.html" ]] || die "web/dist/index.html 未生成"
     ok "前端已构建"
 }
@@ -1501,6 +1562,7 @@ main() {
     ensure_apt_packages
     ensure_uv
     sync_code
+    persist_uv
     if [[ "$RELEASE_UPGRADE_PENDING" -eq 1 ]]; then
         # 事务升级的依赖已在 staging 中准备；先完成所有无需停服的本机工作。
         if [[ -z "${WEB_PORT:-}" ]]; then

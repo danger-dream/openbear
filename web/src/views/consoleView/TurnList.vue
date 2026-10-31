@@ -28,6 +28,8 @@ import {useMessageVisibility, visibilitySelectionClasses, selectVisibilityRow} f
 const visibility = useMessageVisibility();
 import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conversationTimeline.js";
 import {eventPrimaryToolName, isAgentEvent, tokenLine, tokenPartsFromStats, fmtTokens, cachePct} from "./display.js";
+import {ListChecks} from "@lucide/vue";
+import {isClosed, leaves, topNumber, turnTaskNumbers, useWorkItems} from "./workItems.js";
 
 const props = defineProps({
 	turns: {type: Array, default: () => []},
@@ -105,6 +107,33 @@ function continuationRootLabel(turn) {
 function turnWorking(turn, turnIndex) {
 	return Boolean(turnInProgress(turnIndex) || turn?.stats?.live
 		|| displayEvents(turn).some(event => event?.persistentRunIndicator) || turnView(turn).liveAnswer);
+}
+
+const workItems = useWorkItems();
+function turnFocus(turn) {
+	const uuid = String(turn?.user?.turnUuid || turn?.turnUuid || "");
+	return uuid && workItems ? workItems.focusFor(uuid) : null;
+}
+function focusLabel(focus) {
+	return (focus?.numbers || []).map(number => `#${number} ${workItems?.find(number)?.title || ""}`.trim()).join("、");
+}
+// One line per task this turn worked on, shown once the turn has finished.
+function turnTaskChips(turn) {
+	if (!workItems?.state.tasks.length) return [];
+	const numbers = turnTaskNumbers(conversationEvents(turn).map(entry => entry.event));
+	const focus = turnFocus(turn);
+	for (const number of focus?.numbers || []) if (!numbers.includes(topNumber(number))) numbers.push(topNumber(number));
+	return numbers.map(number => workItems.find(number)).filter(Boolean).map(task => {
+		const live = (task.children?.length ? leaves(task) : [task]).filter(item => item.status !== "dropped");
+		const roots = (focus?.numbers || []).filter(root => topNumber(root) === task.number);
+		const left = roots.flatMap(root => { const node = workItems.find(root); return node ? leaves(node) : []; })
+			.filter(item => !isClosed(item.status) && !["blocked", "ask"].includes(item.status));
+		return {
+			number: task.number, done: live.filter(item => item.status === "done").length, total: live.length,
+			ask: live.filter(item => item.status === "ask").length,
+			range: roots.map(root => `#${root}`).join("、"), left: left.length,
+		};
+	});
 }
 
 function hasAssistantContent(turn) {
@@ -406,6 +435,9 @@ async function copyMessage(content, key) {
 
 		<div v-if="hasAssistantContent(turn) || assistantMetaVisible(turn, turnIndex)" class="assistant-row">
 			<article class="assistant-card">
+				<button v-if="turnFocus(turn)" type="button" class="wi-turn-focus" @click="workItems.open(turnFocus(turn).numbers[0])">
+					<ListChecks :stroke-width="1.7" aria-hidden="true"/>本轮执行范围：<b>{{ focusLabel(turnFocus(turn)) }}</b>
+				</button>
 				<ConversationWorkBlock :turn="turn" :entries="conversationEvents(turn)" :running="turnWorking(turn, turnIndex)" :duration-ms="assistantDurationMs(turn)">
 				<template #default="{entry, conversationIndex}">
 					<div class="timed-row timed-row-assistant visibility-hover-surface" :data-search-op-id="(entry.part !== 'reasoning' && entry.event.kind === 'answer') || entry.event.kind === 'live_status' ? entry.event.id : undefined" :class="[visibilitySelectionClasses(entry.event, visibility), {'has-inline-retry': entry.event.kind === 'model_retry'}]" @click.capture="selectVisibilityRow($event, entry.event, visibility)">
@@ -436,6 +468,13 @@ async function copyMessage(content, key) {
 					</div>
 				</template>
 				</ConversationWorkBlock>
+				<div v-if="!turnWorking(turn, turnIndex) && turnTaskChips(turn).length" class="wi-turn-chips">
+					<button v-for="chip in turnTaskChips(turn)" :key="chip.number" type="button" class="wi-turn-chip" @click="workItems.open(chip.number)">
+						<ListChecks :stroke-width="1.7" aria-hidden="true"/><b>任务 #{{ chip.number }}</b><span>{{ chip.done }}/{{ chip.total }} 完成</span>
+						<template v-if="chip.range && chip.left"><span class="wi-turn-sep">·</span><span class="wi-turn-warn">本轮范围 {{ chip.range }} 还剩 {{ chip.left }} 项没收尾</span></template>
+						<template v-if="chip.ask"><span class="wi-turn-sep">·</span><span class="wi-turn-warn">{{ chip.ask }} 项等你定</span></template>
+					</button>
+				</div>
 				<div v-if="assistantMetaVisible(turn, turnIndex)" class="assistant-message-meta">
 					<span class="assistant-meta-details">
 						<time v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-message-time" :title="formatFullTime(assistantTimeMs(turn))"><span v-if="assistantTimeMs(turn)" class="footer-metric" title="回复时间"><Clock class="footer-meta-icon" aria-hidden="true"/>{{ formatHoverTime(assistantTimeMs(turn)) }}</span><span v-if="assistantTimeMs(turn) && assistantDurationMs(turn)"> · </span><span v-if="assistantDurationMs(turn)" class="footer-metric" title="耗时"><Timer class="footer-meta-icon" aria-hidden="true"/>{{ formatDuration(assistantDurationMs(turn)) }}</span></time>
@@ -461,6 +500,16 @@ async function copyMessage(content, key) {
 </template>
 
 <style scoped>
+.wi-turn-focus { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 10px; padding: 0; border: 0; background: transparent; color: var(--ob-chat-text); font-size: 12px; line-height: 1.6; text-align: left; cursor: pointer; }
+.wi-turn-focus svg, .wi-turn-chip svg { width: 14px; height: 14px; flex: none; color: var(--ob-chat-subtle); }
+.wi-turn-focus b { font-weight: 500; }
+.wi-turn-focus:hover b, .wi-turn-chip:hover b { text-decoration: underline; }
+.wi-turn-chips { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 6px; }
+.wi-turn-chip { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; font-size: 12px; line-height: 1.6; color: var(--ob-chat-subtle); text-align: left; cursor: pointer; }
+.wi-turn-chip b { color: var(--ob-chat-text); font-weight: 500; }
+.wi-turn-sep { color: var(--ob-chat-muted); }
+.wi-turn-warn { color: var(--ob-orange); }
+
 .turn-block {
 	margin: 1.15rem 0 1.55rem;
 }

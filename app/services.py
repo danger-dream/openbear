@@ -34,6 +34,7 @@ from app.agents.profiles import ensure_builtin_workflows
 from app.agents.dao import AgentDAO
 from app.agents.control import AgentControlService
 from app.task_memory import TaskMemoryDAO
+from app.work_items import WorkItemsDAO
 from app.tools.agent_history import register_agent_history_tool
 from app.tools.agents import register_agent_tools
 from app.tools.allowlist import refresh_agent_tool_enums
@@ -57,6 +58,7 @@ from app.webhooks.runtime_bridge import RuntimeBridge
 from app.webhooks.worker import Worker
 from app.tools.skills import filter_skills, load_skills, render_skills_block
 from app.tools.task_memory import register_task_memory_tool
+from app.tools.work_items import register_work_item_tool
 from app.tools.user_interaction import UserInteractionManager, register_user_interaction_tools
 from app.update.service import UpdateService
 
@@ -100,6 +102,7 @@ class Services:
         self.runs = ControllerRuns(self.runtime)
         self.agent_dao = AgentDAO(self.db)
         self.task_memories = TaskMemoryDAO(self.db)
+        self.work_items = WorkItemsDAO(self.db)
         self.agents = AgentControlService(self.agent_dao, scheduler=self.runtime)
         # workspace: 默认为运行目录下的 workspace/，不存在则自动创建
         self.workspace_dir = str(Path(config.managed.workspace_root if config.managed.enabled else os.getcwd(), "workspace").resolve())
@@ -163,6 +166,13 @@ class Services:
             from app.instances.service import InstanceService
             self.instances = InstanceService(self.db, self.web_admin)
         self.web_admin.instances = self.instances
+        self.servers = None
+        if self.instances is not None:
+            from app.servers.service import ServerService
+            self.servers = ServerService(self.db, self.web_admin, self.instances)
+            self.servers.browsers.on_change = lambda: self._rebuild_tools_and_context(
+                include_mcp=bool(self.mcp.available_tools()), preserve_file_state=True)
+        self.web_admin.servers = self.servers
 
         # 工具注册
         self.file_state = FileStateStore(config.tools.file_state_max_entries)
@@ -184,13 +194,12 @@ class Services:
                            auto_background_after_s=config.tools.bash_auto_background_after_s)
         register_memory_tools(self.tools, self.mem)
         register_task_memory_tool(self.tools, self.task_memories)
+        register_work_item_tool(self.tools, self.work_items, limits=config.work_items)
         register_history_tools(self.tools, self.db)
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
-        if self.instances is not None:
-            from app.tools.instances import register_instance_tools
-            register_instance_tools(self.tools, self.instances)
+        self._register_optional_feature_tools(config)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
         register_collab_tools(self.tools, self.collab, self.collab_groups)
@@ -231,6 +240,39 @@ class Services:
         self.total_cache_write_tokens = 0
         self.total_cost_usd = 0.0
 
+    def _register_optional_feature_tools(self, config: Config) -> None:
+        """InstanceControl/Servers only when their settings switch is on.
+
+        Must run before the Browser tool registers: server-node browsers belong to
+        the 主机 feature, so with it off the Browser tool, its describe and status
+        no longer mention nodes. The services themselves keep running either way.
+        """
+        if self.instances is not None and config.features.enabled("instances"):
+            from app.tools.instances import register_instance_tools
+            register_instance_tools(self.tools, self.instances)
+        servers_on = self.servers is not None and config.features.enabled("servers")
+        self.browser.nodes = self.servers.browsers if servers_on else None
+        if servers_on:
+            from app.tools.servers import register_server_tools
+            register_server_tools(self.tools, self.servers)
+
+    async def _decide_optional_features(self) -> None:
+        """One-time default for the 实例/主机 switches; see app.features."""
+        if self.config.managed.enabled:
+            return
+        from app import features
+        try:
+            decided = await features.migrate(self.config_store, self.db.conn)
+        except Exception as exc:
+            # Undecided switches count as on; the next start tries again.
+            log.warning("可选功能开关初始化失败，暂按开启处理", 错误=f"{type(exc).__name__}: {exc}")
+            return
+        if decided is None:
+            return
+        self.config = self.config.model_copy(update={"features": decided.features})
+        self.web_admin.config = self.config
+        self._rebuild_tools_and_context(include_mcp=bool(self.mcp.available_tools()), preserve_file_state=True)
+
     def _make_memory_client(self, config: Config):
         if config.memory.provider == "builtin":
             return BuiltinMemoryClient(self.db, identity=config.memory.identity)
@@ -256,6 +298,7 @@ class Services:
             if component is not None:
                 component.startup_ready = self.startup_ready
         await self.db.connect()
+        await self._decide_optional_features()
         await self.mcp_exposure_approvals.initialize(self.config)
         if self.managed_runtime:
             await self.managed_runtime.open()
@@ -288,6 +331,8 @@ class Services:
             log.info("MCP 工具已注册", 数量=registered_mcp_tools)
         if self.instances is not None:
             await self.instances.start()
+        if self.servers is not None:
+            await self.servers.start()
         await self.web_admin.start()
         await self.webhook_worker.start()
         await self.cron.start()
@@ -735,13 +780,12 @@ class Services:
                            auto_background_after_s=config.tools.bash_auto_background_after_s)
         register_memory_tools(self.tools, self.mem)
         register_task_memory_tool(self.tools, self.task_memories)
+        register_work_item_tool(self.tools, self.work_items, limits=config.work_items)
         register_history_tools(self.tools, self.db)
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
-        if self.instances is not None:
-            from app.tools.instances import register_instance_tools
-            register_instance_tools(self.tools, self.instances)
+        self._register_optional_feature_tools(config)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
         register_collab_tools(self.tools, self.collab, self.collab_groups)
@@ -1093,6 +1137,8 @@ class Services:
         if self.update:
             await close("update", self.update.stop)
         await close("web", self.web_admin.stop)
+        if self.servers is not None:
+            await close("servers", self.servers.close)
         if self.instances is not None:
             await close("instances", self.instances.close)
         if self.managed_runtime:

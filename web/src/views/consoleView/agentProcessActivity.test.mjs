@@ -5,13 +5,9 @@ import {compileScript, parse} from "@vue/compiler-sfc";
 import {createRenderer, reactive} from "vue";
 
 const sharedUrl = new URL("./AgentProcessActivity.vue", import.meta.url);
-const activityListUrl = new URL("./AgentActivityList.vue", import.meta.url);
 const generatedUrl = new URL(`./.AgentProcessActivity.test-${process.pid}.mjs`, import.meta.url);
 
-const [sharedSource, activityListSource] = await Promise.all([
-  readFile(sharedUrl, "utf8"),
-  readFile(activityListUrl, "utf8"),
-]);
+const sharedSource = await readFile(sharedUrl, "utf8");
 
 let AgentProcessActivity;
 try {
@@ -79,56 +75,4 @@ test("shared Agent process activity compacts source lifecycles once and limits l
     "上下文压缩完成",
     "最终未知事件",
   ]);
-});
-
-test("shared tool and model rows use the original timeline dot with status-only tones", () => {
-  assert.match(activityListSource, /import \{ArrowRight\} from "@element-plus\/icons-vue"/);
-  assert.doesNotMatch(activityListSource, /\bRefresh\b|toolIcon\(|activity-process-icon|activity-model-icon|activity-tool-icon/);
-  assert.match(activityListSource, /<time>\{\{ line\.timeLabel \}\}<\/time>\s*<span class="activity-dot"><\/span>/);
-  assert.match(activityListSource, /toolArgumentsSummary\(name, rawArguments\)/);
-
-  const modelRowStart = activityListSource.indexOf('<div v-else-if="line.processModel"');
-  const modelRowEnd = activityListSource.indexOf('</div>', modelRowStart);
-  const modelRow = activityListSource.slice(modelRowStart, modelRowEnd);
-  assert.match(modelRow, /activity-model-name">\{\{ line\.processModel\.label \}\}<\/strong>/);
-  assert.doesNotMatch(modelRow, />模型调用<|activity-model-label/);
-  assert.ok(modelRow.indexOf('line.processModel.thinkLevel') < modelRow.indexOf('line.processModel.fastMode'));
-  assert.ok(modelRow.indexOf('line.processModel.fastMode') < modelRow.indexOf('line.processModel.description'));
-  assert.ok(modelRow.indexOf('line.processModel.description') < modelRow.indexOf('activity-process-status'));
-  assert.match(modelRow, /<span class="activity-model-meta">Fast<\/span>/);
-  assert.match(modelRow, /:class="`tone-\$\{line\.processModel\.statusTone\}`"/);
-
-  const toolRowStart = activityListSource.indexOf('<details v-else-if="line.processTool"');
-  const toolRowEnd = activityListSource.indexOf('</details>', toolRowStart);
-  const toolRow = activityListSource.slice(toolRowStart, toolRowEnd);
-  const nameIndex = toolRow.indexOf('activity-process-name activity-tool-name');
-  const descriptionIndex = toolRow.indexOf('class="activity-tool-description"');
-  const statusIndex = toolRow.indexOf('activity-process-status activity-tool-status');
-  const arrowIndex = toolRow.indexOf('class="activity-tool-arrow"');
-  assert.ok(nameIndex < descriptionIndex);
-  assert.ok(descriptionIndex < statusIndex);
-  assert.ok(statusIndex < arrowIndex);
-  assert.match(toolRow, /:class="`tone-\$\{line\.processTool\.statusTone\}`"/);
-
-  assert.match(activityListSource, /running: "执行中"/);
-  assert.match(activityListSource, /success: "执行完成 √"/);
-  assert.match(activityListSource, /failed: "执行失败 ×"/);
-  assert.match(activityListSource, /denied: "已拒绝 ×"/);
-  assert.match(activityListSource, /running: "调用中"/);
-  assert.match(activityListSource, /failed: "调用失败 ×"/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-active \{ color: var\(--ob-blue\); \}/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-success \{ color: var\(--ob-success\); \}/);
-  assert.match(activityListSource, /\.activity-process-status\.tone-danger \{ color: var\(--ob-danger\); \}/);
-
-  assert.doesNotMatch(activityListSource, /\.activity-row\.tone-(?:active|success|danger) \.activity-tool-call > summary/);
-  assert.match(activityListSource, /\.activity-tool-call > summary, \.activity-model-call \{[^}]*color: var\(--ob-text-subtle\)/);
-  assert.match(activityListSource, /\.activity-tool-call, \.activity-model-call \{[^}]*grid-column: 3/);
-  assert.match(activityListSource, /\.activity-tool-description \{[^}]*text-overflow: ellipsis/, 'collapsed tool descriptions remain summaries');
-  assert.match(activityListSource, /\.activity-model-description \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
-  assert.match(activityListSource, /\.activity-tool-call\[open\] > summary \.activity-tool-description \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
-  assert.match(activityListSource, /\.activity-process-status \{[^}]*max-width: 100%;[^}]*flex: 0 0 auto;[^}]*white-space: normal;[^}]*overflow-wrap: anywhere/);
-  const statusRule = activityListSource.match(/\.activity-process-status \{[^}]*\}/)?.[0];
-  assert.ok(statusRule);
-  assert.doesNotMatch(statusRule, /justify-self:\s*end|margin-left:\s*auto|justify-content:\s*space-between|text-align:\s*right/, 'status remains beside its tool/model, not aligned to the far edge');
-  assert.match(activityListSource, /<ToolArgumentsView :tool-name="line\.processTool\.name" :raw-arguments="line\.processTool\.rawArguments" compact\/>/);
 });

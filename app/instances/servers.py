@@ -1,9 +1,12 @@
 """Servers that host the gateway and instances. The local host runs commands
-directly; remote servers use SSH with a password or a vault key reference."""
+directly; remote servers use their node when it is online, else SSH with a
+password or a vault key reference."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import getpass
 import json
 import os
 import re
@@ -19,6 +22,8 @@ from app.instances.security import Scrubber
 from app.webhooks.repository import many, one
 
 LOCAL = 'local'
+# The node method that makes HTTP requests on its own loopback.
+HTTP_FEATURE = 'http.local'
 PUBLIC_IP_SOURCES = ('https://api.ip.sb/ip', 'https://4.icanhazip.com', 'https://ipv4.icanhazip.com')
 _IPV4 = re.compile(r'(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}')
 _HOST = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9.:-]*')
@@ -30,12 +35,33 @@ CREATE TABLE IF NOT EXISTS instance_servers (
 )'''
 # One probe reports what the UI needs: OS, Docker, public IP and listening ports.
 PROBE = r'''
-. /etc/os-release 2>/dev/null; echo "os=${PRETTY_NAME:-$(uname -s)}"
+. /etc/os-release 2>/dev/null
+[ -z "${PRETTY_NAME:-}" ] && command -v sw_vers >/dev/null 2>&1 && PRETTY_NAME="macOS $(sw_vers -productVersion)"
+echo "os=${PRETTY_NAME:-$(uname -s)}"
+echo "system=$(uname -s)"
 echo "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
 for u in https://api.ip.sb/ip https://4.icanhazip.com; do
   ip=$( (curl -4fsS --max-time 6 "$u" || wget -4qO- -T 6 "$u") 2>/dev/null | tr -d '[:space:]'); [ -n "$ip" ] && break
 done; echo "ip=$ip"
 '''
+# Windows OpenSSH runs commands with cmd (or PowerShell when configured); an
+# encoded PowerShell command reads the same under both.
+_WINDOWS_PROBE = r'''
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+"os=" + (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').ProductName
+"system=Windows"
+$docker = if (Get-Command docker -ErrorAction SilentlyContinue) { docker version --format '{{.Server.Version}}' 2>$null }
+"docker=$docker"
+$ip = ''
+foreach ($u in 'https://api.ip.sb/ip', 'https://4.icanhazip.com') {
+  try { $ip = ([string](Invoke-RestMethod -UseBasicParsing -TimeoutSec 6 $u)).Trim(); if ($ip) { break } } catch {}
+}
+"ip=$ip"
+'''
+WINDOWS_PROBE = ('powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '
+                 + base64.b64encode(_WINDOWS_PROBE.encode('utf-16-le')).decode())
+SYSTEMS = {'Linux': 'linux', 'Darwin': 'darwin', 'Windows': 'windows'}
 PORT_CHECK = r'''
 p=%d
 if command -v ss >/dev/null 2>&1; then
@@ -55,7 +81,8 @@ def now():
 def _parse_probe(text):
     values = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
     ip = values.get('ip', '').strip()
-    return {'os': values.get('os', '')[:120], 'docker': values.get('docker', '')[:40], 'publicIp': ip if _IPV4.fullmatch(ip) else ''}
+    return {'os': values.get('os', '')[:120], 'docker': values.get('docker', '')[:40], 'publicIp': ip if _IPV4.fullmatch(ip) else '',
+            'platform': SYSTEMS.get(values.get('system', '').strip(), '')}
 
 
 class Servers:
@@ -104,9 +131,22 @@ class Servers:
                 'publicIp': self.local_ip or '', 'usedBy': used.get(LOCAL, []), 'status': 'ok'}
 
     async def list(self, owner):
+        """Servers that can host the gateway or instances: local, SSH and Linux node ones."""
         used = await self.usage(owner)
+        channels = await self._channels(owner)
         items = [await self.local(used)] + [self.public(r, used) for r in await self._rows(owner)]
-        return {'ok': True, 'items': items}
+        for item in items:
+            if item['id'] in channels:
+                item['node'] = channels[item['id']]
+        return {'ok': True, 'items': [i for i in items if i.get('auth') != 'none' or i.get('node')]}
+
+    async def _channels(self, owner, identity=None):
+        nodes = getattr(self.service.host, 'servers', None)
+        return await nodes.node_channels(owner, identity) if nodes else {}
+
+    async def all(self, owner):
+        used = await self.usage(owner)
+        return [await self.local(used)] + [self.public(r, used) for r in await self._rows(owner)]
 
     async def get(self, owner, identity):
         if identity == LOCAL:
@@ -114,7 +154,10 @@ class Servers:
         row = await one(self.db.conn, 'SELECT * FROM instance_servers WHERE id=? AND owner=?', (identity, owner))
         if not row:
             raise InstanceError('server_not_found', 404)
-        return self.public(row, await self.usage(owner))
+        item = self.public(row, await self.usage(owner))
+        if channel := (await self._channels(owner, identity)).get(identity):
+            item['node'] = channel
+        return item
 
     def _validate(self, data, prior):
         if set(data) - {'name', 'host', 'port', 'username', 'auth', 'password', 'privateKey', 'keyRef', 'saveKey'}:
@@ -124,6 +167,9 @@ class Servers:
         port = merged.get('port', 22)
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
             raise InstanceError('server_name_required')
+        if merged.get('auth') == 'none':
+            # Monitored through its node only; no SSH connection is recorded.
+            return {'name': name.strip(), 'host': '', 'port': 0, 'username': '', 'auth': 'none'}
         if not isinstance(host, str) or not _HOST.fullmatch(host) or '..' in host or len(host) > 253:
             raise InstanceError('invalid_server_host')
         if type(port) is not int or not 1 <= port <= 65535:
@@ -147,6 +193,17 @@ class Servers:
         secret = self.service.vault.open(row['protected']) if row else {}
         item = self._validate(data, prior)
         auth = item['auth']
+        if auth == 'none':
+            if row and prior.get('auth') != 'none' and (await self.usage(owner)).get(identity):
+                raise InstanceError('server_in_use', 409)
+            identity = identity or str(uuid.uuid4())
+            item['keyLabel'] = ''
+            async with self.db.write_transaction(label='instance-server-save') as conn:
+                if row:
+                    await conn.execute('UPDATE instance_servers SET public_json=?,protected=?,updated_ms=? WHERE id=?', (json.dumps(item, ensure_ascii=False), self.service.vault.seal({}), now(), identity))
+                else:
+                    await conn.execute('INSERT INTO instance_servers VALUES(?,?,?,?,?,?)', (identity, owner, json.dumps(item, ensure_ascii=False), self.service.vault.seal({}), now(), now()))
+            return {'ok': True, 'item': await self.get(owner, identity)}
         if auth == 'key' and ('keyRef' in data or not secret.get('keyRef')):
             ref = data.get('keyRef')
             if not isinstance(ref, dict) or set(ref) - {'secret', 'field', 'passphraseField'}:
@@ -234,15 +291,80 @@ class Servers:
         return {'ok': True}
 
     # ----- execution -----
-    async def target(self, owner, identity):
-        """Fully resolved connection material, read at use time (vault keys may change)."""
+    async def target(self, owner, identity, *, nodes=False):
+        """Fully resolved connection material, read at use time (vault keys may change).
+        nodes=True (instances, gateway): an online Linux node with command execution is
+        used before SSH. Installing the node itself always goes over SSH."""
         if identity == LOCAL:
-            return {'id': LOCAL, 'local': True}
+            return {'id': LOCAL, 'local': True, 'channel': 'local'}
         row = await one(self.db.conn, 'SELECT * FROM instance_servers WHERE id=? AND owner=?', (identity, owner))
         if not row:
             raise InstanceError('server_not_found', 404)
         item, secret = json.loads(row['public_json']), self.service.vault.open(row['protected'])
-        return {'id': identity, 'local': False, **item, **secret}
+        channel = (await self._channels(owner, identity)).get(identity) if nodes else None
+        if channel and channel['online'] and channel['exec']:
+            return {'id': identity, 'owner': owner, 'local': False, 'channel': 'node', **item, 'nodeAddress': channel['address']}
+        if item.get('auth') == 'none':
+            if channel:
+                raise InstanceError('node_exec_disabled' if channel['online'] else 'node_offline', 409)
+            raise InstanceError('server_ssh_unavailable', 409)
+        return {'id': identity, 'local': False, 'channel': 'ssh', **item, **secret}
+
+    async def channel(self, owner, identity):
+        """How instance and gateway commands reach the server right now, and as whom."""
+        try:
+            target = await self.target(owner, identity, nodes=True)
+        except InstanceError as exc:
+            return {'channel': 'unavailable', 'error': exc.error}
+        if target['channel'] == 'local':
+            return {'channel': 'local', 'runAs': getpass.getuser()}
+        return {'channel': target['channel'], 'runAs': 'root' if target['channel'] == 'node' else target['username']}
+
+    # ----- HTTP on a server's loopback, through its node -----
+    async def http_ready(self, owner, identity):
+        """Whether the controller reaches services on this server's 127.0.0.1 through its node:
+        enrolled, online, running commands (the same consent) and new enough for http.local."""
+        return not await self.http_blocker(owner, identity)
+
+    async def http_blocker(self, owner, identity):
+        """'' when http_ready, else why not: node_missing (no enrolled node: SSH only),
+        node_offline, node_exec_disabled or node_upgrade_required."""
+        nodes = getattr(self.service.host, 'servers', None)
+        if identity == LOCAL or not nodes or identity not in await self._channels(owner, identity):
+            return 'node_missing'
+        session = nodes.hub.sessions.get(identity)
+        if not session:
+            # As last recorded: an offline node known to be too old needs upgrading either way.
+            row = await one(self.db.conn, 'SELECT info_json FROM server_nodes WHERE owner=? AND server_id=?', (owner, identity))
+            features = json.loads(row['info_json']).get('features') if row else None
+            return 'node_upgrade_required' if isinstance(features, list) and HTTP_FEATURE not in features else 'node_offline'
+        if not session.caps.get('exec'):
+            return 'node_exec_disabled'
+        if session.incompatible or HTTP_FEATURE not in session.features:
+            return 'node_upgrade_required'
+        return ''
+
+    async def local_http(self, owner, identity, method, port, path, *, headers, body=b'', timeout=20):
+        """(status, body) of one request the node makes to 127.0.0.1:port on its own machine."""
+        params = {'method': method, 'port': port, 'path': path, 'headers': headers,
+                  'body': base64.b64encode(body).decode(), 'timeoutMs': int(timeout * 1000)}
+        result = await self.service.host.servers._call_newer(owner, identity, HTTP_FEATURE, 'http.local', params, timeout=timeout + 10)
+        try:
+            status, raw = result['status'], base64.b64decode(result.get('body') or '', validate=True)
+        except (KeyError, TypeError, ValueError):
+            raise InstanceError('node_invalid_reply', 502) from None
+        if type(status) is not int:
+            raise InstanceError('node_invalid_reply', 502)
+        return status, raw
+
+    async def mesh_address(self, owner, identity):
+        """The server's address in the applied mesh, '' when it is not an active member."""
+        mesh = getattr(getattr(self.service.host, 'servers', None), 'mesh', None)
+        if not mesh:
+            return ''
+        from app.servers import mesh_model
+        doc = await mesh._load(owner, 'applied')
+        return next((m['address'] for m in mesh_model.active(doc) if m['serverId'] == identity and m.get('address')), '')
 
     async def remember_host_key(self, identity, known):
         if identity == LOCAL or not known:
@@ -257,9 +379,13 @@ class Servers:
         async with self.db.write_transaction(label='instance-server-host-key') as conn:
             await conn.execute('UPDATE instance_servers SET protected=? WHERE id=?', (self.service.vault.seal(secret), identity))
 
-    async def run(self, target, command, *, stdin=b'', timeout=120, sudo=False, root=False):
-        """Run on the target. Returns the same result shape for local and SSH.
+    async def run(self, target, command, *, stdin=b'', timeout=120, sudo=False, root=False, source='instance'):
+        """Run on the target. Returns the same result shape for local, node and SSH.
         root=True runs through non-interactive sudo for a non-root SSH user."""
+        if target.get('channel') == 'node':
+            # The node runs as root: sudo and root need no wrapping.
+            return await self.service.host.servers.run_command(target['owner'], target['id'], command, stdin=stdin,
+                                                               timeout=timeout, source=source)
         if root and (os.geteuid() != 0 if target.get('local') else target.get('username') != 'root'):
             command = 'sudo -n -- sh -c ' + _quote(command)
         if target.get('local'):
@@ -277,10 +403,26 @@ class Servers:
 
     async def test_target(self, target, known=''):
         result = await _ssh(self.db, {**target, 'knownHosts': known or target.get('knownHosts', '')}, PROBE, timeout=40)
+        if not (result['ok'] and 'system=' in result['stdout']):
+            windows = await _ssh(self.db, {**target, 'knownHosts': result['knownHosts']}, WINDOWS_PROBE, timeout=60)
+            if windows['ok'] and 'system=Windows' in windows['stdout']:
+                result = windows
         if not result['ok']:
             raise InstanceError('server_connection_failed' if not result['timedOut'] else 'server_connection_timeout', 502)
         facts = _parse_probe(result['stdout'])
         return {'facts': {**facts, 'status': 'ok', 'checkedAtMs': now(), 'error': ''}, 'knownHosts': result['knownHosts']}
+
+    async def platform(self, target):
+        """linux, darwin or windows: the probed fact, else asked now (logins saved before it was recorded)."""
+        if target.get('local'):
+            return 'linux'
+        if target.get('platform') in SYSTEMS.values():
+            return target['platform']
+        result = await self.run(target, 'uname -s', timeout=60)
+        if result['ok'] and result['stdout'].strip() in SYSTEMS:
+            return SYSTEMS[result['stdout'].strip()]
+        result = await self.run(target, WINDOWS_PROBE, timeout=60)
+        return 'windows' if result['ok'] and 'system=Windows' in result['stdout'] else 'linux'
 
     async def check(self, owner, identity):
         """Refresh connection facts (OS, Docker, public IP)."""
@@ -292,6 +434,8 @@ class Servers:
         if not row:
             raise InstanceError('server_not_found', 404)
         item, secret = json.loads(row['public_json']), self.service.vault.open(row['protected'])
+        if item.get('auth') == 'none':
+            raise InstanceError('server_ssh_unavailable', 409)
         try:
             result = await self.test_target({**item, **secret})
             item.update(result['facts'])
@@ -306,7 +450,7 @@ class Servers:
         """Whether a TCP port is free on the target, as the gateway/instance will need it."""
         if type(port) is not int or not 1 <= port <= 65535:
             raise InstanceError('invalid_port')
-        target = await self.target(owner, identity)
+        target = await self.target(owner, identity, nodes=True)
         result = await self.run(target, PORT_CHECK % port, timeout=30)
         if not result['ok']:
             raise InstanceError('server_connection_failed', 502)
@@ -320,7 +464,8 @@ class Servers:
     async def public_ip(self, owner, identity):
         if identity == LOCAL:
             return await self._local_ip() or ''
-        return (await self.get(owner, identity)).get('publicIp', '')
+        item = await self.get(owner, identity)
+        return item.get('publicIp') or (item.get('node') or {}).get('publicIp', '')
 
     async def _fetch_local_ip(self):
         import aiohttp

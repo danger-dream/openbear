@@ -46,6 +46,11 @@ async def migrate(db):
                                   ('gateway_report_hash', "TEXT NOT NULL DEFAULT ''")],
             'instance_notifications': [('created_ms', 'INTEGER NOT NULL DEFAULT 0'),
                                        ('updated_ms', 'INTEGER NOT NULL DEFAULT 0')],
+            # The turn that started the operation through InstanceControl; empty: started by a person on the page.
+            'instance_operations': [('origin_conversation', "TEXT NOT NULL DEFAULT ''"),
+                                    ('origin_root', "TEXT NOT NULL DEFAULT ''"),
+                                    # A completed operation's conversation talked to again: completed until the turn acts (acted()).
+                                    ('resumed', "TEXT NOT NULL DEFAULT ''")],
         }.items():
             fields = {row[1] for row in await (await conn.execute('PRAGMA table_info('+table+')')).fetchall()}
             for name, definition in additions:

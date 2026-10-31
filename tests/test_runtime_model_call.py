@@ -555,3 +555,17 @@ async def test_backend_receives_per_attempt_copied_options_and_messages():
     assert result.response.text == "fine"
     assert outbound.options == source and outbound.messages[0]["content"] == "question"
     assert outbound.options["max_tokens"] == 77
+
+
+@pytest.mark.asyncio
+async def test_driver_marks_first_three_retries_quiet_including_their_terminal_states():
+    backend = FakeStream([[fault()], [fault()], [fault()], [fault()],
+                          [StreamEvent("content", text="ok"), StreamEvent("finish", finish_reason="stop")]])
+    states = []
+    result = await driver(max_retries=5).call(lambda tail: req(backend), lambda outcome: None,
+                                              on_retry=states.append)
+    assert result.response.text == "ok" and result.retries == 4
+    assert [(s["attempt"], s["quiet"]) for s in states if s["active"]] == [
+        (1, True), (2, True), (3, True), (4, False)]
+    assert all(s["quiet"] == (s["attempt"] <= 3) for s in states)
+    assert states[-1]["status"] == "completed" and states[-1]["quiet"] is False

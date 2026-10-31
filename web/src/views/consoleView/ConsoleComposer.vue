@@ -3,6 +3,7 @@ import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import ReferenceEditor from "../../references/ReferenceEditor.vue";
 import ReferencePlainText from "../../references/ReferencePlainText.vue";
 import InteractionMarkdown from "./InteractionMarkdown.vue";
+import WorkItemsDock from "./WorkItemsDock.vue";
 import GroupProposalCard from "./GroupProposalCard.vue";
 import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import ModelFeatureIcon from "./ModelFeatureIcon.vue";
@@ -1016,6 +1017,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 
 			<div class="composer-box">
 				<input ref="fileInput" type="file" multiple class="hidden" @change="onAttachmentChange"/>
+				<WorkItemsDock/>
 				<div v-if="props.pendingAttachments.length" class="attachment-strip">
 					<div v-for="item in props.pendingAttachments" :key="item.id" class="attachment-card group">
 						<el-image v-if="attachmentPreviewUrl(item)" class="attachment-thumb"

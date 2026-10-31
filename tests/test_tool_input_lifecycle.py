@@ -124,9 +124,12 @@ async def test_controller_clears_parameter_activity_when_stream_changes_phase(pr
         await task
 
 
+@pytest.mark.parametrize('visible', [False, True])
 @pytest.mark.parametrize('kind', ['reasoning', 'encrypted_reasoning', 'content'])
-async def test_retry_uses_new_display_segment_without_replaying_old_snapshot(presentation, kind):
+async def test_retry_uses_new_display_segment_without_replaying_old_snapshot(presentation, kind, visible, monkeypatch):
     renderer, db, events = presentation
+    if visible:
+        monkeypatch.setattr('app.llm.retry.QUIET_RETRIES', 0)
     entered, release = asyncio.Event(), asyncio.Event()
 
     class Backend:
@@ -159,8 +162,12 @@ async def test_retry_uses_new_display_segment_without_replaying_old_snapshot(pre
         assert 'first attempt' in output[0]['payload']['text']
         assert 'second attempt' in output[1]['payload']['text']
         assert 'first attempt' not in output[1]['payload']['text']
-        retry = next(r for r in rows if r['op_type'] == 'model_retry')
-        assert output[0]['display_seq'] < retry['display_seq'] < output[1]['display_seq']
+        retries = [r for r in rows if r['op_type'] == 'model_retry']
+        if visible:
+            assert output[0]['display_seq'] < retries[0]['display_seq'] < output[1]['display_seq']
+        else:
+            assert retries == []
+            assert output[0]['display_seq'] < output[1]['display_seq']
     finally:
         release.set()
         await task

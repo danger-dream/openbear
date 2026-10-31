@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import hashlib
 import json
 import pathlib
 import shutil
@@ -630,6 +631,45 @@ def test_generic_preservation_works_without_legacy_schema(config, tmp_path):
     proc = subprocess.run([sys.executable, str(harness.SCRIPTS / "verify_upgrade.py"), str(before), str(output)], capture_output=True, text=True)
     assert proc.returncode == 1
     assert not json.loads(output.read_text())["ok"]
+
+
+def test_config_preservation_allows_only_the_feature_switches_a_release_adds(config, tmp_path):
+    root = tmp_path / "installed"
+    data = root / "data"
+    (data / "backups").mkdir(parents=True)
+    database = data / "openbear.db"
+    conn = sqlite3.connect(database)
+    tables = {}
+    for name in ("messages", "sessions", "summaries", "web_conversations", "memory_templates", "web_conversation_folders", "memory_entries", "memory_docs"):
+        conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY, content TEXT)")
+        tables[name] = []
+    conn.commit()
+    conn.close()
+    user_file = root / "openbear.json"
+    old = {"testConfig": True, "web": {"port": 8080}}
+    user_file.write_text(json.dumps(old))
+    user_file.chmod(0o600)
+    digest = hashlib.sha256(json.dumps(old, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    baseline = {"root": str(root), "dbPath": str(database), "version": config["previousVersion"], "tables": tables,
+                "files": {"openbear.json": {"sha256": harness.sha256(user_file), "mode": 0o600, "config": {"sha256": digest, "features": None}}}}
+    before, output = tmp_path / "baseline.json", tmp_path / "preservation.json"
+    before.write_text(json.dumps(baseline))
+
+    def verify(body, mode=0o600):
+        user_file.write_text(json.dumps(body, indent=2))
+        user_file.chmod(mode)
+        proc = subprocess.run([sys.executable, str(harness.SCRIPTS / "verify_upgrade.py"), str(before), str(output), "refresh"], capture_output=True, text=True)
+        return proc.returncode, json.loads(output.read_text())
+
+    code, report = verify({"web": {"port": 8080}, "testConfig": True, "features": {"instances": False, "servers": True}})
+    assert code == 0 and report["configMigrated"] == ["openbear.json"], report
+    for body, mode in (({"testConfig": True, "web": {"port": 9090}, "features": {"servers": True}}, 0o600),
+                       ({"testConfig": True, "web": {"port": 8080}, "features": {"servers": "yes"}}, 0o600),
+                       ({"testConfig": True, "web": {"port": 8080}, "features": {"servers": True, "other": True}}, 0o600),
+                       ({"testConfig": True, "web": {"port": 8080}, "features": {"servers": True}}, 0o644),
+                       ({"testConfig": True, "web": {"port": 8080}, "added": 1}, 0o600)):
+        code, report = verify(body, mode)
+        assert code == 1 and report["errors"] == [{"file": "openbear.json", "error": "changed bytes or permissions"}], (body, report)
 
 
 def test_removed_file_probe_uses_actual_archive_difference(tmp_path):

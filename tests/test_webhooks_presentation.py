@@ -1,11 +1,9 @@
 """Event-facing UI projections with real dispatch, transcripts and legacy repair."""
 import asyncio
 import json
-from pathlib import Path
 
 from app.webhooks.repository import one, many
 from app.webhooks.presentation import conversation_title, event_summary
-from app.webhooks.schema import _apply_sql
 from app.web_operations import web_event_operation_specs
 from tests.test_webhooks_backend import env, create, accept
 
@@ -56,21 +54,6 @@ async def test_live_card_original_input_and_recent_list(env):
     await env.server._publish_operation(cid, op_id='assistant:later', op_type='assistant_message', action='end', turn_uuid=a['root_turn_uuid'], payload={'text':'auto later'}, status='completed', lifecycle='terminal')
     after = (await one(env.db.conn, 'SELECT last_interaction_at_ms FROM web_conversations WHERE conversation_uuid=?', (cid,)))['last_interaction_at_ms']
     assert after == before
-
-
-async def test_legacy_event_card_and_recent_reprojection(env):
-    c = await create(env, batching={'enabled': False})
-    a = await dispatch(env, c)
-    cid = a['conversation_uuid']
-    async with env.db.conn.transaction() as conn:
-        await conn.execute("UPDATE web_operations SET source=CASE WHEN op_type='user_message' THEN 'user' ELSE source END,payload_json=json_remove(payload_json,'$.source','$.eventCard','$.eventTriggered') WHERE conversation_uuid=?", (cid,))
-        await conn.execute('UPDATE web_conversations SET last_interaction_at_ms=123 WHERE conversation_uuid=?', (cid,))
-        await _apply_sql(conn, (Path(__file__).parents[1] / 'app/db/webhooks_presentation_v5.sql').read_text())
-    page, _ = await env.server._web_operations_page(cid, limit=100)
-    user = next(op for op in page if op['opType'] == 'user_message')
-    assert user['source'] == 'webhook' and user['payload']['eventCard']['events']
-    await env.server._tree_ensure_interaction_projection(123)
-    assert (await one(env.db.conn, 'SELECT last_interaction_at_ms FROM web_conversations WHERE conversation_uuid=?', (cid,)))['last_interaction_at_ms'] == 0
 
 
 async def test_fixed_conversation_keeps_name_and_human_recency(env):

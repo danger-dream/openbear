@@ -27,13 +27,17 @@ def source(version="1.0.0"):
 
 @pytest.mark.parametrize("path,kind", [("web/src/App.vue", "frontend"), ("app/llm/client.py", "backend"),
     ("app/web_console/api.py", "both"), ("app/models/request.py", "both"),
-    ("scripts/updater.py", "both"), ("tests/test_one.py", "both"), ("unknown/config", "both")])
+    ("scripts/updater.py", "both"), ("tests/test_one.py", "both"), ("unknown/config", "both"),
+    ("node/node.go", "both"), ("node/VERSION", "both")])
 def test_change_scope_uses_actual_content_and_conservative_shared_boundaries(path, kind):
     old, new = source(), source("1.0.1")
     new[path] = b"modified"
     result = scope.compare(old, new, previous_commit="a" * 40)
     assert result["kind"] == kind
     assert result["changed"] == [path]
+    if path.startswith("node/"):
+        # Node source is an unknown path for the controller: full matrix, no reused backend evidence.
+        assert result["unknown"] == [path] and result["backendChanged"]
 
 
 def test_version_normalization_never_hides_dependencies_or_deleted_frontend():

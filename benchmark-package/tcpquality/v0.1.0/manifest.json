@@ -1,0 +1,22 @@
+{
+  "tool": "tcpquality",
+  "version": "v0.1.0",
+  "name": "TCPQuality",
+  "upstream": {
+    "repo": "https://github.com/ibsgss/TcpQuality",
+    "commit": "708ba0b073a63b10fa8894fb09174e12d01aa665",
+    "date": "2026-10-11",
+    "license": "GPL-3.0"
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "runTcpQuality-core.sh",
+  "files": {
+    "runTcpQuality-core.sh": "4fdb0b4f4300089581e05e63e96cf96438f7b6fb266d94cab93e762c53a512be"
+  },
+  "binaries": [],
+  "patch": "openbear.patch",
+  "built": "2026-10-31"
+}

@@ -5,9 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="OpenBear" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="icon" type="image/x-icon" sizes="16x16 32x32 48x48 64x64" href="/assets/brand/favicon-fe324e6fb666.ico" />
-    <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32-fe324e6fb666.png" />
+    <!-- Behind the access gateway the manifest needs the login cookie, which a manifest fetch omits by default. -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+    <link rel="icon" type="image/x-icon" sizes="16x16 32x32 48x48 64x64" href="/assets/brand/favicon-2888ecac0deb.ico" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32-2888ecac0deb.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
     <meta name="theme-color" content="#f8f8f8" />
@@ -15,6 +16,8 @@
     <script>
       // The serving process replaces this value; an untouched page is the controller.
       window.__OPENBEAR_AUTH_MODE__ = "[[controller]]";
+      // A gateway instance page gets its own asset prefix; untouched is the root.
+      window.__OPENBEAR_ASSET_BASE__ = "[[asset-base]]";
       (() => {
         let mode = "auto";
         try {
@@ -33,7 +36,8 @@
         document.querySelector('meta[name="theme-color"]').content = browserColor;
         document.querySelector('meta[name="color-scheme"]').content = resolvedTheme;
         const manifest = document.querySelector('link[rel="manifest"]');
-        const manifestPath = dark ? "/assets/pwa/manifest-dark.webmanifest" : "/manifest.webmanifest";
+        const assetBase = /^\/_i\/[A-Za-z0-9_-]{1,128}\/$/.test(window.__OPENBEAR_ASSET_BASE__) ? window.__OPENBEAR_ASSET_BASE__ : "/";
+        const manifestPath = dark ? assetBase + "assets/pwa/manifest-dark.webmanifest" : "/manifest.webmanifest";
         if (manifest.getAttribute("href") !== manifestPath) manifest.setAttribute("href", manifestPath);
         root.dataset.theme = dark ? "dark" : "light";
         root.dataset.themeMode = mode;
@@ -41,11 +45,18 @@
     </script>
     <style>
       html, body { background: var(--ob-bg); color: var(--ob-text); }
+      /* Shown only while the app has not mounted after a few seconds; mounting replaces it. */
+      .ob-boot { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--ob-chat-subtle, #8a8a8f); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; pointer-events: none; opacity: 0; animation: ob-boot-in .3s ease 5s forwards; }
+      .ob-boot-spinner { width: 18px; height: 18px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: ob-boot-spin .9s linear infinite; }
+      .ob-boot-slow { font-size: 12px; opacity: 0; animation: ob-boot-in .3s ease 15s forwards; }
+      @keyframes ob-boot-in { to { opacity: 1; } }
+      @keyframes ob-boot-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .ob-boot-spinner { animation: none; } }
     </style>
     <title>OpenBear</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><div class="ob-boot" role="status" aria-live="polite"><span class="ob-boot-spinner" aria-hidden="true"></span><span>正在加载…</span><span class="ob-boot-slow">网络较慢，请稍候</span></div></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

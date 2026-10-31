@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from app.tools.base import current_tool_context
+from app.tools.servers import automatic_turn
 from app.runtime.tool_result import ToolOutcome
 from app.webhooks.contracts import EndpointConfig, Scope, WebhookError, dumps
 from app.webhooks.repository import many, one
@@ -131,6 +132,17 @@ async def dispatch(service,action,params,ctx):
         return await observe(service,eid,params,source='model',event_id=event_id,assignment_id=a['assignment_id'],action_id=ctx.execution_id)
     validate_management_params(action,params)
     eid=params.get('endpointId'); body={k:v for k,v in params.items() if k!='endpointId'}
+    if action in ('create','update','set_enabled','resume','retry') and await automatic_turn(service.db.conn,ctx):
+        # An unattended run never grants an endpoint the right to change servers and instances, and never rewrites, enables
+        # or re-runs an endpoint that has it: that would process events with whatever it wrote. Disabling stays allowed.
+        if action=='retry':
+            event=await one(service.db.conn,'SELECT endpoint_id FROM webhook_events WHERE event_id=?',(params.get('eventId'),))
+            eid=event and event['endpoint_id']
+        disabling=action=='set_enabled' and body.get('enabled') is False
+        if action!='create' and eid and not disabling and (await service.get(owner,eid))['endpoint']['config']['processing'].get('allowServerChanges'):
+            raise WebhookError('automatic_privileged_endpoint_forbidden','自动执行的对话不能修改、启用或重试已允许改动服务器和实例的Webhook',status=403)
+        if action in ('create','update') and grants_server_changes(body.get('config')):
+            raise WebhookError('automatic_permission_forbidden','自动执行的对话不能开启“允许改动服务器和实例”',status=403)
     if action=='delete' or action=='update' and params.get('operation')=='rotate_key':
         sensitive='rotate_key' if action=='update' else action
         if ctx.web_confirm is None: raise WebhookError('user_confirmation_unavailable',status=403)
@@ -156,6 +168,11 @@ async def dispatch(service,action,params,ctx):
         from app.webhooks.recovery import retry
         return await retry(service,owner,params.get('eventId'),body)
     raise WebhookError('invalid_action')
+
+
+def grants_server_changes(config):
+    processing=config.get('processing') if isinstance(config,dict) else None
+    return isinstance(processing,dict) and (processing.get('allowServerChanges') is True or processing.get('allow_server_changes') is True)
 
 
 def register_webhook_tool(registry,service):

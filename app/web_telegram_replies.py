@@ -49,15 +49,19 @@ def reply_candidate(message: Any) -> bool:
     )
 
 
-def reply_keyboard(config: Config, conversation_uuid: str) -> InlineKeyboardMarkup | None:
-    # Every delivered result is already bound to its Web conversation. Native
-    # Telegram replies need neither a continuation button nor a ForceReply prompt.
+def link_keyboard(config: Config, path: str, label: str) -> InlineKeyboardMarkup | None:
     base = str(config.web.custom_url or "").rstrip("/")
     parsed = urlparse(base)
     if parsed.scheme != "https" or not parsed.netloc:
         return None
-    button = InlineKeyboardButton(text="打开 Web 会话", url=f"{base}/chat?id={quote(conversation_uuid, safe='')}")
+    button = InlineKeyboardButton(text=label, url=f"{base}{path}")
     return InlineKeyboardMarkup(inline_keyboard=[[button]], force_reply=False)
+
+
+def reply_keyboard(config: Config, conversation_uuid: str) -> InlineKeyboardMarkup | None:
+    # Every delivered result is already bound to its Web conversation. Native
+    # Telegram replies need neither a continuation button nor a ForceReply prompt.
+    return link_keyboard(config, f"/chat?id={quote(conversation_uuid, safe='')}", "打开 Web 会话")
 
 
 async def bind_message(db: DB, owner: int, message_id: int, conversation_uuid: str, root: str = "", *, role: str = "notification") -> None:

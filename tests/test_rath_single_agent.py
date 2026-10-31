@@ -65,8 +65,9 @@ async def env(tmp_path):
 class _FlakyBackend:
     protocol = "chat"
 
-    def __init__(self) -> None:
+    def __init__(self, failures: int = 1) -> None:
         self.calls = 0
+        self.failures = failures
         self.seen_messages: list[list[dict]] = []
         self.seen_systems: list[str] = []
         self.seen_tools: list[list[dict]] = []
@@ -76,7 +77,7 @@ class _FlakyBackend:
         self.seen_systems.append(system)
         self.seen_tools.append(copy.deepcopy(tools or []))
         self.calls += 1
-        if self.calls == 1:
+        if self.calls <= self.failures:
             raise OpenBearLLMError("temporary upstream error", status=503, retryable=True)
         return AgentResult(text="重试后成功", usage=Usage(input_tokens=1, output_tokens=1))
 
@@ -1190,11 +1191,44 @@ async def test_single_agent_runner_retries_retryable_model_error(env):
     task = await dao.get_task(task_uuid)
     assert task is not None and task.model_call_count == 2
     events = await dao.events(task_uuid)
-    assert any(e.kind == "model_call_retry" for e in events)
+    # The first retry is silent: no retry rows, banner state or retry label.
+    assert not any(e.kind.startswith("model_call_retry") for e in events)
+    assert "retry" not in (task.output or {})
     started = [event for event in events if event.kind == "model_call_started"]
     assert len(started) == 2
     assert started[-1].detail["attempt"] == 1
-    assert "重试 1/10" in started[-1].summary
+    assert started[-1].detail["quietRetry"] is True
+    assert "重试" not in started[-1].summary
+
+
+async def test_single_agent_runner_shows_fourth_retry_after_three_silent_ones(env):
+    dao, task_uuid, agent = env
+    agent.tool_allowlist = []
+    backend = _FlakyBackend(failures=4)
+    runner = AgentExecutor(
+        dao,
+        task_uuid,
+        agent=agent,
+        backend=backend,
+        model="gpt",
+        max_tokens=2048,
+        tools=ToolRegistry(),
+        retry_backoff_s=0,
+    )
+
+    output = await runner.run()
+
+    assert output["summary"] == "重试后成功"
+    assert backend.calls == 5
+    events = await dao.events(task_uuid)
+    retries = [e for e in events if e.kind == "model_call_retry"]
+    assert [e.detail["attempt"] for e in retries] == [4]
+    started = [event for event in events if event.kind == "model_call_started"]
+    assert [e.detail.get("quietRetry", False) for e in started] == [False, True, True, True, False]
+    assert "重试 4/10" in started[-1].summary
+    assert not any("重试" in e.summary for e in started[:-1])
+    waits = [e.detail["retry"]["attempt"] for e in events if e.kind == "model_call_retry_wait"]
+    assert waits == [4]
 
 
 async def test_single_agent_physical_retry_deduplicates_task_memory_and_keeps_prefix(env):

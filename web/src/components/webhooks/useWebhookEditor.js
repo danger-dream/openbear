@@ -1,5 +1,5 @@
 import {computed, reactive, ref} from 'vue';
-import {clone, configErrors, defaultConfig, mergeConfig, serializableDraft} from './webhookConfig.js';
+import {clone, configErrors, defaultConfig, mergeConfig, serializableDraft, submittedConfig} from './webhookConfig.js';
 
 // The key component reads credentials separately; editor drafts and snapshots never hold them.
 export function createWebhookEditor(api, {requestId = () => crypto.randomUUID(), defaultName = () => ''} = {}) {
@@ -39,20 +39,22 @@ export function createWebhookEditor(api, {requestId = () => crypto.randomUUID(),
       return false;
     } finally { if (current === generation && !disposed) loading.value = false; }
   }
-  async function save(enable) {
+  async function save(enable, {confirm} = {}) {
     if (saving.value || loading.value || !loaded.value) return false;
     const enabled = enable === undefined ? draft.enabled : Boolean(enable);
     errors.value = configErrors(draft.config, {enabled, environment: environment.value, scope: scope.value});
     if (errors.value.length) return false;
-    const payload = {name: draft.name.trim() || defaultName(), description: draft.description, config: clone(draft.config), enabled,
+    const payload = {name: draft.name.trim() || defaultName(), description: draft.description, config: submittedConfig(draft.config), enabled,
       ...(endpoint.value ? {expectedRevision: endpoint.value.revision, expectedControlRevision: endpoint.value.controlRevision} : {scope: clone(scope.value)})};
-    const submittedDraft = serializableDraft(draft), current = generation;
+    const submittedDraft = serializableDraft(draft), current = generation, id = endpoint.value?.id;
     const fingerprint = JSON.stringify(payload);
     if (!write || write.fingerprint !== fingerprint) write = {fingerprint, requestId: requestId()};
     payload.requestId = write.requestId;
     saving.value = true; error.value = ''; conflict.value = null;
     try {
-      const data = endpoint.value ? await api.updateWebhook(endpoint.value.id, payload) : await api.createWebhook(payload);
+      if (confirm && !await confirm({id,config:clone(payload.config)})) return false;
+      if (disposed || current !== generation) return false;
+      const data = id ? await api.updateWebhook(id, payload) : await api.createWebhook(payload);
       if (data.ok === false) throw new Error(data.message || data.error || '保存失败');
       if (disposed || current !== generation) return false;
       const laterDraft = serializableDraft(draft) !== submittedDraft ? clone(draft) : null;

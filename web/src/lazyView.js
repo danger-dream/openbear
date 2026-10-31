@@ -6,7 +6,8 @@ const LOADING_DELAY_MS = 300;
 // Call once per view definition (never in a computed/render function). Successful
 // modules and concurrent requests are shared; a failed request is NOT cached.
 // No reload here: App's existing version/preload-error confirmation owns that.
-export function defineLazyView(loader, label = "页面") {
+// `name` lets App keep one view alive across navigation.
+export function defineLazyView(loader, label = "页面", name = "LazyView") {
   let resolved;
   let pending;
   function load() {
@@ -20,7 +21,7 @@ export function defineLazyView(loader, label = "页面") {
     return pending;
   }
   return defineComponent({
-    name: "LazyView",
+    name,
     inheritAttrs: false,
     setup(_, { attrs, slots }) {
       const view = shallowRef(resolved);

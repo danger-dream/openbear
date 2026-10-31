@@ -102,6 +102,23 @@ function selectTargetMode(value) {
   draft.config.target.mode = value;
   if (value === 'newConversation') { draft.config.target.conversationId = null; draft.config.target.runConfig = {mainModel:null,mainThinkingLevel:null,mainFastMode:null}; }
   else draft.config.target.runConfig = null;
+  draft.config.target.conversationRetention = {keepLast:null,keepDays:null};
+}
+function retentionNeedsPreview(id,target) {
+  const next = target.conversationRetention || {};
+  const saved = endpoint.value?.config?.target?.conversationRetention || {};
+  const values = [next.keepLast, next.keepDays];
+  if (!id || target.mode !== 'newConversation' || values.every(value => value == null)) return false;
+  if (values.some(value => value != null && !(Number.isInteger(value) && value > 0))) return false;
+  return next.keepLast !== (saved.keepLast ?? null) || next.keepDays !== (saved.keepDays ?? null);
+}
+async function confirmRetention({id,config}) {
+  if (!retentionNeedsPreview(id,config.target)) return true;
+  const next = config.target.conversationRetention;
+  const {count} = await Api.previewConversationRetention({kind: 'webhook', id, retention: {keepLast: next.keepLast ?? null, keepDays: next.keepDays ?? null}});
+  if (!count) return true;
+  try { await ElMessageBox.confirm(`保存后会立即删除这个入口创建的 ${count} 个旧会话，删除后不可恢复。`, '确认会话保留', {type: 'warning', confirmButtonText: '保存并清理', cancelButtonText: '取消', closeOnClickModal: false}); return true; }
+  catch { return false; }
 }
 async function navigate(event) {
   const next = tabKey(event, tab.value, TRIGGER_TABS); if (next === tab.value) return;
@@ -115,7 +132,7 @@ async function save(enable) {
     field?.scrollIntoView?.({block:'nearest'}); field?.querySelector('input, textarea')?.focus(); return false;
   }
   const submittedSchema = schemaInput.value;
-  const success = await editor.save(enable);
+  const success = await editor.save(enable, {confirm:confirmRetention});
   if (success) { if (schemaInput.value === submittedSchema && !schemaError.value) schemaInput.value = null; ElMessage.success('规则已保存；实际接收与派发状态见连接页'); emit('saved', endpoint.value); }
   else if (errors.value.length) {
     const first = errors.value[0]; tab.value = first.tab;
@@ -198,12 +215,14 @@ defineExpose({canLeave, save, dirty, saving, endpoint});
               <template v-else><el-radio-group :model-value="draft.config.target.mode" @update:model-value="selectTargetMode"><el-radio value="newConversation">新建会话</el-radio><el-radio value="fixedConversation">固定会话</el-radio></el-radio-group><p>新建会话的模型设置可单独选择；固定会话沿用它自己的设置。</p>
                 <div v-if="draft.config.target.mode === 'fixedConversation'" class="wh-field" data-field="target.conversationId"><label for="wh-target">目标会话</label><el-tree-select id="wh-target" :model-value="draft.config.target.conversationId" :data="tree" filterable :check-strictly="false" :render-after-expand="false" node-key="value" :loading="targetsLoading" :filter-method="loadTargets" placeholder="搜索并选择具体会话" :aria-invalid="Boolean(errorFor('target.conversationId'))" @update:model-value="selectTarget" /><small :class="{'wh-error-text': errorFor('target.conversationId') || targetError}">{{ errorFor('target.conversationId') || targetError || selectedTarget?.path || '只显示当前目录及子目录内未归档的会话。' }}</small></div>
                 <div v-else class="wh-target-models"><p v-if="modelsError" class="wh-error-text" role="alert">{{ modelsError }}<el-button link @click="loadModelOptions">重新读取模型</el-button></p><ModelSettings :model-value="targetOverrides" :effective="targetEffective" :inherited="targetInherited" :models="modelOptions" inheritable inherit-label="继承目录" :show-agent="false" :show-strategy="false" :disabled="modelsLoading || Boolean(modelsError)" @change="setTargetRunConfig" /><p>每项留空先继承目录，再用系统默认。只对之后新建的会话生效。</p></div>
+                <div v-if="draft.config.target.mode === 'newConversation' && draft.config.target.conversationRetention" class="wh-retention"><h4>会话保留</h4><div class="wh-form-grid"><WebhookField v-model="draft.config.target.conversationRetention.keepLast" path="target.conversationRetention.keepLast" type="number" nullable :step="1" :min="1" label="保留最近" unit="个" :error="errorFor('target.conversationRetention.keepLast')" /><WebhookField v-model="draft.config.target.conversationRetention.keepDays" path="target.conversationRetention.keepDays" type="number" nullable :step="1" :min="1" label="保留天数" unit="天" :error="errorFor('target.conversationRetention.keepDays')" /></div><p>超过任一条件的旧会话会自动删除，不可恢复；留空不清理。置顶、归档、移出本目录或你发过消息的会话会保留。</p></div>
               </template>
             </section>
             <section v-if="endpoint" class="wh-section"><div class="wh-actions"><el-button :disabled="saving" @click="control(endpoint.dispatchPaused ? 'resume' : 'pause')">{{ endpoint.dispatchPaused ? '恢复处理…' : '暂停处理…' }}</el-button><el-button :disabled="saving" type="danger" plain @click="control('stop', {scope:'all'})">停止处理…</el-button></div><p>暂停时仍接收消息；关闭上方启用开关并保存，才会停止接收。</p></section>
           </section>
           <section v-show="tab === 'processing'" id="wh-panel-processing" class="wh-processing" role="tabpanel" aria-labelledby="wh-tab-processing">
             <div class="wh-instructions" data-field="processing.instructions"><AdaptiveMdEditor v-model="draft.config.processing.instructions" language="markdown" completion-mode="none" /></div>
+            <div class="wh-server-changes" data-field="processing.allowServerChanges"><el-checkbox v-model="draft.config.processing.allowServerChanges">允许改动服务器和实例</el-checkbox><p :class="{'is-risk': draft.config.processing.allowServerChanges}">{{ draft.config.processing.allowServerChanges ? '事件处理无人值守，可能被事件内容或服务器返回的内容误导而执行改动（运行命令、写文件、操作节点和实例）。只在确实需要时开启。' : '未勾选时，处理事件时只能查看服务器和实例。' }}</p></div>
 
           </section>
           <section v-show="tab === 'scripts'" id="wh-panel-scripts" class="wh-fill" role="tabpanel" aria-labelledby="wh-tab-scripts"><WebhookScriptEditor v-model:phase="phase" :config="draft.config" :environment="environment" :errors="errors" /></section>

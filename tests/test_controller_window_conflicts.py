@@ -62,7 +62,8 @@ async def test_completed_reply_with_pinned_reader_does_not_repeat_execution(env,
     class Backend(FakeBackend):
         async def stream(self, messages, **kwargs):
             if self._round == 1:
-                cursor = await env.db.conn.execute("SELECT * FROM messages ORDER BY id")
+                # Router reads finish before they return; pin the shared reader directly.
+                cursor = await env.db._router()._reader.execute("SELECT * FROM messages ORDER BY id")
                 await cursor.fetchone()
                 held.append(cursor)
             async for event in super().stream(messages, **kwargs):
@@ -458,7 +459,7 @@ async def test_stale_history_backfills_before_latest_input_without_forgetting_ex
     before = await env.store.load(fresh=True)
     for index in range(4):
         await env.dao.add(8, "user", f"unrelated snapshot row {index}")
-    held = await env.db.conn.execute("SELECT * FROM messages ORDER BY id")
+    held = await env.db._router()._reader.execute("SELECT * FROM messages ORDER BY id")
     await held.fetchone()
     try:
         old_id = await env.dao.add(env.chat, "user", "OLD instruction: perform the effect once.", turn_uuid="old-turn")

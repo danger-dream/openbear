@@ -1,11 +1,13 @@
-import {fmtElapsedClockMs, fmtLiveElapsedMs} from "./display.js";
+import {fmtElapsedClockMs, fmtElapsedHoursClockMs, fmtLiveElapsedMs} from "./display.js";
+
+const elapsedFormats = {clock: fmtElapsedClockMs, "hours-clock": fmtElapsedHoursClockMs, elapsed: fmtLiveElapsedMs};
 
 const elapsedElements = new Set();
 let elapsedTimer = 0;
 
 function paintElapsed(el) {
 	const state = el?._openbearElapsedState || {};
-	const format = state.format === "clock" ? fmtElapsedClockMs : fmtLiveElapsedMs;
+	const format = elapsedFormats[state.format] || fmtLiveElapsedMs;
 	el.textContent = state.active && state.startAt ? format(Date.now() - state.startAt) : state.fallback;
 }
 
@@ -35,7 +37,7 @@ function bindElapsed(el, options = {}) {
 	const active = Boolean(options?.active);
 	const fallback = String(options?.fallback || "—");
 	const intervalMs = Math.max(250, Number(options?.intervalMs || 250));
-	const format = options?.format === "clock" ? "clock" : "elapsed";
+	const format = Object.hasOwn(elapsedFormats, options?.format) ? options.format : "elapsed";
 	const signature = `${startAt}:${active}:${fallback}:${intervalMs}:${format}`;
 	if (el._openbearElapsedSignature === signature) return;
 	el._openbearElapsedSignature = signature;

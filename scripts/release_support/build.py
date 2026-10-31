@@ -37,9 +37,11 @@ from pathlib import Path, PurePosixPath
 
 # Also works when invoked directly as a script or loaded by an isolated test.
 if __package__:
+    from .candidate import BENCHMARK_FILES, benchmark_path
     from .scope import FRONTEND_CHECKS, build_identity, identities
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from release_support.candidate import BENCHMARK_FILES, benchmark_path
     from release_support.scope import FRONTEND_CHECKS, build_identity, identities
 
 STAGES = ("env", "py311", "py312", "py313", "frontend", "frontend-checks", "build", "package", "smoke")
@@ -704,6 +706,7 @@ done
             return result
         for name in ("app", "prompts", "scripts"):
             shutil.copytree(self.source / name, package / name, ignore=ignore)
+        copy_benchmarks(self.source, package)
         for name in TOP_FILES:
             shutil.copy2(self.source / name, package / name)
         for name in OPTIONAL_FILES:
@@ -817,6 +820,23 @@ print(json.dumps(c))
         return result
 
 
+def copy_benchmarks(source, package):
+    base = source / "benchmark-package"
+    files = tree_files(base)
+    for tool in BENCHMARK_FILES:
+        require(any(name.startswith(tool + "/") and name.endswith("/manifest.json") for name in files), f"benchmark package is missing: {tool}")
+    for name in files:
+        require(benchmark_path("benchmark-package/" + name), f"unexpected benchmark resource: {name}")
+    for name in files:
+        if not name.endswith("/manifest.json"):
+            continue
+        manifest = read_json(base / name)
+        parent = PurePosixPath(name).parent
+        for rel, digest in manifest.get("files", {}).items():
+            require(files.get(str(parent / rel)) == digest, f"benchmark resource checksum mismatch: {parent / rel}")
+    shutil.copytree(base, package / "benchmark-package")
+
+
 def audit_package(root):
     files = tree_files(root)
     forbidden = {".git", ".venv", ".env", "__pycache__", "node_modules", "tests", "test", "harness", "test_harness", "data", "workspace", "logs", "private", "private-data", "release_support", ".pytest_cache", ".ruff_cache"}
@@ -827,8 +847,10 @@ def audit_package(root):
                 and not name.startswith(".env") and not name.endswith((".pyc", ".pyo", ".db", ".sqlite", ".sqlite3", ".log", ".pem", ".key"))
                 and not any(name.endswith(suffix) for suffix in (".db-wal", ".db-shm", ".sqlite3-wal", ".sqlite3-shm")),
                 f"private data or test/release harness in package: {relative}")
+        # The node is released on its own (node-v* tags); controllers download it.
+        require(parts[0] != "node" and not name.startswith("openbear-node"), f"node source or program in controller package: {relative}")
         gateway_files = {"gateway/README.md", "gateway/bin/manifest.json", "gateway/bin/openbear-gateway-linux-amd64", "gateway/bin/openbear-gateway-linux-arm64"}
-        require(parts[0] in {"app", "prompts", "scripts", "web"} or relative in (*TOP_FILES, *OPTIONAL_FILES, "release-meta.json") or relative in gateway_files, f"unexpected package file: {relative}")
+        require(parts[0] in {"app", "prompts", "scripts", "web"} or benchmark_path(relative) or relative in (*TOP_FILES, *OPTIONAL_FILES, "release-meta.json") or relative in gateway_files, f"unexpected package file: {relative}")
         require(parts[0] != "web" or relative.startswith("web/dist/"), f"non-built frontend in package: {relative}")
     return files
 

@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -32,6 +33,16 @@ BACKUP_KEEP = 3
 HEALTH_WAIT_S = 90
 HEALTH_INTERVAL_S = 1.0
 USER_AGENT = "OpenBear-Updater/1.0"
+# Installed under the install root when no system uv is found, and used from
+# there; the system is never changed. Same version that writes uv.lock; static
+# musl builds need no particular glibc.
+UV_VERSION = "0.11.6"
+UV_BUILDS = {
+    "x86_64": ("uv-x86_64-unknown-linux-musl", "aa342a53abe42364093506d7704214d2cdca30b916843e520bc67759a5d20132"),
+    "aarch64": ("uv-aarch64-unknown-linux-musl", "d14ebd6f200047264152daaf97b8bd36c7885a5033e9e8bba8366cb0049c0d00"),
+}
+UV_DIR = ".tools/uv"
+UV_SYSTEM_DIRS = ("/root/.local/bin", "/root/.cargo/bin")
 
 REPLACE_DIRS = ("app", "web/dist", "prompts", "scripts", "gateway/bin")
 REPLACE_FILES = (
@@ -54,6 +65,7 @@ PROTECTED_PREFIXES = (
     "mcp-servers/",
     ".venv/",
     ".git/",
+    ".tools/",
 )
 PROTECTED_NAMES = {
     "openbear.json",
@@ -63,6 +75,7 @@ PROTECTED_NAMES = {
     "mcp-servers",
     ".venv",
     ".git",
+    ".tools",
 }
 
 
@@ -78,31 +91,36 @@ def _strip_v(value: str) -> str:
     return text
 
 
+# OpenBear's own version order, the same as app/versioning.py (this script runs
+# copied out of the install, standard library only, so it keeps its own copy;
+# tests/test_release_versions.py checks the two agree). X.Y.Z > X.Y.Z-rc.N > X.Y.Z-beta.N
+# > X.Y.Z-dev.N, then N; not semver's alphabetical label order.
+_VERSION_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(dev|beta|rc)\.([1-9]\d*))?")
+_STAGES = ("dev", "beta", "rc", "")
+
+
 def parse_semver(value: str) -> tuple[int, int, int, str]:
-    """Parse ``1.2.3`` / ``v1.2.3-rc.1`` into (major, minor, patch, prerelease)."""
+    """Parse ``1.2.3`` / ``v1.2.3-rc.1`` into (major, minor, patch, pre-release label such as ``rc.1``)."""
     text = _strip_v(value)
     if not text:
         raise ValueError("empty version")
-    main, sep, pre = text.partition("-")
-    parts = main.split(".")
-    if len(parts) < 3 or not all(p.isdigit() for p in parts[:3]):
-        raise ValueError(f"invalid semver: {value}")
-    return int(parts[0]), int(parts[1]), int(parts[2]), pre if sep else ""
+    match = _VERSION_RE.fullmatch(text)
+    if not match:
+        raise ValueError(f"invalid version: {value}")
+    major, minor, patch, stage, number = match.groups()
+    return int(major), int(minor), int(patch), f"{stage}.{number}" if stage else ""
+
+
+def _version_key(value: str) -> tuple[int, int, int, int, int]:
+    major, minor, patch, pre = parse_semver(value)
+    stage, _, number = pre.partition(".")
+    return major, minor, patch, _STAGES.index(stage), int(number or 0)
 
 
 def cmp_semver(left: str, right: str) -> int:
-    """Compare two semver strings. Pre-release is lower than the same numeric triple."""
-    a = parse_semver(left)
-    b = parse_semver(right)
-    if a[:3] != b[:3]:
-        return -1 if a[:3] < b[:3] else 1
-    if a[3] == b[3]:
-        return 0
-    if not a[3]:
-        return 1
-    if not b[3]:
-        return -1
-    return -1 if a[3] < b[3] else 1
+    """-1, 0 or 1 in OpenBear's version order; ValueError when either is not a version."""
+    a, b = _version_key(left), _version_key(right)
+    return (a > b) - (a < b)
 
 
 def is_newer(latest: str, current: str) -> bool:
@@ -194,7 +212,7 @@ def classify_path(rel: str) -> str:
         return "ignore"
     if any(rel.startswith(prefix) for prefix in PROTECTED_PREFIXES):
         return "ignore"
-    if parts[0] == "app":
+    if parts[0] in {"app", "benchmark-package"}:
         return "restart"
     if rel in {"pyproject.toml", "uv.lock", "openbear.service"}:
         return "restart"
@@ -253,8 +271,11 @@ def _iter_files(root: Path) -> list[str]:
     if not root.is_dir():
         return out
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in {"__pycache__", ".git", ".venv"}]
         base = Path(dirpath)
+        # Everything under a protected top-level directory is ignored anyway;
+        # do not walk user data and workspaces that can hold millions of files.
+        skip = {"__pycache__", ".git", ".venv"} | (PROTECTED_NAMES if base == root else set())
+        dirnames[:] = [d for d in dirnames if d not in skip]
         for name in filenames:
             rel = normalize_rel(str((base / name).relative_to(root)))
             if classify_path(rel) == "ignore":
@@ -406,16 +427,64 @@ def with_tool_path(env: dict[str, str] | None = None) -> dict[str, str]:
     return out
 
 
-def resolve_uv(env: dict[str, str] | None = None) -> str:
+def resolve_uv(env: dict[str, str] | None = None, install_root: Path | None = None) -> str:
     env = with_tool_path(env)
-    found = shutil.which("uv", path=env.get("PATH"))
-    if found:
-        return found
-    for extra in (env.get("PATH") or "").split(":"):
-        candidate = Path(extra) / "uv"
+    home = Path(env["HOME"])
+    dirs = [p for p in (env.get("PATH") or "").split(":") if p]
+    dirs += [str(home / ".cargo" / "bin"), *UV_SYSTEM_DIRS]
+    if install_root is not None:
+        dirs.append(str(Path(install_root) / UV_DIR))
+    for directory in dict.fromkeys(dirs):
+        candidate = Path(directory) / "uv"
+        # is_file() follows links, so a dangling uv link is skipped.
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return ""
+
+
+def install_uv(install_root: Path, log=print) -> str:
+    machine = platform.machine().lower()
+    arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    if arch not in UV_BUILDS:
+        raise UpdateError(f"找不到 uv，也没有适用于 {machine} 的 uv 可自动安装；请安装 uv 后重试")
+    build, digest = UV_BUILDS[arch]
+    target = Path(install_root) / UV_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    # Older git checkouts do not ignore .tools; a dirty tree would block updates.
+    (target.parent / ".gitignore").write_text("*\n", encoding="utf-8")
+    archive, binary = target / (build + ".tar.gz.part"), target / "uv.part"
+    url = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{build}.tar.gz"
+    log(f"找不到 uv，下载 uv {UV_VERSION} 到 {target}")
+    try:
+        for attempt in range(3):
+            try:
+                _download(url, archive)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise UpdateError(f"找不到 uv，自动下载也失败：{exc}；请安装 uv 后重试") from exc
+                time.sleep(2 * (attempt + 1))
+        if sha256_file(archive) != digest:
+            raise UpdateError("下载的 uv 校验和不匹配，已丢弃")
+        with tarfile.open(archive, "r:gz") as tar, binary.open("wb") as handle:
+            source = tar.extractfile(f"{build}/uv")
+            if source is None:
+                raise UpdateError("uv 压缩包缺少 uv 程序")
+            shutil.copyfileobj(source, handle)
+        binary.chmod(0o755)
+        proc = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0 or UV_VERSION not in proc.stdout:
+            raise UpdateError(f"下载的 uv 无法运行: {(proc.stderr or proc.stdout).strip()[:200]}")
+        binary.replace(target / "uv")
+    finally:
+        archive.unlink(missing_ok=True)
+        binary.unlink(missing_ok=True)
+    log(f"已安装 uv {UV_VERSION}: {target / 'uv'}")
+    return str(target / "uv")
+
+
+def ensure_uv(install_root: Path, env: dict[str, str] | None = None, log=print) -> str:
+    return resolve_uv(env, install_root) or install_uv(install_root, log)
 
 
 def parse_sha256sums(text: str, filename: str) -> str:
@@ -580,6 +649,10 @@ class Updater:
         if self.classification.get("error"):
             self.log(f"分类出错，按重启处理: {self.classification['error']}")
         requires_restart = bool(self.classification.get("requiresRestart"))
+        if self._needs_dep_sync():
+            # Before anything stops: a missing uv is installed now, not found
+            # missing after the swap.
+            ensure_uv(self.install_root, with_tool_path(), self.log)
         validation = _load_release_validation(self.install_root)
         retention = validation.retain_previous_assets(
             staging / "web" / "dist",
@@ -736,31 +809,27 @@ class Updater:
             subprocess.run([str(python) if python.is_file() else sys.executable,
                             str(browser_installer), "--if-enabled", "--root", str(self.install_root)],
                            cwd=self.install_root, env=with_tool_path(), check=True, timeout=330)
-        changed = set(self.classification.get("changed") or [])
-        version_only = set(self.classification.get("versionOnly") or [])
-        material = changed - version_only
-        has_lock = (self.install_root / "uv.lock").is_file()
-        # lock 没变、或只改了项目自身版本号，不必重装。
-        if has_lock and "uv.lock" not in material:
-            return
-        if not has_lock and "pyproject.toml" not in material:
+        if not self._needs_dep_sync():
             return
         self.log("同步 Python 依赖")
         env = with_tool_path()
-        uv = resolve_uv(env)
-        if uv and has_lock:
+        uv = ensure_uv(self.install_root, env, self.log)
+        if (self.install_root / "uv.lock").is_file():
             cmd = [uv, "sync", "--frozen", "--directory", str(self.install_root)]
-        elif uv:
-            cmd = [uv, "sync", "--directory", str(self.install_root)]
         else:
-            python = self.install_root / ".venv" / "bin" / "python"
-            if not python.is_file():
-                raise UpdateError("找不到 uv，也没有 .venv/bin/python，无法同步依赖")
-            cmd = [str(python), "-m", "pip", "install", "-e", str(self.install_root)]
+            cmd = [uv, "sync", "--directory", str(self.install_root)]
         proc = subprocess.run(cmd, cwd=self.install_root, env=env, capture_output=True, text=True)
         if proc.returncode != 0:
             tail = ((proc.stderr or "") + "\n" + (proc.stdout or ""))[-2000:]
             raise UpdateError(f"依赖同步失败 rc={proc.returncode}: {tail}")
+
+    def _needs_dep_sync(self) -> bool:
+        changed = set(self.classification.get("changed") or [])
+        material = changed - set(self.classification.get("versionOnly") or [])
+        # lock 没变、或只改了项目自身版本号，不必重装。
+        if (self.install_root / "uv.lock").is_file():
+            return "uv.lock" in material
+        return "pyproject.toml" in material
 
     def _install_unit(self) -> None:
         src = self.install_root / "openbear.service"

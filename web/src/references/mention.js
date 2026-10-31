@@ -38,7 +38,7 @@ export function mentionAtPosition(position) {
   // namespace '/', pinyin, IDs and '*' wildcards; prose separators end it.
   const match = /(?:^|[^\w.+%/@\\-])@([^\s@\uFFFC"'`“”‘’，。！？；：、,.!?;:()[\]{}<>《》【】\\]*)$/u.exec(before);
   if (!match) return null;
-  const raw = match[1], prefix = /^(mem|doc|secret|chat)\//.exec(raw);
+  const raw = match[1], prefix = /^(mem|doc|secret|chat|server)\//.exec(raw);
   return {from: position.pos - raw.length - 1, to: position.pos,
     query: prefix ? raw.slice(prefix[0].length) : raw, kind: prefix?.[1] || ''};
 }

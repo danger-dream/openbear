@@ -20,12 +20,10 @@ install(app, host, host.instances)
 await host.instances.close()
 ```
 
-Controller authentication middleware must pass only
-`POST /api/instance-events/v1` directly to its handler (without cookie auth).
-That handler independently checks the limited report Bearer, authoritative
-instance ID, event type, body bounds and archive status. **Do not bypass this
-path in managed mode.** All `/api/instances` handlers independently require the
-controller role and the existing authenticated owner session/whitelist.
+The controller has no instance event endpoint to let through its authentication:
+instance events are pulled from the access gateway (`GET /control/v1/events`,
+authenticated by the gateway control key), not pushed to the controller. All `/api/instances` handlers independently
+require the controller role and the existing authenticated owner session/whitelist.
 
 `chat_runtime.py` owns `prepare_turn`, `bind_context` → `bind_run`, and `finish`.
 Runtime owner need not change that file. Ordinary Web/Cron/Webhook/recommendation
@@ -60,7 +58,8 @@ with unrestricted existing file/network tools.
 ## Complete deployment and maintenance path
 
 1. `POST /api/instances` saves a draft; secrets omitted from PATCH preserve the
-   original values. Initial child account password is 12–1024 characters.
+   original values. Initial child account password is 1–1024 characters (the UI
+   only advises on strength).
    `initialConfig` uses the real child business configuration schema, including
    valid `models.providers` and `models.primary` for a new workspace.
 2. `POST /{id}/deploy` creates **and starts** a dedicated ordinary Web execution.
@@ -70,11 +69,15 @@ with unrestricted existing file/network tools.
    approval also binds the instance revision and shows the fixed SSH/management
    target; form changes while confirmation waits invalidate that approval.
 3. `InstanceControl(action=describe)` documents the tool. `status` with no ID
-   returns the exact bound operation and revision. `remote` performs a confirmed
-   SSH command only on the recorded target; it does not execute a controller
-   shell, inherit SSH configuration, agent keys or parent environment. Optional
-   `sudo:true` is included in confirmation and sends the stored target password
-   via stdin, not tool arguments. SSH first connection explicitly uses TOFU
+   returns the exact bound operation and revision. `remote` runs a command only
+   on the recorded target, without asking the user per command (the model owns
+   keeping it within the deployment or stated maintenance): on the controller's
+   own machine directly with a sanitized environment; on another server through
+   its node (as root) while the node is online, else over SSH as the login user.
+   The result names the channel used. SSH does not inherit SSH configuration,
+   agent keys or parent environment. Optional `sudo:true` (SSH password logins
+   only) sends the stored target password via stdin, not tool arguments. SSH
+   first connection explicitly uses TOFU
    (`accept-new`); the pinned host key is retained encrypted; changed keys fail.
    Controller requires an existing OpenSSH client; no software is auto-installed.
 4. No published official Docker image is assumed. A user can supply a verified
@@ -83,11 +86,13 @@ with unrestricted existing file/network tools.
    Current release ZIP is not a full source build context. Model may adapt the
    target's Docker environment through confirmed `remote` commands. No real
    image publication is part of this implementation.
-5. `deliver` takes the current revision, host port, optional verified/built image
-   tag and bind address (`127.0.0.1` default, explicitly confirmed `0.0.0.0`
-   available for WG/firewalled access). It privately transfers actual generated
-   keys, seeds and business configuration to `.openbear-instances/<id>` as 0600
-   files. Compose maps the selected host port to **18961**, with only the user's
+5. `deliver` takes the current revision and optional verified/built image tag;
+   port and host bind addresses come from the record (loopback, plus the mesh
+   address for a gateway on another server, with a boot unit that starts the
+   container once that address is up; SSH-only servers `0.0.0.0`). Containers
+   get `pids_limit` and the optional per-instance memory limit. It privately transfers actual generated
+   keys, seeds and business configuration to `.deploy-<directory name>` beside the
+   data directory (not inside it) as 0600 files. Compose maps the selected host port to **18961**, with only the user's
    dedicated host directory mounted at `/workspace`. It never mounts a Docker
    socket or controller/other-tenant state. No image pull or container start is
    hidden in delivery.
@@ -123,15 +128,22 @@ without treating their encoded slash as a route separator. Actual child business
 field validation still applies (e.g. channel mutation's ASCII-name restriction).
 It rejects malformed/double encoding, encoded traversal, absolute URLs, custom
 headers/hosts, auth/controller/updater paths, query/fragment smuggling,
-redirects and oversized responses. TLS verification is always on; HTTP is only
-allowed for explicit RFC1918/loopback/ULA literal addresses. Model mutations
+redirects, oversized responses and JSON nested deeper than 64 levels. TLS
+verification is always on; HTTP is not restricted to private addresses.
+Management and gateway control calls to a server whose node is connected and
+advertises `http.local` go through that node to `127.0.0.1:<port>` over the
+encrypted node channel (loopback only, 2 MB / 60 s caps); new instances there
+listen on loopback, plus their mesh address when the gateway is on another mesh
+member (`POST /{id}/migrate-network` moves older ones). SSH-only servers keep
+server address + port. Model mutations
 (including management jobs/configuration) always confirm. Managed children and
 Agent scope never register `InstanceControl`.
 
 ## Independent OpenResty routing
 
-`GET /api/instances/{id}/route` exports an owned server block from the persistent
-registered mapping and always returns `active:false`. Install the provided
+The controller does not export route files (there is no
+`/api/instances/{id}/route`); public access normally goes through the access
+gateway, which the controller keeps in sync. For an independently run OpenResty, install the provided
 `openresty-common.conf` map/default-deny blocks once, and route files in the
 independently running OpenResty `http {}` context. Resolve existing 1Panel/default
 listeners, the explicit certificate paths and CA bundle path during an

@@ -1,0 +1,35 @@
+{
+  "tool": "service-unlock",
+  "version": "v0.1.0",
+  "name": "Service Unlock",
+  "upstream": {
+    "repo": "https://github.com/shui1iao/service-unlock",
+    "commit": "01786b19f9edb36e63c07f884ebb66dbce669deb",
+    "date": "2026-10-18",
+    "license": "AGPL-3.0-only (combined; original portions MIT)"
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "bin/service-unlock",
+  "files": {},
+  "binaries": [
+    {
+      "platform": "linux/amd64",
+      "dest": "bin/service-unlock",
+      "url": "https://github.com/shui1iao/service-unlock/releases/download/v0.5.4/service-unlock_linux_amd64",
+      "sha256": "928792d4c39f60ac02a12533d5f51908c0eb4ec0d4dad57c3884cec43bf90535",
+      "size": 11411580
+    },
+    {
+      "platform": "linux/arm64",
+      "dest": "bin/service-unlock",
+      "url": "https://github.com/shui1iao/service-unlock/releases/download/v0.5.4/service-unlock_linux_arm64",
+      "sha256": "3df73dcd8413606a352081da673c51fe425674624e1403f7c7a235b83da04fe9",
+      "size": 10748028
+    }
+  ],
+  "patch": null,
+  "built": "2026-10-30"
+}

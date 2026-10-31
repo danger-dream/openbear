@@ -5,7 +5,7 @@ import postcss from 'postcss';
 import tailwindcss from 'tailwindcss';
 import config from '../tailwind.config.js';
 import {editorTheme} from './editorTheme.js';
-import {themeValues, resolveThemeValue, themeColor, contrast} from './testHelpers/theme.mjs';
+import {themeValues, resolveThemeValue, themeColor, contrast} from './testing/theme.mjs';
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 for (const dark of [false, true]) {

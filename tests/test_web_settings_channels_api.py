@@ -260,7 +260,7 @@ async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env
     specs_data = await specs.json()
     assert "memory" in [g["key"] for g in specs_data["groups"]]
     assert [domain["key"] for domain in specs_data["domains"]] == [
-        "agent", "tools", "browser", "memory", "media", "notifications", "web", "webhooks", "interface",
+        "agent", "tools", "work_items", "features", "updates", "browser", "memory", "media", "notifications", "web", "webhooks", "interface",
     ]
     agent_sections = next(domain for domain in specs_data["domains"] if domain["key"] == "agent")["sections"]
     assert [section["key"] for section in agent_sections] == [

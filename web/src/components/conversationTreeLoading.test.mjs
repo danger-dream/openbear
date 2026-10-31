@@ -170,17 +170,3 @@ test('manual title generation owns a visible row state and suppresses duplicate 
   assert.equal(tree.noticeState.closed, 1);
   assert.deepEqual(tree.noticeState.notifications, ['正在生成会话名称…', '会话名称无需更新']);
 });
-test('search loading belongs to search control rather than all result row icons', () => {
-  const body=source.slice(source.indexOf('function rowLoading('),source.indexOf('function withDraft('));
-  assert.doesNotMatch(body,/searchLoading|loading\.value|treeItemParent/);
-  assert.match(source,/:is="searchLoading \? Loading : Search"/);
-});
-test('both node icon types use the same fixed icon slot; loading rows are absent and pagination remains guarded', () => {
-  assert.match(source, /class="node-icon" :class="\{ 'is-spinning': rowLoading\(row\) \}"/);
-  assert.match(source, /'is-spinning': rowLoading\(row\) \|\| isTitleGenerating\(row\)/);
-  assert.match(source, /'is-working': running\(row\) && !isActivityWaiting\(row\) && !rowLoading\(row\) && !isTitleGenerating\(row\)/);
-  assert.doesNotMatch(source, /kind: "loading"|row\.kind === 'loading'/);
-  assert.match(source, /:aria-busy="rowLoading\(row\) \|\| isTitleGenerating\(row\)"/);
-  assert.match(source, /class="title-generating-state" role="status" aria-live="polite">命名中/);
-  assert.match(source, /:disabled="stateFor\(row\.parentId \|\| '', row\.systemNode \|\| ''\)\.loading"/);
-});

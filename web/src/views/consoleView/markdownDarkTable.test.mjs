@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parse, compileStyle} from '@vue/compiler-sfc';
 import postcss from 'postcss';
-import {themeValues, themeColor, contrast} from '../../testHelpers/theme.mjs';
+import {themeValues, themeColor, contrast} from '../../testing/theme.mjs';
 
 const source = readFileSync(new URL('./ConsoleMarkdown.vue', import.meta.url), 'utf8');
 const {descriptor} = parse(source);

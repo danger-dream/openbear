@@ -1,0 +1,153 @@
+/* A server's addresses and network tests: the detail page's cards and the mesh member panel. */
+.net-addresses .pb-tag[data-tone='info'], .net-probe .pb-tag[data-tone='info'] { border-color: transparent; background: var(--ob-info-soft); color: var(--ob-info); }
+.net-addresses-panel { margin-top: 12px; }
+.net-state { margin: 6px 0 0; font-size: var(--ix-sm); }
+.net-refresh { font-size: var(--ix-xs); }
+
+/* Addresses, grouped by interface; a row copies its address. */
+.net-iface + .net-iface { margin-top: 8px; }
+.net-iface-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-height: 22px; padding: 0 6px; }
+.net-iface-name { color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-weight: 600; }
+.net-iface[data-down] .net-addr-ip { color: var(--ob-chat-subtle); }
+.net-addr[data-control] .net-addr-ip { color: var(--ob-chat-subtle); }
+.net-addr-list { margin: 0; padding: 0; list-style: none; }
+.net-addr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; box-sizing: border-box; width: 100%; min-height: 28px; padding: 3px 6px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--ob-chat-text); font: inherit; text-align: left; cursor: pointer; }
+.net-addr:hover { background: var(--ob-chat-hover); }
+.net-addr:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: -2px; }
+.net-addr-ip { min-width: 0; font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.net-exit { display: flex; flex-wrap: wrap; align-items: center; gap: 0 8px; margin: 8px 0 0; }
+.net-exit > .net-addr { width: auto; }
+.net-exit > small { padding: 0 6px; font-size: var(--ix-xs); }
+.net-more { margin: 2px 0 0 6px; font-size: var(--ix-xs); }
+
+/* The test form: mode, target (and port), start / stop; the rest folded away. */
+.net-probe.ix-card { grid-column: 1 / -1; }
+.net-form { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sv-ranges > button[role='radio'][aria-checked='true'] { background: var(--ob-chat-panel); color: var(--ob-chat-text); box-shadow: 0 1px 2px rgb(0 0 0 / .08); font-weight: 600; }
+.sv-ranges > button[role='radio']:disabled { cursor: not-allowed; opacity: .6; }
+.net-modes { align-self: flex-start; }
+.net-line { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; min-width: 0; }
+.net-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: var(--ix-sm); }
+.net-field > span { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.net-field > small { font-size: var(--ix-xs); }
+.net-line .net-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.net-target { flex: 1 1 220px; max-width: 520px; }
+.net-port { flex: 0 0 96px; }
+.net-field input.invalid { border-color: var(--ob-danger); }
+.net-go { flex: none; min-width: 72px; }
+.net-advanced > summary { width: fit-content; padding: 2px 0; color: var(--ob-chat-subtle); font-size: var(--ix-xs); cursor: pointer; }
+.net-advanced[open] > summary { margin-bottom: 8px; }
+.net-adv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 12px; max-width: 640px; }
+.net-families { align-self: flex-start; }
+/* The detail page's card: mode, target, port and start on one line across the card; the options under it. */
+.net-probe.ix-card .net-line { align-items: center; gap: 8px 10px; }
+.net-probe.ix-card .net-modes > button { min-height: 28px; padding: 1px 12px; font-size: var(--ix-sm); }
+.net-probe.ix-card .net-target { flex: 1 1 260px; max-width: none; }
+.net-probe.ix-card .net-go { min-width: 88px; }
+.net-probe.ix-card .net-form, .net-probe.ix-card .net-advanced { margin: 0; }
+.net-advanced.is-inline > summary { display: none; }
+.net-advanced.is-inline > .net-adv-grid { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; max-width: none; padding: 7px 12px; border-radius: 10px; background: var(--ob-chat-hover); }
+.net-advanced.is-inline .net-field { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.net-advanced.is-inline .net-field > span { font-size: var(--ix-sm); }
+.net-probe .net-advanced.is-inline .net-field > input:not([type='radio']):not([type='checkbox']) { width: 84px; }
+.net-advanced.is-inline .net-field > small { flex: 1 0 100%; }
+.net-advanced.is-inline .net-field input { background: var(--ob-chat-panel); }
+.net-advanced.is-inline .net-families { background: var(--ob-chat-panel); }
+.net-advanced.is-inline .net-families > button[role='radio'][aria-checked='true'] { background: var(--ob-chat-hover); }
+
+/* Results. */
+.net-result { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--ob-chat-line); min-width: 0; }
+.net-result-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.net-result-target { min-width: 0; font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.net-summary { display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+.net-summary > div { display: flex; align-items: baseline; gap: 4px; }
+.net-summary dt { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.net-summary dd { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.net-through { margin: 4px 0 0; font-size: var(--ix-xs); overflow-wrap: anywhere; }
+/* On the detail page the summary is a row of tiles, the latency of each try as bars under it. */
+.net-summary.is-tiles { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.net-summary.is-tiles > div { flex-direction: column; align-items: flex-start; gap: 0; min-width: 0; padding: 6px 10px; border: 1px solid var(--ob-chat-line); border-radius: 10px; }
+.net-summary.is-tiles dd { font-size: var(--ix-md); white-space: nowrap; }
+.net-summary.is-tiles > div[data-tone='warn'] dd { color: var(--ob-warning); }
+.net-summary.is-tiles > div[data-tone='bad'] dd { color: var(--ob-danger); }
+.net-bars { display: flex; align-items: flex-end; gap: 2px; height: 40px; margin: 10px 0 2px; padding: 0 1px; border-bottom: 1px solid var(--ob-chat-line); }
+.net-bars > i { flex: 1 1 0; max-width: 14px; min-width: 2px; border-radius: 2px 2px 0 0; background: var(--ob-success); opacity: .75; transition: height .3s ease; }
+.net-bars > i[data-fail] { background: var(--ob-danger); opacity: .35; }
+.net-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0 20px; margin: 6px 0 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+.net-results > li { display: grid; grid-template-columns: 2.4em minmax(0, 1fr) auto; align-items: baseline; gap: 6px; min-height: 24px; border-bottom: 1px solid var(--ob-chat-line); font-size: var(--ix-sm); line-height: 24px; }
+.net-seq { color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: right; }
+.net-results > li[data-fail] > .net-rtt { color: var(--ob-danger); }
+.net-ttl { font-size: var(--ix-xs); }
+.net-sub-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 10px 0 4px; }
+.net-sub-head > h4, .net-sub-title { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.net-sub-head > .instance-muted { font-size: var(--ix-xs); }
+/* The section head in the mesh member panel: the same as the panel's other sections (趋势, 路由). */
+.net-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-bottom: 6px; }
+.net-panel-head > h4 { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.net-sub-title { margin-top: 12px; }
+.net-path-line { margin: 0; font-size: var(--ix-md); line-height: 1.7; overflow-wrap: anywhere; }
+.net-path-total { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 12px; margin: 2px 0 0; font-size: var(--ix-sm); }
+.net-path-total > .ob-warn { font-size: var(--ix-xs); }
+.net-on-board[aria-pressed='true'] { color: var(--ob-chat-text); font-weight: 600; }
+
+/* The trace table: wide on a phone, so it scrolls sideways inside its own box. */
+.net-trace-wrap { margin-top: 8px; overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.net-trace { width: 100%; min-width: 600px; border-collapse: collapse; font-size: var(--ix-sm); font-variant-numeric: tabular-nums; }
+.net-trace th { padding: 4px 8px; border-bottom: 1px solid var(--ob-chat-line); color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-weight: 400; text-align: left; white-space: nowrap; }
+.net-trace td { padding: 3px 8px; border-bottom: 1px solid var(--ob-chat-line); vertical-align: top; line-height: 20px; white-space: nowrap; }
+.net-trace .net-num { width: 1%; text-align: right; }
+.net-trace th:first-child, .net-trace td:first-child { padding-left: 2px; color: var(--ob-chat-subtle); }
+.net-trace tr[data-silent] td { color: var(--ob-chat-subtle); }
+.net-failed { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.net-failed > small { font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.net-trace-addr { max-width: 340px; }
+.net-trace-geo { max-width: 260px; }
+/* One line per address in both columns, so a name or a place arriving later moves nothing. */
+.net-line-cell { display: flex; align-items: baseline; gap: 6px; height: 20px; min-width: 0; overflow: hidden; }
+.net-line-cell > * { flex: none; }
+.net-line-cell > small, .net-trace-geo .net-line-cell > span:last-child { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.net-line-cell > small { font-size: var(--ix-xs); }
+.net-line-cell > .sv-flag { font-size: 14px; }
+.net-geo-wait { display: inline-block; align-self: center; width: 84px; height: 12px; overflow: hidden; border-radius: 4px; background: var(--ob-chat-hover); color: transparent; font-size: 10px; animation: net-wait 1.2s ease-in-out infinite alternate; }
+/* The trace on a phone: two lines an address, nothing wider than the screen. Fixed line heights, so a place or a
+   name arriving later moves nothing. */
+.net-hops { margin: 8px 0 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+.net-hops > li { padding: 4px 0; border-bottom: 1px solid var(--ob-chat-line); }
+.net-hop-line { display: grid; grid-template-columns: 2em minmax(0, 1fr) auto; align-items: center; gap: 0 8px; height: 22px; font-size: var(--ix-md); }
+.net-hop-sub { height: 18px; font-size: var(--ix-sm); color: var(--ob-chat-subtle); }
+.net-hop-ttl { color: var(--ob-chat-subtle); text-align: right; font-size: var(--ix-sm); }
+.net-hop-addr { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
+.net-hop-addr > * { flex: none; }
+.net-hop-addr > small, .net-hop-addr > .net-hop-place { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.net-hop-addr > small { font-size: var(--ix-sm); }
+.net-hop-addr > .sv-flag { font-size: 13px; }
+.net-hop-addr > .net-geo-wait { align-self: center; }
+/* The next address of the same hop: a little apart, so each address goes with its place. */
+.net-hop-sub + .net-hop-line { margin-top: 4px; }
+.net-hop-rtt { white-space: nowrap; text-align: right; }
+.net-hop-loss { white-space: nowrap; text-align: right; }
+.net-hops > li[data-silent] .net-hop-line, .net-hops > li[data-silent] .net-hop-rtt { color: var(--ob-chat-subtle); }
+@keyframes net-wait { from { opacity: .45; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .net-geo-wait { animation: none; } }
+
+/* In the mesh member panel the column is narrow: everything stacks. */
+.mesh-pane .net-target { flex-basis: 100%; max-width: none; }
+.mesh-pane .net-port { flex: 1 1 96px; }
+.mesh-pane .net-go { flex: 1 0 auto; }
+
+@media (max-width: 760px) {
+  .net-addr { min-height: 40px; }
+  .net-form .net-modes > button, .net-form .net-families > button { min-height: 36px; padding: 2px 12px; white-space: nowrap; }
+  .net-adv-grid .net-family-field { grid-column: 1 / -1; }
+  .net-target { flex-basis: 100%; max-width: none; }
+  .net-port { flex: 1 1 96px; }
+  .instance-ui .net-form .net-go { flex: 1 0 auto; min-height: 40px; }
+  .net-form .net-advanced > summary { display: flex; align-items: center; min-height: 40px; }
+  .net-probe .ix-text-button.net-on-board, .net-probe .ix-text-button.net-more, .net-addresses .ix-text-button.net-refresh, .net-addresses .ix-text-button.net-more { display: inline-flex; align-items: center; min-height: 40px; }
+  .net-results > li { min-height: 30px; line-height: 30px; }
+  .net-probe.ix-card .net-modes { flex: 1 1 100%; }
+  .net-probe.ix-card .net-modes > button { flex: 1; min-height: 36px; }
+  .net-summary.is-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  .net-summary.is-tiles > div { padding: 5px 8px; }
+}

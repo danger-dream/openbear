@@ -74,7 +74,7 @@ async def test_status_text_contains_only_process_and_total_stats(monkeypatch):
         started_at=0,
     )
 
-    text = await _status_text(svc, 5352767013)
+    text = await _status_text(svc, 424242424)
 
     assert "OpenBear 状态" in text
     assert "总计统计" in text

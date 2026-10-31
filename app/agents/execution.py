@@ -2057,6 +2057,7 @@ class AgentExecutor(AgentTaskContext):
             ], "openbear_context_source": {"kind": "execution"}})
             self._pending_tool_images = []
         attempt_no = 0
+        quiet_retry = False
         overflow_attempt = 0
         media_recovery_attempted = False
         partial = AgentResult()
@@ -2109,8 +2110,10 @@ class AgentExecutor(AgentTaskContext):
             }, metadata={"ticket": ticket})
 
         async def started(outcome):
-            nonlocal attempt_no, partial_time, partial_chars, tool_input_active, attempt_id
+            nonlocal attempt_no, partial_time, partial_chars, tool_input_active, attempt_id, quiet_retry
             attempt_no += 1
+            quiet_start, quiet_retry = quiet_retry, False
+            retry_label = attempt_no > 1 and not quiet_start
             partial_time, partial_chars = time.monotonic(), 0
             tool_input_active = False
             attempt_id = outcome.attempt_id
@@ -2118,10 +2121,10 @@ class AgentExecutor(AgentTaskContext):
             await self.dao.update_task(self.task_uuid, current_agent_key=self.agent.agent_key,
                                        current_status="模型调用中")
             await self.emit("model_call_started", agent_key=self.agent.agent_key,
-                summary=f"{self.agent.name} 模型调用开始" + (f"（重试 {attempt_no - 1}/{self.retry_policy.max_retries}）" if attempt_no > 1 else ""), detail={
+                summary=f"{self.agent.name} 模型调用开始" + (f"（重试 {attempt_no - 1}/{self.retry_policy.max_retries}）" if retry_label else ""), detail={
                     "model": self.model, "modelLabel": self.model_label, "thinkLevel": self.think_level,
                     "maxTokens": self.max_tokens, "attempt": attempt_no - 1, "round": round_no,
-                    "attemptId": outcome.attempt_id,
+                    "attemptId": outcome.attempt_id, **({"quietRetry": True} if quiet_start else {}),
                 })
 
         async def observe(event, logical_partial, outcome):
@@ -2231,10 +2234,15 @@ class AgentExecutor(AgentTaskContext):
             return True
 
         async def retry_state(payload):
+            nonlocal quiet_retry
+            if payload.get("active"):
+                quiet_retry = bool(payload.get("quiet"))
             session = current_session()
             if session:
                 await session.phase("retry_wait" if payload.get("active") else "model", waiting=bool(payload.get("active")))
             live_state.clear(self.task_uuid)
+            if payload.get("quiet"):
+                return
             task = await self.dao.get_task(self.task_uuid)
             output = dict(task.output or {}) if task else {}
             output.update(retry=dict(payload), taskUuid=self.task_uuid)

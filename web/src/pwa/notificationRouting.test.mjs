@@ -30,7 +30,7 @@ function settingsPage(win) {
   const ast = parseJs(source, {sourceType: 'module'});
   const code = ast.program.body.filter(n => n.type !== 'ImportDeclaration').map(n => source.slice(n.start, n.end)).join('\n');
   const mounted = [], unmounted = [];
-  const context = vm.createContext({...Vue, window: win, URLSearchParams,
+  const context = vm.createContext({...Vue, window: win, URLSearchParams, applyFeatureSettings: () => {},
     onMounted: callback => mounted.push(callback), onBeforeUnmount: callback => unmounted.push(callback),
     Api: {
       async settingsSpecs() {return {ok: true, domains: [

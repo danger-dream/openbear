@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import * as Vue from 'vue';
 import {parse} from '@vue/compiler-sfc';
 import {parse as parseJs} from '@babel/parser';
-import {mobileAssetsRuntime} from '../testHelpers/mobileAssets.mjs';
+import {mobileAssetsRuntime} from '../testing/mobileAssets.mjs';
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; };

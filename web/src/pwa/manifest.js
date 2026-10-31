@@ -1,5 +1,7 @@
+import { assetUrl } from "../assetBase.js";
+
 export const MANIFEST_PATH = "/manifest.webmanifest";
-export const DARK_MANIFEST_PATH = "/assets/pwa/manifest-dark.webmanifest";
+export const DARK_MANIFEST_PATH = assetUrl("assets/pwa/manifest-dark.webmanifest");
 
 export function themeManifestPath(theme) {
   return theme === "dark" ? DARK_MANIFEST_PATH : MANIFEST_PATH;

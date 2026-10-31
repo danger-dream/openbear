@@ -238,8 +238,8 @@ async def test_web_login_callback_approves_request(monkeypatch):
 
     class _Query:
         data = "web_login:approve:req-1"
-        from_user = SimpleNamespace(id=5352767013)
-        message = SimpleNamespace(chat=SimpleNamespace(id=5352767013), message_id=9)
+        from_user = SimpleNamespace(id=424242424)
+        message = SimpleNamespace(chat=SimpleNamespace(id=424242424), message_id=9)
         bot = object()
 
         async def answer(self, *args, **kwargs):
@@ -248,7 +248,7 @@ async def test_web_login_callback_approves_request(monkeypatch):
     query = _Query()
     await admin.cb_web_login_decision(query, svc)
 
-    assert svc.web_admin.decision == ("req-1", True, 5352767013)
+    assert svc.web_admin.decision == ("req-1", True, 424242424)
     assert edits and "已确认登录" in edits[0]
 
 
@@ -266,11 +266,11 @@ async def test_telegram_restart_writes_completion_notice(tmp_path, monkeypatch):
     monkeypatch.setattr("app.control_actions.schedule_openbear_restart", fake_restart)
     monkeypatch.setattr(admin.asyncio, "sleep", fake_sleep)
 
-    await admin._schedule_restart(svc, 5352767013, reason="test tg restart")
+    await admin._schedule_restart(svc, 424242424, reason="test tg restart")
 
     assert scheduled == [1.0]
     raw = json.loads(restart_notification_path(svc.config).read_text(encoding="utf-8"))
-    assert raw[0]["chatId"] == 5352767013
+    assert raw[0]["chatId"] == 424242424
     assert raw[0]["reason"] == "test tg restart"
     assert raw[0]["requestedBy"] == "telegram"
 
@@ -288,6 +288,6 @@ async def test_telegram_restart_schedule_failure_removes_notice(tmp_path, monkey
     monkeypatch.setattr("app.control_actions.schedule_openbear_restart", fake_restart)
     monkeypatch.setattr(admin.asyncio, "sleep", fake_sleep)
 
-    await admin._schedule_restart(svc, 5352767013, reason="test tg restart")
+    await admin._schedule_restart(svc, 424242424, reason="test tg restart")
 
     assert not restart_notification_path(svc.config).exists()

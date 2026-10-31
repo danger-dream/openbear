@@ -32,8 +32,17 @@ const buildIdentity = {
   },
 };
 
+// A gateway serves each instance's build below its own /_i/<instance>/ prefix.
+// Compiled JS and CSS locate their assets relative to their own URL, so they
+// follow whichever prefix loaded the page; index.html keeps root URLs, which
+// the serving process rewrites for a prefixed page.
+export function renderBuiltUrl(filename, {hostType}) {
+  if (hostType === "js" || hostType === "css") return {relative: true};
+}
+
 export default defineConfig({
   plugins: [vue(), buildIdentity],
+  experimental: { renderBuiltUrl },
   define: {
     __OPENBEAR_BUILD_ID__: JSON.stringify(buildInfo.buildId),
     __OPENBEAR_VERSION__: JSON.stringify(buildInfo.version),

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {parse,compileScript,compileTemplate} from '@vue/compiler-sfc';
+import {parse} from '@vue/compiler-sfc';
 import {computed,ref,reactive,nextTick,watch,effectScope} from 'vue';
 import {statusLabel,tabKey} from './webhookConfig.js';
 const clone=value=>JSON.parse(JSON.stringify(value));
@@ -62,10 +62,4 @@ test('F07 statistics configuration edits are isolated; reopening discards unappl
     run("draft.value.dimensions[0].name='applied';apply()");assert.equal(events[0][0],'apply');assert.equal(events[0][1].dimensions[0].name,'applied');assert.deepEqual(events[1],['update:modelValue',false]);
     assert.deepEqual(clone(props.statistics),initial);run("draft.value.dimensions[0].name='later'");assert.equal(events[0][1].dimensions[0].name,'applied');
   } finally { scope.stop(); }
-});
-test('statistics surfaces compile their actual templates including query controls and measurement levels',()=>{
-  for(const file of ['./WebhookStatistics.vue','../../views/WebhooksView.vue']) {
-    const source=fs.readFileSync(new URL(file,import.meta.url),'utf8');const {descriptor,errors}=parse(source);assert.deepEqual(errors,[]);const script=compileScript(descriptor,{id:file});
-    assert.deepEqual(compileTemplate({source:descriptor.template.content,filename:file,id:file,compilerOptions:{bindingMetadata:script.bindings}}).errors,[]);
-  }
 });

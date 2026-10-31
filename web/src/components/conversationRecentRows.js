@@ -26,7 +26,7 @@ export function useRecentConversationRows(props) {
   const rows = computed(() => {
     const unique = new Map(recent.value.map(item => [item.conversationUuid, item]));
     for (const item of visibleItems.value) {
-      if (!item?.conversationUuid || item.archived || item.local) continue;
+      if (!item?.conversationUuid || item.archived || item.local || item.hiddenFromRecent || props.hiddenConversationIds?.includes(item.conversationUuid)) continue;
       const current = unique.get(item.conversationUuid);
       // Live status beats a retention snapshot; do not duplicate pending work.
       if (!current || !item.readWhileSelected) unique.set(item.conversationUuid, {...current, ...item});

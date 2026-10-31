@@ -14,6 +14,8 @@ import * as catalog from './catalog.js';
 import * as policy from './sizePolicy.js';
 import * as editorPolicy from './editorPolicy.js';
 import * as presentation from './presentation.js';
+import * as servers from './servers.js';
+servers.setServerDirectoryLoader(async()=>({ok:true,enabled:true,items:[]}));
 import {conversationMessages} from './conversationMessages.js';
 import {renderMarkdown} from './rendererHarness.mjs';
 
@@ -28,14 +30,14 @@ function picker(t,{items=[chat('long',20001)],selected=[],pages=[],limit=20000}=
  catalog.applyCatalogPacket({type:'snapshot',epoch:'size-test',seq:1,includeArchived:false,items,conversationContentLimit:limit});
  const props=reactive({open:true,anchor:null,placement:'top-start',kind:'chat',query:'',currentConversation:'current',selectedReferences:selected,searchable:false,allowDrag:true});
  const emitted=[];
- const ctx=vm.createContext({...codec,...catalog,...policy,...presentation,conversationMessages,computed,ref,nextTick,
+ const ctx=vm.createContext({...codec,...catalog,...policy,...presentation,...servers,conversationMessages,computed,ref,nextTick,
   watch:(...args)=>{const stop=watch(...args);t.after(stop);return stop;},defineProps:()=>props,defineEmits:()=>(...args)=>emitted.push(args),defineExpose:()=>{},
   Api:{referenceHistory:async(_id,offset)=>pages[offset?1:0]},
  });
  vm.runInContext(pickerSource.scriptSetup.content.replace(/^import .*?;\n/gm,''),ctx);
  const run=code=>vm.runInContext(code,ctx);
  const key=key=>{ctx.event={key,target:{tagName:'DIV'},preventDefault(){this.defaultPrevented=true;},stopPropagation(){}};return run('key(event)');};
- const names='props,emit,list,searchInput,searchOpen,toggleSearch,localQuery,filter,selected,mode,child,childQuery,checked,queryText,results,groups,tabs,historyMode,historyError,historyBusy,historyMore,selectionError,referenceCatalog,KIND_LABELS,referenceIconHtml,referenceCandidateDetail,includeArchivedReferences,key,back,changeTab,choose,clickItem,toggle,inspectHistory,loadHistory,dragStart,dragEnd,dragging,chooseTurn,candidateState,candidateWarning,policyReasonTitle';
+ const names='props,emit,list,searchInput,searchOpen,toggleSearch,localQuery,filter,selected,mode,child,childQuery,checked,queryText,results,groups,tabs,historyMode,historyError,historyBusy,historyMore,selectionError,referenceCatalog,KIND_LABELS,referenceLeadHtml,referenceCandidateDetail,includeArchivedReferences,key,back,changeTab,choose,clickItem,toggle,inspectHistory,loadHistory,dragStart,dragEnd,dragging,chooseTurn,candidateState,candidateWarning,policyReasonTitle,multiSelect,serverMode,serverDirectory,loadServerDirectory';
  const render=()=>renderToString(createSSRApp({render:compile(pickerSource.template.content),setup:()=>({...props,...run(`({${names}})`)}),components:{FloatingPanel:{render(){return h('section',{},this.$slots.default?.());}}}}));
  function row(item=run('results.value[0]')){
   const start=pickerSource.template.content.indexOf('<div v-for="{item,index} in group.rows"');

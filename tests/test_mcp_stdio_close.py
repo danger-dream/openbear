@@ -130,6 +130,9 @@ async def test_manager_shutdown_after_tool_timeout_reaps_backpressured_peer(paus
     env = paused_manager
     manager, transport = env.manager, env.transport
     shorten_sigint_grace(monkeypatch, transport)
+    # The config floor is a whole second; the timeout path is the same with a shorter one.
+    for server_config in {id(c): c for c in (manager.mcp_config.servers["paused"], manager._clients["paused"].config)}.values():
+        monkeypatch.setattr(server_config, "tool_call_timeout_s", 0.2)
     result = json.loads(await manager.call_tool(
         manager.available_tools()[0].public_name, PAYLOAD,
         ToolRuntimeContext(source="web", conversation_uuid="test"),
@@ -185,6 +188,9 @@ async def test_cancel_close_waits_for_cleanup_and_other_closers_join(paused_mana
 
         monkeypatch.setattr(transport, "notify", observed)
     else:
+        # This case cancels during the INT grace window, so it keeps one, but 0.5 s is ample
+        # for the few loop turns below (the production 1.5 s only lengthened the test).
+        monkeypatch.setattr(transport, "_SIGINT_WAIT_S", 0.5)
         original = transport._terminate_process
 
         async def observed(proc):
@@ -226,8 +232,11 @@ async def test_shutdown_notification_failure_still_reaps_peer(paused_manager, mo
 
 
 @pytest.mark.parametrize("paused_manager", [True], indirect=True)
-async def test_stubborn_backpressured_peer_is_killed_and_reaped(paused_manager):
+async def test_stubborn_backpressured_peer_is_killed_and_reaped(paused_manager, monkeypatch):
     env = paused_manager
+    # The peer ignores INT and TERM; the escalation is the same with a short INT grace.
+    # (The 2 s TERM grace is a literal in _terminate_process and cannot be shortened here.)
+    shorten_sigint_grace(monkeypatch, env.transport)
     await backpressure(env.transport)
     await finished(env.spawn(env.transport.close()), timeout=5.5)
     assert env.transport.proc.returncode == -signal.SIGKILL

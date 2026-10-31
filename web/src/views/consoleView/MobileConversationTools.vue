@@ -1,8 +1,12 @@
 <script setup>
-import {nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
+import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ChatLineRound, CollectionTag, DataAnalysis, EditPen, Hide, Lock, Money, MoreFilled, Search, Timer, Unlock} from "@element-plus/icons-vue";
 import {useMessageVisibility} from './messageVisibility.js';
+import {ListChecks} from "@lucide/vue";
+import {useWorkItems} from "./workItems.js";
 const visibility = useMessageVisibility();
+const workItems = useWorkItems();
+const workItemsSummary = computed(() => workItems?.summary() || {done: 0, total: 0, attention: 0});
 import {cachePct, conversationPathText, fmtTokens, shortText} from "./display.js";
 
 const props = defineProps({
@@ -17,7 +21,7 @@ const props = defineProps({
 	durationText: {type: String, default: "0s"},
 	costText: {type: String, default: "$0.0000"},
 });
-const emit = defineEmits(["open-hidden", "open-search", "open-memory", "open-context", "toggle-scroll-lock", "scroll-to-turn"]);
+const emit = defineEmits(["open-hidden", "open-search", "open-memory", "open-work-items", "open-context", "toggle-scroll-lock", "scroll-to-turn"]);
 const phone = ref(false);
 const menuOpen = ref(false);
 const navigationOpen = ref(false);
@@ -48,7 +52,7 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 <template>
 	<div v-if="phone" class="mobile-conversation-tools">
 		<button type="button" class="mobile-more-button" aria-label="搜索此会话" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="emit('open-search')"><Search/></button>
-		<button type="button" class="mobile-more-button" aria-label="更多会话操作" aria-haspopup="dialog" :aria-expanded="menuOpen" @click="menuOpen = !menuOpen"><MoreFilled/></button>
+		<button type="button" class="mobile-more-button" :aria-label="workItemsSummary.attention ? `更多会话操作，${workItemsSummary.attention} 项任务等你定` : '更多会话操作'" aria-haspopup="dialog" :aria-expanded="menuOpen" @click="menuOpen = !menuOpen"><MoreFilled/><i v-if="workItemsSummary.attention" class="mobile-more-dot" aria-hidden="true"></i></button>
 		<el-drawer v-model="menuOpen" direction="btt" size="auto" title="会话工具" class="mobile-conversation-menu mobile-viewport-sheet" append-to-body>
 			<div class="mobile-sheet-grip" aria-hidden="true"></div>
 			<section class="mobile-conversation-location" aria-label="会话信息">
@@ -71,6 +75,7 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 				</dl>
 			</section>
 			<div class="mobile-tool-actions">
+				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-work-items')"><ListChecks class="mobile-lucide" :stroke-width="1.7"/><span>任务</span><small v-if="workItemsSummary.total" :class="{'mobile-attention': workItemsSummary.attention}">{{ workItemsSummary.attention ? `${workItemsSummary.attention} 项等你定` : `${workItemsSummary.done}/${workItemsSummary.total}` }}</small></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-hidden')"><Hide/><span>隐藏内容</span><small v-if="props.hiddenCount">{{ props.hiddenCount }}</small></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-memory')"><CollectionTag/><span>任务记忆</span></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-context')"><EditPen/><span>编辑上下文</span></button>
@@ -118,6 +123,9 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 .mobile-tool-actions button:disabled { opacity: .4; cursor: default; }
 .mobile-tool-actions svg { width: 17px; height: 17px; flex: none; color: var(--el-text-color-secondary); }
 .mobile-tool-actions small { margin-left: auto; color: var(--el-text-color-secondary); font-size: 11px; }
+.mobile-tool-actions small.mobile-attention { color: var(--ob-orange); }
+.mobile-more-button { position: relative; }
+.mobile-more-dot { position: absolute; top: 10px; right: 9px; width: 7px; height: 7px; border: 2px solid var(--ob-chat-bg); border-radius: 50%; background: var(--ob-orange); box-sizing: content-box; }
 .mobile-menu-divider { height: 1px; margin: 4px 10px; background: var(--el-border-color-lighter); }
 .mobile-turn-list { position: relative; height: 100%; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .mobile-turn-row { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 12px; align-items: center; width: 100%; min-height: 48px; padding: 10px; border: 0; border-radius: 10px; background: transparent; color: var(--el-text-color-primary); text-align: left; font-size: 13px; line-height: 1.5; }

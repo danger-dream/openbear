@@ -8,6 +8,8 @@ import {installPushNavigation, installPushPresence} from "./pwa/pushClient.js";
 import NotificationOnboarding from "./pwa/NotificationOnboarding.vue";
 import LoginView from "./views/LoginView.vue";
 import { authMode, loadAuthMode, canManageInstances } from './authMode.js';
+import { applyFeatureSettings, featurePageListed, featurePageState, featureSettingsUnavailable } from './featureToggles.js';
+import { requestDdns } from './ddns/ddnsLink.js';
 import { userStorage } from './sessionBoundary.js';
 import BearLogoPreview from "./components/BearLogoPreview.vue";
 import ConversationTree from "./components/ConversationTree.vue";
@@ -31,6 +33,7 @@ import {documentTitle as browserDocumentTitle} from "./pageTitle.js";
 import { frontendMismatch } from "./versionSync.js";
 import { getThemeState, setThemeMode, subscribeTheme } from "./theme.js";
 import ReferencePicker from "./references/ReferencePicker.vue";
+import SidebarDesktopNav from "./components/SidebarDesktopNav.vue";
 import ReferenceInspector from "./references/ReferenceInspector.vue";
 import ArtifactPreview from "./artifacts/ArtifactPreview.vue";
 import { referenceCatalog, referenceItem, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
@@ -60,6 +63,9 @@ const StatisticsView = defineLazyView(() => import("./views/StatisticsView.vue")
 const WebhooksView = defineLazyView(() => import('./views/WebhooksView.vue'), '触发器总览');
 
 const InstancesView = defineLazyView(() => import('./views/InstancesView.vue'), '实例管理');
+// Kept alive while away, so open terminals survive a visit to a conversation.
+const ServersView = defineLazyView(() => import('./views/ServersView.vue'), '服务器', 'ServersPage');
+const FeatureDisabledView = defineLazyView(() => import('./views/FeatureDisabledView.vue'), '可选功能');
 const allNav = [
   { key: "memory", label: "记忆管理", shortLabel: "记忆", icon: "Collection", component: MemoryView },
   { key: "secrets", label: "凭证库", shortLabel: "凭证", icon: "Key", component: SecretsView },
@@ -68,13 +74,15 @@ const allNav = [
   { key: "skills", label: "Skills", shortLabel: "Skills", icon: "MagicStick", component: SkillsView },
   { key: "mcp", label: "MCP 管理", shortLabel: "MCP", icon: "Connection", component: McpView },
   { key: 'instances', label: '实例管理', shortLabel: '实例', icon: 'SetUp', component: InstancesView },
+  { key: 'servers', label: '服务器', shortLabel: '主机', icon: 'Monitor', component: ServersView },
   { key: "settings", label: "设置", shortLabel: "设置", icon: "Setting", component: SettingsHubView },
   { key: "statistics", label: "数据统计", shortLabel: "统计", icon: "DataAnalysis", component: StatisticsView, headerOnly: true },
   { key: 'webhooks', label: '触发器总览', shortLabel: '触发器', icon: 'Connection', component: WebhooksView, headerOnly: true },
 ];
-const nav = computed(() => allNav.filter(item => item.key !== 'instances' || canManageInstances(authMode.value)));
+const nav = computed(() => allNav.filter(item => !CONTROLLER_PAGES.includes(item.key) || canManageInstances(authMode.value)));
 const pageToPath = {
   instances: '/instances',
+  servers: '/servers',
   console: "/chat",
   memory: "/memory",
   secrets: "/secrets",
@@ -88,6 +96,9 @@ const pageToPath = {
 };
 const pathToPage = {
   '/instances': 'instances',
+  '/servers': 'servers',
+  // 动态域名 is a tab of the servers page; /ddns (reminders, older links) opens it there.
+  '/ddns': 'servers',
   "/": "console",
   "/chat": "console",
   "/memory": "memory",
@@ -100,8 +111,16 @@ const pathToPage = {
   "/statistics": "statistics",
   '/webhooks': 'webhooks',
 };
+// Pages that exist only on a controller, never on a managed child or behind the gateway.
+const CONTROLLER_PAGES = ['instances', 'servers'];
 
-const desktopNav = computed(() => nav.value.filter((n) => n.key !== "settings" && !n.headerOnly));
+// 实例/主机 stay routable when switched off (a direct link shows how to turn them on); only the menus hide them.
+const listedNav = computed(() => nav.value.filter((item) => featurePageListed(item.key)));
+const activeFeatureState = computed(() => featurePageState(active.value));
+function openFeatureSettings(path) {
+  navigateToUrl(`/settings?section=system-settings&setting=${encodeURIComponent(path)}`);
+}
+const desktopNav = computed(() => listedNav.value.filter((n) => n.key !== "settings" && !n.headerOnly));
 const active = ref("console");
 const referenceShelf = shallowRef({open:false,kind:'',anchor:null});
 let referenceShelfTimer = null;
@@ -126,11 +145,14 @@ const channelStatsText = ref("系统就绪");
 async function refreshChannelStats() {
   try {
     const data = await Api.settings();
+    applyFeatureSettings(data?.values);
     const count = Number(data?.providerCount || 0);
     if (count > 0) {
       channelStatsText.value = `${count} 渠道就绪`;
     }
-  } catch {}
+  } catch {
+    featureSettingsUnavailable();
+  }
 }
 const memoryType = ref("identity");
 const settingsSection = ref("channels");
@@ -139,6 +161,10 @@ const cronLeaveGuard = shallowRef(null);
 function handleOpenCron(event) {
   cronFolderId.value = String(event?.detail?.folderId || '');
   selectNav('cron');
+}
+function handleOpenDdns(event) {
+  requestDdns(event?.detail || {});
+  selectNav('servers');
 }
 function handleCronFolderChanged(folderId) {
   cronFolderId.value = String(folderId || '');
@@ -349,13 +375,15 @@ function applyRouteFromLocation(options = {}) {
   if (isLoginPath) return;
   const url = new URL(window.location.href);
   const requested = pathToPage[url.pathname] || 'console';
-  const page = requested === 'instances' && ['managed', 'gateway'].includes(authMode.value) ? 'console' : requested;
+  const page = CONTROLLER_PAGES.includes(requested) && ['managed', 'gateway'].includes(authMode.value) ? 'console' : requested;
   active.value = page;
   if (page === "console") activeConversationUuid.value = url.searchParams.get("id") || activeConversationUuid.value || "";
   if (page === "memory") memoryType.value = url.searchParams.get("type") || "identity";
   if (page === 'cron') cronFolderId.value = url.searchParams.get('folderId') || '';
   if (page === "settings") settingsSection.value = url.searchParams.get("section") || "channels";
-  if (options.replaceUnknown || !pathToPage[url.pathname]) syncRoute({ replace: true });
+  const ddnsLink = page === 'servers' && url.pathname === '/ddns';
+  if (ddnsLink) requestDdns({serverId: url.searchParams.get('server'), recordId: url.searchParams.get('record'), add: url.searchParams.get('add')});
+  if (options.replaceUnknown || ddnsLink || !pathToPage[url.pathname]) syncRoute({ replace: true });
 }
 function closeSidebar() {
   sidebarOpen.value = false;
@@ -390,7 +418,7 @@ function handleHistoryNavigation() {
   });
 }
 function selectNav(key) {
-  if (key === 'instances' && !canManageInstances(authMode.value)) return;
+  if (CONTROLLER_PAGES.includes(key) && !canManageInstances(authMode.value)) return;
   return navigateFromCron(() => {
     active.value = key;
     closeSidebar();
@@ -424,9 +452,12 @@ function conversationTitle(row) {
   return row.title || "新会话";
 }
 const activeConversationPath = computed(() => conversationTreeRef.value?.conversationPath(activeConversationUuid.value) || "");
-const activeConversationTitle = computed(() => conversationTitle(
-  conversations.value.find((row) => row.conversationUuid === activeConversationUuid.value),
-));
+// Group members are not tree rows; their persisted title still comes from the reference catalog.
+const activeConversationTitle = computed(() => {
+  const uuid = activeConversationUuid.value;
+  return conversationTitle(conversations.value.find((row) => row.conversationUuid === uuid)
+    || (uuid && !isLocalConversation(uuid) ? {conversationUuid: uuid} : null));
+});
 const pageDocumentTitle = computed(() => browserDocumentTitle({
   page: isLoginPath ? "login" : active.value,
   conversationTitle: activeConversationTitle.value,
@@ -851,6 +882,27 @@ async function deleteConversation(row) {
     ElMessage.error(apiError(error));
   } finally { deletingConversations.delete(uuid); }
 }
+// The tree already deleted these on the server and forgot their rows.
+async function handleTreeConversationsDeleted(uuids) {
+  const removed = new Set(uuids);
+  const activeUuid = activeConversationUuid.value;
+  const activeRow = removed.has(activeUuid)
+    ? conversations.value.find((item) => item.conversationUuid === activeUuid) || { conversationUuid: activeUuid, folderId: selectedFolderId.value }
+    : null;
+  for (const uuid of uuids) await discardConversationDraft(uuid);
+  setConversationsIfChanged(conversations.value.filter((item) => !removed.has(item.conversationUuid)));
+  if (activeRow && activeConversationUuid.value === activeUuid) {
+    const next = await conversationAfterRemoval(activeRow);
+    if (next?.conversationUuid && !removed.has(next.conversationUuid)) {
+      activeConversationUuid.value = next.conversationUuid;
+      selectedFolderId.value = String(next.folderId || "");
+      syncRoute({ replace: true });
+      await nextTick();
+      await conversationTreeRef.value?.revealConversation(next.conversationUuid);
+    } else await navigateFromCron(() => focusLocalConversation());
+  }
+  await loadConversations({ trackActive: false });
+}
 function closeConversationMenu() {
   if (!conversationMenu.value.open) return;
   conversationMenu.value = { open: false, x: 0, y: 0, row: null };
@@ -1088,7 +1140,7 @@ let stopPushNavigation = null, pushPresence = null;
 watch([active, activeConversationUuid], () => pushPresence?.update(), {flush: 'post'});
 onMounted(() => {
   void loadAuthMode().then(mode => {
-    if (['managed', 'gateway'].includes(mode) && active.value === 'instances') { active.value = 'console'; syncRoute({replace: true}); }
+    if (['managed', 'gateway'].includes(mode) && CONTROLLER_PAGES.includes(active.value)) { active.value = 'console'; syncRoute({replace: true}); }
   });
   if (!isLoginPath) {
     stopPushNavigation = installPushNavigation(window, navigateToUrl);
@@ -1100,6 +1152,7 @@ onMounted(() => {
   });
   window.addEventListener("popstate", handleHistoryNavigation);
   window.addEventListener('openbear:open-cron', handleOpenCron);
+  window.addEventListener('openbear:open-ddns', handleOpenDdns);
   window.addEventListener('openbear:open-conversation', handleOpenConversation);
   window.addEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.addEventListener("click", closeConversationMenu);
@@ -1126,6 +1179,7 @@ onBeforeUnmount(() => {
   stopThemeSubscription();
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener('openbear:open-cron', handleOpenCron);
+  window.removeEventListener('openbear:open-ddns', handleOpenDdns);
   window.removeEventListener('openbear:open-conversation', handleOpenConversation);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.removeEventListener("click", closeConversationMenu);
@@ -1143,7 +1197,7 @@ onBeforeUnmount(() => {
 
 <template>
   <LoginView v-if="isLoginPath" />
-  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances'].includes(active) && pageHeaderReady}">
+  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active) && pageHeaderReady}">
     <NotificationOnboarding />
     <div class="mobile-app-bar">
       <button
@@ -1239,22 +1293,8 @@ onBeforeUnmount(() => {
         <span>新会话</span>
       </button>
 
-      <nav class="sidebar-desktop-nav sidebar-resource-grid text-sm" :style="{'--sidebar-resource-columns': desktopNav.length}" aria-label="资源与设置">
-        <button
-          v-for="n in desktopNav"
-          :key="n.key"
-          type="button"
-          :aria-current="active === n.key ? 'page' : undefined"
-          @click="closeReferenceShelf(); selectNav(n.key)"
-          @pointerenter="showReferenceShelf($event,n.key)"
-          @pointerleave="leaveReferenceShelf"
-          @keydown="referenceNavKey($event,n.key)"
-          class="sidebar-resource-tile"
-        >
-          <el-icon class="sidebar-resource-icon" :size="16" aria-hidden="true"><component :is="n.icon" /></el-icon>
-          <span class="sidebar-resource-label">{{ n.shortLabel || n.label }}</span>
-        </button>
-      </nav>
+      <SidebarDesktopNav :items="desktopNav" :active="active" @select="closeReferenceShelf(); selectNav($event)"
+        @shelf-enter="showReferenceShelf" @shelf-leave="leaveReferenceShelf" @shelf-key="referenceNavKey" />
       <ReferencePicker :open="referenceShelf.open" :anchor="referenceShelf.anchor" :kind="referenceShelf.kind" :current-conversation="activeConversationUuid" placement="right-start" searchable allow-drag @select="insertShelfReference" @close="closeReferenceShelf" @enter="keepReferenceShelf" @leave="leaveReferenceShelf"/>
       <ReferenceInspector :current-conversation="activeConversationUuid"/>
       <ArtifactPreview :navigation-key="`${active}:${activeConversationUuid}`"/>
@@ -1273,6 +1313,7 @@ onBeforeUnmount(() => {
           @selected-folder="handleTreeSelectedFolder"
           @refresh-list="handleConsoleRefreshList"
           @delete-conversation="deleteConversation"
+          @conversations-deleted="handleTreeConversationsDeleted"
           @folder-removed="handleTreeFolderRemoved"
           @conversation-properties="openConversationProperties"
         />
@@ -1431,7 +1472,7 @@ onBeforeUnmount(() => {
           <button type="button" class="version-entry sidebar-version" :class="{'has-update': versionInfo?.updateAvailable}" :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'" @click="openVersionDialog">v{{ appVersion || '…' }}<span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span></button>
         </div>
       </footer>
-      <MobileSidebarResources :items="nav.filter(item => !item.headerOnly)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)">
+      <MobileSidebarResources :items="listedNav.filter(item => !item.headerOnly)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf(); selectNav($event)">
         <template #footer><div class="sidebar-mobile-status"><span class="status-indicator-dot"></span><span>{{ channelStatsText }}</span><button type="button" class="version-entry sidebar-version" :class="{'has-update': versionInfo?.updateAvailable}" :title="versionInfo?.updateAvailable ? '有新版本，点击查看' : '查看版本'" @click="openVersionDialog">v{{ appVersion || '…' }}<span v-if="versionInfo?.updateAvailable" class="version-dot" aria-hidden="true"></span></button></div></template>
       </MobileSidebarResources>
     </aside>
@@ -1510,6 +1551,8 @@ onBeforeUnmount(() => {
           <el-button link type="primary" @click="requestFrontendRefresh">刷新页面</el-button>
         </template>
       </el-alert>
+      <!-- Enclose every page: a KeepAlive inside one v-if branch would itself unmount, with its cache, on a visit to a conversation. -->
+      <KeepAlive :include="['ServersPage']">
       <ConsoleView
         v-if="active === 'console'"
         ref="consoleViewRef"
@@ -1544,6 +1587,24 @@ onBeforeUnmount(() => {
           ><span></span><span></span><span></span></button>
         </template>
       </MemoryView>
+      <FeatureDisabledView
+        v-else-if="activeFeatureState !== 'on'"
+        :feature="active"
+        :pending="activeFeatureState === 'pending'"
+        @open-settings="openFeatureSettings"
+        @mobile-header-ready="pageHeaderReady = $event"
+      >
+        <template #mobile-navigation>
+          <button
+            type="button"
+            class="mobile-sidebar-toggle"
+            :aria-expanded="sidebarOpen"
+            aria-controls="openbear-sidebar"
+            aria-label="打开导航"
+            @click="sidebarOpen = true"
+          ><span></span><span></span><span></span></button>
+        </template>
+      </FeatureDisabledView>
       <component
         v-else
         :is="activeView"
@@ -1560,7 +1621,7 @@ onBeforeUnmount(() => {
       >
         <template #mobile-navigation>
           <button
-            v-if="['settings', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances'].includes(active)"
+            v-if="['settings', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active)"
             type="button"
             class="mobile-sidebar-toggle"
             :aria-expanded="sidebarOpen"
@@ -1570,6 +1631,7 @@ onBeforeUnmount(() => {
           ><span></span><span></span><span></span></button>
         </template>
       </component>
+      </KeepAlive>
     </main>
 
     <ConversationPropertiesDialog ref="conversationPropertiesRef" v-model="conversationPropertiesOpen" :conversation="conversationPropertiesRow" :initial-tab="conversationPropertiesTab" @persist="persistPropertyConversation" />
@@ -1873,7 +1935,6 @@ onBeforeUnmount(() => {
     border-radius: 8px;
     background: transparent;
     padding: 4px;
-    box-shadow: inset 0 0 0 1px var(--ob-border);
   }
 
   .app-main {

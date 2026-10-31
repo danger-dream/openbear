@@ -1,23 +1,23 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { ArrowLeft, CircleCheckFilled, CircleCloseFilled, Clock, CopyDocument, Monitor, MoreFilled, Refresh, Remove, TopRight } from '@element-plus/icons-vue';
+import { ArrowLeft, CircleCheckFilled, CircleCloseFilled, Clock, CopyDocument, Monitor, MoreFilled, Remove, TopRight } from '@element-plus/icons-vue';
 import { Api } from '../api.js';
 import AdminPageHeader from '../components/AdminPageHeader.vue';
 import InstanceForm from '../instances/InstanceForm.vue';
 import GatewaySetup from '../instances/GatewaySetup.vue';
 import GatewaySettings from '../instances/GatewaySettings.vue';
-import ServerForm from '../instances/ServerForm.vue';
 import ChildBusinessPanel from '../instances/ChildBusinessPanel.vue';
-import { displayStatus, errorText, eventTypes, generatePassword, ok, operationStatuses, publicLink, relativeTime, safeError, statusLabel, statusTone, timeLabel } from '../instances/instanceHelpers.js';
+import { displayStatus, errorText, eventTypes, gatewayLastUpdate, gatewayUpdateHint, generatePassword, ok, operationStatuses, publicLink, relativeTime, safeError, statusLabel, statusTone, timeLabel, withServerPage } from '../instances/instanceHelpers.js';
+import { flag } from '../servers/serverHelpers.js';
 import '../instances/instances.css';
 
 const emit = defineEmits(['open-conversation', 'open-folder', 'mobile-header-ready']);
-const page = ref('instances');
-const items = ref([]), servers = ref([]), gateway = ref(null), selected = ref(null);
+const items = ref([]), serverItems = ref([]), pageServers = ref([]), gateway = ref(null), selected = ref(null);
+const servers = computed(() => withServerPage(serverItems.value, pageServers.value));
 const loading = ref(false), error = ref(''), detailError = ref(''), busy = ref(false);
 const tab = ref('overview'), operations = ref([]), events = ref([]), now = ref(Date.now());
-const dialog = ref(''), dialogRef = ref(null), created = ref(null), editingServer = ref(null);
+const dialog = ref(''), dialogRef = ref(null), created = ref(null);
 const maintain = reactive({instructions: '', model: ''}), modelOptions = ref([]);
 const notifications = reactive({loginSuccess: false, loginFailure: true, health: true});
 const listFilter = ref('all');
@@ -34,9 +34,21 @@ const issueTexts = {
 const detailTabs = [['overview', '概况'], ['events', '登录与通知'], ['sessions', '部署记录'], ['business', '实例配置']];
 const notifyKeys = [['loginFailure', '登录失败', '有人输错密码时提醒'], ['loginSuccess', '登录成功', '每次登录都提醒'], ['health', '运行异常与恢复', '自动检查发现异常或恢复时提醒']];
 const attentionStates = ['unreachable', 'failed', 'needs_verification'];
+// What must change before the network migration can run (backend networkMigration.blockers).
+const migrationBlockers = {
+  server_mesh_required: '网关和实例不在同一台服务器，需要先把该服务器加入组网，才能改为加密访问。',
+  gateway_mesh_required: '网关所在的服务器也需要加入组网。',
+  node_upgrade_required: '需要先升级该服务器的节点，才能改为加密访问。',
+  node_offline: '该服务器的节点当前不在线，上线后才能迁移。',
+  node_exec_disabled: '该服务器的节点关闭了命令执行，开启后才能迁移。',
+};
 function closeCreatedDialog(done) { closeCreated(); done(); }
 
 const gatewayOn = computed(() => Boolean(gateway.value?.enabled));
+// The one-click update, shared by the page strip and the gateway settings dialog.
+const gatewayUpdating = ref(false);
+const gatewayUpdatePending = computed(() => gatewayUpdating.value || Boolean(gateway.value?.updating));
+const gatewayUpdateText = computed(() => gatewayUpdatePending.value ? '正在更新…' : gatewayUpdateHint(gateway.value));
 const active = computed(() => items.value.filter(i => i.status !== 'archived'));
 const counts = computed(() => {
   const result = {total: active.value.length, ready: 0, attention: 0, deploying: 0};
@@ -61,6 +73,20 @@ const selectedStatus = computed(() => selected.value ? displayStatus(selected.va
 const syncProblem = computed(() => selected.value?.gateway?.status === 'pending_sync' ? selected.value.gateway.error : '');
 const version = computed(() => selected.value?.verification?.gateway?.status?.version || selected.value?.verification?.status?.version || '');
 const checkedAt = computed(() => selected.value?.monitor?.checkedAtMs || selected.value?.lastHealthAtMs || 0);
+// Kept per instance from list and detail reads: other results (saves, checks) do not carry it.
+const migrations = ref({});
+const migration = computed(() => selected.value ? migrations.value[selected.value.id] || null : null);
+const canMigrate = computed(() => Boolean(migration.value && !migration.value.blockers?.length));
+const migrationText = computed(() => {
+  const value = migration.value;
+  if (!value) return '';
+  if (value.pending) return '网络迁移尚未完成，可在「更多」中再次选择「迁移网络」完成。';
+  const intro = value.moved ? '实例所在服务器的组网地址变了，实例还监听在原地址上，网关访问不到它。' : '实例端口仍对外开放，主控和网关经服务器地址明文访问它。';
+  if (value.moved && !value.blockers?.length) return `${intro}可在「更多」中选择「迁移网络」改到新地址。`;
+  if (!value.blockers?.length) return `${intro}可在「更多」中选择「迁移网络」改为加密访问。`;
+  return intro + value.blockers.map(code => migrationBlockers[code] || errorText(code)).join('');
+});
+const rotationPending = computed(() => selected.value?.rotation?.status === 'pending');
 const runningOperation = computed(() => operations.value.find(o => ['pending', 'running'].includes(o.status)));
 const checks = computed(() => {
   const v = selected.value?.verification;
@@ -77,7 +103,6 @@ const notice = computed(() => {
   if (status === 'draft') return {tone: 'off', title: '尚未部署', text: '在「更多」中选择「重新部署」开始部署。'};
   return null;
 });
-const serverAddress = server => !server ? '' : server.local ? '主控所在服务器' : `${server.username}@${server.host}:${server.port}`;
 const rowMeta = item => {
   const status = displayStatus(item);
   if (status === 'deploying') return item.updatedAtMs ? `部署开始于 ${timeLabel(item.updatedAtMs).slice(-8, -3)}` : '部署中';
@@ -90,17 +115,22 @@ const initial = name => Array.from(String(name || '?').trim())[0]?.toUpperCase()
 async function load(silent = false) {
   if (!silent) loading.value = true;
   try {
-    const [list, serverList, gw] = await Promise.all([Api.instances(), Api.instanceServers(), Api.instanceGateway()]);
+    const [list, serverList, gw] = await Promise.all([Api.instances(), Api.instanceServers(), Api.instanceGateway(), silent || loadPageServers()]);
     if (!alive) return;
     items.value = ok(list).items || [];
-    servers.value = ok(serverList).items || [];
+    migrations.value = Object.fromEntries(items.value.map(i => [i.id, i.networkMigration || null]));
+    serverItems.value = ok(serverList).items || [];
     gateway.value = ok(gw);
     error.value = '';
     if (selected.value) selected.value = items.value.find(i => i.id === selected.value.id) || null;
   } catch (e) { if (alive) error.value = safeError(e); }
   finally { if (alive) loading.value = false; }
 }
-async function loadServers() { try { servers.value = ok(await Api.instanceServers()).items || []; } catch (e) { error.value = safeError(e); } }
+async function loadServers() {
+  try { serverItems.value = ok((await Promise.all([Api.instanceServers(), loadPageServers()]))[0]).items || []; } catch (e) { error.value = safeError(e); }
+}
+// Only for flags, the host's own name and order: without it the picker still works.
+async function loadPageServers() { try { pageServers.value = ok(await Api.servers()).items || []; } catch { /* keep the previous list */ } }
 async function loadDetail(id) {
   const generation = ++detailGeneration;
   const current = () => alive && generation === detailGeneration && selected.value?.id === id;
@@ -108,6 +138,7 @@ async function loadDetail(id) {
     const [item, ops, evs] = await Promise.all([Api.instance(id), Api.instanceOperations(id), Api.instanceEvents(id)]);
     if (!current()) return;
     selected.value = ok(item).item;
+    migrations.value = {...migrations.value, [id]: selected.value.networkMigration || null};
     operations.value = ok(ops).items || [];
     events.value = ok(evs).items || [];
     Object.assign(notifications, selected.value.notifications || {});
@@ -123,6 +154,16 @@ function dismiss(name) { if (dialog.value === name) dialog.value = ''; }
 function closeDialog(done) { if (!dialogRef.value?.busy) done(); }
 function gatewayDone(value) { gateway.value = value; dialog.value = gatewayOn.value ? '' : dialog.value; ElMessage.success('访问网关已启用'); void load(true); }
 function gatewayChanged(value) { gateway.value = value; if (!value.enabled) dialog.value = ''; }
+async function updateGateway() {
+  if (gatewayUpdatePending.value) return;
+  gatewayUpdating.value = true;
+  try { gateway.value = ok(await Api.updateInstanceGateway()); ElMessage.success('访问网关已更新'); }
+  catch (e) {
+    ElMessage.error(safeError(e));
+    try { gateway.value = ok(await Api.instanceGateway()); } catch { /* keep the previous state */ }
+  }
+  finally { gatewayUpdating.value = false; }
+}
 function instanceCreated(result) {
   created.value = {...result, url: gateway.value?.publicUrl};
   dialog.value = 'created';
@@ -196,7 +237,29 @@ async function resetPassword() {
 async function archive() {
   try { await ElMessageBox.confirm(`归档「${selected.value.name}」后，使用者将无法登录。容器和数据目录不会被删除。`, '归档实例', {confirmButtonText: '归档', cancelButtonText: '取消', type: 'warning'}); } catch { return; }
   const id = selected.value.id;
-  await run(async () => { ok(await Api.archiveInstance(id)); await load(true); back(); }, '已归档');
+  await run(async () => {
+    const result = ok(await Api.archiveInstance(id));
+    // Archived once the gateway has disabled its account; until then the user can still log in.
+    if (result.synced === false) ElMessage.warning('已提交归档，访问网关暂时连不上：网关恢复后完成，在那之前使用者仍能登录');
+    else ElMessage.success('已归档');
+    await load(true); back();
+  });
+}
+async function rotateKeys() {
+  try { await ElMessageBox.confirm(`将为「${selected.value.name}」重新生成密钥，并同步到访问网关。该实例现有的登录会话会全部失效，使用者需要重新登录。\n\n实例当前不在线时，会在它恢复后自动完成更换。`, '更换密钥', {confirmButtonText: '更换', cancelButtonText: '取消', type: 'warning'}); } catch { return; }
+  const id = selected.value.id;
+  await run(async () => {
+    const result = ok(await Api.rotateInstanceKeys(id));
+    if (result.rotated && result.synced === false) ElMessage.warning('密钥已更换，访问网关还没同步上：会自动重试，同步前使用者暂时登录不了');
+    else if (result.rotated) ElMessage.success('密钥已更换');
+    else ElMessage.warning('实例暂时连不上，恢复后会自动完成更换');
+    await loadDetail(id);
+  });
+}
+async function migrateNetwork() {
+  try { await ElMessageBox.confirm(`将把「${selected.value.name}」的端口改为只在服务器本机监听（网关在其他服务器时加上组网地址），主控不再经公网明文访问它，并同步访问网关。\n\n过程中会重建容器，使用者会短暂无法访问；数据目录不受影响。`, '迁移网络', {confirmButtonText: '迁移', cancelButtonText: '取消'}); } catch { return; }
+  const id = selected.value.id;
+  await run(async () => { ok(await Api.migrateInstanceNetwork(id)); await loadDetail(id); }, '网络已迁移');
 }
 async function retrySync() {
   const id = selected.value.id;
@@ -213,21 +276,10 @@ async function openFolder() {
 function moreCommand(command) {
   if (command === 'password') void resetPassword();
   else if (command === 'redeploy') void redeploy();
+  else if (command === 'rotate') void rotateKeys();
+  else if (command === 'migrate') void migrateNetwork();
   else if (command === 'archive') void archive();
 }
-
-async function checkServer(server) {
-  await run(async () => { const result = ok(await Api.checkInstanceServer(server.id)); await loadServers(); ElMessage[result.item.status === 'unreachable' ? 'warning' : 'success'](result.item.status === 'unreachable' ? '连接失败' : `连接正常${result.item.docker ? ' · Docker ' + result.item.docker : ''}`); });
-}
-function editServer(server) { editingServer.value = server; dialog.value = 'server'; }
-async function deleteServer(server) {
-  try { await ElMessageBox.confirm(`删除服务器「${server.name}」的连接信息？不会影响服务器本身。`, '删除服务器', {confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning'}); } catch { return; }
-  await run(async () => { ok(await Api.deleteInstanceServer(server.id)); await loadServers(); });
-}
-function serverSaved() { dialog.value = ''; editingServer.value = null; void loadServers(); }
-const serverFacts = server => server.local
-  ? [['连接', '直接执行，不使用 SSH'], ['外网 IP', server.publicIp || '未获取']]
-  : [['连接', `${server.username}@${server.host}:${server.port}`, true], ['认证', server.keyLabel || (server.auth === 'password' ? '密码' : '密钥')], ['外网 IP', server.publicIp || '未获取'], ['Docker', server.docker || '未检测']];
 
 function schedule() {
   poll = setTimeout(async () => {
@@ -240,38 +292,38 @@ onMounted(() => { void load(); schedule(); clock = setInterval(() => { now.value
 onBeforeUnmount(() => { alive = false; clearTimeout(poll); clearInterval(clock); emit('mobile-header-ready', false); });
 </script>
 <template>
-  <section class="instances-page instance-ui h-full min-h-0" :class="{'has-selection': page === 'instances' && selected}">
-    <AdminPageHeader title="实例" subtitle="子实例部署、访问网关与运行服务器" @mobile-header-ready="emit('mobile-header-ready', $event)">
+  <section class="instances-page instance-ui h-full min-h-0" :class="{'has-selection': selected}">
+    <AdminPageHeader title="实例" subtitle="子实例部署与访问网关" @mobile-header-ready="emit('mobile-header-ready', $event)">
       <template #mobile-navigation><slot name="mobile-navigation" /></template>
       <template #primary>
-        <el-button v-if="page === 'instances'" type="primary" :disabled="!gatewayOn || busy" @click="open('create')">创建实例</el-button>
-        <el-button v-else type="primary" :disabled="busy" @click="editServer(null)">添加服务器</el-button>
+        <el-button type="primary" :disabled="!gatewayOn || busy" @click="open('create')">创建实例</el-button>
       </template>
     </AdminPageHeader>
 
-    <div class="ix-bar">
-      <nav class="ob-pages" aria-label="实例分区">
-        <button type="button" :aria-current="page === 'instances' ? 'page' : undefined" @click="page = 'instances'">实例<span class="ix-count" aria-hidden="true">{{ counts.total }}</span></button>
-        <button type="button" :aria-current="page === 'servers' ? 'page' : undefined" @click="page = 'servers'">服务器<span class="ix-count" aria-hidden="true">{{ servers.length }}</span></button>
-      </nav>
-      <div v-if="gatewayOn" class="ob-strip" role="group" aria-label="访问网关">
+    <div v-if="gatewayOn" class="ix-bar">
+      <div class="ob-strip" role="group" aria-label="访问网关">
         <span class="ix-strip-label">访问网关</span>
         <span class="ix-pill" :data-tone="gateway.connected ? 'ok' : 'bad'">{{ gateway.connected ? '运行中' : '无法连接' }}</span>
         <a v-if="publicLink(gateway.publicUrl)" :href="publicLink(gateway.publicUrl)" target="_blank" rel="noopener noreferrer" class="ob-addr" :title="gateway.publicUrl">{{ gateway.publicUrl }}</a>
         <button type="button" class="ix-icon-button" aria-label="复制访问地址" title="复制访问地址" @click="copy(gateway.publicUrl, '访问地址')"><el-icon><CopyDocument /></el-icon></button>
         <button type="button" class="ix-text-button" @click="open('gateway')">设置</button>
       </div>
+      <div v-if="gateway.updateAvailable" class="ix-update" role="group" aria-label="访问网关更新">
+        <span class="ob-dot" data-tone="warn">访问网关有新版本</span>
+        <span v-if="gatewayUpdateText" class="instance-muted" :title="gatewayLastUpdate(gateway)">{{ gatewayUpdateText }}</span>
+        <button type="button" class="ix-text-button ix-update-button" :disabled="gatewayUpdatePending" @click="updateGateway">更新网关</button>
+      </div>
     </div>
     <p v-if="error" role="alert" class="instance-error instance-banner">{{ error }} <button type="button" class="instance-link" @click="load()">重试</button></p>
 
-    <template v-if="page === 'instances'">
-      <div v-if="gateway && !gatewayOn" class="ob-empty">
+    <template v-if="gateway">
+      <div v-if="!gatewayOn" class="ob-empty">
         <div class="ix-empty-mark" aria-hidden="true"><el-icon><Monitor /></el-icon></div>
         <h2>还没有启用访问网关</h2>
         <p>实例的使用者通过访问网关登录，登录后自动进入各自的实例。启用网关后才能创建实例。</p>
         <el-button type="primary" @click="open('gateway-setup')">启用访问网关</el-button>
       </div>
-      <div v-else-if="gateway" class="instances-workspace" :class="{'has-selection': selected}">
+      <div v-else class="instances-workspace" :class="{'has-selection': selected}">
         <aside class="instance-list" aria-label="实例列表">
           <div v-if="active.length" class="ix-list-head">
             <div class="ix-summary" aria-label="实例状态汇总">
@@ -314,12 +366,14 @@ onBeforeUnmount(() => { alive = false; clearTimeout(poll); clearInterval(clock);
                 <a v-if="publicLink(gateway.publicUrl)" :href="publicLink(gateway.publicUrl)" target="_blank" rel="noopener noreferrer" class="el-button ob-link-button">打开<el-icon class="el-icon--right"><TopRight /></el-icon></a>
                 <el-button :disabled="busy || selected.status === 'deploying'" @click="openMaintain">维护…</el-button>
                 <el-button :loading="busy" :disabled="busy" @click="check">立即检查</el-button>
-                <el-dropdown trigger="click" :disabled="busy" @command="moreCommand">
+                <el-dropdown trigger="click" :disabled="busy" popper-class="ix-more-menu" @command="moreCommand">
                   <el-button class="ix-more" aria-label="更多操作"><el-icon><MoreFilled /></el-icon></el-button>
                   <template #dropdown>
                     <el-dropdown-menu>
                       <el-dropdown-item command="password">重置密码…</el-dropdown-item>
                       <el-dropdown-item command="redeploy" :disabled="selected.status === 'deploying'">重新部署…</el-dropdown-item>
+                      <el-dropdown-item v-if="selected.authMode === 'gateway'" command="rotate" :disabled="selected.status === 'deploying'">更换密钥…</el-dropdown-item>
+                      <el-dropdown-item v-if="canMigrate" command="migrate" :disabled="selected.status === 'deploying'">迁移网络…</el-dropdown-item>
                       <el-dropdown-item command="archive" class="ob-danger" divided>归档…</el-dropdown-item>
                     </el-dropdown-menu>
                   </template>
@@ -365,17 +419,19 @@ onBeforeUnmount(() => { alive = false; clearTimeout(poll); clearInterval(clock);
                     <div><dt>最近登录</dt><dd>{{ selected.lastLoginSuccessAtMs ? timeLabel(selected.lastLoginSuccessAtMs) : '尚无记录' }}</dd></div>
                   </dl>
                   <p class="ix-card-note">访问地址由所有实例共用，使用者登录后自动进入自己的实例。</p>
+                  <p v-if="rotationPending" class="ix-card-note" data-tone="warn">密钥更换尚未完成：实例恢复连接后会自动完成。</p>
                 </section>
 
                 <section class="ix-card">
                   <header class="ix-card-head"><h3>运行环境</h3></header>
                   <dl class="ix-facts">
-                    <div><dt>运行位置</dt><dd>{{ selectedServer?.local ? '本机' : selectedServer?.name || '未知服务器' }} · 端口 {{ selected.port }}</dd></div>
+                    <div><dt>运行位置</dt><dd><span v-if="selectedServer" class="ss-flag" aria-hidden="true">{{ flag(selectedServer.region) || '🖥' }}</span>{{ selectedServer?.local ? '本机' : selectedServer?.name || '未知服务器' }} · 端口 {{ selected.port }}</dd></div>
                     <div><dt>默认模型</dt><dd class="ix-ellipsis" :title="selected.models?.primary">{{ selected.models?.primary || '未设置' }}</dd></div>
                     <div><dt>数据目录</dt><dd><span class="mono ix-ellipsis" :title="selected.workspacePath">{{ selected.workspacePath }}</span><button type="button" class="ix-icon-button" aria-label="复制数据目录" title="复制" @click="copy(selected.workspacePath, '数据目录')"><el-icon><CopyDocument /></el-icon></button></dd></div>
                     <div v-if="selected.image"><dt>镜像</dt><dd>{{ selected.image }}</dd></div>
                     <div v-if="selected.createdAtMs"><dt>创建于</dt><dd>{{ timeLabel(selected.createdAtMs) }}</dd></div>
                   </dl>
+                  <p v-if="migrationText" class="ix-card-note" data-tone="warn" role="note">{{ migrationText }}</p>
                 </section>
 
                 <section class="ix-card ix-span">
@@ -434,40 +490,11 @@ onBeforeUnmount(() => { alive = false; clearTimeout(poll); clearInterval(clock);
       </div>
     </template>
 
-    <div v-else class="ob-servers">
-      <article v-for="server in servers" :key="server.id" class="ob-server">
-        <header class="ix-server-head">
-          <span class="ix-server-icon" aria-hidden="true"><el-icon><Monitor /></el-icon></span>
-          <div class="ob-server-main">
-            <strong>{{ server.local ? '本机' : server.name }}</strong>
-            <span class="instance-muted">{{ serverAddress(server) }}</span>
-          </div>
-          <span class="ix-pill" :data-tone="server.status === 'unreachable' ? 'bad' : 'ok'">{{ server.status === 'unreachable' ? '无法连接' : server.local ? '正常' : '连接正常' }}</span>
-        </header>
-        <dl class="ix-facts is-compact">
-          <div v-for="[label, value, mono] in serverFacts(server)" :key="label"><dt>{{ label }}</dt><dd :class="{mono}">{{ value }}</dd></div>
-        </dl>
-        <div class="ix-usage">
-          <span class="instance-muted">用于</span>
-          <template v-if="server.usedBy?.length"><span v-for="name in server.usedBy" :key="name" class="ix-chip">{{ name }}</span></template>
-          <span v-else class="instance-muted">未使用</span>
-        </div>
-        <footer class="instance-actions">
-          <el-button :disabled="busy" @click="checkServer(server)"><el-icon class="el-icon--left"><Refresh /></el-icon>{{ server.local ? '检查' : '测试连接' }}</el-button>
-          <template v-if="!server.local">
-            <el-button :disabled="busy" @click="editServer(server)">编辑</el-button>
-            <el-button :disabled="busy || server.usedBy?.length > 0" :title="server.usedBy?.length ? '正在被使用' : ''" @click="deleteServer(server)">删除</el-button>
-          </template>
-        </footer>
-      </article>
-      <button type="button" class="ix-add-server" :disabled="busy" @click="editServer(null)"><span>+</span>添加服务器</button>
-    </div>
-
     <el-dialog :model-value="dialog === 'gateway-setup'" @update:model-value="dismiss('gateway-setup')" :title="gatewayOn ? '修改访问网关' : '启用访问网关'" width="540px" class="admin-dialog instance-dialog instance-ui" append-to-body destroy-on-close :close-on-click-modal="false" :before-close="closeDialog">
       <GatewaySetup v-if="dialog === 'gateway-setup'" ref="dialogRef" :servers="servers" :gateway="gateway" @done="gatewayDone" @cancel="dialog = ''" @servers-changed="loadServers" />
     </el-dialog>
     <el-dialog :model-value="dialog === 'gateway'" @update:model-value="dismiss('gateway')" title="访问网关" width="540px" class="admin-dialog instance-dialog instance-ui" append-to-body destroy-on-close :before-close="closeDialog">
-      <GatewaySettings v-if="dialog === 'gateway' && gateway" ref="dialogRef" :gateway="gateway" :servers="servers" :instance-count="active.length" @changed="gatewayChanged" @edit="dialog = 'gateway-setup'" @cancel="dialog = ''" />
+      <GatewaySettings v-if="dialog === 'gateway' && gateway" ref="dialogRef" :gateway="gateway" :servers="servers" :instance-count="active.length" :updating="gatewayUpdating" @changed="gatewayChanged" @update="updateGateway" @edit="dialog = 'gateway-setup'" @cancel="dialog = ''" />
     </el-dialog>
     <el-dialog :model-value="dialog === 'create'" @update:model-value="dismiss('create')" title="创建实例" width="540px" class="admin-dialog instance-dialog instance-ui" append-to-body destroy-on-close :close-on-click-modal="false" :before-close="closeDialog">
       <InstanceForm v-if="dialog === 'create'" ref="dialogRef" :servers="servers" @created="instanceCreated" @cancel="dialog = ''" @servers-changed="loadServers" />
@@ -505,9 +532,6 @@ onBeforeUnmount(() => { alive = false; clearTimeout(poll); clearInterval(clock);
           <el-button type="primary" native-type="submit" :loading="busy" :disabled="!maintain.instructions.trim()">开始维护</el-button>
         </div>
       </form>
-    </el-dialog>
-    <el-dialog :model-value="dialog === 'server'" @update:model-value="dismiss('server')" :title="editingServer ? '编辑服务器' : '添加服务器'" width="500px" class="admin-dialog instance-dialog instance-ui" append-to-body destroy-on-close :close-on-click-modal="false" :before-close="closeDialog">
-      <ServerForm v-if="dialog === 'server'" ref="dialogRef" :server="editingServer" @saved="serverSaved" @cancel="dialog = ''" />
     </el-dialog>
   </section>
 </template>

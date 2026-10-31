@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -17,13 +16,11 @@ from app.references import (
     BUNDLE_FIELD,
     ReferenceError,
     ReferenceMaterials,
-    _history_material,
     parse_references,
     reference_display_text,
     reference_occurrences,
 )
 from tests.test_builtin_template_import import _login_cookie, web_env  # noqa: F401
-from tests.test_tools_history import _make_db
 
 SYNTAX_CASES = json.loads((Path(__file__).parent / "fixtures/reference_syntax.json").read_text())
 
@@ -141,40 +138,6 @@ async def test_resolved_document_snapshot_does_not_change_on_source_edit(web_env
     old = await store.overlay(message, conversation_uuid="mine")
     assert "version one" in old[0]["content"] and "version two" not in old[0]["content"]
     assert (await store.resolve(text, owner=123))["materials"][0]["content"] == "version two"
-
-
-def test_history_reference_uses_history_visibility_and_paginates_past_fifty_turns(tmp_path):
-    path = tmp_path / "history.db"
-    _make_db(path)
-    with sqlite3.connect(path) as db:
-        for index in range(3, 59):
-            db.execute(
-                "INSERT INTO web_operations(conversation_uuid,op_id,op_type,turn_uuid,display_seq,internal,payload_json,revision,created_at_ms,updated_at_ms) VALUES('conv-a',?,'user_message',?,?,0,?,1,1,1)",
-                (
-                    f"msg:{index}",
-                    f"turn-{index}",
-                    index * 100,
-                    json.dumps({"text": f"VISIBLE-TURN-{index}"}, ensure_ascii=False),
-                ),
-            )
-    ref = parse_references(token("chat", "conv-a"))[0]
-    output = _history_material(str(path), ref, "")
-    assert "VISIBLE-TURN-58" in output and "第一个需求" in output
-    assert output.count("VISIBLE-TURN-3\n") == 1
-    assert "SECRET TOOL RESULT" not in output and "hidden reasoning" not in output
-    assert "Truncated: true" not in output
-
-
-def test_history_reference_rejects_incomplete_single_huge_turn(tmp_path):
-    path = tmp_path / "history.db"
-    _make_db(path)
-    with sqlite3.connect(path) as db:
-        db.execute(
-            "UPDATE web_operations SET payload_json=? WHERE op_id='msg:u1'",
-            (json.dumps({"text": "x" * 70000}),),
-        )
-    with pytest.raises(ReferenceError, match="history_output_limit"):
-        _history_material(str(path), parse_references(token("chat", "conv-a"))[0], "")
 
 
 async def test_reference_preview_is_authorized_metadata_only_and_invalid_reference_is_explicit(

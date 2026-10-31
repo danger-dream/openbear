@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
-import {themeValues, themeColor, contrast} from '../../testHelpers/theme.mjs';
+import {themeValues, themeColor, contrast} from '../../testing/theme.mjs';
 import {compile, computed, createSSRApp, h, proxyRefs, ref, shallowReactive, watch} from "vue";
 import {renderToString} from "vue/server-renderer";
 import {parse} from "@vue/compiler-sfc";

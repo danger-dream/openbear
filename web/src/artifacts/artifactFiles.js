@@ -8,6 +8,8 @@ export const TEXT_PREVIEW_LIMIT = 2 * 1024 * 1024;
 const TEXT_CACHE_LIMIT = 8 * 1024 * 1024;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const ARTIFACT_PATH = new RegExp(`^/api/conversations/(${UUID})/artifacts/(${UUID})/content$`, "i");
+const TOOL_FILE_PATH = new RegExp(`^/api/conversations/(${UUID})/operations/([^/]+)/file/content$`, "i");
+const WORK_ITEM_FILE_PATH = new RegExp(`^/api/conversations/(${UUID})/work-items/([0-9.]+)/file/content$`, "i");
 const records = new Map(), texts = new Map(), readingStates = new Map();
 let cachedBytes = 0, cacheGeneration = 0;
 const summaryMarkdown = new MarkdownIt({html: false}).use(cjkFriendly);
@@ -28,12 +30,38 @@ export function artifactFromUrl(value, origin = globalThis.location?.origin) {
 	try {
 		const url = new URL(value, origin);
 		if (url.origin !== origin || url.username || url.password || !["http:", "https:"].includes(url.protocol)) return null;
+		const tool = url.pathname.match(TOOL_FILE_PATH);
+		if (tool) return toolFileIdentity(tool[1], decodeURIComponent(tool[2]));
+		const workItem = url.pathname.match(WORK_ITEM_FILE_PATH);
+		if (workItem && url.searchParams.get("ref")) return workItemFileIdentity(workItem[1], workItem[2], url.searchParams.get("ref"));
 		const match = url.pathname.match(ARTIFACT_PATH);
 		if (!match) return null;
 		const [, conversationUuid, artifactUuid] = match;
 		const contentUrl = `/api/conversations/${conversationUuid}/artifacts/${artifactUuid}/content`;
 		return {conversationUuid, artifactUuid, key: `${conversationUuid}:${artifactUuid}`, contentUrl: contextResourceUrl(contentUrl), metadataUrl: contentUrl.slice(0, -8), downloadUrl: contextResourceUrl(`${contentUrl}?download=1`), download: ["1", "true", "yes", "on"].includes((url.searchParams.get("download") || "").toLowerCase())};
 	} catch { return null; }
+}
+
+// The file a recorded Read/Write/Edit call operated on, read live from disk; the
+// server resolves the path from that call, so the identity carries only its id.
+export function toolFileIdentity(conversationUuid, operationId) {
+	const contentUrl = `/api/conversations/${conversationUuid}/operations/${encodeURIComponent(operationId)}/file/content`;
+	return {conversationUuid, artifactUuid: operationId, toolFile: true, key: `${conversationUuid}:op:${operationId}`, contentUrl: contextResourceUrl(contentUrl), metadataUrl: contentUrl.slice(0, -8), downloadUrl: contextResourceUrl(`${contentUrl}?download=1`), download: false};
+}
+
+// A file named in a work item's record. The server resolves the path from that
+// record; the identity carries only the item number and which entry it is.
+export function workItemFileIdentity(conversationUuid, number, ref) {
+	const base = `/api/conversations/${conversationUuid}/work-items/${number}/file`;
+	const query = `?ref=${encodeURIComponent(ref)}`;
+	return {conversationUuid, artifactUuid: `work-item:${number}:${ref}`, toolFile: true, workItem: true, key: `${conversationUuid}:wi:${number}:${ref}`,
+		contentUrl: contextResourceUrl(`${base}/content${query}`), metadataUrl: `${base}${query}`, diffUrl: `${base}/diff${query}`,
+		downloadUrl: contextResourceUrl(`${base}/content${query}&download=1`), download: false};
+}
+
+// What the work item changed in the file: its commit, or the snapshot taken at completion.
+export async function loadWorkItemDiff(identity) {
+	return request(identity.diffUrl, response => response.json(), true);
 }
 
 // Only the server-validated workspace path is shareable with another conversation.
@@ -103,17 +131,18 @@ export function artifactErrorMessage(error) {
 	if (error?.name === "AbortError") return "读取超时，请重试或下载原文件。";
 	return error?.message || "附件暂时无法读取，请重试。";
 }
-function responseError(status) {
+function responseError(status, toolFile) {
 	if (status === 401) return new Error("登录已失效，请刷新页面后重试。");
+	if (toolFile && status === 404) return new Error("文件已经不存在，可能被移动、改名或删除。");
 	if (status === 403 || status === 404) return new Error("附件不存在、已删除，或当前无权访问。");
-	return new Error(`读取附件失败（HTTP ${status}），请重试。`);
+	return new Error(`${toolFile ? "读取文件" : "读取附件"}失败（HTTP ${status}），请重试。`);
 }
-async function request(url, consume) {
+async function request(url, consume, toolFile = false) {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 30000);
 	try {
 		const response = await contextFetch(url, {credentials: "same-origin", signal: controller.signal, redirect: "error"});
-		if (!response.ok) throw responseError(response.status);
+		if (!response.ok) throw responseError(response.status, toolFile);
 		return await consume(response);
 	} finally { clearTimeout(timer); }
 }
@@ -126,7 +155,7 @@ export async function loadArtifactMetadata(record, {force = false} = {}) {
 	if (record.metadataRequest) return record.metadataRequest;
 	if (!force && record.metadata && Date.now() - record.checkedAt < 60000) return record.metadata;
 	record.busy = true; record.metadataError = "";
-	const promise = request(record.identity.metadataUrl, response => response.json()).then(result => {
+	const promise = request(record.identity.metadataUrl, response => response.json(), record.identity.toolFile).then(result => {
 		assertCurrentRecord(record);
 		const meta = result?.artifact;
 		if (!meta || meta.artifactUuid !== record.identity.artifactUuid || meta.conversationUuid !== record.identity.conversationUuid || !Number.isSafeInteger(meta.sizeBytes) || meta.sizeBytes < 0) throw new Error("附件信息不完整，暂时无法预览。");
@@ -173,7 +202,7 @@ export async function loadArtifactText(record) {
 	if (texts.has(key)) { const cached = texts.get(key); texts.delete(key); texts.set(key, cached); return cached.text; }
 	if (record.textRequest) return record.textRequest;
 	const currentGeneration = cacheGeneration;
-	const promise = request(record.identity.contentUrl, readTextResponse).then(value => {
+	const promise = request(record.identity.contentUrl, readTextResponse, record.identity.toolFile).then(value => {
 		if (currentGeneration !== cacheGeneration) return value.text;
 		texts.set(key, value); cachedBytes += value.bytes;
 		while (cachedBytes > TEXT_CACHE_LIMIT || texts.size > 64) { const oldest = texts.keys().next().value; cachedBytes -= texts.get(oldest).bytes; texts.delete(oldest); }

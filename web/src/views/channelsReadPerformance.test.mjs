@@ -21,6 +21,7 @@ test("App channel count uses config-only settings and preserves fallback text", 
   async function renderWith(response) {
     const context = {
       channelStatsText: { value: "系统就绪" },
+      applyFeatureSettings: () => {}, featureSettingsUnavailable: () => {},
       Api: { settings: async () => {
         if (response instanceof Error) throw response;
         return response;

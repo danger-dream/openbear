@@ -17,9 +17,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.instances import InstanceService, install
+from app.instances import InstanceService, install, remote
 from app.instances.contracts import Form, InstanceError, origin, relay_path
-from app.instances import remote
 from app.instances.remote import deployment_archive
 from app.instances.security import _AUDIT, _REFERENCE_AUTH, Scrubber
 from app.llm.events import StreamEvent, ToolCall
@@ -131,15 +130,21 @@ async def env(base_env, monkeypatch):  # noqa: F811
     g.url = str(e.gateway_server.make_url('')).rstrip('/')
     g.public = 'http://203.0.113.10:18962'
     e.gateway = g
-    # The fixture gateway is already "installed": state as enable() would leave it.
-    await e.instances.gateway.store({'enabled': True, 'publicUrl': g.public, 'serverId': 'local', 'port': 18962, 'status': 'connected'},
+    # The fixture gateway is already "installed": state as enable() would leave it. It reports
+    # no build, so automatic updates (which would reinstall it) are off unless a test enables them.
+    await e.instances.gateway.store({'enabled': True, 'publicUrl': g.public, 'serverId': 'local', 'port': 18962, 'status': 'connected', 'autoUpdate': False},
                                     {'controlKey': g.key, 'controlUrl': g.url})
     commands = []
+    # Commands are only recorded: they would run as root on this machine. A test that needs a
+    # delivery script to really write its files under e.tmp sets e.execute.
+    e.execute = False
 
     async def fake_run(target, command, *, stdin=b'', timeout=120, sudo=False, root=False):
         commands.append((target.get('id'), command))
         if 'ss -Hltnp' in command or 'netstat' in command:
             return {'ok': True, 'stdout': 'free\n', 'stderr': '', 'exitCode': 0, 'knownHosts': ''}
+        if not e.execute:
+            return {'ok': True, 'exitCode': 0, 'stdout': '', 'stderr': '', 'knownHosts': ''}
         process = await asyncio.create_subprocess_exec('/bin/sh', '-c', command, cwd=e.tmp, stdin=asyncio.subprocess.PIPE,
                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await process.communicate(stdin)
@@ -168,7 +173,7 @@ async def env(base_env, monkeypatch):  # noqa: F811
 
 def form(e, **patch):
     return {'name': '实例丙', 'serverId': 'local', 'managementUrl': e.child_url, 'workspacePath': str(e.tmp/'child-workspace'),
-            'account': {'username': 'wife', 'password': 'account-fixture-password'},
+            'account': {'username': 'family', 'password': 'account-fixture-password'},
             'models': {'mode': 'copy', 'primary': 'openai/gpt'},
             'notifications': {'loginSuccess': True, 'loginFailure': True, 'health': True}, **patch}
 
@@ -228,10 +233,10 @@ async def test_create_and_deploy_in_one_step_with_automatic_values(env):
     await asyncio.gather(*list(e.instances.tasks.values()))
     # Port, address and data directory are automatic.
     assert item['port'] == 18970 and item['managementUrl'] == 'http://127.0.0.1:18970'
-    assert item['workspacePath'] == '/opt/openbear/instances/wife'
+    assert item['workspacePath'] == '/opt/openbear/instances/family'
     assert item['serverName'] == '本机' and item['models'] == {'mode': 'copy', 'primary': 'openai/gpt'}
     # Account reached the gateway immediately; password never stored afterwards.
-    assert e.gateway.routes[item['id']]['username'] == 'wife'
+    assert e.gateway.routes[item['id']]['username'] == 'family'
     stored = e.instances.vault.open((await e.instances.row(123, item['id']))['protected'])
     assert 'account-fixture-password' not in json.dumps(stored)
     # Controller providers (with keys) were copied for the instance's first start.
@@ -255,7 +260,8 @@ async def test_model_choice_and_later(env):
     item, credentials = await create(e, models={'mode': 'later'})
     assert credentials['initialConfig'] == {}
     with pytest.raises(InstanceError, match='primary_model_not_copied'):
-        await e.instances.save(123, form(e, account={'username': 'x', 'password': 'another-fixture-pass'}, models={'mode': 'copy', 'primary': 'missing/model'}))
+        await e.instances.save(123, form(e, account={'username': 'x', 'password': 'another-fixture-pass'}, workspacePath=str(e.tmp / 'x'),
+                                         models={'mode': 'copy', 'primary': 'missing/model'}))
     options = e.instances.model_options()
     assert options['primary'] == 'openai/gpt' and options['providers'][0]['models'] == ['gpt', 'cheap']
     assert 'apiKey' not in json.dumps(options)
@@ -286,8 +292,8 @@ def test_closed_relay_rejects_bypasses(path):
 
 def test_form_defaults():
     # Short passwords are allowed; the UI only advises.
-    value = Form.model_validate({'name': 'x', 'serverId': 'local', 'account': {'username': 'Wife Name', 'password': 'abc'}}).model_dump()
-    assert value['workspacePath'] == '/opt/openbear/instances/wife-name' and value['port'] == 0 and value['managementUrl'] == ''
+    value = Form.model_validate({'name': 'x', 'serverId': 'local', 'account': {'username': 'Family Name', 'password': 'abc'}}).model_dump()
+    assert value['workspacePath'] == '/opt/openbear/instances/family-name' and value['port'] == 0 and value['managementUrl'] == ''
 
 
 async def test_verify_uses_instance_and_gateway_route(env):
@@ -461,6 +467,20 @@ async def test_reference_copy_and_context_inspection_no_authority(env):
     assert await e.instances.prepare_turn(copy, str(uuid.uuid4())) is None
 
 
+async def test_tool_changes_from_automatic_turns_follow_their_task(env):
+    from tests.test_servers import automatic_turn
+    e = env
+    item, _ = await create(e)
+    for index, kind in enumerate(('cron', 'webhook')):
+        refused = await automatic_turn(e.db, 123, 9100 + index, kind, allowed=False)
+        assert (await dispatch(e.instances, 'status', {'instanceId': item['id']}, refused))['item']['id'] == item['id']
+        with pytest.raises(InstanceError, match='automatic_mutation_forbidden'):
+            await dispatch(e.instances, 'archive', {'instanceId': item['id']}, refused)
+    allowed = await automatic_turn(e.db, 123, 9110, 'webhook', allowed=True)
+    assert (await dispatch(e.instances, 'archive', {'instanceId': item['id']}, allowed))['item']['status'] == 'archived'
+    assert 'allowServerChanges' in (await dispatch(e.instances, 'describe', {}, allowed))['rules']
+
+
 async def test_tool_runs_without_user_confirmation_and_secret_delivery_material(env, monkeypatch):
     e = env
     # The real source context's contents are under test, not gzip level 9:
@@ -495,7 +515,7 @@ async def test_tool_runs_without_user_confirmation_and_secret_delivery_material(
     for name in ('Dockerfile', 'pyproject.toml', 'uv.lock', 'README.md', 'scripts/container-entrypoint.sh'):
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(real / name, root / name)
-    for name in ('app', 'prompts'):
+    for name in ('app', 'prompts', 'benchmark-package'):
         shutil.copytree(real / name, root / name, ignore=shutil.ignore_patterns('__pycache__'))
     for name, text in {'web/dist/index.html': '<!doctype html>', 'app/__pycache__/decoy.pyc': 'x', 'data/openbear.db': 'x',
                        'workspace/notes.md': 'x', 'openbear.json': '{}'}.items():
@@ -520,6 +540,8 @@ async def test_tool_runs_without_user_confirmation_and_secret_delivery_material(
         with tarfile.open(fileobj=archive.extractfile('source.tar.gz')) as source:
             files = set(source.getnames())
             assert 'Dockerfile' in files and any(f.startswith('web/dist/') for f in files)
+            assert 'benchmark-package/ip.check.place/v0.1.0/main/ref/cookies.txt' in files
+            assert 'benchmark-package/geekbench5/v0.1.0/manifest.json' in files
             assert not any(f.startswith(('data/', 'workspace/')) or 'openbear.json' in f or '__pycache__' in f for f in files)
     registry = e.server.tools
     assert 'InstanceControl' in registry.names(scope='main') and 'InstanceControl' not in registry.names(scope='agent')
@@ -553,6 +575,7 @@ async def test_delivery_preserves_existing_data_directory(env):
 
 async def test_model_delivers_executes_and_reports_actual_started_fixture(env, monkeypatch):
     e = env
+    e.execute = True
     item, _ = await create(e)
     e.child.ready = False
     original = e.instances.servers.run
@@ -716,3 +739,25 @@ async def test_deployment_message_is_a_card_and_stays_out_of_recent(env):
     other = [{'opId': 'msg:human', 'opType': 'user_message', 'turnId': op['root'], 'payload': {'text': 'x'}}]
     await enrich_operations(e.db.conn, other, op['conversation_uuid'])
     assert 'instanceCard' not in other[0]['payload']
+
+
+async def test_instance_and_gateway_changes_bring_the_mesh_rules_up_to_date(env, monkeypatch):
+    """Instances on a mesh address are let through by the mesh's automatic rules: saving one (placed,
+    another port), archiving it and the gateway's enable or disable each tell the mesh, which reconciles."""
+    e = env
+    told = []
+    monkeypatch.setattr(e.server, 'servers', SimpleNamespace(mesh=SimpleNamespace(instances_changed=told.append)), raising=False)
+    item, _ = await create(e)
+    assert told == [123]
+    await e.instances.save(123, {'port': item['port'] + 1}, item['id'])
+    assert told == [123, 123]
+    await e.instances.archive(123, item['id'])  # through the gateway's revocation
+    assert (await e.instances.get(123, item['id']))['item']['status'] == 'archived' and told == [123, 123, 123]
+    ran = []
+
+    async def no_run(target, command, **kw):
+        ran.append(command)
+        return {'ok': True, 'stdout': '', 'stderr': '', 'exitCode': 0, 'knownHosts': ''}
+    monkeypatch.setattr(e.instances.servers, 'run', no_run)
+    await e.instances.gateway.disable(123)
+    assert told[-1] is None and len(ran) == 1 and 'systemctl disable --now' in ran[0]

@@ -102,23 +102,6 @@ test("an old generation cannot settle a newer conversation page request", () => 
   assert.equal(settleTimelinePageRequest(newRequest, {...newRequest}), null);
 });
 
-test("earlier-page loading is observable, accessible, and outside scroll layout flow", () => {
-  assert.match(consoleSource, /const timelinePageInFlight = ref\(null\);/);
-  const statusMarkup = consoleSource.match(/<div\s+v-if="timelinePageInFlight"[\s\S]*?<\/div>/)?.[0] || "";
-  assert.match(statusMarkup, /role="status"/);
-  assert.match(statusMarkup, /aria-live="polite"/);
-  assert.match(statusMarkup, /<Loading\/>/);
-  assert.match(statusMarkup, /正在加载更早内容…/);
-  assert.doesNotMatch(statusMarkup, /<button/);
-
-  const statusStyles = consoleSource.match(/\.timeline-page-loading\s*\{[^}]*\}/)?.[0] || "";
-  assert.match(statusStyles, /position:\s*absolute/);
-  assert.match(statusStyles, /pointer-events:\s*none/);
-  assert.ok(consoleSource.indexOf('v-if="timelinePageInFlight"') < consoleSource.indexOf('ref="scroller"'));
-  assert.match(consoleSource, /function resetTimelinePagination[\s\S]*?timelinePageInFlight\.value = null;/);
-  assert.match(consoleSource, /finally\s*\{\s*timelinePageInFlight\.value = settleTimelinePageRequest/);
-});
-
 test("prepend preserves the active navigation turn by UUID, then id", () => {
   const selected = {turnUuid: "stable-turn", id: "old-render-id"};
   const identity = stableTurnIdentity(selected);

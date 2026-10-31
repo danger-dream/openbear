@@ -15,6 +15,7 @@ import {treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop} 
 import {activityLabel, activityState, activityReadRequests, isActivityWaiting, pendingConversationRows, pendingFolderCounts, folderActivityCounts} from '../conversationActivity.js';
 import {REFERENCE_MIME, referenceToken} from '../references/codec.js';
 import * as conversationGroupsTree from './conversationGroupsTree.js';
+import * as conversationTreeSelection from './conversationTreeSelection.js';
 
 const source = fs.readFileSync(new URL('./ConversationTree.vue', import.meta.url), 'utf8');
 const {descriptor} = parse(source);
@@ -46,7 +47,7 @@ function harness(t, {phone=true, storedView='recent', blockedStorage=false}={}) 
     locateConversationFolderInTree:async id=>{requests.push(['folder',id]);return {folderPath:[id],folderItems:[folder(id)]};},
     locateConversationInTree:async id=>{requests.push(['locate',id]);return {item:conversation(id),folderPath:['F'],folderItems:[folder('F')]};},
   };
-  const ctx=vm.createContext({...conversationGroupsTree,userStorage,...promptPolicy,...icons,computed,nextTick,reactive,ref,watch,useRecentConversationRows,rowId,treeItemParent,compareTreeItems,resolveTreeDrop,activityLabel,activityState,activityReadRequests,isActivityWaiting,pendingConversationRows,pendingFolderCounts, folderActivityCounts,
+  const ctx=vm.createContext({...conversationGroupsTree,...conversationTreeSelection,userStorage,...promptPolicy,...icons,computed,nextTick,reactive,ref,watch,useRecentConversationRows,rowId,treeItemParent,compareTreeItems,resolveTreeDrop,activityLabel,activityState,activityReadRequests,isActivityWaiting,pendingConversationRows,pendingFolderCounts, folderActivityCounts,
     props,referenceCatalog:catalog,referenceItem:()=>null,acceptActivityReadReceipt(){},REFERENCE_MIME,referenceToken,
     defineLazyView:()=>({}),defineProps:()=>props,defineEmits:()=>(...args)=>events.push(args),defineExpose(){},
     onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>unmounted.push(fn),Api:api,apiError:String,ElMessage:{error:value=>assert.fail(String(value))},
@@ -54,7 +55,7 @@ function harness(t, {phone=true, storedView='recent', blockedStorage=false}={}) 
     document:{querySelector:selector=>selector.startsWith('[data-tree-id=')?{scrollIntoView:()=>scrolled.push(selector)}:null},CSS:{escape:s=>s},setTimeout:()=>1,clearTimeout(){},
   });
   scope.run(()=>vm.runInContext(descriptor.scriptSetup.content.replace(/^import[\s\S]*?;\n/gm,'')+`
-    globalThis.s={sidebarView,isDirectoryView,sidebarScroll,sidebarScrollKey,switchSidebarView,sidebarTabKeydown,showRecentActivity,revealInFolders,revealDraft,locatingConversation,
+    globalThis.s={selecting,isSelected,selectableRow,toggleSelected,clickConversation,sidebarView,isDirectoryView,sidebarScroll,sidebarScrollKey,switchSidebarView,sidebarTabKeydown,showRecentActivity,revealInFolders,revealDraft,locatingConversation,
       activeConversationRow,recentClock,recentConversationRows,recentUnreadRows,recentUnreadCount,recentWaitingCount,recentRunningCount,recentLabel,displayRows,visibleRows,query,initialized,loading,
       activityItems,recentItems,pendingRows,folderWaitingCount,collapsedFolderActivity,isActivityWaiting,activityReadBusy,titleGenerating,referenceCatalog,rootFolders,stateFor,expanded,selectedFolderId,selectedTargetLabel,emit,menu,listRef,runMenuAction,
       activateRow,toggleRow,dragStart,dropIntent,dragOver,drop,clearDrag,rootDropTarget,drag,moveInFlight,rowId,rowLabel,rowLoading,nodePath,indentation,isExpanded,running,isTitleGenerating,liveConversationTitle,conversationOrigin,

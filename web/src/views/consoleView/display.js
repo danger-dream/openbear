@@ -127,6 +127,12 @@ export function fmtElapsedClockMs(ms) {
 	return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+export function fmtElapsedHoursClockMs(ms) {
+	const seconds = Math.floor(Math.max(0, Number(ms) || 0) / 1000);
+	if (seconds < 3600) return fmtElapsedClockMs(seconds * 1000);
+	return `${Math.floor(seconds / 3600)}:${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
 export function conversationPathText(path) {
 	const text = String(path || "").trim().replaceAll(" / ", "/");
 	return text ? (text.startsWith("/") ? text : `/${text}`) : "—";

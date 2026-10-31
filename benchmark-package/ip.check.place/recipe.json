@@ -1,0 +1,15 @@
+{
+  "name": "IP.Check.Place",
+  "repo": "https://github.com/xykt/IPQuality",
+  "license": "AGPL-3.0",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "ip.sh",
+  "files": {
+    "ip.sh": "ip.sh",
+    "main/ref/iso3166.json": "ref/iso3166.json",
+    "main/ref/dnsbl.list": "ref/dnsbl.list",
+    "main/ref/cookies.txt": "ref/cookies.txt",
+    "main/ref/iata-icao.csv": "ref/iata-icao.csv"
+  },
+  "keep": ["LICENSE"]
+}

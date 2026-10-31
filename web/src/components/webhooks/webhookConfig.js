@@ -10,8 +10,8 @@ export function scriptDefaults(post = false) {
 }
 export function defaultConfig(scope = {}) {
   return {
-    target: {mode: scope.type === 'conversation' ? 'fixedConversation' : 'newConversation', conversationId: scope.type === 'conversation' ? scope.id : null, runConfig: scope.type === 'conversation' ? null : {mainModel:null,mainThinkingLevel:null,mainFastMode:null}},
-    processing: {instructions: '', eventTemplate: null, resultSchema: null, scriptScheduling: 'independent'},
+    target: {mode: scope.type === 'conversation' ? 'fixedConversation' : 'newConversation', conversationId: scope.type === 'conversation' ? scope.id : null, runConfig: scope.type === 'conversation' ? null : {mainModel:null,mainThinkingLevel:null,mainFastMode:null}, ...(scope.type === 'conversation' ? {} : {conversationRetention: {keepLast: null, keepDays: null}})},
+    processing: {instructions: '', eventTemplate: null, resultSchema: null, scriptScheduling: 'independent', allowServerChanges: false},
     pre: scriptDefaults(), post: scriptDefaults(true),
     idempotency: {bodyIdPath: null}, correlation: {idPath: null, originPath: null, ignoreOwnEcho: false, ownOriginValues: []},
     batching: {enabled: true, idleSeconds: 3, maxWaitSeconds: 30, maxEvents: 100, maxBytes: 65536, oversizeEvent: 'hold'},
@@ -27,6 +27,14 @@ export function mergeConfig(base, value) {
     result[key] = item && typeof item === 'object' && !Array.isArray(item) && result[key] && typeof result[key] === 'object'
       ? mergeConfig(result[key], item) : clone(item);
   }
+  return result;
+}
+// An unset retention is omitted so the payload stays valid for a backend without the field.
+export function submittedConfig(config) {
+  const result = clone(config);
+  if (result.processing?.allowServerChanges === false) delete result.processing.allowServerChanges;
+  const retention = result.target?.conversationRetention;
+  if (retention && retention.keepLast == null && retention.keepDays == null) delete result.target.conversationRetention;
   return result;
 }
 export function getPath(object, path) { return path.split('.').reduce((value, key) => value?.[key], object); }
@@ -73,6 +81,10 @@ export function configErrors(config, {enabled = false, environment = {}, scope =
   if (scope.type === 'conversation' && (config.target.mode !== 'fixedConversation' || config.target.conversationId !== scope.id)) add('target.conversationId', '会话入口只能指向当前会话', 'connection');
   if (config.target.mode === 'fixedConversation' && !config.target.conversationId) add('target.conversationId', '请选择具体的目标会话', 'connection');
   if (config.target.mode === 'newConversation' && config.target.conversationId != null) add('target.conversationId', '新会话模式不能指定已有会话', 'connection');
+  if (config.target.mode === 'newConversation' && config.target.conversationRetention) {
+    numeric('target.conversationRetention.keepLast', {nullable: true, integer: true, max: 10000, tab: 'connection'});
+    numeric('target.conversationRetention.keepDays', {nullable: true, integer: true, max: 3650, tab: 'connection'});
+  }
   if (enabled && !config.processing.instructions.trim()) add('processing.instructions', '启用入口前请填写处理目标、范围与授权', 'processing');
   for (const phase of ['pre', 'post']) {
     const script = config[phase];

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import postcss from 'postcss';
 import {parse, compileStyle} from '@vue/compiler-sfc';
-import {themeValues, themeColor, contrast} from '../../testHelpers/theme.mjs';
+import {themeValues, themeColor, contrast} from '../../testing/theme.mjs';
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 function rules(file, selector) {

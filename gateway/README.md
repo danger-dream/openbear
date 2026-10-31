@@ -29,19 +29,19 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/openbear-gatewa
 }
 ```
 
-- `listen` 默认 `127.0.0.1:18962`，登录入口、业务代理和控制接口共用这一个端口。旧配置中的 `controlListen` 仍兼容：设置后额外开一个只提供控制接口的监听，必须与 `listen` 不同。主控端口不受接管。
+- `listen` 默认 `127.0.0.1:18962`，提供登录入口和业务代理。可选 `controlListen`（必须与 `listen` 不同）单独提供控制接口；设置后 `listen` 上的 `/control/*` 和 `/api/gateway/probe` 一律 404。主控安装时，若能访问目标服务器的回环地址（本机，或节点在线且支持 `http.local`），会把 `controlListen` 设为 `127.0.0.1:<空闲端口>`，控制接口只在本机可访问；只有 SSH 的服务器不设置，控制接口与登录入口共用端口、以 controlKey 鉴权。主控端口不受接管。
 - `publicUrl` 必须是无用户信息、query、fragment 的 HTTP(S) 根 origin，允许域名、公网 IP、IPv6、非标准端口。浏览器必须用这个 origin 访问；Origin/CSRF 校验不根据不可信转发头放宽。
 - HTTP 可以直接正常登录、访问 API 和 WS；Cookie 的 `Secure` 只取决于配置的 `publicUrl` 是否为 HTTPS。不自动跳转 HTTPS，不要求任何指定网络隧道。
-- 可选 `tlsCert` / `tlsKey` 必须成对配置，用于家庭监听的直接 TLS；也支持前置反向代理终止 TLS。兼容的独立控制监听为 HTTP。
+- 可选 `tlsCert` / `tlsKey` 必须成对配置，用于家庭监听的直接 TLS；也支持前置反向代理终止 TLS。独立控制监听为 HTTP。
 - 不需要本地 `web/dist`。旧 JSON 的 `webRoot` 字段仅兼容读取，完全不打开或提供该目录，目录不存在也可启动。`stateDir` 仍为私有持久状态目录，不能通过业务节点另行公开。
 - `gateway/login.html` 使用 `go:embed` 编译进二进制，发行源码构建须包含该文件。登录页无外部字体、脚本、CSS 或框架依赖；支持深浅主题、16px 手机输入、标准 form submit。
 - SIGINT/SIGTERM 会取消业务流和 WS，并关闭所有监听。`--help` / `--version` 不读取配置、不绑定端口、不写状态。
 
 ## 控制协议 v1
 
-`/control/v1/*` 位于主监听（配置了兼容的 `controlListen` 时也在该监听上），必须携带 `Authorization: Bearer <controlKey>`，响应为 JSON / `no-store`，不回显密码或密钥：
+`/control/v1/*` 位于 `controlListen`；未配置 `controlListen` 时位于主监听。必须携带 `Authorization: Bearer <controlKey>`，响应为 JSON / `no-store`，不回显密码或密钥：
 
-- `GET /control/v1/status`：`{ok,version:1,publicUrl,clientIp,instances:[{id,revision,enabled,username}],outboxPending,outboxDropped}`。
+- `GET /control/v1/status`：`{ok,version:1,build,publicUrl,clientIp,instances:[{id,revision,enabled,username}],outboxPending,outboxDropped}`。`version` 是状态文件格式号；`build` 是网关启动时计算的自身程序 sha256（读不到时为空），主控据此判断网关是否需要更新。
 - `PUT /control/v1/instances/{id}`：`{revision,upstream,businessKey,username?,password?,enabled,reportUrl,reportToken}`。
   - 首次必须提供账号和密码；用户名区分大小写、全局唯一，1–128 UTF-8 字节且无首尾空白/控制字符；密码 1–1024 UTF-8 字节（长度和强度建议由主控界面提示，不在网关强制）。之后省略账号字段保持当前值；空串不是保持值。
   - revision 必须为正整数。相同 revision、相同配置幂等 ACK；同 revision 不同内容及旧 revision 返回 409。幂等比较不会将密码变成快速离线口令摘要。
@@ -63,9 +63,10 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/openbear-gatewa
 {"source":"header","trustedProxies":["203.0.113.10/32"]}
 ```
 
-原子持久成功后热应用，ACK `{ok:true,clientIp:<规范化实际策略>}`；GET status 回读实际值。失败不 ACK、不应用。策略变更只清理旧来源识别的限流桶，不撤销会话或更改账号/路由；同值 PUT 不重置限流。
+原子持久成功后热应用，ACK `{ok:true,clientIp:<规范化实际策略>,clientIpObserved:<按新策略重算 trusted 的最近观察>}`；GET status 回读实际值。失败不 ACK、不应用。策略变更只清理旧来源识别的限流桶，不撤销会话或更改账号/路由；同值 PUT 不重置限流。
 
-- `source` 为 `auto`、`header` 或 `socket`。`auto` 把本机、内网地址和 Cloudflare 公布的边缘网段视为可信代理；`header` 在此基础上再加上 `trustedProxies` 中的地址；`socket` 只用连接地址、忽略所有转发头。可信列表最多 128 条 IP/CIDR；单 IP 转 /32 或 /128，CIDR 清除 host bits，去重、按字符串排序；拒绝 zone、非法地址/字段及 header 模式空列表。
+- `source` 为 `auto`、`header` 或 `socket`。`auto` 只把本机回环地址视为可信代理，另外对 Cloudflare 公布的边缘网段只读取 `CF-Connecting-IP`（该头由 Cloudflare 覆盖）；内网中的其他代理不自动信任；`header` 在此基础上再加上 `trustedProxies` 中的地址；`socket` 只用连接地址、忽略所有转发头。可信列表最多 128 条 IP/CIDR；单 IP 转 /32 或 /128，CIDR 清除 host bits，去重、按字符串排序；拒绝 zone、非法地址/字段及 header 模式空列表。
+- status 的 `clientIpObserved` `{peer,header,atMs,trusted}` 是最近一次带转发头的请求：可信代理（`trusted:true`），或头被忽略的内网对端（`trusted:false`，供主人在网关设置中一键确认）。旧版网关只报告可信代理且没有 `trusted` 字段；主控升级时把旧版报告过的内网代理写入 `trustedProxies` 一次，现有内网反代部署不受影响。
 - 直接对端是可信代理时，按固定顺序读取 `CF-Connecting-IP`、`True-Client-IP`、`X-Real-IP`、`X-Forwarded-For`、`Forwarded`，取第一个有效值；缺失、无效或来源不可信均退回连接地址。旧策略中的 `header` 字段仅兼容读取，不再决定读取哪个头。
 - XFF / RFC7239 Forwarded 从右向左剥除可信代理，使用首个非可信 IP，防左侧伪造；链最多 128 跳、8192 字节。单值头拒绝多行重复、逗号多值或非法地址。支持 IPv4/IPv6 和标准 Forwarded 的引号/端口格式。
 - 限流与会话 IP 在每次认证尝试中使用同一策略快照。所有上述来源头均从发往节点的请求剥离，不作为节点鉴权凭证。
@@ -83,9 +84,11 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/openbear-gatewa
 
 `GET/HEAD /login` 始终由网关内置页面提供。已有 Cookie 时展示“继续当前登录”或“退出并切换账号”，不会静默换人。`next` 仅接受同源根相对、精确应用页面，保留通知 `_ob_instance`，拒绝外部/协议相对 URL、API、资源及登录循环；旧 `_ob_ctx` 不带入新登录导航。
 
-节点 bootstrap 仅允许 GET/HEAD 精确应用页面 `/`、`/chat`、`/memory`、`/secrets`、`/docs`、`/mcp`、`/skills`、`/settings`、`/statistics`、`/webhooks`、`/cron`，以及 `/assets/...`、`/openbear-push-sw.js`、`/manifest.webmanifest`、三个固定 `/icons/` PWA 图标。必须有有效 Cookie，提供 context 时仍严格校验。匿名文档导航转到内置登录页；匿名资源返回 401，不选默认节点。API、业务文件和 WS 继续要求双校验；构建信息位于 `/api/system/version` 的 `frontend` 字段，**没有** `/build-info.json` 匿名兜底。
+节点 bootstrap 仅允许 GET/HEAD 精确应用页面 `/`、`/chat`、`/memory`、`/secrets`、`/docs`、`/mcp`、`/skills`、`/settings`、`/statistics`、`/webhooks`、`/cron`，以及 `/_i/<实例>/assets/...`、兼容旧节点的 `/assets/...`、`/openbear-push-sw.js`、`/manifest.webmanifest`、三个固定 `/icons/` PWA 图标。`/_i/<实例>/` 中的实例必须是当前会话的实例，否则 `409 session_context_changed`；转发给节点时去掉该前缀。必须有有效 Cookie，提供 context 时仍严格校验。匿名文档导航转到内置登录页；匿名资源返回 401，不选默认节点。API、业务文件和 WS 继续要求双校验；构建信息位于 `/api/system/version` 的 `frontend` 字段，**没有** `/build-info.json` 匿名兜底。
 
-节点静态响应保持 MIME。`/assets/` 内带内容哈希的构建文件使用浏览器私有长期缓存（`private, max-age=31536000, immutable`），保留 ETag/Last-Modified 和条件请求，允许 304 复用；节点升级后新哈希文件会正常重新获取。页面、固定名称资源、业务接口及错误响应仍为 `no-store`，其中 bootstrap 请求移除旧 If-None-Match/If-Modified-Since。只代理现有通知 worker，不新增离线业务缓存。
+同一 origin 下的实例各自从 `/_i/<实例>/` 加载构建资源：网关在发往节点的页面请求上带 `X-OpenBear-Gateway-Assets: /_i/<实例>/`，支持前缀的节点据此在 index.html 中写入自己的前缀，编译后的 JS/CSS 按自身地址相对解析其余资源。节点静态响应保持 MIME。`/_i/<实例>/assets/` 内带内容哈希的构建文件使用浏览器私有长期缓存（`private, max-age=31536000, immutable`），保留 ETag/Last-Modified 和条件请求，允许 304 复用；节点升级后新哈希文件会正常重新获取。不支持前缀的旧节点仍用 `/assets/`，这些响应一律 `no-store`，避免缓存条目被同 origin 的其他实例使用。页面、固定名称资源、业务接口及错误响应仍为 `no-store`，其中 bootstrap 请求移除旧 If-None-Match/If-Modified-Since。
+
+通知 Service Worker `/openbear-push-sw.js` 由网关内置提供（与 `web/public/openbear-push-sw.js` 相同，`no-store`），不转发给节点；其他任何带 `Service-Worker` 请求头的脚本请求一律 `403`，节点无法在该 origin 注册 worker。不新增离线业务缓存。
 
 context 本身不能登录。会话最长 30 天、非滑动过期，到期也会断流。业务 Cookie / Authorization、客户端内部认证头及伪造 forwarding 头均不传子实例。网关重建 `X-OpenBear-Gateway-Key`、`X-OpenBear-Instance`、`X-OpenBear-Gateway-Session`；最后一项是独立随机值，不是原 Cookie。
 
@@ -146,4 +149,4 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/openbear-gateway-linux-ar
 
 这些不是实际 Python 子实例、最终前端浏览器、真实家庭网络、线上服务的验收；相关集成另由主控执行。arm64 交叉编译不等于 arm64 主机执行验收。
 
-安全建议：HTTP 在不可信链路会暴露密码/Cookie，建议按自己的网络条件使用 HTTPS；但网关不要求 HTTPS。控制接口与家庭入口共用端口，安全性依赖独立强随机的 controlKey；不要泄露该密钥，需要进一步收紧时可在前置代理上限制 `/control/` 路径的来源。前置代理的访问日志应避免记录 Cookie、Authorization、`_ob_ctx` 或含凭证的请求体。同源代理明确**信任各节点的前端代码与通知 worker**：它们拥有同一浏览器 origin 的权限，Cookie/context 防串号不等于隔离互相恶意的节点。对不同信任级别应用可考虑分离 origin，但本服务不强制域名、HTTPS 或改为直连/SSO。妥善保护和备份私有状态/配置，其中必须保存转发与上报密钥；不要上传公开仓库。不实现自研传输加密或 mTLS。
+安全建议：HTTP 在不可信链路会暴露密码/Cookie，建议按自己的网络条件使用 HTTPS；但网关不要求 HTTPS。配置了回环 `controlListen` 时控制接口不对外；未配置时控制接口与家庭入口共用端口，安全性依赖独立强随机的 controlKey，不要泄露该密钥，需要进一步收紧时可在前置代理上限制 `/control/` 路径的来源。前置代理的访问日志应避免记录 Cookie、Authorization、`_ob_ctx` 或含凭证的请求体。同源代理明确**信任各节点的前端代码与通知 worker**：它们拥有同一浏览器 origin 的权限，Cookie/context 防串号不等于隔离互相恶意的节点。对不同信任级别应用可考虑分离 origin，但本服务不强制域名、HTTPS 或改为直连/SSO。妥善保护和备份私有状态/配置，其中必须保存转发与上报密钥；不要上传公开仓库。不实现自研传输加密或 mTLS。

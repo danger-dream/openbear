@@ -36,6 +36,8 @@ function harness({ mobile = true, row = saved } = {}) {
     nodePath: row => row.path || '目录 F', recentLabel: () => '刚刚', rowLabel: row => row.title || row.name, indentation: () => '0px', isExpanded: () => false, toggleRow() {},
     activateRow: row => opened.push(row.id), locateAndOpen: row => opened.push(row.id), dragOver() {}, drop() {}, clearDrag() {},
     rootDropTarget: {kind: 'root', id: '__root'},
+    selecting: ref(false), isSelected: () => false, selectableRow: row => row?.kind === 'conversation' && !row.local, toggleSelected() {}, exitSelection() {}, enterSelection() {},
+    clickConversation: (_event, row) => row.search ? ctx.locateAndOpen(row) : ctx.activateRow(row),
     selectFolder() {}, emit: (...args) => emitted.push(args), loadAllFolders: async () => moved.push('folders'),
     ElMessage: { error(error) { assert.fail(String(error)); } }, apiError: String,
   });
@@ -47,7 +49,7 @@ function harness({ mobile = true, row = saved } = {}) {
     const app = createSSRApp({ render() { tree = (menu === 'shield' ? renderShield : menu ? renderMenu : renderRow).call(this, bindings, []); return tree; } });
     app.component('ElIcon', { render() { return h('i', this.$slots.default?.()); } });
     app.component('AnimatedConversationTitle', { props: ['text'], render() { return h('span', this.text); } });
-    for (const icon of ['Aim', 'MoreFilled', 'StarFilled', 'FolderOpened', 'EditPen', 'DocumentCopy', 'Refresh', 'Box', 'Delete', 'Star', 'Check', 'InfoFilled', 'FolderAdd', 'ChatLineRound', 'MagicStick']) app.component(icon, { render: () => h('svg') });
+    for (const icon of ['Aim', 'Finished', 'MoreFilled', 'StarFilled', 'FolderOpened', 'EditPen', 'DocumentCopy', 'Refresh', 'Box', 'Delete', 'Star', 'Check', 'InfoFilled', 'FolderAdd', 'ChatLineRound', 'MagicStick']) app.component(icon, { render: () => h('svg') });
     const html = await renderToString(app);
     return { html, nodes: walk([tree]) };
   } };
@@ -202,11 +204,12 @@ for (const mobile of [false, true]) for (const [state, extra] of Object.entries(
     assert.deepEqual(directory, recent.filter(item => item.label !== '在目录中定位'));
     assert.deepEqual(directory.map(item => item.label), [
       '新建同级会话', ...(extra.activityUnread ? ['标为已读'] : []), '生成会话名称', '重命名', '复制会话', extra.pinned ? '取消置顶' : '置顶',
-      'separator', '移动到…', '更新系统提示词…', extra.archived ? '取消归档' : '归档', '会话属性', 'separator', '删除会话',
+      'separator', '多选', '移动到…', '更新系统提示词…', extra.archived ? '取消归档' : '归档', '会话属性', 'separator', '删除会话',
     ]);
     const disabled = label => directory.find(item => item.label === label).disabled;
     assert.equal(disabled('会话属性'), false, 'properties can show the explicit local-draft persistence gate');
     assert.equal(disabled('重命名'), Boolean(extra.local));
+    assert.equal(disabled('多选'), Boolean(extra.local));
     assert.equal(disabled('复制会话'), Boolean(extra.local || extra.running));
     assert.equal(disabled('更新系统提示词…'), Boolean(extra.local || extra.running));
     assert.equal(disabled('删除会话'), Boolean(extra.running));

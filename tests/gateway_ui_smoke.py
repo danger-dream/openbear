@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from gateway_stack_smoke import port, ready
 
@@ -109,12 +109,39 @@ async def exercise_browser(stack, client, chrome):
         await old.evaluate("window.__beforeSkillsReload = true")
         await old.call("Page.reload")
         await old.wait("!window.__beforeSkillsReload && location.pathname === '/skills' && document.querySelector('.skills-page')")
-        sizes = await old.evaluate("(() => {const assets=performance.getEntriesByType('resource').filter(e=>new URL(e.name).pathname.startsWith('/assets/') && /-[A-Za-z0-9_-]{8,}\\.(js|css)$/.test(new URL(e.name).pathname)); return {count:assets.length,bodyBytes:assets.reduce((n,e)=>n+e.encodedBodySize,0),networkBytes:assets.reduce((n,e)=>n+e.transferSize,0)};})()")
+        prefix = "/_i/" + first["id"] + "/"
+        sizes = await old.evaluate("(() => {const assets=performance.getEntriesByType('resource').filter(e=>new URL(e.name).pathname.startsWith(" + json.dumps(prefix + "assets/") + ") && /-[A-Za-z0-9_-]{8,}\\.(js|css)$/.test(new URL(e.name).pathname)); return {count:assets.length,bodyBytes:assets.reduce((n,e)=>n+e.encodedBodySize,0),networkBytes:assets.reduce((n,e)=>n+e.transferSize,0)};})()")
         assert sizes['count'] > 0 and sizes['bodyBytes'] > 0 and sizes['networkBytes'] < sizes['bodyBytes'] / 2, f"compiled resources were downloaded again: {sizes}"
         print(f"real Chrome Skills: bookmark -> login -> Skills -> refresh passed; hashed JS/CSS body={sizes['bodyBytes']} bytes, refresh network={sizes['networkBytes']} bytes")
         assert "served-by:" + first["username"] in await old.evaluate("new XMLSerializer().serializeToString(document)")
         await old.navigate(stack.public + "/chat")
         await old.wait("document.body.innerText.includes('family-one-private')")
+        loaded = await old.evaluate("""(async () => {
+          const prefix = """ + json.dumps(prefix) + """;
+          await document.fonts.load('16px KaTeX_Main');
+          const worker = window.MonacoEnvironment.getWorker();
+          const registration = await navigator.serviceWorker.register('/openbear-push-sw.js', {scope: '/', updateViaCache: 'none'});
+          const ready = await navigator.serviceWorker.ready;
+          let rejected = false;
+          try { await navigator.serviceWorker.register(document.querySelector('script[type=module]').src, {scope: prefix + 'assets/'}); } catch { rejected = true; }
+          await new Promise(resolve => setTimeout(resolve, 500));
+          worker.terminate();
+          const script = ready.active.scriptURL;
+          await registration.unregister();
+          const paths = performance.getEntriesByType('resource').map(entry => new URL(entry.name).pathname);
+          return {rejected, script: new URL(script).pathname, katex: paths.filter(path => path.includes('KaTeX_Main-Regular'))};
+        })()""")
+        assert loaded["rejected"] and loaded["script"] == "/openbear-push-sw.js", loaded
+        assert loaded["katex"] and all(path.startswith(prefix + "assets/") for path in loaded["katex"]), loaded
+        worker = [item["url"] for item in old.requests if "editor.worker" in item["url"]]
+        assert worker and all(urlsplit(url).path.startswith(prefix + "assets/") for url in worker), worker
+        # The install manifest is fetched by the browser itself and needs the login cookie.
+        manifest = await old.call("Page.getAppManifest")
+        manifest_path = urlsplit(manifest.get("url", "")).path
+        assert json.loads(manifest.get("data") or "{}").get("name") == "OpenBear", manifest
+        assert manifest_path == "/manifest.webmanifest" or manifest_path.startswith(prefix + "assets/pwa/"), manifest_path
+        print("real Chrome: gateway notification worker registered, node script refused as a worker; KaTeX font, editor worker and "
+              f"install manifest ({manifest_path}) load below " + prefix)
         await old.evaluate("localStorage.setItem('controller-fixture','preserve'); true")
         other = await new_page(client, debug, stack.public + "/chat")
         await other.wait("document.body.innerText.includes('family-one-private')")
@@ -132,8 +159,15 @@ async def exercise_browser(stack, client, chrome):
         assert await old.evaluate("localStorage.getItem('controller-fixture')") == "preserve"
         cookies = await other.call("Network.getCookies", {"urls": [stack.public]})
         assert any(cookie["name"] == "openbear_controller_fixture" for cookie in cookies["cookies"])
-        for page in (old, other):
+        # The second tab showed the first instance before switching accounts.
+        for page, children in ((old, (first,)), (other, (first, second))):
             assert not page.exceptions, "uncaught frontend exception"
+            # Every compiled file comes from the instance prefix of its document.
+            prefixes = tuple("/_i/" + child["id"] + "/assets/" for child in children)
+            paths = [urlsplit(item["url"]).path for item in page.requests if item["url"].startswith(stack.public)]
+            assert all(any(path.startswith(prefix) for path in paths) for prefix in prefixes), "no prefixed asset loaded"
+            stray = [path for path in paths if path.startswith(("/assets/", "/_i/")) and not path.startswith(prefixes)]
+            assert not stray, f"asset outside the page's instance prefix: {stray[:5]}"
             requests = [item for item in page.requests if item["url"].startswith(stack.public + "/api/") and "/api/auth/" not in item["url"]]
             assert requests, "frontend did not make real business requests"
             for item in requests:

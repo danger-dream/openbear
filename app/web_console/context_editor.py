@@ -6,18 +6,33 @@ import uuid
 
 from aiohttp import web
 
-from app.agent.native_continuation import deserialize_messages, serialize_messages, validate_model_context
-from app.context.editor import branch_settings, clone, compile_document, digest, document, validate_document
+from app.agent.native_continuation import (
+    deserialize_messages,
+    serialize_messages,
+    validate_model_context,
+)
+from app.config import fast_request_mode
 from app.context.configuration import conversation_strategy
+from app.context.editor import (
+    branch_settings,
+    clone,
+    compile_document,
+    digest,
+    document,
+    validate_document,
+)
 from app.context.prompts import effective_context_prompt
 from app.context.runtime import ContextManager
-from app.context.store import ContextOwner, WindowStore
+from app.context.store import ContextOwner, StaleWindow, WindowStore
 from app.context.window import WindowPolicy
-from app.config import fast_request_mode
 from app.db.dao import MessageDAO
 from app.db.engine import now_ts
 from app.references import BUNDLE_FIELD
-from app.task_memory import TaskMemoryDAO, reconcile_task_memory_runtime_state, task_memory_runtime_epoch
+from app.task_memory import (
+    TaskMemoryDAO,
+    reconcile_task_memory_runtime_state,
+    task_memory_runtime_epoch,
+)
 from app.web_console.core import _WEB_SESSION_KEY
 
 
@@ -111,7 +126,8 @@ class WebAdminContextEditorMixin:
         backend, model, max_tokens = self.llm_factory.backend_for(label)
         protocol = self.config.models.resolve(label)[0].protocol
         doc, issues = compile_document(body.get('baseline'), body.get('working'), protocol=protocol, model_label=label,
-                                       available_tools=self.tools.names(scope='main') if self.tools else [])
+                                       available_tools=self.tools.names(scope='main') if self.tools else [],
+                                       repair_reasoning=body.get('mode', 'compatible') == 'compatible')
         payload = None
         if not any(x['severity'] == 'error' for x in issues):
             dao = MessageDAO(self.db)
@@ -163,6 +179,83 @@ class WebAdminContextEditorMixin:
             await conn.execute('INSERT INTO context_editor_drafts VALUES(?,?,?,?) ON CONFLICT(conversation_uuid) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json,updated_at=excluded.updated_at',
                                (row['conversation_uuid'], revision + 1, encoded, now_ts()))
         return response({'ok': True, 'draft': {**draft, 'revision': revision + 1}})
+
+    async def handle_api_context_editor_save(self, request):
+        row = await self._conversation_from_request(request)
+        body = await self._editor_body(request)
+        if body.get('mode', 'compatible') != 'compatible':
+            return response({'ok': False, 'error': 'raw_draft_not_executable'}, 400)
+        revision = body.get('revision', 0)
+        if type(revision) is not int or revision < 0:
+            return response({'ok': False, 'error': 'invalid_revision'}, 400)
+        chat, conv = int(row['internal_chat_id']), row['conversation_uuid']
+        async with self.operation_locks.try_chat(chat, 'context_editor_save') as acquired:
+            if not acquired or await self._editor_busy(row):
+                return response({'ok': False, 'error': 'busy'}, 409)
+            row = await self._conversation_row(request[_WEB_SESSION_KEY].chat_id, conv, require=True)
+            try:
+                _, token = await self._editor_snapshot(row)
+                if body.get('snapshotToken') != token:
+                    return response({'ok': False, 'error': 'context_source_changed'}, 409)
+                doc, issues, _, label, _, _ = await self._editor_compile(row, body)
+                if any(x['severity'] == 'error' for x in issues):
+                    return response({'ok': False, 'error': 'context_validation_failed', 'issues': issues}, 400)
+                history = deserialize_messages([e['message'] for e in doc['entries']])
+                edit_id = str(uuid.uuid4())
+                for index, message in enumerate(history):
+                    prior = message.get('openbear_context_source') or {}
+                    # Edited context is a new lineage, never a rewrite of an original event.
+                    message['openbear_context_source'] = {
+                        **prior, 'id': f'context-edit:{edit_id}:{index}', 'derived_from': prior.get('id', ''),
+                        'kind': 'human' if message['role'] == 'user' else 'execution',
+                        'reference_only': False, 'task_uuid': '',
+                    }
+                    message['openbear_context_source'].pop('message_id', None)
+                    message.pop(BUNDLE_FIELD, None)
+                dao = MessageDAO(self.db)
+                sid = await dao.get_or_create_session_uuid(chat)
+                store = WindowStore(self.db, ContextOwner.controller(chat_id=chat, session_uuid=sid, conversation_uuid=conv))
+                async with self.db.conn.transaction(label='context-editor-save-original') as conn:
+                    row = await self._conversation_row(request[_WEB_SESSION_KEY].chat_id, conv, require=True)
+                    _, current_token = await self._editor_snapshot(row)
+                    if current_token != token:
+                        return response({'ok': False, 'error': 'context_source_changed'}, 409)
+                    cur = await conn.execute('SELECT revision FROM context_editor_drafts WHERE conversation_uuid=?', (conv,))
+                    draft = await cur.fetchone()
+                    if (draft['revision'] if draft else 0) != revision:
+                        return response({'ok': False, 'error': 'draft_conflict'}, 409)
+                    cur = await conn.execute('SELECT COALESCE(MAX(id),0) FROM messages WHERE chat_id=?', (chat,))
+                    high_water = int((await cur.fetchone())[0])
+                    archived = await store.archive(history)
+                    await store.save(history, expected_revision=archived['revision'],
+                        expected_source_revision=archived['sourceRevision'], route='', rotated=True,
+                        reason='context_edit', source_message_high_water=high_water,
+                        detail={'editId': edit_id, 'messageCount': len(history)})
+                    settings = {'system': doc['system'], 'tools': doc['tools'], 'frozen': True}
+                    package = {'format': 'openbear-context-edit-package/1', 'baseline': body['baseline'],
+                        'working': body['working'], 'compiled': doc, 'editor': {'mode': 'compatible', 'targetModel': label}}
+                    await conn.execute('''INSERT INTO context_editor_branches VALUES(?,?,?,?,?)
+                        ON CONFLICT(conversation_uuid) DO UPDATE SET settings_json=excluded.settings_json,document_json=excluded.document_json''',
+                        (conv, conv, json.dumps(settings, ensure_ascii=False), json.dumps(package, ensure_ascii=False), now_ts()))
+                    await conn.execute('UPDATE sessions SET system_snapshot=?,updated_at=? WHERE chat_id=?', (doc['system'], now_ts(), chat))
+                    await conn.execute('UPDATE web_conversations SET model=?,updated_at=? WHERE conversation_uuid=?', (label, now_ts(), conv))
+                    await dao.save_controller_model_context(chat, conversation_uuid=conv, session_id=sid,
+                        protocol=self.config.models.resolve(label)[0].protocol, model=self.config.models.resolve(label)[1].id,
+                        model_label=label, state={'messages': serialize_messages(history)})
+                    row = await self._conversation_row(request[_WEB_SESSION_KEY].chat_id, conv, require=True)
+                    baseline, token = await self._editor_snapshot(row)
+                    draft = {'baseline': baseline, 'working': clone(baseline), 'snapshotToken': token,
+                        'mode': 'compatible', 'targetModel': label}
+                    await conn.execute('''INSERT INTO context_editor_drafts VALUES(?,?,?,?)
+                        ON CONFLICT(conversation_uuid) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json,updated_at=excluded.updated_at''',
+                        (conv, revision + 1, json.dumps(draft, ensure_ascii=False), now_ts()))
+            except StaleWindow:
+                return response({'ok': False, 'error': 'context_source_changed'}, 409)
+            except (ValueError, TypeError, KeyError) as exc:
+                return response({'ok': False, 'error': str(exc)}, 400)
+            return response({'ok': True, 'conversation': self._web_conversation_json(row, live=self._live_for(row)),
+                'baseline': baseline, 'snapshotToken': token, 'targetModel': label,
+                'draft': {**draft, 'revision': revision + 1}, 'issues': issues})
 
     async def handle_api_context_editor_branch(self, request):
         row = await self._conversation_from_request(request)

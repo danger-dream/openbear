@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """把 app/__init__.py 的版本同步到 pyproject.toml、前端 package 及两种锁文件。
 
+版本格式见 app/versioning.py：X.Y.Z、X.Y.Z-rc.N、X.Y.Z-beta.N、X.Y.Z-dev.N。
+uv.lock 里写 uv 自己的 PEP 440 规范化写法（1.2.0b1、1.2.0.dev3），其余文件写原样。
+
 用法：
   python scripts/bump_version.py 0.2.0
+  python scripts/bump_version.py 0.3.0-beta.1
   python scripts/bump_version.py --check   # 所有版本字段必须与 __version__ 一致
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_versioning():
+    # By path: this script runs from a bare checkout, without the app package installed.
+    path = ROOT / "app" / "versioning.py"
+    spec = importlib.util.spec_from_file_location("openbear_versioning", path)
+    module = importlib.util.module_from_spec(spec)
+    # No app/__pycache__ in the tree whose version this changes (a release commits it).
+    keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = keep
+    return module
+
+
+versioning = _load_versioning()
 INIT_PATH = ROOT / "app" / "__init__.py"
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 PACKAGE_PATH = ROOT / "web" / "package.json"
@@ -86,7 +108,7 @@ def read_lock_version() -> str:
 
 def write_lock_version(version: str) -> None:
     text = LOCK_PATH.read_text(encoding="utf-8")
-    new_text, count = LOCK_RE.subn(rf"\g<1>{version}\g<2>", text, count=1)
+    new_text, count = LOCK_RE.subn(rf"\g<1>{versioning.pep440(version)}\g<2>", text, count=1)
     if count != 1:
         raise SystemExit(f"无法更新 {LOCK_PATH} 中的 openbear version（匹配 {count} 次）")
     LOCK_PATH.write_text(new_text, encoding="utf-8")
@@ -96,6 +118,9 @@ def check(expected: str | None = None) -> int:
     init = read_init_version()
     if expected and init != expected:
         print(f"__version__={init} 与期望 {expected} 不一致", file=sys.stderr)
+        return 1
+    if not versioning.valid(init) or init.startswith("v"):
+        print(f"__version__={init} 不是 X.Y.Z、X.Y.Z-rc.N、X.Y.Z-beta.N 或 X.Y.Z-dev.N", file=sys.stderr)
         return 1
     pyproject = read_pyproject_version()
     package = read_package_version()
@@ -112,8 +137,8 @@ def check(expected: str | None = None) -> int:
         if value != init:
             print(f"web/package-lock.json {field}={value} 与 __version__={init} 不一致", file=sys.stderr)
             bad = True
-    if lock != init:
-        print(f"uv.lock openbear version={lock} 与 __version__={init} 不一致", file=sys.stderr)
+    if lock != versioning.pep440(init):
+        print(f"uv.lock openbear version={lock} 与 __version__={init}（应写作 {versioning.pep440(init)}）不一致", file=sys.stderr)
         bad = True
     if bad:
         return 1
@@ -123,7 +148,7 @@ def check(expected: str | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("version", nargs="?", help="要写入的 semver，不含 v")
+    parser.add_argument("version", nargs="?", help="要写入的版本：X.Y.Z、X.Y.Z-rc.N、X.Y.Z-beta.N 或 X.Y.Z-dev.N")
     parser.add_argument("--check", action="store_true", help="只检查所有版本字段是否一致")
     parser.add_argument("--expect", default="", help="check 时额外要求等于该版本")
     args = parser.parse_args(argv)
@@ -131,7 +156,10 @@ def main(argv: list[str] | None = None) -> int:
         return check(args.expect or None)
     if not args.version:
         parser.error("需要版本号，或使用 --check")
-    version = args.version[1:] if args.version.startswith("v") else args.version
+    parsed = versioning.parse(args.version)
+    if parsed is None:
+        parser.error(f"{args.version} 不是 X.Y.Z、X.Y.Z-rc.N、X.Y.Z-beta.N 或 X.Y.Z-dev.N")
+    version = str(parsed)
     write_init_version(version)
     write_pyproject_version(version)
     write_package_version(version)

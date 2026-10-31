@@ -49,7 +49,8 @@ func run() error {
 		return errors.New("cannot bind public listener")
 	}
 	defer public.Close()
-	// Control shares the public port; a legacy separate listener still works.
+	// The controller installs a loopback controlListen, which takes the control
+	// API off the public port; without one both share the public listener.
 	var control net.Listener
 	if c.ControlListen != "" {
 		if control, e = net.Listen("tcp", c.ControlListen); e != nil {

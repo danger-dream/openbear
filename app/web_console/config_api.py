@@ -40,7 +40,7 @@ class WebAdminSettingsChannelsMixin:
         )
 
     async def handle_api_settings_specs(self, request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, **settings_admin.settings_specs_payload()})
+        return web.json_response({"ok": True, **settings_admin.settings_specs_payload(managed=self.config.managed.enabled)})
 
     async def handle_api_settings_get(self, request: web.Request) -> web.Response:
         data = self.config.model_dump(by_alias=True)

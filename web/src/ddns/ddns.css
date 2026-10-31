@@ -1,0 +1,255 @@
+/* 动态域名: builds on instances.css and servers.css (rows, cards, pills, sheets); only what they lack. */
+/* A tab of the servers page: it fills what the tabs leave, the list scrolling inside. */
+.dd-page { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.dd-body { display: flex; flex: 1; min-height: 0; }
+.dd-btn-icon { margin-right: 4px; }
+.dd-ui .mono, .dd-card .mono { font-family: var(--ix-mono); font-size: var(--ix-sm); }
+
+/* Letter marks for providers. */
+.dd-logo { display: grid; flex: none; place-items: center; width: 26px; height: 26px; border-radius: 7px; color: #fff; font-size: 11px; font-weight: 700; letter-spacing: -.02em; line-height: 1; }
+.dd-logo.is-all { background: var(--ob-chat-hover); color: var(--ob-chat-subtle); }
+
+/* Left: accounts. */
+.dd-providers { display: flex; flex: none; flex-direction: column; gap: 2px; width: 248px; padding: 10px 8px; border-right: 1px solid var(--ob-chat-line); overflow-y: auto; overscroll-behavior: contain; }
+.dd-providers > h2 { margin: 4px 8px 6px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
+.dd-prov { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border-radius: 8px; color: var(--ob-chat-text); text-align: left; cursor: pointer; }
+.dd-prov:hover:not(:disabled) { background: var(--ob-chat-hover); }
+.dd-prov[aria-current='true'] { background: var(--ob-chat-selected); }
+.dd-prov-text { display: flex; flex-direction: column; min-width: 0; }
+.dd-prov-name { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.dd-prov-meta { overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-overflow: ellipsis; white-space: nowrap; }
+.dd-prov-meta[data-tone='bad'] { color: var(--ob-danger); }
+.dd-prov-count { color: var(--ob-chat-muted); font-size: var(--ix-sm); font-variant-numeric: tabular-nums; }
+.dd-prov-sep { height: 1px; margin: 8px 6px; background: var(--ob-chat-line); }
+.dd-prov-add { margin-top: 6px; }
+.dd-prov-add .dd-prov-name { color: var(--ob-chat-subtle); font-weight: 400; }
+
+/* Right: the account bar, tools and the table. */
+.dd-main { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.dd-acct-bar { display: flex; flex: none; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--ob-chat-line); }
+.dd-acct-name { flex: none; font-weight: 600; }
+.dd-zones { min-width: 0; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-overflow: ellipsis; white-space: nowrap; }
+.dd-gear { width: 30px; height: 30px; }
+.dd-toolbar { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 20px; }
+.dd-search { display: flex; flex: 0 1 280px; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border-radius: 7px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); }
+.instance-ui .dd-search > input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; background: transparent; box-shadow: none; }
+.instance-ui .dd-search > input::-webkit-search-cancel-button { display: none; }
+.dd-chip { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 0 4px 0 9px; border-radius: 13px; background: var(--ob-chat-selected); font-size: var(--ix-sm); }
+.dd-chip > .sv-flag { font-size: 14px; line-height: 1; }
+.dd-chip-x { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; color: var(--ob-chat-subtle); }
+.dd-chip-x:hover { background: var(--ob-chat-hover); color: var(--ob-chat-text); }
+.dd-total { color: var(--ob-chat-muted); font-size: var(--ix-sm); }
+/* The tab's own actions, looking like the ones in the page header above: quiet, the main one neutral. */
+.dd-actions { display: inline-flex; align-items: center; gap: 6px; }
+.instance-ui .dd-actions .el-button { height: 30px; min-height: 30px; margin: 0; padding: 0 10px; border: 1px solid transparent; background: transparent; color: var(--ob-chat-subtle); box-shadow: none; white-space: nowrap; }
+.instance-ui .dd-actions .el-button:not(.is-disabled):hover { background: var(--ob-chat-hover); color: var(--ob-chat-text); }
+.instance-ui .dd-actions .el-button--primary { background: var(--ob-chat-selected); color: var(--ob-chat-text); font-weight: 500; }
+.instance-ui .dd-actions .el-button.is-disabled { opacity: .45; }
+.dd-table-wrap { flex: 1; min-height: 0; padding: 0 12px 16px; overflow: auto; overscroll-behavior: contain; }
+.dd-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.dd-table th { position: sticky; top: 0; z-index: 1; padding: 6px 8px; border-bottom: 1px solid var(--ob-chat-line); background: var(--ob-chat-bg); color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; text-align: left; }
+.dd-table td { padding: 9px 8px; border-bottom: 1px solid var(--ob-chat-line); vertical-align: middle; }
+.dd-table tbody tr { cursor: pointer; }
+.dd-table tbody tr:hover td { background: var(--ob-chat-hover); }
+.dd-table tbody tr[aria-selected='true'] td { background: var(--ob-chat-selected); }
+.dd-table tbody tr:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: -2px; }
+.dd-c-domain .dd-name { color: var(--ob-text-strong); font-weight: 500; overflow-wrap: anywhere; }
+.dd-acct { display: block; color: var(--ob-chat-muted); font-size: var(--ix-sm); }
+.dd-type { display: inline-block; min-width: 40px; padding: 0 6px; border-radius: 5px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-size: 11.5px; font-weight: 600; line-height: 18px; text-align: center; }
+.dd-type-inline, .dd-mobile-src { display: none; }
+.dd-src-how { color: var(--ob-chat-muted); font-size: var(--ix-sm); }
+.dd-c-val .mono { overflow-wrap: anywhere; }
+.dd-c-state { white-space: nowrap; }
+.dd-c-go { width: 20px; color: var(--ob-chat-muted); }
+.dd-empty { padding: 48px 20px; }
+
+/* Pills: instances.css has ok / warn / bad; syncing and waiting are violet, quiet states gray. */
+.dd-ui .ix-pill[data-tone='busy'], .dd-card .ix-pill[data-tone='busy'] { background: var(--ob-violet-soft); color: var(--ob-violet); }
+.dd-ui .ix-pill[data-tone='idle'], .dd-card .ix-pill[data-tone='idle'] { background: var(--ob-chat-hover); color: var(--ob-chat-subtle); }
+.dd-ui .ix-pill, .dd-card .ix-pill { font-size: var(--ix-sm); line-height: 20px; }
+
+/* Surfaces: the drawer on a desktop, dialogs, and the phone sheet. */
+.dd-sub { margin: -2px 0 12px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.dd-drawer.el-drawer { background: var(--ob-chat-bg); }
+.dd-drawer > .el-drawer__body { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
+.dd-drawer-head { display: flex; flex: none; align-items: flex-start; gap: 10px; padding: 14px 12px 10px 16px; border-bottom: 1px solid var(--ob-chat-line); }
+.dd-drawer-title { flex: 1; min-width: 0; }
+.dd-drawer-title h2 { margin: 0; color: var(--ob-text-strong); font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.dd-drawer-title .dd-sub { margin: 2px 0 0; }
+.dd-close { width: 30px; height: 30px; }
+.dd-drawer-body { flex: 1; min-height: 0; padding: 12px 16px 0; overflow-y: auto; overscroll-behavior: contain; }
+.dd-drawer .instance-form-footer { bottom: 0; margin: 0 -16px; padding: 10px 16px; }
+.dd-dialog .el-dialog__body { padding-top: 4px; }
+.dd-sheet .dd-sub { margin-top: -4px; }
+
+/* Shared building blocks of the forms and the details. */
+.dd-form { gap: 14px; }
+.dd-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; font-size: var(--ix-sm); }
+.dd-field > span:first-child, .dd-field > label:first-child, .dd-field-head { color: var(--ob-chat-subtle); }
+.dd-field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dd-full { grid-column: 1 / -1; }
+.dd-step { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; }
+.dd-step-n { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 600; }
+.dd-step-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dd-step-title { color: var(--ob-text-strong); font-size: var(--ix-md); font-weight: 500; }
+.dd-domains { min-height: 70px; line-height: 1.55; }
+.dd-detect { display: grid; gap: 3px; font-size: var(--ix-md); }
+.dd-detect:empty { display: none; }
+.dd-detect-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+.dd-detect-row > .mono { overflow-wrap: anywhere; }
+.dd-detect-row[data-tone='warn'] { color: var(--ob-warning); }
+.dd-detect-row[data-tone='bad'] { color: var(--ob-danger); }
+.dd-detect-lab { min-width: 34px; color: var(--ob-chat-subtle); }
+.dd-checks { display: flex; flex-wrap: wrap; gap: 8px; }
+.instance-form .dd-check { display: inline-flex; flex-direction: row; font-size: var(--ix-md); align-items: center; gap: 7px; min-height: 34px; padding: 5px 10px; border: 1px solid var(--ob-chat-border); border-radius: 8px; cursor: pointer; user-select: none; }
+.dd-check small { color: var(--ob-chat-muted); }
+.dd-check:has(input:disabled) { cursor: default; opacity: .6; }
+.dd-sec > h4 { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
+.dd-sec-action { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.dd-preview { overflow: hidden; border: 1px solid var(--ob-chat-line); border-radius: 10px; background: var(--ob-chat-panel); }
+.dd-pr { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 10px; padding: 8px 11px; border-bottom: 1px solid var(--ob-chat-line); font-size: var(--ix-md); }
+.dd-pr:last-child { border-bottom: 0; }
+.dd-pr-name { min-width: 0; color: var(--ob-text-strong); font-weight: 500; overflow-wrap: anywhere; }
+.dd-pr-meta { grid-column: 1 / -1; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.instance-ui select.dd-pr-account { display: inline-block; width: auto; max-width: 100%; padding: 1px 24px 1px 6px; font-size: var(--ix-sm); background-position: right 6px center; }
+.instance-form .dd-take { grid-column: 1 / -1; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 7px; color: var(--ob-warning); font-size: var(--ix-sm); cursor: pointer; }
+.dd-take input { margin-top: 2px !important; accent-color: var(--ob-warning); }
+.dd-take-all { padding: 8px 11px; border-radius: 9px; background: var(--ob-warning-soft); }
+.dd-bad-text { color: var(--ob-danger); }
+.dd-note { padding: 9px 11px; border-radius: 9px; background: var(--ob-chat-hover); font-size: var(--ix-md); overflow-wrap: anywhere; }
+.dd-note[data-tone='ok'] { background: var(--ob-success-soft); }
+.dd-note[data-tone='warn'] { background: var(--ob-warning-soft); }
+.dd-note[data-tone='bad'] { background: var(--ob-danger-soft); }
+.dd-note b { font-weight: 600; }
+.dd-note p { margin: 0 0 6px; }
+.dd-adv { margin: 0 !important; padding-top: 10px; border-top: 1px solid var(--ob-chat-line); }
+.instance-ui .dd-adv > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; min-height: 32px; list-style: none; color: var(--ob-chat-subtle); font-size: var(--ix-md); }
+.dd-adv > summary::-webkit-details-marker { display: none; }
+.dd-adv-chev { transition: transform .15s; }
+.dd-adv[open] .dd-adv-chev { transform: rotate(90deg); }
+.dd-adv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; margin-top: 10px; }
+.dd-choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.dd-choices > label { display: inline-flex; flex-direction: row; align-items: center; gap: 5px; min-height: 30px; padding: 3px 9px; border: 1px solid var(--ob-chat-border); border-radius: 7px; color: var(--ob-chat-text); font-size: var(--ix-sm); cursor: pointer; }
+.dd-choices > label:has(input:checked) { border-color: transparent; background: var(--ob-chat-selected); }
+.dd-ui .ob-check > span { display: flex; flex-direction: column; gap: 1px; }
+.dd-ui .ob-check { align-items: flex-start; }
+.dd-ui .ob-check > input { margin-top: 3px; }
+.dd-foot { align-items: center; }
+.dd-save-note { flex: 1; min-width: 0; color: var(--ob-warning); font-size: var(--ix-sm); }
+.dd-save-note:empty { visibility: hidden; }
+.dd-danger.el-button { color: var(--ob-danger); }
+.dd-yaml { min-height: 150px; }
+.dd-list { margin: 0; padding-left: 18px; font-size: var(--ix-md); }
+
+/* Provider choice and credentials. */
+.instance-ui input.dd-provider-search { flex: none; }
+.dd-pgroups { display: flex; flex-direction: column; gap: 12px; }
+.dd-pgroup > h5 { margin: 0 0 6px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
+.dd-pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 6px; }
+.dd-pcard { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 36px; padding: 6px 9px; border: 1px solid var(--ob-chat-line); border-radius: 9px; background: var(--ob-chat-panel); color: var(--ob-chat-text); font-size: var(--ix-md); text-align: left; cursor: pointer; }
+.dd-pcard:hover { background: var(--ob-chat-hover); }
+.dd-pcard .dd-logo, .dd-picked .dd-logo { width: 22px; height: 22px; border-radius: 6px; font-size: 10px; }
+.dd-picked { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dd-link { color: var(--ob-violet); font-size: var(--ix-sm); text-decoration: none; }
+.dd-link:hover { text-decoration: underline; }
+.dd-map { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--ob-chat-line); border-radius: 10px; }
+.instance-form .dd-map-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); align-items: center; gap: 10px; font-size: var(--ix-sm); }
+
+/* Details. */
+.dd-detail { display: flex; flex-direction: column; gap: 14px; }
+.dd-detail-meta { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.dd-detail-meta > .ix-pill { margin-left: auto; }
+.dd-kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; overflow: hidden; border-radius: 10px; background: var(--ob-chat-line); }
+.dd-kv > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 9px 11px; background: var(--ob-chat-panel); }
+.dd-k { color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.dd-v { color: var(--ob-text-strong); overflow-wrap: anywhere; }
+.dd-v.is-diff { color: var(--ob-warning); }
+.dd-diag { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 0; padding: 0; list-style: none; font-size: var(--ix-md); }
+.dd-diag > li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.dd-diag-how { min-width: 56px; color: var(--ob-chat-subtle); }
+.dd-diag + p, .dd-sec > .dd-note + .dd-note { margin: 6px 0 0; }
+.dd-events { margin: 0; padding: 0; list-style: none; }
+.dd-events > li { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--ob-chat-line); font-size: var(--ix-md); }
+.dd-events time { color: var(--ob-chat-muted); font-size: var(--ix-sm); font-variant-numeric: tabular-nums; }
+.dd-events [data-tone='ok'] { color: var(--ob-success); }
+.dd-events [data-tone='warn'] { color: var(--ob-warning); }
+.dd-events [data-tone='bad'] { color: var(--ob-danger); }
+
+/* The node picker: flags, and the address at the end. */
+.dd-node-trigger .ss-via, .dd-node-panel .ss-via { font-family: var(--ix-mono, ui-monospace, monospace); }
+.dd-node-trigger .ss-via.dd-off, .dd-node-panel .ss-option.is-off .ss-name { color: var(--ob-chat-subtle); }
+.ss-tag.dd-tag-warn { background: var(--ob-warning-soft); color: var(--ob-warning); }
+
+/* The card on a server's detail page. */
+/* Rows share the list's columns (subgrid), so types, values and states line up. */
+.dd-card-list { display: grid; grid-template-columns: minmax(0, 1.4fr) auto minmax(0, 1fr) auto 14px; column-gap: 8px; margin: 0; padding: 0; list-style: none; }
+.dd-card-list > li { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
+.dd-card-list > li + li { border-top: 1px solid var(--ob-chat-line); }
+.dd-card-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; gap: 8px; width: 100%; min-height: 34px; padding: 4px 2px; border-radius: 6px; color: var(--ob-chat-text); font-size: var(--ix-md); text-align: left; cursor: pointer; }
+.dd-card-row:hover { background: var(--ob-chat-hover); }
+.dd-card-row > .dd-type { justify-self: start; }
+.dd-card-row > .ix-pill { justify-self: end; }
+.dd-card-name { font-weight: 500; }
+.dd-card-value { color: var(--ob-chat-subtle); }
+.dd-card-go { color: var(--ob-chat-muted); }
+.dd-card-empty { margin: 0; font-size: var(--ix-sm); }
+/* As a section of the mesh member's status page, headed like 本机地址 there. */
+.dd-card-panel { margin-top: 12px; }
+.dd-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-bottom: 6px; }
+.dd-panel-head > h4 { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.dd-panel-head > .ix-text-button { font-size: var(--ix-xs); }
+
+@media (max-width: 760px) {
+  .dd-body { flex-direction: column; }
+  /* Accounts become a row of chips under the header, "全部" first. */
+  .dd-providers { flex-direction: row; gap: 6px; width: auto; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--ob-chat-line); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  .dd-providers::-webkit-scrollbar { display: none; }
+  .dd-providers > h2, .dd-prov-sep, .dd-prov-meta { display: none; }
+  .dd-prov { flex: none; grid-template-columns: 20px auto auto; gap: 6px; width: auto; min-height: 34px; padding: 4px 11px 4px 7px; border-radius: 17px; background: var(--ob-chat-hover); }
+  .dd-prov[aria-current='true'] { background: var(--ob-chat-selected); box-shadow: inset 0 0 0 1px var(--ob-chat-border); }
+  .dd-prov .dd-logo { width: 20px; height: 20px; border-radius: 50%; font-size: 9px; }
+  .dd-prov-name { max-width: 120px; font-size: var(--ix-md); }
+  .dd-prov.is-bad .dd-prov-name::after { content: ' ●'; color: var(--ob-danger); font-size: 9px; vertical-align: 2px; }
+  .dd-prov-add { margin-top: 0; }
+  /* Name, 测试连接 and the gear on the first line; the state and the zones under them. */
+  .dd-acct-bar { flex-wrap: wrap; row-gap: 6px; padding: 8px 14px; }
+  .dd-acct-name { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dd-acct-bar > .ob-grow { order: 1; flex-basis: 100%; height: 0; }
+  .dd-acct-bar > .ix-pill { order: 2; flex: none; }
+  .dd-zones { order: 3; flex: 1 1 0; }
+  .dd-acct-bar .el-button { min-height: 36px; }
+  .dd-gear { width: 36px; height: 36px; }
+  .dd-toolbar { padding: 8px 14px; }
+  .dd-search { flex: 1 1 100%; height: 38px; }
+  .instance-ui .dd-search > input { font-size: 16px; }
+  .dd-toolbar .sv-ranges > button { min-height: 30px; }
+  .instance-ui .dd-actions .el-button { height: 34px; min-height: 34px; padding: 0 12px; }
+  /* The table becomes a compact list: name, type and state, then source and value in small type. */
+  .dd-table-wrap { padding: 0 0 max(16px, env(safe-area-inset-bottom, 0px)); }
+  .dd-table thead { display: none; }
+  .dd-table, .dd-table tbody { display: block; }
+  .dd-table tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 9px 14px; border-bottom: 1px solid var(--ob-chat-line); }
+  .dd-table tbody tr:hover td, .dd-table tbody tr[aria-selected='true'] td { background: transparent; }
+  .dd-table tbody tr[aria-selected='true'] { background: var(--ob-chat-selected); }
+  .dd-table td { display: block; min-width: 0; padding: 0; border: 0; }
+  .dd-c-domain { grid-column: 1; display: flex !important; align-items: center; gap: 6px; }
+  .dd-c-domain .dd-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dd-c-domain .dd-acct, .dd-c-type, .dd-c-src, .dd-c-go { display: none !important; }
+  .dd-type-inline { display: inline-block; flex: none; min-width: 0; }
+  .dd-c-state { grid-column: 2; grid-row: 1; justify-self: end; }
+  .dd-c-val { grid-column: 1 / -1; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-overflow: ellipsis; white-space: nowrap; }
+  .dd-mobile-src { display: inline; }
+  .dd-adv-grid { grid-template-columns: minmax(0, 1fr); }
+  .instance-form .dd-check, .dd-choices > label { min-height: 38px; }
+  .instance-ui .dd-adv > summary { min-height: 40px; }
+  .dd-pcard { min-height: 42px; }
+  .instance-ui select.dd-pr-account { min-height: 32px; font-size: 16px; }
+  .dd-events > li { grid-template-columns: 74px minmax(0, 1fr); }
+  .dd-card-row { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: 'name name state' 'type value go'; row-gap: 2px; min-height: 44px; padding: 6px 2px; }
+  .dd-card-row > .dd-card-name { grid-area: name; }
+  .dd-card-row > .dd-type { grid-area: type; }
+  .dd-card-row > .dd-card-value { grid-area: value; }
+  .dd-card-row > .ix-pill { grid-area: state; justify-self: end; }
+  .dd-card-row > .dd-card-go { grid-area: go; justify-self: end; }
+  .instance-form .dd-map-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+}

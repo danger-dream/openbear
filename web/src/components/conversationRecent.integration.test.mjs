@@ -12,6 +12,7 @@ import * as icons from '@element-plus/icons-vue';
 import {treeItemId as rowId, treeItemParent, compareTreeItems, resolveTreeDrop} from './conversationTreeInteractions.js';
 import {activityLabel, activityState, activityReadRequests, applyActivityReadVersions, isActivityWaiting, pendingConversationRows, pendingFolderCounts, folderActivityCounts} from '../conversationActivity.js';
 import * as conversationGroupsTree from './conversationGroupsTree.js';
+import * as conversationTreeSelection from './conversationTreeSelection.js';
 
 const read = file => fs.readFileSync(new URL(file, import.meta.url), 'utf8');
 const treeSource = parse(read('./ConversationTree.vue')).descriptor;
@@ -26,7 +27,7 @@ function treeHarness(t) {
   const props = reactive({activeConversationUuid: '', draftConversation: null});
   const catalog = reactive({connected: false, ready: false, activityReadVersions: new Map()});
   const emitted = [], timers = new Map(); let time = 0, serial = 0;
-  const ctx = vm.createContext({...conversationGroupsTree,...promptPolicy,...icons, referenceItem: () => null, useRecentConversationRows, computed, nextTick, reactive, ref, watch, rowId, treeItemParent, compareTreeItems, resolveTreeDrop,
+  const ctx = vm.createContext({...conversationGroupsTree,...conversationTreeSelection,...promptPolicy,...icons, referenceItem: () => null, useRecentConversationRows, computed, nextTick, reactive, ref, watch, rowId, treeItemParent, compareTreeItems, resolveTreeDrop,
     activityLabel, activityState, activityReadRequests, isActivityWaiting, pendingConversationRows, pendingFolderCounts, folderActivityCounts, referenceCatalog: catalog,
     defineLazyView: () => ({}), defineProps: () => props, defineEmits: () => (...args) => emitted.push(args), defineExpose() {}, onMounted() {}, onBeforeUnmount() {},
     Api: {}, apiError: String, ElMessage: {error(value) {assert.fail(String(value));}},
@@ -34,7 +35,7 @@ function treeHarness(t) {
     setTimeout(fn, delay) {timers.set(++serial, {fn, at: time + delay}); return serial;}, clearTimeout(id) {timers.delete(id);},
   });
   scope.run(() => vm.runInContext(strip(treeSource) + `
-    globalThis.tree={props,activityItems,recentItems,activityReadBusy,titleGenerating,referenceCatalog,applyStatus,knownConversationRows,forgetConversation,withDraft,rootFolders,stateFor,expanded,selectedFolderId,openActivityConversation,markActivityRead,overview,enterOverview,leaveOverview,closeOverview,keepOverview,menu,openMoreMenu,
+    globalThis.tree={selecting,isSelected,selectableRow,toggleSelected,clickConversation,props,activityItems,recentItems,activityReadBusy,titleGenerating,referenceCatalog,applyStatus,knownConversationRows,forgetConversation,withDraft,rootFolders,stateFor,expanded,selectedFolderId,openActivityConversation,markActivityRead,overview,enterOverview,leaveOverview,closeOverview,keepOverview,menu,openMoreMenu,
       activeConversationRow,sidebarView,isDirectoryView,switchSidebarView,recentClock,recentConversationRows,recentUnreadCount,recentWaitingCount,recentLabel,displayRows,query,initialized,loading,listRef,
       activateRow,toggleRow,dragStart,dragOver,drop,clearDrag,rootDropTarget,drag,moveInFlight,rowId,rowLabel,rowLoading,nodePath,indentation,isExpanded,running,isTitleGenerating,liveConversationTitle,conversationOrigin,
       loadChildren,searchHasMore,searchRows,searchLoading,runSearch,locateAndOpen,openMenu,openRootMenu,rowKeydown,moreMenuKeydown,clearDropTarget};
@@ -185,4 +186,23 @@ test('local draft heads the unpinned conversations without mutating loaded rows 
   const persisted = merged.map(item => item.local ? {...item, local: false, id: 'sent', conversationUuid: 'sent', displayOrder: 1 - 1024} : item).sort(compareTreeItems);
   h.props.draftConversation = null;
   assert.deepEqual(Array.from(h.tree.withDraft(persisted, 'F'), rowId), ['child', 'pinned', 'sent', 'manual', 'older']);
+});
+
+test('hidden activity and selected retention stay out of recent without losing status', async () => {
+  const {reactive, nextTick} = await import('vue');
+  const props = reactive({items: [{conversationUuid:'a', activityVersion:1, activityUnread:true, running:true}], recentItems:[], activeConversationUuid:'a', readVersions:new Map(), hiddenConversationIds:[]});
+  const view = useRecentConversationRows(props);
+  assert.equal(view.rows.value.length, 1);
+  props.hiddenConversationIds = ['a'];
+  props.items = [{...props.items[0], hiddenFromRecent:true}];
+  await nextTick();
+  assert.equal(view.rows.value.length, 0);
+  assert.equal(props.items[0].running, true);
+  props.items = [];
+  await nextTick();
+  assert.equal(view.rows.value.length, 0);
+  props.hiddenConversationIds = [];
+  props.items = [{conversationUuid:'a', activityVersion:1, activityUnread:true, running:true}];
+  await nextTick();
+  assert.equal(view.rows.value.length, 1);
 });

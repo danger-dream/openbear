@@ -1,13 +1,15 @@
 {
   "name": "openbear-web",
   "private": true,
-  "version": "0.13.1",
+  "version": "0.15.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/bump-dev-version.mjs",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test --test-concurrency=4",
+    "test": "node scripts/run-tests.mjs",
+    "test:browser": "node scripts/run-tests.mjs --browser",
     "postinstall": "node scripts/patch-sortable-scroll.mjs",
     "test:timeline": "node --test src/timelineProjection.test.mjs"
   },
@@ -18,8 +20,14 @@
     "@tiptap/core": "3.31.3",
     "@tiptap/pm": "3.31.3",
     "@tiptap/vue-3": "3.31.3",
+    "@vue-flow/core": "1.48.2",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
     "axios": "^1.7.9",
     "core-js": "3.50.0",
+    "country-flag-emoji-polyfill": "^0.1.10",
     "element-plus": "^2.9.1",
     "fuse.js": "7.5.0",
     "gpt-tokenizer": "^3.4.0",
@@ -36,7 +44,9 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "2.5.1",
     "autoprefixer": "^10.4.20",
+    "happy-dom": "21.0.4",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "vite": "^6.0.7"

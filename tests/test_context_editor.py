@@ -21,14 +21,16 @@ def fixture_document():
         {'role': 'tool', 'content': 'result', 'name': 'Read', 'tool_call_id': 'c1'}], origin={'protocol': 'responses', 'modelLabel': 'p/m'})
 
 
-def test_bidirectional_native_edits_keep_unknown_and_opaque_fields():
+def test_bidirectional_native_edits_keep_readable_fields_and_preserve_opaque_originals():
     base = fixture_document()
     edit = copy.deepcopy(base)
     edit['entries'][1]['message']['content'] = 'short'
     compiled, issues = compile_document(base, edit, protocol='responses', available_tools=['Read'])
     assert not any(i['severity'] == 'error' for i in issues)
-    assert compiled['entries'][1]['message']['native_output_items'][1]['content'][0]['text'] == 'short'
-    assert compiled['entries'][1]['message']['native_output_items'][0] == base['entries'][1]['message']['native_output_items'][0]
+    assert compiled['entries'][1]['message']['native_output_items'][0]['content'][0]['text'] == 'short'
+    assert not any(n['type'] == 'reasoning' for n in compiled['entries'][1]['message']['native_output_items'])
+    assert edit['entries'][1]['message']['native_output_items'][0] == base['entries'][1]['message']['native_output_items'][0]
+    assert any(i['code'] == 'reasoning_cleanup' for i in issues)
     assert base['entries'][1]['message']['content'] == 'long answer'
     edit = copy.deepcopy(base)
     edit['entries'][1]['message']['native_output_items'][1]['content'][0]['text'] = 'from native'
@@ -48,15 +50,20 @@ def test_conflicts_dangling_and_unbound_tools_do_not_autofix():
     assert len(edit['entries']) == 2
 
 
-def test_anthropic_thinking_only_is_not_a_second_body_and_prefix_change_is_blocked():
+def test_anthropic_thinking_only_is_not_a_second_body_and_prefix_change_is_repaired():
     base = document('s', [], [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'answer', 'reasoning': '', 'signature': 'sig', 'native_output_items': [{'type': 'thinking', 'thinking': '', 'signature': 'sig'}, {'type': 'redacted_thinking', 'data': 'opaque'}]}], origin={'protocol': 'anthropic', 'modelLabel': 'p/a'})
     compiled, issues = compile_document(base, base, protocol='anthropic', model_label='p/a')
     assert compiled['entries'][1]['message']['content'] == 'answer'
     assert all(x['severity'] == 'warning' for x in issues)
     edit = copy.deepcopy(base)
     edit['entries'][0]['message']['content'] = 'edited prefix'
-    _, issues = compile_document(base, edit, protocol='anthropic', model_label='p/a')
-    assert 'signed_prefix_changed' in {i['code'] for i in issues}
+    compiled, issues = compile_document(base, edit, protocol='anthropic', model_label='p/a')
+    assert 'reasoning_cleanup' in {i['code'] for i in issues}
+    assert not any(i['severity'] == 'error' for i in issues)
+    assert compiled['entries'][1]['message']['content'] == 'answer'
+    assert 'signature' not in compiled['entries'][1]['message']
+    assert compiled['entries'][1]['message'].get('native_output_items') is None
+    assert edit['entries'][1]['message']['signature'] == 'sig'
 
 
 class Backend(FakeStreamBackend):
@@ -166,19 +173,23 @@ async def test_branch_real_runtime_reload_two_turns_and_model_change(web_env):
     assert await branch_settings(env.db, duplicate['conversation_uuid']) == await branch_settings(env.db, bid)
 
 
-def test_responses_reasoning_summary_sync_is_explicit_and_opaque_bytes_unchanged():
+def test_raw_responses_reasoning_summary_sync_keeps_opaque_bytes_unchanged():
     base = document('s', [], [{'role': 'assistant', 'content': '', 'reasoning': 'old summary',
         'native_output_items': [{'type': 'reasoning', 'encrypted_content': 'opaque-bytes', 'summary': [{'type': 'summary_text', 'text': 'old summary', 'vendor': 7}]}]}])
     edit = copy.deepcopy(base)
     edit['entries'][0]['message']['reasoning'] = 'new summary'
-    doc, issues = compile_document(base, edit, protocol='responses')
+    doc, issues = compile_document(base, edit, protocol='responses', repair_reasoning=False)
     native = doc['entries'][0]['message']['native_output_items'][0]
     assert native['summary'] == [{'type': 'summary_text', 'text': 'new summary', 'vendor': 7}]
     assert native['encrypted_content'] == 'opaque-bytes'
     assert any(i['code'] == 'opaque_reasoning_unverified' for i in issues)
     assert not any(i['severity'] == 'error' for i in issues)
     edit['entries'][0]['message']['native_output_items'][0]['summary'][0]['text'] = 'conflict'
-    assert any(i['code'] == 'reasoning_conflict' for i in compile_document(base, edit, protocol='responses')[1])
+    assert any(i['code'] == 'reasoning_conflict' for i in compile_document(base, edit, protocol='responses', repair_reasoning=False)[1])
+    compiled, issues = compile_document(base, edit, protocol='responses')
+    assert not compiled['entries']
+    assert any(i['code'] == 'reasoning_cleanup' for i in issues)
+    assert not any(i['severity'] == 'error' for i in issues)
 
 
 async def test_busy_read_and_branch_preserve_draft(web_env):
@@ -191,7 +202,8 @@ async def test_busy_read_and_branch_preserve_draft(web_env):
 
 
 @pytest.mark.parametrize('protocol', ['chat', 'responses', 'anthropic'])
-async def test_actual_protocol_preview_and_private_branch_fields(web_env, protocol):
+@pytest.mark.parametrize('destination', ['branch', 'original'])
+async def test_actual_protocol_preview_and_private_branch_fields(web_env, protocol, destination):
     from app.llm.anthropic import AnthropicBackend
     from app.llm.openai_responses import OpenAIResponsesBackend
     env = web_env
@@ -223,9 +235,10 @@ async def test_actual_protocol_preview_and_private_branch_fields(web_env, protoc
     else:
         assert 'long response' in str(preview['payload'])
     assert not any(i['severity'] == 'error' for i in preview['issues'])
-    created = await env.client.post(url + '/branch', json=body)
+    created = await env.client.post(url + '/branch', json=body) if destination == 'branch' else await env.client.put(url, json=body)
     assert created.status == 200, await created.text()
     bid = (await created.json())['conversation']['conversationUuid']
+    assert (bid == row['conversation_uuid']) == (destination == 'original')
     branch_view = await (await env.client.get(f'/api/conversations/{bid}/context-editor')).json()
     # Reopen from saved window + anchored private sidecar, not the creation DTO.
     edited = branch_view['baseline']['entries'][1]['message']
@@ -240,13 +253,13 @@ async def test_actual_protocol_preview_and_private_branch_fields(web_env, protoc
         assert _to_anthropic(restored['messages'])[1]['content'] == original['native_output_items']
 
 
-def test_readable_responses_projection_requires_explicit_thinking_removal():
+def test_readable_responses_projection_automatically_handles_thinking():
     base = fixture_document()
     edit = copy.deepcopy(base)
-    _, issues = compile_document(base, edit, protocol='chat', available_tools=['Read'])
-    assert any(i['code'] == 'native_protocol_mismatch' for i in issues)
-    edit['entries'][1]['message']['native_output_items'].pop(0)
+    _, raw_issues = compile_document(base, edit, protocol='chat', available_tools=['Read'], repair_reasoning=False)
+    assert any(i['code'] == 'native_protocol_mismatch' for i in raw_issues)
     doc, issues = compile_document(base, edit, protocol='chat', available_tools=['Read'])
+    assert any(i['code'] == 'reasoning_cleanup' for i in issues)
     assert not any(i['severity'] == 'error' for i in issues)
     assert any(i['code'] == 'readable_native_projection' for i in issues)
     assert 'native_output_items' not in doc['entries'][1]['message']

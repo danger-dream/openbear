@@ -23,7 +23,7 @@ function headerState(overrides = {}) {
   const script = header.scriptSetup.content.replace(/^import .*;\n/gm, '');
   const ctx = vm.createContext({computed,defineProps:()=>props,defineEmits:()=>()=>{},...helpers});
   vm.runInContext(script, ctx);
-  return proxyRefs(vm.runInContext('({props,pathText,tokenValue,tokenUnit,durationParts,fmtElapsedClockMs})', ctx));
+  return proxyRefs(vm.runInContext('({props,pathText,tokenValue,tokenUnit,durationParts,runStatusText,fmtElapsedClockMs})', ctx));
 }
 async function renderHeader(overrides) {
   const state = headerState(overrides), render = compile(header.template.content);
@@ -66,11 +66,23 @@ test('running badge and current-run clock are separate from cumulative duration,
   assert.doesNotMatch(idle,/header-run-clock|header-status is-running/);
 });
 
+test('phone run line puts the run clock before the current phase under the title, and is absent while idle', async () => {
+  const running = await renderHeader({running:true,status:'工具执行中'});
+  const line = running.match(/<div class="header-mobile-run">([\s\S]*?)<\/div>/);
+  assert.ok(line, 'the run line renders while running');
+  assert.ok(running.indexOf('header-title-row') < running.indexOf('header-mobile-run'), 'the line sits below the title');
+  assert.match(line[1], /<i aria-hidden="true"><\/i><span class="header-mobile-run-clock"[^>]*>00:00<\/span><span class="header-mobile-run-sep" aria-hidden="true">·<\/span><span class="header-mobile-run-status" role="status">工具执行中<\/span>/);
+  assert.match(header.template.content, /class="header-mobile-run-clock"[^>]*v-elapsed="\{ startAt: props.runStartedAt, active: props.running, format: 'hours-clock', fallback: '00:00' \}"/, 'same start as the desktop clock');
+  for (const status of ['就绪', '']) assert.match(await renderHeader({running:true,status}), /class="header-mobile-run-status" role="status">运行中</);
+  assert.doesNotMatch(await renderHeader({status:'已停止'}), /header-mobile-run/);
+});
+
 test('path, duration and clock formatting covers nested directories, missing values and minute boundaries', () => {
   for (const [input, expected] of [['OpenBear','/OpenBear'],['项目 / OpenBear','/项目/OpenBear'],['/OpenBear','/OpenBear'],['临时会话','/临时会话'],['','—']]) {
     assert.equal(helpers.conversationPathText(input), expected);
   }
   for (const [ms, expected] of [[0,'00:00'],[42999,'00:42'],[60000,'01:00'],[3601000,'60:01']]) assert.equal(helpers.fmtElapsedClockMs(ms), expected);
+  for (const [ms, expected] of [[0,'00:00'],[-5,'00:00'],[NaN,'00:00'],[83000,'01:23'],[3599999,'59:59'],[3600000,'1:00:00'],[3735000,'1:02:15'],[36061000,'10:01:01']]) assert.equal(helpers.fmtElapsedHoursClockMs(ms), expected);
   const parts = ms => JSON.parse(JSON.stringify(helpers.headerDurationParts(ms)));
   assert.deepEqual(parts(59999),[{value:'1',unit:'分'},{value:'0',unit:'秒'}]);
   assert.deepEqual(parts(0),[{value:'—',unit:''}]);
@@ -81,11 +93,15 @@ test('shared elapsed directive uses header clock only when requested, updates an
   let now = 100000, tick, timers = 0, clears = 0;
   const ctx = vm.createContext({...helpers,Date:{now:()=>now},window:{setInterval:fn=>{tick=fn;timers++;return 1;},clearInterval:()=>{clears++;}}});
   vm.runInContext(read('./elapsedDirective.js').replace(/^import .*;\n/, '').replace('export const vElapsed', 'var vElapsed'),ctx);
-  const clock = {}, legacy = {}, directive = ctx.vElapsed;
+  const clock = {}, legacy = {}, hours = {}, unknown = {}, directive = ctx.vElapsed;
   directive.mounted(clock,{value:{startAt:58000,active:true,format:'clock'}});
   directive.mounted(legacy,{value:{startAt:58000,active:true}});
-  assert.equal(clock.textContent,'00:42'); assert.equal(legacy.textContent,'42.0s'); assert.equal(timers,1);
-  now += 18000; tick(); assert.equal(clock.textContent,'01:00'); assert.equal(legacy.textContent,'1m00s');
+  directive.mounted(hours,{value:{startAt:58000,active:true,format:'hours-clock'}});
+  directive.mounted(unknown,{value:{startAt:58000,active:true,format:'toString'}});
+  assert.equal(clock.textContent,'00:42'); assert.equal(legacy.textContent,'42.0s'); assert.equal(hours.textContent,'00:42'); assert.equal(unknown.textContent,'42.0s'); assert.equal(timers,1);
+  now += 18000; tick(); assert.equal(clock.textContent,'01:00'); assert.equal(legacy.textContent,'1m00s'); assert.equal(hours.textContent,'01:00');
+  now += 3600000; tick(); assert.equal(clock.textContent,'61:00'); assert.equal(hours.textContent,'1:01:00');
+  directive.beforeUnmount(hours); directive.beforeUnmount(unknown);
   directive.updated(clock,{value:{active:false,fallback:'00:00'}}); assert.equal(clock.textContent,'00:00');
   directive.beforeUnmount(legacy); assert.equal(clears,1);
   directive.beforeUnmount(clock); assert.equal(clears,1);

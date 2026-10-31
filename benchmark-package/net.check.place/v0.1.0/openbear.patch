@@ -1,0 +1,63 @@
+diff --git a/net.sh b/net.sh
+--- a/net.sh
++++ b/net.sh
+@@ -363,6 +363,7 @@
+ esac
+ }
+ countRunTimes(){
++[[ -n $OB_BENCH_DIR ]]&&{ stail[stoday]="";stail[stotal]="";stail[thanks]="${stail[thanks]#。}";stail[thanks]="${stail[thanks]#. }";return; }
+ local RunTimes=$(curl $CurlARG -s --max-time 10 "https://hits.xykt.de/net?action=hit" 2>&1)
+ stail[today]=$(echo "$RunTimes"|jq '.daily')
+ stail[total]=$(echo "$RunTimes"|jq '.total')
+@@ -595,9 +596,11 @@
+ http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" "$url" 2>/dev/null)
+ if [[ $http_code == "204" ]];then
+ rawgithub="https://github.com/xykt/NetQuality/raw/"
++[[ -n $OB_BENCH_DIR ]]&&{ ob_google=1;rawgithub="file://$OB_BENCH_DIR/"; }
+ return 0
+ else
+ rawgithub="https://testingcf.jsdelivr.net/gh/xykt/NetQuality@"
++[[ -n $OB_BENCH_DIR ]]&&rawgithub="file://$OB_BENCH_DIR/"
+ return 1
+ fi
+ }
+@@ -1043,7 +1046,7 @@
+ bar_pid="$!"&&disown "$bar_pid"
+ trap "kill_progress_bar" RETURN
+ getnat=()
+-if [[ $rawgithub == *"github.com"* ]];then
++if [[ $rawgithub == *"github.com"* || $ob_google -eq 1 ]];then
+ local result=$(stun "stun.l.google.com" 2>/dev/null)
+ else
+ local result=$(stun "stun.miwifi.com" 2>/dev/null)
+@@ -2733,6 +2736,7 @@
+ exit 0
+ }
+ show_ad(){
++[[ -n $OB_BENCH_DIR ]]&&{ ADLines=0;return; }
+ RANDOM=$(date +%s)
+ local -a ads=()
+ local i=1
+@@ -2999,8 +3003,8 @@
+ [[ $mode_skip != *"6"* && $2 -eq 4 ]]&&show_speedtest
+ [[ $mode_skip != *"7"* ]]&&show_iperf
+ show_tail)
+-[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 ]]&&save_json $2
+-[[ mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s -X POST https://upload.check.place -d "type=net" --data-urlencode "json=$netdata" --data-urlencode "content=$net_report")
++[[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 || -n $OB_BENCH_OUT ]]&&save_json $2
++[[ mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s --connect-timeout 10 --max-time 60 -X POST https://upload.check.place -d "type=net" --data-urlencode "json=$netdata" --data-urlencode "content=$net_report")
+ [[ mode_json -eq 0 ]]&&echo -ne "\r$net_report\n"
+ [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
+ [[ mode_json -eq 1 ]]&&echo -ne "\r$netdata\n"
+@@ -3013,6 +3017,11 @@
+ ;;
+ *)echo -e "$net_report"|sed 's/\x1b\[[0-9;]*[mGKHF]//g' >>"$outputfile" 2>/dev/null
+ esac
++fi
++if [[ -n $OB_BENCH_OUT ]];then
++echo "$net_report" >"$OB_BENCH_OUT/report-$2.ansi"
++echo "$netdata" >"$OB_BENCH_OUT/result-$2.json"
++[[ -n $report_link ]]&&echo "$report_link" >"$OB_BENCH_OUT/link-$2.txt"
+ fi
+ }
+ generate_random_user_agent

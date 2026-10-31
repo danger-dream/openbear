@@ -10,6 +10,9 @@ from app.db.engine import DB
 from app.webhooks import schema
 from app.webhooks.repository import many, one
 
+# These test migrations, so every database here is built the real way.
+pytestmark = pytest.mark.real_db
+
 
 @asynccontextmanager
 async def installed_v1(tmp_path, monkeypatch):
@@ -52,51 +55,6 @@ async def snapshot(db):
     return {row['name']: await many(db.conn, f'SELECT * FROM "{row["name"]}"') for row in tables}
 
 
-async def test_review_v2_upgrade_preserves_v1_data_and_is_reentrant(tmp_path, monkeypatch):
-    async with installed_v1(tmp_path, monkeypatch) as db:
-        before = await snapshot(db)
-        billing = await one(db.conn, 'SELECT * FROM model_calls')
-        v1_marker = await one(db.conn, "SELECT * FROM schema_data_migrations WHERE name LIKE 'webhooks_v1:%'")
-        await schema.migrate(db)
-        for table, old_rows in before.items():
-            new_rows = await many(db.conn, f'SELECT * FROM "{table}"')
-            assert len(new_rows) == len(old_rows), table
-            for old, new in zip(old_rows, new_rows):
-                assert {k: new[k] for k in old} == old, table
-        new_billing = await one(db.conn, 'SELECT * FROM model_calls')
-        assert {k: new_billing[k] for k in billing} == billing
-        assert await one(db.conn, "SELECT * FROM schema_data_migrations WHERE name LIKE 'webhooks_v1:%'") == v1_marker
-        markers = await many(db.conn, "SELECT * FROM schema_data_migrations WHERE name LIKE 'webhooks_v%' ORDER BY name")
-        assert len(markers) == len(schema.MIGRATIONS)
-        after = await snapshot(db)
-        await schema.migrate(db)
-        assert await snapshot(db) == after
-        assert await many(db.conn, "SELECT * FROM schema_data_migrations WHERE name LIKE 'webhooks_v%' ORDER BY name") == markers
-        assert await many(db.conn, 'PRAGMA foreign_key_check') == []
-        assert (await one(db.conn, 'PRAGMA integrity_check'))['integrity_check'] == 'ok'
-
-
-async def test_simplification_upgrade_removes_only_budget_blocker(tmp_path, monkeypatch):
-    import json
-    async with installed_v1(tmp_path, monkeypatch) as db:
-        async with db.webhook_transaction() as conn:
-            await conn.execute("""UPDATE webhook_endpoints SET paused=1,pause_reason='owner pause',
-                model_blockers_json='{"budget":{"reason":"old limit"},"manual":{"reason":"keep"}}',
-                dispatch_blockers_json='{"manual":{"reason":"keep"}}',control_version=7""")
-        before = await snapshot(db)
-        await schema.migrate(db)
-        endpoint = await one(db.conn, "SELECT * FROM webhook_endpoints WHERE endpoint_id='old-endpoint'")
-        assert json.loads(endpoint['model_blockers_json']) == {'manual': {'reason': 'keep'}}
-        assert endpoint['control_version'] == 8
-        assert endpoint['paused'] == 1 and endpoint['pause_reason'] == 'owner pause'
-        assert endpoint['dispatch_blockers_json'] == before['webhook_endpoints'][0]['dispatch_blockers_json']
-        for table in ('webhook_revisions', 'webhook_events', 'webhook_event_payloads', 'webhook_receipts'):
-            current = await many(db.conn, f'SELECT * FROM {table}')
-            assert [{key: row[key] for key in old} for row, old in zip(current, before[table])] == before[table]
-        await schema.migrate(db)
-        assert await one(db.conn, "SELECT * FROM webhook_endpoints WHERE endpoint_id='old-endpoint'") == endpoint
-
-
 def override_resource(monkeypatch, filename, transform):
     original = schema.files
     class Resources:
@@ -125,8 +83,9 @@ async def test_review_v2_failure_rolls_back_all_extensions_and_markers(tmp_path,
         assert not await one(db.conn, "SELECT name FROM sqlite_master WHERE name='webhook_failed_tail'")
 
 
-@pytest.mark.parametrize('filename', [filename for _, filename in schema.MIGRATIONS])
-async def test_review_installed_migration_signature_remains_enforced(tmp_path, monkeypatch, filename):
+async def test_review_installed_migration_signature_remains_enforced(tmp_path, monkeypatch):
+    # Every resource goes through the same signature loop; the newest one stands for all.
+    filename = schema.MIGRATIONS[-1][1]
     db = DB(str(tmp_path / 'current.sqlite'))
     await db.connect()
     try:

@@ -101,6 +101,12 @@ LABELS = {
     ),
 }
 
+# Only a controller has server nodes; a managed instance is shown the text without these.
+CONTROLLER_NOTES = {
+    "enabled": "只管这里配置的浏览器。服务器节点的浏览器在服务器页按台开启，不受这个开关影响；关掉这里后，浏览器工具仍可使用节点浏览器。下面的等待时间和用量限制同样适用于节点浏览器。",
+    "agentAccess": "服务器节点的浏览器始终只给主助手用，不受这个开关影响。",
+}
+
 DISPLAY = {
     "maxBodyBytes": ("MB", 1024 * 1024),
     "maxArtifactBytes": ("MB", 1024 * 1024),
@@ -108,6 +114,12 @@ DISPLAY = {
     "maxEventEntries": ("条", 1),
     "maxPagesPerOwner": ("页", 1),
 }
+
+
+def managed_desc(path, desc):
+    """desc as a managed instance shows it, without the notes about server nodes."""
+    alias = path.removeprefix("browser.")
+    return desc.removesuffix(CONTROLLER_NOTES[alias]) if path.startswith("browser.") and alias in CONTROLLER_NOTES else desc
 
 
 def build_specs(make):
@@ -136,7 +148,7 @@ def build_specs(make):
         result[path] = make(
             path,
             title,
-            desc,
+            desc + CONTROLLER_NOTES.get(alias, ""),
             kind,
             group,
             "下一轮生效",

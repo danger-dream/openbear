@@ -62,23 +62,28 @@ func TestClientIPAutomaticDetection(t *testing.T) {
 		{"direct-public", "203.0.113.1:123", nil, "203.0.113.1"},
 		{"public-peer-spoof-ignored", "203.0.113.1:123", map[string][]string{"X-Forwarded-For": {"198.51.100.9"}, "X-Real-IP": {"198.51.100.9"}}, "203.0.113.1"},
 		{"local-nginx-xff", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"198.51.100.99, 203.0.113.9"}}, "203.0.113.9"},
-		{"private-proxy-real-ip", "10.0.0.1:123", map[string][]string{"X-Real-IP": {"203.0.113.9"}}, "203.0.113.9"},
+		{"local-proxy-real-ip", "127.0.0.1:123", map[string][]string{"X-Real-IP": {"203.0.113.9"}}, "203.0.113.9"},
+		{"private-proxy-needs-confirmation", "10.0.0.1:123", map[string][]string{"X-Real-IP": {"203.0.113.9"}}, "10.0.0.1"},
+		{"private-peer-cf-header-ignored", "192.168.1.5:123", map[string][]string{"CF-Connecting-IP": {"203.0.113.9"}}, "192.168.1.5"},
 		{"local-proxy-no-header", "127.0.0.1:123", nil, "127.0.0.1"},
 		{"cloudflare-edge", "104.16.0.10:443", map[string][]string{"CF-Connecting-IP": {"203.0.113.50"}, "X-Forwarded-For": {"198.51.100.1, 104.16.0.10"}}, "203.0.113.50"},
+		{"cloudflare-edge-v6", "[2606:4700::1]:443", map[string][]string{"CF-Connecting-IP": {"2001:db8::50"}}, "2001:db8::50"},
+		{"cloudflare-edge-only-vouches-cf-header", "104.16.0.10:443", map[string][]string{"X-Forwarded-For": {"198.51.100.1"}, "True-Client-IP": {"198.51.100.2"}}, "104.16.0.10"},
 		{"cf-header-from-non-cloudflare", "203.0.113.1:123", map[string][]string{"CF-Connecting-IP": {"198.51.100.50"}}, "203.0.113.1"},
 		{"priority-real-ip-before-xff", "127.0.0.1:123", map[string][]string{"X-Real-IP": {"203.0.113.7"}, "X-Forwarded-For": {"198.51.100.1"}}, "203.0.113.7"},
-		{"chain-of-private-hops", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"203.0.113.9, 10.0.0.2, 192.168.1.1"}}, "203.0.113.9"},
+		{"chain-of-local-hops", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"203.0.113.9, 127.0.0.2, ::1"}}, "203.0.113.9"},
+		{"lan-client-spoof-through-local-proxy", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"203.0.113.9, 192.168.1.5"}}, "192.168.1.5"},
 		{"lan-client-behind-local-proxy", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"192.168.1.23"}}, "192.168.1.23"},
 		{"bad-chain", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"invalid, 203.0.113.9"}}, "127.0.0.1"},
-		{"forwarded", "10.0.0.1:123", map[string][]string{"Forwarded": {`for=198.51.100.99;proto=http, for="203.0.113.9:1234", for=10.0.0.2`}}, "203.0.113.9"},
-		{"forwarded-v6", "[fd00::1]:123", map[string][]string{"Forwarded": {`for="[2001:db8:1::a]:456";proto=https`}}, "2001:db8:1::a"},
-		{"forwarded-quoted-extension", "10.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;ext="one,two;three"`}}, "203.0.113.9"},
-		{"forwarded-invalid-key", "10.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;bad key=yes`}}, "10.0.0.1"},
-		{"forwarded-duplicate", "10.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;for=203.0.113.8`}}, "10.0.0.1"},
-		{"forwarded-unknown", "10.0.0.1:123", map[string][]string{"Forwarded": {`for=unknown`}}, "10.0.0.1"},
+		{"forwarded", "127.0.0.1:123", map[string][]string{"Forwarded": {`for=198.51.100.99;proto=http, for="203.0.113.9:1234", for=127.0.0.2`}}, "203.0.113.9"},
+		{"forwarded-v6", "[::1]:123", map[string][]string{"Forwarded": {`for="[2001:db8:1::a]:456";proto=https`}}, "2001:db8:1::a"},
+		{"forwarded-quoted-extension", "127.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;ext="one,two;three"`}}, "203.0.113.9"},
+		{"forwarded-invalid-key", "127.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;bad key=yes`}}, "127.0.0.1"},
+		{"forwarded-duplicate", "127.0.0.1:123", map[string][]string{"Forwarded": {`for=203.0.113.9;for=203.0.113.8`}}, "127.0.0.1"},
+		{"forwarded-unknown", "127.0.0.1:123", map[string][]string{"Forwarded": {`for=unknown`}}, "127.0.0.1"},
 		{"single-value-header-repeated", "127.0.0.1:123", map[string][]string{"X-Real-IP": {"203.0.113.9", "203.0.113.10"}}, "127.0.0.1"},
 		{"zone-rejected", "127.0.0.1:123", map[string][]string{"X-Forwarded-For": {"fe80::1%eth0"}}, "127.0.0.1"},
-		{"mapped-peer", "[::ffff:10.0.0.1]:123", map[string][]string{"X-Real-IP": {"::ffff:203.0.113.9"}}, "203.0.113.9"},
+		{"mapped-peer", "[::ffff:127.0.0.1]:123", map[string][]string{"X-Real-IP": {"::ffff:203.0.113.9"}}, "203.0.113.9"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := gatewayWith(t, auto)
@@ -105,6 +110,25 @@ func TestClientIPManualAndSocketPolicies(t *testing.T) {
 	}
 	if got := gatewayWith(t, ClientIPConfig{Source: "header", TrustedProxies: []string{"198.51.100.0/24"}}).clientIP(r); got != "203.0.113.9" {
 		t.Fatalf("manual proxy not trusted: %s", got)
+	}
+	// A confirmed LAN proxy is trusted, including hops through other listed proxies.
+	lan := httptest.NewRequest("GET", "http://gateway.test/", nil)
+	lan.RemoteAddr = "10.0.0.7:123"
+	lan.Header.Set("X-Forwarded-For", "198.51.100.9, 203.0.113.9, 10.0.0.8")
+	if got := gatewayWith(t, ClientIPConfig{Source: "header", TrustedProxies: []string{"10.0.0.0/24"}}).clientIP(lan); got != "203.0.113.9" {
+		t.Fatalf("confirmed LAN proxy not trusted: %s", got)
+	}
+	if got := gatewayWith(t, ClientIPConfig{Source: "header", TrustedProxies: []string{"10.0.0.7"}}).clientIP(lan); got != "10.0.0.8" {
+		t.Fatalf("unlisted hop trusted: %s", got)
+	}
+	edge := httptest.NewRequest("GET", "http://gateway.test/", nil)
+	edge.RemoteAddr = "104.16.0.10:443"
+	edge.Header.Set("CF-Connecting-IP", "203.0.113.50")
+	if got := gatewayWith(t, ClientIPConfig{Source: "header", TrustedProxies: []string{"10.0.0.7"}}).clientIP(edge); got != "203.0.113.50" {
+		t.Fatalf("manual proxies dropped Cloudflare detection: %s", got)
+	}
+	if got := gatewayWith(t, ClientIPConfig{Source: "socket", TrustedProxies: []string{}}).clientIP(edge); got != "104.16.0.10" {
+		t.Fatal("socket policy read Cloudflare's header")
 	}
 	local := httptest.NewRequest("GET", "http://gateway.test/", nil)
 	local.RemoteAddr = "127.0.0.1:123"
@@ -147,8 +171,40 @@ func TestClientIPDefaultObservationAndLogin(t *testing.T) {
 	res, b = request(t, "GET", f.public.URL+"/control/v1/status", nil, map[string]string{"Authorization": "Bearer " + f.cfg.ControlKey})
 	requireStatus(t, res, b, 200)
 	observed, _ := object(t, b)["clientIpObserved"].(map[string]any)
-	if observed["peer"] != "127.0.0.1" || observed["header"] != "X-Forwarded-For" {
+	if observed["peer"] != "127.0.0.1" || observed["header"] != "X-Forwarded-For" || observed["trusted"] != true {
 		t.Fatalf("observation not reported: %s", b)
+	}
+}
+
+func TestClientIPUntrustedProxyObservationAndConfirmation(t *testing.T) {
+	f := newFixture(t, nil)
+	lan := httptest.NewRequest("GET", "http://gateway.test/", nil)
+	lan.RemoteAddr = "192.168.1.20:123"
+	lan.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := f.g.clientIP(lan); got != "192.168.1.20" {
+		t.Fatalf("unconfirmed LAN proxy chose the client IP: %s", got)
+	}
+	if o := f.g.observedProxy(); o == nil || o.Peer != "192.168.1.20" || o.Header != "X-Forwarded-For" || o.Trusted {
+		t.Fatalf("untrusted proxy not reported for confirmation: %#v", o)
+	}
+	// Public peers sending headers are ordinary clients, not proxy candidates.
+	public := httptest.NewRequest("GET", "http://gateway.test/", nil)
+	public.RemoteAddr = "198.51.100.20:123"
+	public.Header.Set("X-Forwarded-For", "203.0.113.9")
+	f.g.clientIP(public)
+	if f.g.observedProxy().Peer != "192.168.1.20" {
+		t.Fatal("public peer reported as a proxy candidate")
+	}
+	ack := putIP(t, f, ClientIPConfig{Source: "header", TrustedProxies: []string{"192.168.1.20"}}, 200)
+	if o, _ := ack["clientIpObserved"].(map[string]any); o["peer"] != "192.168.1.20" || o["trusted"] != true {
+		t.Fatalf("confirmed proxy still reported untrusted: %v", ack)
+	}
+	if got := f.g.clientIP(lan); got != "203.0.113.9" {
+		t.Fatalf("confirmed proxy not trusted: %s", got)
+	}
+	ack = putIP(t, f, defaultClientIP(), 200)
+	if o, _ := ack["clientIpObserved"].(map[string]any); o["trusted"] != false {
+		t.Fatalf("removed proxy still reported trusted: %v", ack)
 	}
 }
 

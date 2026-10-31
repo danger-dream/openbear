@@ -21,7 +21,7 @@ from tests.test_web_admin import web_env as web_env
 agent_env = shared_agent_env
 
 
-def response(*, reason, text, thinking):
+def response(*, reason, text, thinking, details=None):
     events = [{"type": "message_start", "message": {"usage": {"input_tokens": 7}}}]
     blocks = []
     if thinking:
@@ -36,7 +36,7 @@ def response(*, reason, text, thinking):
             {"type": "content_block_stop", "index": index},
         ])
     events.extend([
-        {"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 11}},
+        {"type": "message_delta", "delta": {"stop_reason": reason, **({"stop_details": details} if details else {})}, "usage": {"output_tokens": 11}},
         {"type": "message_stop"},
     ])
     body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
@@ -58,7 +58,8 @@ async def test_web_rejected_or_empty_response_is_not_completed(
 
     def handler(request):
         requests.append(request)
-        return response(reason=reason, text=text, thinking=thinking)
+        return response(reason=reason, text=text, thinking=thinking,
+                        details={'type': 'refusal', 'category': 'cyber', 'explanation': 'Cyber policy restriction from upstream.'} if reason == 'refusal' else None)
 
     x.backends[OLD] = AnthropicBackend(make_client(handler), "https://fixture.invalid", "fixture")
     turn = "refusal-test"
@@ -81,9 +82,13 @@ async def test_web_rejected_or_empty_response_is_not_completed(
     assert sum(item["output_tokens"] for item in ledger) == calls * 11
     if reason == "refusal":
         assert ledger[0]["status"] == "error" and ledger[0]["error_type"] == "refusal"
+        assert '网络安全（cyber）' in row['last_error']
+        assert 'Cyber policy restriction from upstream.' in row['last_error']
     cur = await web_env.db.conn.execute("SELECT payload_json FROM web_operations WHERE conversation_uuid=?", (x.uuid,))
     payloads = [item["payload_json"] for item in await cur.fetchall()]
     assert any("本轮未完成" in payload for payload in payloads)
+    if reason == 'refusal':
+        assert any('Cyber policy restriction from upstream.' in payload for payload in payloads)
     assert all("（空回复）" not in payload for payload in payloads)
     if text:
         assert any(item["role"] == "assistant" and item["content"] == text for item in await originals(x))

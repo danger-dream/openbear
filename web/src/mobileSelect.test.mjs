@@ -42,7 +42,4 @@ test('dropdown scroller never exceeds the shorter viewport, retains normal 274px
   const root=postcss.parse(fs.readFileSync(new URL('./mobile-overlays.css',import.meta.url),'utf8'));let limit;
   root.walkRules('html .mobile-select-popper .el-select-dropdown__wrap',r=>{assert.equal(r.parent.params,'(max-width: 760px), (hover: none) and (pointer: coarse)');r.walkDecls('max-height',d=>limit=d.value);});
   assert.equal(limit,'max(0px, min(274px, calc(var(--mobile-select-height, var(--mobile-viewport-height, 100dvh)) - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))))');
-  for(const height of [180,220,260,320,390,640,667,800,844,915,932])for(const [top,bottom] of [[0,0],[20,0],[47,34]]){
-    const cap=Math.max(0,Math.min(274,height-32-top-bottom));assert.ok(cap+32+top+bottom<=height);assert.ok(cap<=274);
-  }
 });

@@ -51,10 +51,12 @@ export function scriptDefaults(post = false) {
   return {enabled:false, runtime:'python', code:'', timeoutSeconds:30, onError:'fail', retry:{maxAttempts:1, backoffSeconds:[2,10,30,60]}, ...(post ? {onOutcomes:[...OUTCOMES]} : {})};
 }
 export function defaultConfig() {
-  return {schedule:{kind:'cron',timezone:'Asia/Shanghai',expression:'0 9 * * *',at:null,everySeconds:null,anchorAt:null}, runConfig:{mainModel:null,mainThinkingLevel:null,mainFastMode:null}, instructions:'', timeoutSeconds:null,totalTokensBudget:null,costBudgetUsd:null,notifications:{mode:'inherit',errorsOnly:false},pre:scriptDefaults(),post:scriptDefaults(true)};
+  return {schedule:{kind:'cron',timezone:'Asia/Shanghai',expression:'0 9 * * *',at:null,everySeconds:null,anchorAt:null}, runConfig:{mainModel:null,mainThinkingLevel:null,mainFastMode:null}, instructions:'', allowServerChanges:false, timeoutSeconds:null,totalTokensBudget:null,costBudgetUsd:null,notifications:{mode:'inherit',errorsOnly:false},conversationRetention:{keepLast:null,keepDays:null},pre:scriptDefaults(),post:scriptDefaults(true)};
 }
 export function draftOf(job, folderId = '') {
-  return {folderId:job?.folderId || folderId,name:job?.name || '',description:job?.description || '',enabled:job?.enabled ?? false,config:clone(job?.config || defaultConfig())};
+  const config = clone(job?.config || defaultConfig());
+  config.conversationRetention = {keepLast:null,keepDays:null,...config.conversationRetention};
+  return {folderId:job?.folderId || folderId,name:job?.name || '',description:job?.description || '',enabled:job?.enabled ?? false,config};
 }
 export function schedulePayload(schedule) {
   const bounds=schedule.kind!=='at' && (schedule.startAt || schedule.endAt) ? {startAt:schedule.startAt || null,endAt:schedule.endAt || null} : {};
@@ -118,6 +120,10 @@ export function validateDraft(draft, {models,folder = {},environment = {}} = {})
   const tokens = parseTokenBudget(c.totalTokensBudget);
   if (tokens != null && (!Number.isSafeInteger(tokens) || tokens <= 0)) add('totalTokensBudget','Tokens 预算须为正整数，可用 k / m / b（例如 1024k、10m），且不能超过安全整数范围');
   if (!['inherit','silent','telegram','push','both'].includes(c.notifications.mode)) add('notifications.mode','请选择通知方式');
+  for (const [field,max] of [['keepLast',10000],['keepDays',3650]]) {
+    const value = c.conversationRetention[field];
+    if (value != null && !(Number.isInteger(value) && value > 0 && value <= max)) add(`conversationRetention.${field}`,`会话保留须为 1–${max} 的整数，或留空`);
+  }
   if (draft.enabled && !c.instructions.trim()) add('instructions','启用前请填写执行目标、范围与授权','instructions');
   const rc = c.runConfig;
   if (models) {

@@ -9,11 +9,14 @@ from app.tools.base import current_tool_context
 
 def register_browser_tool(registry, service):
     registry.browser_service = service
-    if not service.available:
+    if not service.available and not (service.nodes is not None and service.nodes.any_browser):
         return
     max_timeout_ms = int(service.cfg.max_timeout_s * 1000)
     action_timeout_ms = min(int(service.cfg.action_timeout_s * 1000), max_timeout_ms)
     navigation_timeout_ms = min(int(service.cfg.navigation_timeout_s * 1000), max_timeout_ms)
+    # A managed instance has no server nodes, so it is not told about them.
+    nodes = service.nodes is not None
+    node_note = " page {op:new,node} opens it in a server node's browser (names from status; main controller only) and later operations follow the page." if nodes else ""
 
     async def browser(args):
         result = await service.call(args, current_tool_context())
@@ -30,7 +33,7 @@ def register_browser_tool(registry, service):
 
     registry.add(
         "Browser",
-        "Remote browser service with its existing logins; no local browser is launched. Every page operation uses an explicit page handle; start with page {op:new,url?} or page {op:list}. Core: snapshot/find return refs; act {op:click|fill|type|press|check|select|hover|drag|scroll|resize|emulate, target?, text?, key?, checked?, values?, to?} where target is a ref or css=selector; navigate {url, op?:goto|back|reload}; capture {fullPage?, view?} (view=true also returns the image to you); wait {text|target|url|timeMs}; dialog. Use describe {action} for files/network/console/evaluate/recover and full parameters. Results: failed = executed and failed; not_started = rejected; unknown = effects unconfirmed, do not replay blindly. After page_not_ready use recover probe, not repeated snapshots. evaluate runs in the page and may have external effects. Destructive recovery has its own confirmation gate; on amendments_required apply the user's conditions and resubmit the same operation with _openbearApprovalId. URLs and localhost resolve in the browser's network, not OpenBear's.",
+        "Remote browser service with its existing logins; no local browser is launched. Every page operation uses an explicit page handle; start with page {op:new,url?} or page {op:list}." + node_note + " Core: snapshot/find return refs; act {op:click|fill|type|press|check|select|hover|drag|scroll|resize|emulate, target?, text?, key?, checked?, values?, to?} where target is a ref or css=selector; navigate {url, op?:goto|back|reload}; capture {fullPage?, view?} (view=true also returns the image to you); wait {text|target|url|timeMs}; dialog. Use describe {action} for files/network/console/evaluate/recover and full parameters. Results: failed = executed and failed; not_started = rejected; unknown = effects unconfirmed, do not replay blindly. After page_not_ready use recover probe, not repeated snapshots. evaluate runs in the page and may have external effects. Destructive recovery has its own confirmation gate; on amendments_required apply the user's conditions and resubmit the same operation with _openbearApprovalId. URLs and localhost resolve in the browser's network, not OpenBear's.",
         {
             "type": "object",
             "properties": {
@@ -51,6 +54,7 @@ def register_browser_tool(registry, service):
                     "properties": {
                         "op": {"type": "string"},
                         "url": {"type": "string"},
+                        **({"node": {"type": "string"}} if nodes else {}),
                         "target": {"type": "string"},
                         "text": {"type": "string"},
                         "key": {"type": "string"},

@@ -71,7 +71,8 @@ func TestNodeFrontendIndependentVersionsAndContext(t *testing.T) {
 		t.Fatal("anonymous static fetch reached a node")
 	}
 	a := f.login(t, "alice", f.password)
-	paths := []string{"/", "/chat", "/skills", "/assets/shared.js", "/manifest.webmanifest", "/openbear-push-sw.js", "/icons/openbear-192.png", "/icons/openbear-512.png", "/icons/apple-touch-icon.png"}
+	// The notification worker is the gateway's own (TestGatewayOwnsServiceWorker).
+	paths := []string{"/", "/chat", "/skills", "/assets/shared.js", "/_i/a/assets/shared.js", "/manifest.webmanifest", "/icons/openbear-192.png", "/icons/openbear-512.png", "/icons/apple-touch-icon.png"}
 	for _, path := range paths {
 		res, b := request(t, "GET", f.public.URL+path, nil, map[string]string{"Cookie": a.cookie.String()})
 		requireStatus(t, res, b, 200)
@@ -103,6 +104,7 @@ func TestNodeFrontendIndependentVersionsAndContext(t *testing.T) {
 	}
 	f.call(t, a, "POST", "/api/auth/logout", nil, 200)
 	bob := f.login(t, "bob", p["password"].(string))
+	paths[4] = "/_i/b/assets/shared.js"
 	for _, path := range paths {
 		res, b = request(t, "GET", f.public.URL+path, nil, map[string]string{"Cookie": bob.cookie.String(), "If-None-Match": `"same-across-nodes"`, "If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT"})
 		requireStatus(t, res, b, 200)
@@ -111,10 +113,13 @@ func TestNodeFrontendIndependentVersionsAndContext(t *testing.T) {
 		}
 	}
 	beforeB := hitsB.Load()
-	for _, path := range []string{"/", "/assets/shared.js", "/openbear-push-sw.js"} {
+	for _, path := range []string{"/", "/assets/shared.js", "/_i/b/assets/shared.js", "/openbear-push-sw.js"} {
 		res, b = request(t, "GET", f.public.URL+path, nil, map[string]string{"Cookie": bob.cookie.String(), "X-OpenBear-Context": a.context})
 		requireStatus(t, res, b, 409)
 	}
+	// A page of the previous instance cannot pull its prefix from this session.
+	res, b = request(t, "GET", f.public.URL+"/_i/a/assets/shared.js", nil, map[string]string{"Cookie": bob.cookie.String()})
+	requireStatus(t, res, b, 409)
 	res, b = request(t, "GET", f.public.URL+"/assets/shared.js?_ob_ctx=", nil, map[string]string{"Cookie": bob.cookie.String()})
 	requireStatus(t, res, b, 409)
 	if hitsB.Load() != beforeB {
@@ -125,6 +130,63 @@ func TestNodeFrontendIndependentVersionsAndContext(t *testing.T) {
 	requireStatus(t, res, b, 200)
 	if !strings.Contains(string(b), "node-b-v8") {
 		t.Fatal("node upgrade required a gateway frontend update")
+	}
+}
+
+func TestGatewayOwnsServiceWorkerAndInstancePrefix(t *testing.T) {
+	var mu sync.Mutex
+	var seen []*http.Request
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Service-Worker-Allowed", "/")
+		fmt.Fprint(w, "self.addEventListener('fetch', () => {});")
+	})
+	res, b := request(t, "GET", f.public.URL+pushWorkerPath, nil, nil)
+	requireStatus(t, res, b, 401)
+	a := f.login(t, "alice", f.password)
+	cookie := map[string]string{"Cookie": a.cookie.String()}
+	for _, method := range []string{"GET", "HEAD"} {
+		for _, h := range []map[string]string{cookie, {"Cookie": a.cookie.String(), "Service-Worker": "script"}} {
+			res, b = request(t, method, f.public.URL+pushWorkerPath, nil, h)
+			requireStatus(t, res, b, 200)
+			want := string(pushWorker)
+			if method == "HEAD" {
+				want = ""
+			}
+			if string(b) != want || !strings.Contains(res.Header.Get("Content-Type"), "javascript") || res.Header.Get("Cache-Control") != "no-store" {
+				t.Fatalf("gateway notification worker not served: %s", b)
+			}
+		}
+	}
+	if !strings.Contains(string(pushWorker), `addEventListener("push"`) || strings.Contains(string(pushWorker), `addEventListener("fetch"`) {
+		t.Fatal("embedded worker is not the notification-only worker")
+	}
+	// No node script may become a service worker on the shared origin.
+	for _, path := range []string{"/", "/chat", "/assets/app.js", "/_i/a/assets/app-CtVmYnDX.js", "/manifest.webmanifest", "/api/data", "/i/a/webhook/w1/events/e1", "/login"} {
+		for _, value := range []string{"script", "Script"} {
+			res, b = request(t, "GET", f.public.URL+path, nil, map[string]string{"Cookie": a.cookie.String(), "X-OpenBear-Context": a.context, "Service-Worker": value})
+			requireStatus(t, res, b, 403)
+		}
+	}
+	if f.hits.Load() != 0 {
+		t.Fatal("service worker script request reached a node")
+	}
+	res, b = request(t, "GET", f.public.URL+"/_i/a/assets/brand/openbear-d32cdfb09c17.png?v=1", nil, cookie)
+	requireStatus(t, res, b, 200)
+	res, b = request(t, "GET", f.public.URL+"/chat", nil, cookie)
+	requireStatus(t, res, b, 200)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0].URL.Path != "/assets/brand/openbear-d32cdfb09c17.png" || seen[0].URL.RawQuery != "v=1" {
+		t.Fatalf("prefixed asset not mapped to the node path: %v", seen)
+	}
+	for _, r := range seen {
+		if r.Header.Get("X-OpenBear-Gateway-Assets") != "/_i/a/" {
+			t.Fatal("node was not told its asset prefix")
+		}
 	}
 }
 

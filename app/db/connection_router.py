@@ -212,6 +212,17 @@ class InterruptibleConnection(aiosqlite.Connection):
         finally:
             self._requests.discard(request)
 
+    async def fetch_read(self, sql: str, parameters: Any) -> tuple[list[Any], Any]:
+        """Run a read to its end in one worker call: its rows and description."""
+        return await self._execute(self._fetch_read, sql, parameters)
+
+    def _fetch_read(self, sql: str, parameters: Any) -> tuple[list[Any], Any]:
+        cursor = self._conn.execute(sql, parameters)
+        try:
+            return cursor.fetchall(), cursor.description
+        finally:
+            cursor.close()
+
     async def interrupt(self) -> None:
         """Explicit emergency stop of currently queued/running work only."""
         for request in tuple(self._requests):
@@ -246,6 +257,58 @@ async def open_sqlite_connection(path: str) -> InterruptibleConnection:
         raise
 
 
+class _ReadCursor:
+    """The rows of a finished read, served without touching the shared reader."""
+
+    rowcount = -1
+
+    def __init__(self, rows: list[Any], description: Any) -> None:
+        self._rows: list[Any] | None = rows
+        self._next = 0
+        self.description = description
+        self.arraysize = 1
+
+    def _open_rows(self) -> list[Any]:
+        if self._rows is None:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed cursor.")
+        return self._rows
+
+    async def fetchone(self) -> Any:
+        rows = self._open_rows()
+        if self._next >= len(rows):
+            return None
+        self._next += 1
+        return rows[self._next - 1]
+
+    async def fetchmany(self, size: int | None = None) -> list[Any]:
+        rows, start = self._open_rows(), self._next
+        self._next = min(len(rows), start + max(0, self.arraysize if size is None else size))
+        return rows[start:self._next]
+
+    async def fetchall(self) -> list[Any]:
+        rows, start = self._open_rows(), self._next
+        self._next = len(rows)
+        return rows[start:]
+
+    async def close(self) -> None:
+        self._rows = None
+
+    def __aiter__(self) -> _ReadCursor:
+        return self
+
+    async def __anext__(self) -> Any:
+        row = await self.fetchone()
+        if row is None:
+            raise StopAsyncIteration
+        return row
+
+    async def __aenter__(self) -> _ReadCursor:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.close()
+
+
 class SQLiteConnectionRouter:
     """Duck-typed subset of ``aiosqlite.Connection`` used by OpenBear.
 
@@ -257,7 +320,7 @@ class SQLiteConnectionRouter:
     def __init__(
         self,
         *,
-        reader: aiosqlite.Connection,
+        reader: InterruptibleConnection,
         writer: aiosqlite.Connection,
         lock_retries: int = 2,
         writer_wait_timeout_s: float = 30.0,
@@ -395,27 +458,15 @@ class SQLiteConnectionRouter:
                 await asyncio.sleep(delay)
         raise AssertionError("unreachable")
 
-    async def _execute_read(self, sql: str, parameters: Any) -> aiosqlite.Cursor:
-        # SQLite keeps executing queued SQL after its caller is cancelled. Keep
-        # the result alive until we can close the otherwise unclaimed cursor;
-        # an unfinished SELECT would pin the shared reader to an old WAL snapshot.
-        pending = asyncio.ensure_future(self._reader.execute(sql, parameters))
-        try:
-            return await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            pending.cancel()
+    async def _execute_read(self, sql: str, parameters: Any) -> _ReadCursor:
+        # An unfinished SELECT holds its WAL snapshot, and every other read on the
+        # shared reader joins it: while one caller awaited between execute and
+        # fetch, or was cancelled there, the others could not see later commits.
+        # Executing and fetching in one worker call leaves no statement open across
+        # an await, and the worker finishes it even if the caller is cancelled.
+        return _ReadCursor(*await self._reader.fetch_read(sql, parameters))
 
-            async def close_unclaimed_cursor() -> None:
-                cursor = await pending
-                await cursor.close()
-
-            # Repeated cancellation must not abandon cursor cleanup either.
-            # A query failure during cancellation must not replace cancellation.
-            with contextlib.suppress(BaseException):
-                await self._drain_cleanup(close_unclaimed_cursor())
-            raise
-
-    async def execute(self, sql: str, parameters: Any = None) -> aiosqlite.Cursor:
+    async def execute(self, sql: str, parameters: Any = None) -> aiosqlite.Cursor | _ReadCursor:
         if self._closed:
             raise RuntimeError("数据库已关闭")
         params = () if parameters is None else parameters

@@ -26,9 +26,13 @@ import MessageVisibilityMobileMenu from "./MessageVisibilityMobileMenu.vue";
 import {createMessageVisibility, MESSAGE_VISIBILITY} from "./messageVisibility.js";
 import TurnMinimap from "./TurnMinimap.vue";
 import TaskMemoryDrawer from "./TaskMemoryDrawer.vue";
+import WorkItemsDrawer from "./WorkItemsDrawer.vue";
+import {WORK_ITEMS_KEY, createWorkItemsStore} from "./workItems.js";
 import ContextEditor from "./ContextEditor.vue";
 import {chooseActiveTurnIndex} from "./activeTurn.js";
 import {
+	AGENT_LOCATOR,
+	agentPanelDetailKey,
 	decideAgentAutoOpen,
 	isAgentPanelDetailKey,
 	normalizeAgentPanelIntents,
@@ -90,6 +94,7 @@ import {
 	preferNewerLiveOperations,
 	projectOperationMessages as projectOperationMessagesFromOperations,
 	shouldApplyOperationFrame,
+	stableWaitingAgents,
 	withTransientIdleThinking as projectTransientIdleThinking,
 	findActiveTurnIndex,
 } from "../../timelineProjection.js";
@@ -172,6 +177,7 @@ const rootTurnRunning = ref(false);
 const modelOutputProgress = ref(null);
 // Set only from operation-derived run state; shown only while the root turn runs.
 const runWaitingLabel = ref("");
+const runWaitingAgents = shallowRef([]);
 const activeRunTurnUuid = ref("");
 const activeRunId = ref("");
 const messages = ref([]);
@@ -252,6 +258,9 @@ const visiblePromptSuggestions = computed(() => (
 ));
 const taskMemoryChangedEvent = ref(null);
 provide(TASK_MEMORY_CHANGED_EVENT_KEY, taskMemoryChangedEvent);
+const workItems = createWorkItemsStore();
+provide(WORK_ITEMS_KEY, workItems);
+const workItemReturn = ref(null);
 const toolDetailCache = createToolDetailCache();
 provide(TOOL_DETAIL_CACHE_KEY, toolDetailCache);
 const collabRequests = createCollabRequestStore(Api);
@@ -431,6 +440,8 @@ const messageVisibility = createMessageVisibility({
 const hiddenMessageCount = computed(() => messageVisibility.items.value.length);
 provide(MESSAGE_VISIBILITY, messageVisibility);
 provide(WORK_MOTION, {capture: captureWorkMotion, restore: restoreWorkMotion, finish: finishWorkMotion, reveal: revealWorkSummary});
+const agentLocateRequest = ref({key: "", seq: 0});
+provide(AGENT_LOCATOR, {request: agentLocateRequest, locate: locateAgent});
 const isLocalConversation = computed(() => String(props.conversationUuid || "").startsWith("local:"));
 const modelMutationCounts = ref(new Map());
 function modelMutationKey(conversationUuid = activeConversationUuid.value, folderId = props.folderId) {
@@ -2318,6 +2329,7 @@ function syncRunStateFromOperations(operations = orderedOperationsList(), stateF
 	rootTurnRunning.value = Boolean(derived.rootTurnRunning);
 	modelOutputProgress.value = derived.modelOutput || null;
 	runWaitingLabel.value = derived.waitingLabel || "";
+	runWaitingAgents.value = stableWaitingAgents(runWaitingAgents.value, derived.waitingAgents);
 	activeRunTurnUuid.value = derived.activeRootTurnId || "";
 	activeRunId.value = derived.activeRunId || "";
 	runStartedAt.value = Number(derived.activeStartedAtMs || 0)
@@ -2718,6 +2730,7 @@ function withTransientIdleThinking(turnList = []) {
 		lastVisibleOutputAtMs: lastVisibleOutputAt,
 		modelOutput: modelOutputProgress.value,
 		waitingLabel: rootTurnRunning.value ? runWaitingLabel.value : "",
+		waitingAgents: rootTurnRunning.value ? runWaitingAgents.value : [],
 	});
 }
 
@@ -3053,6 +3066,32 @@ function highlightSearchNode(node) {
 	}, 2600);
 }
 
+function agentNode(key) {
+	return Array.from(scroller.value?.querySelectorAll('[data-agent-key]') || [])
+		.find(node => node.dataset.agentKey === key) || null;
+}
+
+async function locateAgent(key) {
+	const uuid = String(activeConversationUuid.value || '');
+	const panelKey = agentPanelDetailKey(uuid, key);
+	if (!panelKey) return;
+	const rendered = Boolean(agentNode(key));
+	agentLocateRequest.value = {key, seq: agentLocateRequest.value.seq + 1};
+	setAgentPanelIntent(panelKey, 'open');
+	unlockAutoScroll();
+	pinnedActiveTurnIndex = null;
+	await nextTick();
+	// A folded work block mounts its rows first, then animates its height.
+	if (!rendered) await new Promise(resolve => window.setTimeout(resolve, 320));
+	const node = agentNode(key);
+	if (!componentMounted || uuid !== String(activeConversationUuid.value || '') || !node) return;
+	if (scrollFrame) window.cancelAnimationFrame(scrollFrame);
+	scrollFrame = 0;
+	runProgrammaticScroll(() => node.scrollIntoView({block: 'start', behavior: 'instant'}), 250);
+	highlightSearchNode(node);
+	scheduleActiveTurnFromScroll({force: true});
+}
+
 async function locateSearchResult(hit) {
 	const uuid = String(activeConversationUuid.value || '');
 	if (!hit?.opId || !uuid || uuid.startsWith('local:') || hit.hidden || messageVisibility.hiddenIds.value.has(hit.opId)) return false;
@@ -3121,6 +3160,17 @@ async function locateSearchResult(hit) {
 	} finally {
 		if (current()) searchLocating.value = false;
 	}
+}
+
+// The task panel closes itself before jumping; the return bar then offers the way back to that item.
+async function locateFromWorkItems(target) {
+	const located = await locateSearchResult({opId: target?.opId});
+	workItemReturn.value = located ? {number: String(target.number || ""), label: String(target.label || "")} : null;
+}
+function returnToWorkItem() {
+	const target = workItemReturn.value;
+	void returnFromSearch();
+	if (target) workItems.open(target.number);
 }
 
 async function returnFromSearch() {
@@ -3585,6 +3635,10 @@ function handleWsMessage(raw, source = {}) {
 			sourceIsActive: !source.socket || source.socket === ws,
 		});
 		if (event) taskMemoryChangedEvent.value = event;
+		return;
+	}
+	if (data.type === "work_items.changed") {
+		workItems.changed(data);
 		return;
 	}
 	if (data.type === "message_visibility.changed") {
@@ -4303,6 +4357,10 @@ watch(() => props.conversationUuid, async (next, prev) => {
 	await switchConversation(next, prev);
 }, {immediate: false});
 watch(() => props.conversationUuid, next => collabRequests.reset(next), {immediate: true});
+watch(activeConversationUuid, next => workItems.setConversation(next), {immediate: true});
+// The server owns whether a focused turn is still running; re-read it at each start and stop.
+watch(running, () => workItems.schedule(300));
+watch(searchReturnPosition, value => { if (!value) workItemReturn.value = null; });
 
 
 watch(() => props.folderId, (next, prev) => {
@@ -4454,6 +4512,7 @@ onBeforeUnmount(() => {
 						@open-hidden="messageVisibility.managing.value = true"
 						@open-search="searchOpen = true"
 						@open-memory="taskMemoryDrawer?.open()"
+						@open-work-items="workItems.open()"
 						@open-context="contextEditor?.open()"
 						@toggle-scroll-lock="toggleAutoScrollLock"
 						@scroll-to-turn="scrollToTurnIndex"
@@ -4475,8 +4534,9 @@ onBeforeUnmount(() => {
 						</div>
 					</div>
 					<div v-if="searchReturnPosition" class="search-return-bar" role="status">
-					<span>{{ searchLocating ? '正在定位历史消息…' : '正在查看定位的历史消息' }}</span>
-					<button type="button" @click="returnFromSearch">返回原位置</button>
+					<span>{{ searchLocating ? '正在定位历史消息…' : workItemReturn?.label ? `正在查看${workItemReturn.label}` : '正在查看定位的历史消息' }}</span>
+					<button v-if="workItemReturn" type="button" @click="returnToWorkItem">返回任务</button>
+					<button v-else type="button" @click="returnFromSearch">返回原位置</button>
 					<button type="button" @click="returnToLatestFromSearch">最新消息</button>
 				</div>
 				<div
@@ -4546,7 +4606,7 @@ onBeforeUnmount(() => {
 			</div>
 			<MessageVisibilityBar v-show="!contextEditorOpen"/>
 			<ConversationSearch :conversation-uuid="activeConversationUuid" v-model:open="searchOpen" @locate="locateSearchResult"/>
-			<ContextEditor v-if="!isLocalConversation" ref="contextEditor" :conversation-uuid="activeConversationUuid" :busy="running" @open-change="contextEditorOpen = $event" @created="emit('conversation-created', $event.conversationUuid)"/>
+			<ContextEditor v-if="!isLocalConversation" ref="contextEditor" :conversation-uuid="activeConversationUuid" :busy="running" @open-change="contextEditorOpen = $event" @created="emit('conversation-created', $event.conversationUuid)" @saved="load(); emit('conversations-refresh')"/>
 			<aside class="console-controls" v-show="!contextEditorOpen" :inert="contextEditorOpen" aria-label="会话工具与导航">
 				<el-tooltip v-if="!isLocalConversation" :content="hiddenMessageCount ? `隐藏内容 · ${hiddenMessageCount} 条` : '隐藏内容'" placement="left" :show-after="260">
 					<button type="button" class="hidden-content-toggle" :class="{populated: hiddenMessageCount > 0}" :aria-label="`管理隐藏内容，${hiddenMessageCount} 条`" @click="messageVisibility.managing.value = true">
@@ -4557,6 +4617,7 @@ onBeforeUnmount(() => {
 					<button type="button" class="search-content-toggle" aria-label="搜索此会话" @click="searchOpen = true"><Search/></button>
 				</el-tooltip>
 				<TaskMemoryDrawer ref="taskMemoryDrawer" :conversation-uuid="activeConversationUuid"/>
+				<WorkItemsDrawer :conversation-uuid="activeConversationUuid" @locate="locateFromWorkItems"/>
 			<TurnMinimap
 				:turns="turns"
 				:active-turn-index="activeTurnIndex"

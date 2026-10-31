@@ -184,3 +184,14 @@ test('16 stale out-of-range responses and disposed views cannot rewind a newer f
   h.run('page(60)');props.folderId='F2';await flush();wait.resolve({items:[],total:30});await flush();assert.equal(h.run('offset.value'),0);assert.equal(calls.at(-1).folderId,'F2');assert.equal(h.run('data.value.total'),1);
   const late=deferred();h.ctx.Api.cronJobs=()=>late.promise;h.run('page(30)');h.close();late.resolve({items:[],total:0});await flush();assert.equal(h.run('offset.value'),30);assert.equal(h.run('data.value'),null);
 });
+test('U2 a task may change servers and instances only once ticked; the box explains the risk and is saved with the task',async()=>{
+  assert.equal(config.defaultConfig().allowServerChanges,false);
+  const io=fixture();const ed=harness('./CronEditor.vue',{props:{jobId:'J1',folderId:'F1'},Api:io.api});await flush();
+  assert.equal(ed.run('draft.config.allowServerChanges'),false);
+  ed.run('draft.config.allowServerChanges=true');assert.equal(await ed.run('save()'),true);
+  assert.equal(io.calls.at(-1).config.allowServerChanges,true);ed.close();
+  const template=ed.descriptor.template.content;
+  assert.match(template,/<el-checkbox v-model="draft\.config\.allowServerChanges"[^>]*>允许改动服务器和实例<\/el-checkbox>/);
+  assert.match(template,/draft\.config\.allowServerChanges \? '定时任务无人值守，可能被服务器返回的内容误导而执行改动/);
+  assert.match(template,/'未勾选时，执行中只能查看服务器和实例。'/);
+});

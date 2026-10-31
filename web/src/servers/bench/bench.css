@@ -1,0 +1,135 @@
+/* 评测: builds on instances.css, servers.css and ddns.css (pills, notes, sheets, form fields); only what they lack. */
+.bn-page { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.bn-body { display: flex; flex: 1; min-height: 0; }
+
+/* Left: the tree. */
+.bn-tree { display: flex; flex: none; flex-direction: column; width: 320px; min-width: 0; min-height: 0; border-right: 1px solid var(--ob-chat-line); }
+.bn-tree-head { display: flex; flex: none; align-items: center; gap: 8px; padding: 10px 12px 8px 16px; }
+.bn-tree-head > h2 { margin: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
+.bn-pickbar { display: flex; flex: none; align-items: center; gap: 8px; margin: 0 10px 6px; padding: 5px 6px 5px 12px; border-radius: 8px; background: var(--ob-chat-selected); font-size: var(--ix-sm); }
+.bn-nodes, .bn-nodes ul { margin: 0; padding: 0; list-style: none; }
+.bn-nodes { flex: 1; min-height: 0; padding: 0 8px 16px; overflow-y: auto; overscroll-behavior: contain; }
+.bn-row { display: flex; align-items: center; gap: 2px; border-radius: 7px; }
+.bn-row:hover { background: var(--ob-chat-hover); }
+.bn-row-main { display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; min-height: 30px; padding: 4px 6px; color: var(--ob-chat-text); text-align: left; cursor: pointer; }
+.bn-row-main:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: -2px; border-radius: 7px; }
+.bn-chev { flex: none; color: var(--ob-chat-muted); transition: transform .15s; }
+.bn-chev.is-open { transform: rotate(90deg); }
+.bn-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bn-row-server .bn-name { font-weight: 500; }
+.bn-row-server .sv-flag { flex: none; font-size: 14px; line-height: 1; }
+.bn-row-cat .bn-row-main { min-height: 26px; padding-left: 22px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.bn-row-test .bn-row-main { padding-left: 38px; }
+.bn-row-run { padding-left: 52px; }
+.bn-row-run[aria-current='true'] { background: var(--ob-chat-selected); }
+.bn-count { margin-left: auto; color: var(--ob-chat-muted); font-size: var(--ix-sm); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bn-count[data-tone='busy'] { color: var(--ob-violet); }
+.bn-add { flex: none; width: 26px; height: 26px; color: var(--ob-chat-muted); }
+.bn-add:hover { color: var(--ob-chat-text); }
+.bn-pick { display: grid; flex: none; place-items: center; width: 24px; height: 30px; cursor: pointer; }
+.bn-pick > input { margin: 0; cursor: pointer; }
+.bn-row-run .bn-row-main { padding-left: 2px; }
+.bn-time { flex: none; font-variant-numeric: tabular-nums; }
+.bn-label { min-width: 0; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-overflow: ellipsis; white-space: nowrap; }
+.bn-row-run .ix-pill { flex: none; margin-left: auto; }
+.bn-empty { padding: 32px 16px; }
+
+/* Right: one report, the comparison, or what the tab is for. */
+.bn-main { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+/* One report fits the pane: its box takes the height left under the header and scrolls inside, as wide as the
+   report needs up to the pane's width. Only when even the header and a minimal box do not fit does the pane scroll. */
+.bn-main-scroll { display: flex; flex: 1; flex-direction: column; min-height: 0; padding: 14px 20px 20px; overflow: auto; overscroll-behavior: contain; }
+.bn-main-scroll > .bn-report { flex: 1 1 auto; min-height: 0; }
+.bn-main-scroll .bn-section { display: flex; flex: 0 1 auto; flex-direction: column; min-height: 0; }
+.bn-main-scroll .bn-section > .bn-term { flex: 0 1 auto; min-height: 160px; }
+.bn-main-bar { display: flex; flex: none; align-items: center; gap: 10px; padding: 9px 20px; border-bottom: 1px solid var(--ob-chat-line); font-size: var(--ix-sm); }
+.bn-main-bar > b { color: var(--ob-text-strong); font-weight: 600; }
+.bn-intro { max-width: 580px; margin: 56px auto; padding: 0 24px; }
+.bn-intro h3 { margin: 0 0 8px; color: var(--ob-text-strong); font-size: 15px; font-weight: 600; }
+.bn-intro p { margin: 0 0 10px; line-height: 1.65; }
+
+/* A report. */
+.bn-report { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.bn-rep-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px 10px; }
+.bn-rep-title { flex: 1; min-width: 0; }
+.bn-rep-title h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 0; color: var(--ob-text-strong); font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.bn-rep-title .sv-flag { margin-right: 4px; font-size: 15px; }
+.bn-rep-test { color: var(--ob-chat-subtle); font-weight: 500; }
+.bn-rep-meta { margin: 2px 0 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.bn-rep-head > .ix-pill { flex: none; margin-top: 1px; }
+.bn-rep-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.bn-rep-actions .el-button + .el-button { margin-left: 0; }
+.bn-link { display: inline-flex; align-items: center; gap: 3px; text-decoration: none; }
+.bn-note, .bn-wait { margin: 0; }
+.bn-section > h4 { flex: none; margin: 0 0 6px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
+.bn-section-tabs { flex: none; align-self: flex-start; }
+
+/* The reports keep a terminal's dark ground in both themes: they are drawn for one, white text included.
+   Lines never wrap (the page's own pre rule would), so columns stay aligned and a wide report scrolls in its box. */
+/* Sideways scrolling stays in the box; up and down goes on to the page or sheet when the box is not scrolled that way
+   (contain on both would trap a vertical swipe on a phone inside a box that only scrolls sideways). */
+.bn-term, .instance-ui pre.bn-term { box-sizing: border-box; max-width: none; margin: 0; overflow-wrap: normal; padding: 12px 14px; overflow: auto; border-radius: 10px;
+  background: #15171c; color: #d4d7dd; overscroll-behavior-x: contain;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; font-size: 12.5px; line-height: 1.45; white-space: pre; tab-size: 8; }
+.bn-report:not(.is-compact) .bn-term { width: fit-content; max-width: 100%; }
+.bn-term:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: 2px; }
+.bn-live { flex: none; max-height: 320px; }
+.bn-w1, .bn-w2 { display: inline-block; overflow: hidden; text-align: center; vertical-align: top; }
+.bn-w1 { width: 1ch; }
+.bn-w2 { width: 2ch; }
+.bn-b { font-weight: 700; }
+.bn-dim { opacity: .65; }
+.bn-i { font-style: italic; }
+.bn-u { text-decoration: underline; }
+.bn-fg-0 { color: #5c6370; } .bn-fg-1 { color: #e06c75; } .bn-fg-2 { color: #98c379; } .bn-fg-3 { color: #e5c07b; }
+.bn-fg-4 { color: #61afef; } .bn-fg-5 { color: #c678dd; } .bn-fg-6 { color: #56b6c2; } .bn-fg-7 { color: #d4d7dd; }
+.bn-fg-8 { color: #7f848e; } .bn-fg-9 { color: #ff7b86; } .bn-fg-10 { color: #b5e890; } .bn-fg-11 { color: #ffd787; }
+.bn-fg-12 { color: #82c4ff; } .bn-fg-13 { color: #e3a6f2; } .bn-fg-14 { color: #7fd8e3; } .bn-fg-15 { color: #ffffff; }
+.bn-bg-0 { background: #2b2f37; } .bn-bg-1 { background: #c0444f; } .bn-bg-2 { background: #4f8a3a; } .bn-bg-3 { background: #b38b2e; }
+.bn-bg-4 { background: #3a78c2; } .bn-bg-5 { background: #9a50b5; } .bn-bg-6 { background: #2f8f9b; } .bn-bg-7 { background: #c8ccd4; }
+.bn-bg-8 { background: #4b515c; } .bn-bg-9 { background: #e0606b; } .bn-bg-10 { background: #6aa84f; } .bn-bg-11 { background: #d4a642; }
+.bn-bg-12 { background: #5296e0; } .bn-bg-13 { background: #b670cf; } .bn-bg-14 { background: #45aab6; } .bn-bg-15 { background: #eceef2; }
+.bn-fg-fg { color: #d4d7dd; } .bn-fg-bg { color: #15171c; } .bn-bg-fg { background: #d4d7dd; } .bn-bg-bg { background: #15171c; }
+
+/* Side by side: each column scrolls as a whole (reports inside do not), so the columns can follow each other. */
+.bn-compare { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.bn-compare-cols { display: grid; flex: 1; grid-template-columns: repeat(var(--bn-cols), minmax(0, 1fr)); min-height: 0; }
+.bn-compare-col { min-width: 0; min-height: 0; padding: 14px 14px 24px; overflow: auto; border-right: 1px solid var(--ob-chat-line); overscroll-behavior: contain; }
+.bn-compare-col:last-child { border-right: 0; }
+.bn-compare:not(.is-phone) .bn-report.is-compact .bn-term { overflow: visible; width: max-content; min-width: 100%; box-sizing: border-box; }
+.bn-compare.is-phone .bn-compare-col { padding: 0; overflow: visible; border: 0; }
+.bn-compare-tabs { flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; scrollbar-width: none; }
+.bn-compare-tabs::-webkit-scrollbar { display: none; }
+.bn-compare-tabs > button { flex: none; white-space: nowrap; }
+.bn-compare-tabs .sv-flag { margin-right: 4px; }
+
+/* The form. */
+.bn-form .dd-field > select { width: 100%; }
+.bn-check > span { display: flex; flex-direction: column; gap: 2px; }
+.bn-check small { font-size: var(--ix-sm); }
+.bn-radio { margin: 0; }
+.bn-warnings { margin: 0; padding: 9px 12px 9px 28px; border-radius: 9px; background: var(--ob-warning-soft); font-size: var(--ix-md); line-height: 1.55; }
+.bn-warnings li + li { margin-top: 3px; }
+
+@media (max-width: 760px) {
+  .bn-tree { flex: 1; width: auto; border-right: 0; }
+  .bn-tree-head { padding: 8px 12px 6px 16px; }
+  .instance-ui .bn-tree-head .dd-actions .el-button { height: 34px; min-height: 34px; padding: 0 12px; }
+  .bn-pickbar { margin: 0 8px 6px; }
+  .bn-nodes { padding: 0 6px max(16px, env(safe-area-inset-bottom, 0px)); }
+  .bn-row-main { min-height: 40px; }
+  .bn-row-cat .bn-row-main { min-height: 34px; padding-left: 20px; }
+  .bn-row-test .bn-row-main { padding-left: 32px; }
+  .bn-row-run { padding-left: 34px; }
+  .bn-pick { width: 36px; height: 40px; }
+  .bn-pick > input { width: 18px; height: 18px; }
+  .bn-add { width: 38px; height: 38px; }
+  .bn-term, .instance-ui pre.bn-term { padding: 10px; font-size: 11.5px; }
+  /* The title takes the line, so the details stay on one or two; state and actions go under it. */
+  .bn-rep-title { flex-basis: 100%; }
+  .bn-rep-head { align-items: center; }
+  .bn-rep-actions { margin-left: auto; }
+  .bn-rep-actions .el-button { min-height: 34px; }
+  .bn-section-tabs > button { min-height: 32px; }
+  .bn-compare-tabs > button { min-height: 32px; }
+}

@@ -67,10 +67,17 @@ def serialize_spec(spec: SettingSpec) -> dict[str, Any]:
     return payload
 
 
-def settings_specs_payload() -> dict[str, Any]:
+# Controller-only sections: a managed instance has no 实例/主机 pages or tools, and
+# neither updates itself nor runs nodes.
+_CONTROLLER_GROUPS = frozenset({"features", "updates"})
+
+
+def settings_specs_payload(managed: bool = False) -> dict[str, Any]:
     groups = []
     groups_by_key: dict[str, dict[str, Any]] = {}
     for key, (title, paths) in GROUPS.items():
+        if managed and key in _CONTROLLER_GROUPS:
+            continue
         payload = {
             "key": key,
             "title": title,
@@ -80,6 +87,8 @@ def settings_specs_payload() -> dict[str, Any]:
         groups_by_key[key] = payload
     domains = []
     for key, (title, desc, section_keys) in WEB_DOMAINS.items():
+        if not any(section_key in groups_by_key for section_key in section_keys):
+            continue
         domains.append({
             "key": key,
             "title": title,
@@ -89,8 +98,14 @@ def settings_specs_payload() -> dict[str, Any]:
     return {
         "domains": domains,
         "groups": groups,  # backward-compatible for older Web clients
-        "specs": {path: serialize_spec(spec) for path, spec in SPECS.items()},
+        "specs": {path: _managed_spec(path, serialize_spec(spec)) if managed else serialize_spec(spec) for path, spec in SPECS.items()
+                  if not (managed and spec.group in _CONTROLLER_GROUPS)},
     }
+
+
+def _managed_spec(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from app.browser.settings import managed_desc
+    return {**payload, "desc": managed_desc(path, payload["desc"])}
 
 
 def safe_settings_payload(config_dump: dict[str, Any]) -> dict[str, Any]:

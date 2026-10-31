@@ -1,0 +1,26 @@
+{
+  "tool": "ip.check.place",
+  "version": "v0.1.0",
+  "name": "IP.Check.Place",
+  "upstream": {
+    "repo": "https://github.com/xykt/IPQuality",
+    "commit": "87397e2c3196ec796f5477c83343c2354df601ea",
+    "date": "2026-09-30",
+    "license": "AGPL-3.0"
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "ip.sh",
+  "files": {
+    "ip.sh": "a7c4d21321b965b2771a3b31ae730f5b46242b53c6494b78349870eea4bdfceb",
+    "main/ref/iso3166.json": "e1434e42786484b1841082a0a16cf27208691443dc6440d125ad81d49007ea42",
+    "main/ref/dnsbl.list": "a92ca482843310167309c82f05cb7e208d7decc7f8bb7eada0f96af42f1143ad",
+    "main/ref/cookies.txt": "8d05deb991fd5a094b4971b389bdd24c1c86c462dfb45dd3aa4befe77b34616f",
+    "main/ref/iata-icao.csv": "4707f3bfa58d70cd7c0a94cbaeeedfd355e1e81334751ad32b5b2d24d6eada0d"
+  },
+  "binaries": [],
+  "patch": "openbear.patch",
+  "built": "2026-10-31"
+}

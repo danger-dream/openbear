@@ -7,7 +7,7 @@ import * as conversationGroupsTree from './conversationGroupsTree.js';
 
 const source = fs.readFileSync(new URL('./ConversationPromptDialog.vue', import.meta.url), 'utf8');
 const script = source.split('<script setup>')[1].split('</script>')[0].replace(/^import .*;\n/gm, '');
-const reviewed = (id = 'a') => ({conversationUuid: id, changed: true, beforeHash: '1'.repeat(64), afterHash: '2'.repeat(64), beforeChars: 1, afterChars: 2, diff: '-old\n+new'});
+const reviewed = (id = 'a') => ({conversationUuid: id, changed: true, systemChanged: true, toolsChanged: true, beforeHash: '1'.repeat(64), afterHash: '2'.repeat(64), toolsBeforeHash: '3'.repeat(64), toolsAfterHash: '4'.repeat(64), beforeChars: 1, afterChars: 2, diff: '-old\n+new'});
 function defer() { let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;});return {promise,resolve,reject}; }
 function harness({get = async id => reviewed(id), put = async () => ({updated:true}), local = false} = {}) {
   const props = {modelValue:true, conversation:{conversationUuid:local?'local:new':'a', title:'A', local}};
@@ -31,7 +31,8 @@ test('preview and cancel do not update; late response after closing is ignored',
 test('save sends only the reviewed conversation and exact hashes without another confirmation',async()=>{
   const h=harness();await h.run('loadPreview()');h.props.conversation={conversationUuid:'other'};
   await h.run('save()');assert.equal(h.calls.put.length,1);assert.equal(h.calls.put[0].id,'a');
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.put[0].body)),{confirmed:true,beforeHash:'1'.repeat(64),afterHash:'2'.repeat(64)});
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.put[0].body)),{confirmed:true,beforeHash:'1'.repeat(64),afterHash:'2'.repeat(64),toolsBeforeHash:'3'.repeat(64),toolsAfterHash:'4'.repeat(64)});
+  assert.match(h.calls.messages[0],/系统提示词和工具定义已更新/);
   assert.equal(h.calls.messages.length,1);assert.equal(h.state.saving.value,false);assert.equal(h.state.preview.value,null);
 });
 test('double submit is suppressed and dialog cannot close during update',async()=>{
@@ -64,4 +65,12 @@ test('menu respects running/local state and diff is rendered as text, never HTML
   const tree=fs.readFileSync(new URL('./ConversationTree.vue',import.meta.url),'utf8');
   assert.match(tree,/:disabled="menu\.row\?\.local \|\| running\(menu\.row\)" @click="runMenuAction\('refresh-prompt'\)"/);
   assert.match(source,/<pre>\{\{ preview\.diff \}\}<\/pre>/);assert.doesNotMatch(source,/v-html|ElMessageBox/);
+});
+test('tool changes are listed by kind and long lists are shortened',()=>{
+  const h=harness();
+  const names=Array.from({length:10},(_,i)=>`T${i}`);
+  const lines=h.ctx.toolChangeLines({toolChanges:{added:['Servers'],removed:[],changed:names,reordered:true}});
+  assert.deepEqual(JSON.parse(JSON.stringify(lines)),['新增：Servers','说明或参数有变化：T0、T1、T2、T3、T4、T5、T6、T7 等 10 个']);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ctx.toolChangeLines({toolChanges:{added:[],removed:[],changed:[],reordered:true}}))),['工具顺序有变化']);
+  assert.match(source,/<li v-for="line in toolChangeLines\(preview\)" :key="line">\{\{ line \}\}<\/li>/);
 });

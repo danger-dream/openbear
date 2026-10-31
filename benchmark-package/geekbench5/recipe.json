@@ -1,0 +1,12 @@
+{
+  "name": "Geekbench 5",
+  "repo": null,
+  "license": "Geekbench 5 is proprietary software by Primate Labs; it is downloaded from the official CDN, not redistributed. run.sh is ours.",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "run.sh",
+  "files": {"run.sh": "run.sh"},
+  "binaries": [
+    {"platform": "linux/amd64", "dest": "bin/geekbench", "url": "https://cdn.geekbench.com/Geekbench-5.5.1-Linux.tar.gz", "unpack": "tar", "strip": 1},
+    {"platform": "linux/arm64", "dest": "bin/geekbench", "url": "https://cdn.geekbench.com/Geekbench-5.5.1-LinuxARMPreview.tar.gz", "unpack": "tar", "strip": 1}
+  ]
+}

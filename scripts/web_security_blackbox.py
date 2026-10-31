@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -38,7 +39,7 @@ FORBIDDEN_MARKERS = [
     "sqlite_master",
     "CREATE TABLE sessions",
     "Traceback (most recent call last)",
-    "/opt/src-space/openbear/openbear.json",
+    str(Path(__file__).resolve().parents[1] / "openbear.json"),
 ]
 
 

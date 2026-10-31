@@ -895,7 +895,7 @@ class Agent:
                         maybe = hook(state)
                         if inspect.isawaitable(maybe):
                             await maybe
-                    if state.get("active"):
+                    if state.get("active") and not state.get("quiet"):
                         label = retry_delay_label(int(state.get("delayMs") or 0) / 1000)
                         reason = str(state.get("summary") or "").strip()
                         await renderer.on_status(f"模型调用失败{f'：{reason}' if reason else ''}，{label}后重试 "

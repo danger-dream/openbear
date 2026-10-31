@@ -34,7 +34,9 @@ func withoutContext(raw string) string {
 	}
 	return strings.Join(out, "&")
 }
-func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, i instance, s *session, callbackPath string) {
+
+// A non-empty upstreamPath replaces the request path on the node.
+func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, i instance, s *session, upstreamPath string) {
 	target, _ := url.Parse(i.Upstream)
 	proxy := &httputil.ReverseProxy{
 		Transport: g.transport, FlushInterval: -1,
@@ -43,6 +45,10 @@ func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, i instance, s *s
 			p.SetURL(target)
 			// Rewrite deliberately does not trust browser-supplied forwarding headers.
 			stripInternal(p.Out.Header)
+			if upstreamPath != "" {
+				p.Out.URL.Path = upstreamPath
+				p.Out.URL.RawPath = ""
+			}
 			if s != nil {
 				p.Out.URL.RawQuery = withoutContext(p.In.URL.RawQuery)
 				p.Out.Header.Del("Authorization")
@@ -51,9 +57,8 @@ func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, i instance, s *s
 				p.Out.Header.Set("X-OpenBear-Gateway-Session", s.UpstreamID)
 				p.Out.Header.Set("X-OpenBear-Gateway-Origin", g.cfg.PublicURL)
 				p.Out.Header.Set("X-OpenBear-Gateway-Expires", strconv.FormatInt(s.ExpiresAt, 10))
+				p.Out.Header.Set(assetPrefixHeader, assetPrefix(i.ID))
 			} else {
-				p.Out.URL.Path = callbackPath
-				p.Out.URL.RawPath = ""
 				p.Out.URL.RawQuery = p.In.URL.RawQuery
 			}
 		},

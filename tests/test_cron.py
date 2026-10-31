@@ -14,7 +14,7 @@ from app.cron.service import CronService
 from app.llm.events import StreamEvent, ToolCall, Usage
 from app.tools.base import ToolRuntimeContext
 from app.tools.cron import dispatch, register_cron_tool
-from app.webhooks.contracts import iso
+from app.webhooks.contracts import WebhookError, iso
 from app.webhooks.repository import many, one
 from tests.test_web_admin import FakeRunFactory, FakeStreamBackend, _login_cookie
 from tests.test_webhooks_backend import env as base_env
@@ -293,6 +293,43 @@ async def test_tool_manages_schedules_from_automatic_runs(cron_env, source):
     deleted = await dispatch(e.cron, 'delete', {'jobId': job['id'], 'expectedRevision': job['revision'],
         'requestId': 'delete-follow-up'}, ctx)
     assert deleted['job']['scheduleState'] == 'deleted'
+
+
+async def test_server_changes_are_granted_by_people_never_by_automatic_runs(cron_env):
+    from app.tools.webhook import dispatch as webhook_dispatch
+    e = cron_env
+    row = await e.server._create_web_conversation(123, folder_uuid='folder')
+    person = ToolRuntimeContext(conversation_uuid=row['conversation_uuid'], chat_id=row['internal_chat_id'], webhook_owner_id=123)
+    automatic = ToolRuntimeContext(conversation_uuid=row['conversation_uuid'], chat_id=row['internal_chat_id'], source='cron', webhook_owner_id=123)
+    config = {'instructions': 'Check the servers.', 'notifications': {'mode': 'silent'}}
+    plain = (await dispatch(e.cron, 'create', {'folderId': 'folder', 'name': '巡检', 'requestId': 'plain', 'config': config}, automatic))['job']
+    assert plain['config']['allowServerChanges'] is False
+    with pytest.raises(CronError) as refused:
+        await dispatch(e.cron, 'create', {'folderId': 'folder', 'name': '改动', 'requestId': 'grant', 'config': {**config, 'allowServerChanges': True}}, automatic)
+    assert refused.value.payload['code'] == 'automatic_permission_forbidden'
+    with pytest.raises(CronError) as refused:
+        await dispatch(e.cron, 'update', {'jobId': plain['id'], 'expectedRevision': plain['revision'], 'requestId': 'grant-update', 'name': '巡检',
+                                          'config': {**plain['config'], 'allowServerChanges': True}}, automatic)
+    assert refused.value.payload['code'] == 'automatic_permission_forbidden'
+    granted = (await dispatch(e.cron, 'update', {'jobId': plain['id'], 'expectedRevision': plain['revision'], 'requestId': 'person', 'name': '巡检',
+                                                 'config': {**plain['config'], 'allowServerChanges': True}}, person))['job']
+    assert granted['config']['allowServerChanges'] is True
+    # A run never edits a task the user allowed, even keeping the permission: it would run what it wrote with it.
+    with pytest.raises(CronError) as refused:
+        await dispatch(e.cron, 'update', {'jobId': granted['id'], 'expectedRevision': granted['revision'], 'requestId': 'keep', 'name': '巡检 2',
+                                          'config': granted['config']}, automatic)
+    assert refused.value.payload['code'] == 'automatic_privileged_task_forbidden'
+    kept = (await dispatch(e.cron, 'update', {'jobId': granted['id'], 'expectedRevision': granted['revision'], 'requestId': 'keep-person',
+                                              'name': '巡检 2', 'config': granted['config']}, person))['job']
+    assert kept['name'] == '巡检 2' and kept['config']['allowServerChanges'] is True
+    with pytest.raises(WebhookError) as refused:
+        await webhook_dispatch(e.s, 'create', {'scope': {'type': 'folder', 'id': 'folder'}, 'requestId': 'hook',
+                                               'config': {'processing': {'instructions': 'x', 'allowServerChanges': True}}}, automatic)
+    assert refused.value.payload['code'] == 'automatic_permission_forbidden'
+    assert not await many(e.db.conn, 'SELECT * FROM webhook_endpoints')
+    hook = (await webhook_dispatch(e.s, 'create', {'scope': {'type': 'folder', 'id': 'folder'}, 'requestId': 'hook-person',
+                                                   'config': {'processing': {'instructions': 'x', 'allowServerChanges': True}}}, person))['endpoint']
+    assert hook['config']['processing']['allowServerChanges'] is True
 
 
 async def test_scheduled_turn_creates_and_executes_one_time_follow_up(cron_env):

@@ -7,22 +7,24 @@ from pathlib import Path
 
 from aiohttp import web
 
+from app.reference_policy import CONVERSATION_CONTENT_LIMIT
+from app.reference_servers import ServersUnavailable, picker_row, server_index, servers_enabled
 from app.references import (
     ReferenceError,
     ReferenceMaterials,
     parse_references,
     reference_display_text,
-    reference_occurrences,
 )
 from app.tools.history import _group_turns, _visible_history_items
-from app.reference_policy import CONVERSATION_CONTENT_LIMIT
 from app.web_console.core import _WEB_SESSION_KEY
 
 
 class WebAdminReferenceMixin:
     def _reference_store(self):
         if not hasattr(self, "_reference_material_store"):
-            self._reference_material_store = ReferenceMaterials(self.db)
+            self._reference_material_store = ReferenceMaterials(
+                self.db, servers=lambda: getattr(self, "servers", None)
+            )
         return self._reference_material_store
 
     def _reference_budget(self, conversation=None):
@@ -147,6 +149,24 @@ class WebAdminReferenceMixin:
                 status=422,
                 headers={"Cache-Control": "no-store"},
             )
+
+    async def handle_api_reference_servers(self, request):
+        """The owner's servers as @ candidates; nothing while the 主机 feature is off."""
+        owner = int(request[_WEB_SESSION_KEY].chat_id)
+        headers = {"Cache-Control": "no-store"}
+        service = getattr(self, "servers", None)
+        if not servers_enabled(service):
+            return web.json_response({"ok": True, "enabled": False, "items": []}, headers=headers)
+        try:
+            index = await server_index(service, owner)
+        except ServersUnavailable as exc:
+            if exc.code == "servers_feature_disabled":
+                return web.json_response({"ok": True, "enabled": False, "items": []}, headers=headers)
+            return web.json_response({"ok": False, "error": exc.code}, status=503, headers=headers)
+        return web.json_response(
+            {"ok": True, "enabled": True, "items": [picker_row(facts) for facts in index.values()]},
+            headers=headers,
+        )
 
     async def handle_api_reference_history(self, request):
         owner = int(request[_WEB_SESSION_KEY].chat_id)

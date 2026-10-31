@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -92,6 +95,31 @@ def test_classify_trees_compares_digests(tmp_path: Path):
     (incoming / "app" / "main.py").write_text("new\n", encoding="utf-8")
     result = u.classify_trees(current, incoming)
     assert result["requiresRestart"] is True
+
+
+def test_classify_trees_never_walks_user_data_or_tools(tmp_path: Path, monkeypatch):
+    u = updater()
+    current, incoming = tmp_path / "current", tmp_path / "incoming"
+    for root in (current, incoming):
+        (root / "app").mkdir(parents=True)
+        (root / "app" / "main.py").write_text("same\n", encoding="utf-8")
+    for rel in ("data/node-bin/1.0.0/openbear-node-linux-amd64", "workspace/repo/app/x.py", ".tools/uv/uv",
+                "skills/s/SKILL.md", "mcp-servers/m/server.py", ".venv/bin/python", "web/dist/data/keep.txt"):
+        (current / rel).parent.mkdir(parents=True, exist_ok=True)
+        (current / rel).write_text("local\n", encoding="utf-8")
+    walked = []
+    real_walk = os.walk
+
+    def spy(top, *args, **kwargs):
+        for item in real_walk(top, *args, **kwargs):
+            walked.append(Path(item[0]))
+            yield item
+
+    monkeypatch.setattr(u.os, "walk", spy)
+    result = u.classify_trees(current, incoming)
+    assert result["changed"] == ["web/dist/data/keep.txt"]  # only managed paths are compared
+    tops = {p.relative_to(current).parts[0] for p in walked if p.is_relative_to(current) and p != current}
+    assert tops == {"app", "web"}
 
 
 def test_classify_trees_version_bump_and_dist_is_refresh(tmp_path: Path):
@@ -466,6 +494,126 @@ def test_resolve_uv_finds_home_local_bin(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     found = u.resolve_uv({"HOME": str(tmp_path), "PATH": "/usr/bin"})
     assert found == str(fake)
+
+
+def _fake_uv(path: Path, version: str = "0.11.6") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\necho 'uv {version} (fake)'\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _only_test_uv_dirs(u, monkeypatch, tmp_path: Path) -> dict[str, str]:
+    # Search exactly these: PATH, ~/.cargo/bin and the install root; never the host's uv.
+    monkeypatch.setattr(u, "with_tool_path", lambda env=None: dict(env))
+    monkeypatch.setattr(u, "UV_SYSTEM_DIRS", ())
+    return {"HOME": str(tmp_path / "home"), "PATH": str(tmp_path / "bin")}
+
+
+def test_resolve_uv_prefers_system_uv_over_its_own_and_skips_dangling_links(tmp_path: Path, monkeypatch):
+    u = updater()
+    env = _only_test_uv_dirs(u, monkeypatch, tmp_path)
+    install = tmp_path / "install"
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "uv").symlink_to(tmp_path / "removed-uv")
+    assert u.resolve_uv(env, install) == ""
+    _fake_uv(install / ".tools" / "uv" / "uv")
+    assert u.resolve_uv(env, install) == str(install / ".tools" / "uv" / "uv")
+    _fake_uv(tmp_path / "home" / ".cargo" / "bin" / "uv")
+    assert u.resolve_uv(env, install) == str(tmp_path / "home" / ".cargo" / "bin" / "uv")
+    (tmp_path / "bin" / "uv").unlink()
+    _fake_uv(tmp_path / "bin" / "uv")
+    assert u.resolve_uv(env, install) == str(tmp_path / "bin" / "uv")
+
+
+def _uv_release(tmp_path: Path, build: str, version: str = "0.11.6") -> Path:
+    _fake_uv(tmp_path / "src" / build / "uv", version)
+    archive = tmp_path / "uv.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(tmp_path / "src" / build, arcname=build)
+    return archive
+
+
+def test_install_uv_downloads_verified_build_into_install_root(tmp_path: Path, monkeypatch):
+    u = updater()
+    build = "uv-x86_64-unknown-linux-musl"
+    archive = _uv_release(tmp_path, build)
+    monkeypatch.setattr(u.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(u, "UV_BUILDS", {"x86_64": (build, u.sha256_file(archive))})
+    urls = []
+    monkeypatch.setattr(u, "_download", lambda url, dest: (urls.append(url), shutil.copyfile(archive, dest)))
+    installed = u.install_uv(tmp_path / "install", log=lambda _m: None)
+    assert installed == str(tmp_path / "install" / ".tools" / "uv" / "uv")
+    assert os.access(installed, os.X_OK)
+    assert urls == [f"https://github.com/astral-sh/uv/releases/download/0.11.6/{build}.tar.gz"]
+    assert sorted(p.name for p in (tmp_path / "install" / ".tools" / "uv").iterdir()) == ["uv"]
+
+
+def test_install_uv_rejects_checksum_mismatch_and_reports_download_failure(tmp_path: Path, monkeypatch):
+    u = updater()
+    build = "uv-x86_64-unknown-linux-musl"
+    archive = _uv_release(tmp_path, build)
+    monkeypatch.setattr(u.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(u, "UV_BUILDS", {"x86_64": (build, "0" * 64)})
+    monkeypatch.setattr(u, "_download", lambda url, dest: shutil.copyfile(archive, dest))
+    with pytest.raises(u.UpdateError, match="校验和不匹配"):
+        u.install_uv(tmp_path / "install", log=lambda _m: None)
+    assert list((tmp_path / "install" / ".tools" / "uv").iterdir()) == []
+
+    def offline(url, dest):
+        raise u.UpdateError("下载失败: offline")
+
+    monkeypatch.setattr(u, "_download", offline)
+    monkeypatch.setattr(u.time, "sleep", lambda _s: None)
+    with pytest.raises(u.UpdateError, match="自动下载也失败"):
+        u.install_uv(tmp_path / "install", log=lambda _m: None)
+
+
+def test_ensure_uv_installs_its_own_once_and_never_touches_the_system(tmp_path: Path, monkeypatch):
+    u = updater()
+    env = _only_test_uv_dirs(u, monkeypatch, tmp_path)
+    install = tmp_path / "install"
+    installs = []
+
+    def install_uv(root, log=print):
+        installs.append(root)
+        _fake_uv(Path(root) / ".tools" / "uv" / "uv")
+        return str(Path(root) / ".tools" / "uv" / "uv")
+
+    monkeypatch.setattr(u, "install_uv", install_uv)
+    own = str(install / ".tools" / "uv" / "uv")
+    assert u.ensure_uv(install, env) == own
+    assert u.ensure_uv(install, env) == own
+    assert installs == [install]
+    assert not hasattr(u, "UV_LINK") and not (tmp_path / "bin").exists()
+
+
+def test_missing_uv_stops_update_before_the_service_is_touched(tmp_path: Path, monkeypatch):
+    u = updater()
+    install, staging = tmp_path / "install", tmp_path / "staging"
+    install.mkdir()
+    staging.mkdir()
+    (install / "uv.lock").write_text("old\n", encoding="utf-8")
+    worker = u.Updater({
+        "installRoot": str(install),
+        "dataDir": str(tmp_path / "data"),
+        "fromVersion": "1.0.0",
+        "toVersion": "2.0.0",
+        "serviceName": "openbear.service",
+        "healthUrl": "http://127.0.0.1:18961/health",
+    })
+    systemctl = []
+
+    def no_uv(*_args, **_kwargs):
+        raise u.UpdateError("找不到 uv，自动下载也失败：offline；请安装 uv 后重试")
+
+    monkeypatch.setattr(worker, "_download_and_verify", lambda: staging)
+    monkeypatch.setattr(u, "classify_trees", lambda *_a: {"changed": ["uv.lock"], "requiresRestart": True, "effect": "restart"})
+    monkeypatch.setattr(u, "ensure_uv", no_uv)
+    monkeypatch.setattr(worker, "_systemctl", lambda *args, check=True: systemctl.append(args))
+    assert worker.run() == 1
+    assert systemctl == [] and worker.did_swap is False
+    result = json.loads((tmp_path / "data" / "update-result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "failed" and "uv" in result["message"]
 
 
 async def test_release_assets_follow_github_redirects():

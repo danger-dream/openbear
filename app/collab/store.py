@@ -40,13 +40,19 @@ def dumps(value: Any) -> str:
 
 async def one(conn, sql: str, params: tuple = ()) -> dict[str, Any] | None:
     cur = await conn.execute(sql, params)
-    row = await cur.fetchone()
-    return dict(row) if row is not None else None
+    try:
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        await cur.close()
 
 
 async def many(conn, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     cur = await conn.execute(sql, params)
-    return [dict(row) for row in await cur.fetchall()]
+    try:
+        return [dict(row) for row in await cur.fetchall()]
+    finally:
+        await cur.close()
 
 
 def public_request(row: dict[str, Any], *, titles: dict[str, str] | None = None) -> dict[str, Any]:

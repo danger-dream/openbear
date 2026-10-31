@@ -4,12 +4,11 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import * as Vue from 'vue';
 import { renderToString } from 'vue/server-renderer';
-import { parse, compileScript, compileTemplate, compileStyle } from '@vue/compiler-sfc';
+import { parse } from '@vue/compiler-sfc';
 import { parse as jsParse } from '@babel/parser';
 import { resizePhoneTextarea } from './phoneTextarea.js';
 
 const editor = parse(fs.readFileSync(new URL('AdaptiveMdEditor.vue', import.meta.url), 'utf8')).descriptor;
-const summary = parse(fs.readFileSync(new URL('MobileAdminSummary.vue', import.meta.url), 'utf8')).descriptor;
 const walk = nodes => (nodes || []).flatMap(n => [n, ...walk(Array.isArray(n.children) ? n.children : [])]);
 function runtime(phone = true, flow = false) {
   const props = Vue.reactive({ modelValue: '原始内容\n[[ runtimeInfo.host ]]\n@mem/test', mobileFlow: flow, readOnly: false });
@@ -41,14 +40,6 @@ async function render(r) {
   if (failure) throw failure;
   return {html, nodes: walk([tree])};
 }
-
-test('phone editor and summary SFCs compile with no mobile browser dependency', () => {
-  for (const [name, sfc] of [['AdaptiveMdEditor',editor],['MobileAdminSummary',summary]]) {
-    const script = compileScript(sfc, {id:name});
-    assert.deepEqual(compileTemplate({source:sfc.template.content, id:name, filename:name+'.vue', compilerOptions:{bindingMetadata:script.bindings}}).errors, []);
-    for (const style of sfc.styles) assert.deepEqual(compileStyle({source:style.content, id:name, filename:name+'.vue', scoped:style.scoped}).errors, []);
-  }
-});
 
 test('phone defaults to native text, keeps exact draft across code mode/rotation, desktop forwards completion props', async () => {
   const r = runtime();

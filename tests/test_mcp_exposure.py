@@ -348,7 +348,7 @@ async def test_instance_control_requires_native_panel_and_ignores_model_supplied
     monkeypatch.setattr('app.tools.instances.one', one)
     service = SimpleNamespace(managed=False, db=SimpleNamespace(conn=None), require_controller=lambda: None,
                               host=SimpleNamespace(config=SimpleNamespace(telegram=SimpleNamespace(whitelist_ids=[123]))),
-                              row=row, request=request)
+                              row=row, request=request, public=lambda row: {'name': 'child'})
     registry = ToolRegistry()
     register_instance_tools(registry, service)
     result = json.loads(await registry.dispatch('InstanceControl', json.dumps({'action': 'request', 'params': {

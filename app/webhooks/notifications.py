@@ -86,6 +86,7 @@ async def deliver(s,n):
         return
     async with s.db.webhook_transaction() as conn:
         await conn.execute("UPDATE web_task_notifications SET state='delivered',delivered_at=?,updated_at=?,claim_token='',last_error='' WHERE notification_uuid=?",(now,now,n['notification_uuid']))
+    if hasattr(s.host,'_schedule_conversation_retention'): s.host._schedule_conversation_retention()
 
 
 async def channel_delivery_states(s,notification_key):

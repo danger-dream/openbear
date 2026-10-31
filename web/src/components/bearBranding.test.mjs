@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { compileScript, parse } from "@vue/compiler-sfc";
+import { inflateSync } from "node:zlib";
+import { parse } from "@vue/compiler-sfc";
 import { compile } from "@vue/compiler-dom";
 import * as Vue from "vue";
 import { renderToString } from "vue/server-renderer";
@@ -9,19 +10,8 @@ import { renderToString } from "vue/server-renderer";
 const webRoot = new URL("../../", import.meta.url);
 const source = readFileSync(new URL("src/components/BearLogo.vue", webRoot), "utf8");
 const { descriptor } = parse(source);
-const script = compileScript(descriptor, {id: 'bear-logo-theme-test'});
-const setupCode = script.content.replace(/^import .*;\n/gm, '').replace('export default', 'return');
-const {code} = compile(descriptor.template.content, {mode: 'function', prefixIdentifiers: true, bindingMetadata: script.bindings});
+const {code} = compile(descriptor.template.content, {mode: 'function'});
 const render = new Function('Vue', code)(Vue);
-function component(initialDark = true) {
-  let listener, unmount, stopped = false;
-  const sfc = new Function('ref', 'onBeforeUnmount', 'getThemeState', 'subscribeTheme', setupCode)(
-    Vue.ref, callback => { unmount = callback; }, () => ({dark: initialDark}),
-    callback => { listener = callback; return () => { stopped = true; }; },
-  );
-  const state = sfc.setup({}, {expose() {}});
-  return {tree: () => render({}, [], {}, Vue.proxyRefs(state)), change: dark => listener({dark}), unmount: () => unmount(), stopped: () => stopped};
-}
 const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 function asset(path) {
   return readFileSync(new URL(`public${path}`, webRoot));
@@ -31,44 +21,54 @@ function assertPngSize(data, size) {
   assert.equal(data.readUInt32BE(16), size);
   assert.equal(data.readUInt32BE(20), size);
 }
+// Alpha of one pixel from an 8-bit RGBA, non-interlaced PNG.
+function pngAlpha(data, x, y) {
+  assert.equal(data[25], 6, "artwork keeps an alpha channel");
+  const width = data.readUInt32BE(16), stride = width * 4, idat = [];
+  for (let offset = 8; offset < data.length;) {
+    const length = data.readUInt32BE(offset);
+    if (data.toString("ascii", offset + 4, offset + 8) === "IDAT") idat.push(data.subarray(offset + 8, offset + 8 + length));
+    offset += length + 12;
+  }
+  const raw = inflateSync(Buffer.concat(idat));
+  let previous = Buffer.alloc(stride), row;
+  for (let line = 0; line <= y; line += 1) {
+    const filter = raw[line * (stride + 1)];
+    row = Buffer.from(raw.subarray(line * (stride + 1) + 1, (line + 1) * (stride + 1)));
+    for (let i = 0; i < stride; i += 1) {
+      const left = i >= 4 ? row[i - 4] : 0, up = previous[i], upLeft = i >= 4 ? previous[i - 4] : 0;
+      const p = left + up - upLeft, pa = Math.abs(p - left), pb = Math.abs(p - up), pc = Math.abs(p - upLeft);
+      const predictor = [0, left, up, (left + up) >> 1, pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft][filter];
+      row[i] = (row[i] + predictor) & 255;
+    }
+    previous = row;
+  }
+  return row[x * 4 + 3];
+}
 
-test("shared logo renders the approved raster artwork with accessible name and uncropped sizing", async () => {
-  const view = component(true);
-  const html = await renderToString(Vue.createSSRApp({render: view.tree}));
+test("shared logo renders one transparent raster artwork for both themes with accessible name and uncropped sizing", async () => {
+  const html = await renderToString(Vue.createSSRApp({render}));
   assert.match(html, /<img\b/);
   assert.match(html, /alt="OpenBear"/);
   assert.match(html, /draggable="false"/);
   const src = html.match(/src="([^"]+)"/)[1];
   assert.match(src, /^\/assets\/brand\/openbear-[a-f0-9]{12}\.png$/);
   assertPngSize(asset(src), 512);
-  assert.equal(asset(src)[25], 2, "the approved dark background stays opaque RGB");
+  assert.equal(pngAlpha(asset(src), 0, 0), 0, "the artwork has no backdrop");
+  assert.equal(pngAlpha(asset(src), 511, 0), 0);
+  assert.equal(pngAlpha(asset(src), 256, 384), 255);
   assert.deepEqual(asset(src), asset("/icons/openbear-512.png"), "UI and installed-app icons use the same approved artwork");
+  assert.doesNotMatch(source, /<script|theme/i, "a transparent logo needs no per-theme variant");
   assert.match(descriptor.styles[0].content, /border-radius:\s*22%/);
   assert.match(descriptor.styles[0].content, /object-fit:\s*contain/);
   assert.doesNotMatch(source, /<svg|🐻/);
 });
 
-test("light UI uses its own opaque backdrop and reacts to the actual app theme without changing PWA icons", () => {
-  const view = component(false);
-  const light = view.tree().props.src;
-  assert.match(light, /^\/assets\/brand\/openbear-light-[a-f0-9]{12}\.png$/);
-  assertPngSize(asset(light), 512);
-  assert.equal(asset(light)[25], 2);
-  view.change(true);
-  const dark = view.tree().props.src;
-  assert.equal(dark, '/assets/brand/openbear-d60af5867ad8.png');
-  assert.deepEqual(asset(dark), asset('/icons/openbear-512.png'));
-  assert.notDeepEqual(asset(light), asset(dark));
-  view.change(false);
-  assert.equal(view.tree().props.src, light);
-  view.unmount();
-  assert.equal(view.stopped(), true);
-});
-
-test("PWA and Apple icons retain their sizes and existing application identity", () => {
+test("PWA and Apple icons are transparent so the platform supplies the backdrop", () => {
   for (const [path, size] of [["/icons/openbear-192.png", 192], ["/icons/openbear-512.png", 512], ["/icons/apple-touch-icon.png", 180]]) {
     assertPngSize(asset(path), size);
-    assert.equal(asset(path)[25], 2, "installed-app icons retain the dark RGB background");
+    assert.equal(pngAlpha(asset(path), 0, 0), 0);
+    assert.equal(pngAlpha(asset(path), size - 1, 0), 0);
   }
   const manifest = JSON.parse(asset("/manifest.webmanifest"));
   assert.deepEqual([manifest.id, manifest.start_url, manifest.scope], ["./", "./", "./"]);
@@ -96,6 +96,7 @@ test("favicon links use versioned assets and provide real small-size ICO frames"
     const offset = ico.readUInt32LE(entry + 12);
     assert.ok(offset >= 6 + count * 16 && offset + length <= ico.length);
     assertPngSize(ico.subarray(offset, offset + length), size);
+    assert.equal(pngAlpha(ico.subarray(offset, offset + length), size / 2, Math.floor(size / 10)), 0, "no backdrop between the horns");
     sizes.push(size);
   }
   assert.deepEqual(sizes, [16, 32, 48, 64]);

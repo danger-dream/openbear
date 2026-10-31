@@ -101,6 +101,23 @@
   color: var(--ob-chat-text);
 }
 
+/* PC 桌面端「更多」：未固定的入口在上，已固定的在下，每行一个图钉开关 */
+.sidebar-more { display: flex; flex-direction: column; gap: 1px; padding: 5px; }
+.sidebar-more-caption { margin: 4px 8px 3px; color: var(--ob-chat-muted); font-size: 11px; }
+.sidebar-more-caption:not(:first-child) { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--ob-chat-line); }
+.sidebar-more-row { display: flex; align-items: center; gap: 2px; border-radius: 7px; }
+.sidebar-more-row:hover { background: var(--ob-chat-hover); }
+.sidebar-more-row.is-active { background: var(--ob-chat-selected); }
+.sidebar-more-go { display: flex; flex: 1; align-items: center; gap: 9px; min-width: 0; height: 32px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--ob-chat-text); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.sidebar-more-go .el-icon { color: var(--ob-chat-subtle); }
+.sidebar-more-go[aria-current='page'] { font-weight: 500; }
+.sidebar-more-pin { display: grid; flex: none; place-items: center; width: 28px; height: 28px; margin-right: 2px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--ob-chat-subtle); cursor: pointer; }
+.sidebar-more-pin svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transform: rotate(35deg); }
+.sidebar-more-pin[aria-pressed='true'] { color: var(--ob-chat-text); }
+.sidebar-more-pin[aria-pressed='true'] svg { fill: currentColor; }
+.sidebar-more-pin:hover:not(:disabled) { background: var(--ob-chat-selected); color: var(--ob-chat-text); }
+.sidebar-more-pin:disabled { opacity: .3; cursor: not-allowed; }
+
 /* =========================================================================
    PC 桌面端侧边栏底部工具条 (系统设置 + 多渠道健康状态)
    ========================================================================= */

@@ -1,14 +1,17 @@
 <script setup>
 import {computed, onBeforeUnmount, ref, watch} from "vue";
-import {ArrowRight} from "@element-plus/icons-vue";
+import {ArrowRight, View} from "@element-plus/icons-vue";
 import {Api, apiError} from "../../api.js";
 import {copyTextToClipboard} from "../../utils/clipboard.js";
 import {contextCompactionView} from "./agentPlanPresentation.js";
-import {toolArgumentsRawPayload} from "./toolArgumentsPresentation.js";
+import {serversEditDiff, toolArgumentsRawPayload} from "./toolArgumentsPresentation.js";
 import {toolDisplayState, toolResultText} from "./display.js";
 import {highlightCodeHtml} from "./markdown.js";
 import {detailIsAtLeast, useToolDetailCache} from "./toolDetailCache.js";
 import {agentInfoResultView, shortAgentId} from "./agentInstancePresentation.js";
+import {openArtifactPreview} from "../../artifacts/artifactFiles.js";
+import {toolFileIdentityFor} from "./toolFileAction.js";
+import {useWorkItems, workItemCallNumber} from "./workItems.js";
 
 const props = defineProps({
 	event: {type: Object, required: true},
@@ -135,6 +138,7 @@ const displayEvent = computed(() => {
 	};
 });
 const toolState = computed(() => toolDisplayState(displayEvent.value, props.activeIndex, {includeDetail: props.open}));
+const fileIdentity = computed(() => props.detailOnly ? null : toolFileIdentityFor(displayEvent.value, props.conversationUuid));
 
 const baseCompaction = computed(() => {
 	const payload = object(displayEvent.value?.operation?.payload);
@@ -185,6 +189,8 @@ const resultSource = computed(() => isContextCompaction.value
 	? (compactionOutput.value || compactionPreview.value || "")
 	: (toolState.value.activeResult ? toolResultText(displayEvent.value, toolState.value.activeResult) : ""));
 const resultPayload = computed(() => formatPayload(resultSource.value));
+const editDiff = computed(() => serversEditDiff(toolState.value.activeToolName, toolState.value.activeArguments, resultSource.value));
+const editDiffHtml = computed(() => editDiff.value ? highlightCodeHtml(editDiff.value, "diff") : "");
 const resultHtml = computed(() => highlightCodeHtml(resultPayload.value.content, resultPayload.value.language));
 const agentInfo = computed(() => agentInfoResultView(toolState.value.activeToolName, resultSource.value));
 const toolDetailNotice = computed(() => {
@@ -325,6 +331,16 @@ function selectCallTab(index) {
 	emit("select-tab", index);
 }
 
+function openFile(event) {
+	if (fileIdentity.value) openArtifactPreview(fileIdentity.value, "", event.currentTarget);
+}
+const workItems = useWorkItems();
+const workItemNumber = computed(() => {
+	const call = displayEvent.value?.calls?.[0];
+	if (props.detailOnly || !workItems || !call || call.name !== "WorkItem") return "";
+	return workItemCallNumber(call.arguments || "", displayEvent.value?.result?.content || "");
+});
+
 </script>
 
 <template>
@@ -333,7 +349,9 @@ function selectCallTab(index) {
 			<span class="tool-icon"><component :is="toolState.icon"/></span>
 			<span class="tool-name">{{ toolState.title }}</span>
 			<span class="disclosure-icon"><ArrowRight/></span>
-			<span class="tool-preview">{{ toolState.preview }}</span>
+			<span class="tool-preview" :class="{'has-file-open': fileIdentity}">{{ toolState.preview }}</span>
+			<button v-if="fileIdentity" type="button" class="tool-file-open" title="打开文件" :aria-label="`打开文件：${toolState.preview}`" @click.stop.prevent="openFile"><View/></button>
+			<button v-else-if="workItemNumber" type="button" class="tool-file-open" title="打开任务" :aria-label="`打开任务 #${workItemNumber}`" @click.stop.prevent="workItems.open(workItemNumber)"><View/></button>
 		</summary>
 		<div v-if="open" class="tool-detail" tabindex="0" aria-label="工具详情，可滚动">
 			<div v-if="toolState.isBatch" class="tool-call-selector" role="tablist" aria-label="选择工具调用">
@@ -386,6 +404,13 @@ function selectCallTab(index) {
 					<pre><code class="hljs" :class="argumentsPayload.language ? `language-${argumentsPayload.language}` : ''" v-html="argumentsHtml"></code></pre>
 				</div>
 				<p v-else class="tool-payload-empty">无调用参数</p>
+			</section>
+
+			<section v-if="editDiff" class="tool-payload-section" aria-label="文件差异">
+				<header class="tool-payload-heading"><span class="tool-payload-title">文件差异</span></header>
+				<div class="tool-payload-code" tabindex="0" aria-label="文件差异正文，可滚动">
+					<pre><code class="hljs language-diff" v-html="editDiffHtml"></code></pre>
+				</div>
 			</section>
 
 			<section class="tool-payload-section" :class="{'context-detail-section': isContextCompaction}" aria-label="返回结果">
@@ -639,6 +664,42 @@ details[open] > summary > .disclosure-icon {
 
 .tool-preview {
 	color: var(--ob-text-muted);
+}
+
+/* Keep the button right after the file name instead of at the far edge. */
+.tool-preview.has-file-open {
+	flex: 0 1 auto;
+}
+
+.tool-file-open {
+	position: relative;
+	display: grid;
+	width: 1.15rem;
+	height: 1.15rem;
+	flex: 0 0 auto;
+	place-items: center;
+	border: 0;
+	border-radius: 5px;
+	background: transparent;
+	padding: 0;
+	color: var(--ob-text-muted);
+	cursor: pointer;
+}
+
+.tool-file-open svg {
+	width: .82rem;
+	height: .82rem;
+}
+
+.tool-file-open::after {
+	content: "";
+	position: absolute;
+	inset: -6px;
+}
+
+.tool-file-open:hover {
+	color: var(--ob-text);
+	background: var(--ob-hover);
 }
 
 .tool-running > summary .tool-name {

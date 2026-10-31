@@ -1,0 +1,9 @@
+{
+  "name": "TCPQuality",
+  "repo": "https://github.com/ibsgss/TcpQuality",
+  "license": "GPL-3.0",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entry": "runTcpQuality-core.sh",
+  "files": {"runTcpQuality-core.sh": "runTcpQuality-core.sh"},
+  "keep": ["LICENSE"]
+}

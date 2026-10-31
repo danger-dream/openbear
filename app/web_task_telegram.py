@@ -22,7 +22,8 @@ from app.html_chunking import split_html_chunks
 from app.lifecycle import wait_for_startup
 from app.logging import get_logger
 from app.telegram_ui import send_rich
-from app.web_telegram_replies import bind_message, reply_keyboard
+from app.web_telegram_replies import bind_message, link_keyboard, reply_keyboard
+from app.work_items import WorkItemsDAO
 
 log = get_logger("web_task_telegram")
 
@@ -320,6 +321,39 @@ class WebTaskTelegramNotifier:
         )
         await self.db.conn.commit()
 
+    async def send_notice(
+        self, key: str, *, owner_chat_id: int, title: str, text: str, link: tuple[str, str] | None = None,
+        conversation_uuid: str = "", internal_chat_id: int = 0, text_html: bool = False,
+    ) -> bool:
+        """Queue a notice that is not the result of a task turn.
+
+        It shares the durable outbox (one delivery per key, retries) but renders
+        only its own title and text, never the task-completion layout. With a
+        conversation, Telegram replies to it still route into that conversation.
+        """
+        owner = int(owner_chat_id or 0)
+        if not key or owner <= 0 or owner not in {int(value) for value in self.config.telegram.whitelist_ids}:
+            return False
+        now = _now()
+        await self.db.conn.execute(
+            """
+            INSERT OR IGNORE INTO web_tg_notification_runs (
+              root_turn_uuid, conversation_uuid, owner_chat_id, internal_chat_id,
+              title, model, status, config_json, result_text, started_at,
+              threshold_at, completed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, '', 'completed', '{}', '', ?, ?, ?, ?, ?)
+            """,
+            (key, str(conversation_uuid or ""), owner, int(internal_chat_id or owner), _safe_text(title, 200), now, now, now, now, now),
+        )
+        payload: dict[str, Any] = {"title": _safe_text(title, 120), "text": str(text or "")[:3500]}
+        if text_html:
+            # Already Telegram HTML, escaped by the caller; only short texts, so the cut above never splits a tag.
+            payload["html"] = True
+        if link:
+            payload["link"] = {"path": link[0], "label": link[1]}
+        await self._queue_event(key, "notice", "notice", payload, deliver_after=now)
+        return True
+
     async def register(self, event: dict[str, Any], *, owner_chat_id: int, internal_chat_id: int, title: str, model: str, config_override: WebTaskNotificationsConfig | None = None) -> None:
         direct = event.get("source") == "telegram"
         cfg = config_override if config_override is not None else self._direct_reply_config() if direct else self.config.web.task_notifications
@@ -426,6 +460,10 @@ class WebTaskTelegramNotifier:
                     "title": _safe_text(task.get("title") or task.get("displayName") or nested.get("title") or "", 120),
                     "status": status,
                 }
+                if task_uuid.startswith("collab:"):
+                    # A conversation-request result always reports status=completed; only its
+                    # summary carries the receiver and the real request state.
+                    payload.update(source="collab", title=_safe_text(nested.get("summary") or payload["title"], 120))
                 if status == "running":
                     await self._queue_selected(run, "agent_started", f"agent_started:{task_uuid}", payload)
                 elif status in _AGENT_TERMINAL:
@@ -465,11 +503,21 @@ class WebTaskTelegramNotifier:
         event_type = {"completed": "task_completed", "failed": "task_failed", "interrupted": "task_interrupted"}[normalized]
         result = str(run.get("result_text") or "")
         if normalized == "completed" and config.include_result and result:
+            result = await self._with_work_items(run, root_turn_uuid, result)
             # One logical completion message, with metadata and the full answer.
             await self._queue_event(root_turn_uuid, "result", "result", {"text": result, "combined": True}, deliver_after=now)
         elif event_type in config.events:
             await self._queue_event(root_turn_uuid, event_type, event_type, {}, deliver_after=now)
         self._wake.set()
+
+    async def _with_work_items(self, run: dict[str, Any], root_turn_uuid: str, result: str) -> str:
+        """The answer followed by the state of the tasks this turn worked on, as plain lines."""
+        try:
+            lines = await WorkItemsDAO(self.db).turn_status_lines(str(run.get("conversation_uuid") or ""), root_turn_uuid)
+        except Exception:
+            log.exception("web_task_telegram.work_items_failed", root_turn_uuid=root_turn_uuid)
+            return result
+        return result.rstrip() + "\n\n" + "\n\n".join(lines) if lines else result
 
     async def _run(self, root_turn_uuid: str) -> dict[str, Any] | None:
         cur = await self.db.conn.execute(
@@ -646,6 +694,10 @@ class WebTaskTelegramNotifier:
         try:
             if delivery.event_type == "result":
                 message_ids = await self._stream_result(delivery, owner, str(delivery.payload.get("text") or ""), run=run)
+            elif delivery.event_type == "notice":
+                text = str(delivery.payload.get('text') or '')
+                body = f"<b>{html.escape(str(delivery.payload.get('title') or ''))}</b>\n\n{text if delivery.payload.get('html') is True else html.escape(text)}"
+                message_ids = await self._send_notification_page(delivery, owner, run, 1, body)
             else:
                 message_ids = await self._send_notification_page(delivery, owner, run, 1, await self._event_html(run, delivery))
         except asyncio.CancelledError:
@@ -704,6 +756,9 @@ class WebTaskTelegramNotifier:
             "task_interrupted": ("⏹", "OpenBear 任务已中断"),
         }
         icon, title = labels.get(event, ("ℹ️", "OpenBear 任务通知"))
+        collab = event.startswith("agent_") and delivery.payload.get("source") == "collab"
+        if collab:
+            icon, title = "💬", "会话请求有结果"
         latest_title = str(run.get("title") or "新对话")
         latest_model = str(run.get("model") or "")
         with contextlib.suppress(Exception):
@@ -721,7 +776,9 @@ class WebTaskTelegramNotifier:
             lines.append(f"模型：<code>{html.escape(_safe_text(latest_model, 120))}</code>")
         lines.append(f"耗时：{elapsed}")
         payload = delivery.payload
-        if event.startswith("agent_"):
+        if collab:
+            lines.append(f"会话请求：{html.escape(_safe_text(payload.get('title') or payload.get('taskUuid'), 120))}")
+        elif event.startswith("agent_"):
             agent_name = _safe_text(payload.get("title") or payload.get("taskUuid") or "Agent", 100)
             lines.append(f"Agent：{html.escape(agent_name)}")
             if payload.get("status"):
@@ -742,6 +799,8 @@ class WebTaskTelegramNotifier:
             for item in payload.get("events") if isinstance(payload.get("events"), list) else []:
                 item_payload = item.get("payload") if isinstance(item, dict) and isinstance(item.get("payload"), dict) else {}
                 label = event_labels.get(str((item or {}).get("eventType") or ""), "任务更新")
+                if item_payload.get("source") == "collab":
+                    label = "会话请求有结果"
                 suffix = ""
                 if item_payload.get("title") or item_payload.get("taskUuid"):
                     suffix = " · " + _safe_text(item_payload.get("title") or item_payload.get("taskUuid"), 80)
@@ -775,7 +834,13 @@ class WebTaskTelegramNotifier:
             "html": body, "mode": "rich" if telegram_ui.USE_RICH_MESSAGES else "html", "ids": [],
         })
         body = str(page["html"])
-        markup = reply_keyboard(self.config, str(run.get("conversation_uuid") or ""))
+        link = delivery.payload.get("link") if delivery.event_type == "notice" and isinstance(delivery.payload.get("link"), dict) else {}
+        if link:
+            markup = link_keyboard(self.config, str(link.get("path") or ""), str(link.get("label") or ""))
+        elif delivery.event_type == "notice" and not run.get("conversation_uuid"):
+            markup = None
+        else:
+            markup = reply_keyboard(self.config, str(run.get("conversation_uuid") or ""))
         if page["mode"] == "rich":
             if page["ids"] and not page.get("needsEdit"):
                 return list(page["ids"])

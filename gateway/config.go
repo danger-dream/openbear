@@ -15,7 +15,7 @@ import (
 
 type Config struct {
 	Listen        string          `json:"listen"`
-	ControlListen string          `json:"controlListen,omitempty"` // legacy; control shares listen
+	ControlListen string          `json:"controlListen,omitempty"` // control API only, normally loopback; unset: shares listen
 	PublicURL     string          `json:"publicUrl"`
 	StateDir      string          `json:"stateDir"`
 	WebRoot       string          `json:"webRoot"`

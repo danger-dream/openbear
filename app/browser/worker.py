@@ -23,8 +23,10 @@ class WorkerError(RuntimeError):
 
 
 class Worker:
-    def __init__(self, python=None):
+    def __init__(self, python=None, command=None):
         self.python = python or sys.executable
+        # Optional complete argv for a protocol-compatible engine; default is the Python worker.
+        self.command = list(command) if command else None
         self.proc = None
         self.reader = None
         self.pending = {}
@@ -51,10 +53,9 @@ class Worker:
             await self.close()
             self.fatal = ""
             from app.managed.settings import sanitized_env
+            argv = self.command or [self.python, "-m", "app.browser.pyworker.main"]
             self.proc = await asyncio.create_subprocess_exec(
-                self.python,
-                "-m",
-                "app.browser.pyworker.main",
+                *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

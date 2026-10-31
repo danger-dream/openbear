@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from urllib.parse import quote, unquote, urlsplit
 
+from app.tools.file_state import normalize_path
 from app.web_console.core import *
 from app.web_console.live_stream import *
 
@@ -37,6 +38,17 @@ _ARTIFACT_FORCE_DOWNLOAD_EXTS = {
     ".dmg", ".exe", ".gz", ".iso", ".jar", ".msi", ".pkg", ".ps1", ".rar",
     ".rpm", ".run", ".sh", ".tar", ".tgz", ".xz", ".zip", ".zst",
 }
+_TOOL_FILE_TOOLS = {"Read", "Write", "Edit", "EditBatch"}
+_TOOL_FILE_HASH_LIMIT = 32 * 1024 * 1024
+_TOOL_FILE_SNIFF_BYTES = 8192
+# Guessed types the preview already reads as text; any other guess for a file whose
+# content is UTF-8 (e.g. ".ts" guessed as video/mp2t) is served as text/plain.
+_TOOL_FILE_TEXT_MIMES = {
+    "application/json", "application/x-jsonlines", "application/xml", "application/yaml",
+    "application/x-yaml", "application/toml", "application/javascript", "application/typescript",
+    "application/sql", "application/xhtml+xml", "image/svg+xml",
+}
+_TOOL_FILE_NEW_SHA_RE = re.compile(r"^new_sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE)
 
 
 class WebAdminArtifactsMixin:
@@ -223,6 +235,32 @@ class WebAdminArtifactsMixin:
         internal_chat_id = int(conversation.get("internal_chat_id") or 0)
         safe_name = _safe_upload_name(source.name, fallback="artifact.bin")
         mime_type = _guess_mime(safe_name, "")
+        # A segment is rewritten at its boundary and again when persisted; skip
+        # re-copying an unchanged file. The stat precedes the copy, so a write
+        # during the copy yields a new key on the next lookup.
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
+        cache_key = (conv_uuid, str(source.resolve()), stat.st_size, stat.st_mtime_ns)
+        registered = getattr(self, "_web_artifact_registered", None)
+        if registered is None:
+            registered = self._web_artifact_registered = {}
+        cached_uuid = registered.pop(cache_key, "")
+        if cached_uuid:
+            cur = await self.db.conn.execute(
+                "SELECT * FROM web_artifacts WHERE conversation_uuid=? AND artifact_uuid=? AND deleted_at=0 LIMIT 1",
+                (conv_uuid, cached_uuid),
+            )
+            cached_row = await cur.fetchone()
+            if cached_row is not None:
+                registered[cache_key] = cached_uuid
+                return self._web_artifact_public(dict(cached_row), conv_uuid)
+
+        def remember(artifact_uuid: str) -> None:
+            registered[cache_key] = artifact_uuid
+            while len(registered) > 256:
+                registered.pop(next(iter(registered)))
 
         tmp_dir = self._web_artifact_root() / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -250,6 +288,7 @@ class WebAdminArtifactsMixin:
                 if existing is not None:
                     with contextlib.suppress(OSError):
                         tmp_path.unlink()
+                    remember(str(existing["artifact_uuid"]))
                     return self._web_artifact_public(dict(existing), conv_uuid)
 
                 blob_path = self._web_artifact_blob_path(sha256_value)
@@ -286,6 +325,7 @@ class WebAdminArtifactsMixin:
                         now_ts(),
                     ),
                 )
+            remember(artifact_uuid)
             return self._web_artifact_public(
                 {
                     "artifact_uuid": artifact_uuid,
@@ -392,6 +432,112 @@ class WebAdminArtifactsMixin:
         if int(data.get("internal_chat_id") or 0) != int(conversation.get("internal_chat_id") or 0):
             raise web.HTTPNotFound(text="artifact not found")
         return conversation, data
+
+    async def _tool_file_for_request(self, request: web.Request) -> tuple[str, str, Path, dict[str, Any]]:
+        """Resolve the file a recorded Read/Write/Edit call operated on; no client-supplied path."""
+        conversation = await self._conversation_from_request(request)
+        conv_uuid = str(conversation.get("conversation_uuid") or "")
+        op_id = str(request.match_info.get("operation_id") or "").strip()
+        if not op_id or len(op_id) > 512:
+            raise web.HTTPBadRequest(text="invalid operation id")
+        cur = await self.db.conn.execute(
+            "SELECT payload_json FROM web_operations WHERE conversation_uuid=? AND op_id=? AND op_type='tool' LIMIT 1",
+            (conv_uuid, op_id),
+        )
+        row = await cur.fetchone()
+        payload = operation_json_loads_dict(str(row["payload_json"] or "{}")) if row is not None else {}
+        if str(payload.get("toolName") or payload.get("name") or "") not in _TOOL_FILE_TOOLS:
+            raise web.HTTPNotFound(text="file not found")
+        args = payload.get("arguments", payload.get("args"))
+        if not isinstance(args, dict):
+            args = operation_json_loads_dict(str(args or "{}"))
+        raw_path = str(args.get("path") or "").strip()
+        if not raw_path or "\x00" in raw_path:
+            raise web.HTTPNotFound(text="file not found")
+        try:
+            path = normalize_path(raw_path).resolve()
+            found = path.is_file()
+        except OSError:
+            found = False
+        if not found:
+            raise web.HTTPNotFound(text="file not found")
+        return conv_uuid, op_id, path, payload
+
+    @staticmethod
+    def _tool_file_probe(path: Path, *, digest: bool) -> tuple[bool, str]:
+        """Return whether the file starts as UTF-8 text, and its SHA-256 when requested."""
+        sha = hashlib.sha256() if digest else None
+        head = b""
+        with path.open("rb") as fh:
+            while chunk := fh.read(1024 * 1024):
+                if len(head) < _TOOL_FILE_SNIFF_BYTES:
+                    head += chunk[: _TOOL_FILE_SNIFF_BYTES - len(head)]
+                if sha is None:
+                    break
+                sha.update(chunk)
+        looks_text = b"\x00" not in head
+        if looks_text:
+            try:
+                head.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # The sniffed prefix may end inside a multi-byte character.
+                looks_text = exc.end == len(head) and exc.start >= len(head) - 3
+        return looks_text, sha.hexdigest() if sha is not None else ""
+
+    @staticmethod
+    def _tool_file_mime(file_name: str, looks_text: bool) -> str:
+        guessed = _guess_mime(file_name, "")
+        if looks_text and not guessed.startswith("text/") and guessed not in _TOOL_FILE_TEXT_MIMES:
+            return "text/plain"
+        return guessed
+
+    async def handle_api_conversation_tool_file(self, request: web.Request) -> web.Response:
+        conv_uuid, op_id, path, payload = await self._tool_file_for_request(request)
+        stat = path.stat()
+        looks_text, sha256_value = await asyncio.to_thread(
+            self._tool_file_probe, path, digest=stat.st_size <= _TOOL_FILE_HASH_LIMIT
+        )
+        file_name = path.name or "file"
+        mime_type = self._tool_file_mime(file_name, looks_text)
+        match = _TOOL_FILE_NEW_SHA_RE.search(str(payload.get("resultText") or payload.get("result") or ""))
+        recorded = match.group(1) if match else ""
+        file_state = ("same" if sha256_value == recorded else "changed") if sha256_value and recorded else ""
+        base = f"/api/conversations/{conv_uuid}/operations/{quote(op_id, safe='')}/file/content"
+        return web.json_response({
+            "ok": True,
+            "artifact": {
+                "artifactUuid": op_id,
+                "conversationUuid": conv_uuid,
+                "source": "tool-file",
+                "fileName": file_name,
+                "mimeType": mime_type,
+                "sizeBytes": int(stat.st_size),
+                "sha256": sha256_value,
+                "modifiedAt": int(stat.st_mtime * 1000),
+                "path": str(path),
+                "fileState": file_state,
+                "inlinePreview": self._web_artifact_inline_allowed(file_name, mime_type),
+                "contentUrl": base,
+                "downloadUrl": f"{base}?download=1",
+            },
+        })
+
+    async def handle_api_conversation_tool_file_content(self, request: web.Request) -> web.StreamResponse:
+        _conv_uuid, _op_id, path, _payload = await self._tool_file_for_request(request)
+        looks_text, _ = await asyncio.to_thread(self._tool_file_probe, path, digest=False)
+        file_name = path.name or "file"
+        mime_type = self._tool_file_mime(file_name, looks_text)
+        forced_download = str(request.query.get("download") or "").lower() in {"1", "true", "yes", "on"}
+        inline = self._web_artifact_inline_allowed(file_name, mime_type) and not forced_download
+        response_mime_type = f"{mime_type}; charset=utf-8" if _is_text_file(file_name, mime_type) else mime_type
+        headers = {
+            "Content-Type": response_mime_type,
+            "Content-Disposition": self._web_artifact_content_disposition(file_name, inline=inline),
+            "X-Content-Type-Options": "nosniff",
+            # The file lives outside artifact storage and may change between opens.
+            "Cache-Control": "no-store",
+        }
+        return web.FileResponse(path, headers=headers)
 
     async def handle_api_conversation_artifacts(self, request: web.Request) -> web.Response:
         conversation = await self._conversation_from_request(request)

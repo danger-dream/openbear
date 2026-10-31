@@ -213,6 +213,34 @@ async def test_selected_agent_and_retry_events_are_deduplicated_and_delayed(tmp_
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_conversation_request_result_is_not_reported_as_agent(tmp_path, monkeypatch):
+    db = await _db(tmp_path)
+    monkeypatch.setattr("app.web_task_telegram._now", lambda: 1000)
+    notifier = WebTaskTelegramNotifier(_config(events=["agent_finished"], include_result=False), db, SimpleNamespace())
+    try:
+        await _register(notifier)
+        await notifier.observe(
+            {"type": "task_notification", "runUuid": "turn-1", "taskUuid": "collab:req-1", "status": "completed",
+             "title": "TCP 传输", "summary": "会话「实测工程师」：TCP 传输 · 需要补充信息"},
+            owner_chat_id=123, internal_chat_id=-1,
+        )
+        cur = await db.conn.execute("SELECT event_type, payload_json FROM web_tg_notification_outbox")
+        row = await cur.fetchone()
+        assert row["event_type"] == "agent_finished"
+        payload = json.loads(row["payload_json"])
+        html_text = await notifier._event_html(await notifier._run("turn-1"), Delivery(
+            id=1, root_turn_uuid="turn-1", event_type="agent_finished", payload=payload, attempts=0, message_ids=()))
+        assert "会话请求有结果" in html_text and "需要补充信息" in html_text
+        assert "Agent" not in html_text and "completed" not in html_text
+        summary = await notifier._event_html(await notifier._run("turn-1"), Delivery(
+            id=2, root_turn_uuid="turn-1", event_type="threshold_summary", attempts=0, message_ids=(),
+            payload={"events": [{"eventType": "agent_finished", "elapsedSeconds": 60, "payload": payload}]}))
+        assert "会话请求有结果 · 会话「实测工程师」" in summary and "Agent 执行结束" not in summary
+    finally:
+        await db.close()
+
+
 def _agent_tool_event(name, kind, status="running", task_uuid="agent-1"):
     payload = {
         "status": status,
@@ -571,6 +599,46 @@ async def test_upgrade_imports_all_old_checkpoints_before_retrying_an_edit(tmp_p
         await db.close()
 
 
+async def test_standalone_notice_uses_its_own_layout_and_is_sent_once(tmp_path, monkeypatch):
+    db = await _db(tmp_path)
+    monkeypatch.setattr("app.web_task_telegram._now", lambda: 3000)
+    cfg = _config(events=[], include_result=False)
+    cfg.web.task_notifications.enabled = False
+    cfg.web.custom_url = "https://bear.example"
+    bot = NotificationBot()
+    notifier = WebTaskTelegramNotifier(cfg, db, bot)
+    try:
+        assert not await notifier.send_notice("notice-x", owner_chat_id=999, title="提醒", text="陌生人")
+        for _ in range(2):
+            assert await notifier.send_notice("notice-1", owner_chat_id=123, title="🔔 服务器提醒",
+                                              text='组网：链路 "tcp://:52000" <无效>', link=("/servers", "打开服务器"))
+        await notifier._deliver(await notifier._claim_due())
+        assert await notifier._claim_due() is None
+        assert len(bot.sent) == 1
+        body = bot.sent[0]["body"]
+        assert body.startswith("<b>🔔 服务器提醒</b>") and "&lt;无效&gt;" in body
+        assert "任务" not in body and "最终回答" not in body and "耗时" not in body
+        button = bot.sent[0]["reply_markup"].inline_keyboard[0][0]
+        assert (button.text, button.url) == ("打开服务器", "https://bear.example/servers")
+        assert await (await db.conn.execute("SELECT * FROM web_tg_messages")).fetchall() == []
+
+        assert await notifier.send_notice("notice-2", owner_chat_id=123, title="🧩 实例管理", text="实例「甲」已恢复正常",
+                                          conversation_uuid="conv-1", internal_chat_id=-1)
+        await notifier._deliver(await notifier._claim_due())
+        assert "任务" not in bot.sent[1]["body"]
+        assert bot.sent[1]["reply_markup"].inline_keyboard[0][0].url == "https://bear.example/chat?id=conv-1"
+        bound = await (await db.conn.execute("SELECT conversation_uuid FROM web_tg_messages")).fetchall()
+        assert [row["conversation_uuid"] for row in bound] == ["conv-1"]
+
+        # A caller that already made Telegram HTML (server reminders put names in <code>) gets it sent as is.
+        assert await notifier.send_notice("notice-3", owner_chat_id=123, title="🔔 服务器提醒",
+                                          text="「<code>evil.example</code>」今天到期 &amp;", text_html=True)
+        await notifier._deliver(await notifier._claim_due())
+        assert bot.sent[2]["body"].endswith("「<code>evil.example</code>」今天到期 &amp;")
+    finally:
+        await db.close()
+
+
 async def test_existing_database_gets_additive_reply_tables_without_losing_conversations(tmp_path):
     db = await _db(tmp_path)
     await db.conn.execute("DROP TABLE web_tg_messages")
@@ -585,3 +653,29 @@ async def test_existing_database_gets_additive_reply_tables_without_losing_conve
         assert await (await upgraded.conn.execute("SELECT * FROM web_tg_messages")).fetchall() == []
     finally:
         await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_result_ends_with_the_state_of_the_tasks_this_turn_worked_on(tmp_path, monkeypatch):
+    from app.work_items import Actor, Source, WorkItemsDAO
+
+    db = await _db(tmp_path)
+    clock = {"now": 1000}
+    monkeypatch.setattr("app.web_task_telegram._now", lambda: clock["now"])
+    notifier = WebTaskTelegramNotifier(_config(events=[]), db, SimpleNamespace())
+    try:
+        dao = WorkItemsDAO(db)
+        actor = Actor("controller", turn_uuid="turn-1")
+        await dao.create("conv-1", actor, {"title": "修复", "children": ["网关", "防火墙", "版本"]}, source=Source("turn", False, "controller"))
+        await dao.set_focus("conv-1", "turn-1", ["1"], basis={"type": "message", "human": True}, actor=actor)
+        await dao.transition("conv-1", actor, "1.1", "complete", summary="ok", evidence=[{"kind": "test", "text": "ok"}])
+        await dao.transition("conv-1", actor, "1.2", "ask", reason="要不要固定版本？")
+        await _register(notifier)
+        await notifier.observe({"type": "final", "runUuid": "turn-1", "turnUuid": "turn-1", "text": "完成了一部分。"},
+                               owner_chat_id=123, internal_chat_id=-1)
+        clock["now"] = 1200
+        await notifier.finish("turn-1", "completed")
+        delivery = await notifier._claim_due()
+        assert delivery.payload["text"] == "完成了一部分。\n\n任务 #1 修复：1/3 完成 · 本轮范围还剩 1 项没收尾 · 1 项等你定"
+    finally:
+        await db.close()

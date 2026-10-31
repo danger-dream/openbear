@@ -55,7 +55,7 @@ func (g *Gateway) serveControl(w http.ResponseWriter, r *http.Request) {
 		for _, id := range ids {
 			items = append(items, summary(g.state.Instances[id]))
 		}
-		jsonResponse(w, 200, map[string]any{"ok": true, "version": 1, "publicUrl": g.cfg.PublicURL, "clientIp": g.ipPolicy.Load().Config, "clientIpObserved": g.observedProxy(), "instances": items, "eventsPending": len(g.state.Events), "eventsDropped": g.state.DroppedEvents})
+		jsonResponse(w, 200, map[string]any{"ok": true, "version": 1, "build": g.build, "publicUrl": g.cfg.PublicURL, "clientIp": g.ipPolicy.Load().Config, "clientIpObserved": g.observedProxy(), "instances": items, "eventsPending": len(g.state.Events), "eventsDropped": g.state.DroppedEvents})
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/control/v1/instances/"), "/")
@@ -154,8 +154,9 @@ func (g *Gateway) putInstance(w http.ResponseWriter, r *http.Request, id string)
 	if p.Username != nil {
 		next.Username = *p.Username
 	}
+	// An archived (disabled) instance keeps its name but does not hold it against a new one.
 	for other, i := range g.state.Instances {
-		if other != id && i.Username == next.Username {
+		if other != id && i.Username == next.Username && i.Enabled && next.Enabled {
 			fail(w, 409, "username_unavailable")
 			return
 		}

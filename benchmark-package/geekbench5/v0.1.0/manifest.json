@@ -1,0 +1,36 @@
+{
+  "tool": "geekbench5",
+  "version": "v0.1.0",
+  "name": "Geekbench 5",
+  "upstream": null,
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "run.sh",
+  "files": {
+    "run.sh": "6775cc1a27378245a7735dd2d1bd6f0b457fbad064aa265704b579cf5e05c44d"
+  },
+  "binaries": [
+    {
+      "platform": "linux/amd64",
+      "dest": "bin/geekbench",
+      "url": "https://cdn.geekbench.com/Geekbench-5.5.1-Linux.tar.gz",
+      "unpack": "tar",
+      "strip": 1,
+      "sha256": "32037e55c3dc8f360fe16b7fbb188d31387ea75980e48d8cf028330e3239c404",
+      "size": 93199992
+    },
+    {
+      "platform": "linux/arm64",
+      "dest": "bin/geekbench",
+      "url": "https://cdn.geekbench.com/Geekbench-5.5.1-LinuxARMPreview.tar.gz",
+      "unpack": "tar",
+      "strip": 1,
+      "sha256": "9eb3ca9ec32abf0ebe1c64002b19108bfea53c411c6b556b0c2689514b8cbd6f",
+      "size": 111581640
+    }
+  ],
+  "patch": null,
+  "built": "2026-10-31"
+}

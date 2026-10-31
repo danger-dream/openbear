@@ -260,6 +260,8 @@ async def execute(s, row):
                     'turnUuid': root, 'runUuid': root, 'source': 'cron', 'error': error or status})
             from app.cron.notifications import deliver
             await deliver(s, await one(s.db.conn, 'SELECT * FROM cron_runs WHERE run_id=?', (run_id,)))
+            if hasattr(s.host, '_schedule_conversation_retention'):
+                s.host._schedule_conversation_retention()
 
     cleanup = asyncio.create_task(finalize(), name='cron-finalize:' + run_id)
     deadline = None

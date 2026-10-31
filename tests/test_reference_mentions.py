@@ -75,7 +75,6 @@ async def forbid_body_reads(e, monkeypatch, *, frozen_inspect=False):
         cipher = Mock(side_effect=AssertionError("mention loaded encryption key"))
         patch.setattr(BuiltinMemoryClient, "tool_call", memory)
         patch.setattr("app.references.run_history_action", history)
-        patch.setattr("app.references._history_material", history)
         patch.setattr("app.web_console.reference_api._visible_history_items", history)
         patch.setattr(e.server._reference_store(), "cipher", cipher)
         patch.setattr(Fernet, "decrypt", Mock(side_effect=AssertionError("mention decrypted")))

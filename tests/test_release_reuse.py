@@ -113,7 +113,7 @@ def test_failed_candidate_fix_reuses_independent_stages_and_reaccepts(git_repo, 
         return {"ok": True}
 
     monkeypatch.setattr(candidate, "export", export)
-    monkeypatch.setattr(runner, "publish", lambda *_: calls.update(["publication"]) or {"ok": True, "url": "https://example.invalid/release"})
+    monkeypatch.setattr(runner, "publish", lambda *_, **__: calls.update(["publication"]) or {"ok": True, "url": "https://example.invalid/release"})
 
     class LocalRunner(runner.Runner):
         def preflight(self, approved):

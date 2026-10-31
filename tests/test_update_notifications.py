@@ -179,6 +179,28 @@ async def test_duplicate_whitelist_entries_do_not_duplicate_same_version_notice(
     assert [chat_id for chat_id, _text in env.sent] == [123, 456]
 
 
+@pytest.mark.parametrize('version', ['1.0.0-beta.1', '1.0.0-rc.1'])
+async def test_disabling_prereleases_filters_cached_display_and_launch(notifications, tmp_path, monkeypatch, version):
+    service = notifications.service()
+    service.install_root = tmp_path
+    service.config.updates = SimpleNamespace(prerelease=True)
+    atomic_write_json(service.state_path, {'phase': 'idle', 'available': {'version': version, 'zipUrl': 'https://example.invalid/update.zip'}})
+    assert service.snapshot()['updateAvailable'] is True
+    service.config.updates.prerelease = False
+    assert service.snapshot()['latest'] is None and service.snapshot()['updateAvailable'] is False
+    calls = []
+
+    async def launch(script):
+        calls.append(script)
+
+    monkeypatch.setattr(service, '_launch_updater', launch)
+    result = await service.start_update(confirm=True, force=True, allow_dirty=True, running={})
+    assert result == {'ok': False, 'error': 'no_release'} and not calls
+    service.config.updates.prerelease = True
+    result = await service.start_update(confirm=True, force=False, allow_dirty=False, running={})
+    assert result['started'] and result['toVersion'] == version and len(calls) == 1
+
+
 async def test_failed_launch_keeps_release_and_notice_claim_written_while_awaiting_launch(notifications, tmp_path, monkeypatch):
     env = notifications
     service = env.service()

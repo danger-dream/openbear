@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -243,6 +244,8 @@ async def test_web_admin_public_exports_and_route_baseline(web_env):
     assert ("GET", "/api/conversations/{conversation_uuid}/ws") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/state") in routes
     assert ("GET", "/api/conversations/{conversation_uuid}/operations/{operation_id}/detail") in routes
+    assert ("GET", "/api/conversations/{conversation_uuid}/operations/{operation_id}/file") in routes
+    assert ("GET", "/api/conversations/{conversation_uuid}/operations/{operation_id}/file/content") in routes
     assert ("PATCH", "/api/conversations/{conversation_uuid}") in routes
     assert ("POST", "/api/conversations/{conversation_uuid}/title/generate") in routes
     assert ("POST", "/api/conversations/{conversation_uuid}/duplicate") in routes
@@ -359,6 +362,76 @@ async def test_web_artifacts_rewrite_and_auth_scoped_content(web_env, tmp_path):
     assert await download.read() == source.read_bytes()
 
 
+async def test_tool_file_endpoints_serve_only_the_recorded_file(web_env, tmp_path):
+    cookies = {"openbear_web_session": await _login_cookie(web_env)}
+    row = await web_env.server._create_web_conversation(123, title="tool files")
+    other = await web_env.server._create_web_conversation(123, title="other")
+    conv_uuid = row["conversation_uuid"]
+    script = tmp_path / "build.recipe"
+    script.write_text("const answer: number = 42;\n", encoding="utf-8")
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    written_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+    live = web_env.server._live_for(row)
+    other_live = web_env.server._live_for(other)
+    await live.publish({"type": "accepted", "turnUuid": "turn-files"})
+    await other_live.publish({"type": "accepted", "turnUuid": "turn-other"})
+    calls = [
+        (live, "turn-files", "call-write", "Write", {"path": str(script), "content": "..."}, f"status: success\nnew_sha256: {written_sha}"),
+        (live, "turn-files", "call-read", "Read", {"path": str(image)}, "{}"),
+        (live, "turn-files", "call-bash", "Bash", {"command": f"cat {script}", "path": str(script)}, "ok"),
+        (other_live, "turn-other", "call-other", "Read", {"path": str(script)}, "ok"),
+    ]
+    for stream, turn, call_id, name, args, result in calls:
+        await stream.publish({"type": "tool_start", "turnUuid": turn, "toolCallId": call_id, "name": name, "arguments": json.dumps(args)})
+        await stream.publish({"type": "tool_result", "turnUuid": turn, "toolCallId": call_id, "name": name, "arguments": json.dumps(args), "result": result, "durationMs": 1})
+    base = f"/api/conversations/{conv_uuid}/operations"
+
+    meta_response = await web_env.client.get(f"{base}/tool%3Acall-write/file", cookies=cookies)
+    assert meta_response.status == 200
+    meta = (await meta_response.json())["artifact"]
+    assert meta["artifactUuid"] == "tool:call-write"
+    assert meta["conversationUuid"] == conv_uuid
+    assert meta["fileName"] == "build.recipe"
+    # An unknown extension guesses application/octet-stream; readable content is served as text.
+    assert meta["mimeType"] == "text/plain"
+    assert meta["path"] == str(script.resolve())
+    assert meta["sizeBytes"] == script.stat().st_size
+    assert meta["sha256"] == written_sha
+    assert meta["fileState"] == "same"
+    assert meta["contentUrl"] == f"{base}/tool%3Acall-write/file/content"
+
+    content = await web_env.client.get(meta["contentUrl"], cookies=cookies)
+    assert content.status == 200
+    assert await content.text() == "const answer: number = 42;\n"
+    assert content.headers["Content-Type"] == "text/plain; charset=utf-8"
+    assert content.headers["Cache-Control"] == "no-store"
+    assert content.headers["X-Content-Type-Options"] == "nosniff"
+
+    script.write_text("const answer = 43;\n", encoding="utf-8")
+    changed = (await (await web_env.client.get(f"{base}/tool%3Acall-write/file", cookies=cookies)).json())["artifact"]
+    assert changed["fileState"] == "changed"
+    assert await (await web_env.client.get(meta["contentUrl"], cookies=cookies)).text() == "const answer = 43;\n"
+
+    picture = (await (await web_env.client.get(f"{base}/tool%3Acall-read/file", cookies=cookies)).json())["artifact"]
+    assert picture["mimeType"] == "image/png"
+    assert picture["fileState"] == ""
+    picture_content = await web_env.client.get(f"{base}/tool%3Acall-read/file/content", cookies=cookies)
+    assert picture_content.headers["Content-Type"] == "image/png"
+    assert picture_content.headers["Content-Disposition"].startswith("inline;")
+    assert await picture_content.read() == image.read_bytes()
+    download = await web_env.client.get(f"{base}/tool%3Acall-read/file/content?download=1", cookies=cookies)
+    assert download.headers["Content-Disposition"].startswith("attachment;")
+
+    for op_id in ("tool%3Acall-bash", "tool%3Acall-other", "tool%3Adoes-not-exist"):
+        assert (await web_env.client.get(f"{base}/{op_id}/file", cookies=cookies)).status == 404, op_id
+        assert (await web_env.client.get(f"{base}/{op_id}/file/content", cookies=cookies)).status == 404, op_id
+    image.unlink()
+    assert (await web_env.client.get(f"{base}/tool%3Acall-read/file", cookies=cookies)).status == 404
+    web_env.client.session.cookie_jar.clear()
+    assert (await web_env.client.get(f"{base}/tool%3Acall-write/file")).status == 401
+
+
 async def test_web_artifact_metadata_only_shares_valid_existing_workspace_paths(web_env, tmp_path):
     cookies = {"openbear_web_session": await _login_cookie(web_env)}
     row_a = await web_env.server._create_web_conversation(123, title="A")
@@ -422,6 +495,125 @@ async def test_web_assistant_workspace_image_link_rewritten_before_display(web_e
     assert "workspace/artifacts/assistant-image.png" not in text
     assert "/api/conversations/" in text
     assert "preview=1" in text
+
+
+async def test_web_assistant_pre_tool_segment_artifacts_rewritten_at_cut(web_env, tmp_path):
+    row = await web_env.server._create_web_conversation(123, title="pre-tool artifact")
+    workspace = tmp_path / "workspace"
+    web_env.server.workspace_dir = str(workspace)
+    source = workspace / "artifacts" / "preview" / "light.png"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    (source.parent / "preview.html").write_text("<p>preview</p>", encoding="utf-8")
+
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": "turn-pre-tool"})
+    renderer = _WebStreamRenderer(
+        live=live,
+        artifact_rewriter=web_env.server._web_assistant_artifact_rewriter(row),
+    )
+    streamed = "预览：\n\n[preview.html](workspace/artifacts/preview/preview.html)\n\n![浅色](workspace/artifacts/preview/light.png)"
+    await renderer.on_delta(streamed)
+    await renderer.on_model_output_progress({"toolName": "UserInteraction"})
+
+    ops = await web_env.server._web_operations(row["conversation_uuid"])
+    segment = next(op for op in ops if op.get("opType") == "assistant_message")
+    text = segment["payload"]["text"]
+    assert segment["payload"]["complete"] is True
+    assert "workspace/artifacts/" not in text
+    assert text.count("/api/conversations/") == 2
+    assert "preview=1" in text
+    await renderer.close()
+
+
+async def test_web_assistant_streamed_artifact_link_rewritten_once_closed(web_env, tmp_path):
+    row = await web_env.server._create_web_conversation(123, title="streamed artifact")
+    workspace = tmp_path / "workspace"
+    web_env.server.workspace_dir = str(workspace)
+    source = workspace / "artifacts" / "live" / "shot.png"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": "turn-streamed"})
+    rewrite = web_env.server._web_assistant_artifact_rewriter(row)
+    calls = []
+
+    async def counting_rewrite(content):
+        calls.append(content)
+        return await rewrite(content)
+
+    renderer = _WebStreamRenderer(live=live, artifact_rewriter=counting_rewrite)
+    await renderer.on_model_start()
+    await renderer.on_delta("截图：\n\n![预览](workspace/artifacts/live/sho")
+    await renderer.on_status("运行中")
+    assert "workspace/artifacts/live/sho" in live.draft_text
+    assert calls == []
+
+    await renderer.on_delta("截图：\n\n![预览](workspace/artifacts/live/shot.png)\n\n还在")
+    await renderer.on_status("运行中")
+    streamed = live.draft_text
+    assert "workspace/artifacts/" not in streamed
+    assert "/api/conversations/" in streamed and "preview=1" in streamed
+    await renderer.on_delta("截图：\n\n![预览](workspace/artifacts/live/shot.png)\n\n还在输出")
+    await renderer.on_status("运行中")
+    assert len(calls) == 1
+
+    await renderer.finalize("截图：\n\n![预览](workspace/artifacts/live/shot.png)\n\n还在输出。")
+    ops = await web_env.server._web_operations(row["conversation_uuid"])
+    final_text = next(op for op in ops if op.get("opType") == "assistant_message")["payload"]["text"]
+    assert final_text == streamed.replace("还在", "还在输出。")
+    await renderer.close()
+
+
+async def test_web_streamed_link_lookup_is_best_effort_and_cached_per_call(web_env):
+    row = await web_env.server._create_web_conversation(123, title="streamed failure")
+    live = web_env.server._live_for(row)
+    await live.publish({"type": "accepted", "turnUuid": "turn-streamed-failure"})
+    calls = []
+
+    async def failing_rewrite(content):
+        calls.append(content)
+        if "broken" in content:
+            raise OSError("copy failed")
+        return content
+
+    renderer = _WebStreamRenderer(live=live, artifact_rewriter=failing_rewrite)
+    await renderer.on_model_start()
+    text = "a [x](workspace/artifacts/broken.png) b [y](workspace/artifacts/missing.png)"
+    await renderer.on_delta(text)
+    await renderer.on_status("运行中")
+    await renderer.on_delta(text + " more")
+    await renderer.on_status("运行中")
+    assert live.draft_text == text + " more"
+    assert sorted(calls) == ["[x](workspace/artifacts/broken.png)", "[y](workspace/artifacts/missing.png)"]
+    await renderer.close()
+
+
+async def test_web_artifact_registration_reuses_unchanged_file_without_copy(web_env, tmp_path, monkeypatch):
+    row = await web_env.server._create_web_conversation(123, title="artifact reuse")
+    workspace = tmp_path / "workspace"
+    web_env.server.workspace_dir = str(workspace)
+    source = workspace / "artifacts" / "reuse.png"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"first")
+    copies = []
+    copy = web_env.server._copy_web_artifact
+
+    def counting_copy(src, target):
+        copies.append(src)
+        return copy(src, target)
+
+    monkeypatch.setattr(web_env.server, "_copy_web_artifact", counting_copy)
+    first = await web_env.server._register_web_artifact_from_path(source, conversation=row)
+    again = await web_env.server._register_web_artifact_from_path(source, conversation=row)
+    assert again["artifactUuid"] == first["artifactUuid"]
+    assert len(copies) == 1
+
+    source.write_bytes(b"second version")
+    changed = await web_env.server._register_web_artifact_from_path(source, conversation=row)
+    assert changed["artifactUuid"] != first["artifactUuid"]
+    assert len(copies) == 2
 
 
 async def test_web_artifacts_force_risky_types_to_download(web_env, tmp_path):
@@ -2727,10 +2919,10 @@ async def test_web_task_notification_claim_reads_its_write_with_pinned_reader_sn
         queued.append(item)
     expected = {item["_notificationUuid"] for item in queued}
 
-    # A concurrent recovery/list query can hold the shared read connection on a
-    # snapshot from before the claim's writer transaction. Leave one row unread
-    # to make that production interleaving deterministic instead of sleeping.
-    cursor = await web_env.db.conn.execute(
+    # Hold the shared read connection on a snapshot from before the claim's writer
+    # transaction (router reads finish before they return, so pin the reader
+    # directly): the claim must read its own write regardless.
+    cursor = await web_env.db._router()._reader.execute(
         "SELECT notification_uuid FROM web_task_notifications ORDER BY id",
     )
     assert await cursor.fetchone() is not None
@@ -3719,7 +3911,7 @@ async def test_web_image_upload_renders_as_attachment_not_path_text(web_env, mon
     web_env.server.runs = ControllerRuns()
     row = await web_env.server._create_web_conversation(123, title="image upload")
     live = web_env.server._live_for(row)
-    media = [InboundMedia(kind="image", upload_type="websocket_upload", file_name="image.png", mime_type="image/png", size=1234, path="/opt/src-space/openbear/data/media/inbound/web/test/image.png")]
+    media = [InboundMedia(kind="image", upload_type="websocket_upload", file_name="image.png", mime_type="image/png", size=1234, path="/srv/openbear/data/media/inbound/web/test/image.png")]
     calls: list[dict] = []
 
     async def fake_register(path, *, conversation, turn_uuid="", op_id="", source_url=""):
@@ -8370,6 +8562,36 @@ async def test_vue_static_entry_requires_auth_but_login_assets_are_public(tmp_pa
         asset = await client.get("/assets/app.js", cookies={"openbear_web_session": cookie})
         assert asset.status == 200
         assert "__openbear" in await asset.text()
+    finally:
+        await client.close()
+        await db.close()
+
+
+async def test_only_content_hashed_assets_are_cached_for_good(tmp_path):
+    db = DB(str(tmp_path / "static.db"))
+    await db.connect()
+    server = WebAdminServer(_cfg(), db, FakeBot())  # type: ignore[arg-type]
+    dist = tmp_path / "dist"
+    (dist / "assets" / "brand").mkdir(parents=True)
+    (dist / "index.html").write_text("<div id='app'></div>", encoding="utf-8")
+    for name in ("App-2rU48T1O.js", "ts.worker-DG0myAZU.js", "brand/favicon-2888ecac0deb.ico",
+                 "manifest-dark.webmanifest", "monaco-language.js", "app.js"):
+        (dist / "assets" / name).write_text("x", encoding="utf-8")
+    server._web_dist_dir = lambda: dist  # type: ignore[method-assign]
+    await server.ensure_secret_key()
+    client = TestClient(TestServer(server.make_app()))
+    await client.start_server()
+    try:
+        for name in ("App-2rU48T1O.js", "ts.worker-DG0myAZU.js", "brand/favicon-2888ecac0deb.ico"):
+            resp = await client.get(f"/assets/{name}")
+            assert resp.status == 200
+            assert resp.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+        for name in ("manifest-dark.webmanifest", "monaco-language.js", "app.js"):
+            resp = await client.get(f"/assets/{name}")
+            assert resp.status == 200
+            assert "Cache-Control" not in resp.headers
+        page = await client.get("/login")
+        assert page.headers["Cache-Control"] == "no-store"
     finally:
         await client.close()
         await db.close()

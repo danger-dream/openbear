@@ -1,6 +1,7 @@
 import {contextCompactionSourceLabel} from "./agentPlanPresentation.js";
 import {taskMemoryToolPreview} from "./taskMemoryPresentation.js";
-import {toolActionSummary} from "./toolCallPresentation.js";
+import {workItemToolPreview} from "./workItemsPresentation.js";
+import {BENCH_STATES, BENCH_TESTS, toolActionSummary} from "./toolCallPresentation.js";
 
 const HAS = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
 
@@ -160,6 +161,32 @@ function redactedMemorySecretArguments(value) {
 	};
 }
 
+// SSH passwords and keys never reach the card; uploads show their size only.
+function redactedServersArguments(value) {
+	const params = value?.params;
+	if (!params || typeof params !== "object" || Array.isArray(params)) return value;
+	const next = {...params};
+	if (next.ssh && typeof next.ssh === "object") {
+		next.ssh = {...next.ssh};
+		for (const key of ["password", "privateKey", "passphrase"]) if (HAS(next.ssh, key)) next.ssh[key] = "[已隐藏]";
+	}
+	if (typeof next.contentBase64 === "string") next.contentBase64 = `[二进制内容，约 ${Math.round(next.contentBase64.length * 3 / 4 / 1024)} KB]`;
+	return {...value, params: next};
+}
+// Unparsed (e.g. still streaming) Servers arguments: mask the same fields as text,
+// including a value whose closing quote has not arrived yet.
+function redactedServersText(raw) {
+	return String(raw || "").replace(/("(?:password|privateKey|passphrase)"\s*:\s*)"(?:[^"\\]|\\.)*("|$)/g, '$1"[已隐藏]"');
+}
+// Memory credentials travel only in kvJson; before the arguments parse, resource may not have arrived yet.
+function redactedMemoryText(raw) {
+	return String(raw || "").replace(/("kvJson"\s*:\s*)"(?:[^"\\]|\\.)*("|$)/g, '$1"[已隐藏凭证值]"');
+}
+function redactedRawText(toolName, raw) {
+	const name = String(toolName || "").trim().toLowerCase();
+	return name === "servers" ? redactedServersText(raw) : name === "memory" ? redactedMemoryText(raw) : raw;
+}
+
 // The detailed tool card deliberately shows one faithful payload document instead
 // of reconstructing it into tool-specific tags and cards. Keep the existing
 // Memory-secret masking rule so a simpler presentation never widens disclosure.
@@ -167,11 +194,13 @@ export function toolArgumentsRawPayload(toolName, rawArguments) {
 	const parsed = parseArguments(rawArguments);
 	if (!parsed.raw && !parsed.data) return {content: "", language: ""};
 	if (!parsed.parsed || !parsed.data || typeof parsed.data !== "object" || Array.isArray(parsed.data)) {
-		return {content: parsed.raw || prettyJson(parsed.data), language: ""};
+		const content = parsed.raw || prettyJson(parsed.data);
+		return {content: redactedRawText(toolName, content), language: ""};
 	}
-	const data = String(toolName || "").trim().toLowerCase() === "memory"
-		? redactedMemorySecretArguments(parsed.data)
-		: parsed.data;
+	const name = String(toolName || "").trim().toLowerCase();
+	const data = name === "memory" ? redactedMemorySecretArguments(parsed.data)
+		: name === "servers" ? redactedServersArguments(parsed.data)
+			: parsed.data;
 	return {content: prettyJson(data), language: "json"};
 }
 
@@ -645,7 +674,7 @@ export function buildToolArgumentsView(toolName, rawArguments) {
 			summary: "",
 			tags: [],
 			rows: [],
-			blocks: [{label: "原始参数", content: parsed.raw || prettyJson(parsed.data), language: parsed.parsed ? "json" : "", role: ""}],
+			blocks: [{label: "原始参数", content: redactedRawText(name, parsed.raw || prettyJson(parsed.data)), language: parsed.parsed ? "json" : "", role: ""}],
 		};
 	}
 	const presenter = PRESENTERS[name];
@@ -656,12 +685,72 @@ export function buildToolArgumentsView(toolName, rawArguments) {
 		summary: "",
 		tags: [],
 		rows: [],
-		blocks: [{label: "JSON 参数", content: prettyJson(parsed.data), language: "json", role: ""}],
+		blocks: [{label: "JSON 参数", content: prettyJson(name === "Servers" ? redactedServersArguments(parsed.data) : parsed.data), language: "json", role: ""}],
 	};
+}
+
+// How a mesh change came out: a refused draft, the rollout it started, or the servers that did not join.
+function meshResultSuffix(action, result) {
+	if (result.ok === false && result.error === "mesh_invalid") {
+		const errors = Array.isArray(result.errors) ? result.errors.length : 0;
+		return `${action === "mesh_save_draft" ? "未保存" : "未应用"}：草稿有${errors ? ` ${errors} 处` : ""}错误`;
+	}
+	if (action === "mesh_join") {
+		const failed = Array.isArray(result.items) ? result.items.filter(item => item?.ok === false).length : 0;
+		return failed ? `${failed} 台没有加入` : "";
+	}
+	if (action !== "mesh_apply" && action !== "mesh_rollback") return "";
+	const apply = result.apply && typeof result.apply === "object" ? result.apply : null;
+	if (!apply) return "";
+	const progress = Array.isArray(apply.progress) ? apply.progress : [];
+	const failed = progress.filter(item => item?.state === "failed").length;
+	const offline = progress.filter(item => item?.state === "offline").length;
+	return [Number.isFinite(apply.revision) ? `版本 ${apply.revision}` : "", apply.running ? "仍在下发" : "",
+		failed ? `${failed} 台失败` : "", offline ? `${offline} 台离线，重连后下发` : ""].filter(Boolean).join(" · ");
+}
+
+// Which run a benchmark result is about and where it stands: “Wawo-US”的 IP.Check.Place · 完成.
+function benchResultSuffix(action, result) {
+	if (action === "bench_start") return Array.isArray(result.runs) && result.runs.length > 1 ? `排入 ${result.runs.length} 项` : "";
+	const run = result.run && typeof result.run === "object" ? result.run : null;
+	if (!run) return "";
+	const what = `${typeof run.server === "string" && run.server ? `“${compact(run.server, 30)}”的 ` : ""}${BENCH_TESTS[run.test] || compact(String(run.name || ""), 30)}`;
+	const state = run.stopping === true ? "正在停止" : action === "bench_wait" && result.reason === "timeout" ? `仍${BENCH_STATES[run.state] || "在进行"}` : BENCH_STATES[run.state] || "";
+	return [what.trim(), state].filter(Boolean).join(" · ");
+}
+
+// What a Servers result adds to its card line: the id of a job just started,
+// how an exact edit went, how a mesh change came out, or which benchmark run it was.
+function serversResultSuffix(data, rawResult) {
+	const action = data?.action;
+	const mesh = ["mesh_save_draft", "mesh_join", "mesh_apply", "mesh_rollback"].includes(action);
+	const bench = ["bench_start", "bench_wait", "bench_get", "bench_stop"].includes(action);
+	if (!rawResult || (!["job_start", "edit_file"].includes(action) && !mesh && !bench)) return "";
+	const result = parseArguments(rawResult).data;
+	if (!result || typeof result !== "object") return "";
+	if (mesh) return meshResultSuffix(action, result);
+	if (bench) return result.ok === false ? "" : benchResultSuffix(action, result);
+	if (action === "job_start") return typeof result.job?.id === "string" ? `任务 ${compact(result.job.id, 40)}` : "";
+	if (result.ok === true) return result.changed === false ? "内容没有变化" : Number.isFinite(result.replacements) ? `${result.replacements} 处替换` : "";
+	return result.error === "edit_not_applied" ? "未修改：有替换没能匹配" : "";
+}
+
+// The unified diff an exact Servers edit returned, for the card to show as a diff.
+export function serversEditDiff(toolName, rawArguments, rawResult) {
+	if (String(toolName || "") !== "Servers" || parseArguments(rawArguments).data?.action !== "edit_file") return "";
+	const result = parseArguments(rawResult).data;
+	return result && typeof result.diff === "string" ? result.diff : "";
 }
 
 export function toolArgumentsSummary(toolName, rawArguments, rawResult = "") {
 	if (String(toolName || "") === "TaskMemory") return taskMemoryToolPreview(rawArguments, rawResult);
+	if (String(toolName || "") === "WorkItem") return workItemToolPreview(rawArguments, rawResult);
+	if (String(toolName || "") === "Servers") {
+		const {data} = parseArguments(rawArguments);
+		const summary = toolActionSummary("Servers", data);
+		const suffix = summary ? serversResultSuffix(data, rawResult) : "";
+		if (summary) return suffix ? `${summary} · ${suffix}` : summary;
+	}
 	const {data} = parseArguments(rawArguments);
 	return toolActionSummary(String(toolName || ""), data) || buildToolArgumentsView(toolName, rawArguments).summary;
 }

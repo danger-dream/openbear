@@ -9,6 +9,9 @@ import pytest
 from app.db.engine import DB
 from app.db import schema_migrations as migrations
 
+# These test migrations, so every database here is built the real way.
+pytestmark = pytest.mark.real_db
+
 
 async def legacy_database(path, *, count=5):
     database = DB(str(path))

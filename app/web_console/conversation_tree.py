@@ -51,7 +51,7 @@ class WebAdminConversationTreeMixin:
     ) -> dict[str, dict[str, Any]]:
         columns = "*" if include_properties else """
             id, folder_uuid, owner_chat_id, parent_uuid, name, pinned_at,
-            display_order, created_at, updated_at,
+            display_order, created_at, updated_at, hide_from_recent,
             CASE WHEN TRIM(COALESCE(workspace_dir,''))<>'' THEN 1 ELSE 0 END AS has_local_workspace,
             CASE WHEN TRIM(COALESCE(prompt_markdown,''))<>'' THEN 1 ELSE 0 END AS has_local_prompt
         """
@@ -418,14 +418,22 @@ class WebAdminConversationTreeMixin:
         # definition; steady-state selection is now an indexed fifteen-row lookup.
         cur = await self.db.conn.execute(
             """
+            WITH RECURSIVE hidden(folder_uuid) AS (
+                SELECT folder_uuid FROM web_conversation_folders
+                WHERE owner_chat_id=? AND hide_from_recent=1
+                UNION
+                SELECT f.folder_uuid FROM web_conversation_folders f
+                JOIN hidden h ON f.parent_uuid=h.folder_uuid WHERE f.owner_chat_id=?
+            )
             SELECT conversation_uuid,last_interaction_at_ms
             FROM web_conversations
             WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
+              AND COALESCE(folder_uuid,'') NOT IN (SELECT folder_uuid FROM hidden)
               AND last_interaction_at_ms>0
             ORDER BY last_interaction_at_ms DESC,conversation_uuid ASC
             LIMIT 15
             """,
-            (int(owner_chat_id),),
+            (int(owner_chat_id), int(owner_chat_id), int(owner_chat_id)),
         )
         recent_times = {
             str(row["conversation_uuid"]): int(row["last_interaction_at_ms"])
@@ -505,6 +513,10 @@ class WebAdminConversationTreeMixin:
         folder_counts: dict[str, int] = {}
         direct_conversation_counts: dict[str, int] = {}
         folders = await self._tree_folders(owner_chat_id)
+        hidden_folders = {folder_id for folder_id in folders if any(
+            folders[parent].get("hide_from_recent") for parent in self._tree_folder_path(folder_id, folders)
+        )}
+        hidden_conversation_ids = [str(row["conversation_uuid"]) for row in rows if str(row.get("folder_uuid") or "") in hidden_folders]
         member_uuids = {str(r["conversation_uuid"]) for r in await (await self.db.conn.execute("SELECT conversation_uuid FROM collab_members")).fetchall()}
         for row in rows:
             folder_id = str(row.get("folder_uuid") or "")
@@ -550,6 +562,7 @@ class WebAdminConversationTreeMixin:
                 "parentId": str(row.get("folder_uuid") or ""),
                 # Root-to-leaf folder IDs, so the tree can summarize collapsed, unloaded ancestors.
                 "folderPath": folder_path,
+                "hiddenFromRecent": folder_id in hidden_folders,
                 "title": str(row.get("title") or "新会话"),
                 "origin": str(row.get("origin_kind") or "user"),
                 "pinned": int(row.get("pinned_at") or 0) > 0,
@@ -581,6 +594,7 @@ class WebAdminConversationTreeMixin:
         return {
             "items": running_items,
             "activityItems": activity_items,
+            "hiddenConversationIds": hidden_conversation_ids,
             "recentItems": [recent_items[key] for key in recent_times if key in recent_items],
             "folderRunningCounts": folder_counts,
             "folderConversationCounts": self._tree_subtree_counts(direct_conversation_counts, folders),
@@ -1183,6 +1197,8 @@ class WebAdminConversationTreeMixin:
             "ok": True,
             "folderId": folder_id,
             "systemNode": "temporary" if folder_id == _TEMPORARY_PROPERTIES_ID else "",
+            "hideFromRecent": bool(row.get("hide_from_recent")),
+            "hiddenFromRecentByAncestor": any(folders[parent].get("hide_from_recent") for parent in self._tree_folder_path(folder_id, folders)[:-1]),
             "name": str(row.get("name") or ""),
             "path": self._tree_folder_path_text(folder_id, folders),
             "runDefaults": {
@@ -1387,6 +1403,8 @@ class WebAdminConversationTreeMixin:
         folder_id = str(request.match_info.get("folder_uuid") or "").strip()
         body = await self._json_body(request)
         update_snapshots = body.get("updateSnapshots") is True
+        if "hideFromRecent" in body and (not isinstance(body["hideFromRecent"], bool) or folder_id == _TEMPORARY_PROPERTIES_ID):
+            raise web.HTTPBadRequest(text="invalid_hide_from_recent")
         async with self._conversation_tree_lock:
             workspace, prompt, run_defaults = await self._tree_run_property_payload(owner, folder_id, body)
             value = await self._folder_policy_from_body(owner, folder_id, body, prompt)
@@ -1412,9 +1430,9 @@ class WebAdminConversationTreeMixin:
                     return
                 await conn.execute(
                     """UPDATE web_conversation_folders
-                       SET workspace_dir=?, prompt_markdown=?, run_defaults_json=COALESCE(?, run_defaults_json), updated_at=?
+                       SET workspace_dir=?, prompt_markdown=?, run_defaults_json=COALESCE(?, run_defaults_json), hide_from_recent=COALESCE(?, hide_from_recent), updated_at=?
                        WHERE owner_chat_id=? AND folder_uuid=?""",
-                    (workspace, prompt, json.dumps(run_defaults) if run_defaults is not None else None, now_ts(), owner, folder_id),
+                    (workspace, prompt, json.dumps(run_defaults) if run_defaults is not None else None, int(body["hideFromRecent"]) if "hideFromRecent" in body else None, now_ts(), owner, folder_id),
                 )
 
             result = await self._tree_apply_snapshot_updates_locked(
@@ -1534,7 +1552,9 @@ class WebAdminConversationTreeMixin:
             """SELECT conversation_uuid, title, folder_uuid
                FROM web_conversations
                WHERE owner_chat_id=? AND COALESCE(folder_uuid,'')=?
-                 AND (COALESCE(archived_at,0)=0 OR conversation_uuid=?)
+                 AND ((COALESCE(archived_at,0)=0
+                       AND conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members))
+                      OR conversation_uuid=?)
                ORDER BY CASE WHEN COALESCE(pinned_at,0)>0 THEN 0 ELSE 1 END,
                         CASE WHEN display_order IS NULL THEN 1 ELSE 0 END,
                         display_order ASC, COALESCE(created_at,0) DESC, id DESC""",

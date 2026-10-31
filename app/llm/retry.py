@@ -25,6 +25,9 @@ class RetryCancelledError(RuntimeError):
 
 
 RETRY_DELAYS_S = (3, 5, 10, 30, 180, 300, 600)
+# Early retries absorb brief network faults without user-visible rows or
+# notifications; any wait longer than the default staircase step is shown.
+QUIET_RETRIES = 3
 
 
 def retry_delay_label(seconds: float) -> str:
@@ -55,6 +58,10 @@ class RetryPolicy:
         )
         return float(math.ceil(max(base, float(retry_after_s or 0.0))))
 
+    def quiet(self, retry_number: int, delay_s: float) -> bool:
+        number = int(retry_number or 0)
+        return 1 <= number <= QUIET_RETRIES and float(delay_s) <= RETRY_DELAYS_S[number - 1]
+
 
 def retry_wait_payload(
     *,
@@ -71,6 +78,7 @@ def retry_wait_payload(
     details: dict[str, Any] | None = None,
     scope: str = "model_call",
     task_uuid: str = "",
+    quiet: bool = False,
 ) -> dict[str, Any]:
     from app.llm.error_payloads import sanitize_error_detail
     from app.llm.error_sanitize import redact_sensitive_text, sanitize_user_facing_text
@@ -96,6 +104,7 @@ def retry_wait_payload(
         "attempts": sanitize_error_detail(attempts or []),
         "details": sanitize_error_detail(details or {}),
         "cancelable": True,
+        "quiet": bool(quiet),
     }
 
 

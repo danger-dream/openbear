@@ -1,0 +1,756 @@
+/* Mesh tab: a board with servers and tools on the left, the network in the
+   middle and the selection's properties on the right. Builds on instances.css
+   and servers.css. */
+.mesh { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.mesh-state { margin: 0; padding: 16px 20px; }
+.mesh-board { display: grid; flex: 1; grid-template-columns: 232px minmax(0, 1fr) 380px; min-height: 0; height: 100%; }
+@media (max-width: 1360px) { .mesh-board { grid-template-columns: 220px minmax(0, 1fr) 352px; } }
+@media (max-width: 1180px) { .mesh-board { grid-template-columns: 208px minmax(0, 1fr) 316px; } }
+
+/* Left: servers and tools. */
+.mesh-palette { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--ob-chat-line); }
+.mesh-servers { display: flex; flex: 1 1 auto; flex-direction: column; gap: 4px; min-height: 0; padding: 12px 10px 8px; overflow-y: auto; }
+.servers-ui .mesh-servers-search { width: 100%; height: 30px; margin-bottom: 4px; font-size: var(--ix-sm); }
+.mesh-servers-group > h3, .mesh-tools > h3, .mesh-section > h3 { display: flex; align-items: baseline; gap: 6px; margin: 6px 4px 4px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-weight: 500; }
+.mesh-servers-group > h3 > .instance-muted { margin-left: auto; font-weight: 400; }
+.mesh-servers-group > ul { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; }
+.mesh-servers-group > p { margin: 2px 4px 6px; font-size: var(--ix-xs); }
+.mesh-server { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 32px; padding: 4px 6px; border-radius: 7px; color: var(--ob-chat-text); font-size: var(--ix-sm); text-align: left; cursor: pointer; }
+.mesh-server[draggable='true'] { cursor: grab; }
+.mesh-server:hover:not(:disabled) { background: var(--ob-chat-hover); }
+.mesh-server[aria-pressed='true'] { background: var(--ob-chat-selected); }
+.mesh-server:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: -2px; }
+.mesh-server:disabled { cursor: default; }
+.mesh-server.is-disabled .mesh-server-name { color: var(--ob-chat-subtle); }
+.mesh-server > .sv-flag { flex: none; width: 18px; font-size: 14px; line-height: 1; }
+.mesh-server-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-server-name.is-removing { text-decoration: line-through; opacity: .7; }
+.mesh-server-note { flex: 0 1 auto; max-width: 56%; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-overflow: ellipsis; white-space: nowrap; }
+.mesh-server-note[data-tone='warn'] { color: var(--ob-warning); }
+.mesh-server > .pb-tag { flex: none; }
+.mesh-server-add { flex: none; color: var(--ob-chat-subtle); font-size: 16px; }
+.mesh-tools { flex: none; padding: 6px 10px 12px; border-top: 1px solid var(--ob-chat-line); }
+.mesh-tool-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; }
+.mesh-tool { display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 4px 8px; border-radius: 7px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-align: left; cursor: pointer; }
+.mesh-tool:hover { background: var(--ob-chat-hover); color: var(--ob-chat-text); }
+.mesh-tool[aria-checked='true'] { background: var(--ob-chat-selected); color: var(--ob-chat-text); font-weight: 600; }
+.mesh-tool > svg { flex: none; }
+.mesh-tool > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-tool-hint { min-height: 2.8em; margin: 6px 4px 0; font-size: var(--ix-xs); line-height: 1.4; }
+
+/* Middle: summary and tools above the canvas. */
+.mesh-stage { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; padding: 10px 12px 12px; }
+.mesh-stage-head { display: flex; flex: none; align-items: center; gap: 8px 12px; min-height: 30px; }
+.mesh-summary { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 2px 14px; min-width: 0; margin: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.mesh-summary > .mono { color: var(--ob-chat-text); }
+.mesh-toolbar { display: flex; flex: none; align-items: center; gap: 2px; }
+.mesh-tb { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 28px; height: 28px; padding: 0 6px; border-radius: 7px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); cursor: pointer; }
+.mesh-tb:hover { background: var(--ob-chat-hover); color: var(--ob-chat-text); }
+.mesh-tb[aria-pressed='true'] { background: var(--ob-chat-selected); color: var(--ob-chat-text); }
+.mesh-tb:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: 0; }
+.mesh-tb-zoom { min-width: 40px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: center; font-variant-numeric: tabular-nums; }
+.mesh-tb-sep { width: 1px; height: 16px; margin: 0 4px; background: var(--ob-chat-line); }
+.mesh-layout-note { margin-right: 6px; font-size: var(--ix-xs); }
+.mesh-stage > .mesh-bar { flex: none; margin: 0; }
+.mesh-stage > .mesh-error { flex: none; margin: 0; }
+
+/* The canvas. */
+.mesh-canvas { position: relative; flex: 1 1 auto; min-height: 240px; overflow: hidden; border: 1px solid var(--ob-chat-line); border-radius: 12px;
+  background-color: var(--ob-chat-panel); background-image: radial-gradient(var(--ob-chat-border) 1px, transparent 1px); background-size: 22px 22px; }
+.mesh-canvas.is-dropping { box-shadow: inset 0 0 0 2px var(--ob-focus); }
+.mesh-canvas .vue-flow { width: 100%; height: 100%; }
+.mesh-canvas .vue-flow__node { cursor: pointer; }
+.mesh-canvas .vue-flow__node.draggable { cursor: grab; }
+.mesh-canvas .vue-flow__node.dragging { cursor: grabbing; }
+.mesh-canvas.is-tool .vue-flow__node { cursor: crosshair; }
+.mesh-canvas .vue-flow__node:focus-visible { outline: none; }
+.mesh-canvas .vue-flow__node:focus-visible > .mesh-node { box-shadow: 0 0 0 2px var(--ob-focus); }
+.mesh-canvas-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; pointer-events: none; }
+.mesh-canvas-empty > p { max-width: 320px; margin: 0; padding: 16px 20px; border: 1px dashed var(--ob-chat-border); border-radius: 12px; background: var(--ob-chat-panel); color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-align: center; }
+.mesh-banner { position: absolute; top: 10px; left: 50%; z-index: 5; display: flex; align-items: center; gap: 10px; max-width: calc(100% - 24px); margin: 0; padding: 6px 8px 6px 12px; transform: translateX(-50%);
+  border: 1px solid var(--ob-chat-line); border-radius: 9px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); color: var(--ob-chat-text); font-size: var(--ix-sm); }
+.mesh-banner > .ix-text-button { flex: none; }
+.mesh-notice { position: absolute; z-index: 6; width: max-content; max-width: min(340px, calc(100% - 24px)); margin: 0; padding: 6px 10px; border-radius: 8px;
+  background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); color: var(--ob-chat-text); font-size: var(--ix-sm); line-height: 1.45; pointer-events: none; }
+.mesh-notice[data-tone='bad'] { background: linear-gradient(var(--ob-danger-soft), var(--ob-danger-soft)), var(--ob-chat-bg); color: var(--ob-danger); }
+.mesh-notice[data-tone='ok'] { color: var(--ob-success); }
+.mesh-drag-line { position: absolute; inset: 0; z-index: 4; width: 100%; height: 100%; pointer-events: none; }
+.mesh-drag-line > line { stroke: var(--ob-chat-text); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.mesh-drag-line[data-bad] > line { stroke: var(--ob-danger); }
+.mesh-drag-tip { position: absolute; z-index: 5; max-width: 300px; margin: 0; padding: 4px 8px; transform: translate(12px, 12px); border-radius: 7px; background: var(--ob-chat-bg);
+  box-shadow: var(--ob-shadow-popover); color: var(--ob-chat-text); font-size: var(--ix-xs); line-height: 1.45; pointer-events: none; }
+.mesh-drag-tip[data-at] { width: max-content; transform: translate(-50%, 0); }
+.mesh-drag-tip[data-at='above'] { transform: translate(-50%, -100%); }
+.mesh-fade-enter-active, .mesh-fade-leave-active { transition: opacity .25s ease; }
+.mesh-fade-enter-from, .mesh-fade-leave-to { opacity: 0; }
+.mesh-drag-tip[data-tone='bad'] { color: var(--ob-danger); }
+
+/* Nodes. */
+.mesh-node { position: relative; display: flex; flex-direction: column; gap: 2px; width: 184px; padding: 8px 10px; border: 1px solid var(--ob-chat-border); border-radius: 10px;
+  background: var(--ob-chat-bg); box-shadow: 0 1px 2px rgb(0 0 0 / .05); color: var(--ob-chat-text); font-size: var(--ix-sm); text-align: left; }
+.mesh-node[data-relay] { border-top-width: 2px; }
+.mesh-node[data-selected] { border-color: var(--ob-chat-text); box-shadow: 0 0 0 3px var(--ob-chat-selected); }
+.mesh-node[data-source] { border-color: var(--ob-chat-text); border-style: dashed; }
+.mesh-node[data-target='ok'] { box-shadow: 0 0 0 3px var(--ob-success-soft); border-color: var(--ob-success); }
+.mesh-node[data-target='bad'] { box-shadow: 0 0 0 3px var(--ob-danger-soft); border-color: var(--ob-danger); }
+.mesh-node[data-installing] { border-style: dashed; }
+.mesh-node[data-removing] { opacity: .66; }
+.mesh-node[data-dim] { opacity: .32; }
+.mesh-node[data-compact] { width: 150px; gap: 1px; padding: 6px 9px; }
+.mesh-node[data-compact] .mesh-node-title > strong { font-size: 13px; }
+.mesh-node[data-compact] .mesh-node-meta > .mono, .mesh-node[data-compact] .mesh-node-role, .mesh-node[data-compact] .mesh-node-rtt, .mesh-node[data-compact] .pb-tag { font-size: 12px; }
+.mesh-node-role { flex: none; margin-left: auto; color: var(--ob-chat-subtle); font-size: var(--ix-xs); white-space: nowrap; }
+/* Phone cards: when the address and a long role (站点中转 · 网关) do not fit together, the role takes the next line. */
+.mesh-node[data-compact] .mesh-node-meta { flex-wrap: wrap; row-gap: 0; }
+.mesh-node[data-compact] .mesh-node-meta > .mono { flex: 0 1 auto; }
+.mesh-node[data-removing] .mesh-node-title > strong { text-decoration: line-through; }
+.mesh-node-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mesh-node-title > strong { min-width: 0; overflow: hidden; font-size: var(--ix-md); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-node-title > .sv-flag { flex: none; font-size: 14px; line-height: 1; }
+.mesh-node-meta { display: flex; align-items: baseline; gap: 8px; min-width: 0; color: var(--ob-chat-subtle); }
+.mesh-node-meta > .mono { min-width: 0; overflow: hidden; font-size: var(--ix-xs); text-overflow: ellipsis; white-space: nowrap; }
+.mesh-node-rtt { margin-left: auto; font-size: var(--ix-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mesh-node-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.mesh-node-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Reachability: a quiet tag; 'info' and 'off' tones only exist on the board. */
+.mesh-node-reach, .mesh-node-alert { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-node .pb-tag[data-tone='info'], .mesh-reach .pb-tag[data-tone='info'] { border-color: transparent; background: var(--ob-info-soft); color: var(--ob-info); }
+.mesh-node .pb-tag[data-tone='off'], .mesh-reach .pb-tag[data-tone='off'] { color: var(--ob-chat-subtle); }
+.mesh-node[data-path] { border-color: var(--ob-chat-text); box-shadow: 0 0 0 3px var(--ob-info-soft); }
+.mesh-node-progress { position: relative; height: 2px; margin-top: 4px; overflow: hidden; border-radius: 2px; background: var(--ob-chat-hover); }
+.mesh-node-progress::after { position: absolute; inset: 0; width: 40%; border-radius: 2px; background: var(--ob-warning); content: ''; animation: mesh-progress 1.2s ease-in-out infinite; }
+@keyframes mesh-progress { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+.mesh-node-nets { position: absolute; top: calc(100% + 6px); left: 10px; display: inline-flex; align-items: center; gap: 4px; max-width: calc(100% - 20px); padding: 1px 8px; border: 1px solid var(--ob-chat-line);
+  border-radius: 999px; background: var(--ob-chat-bg); color: var(--ob-chat-subtle); font-size: var(--ix-xs); white-space: nowrap; }
+.mesh-node-nets > .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mesh-node-nets > svg { flex: none; }
+.mesh-port { position: absolute; width: 10px; height: 10px; border: 1.5px solid var(--ob-chat-subtle); border-radius: 50%; background: var(--ob-chat-bg); opacity: 0; cursor: crosshair; transition: opacity .12s; }
+.mesh-port[data-side='top'] { top: -6px; left: calc(50% - 5px); }
+.mesh-port[data-side='bottom'] { bottom: -6px; left: calc(50% - 5px); }
+.mesh-port[data-side='left'] { top: calc(50% - 5px); left: -6px; }
+.mesh-port[data-side='right'] { top: calc(50% - 5px); right: -6px; }
+.mesh-port::after { position: absolute; inset: -6px; content: ''; }
+.vue-flow__node:hover .mesh-port, .mesh-node[data-selected] .mesh-port { opacity: 1; }
+.mesh-port:hover { border-color: var(--ob-chat-text); background: var(--ob-chat-text); }
+
+/* Links. Entry: solid when in use (green) or first, dashed for standbys, red when broken. */
+.mesh-edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; }
+.mesh-edge-line { fill: none; stroke: var(--ob-chat-subtle); stroke-width: 1.4; pointer-events: none; }
+.mesh-edge-arrow { fill: var(--ob-chat-subtle); stroke: none; pointer-events: none; }
+.mesh-edge[data-kind='entry'][data-look='standby'] .mesh-edge-line { stroke-dasharray: 6 4; }
+.mesh-edge[data-look='active'] .mesh-edge-line { stroke: var(--ob-success); stroke-width: 2.2; }
+.mesh-edge[data-look='active'] .mesh-edge-arrow { fill: var(--ob-success); }
+.mesh-edge[data-look='bad'] .mesh-edge-line { stroke: var(--ob-danger); }
+.mesh-edge[data-look='bad'] .mesh-edge-arrow { fill: var(--ob-danger); }
+.mesh-edge[data-kind='relay'] .mesh-edge-line { stroke: var(--ob-chat-text); stroke-opacity: .5; stroke-width: 1.6; }
+.mesh-edge[data-kind='relay'][data-look='auto'] .mesh-edge-line { stroke: var(--ob-chat-border); stroke-opacity: 1; stroke-width: 1.2; }
+.mesh-edge[data-kind='direct'] .mesh-edge-line { stroke: var(--ob-info); stroke-width: 1.6; }
+.mesh-edge[data-live='direct'] .mesh-edge-line { stroke: var(--ob-success); stroke-width: 2.4; }
+.mesh-edge[data-live='punching'] .mesh-edge-line { stroke: var(--ob-info); stroke-width: 1.8; stroke-dasharray: 7 5; animation: mesh-punch 1.2s linear infinite; }
+.mesh-edge[data-live='relayed'] .mesh-edge-line { stroke: var(--ob-chat-subtle); stroke-opacity: .75; stroke-width: 1.8; stroke-dasharray: .5 4.5; stroke-linecap: round; }
+@keyframes mesh-punch { to { stroke-dashoffset: -24; } }
+/* Relay links as measured: down in red, suppressed (flapping) in amber dots. */
+.mesh-edge[data-kind='relay'][data-look='down'] .mesh-edge-line { stroke: var(--ob-danger); stroke-opacity: .8; stroke-dasharray: 4 4; }
+.mesh-edge[data-kind='relay'][data-look='suppressed'] .mesh-edge-line { stroke: var(--ob-warning); stroke-opacity: .9; stroke-dasharray: 1 5; stroke-linecap: round; stroke-width: 2; }
+.mesh-edge[data-kind='entry'][data-look='punching'] .mesh-edge-line { stroke: var(--ob-info); stroke-dasharray: 7 5; animation: mesh-punch 1.2s linear infinite; }
+.mesh-edge[data-kind='entry'][data-look='punching'] .mesh-edge-arrow { fill: var(--ob-info); }
+/* A standby whose last try failed: red, dashed like a standby. */
+.mesh-edge[data-kind='entry'][data-look='failing'] .mesh-edge-line { stroke: var(--ob-danger); stroke-opacity: .8; stroke-dasharray: 6 4; }
+.mesh-edge[data-kind='entry'][data-look='failing'] .mesh-edge-arrow { fill: var(--ob-danger); }
+.mesh-edge-label[data-look='failing'] { border-color: transparent; background: linear-gradient(var(--ob-danger-soft), var(--ob-danger-soft)), var(--ob-chat-bg); color: var(--ob-danger); }
+/* The path being shown: its links thicker, on top of everything that steps back. */
+.mesh-edge[data-path] .mesh-edge-line { stroke-width: 3.2; stroke-opacity: 1; }
+/* A quiet line carries nothing now (a standby entry, a relay link nothing is routed through): thin, faint
+   and still, with no label; a standby entry finely dashed. Normal again while it or one of its ends is in focus. */
+.mesh-edge[data-quiet] .mesh-edge-line { stroke-width: 1 !important; stroke-opacity: .4 !important; animation: none !important; }
+.mesh-edge[data-quiet][data-kind='entry'] .mesh-edge-line { stroke-dasharray: 2 4 !important; }
+.mesh-edge[data-quiet][data-kind='relay'] .mesh-edge-line { stroke: var(--ob-chat-subtle) !important; stroke-opacity: .32 !important; stroke-width: .9 !important; }
+.mesh-edge[data-quiet] .mesh-edge-arrow { opacity: .4; }
+.mesh-edge[data-path][data-kind='relay'][data-look='auto'] .mesh-edge-line { stroke: var(--ob-chat-text); }
+.mesh-edge[data-kind='rule'] .mesh-edge-line { stroke: var(--ob-violet); stroke-width: 1.3; stroke-dasharray: 2 4; stroke-linecap: round; }
+.mesh-edge[data-kind='rule'] .mesh-edge-arrow { fill: var(--ob-violet); }
+.mesh-edge[data-selected] .mesh-edge-hit { stroke: var(--ob-chat-selected); stroke-width: 10; }
+.mesh-edge[data-selected] .mesh-edge-line { stroke-width: 2.6; stroke-opacity: 1; }
+.mesh-edge[data-selected][data-kind='relay'][data-look='auto'] .mesh-edge-line { stroke: var(--ob-chat-subtle); }
+.mesh-edge-label { position: absolute; z-index: 2; padding: 0 6px; border: 1px solid var(--ob-chat-line); border-radius: 6px; background: var(--ob-chat-bg); color: var(--ob-chat-subtle);
+  font-size: 11px; line-height: 18px; white-space: nowrap; font-variant-numeric: tabular-nums; pointer-events: all; cursor: pointer; }
+.mesh-edge-label:hover { color: var(--ob-chat-text); }
+.mesh-edge-label[data-look='active'] { border-color: transparent; background: linear-gradient(var(--ob-success-soft), var(--ob-success-soft)), var(--ob-chat-bg); color: var(--ob-success); }
+.mesh-edge-label[data-look='bad'] { border-color: transparent; background: linear-gradient(var(--ob-danger-soft), var(--ob-danger-soft)), var(--ob-chat-bg); color: var(--ob-danger); }
+.mesh-edge-label[data-kind='rule'] { color: var(--ob-violet); }
+.mesh-edge-label[data-live='direct'] { border-color: transparent; background: linear-gradient(var(--ob-success-soft), var(--ob-success-soft)), var(--ob-chat-bg); color: var(--ob-success); }
+.mesh-edge-label[data-live='punching'] { border-color: transparent; background: linear-gradient(var(--ob-info-soft), var(--ob-info-soft)), var(--ob-chat-bg); color: var(--ob-info); }
+.mesh-edge-label[data-live='relayed'] { border-style: dashed; color: var(--ob-chat-subtle); }
+.mesh-edge-label[data-look='down'] { border-color: transparent; background: linear-gradient(var(--ob-danger-soft), var(--ob-danger-soft)), var(--ob-chat-bg); color: var(--ob-danger); }
+.mesh-edge-label[data-look='suppressed'] { border-color: transparent; background: linear-gradient(var(--ob-warning-soft), var(--ob-warning-soft)), var(--ob-chat-bg); color: var(--ob-warning); }
+.mesh-edge-label[data-look='punching'] { border-color: transparent; background: linear-gradient(var(--ob-info-soft), var(--ob-info-soft)), var(--ob-chat-bg); color: var(--ob-info); }
+.mesh-edge-label[data-path] { border-color: var(--ob-chat-text); color: var(--ob-chat-text); font-weight: 600; }
+.mesh-edge[data-dim] { opacity: .22; }
+.mesh-edge-label[data-dim] { opacity: .35; }
+.mesh-edge-label[data-flash] { animation: mesh-flash 1.6s ease-out; }
+@keyframes mesh-flash { 0%, 40% { box-shadow: 0 0 0 4px var(--ob-focus); } 100% { box-shadow: 0 0 0 0 transparent; } }
+/* Rules for everyone, tags or networks: a small list in the board's corner. */
+.mesh-legend { position: absolute; bottom: 10px; left: 10px; z-index: 4; display: flex; flex-direction: column; gap: 2px; max-width: min(300px, calc(100% - 20px)); max-height: 40%; padding: 6px;
+  overflow-y: auto; border: 1px solid var(--ob-chat-line); border-radius: 10px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); font-size: var(--ix-xs); }
+/* The path from one node to another: hops in a wrapping chain, the total below. */
+.mesh-path { position: absolute; top: 10px; left: 10px; z-index: 4; display: flex; flex-direction: column; gap: 4px; width: max-content; max-width: min(340px, calc(100% - 20px)); padding: 6px 6px 8px 12px;
+  border: 1px solid var(--ob-chat-line); border-radius: 10px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); font-size: var(--ix-sm); }
+.mesh-path > p { margin: 0; padding-right: 6px; overflow-wrap: anywhere; }
+.mesh-path-head { display: flex; align-items: center; gap: 6px; }
+.mesh-path-head > h3 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: var(--ix-sm); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-path-close { display: grid; flex: none; place-items: center; width: 26px; height: 26px; border-radius: 50%; color: var(--ob-chat-subtle); }
+.mesh-path-close:hover { background: var(--ob-chat-hover); color: var(--ob-chat-text); }
+.mesh-path-hops { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; margin: 0; padding: 0 6px 0 0; list-style: none; }
+.mesh-path-hops > li { display: inline-flex; align-items: center; gap: 4px; }
+.mesh-path-via { color: var(--ob-chat-subtle); font-size: var(--ix-xs); white-space: nowrap; }
+.mesh-path-node { padding: 1px 6px; border-radius: 6px; background: var(--ob-chat-hover); color: var(--ob-chat-text); font-weight: 600; cursor: pointer; }
+.mesh-path-node:hover { background: var(--ob-chat-selected); }
+.mesh-path-total { display: flex; flex-wrap: wrap; gap: 0 8px; font-variant-numeric: tabular-nums; }
+.mesh-path-total > strong { font-weight: 600; }
+.mesh-path-total > .ob-warn { font-size: var(--ix-xs); }
+.mesh-path-broken { color: var(--ob-danger); }
+.mesh-legend-note { display: flex; align-items: center; gap: 6px; margin: 0; padding: 2px 6px; color: var(--ob-chat-subtle); }
+.mesh-legend-quiet { flex: none; width: 18px; border-top: 1px dashed var(--ob-chat-subtle); opacity: .55; }
+.mesh-legend > h3 { margin: 0; padding: 2px 6px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-weight: 500; }
+.mesh-legend > ul { margin: 0; padding: 0; list-style: none; }
+.mesh-legend button { display: flex; gap: 6px; width: 100%; min-height: 26px; padding: 3px 6px; overflow: hidden; border-radius: 6px; color: var(--ob-violet); text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.mesh-legend button > .instance-muted { flex: none; font-variant-numeric: tabular-nums; }
+.mesh-legend button:hover { background: var(--ob-chat-hover); }
+.mesh-legend button[data-selected] { background: var(--ob-chat-selected); color: var(--ob-chat-text); font-weight: 600; }
+.mesh-legend button[data-bad] { color: var(--ob-danger); }
+.mesh-pair-rules > p { margin: 0 0 6px; font-size: var(--ix-sm); }
+.mesh-edge-label[data-selected] { border-color: var(--ob-chat-text); color: var(--ob-chat-text); font-weight: 600; }
+
+/* Right: properties. */
+.mesh-inspector-col { min-width: 0; min-height: 0; overflow-y: auto; border-left: 1px solid var(--ob-chat-line); --mesh-panel-bg: var(--ob-chat-bg); }
+.mesh-inspector { display: flex; flex-direction: column; min-width: 0; }
+.mesh-inspector-head { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 8px; min-height: 46px; padding: 10px 12px 8px 16px; background: var(--ob-chat-bg); }
+.mesh-inspector-head > h2 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: var(--ix-md); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-inspector-head > .ix-icon-button { width: 28px; height: 28px; }
+.mesh-inspector-body { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 20px; }
+.mesh-inspector.is-phone .mesh-inspector-body { padding: 0; }
+.mesh-inspector-head + .mesh-inspector-body .mesh-member-tabs { top: 46px; }
+.mesh-section { padding: 4px 0 10px; }
+.mesh-section + .mesh-section { border-top: 1px solid var(--ob-chat-line); padding-top: 8px; }
+.mesh-section > h3 { margin: 4px 0 8px; }
+.mesh-section > h3 > .instance-muted { font-weight: 400; }
+.mesh-changes { display: flex; flex-direction: column; gap: 4px; font-size: var(--ix-sm); }
+.mesh-changes > p { margin: 0; }
+.mesh-changes > strong { font-weight: 600; }
+.mesh-changes[data-tone='warn'] > strong { color: var(--ob-warning); }
+.mesh-changes[data-tone='bad'] > strong { color: var(--ob-danger); }
+.mesh-changes > .mesh-bar-list { max-height: 220px; margin: 0; padding: 0; border: 0; font-size: var(--ix-sm); }
+.mesh-inspector .ob-fields { gap: 12px; }
+.mesh-inspector .ob-field { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.mesh-inspector .ob-field > span { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-installing-note > p { margin: 0 0 6px; font-size: var(--ix-sm); }
+.mesh-panel-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--ob-chat-line); }
+.mesh-link { display: flex; flex-direction: column; gap: 10px; }
+.mesh-link > p { margin: 0; }
+.mesh-link-ends { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: var(--ix-md); }
+.mesh-link-ends > .ix-text-button { padding: 0 2px; color: var(--ob-chat-text); font-weight: 600; overflow-wrap: anywhere; text-align: left; }
+.mesh-link-ends > span[aria-hidden] { color: var(--ob-chat-subtle); }
+.mesh-link-notes { display: flex; flex-direction: column; gap: 2px; }
+.mesh-link-notes > .mesh-cand-note { margin: 0; }
+.mesh-link-text { margin: 0; font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.mesh-link-group { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.mesh-link-group > .mesh-group-title { margin: 0 0 2px; }
+.mesh-link-group > .mesh-stats { margin: 0; padding: 0; border: 0; }
+.mesh-stats.is-compact { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mesh-link-settings { gap: 0; padding-top: 8px; border-top: 1px solid var(--ob-chat-line); }
+.mesh-link-settings > .mesh-link-text { padding: 4px 0; font-size: var(--ix-xs); }
+.mesh-link-settings > .ob-check { margin-top: 6px; font-size: var(--ix-sm); }
+.mesh-link-value { font-size: var(--ix-sm); overflow-wrap: anywhere; }
+.mesh-link-order { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: var(--ix-sm); }
+.mesh-link-order > .ix-text-button { min-height: 28px; padding: 0 2px; }
+.mesh-link-transport { align-self: flex-start; }
+.mesh-link-transport > button { min-width: 52px; min-height: 28px; font-size: var(--ix-sm); }
+.mesh-trend { margin-top: 12px; }
+.mesh-routes { margin-top: 12px; }
+.mesh-routes > p { margin: 0; font-size: var(--ix-sm); }
+.mesh-route-list { margin: 0; padding: 0; list-style: none; }
+.mesh-route { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto; align-items: baseline; gap: 2px 10px; width: 100%; min-height: 30px; padding: 4px 6px; border: 0; border-radius: 6px;
+  background: none; color: var(--ob-chat-text); font: inherit; font-size: var(--ix-sm); text-align: left; cursor: pointer; }
+@media (hover: hover) { .mesh-route:hover { background: var(--ob-chat-hover); } }
+.mesh-route[aria-pressed='true'] { background: var(--ob-chat-selected); }
+.mesh-route-name { font-weight: 600; overflow-wrap: anywhere; }
+.mesh-route-name.mono { font-weight: 500; font-size: var(--ix-xs); }
+.mesh-route-through { min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-route[data-broken] .mesh-route-through { color: var(--ob-danger); }
+.mesh-route-rtt { color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mesh-route-sub { margin: 8px 0 2px; padding: 0 6px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-weight: 600; }
+.mesh-routes > .mesh-fold-toggle { margin: 2px 0 0 6px; font-size: var(--ix-xs); }
+.mesh-trend-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-bottom: 6px; }
+.mesh-trend-head > h4 { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.mesh-trend-head > .instance-muted { font-size: var(--ix-xs); }
+.mesh-trend > p { margin: 0; font-size: var(--ix-sm); }
+.mesh-sparks { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.mesh-sparks > li { display: grid; grid-template-columns: 56px minmax(0, 1fr) 72px; align-items: center; gap: 8px; min-height: 30px; font-size: var(--ix-xs); }
+.mesh-spark-label { color: var(--ob-chat-subtle); }
+.mesh-sparks svg { width: 100%; height: 28px; overflow: visible; }
+.mesh-spark-line { fill: none; stroke: var(--ob-chat-subtle); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.mesh-spark-area { fill: var(--ob-chat-hover); stroke: none; }
+.mesh-sparks > li[data-tone='bad'] .mesh-spark-line { stroke: var(--ob-danger); }
+.mesh-sparks > li[data-tone='bad'] .mesh-spark-area { fill: var(--ob-danger-soft); }
+.mesh-spark-value { color: var(--ob-chat-text); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mesh-spark-empty { color: var(--ob-chat-subtle); }
+.mesh-rule[data-selected] .mesh-rule-text { background: var(--ob-chat-selected); }
+
+/* Phone: one canvas with a compact tool row, an add button and a dock for the selection. */
+.mesh-board.is-phone { display: flex; flex-direction: column; }
+.mesh-board.is-phone .mesh-stage { flex: 1; gap: 6px; padding: 8px 10px max(10px, env(safe-area-inset-bottom, 0px)); }
+.mesh-board.is-phone .mesh-canvas { border-radius: 12px; }
+.mesh-fab-row { position: absolute; top: 8px; left: 8px; z-index: 5; display: flex; gap: 2px; padding: 3px; border: 1px solid var(--ob-chat-line); border-radius: 11px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); }
+.mesh-fab-row > .mesh-tb { width: 38px; height: 38px; border-radius: 8px; }
+.mesh-board.is-phone .mesh-banner { top: 60px; }
+.mesh-fab { position: absolute; right: 12px; bottom: 64px; z-index: 5; display: grid; place-items: center; width: 46px; height: 46px; border: 1px solid var(--ob-chat-line); border-radius: 50%;
+  background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); color: var(--ob-chat-text); }
+.mesh-dock { position: absolute; right: 8px; bottom: 8px; left: 8px; z-index: 5; display: flex; align-items: center; gap: 4px; min-height: 46px; padding: 3px 4px 3px 12px; border: 1px solid var(--ob-chat-line);
+  border-radius: 12px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); font-size: var(--ix-sm); }
+.mesh-dock:empty { display: none; }
+.mesh-dock-title { display: flex; flex: 1; flex-direction: column; min-width: 0; overflow: hidden; font-weight: 600; line-height: 1.3; white-space: nowrap; }
+.mesh-dock-title > small { font-size: var(--ix-xs); font-weight: 400; }
+.mesh-dock > .ix-text-button { flex: none; min-height: 40px; padding: 0 10px; }
+.mesh-dock-close { display: grid; flex: none; place-items: center; width: 40px; height: 40px; border-radius: 50%; color: var(--ob-chat-subtle); }
+.mesh-dock-entry { display: flex; flex: 1; align-items: center; justify-content: space-between; min-height: 40px; margin-left: -8px; padding: 0 8px; color: var(--ob-chat-text); font-size: var(--ix-sm); }
+.mesh-dock-entry > span { color: var(--ob-chat-subtle); font-size: 18px; }
+.mesh-board.is-phone .mesh-edge-label { line-height: 22px; padding: 0 8px; font-size: 12px; }
+.mesh-board.is-phone .mesh-legend { bottom: 62px; font-size: 12px; }
+.mesh-board.is-phone .mesh-legend button { min-height: 36px; align-items: center; }
+.mesh-board.is-phone .mesh-node-nets { display: none; }
+.mesh-board.is-phone .mesh-path { top: 60px; right: 8px; left: 8px; width: auto; max-width: none; }
+.mesh-board.is-phone .mesh-path-close { width: 40px; height: 40px; margin: -6px -4px -6px 0; }
+.mesh-board.is-phone .mesh-path-node { min-height: 32px; padding: 4px 8px; }
+.mesh-servers.is-phone { padding: 0; overflow: visible; }
+.mesh-servers.is-phone .mesh-server { min-height: 48px; padding: 6px 4px; font-size: var(--ix-md); }
+.mesh-servers.is-phone .mesh-servers-search { height: 40px; }
+
+/* Changes bar: stays at the top of the scrolling tab. */
+/* The tint is laid over a solid base so content scrolling under the pinned bar never shows through. */
+.mesh-bar { position: sticky; top: 0; z-index: 3; margin: -4px 0 0; padding: 8px 10px 8px 14px; border-radius: 12px; background: linear-gradient(var(--ob-warning-soft), var(--ob-warning-soft)), var(--ob-chat-bg); box-shadow: 0 0 0 1px var(--ob-chat-line); font-size: var(--ix-sm); }
+.mesh-bar[data-tone='bad'] { background: linear-gradient(var(--ob-danger-soft), var(--ob-danger-soft)), var(--ob-chat-bg); }
+.mesh-bar[data-tone='off'] { background: linear-gradient(var(--ob-chat-hover), var(--ob-chat-hover)), var(--ob-chat-bg); }
+.mesh-bar-main { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.mesh-bar-text { display: flex; flex: 1 1 240px; flex-direction: column; min-width: 0; }
+.mesh-bar-text > strong { font-size: var(--ix-md); font-weight: 600; font-variant-numeric: tabular-nums; }
+.mesh-bar[data-tone='warn'] .mesh-bar-text > strong { color: var(--ob-warning); }
+.mesh-bar[data-tone='bad'] .mesh-bar-text > strong { color: var(--ob-danger); }
+.mesh-bar-summary { overflow: hidden; color: var(--ob-chat-subtle); text-overflow: ellipsis; white-space: nowrap; }
+.mesh-bar-problem { color: var(--ob-danger); }
+.mesh-bar-actions { display: flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
+.mesh-bar-actions .el-button + .el-button { margin-left: 0; }
+.mesh-bar-actions > .sv-bar { width: 140px; }
+.mesh-bar[data-kind='running'] .sv-bar::after { background: var(--ob-warning); }
+.mesh-bar-list { max-height: 40vh; margin: 8px 0 2px; padding: 8px 0 0; overflow-y: auto; border-top: 1px solid var(--ob-chat-line); list-style: none; color: var(--ob-chat-text); line-height: 1.7; overflow-wrap: anywhere; }
+.mesh-bar-list > li[data-tone='bad'] { color: var(--ob-danger); }
+.mesh-bar-list .ix-text-button { padding: 0 2px; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+
+.mesh-drop { width: 28px; height: 28px; font-size: 12px; }
+.mesh-add-line { align-self: flex-start; margin-top: 4px; }
+.mesh-cand-note { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 4px 0 0; color: var(--ob-warning); font-size: var(--ix-sm); }
+.mesh-cand-note.is-error { color: var(--ob-danger); }
+/* The controller's advice (a prediction, a suggestion): read, but not a fault. */
+.mesh-cand-note.is-info { color: var(--ob-chat-subtle); }
+.mesh-cand-note > .ix-text-button { padding: 0 2px; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+
+.mesh-entries { display: flex; flex-direction: column; gap: 8px; }
+.mesh-entries > .ix-notice, .mesh-entries > .instance-error { margin: 0; }
+.mesh-entry-mode { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.mesh-entries > .mesh-hint { margin-top: -2px; }
+/* Each entry is a card: the relay with order and delete on top, how it connects and its state below. */
+.mesh-cands { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.mesh-cands:empty { display: none; }
+.mesh-cand { padding: 6px 6px 8px 8px; border: 1px solid var(--ob-chat-line); border-radius: 10px; background: var(--ob-chat-panel); }
+.mesh-cand[data-error='true'] { box-shadow: inset 2px 0 var(--ob-danger); }
+.mesh-cand-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.servers-ui .mesh-cand-relay { flex: 1 1 auto; width: auto; min-width: 0; }
+.mesh-cand-actions { flex: none; margin-left: 2px; }
+.mesh-cand-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 6px 0 0; padding-left: 26px; }
+.mesh-cand-transport.sv-ranges > button { min-width: 42px; }
+.mesh-cand-punch { display: inline-flex; align-items: center; height: 24px; color: var(--ob-info); font-size: var(--ix-sm); }
+.mesh-cand-state { display: inline-flex; flex: 1 1 120px; flex-wrap: wrap; align-items: baseline; justify-content: flex-end; gap: 0 6px; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: right; }
+.mesh-cand-state > b { font-weight: 600; white-space: nowrap; }
+.mesh-cand-state > small { min-width: 0; font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-cand-state[data-tone='bad'] > b { color: var(--ob-danger); }
+.mesh-cand-state[data-tone='ok'] > b { color: var(--ob-success); }
+.mesh-cand-state[data-tone='info'] > b { color: var(--ob-info); }
+.mesh-cand-state[data-tone='warn'] > b { color: var(--ob-warning); }
+.mesh-cand > .mesh-cand-note { padding-left: 26px; }
+.mesh-entries-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 12px; }
+.mesh-entries-foot > .mesh-add-line { margin-top: 0; }
+.mesh-hint { margin: 0; font-size: var(--ix-xs); }
+/* Two or three choices in a row: radios that read as one control. */
+.mesh-choice { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.mesh-choice > label, .instance-form .mesh-choice > label { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; min-height: 28px; font-size: var(--ix-sm); white-space: nowrap; }
+
+/* Member panel. */
+.mesh-member { display: flex; flex-direction: column; min-width: 0; }
+.mesh-member-tabs { position: sticky; top: 0; z-index: 2; padding: 0 0 12px; background: var(--mesh-panel-bg, var(--ob-chat-bg)); }
+.mesh-member-tabs > .sv-ranges { display: flex; }
+.mesh-member-tabs > .sv-ranges > button { position: relative; flex: 1 1 0; min-width: 0; padding: 1px 4px; white-space: nowrap; }
+/* The summary that stays above the tabs: state, role and address; how it is connected and what needs attention. */
+.mesh-member-summary { display: flex; flex-direction: column; gap: 4px; padding: 0 0 10px; font-size: var(--ix-sm); }
+.mesh-member-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-width: 0; }
+.mesh-member-line:empty { display: none; }
+.mesh-member-line > .sv-flag { font-size: var(--ix-md); }
+.mesh-member-line > .ob-dot { font-size: var(--ix-sm); }
+.mesh-member-role { color: var(--ob-chat-text); }
+.mesh-member-address { color: var(--ob-chat-subtle); font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-member-via { min-width: 0; max-width: 100%; overflow: hidden; color: var(--ob-chat-text); text-overflow: ellipsis; white-space: nowrap; }
+.mesh-member-rtt { color: var(--ob-chat-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mesh-member-attention { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+.mesh-member .pb-tag[data-tone='info'] { border-color: transparent; background: var(--ob-info-soft); color: var(--ob-info); }
+.mesh-member .pb-tag[data-tone='off'] { color: var(--ob-chat-subtle); }
+.mesh-tab-alert { display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%; background: var(--ob-danger); vertical-align: 2px; }
+.mesh-pane { min-width: 0; }
+.mesh-problem { margin: 0 0 8px; }
+/* A member whose mesh service is gone: what happened, then the one thing to do about it. */
+.mesh-missing { flex-direction: column; align-items: stretch; gap: 8px; }
+.mesh-missing > span:first-child { color: var(--ob-chat-text); }
+.mesh-missing-action { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.mesh-missing-action > .el-button { margin: 0; }
+/* The notice greys its spans; the button keeps its own text colour. */
+.ix-notice.mesh-missing .el-button span { color: inherit; font-size: inherit; }
+.mesh-missing-action > small, .mesh-missing-error { font-size: var(--ix-sm); }
+/* Machine hints: one line each, the explanation opens below. */
+.mesh-hints { display: flex; flex-direction: column; gap: 2px; margin: 0 0 6px; padding: 0; list-style: none; font-size: var(--ix-sm); }
+.mesh-hints details > summary, .mesh-hint-plain { font-size: var(--ix-sm); box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-height: 28px; margin: 0; padding: 4px 8px; line-height: 20px; border-radius: 7px; color: var(--ob-warning); list-style: none; }
+.mesh-hints details > summary { cursor: pointer; }
+.mesh-hints summary::-webkit-details-marker { display: none; }
+.mesh-hints summary::after { flex: none; margin-left: auto; color: var(--ob-chat-subtle); font-size: var(--ix-xs); content: '详情'; }
+.mesh-hints details[open] summary::after { content: '收起'; }
+@media (hover: hover) { .mesh-hints summary:hover { background: var(--ob-chat-hover); } }
+.mesh-hints summary > svg, .mesh-hint-plain > svg { flex: none; }
+.mesh-hints summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-hint-plain > span { min-width: 0; overflow-wrap: anywhere; }
+.mesh-hints li[data-tone='bad'] summary, .mesh-hints li[data-tone='bad'] .mesh-hint-plain { color: var(--ob-danger); }
+.mesh-hints li[data-tone='info'] summary, .mesh-hints li[data-tone='info'] .mesh-hint-plain { color: var(--ob-chat-subtle); }
+.mesh-hints > li > details { margin: 0; }
+.mesh-hints details > p { margin: 2px 0 6px; padding: 0 8px 0 28px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); line-height: 1.6; white-space: pre-line; }
+.mesh-hints details > p.mesh-hint-line { margin-top: 0; color: var(--ob-danger); overflow-wrap: anywhere; }
+/* The member's own actions, right under what needs attention. */
+.mesh-actions { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 0 0 2px; }
+.mesh-actions > .ix-text-button { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; padding: 0; font-size: var(--ix-sm); }
+/* Status groups: a light heading, a list or a few facts. */
+.mesh-group { margin-top: 14px; }
+.mesh-config > .mesh-group:first-child { margin-top: 0; }
+.mesh-group-head { display: flex; align-items: center; gap: 8px; min-height: 26px; margin-bottom: 4px; }
+.mesh-group-head > h4, .mesh-group-title { margin: 0; font-size: var(--ix-sm); font-weight: 600; }
+.mesh-group-head > .instance-muted { font-size: var(--ix-xs); }
+.mesh-group-head > .ix-text-button { min-height: 26px; padding: 0 2px; font-size: var(--ix-xs); }
+.mesh-group-title { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+.mesh-group-title > .instance-muted { font-size: var(--ix-xs); font-weight: 400; }
+.mesh-group-empty { margin: 0; font-size: var(--ix-sm); }
+/* A member's entries as they are now: place, relay and how, state and since when. */
+.mesh-cand-list { margin: 0; padding: 0; list-style: none; border: 1px solid var(--ob-chat-line); border-radius: 10px; }
+.mesh-cand-list > li { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: baseline; gap: 2px 8px; padding: 7px 10px; font-size: var(--ix-sm); }
+.mesh-cand-list > li + li { border-top: 1px solid var(--ob-chat-line); }
+.mesh-cand-list[data-stale] .mesh-cand-now { opacity: .55; }
+.mesh-cand-no { color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-variant-numeric: tabular-nums; }
+.mesh-cand-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; min-width: 0; }
+.mesh-cand-name > strong { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.mesh-cand-name > small { color: var(--ob-chat-subtle); font-size: var(--ix-xs); white-space: nowrap; }
+.mesh-cand-now { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; min-width: 0; max-width: 150px; text-align: right; }
+.mesh-cand-now > small { color: var(--ob-chat-subtle); font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-cand-list > li[data-tone='bad'] .mesh-cand-now > small { color: var(--ob-danger); }
+.mesh-connection { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; margin: 6px 0 0; padding: 0 2px; font-size: var(--ix-sm); }
+.mesh-connection > span:not(.instance-muted) { min-width: 0; overflow-wrap: anywhere; }
+.mesh-connection > .instance-muted { font-size: var(--ix-xs); }
+.mesh-connection > small { flex-basis: 100%; font-size: var(--ix-xs); }
+/* Label and value rows inside a group. */
+.mesh-kv { display: flex; flex-direction: column; gap: 6px; margin: 0; font-size: var(--ix-sm); }
+.mesh-kv > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+.mesh-kv dt { color: var(--ob-chat-subtle); font-size: var(--ix-xs); line-height: 20px; }
+.mesh-kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.mesh-riders { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.mesh-riders > span { display: inline-flex; align-items: baseline; gap: 4px; padding: 1px 7px; border: 1px solid var(--ob-chat-line); border-radius: 6px; }
+.mesh-riders > span > small { color: var(--ob-chat-subtle); font-size: 11px; }
+.mesh-riders > span[data-tone='ok'] > small { color: var(--ob-success); }
+.mesh-riders > span[data-tone='bad'] > small { color: var(--ob-danger); }
+/* Reachability: the verdict and the real exit on one line, observers behind a fold. */
+.mesh-reach { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: var(--ix-sm); }
+.mesh-reach-line { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; min-width: 0; margin: 0; }
+.mesh-reach-line > .mono { font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-reach small { font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-observers { width: 100%; margin: 0; font-size: var(--ix-xs); }
+.mesh-observers > summary { padding: 2px 0; color: var(--ob-chat-subtle); cursor: pointer; }
+.mesh-observers > p { margin: 4px 0; line-height: 1.6; overflow-wrap: anywhere; }
+.mesh-observers > ul { margin: 2px 0 0; padding: 0; list-style: none; }
+.mesh-observers li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0 8px; padding: 2px 0; color: var(--ob-chat-subtle); }
+.mesh-observers li[data-ok] { color: var(--ob-chat-text); }
+.mesh-observers li > .mono { min-width: 0; overflow-wrap: anywhere; }
+.mesh-observer-name { display: inline-flex; align-items: center; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.mesh-observer-name > .pb-tag { font-size: 11px; }
+.mesh-exports, .mesh-plain-nets { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 0; font-size: var(--ix-sm); }
+.mesh-exports-title { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-plain-nets > .mono { overflow-wrap: anywhere; }
+.mesh-export { display: flex; flex-direction: column; min-width: 0; }
+.mesh-export > .mono { overflow-wrap: anywhere; }
+.mesh-export > small { color: var(--ob-chat-subtle); font-size: var(--ix-xs); overflow-wrap: anywhere; }
+.mesh-export > small.ob-warn { color: var(--ob-warning); }
+/* Running figures, two to a row; a long one spans both. */
+.mesh-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; margin: 14px 0 0; padding: 10px 0 0; border-top: 1px solid var(--ob-chat-line); font-size: var(--ix-sm); }
+.mesh-stats > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.mesh-stats > div.is-wide { grid-column: 1 / -1; }
+.mesh-stats dt { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-stats dd { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin: 0; min-width: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.mesh-stats dd > .mono { font-size: var(--ix-xs); }
+.mesh-stats dd > small { flex-basis: 100%; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-stats dd > small.ob-bad { color: var(--ob-danger); }
+.mesh-stats dd > small.ob-warn { color: var(--ob-warning); }
+.mesh-detail-error { margin: 6px 0 0; font-size: var(--ix-xs); }
+.mesh-member-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--ob-chat-line); }
+/* Settings: the name and the value on one row, what it does behind ⓘ. */
+.mesh-config { gap: 0; }
+.mesh-config .mesh-group { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--ob-chat-line); }
+.mesh-config .mesh-group:first-child { padding-top: 0; border-top: 0; }
+.mesh-field { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: start; gap: 4px 10px; padding: 5px 0; }
+.mesh-field.is-stack { grid-template-columns: minmax(0, 1fr); }
+.mesh-field-label { display: flex; align-items: center; gap: 2px; min-height: 30px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.mesh-help-toggle { display: inline-grid; flex: none; place-items: center; width: 22px; height: 22px; border-radius: 50%; color: var(--ob-chat-subtle); opacity: .7; cursor: pointer; }
+.mesh-help-toggle[aria-expanded='true'] { color: var(--ob-chat-text); opacity: 1; }
+@media (hover: hover) { .mesh-help-toggle:hover { background: var(--ob-chat-hover); opacity: 1; } }
+.mesh-field-ctl { display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; min-height: 30px; justify-content: center; }
+.mesh-field-ctl > small { font-size: var(--ix-xs); line-height: 1.5; }
+.mesh-field-ctl > .ob-check { min-height: 28px; font-size: var(--ix-sm); }
+.mesh-help { margin: 0; padding: 6px 8px; border-radius: 7px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-size: var(--ix-xs); line-height: 1.6; white-space: pre-line; }
+.mesh-config-note { margin: 0; font-size: var(--ix-sm); }
+.mesh-listen { display: flex; flex-direction: column; gap: 4px; }
+.mesh-listen-item { display: flex; align-items: center; gap: 6px; min-height: 30px; }
+.mesh-listen-item > .ob-check { width: 56px; }
+.servers-ui .mesh-listen-item > input { flex: 0 1 96px; width: 96px !important; min-width: 0; }
+.mesh-listen-off { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.servers-ui .mesh-rate > input:not(.ob-port) { flex: 0 1 120px; width: 120px !important; min-width: 0; }
+.mesh-relay-mode > label { min-height: 28px; }
+/* Peers by kind; in each, the name and handshake, then where it is and the traffic. */
+.mesh-peer-group + .mesh-peer-group { margin-top: 12px; }
+.mesh-peers, .mesh-events { margin: 0; padding: 0; list-style: none; }
+.mesh-routine-note { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0 0 6px; font-size: var(--ix-xs); }
+.mesh-routine-note > .ix-text-button { min-height: 28px; padding: 0 4px; }
+.mesh-peers { border: 1px solid var(--ob-chat-line); border-radius: 10px; }
+.mesh-peers > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 2px 10px; padding: 7px 10px; font-size: var(--ix-sm); }
+.mesh-peers > li + li, .mesh-events > li + li { border-top: 1px solid var(--ob-chat-line); }
+.mesh-peers > li[data-active='false'] { opacity: .6; }
+.mesh-peer-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mesh-peer-name > strong { min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-peer-time { display: inline-flex; align-items: center; gap: 5px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: right; white-space: nowrap; }
+.mesh-peer-time::before { width: 6px; height: 6px; border-radius: 50%; background: var(--ob-chat-border); content: ''; }
+.mesh-peer-time[data-fresh]::before { background: var(--ob-success); }
+.mesh-peer-transport { flex: none; color: var(--ob-chat-subtle); }
+.mesh-peer-endpoint { min-width: 0; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-overflow: ellipsis; white-space: nowrap; }
+.mesh-peer-traffic { color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mesh-peer-direct, .mesh-peer-note { grid-column: 1 / -1; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-peer-direct[data-state='direct'] { color: var(--ob-success); }
+.mesh-peer-direct[data-state='punching'] { color: var(--ob-info); }
+.mesh-direct-why { color: var(--ob-chat-subtle); }
+.mesh-bias { flex-wrap: nowrap; }
+.servers-ui .mesh-bias > input.mesh-short { flex: 0 0 120px; }
+.mesh-events > li[data-tone='ok'] .sv-log-source { background: var(--ob-success-soft); color: var(--ob-success); }
+.mesh-events > li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: baseline; gap: 8px; padding: 7px 0; font-size: var(--ix-sm); }
+.mesh-events > li[data-tone='bad'] .sv-log-source { background: var(--ob-danger-soft); color: var(--ob-danger); }
+.mesh-events > li[data-tone='warn'] .sv-log-source { background: var(--ob-warning-soft); color: var(--ob-warning); }
+.mesh-event-detail { min-width: 0; overflow-wrap: anywhere; }
+.mesh-events time { color: var(--ob-chat-subtle); font-size: var(--ix-xs); white-space: nowrap; }
+.mesh-event-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mesh-event-more { display: flex; flex-wrap: wrap; align-items: center; gap: 0 10px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-event-repeat { font-size: inherit; }
+.mesh-event-more > .ix-text-button { min-height: 24px; padding: 0 2px; font-size: var(--ix-xs); }
+.mesh-event-raw > summary { display: inline-flex; align-items: center; min-height: 24px; color: var(--ob-chat-subtle); cursor: pointer; }
+.mesh-event-raw[open] { flex-basis: 100%; }
+.mesh-event-raw > code { display: block; margin: 2px 0 4px; padding: 6px 8px; border-radius: 6px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-family: var(--ix-mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mesh-event-items { margin: 4px 0 2px; padding: 0 0 0 10px; border-left: 2px solid var(--ob-chat-line); list-style: none; }
+.mesh-event-items > li { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 2px 0; font-size: var(--ix-xs); }
+.mesh-event-items > li > span { min-width: 0; overflow-wrap: anywhere; }
+
+/* Access rules. */
+.mesh-deny { margin: 0 0 8px; padding: 6px 10px; border-radius: 8px; background: var(--ob-chat-hover); color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.mesh-rule-list { margin: 0; padding: 0; list-style: none; }
+.mesh-rule + .mesh-rule { border-top: 1px solid var(--ob-chat-line); }
+.mesh-rule { display: flex; align-items: center; gap: 4px; min-height: 40px; }
+.mesh-rule[data-error='true'] .mesh-rule-text { box-shadow: inset 2px 0 var(--ob-danger); }
+.mesh-rule-text { display: flex; flex: 1; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; padding: 7px 6px; border-radius: 8px; color: var(--ob-chat-text); font-size: var(--ix-sm); text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.mesh-rule-text:hover { background: var(--ob-chat-hover); }
+.mesh-rule-text b { font-weight: 600; }
+.mesh-rule-text > small { font-size: var(--ix-xs); }
+.mesh-rule-edit { display: flex; flex-direction: column; gap: 2px; }
+.mesh-rule-edit > .mesh-link-text { padding-bottom: 4px; }
+.mesh-rule-edit > .instance-error, .mesh-rule-edit > p { margin: 0; }
+.mesh-rule-add { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 8px; }
+.mesh-rules-empty { margin: 0 0 4px !important; }
+.mesh-auto-head { margin: 12px 0 2px; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.mesh-rule-pad { flex: none; width: 20px; }
+.mesh-rule[data-auto] .mesh-rule-text { margin: 0; cursor: default; }
+.mesh-rule[data-auto] .mesh-rule-text:hover { background: none; }
+.mesh-side { gap: 6px; }
+.mesh-all { color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.mesh-all.ob-warn { color: var(--ob-warning); }
+.mesh-side-all { align-items: flex-start; font-size: var(--ix-sm); }
+/* The checkbox sits by "所有成员", not in the middle of its note (forms centre checkboxes otherwise). */
+.servers-ui .mesh-side > label.ob-check.mesh-side-all { align-items: flex-start; }
+.mesh-side-all > input { flex: none; margin-top: 3px; }
+.mesh-side-all small { display: block; font-size: var(--ix-xs); }
+.mesh-side-add { flex-wrap: wrap; }
+.servers-ui .mesh-side-add > select, .servers-ui .mesh-side-add > input { flex: 1 1 160px; width: auto !important; min-width: 0; }
+
+/* Settings. */
+.mesh-settings .instance-form-footer { position: static; margin-top: 12px; padding: 0; border: 0; background: none; }
+.servers-ui .mesh-short { width: 120px !important; }
+.mesh-settings-fields { display: flex; flex-direction: column; }
+.mesh-settings-fields.busy { opacity: .7; pointer-events: none; }
+.mesh-settings-fields > .mesh-fold { margin-top: 4px; }
+.mesh-ports { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.mesh-ports > label { display: flex; flex-direction: column; gap: 2px; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.servers-ui .mesh-ports input { width: 100% !important; min-width: 0; }
+.mesh-fold-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 4px 0; color: var(--ob-chat-subtle); }
+.mesh-health { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; margin-top: 6px; }
+.mesh-health > p { grid-column: 1 / -1; margin: 0; font-size: var(--ix-xs); }
+.mesh-health-item { display: flex; flex-direction: column; gap: 4px; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.mesh-health-item .ob-inline { flex-wrap: nowrap; }
+.servers-ui .mesh-health-item input { flex: 0 1 130px; width: 130px !important; }
+
+/* The card on a server's detail page. */
+.mesh-card-join { margin: 0; font-size: var(--ix-sm); }
+
+/* Phone bottom sheet; drag the header down to close. */
+.mesh-sheet.el-drawer { --el-drawer-padding-primary: 0; max-height: calc(var(--mobile-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top, 0px))); border-radius: 16px 16px 0 0; background: var(--ob-chat-bg); transition: transform 280ms cubic-bezier(.22, .68, 0, 1); }
+html .mesh-sheet.mobile-viewport-sheet > .el-drawer__body { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
+.mesh-sheet.is-dragging { transition: none; user-select: none; }
+.mesh-sheet-head { position: relative; display: flex; flex: none; align-items: center; gap: 10px; padding: 18px max(10px, env(safe-area-inset-right, 0px)) 8px max(17px, env(safe-area-inset-left, 0px)); touch-action: none; }
+.mesh-sheet-head > .mobile-asset-grip { position: absolute; top: 7px; left: calc(50% - 15px); width: 30px; height: 4px; border-radius: 4px; background: var(--ob-chat-border); }
+.mesh-sheet-head > h2 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: 15px; font-weight: 500; line-height: 22px; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-sheet-close { display: grid; flex: none; place-items: center; width: 40px; height: 40px; border-radius: 50%; color: var(--ob-chat-subtle); }
+.mesh-sheet-close > .el-icon { width: 32px; height: 32px; border-radius: 50%; background: var(--ob-chat-hover); font-size: 16px; }
+.mesh-sheet-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px max(17px, env(safe-area-inset-right, 0px)) max(21px, env(safe-area-inset-bottom, 0px)) max(17px, env(safe-area-inset-left, 0px)); }
+.mesh-sheet-overlay.el-drawer-fade-leave-active { transition: background-color 280ms linear; }
+.mesh-sheet-overlay.el-drawer-fade-leave-from .mesh-sheet { transform: translateY(var(--mesh-drag-y, 0px)); }
+.mesh-sheet-overlay.el-drawer-fade-leave-active .mesh-sheet { pointer-events: none; }
+.mesh-sheet .instance-form-footer { bottom: calc(-1 * max(21px, env(safe-area-inset-bottom, 0px))); padding-bottom: max(10px, env(safe-area-inset-bottom, 0px)); }
+
+@media (max-width: 760px) {
+  .mesh-bar { padding: 8px 10px 8px 12px; }
+  /* Two lines at most: title and one line of summary on the left, buttons on the right. */
+  .mesh-bar-main { flex-wrap: nowrap; gap: 10px; }
+  .mesh-bar-text { flex: 1 1 0; }
+  .mesh-bar-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mesh-bar-text.has-note > .mesh-bar-summary:not(.mesh-bar-note) { display: none; }
+  .mesh-bar-actions > .sv-bar { width: 88px; }
+  .mesh-bar-actions .el-button { min-height: 36px; padding: 8px 10px; }
+  .mesh-drop { width: 36px; height: 36px; }
+  .mesh-add-line, .mesh-rule-add > .ix-text-button, .mesh-panel-foot > .ix-text-button, .mesh-member-foot > .ix-text-button, .mesh-fold-toggle, .mesh-link-ends > .ix-text-button, .mesh-hints details > summary { min-height: 40px; }
+  .mesh-observers > summary, .mesh-choice > label { min-height: 36px; display: flex; align-items: center; }
+  .mesh-side-all { min-height: 36px; padding-top: 4px; }
+  .mesh-actions > .ix-text-button, .mesh-group-head > .ix-text-button, .mesh-routine-note > .ix-text-button { min-height: 36px; }
+  .mesh-event-more > .ix-text-button, .mesh-event-raw > summary { min-height: 32px; }
+  .mesh-events .sv-log-source, .mesh-events time, .mesh-event-more, .mesh-event-more > .ix-text-button, .mesh-event-items > li { font-size: 12px; }
+  .mesh-help-toggle { width: 32px; height: 32px; margin: -5px 0; }
+  .mesh-link-order > .ix-text-button { min-height: 36px; }
+  .mesh-member-attention { line-height: 26px; }
+  .mesh-field-label, .mesh-field-ctl, .mesh-listen-item { min-height: 36px; }
+  .mesh-field { grid-template-columns: 98px minmax(0, 1fr); }
+  .mesh-field-label { white-space: nowrap; }
+  .mesh-cand-move { margin-left: auto; }
+  .mesh-cand-sub > .mesh-cand-state { flex-basis: 100%; justify-content: flex-start; text-align: left; }
+  .mesh-route { min-height: 40px; align-items: center; }
+  .mesh-routes > .mesh-fold-toggle { min-height: 40px; }
+  .mesh-health { grid-template-columns: minmax(0, 1fr); }
+  .mesh-sheet-overlay { top: var(--mobile-viewport-top, 0px); bottom: auto; height: var(--mobile-viewport-height, 100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mesh-edge[data-live='punching'] .mesh-edge-line, .mesh-edge[data-kind='entry'][data-look='punching'] .mesh-edge-line { animation: none; }
+  .mesh-sheet.el-drawer, .mesh-sheet-overlay.el-drawer-fade-leave-active { transition-duration: 1ms; }
+}
+
+/* ---- folding the side columns (desktop): the server list to a rail, the properties panel away ---- */
+.mesh-board.is-palette-folded { grid-template-columns: 44px minmax(0, 1fr) 380px; }
+.mesh-board.is-panel-folded { grid-template-columns: 232px minmax(0, 1fr); }
+.mesh-board.is-palette-folded.is-panel-folded { grid-template-columns: 44px minmax(0, 1fr); }
+@media (max-width: 1360px) {
+  .mesh-board.is-palette-folded { grid-template-columns: 44px minmax(0, 1fr) 352px; }
+  .mesh-board.is-panel-folded { grid-template-columns: 220px minmax(0, 1fr); }
+  .mesh-board.is-palette-folded.is-panel-folded { grid-template-columns: 44px minmax(0, 1fr); }
+}
+@media (max-width: 1180px) {
+  .mesh-board.is-palette-folded { grid-template-columns: 44px minmax(0, 1fr) 316px; }
+  .mesh-board.is-panel-folded { grid-template-columns: 208px minmax(0, 1fr); }
+  .mesh-board.is-palette-folded.is-panel-folded { grid-template-columns: 44px minmax(0, 1fr); }
+}
+.mesh-rail { align-items: center; gap: 4px; padding: 10px 0; }
+.mesh-rail .mesh-tb { width: 32px; height: 32px; padding: 0; }
+.mesh-rail-sep { width: 20px; height: 1px; margin: 4px 0; background: var(--ob-chat-line); }
+.mesh-rail-tools { display: flex; flex-direction: column; gap: 2px; }
+.mesh-rail-tools > .mesh-tb[aria-checked='true'] { background: var(--ob-chat-selected); color: var(--ob-chat-text); }
+/* The search stays on top of the server list; the groups under it scroll. */
+.mesh-servers:not(.is-phone) { overflow: hidden; }
+.mesh-servers-top { display: flex; flex: none; align-items: center; gap: 4px; margin-bottom: 4px; }
+.servers-ui .mesh-servers-top > .mesh-servers-search { flex: 1 1 auto; width: auto; min-width: 0; margin: 0; }
+.mesh-servers-scroll { display: flex; flex: 1 1 auto; flex-direction: column; gap: 4px; min-height: 0; margin: 0 -10px; padding: 0 10px; overflow-y: auto; }
+.mesh-servers.is-phone .mesh-servers-scroll { margin: 0; padding: 0; overflow: visible; }
+/* Alignment guides while a node is dragged. */
+.mesh-guides { position: absolute; inset: 0; z-index: 4; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.mesh-guides > line { stroke: var(--ob-violet); stroke-width: 1; stroke-dasharray: 4 3; }
+/* The selection in short while the panel is folded: top right, where the panel was. */
+.mesh-peek { position: absolute; top: 10px; right: 10px; z-index: 5; display: flex; flex-direction: column; gap: 4px; width: min(300px, calc(100% - 20px)); padding: 6px 6px 8px 12px;
+  border: 1px solid var(--ob-chat-line); border-radius: 10px; background: var(--ob-chat-bg); box-shadow: var(--ob-shadow-popover); font-size: var(--ix-sm); }
+.mesh-peek-head { display: flex; align-items: center; gap: 6px; }
+.mesh-peek-head > h3 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: var(--ix-sm); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-peek-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 0; padding-right: 6px; line-height: 1.5; overflow-wrap: anywhere; }
+.mesh-peek-row > .instance-muted { font-size: var(--ix-xs); }
+.mesh-peek-open { display: inline-flex; align-self: flex-start; align-items: center; gap: 4px; margin-top: 2px; }
+/* A member's entries on its status tab open their line. */
+.mesh-cand-list > li.mesh-cand-open { cursor: pointer; }
+.mesh-cand-list > li.mesh-cand-open:first-child { border-radius: 9px 9px 0 0; }
+.mesh-cand-list > li.mesh-cand-open:last-child { border-radius: 0 0 9px 9px; }
+.mesh-cand-list > li.mesh-cand-open:only-child { border-radius: 9px; }
+@media (hover: hover) { .mesh-cand-list > li.mesh-cand-open:hover { background: var(--ob-chat-hover); } }
+.mesh-cand-list > li.mesh-cand-open:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: -2px; }
+/* A line's two ends. */
+.mesh-line-ends > .mesh-group-title > .ob-dot { font-size: var(--ix-xs); font-weight: 400; }
+.mesh-line-end-list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; border: 1px solid var(--ob-chat-line); border-radius: 10px; }
+.mesh-line-end-list > li { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 7px 10px; }
+.mesh-line-end-list > li + li { border-top: 1px solid var(--ob-chat-line); }
+.mesh-line-end-name { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0; font-size: var(--ix-sm); }
+.mesh-line-end-route { margin: 0; font-size: var(--ix-xs); line-height: 1.6; overflow-wrap: anywhere; }
+.mesh-line-end-route > .mono { color: var(--ob-chat-text); }
+/* A line's long-term record: availability as cells, latency and loss as lines. */
+.mesh-line-trend { margin-top: 0; }
+.mesh-line-ranges { flex-wrap: wrap; }
+.mesh-line-ranges > button { padding: 1px 7px; }
+.mesh-line-base { stroke: var(--ob-chat-line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.mesh-line-up rect[data-tone='ok'] { fill: var(--ob-success); }
+.mesh-line-up rect[data-tone='warn'] { fill: var(--ob-warning); }
+.mesh-line-up rect[data-tone='bad'] { fill: var(--ob-danger); }
+.mesh-line-up rect[data-tone='none'] { fill: transparent; }
+.mesh-line-legend { display: flex; flex-wrap: wrap; gap: 2px 10px; margin: 4px 0 0; font-size: var(--ix-xs); }
+.mesh-line-legend > span { display: inline-flex; align-items: center; gap: 4px; }
+.mesh-line-legend > span::before { width: 8px; height: 8px; border-radius: 2px; content: ''; }
+.mesh-line-legend > span[data-tone='ok']::before { background: var(--ob-success); }
+.mesh-line-legend > span[data-tone='warn']::before { background: var(--ob-warning); }
+.mesh-line-legend > span[data-tone='bad']::before { background: var(--ob-danger); }
+.mesh-line-legend > span[data-tone='none']::before { height: 2px; border-radius: 0; background: var(--ob-chat-line); }
+.mesh-line-facts { margin-top: 8px; }
+.mesh-line-note, .mesh-trend-note { margin: 6px 0 0; font-size: var(--ix-xs); line-height: 1.5; }
+
+/* Setting explanations (MeshHelp): a tooltip over the panel in the panel's own colours, nothing moves. */
+.mesh-help-toggle[data-open] { color: var(--ob-chat-text); opacity: 1; }
+.el-popper.is-light.mesh-help-tip { max-width: min(300px, calc(100vw - 24px)); padding: 7px 10px; border: 1px solid var(--ob-border); border-radius: 8px; background: var(--ob-surface-raised);
+  color: var(--ob-text); box-shadow: var(--ob-shadow-popover); font-size: 12px; line-height: 1.6; white-space: pre-line; }
+.el-popper.is-light.mesh-help-tip > .el-popper__arrow::before { border-color: var(--ob-border); background: var(--ob-surface-raised); }
+/* Member settings: what is wrong with a port, or who holds it, right under the ports; the masquerade switch with its ⓘ. */
+.mesh-listen > .mesh-listen-note { padding-left: 62px; font-size: var(--ix-xs); line-height: 1.5; }
+.mesh-masq { display: flex; align-items: center; gap: 2px; min-height: 28px; }
+.mesh-masq > .ob-check { font-size: var(--ix-sm); }
+.mesh-chips > .sv-chips-edit { cursor: text; }
+.servers-ui .mesh-chips .sv-chips-edit > input { flex: 1 1 104px; min-width: 104px; }
+@media (max-width: 760px) {
+  .el-popper.is-light.mesh-help-tip { font-size: 13px; }
+  .mesh-masq { min-height: 36px; }
+  .servers-ui .mesh-chips .sv-chips-edit > input { min-height: 36px; }
+}
+/* A rule side: 所有成员 and 所有网关网段 one under the other. */
+.mesh-side-every { display: flex; flex-direction: column; gap: 2px; }
+.servers-ui .mesh-side-every > label.ob-check.mesh-side-all { align-items: flex-start; }
+.mesh-spark-dots { stroke-width: 4; stroke-linecap: round; }
+/* In the phone sheet the sticky summary sits at the very top of the scrolling body, not below its
+   4px top padding: otherwise a strip of the content scrolls by between it and the sheet's header.
+   The negative margin and the padding cancel out, so at rest nothing moves. */
+.mesh-sheet-body .mesh-member-tabs { top: -4px; margin-top: -4px; padding-top: 4px; }

@@ -3,18 +3,23 @@ and derives health events from its own probes; nothing pushes to the controller.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import re
 import time
 import uuid
 
 from app.instances.contracts import EVENT_TYPES, InstanceError
+from app.notice_names import quoted
 from app.webhooks.repository import many, one
 
 AUDIT_TTL = 30*86400000
 LOGIN_MAX = 1000
 HEALTH_MAX = 200
 LABELS = {'login_success': '登录成功', 'login_failure': '登录失败', 'health': '运行异常', 'recovery': '运行恢复'}
+# Telegram notices per instance and window; a password-guessing run must not flood the chat.
+NOTICE_WINDOW_MS = 600000
+NOTICE_BURST = 5
 
 
 def now():
@@ -37,6 +42,21 @@ async def cleanup(service):
         await conn.execute("DELETE FROM instance_notifications WHERE status!='pending' AND (updated_ms<? OR id IN (SELECT id FROM instance_notifications WHERE status!='pending' ORDER BY updated_ms DESC,rowid DESC LIMIT -1 OFFSET 5000))", (timestamp-AUDIT_TTL,))
 
 
+def notice_text(item, text, timestamp):
+    """text when this instance may notify now, else None (counted). The first notice of the
+    next window says how many were left out."""
+    window = item.get('noticeWindow') or {}
+    if timestamp - window.get('startMs', 0) >= NOTICE_WINDOW_MS:
+        skipped = window.get('skipped', 0)
+        item['noticeWindow'] = {'startMs': timestamp, 'count': 1, 'skipped': 0}
+        return text + (f'（期间另有 {skipped} 条通知未发送）' if skipped else '')
+    if window.get('count', 0) < NOTICE_BURST:
+        item['noticeWindow'] = {**window, 'count': window.get('count', 0) + 1}
+        return text
+    item['noticeWindow'] = {**window, 'skipped': window.get('skipped', 0) + 1}
+    return None
+
+
 async def record(service, conn, row, item, kind, data, *, event_id=None, at_ms=None):
     event_id = event_id or uuid.uuid4().hex
     at_ms = at_ms or now()
@@ -48,7 +68,9 @@ async def record(service, conn, row, item, kind, data, *, event_id=None, at_ms=N
         toggle = 'loginSuccess' if kind == 'login_success' else 'loginFailure'
         if item.get('notifications', {}).get(toggle):
             ip = f'（{data["ip"]}）' if data.get('ip') else ''
-            await service._enqueue(conn, 'event:'+row['id']+':'+event_id, row, f'实例「{item["name"]}」{LABELS[kind]}{ip}', item.get('conversationUuid', ''))
+            text = notice_text(item, f'实例{quoted(item["name"])}{LABELS[kind]}{ip}', now())
+            if text:
+                await service._enqueue(conn, 'event:'+row['id']+':'+event_id, row, text, item.get('conversationUuid', ''))
     await trim(conn, row['id'], now())
     return True
 
@@ -63,10 +85,24 @@ async def health_notice(service, conn, row, item, state):
     await record(service, conn, row, item, kind, {'status': state})
     if item.get('notifications', {}).get('health'):
         text = '已恢复正常' if kind == 'recovery' else {'unreachable': '无法连接', 'degraded': '运行异常'}.get(state, state)
-        await service._enqueue(conn, 'health:'+row['id']+':'+uuid.uuid4().hex, row, f'实例「{item["name"]}」{text}', item.get('conversationUuid', ''))
+        text = notice_text(item, f'实例{quoted(item["name"])}{text}', now())
+        if text:
+            await service._enqueue(conn, 'health:'+row['id']+':'+uuid.uuid4().hex, row, text, item.get('conversationUuid', ''))
 
 
 _SAFE_IP = re.compile(r'[0-9a-fA-F.:]{2,45}')
+
+
+def _safe_ip(ip):
+    """Only a real address: hex-only text such as bad.cafe passes the character check and would
+    become a link in the Telegram notice."""
+    if not isinstance(ip, str) or not _SAFE_IP.fullmatch(ip):
+        return False
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return True
 
 
 async def ingest_gateway(service, items):
@@ -80,15 +116,17 @@ async def ingest_gateway(service, items):
         if kind not in {'login_success', 'login_failure'} or not isinstance(identity, str) or not isinstance(event.get('eventId'), str) or type(event.get('atMs')) is not int:
             continue
         ip = (event.get('data') or {}).get('ip', '')
-        data = {'ip': ip} if isinstance(ip, str) and _SAFE_IP.fullmatch(ip) else {}
+        data = {'ip': ip} if _safe_ip(ip) else {}
         row = await one(service.db.conn, "SELECT * FROM managed_instances WHERE id=? AND status!='archived'", (identity,))
         if not row:
             continue
+        # The gateway's clock may run ahead; an event is never later than its arrival.
+        at_ms = min(event['atMs'], now())
         async with service.lock(row['id']):
             row = await one(service.db.conn, 'SELECT * FROM managed_instances WHERE id=?', (identity,))
             item = json.loads(row['public_json'])
             async with service.db.write_transaction(label='instance-login-event') as conn:
-                if await record(service, conn, row, item, kind, data, event_id='gw:'+event['eventId'][:120], at_ms=event['atMs']):
+                if await record(service, conn, row, item, kind, data, event_id='gw:'+event['eventId'][:120], at_ms=at_ms):
                     await conn.execute('UPDATE managed_instances SET public_json=? WHERE id=?', (json.dumps(item), row['id']))
     return handled
 

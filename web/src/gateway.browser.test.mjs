@@ -11,6 +11,11 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 
 // Actual browser requests, cookies, byte streams and sockets go to an isolated
 // HTTP fixture enforcing the wire protocol. No route interception or online API.
+// Kept in the browser on purpose: HttpOnly cookies, real HTTP byte streams, WebSocket upgrades,
+// image loads, IndexedDB, other tabs and the service worker are what these tests check, plus the
+// real main.js bootstrap. The same rules as plain logic (calls carry the binding, URLs that get
+// it, push owner, refused rebinding, notification for another instance) run without a browser in
+// gateway.dom.test.mjs.
 test('gateway real frontend / HTTP / WS / file / cross-account boundary', {skip: !chromium || !WebSocketServer, timeout: 240000}, async t => {
   const calls=[], forwarded=[], sessions = new Map(), sockets = new Set(); let serial=0, mode='gateway', modeFailure=false;
   const mint = user => {const cookie=`cookie-${++serial}`;const row={cookie,mode:'gateway',instanceId:user,username:user,contextToken:`page-${serial}`,chatId:1,expiresAt:Math.floor(Date.now()/1000)+3600};sessions.set(cookie,row);return row;};
@@ -66,18 +71,18 @@ test('gateway real frontend / HTTP / WS / file / cross-account boundary', {skip:
     const login=await setup(t,null,320);await login.page.getByLabel('账号',{exact:true}).fill('family-a');await login.page.getByLabel('密码',{exact:true}).fill('fixture-password');assert.ok(await login.page.getByLabel('密码',{exact:true}).evaluate(el=>parseFloat(getComputedStyle(el).fontSize)>=16));await login.page.getByRole('button',{name:'登录',exact:true}).click();await login.page.waitForURL(url=>url.pathname==='/'||url.pathname==='/chat');await login.close();
     t.after(()=>{mode='gateway';});for(const old of ['controller','managed']){mode=old;const c=await browser.newContext();t.after(()=>c.close());const p=await c.newPage();await p.goto(base+'/login');await p.getByText(old==='controller'?'输入 Web Secret Key 后，需要在 Telegram 中二次确认。':'使用此实例的账号密码登录。').waitFor();await c.close();}mode='gateway';
   });
-  await t.test('axios, native fetch, WS, Markdown images, attachment previews and download links carry the ORIGINAL binding', {timeout:60000}, async (t)=>{
+  await t.test('axios, native fetch, WS, Markdown images, attachment previews and download links carry the ORIGINAL binding over the wire', {timeout:60000}, async (t)=>{
     const h=await setup(t);
     const result=await h.page.evaluate(async({artifact,uuid})=>{
       const boundary=await import('/src/sessionBoundary.js'),{Api,conversationWsUrl}=await import('/src/api.js');
       await Api.conversations();const response=await boundary.contextFetch(artifact+'?text=1');const text=await response.text();
-      const {artifactFromUrl}=await import('/src/artifacts/artifactFiles.js');const identity=artifactFromUrl(artifact);
       const {renderMarkdown}=await import('/src/views/consoleView/markdown.js');const markup=renderMarkdown(`![test](${artifact})\n\n[download](${artifact}?download=1)`);
       const target=document.createElement('div');target.id='test-resources';target.innerHTML=markup;document.body.append(target);await Promise.all([...target.querySelectorAll('img')].map(img=>new Promise(r=>{if(img.complete)r();else{img.onload=r;img.onerror=r;}})));
       const ws=boundary.contextWebSocket(conversationWsUrl(uuid));await new Promise((resolve,reject)=>{ws.onopen=()=>{ws.send('hello');};ws.onmessage=e=>{if(e.data==='hello')resolve();};ws.onerror=reject;});ws.close();
-      return {text,markup,identity,external:boundary.contextResourceUrl('https://external.example/api/private'),blob:boundary.contextResourceUrl('blob:local')};
+      return {text};
     },{artifact,uuid});
-    assert.equal(result.text,'file-content');assert.ok(result.identity.downloadUrl.includes('_ob_ctx='+h.row.contextToken));assert.ok(result.markup.includes('_ob_ctx='+h.row.contextToken));assert.equal(result.external,'https://external.example/api/private');assert.equal(result.blob,'blob:local');assert.ok(calls.some(c=>c.path===artifact&&c.context===h.row.contextToken));assert.ok(calls.some(c=>c.path===`/api/conversations/${uuid}/ws`&&c.context===h.row.contextToken));await h.close();
+    // URL rewriting itself (download links, Markdown, other origins, blobs): gateway.dom.test.mjs.
+    assert.equal(result.text,'file-content');assert.ok(calls.some(c=>c.path===artifact&&c.context===h.row.contextToken));assert.ok(calls.some(c=>c.path===`/api/conversations/${uuid}/ws`&&c.context===h.row.contextToken));await h.close();
   });
   await t.test('new cookie cannot rebind an old page: reject before upstream, stop streams/WS, erase only its own drafts, no replay', {timeout:60000}, async (t)=>{
     const h=await setup(t,'family-a');
@@ -88,8 +93,8 @@ test('gateway real frontend / HTTP / WS / file / cross-account boundary', {skip:
     });
     const replacement=mint('family-b');await h.context.addCookies([{name:'openbear_gateway_session',value:replacement.cookie,url:base,httpOnly:true,sameSite:'Lax'}]);const before=forwarded.length;
     await h.page.evaluate(async()=>{try{await(await import('/src/api.js')).Api.conversations();}catch{}});await boundary(h.page);assert.equal(forwarded.slice(before).filter(x=>x.path==='/api/conversations').length,0);
-    const result=await h.page.evaluate(async()=>{const b=await import('/src/sessionBoundary.js');try{await(await import('/src/api.js')).Api.createConversation({title:'NEVER REPLAY'});}catch{};await b.initializePageSession();return {blocked:b.pageSession.blocked,id:b.pageSession.instanceId,stream:await window.__stream,keys:Object.keys(localStorage),other:localStorage.getItem('controller-untouched')};});
-    assert.equal(result.blocked,true);assert.equal(result.id,'family-a');assert.equal(result.stream,true);assert.equal(result.other,'keep');assert.ok(!result.keys.some(x=>x.startsWith('openbear.gateway.family-a.')));assert.ok(result.keys.includes('openbear.gateway.family-b.keep'));assert.equal(forwarded.filter(x=>x.body?.title==='NEVER REPLAY').length,0);
+    const result=await h.page.evaluate(async()=>{const b=await import('/src/sessionBoundary.js');try{await(await import('/src/api.js')).Api.createConversation({title:'NEVER REPLAY'});}catch{};await b.initializePageSession();return {blocked:b.pageSession.blocked,id:b.pageSession.instanceId,stream:await window.__stream,keys:Object.keys(localStorage),sessionKeys:Object.keys(sessionStorage),other:localStorage.getItem('controller-untouched')};});
+    assert.equal(result.blocked,true);assert.equal(result.id,'family-a');assert.equal(result.stream,true);assert.equal(result.other,'keep');assert.ok(!result.keys.some(x=>x.startsWith('openbear.gateway.family-a.')));assert.ok(!result.sessionKeys.some(x=>x.startsWith('openbear.gateway.family-a.')));assert.ok(result.keys.includes('openbear.gateway.family-b.keep'));assert.equal(forwarded.filter(x=>x.body?.title==='NEVER REPLAY').length,0);
     await h.page.waitForFunction(async()=>!(await indexedDB.databases()).some(x=>x.name==='openbear.console.attachmentDrafts.gateway.family-a'));
     const fresh=await h.context.newPage();await fresh.goto(base+'/settings?section=sessions');await fresh.getByText('修改账号与密码',{exact:true}).waitFor();assert.equal(await fresh.evaluate(async()=>{const b=await import('/src/sessionBoundary.js');return b.userStorage(localStorage).getItem('openbear.console.drafts.v1');}),null);await h.close();
   });
@@ -99,16 +104,9 @@ test('gateway real frontend / HTTP / WS / file / cross-account boundary', {skip:
     const change=await setup(t);await change.page.getByText('修改账号与密码',{exact:true}).click();for(const name of ['当前密码','新密码','确认新密码'])await change.page.getByLabel(name,{exact:true}).fill('fixture-password');await change.page.getByRole('button',{name:'修改并退出所有设备',exact:true}).click();await change.page.waitForURL(base+'/login');const req=calls.findLast(c=>c.path==='/api/auth/password/change');assert.deepEqual(req.body,{currentPassword:'fixture-password',password:'fixture-password'});await change.close();
     const other=await setup(t,'family-b');await other.page.goto(base+`/chat?id=${uuid}&_ob_instance=family-a`);await boundary(other.page);assert.equal(await other.page.evaluate(async()=> (await import('/src/sessionBoundary.js')).pageSession.blocked),true);await other.close();
   });
-  await t.test('push APIs use Cookie/context; worker retains instance boundary for old and mismatched notifications', {timeout:60000}, async (t)=>{
+  await t.test('service worker retains the instance boundary for old and mismatched notifications', {timeout:60000}, async (t)=>{
+    // The push client's requests and owner handover: gateway.dom.test.mjs.
     const h=await setup(t,'family-a');
-    const flow=await h.page.evaluate(async()=>{
-      const {createPushClient}=await import('/src/pwa/pushClient.js');const actions=[];let subscription={endpoint:'https://push.fixture/old',async unsubscribe(){actions.push('unsubscribe-old');subscription=null;}};
-      const registration={active:{state:'activated',postMessage:data=>actions.push(data)},pushManager:{async getSubscription(){return subscription;},async subscribe(){subscription={endpoint:'https://push.fixture/new',toJSON:()=>({endpoint:'https://push.fixture/new',keys:{p256dh:'fixture',auth:'fixture'}}),async unsubscribe(){actions.push('unsubscribe-new');subscription=null;}};return subscription;}}};
-      localStorage.setItem('openbear.gateway.push-owner','family-b');
-      const native={isSecureContext:true,location,localStorage,Event,crypto,dispatchEvent:window.dispatchEvent.bind(window),BroadcastChannel,Notification:{permission:'granted',requestPermission:async()=> 'granted'},PushManager:{},navigator:{serviceWorker:{getRegistration:async()=>registration,register:async()=>registration}}};
-      const client=createPushClient(native);const initial=await client.status();await client.enable();const owner=localStorage.getItem('openbear.gateway.push-owner');await client.test();await client.disable();return {initial,owner,actions,final:localStorage.getItem('openbear.gateway.push-owner')};
-    });
-    assert.equal(flow.initial.enabled,false);assert.equal(flow.owner,'family-a');assert.equal(flow.final,null);assert.ok(flow.actions.includes('unsubscribe-old'));assert.ok(flow.actions.includes('unsubscribe-new'));const pushCalls=calls.filter(c=>c.cookie===h.row.cookie&&c.path.startsWith('/api/push/'));assert.ok(pushCalls.length>=4);assert.ok(pushCalls.every(c=>c.context===h.row.contextToken));
     const workerEvent=h.context.waitForEvent('serviceworker');await h.page.evaluate(async()=>{const r=await navigator.serviceWorker.register('/openbear-push-sw.js',{scope:'/'});await navigator.serviceWorker.ready;r.active.postMessage({type:'openbear:push-boundary',gateway:true,instanceId:'family-a'});});const worker=await workerEvent;
     const result=await worker.evaluate(async()=>{
       for(let i=0;i<100&&(await boundaryState()).instanceId!=='family-a';i++)await new Promise(r=>setTimeout(r,10));

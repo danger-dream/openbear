@@ -40,7 +40,7 @@ function harness({local = {}, inherited = {}, getProperties, failOptions = false
     impactState:{}, impactDialog:ref(false),
     ElMessage:{warning: text => warnings.push(text), error: text => errors.push(text), success: () => {}},
     CustomEvent: class {constructor(type, options) {this.type=type; this.detail=options.detail;}},
-    window:{dispatchEvent: event => events.push(clone(event.detail))}, mergeLocatedFolders:()=>{}, emitRows:()=>{},
+    window:{dispatchEvent: event => events.push(clone(event.detail))}, mergeLocatedFolders:()=>{}, emitRows:()=>{}, refreshStatus:async()=>{},
     Api:{
       conversationFolderProperties: id => getProperties ? getProperties(id, response) : Promise.resolve(response(id)),
       async rathOptions() {if(failOptions)throw Error('options unavailable');return {models};},

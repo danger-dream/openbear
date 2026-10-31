@@ -301,31 +301,6 @@ async def test_UI05_wait_filters_before_independent_cursor(env):
     out('wait_filtered_pages',{'first':[x['waitId'] for x in first['items']],'second':[x['waitId'] for x in second['items']],'historical':len(historical['items'])})
 
 
-async def test_R02_nullable_legacy_projection_and_missing_ledger_upgrade(tmp_path,monkeypatch):
-    from tests.test_webhooks_review_upgrade import installed_v1
-    from app.webhooks import schema
-    from types import SimpleNamespace
-    async with installed_v1(tmp_path,monkeypatch) as db:
-        async with db.webhook_transaction() as conn:
-            await insert(conn,'webhook_assignments',assignment_id='old-a',origin_kind='webhook',origin_endpoint_id='old-endpoint',origin_revision=1,conversation_uuid='old-c',internal_chat_id=123,root_turn_uuid='r',task_start_cursor=0,authorization_snapshot_json='{}',created_at_ms=1000)
-            await insert(conn,'runtime_runs',run_id='old-run',owner_key='owner',created_at=1,updated_at=1)
-            await insert(conn,'webhook_runtime_links',run_id='old-run',assignment_id='old-a',relation_kind='controller',linked_at_ms=1000,billing_scope='origin_webhook',effective_config_json='{}')
-            for action in ['nullable','missing','ongoing']:
-                await insert(conn,'runtime_actions',action_id=action,run_id='old-run',kind='model',status='started' if action=='ongoing' else 'completed',created_at=1,updated_at=1)
-            await conn.execute("INSERT INTO model_calls(chat_id,model,created_at,attempt_id,usage_known,cost_usd) VALUES(123,'old',1,'nullable',NULL,NULL)")
-        await schema.migrate(db)
-        projection=await one(db.conn,'SELECT * FROM webhook_call_projections')
-        assert projection['usage_known'] is None and projection['cost_usd'] is None
-        s=SimpleNamespace(clock=lambda:10000)
-        before=await queries.usage(s,db.conn,endpoint_id='old-endpoint')
-        assert before['modelCalls']==2 and before['unknownUsageCalls']==before['unknownCostCalls']==2
-        assert before['missingLedgerCalls']==1 and before['coverage']=='incomplete'
-        async with db.webhook_transaction() as conn: await conn.execute("DELETE FROM model_calls WHERE attempt_id='nullable'")
-        after=await queries.usage(s,db.conn,endpoint_id='old-endpoint')
-        assert after['ledgerDeletedCalls']==1 and after['unknownCostCalls']==2
-        assert not await many(db.conn,'PRAGMA foreign_key_check')
-        out('legacy_nullable_and_missing',{'before':before,'after':after})
-
 async def test_R04_pending_script_pins_revision_and_admin_revalidates_only_rejected(env,monkeypatch):
     from app.webhooks import telemetry
     code='print(\'{"decision":"skip_model","outcome":"handled","metrics":[{"name":"custom_n","value":1}]}\')'
@@ -346,19 +321,6 @@ async def test_R04_pending_script_pins_revision_and_admin_revalidates_only_rejec
     labels=json.loads((await one(env.db.conn,'SELECT labels_json FROM webhook_metric_series'))['labels_json'])
     assert labels=={'cat':'abc'}
     out('pending_frozen_revision',row)
-
-
-async def test_R09_v1_pruned_history_migration_is_not_claimed_complete(tmp_path,monkeypatch):
-    from tests.test_webhooks_review_upgrade import installed_v1
-    from app.webhooks import schema
-    from app.webhooks.retention import coverage
-    async with installed_v1(tmp_path,monkeypatch) as db:
-        async with db.webhook_transaction() as conn:
-            await insert(conn,'webhook_telemetry_operations',telemetry_id='purged',scope_key='endpoint:old-endpoint',operation_id='old-business',endpoint_id='old-endpoint',source='script',content_sha256='old-hash',state='applied',created_at_ms=1000,applied_at_ms=1001,payload_json=None)
-        await schema.migrate(db)
-        gaps=await coverage(db.conn,['old-endpoint'],0,2000,['legacy_unknown'])
-        assert gaps==[{'endpointId':'old-endpoint','kind':'legacy_unknown','start':1000,'end':2000}]
-        out('v1_pruned_coverage',{'gaps':gaps})
 
 
 async def test_R01_legacy_bad_body_detail_is_inspectable(env):

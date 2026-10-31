@@ -21,6 +21,7 @@ def version_tree(tmp_path: Path) -> Path:
     for directory in ("app", "scripts", "web"):
         (tmp_path / directory).mkdir()
     shutil.copy2(ROOT / "scripts/bump_version.py", tmp_path / "scripts/bump_version.py")
+    shutil.copy2(ROOT / "app/versioning.py", tmp_path / "app/versioning.py")
     (tmp_path / "app/__init__.py").write_text('__version__ = "1.2.3"\n', encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "openbear"\nversion = "1.2.3"\n', encoding="utf-8",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -14,7 +15,7 @@ from pydantic import ValidationError
 
 from app.browser.cdp import CDP
 from app.browser.connection import probe_connection
-from app.browser.contract import ACTIONS, Request
+from app.browser.contract import ACTIONS, LOCAL_ACTIONS, Request
 from app.browser.worker import Worker, WorkerError
 from app.interaction_data import explicit_authorization
 
@@ -62,6 +63,9 @@ class Instance:
     active: int = 0
     init_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     worker_limits: dict = field(default_factory=dict)
+    # Server id when the browser runs on a server node.
+    node: str = ""
+    node_name: str = ""
 
 
 class BrowserService:
@@ -73,6 +77,8 @@ class BrowserService:
         )
         self.pages: dict[str, Page] = {}
         self.instances: dict[str, Instance] = {}
+        # Server nodes offering a browser (app.servers.browser.NodeBrowsers), controller only.
+        self.nodes = None
         self._instance_lock = asyncio.Lock()
         self._owner_locks: dict[str, asyncio.Lock] = {}
         self._closed = False
@@ -136,7 +142,7 @@ class BrowserService:
             for row in json.loads((self.state_dir / "pages.json").read_text()):
                 if set(row) == {"id", "instance", "epoch", "target", "owner", "state"} and row[
                     "instance"
-                ].startswith("main-"):
+                ].startswith(("main-", "node-")):
                     self.pages[row["id"]] = Page(**row)
         except (OSError, ValueError, TypeError):
             pass
@@ -185,10 +191,41 @@ class BrowserService:
                 )
             return self.instances[key]
 
+    async def _node_instance(self, server_id, name=""):
+        if self.nodes is None:
+            raise ValueError("node_browser_unavailable")
+        from app.browser.remote import RemoteCDP, RemoteWorker
+        key = "node-" + server_id
+        async with self._instance_lock:
+            if key not in self.instances:
+                link = self.nodes.link(server_id)
+                self.instances[key] = Instance(key, RemoteCDP(link, self.cfg.connect_timeout_s), RemoteWorker(link), node=server_id)
+            inst = self.instances[key]
+            inst.node_name = name or inst.node_name
+            return inst
+
+    async def _target_instance(self, req, ctx):
+        """The browser a page-less request names: a server node, or the local one."""
+        if req.params.get("node"):
+            found = await self.nodes.resolve(ctx, req.params["node"])
+            return await self._node_instance(found["serverId"], found["node"])
+        return await self._instance()
+
+    def _uses_node(self, args):
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        page = self.pages.get(args.get("page")) if isinstance(args.get("page"), str) else None
+        return bool(params.get("node")) or bool(page and page.instance.startswith("node-"))
+
     async def _sync(self, inst):
         await inst.cdp.connect()
-        epoch = hashlib.sha256(inst.cdp.ws_url.encode()).hexdigest()[:20]
         targets = (await inst.cdp.call("Target.getTargets"))["targetInfos"]
+        # The browser that answered: the call itself may reconnect, and a node
+        # reports its current browser with every reply.
+        epoch = hashlib.sha256(inst.cdp.ws_url.encode()).hexdigest()[:20]
+        if inst.node and inst.epoch and epoch != inst.epoch:
+            # A new browser on the node has a new engine that still needs this
+            # service's limits.
+            await inst.worker.close()
         targets = [
             x
             for x in targets
@@ -240,6 +277,16 @@ class BrowserService:
                         "recovery_circuit_open: use recover connection", "not_started"
                     )
             inst.last_recovery = time.monotonic()
+            if inst.node:
+                # The node keeps downloads and artifacts in its own folders.
+                try:
+                    await inst.worker.start({"connectTimeoutS": self.cfg.connect_timeout_s, **limits})
+                    inst.failures = 0
+                    inst.worker_limits = limits
+                except BaseException:
+                    inst.failures += 1
+                    raise
+                return
             try:
                 if bool(self.cfg.main_download_host_path) != bool(
                     self.cfg.main_download_browser_path
@@ -286,7 +333,9 @@ class BrowserService:
         if page.owner != owner:
             raise ValueError("page_not_owned: explicit adoption/handoff required")
         inst = self.instances.get(page.instance)
-        if inst is None:
+        if inst is None and page.instance.startswith("node-"):
+            inst = await self._node_instance(page.instance[len("node-"):])
+        elif inst is None:
             inst = await self._instance()
             if inst.id != page.instance:
                 raise ValueError("page_endpoint_changed")
@@ -302,9 +351,16 @@ class BrowserService:
         return folder / (uuid.uuid4().hex + extension)
 
     async def call(self, args, ctx):
-        if not self.cfg.enabled or self._closed:
+        node = self._uses_node(args)
+        # Status and describe still work when only server nodes offer a browser.
+        overview = args.get("action") in {"status", "describe"} and self.nodes is not None and self.nodes.any_browser
+        if self._closed or not (node or overview or self.cfg.enabled):
             return {"status": "error", "error": "browser_disabled", "outcome": "not_started"}
-        if not self.available:
+        if node and (ctx.agent_session_uuid or ctx.task_uuid):
+            return {"status": "error", "error": "node_browser_main_controller_only", "outcome": "not_started"}
+        if node and self.nodes is None:
+            return {"status": "error", "error": "node_browser_unavailable", "outcome": "not_started"}
+        if not node and not overview and not self.available:
             return {
                 "status": "error",
                 "error": "browser_connection_unverified" if self.cfg.main_endpoint else "main_endpoint_missing",
@@ -537,18 +593,26 @@ class BrowserService:
     async def _call(self, req, owner, ctx):
         a, p = req.action, req.params
         if a == "describe":
+            actions = ACTIONS if self.nodes is not None else LOCAL_ACTIONS
             return {
                 "status": "ok",
-                "actions": {p["action"]: ACTIONS[p["action"]]} if p.get("action") else ACTIONS,
+                "actions": {p["action"]: actions[p["action"]]} if p.get("action") else actions,
             }
         if a == "status":
+            nodes = []
+            if self.nodes is not None and not ctx.agent_session_uuid and not ctx.task_uuid:
+                with contextlib.suppress(ValueError):
+                    nodes = await self.nodes.available(await self.nodes.owner(ctx))
             return {
                 "status": "ok",
                 "enabled": True,
+                "local": self.available,
                 "networkScope": "configured_browser",
+                "nodes": nodes,
                 "instances": [
                     {
                         "id": i.id,
+                        **({"node": i.node_name or i.node} if i.node else {}),
                         "cdpConnected": i.cdp.connected,
                         "workerConnected": i.worker.connected,
                         "workerGeneration": i.worker.generation,
@@ -761,7 +825,9 @@ class BrowserService:
             return {"status": "ok", "page": page.id, "owned": True}
         if budget := call_budget.get():
             budget.phase = "connect_browser"
-        inst = await self._instance()
+        if not p.get("node") and not self.available:
+            raise ValueError("browser_connection_unverified" if self.cfg.main_endpoint else "main_endpoint_missing")
+        inst = await self._target_instance(req, ctx)
         inst.active += 1
         try:
             rows = await self._sync(inst)
@@ -832,9 +898,11 @@ class BrowserService:
                         ctx,
                     )
                     return {**result, "pageCreated": True}
-                return {"status": "ok", "page": page.id, "ready": True, "outcome": "completed"}
+                return {"status": "ok", "page": page.id, "ready": True, "outcome": "completed",
+                        **({"node": inst.node_name} if inst.node else {})}
             return {
                 "status": "ok",
+                **({"node": inst.node_name} if inst.node else {}),
                 "pages": [
                     {
                         "page": x.id,
@@ -861,7 +929,7 @@ class BrowserService:
         else:
             if op in {"probe", "terminate", "close"}:
                 raise ValueError("page_required")
-            inst = await self._instance()
+            inst = await self._target_instance(req, ctx)
         if op == "probe":
             diagnosis = await self._diagnose(page, inst)
             url = diagnosis.get("currentUrl", "")
@@ -903,19 +971,20 @@ class BrowserService:
                 "pageState": "unverified",
                 "replayed": False,
             }
-        if op == "restart" and not self.cfg.main_restart_url:
+        if op == "restart" and not inst.node and not self.cfg.main_restart_url:
             raise ValueError(
                 "external_restart_not_configured: set browser.mainRestartUrl or ask the browser owner"
             )
         restart_url = self.cfg.main_restart_url
-        if op == "restart" and inst.cdp.endpoint != self.cfg.main_endpoint:
+        if op == "restart" and not inst.node and inst.cdp.endpoint != self.cfg.main_endpoint:
             raise ValueError(
                 "instance_configuration_changed: do not restart an old endpoint with new settings"
             )
         impact = "此操作影响该浏览器实例的所有会话页面。" if op == "restart" else ""
+        where = f"（服务器「{inst.node_name or inst.node}」的浏览器）" if inst.node else ""
         confirmation = await self._confirm(
             ctx,
-            f"执行 {op}，对象 {page.id if page else inst.id}。{impact}可能终止脚本或丢失页面未保存状态，不会重放原操作。",
+            f"执行 {op}，对象 {page.id if page else inst.id}{where}。{impact}可能终止脚本或丢失页面未保存状态，不会重放原操作。",
         )
         if not explicit_authorization(confirmation):
             return {"status": "denied", "outcome": "not_started", "confirmation": confirmation}
@@ -928,15 +997,19 @@ class BrowserService:
         elif op == "restart":
             if inst.active:
                 raise ValueError("instance_busy")
-            # Independent of CDP/worker health. Configured by the user, never
-            # supplied by the model; still gated above, never retried.
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.cfg.connect_timeout_s), trust_env=False
-            ) as http:
-                async with http.post(restart_url, allow_redirects=False) as response:
-                    response.raise_for_status()
-                    if response.status >= 300:
-                        raise RuntimeError("restart_redirect_refused")
+            if inst.node:
+                from app.browser.remote import restart_node_browser
+                await restart_node_browser(inst.cdp.link, self.cfg.connect_timeout_s)
+            else:
+                # Independent of CDP/worker health. Configured by the user, never
+                # supplied by the model; still gated above, never retried.
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.cfg.connect_timeout_s), trust_env=False
+                ) as http:
+                    async with http.post(restart_url, allow_redirects=False) as response:
+                        response.raise_for_status()
+                        if response.status >= 300:
+                            raise RuntimeError("restart_redirect_refused")
             await inst.worker.close()
             await inst.cdp.close()
             for key, old in list(self.pages.items()):

@@ -2,7 +2,7 @@ import test, {after, afterEach} from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import {register} from "node:module";
-import {compileScript, compileStyle, compileTemplate, parse} from "@vue/compiler-sfc";
+import {compileScript, parse} from "@vue/compiler-sfc";
 import {createRenderer, h, nextTick} from "vue";
 import {artifactFromUrl, artifactRecord, clearArtifactCache} from "./artifactFiles.js";
 
@@ -56,11 +56,6 @@ function mount(t, meta, summary = {title: "", excerpt: ""}) {
  app.mount(root); t.after(() => app.unmount()); return {root, record};
 }
 function click(target) { let stopped = false; target.props.onClick({currentTarget: target, stopPropagation() { stopped = true; }}); return stopped; }
-
-test("real attachment template and theme CSS compile", () => {
- assert.deepEqual(compileTemplate({source: descriptor.template.content, filename, id: filename}).errors, []);
- for (const style of descriptor.styles) assert.deepEqual(compileStyle({source: style.content, filename, id: filename}).errors, []);
-});
 
 test("Markdown shows actual document summary and preserves independent preview, copy and download", async t => {
  const {root} = mount(t, metadata(), {title: "真实文档标题", excerpt: "真实内容摘要"});

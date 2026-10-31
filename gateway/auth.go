@@ -74,10 +74,10 @@ func (g *Gateway) login(w http.ResponseWriter, r *http.Request) {
 	}
 	var account *instance
 	for _, i := range g.state.Instances {
-		if i.Username == p.Username {
+		// An archived instance may share the name; the enabled one is the account.
+		if i.Username == p.Username && (account == nil || i.Enabled && !account.Enabled) {
 			copy := i
 			account = &copy
-			break
 		}
 	}
 	h := g.dummy
@@ -261,7 +261,7 @@ func (g *Gateway) changePassword(w http.ResponseWriter, r *http.Request, s sessi
 	}
 	if p.Username != nil {
 		for id, v := range g.state.Instances {
-			if id != i.ID && v.Username == *p.Username {
+			if id != i.ID && v.Username == *p.Username && v.Enabled {
 				fail(w, 409, "username_unavailable")
 				return
 			}

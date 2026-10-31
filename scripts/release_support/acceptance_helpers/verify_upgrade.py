@@ -12,13 +12,39 @@ output = pathlib.Path(sys.argv[2])
 mode = sys.argv[3] if len(sys.argv) > 3 else 'restart'
 if mode not in {'restart', 'refresh'}:
     raise ValueError('expected restart or refresh verification mode')
-errors = []
+# Optional feature switches a release writes once on first start (app/features.py).
+FEATURE_SWITCHES = {'instances', 'servers'}
+
+
+def config_preserved(p, expected):
+    """Every earlier config value kept; only feature switches the earlier config lacked may be added."""
+    try:
+        config = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return False
+    features = config.pop('features', None)
+    canonical = json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+    if hashlib.sha256(canonical).hexdigest() != expected['sha256']:
+        return False
+    old = expected.get('features') or {}
+    if features is None:
+        return not old
+    return (isinstance(features, dict) and set(features) <= FEATURE_SWITCHES and all(isinstance(v, bool) for v in features.values())
+            and all(features.get(k) == v for k, v in old.items()))
+
+
+errors, migrated = [], []
 for rel, expected in before['files'].items():
     p = root / rel
     if not p.is_file():
         errors.append({'file': rel, 'error': 'missing'})
-    elif hashlib.sha256(p.read_bytes()).hexdigest() != expected['sha256'] or p.stat().st_mode & 0o777 != expected['mode']:
+    elif p.stat().st_mode & 0o777 != expected['mode']:
         errors.append({'file': rel, 'error': 'changed bytes or permissions'})
+    elif hashlib.sha256(p.read_bytes()).hexdigest() != expected['sha256']:
+        if 'config' in expected and config_preserved(p, expected['config']):
+            migrated.append(rel)
+        else:
+            errors.append({'file': rel, 'error': 'changed bytes or permissions'})
 con = sqlite3.connect(f"file:{before['dbPath']}?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 integrity = con.execute('PRAGMA integrity_check').fetchone()[0]
@@ -66,7 +92,7 @@ for p in (root / 'data' / 'backups').glob('*.sqlite3'):
     backups.append({'name': p.name, 'integrity': check, 'seededMessages': count})
 if mode == 'restart' and not any(x['integrity']=='ok' and x['seededMessages']==3 for x in backups):
     errors.append({'backup': 'no verified pre-upgrade backup with original messages'})
-result = {'fromVersion': before['version'], 'ok': not errors, 'filesPreserved': len(before['files'])-sum('file' in x for x in errors),
+result = {'fromVersion': before['version'], 'ok': not errors, 'filesPreserved': len(before['files'])-sum('file' in x for x in errors), 'configMigrated': migrated,
           'tableCounts': counts, 'integrity': integrity, 'foreignKeyViolations': len(foreign_keys), 'backups': backups, 'backupRequired': mode == 'restart', 'errors': errors, 'additionalChecks': additional}
 output.write_text(json.dumps(result, ensure_ascii=False, indent=2))
 print(json.dumps(result, ensure_ascii=False))

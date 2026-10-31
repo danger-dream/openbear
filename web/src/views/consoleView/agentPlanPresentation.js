@@ -897,7 +897,19 @@ export function compactAgentStepActivityLines(events = [], options = {}) {
     }
 
     if (kind === "model_call_started") {
-      const retry = retryPosition(item);
+      if (detail.quietRetry && modelState) {
+        // Early retries are silent: the interrupted row resumes as the same call.
+        modelState.attemptId = text(detail.attemptId);
+        modelState.settled = false;
+        updateModel(item, (label) => ({
+          message: `模型调用：${label} · 调用中`,
+          description: "",
+          status: "running",
+          statusText: "调用中",
+        }), "active");
+        continue;
+      }
+      const retry = detail.quietRetry ? {attempt: 0, maximum: 0} : retryPosition(item);
       if (!modelState || !retry.attempt) {
         if (modelState) endModel(item, "调用已结束（未记录模型结果）", {failed: false});
         const label = text(detail.modelLabel || detail.model, fallbackModelLabel);

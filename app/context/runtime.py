@@ -123,7 +123,7 @@ class ContextManager:
             runtime_kind = agent_runtime.get("kind") if isinstance(agent_runtime, dict) else ""
             if source_of(message).get("kind"):
                 kind = str(source_of(message)["kind"])
-            elif is_task_memory_runtime_message(message) or runtime_kind in {"rath_agent_plan_runtime", "agent_capabilities", "agent_completion_gate"}:
+            elif is_task_memory_runtime_message(message) or runtime_kind in {"rath_agent_plan_runtime", "agent_capabilities", "agent_completion_gate", "work_items_state", "work_items_focus"}:
                 kind = "runtime"
             elif runtime_kind == "rath_agent_context_summary":
                 kind = "legacy_handoff"

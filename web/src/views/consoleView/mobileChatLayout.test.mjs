@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import postcss from 'postcss';
 import {parse, compileStyle} from '@vue/compiler-sfc';
 import {baseParse} from '@vue/compiler-dom';
-import {compile, createSSRApp, h, ref, nextTick} from 'vue';
+import {compile, createSSRApp, h, ref, nextTick, computed} from 'vue';
 import {renderToString} from 'vue/server-renderer';
 
 const paths=['../../App.vue','ConsoleHeader.vue','ConsoleView.vue','ConsoleComposer.vue','TurnMinimap.vue','TaskMemoryDrawer.vue','MobileConversationTools.vue','TurnList.vue'];
@@ -155,7 +155,7 @@ test('phone cumulative footer wraps in normal flow, retaining one context owner 
 
 test('desktop path/title header coexists with unchanged toolbar, editor size and floating rail',()=>{
   assert.deepEqual(css('../../App.vue','.app-shell.is-console .app-main',desktop),{});
-  for(const s of ['.header-mobile-navigation','.header-mobile-actions','.header-mobile-running'])assert.equal(css('ConsoleHeader.vue',s,desktop).display,'none');
+  for(const s of ['.header-mobile-navigation','.header-mobile-actions','.header-mobile-run'])assert.equal(css('ConsoleHeader.vue',s,desktop).display,'none');
   assert.equal(css('ConsoleHeader.vue','.header-subtitle',desktop).display,undefined);
   assert.equal(css('ConsoleHeader.vue','.header-metrics',desktop).display,'flex');
   assert.equal(css('ConsoleHeader.vue','.console-header',desktop)['min-height'],'66px');
@@ -219,18 +219,18 @@ function mobileRuntime(){
   const calls=[],mounted=[],unmounted=[],watchers=[];
   const props={conversationUuid:'A',conversationPath:'工程 / OpenBear',running:false,turns:[{id:'1',user:{content:'first'}},{id:'2',user:{content:'second'}}],activeTurnIndex:1,autoScrollLocked:true,tokenParts:{input:1250000,output:8300,cache:1000000},durationText:'12m 34s',costText:'$3.4567'};
   const media={matches:true,addEventListener(){},removeEventListener(){}};
-  const context=vm.createContext({ref,nextTick,fmtTokens,cachePct,conversationPathText,useMessageVisibility:()=>({userContent:turn=>turn?.user?.content||''}),defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>unmounted.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media},shortText:(s,max)=>s.slice(0,max)});
+  const context=vm.createContext({ref,computed,nextTick,useWorkItems:()=>null,fmtTokens,cachePct,conversationPathText,useMessageVisibility:()=>({userContent:turn=>turn?.user?.content||''}),defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>unmounted.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media},shortText:(s,max)=>s.slice(0,max)});
   vm.runInContext(descriptors['MobileConversationTools.vue'].scriptSetup.content.replace(/^import .*;\n/gm,''),context);
   mounted.forEach(fn=>fn());
   return{context,props,media,calls,watchers,unmounted};
 }
 async function renderTools(runtime){
-  const bindings=vm.runInContext('({props,fmtTokens,cachePct,conversationPathText,phone:phone.value,menuOpen:menuOpen.value,navigationOpen:navigationOpen.value,navigationList:null,chooseAction,openNavigation,chooseTurn,revealCurrentTurn,turnLabel,emit})',runtime.context);
+  const bindings=vm.runInContext('({props,workItemsSummary:workItemsSummary.value,fmtTokens,cachePct,conversationPathText,phone:phone.value,menuOpen:menuOpen.value,navigationOpen:navigationOpen.value,navigationList:null,chooseAction,openNavigation,chooseTurn,revealCurrentTurn,turnLabel,emit})',runtime.context);
   const slots=[],compiled=compile(descriptors['MobileConversationTools.vue'].template.content);let tree;
   const app=createSSRApp({render(){tree=compiled.call(this,bindings,[]);return tree;}});
   app.component('ElPopover',{inheritAttrs:false,props:['visible'],render(){const children=[...(this.$slots.reference?.()||[]),...(this.visible?(this.$slots.default?.()||[]):[])];slots.push(...children);return children;}});
   app.component('ElDrawer',{inheritAttrs:false,props:['modelValue'],emits:['opened'],render(){const children=this.modelValue?(this.$slots.default?.()||[]):[];slots.push(...children);return children;}});
-  for(const name of ['ChatLineRound','CollectionTag','DataAnalysis','EditPen','Lock','Money','MoreFilled','Timer','Unlock','Hide','Search'])app.component(name,{render:()=>h('svg')});
+  for(const name of ['ChatLineRound','CollectionTag','DataAnalysis','EditPen','Lock','Money','MoreFilled','Timer','Unlock','Hide','Search','ListChecks'])app.component(name,{render:()=>h('svg')});
   const html=await renderToString(app);return{html,nodes:walk([tree,...slots])};
 }
 
@@ -271,7 +271,7 @@ test('More shows read-only live totals on demand and retains every action',async
   for(const text of ['会话统计','总 Tokens','总耗时','总花费','1.25M','12m 34s','$3.4567'])assert.ok(view.html.includes(text),text);
   const summary=view.nodes.find(n=>n.type==='section'&&n.props?.class==='mobile-conversation-summary');
   assert.equal(walk([summary]).filter(n=>n.type==='button').length,0);
-  assert.equal(view.nodes.filter(n=>n.type==='button').length,7);
+  assert.equal(view.nodes.filter(n=>n.type==='button').length,8);
   assert.doesNotMatch(view.html,/工作详情/);
   assert.match(view.html,/隐藏内容/);
   Object.assign(r.props,{tokenParts:{input:2500000,output:16600,cache:2000000},durationText:'25m 8s',costText:'$6.9134'});
@@ -326,29 +326,26 @@ test('screenshot-sized token totals use three full-width rows, keeping cache cou
   assert.deepEqual(r.calls,[]);
 });
 
-test('running indicator is a mobile-only out-of-flow dot that never shrinks the title',async()=>{
-  const compiled=compile(descriptors['ConsoleHeader.vue'].template.content);
-  for(const running of [true,false]){
-    const props={title:'测试会话',running,status:'就绪',runStartedAt:0,tokensText:'10',durationText:'1s',costText:'$0.0010'};
-    let tree;const app=createSSRApp({render(){tree=compiled.call(this,{props,$slots:{},pathText:'/OpenBear',tokenValue:'10',tokenUnit:'',durationParts:[],fmtElapsedClockMs:()=> '00:00'},[]);return tree;}});
-    for(const name of ['BearLogo','DataAnalysis','Money','Stopwatch','Timer'])app.component(name,{render:()=>h('svg')});
-    app.directive('elapsed',{getSSRProps:()=>({})});
-    await renderToString(app);
-    const stack=walk([tree]).find(n=>n.type==='div'&&n.props?.class?.includes('header-title-stack'));
-    const tag=walk([stack]).find(n=>n.type==='span'&&n.props?.class==='header-mobile-running');
-    assert.equal(Boolean(tag),running);
-    if(tag){assert.equal(tag.props.role,'status');assert.equal(tag.props['aria-label'],'运行中');
-      assert.equal(tag.children[0].type,'i');assert.equal(tag.children[0].props['aria-hidden'],'true');
-      assert.equal(tag.props.title,'运行中');assert.equal(tag.children.length,1);}
-  }
+test('phone run line sits under the title inside the title stack, never beside it, and truncates only the phase',async()=>{
+  const stack=nodes('ConsoleHeader.vue').find(n=>hasClass(n,'header-title-stack'));
+  const transition=stack.children.find(n=>n.tag==='Transition');
+  assert.equal(transition.props.find(p=>p.name==='name').value.content,'header-mobile-run');
+  assert.ok(stack.children.indexOf(transition)>stack.children.findIndex(n=>hasClass(n,'header-title-row')),'below the title row, not competing for its width');
+  const line=transition.children.find(n=>hasClass(n,'header-mobile-run'));
+  assert.equal(line.props.find(p=>p.name==='if').exp.content,'props.running');
+  assert.deepEqual(line.children.filter(n=>n.type===1).map(n=>n.tag==='i'?'i':n.props.find(p=>p.name==='class').value.content),['i','header-mobile-run-clock','header-mobile-run-sep','header-mobile-run-status']);
   for(const width of [320,390,760]){
-    const env={...phone,width},tag=css('ConsoleHeader.vue','.header-mobile-running',env);
-    assert.equal(tag.display,'inline-flex');assert.equal(tag.position,'absolute');assert.equal(tag.right,'0');
-    assert.equal(tag.color,'var(--ob-success)');assert.equal(tag.height,'6px');assert.equal(tag.width,'6px');
+    const env={...phone,width},row=css('ConsoleHeader.vue','.header-mobile-run',env);
+    assert.equal(row.display,'flex');assert.equal(row['white-space'],'nowrap');assert.equal(row['line-height'],'15px');assert.equal(row.position,undefined);
+    assert.equal(css('ConsoleHeader.vue','.header-mobile-run-clock',env).flex,'none');
+    assert.equal(css('ConsoleHeader.vue','.header-mobile-run-clock',env).color,'var(--ob-success)');
+    const status=css('ConsoleHeader.vue','.header-mobile-run-status',env);
+    assert.equal(status['min-width'],'0');assert.equal(status['text-overflow'],'ellipsis');
+    assert.equal(css('ConsoleHeader.vue','.header-mobile-run-enter-from',env)['max-height'],'0');
   }
-  assert.equal(css('ConsoleHeader.vue','.header-mobile-running',desktop).display,'none');
-  assert.equal(css('ConsoleHeader.vue','.header-mobile-running i')['background'],'currentColor');
-  assert.equal(css('ConsoleHeader.vue','html.dark .header-mobile-running').color,undefined, 'the same semantic role follows the root theme instead of a local override');
+  assert.equal(css('ConsoleHeader.vue','.header-mobile-run',desktop).display,'none');
+  assert.equal(css('ConsoleHeader.vue','.header-mobile-run-enter-active',desktop).transition,undefined,'desktop never animates a hidden line');
+  assert.equal(css('ConsoleHeader.vue','html.dark .header-mobile-run').color,undefined, 'the same semantic role follows the root theme instead of a local override');
 });
 
 test('More retains memory/follow actions and exposes titled turn navigation only on demand',async()=>{
@@ -356,15 +353,15 @@ test('More retains memory/follow actions and exposes titled turn navigation only
   let view=await renderTools(r);assert.match(view.html,/更多会话操作/);assert.doesNotMatch(view.html,/first|second/);
   vm.runInContext('menuOpen.value=true',r.context);view=await renderTools(r);
   const buttons=view.nodes.filter(n=>n.type==='button');
-  assert.equal(buttons.length,7);
+  assert.equal(buttons.length,8);
   assert.equal(buttons[0].props['aria-label'],'搜索此会话');
   buttons[0].props.onClick(); assert.deepEqual(r.calls.at(-1),['open-search']);
   r.calls.pop();
-  for(const event of ['open-hidden','open-memory','open-context','toggle-scroll-lock']){
+  for(const event of ['open-work-items','open-hidden','open-memory','open-context','toggle-scroll-lock']){
     await vm.runInContext(`chooseAction('${event}')`,r.context);
     assert.equal(vm.runInContext('menuOpen.value',r.context),false);
   }
-  assert.deepEqual(r.calls,[['open-hidden'],['open-memory'],['open-context'],['toggle-scroll-lock']]);
+  assert.deepEqual(r.calls,[['open-work-items'],['open-hidden'],['open-memory'],['open-context'],['toggle-scroll-lock']]);
   vm.runInContext('openNavigation()',r.context);view=await renderTools(r);
   const rows=view.nodes.filter(n=>n.type==='button'&&n.props.class==='mobile-turn-row');
   assert.equal(rows.length,2);assert.equal(rows[1].props['aria-current'],'true');assert.match(view.html,/first/);assert.match(view.html,/second/);
@@ -376,9 +373,10 @@ test('new drafts disable scoped tools and empty navigation, and route/desktop ch
   vm.runInContext('menuOpen.value=true',r.context);const view=await renderTools(r);
   const buttons=view.nodes.filter(n=>n.type==='button');
   assert.equal(buttons[0].props.disabled,true,'local drafts cannot search the server');
-  assert.equal(buttons[2].props.disabled,true);assert.equal(buttons[3].props.disabled,true);assert.equal(buttons[4].props.disabled,true);
-  assert.equal(buttons[5].props.disabled,true,'empty navigation remains disabled after context editor');
-  assert.equal(buttons[6].props.disabled,undefined,'following messages remains available');
+  assert.equal(buttons[2].props.disabled,true,'local drafts have no tasks');
+  assert.equal(buttons[3].props.disabled,true);assert.equal(buttons[4].props.disabled,true);assert.equal(buttons[5].props.disabled,true);
+  assert.equal(buttons[6].props.disabled,true,'empty navigation remains disabled after context editor');
+  assert.equal(buttons[7].props.disabled,undefined,'following messages remains available');
   vm.runInContext('navigationOpen.value=true',r.context);r.watchers.forEach(fn=>fn());assert.equal(vm.runInContext('navigationOpen.value',r.context),false);
   vm.runInContext('menuOpen.value=true;navigationOpen.value=true',r.context);r.media.matches=false;vm.runInContext('updateMedia()',r.context);
   assert.equal(vm.runInContext('phone.value||menuOpen.value||navigationOpen.value',r.context),false);

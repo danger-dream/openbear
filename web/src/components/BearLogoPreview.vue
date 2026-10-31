@@ -2,10 +2,11 @@
 import { nextTick, ref } from "vue";
 import { ElImageViewer } from "element-plus";
 import BearLogo from "./BearLogo.vue";
+import { assetUrl } from "../assetBase.js";
 
 const previewOpen = ref(false);
 const trigger = ref(null);
-const originalImages = ["/assets/brand/openbear-original-d60af5867ad8.png"];
+const originalImages = [assetUrl("assets/brand/openbear-original-2eaaca574a27.png")];
 
 function openPreview() {
   previewOpen.value = true;

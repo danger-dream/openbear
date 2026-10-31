@@ -1,0 +1,22 @@
+{
+  "tool": "hardware.check.place",
+  "version": "v0.1.0",
+  "name": "Hardware.Check.Place",
+  "upstream": {
+    "repo": "https://github.com/xykt/HardwareQuality",
+    "commit": "06f99880d516bb744afa2948261b9697c79789e2",
+    "date": "2026-07-15",
+    "license": "AGPL-3.0"
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "entry": "hardware.sh",
+  "files": {
+    "hardware.sh": "7c4a076d5af6799629d44e34d73da63547db80b50b557b42ca039ad8f26525c8"
+  },
+  "binaries": [],
+  "patch": "openbear.patch",
+  "built": "2026-10-31"
+}

@@ -65,7 +65,8 @@ class Notifications(Strict):
 
 
 class Models(Strict):
-    # 'copy' copies the controller's enabled providers; 'later' leaves the instance empty.
+    # 'copy' copies the listed controller providers (default: only the primary model's);
+    # 'later' leaves the instance empty.
     mode: str = Field(default='copy', pattern=r'^(copy|later)$')
     primary: str = Field(default='', max_length=300)
     providers: list[str] | None = None
@@ -79,6 +80,8 @@ class Form(Strict):
     managementUrl: str = ''
     image: str = Field(default='', max_length=512, pattern=r'^[a-zA-Z0-9._:/@-]*$')
     workspacePath: str = Field(default='', max_length=1024)
+    # Container memory cap in MiB; 0 is no limit.
+    memoryLimitMb: int = Field(default=0, ge=0, le=1048576)
     account: Account
     models: Models = Field(default_factory=Models)
     notifications: Notifications = Field(default_factory=Notifications)
@@ -99,12 +102,42 @@ class Form(Strict):
             raise ValueError('dedicated_volume_required')
         return str(PurePosixPath(v))
 
+    @field_validator('memoryLimitMb')
+    @classmethod
+    def memory(cls, v):
+        if v and v < 256:
+            raise ValueError('memory_limit_too_small')
+        return v
+
     @model_validator(mode='after')
     def automatic_defaults(self):
         slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', self.account.username).strip('-').lower()[:40] or 'instance'
         if not self.workspacePath:
             self.workspacePath = '/opt/openbear/instances/' + slug
         return self
+
+
+# The data directory is mounted read-write into a container running as root.
+# Neither a system tree nor anything inside one:
+SYSTEM_TREES = ('/etc', '/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/boot', '/proc', '/sys', '/dev', '/run',
+                '/var/run', '/root', '/snap', '/var/lib/docker', '/var/lib/containerd',
+                # the gateway's state (every instance's keys) on this machine, and the node's mesh keys
+                '/var/lib/openbear-gateway', '/var/lib/openbear-node')
+# nor a directory that holds other people's or other instances' data:
+SHARED_DIRECTORIES = ('/', '/var', '/var/lib', '/home', '/opt', '/srv', '/mnt', '/media', '/tmp', '/var/tmp',
+                      '/opt/openbear', '/opt/openbear/instances')
+
+
+def check_workspace(path, protected=()):
+    """Checked when an instance gets a data directory (created, or the path changed), so a saved
+    instance keeps saving. protected: the controller's own directories on the same machine;
+    the data directory may be neither one of them nor contain one."""
+    p = PurePosixPath(path)
+    if (str(p) in SHARED_DIRECTORIES or p.parent == PurePosixPath('/home')
+            or any(p.is_relative_to(tree) for tree in SYSTEM_TREES)):
+        raise InstanceError('dedicated_volume_required')
+    if any(p == PurePosixPath(d) or PurePosixPath(d).is_relative_to(p) for d in protected):
+        raise InstanceError('controller_directory_volume_forbidden')
 
 
 EVENT_TYPES = {'login_success', 'login_failure', 'health', 'recovery'}

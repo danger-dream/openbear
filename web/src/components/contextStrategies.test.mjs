@@ -184,18 +184,17 @@ test("strategy inheritance is sparse and an explicit child override wins", () =>
   assert.equal(normalizedRunDefaults({local, inherited: base}).contextStrategy, "model_summary");
 });
 
-test("both custom macOS controls compile and expose keyboard, busy and readable text contracts", () => {
-  for (const file of ["./ContextStrategySwitch.vue", "./ModelOrderPicker.vue"]) {
-    const source = read(file);
-    const {descriptor} = parse(source);
-    const result = compileTemplate({source: descriptor.template.content, filename: file, id: file});
-    assert.deepEqual(result.errors, []);
-    assert.match(source, /:disabled=/);
-    assert.match(source, /aria-/);
-    assert.doesNotMatch(source, /<el-(select|option|dropdown)/);
-    const sizes = [...source.matchAll(/font-size:\s*(\d+)px/g)].map(match => Number(match[1]));
-    assert.ok(sizes.length && sizes.every(size => size >= 13));
-  }
+test("custom macOS model order picker compiles and exposes keyboard, busy and readable text contracts", () => {
+  const file = "./ModelOrderPicker.vue";
+  const source = read(file);
+  const {descriptor} = parse(source);
+  const result = compileTemplate({source: descriptor.template.content, filename: file, id: file});
+  assert.deepEqual(result.errors, []);
+  assert.match(source, /:disabled=/);
+  assert.match(source, /aria-/);
+  assert.doesNotMatch(source, /<el-(select|option|dropdown)/);
+  const sizes = [...source.matchAll(/font-size:\s*(\d+)px/g)].map(match => Number(match[1]));
+  assert.ok(sizes.length && sizes.every(size => size >= 13));
 });
 
 test("window and summary cards separate estimated next input from actual summary-model usage", () => {

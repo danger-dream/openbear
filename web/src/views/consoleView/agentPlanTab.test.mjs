@@ -47,7 +47,8 @@ try {
   let compiled = compileScript(descriptor, {id: "agent-plan-tab-test"}).content;
   compiled = compiled
     .replace(/^import (\w+) from "(\.\/[^"\n]+\.vue)";$/gm, "const $1 = {};")
-    .replace('from "./display.js"', `from "./${displayStubUrl.pathname.split("/").at(-1)}"`);
+    .replace('from "./display.js"', `from "./${displayStubUrl.pathname.split("/").at(-1)}"`)
+    .replace('import {vElapsed} from "./elapsedDirective.js";', "const vElapsed = {};");
   await writeFile(displayStubUrl, displayStubSource);
   await writeFile(generatedUrl, compiled);
   ({default: AgentEventCard} = await import(`${generatedUrl.href}?test=${Date.now()}`));
@@ -135,7 +136,7 @@ function installApi(planRequest) {
   return {planCalls, eventCalls};
 }
 
-function createCard(task, {previewOnly = false, open = true, agentSession = null} = {}) {
+function createCard(task, {previewOnly = false, open = true, agentSession = null, processRow = false} = {}) {
   const props = reactive({
     event: taskEvent(task, agentSession),
     conversationUuid: "conversation-1",
@@ -145,6 +146,7 @@ function createCard(task, {previewOnly = false, open = true, agentSession = null
     isDetailOpen: () => open,
     onDetailsToggle: () => {},
     previewOnly,
+    processRow,
   });
   const scope = effectScope();
   const bindings = scope.run(() => AgentEventCard.setup(props, {expose: () => {}}));
@@ -174,6 +176,25 @@ test("single Agent summary uses its task title for running and completed states"
   assert.equal(running.bindings.panelTitle.value, "Agent 运行中", "expanded panel heading remains unchanged");
   assert.equal(completed.bindings.summaryTitle.value, "Agent");
   assert.equal(completed.bindings.summarySubtitle.value, "· 分析会话首屏加载链路 · 本轮已结束");
+});
+
+test("a started Agent in the work timeline shows its own title and status", (t) => {
+  installApi(async () => noPlanSnapshot());
+  const cards = {
+    running: createCard({taskUuid: "task-running", title: "Go 浏览器引擎", status: "running", startedAtMs: 1234}, {previewOnly: true, processRow: true}),
+    completed: createCard({taskUuid: "task-completed", title: "Go 浏览器引擎", status: "completed"}, {previewOnly: true, processRow: true}),
+    failed: createCard({taskUuid: "task-failed", title: "Go 浏览器引擎", status: "failed"}, {previewOnly: true, processRow: true}),
+    detail: createCard({taskUuid: "task-detail", title: "Go 浏览器引擎", status: "running"}, {previewOnly: true}),
+  };
+  for (const card of Object.values(cards)) t.after(card.stop);
+
+  assert.equal(cards.running.bindings.isLaunchRow.value, true);
+  assert.deepEqual(cards.running.bindings.launchStatus.value, {label: "运行中", tone: "running"});
+  assert.equal(cards.running.bindings.launchStartedAt.value, 1234);
+  assert.deepEqual(cards.completed.bindings.launchStatus.value, {label: "已完成", tone: "ok"});
+  assert.deepEqual(cards.failed.bindings.launchStatus.value, {label: "未成功", tone: "error"});
+  assert.equal(cards.detail.bindings.isLaunchRow.value, false, "outside the work timeline the summary keeps its layout");
+  assert.equal(cards.running.bindings.agentIdentity.value, "task-running");
 });
 
 test("planMode=direct hides the Plan tab on first open without blocking workspace loading", async (t) => {

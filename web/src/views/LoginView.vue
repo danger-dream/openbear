@@ -59,7 +59,7 @@ onBeforeUnmount(() => { alive = false; password.value = ''; state.secret = ''; f
   <div class="login-screen min-h-screen flex items-center justify-center bg-macbg px-4 text-mactext">
     <section class="w-full max-w-md mac-panel mac-shadow p-7 space-y-5">
       <div class="text-center space-y-2">
-        <div class="mx-auto w-14 h-14 rounded-3xl bg-ob-surface border border-macborder shadow-sm flex items-center justify-center"><BearLogo /></div>
+        <div class="mx-auto w-14 h-14"><BearLogo /></div>
         <h1 class="text-xl font-semibold">OpenBear 管理台登录</h1>
         <p v-if="authMode === 'controller'" class="text-sm text-macsub">输入 Web Secret Key 后，需要在 Telegram 中二次确认。</p>
         <p v-else-if="authMode === 'managed' || authMode === 'gateway'" class="text-sm text-macsub">{{ authMode === 'gateway' ? '使用你的账号登录，自动进入你的实例。' : '使用此实例的账号密码登录。' }}</p>

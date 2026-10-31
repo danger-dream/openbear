@@ -447,6 +447,40 @@ function operationTaskUuid(op = {}) {
   return String(op?.taskUuid || payload.taskUuid || payload.task_uuid || task.taskUuid || task.task_uuid || "").trim();
 }
 
+function agentOperationTitle(op = {}) {
+  const payload = isPlainObject(op?.payload) ? op.payload : {};
+  const task = isPlainObject(payload.task) ? payload.task : {};
+  let args = {};
+  try {
+    const parsed = JSON.parse(String(payload.args || payload.arguments || "{}"));
+    if (isPlainObject(parsed)) args = parsed;
+  } catch {}
+  return String(task.title || args.description || task.displayName || "Agent").trim();
+}
+
+// One entry per awaited task; a tool-call row merged into its task row is not a second Agent.
+function waitingAgentItems(ops = []) {
+  const seen = new Set();
+  const items = [];
+  for (const op of ops) {
+    if (op?.payload?.merged === true) continue;
+    const key = operationTaskUuid(op) || String(op?.opId || "");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    items.push({key, title: agentOperationTitle(op)});
+  }
+  return items;
+}
+
+// Reuse the previous list when nothing visible changed, so a run-state sync
+// does not invalidate everything projected from it.
+export function stableWaitingAgents(previous, next) {
+  const list = Array.isArray(next) ? next : [];
+  if (Array.isArray(previous) && previous.length === list.length
+      && list.every((agent, index) => agent?.key === previous[index]?.key && agent?.title === previous[index]?.title)) return previous;
+  return list;
+}
+
 export function deriveOperationRunState(operations = []) {
   const ops = normalizeOperations(operations);
   const active = ops.filter((op) => {
@@ -487,6 +521,7 @@ export function deriveOperationRunState(operations = []) {
     modelOutput,
     // A root turn waiting on Agents or other conversations says what it waits for.
     waitingLabel: rootTurnRunning && activeSupervisor ? String(activeSupervisor.payload?.statusText || "") : "",
+    waitingAgents: rootTurnRunning && activeSupervisor ? waitingAgentItems(activeAgents) : [],
     activeTurnId: activeTurn?.turnId || activeTurn?.turnUuid || "",
     activeStartedAtMs: startedAt,
     activeOperationIds: active.map((op) => op.opId).filter(Boolean),
@@ -523,6 +558,7 @@ export function withTransientIdleThinking(turnList = [], runState = {}, options 
         id: "transient-run-thinking",
         status: options.modelOutput ? "正在生成工具参数" : "正在思考 …",
         waitingLabel: options.modelOutput ? "" : String(options.waitingLabel || ""),
+        waitingAgents: options.modelOutput || !Array.isArray(options.waitingAgents) ? [] : options.waitingAgents,
         modelOutput: options.modelOutput || null,
         startedAt: Number(options.modelOutput?.startedAtMs || options.startedAtMs || options.lastVisibleOutputAtMs || Date.now()) || Date.now(),
         active: true,

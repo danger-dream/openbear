@@ -46,7 +46,7 @@ async def preview(env):
 
 
 def confirmation(data):
-    return {"confirmed": True, "beforeHash": data["beforeHash"], "afterHash": data["afterHash"]}
+    return {"confirmed": True, **{key: data[key] for key in ("beforeHash", "afterHash", "toolsBeforeHash", "toolsAfterHash")}}
 
 
 async def test_refresh_is_authenticated_owned_and_not_a_draft_create(prompt_env):

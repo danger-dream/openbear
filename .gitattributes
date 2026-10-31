@@ -1,0 +1,10 @@
+# Preserve pinned third-party bytes; first-party whitespace is still checked.
+/node/browser/resources/LICENSE -text -whitespace
+/node/mesh/wintun/LICENSE.txt -text -whitespace
+/node/third_party/wireguard-go/README.md -text -whitespace
+/benchmark-package/ip.check.place/v0.1.0/main/ref/iata-icao.csv -text -whitespace
+/benchmark-package/hardware.check.place/v0.1.0/hardware.sh -text -whitespace
+/benchmark-package/hardware.check.place/v0.1.0/openbear.patch -text -whitespace
+/benchmark-package/ip.check.place/v0.1.0/openbear.patch -text -whitespace
+/benchmark-package/net.check.place/v0.1.0/openbear.patch -text -whitespace
+/benchmark-package/tcpquality/v0.1.0/openbear.patch -text -whitespace

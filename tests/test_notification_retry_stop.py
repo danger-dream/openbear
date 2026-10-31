@@ -247,3 +247,40 @@ async def test_retry_wait_is_not_success_until_model_returns(monkeypatch):
     assert result.model_retry == 2
     assert [s.get("status") for s in renderer.retry_states] == [None, "resumed", "failed", None, "resumed", "completed"]
     assert [s["delayMs"] for s in renderer.retry_states if s["active"]] == [3000, 5000]
+
+
+async def test_main_conversation_hides_first_three_retries(monkeypatch):
+    class Renderer(RecordRenderer):
+        def __init__(self):
+            super().__init__()
+            self.retry_states = []
+
+        async def on_retry_state(self, state):
+            self.retry_states.append(dict(state))
+
+    failure = [StreamEvent(kind="error", error="service unavailable", status=503, retryable=True)]
+    backend = FakeStreamBackend([failure, failure, failure, failure,
+                                 [StreamEvent(kind="content", text="recovered"), StreamEvent(kind="finish", finish_reason="stop")]])
+    monkeypatch.setattr("app.runtime.model_call.wait_for_retry", no_delay)
+    renderer = Renderer()
+    result = await Agent(backend, ToolRegistry()).run([{"role": "user", "content": "run"}], renderer, model="test")
+    assert result.model_retry == 4 and result.text == "recovered"
+    assert [s["quiet"] for s in renderer.retry_states if s["active"]] == [True, True, True, False]
+    retry_statuses = [s for s in renderer.statuses if "后重试" in s]
+    assert len(retry_statuses) == 1 and "（4/10）" in retry_statuses[0]
+
+
+async def test_web_renderer_drops_quiet_retry_frames_but_still_cuts_output():
+    renderer = _WebStreamRenderer()
+    emitted = []
+
+    async def record(event):
+        emitted.append(event)
+
+    renderer.emit = record
+    renderer._output_phase = "content"
+    await renderer.on_retry_state({"active": True, "quiet": True, "attempt": 1})
+    await renderer.on_retry_state({"active": False, "quiet": True, "attempt": 1, "status": "resumed"})
+    assert [event["type"] for event in emitted] == ["cut"]
+    await renderer.on_retry_state({"active": True, "quiet": False, "attempt": 4})
+    assert emitted[-1]["type"] == "retry_wait" and emitted[-1]["retry"]["attempt"] == 4

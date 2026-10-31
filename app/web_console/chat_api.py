@@ -1580,6 +1580,8 @@ class WebAdminChatHandlersMixin:
                 conv_uuid,
                 conn=self.db.conn,
             )
+            from app.work_items import WorkItemsDAO
+            await WorkItemsDAO(self.db).hard_delete_conversation(conv_uuid, conn=self.db.conn)
             await self.db.conn.execute("DELETE FROM rath_agent_sessions WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM sessions WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,))
@@ -2423,6 +2425,10 @@ class WebAdminChatHandlersMixin:
                         public_event = task_memory_changed_public_event(event)
                         if public_event is not None:
                             await _send_json(public_event)
+                    elif event_type == "work_items.changed":
+                        await _send_json({"type": event_type, "conversationUuid": str(event.get("conversationUuid") or ""),
+                                          "numbers": [str(n) for n in event.get("numbers") or []][:100],
+                                          "action": str(event.get("action") or "")[:40]})
                     elif event_type == "message_visibility.changed":
                         await _send_json({"type": event_type, "visibility": event.get("visibility")})
                     elif event_type == "collab_requests":

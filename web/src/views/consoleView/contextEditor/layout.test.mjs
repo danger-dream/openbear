@@ -74,7 +74,7 @@ test('tool lists and native fields own scrolling instead of growing their docume
 
 test('form reset loses to footer grid, model selector, navigation and primary button styles', () => {
   assert.equal(specificity(inputBase),1000);assert.equal(specificity(buttonBase),1000);
-  const submit=css(['.ce-surface .ce-actions','.context-editor .ce-submit']);assert.equal(submit.display,'grid');assert.equal(submit['grid-template-columns'],'auto auto minmax(100px,145px) auto');
+  const submit=css(['.ce-surface .ce-actions','.context-editor .ce-submit']);assert.equal(submit.display,'grid');assert.equal(submit['grid-template-columns'],'auto auto minmax(100px,145px) auto auto');
   assert.equal(css([inputBase,'.context-editor .ce-footer input','.context-editor .ce-submit input']).width,'100%');
   assert.equal(css([inputBase,'.context-editor .ce-request select']).width,'auto');
   assert.equal(css([inputBase,'.ce-surface .ce-tools-toolbar input']).width,'min(330px,60%)');

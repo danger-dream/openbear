@@ -174,9 +174,18 @@ test('S06 real advanced and collection fields round-trip MB decimals, null, erro
 test('S07 config and submission drop deleted product keys while preserving template, schema, notification and scripts',async()=>{
  const incoming={...cfg.defaultConfig(scope),budget:{maxCostUsd:1}};Object.assign(incoming.pre,{sourceMode:'file',entryFile:'/old',cwd:'/old',env:[{secretRef:'old'}]});Object.assign(incoming.batching,{groupBy:['body.id'],missingGroupValue:'hold'});incoming.limits.burst=9;incoming.processing={...incoming.processing,eventTemplate:'[[ events ]]',resultSchema:{type:'object',properties:{status:{type:'string'}}}};incoming.notifications={policy:'errorsDigest',digestSeconds:60};incoming.pre.code='saved code';
  let submitted;const ed=createWebhookEditor({...api,webhook:async()=>({endpoint:{...endpoint,config:incoming}}),updateWebhook:async(_id,body)=>{submitted=body;return {endpoint:{...endpoint,...body}};}});await ed.load(scope);assert.equal(await ed.save(),true);
- assert.ok(!('budget' in submitted.config));assert.ok(!('groupBy' in submitted.config.batching));assert.ok(!('missingGroupValue' in submitted.config.batching));assert.ok(!('burst' in submitted.config.limits));for(const key of ['sourceMode','entryFile','cwd','env','interpreter'])assert.ok(!(key in submitted.config.pre));assert.equal(submitted.config.pre.code,'saved code');assert.deepEqual(submitted.config.processing,incoming.processing);assert.deepEqual(submitted.config.notifications,incoming.notifications);ed.dispose();
+ assert.ok(!('budget' in submitted.config));assert.ok(!('groupBy' in submitted.config.batching));assert.ok(!('missingGroupValue' in submitted.config.batching));assert.ok(!('burst' in submitted.config.limits));for(const key of ['sourceMode','entryFile','cwd','env','interpreter'])assert.ok(!(key in submitted.config.pre));assert.equal(submitted.config.pre.code,'saved code');assert.deepEqual({...submitted.config.processing,allowServerChanges:false},incoming.processing);assert.equal(Object.hasOwn(submitted.config.processing,'allowServerChanges'),false);assert.deepEqual(submitted.config.notifications,incoming.notifications);ed.dispose();
 });
 
 test('S08 receive status remains understandable while processing is paused',()=>{
  const ed=harness('./WebhookEditor.vue',{props:{scope},api});ed.run("endpoint.value={effectiveStatus:'paused'}");assert.equal(ed.run('receivingStatus.value'),'正在接收 · 处理已暂停');ed.run("endpoint.value={effectiveStatus:'disabled'}");assert.equal(ed.run('receivingStatus.value'),'不接收 · 入口未启用');ed.close();
+});
+test('U2 an endpoint may change servers and instances only once ticked; the box explains the risk and is submitted',()=>{
+  const config=cfg.defaultConfig({type:'folder',id:'F1'});
+  assert.equal(config.processing.allowServerChanges,false);
+  config.processing.allowServerChanges=true;assert.equal(cfg.submittedConfig(config).processing.allowServerChanges,true);
+  const template=parse(fs.readFileSync(new URL('./WebhookEditor.vue',import.meta.url),'utf8')).descriptor.template.content;
+  assert.match(template,/<el-checkbox v-model="draft\.config\.processing\.allowServerChanges">允许改动服务器和实例<\/el-checkbox>/);
+  assert.match(template,/'事件处理无人值守，可能被事件内容或服务器返回的内容误导而执行改动/);
+  assert.match(template,/'未勾选时，处理事件时只能查看服务器和实例。'/);
 });

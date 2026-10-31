@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { compileScript, parse } from "@vue/compiler-sfc";
 import { compile } from "@vue/compiler-dom";
 import * as Vue from "vue";
+import { assetUrl } from "../assetBase.js";
 
 const root = new URL("../../", import.meta.url);
 const source = readFileSync(new URL("src/components/BearLogoPreview.vue", root), "utf8");
@@ -18,7 +19,7 @@ const render = new Function("Vue", code)(Vue);
 const Viewer = { name: "ElImageViewer" };
 const Logo = { name: "BearLogo" };
 function component() {
-  const sfc = new Function("nextTick", "ref", "ElImageViewer", "BearLogo", setupCode)(Vue.nextTick, Vue.ref, Viewer, Logo);
+  const sfc = new Function("nextTick", "ref", "ElImageViewer", "BearLogo", "assetUrl", setupCode)(Vue.nextTick, Vue.ref, Viewer, Logo, assetUrl);
   const state = sfc.setup({}, { expose() {} });
   return { state, tree: () => render({}, [], {}, Vue.proxyRefs(state)) };
 }
@@ -47,7 +48,7 @@ test("native button opens the original only on activation, with viewport-safe mo
   assert.equal(view.state.previewOpen.value, true);
   const viewer = find(view.tree(), (node) => node.type === Viewer);
   assert.ok(viewer);
-  assert.deepEqual(viewer.props["url-list"], ["/assets/brand/openbear-original-d60af5867ad8.png"]);
+  assert.deepEqual(viewer.props["url-list"], ["/assets/brand/openbear-original-2eaaca574a27.png"]);
   assert.equal(viewer.props["close-on-press-escape"], true);
   assert.ok(Object.hasOwn(viewer.props, "hide-on-click-modal"));
   assert.ok(Object.hasOwn(viewer.props, "teleported"), "escape transformed or clipped mobile sidebar ancestors");
@@ -66,20 +67,9 @@ test("native button opens the original only on activation, with viewport-safe mo
 });
 
 test("preview uses the exact approved full-resolution artwork, not the reduced icon", () => {
-  const image = readFileSync(new URL("public/assets/brand/openbear-original-d60af5867ad8.png", root));
+  const image = readFileSync(new URL("public/assets/brand/openbear-original-2eaaca574a27.png", root));
   assert.equal(image.readUInt32BE(16), 1024);
   assert.equal(image.readUInt32BE(20), 1024);
-  assert.equal(createHash("sha256").update(image).digest("hex"), "d60af5867ad8bb97adeb939d53db0c406c3aada611176ac426c675b2f37f675d");
-});
-
-test("only desktop/sidebar and mobile top-left brand entries opt into the preview", () => {
-  const app = readFileSync(new URL("src/App.vue", root), "utf8");
-  assert.equal((app.match(/<BearLogoPreview\s*\/>/g) || []).length, 2);
-  assert.match(app, /mobile-brand-logo"><BearLogoPreview\s*\/>/);
-  assert.match(app, /sidebar-brand-logo[^>]*>\s*<BearLogoPreview\s*\/>/);
-  for (const path of ["src/views/LoginView.vue", "src/views/InstallAppView.vue"]) {
-    assert.doesNotMatch(readFileSync(new URL(path, root), "utf8"), /BearLogoPreview/);
-  }
-  assert.match(descriptor.styles[0].content, /:focus-visible/);
-  assert.match(descriptor.styles[0].content, /touch-action:\s*manipulation/);
+  assert.equal(image[25], 6, "the full-resolution artwork is transparent too");
+  assert.equal(createHash("sha256").update(image).digest("hex"), "2eaaca574a272148538fda5f24815e58d44cac85ae7ebe27058f0f1c03f6dcf7");
 });

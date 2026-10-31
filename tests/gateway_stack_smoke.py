@@ -155,7 +155,8 @@ async def control_plane(stack):
     value, private = await service.gateway.config()
     if not value["enabled"]:
         await service.gateway.store({**value, "enabled": True, "publicUrl": stack.public, "serverId": "local",
-                                     "port": int(stack.public.rsplit(":", 1)[1]), "status": "connected"},
+                                     "port": int(stack.public.rsplit(":", 1)[1]), "status": "connected",
+                                     "autoUpdate": False},  # Never reinstall the host's gateway.
                                     {"controlKey": stack.control_key, "controlUrl": stack.public})
     return service, db
 
@@ -225,19 +226,36 @@ async def push_session_status(stack, child, binding):
                                       "X-OpenBear-Gateway-Session-Hash": binding})
 
 
-async def node_frontend(client, stack, child):
+def node_page(child, raw):
+    """The node writes its login mode and its gateway asset prefix into the page."""
+    from app.web_console.auth_api import _INDEX_ASSET_REF
+    prefix = "/_i/" + child["id"] + "/"
+    text = raw.replace('"[[controller]]"', '"gateway"', 1).replace('"[[asset-base]]"', json.dumps(prefix), 1)
+    return _INDEX_ASSET_REF.sub(lambda match: match[1] + prefix + "assets/", text)
+
+
+async def node_frontend(client, stack, child, other):
     from app.web_console.auth_api import PWA_PUBLIC_FILES
-    for path in ("/", "/chat", "/skills", "/assets/node-proof.js", *PWA_PUBLIC_FILES):
+    prefix = "/_i/" + child["id"] + "/"
+    for path in ("/", "/chat", "/skills", "/assets/node-proof.js", prefix + "assets/node-proof.js", *PWA_PUBLIC_FILES):
         page = path in {"/", "/chat", "/skills"}
-        relative = "index.html" if page else PWA_PUBLIC_FILES.get(path, (path.lstrip("/"),))[0]
+        relative = "index.html" if page else PWA_PUBLIC_FILES.get(path, (path.removeprefix(prefix).lstrip("/"),))[0]
         expected = (child["webRoot"] / relative).read_bytes()
-        if page:  # The node writes its login mode into the page.
-            expected = expected.replace(b'"[[controller]]"', b'"gateway"', 1)
+        if path == "/openbear-push-sw.js":  # The gateway's own copy, never the node's.
+            expected = (ROOT / "gateway/openbear-push-sw.js").read_bytes()
+        if page:
+            expected = node_page(child, expected.decode()).encode()
+            assert b'"/assets/' not in expected
         async with client.get(stack.public + path) as response:
             assert response.status == 200, f"node frontend rejected {path}"
             assert await response.read() == expected, f"wrong node frontend at {path}"
+    async with client.get(stack.public + "/openbear-push-sw.js", headers={"Service-Worker": "script"}) as response:
+        assert response.status == 200
+    for path in ("/", prefix + "assets/node-proof.js", "/assets/node-proof.js"):
+        async with client.get(stack.public + path, headers={"Service-Worker": "script"}) as response:
+            assert response.status == 403, f"node script accepted as a service worker: {path}"
     asset = next((child["webRoot"] / "assets").glob("index-*.js"))
-    asset_url = stack.public + "/assets/" + asset.name
+    asset_url = stack.public + prefix + "assets/" + asset.name
     async with client.get(asset_url) as response:
         assert response.status == 200 and await response.read() == asset.read_bytes()
         assert response.headers["Cache-Control"] == "private, max-age=31536000, immutable"
@@ -245,14 +263,19 @@ async def node_frontend(client, stack, child):
     for name, value in validators.items():
         async with client.get(asset_url, headers={name: value}) as response:
             assert response.status == 304 and not await response.read()
+    # Unprefixed (pre-prefix node) assets are shared by every instance: never cached.
+    async with client.get(stack.public + "/assets/" + asset.name, headers=validators) as response:
+        assert response.status == 200 and response.headers["Cache-Control"] == "no-store"
+    async with client.get(stack.public + "/_i/" + other["id"] + "/assets/" + asset.name) as response:
+        assert response.status == 409, "another instance's prefix was served"
     async with client.get(stack.public + "/skills", headers=validators) as response:
         assert response.status == 200 and response.headers["Cache-Control"] == "no-store"
     index = child["webRoot"] / "index.html"
     updated = index.read_text() + "<!-- independent-node-update -->\n"
     index.write_text(updated)
     async with client.get(stack.public + "/chat") as response:
-        assert response.status == 200 and await response.text() == updated.replace('"[[controller]]"', '"gateway"', 1)
-    print("node-owned frontend: " + child["username"] + " exact HTML/Skills/JS/PWA bytes, hashed asset 304 revalidation and independent update without gateway restart passed")
+        assert response.status == 200 and await response.text() == node_page(child, updated)
+    print("node-owned frontend: " + child["username"] + " exact HTML/Skills/JS/PWA bytes below its own asset prefix, gateway-owned service worker, prefixed hashed asset 304 revalidation, unprefixed no-store and independent update without gateway restart passed")
 
 
 async def ip_policy(stack, child):
@@ -268,7 +291,7 @@ async def ip_policy(stack, child):
     service, db = await control_plane(stack)
     try:
         observed = (await service.gateway.get())["observed"]
-        assert observed["peer"] == "127.0.0.1" and observed["header"] == "X-Forwarded-For", observed
+        assert observed["peer"] == "127.0.0.1" and observed["header"] == "X-Forwarded-For" and observed["trusted"] is True, observed
         print("real Go automatic client IP: local proxy detected, forwarded IP recorded, observation reported to controller passed")
     finally:
         await service.close()
@@ -283,7 +306,7 @@ async def exercise(stack, client, *, check_push=False):
     await ip_policy(stack, first)
     await login_events(stack)
     auth = await login(client, stack, first)
-    await node_frontend(client, stack, first)
+    await node_frontend(client, stack, first, second)
     await request(client, "POST", stack.public + "/api/auth/password/login", expected=409,
                   json={"username": second["username"], "password": second["password"]}, headers={"Origin": stack.public})
     await request(client, "GET", stack.public + "/api/conversations", expected=409)
@@ -314,7 +337,7 @@ async def exercise(stack, client, *, check_push=False):
         assert not (await push_session_status(stack, first, binding))["active"]
         print("real Go/Python push: subscription/status/presence use nonempty original-session binding; node-authenticated active check flips inactive on logout; no provider traffic sent")
     new_auth = await login(client, stack, second)
-    await node_frontend(client, stack, second)
+    await node_frontend(client, stack, second, first)
     await request(client, "POST", stack.public + "/api/conversations", expected=409, headers=auth, json={"title": "must-not-arrive"})
     async with client.get(stack.public + first["download"] + "&_ob_ctx=" + quote(auth["X-OpenBear-Context"])) as response:
         assert response.status == 409

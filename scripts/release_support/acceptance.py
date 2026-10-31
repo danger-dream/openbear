@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -34,7 +35,23 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent / "acceptance_helpers"
 ADMIN_ID = "123456789"
 BOT_TOKEN = "900000001:ACCEPTANCE_LOCAL_ONLY_123456789_ABCDEFGHIJK"
 MODEL_KEY = "acceptance-local-only"
-VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+
+
+def _load_versioning():
+    # app/versioning.py by path: this harness runs from the checkout without importing app.
+    spec = importlib.util.spec_from_file_location("openbear_acceptance_versioning", pathlib.Path(__file__).resolve().parents[2] / "app/versioning.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+versioning = _load_versioning()
+
+
+def published_version(value) -> bool:
+    """A beta, rc or release version as written in tags and asset names."""
+    parsed = versioning.parse(value) if isinstance(value, str) else None
+    return parsed is not None and str(parsed) == value and versioning.publishable(value)
 
 
 class CommandFailure(RuntimeError):
@@ -98,8 +115,8 @@ def validate_config(config: dict, case: str) -> dict:
     require(type(config.get("schema")) is int and config["schema"] == 1, "config schema must be 1")
     require(isinstance(config.get("runId"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", config["runId"]), "runId must be a safe ASCII ID")
     for key in ("version", "previousVersion"):
-        require(isinstance(config.get(key), str) and VERSION_RE.fullmatch(config[key]), f"invalid {key}: expected stable X.Y.Z")
-    require(tuple(map(int, config["version"].split("."))) > tuple(map(int, config["previousVersion"].split("."))), "version must be newer than previousVersion")
+        require(published_version(config.get(key)), f"invalid {key}: expected X.Y.Z, X.Y.Z-rc.N or X.Y.Z-beta.N")
+    require(versioning.compare(config["version"], config["previousVersion"]) > 0, "version must be newer than previousVersion")
     require(isinstance(config.get("image"), str) and re.fullmatch(r"sha256:[0-9a-f]{64}", config["image"]), "image must be a fixed Docker image ID")
     paths = validated_paths(config)
     for key in ("currentAssets", "previousAssets"):

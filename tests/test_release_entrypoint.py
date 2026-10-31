@@ -88,6 +88,7 @@ def git_repo(tmp_path):
         target.write_text(body)
     (repo / "scripts").mkdir()
     shutil.copy2(ROOT / "scripts/bump_version.py", repo / "scripts/bump_version.py")
+    shutil.copy2(ROOT / "app/versioning.py", repo / "app/versioning.py")  # bump_version.py's version rules
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture base"], cwd=repo, check=True, capture_output=True)
     return repo
@@ -329,8 +330,27 @@ def test_matrix_collection_and_skip_contract():
     unlisted = {"ok": True, "testCases": [{"id": "tests.test_other::test_case", "status": "skipped", "skipReason": "需 --run-live"}]}
     with pytest.raises(ReleaseError, match="Unexpected conditional skip"):
         runner.matrix_contract({name: unlisted for name in runner.TEST_STAGES})
-    for case in ({"id": "tests.test_other::test_case", "skipReason": systemd["testCases"][0]["skipReason"]},
-                 {"id": "tests.test_systemd_watchdog_live::test_case", "skipReason": "not installed"}):
+    node = {"ok": True, "testCases": [{"id": "tests.test_servers::test_node", "status": "skipped", "skipReason": "Go toolchain is not available"},
+                                      {"id": "tests.test_node_browser::test_drive", "status": "skipped", "skipReason": "needs Chrome and Go"},
+                                      {"id": "tests.test_browser_engine_parity::test_same", "status": "skipped", "skipReason": "needs google-chrome and Go"},
+                                      {"id": "tests.test_gateway_update::test_reinstall", "status": "skipped", "skipReason": "needs the built gateway program"},
+                                      {"id": "tests.test_servers_transfers::test_upload", "status": "skipped", "skipReason": "Go toolchain is not available"},
+                                      {"id": "tests.test_instance_hardening::test_gateway", "status": "skipped", "skipReason": "gateway binary not built"},
+                                      {"id": "tests.test_servers_hardening::test_ssh", "status": "skipped", "skipReason": "ssh-keygen is not available"}]}
+    assert runner.matrix_contract({name: node for name in runner.TEST_STAGES})["ok"]
+    benchmark = {"ok": True, "testCases": [{"id": "tests.test_servers_bench_live::test_real", "status": "skipped",
+        "skipReason": "set OPENBEAR_BENCH_LIVE=1 to run a real benchmark"}]}
+    assert runner.matrix_contract({name: benchmark for name in runner.TEST_STAGES})["ok"]
+    for case in ({"id": "tests.test_servers_bench_live::test_real", "skipReason": "network failed"},
+                 {"id": "tests.test_other::test_case", "skipReason": benchmark["testCases"][0]["skipReason"]},
+                 {"id": "tests.test_other::test_case", "skipReason": systemd["testCases"][0]["skipReason"]},
+                 {"id": "tests.test_systemd_watchdog_live::test_case", "skipReason": "not installed"},
+                 {"id": "tests.test_other::test_case", "skipReason": "Go toolchain is not available"},
+                 {"id": "tests.test_other::test_case", "skipReason": "needs the built gateway program"},
+                 {"id": "tests.test_gateway_update::test_reinstall", "skipReason": "gateway unreachable"},
+                 {"id": "tests.test_other::test_case", "skipReason": "ssh-keygen is not available"},
+                 {"id": "tests.test_servers_hardening::test_ssh", "skipReason": "Go toolchain is not available"},
+                 {"id": "tests.test_node_browser::test_case", "skipReason": "dropping to another account needs root"}):
         values = {name: {"ok": True, "testCases": [{**case, "status": "skipped"}]} for name in runner.TEST_STAGES}
         with pytest.raises(ReleaseError, match="Unexpected conditional skip"):
             runner.matrix_contract(values)
@@ -434,7 +454,7 @@ def test_whole_pipeline_B_failure_resumes_without_repeating_tests_build_or_A(tmp
                 raise ReleaseError("B fixture failure")
             return {"ok": True}
 
-    def publisher(*_):
+    def publisher(*_, **__):
         calls["publish"] += 1
         return {"ok": True, "url": "https://example.invalid/release"}
 

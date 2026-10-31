@@ -121,3 +121,13 @@ async def test_manual_retry_control_targets_only_one_wait_and_keeps_final_state(
     assert updates[-1]["active"] is False
     assert queue.request_retry_action(1, state["waitId"], action)  # late click from completed wait
     assert queue.consume_retry_action(1, other["waitId"]) == ""
+
+
+def test_first_three_default_retries_are_quiet_unless_the_wait_grows():
+    policy = RetryPolicy()
+    assert [policy.quiet(i, policy.delay(i)) for i in range(1, 6)] == [True, True, True, False, False]
+    assert policy.quiet(2, policy.delay(2, retry_after_s=4)) is True
+    assert policy.quiet(1, policy.delay(1, retry_after_s=120)) is False
+    assert RetryPolicy(base_delay_s=0).quiet(3, 0) is True
+    assert RetryPolicy(base_delay_s=60).quiet(1, RetryPolicy(base_delay_s=60).delay(1)) is False
+    assert policy.quiet(0, 0) is False

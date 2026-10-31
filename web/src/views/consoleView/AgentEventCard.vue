@@ -8,6 +8,7 @@ import {copyTextToClipboard} from "../../utils/clipboard.js";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import AgentPlanWorkspace from "./AgentPlanWorkspace.vue";
 import AgentProcessActivity from "./AgentProcessActivity.vue";
+import {vElapsed} from "./elapsedDirective.js";
 import {agentEventIdentity, agentPanelDetailKey} from "./agentPanelState.js";
 import {
 	agentDisplayState,
@@ -88,7 +89,8 @@ let instanceLoadPromise = null;
 let activityRequestGeneration = 0;
 
 const legacyDetailId = computed(() => props.detailKey(props.turnId, "agent", props.index));
-const detailId = computed(() => agentPanelDetailKey(props.conversationUuid, agentEventIdentity(props.event)) || legacyDetailId.value);
+const agentIdentity = computed(() => agentEventIdentity(props.event));
+const detailId = computed(() => agentPanelDetailKey(props.conversationUuid, agentIdentity.value) || legacyDetailId.value);
 const isOpen = computed(() => !props.previewOnly && props.isDetailOpen(detailId.value));
 
 function liveLines() {
@@ -149,6 +151,16 @@ const summarySubtitle = computed(() => isSingleAgentSummary.value
 	: panelSubtitle.value);
 const panelStatusLabel = computed(() => assignmentStatusLabel.value);
 const panelStatusClass = computed(() => isActiveLiveAgent.value ? "running" : agentState.value.summary.cls);
+// In the work timeline a started Agent must stand out from ordinary tool rows.
+const isLaunchRow = computed(() => props.processRow && isSingleAgentSummary.value);
+const launchStartedAt = computed(() => Number(immediateTask.value?.startedAtMs || immediateTask.value?.started_at_ms || props.event?.operation?.createdAtMs || 0) || 0);
+const launchStatus = computed(() => {
+	if (isActiveLiveAgent.value) return {label: "运行中", tone: "running"};
+	const view = instanceView.value.statusView || {};
+	if (view.tone === "ok") return {label: "已完成", tone: "ok"};
+	if (view.tone === "error" || panelStatusClass.value === "error") return {label: "未成功", tone: "error"};
+	return {label: String(view.label || agentState.value.summary.label || "").replace(/^本轮/, "").split("，")[0], tone: view.tone || "partial"};
+});
 
 function rowOutputAvailable(row) {
 	return Boolean(row?.hasOutput && !["running", "resuming", "queued", "pausing", "stopping"].includes(String(row?.status || "")));
@@ -794,14 +806,20 @@ watch(agentPushKey, (value, oldValue) => {
 	<div
 		v-if="props.previewOnly"
 		class="agent-tool-event"
-		:class="[`agent-${panelStatusClass}`, {'is-process-row': props.processRow, 'process-live': isActiveLiveAgent || (props.event.live && panelStatusClass === 'running')}]"
+		:class="[`agent-${panelStatusClass}`, {'is-process-row': props.processRow, 'is-agent-launch': isLaunchRow, 'process-live': isActiveLiveAgent || (props.event.live && panelStatusClass === 'running')}]"
 	>
 		<div class="agent-summary-row agent-preview-row">
 			<span class="agent-icon"><AgentProcessIcon v-if="props.processRow" :stroke-width="1.75"/><Cpu v-else/></span>
 			<span class="agent-summary-copy">
-			<span class="agent-summary-title" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running'}">{{ summaryTitle }}</span>
+			<span class="agent-summary-title" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running' && !isLaunchRow}">{{ summaryTitle }}</span>
+			<template v-if="isLaunchRow">
+			<span class="agent-launch-title" :title="agentState.subtitle">{{ agentState.subtitle }}</span>
+			<span class="agent-launch-status" :class="`tone-${launchStatus.tone}`"><span :class="{'work-status-sweep': launchStatus.tone === 'running'}">{{ launchStatus.label }}</span><template v-if="launchStatus.tone === 'running' && launchStartedAt"><span class="agent-launch-sep" aria-hidden="true">·</span><span v-elapsed="{startAt: launchStartedAt, active: true, format: 'clock', fallback: ''}"></span></template></span>
+			</template>
+			<template v-else>
 			<span v-if="props.processRow && panelStatusClass === 'error'" class="agent-process-error">未成功</span>
 			<span class="agent-summary-preview" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running'}">{{ summarySubtitle }}</span>
+			</template>
 			</span>
 			<span v-if="!props.processRow" class="agent-summary-status-icon" :class="panelStatusClass">
 				<Loading v-if="panelStatusClass === 'running'"/>
@@ -812,17 +830,24 @@ watch(agentPushKey, (value, oldValue) => {
 
 	<details
 		v-else
+		:data-agent-key="agentIdentity || undefined"
 		class="agent-tool-event"
-		:class="[`agent-${panelStatusClass}`, {'is-process-row': props.processRow, 'process-live': isActiveLiveAgent || (props.event.live && panelStatusClass === 'running')}]"
+		:class="[`agent-${panelStatusClass}`, {'is-process-row': props.processRow, 'is-agent-launch': isLaunchRow, 'process-live': isActiveLiveAgent || (props.event.live && panelStatusClass === 'running')}]"
 		:open="isOpen"
 		@toggle="onToggle"
 	>
 		<summary class="agent-summary-row">
 			<span class="agent-icon"><AgentProcessIcon v-if="props.processRow" :stroke-width="1.75"/><Cpu v-else/></span>
 			<span class="agent-summary-copy">
-			<span class="agent-summary-title" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running'}">{{ summaryTitle }}</span>
+			<span class="agent-summary-title" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running' && !isLaunchRow}">{{ summaryTitle }}</span>
+			<template v-if="isLaunchRow">
+			<span class="agent-launch-title" :title="agentState.subtitle">{{ agentState.subtitle }}</span>
+			<span class="agent-launch-status" :class="`tone-${launchStatus.tone}`"><span :class="{'work-status-sweep': launchStatus.tone === 'running'}">{{ launchStatus.label }}</span><template v-if="launchStatus.tone === 'running' && launchStartedAt"><span class="agent-launch-sep" aria-hidden="true">·</span><span v-elapsed="{startAt: launchStartedAt, active: true, format: 'clock', fallback: ''}"></span></template></span>
+			</template>
+			<template v-else>
 			<span v-if="props.processRow && panelStatusClass === 'error'" class="agent-process-error">未成功</span>
 			<span class="agent-summary-preview" :class="{'work-status-sweep': props.processRow && panelStatusClass === 'running'}">{{ summarySubtitle }}</span>
+			</template>
 			</span>
 			<span v-if="!props.processRow" class="agent-summary-status-icon" :class="panelStatusClass">
 				<Loading v-if="panelStatusClass === 'running'"/>
@@ -1054,6 +1079,13 @@ watch(agentPushKey, (value, oldValue) => {
 .is-process-row .disclosure-icon { width: 13px; height: 13px; align-self: center; color: var(--work-faint); }
 .is-process-row .disclosure-icon svg { width: 13px; height: 13px; }
 .agent-process-error { flex: none; color: var(--ob-danger); font-size: 12px; white-space: nowrap; }
+.is-agent-launch .agent-icon { color: var(--work-text, var(--ob-text)); }
+.agent-launch-title { min-width: 0; overflow: hidden; color: var(--work-text, var(--ob-text)); text-overflow: ellipsis; white-space: nowrap; }
+.agent-launch-status { flex: none; color: var(--work-faint); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.agent-launch-sep { margin: 0 4px; }
+.agent-launch-status.tone-ok { color: var(--ob-success); }
+.agent-launch-status.tone-error { color: var(--ob-danger); }
+.agent-launch-status.tone-stopped, .agent-launch-status.tone-pending, .agent-launch-status.tone-partial { color: var(--ob-warning); }
 @media (hover: none) { .is-process-row .agent-summary-row { min-height: 32px; } .is-process-row .disclosure-icon { opacity: .6; } }
 .agent-summary-row::-webkit-details-marker { display: none; }
 .agent-icon, .agent-summary-status-icon, .disclosure-icon { display: grid; place-items: center; }

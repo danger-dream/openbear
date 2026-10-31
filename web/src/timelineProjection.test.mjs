@@ -14,6 +14,7 @@ import {
   isTerminalOperationFrame,
   projectOperationMessages,
   shouldApplyOperationFrame,
+  stableWaitingAgents,
   withTransientIdleThinking,
 } from "./timelineProjection.js";
 import {
@@ -1857,4 +1858,52 @@ test("TaskMemory summary carries action and target facts through lazy projection
   assert.equal(tool.calls[0].arguments, '{"action":"delete","memoryLabel":"记录案件要点","memoryUuid":"memory-123"}');
   assert.equal(tool.calls[0].previewArguments, '{"action":"delete","memoryLabel":"记录案件要点","memoryUuid":"memory-123"}');
   assert.equal("taskMemorySummary" in tool.calls[0], false);
+});
+
+test("a root turn waiting on Agents names each awaited task once", () => {
+  const activeRun = {opId: "run:root", opType: "run", turnId: "turn-root", displaySeq: 10, lifecycle: "active", status: "running", createdAtMs: 1000, payload: {status: "running"}};
+  const mergedCall = {opId: "agent:toolu-1", opType: "agent", turnId: "turn-root", taskUuid: "task-1", displaySeq: 20, lifecycle: "active", status: "running", createdAtMs: 2000, payload: {merged: true, args: JSON.stringify({description: "调用参数里的描述"})}};
+  const task = {opId: "agent:task-1", opType: "agent", turnId: "turn-root", taskUuid: "task-1", displaySeq: 21, lifecycle: "active", status: "running", createdAtMs: 2000, payload: {status: "running", task: {taskUuid: "task-1", title: "Go 浏览器引擎", status: "running"}}};
+  const continued = {opId: "tool:call-2", opType: "tool", turnId: "turn-root", displaySeq: 22, lifecycle: "active", status: "running", createdAtMs: 2100, payload: {name: "AgentContinue", taskUuid: "task-2", args: JSON.stringify({description: "复查一致性测试"})}};
+  const supervision = {opId: "agent-supervision:root", opType: "agent_supervision", turnId: "turn-root", displaySeq: 30, lifecycle: "active", status: "running", createdAtMs: 3000, payload: {active: true, statusText: "等待 Agent 事件"}};
+
+  const waiting = deriveOperationRunState([activeRun, mergedCall, task, continued, supervision]);
+  assert.deepEqual(waiting.waitingAgents, [{key: "task-1", title: "Go 浏览器引擎"}, {key: "task-2", title: "复查一致性测试"}]);
+  const turns = [{turnUuid: "turn-root", events: []}];
+  const row = withTransientIdleThinking(turns, waiting, {waitingLabel: waiting.waitingLabel, waitingAgents: waiting.waitingAgents})[0].events.at(-1);
+  assert.equal(row.waitingLabel, "等待 Agent 事件");
+  assert.deepEqual(row.waitingAgents, waiting.waitingAgents);
+
+  assert.deepEqual(deriveOperationRunState([activeRun, task, continued]).waitingAgents, [], "Agents running beside a working root are not awaited");
+  const woken = {...supervision, lifecycle: "terminal", status: "completed", payload: {active: false, statusText: "Agent 关键事件已唤醒主控"}};
+  assert.deepEqual(deriveOperationRunState([activeRun, task, woken]).waitingAgents, []);
+});
+
+test("repeated run-state syncs keep one waiting-Agent list until its content changes", async () => {
+  const {shallowRef, computed} = await import("vue");
+  const {readFileSync} = await import("node:fs");
+  const view = readFileSync(new URL("./views/consoleView/ConsoleView.vue", import.meta.url), "utf8");
+  assert.match(view, /runWaitingAgents\.value = stableWaitingAgents\(runWaitingAgents\.value, derived\.waitingAgents\);/);
+  const activeRun = {opId: "run:root", opType: "run", turnId: "turn-root", displaySeq: 10, lifecycle: "active", status: "running", createdAtMs: 1000, payload: {status: "running"}};
+  const task = {opId: "agent:task-1", opType: "agent", turnId: "turn-root", taskUuid: "task-1", displaySeq: 21, lifecycle: "active", status: "running", createdAtMs: 2000, payload: {status: "running", task: {taskUuid: "task-1", title: "Go 浏览器引擎", status: "running"}}};
+  const supervision = {opId: "agent-supervision:root", opType: "agent_supervision", turnId: "turn-root", displaySeq: 30, lifecycle: "active", status: "running", createdAtMs: 3000, payload: {active: true, statusText: "等待 Agent 事件"}};
+  const agents = shallowRef([]);
+  let projections = 0;
+  const projected = computed(() => { projections += 1; return agents.value.length; });
+  const sync = (ops) => { agents.value = stableWaitingAgents(agents.value, deriveOperationRunState(ops).waitingAgents); projected.value; };
+  sync([activeRun]); sync([activeRun]);
+  assert.equal(projections, 1, "an empty list stays the same empty list");
+  sync([activeRun, task, supervision]);
+  const first = agents.value;
+  assert.deepEqual(first, [{key: "task-1", title: "Go 浏览器引擎"}]);
+  sync([activeRun, task, supervision]);
+  assert.equal(agents.value, first);
+  assert.equal(projections, 2);
+  sync([activeRun, {...task, payload: {...task.payload, task: {...task.payload.task, title: "改名后的任务"}}}, supervision]);
+  assert.notEqual(agents.value, first);
+  assert.equal(agents.value[0].title, "改名后的任务");
+  assert.equal(projections, 3);
+  sync([activeRun]);
+  assert.deepEqual(agents.value, []);
+  assert.deepEqual(stableWaitingAgents(undefined, undefined), []);
 });

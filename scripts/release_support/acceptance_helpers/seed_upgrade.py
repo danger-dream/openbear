@@ -84,6 +84,14 @@ async def seed():
     for rel in ('openbear.json', 'workspace/acceptance-preserved.txt', 'skills/acceptance-preserved/SKILL.md', 'mcp-servers/acceptance-preserved.txt', 'data/acceptance-user-state.txt'):
         p = root / rel
         files[rel] = {'sha256': hashlib.sha256(p.read_bytes()).hexdigest(), 'mode': p.stat().st_mode & 0o777}
+    # A newer release may add its one-time feature switches to the config; the values
+    # already there are compared by digest, never exported.
+    config = json.loads((root / 'openbear.json').read_text())
+    features = config.pop('features', None)
+    files['openbear.json']['config'] = {
+        'sha256': hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest(),
+        'features': {k: v for k, v in features.items() if isinstance(v, bool)} if isinstance(features, dict) else None,
+    }
     result = {'version': installed_version(), 'root': str(root), 'dbPath': str(db_path), 'conversationUuid': row['conversation_uuid'], 'chatId': chat, 'files': files, 'tables': tables, 'additionalChecks': ['legacy-terminal-time'] if '--legacy-terminal-time' in sys.argv[3:] else []}
     result['heavyHistory'] = heavy_history
     report.write_text(json.dumps(result, ensure_ascii=False, indent=2))

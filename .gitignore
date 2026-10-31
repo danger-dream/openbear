@@ -34,6 +34,7 @@ workspace/
 .release-runs/
 .release-environment.json
 /gateway/bin/
+/node/bin/
 /gateway/gateway.json
 /gateway/state/
 /evals/
@@ -63,3 +64,12 @@ mcp-servers/
 *~
 bak/
 backups/
+
+# uv the installer/updater keeps in the install root when none is found
+/.tools/
+
+# ─── scripts/check.py 的状态、testmon 记录和日志 ─────────────
+/.check/
+
+# ─── 测试的编译缓存（Go、Vue 组件），不放内存盘 /tmp ──────────
+/.cache/

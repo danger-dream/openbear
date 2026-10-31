@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml uv.lock README.md ./
 COPY app/ ./app/
 COPY prompts/ ./prompts/
+COPY benchmark-package/ ./benchmark-package/
 COPY --from=frontend /source/web/dist/ ./web/dist/
 COPY scripts/container-entrypoint.sh /usr/local/bin/openbear-entrypoint
 # The repository is a virtual uv project: run its source via PYTHONPATH and

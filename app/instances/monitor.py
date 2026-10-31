@@ -89,11 +89,14 @@ async def monitor(service):
     await wait_for_startup(service)
     if service.recovery_task:
         await asyncio.shield(service.recovery_task)
-    last_cleanup = now()
+    # The first pass already refreshes the gateway status: a due (automatic) gateway
+    # update is found right after the controller starts.
+    last_cleanup = 0
     while not service.closing:
         try:
             await once(service)
             await gateway_upkeep(service)
+            await service.rotation_upkeep()
             if now()-last_cleanup >= 60000:
                 await cleanup(service)
                 # Refresh self-service account names without replaying cached passwords.

@@ -53,7 +53,7 @@ class OpenBearLLMError(Exception):
         self.status = int(status or self.upstream_status or self.transport_status or 0)
         self.protocol = protocol
         self.payload = redact_sensitive_text(str(payload or ""))[:4000]
-        self.summary = sanitize_user_facing_text(summary) if summary else ""
+        self.summary = sanitize_user_facing_text(summary, max_len=1200 if reason == "refusal" else 300) if summary else ""
         safe_root = sanitize_error_detail(root_cause or {})
         safe_attempts = sanitize_error_detail(attempts or [])
         safe_details = sanitize_error_detail(details or {})
@@ -108,7 +108,7 @@ class OpenBearLLMError(Exception):
         from app.llm.error_classify import user_message_for
         from app.llm.error_sanitize import sanitize_user_facing_text
         if self.summary:
-            return sanitize_user_facing_text(self.summary)
+            return sanitize_user_facing_text(self.summary, max_len=1200 if self.reason == "refusal" else 300)
         return user_message_for(self.reason, self.message)
 
     def public_detail(self) -> dict[str, Any]:
@@ -139,6 +139,7 @@ class AgentResult:
     # Actual response billing facts for this one physical provider request.
     service_tier: str = ""
     provider_cost_usd: float | None = None
+    finish_details: dict[str, Any] = field(default_factory=dict)
 
 
 def provider_billing_details(service_tier: Any, usage: Any) -> dict[str, Any]:
@@ -283,6 +284,7 @@ async def collect_backend_result(
                         result.native_output_items.extend(event.native_output_items or [])
                     elif event.kind == "finish":
                         result.finish_reason = event.finish_reason
+                        result.finish_details = dict(event.details.get('stopDetails') or {})
                     elif event.kind == "error":
                         if allow_partial and (result.text or result.reasoning):
                             return result, True, event.error or "stream error"
@@ -376,6 +378,7 @@ async def aggregate(stream: AsyncIterator[StreamEvent]) -> AgentResult:
             result.usage.merge(ev.usage)
         elif ev.kind == "finish":
             result.finish_reason = ev.finish_reason
+            result.finish_details = dict(ev.details.get('stopDetails') or {})
         elif ev.kind == "error":
             raise OpenBearLLMError.from_stream_event(ev)
     return result

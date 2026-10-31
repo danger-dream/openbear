@@ -392,6 +392,21 @@ class ContextManagementConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
+class WorkItemsConfig(BaseModel):
+    """Limits of the conversation task record and of what the model is shown from it."""
+
+    title_chars: int = Field(default=300, alias="titleChars", ge=50, le=2000)
+    quote_chars: int = Field(default=2000, alias="quoteChars", ge=200, le=20_000)
+    max_criteria: int = Field(default=20, alias="maxCriteria", ge=1, le=100)
+    max_evidence: int = Field(default=30, alias="maxEvidence", ge=1, le=200)
+    outline_chars: int = Field(default=6000, alias="outlineChars", ge=1000, le=50_000)
+    briefing_chars: int = Field(default=24_000, alias="briefingChars", ge=2000, le=200_000)
+    recent_edits: int = Field(default=5, alias="recentEdits", ge=0, le=50)
+    recent_edit_days: int = Field(default=7, alias="recentEditDays", ge=1, le=90)
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
 class AgentConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
@@ -703,6 +718,38 @@ class UIConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
 
+class FeaturesConfig(BaseModel):
+    """Optional controller features the user turns on in settings.
+
+    A missing value means "not decided yet" and counts as on, so an older or
+    hand-written config never silently loses a feature; startup writes the
+    one-time decision (see app.features) and from then on only the user flips it.
+    """
+
+    instances: bool | None = None
+    servers: bool | None = None
+
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+    def enabled(self, name: str) -> bool:
+        return getattr(self, name) is not False
+
+
+class UpdatesConfig(BaseModel):
+    """Which versions this controller takes, for itself and for its nodes.
+
+    prerelease: beta and rc versions are offered as well as releases (the controller's own
+    updater and the node builds it picks both read it). auto_update_nodes: nodes are
+    brought to the node build this controller picks without asking; it only acts while
+    the 主机 feature is on.
+    """
+
+    prerelease: bool = False
+    auto_update_nodes: bool = Field(default=False, alias="autoUpdateNodes")
+
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+
 from app.webhooks.contracts import WebhooksConfig
 
 
@@ -715,12 +762,15 @@ class Config(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     user_message_template: UserMessageTemplateConfig = Field(default_factory=UserMessageTemplateConfig, alias="userMessageTemplate")
     context_management: ContextManagementConfig = Field(default_factory=ContextManagementConfig, alias="contextManagement")
+    work_items: WorkItemsConfig = Field(default_factory=WorkItemsConfig, alias="workItems")
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig, alias="rath", validation_alias=AliasChoices("agents", "rath"))
     web: WebConfig = Field(default_factory=WebConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
+    updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)

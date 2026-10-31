@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
+import { nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, useId, watch } from "vue";
 import { useAdminPhone } from "../adminViewport.js";
 
 const props = defineProps({
@@ -46,6 +46,9 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", closeOutside);
   emit("mobile-header-ready", false);
 });
+// A kept-alive page is not mounted again when it comes back.
+onActivated(() => emit("mobile-header-ready", true));
+onDeactivated(() => { closeMore(); emit("mobile-header-ready", false); });
 </script>
 
 <template>

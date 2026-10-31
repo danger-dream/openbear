@@ -31,7 +31,7 @@ function page(newBackend) {
   const setup = descriptor.scriptSetup.content;
   const ast = parseJs(setup, {sourceType:'module'});
   const code = ast.program.body.filter(n=>n.type !== 'ImportDeclaration').map(n=>setup.slice(n.start,n.end)).join('\n');
-  const ctx = vm.createContext({...Vue, authMode:Vue.ref('controller'), onMounted:()=>{}, onBeforeUnmount:()=>{},
+  const ctx = vm.createContext({...Vue, authMode:Vue.ref('controller'), onMounted:()=>{}, onBeforeUnmount:()=>{}, applyFeatureSettings:()=>{},
     settingDisplayValue, settingStorageValue, settingRangeLabel, Api, apiError:e=>e.message,
     ElMessage:{error:e=>errors.push(e), success:()=>{}, info:()=>{}}, ElMessageBox:{},
     window:{location:{pathname:'/settings', search:'?section=system-settings'}}, URLSearchParams});

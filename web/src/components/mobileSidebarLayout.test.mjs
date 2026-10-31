@@ -5,10 +5,11 @@ import vm from 'node:vm';
 import postcss from 'postcss';
 import {parse} from '@vue/compiler-sfc';
 import {baseParse} from '@vue/compiler-dom';
-import {compile,createSSRApp,h,ref} from 'vue';
+import {compile,computed,createSSRApp,h,ref} from 'vue';
 import {renderToString} from 'vue/server-renderer';
 const app=fs.readFileSync(new URL('../App.vue',import.meta.url),'utf8');
 const component=fs.readFileSync(new URL('./MobileSidebarResources.vue',import.meta.url),'utf8');
+const desktop=fs.readFileSync(new URL('./SidebarDesktopNav.vue',import.meta.url),'utf8');
 const descriptor=parse(component).descriptor;
 const appCSS=postcss.parse(parse(app).descriptor.styles.map(s=>s.content).join('\n'));
 const gridCSS=postcss.parse(fs.readFileSync(new URL('./sidebarResources.css',import.meta.url),'utf8'));
@@ -44,13 +45,12 @@ test('top new-conversation button is hidden on desktop but retains its mobile to
 });
 
 test('desktop navigation/source order, new-conversation ownership, theme and version actions remain intact',()=>{
-  assert.match(app,/<nav class="sidebar-desktop-nav sidebar-resource-grid text-sm"[^>]*aria-label="资源与设置">/);
-  assert.match(app,/@click="closeReferenceShelf\(\); selectNav\(n.key\)"/);
-  assert.match(app,/@pointerenter="showReferenceShelf\(\$event,n.key\)"/);
+  assert.match(app,/<SidebarDesktopNav :items="desktopNav" :active="active" @select="closeReferenceShelf\(\); selectNav\(\$event\)"\s+@shelf-enter="showReferenceShelf" @shelf-leave="leaveReferenceShelf" @shelf-key="referenceNavKey" \/>/);
+  assert.match(desktop,/<nav class="sidebar-desktop-nav sidebar-resource-grid text-sm"[^>]*aria-label="资源与设置">/);
   const newButton=appNodes.find(n=>hasClass(n,'sidebar-new-session'));
   assert.match(newButton.loc.source,/@click="startConsoleNewSession"/);
   assert.match(app,/@command="chooseThemeMode"/);assert.match(app,/@click="openVersionDialog"/);
-  assert.match(app,/<MobileSidebarResources :items="nav\.filter\(item => !item\.headerOnly\)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf\(\); selectNav\(\$event\)">/);
+  assert.match(app,/<MobileSidebarResources :items="listedNav\.filter\(item => !item\.headerOnly\)" :active="active" :sidebar-open="sidebarOpen" @select="closeReferenceShelf\(\); selectNav\(\$event\)">/);
   assert.match(app,/<template #footer>[\s\S]*?class="sidebar-mobile-status"/);
   const closeButton=appNodes.find(n=>hasClass(n,'sidebar-close'));
   assert.match(closeButton.loc.source,/@click="closeSidebar"/);
@@ -102,7 +102,7 @@ test('both resource surfaces share three columns, quiet vertical tiles, inherite
   assert.equal(baseGridRules('.sidebar-resource-grid > .sidebar-resource-tile:focus-visible').outline,'2px solid var(--ob-chat-subtle)');
   assert.match(component,/sidebar-resources-grid sidebar-resource-grid/);
   assert.match(component,/font-size: 13px/);
-  assert.match(app,/sidebar-desktop-nav sidebar-resource-grid text-sm/);
+  assert.match(desktop,/sidebar-desktop-nav sidebar-resource-grid text-sm/);
   assert.match(app,/import "\.\/components\/sidebarResources.css"/);
   assert.match(component,/import "\.\/sidebarResources.css"/);
   let reduced=false;
@@ -117,32 +117,45 @@ test('desktop role-aware dock stays in one row without changing the mobile resou
   assert.equal(baseGridRules('.sidebar-resource-grid')['grid-template-columns'],'repeat(3, minmax(0, 1fr))');
 });
 
-test('desktop grid renders native buttons with Cron between docs and Skills, marks the active page and preserves all reference entry gestures',async()=>{
-  const r=runtime(),calls=[];
-  assert.deepEqual(Array.from(r.props.items,item=>item.key),['memory','secrets','docs','cron','skills','mcp','instances','settings']);
-  const markup=appNodes.find(n=>hasClass(n,'sidebar-desktop-nav')).loc.source;
-  const scope={desktopNav:r.props.items.filter(item=>item.key!=='settings'),active:'docs',closeReferenceShelf:()=>calls.push(['close']),selectNav:key=>calls.push(['select',key]),
-    showReferenceShelf:(event,key)=>calls.push(['hover',key,event]),leaveReferenceShelf:()=>calls.push(['leave']),referenceNavKey:(event,key)=>calls.push(['key',key,event])};
-  const compiled=compile(markup);let tree;
-  const ssr=createSSRApp({render(){tree=compiled.call(this,scope,[]);return tree;}});
+async function renderDesktop(items,active){
+  const calls=[],stored={};
+  const desktopDescriptor=parse(desktop).descriptor;
+  const context=vm.createContext({defineProps:()=>({items,active}),defineEmits:()=>((...args)=>calls.push(args)),ref,computed,
+    localStorage:{getItem:k=>stored[k]??null,setItem:(k,v)=>{stored[k]=v;}}});
+  vm.runInContext(desktopDescriptor.scriptSetup.content.replace(/^import .*;\n/gm,''),context);
+  const binding=vm.runInContext('({items:props.items,active:props.active,shown:shown.value,overflow:overflow.value,rest:rest.value,moreActive:moreActive.value,full:full.value,pinnedKeys:pinnedKeys.value,open:open.value,moreButton:null,emit,pin,unpin,go})',context);
+  const compiled=compile(desktopDescriptor.template.content);let tree;
+  const ssr=createSSRApp({render(){tree=compiled.call(this,binding,[]);return tree;}});
   ssr.component('ElIcon',{inheritAttrs:false,render:()=>h('i')});
+  ssr.component('MoreFilled',{render:()=>h('svg')});
+  ssr.component('FloatingPanel',{props:['open'],render(){return this.open?this.$slots.default?.():null;}});
   ssr.config.warnHandler=message=>assert.fail(message);
   const html=await renderToString(ssr);
-  const buttons=walk([tree]).filter(n=>n.type==='button');
-  assert.equal(buttons.length,7);
+  return {html,calls,buttons:walk([tree]).filter(n=>n.type==='button')};
+}
+test('desktop dock keeps five pinned destinations plus More once there are more than six, routing and reference gestures intact',async()=>{
+  const r=runtime();
+  assert.deepEqual(Array.from(r.props.items,item=>item.key),['memory','secrets','docs','cron','skills','mcp','instances','servers','settings']);
   const desktopItems=r.props.items.filter(item=>item.key!=='settings');
-  for(const [index,item] of desktopItems.entries()){
-    const button=buttons[index];
-    assert.equal(button.props.type,'button');
+  const view=await renderDesktop(desktopItems,'docs');
+  assert.deepEqual(view.buttons.map(b=>b.props['aria-label']||b.children?.at?.(-1)?.children),['记忆','凭证','文档','实例','主机','更多入口']);
+  const pinned=['memory','secrets','docs','instances','servers'].map(key=>desktopItems.find(item=>item.key===key));
+  for(const [index,item] of pinned.entries()){
+    const button=view.buttons[index];
     assert.equal(button.props.class,'sidebar-resource-tile');
     assert.equal(button.props['aria-current'],item.key==='docs'?'page':undefined);
-    assert.ok(html.includes(item.shortLabel||item.label));
-    button.props.onClick();assert.deepEqual(calls.slice(-2),[['close'],['select',item.key]]);
+    assert.ok(view.html.includes(item.shortLabel||item.label));
+    button.props.onClick();assert.deepEqual(view.calls.at(-1),['select',item.key]);
     const event={key:'ArrowRight',currentTarget:{}};
-    button.props.onPointerenter(event);assert.deepEqual(calls.at(-1),['hover',item.key,event]);
-    button.props.onPointerleave();assert.deepEqual(calls.at(-1),['leave']);
-    button.props.onKeydown(event);assert.deepEqual(calls.at(-1),['key',item.key,event]);
+    button.props.onPointerenter(event);assert.deepEqual(view.calls.at(-1),['shelf-enter',event,item.key]);
+    button.props.onPointerleave();assert.deepEqual(view.calls.at(-1),['shelf-leave']);
+    button.props.onKeydown(event);assert.deepEqual(view.calls.at(-1),['shelf-key',event,item.key]);
   }
+  assert.match(view.html,/--sidebar-resource-columns:6/);
+  for(const name of ['定时','Skills','MCP'])assert.doesNotMatch(view.html,new RegExp(`>${name}<`));
+  // Six or fewer destinations all stay in the row, with no More.
+  const few=await renderDesktop(desktopItems.filter(item=>!['instances','servers'].includes(item.key)),'docs');
+  assert.equal(few.buttons.length,6);assert.doesNotMatch(few.html,/更多/);
   const footerButton=appNodes.find(n=>hasClass(n,'sidebar-footer-settings'));
   assert.ok(footerButton,'footer contains dedicated desktop settings action');
   assert.match(footerButton.loc.source,/@click="closeReferenceShelf\(\); selectNav\('settings'\)"/);
@@ -175,7 +188,7 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
 });
 
 function runtime(){
-  const nav=vm.runInNewContext(app.slice(app.indexOf('const allNav = ['),app.indexOf('const nav = computed')).replace('const allNav =','result ='),{InstancesView:null,MemoryView:null,SecretsView:null,DocsView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null});
+  const nav=vm.runInNewContext(app.slice(app.indexOf('const allNav = ['),app.indexOf('const nav = computed')).replace('const allNav =','result ='),{InstancesView:null,ServersView:null,MemoryView:null,SecretsView:null,DocsView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null});
   const props={items:nav.filter(item=>!item.headerOnly),active:'docs',sidebarOpen:true},calls=[],mount=[],unmount=[],watchers=[];
   const media={matches:true,addEventListener(){},removeEventListener(){}};
   const context=vm.createContext({defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),ref,onMounted:fn=>mount.push(fn),onBeforeUnmount:fn=>unmount.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media}});
@@ -191,11 +204,11 @@ async function render(r){
   for(const name of ['Grid','ArrowUp'])app.component(name,{render:()=>h('svg')});
   const html=await renderToString(app);return{html,nodes:walk([tree,...slots])};
 }
-test('collapsed resource footer is one entry; expanded controller grid keeps all eight destinations, active page and click routing',async()=>{
+test('collapsed resource footer is one entry; expanded controller grid keeps all nine destinations, active page and click routing',async()=>{
   const r=runtime();let view=await render(r);
   assert.match(view.html,/资源与设置/);assert.doesNotMatch(view.html,/记忆管理|凭证库|MCP 管理/);
   vm.runInContext('menuOpen.value=true',r.context);view=await render(r);
-  const buttons=view.nodes.filter(n=>n.type==='button');assert.equal(buttons.length,9);
+  const buttons=view.nodes.filter(n=>n.type==='button');assert.equal(buttons.length,10);
   for(const [index,item] of r.props.items.entries()){
     assert.ok(view.html.includes(item.label));
     assert.equal(buttons[index+1].props['aria-current'],item.key==='docs'?'page':undefined);

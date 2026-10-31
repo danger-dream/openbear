@@ -24,7 +24,19 @@ from cryptography.fernet import Fernet, InvalidToken
 from markdown_it import MarkdownIt
 
 from app.memory.builtin import BuiltinMemoryClient
-from app.reference_policy import CONVERSATION_CONTENT_LIMIT, CONVERSATION_KINDS, CONVERSATION_MODE_REASONS, conversation_material
+from app.reference_policy import (
+    CONVERSATION_CONTENT_LIMIT,
+    CONVERSATION_KINDS,
+    CONVERSATION_MODE_REASONS,
+    conversation_material,
+)
+from app.reference_servers import (
+    SERVER_ID,
+    ServersUnavailable,
+    server_content,
+    server_index,
+    server_locator,
+)
 from app.tools.history import run_history_action
 from app.utils import estimate_tokens
 
@@ -33,7 +45,7 @@ REFERENCE_LINK = re.compile(r"\[((?:\\.|[^\[\]\\\n])*)\]\((openbear://ref/[^\s)]
 # linkify bare URLs, or recursively parse image alt text as explicit references.
 REFERENCE_MARKDOWN = MarkdownIt("default", {"html": False, "linkify": False})
 BUNDLE_FIELD = "openbear_reference_bundle"
-KINDS = {"mem", "doc", "secret", "chat", "turn", "message"}
+KINDS = {"mem", "doc", "secret", "chat", "turn", "message", "server"}
 MAX_REFERENCES = 30
 MENTION_NOTICE = "仅提及：仅提供名称和定位，未提供正文；不表示要求读取。"
 
@@ -71,6 +83,8 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
         if kind in {"mem", "doc", "secret"} and (
             not re.fullmatch(r"[1-9][0-9]*", identity) or int(identity) > 9223372036854775807
         ):
+            return None
+        if kind == "server" and not SERVER_ID.fullmatch(identity):
             return None
         if kind in {"turn", "message"} and (len(parts) != 3 or not parts[2]):
             return None
@@ -259,9 +273,21 @@ def _history_material(db_path: str, ref: dict, current: str) -> str:
 
 
 class ReferenceMaterials:
-    def __init__(self, db):
+    def __init__(self, db, servers=None):
         self.db = db
+        # The ServerService, or a callable returning it (None: no server references).
+        self._servers = servers
         self._cipher_instance: Fernet | None = None
+
+    async def _server_facts(self, ref: dict, *, owner: int, cache: dict) -> dict | None:
+        """The owner's live facts for one server; None when it no longer exists for them."""
+        if "index" not in cache:
+            service = self._servers() if callable(self._servers) else self._servers
+            try:
+                cache["index"] = await server_index(service, owner)
+            except ServersUnavailable as exc:
+                raise ReferenceError(exc.code, ref["label"], key=ref["key"]) from None
+        return cache["index"].get(ref["id"])
 
     def cipher(self) -> Fernet:
         try:
@@ -386,9 +412,27 @@ class ReferenceMaterials:
         ordered = sorted(refs, key=lambda ref: existing.get(ref["key"], len(existing)))
         used_chars = 0
         memory = BuiltinMemoryClient(self.db)
+        servers: dict = {}
         for original in ordered:
             ref = dict(original)
             history = None
+            if ref["kind"] == "server":
+                # Live facts, not a stored body: a deleted (or another owner's)
+                # server resolves to an explicit "no longer exists" fact.
+                facts = await self._server_facts(ref, owner=owner, cache=servers)
+                label = str(facts["name"]) if facts else ref["label"]
+                public = {**ref, "sourceLabel": label, "sensitive": False, "exists": facts is not None}
+                if ref.get("mode") == "mention":
+                    public["locator"] = server_locator(ref["id"], facts is not None)
+                    material = {"reference": public, "notice": MENTION_NOTICE}
+                    public["estimatedTokens"] = estimate_tokens(json.dumps(material, ensure_ascii=False))
+                else:
+                    content = server_content(facts, ref["id"])
+                    public.update(estimatedTokens=estimate_tokens(content), contentHash=hashlib.sha256(content.encode()).hexdigest())
+                    material = {"reference": public, "content": content}
+                by_requested[original["key"]] = public
+                materials.append(material)
+                continue
             if ref["kind"] in CONVERSATION_KINDS and (ref.get("mode") != "mention" or ref.get("modeReason")):
                 history = await asyncio.to_thread(
                     conversation_material, self.db.path, ref, owner=owner,

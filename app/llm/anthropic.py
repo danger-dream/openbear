@@ -354,6 +354,7 @@ class AnthropicBackend(LLMBackend):
         tool_input = ToolInputTracker()
         in_usage = Usage()
         stop_reason = ""
+        stop_details = {}
         message_stopped = False
 
         async for ev_name, data in self._client.post_sse(
@@ -449,6 +450,8 @@ class AnthropicBackend(LLMBackend):
                 d = data.get("delta") or {}
                 if d.get("stop_reason"):
                     stop_reason = d["stop_reason"]
+                if isinstance(d.get("stop_details"), dict):
+                    stop_details = dict(d["stop_details"])
                 u = data.get("usage") or {}
                 # message_delta usage is a cumulative snapshot, not an amount
                 # to add. Managed server tools may revise input/cache totals
@@ -493,7 +496,8 @@ class AnthropicBackend(LLMBackend):
             yield StreamEvent(kind="tool_call", tool_calls=calls)
         if not stop_reason and not message_stopped:
             raise OpenBearLLMError("Anthropic 流提前结束：未收到消息终态", retryable=True, protocol="anthropic")
-        yield StreamEvent(kind="finish", finish_reason="tool_calls" if calls else _norm_stop(stop_reason))
+        yield StreamEvent(kind="finish", finish_reason="tool_calls" if calls else _norm_stop(stop_reason),
+                          details={"stopDetails": stop_details} if stop_details else {})
 
     async def complete(
         self, messages: list[Message], *, model: str, system: str = "",
@@ -557,4 +561,6 @@ class AnthropicBackend(LLMBackend):
             cache_write_tokens=cache_write,
         )
         result.finish_reason = _norm_stop(data.get("stop_reason") or "")
+        if isinstance(data.get("stop_details"), dict):
+            result.finish_details = dict(data["stop_details"])
         return result

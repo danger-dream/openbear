@@ -8,7 +8,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import build, candidate, scope
+from . import build, candidate, node_compat, scope, versions
 from .common import Commands, ReleaseError, State, atomic_json, fingerprint, load, process_ticks, sha
 from .github import GitHub
 from .publication import asset_metadata, publish
@@ -53,6 +53,18 @@ def verified_build(result, root=None, identity=None):
         return False
 
 
+# Tests that build the Go node, drive a real Chrome, run the built Go gateway or call
+# ssh-keygen; the matrix images carry none of them, and gateway/bin is a build output
+# outside the exported source. The node's own tests run in the node release's Go container.
+NODE_TOOLCHAIN_SKIPS = (("tests.test_servers::", "Go toolchain is not available"),
+                        ("tests.test_servers_transfers::", "Go toolchain is not available"),
+                        ("tests.test_node_browser::", "needs Chrome"),
+                        ("tests.test_browser_engine_parity::", "needs google-chrome and Go"),
+                        ("tests.test_gateway_update::", "needs the built gateway program"),
+                        ("tests.test_instance_hardening::", "gateway binary not built"),
+                        ("tests.test_servers_hardening::", "ssh-keygen is not available"))
+
+
 def matrix_contract(results):
     backends = [results[name] for name in TEST_STAGES[:3]]
     suites = []
@@ -68,7 +80,9 @@ def matrix_contract(results):
                 # Real-upstream tests, and real-systemd tests that need PID 1 systemd
                 # (the matrix containers have none; A/B run the unit under systemd).
                 approved = ((name.startswith(("tests.test_live_parrot::", "tests.test_live_read_images::")) and "--run-live" in reason)
-                            or (name.startswith("tests.test_systemd_watchdog_live::") and "OPENBEAR_SYSTEMD_TEST=1" in reason))
+                            or (name.startswith("tests.test_systemd_watchdog_live::") and "OPENBEAR_SYSTEMD_TEST=1" in reason)
+                            or (name.startswith("tests.test_servers_bench_live::") and reason.endswith("set OPENBEAR_BENCH_LIVE=1 to run a real benchmark"))
+                            or any(name.startswith(module) and why in reason for module, why in NODE_TOOLCHAIN_SKIPS))
                 if not approved:
                     raise ReleaseError(f"Unexpected conditional skip requires review: {name}: {case.get('skipReason')}")
             elif case["status"] != "passed":
@@ -82,6 +96,9 @@ def matrix_contract(results):
 
 
 class Runner:
+    versioning = candidate.APP_VERSIONING
+    resume_command = "scripts/release.py resume"
+
     def __init__(self, repo: Path, directory: Path, value: dict, *, github=None, command=None):
         self.repo, self.directory = repo, directory
         self.state = State(directory, value)
@@ -128,18 +145,24 @@ class Runner:
             permission = self.github.api("")
             if not permission.get("permissions", {}).get("push"):
                 raise ReleaseError("GitHub credential lacks push access for the requested repository")
-            tag = "v" + self.value["version"]
+            version = versions.target(self.value["version"])
+            tag = "v" + version
             if self.github.api("/releases/tags/" + tag, missing=True) or self.github.api("/git/ref/tags/" + tag, missing=True):
                 raise ReleaseError("Version/tag already exists; do not start a duplicate release")
+            published = versions.published(self.github, "v")
+            versions.require_newer(version, published, "v")
+            # Upgrade acceptance and the change scope start from the latest release
+            # (/releases/latest never returns a pre-release): what users install.
             previous = self.github.api("/releases/latest")
             old = str(previous["tag_name"]).removeprefix("v")
-            if previous["draft"] or previous["prerelease"] or not candidate.VERSION_RE.fullmatch(old):
+            if previous["draft"] or previous["prerelease"] or not versions.written(old) or versions.prerelease(old):
                 raise ReleaseError("Previous release is not a stable formal version")
-            if tuple(map(int, old.split("."))) >= tuple(map(int, self.value["version"].split("."))):
+            if versions.versioning.compare(old, version) >= 0:
                 raise ReleaseError("Target version must exceed the actual previous formal release")
             self.value.update(previous=previous, previousVersion=old,
                               publicBase=self.github.api("/git/ref/heads/main")["object"]["sha"])
-            compare = f"https://github.com/{self.value['repository']}/compare/v{old}...{tag}"
+            base = versions.changelog_base(version, sorted({*published, old}, key=lambda v: versions.versioning.parse(v).key)) or old
+            compare = f"https://github.com/{self.value['repository']}/compare/v{base}...{tag}"
             notes = self.value["notes"]
             if "Full Changelog" in notes and compare not in notes:
                 raise ReleaseError("Release notes have an incorrect Full Changelog range")
@@ -147,6 +170,12 @@ class Runner:
                 self.value["notes"] = notes.rstrip() + f"\n\n**Full Changelog**: {compare}\n"
             (self.directory / "notes.md").write_text(self.value["notes"], encoding="utf-8")
             self.state.save()
+        if "nodeCompatibility" not in self.value:
+            # Advisory only: the node is optional and released on its own line.
+            self.value["nodeCompatibility"] = node_compat.check(self.repo, self.github, versions.prerelease(self.value["version"]))
+            self.state.save()
+            if not self.value["nodeCompatibility"]["ok"]:
+                print("Warning: " + self.value["nodeCompatibility"]["warning"], flush=True)
         if not self.value.get("previousSourceCommit"):
             ref = self.github.api("/git/ref/tags/v" + self.value["previousVersion"])["object"]
             if ref["type"] == "tag":
@@ -365,7 +394,8 @@ class Runner:
                   "wallSeconds": round(elapsed, 3), "scriptActiveSeconds": round(active, 3),
                   "outsideScriptSeconds": round(max(0, elapsed - active), 3), "lastError": value.get("lastError"),
                   "publication": stages.get("publication", {}).get("result"), "cleanup": value.get("cleanup"),
-                  "scope": value.get("scope"),
+                  "scope": value.get("scope"), "nodeCompatibility": value.get("nodeCompatibility"),
+                  "development": value.get("development"),
                   "developmentInstance": "No online dist update or service restart is performed by this entrypoint."}
         atomic_json(self.directory / "report.json", result)
         print(json.dumps({"runId": value["runId"], "completed": result["completed"], "report": str(self.directory / "report.json"),
@@ -387,17 +417,42 @@ class Runner:
             self.value["completed"] = True
             self.value.setdefault("completedAt", time.time())
 
+    def develop(self):
+        """After publication: the local version becomes the next minor's dev.1 (one local commit, never pushed).
+        Runs started before this rule (no startsDevelopment) are left as they finished."""
+        if not self.value.get("startsDevelopment"):
+            return None
+        if not self.value.get("development"):
+            try:
+                result = candidate.start_development(self.repo, self.state, self.command, self.versioning)
+            except BaseException as exc:
+                self.value["lastError"] = {"type": type(exc).__name__, "message": self.command.redact(str(exc)),
+                    "exitCode": getattr(exc, "code", 1), "published": True,
+                    "resume": f"{self.value['python']} {self.resume_command} {self.value['runId']}"}
+                self.state.save()
+                raise
+            print(f"Local version is now {result['version']} (local commit, not pushed)", flush=True)
+        self.value.pop("lastError", None)
+        self.state.save()
+        return self.value["development"]
+
+    def finish_published(self):
+        # A cleanup failure never invalidates successful publication.
+        self.command.recover_children()
+        self.finish_cleanup()
+        self.value.pop("lastError", None)
+        self.state.save()
+        try:
+            self.develop()
+        finally:
+            self.report()
+
     def run(self, *, approved=False):
-        if self.value.get("completed"):
+        if self.value.get("completed") and (self.value.get("development") or not self.value.get("startsDevelopment")):
             self.report()
             return
         if self.value.get("published"):
-            # A cleanup failure never invalidates successful publication.
-            self.command.recover_children()
-            self.finish_cleanup()
-            self.value.pop("lastError", None)
-            self.state.save()
-            self.report()
+            self.finish_published()
             return
         invocation = {"startedAt": time.time(), "pid": os.getpid(), "startTicks": process_ticks(os.getpid())}
         self.value.setdefault("invocations", []).append(invocation)
@@ -434,14 +489,15 @@ class Runner:
                     lambda: self.acceptance(case, approved))
             self.parallel(operations)
             candidate.assert_local(self.repo, self.value, self.command)
+            prerelease = versions.prerelease(self.value["version"])
             self.state.execute("publication", {"candidate": identity, "notes": self.value["notes"], "assets": package["assets"]},
-                               lambda: publish(self.directory, self.state, self.command, self.github))
+                               lambda: publish(self.directory, self.state, self.command, self.github, latest=not prerelease, prerelease=prerelease))
             self.value.pop("lastError", None)
             self.value["published"] = True
         except BaseException as exc:
             self.value["lastError"] = {"type": type(exc).__name__, "message": self.command.redact(str(exc)),
                 "exitCode": getattr(exc, "code", 130 if isinstance(exc, KeyboardInterrupt) else 1),
-                "resume": f"{self.value['python']} scripts/release.py resume {self.value['runId']}"}
+                "resume": f"{self.value['python']} {self.resume_command} {self.value['runId']}"}
             raise
         finally:
             self.command.cancel_all()
@@ -455,3 +511,7 @@ class Runner:
                 invocation["finishedAt"] = time.time()
                 self.state.save()
                 self.report()
+        try:
+            self.develop()
+        finally:
+            self.report()

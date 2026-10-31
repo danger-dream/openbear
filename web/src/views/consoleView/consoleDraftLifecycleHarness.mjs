@@ -25,6 +25,7 @@ async function consoleSetupCode() {
       b.onResolve({filter: /^element-plus$/}, () => ({path: 'messages', namespace: 'seam'}));
       b.onResolve({filter: /api\.js$/}, () => ({path: 'api', namespace: 'seam'}));
       b.onResolve({filter: /^@element-plus\/icons-vue$/}, () => ({path: 'icons', namespace: 'seam'}));
+      b.onResolve({filter: /\?url$/}, () => ({path: 'assetUrl', namespace: 'seam'}));
       b.onResolve({filter: /attachmentDraftStorage\.js$/}, a => a.importer === consoleFile
         ? {path: 'storage', namespace: 'seam'} : undefined);
       b.onLoad({filter: /.*/, namespace: 'seam'}, ({path: name}) => {
@@ -32,6 +33,7 @@ async function consoleSetupCode() {
           messages: 'export const ElMessage=__env.messages; export const ElMessageBox=__env.confirm;',
           api: 'export const Api=__env.api; export const apiError=e=>e.message||String(e); export const conversationWsUrl=id=>`ws://test/${id}`;',
           icons: Object.keys(require('@element-plus/icons-vue')).map(key => `export const ${key}={};`).join('\n'),
+          assetUrl: "export default '';",
           storage: `import {createAttachmentDraftStorage as actual, planAttachmentDraftRecord} from ${JSON.stringify(path.join(directory, 'attachmentDraftStorage.js'))}; export {planAttachmentDraftRecord}; export const createAttachmentDraftStorage=()=>actual({driver:__env.driver});`,
         }[name];
         return {contents, resolveDir: directory};

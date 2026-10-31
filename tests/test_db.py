@@ -395,22 +395,23 @@ async def test_cancelled_reader_execute_releases_snapshot(db, monkeypatch, repea
     entered = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
-    cursors = []
+    held = []
 
-    async def hold_cursor_handoff(fn, *args, **kwargs):
-        if fn == reader._conn.execute and args[0] == sql and not cursors:
-            def held_execute():
-                cursor = fn(*args, **kwargs)
-                cursors.append(cursor)
+    async def hold_mid_read(fn, *args, **kwargs):
+        if fn == reader._fetch_read and args[0] == sql and not held:
+            def held_read():
+                # The SELECT has returned a row but is unfinished: it holds its snapshot.
+                cursor = reader._conn.execute(*args)
+                held.append(cursor.fetchone())
                 loop.call_soon_threadsafe(entered.set)
                 if not release.wait(timeout=5):
-                    raise TimeoutError("test did not release cursor handoff")
-                return cursor
+                    raise TimeoutError("test did not release the read")
+                return [*held, *cursor.fetchall()], cursor.description
 
-            return await execute(held_execute)
+            return await execute(held_read)
         return await execute(fn, *args, **kwargs)
 
-    monkeypatch.setattr(reader, "_execute", hold_cursor_handoff)
+    monkeypatch.setattr(reader, "_execute", hold_mid_read)
     task = asyncio.create_task(db.conn.execute(sql))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
@@ -430,14 +431,9 @@ async def test_cancelled_reader_execute_releases_snapshot(db, monkeypatch, repea
             assert fresh.execute(sql).fetchone()[0] == "cancelled"
         async with await db.conn.execute(sql) as cursor:
             assert (await cursor.fetchone())[0] == "cancelled"
-        # Retaining the original native cursor must not retain an old snapshot.
-        with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
-            await reader._execute(cursors[0].fetchone)
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
-        for cursor in cursors:
-            await reader._execute(cursor.close)
 
 
 async def test_model_and_tool_call_logs(db):

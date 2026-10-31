@@ -173,8 +173,8 @@ def validate_document(doc):
     clone(doc)  # Reject non-JSON/NaN without filtering unknown fields.
 
 
-def compile_document(baseline, working, *, protocol, model_label='', available_tools=()):
-    """Return issues and a copy; never auto-complete tools or strip opaque state."""
+def compile_document(baseline, working, *, protocol, model_label='', available_tools=(), repair_reasoning=True):
+    """Compile a replayable view without modifying the lossless editor document."""
     validate_document(baseline)
     validate_document(working)
     doc = clone(working)
@@ -189,9 +189,15 @@ def compile_document(baseline, working, *, protocol, model_label='', available_t
     prefix_changed = doc['system'] != baseline['system'] or doc['tools'] != baseline['tools']
     base_ids = [e['entryId'] for e in baseline['entries']]
     origin = baseline.get('origin') or {}
+    route_changed = origin.get('protocol') != protocol or bool(origin.get('modelLabel') and model_label and origin['modelLabel'] != model_label)
+    cleaned, preserved, unsigned, projected, empty = [], [], [], [], set()
+    thinking_types = {'reasoning', 'thinking', 'redacted_thinking'}
     for index, entry in enumerate(doc['entries']):
         eid, m = entry['entryId'], entry['message']
         old = originals.get(eid, {})
+        if index >= len(base_ids) or base_ids[index] != eid or m != old:
+            prefix_changed = True
+        reset_reasoning = repair_reasoning and (prefix_changed or route_changed)
         role = m.get('role')
         native = m.get('native_output_items') or []
         calls = m.get('tool_calls') or []
@@ -240,7 +246,7 @@ def compile_document(baseline, working, *, protocol, model_label='', available_t
                     issue('native_conflict', '正文/工具调用与 Responses 原生块不一致，请明确解决冲突。', eid)
             except (ValueError, TypeError, KeyError) as exc:
                 issue('native_sync', str(exc), eid)
-        if native and not anthro:
+        if native and not anthro and not reset_reasoning:
             # Responses' readable reasoning summary is another representation;
             # editing it must not leave the actual outgoing summary unchanged.
             native_reasoning = [n for n in m['native_output_items'] if n.get('type') == 'reasoning']
@@ -269,6 +275,31 @@ def compile_document(baseline, working, *, protocol, model_label='', available_t
                     m['reasoning'] = summary_text(native_reasoning)
                 if prefix_changed or m != old:
                     issue('opaque_reasoning_unverified', 'Responses 原生推理已保留；修改可读内容不等于改写加密推理，也不能保证上游接受续接。', eid, 'warning')
+        signed = bool(m.get('signature')) or any(n.get('type') in {'thinking', 'redacted_thinking'} for n in native)
+        has_reasoning = signed or 'reasoning' in m or 'signature' in m or any(n.get('type') in thinking_types for n in native)
+        if reset_reasoning and has_reasoning:
+            m.pop('reasoning', None)
+            m.pop('signature', None)
+            if native:
+                dropped_responses_reasoning = any(n.get('type') == 'reasoning' for n in m['native_output_items'])
+                native = [n for n in m['native_output_items'] if n.get('type') not in thinking_types]
+                if dropped_responses_reasoning:
+                    # Under store=false the server never resolves replayed item ids,
+                    # but a msg_/fc_ id without its reasoning item can be rejected.
+                    # Pairing uses call_id, so a function_call keeps its id only
+                    # when it has no call_id to pair by.
+                    native = [{k: v for k, v in n.items() if k != 'id'}
+                              if n.get('type') == 'message' or (n.get('type') == 'function_call' and n.get('call_id'))
+                              else n for n in native]
+                if native:
+                    m['native_output_items'] = native
+                else:
+                    m.pop('native_output_items', None)
+            cleaned.append(eid)
+            signed = False
+            if role == 'assistant' and not m.get('content') and not m.get('tool_calls') and not native:
+                empty.add(eid)
+                continue
         calls = m.get('tool_calls') or []
         if role != 'tool' and pending:
             issue('missing_tool_results', '工具结果必须在下一条非工具消息之前完整回传。', eid)
@@ -293,27 +324,34 @@ def compile_document(baseline, working, *, protocol, model_label='', available_t
                 issue('tool_name_mismatch', '调用与结果的工具名不一致。', eid)
             else:
                 pending.pop(key)
-        signed = bool(m.get('signature')) or any(n.get('type') in {'thinking', 'redacted_thinking'} for n in native)
-        if index >= len(base_ids) or base_ids[index] != eid:
-            prefix_changed = True
         if signed:
             if prefix_changed or m != old:
                 issue('signed_prefix_changed', '签名/密文依赖原始回合和历史前缀；修改后不能保证续接。请撤销修改或显式删除本条及后续思考组。', eid)
             if origin.get('protocol') != protocol or (origin.get('modelLabel') and model_label and origin['modelLabel'] != model_label):
                 issue('signed_model_change', '签名思考不能保证跨模型/协议重放；请显式删除思考组后再切换。', eid)
-            issue('signature_unverified', '原样保留签名/密文，不代表已经通过上游验签。', eid, 'warning')
+            preserved.append(eid)
         if not native and m.get('reasoning') is not None and m.get('signature') is None:
-            issue('unsigned_reasoning', '无签名 reasoning 仅保留在文档；当前目标协议不保证采用。', eid, 'warning')
+            unsigned.append(eid)
         if native and ((anthro and protocol != 'anthropic') or (not anthro and protocol != 'responses')):
             portable = (all(n.get('type') in {'text', 'tool_use'} for n in native) if anthro else
                         all(n.get('type') in {'message', 'function_call'} and (n.get('type') != 'message' or all(b.get('type') in {'text', 'output_text'} for b in n.get('content', []))) for n in native))
             if portable:
                 m.pop('native_output_items', None)
-                issue('readable_native_projection', '目标协议使用已同步的通用正文/调用；原生可读块仍保存在原始编辑包，不放入本协议执行视图。', eid, 'warning')
+                projected.append(eid)
             else:
                 issue('native_protocol_mismatch', '目标协议不接受这组原生块；请显式删除思考/原生数据或选择原协议。', eid)
         if m != old:
             prefix_changed = True
+    if cleaned:
+        issue('reasoning_cleanup', f'框架已自动处理 {len(cleaned)} 组受编辑或模型切换影响的历史思考、签名和密文；保留正文、工具调用及返回，原始编辑稿和聊天记录不变。', severity='warning')
+    if preserved:
+        issue('signature_unverified', f'{len(preserved)} 组未受改动影响的签名思考已原样保留；是否接受续接由上游验证，无需逐条处理。', severity='warning')
+    if unsigned:
+        issue('unsigned_reasoning', f'{len(unsigned)} 条无签名思考仅保留在文档，目标协议不保证采用。', severity='warning')
+    if projected:
+        issue('readable_native_projection', f'{len(projected)} 条消息已自动适配为目标协议的正文和调用；原生数据保留在原始编辑包。', severity='warning')
+    if empty:
+        doc['entries'] = [entry for entry in doc['entries'] if entry['entryId'] not in empty]
     if pending:
         issue('missing_tool_results', '工具批次未闭合；不会自动补造返回值。异步 Responses 是专用模式，不是普通调用的例外。')
     if not any(x['severity'] == 'error' for x in issues):

@@ -8,8 +8,8 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, StrictBool, StrictStr, model_validator
 
 ACTIONS = {
-    "status": "Cached service/instance status; does not start a browser.",
-    "page": "op=list|new|adopt|close; new: url?; connects only the configured browser service and verifies the new page before navigation. adopt: page handle from list (confirmation). URLs resolve in the browser's network, not OpenBear's; localhost is browser-local.",
+    "status": "Cached service/instance status; does not start a browser. nodes lists server nodes that offer a browser (main controller only).",
+    "page": "op=list|new|adopt|close; new: url?; connects only the configured browser service and verifies the new page before navigation. new/list: node? = a server name or id from status to use that server's browser instead; every later operation on the page follows it. A node browser has that machine's network, logins and IP. adopt: page handle from list (confirmation). URLs resolve in the browser's network, not OpenBear's; localhost is browser-local.",
     "navigate": "op=goto|back|reload (default goto); goto requires url. Waits for DOMContentLoaded.",
     "snapshot": "target?, depth?, boxes?, interactive?, maxChars?. Returns versioned refs for this page. Re-snapshot after navigation/recovery.",
     "find": "text required, literal case-insensitive search in a fresh snapshot; target?, maxChars?. Returns new versioned refs.",
@@ -21,14 +21,21 @@ ACTIONS = {
     "console": "after: event cursor, default 0; bounded events and overflow marker. Events start when this worker binds the page.",
     "network": "after cursor for list; id and part=request-headers|response-headers|request-body|response-body for details. Bodies saved as artifacts; limited retention.",
     "evaluate": "expression: JavaScript function/expression executed ONLY in the web page; target optional. May have effects, is not inherently read-only, never automatically retried.",
-    "recover": "op=probe|connection|terminate|close|restart. page required except instance-level connection/restart; destructive operations require built-in confirmation. Does not replay the previous action.",
+    "recover": "op=probe|connection|terminate|close|restart. page required except instance-level connection/restart (node? selects a server node's browser); destructive operations require built-in confirmation. Does not replay the previous action.",
     "describe": "action: name to return full argument reference, or omit to list all. Not needed for ordinary page/snapshot/act calls.",
+}
+# Where no server node can offer a browser (a managed instance) the node references are left out.
+LOCAL_ACTIONS = {
+    **ACTIONS,
+    "status": "Cached service/instance status; does not start a browser.",
+    "page": "op=list|new|adopt|close; new: url?; connects only the configured browser service and verifies the new page before navigation. adopt: page handle from list (confirmation). URLs resolve in the browser's network, not OpenBear's; localhost is browser-local.",
+    "recover": "op=probe|connection|terminate|close|restart. page required except instance-level connection/restart; destructive operations require built-in confirmation. Does not replay the previous action.",
 }
 
 ALLOWED = {
     "status": set(),
     "describe": {"action"},
-    "page": {"op", "url"},
+    "page": {"op", "url", "node"},
     "navigate": {"op", "url"},
     "snapshot": {"target", "depth", "boxes", "interactive", "maxChars"},
     "find": {"target", "text", "depth", "maxChars"},
@@ -59,7 +66,7 @@ ALLOWED = {
     "console": {"after"},
     "network": {"after", "id", "part"},
     "evaluate": {"target", "expression"},
-    "recover": {"op"},
+    "recover": {"op", "node"},
 }
 OPS = {
     "page": {"list", "new", "adopt", "close"},
@@ -94,6 +101,7 @@ class Parameters(BaseModel):
     op: StrictStr | None = None
     action: StrictStr | None = None
     url: StrictStr | None = None
+    node: StrictStr | None = Field(default=None, min_length=1, max_length=120)
     target: StrictStr | None = None
     text: StrictStr | None = None
     key: StrictStr | None = None

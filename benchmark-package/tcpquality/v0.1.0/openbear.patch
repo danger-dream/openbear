@@ -1,0 +1,34 @@
+diff --git a/runTcpQuality-core.sh b/runTcpQuality-core.sh
+--- a/runTcpQuality-core.sh
++++ b/runTcpQuality-core.sh
+@@ -4941,6 +4941,9 @@
+   chain="TCPQ_TOS_$$_$RANDOM"
+ 
+   $USE_SUDO "$tool" -N "$chain" >/dev/null 2>&1 || return 1
++  SPEEDTEST_COUNTER_CHAIN="$chain"
++  SPEEDTEST_COUNTER_HOOK="$hook"
++  SPEEDTEST_COUNTER_TOOL="$tool"
+   $USE_SUDO "$tool" -I "$hook" 1 -j "$chain" >/dev/null 2>&1 || {
+     $USE_SUDO "$tool" -F "$chain" >/dev/null 2>&1 || true
+     $USE_SUDO "$tool" -X "$chain" >/dev/null 2>&1 || true
+@@ -5261,7 +5264,10 @@
+   } > "$debug_dir/${name}.meta.txt" 2>/dev/null || true
+ }
+ 
+-speedtest_run_probe() {
++speedtest_run_probe() (
++  trap speedtest_counter_stop_current EXIT
++  trap 'exit 130' INT
++  trap 'exit 143' TERM
+   local probe_type="$1" output_file="$2" server_ip="$3"
+   local before after nstat_retrans retrans start_bytes end_bytes start_packets end_packets packet_delta delta_bytes counter_enabled
+   local host key size timeout meta raw_file exit_code result parsed transfer_bytes partial_timeout probe_pid
+@@ -5559,7 +5565,7 @@
+   [[ "$display_connect_ms" =~ ^[0-9]+$ ]] && display_connect_ms=$((display_connect_ms * 2))
+   printf '%s|%s|%s|%s' "${result:-failed}" "$retrans" "$display_connect_ms" "$display_tls_ms"
+   return 0
+-}
++)
+ 
+ speedtest_applecdn_timeout() {
+   local timeout="$SPEEDTEST_TOS_TIMEOUT"

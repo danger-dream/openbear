@@ -4,6 +4,10 @@ Explain how the recommendation addresses the current problem: an external system
 
 Webhook supports both ongoing trigger rules and a particular in-progress task waiting for a specific callback. A directory-bound endpoint can create a new conversation for an event batch or deliver it to a permitted fixed conversation; a conversation-bound endpoint delivers to that conversation. Choose according to whether the work needs independent context, continuous processing or continuation of existing work.
 
+Event processing is unattended. By default it may only read servers and instances (Servers and InstanceControl read actions); `processing.allowServerChanges` lets it change them too. Leave it false unless the user explicitly asks for event-driven changes to servers or instances, and tell the user the risk: event content and what a server returns can mislead the run into a change. The permission follows where a turn came from: turns that continue a run (results of its Agents and background tasks, ConversationRequests and instance operations it started) have the run's permission, never more. A scheduled or Webhook run, including those turns, cannot turn it on, and cannot change, enable, resume or retry an endpoint or task that already has it.
+
+A new-conversation endpoint with frequent events accumulates many conversations. `target.conversationRetention` (`keepLast`, `keepDays`) deletes this endpoint's conversations once they exceed either limit; pinned, archived, moved and human-continued conversations, and those still being processed or notified, are kept. Deletion is permanent, so mention the option for busy endpoints but set it only when the user agrees that older event conversations need not be kept.
+
 A pre-execution script runs before an event reaches the model; it is not merely a format converter. When stable, programmable processing is available, proactively consider using it to:
 - Filter irrelevant events or events that do not meet the processing conditions, avoiding unnecessary model activation.
 - Complete processing directly under established rules and return a result that skips the model.

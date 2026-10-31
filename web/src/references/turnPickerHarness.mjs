@@ -10,6 +10,8 @@ import * as codec from './codec.js';
 import {searchReferences,acceptReferenceSizes,referencePolicyOptions} from './catalog.js';
 import * as sizePolicy from './sizePolicy.js';
 import {conversationMessages} from './conversationMessages.js';
+import * as servers from './servers.js';
+servers.setServerDirectoryLoader(async()=>({ok:true,enabled:true,items:[]}));
 
 const descriptor=parse(readFileSync(new URL('./ReferencePicker.vue',import.meta.url),'utf8')).descriptor;
 const settled=async()=>{await new Promise(setImmediate);await nextTick();};
@@ -22,7 +24,7 @@ export async function exerciseTurnPicker({source,currentConversation,pages,mode,
  const context=vm.createContext({computed,nextTick,ref,watch:(...args)=>{const stop=watch(...args);stops.push(stop);return stop;},
   defineProps:()=>props,defineEmits:()=>(...args)=>emitted.push(args),defineExpose:()=>{},
   referenceCatalog:{ready:true,connected:true,stale:false,includeArchived:false},includeArchivedReferences:()=>{},
-  searchReferences:(query,options)=>searchReferences(query,{...options,items:options.items||chats}),...codec,...sizePolicy,acceptReferenceSizes,referencePolicyOptions,conversationMessages,
+  searchReferences:(query,options)=>searchReferences(query,{...options,items:options.items||chats}),...codec,...sizePolicy,...servers,acceptReferenceSizes,referencePolicyOptions,conversationMessages,
   Api:{referenceHistory:async(id,offset=0)=>{requests.push([id,offset]);assert.equal(id,source.id);const index=offset===0?0:1;assert.equal(offset,index?pages[0].nextOffset:0);return pages[index];}},
  });
  const run=code=>vm.runInContext(code,context);

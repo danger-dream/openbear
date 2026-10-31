@@ -10,7 +10,7 @@ import {renderToString} from 'vue/server-renderer';
 import {parse, compileScript, compileStyle, compileTemplate} from '@vue/compiler-sfc';
 import {baseParse} from '@vue/compiler-dom';
 import postcss from 'postcss';
-import {mobileAssetsRuntime} from '../testHelpers/mobileAssets.mjs';
+import {mobileAssetsRuntime} from '../testing/mobileAssets.mjs';
 import {assetTimeLine, formatAssetTime} from '../utils/assetTime.js';
 import {mobileSelectOptions} from '../mobileSelect.js';
 

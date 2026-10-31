@@ -186,7 +186,9 @@ async def test_claude_full_blocks_round_trip_tool_filter_and_context_editor(stre
         edit['entries'][1]['message']['content'] = 'changed'
         _, issues = compile_document(doc, edit, protocol='anthropic', model_label='p/claude',
                                       available_tools=['lookup'])
-        assert 'signed_prefix_changed' in {issue['code'] for issue in issues}
+        assert 'reasoning_cleanup' in {issue['code'] for issue in issues}
+        assert 'signed_prefix_changed' not in {issue['code'] for issue in issues}
+        assert 'native_conflict' in {issue['code'] for issue in issues}
     finally:
         await client.close()
 

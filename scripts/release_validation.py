@@ -69,6 +69,22 @@ def normalize_version(value: Any) -> str:
     return text[1:] if text[:1].lower() == "v" else text
 
 
+_PEP440_RE = re.compile(r"(\d+\.\d+\.\d+)(?:(b|rc)([1-9]\d*)|\.dev([1-9]\d*))?")
+
+
+def uv_lock_version(value: Any) -> str:
+    """uv.lock holds uv's PEP 440 spelling (1.2.0b1, 1.2.0rc1, 1.2.0.dev3); the
+    other version files hold OpenBear's (1.2.0-beta.1, 1.2.0-rc.1, 1.2.0-dev.3)."""
+    text = normalize_version(value)
+    match = _PEP440_RE.fullmatch(text)
+    if not match:
+        return text
+    base, label, number, dev = match.groups()
+    if dev:
+        return f"{base}-dev.{dev}"
+    return f"{base}-{'beta' if label == 'b' else 'rc'}.{number}" if label else base
+
+
 def resolve_storage_db_path(install_root: Path, config_path: Path | None = None) -> Path:
     """Resolve storage.dbPath with the same default/cwd meaning as ``app.config``."""
     root = Path(install_root).resolve()
@@ -439,7 +455,7 @@ def _read_versions(root: Path) -> dict[str, str]:
             raise ReleaseValidationError(f"uv.lock 无效: {exc}") from exc
         if len(own_versions) != 1:
             raise ReleaseValidationError("uv.lock 必须包含唯一 openbear package")
-        versions["uv.lock"] = normalize_version(own_versions[0])
+        versions["uv.lock"] = uv_lock_version(own_versions[0])
 
     meta_path = root / "release-meta.json"
     if meta_path.is_file():

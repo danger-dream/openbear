@@ -15,7 +15,7 @@ let Component;
 try { const compiled=compileScript(descriptor,{id:'ce-test'}).content.replace("import './contextEditor/style.css';",'').replace("onBeforeUnmount(() => { disposed = true; generation++; emit('open-change', false); });",'void 0;');
   await writeFile(generated,compiled); ({default:Component}=await import(generated.href));
 } finally { await unlink(generated).catch(()=>{}); }
-const original={};for(const k of ['contextEditor','previewContextEditor','saveContextEditorDraft','createContextEditorBranch']) original[k]=Api[k];
+const original={};for(const k of ['contextEditor','previewContextEditor','saveContextEditorDraft','createContextEditorBranch','saveContextEditor']) original[k]=Api[k];
 after(()=>{for(const [k,v] of Object.entries(original)) Api[k]=v;});
 function deferred(){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};}
 function sample(id='u'){return {format:'openbear-context-edit/1',revision:1,origin:{protocol:'responses'},runtime:{frozen:true},system:`system-${id}`,tools:[],entries:[{entryId:id,message:{role:'user',content:'hello'}}]};}
@@ -76,13 +76,14 @@ test('older Safari can add a message and tool call using getRandomValues without
   assert.equal(vm.entityError.value,'');assert.equal(vm.entry.value.message.tool_calls[0].name,'Read');
  } finally {scope.stop();Object.defineProperty(globalThis,'crypto',descriptor);}
 });
-test('loading, draft isolation, late responses never overwrite another conversation',async()=>{
- const first=deferred();Api.contextEditor=key=>key==='one'?first.promise:Promise.resolve(reply(key));
+test('switching reads nothing until opened; drafts are isolated and late responses never overwrite another conversation',async()=>{
+ const first=deferred(),reads=[];Api.contextEditor=key=>{reads.push(key);return key==='one'?first.promise:Promise.resolve(reply(key));};
  const {scope,props,vm,exposed}=setup();exposed.open();assert.equal(vm.loading.value,true);
- props.conversationUuid='two';await settle();assert.equal(vm.doc.value.system,'system-two');
+ props.conversationUuid='two';await settle();assert.deepEqual(reads,['one']);assert.equal(vm.opened.value,false);assert.equal(vm.loading.value,false);
+ exposed.open();await settle();assert.deepEqual(reads,['one','two']);assert.equal(vm.doc.value.system,'system-two');
  first.resolve(reply('one'));await settle();assert.equal(vm.doc.value.system,'system-two');
  vm.setField('system','draft-two');assert.equal(vm.doc.value.system,'draft-two');exposed.close();exposed.open();assert.equal(vm.doc.value.system,'draft-two');
- props.conversationUuid='one';await settle();assert.equal(vm.doc.value.system,'system-one');
+ props.conversationUuid='one';await settle();exposed.open();await settle();assert.equal(vm.doc.value.system,'system-one');
  props.conversationUuid='two';await settle();assert.equal(vm.doc.value.system,'draft-two');scope.stop();
 });
 test('server preview is prerequisite; mutations/target changes invalidate it; creation only emits actual server conversation',async()=>{
@@ -113,9 +114,9 @@ test('server draft revision is used verbatim; late save cannot overwrite another
  const {scope,props,vm,exposed}=setup();exposed.open();await settle();
  assert.equal(vm.doc.value.system,'restored');assert.equal(vm.state.value.mode,'raw');
  vm.setField('system','new draft');const p=vm.saveDraft();assert.equal(requests[0].data.revision,7);assert.equal(requests[0].data.snapshotToken,'source-1');
- props.conversationUuid='two';await settle();save.resolve({ok:true,draft:{revision:8}});await p;
+ props.conversationUuid='two';await settle();exposed.open();await settle();save.resolve({ok:true,draft:{revision:8}});await p;
  assert.equal(vm.doc.value.system,'system-two');assert.equal(vm.state.value.revision,0);
- props.conversationUuid='one';await settle();assert.equal(vm.doc.value.system,'new draft');assert.equal(vm.state.value.revision,8);scope.stop();
+ props.conversationUuid='one';await settle();exposed.open();await settle();assert.equal(vm.doc.value.system,'new draft');assert.equal(vm.state.value.revision,8);scope.stop();
 });
 test('preview retains actionable validation without a permanent inspector, including null payload and local repair navigation',async()=>{
  Api.contextEditor=key=>Promise.resolve(reply(key));
@@ -141,14 +142,45 @@ test('preview retains actionable validation without a permanent inspector, inclu
  assert.match(styles,/\.ce-preview-validation \{/);
  scope.stop();
 });
-test('snapshot label spells out memory freeze and compression behavior',()=>{
- assert.match(text,/冻结快照 · \{\{ doc\.entries\.length \}\} 条消息<\/summary><p>分支冻结系统提示、工具定义及已有记忆；不会自动注入新的任务记忆；仍遵循会话压缩设置<\/p>/);
- assert.match(styles,/\.ce-snapshot-summary summary/);
+test('save original requires fresh preview and confirmation, keeps identity and updates the clean baseline',async()=>{
+ Api.contextEditor=async key=>reply(key);Api.previewContextEditor=async(key,data)=>({ok:true,payload:{input:[]},issues:[],document:data.working});
+ const requests=[],wait=deferred();Api.saveContextEditor=(key,data)=>{requests.push({key,data});return wait.promise;};
+ const {scope,vm,exposed,events}=setup();exposed.open();await settle();
+ vm.setField('system','edited');vm.askSaveOriginal();assert.equal(vm.dialog.value,null);assert.match(vm.error.value,/预览/);
+ await vm.preview();assert.equal(vm.saveReady.value,true);vm.askSaveOriginal();assert.equal(vm.dialog.value.kind,'apply');assert.equal(requests.length,0);
+ const saving=vm.confirmDelete();assert.equal(requests.length,1);assert.equal(requests[0].key,'one');assert.equal(requests[0].data.revision,0);assert.equal(requests[0].data.snapshotToken,'token-one');
+ vm.setField('system','must not race');assert.equal(vm.doc.value.system,'edited');assert.equal(vm.saveReady.value,false);
+ const result={...reply('one'),baseline:structuredClone(requests[0].data.working),snapshotToken:'saved-token',draft:{revision:1},conversation:{conversationUuid:'one'}};wait.resolve(result);await saving;
+ assert.equal(vm.doc.value.system,'edited');assert.equal(vm.state.value.snapshotToken,'saved-token');assert.equal(vm.state.value.revision,1);assert.equal(vm.changes.value.length,0);assert.equal(vm.opened.value,true);assert.equal(vm.branchTitle.value,'');
+ assert.deepEqual(events.filter(e=>e[0]==='saved'),[['saved',{conversationUuid:'one'}]]);assert.equal(events.filter(e=>e[0]==='created').length,0);assert.match(vm.notice.value,/原始聊天/);
+ assert.match(text,/保存副本/);assert.match(text,/保存到原会话/);scope.stop();
 });
-test('component entry matches rail, theme and overlay constraints',()=>{
- assert.match(styles,/--console-float-rail-top,48% - 3\.25rem/);assert.match(text,/<el-tooltip v-if="uuid && !opened"/);
- assert.match(text,/class="context-editor-entry"/);assert.match(text,/class="context-editor ce-surface"/);assert.match(text,/defineExpose\(\{open, close\}\)/);
- assert.ok(!text.includes('localStorage'));
+test('original save rejects busy, raw, stale and invalid contexts; conflicts preserve the working copy',async()=>{
+ Api.contextEditor=async key=>reply(key);Api.previewContextEditor=async()=>({ok:true,payload:{input:[]},issues:[]});let calls=0;
+ Api.saveContextEditor=async()=>{calls++;throw {response:{status:409,data:{error:'context_source_changed'}}};};
+ const {scope,vm,props,exposed}=setup();exposed.open();await settle();vm.setField('system','keep');await vm.preview();
+ props.busy=true;await vm.saveOriginal();assert.equal(calls,0);props.busy=false;
+ vm.setting('mode','raw');await vm.saveOriginal();assert.equal(calls,0);vm.setting('mode','compatible');await vm.preview();
+ vm.askSaveOriginal();vm.setField('system','new edit');await vm.confirmDelete();assert.equal(calls,0);assert.match(vm.error.value,/预览/);
+ await vm.preview();await vm.saveOriginal();assert.equal(calls,1);assert.match(vm.error.value,/409/);assert.equal(vm.doc.value.system,'new edit');
+ vm.state.value={...vm.state.value,latestSource:reply('one')};await vm.saveOriginal();assert.equal(calls,1);assert.match(vm.error.value,/新内容/);scope.stop();
+});
+test('late original-save completion updates only its own unchanged cached editor',async()=>{
+ let applied=null;Api.contextEditor=async key=>key==='one' && applied ? applied : reply(key);Api.previewContextEditor=async()=>({ok:true,payload:{input:[]},issues:[]});const wait=deferred();Api.saveContextEditor=()=>wait.promise;
+ const {scope,vm,props,exposed,events}=setup();exposed.open();await settle();vm.setField('system','saved edit');await vm.preview();const saved=vm.saveOriginal();
+ props.conversationUuid='two';await settle();exposed.open();await settle();assert.equal(vm.doc.value.system,'system-two');applied={...reply('one'),baseline:{...sample('one'),system:'saved edit'},snapshotToken:'applied',draft:{revision:1},conversation:{conversationUuid:'one'}};wait.resolve(applied);await saved;
+ assert.equal(vm.doc.value.system,'system-two');assert.equal(events.filter(e=>e[0]==='saved').length,0);
+ props.conversationUuid='one';await settle();exposed.open();await settle();assert.equal(vm.doc.value.system,'saved edit');assert.equal(vm.state.value.snapshotToken,'applied');scope.stop();
+});
+test('automatic reasoning repair is informational, leaves the editor lossless and does not block either save target',async()=>{
+ const data=reply('one');data.baseline.entries.push({entryId:'signed',message:{role:'assistant',content:'answer',reasoning:'historic thinking',signature:'historic signature'}});
+ Api.contextEditor=async()=>data;const repairText='框架已自动处理 25 组受编辑影响的历史思考、签名和密文';
+ Api.previewContextEditor=async()=>({ok:true,payload:{input:[{role:'assistant',content:'answer'}]},issues:[{code:'reasoning_cleanup',severity:'warning',entryId:'',text:repairText}]});
+ const {scope,vm,exposed}=setup();exposed.open();await settle();vm.setField('system','edited prefix');await vm.preview();
+ assert.equal(vm.automaticRepair.value.text,repairText);assert.equal(vm.serverIssues.value.length,1);assert.equal(vm.serverErrors.value.length,0);assert.equal(vm.saveReady.value,true);
+ assert.equal(vm.doc.value.entries[1].message.signature,'historic signature');assert.equal(vm.doc.value.entries[1].message.reasoning,'historic thinking');
+ assert.equal(vm.issueTarget(vm.automaticRepair.value),'');vm.askSaveOriginal();assert.equal(vm.dialog.value.kind,'apply');
+ assert.match(text,/v-if="automaticRepair" class="ce-help" role="status"/);scope.stop();
 });
 
 test('tool table filters retain original indexes; dialogs are transactional and preserve unknown fields',async()=>{
@@ -180,7 +212,7 @@ test('text commits target the originating message; duplicate and stale cross-con
  vm.choose('one');vm.choose('system');vm.commitText({scope:'one',id:'one',field:'content',value:'last edit'});
  assert.equal(vm.doc.value.entries[0].message.content,'last edit');assert.equal(vm.doc.value.system,'system-one');assert.equal(vm.state.value.undo.length,1);
  vm.commitText({scope:'one',id:'one',field:'content',value:'last edit'});assert.equal(vm.state.value.undo.length,1);
- props.conversationUuid='two';await settle();vm.commitText({scope:'one',id:'system',field:'system',value:'stale'});assert.equal(vm.doc.value.system,'system-two');scope.stop();
+ props.conversationUuid='two';await settle();exposed.open();await settle();vm.commitText({scope:'one',id:'system',field:'system',value:'stale'});assert.equal(vm.doc.value.system,'system-two');scope.stop();
 });
 
 test('invalid raw JSON stays visible; valid raw applies before navigation and server save',async()=>{

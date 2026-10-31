@@ -7,6 +7,7 @@ import { authMode } from '../authMode.js';
 import ModelOrderPicker from "../components/ModelOrderPicker.vue";
 import DeviceNotifications from "../pwa/DeviceNotifications.vue";
 import { settingDisplayValue, settingStorageValue, settingRangeLabel } from "./settingsDisplay.js";
+import { applyFeatureSettings } from "../featureToggles.js";
 
 const webhookEnvironment = ref(null);
 const webhookSettingFailures = reactive({});
@@ -71,11 +72,14 @@ const vAutofocus = {
 const domainIcons = {
   agent: 'M8 4h8v4H8zM5 8h14v12H5zM9 12v2m6-2v2M9 17h6M2 11v5m20-5v5',
   tools: 'm8 5-5 7 5 7m8-14 5 7-5 7M14 3l-4 18',
+  work_items: 'M4 6h2M4 12h2M4 18h2M9 6h11M9 12h11M9 18h11',
   browser: 'M3 4h18v16H3zM3 9h18M7 6.5h.01M11 6.5h.01',
   memory: 'M5 3h14v18H5zM9 7h6M9 11h6M9 15h4',
   media: 'M3 4h18v16H3zM3 16l5-5 4 4 3-3 6 6M16 8h.01',
   web: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18',
   interface: 'M3 4h18v16H3zM3 9h18M9 9v11',
+  features: 'M8 7h8a5 5 0 0 1 0 10H8A5 5 0 0 1 8 7m8 2.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5',
+  updates: 'M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4M12 8v4l3 2',
   webhooks: 'M4 7h16m-4-4 4 4-4 4M20 17H4m4-4-4 4 4 4',
 };
 
@@ -89,7 +93,7 @@ function matchesQuery(spec) {
 const managedMaintenancePaths = new Set(['web.enabled', 'web.host', 'web.port', 'tools.skillsDir', 'mcp.installDir', 'media.downloadDir', 'web.loginRequestTtlSeconds']);
 function settingAvailable(spec) {
   if (!spec) return false;
-  if (authMode.value !== 'controller' && (spec.group === 'web_notifications' || /^(telegram\.|web\.(taskNotifications|interactionNotifications)\.)/.test(spec.path))) return false;
+  if (authMode.value !== 'controller' && (spec.group === 'web_notifications' || spec.group === 'features' || spec.group === 'updates' || /^(telegram\.|web\.(taskNotifications|interactionNotifications)\.)/.test(spec.path))) return false;
   return !['managed', 'gateway'].includes(authMode.value) || !managedMaintenancePaths.has(spec.path);
 }
 function specsForSection(section) {
@@ -160,7 +164,10 @@ function namingCallPlan() {
   return `调用顺序：${order.join(" → ")}。${unused ? `当前有 ${selected.length} 个可用候选，但最多调用 ${attempts} 次，后 ${unused} 个不会被使用。` : ""}${unavailable ? `${unavailable} 个不可用候选会被跳过。` : ""}`;
 }
 
+// 实例/主机 switches: only an explicit false is off (null = not decided yet = on).
+function isFeatureSwitch(spec) { return spec?.kind === "bool" && spec.group === "features"; }
 function normalizeDraftValue(spec, value) {
+  if (isFeatureSwitch(spec)) return value !== false;
   if (spec?.kind === "bool") return Boolean(value);
   if (spec?.kind === "multi") return Array.isArray(value) ? [...value] : [];
   if (isPromptEditorSpec(spec) && (value == null || (spec.editor === 'prompt' && value === ""))) return builtinPrompt(spec);
@@ -175,7 +182,7 @@ function hydrateDraft() {
 function displayedValue(spec) {
   if (spec.sensitive && masked.value[spec.path]) return values.value[spec.path] || "已设置";
   const value = values.value[spec.path];
-  if (spec.kind === "bool") return value ? "开" : "关";
+  if (spec.kind === "bool") return (isFeatureSwitch(spec) ? value !== false : value) ? "开" : "关";
   if (spec.kind === "multi") {
     const selected = Array.isArray(value) ? value : [];
     if (!selected.length) return "未选择事件";
@@ -192,7 +199,7 @@ function isDirty(spec) {
   if (isPromptEditorSpec(spec)) {
     return String(draft[spec.path] || "") !== String(normalizeDraftValue(spec, values.value[spec.path]));
   }
-  const original = spec.displayScale > 1 || spec.path.startsWith('webhooks.') ? normalizeDraftValue(spec, values.value[spec.path]) : values.value[spec.path];
+  const original = spec.displayScale > 1 || spec.path.startsWith('webhooks.') || isFeatureSwitch(spec) ? normalizeDraftValue(spec, values.value[spec.path]) : values.value[spec.path];
   return JSON.stringify(draft[spec.path]) !== JSON.stringify(original);
 }
 function inputPlaceholder(spec) {
@@ -236,6 +243,7 @@ async function load() {
     }
     revealNotificationDomain();
     values.value = settingsData.values || {};
+    applyFeatureSettings(values.value);
     masked.value = settingsData.masked || {};
     usingBuiltin.value = settingsData.usingBuiltin || {};
     revision.value = settingsData.revision || 0;
@@ -279,6 +287,7 @@ async function save(spec, overrideValue = undefined) {
     const fresh = await Api.settings();
     okOrThrow(fresh);
     values.value = fresh.values || {};
+    applyFeatureSettings(values.value);
     masked.value = fresh.masked || {};
     usingBuiltin.value = fresh.usingBuiltin || {};
     revision.value = fresh.revision || data.revision || revision.value;

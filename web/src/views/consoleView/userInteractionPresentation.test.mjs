@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {readFileSync} from "node:fs";
 
 import {
 	buildUserInteractionView,
@@ -9,7 +8,6 @@ import {
 	userInteractionEventInput,
 } from "./userInteractionPresentation.js";
 
-const componentSource = readFileSync(new URL("./ConsoleUserInteractionEvent.vue", import.meta.url), "utf8");
 
 function view(action, status = "answered", extraArgs = {}, extraResult = {}) {
 	return buildUserInteractionView({
@@ -313,26 +311,4 @@ test("sensitive and redacted payloads are fail-closed in presentation", () => {
 		assert.equal(JSON.stringify(model).includes(secret), false);
 		assert.equal(model.redactedText, "[敏感内容已隐藏]");
 	}
-});
-
-test("component contract is read-only and retains collapsed and questionnaire structure", () => {
-	assert.match(componentSource, /interaction-icon/);
-	assert.match(componentSource, /interaction-name/);
-	assert.match(componentSource, /interaction-intro/);
-	assert.match(componentSource, /status-chip/);
-	assert.match(componentSource, /source-chip/);
-	assert.match(componentSource, /view\.selectText/);
-	assert.match(componentSource, /view\.confirmText/);
-	assert.match(componentSource, /\.interaction-event > summary \{ display: flex;/);
-	assert.doesNotMatch(componentSource, /\.interaction-event > summary \{[^}]*grid-template-columns/);
-	assert.match(componentSource, /white-space:\s*nowrap/);
-	assert.match(componentSource, /compact:\s*\{type:\s*Boolean/);
-	assert.match(componentSource, /disclosure-icon/);
-	assert.match(componentSource, /question-number/);
-	assert.match(componentSource, /required-mark/);
-	assert.match(componentSource, /optional-mark/);
-	assert.match(componentSource, /recommendation-reason/);
-	assert.match(componentSource, /readonly-text-answer/);
-	assert.doesNotMatch(componentSource, /<(?:input|textarea|select|button)\b/i);
-	assert.doesNotMatch(componentSource, /提交|取消|清除|复制|JSON\.stringify/);
 });

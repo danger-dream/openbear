@@ -27,6 +27,7 @@ def put(path, text):
 def fixture_source(root, version="1.2.4"):
     put(root / "app/__init__.py", f'__version__ = "{version}"\n')
     put(root / "prompts/main.tpl", "hello")
+    shutil.copytree(ROOT / "benchmark-package", root / "benchmark-package", dirs_exist_ok=True)
     put(root / "pyproject.toml", f'[project]\nname="openbear"\nversion="{version}"\n')
     put(root / "uv.lock", f'version=1\n[[package]]\nname="openbear"\nversion="{version}"\nsource={{virtual="."}}\n')
     for name in ("openbear.service", "openbear.json.example", "README.md"):
@@ -45,6 +46,10 @@ def fixture_source(root, version="1.2.4"):
     put(root / "web/scripts/patch.mjs", "// actual lifecycle input\n")
     put(root / "web/src/main.js", "// frontend\n")
     put(root / "tests/test_example.py", "# test input, not package content\n")
+    # Public node source; it is released separately and never enters the ZIP.
+    put(root / "node/go.mod", "module openbear/node\n")
+    put(root / "node/VERSION", "1.0.0\n")
+    put(root / "node/cmd/openbear-node/main.go", "package main\n")
     return root
 
 
@@ -363,10 +368,13 @@ def test_package_actual_candidate_classifier_validator_unique_zip_and_smoke(conf
     with zipfile.ZipFile(assets / "openbear-1.2.4.zip") as archive:
         names = archive.namelist()
         assert "scripts/runtime.py" in names
+        assert "benchmark-package/ip.check.place/v0.1.0/main/ref/cookies.txt" in names
+        assert "benchmark-package/tcpquality/v0.1.0/manifest.json" in names
         assert "scripts/smoke_release_login.py" in names
         assert "scripts/release.py" not in names
         assert "scripts/release_local.py" not in names
         assert not any(n.startswith(("scripts/release_support/", "tests/")) for n in names)
+        assert not any(n.startswith("node/") or n.rsplit("/", 1)[-1].startswith("openbear-node") for n in names)
         assert json.loads(archive.read("release-meta.json"))["comparedWith"] == "1.2.3"
     assert result["classification"]["effect"] in ("restart", "refresh", "noop")
     again = stage(config, "package")

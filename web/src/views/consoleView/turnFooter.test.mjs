@@ -14,6 +14,7 @@ import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conve
 import {replyMarkdownText} from "./replyMarkdownShare.js";
 import {visibilitySelectionClasses, selectVisibilityRow} from './messageVisibility.js';
 import {isInlineProcess} from './conversationWork.js';
+import {formatTime, isClosed, leaves, topNumber, turnTaskNumbers} from './workItemsPresentation.js';
 
 // Use the actual display/usage functions, omitting only browser-only icon/markdown imports.
 const displayUrl = new URL(`./.turn-footer-display-${process.pid}.mjs`, import.meta.url);
@@ -40,6 +41,7 @@ function turnList(turns, running = false, hiddenIds = [], runState = {}) {
   const visibility = {hiddenIds: ref(hidden), selecting: ref(false), selected: ref(new Set()), busy: ref(false), canTarget: () => true, isHidden: value => hidden.has(value?.operation?.opId || value?.opId || value?.eventKey || value?.id), assistantTargets: turn => (turn.events || []).filter(event => !hidden.has(event.id))};
   const context = vm.createContext({contextResourceUrl,ref, ...display, isInlineProcess, conversationTimelineEntries, shouldRenderAssistantDivider, replyMarkdownText, visibilitySelectionClasses, selectVisibilityRow,
     useMessageVisibility: () => visibility,
+    useWorkItems: () => null, formatTime, isClosed, leaves, topNumber, turnTaskNumbers,
     projectedEventDisplayTimeMs: eventDisplayTimeMs, projectedEventStartedAtMs: eventStartedAtMs, projectedEventUpdatedAtMs: eventUpdatedAtMs,
     defineProps: () => props, defineEmits: () => (...args) => emitted.push(args), referenceDisplayText: value => value,
     copyTextToClipboard: async text => copies.push(text), ElMessage: {success() {}, error() {}},

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from app import installed_version
+from app import installed_version, versioning
 from app.logging import get_logger
 from app.telegram_ui import send_rich
 from app.update.loader import load_updater, updater_script_path
@@ -26,6 +26,9 @@ log = get_logger("update")
 GITHUB_REPO = os.environ.get("OPENBEAR_GITHUB_REPO", "danger-dream/openbear")
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
 POLL_INTERVAL_S = 300
+# The release list (taking pre-releases) is read page by page, newest first.
+RELEASE_PAGE = 100
+MAX_RELEASE_PAGES = 50
 USER_AGENT = "OpenBear-UpdateCheck/1.0"
 RESULT_FILE = "update-result.json"
 STATE_FILE = "update-state.json"
@@ -178,7 +181,9 @@ class UpdateService:
         available = state.get("available") if isinstance(state.get("available"), dict) else None
         current = installed_version()
         latest_version = str((available or {}).get("version") or "")
-        update_available = bool(latest_version and updater.is_newer(latest_version, current))
+        if not versioning.offered(latest_version, self._prerelease()):
+            available, latest_version = None, ""
+        update_available = bool(latest_version and versioning.newer(latest_version, current))
         phase = str(state.get("phase") or "idle")
         if phase in {"done", ""}:
             phase = "idle"
@@ -217,8 +222,10 @@ class UpdateService:
             if not available:
                 return {"ok": False, "error": "no_release"}
             latest = str(available.get("version") or "")
+            if not versioning.offered(latest, self._prerelease()):
+                return {"ok": False, "error": "no_release"}
             current = installed_version()
-            if not updater.is_newer(latest, current):
+            if not versioning.newer(latest, current):
                 return {"ok": False, "error": "already_latest", "version": current}
             if running.get("busy") and not force:
                 return {"ok": False, "error": "system_busy", "running": running}
@@ -309,14 +316,27 @@ class UpdateService:
             raise RuntimeError(f"systemd-run updater failed rc={proc.returncode}: {detail}")
         log.info("更新器已通过 systemd-run 启动", stdout=stdout[-500:], stderr=stderr[-500:])
 
+    def _prerelease(self) -> bool:
+        """Whether this controller takes beta and rc versions too (setting 接收测试版)."""
+        return getattr(getattr(self.config, "updates", None), "prerelease", False) is True
+
     async def _check_github(self) -> None:
         if self._http is None:
             return
+        prerelease = self._prerelease()
+        # Releases only: /releases/latest never returns a pre-release (nor a node
+        # release, which is never Latest). With pre-releases the newest offered
+        # controller version comes from the whole release list, every page.
+        url = f"{GITHUB_API}/releases?per_page={RELEASE_PAGE}" if prerelease else f"{GITHUB_API}/releases/latest"
         headers = {}
-        if self._etag:
+        # An ETag only answers for the URL it came from; switching the setting drops it.
+        # For the list it is the first page's: GitHub lists the newest releases first, so
+        # an unchanged first page leaves the answer as it was; any change reads every page.
+        if self._etag and read_json(self.state_path).get("etagUrl", url) == url:
             headers["If-None-Match"] = self._etag
         try:
-            resp = await self._http.get(f"{GITHUB_API}/releases/latest", headers=headers)
+            resp = await self._http.get(url, headers=headers)
+            rows = await self._release_pages(resp) if prerelease and resp.status_code == 200 else None
         except Exception as exc:
             self._merge_state(lastError=f"{type(exc).__name__}: {exc}", checkedAt=int(time.time()))
             return
@@ -332,20 +352,28 @@ class UpdateService:
                 lastError=f"github http {resp.status_code}",
             )
             return
-        etag = resp.headers.get("ETag") or self._etag
-        payload = resp.json()
+        etag = resp.headers.get("ETag") or (self._etag if "If-None-Match" in headers else "")
+        payload = rows if prerelease else resp.json()
+        if prerelease:
+            payload = newest_offered(payload, prerelease=True) if isinstance(payload, list) else None
+            if payload is None:
+                self._merge_state(checkedAt=int(time.time()), etag=etag, etagUrl=url, lastError="", available=None)
+                self._etag = etag
+                return
         if not isinstance(payload, dict):
             return
-        if payload.get("prerelease") or payload.get("draft"):
-            self._merge_state(checkedAt=int(time.time()), etag=etag, lastError="", available=None)
+        # Default users only take releases: never a draft or anything marked pre-release.
+        if (payload.get("draft") or (payload.get("prerelease") and not prerelease)
+                or not versioning.offered(controller_version(payload), prerelease)):
+            self._merge_state(checkedAt=int(time.time()), etag=etag, etagUrl=url, lastError="", available=None)
+            self._etag = etag
             return
         available = await self._release_to_available(payload)
         state = read_json(self.state_path)
         notified_versions = self._notification_history(state)
-        updater = load_updater()
         latest = str(available.get("version") or "")
         current = installed_version()
-        notify = bool(latest and updater.is_newer(latest, current) and latest not in notified_versions)
+        notify = bool(latest and versioning.newer(latest, current) and latest not in notified_versions)
         if notify:
             notified_versions.append(latest)
         if latest in notified_versions:
@@ -359,6 +387,7 @@ class UpdateService:
         self._merge_state(
             checkedAt=int(time.time()),
             etag=etag,
+            etagUrl=url,
             lastError="",
             available=available,
             notifiedVersions=notified_versions,
@@ -366,6 +395,25 @@ class UpdateService:
         self._etag = etag
         if notify:
             await self._notify_admins(self._new_version_text(available))
+
+    async def _release_pages(self, first: httpx.Response) -> list[Any] | None:
+        """The whole release list: page 1 (first) and every page after it, up to
+        MAX_RELEASE_PAGES (newest first, so a cut keeps the newest). A page that fails
+        raises: a partial list could offer an older version than the newest."""
+        rows = first.json()
+        if not isinstance(rows, list):
+            return None
+        found, page = list(rows), 1
+        while len(rows) >= RELEASE_PAGE and page < MAX_RELEASE_PAGES:
+            page += 1
+            resp = await self._http.get(f"{GITHUB_API}/releases?per_page={RELEASE_PAGE}&page={page}")
+            if resp.status_code != 200:
+                raise RuntimeError(f"github http {resp.status_code} (release page {page})")
+            rows = resp.json()
+            if not isinstance(rows, list):
+                raise RuntimeError(f"github release page {page} is not a list")
+            found.extend(rows)
+        return found
 
     async def _release_to_available(self, payload: dict[str, Any]) -> dict[str, Any]:
         tag = str(payload.get("tag_name") or "")
@@ -498,6 +546,20 @@ class UpdateService:
         atomic_write_json(self.notifications_path, {"schema": 1, "notifiedVersions": state["notifiedVersions"]})
         state.setdefault("schema", 1)
         atomic_write_json(self.state_path, state)
+
+
+def controller_version(release: dict[str, Any]) -> str:
+    """The controller version a GitHub release carries (tag vX.Y.Z...), or '' (node-v..., other tags)."""
+    tag = str(release.get("tag_name") or "")
+    version = versioning.parse(tag) if tag.startswith("v") else None
+    return str(version) if version is not None and "v" + str(version) == tag else ""
+
+
+def newest_offered(releases: list[Any], *, prerelease: bool) -> dict[str, Any] | None:
+    """The published controller release with the newest version this user takes."""
+    found = [row for row in releases if isinstance(row, dict) and not row.get("draft")
+             and versioning.offered(controller_version(row), prerelease)]
+    return max(found, key=lambda row: versioning.parse(controller_version(row)).key, default=None)
 
 
 def sys_executable() -> str:

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 from pydantic import Field, model_validator
 
-from app.webhooks.contracts import Model, TargetRunConfig
+from app.webhooks.contracts import SERVER_CHANGES, ConversationRetention, Model, TargetRunConfig
 
 
 class CronError(Exception):
@@ -112,9 +112,11 @@ class JobConfig(Model):
     schedule: Schedule = Field(default_factory=Schedule)
     run_config: TargetRunConfig = Field(default_factory=TargetRunConfig)
     instructions: str = ''
+    allow_server_changes: bool = Field(False, strict=True, description=SERVER_CHANGES)
     timeout_seconds: float | None = Field(None, gt=0)
     total_tokens_budget: int | None = Field(None, gt=0, strict=True)
     cost_budget_usd: float | None = Field(None, gt=0)
     notifications: Notifications = Field(default_factory=Notifications)
+    conversation_retention: ConversationRetention = Field(default_factory=ConversationRetention)
     pre: Script = Field(default_factory=Script)
     post: PostScript = Field(default_factory=PostScript)

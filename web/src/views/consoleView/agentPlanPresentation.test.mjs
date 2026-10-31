@@ -722,3 +722,29 @@ test("retry terminal metadata never opens a phantom failed row or masks recovere
     }
   }
 });
+
+test("quiet early retries resume the same running row without retry labels", () => {
+  const quiet = [
+    {seq: 1, kind: "model_call_started", detail: {modelLabel: "GPT", attemptId: "a"}},
+    {seq: 2, kind: "model_stream_interrupted", detail: {reason: "network", status: "error"}},
+    {seq: 3, kind: "model_call_started", detail: {modelLabel: "GPT", attempt: 1, quietRetry: true, attemptId: "b"}},
+  ];
+  const running = compactAgentStepActivityLines(quiet);
+  assert.equal(running.length, 1);
+  assert.equal(running[0].message, "模型调用：GPT · 调用中");
+  assert.equal(running[0].modelStatus, "running");
+  assert.doesNotMatch(running[0].message, /重试|中断/);
+
+  const finished = compactAgentStepActivityLines([...quiet,
+    {seq: 4, kind: "model_call_finished", detail: {modelLabel: "GPT", durationMs: 1200}}]);
+  assert.equal(finished.length, 1);
+  assert.equal(finished[0].modelStatus, "success");
+
+  const visible = compactAgentStepActivityLines([...quiet,
+    {seq: 4, kind: "model_stream_interrupted", detail: {reason: "network", status: "error"}},
+    {seq: 5, kind: "model_call_retry_wait", detail: {retry: {active: true, attempt: 4, maxRetries: 10}}},
+    {seq: 6, kind: "model_call_started", detail: {modelLabel: "GPT", attempt: 4}, summary: "GPT 模型调用开始（重试 4/10）"},
+  ]);
+  assert.equal(visible.length, 1);
+  assert.match(visible[0].message, /正在重试 4\/10/);
+});

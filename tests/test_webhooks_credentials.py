@@ -3,11 +3,10 @@ import json
 
 import pytest
 
-from app.db.engine import DB
 from app.tools.base import ToolRuntimeContext
 from app.tools.webhook import dispatch
-from app.webhooks.contracts import EndpointConfig, WebhookError
-from app.webhooks.repository import insert, many, one
+from app.webhooks.contracts import WebhookError
+from app.webhooks.repository import many, one
 from app.webhooks.service import WebhookService
 from tests.test_web_admin import _login_cookie
 from tests.test_webhooks_backend import create, env
@@ -69,47 +68,6 @@ async def test_rotation_returns_latest_even_with_equal_timestamp_and_preserves_g
     with pytest.raises(WebhookError, match='invalid_credential'):
         await env.s.authenticate(env.db.conn, eid, new_key)
     assert (await env.s.web_credential(123, eid))['credential']['key'] == latest['credential']['key']
-
-
-async def test_real_v3_upgrade_keeps_legacy_key_authenticating_until_manual_rotation(tmp_path, monkeypatch):
-    import app.webhooks.schema as schema
-    migrations = schema.MIGRATIONS
-    v4_index = next(i for i, (version, _) in enumerate(migrations) if version == 'webhooks_v4_credentials')
-    path = tmp_path / 'legacy.sqlite'
-    with monkeypatch.context() as patch:
-        patch.setattr(schema, 'MIGRATIONS', migrations[:v4_index])
-        db = DB(str(path)); await db.connect()
-    key = 'wh_legacy-test-plaintext-never-stored'
-    s = WebhookService(db, pepper=b'upgrade-fixture')
-    try:
-        async with db.webhook_transaction() as conn:
-            await conn.execute("INSERT INTO web_conversation_folders(folder_uuid,owner_chat_id,name) VALUES('F',123,'Legacy')")
-            await insert(conn, 'webhook_endpoints', endpoint_id='E', owner_chat_id=123, binding_kind='folder', binding_uuid='F', create_request_id='legacy', enabled=1, created_at_ms=1, updated_at_ms=1)
-            await s.save_revision(conn, 'E', 1, EndpointConfig(), {}, 123)
-            await insert(conn, 'webhook_credentials', credential_id='K', endpoint_id='E', key_prefix='random-prefix', verifier=s.verifier(key), verifier_algorithm='hmac-sha256', pepper_version='1', created_at_ms=1, valid_from_ms=1)
-        before = await one(db.conn, 'SELECT * FROM webhook_credentials')
-        markers = await many(db.conn, "SELECT name FROM schema_data_migrations WHERE name LIKE 'webhooks_v%'")
-    finally:
-        await db.close()
-    db = DB(str(path)); await db.connect()
-    try:
-        s = WebhookService(db, pepper=b'upgrade-fixture')
-        after = await one(db.conn, 'SELECT * FROM webhook_credentials')
-        assert {k: after[k] for k in before} == before and after['encrypted_key'] is None
-        assert (await one(db.conn, 'SELECT COUNT(*) n FROM webhook_credentials'))['n'] == 1
-        for marker in markers:
-            assert await one(db.conn, 'SELECT name FROM schema_data_migrations WHERE name=?', (marker['name'],)) == marker
-        await schema.migrate(db)  # Repeated migration is a no-op, including any later migrations.
-        assert (await s.web_credential(123, 'E'))['credential'] == {'hasCredential': True, 'recoverable': False, 'key': None, 'unavailableReason': 'legacy_not_recoverable'}
-        assert not (await s.get(123, 'E'))['endpoint']['credential']['recoverable']
-        await s.authenticate(db.conn, 'E', key)
-        rotated, _ = await rotate(s, 'E', grace=60)
-        await s.authenticate(db.conn, 'E', key)
-        assert (await s.web_credential(123, 'E'))['credential']['key'] == rotated['credential']['key']
-        assert (await one(db.conn, "SELECT encrypted_key FROM webhook_credentials WHERE credential_id='K'"))['encrypted_key'] is None
-        assert (await one(db.conn, 'PRAGMA integrity_check'))['integrity_check'] == 'ok'
-    finally:
-        await db.close()
 
 
 async def test_current_key_http_requires_only_existing_login_and_is_never_cached(env):

@@ -1,4 +1,10 @@
-"""Resumable public-source/tag/four-asset promotion, with remote reconciliation."""
+"""Resumable public-source/tag/asset promotion, with remote reconciliation.
+
+The controller release publishes four assets as Latest; the node release reuses
+the same push/tag/draft/upload/verify path with its own tag, five assets and
+make_latest=false. A beta or rc of either line is a GitHub pre-release and never
+Latest.
+"""
 from __future__ import annotations
 
 import base64
@@ -14,15 +20,17 @@ def asset_metadata(directory: Path, expected: dict) -> bool:
         and sha((directory / name).read_bytes()) == item["sha256"] for name, item in expected.items())
 
 
-def publish(directory: Path, state, command, github) -> dict:
+def publish(directory: Path, state, command, github, *, tag=None, name=None, assets=None, latest=True, prerelease=False) -> dict:
     value = state.value
     candidate = value["candidate"]
     source = directory / "source"
-    package = value["stages"]["package"]["result"]
-    assets = package["assets"]
+    if assets is None:
+        assets = value["stages"]["package"]["result"]["assets"]
     commit = candidate["publicCommit"]
-    tag = "v" + value["version"]
+    tag = tag or "v" + value["version"]
+    title = name or "OpenBear " + tag
     notes = value["notes"]
+    latest = latest and not prerelease  # GitHub never makes a pre-release Latest.
     if not asset_metadata(directory / "assets", assets):
         raise ReleaseError("Release asset bytes differ from the accepted ZIP")
 
@@ -80,16 +88,29 @@ def publish(directory: Path, state, command, github) -> dict:
     state.save()
 
     release = github.api("/releases/tags/" + tag, missing=True)
+    if release is None and value.get("releaseCreateIntent"):
+        # The tag endpoint does not serve drafts; an unknown POST outcome is
+        # reconciled from the saved ID or the release list, never by a new POST.
+        if value.get("releaseId"):
+            release = github.api(f"/releases/{value['releaseId']}", missing=True)
+        else:
+            matches = [item for item in github.api("/releases?per_page=100") or [] if item.get("tag_name") == tag]
+            if len(matches) > 1:
+                raise ReleaseError("Several releases claim this tag; inspect before resuming", code=2)
+            release = matches[0] if matches else None
     if release is None:
         # Persist before the POST: a timed-out response is not permission to
         # create a duplicate. resume first GETs the unique tag's release.
         value["releaseCreateIntent"] = True
         state.save()
-        release = github.api("/releases", method="POST", data={"tag_name": tag, "target_commitish": commit,
-            "name": "OpenBear " + tag, "body": notes, "draft": True, "prerelease": False, "generate_release_notes": False})
+        data = {"tag_name": tag, "target_commitish": commit, "name": title, "body": notes, "draft": True,
+                "prerelease": prerelease, "generate_release_notes": False}
+        if not latest:
+            data["make_latest"] = "false"
+        release = github.api("/releases", method="POST", data=data)
     elif not value.get("releaseCreateIntent"):
         raise ReleaseError("A release for this version already exists and is not owned by this run", code=2)
-    if (release["tag_name"] != tag or release["body"] != notes or release["prerelease"]
+    if (release["tag_name"] != tag or release["body"] != notes or bool(release["prerelease"]) != prerelease
             or release.get("target_commitish") != commit):
         raise ReleaseError("Remote release identity/body does not match this run", code=2)
     if value.get("releaseId") not in {None, release["id"]}:
@@ -119,12 +140,22 @@ def publish(directory: Path, state, command, github) -> dict:
     if release["draft"]:
         value["makePublicIntent"] = True
         state.save()
-        release = github.api(f"/releases/{release['id']}", method="PATCH", data={"draft": False, "prerelease": False, "make_latest": "true"})
-    latest = github.api("/releases/latest")
-    if latest["id"] != release["id"] or latest["tag_name"] != tag or latest["draft"] or latest["prerelease"] or latest["body"] != notes:
-        raise ReleaseError("Release public/Latest state is not confirmed; inspect before resuming", code=2)
+        release = github.api(f"/releases/{release['id']}", method="PATCH",
+                             data={"draft": False, "prerelease": prerelease, "make_latest": "true" if latest else "false"})
+    if latest:
+        public = github.api("/releases/latest")
+        if public["id"] != release["id"] or public["tag_name"] != tag or public["draft"] or public["prerelease"] or public["body"] != notes:
+            raise ReleaseError("Release public/Latest state is not confirmed; inspect before resuming", code=2)
+    else:
+        public = github.api(f"/releases/{release['id']}")
+        if (public["id"] != release["id"] or public["tag_name"] != tag or public["draft"] or bool(public["prerelease"]) != prerelease
+                or public["body"] != notes):
+            raise ReleaseError("Release public state is not confirmed; inspect before resuming", code=2)
+        top = github.api("/releases/latest", missing=True)
+        if top and top.get("id") == release["id"]:
+            raise ReleaseError("This release must never be Latest; restore the previous Latest release before resuming", code=2)
     urls = {}
-    for item in latest["assets"]:
+    for item in public["assets"]:
         if item["name"] not in value["verifiedAssets"] or item["id"] != value["verifiedAssets"][item["name"]]["assetId"]:
             raise ReleaseError("Assets changed during publication", code=2)
         if github.request(item["browser_download_url"], method="HEAD", binary=True, authenticated=False) != 200:
@@ -132,5 +163,5 @@ def publish(directory: Path, state, command, github) -> dict:
         urls[item["name"]] = item["browser_download_url"]
     if set(urls) != set(assets):
         raise ReleaseError("Published asset set changed", code=2)
-    return {"ok": True, "url": release["html_url"], "latest": True, "localCommit": candidate["localCommit"],
+    return {"ok": True, "url": release["html_url"], "latest": latest, "prerelease": prerelease, "localCommit": candidate["localCommit"],
             "publicCommit": commit, "tagObject": object_id, "assets": {name: {**item, "url": urls[name]} for name, item in assets.items()}}
