@@ -32,9 +32,12 @@ func newHealthLab(t *testing.T, s spec) *lab {
 	}
 	return l
 }
+
+// The limits are tripled for slow shared CPUs (the release container has two, with the race
+// detector on); a condition that holds returns at once either way.
 func healthWait(t *testing.T, within time.Duration, f func() bool) {
 	t.Helper()
-	end := time.Now().Add(within)
+	end := time.Now().Add(3 * within)
 	for time.Now().Before(end) {
 		if f() {
 			return

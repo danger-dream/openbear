@@ -21,6 +21,7 @@ func owner(t *testing.T, path string) int {
 func TestMakeUserDirsNeverFollowsTheUsersLinks(t *testing.T) {
 	uid, gid := os.Getuid(), os.Getgid()
 	if uid == 0 {
+		needChown(t)
 		uid, gid = 65534, 65534
 	}
 	parts := []string{"Library", "Application Support", "OpenBear", "Browser", "OpenBear Downloads"}

@@ -97,15 +97,30 @@ func TestJobStopEndsTheWholeProcessGroup(t *testing.T) {
 	if r["stopped"] != true || got["state"] != "stopped" || got["exitCode"] == nil {
 		t.Fatalf("stop: %v", r)
 	}
-	for i := 0; i < 50 && syscall.Kill(child, 0) == nil; i++ {
+	for i := 0; i < 50 && !ended(child); i++ {
 		time.Sleep(50 * time.Millisecond)
 	}
-	if syscall.Kill(child, 0) == nil {
+	if !ended(child) {
 		t.Fatal("the job's child survived the stop")
 	}
 	if again := jobCall(t, s, "job.stop", map[string]any{"id": id}); again["stopped"] != false {
 		t.Fatalf("stopping a finished job: %v", again)
 	}
+}
+
+// ended reports a process that ended, including one left a zombie because nothing
+// reaps it (the tests run under a container's PID 1 without an init).
+func ended(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return true
+	}
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	text := string(stat)
+	fields := strings.Fields(text[strings.LastIndexByte(text, ')')+1:])
+	return len(fields) > 0 && fields[0] == "Z"
 }
 
 func TestJobWhoseRunnerDiedIsInterrupted(t *testing.T) {

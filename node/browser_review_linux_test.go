@@ -69,9 +69,7 @@ func TestBrowserProfileCleanupMatchesUIDAndExactProfile(t *testing.T) {
 }
 
 func TestSharedDownloadsRejectsUnexpectedOwnerWithoutChangingIt(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("changing owner needs root")
-	}
+	needChown(t)
 	path := filepath.Join(t.TempDir(), "shared")
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
