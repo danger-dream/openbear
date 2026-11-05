@@ -18,6 +18,7 @@ from app.llm.error_classify import (
     CONTEXT_OVERFLOW,
     FORMAT,
     classify_error,
+    is_retryable_reason,
     normalize_classification,
     retryable_from_contract,
 )
@@ -115,7 +116,7 @@ def _json_value(text: str) -> Any | None:
     if not stripped or stripped[0] not in "{[\"":
         return None
     try:
-        return json.loads(stripped)
+        return json.loads(stripped, strict=False)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -319,7 +320,7 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
     if not code:
         code = redact_sensitive_text(deepest_code).strip()[:200]
 
-    if not summary and root_message:
+    if not summary and root_message and root_message.lstrip()[:1] not in "{[<":
         summary = sanitize_user_facing_text(root_message)
     if not root_message and isinstance(original, str):
         raw = redact_sensitive_text(original).strip()
@@ -345,6 +346,10 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
         # A generic invalid_request/format envelope must not hide WS 1009.
         # Reuse bounded overflow recovery, not ordinary unchanged retries.
         reason = CONTEXT_OVERFLOW
+    elif not structured and code_reason == FORMAT and not classification and is_retryable_reason(fallback_reason):
+        # Generic outer ``invalid_request_error`` wrappers must not mask an
+        # inner transient status/message (e.g. ``HTTP 502`` inside ``error.message``).
+        reason = fallback_reason
     else:
         reason = classification or code_reason or fallback_reason
 

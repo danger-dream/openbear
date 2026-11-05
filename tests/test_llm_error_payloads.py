@@ -254,6 +254,46 @@ def test_malformed_body_falls_back_without_exposing_authorization_or_credentials
     assert exc.user_message() == "❌ 上游服务异常,稍后重试～"
 
 
+def test_nested_response_failed_json_with_raw_newlines_and_outer_invalid_request_is_retryable():
+    inner_raw = (
+        '{"type": "response.failed", "response": {"id": "resp_1", "object": "response", '
+        '"status": "failed", "error": {"code": "server_error", '
+        '"message": "Internal server error: AI Studio DriveUpload 返回 HTTP 502: \n \n'
+        '<html><head><title>502 Bad Gateway</title></head><body>502</body></html>"}}}'
+    )
+    envelope = {"error": {"message": inner_raw, "type": "invalid_request_error"}}
+
+    normalized = normalize_error_payload(envelope, transport_status=400)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="chat"))
+
+    assert normalized.upstream_status == normalized.status == 502
+    assert normalized.reason == SERVER_ERROR
+    assert normalized.retryable is True
+    assert exc.reason == SERVER_ERROR
+    assert exc.retryable is True
+    assert "response.failed" not in exc.user_message()
+    assert "AI Studio DriveUpload 返回 HTTP 502" in exc.user_message()
+
+
+def test_truncated_nested_json_in_error_message_does_not_leak_raw_json_or_mask_502():
+    truncated_inner = (
+        '{"type": "response.failed", "response": {"id": "resp_1", "object": "response", '
+        '"status": "failed", "error": {"code": "server_error", '
+        '"message": "Internal server error: AI Studio DriveUpload 返回 HTTP 502: \n \n…'
+    )
+    envelope = {"error": {"message": truncated_inner, "type": "invalid_request_error"}}
+
+    normalized = normalize_error_payload(envelope, transport_status=400)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="chat"))
+
+    assert normalized.upstream_status == normalized.status == 502
+    assert normalized.reason == SERVER_ERROR
+    assert normalized.retryable is True
+    assert exc.reason == SERVER_ERROR
+    assert exc.retryable is True
+    assert exc.user_message() == "❌ 上游服务异常,稍后重试～"
+
+
 def test_sse_error_event_propagates_normalized_status_reason_summary_and_details():
     payload = _structured_payload(
         status=429,
