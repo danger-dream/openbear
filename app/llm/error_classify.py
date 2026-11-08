@@ -75,6 +75,12 @@ _CLASSIFICATION_ALIASES = {
     "invalid_request": FORMAT,
     "invalid_request_error": FORMAT,
     "upstream": SERVER_ERROR,
+    "gemini_malformed_function_call": SERVER_ERROR,
+    "gemini_unexpected_tool_call": SERVER_ERROR,
+    "gemini_malformed_response": SERVER_ERROR,
+    "malformed_function_call": SERVER_ERROR,
+    "unexpected_tool_call": SERVER_ERROR,
+    "malformed_response": SERVER_ERROR,
 }
 _CLIENT_REQUEST_RETRY_SCOPES = frozenset({
     "client", "request", "client_request", "client/request", "whole_request",
@@ -245,6 +251,9 @@ def _is_server_error_text(low: str) -> bool:
         or "bad gateway" in low
         or "gateway timeout" in low
         or "temporarily unavailable" in low
+        or "malformed_function_call" in low
+        or "unexpected_tool_call" in low
+        or "malformed function call" in low
         or "503" in low
         or "502" in low
         or "504" in low
@@ -289,11 +298,13 @@ def classify_error(message: str | None, status: int = 0) -> str:
             # 429 多为限流;少数上游用 429 表达欠费(credit required),文本能识别则归 billing
             return BILLING if _is_billing_text(low) else RATE_LIMIT
         if status in (400, 422):
-            # 客户端请求错误:先看是不是被包装的限流/欠费,否则按参数格式错(不可重试)
+            # 客户端请求错误:先看是不是被包装的限流/欠费/采样工具调用畸形,否则按参数格式错(不可重试)
             if _is_rate_limit_text(low):
                 return RATE_LIMIT
             if _is_billing_text(low):
                 return BILLING
+            if "malformed_function_call" in low or "unexpected_tool_call" in low or "malformed function call" in low:
+                return SERVER_ERROR
             return FORMAT
         if status >= 500:
             # Gateways may keep their transport 5xx while embedding the actionable

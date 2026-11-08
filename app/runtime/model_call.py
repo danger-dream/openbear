@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.agent.transcript_repair import is_role_alternation_bridge
 from app.llm.base import AgentResult, Message, OpenBearLLMError, apply_provider_billing
 from app.llm.events import StreamEvent, Usage
 from app.llm.retry import RetryPolicy, retry_wait_payload, wait_for_retry
@@ -511,6 +512,8 @@ class ModelCallDriver:
             logical.tool_calls = []
             if not accumulate_reasoning:
                 logical.reasoning = ""
+            if is_role_alternation_bridge(logical.text):
+                logical.text = ""
             tail = []
             if logical.text.strip():
                 tail.append({"role": "assistant", "content": logical.text})

@@ -327,3 +327,58 @@ async def test_http_sse_non_2xx_propagates_transport_and_structured_root():
         assert exc.summary == "触发上游限流，请稍后重试"
     finally:
         await client.close()
+def test_response_failed_ignores_tool_schema_descriptions_and_retries_gemini_malformed_call():
+    payload = {
+        "type": "response.failed",
+        "sequence_number": 5,
+        "response": {
+            "id": "resp_argon_1",
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "code": "gemini_malformed_function_call",
+                "message": "Gemini generation ended with MALFORMED_FUNCTION_CALL: Function call is empty - no input to parse.",
+            },
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "thinking summary"}],
+                    "status": "incomplete",
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "ConversationGroup",
+                    "description": "Create and manage a group of member conversations.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "group": {
+                                "type": "object",
+                                "properties": {
+                                    "workspaceDir": {
+                                        "type": "string",
+                                        "description": "absolute path; omit for a new isolated group directory",
+                                    }
+                                },
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    }
+
+    event = error_event(payload, event_name="response.failed")
+
+    assert event is not None
+    assert "isolated group directory" not in event.error
+    assert "isolated group directory" not in (event.summary or "")
+    assert event.reason == SERVER_ERROR
+    assert event.retryable is True
+    assert event.root_cause["code"] == "gemini_malformed_function_call"
+    exc = OpenBearLLMError.from_stream_event(event, protocol="responses")
+    assert exc.retryable is True
+    assert "MALFORMED_FUNCTION_CALL" in exc.user_message()

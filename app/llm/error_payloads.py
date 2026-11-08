@@ -37,6 +37,13 @@ _SENSITIVE_KEYS = frozenset({
 })
 _STATUS_KEYS = ("status", "status_code", "statusCode", "http_status", "httpStatus")
 _MESSAGE_KEYS = ("message", "error_message", "errorMessage", "description", "title")
+_NON_ERROR_DICT_KEYS = frozenset({
+    "tools", "tool_choice", "functions",
+    "parameters", "parameters_json_schema", "parametersjsonschema",
+    "input_schema", "response_schema", "response_json_schema",
+    "responseschema", "responsejsonschema",
+    "instructions", "output", "output_text", "usage", "reasoning",
+})
 
 
 def _text(value: Any) -> str:
@@ -127,15 +134,23 @@ class _Scan:
     structured: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
 
 
+def _has_structured_error_fields(node: dict[str, Any]) -> bool:
+    if str(node.get("type") or "").strip().lower() == "reasoning":
+        return False
+    if isinstance(node.get("root_cause") or node.get("rootCause"), dict):
+        return True
+    if isinstance(node.get("attempts"), (list, tuple)):
+        return True
+    summary = node.get("summary")
+    return isinstance(summary, str) and bool(summary.strip())
+
+
 def _details_candidate(node: dict[str, Any]) -> dict[str, Any] | None:
     for key in ("details", "error_details", "errorDetails"):
         candidate = node.get(key)
-        if isinstance(candidate, dict) and any(
-            field_name in candidate
-            for field_name in ("summary", "root_cause", "rootCause", "attempts")
-        ):
+        if isinstance(candidate, dict) and _has_structured_error_fields(candidate):
             return candidate
-    if any(field_name in node for field_name in ("summary", "root_cause", "rootCause", "attempts")):
+    if _has_structured_error_fields(node):
         return node
     return None
 
@@ -160,6 +175,9 @@ def _walk(value: Any, scan: _Scan, *, depth: int = 0, field_name: str = "") -> N
             if index >= _MAX_COLLECTION_ITEMS:
                 break
             if _sensitive_key(key):
+                continue
+            normalized_key = str(key or "").strip().lower().replace("-", "_")
+            if normalized_key in _NON_ERROR_DICT_KEYS:
                 continue
             _walk(item, scan, depth=depth + 1, field_name=str(key))
         return

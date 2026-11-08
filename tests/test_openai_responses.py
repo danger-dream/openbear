@@ -666,3 +666,21 @@ async def test_responses_incomplete_other_reason_passes_through():
     backend = OpenAIResponsesBackend(make_client(lambda _r: sse_response(lines)), "https://x/v1", "k")
     result = await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="m"))
     assert result.finish_reason == "content_filter"
+def test_responses_input_omits_role_alternation_bridge_placeholder():
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT, repair_role_alternation
+    from app.llm.openai_responses import _to_responses_input
+
+    messages = repair_role_alternation([
+        {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c1", name="WorkItem", arguments="{}")]},
+        {"role": "tool", "tool_call_id": "c1", "name": "WorkItem", "content": "{\"ok\":true}"},
+        {"role": "user", "content": "<work-items>#1</work-items>"},
+        {"role": "user", "content": "<work-item-focus>#1.1</work-item-focus>"},
+    ])
+    items = _to_responses_input(messages)
+    assert all(ROLE_ALTERNATION_BRIDGE_TEXT not in json.dumps(item, ensure_ascii=False) for item in items)
+    assert [item.get("type") or item.get("role") for item in items] == [
+        "function_call",
+        "function_call_output",
+        "user",
+        "user",
+    ]

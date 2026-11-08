@@ -569,3 +569,21 @@ async def test_driver_marks_first_three_retries_quiet_including_their_terminal_s
         (1, True), (2, True), (3, True), (4, False)]
     assert all(s["quiet"] == (s["attempt"] <= 3) for s in states)
     assert states[-1]["status"] == "completed" and states[-1]["quiet"] is False
+@pytest.mark.asyncio
+async def test_driver_retry_discards_role_alternation_bridge_partial_text():
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT
+
+    seen_tails = []
+    backend = FakeStream([
+        [StreamEvent("content", text=ROLE_ALTERNATION_BRIDGE_TEXT), fault()],
+        [StreamEvent("content", text="actual answer"), StreamEvent("finish", finish_reason="stop")],
+    ])
+
+    def prepare(tail):
+        seen_tails.append(tail)
+        return req(backend, messages=[{"role": "user", "content": "q"}, *tail])
+
+    result = await driver(max_retries=2).call(prepare, lambda outcome: None)
+    assert result.response.text == "actual answer"
+    assert len(seen_tails) == 2
+    assert all(ROLE_ALTERNATION_BRIDGE_TEXT not in str(item) for item in seen_tails[1])

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app.agent.transcript_repair import is_role_alternation_bridge
 from app.llm._response_text_order import TextOutputOrder
 from app.llm.base import (
     AgentResult,
@@ -65,6 +66,8 @@ def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
                 # exact output order; serializing text/tool_calls again would create
                 # duplicate assistant turns and break the continuation prefix.
                 out.extend(dict(item) for item in native_items if isinstance(item, dict))
+                continue
+            if not m.get("tool_calls") and is_role_alternation_bridge(m.get("content")):
                 continue
             if m.get("content"):
                 out.append({
