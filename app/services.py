@@ -1079,6 +1079,12 @@ class Services:
         self.mem = self._make_memory_client(config)
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(old_mem.close())
+        self.http.configure_timeouts(
+            connect_timeout_s=config.agent.llm_connect_timeout_s,
+            first_byte_timeout_s=config.agent.llm_first_byte_timeout_s,
+            idle_timeout_s=config.agent.llm_idle_timeout_s,
+            total_timeout_s=config.agent.llm_total_timeout_s,
+        )
         self.factory = BackendFactory(config.models, self.http)
         self.selection = ModelSelection(config.models, config_path())
         self.agents.configure(max_concurrent_tasks=config.agents.max_concurrent_tasks)

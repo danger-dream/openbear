@@ -305,3 +305,100 @@ async def test_normal_slow_stream_not_killed():
     got = await _drain(client)
     assert [d for _, d in got] == [{"k": 1}, {"k": 2}, {"k": 3}]
     await client.close()
+
+
+async def test_configure_timeouts_updates_subsequent_requests():
+    """热更新 configure_timeouts 后，下一轮流式与非流式请求立即采用新超时。"""
+    client = HTTPClient(
+        timeout_s=300.0,
+        connect_timeout_s=10.0,
+        first_byte_timeout_s=0.03,
+        idle_timeout_s=0.03,
+        total_timeout_s=0.05,
+    )
+    try:
+        client.configure_timeouts(
+            connect_timeout_s=25.0,
+            first_byte_timeout_s=0.5,
+            idle_timeout_s=0.5,
+            total_timeout_s=0.0,
+        )
+        assert client.raw.timeout.connect == 25.0
+        assert client.raw.timeout.read == 300.0
+        assert client.raw.timeout.write == 300.0
+        assert client.raw.timeout.pool == 300.0
+
+        resp = _FakeStreamResponse([
+            (0.08, 'data: {"k":1}'),
+            (0.08, 'data: {"k":2}'),
+            (0.0, "data: [DONE]"),
+        ])
+        captured = {}
+        _patch_stream(client, resp, captured)
+        got = await _drain(client)
+        assert [d for _, d in got] == [{"k": 1}, {"k": 2}]
+        assert captured["timeout"].connect == 25.0
+    finally:
+        await client.close()
+
+
+async def test_services_apply_config_refreshes_shared_http_timeouts(tmp_path, monkeypatch):
+    """Services.apply_config 必须把新的四段 LLM 超时同步到复用的 HTTPClient 实例。"""
+    from app.config import Config
+    from app.services import Services
+
+    cfg_file = tmp_path / "openbear.json"
+    cfg_file.write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENBEAR_CONFIG", str(cfg_file))
+
+    base_payload = {
+        "telegram": {"botToken": "123456:ABC-test", "whitelistIds": [1]},
+        "models": {
+            "providers": {
+                "default": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "test-key",
+                    "protocol": "responses",
+                    "enabled": True,
+                    "models": [
+                        {
+                            "id": "test-model",
+                            "name": "test-model",
+                            "reasoning": True,
+                            "input": ["text"],
+                            "contextWindow": 128000,
+                            "maxTokens": 8192,
+                        }
+                    ],
+                }
+            },
+            "primary": "default/test-model",
+        },
+        "memory": {"provider": "builtin", "identity": "openbear"},
+        "storage": {"dbPath": str(tmp_path / "openbear.db")},
+        "mcp": {"enabled": False},
+    }
+    initial = Config.model_validate(base_payload)
+    svc = Services(initial)
+    monkeypatch.setattr(svc, "_schedule_browser_validation", lambda: None)
+    try:
+        updated = Config.model_validate({
+            **base_payload,
+            "agent": {
+                "llmConnectTimeoutS": 18.0,
+                "llmFirstByteTimeoutS": 300.0,
+                "llmIdleTimeoutS": 360.0,
+                "llmTotalTimeoutS": 1800.0,
+            },
+        })
+        svc.apply_config(updated)
+        assert svc.http._connect_timeout_s == 18.0
+        assert svc.http.raw.timeout.connect == 18.0
+        assert svc.http._first_byte_timeout_s == 300.0
+        assert svc.http._idle_timeout_s == 360.0
+        assert svc.http._total_timeout_s == 1800.0
+    finally:
+        await svc.http.close()
+        await svc.mem.close()
+        await svc.db.close()

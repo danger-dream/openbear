@@ -87,6 +87,24 @@ class HTTPClient:
             limits=httpx.Limits(max_connections=max_connections),
         )
 
+    def configure_timeouts(
+        self,
+        *,
+        connect_timeout_s: float | None = None,
+        first_byte_timeout_s: float | None = None,
+        idle_timeout_s: float | None = None,
+        total_timeout_s: float | None = None,
+    ) -> None:
+        if connect_timeout_s is not None:
+            self._connect_timeout_s = connect_timeout_s
+            self._http.timeout = httpx.Timeout(self._default_timeout_s, connect=connect_timeout_s)
+        if first_byte_timeout_s is not None:
+            self._first_byte_timeout_s = first_byte_timeout_s
+        if idle_timeout_s is not None:
+            self._idle_timeout_s = idle_timeout_s
+        if total_timeout_s is not None:
+            self._total_timeout_s = total_timeout_s
+
     async def close(self) -> None:
         await self._http.aclose()
 
