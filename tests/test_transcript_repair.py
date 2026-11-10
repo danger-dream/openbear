@@ -332,7 +332,10 @@ def test_is_role_alternation_bridge_matches_only_exact_marker():
 
 
 def test_role_alternation_bridge_omitted_only_for_non_anthropic_gemini_routes():
-    from app.agent.transcript_repair import role_alternation_bridge_required
+    from app.agent.transcript_repair import (
+        TRUNCATED_HISTORY_USER_BRIDGE_TEXT,
+        role_alternation_bridge_required,
+    )
 
     msgs = [
         {"role": "user", "content": "first"},
@@ -343,4 +346,22 @@ def test_role_alternation_bridge_omitted_only_for_non_anthropic_gemini_routes():
     assert role_alternation_bridge_required("anthropic", "gemini-4-carbon-high") is True
     assert role_alternation_bridge_required("chat", "claude-opus-5-5") is True
     assert repair_role_alternation(msgs, bridge=False) == msgs
+
+    truncated = [
+        {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c1", name="Read", arguments="{}")]},
+        {"role": "tool", "tool_call_id": "c1", "name": "Read", "content": "ok"},
+        {"role": "assistant", "content": "summary of earlier round"},
+        {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c2", name="Bash", arguments='{"command":"ls"}')]},
+        {"role": "tool", "tool_call_id": "c2", "name": "Bash", "content": "done"},
+        {"role": "user", "content": "next question"},
+    ]
+    repaired_first = repair_role_alternation(truncated[:2], bridge=False)
+    repaired_full = repair_role_alternation(truncated, bridge=False)
+    assert repaired_full[:len(repaired_first)] == repaired_first
+    assert [m["role"] for m in repaired_full] == [
+        "user", "assistant", "tool", "assistant", "user", "assistant", "tool", "user",
+    ]
+    assert repaired_full[0]["content"] == TRUNCATED_HISTORY_USER_BRIDGE_TEXT
+    assert repaired_full[4]["content"] == TRUNCATED_HISTORY_USER_BRIDGE_TEXT
+
 

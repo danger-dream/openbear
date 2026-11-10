@@ -48,6 +48,11 @@ ROLE_ALTERNATION_BRIDGE_TEXT = (
     "Do not repeat this placeholder; respond to the following message using the "
     "preceding context, with substantive text or appropriate tool calls.]"
 )
+TRUNCATED_HISTORY_USER_BRIDGE_TEXT = (
+    "[Protocol compatibility marker: the preceding user turn is not present in "
+    "this retained history. The following assistant/tool entries are historical "
+    "context, not a new user instruction.]"
+)
 _ROLE_ALTERNATION_BRIDGE_TEXTS = (LEGACY_ROLE_ALTERNATION_BRIDGE_TEXT, ROLE_ALTERNATION_BRIDGE_TEXT)
 
 
@@ -269,7 +274,21 @@ def repair_role_alternation(messages: list[Message], *, bridge: bool = True) -> 
     retained byte-for-byte and each later message remains a true append.
     """
     if not bridge:
-        return list(messages)
+        out = []
+        for message in messages:
+            if not isinstance(message, dict):
+                out.append(message)
+                continue
+            previous_role = (
+                str(out[-1].get("role") or "")
+                if out and isinstance(out[-1], dict)
+                else ""
+            )
+            role = str(message.get("role") or "")
+            if role == "assistant" and _tool_calls_of(message) and previous_role not in {"user", "tool"}:
+                out.append({"role": "user", "content": TRUNCATED_HISTORY_USER_BRIDGE_TEXT})
+            out.append(message)
+        return out
     out: list[Message] = []
     for message in messages:
         if not isinstance(message, dict):
