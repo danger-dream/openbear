@@ -33,6 +33,7 @@ from app.agent.transcript_repair import (
     is_role_alternation_bridge,
     is_role_alternation_bridge_prefix,
     repair_role_alternation,
+    role_alternation_bridge_required,
 )
 from app.context.request_view import expanded_request_view
 from app.context.runtime import WindowRuntime
@@ -395,6 +396,7 @@ class Agent:
         reasoning_only_retry = 0  # 已触发的「只思考无正文」补救重试次数
         open_rendered = False         # 当前 renderer 草稿里是否已有可封口内容（正文/工具行）
         native_continuation = str(getattr(self._backend, "protocol", "") or "").lower() == "responses"
+        role_bridge = role_alternation_bridge_required(getattr(self._backend, "protocol", ""), model)
         # One frozen set drives both serializer budgeting and every physical
         # request. Do not re-read mutable model/Fast settings after selection.
         request_options = copy.deepcopy({
@@ -520,7 +522,7 @@ class Agent:
                     convo = merge_controller_additions(convo, additions)
                     result.steered += new_user_count
                 expanded = list(await model_request_overlay(list(convo))) if model_request_overlay else list(convo)
-                request_view = expanded_request_view(expanded, retry_tail=retry_tail)
+                request_view = expanded_request_view(expanded, retry_tail=retry_tail, bridge=role_bridge)
                 try:
                     prepared = await window_runtime.prepare(
                         convo, system=system, tools=tool_schemas, force=force, attempt=overflow_attempt,
@@ -771,7 +773,7 @@ class Agent:
                         log.info("首次上游请求前耗时", session=session_id, 消息数=len(prefix), **{
                             name: int((marks[index + 1] - marks[index]) * 1000) for index, name in enumerate(
                                 ("requestRefreshMs", "windowPrepareMs", "nativeCheckpointMs", "requestAssembleMs"))})
-                    return PreparedRequest(self._backend, repair_role_alternation(prefix + retry_tail), {
+                    return PreparedRequest(self._backend, repair_role_alternation(prefix + retry_tail, bridge=role_bridge), {
                         "model": model, "system": window_runtime.system if window_runtime else system,
                         "tools": tool_schemas, **copy.deepcopy(request_options),
                         # Billing only: kept out of request_options so it never changes the window identity.

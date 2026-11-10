@@ -244,7 +244,21 @@ def repair_tool_pairing(messages: list[Message]) -> list[Message]:
     return out
 
 
-def repair_role_alternation(messages: list[Message]) -> list[Message]:
+def role_alternation_bridge_required(protocol: Any, model: Any) -> bool:
+    """Whether outbound messages need the synthetic assistant bridge.
+
+    Anthropic rejects adjacent user units. Gemini behind OpenAI-compatible routes
+    accepts them, and unsigned synthetic assistant turns in long contexts can
+    trigger bridge echoes or MALFORMED_FUNCTION_CALL, so those requests carry the
+    original messages unchanged. Other chat upstreams may enforce alternation and
+    keep the bridge.
+    """
+    if str(protocol or "").strip().lower() == "anthropic":
+        return True
+    return "gemini" not in str(model or "").lower()
+
+
+def repair_role_alternation(messages: list[Message], *, bridge: bool = True) -> list[Message]:
     """Normalize strict-provider roles without rewriting an emitted prompt unit.
 
     Consecutive neutral ``user`` messages used to be merged into the earlier
@@ -254,6 +268,8 @@ def repair_role_alternation(messages: list[Message]) -> list[Message]:
     user role, so a following user needs the same bridge. The original messages are
     retained byte-for-byte and each later message remains a true append.
     """
+    if not bridge:
+        return list(messages)
     out: list[Message] = []
     for message in messages:
         if not isinstance(message, dict):

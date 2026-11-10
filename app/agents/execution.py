@@ -21,7 +21,7 @@ from app.agent.native_continuation import (
     native_items_for_tool_calls,
     serialize_messages,
 )
-from app.agent.transcript_repair import repair_role_alternation
+from app.agent.transcript_repair import repair_role_alternation, role_alternation_bridge_required
 from app.context.configuration import conversation_strategy
 from app.context.prompts import effective_context_prompt
 from app.context.runtime import ContextManager as WindowRuntime
@@ -1781,9 +1781,10 @@ class AgentExecutor(AgentTaskContext):
 
     def _context_request_view(self, messages: list[Message], retry_tail: list[Message] | None = None) -> list[Message]:
         """One request-local view for both budgeting and actual transmission."""
+        protocol = str(getattr(self.backend, "protocol", "") or "")
         return repair_role_alternation(_messages_with_task_progress(
-            messages + list(retry_tail or []), protocol=str(getattr(self.backend, "protocol", "") or ""),
-        ))
+            messages + list(retry_tail or []), protocol=protocol,
+        ), bridge=role_alternation_bridge_required(protocol, self.model))
 
     async def _prepare_context_window(
         self, messages: list[Message], tools: list[dict[str, Any]], *,

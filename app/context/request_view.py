@@ -9,7 +9,7 @@ from app.llm.base import Message
 
 
 def expanded_request_view(
-    expanded: list[Message], *, retry_tail: list[Message] | None = None,
+    expanded: list[Message], *, retry_tail: list[Message] | None = None, bridge: bool = True,
 ) -> Callable[[list[Message]], list[Message]]:
     """Project frozen reference contents onto a selection, never its checkpoint.
 
@@ -28,6 +28,6 @@ def expanded_request_view(
             if source_id in content_by_id:
                 item["content"] = content_by_id[source_id]
             messages.append(item)
-        return repair_role_alternation(messages + list(retry_tail or []))
+        return repair_role_alternation(messages + list(retry_tail or []), bridge=bridge)
 
     return view

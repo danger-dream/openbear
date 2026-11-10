@@ -329,3 +329,18 @@ def test_is_role_alternation_bridge_matches_only_exact_marker():
     assert not is_role_alternation_bridge("")
     assert not is_role_alternation_bridge(None)
     assert not is_role_alternation_bridge([{"type": "text"}])
+
+
+def test_role_alternation_bridge_omitted_only_for_non_anthropic_gemini_routes():
+    from app.agent.transcript_repair import role_alternation_bridge_required
+
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "<work-items>state</work-items>"},
+    ]
+    assert role_alternation_bridge_required("chat", "gemini-4-carbon-high") is False
+    assert role_alternation_bridge_required("responses", "gemini-3.8-pro-high") is False
+    assert role_alternation_bridge_required("anthropic", "gemini-4-carbon-high") is True
+    assert role_alternation_bridge_required("chat", "claude-opus-5-5") is True
+    assert repair_role_alternation(msgs, bridge=False) == msgs
+

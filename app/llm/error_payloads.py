@@ -17,7 +17,9 @@ from app.llm.error_classify import (
     BILLING,
     CONTEXT_OVERFLOW,
     FORMAT,
+    SERVER_ERROR,
     classify_error,
+    is_malformed_tool_call_error,
     normalize_classification,
     retryable_from_contract,
 )
@@ -345,6 +347,14 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
         # A generic invalid_request/format envelope must not hide WS 1009.
         # Reuse bounded overflow recovery, not ordinary unchanged retries.
         reason = CONTEXT_OVERFLOW
+    elif (
+        (is_malformed_tool_call_error(message, code=code) or code == "gemini_malformed_response")
+        and classification in {"", FORMAT}
+    ):
+        # Gateways surface model-emitted MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL
+        # inside invalid_request envelopes so channel health is not penalized.
+        # Keep them retryable so ModelCallDriver can guide a clean tool-call retry.
+        reason = SERVER_ERROR
     else:
         reason = classification or code_reason or fallback_reason
 

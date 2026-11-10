@@ -569,3 +569,37 @@ async def test_driver_marks_first_three_retries_quiet_including_their_terminal_s
         (1, True), (2, True), (3, True), (4, False)]
     assert all(s["quiet"] == (s["attempt"] <= 3) for s in states)
     assert states[-1]["status"] == "completed" and states[-1]["quiet"] is False
+
+
+@pytest.mark.asyncio
+async def test_driver_uses_tool_call_simplification_tail_for_malformed_function_call_and_drops_bridge():
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT
+    from app.llm.events import ToolCall
+    from app.runtime.model_call import _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION
+
+    seen_tails = []
+    malformed = OpenBearLLMError(
+        "Gemini generation ended with MALFORMED_FUNCTION_CALL: Malformed function call: thought\ncall:default_api:Bash{command: ...}",
+        status=400,
+        reason="server_error",
+        retryable=True,
+        root_cause={"code": "gemini_malformed_function_call"},
+    )
+    backend = FakeStream([
+        [StreamEvent("content", text=ROLE_ALTERNATION_BRIDGE_TEXT), malformed],
+        [
+            StreamEvent("tool_call", tool_calls=[ToolCall("c1", "Bash", '{"command":"ls"}')]),
+            StreamEvent("finish", finish_reason="tool_calls"),
+        ],
+    ])
+
+    def prepare(tail):
+        seen_tails.append(tail)
+        return req(backend, messages=[{"role": "user", "content": "question"}, *tail])
+
+    result = await driver(max_retries=2).call(prepare, lambda outcome: None)
+    assert result.retries == 1
+    assert [tc.name for tc in result.response.tool_calls] == ["Bash"]
+    assert seen_tails[0] == []
+    assert seen_tails[1] == [{"role": "user", "content": _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION}]
+

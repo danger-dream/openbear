@@ -74,6 +74,9 @@ _CLASSIFICATION_ALIASES = {
     "forbidden": AUTH_PERMANENT,
     "invalid_request": FORMAT,
     "invalid_request_error": FORMAT,
+    "gemini_malformed_function_call": SERVER_ERROR,
+    "gemini_unexpected_tool_call": SERVER_ERROR,
+    "gemini_malformed_response": SERVER_ERROR,
     "upstream": SERVER_ERROR,
 }
 _CLIENT_REQUEST_RETRY_SCOPES = frozenset({
@@ -236,6 +239,22 @@ def _is_model_not_found_text(low: str) -> bool:
     )
 
 
+def is_malformed_tool_call_error(message: str | None = "", *, code: str | None = "") -> bool:
+    """Model-emitted malformed/unexpected tool call output, not an invalid client request."""
+    low_code = _normalized_contract_token(code)
+    if low_code in {"gemini_malformed_function_call", "gemini_unexpected_tool_call"}:
+        return True
+    low = (message or "").lower()
+    return (
+        "malformed_function_call" in low
+        or "malformed function call" in low
+        or "unexpected_tool_call" in low
+        or "unexpected tool call" in low
+        or "gemini_malformed_function_call" in low
+        or "gemini_unexpected_tool_call" in low
+    )
+
+
 def _is_server_error_text(low: str) -> bool:
     return (
         "internal server error" in low
@@ -245,6 +264,8 @@ def _is_server_error_text(low: str) -> bool:
         or "bad gateway" in low
         or "gateway timeout" in low
         or "temporarily unavailable" in low
+        or is_malformed_tool_call_error(low)
+        or "gemini_malformed_response" in low
         or "503" in low
         or "502" in low
         or "504" in low
@@ -289,11 +310,13 @@ def classify_error(message: str | None, status: int = 0) -> str:
             # 429 多为限流;少数上游用 429 表达欠费(credit required),文本能识别则归 billing
             return BILLING if _is_billing_text(low) else RATE_LIMIT
         if status in (400, 422):
-            # 客户端请求错误:先看是不是被包装的限流/欠费,否则按参数格式错(不可重试)
+            # 客户端请求错误:先看是不是被包装的限流/欠费/模型工具调用生成畸形,否则按参数格式错(不可重试)
             if _is_rate_limit_text(low):
                 return RATE_LIMIT
             if _is_billing_text(low):
                 return BILLING
+            if is_malformed_tool_call_error(low) or "gemini_malformed_response" in low:
+                return SERVER_ERROR
             return FORMAT
         if status >= 500:
             # Gateways may keep their transport 5xx while embedding the actionable

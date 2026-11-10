@@ -15,7 +15,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.agent.transcript_repair import is_role_alternation_bridge
 from app.llm.base import AgentResult, Message, OpenBearLLMError, apply_provider_billing
+from app.llm.error_classify import is_malformed_tool_call_error
 from app.llm.events import StreamEvent, Usage
 from app.llm.retry import RetryPolicy, retry_wait_payload, wait_for_retry
 from app.runtime.lifecycle import _consume_cleanup_result, current_session
@@ -376,6 +378,15 @@ _RECOVERY_INSTRUCTION = (
     "text or completed work; preserve all prior tool results and instructions."
 )
 
+_MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION = (
+    "The previous model response failed because the emitted tool call had malformed syntax "
+    "or unescaped nested quotes (MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL). "
+    "Continue the same task and issue the needed tool call using simple, strictly valid JSON "
+    "arguments. Avoid deeply nested quotes or complex inline scripts inside a single command "
+    "string; split complex commands into simpler steps or write a temporary helper file if needed. "
+    "Do not repeat completed text or completed work; preserve all prior tool results and instructions."
+)
+
 
 class ModelCallDriver:
     def __init__(self, retry_policy: RetryPolicy):
@@ -511,7 +522,17 @@ class ModelCallDriver:
             logical.tool_calls = []
             if not accumulate_reasoning:
                 logical.reasoning = ""
+            if is_role_alternation_bridge(logical.text):
+                logical.text = ""
+            recovery_instruction = (
+                _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION
+                if is_malformed_tool_call_error(
+                    error.message,
+                    code=str((error.root_cause or {}).get("code") or ""),
+                )
+                else _RECOVERY_INSTRUCTION
+            )
             tail = []
             if logical.text.strip():
                 tail.append({"role": "assistant", "content": logical.text})
-            tail.append({"role": "user", "content": _RECOVERY_INSTRUCTION})
+            tail.append({"role": "user", "content": recovery_instruction})

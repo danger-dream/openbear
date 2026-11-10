@@ -327,3 +327,42 @@ async def test_http_sse_non_2xx_propagates_transport_and_structured_root():
         assert exc.summary == "触发上游限流，请稍后重试"
     finally:
         await client.close()
+
+
+def test_gemini_malformed_function_call_post_commit_sse_and_structured_envelopes_are_retryable():
+    sse_payload = {
+        "error": {
+            "message": (
+                "Gemini generation ended with MALFORMED_FUNCTION_CALL: Malformed function call: "
+                "thought\ncall:default_api:mcp__fleet_exec__execute{command: docker logs ...}"
+            ),
+            "type": "invalid_request_error",
+            "code": None,
+            "param": None,
+        }
+    }
+    normalized_sse = normalize_error_payload(sse_payload, transport_status=200)
+    assert normalized_sse.reason == SERVER_ERROR
+    assert normalized_sse.retryable is True
+
+    structured_payload = _structured_payload(
+        status=400,
+        classification="invalid_request",
+        summary=(
+            "Upstream 400 invalid_request: Gemini generation ended with MALFORMED_FUNCTION_CALL: "
+            "Malformed function call: thought (3 upstream attempts failed)"
+        ),
+        message="Gemini generation ended with MALFORMED_FUNCTION_CALL: Malformed function call: thought",
+        retryable=True,
+        retry_scope="request",
+        code="gemini_malformed_function_call",
+    )
+    structured_payload["error"]["type"] = "invalid_request_error"
+    normalized_structured = normalize_error_payload(structured_payload, transport_status=400)
+    assert normalized_structured.reason == SERVER_ERROR
+    assert normalized_structured.retryable is True
+    assert normalized_structured.code == "gemini_malformed_function_call"
+
+    assert classify_error("Gemini generation ended with UNEXPECTED_TOOL_CALL", status=400) == SERVER_ERROR
+    assert classify_error("Invalid JSON payload: unknown field", status=400) == FORMAT
+
