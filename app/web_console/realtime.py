@@ -160,6 +160,11 @@ class GlobalRealtime:
         self.cached_version: dict = {}
         self.version_at = 0.0
 
+    def invalidate_tree(self):
+        """Recompute attention at the next coalesced refresh, without a catalog edit."""
+        self.last_calibration = 0.0
+        self.wake.set()
+
     async def start(self):
         if self.task and not self.task.done():
             return
@@ -363,7 +368,11 @@ class GlobalRealtime:
                     (self.last_cursor,),
                 )
                 tree_changed = await cur.fetchone() is not None
-            self.last_cursor, self.last_calibration = latest, time.monotonic()
+            self.last_cursor = latest
+            # Content/resource-only patches must not postpone the tree's deadline.
+            # Advance before awaiting the scan so an invalidation during it survives.
+            if tree_changed:
+                self.last_calibration = time.monotonic()
             version = await self.version()
             catalogs, statuses = {}, {}
             for queue, state in list(self.clients.items()):

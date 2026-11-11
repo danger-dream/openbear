@@ -149,6 +149,9 @@ class WebAdminChatStateMixin:
         return self.interactions.pending_for(str(conversation_uuid or ""))
 
     async def _interaction_changed(self, event: str, item: dict[str, Any]) -> None:
+        hub = getattr(self, "global_realtime", None)
+        if hub is not None:
+            hub.invalidate_tree()
         conv_uuid = str(item.get("conversationUuid") or "")
         live = self._web_live_streams.get(conv_uuid)
         if live is not None:
