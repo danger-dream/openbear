@@ -75,6 +75,7 @@ _CLASSIFICATION_ALIASES = {
     "invalid_request": FORMAT,
     "invalid_request_error": FORMAT,
     "upstream": SERVER_ERROR,
+    "upstream_stream_incomplete": SERVER_ERROR,
 }
 _CLIENT_REQUEST_RETRY_SCOPES = frozenset({
     "client", "request", "client_request", "client/request", "whole_request",
@@ -245,6 +246,7 @@ def _is_server_error_text(low: str) -> bool:
         or "bad gateway" in low
         or "gateway timeout" in low
         or "temporarily unavailable" in low
+        or ("upstream_stream_incomplete" in low or "ended without finishreason" in low) and "blocked by gemini" not in low
         or "503" in low
         or "502" in low
         or "504" in low

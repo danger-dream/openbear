@@ -327,3 +327,47 @@ async def test_http_sse_non_2xx_propagates_transport_and_structured_root():
         assert exc.summary == "触发上游限流，请稍后重试"
     finally:
         await client.close()
+
+
+
+def test_response_failed_upstream_stream_incomplete_is_retryable_server_error():
+    from app.llm.error_payloads import read_error
+
+    parsed = read_error(
+        {
+            "type": "response.failed",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_eof",
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "code": "upstream_stream_incomplete",
+                    "message": "Gemini response ended without finishReason",
+                },
+            },
+        },
+        event_name="response.failed",
+    )
+    assert parsed is not None
+    assert parsed.reason == SERVER_ERROR
+    assert parsed.retryable is True
+
+    blocked = read_error(
+        {
+            "type": "response.failed",
+            "sequence_number": 4,
+            "response": {
+                "id": "resp_flt",
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "code": "content_filter",
+                    "message": "Request blocked by Gemini's filters",
+                },
+            },
+        },
+        event_name="response.failed",
+    )
+    assert blocked is not None
+    assert blocked.retryable is False
