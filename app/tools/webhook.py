@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 
 from app.tools.base import current_tool_context
+from app.tools.describe import guide_for, guide_sections
+from app.tools.schema_outline import outline
 from app.tools.servers import automatic_turn
 from app.runtime.tool_result import ToolOutcome
 from app.webhooks.contracts import EndpointConfig, Scope, WebhookError, dumps
@@ -14,22 +16,55 @@ from app.webhooks import queries, receipts, waits
 ACTIONS=('describe','list','get','create','update','delete','set_enabled','pause','resume','stop','events','retry','wait','report','telemetry')
 READONLY={'describe','events','get','report'}
 AUTOMATIC={'describe','get','events','wait','report','telemetry'}
-GUIDANCE=(Path(__file__).resolve().parents[2]/'prompts'/'guides'/'webhook.md').read_text(encoding='utf-8')
+GUIDE=guide_sections((Path(__file__).resolve().parents[2]/'prompts'/'guides'/'webhook.md').read_text(encoding='utf-8'))
+SUMMARIES={
+    'describe':'this index; params.action=<action> gives that action\'s contract and guidance',
+    'list':'endpoints, filtered; targets=true lists the folders and conversations usable as scope',
+    'get':'one endpoint with its config and revisions; current=true inside an event run gives that run\'s assignment',
+    'create':'new endpoint bound to a folder or conversation',
+    'update':'replace an endpoint\'s config, name and description (get first); operation=rotate_key rotates its key',
+    'delete':'delete an endpoint (user confirmation)',
+    'set_enabled':'enable or disable intake','pause':'hold dispatch','resume':'release a pause','stop':'stop running processing',
+    'events':'received events, or one event in detail','retry':'retry the pre, post or model stage of an event',
+    'wait':'register, await or cancel this task\'s wait for an external callback',
+    'report':'per-event outcomes of an event run','telemetry':'declared metrics and records of an event run'}
+CONTROL={'endpointId':'required','requestId':'required stable ID; reuse only for an identical retry',
+    'expectedControlRevision':'required: endpoint.controlRevision from get'}
+CONTRACTS={
+    'describe':{'action':'optional: one action','schema':'optional boolean, create/update only: the full JSON Schemas instead of the field outline'},
+    'list':{'targets':'true: folders and conversations usable as scope, with search, scopeType, scopeId, selectedId',
+        'effectiveStatus':'receiving|globalDisabled|disabled|paused|deleted|needs_review','scopeType':'folder|conversation','scopeId':'optional',
+        'search':'optional text','limit':'1..100, default 50','cursor':'from the previous page'},
+    'get':{'endpointId':'required unless current','current':'true inside an event run: its assignment, events and execution history'},
+    'events':{'eventId':'one event in detail; without it a list filtered by the other fields','endpointId':'optional','state':'optional route state',
+        'scopeType':'folder|conversation','scopeId':'optional','start':'optional ISO time or epoch ms','end':'optional ISO time or epoch ms',
+        'cursor':'from the previous page','limit':'1..100, default 50'},
+    'delete':{'endpointId':'required','requestId':'required stable ID','stopRunning':'optional boolean, default false: also stop running work',
+        'scope':'all|current with stopRunning, default all','expectedControlRevision':'optional: endpoint.controlRevision from get',
+        'gate':'asks the user through the real confirmation; conversations and events are kept'},
+    'set_enabled':{**CONTROL,'enabled':'required boolean; enabling requires config.processing.instructions'},
+    'pause':{**CONTROL,'scope':'optional: model holds only model dispatch; omitted pauses the endpoint'},
+    'resume':{**CONTROL,'scope':'model releases a model-only pause; omitted resumes the endpoint'},
+    'stop':{**CONTROL,'scope':'all (default): model and scripts | current'},
+    'retry':{'eventId':'required','stage':'required: pre|post|model','requestId':'required stable ID','expectedVersion':'required: the event\'s version from events'},
+    'wait':{'op':'register | await | cancel','register':{'requestId':'stable ID','endpointId':'owned endpoint','match':{'all':[{'path':'body.orderId','op':'eq','value':'123'}]},'afterSeq':'optional task-start cursor override','timeoutSeconds':'positive seconds or null','collection':'optional batching settings'},'await':{'waitId':'registered ID'},'cancel':{'waitId':'registered ID'}},
+    'report':{'receiptId':'stable ID','results':[{'eventId':'owned and delivered event','outcome':'completed | skipped | failed | unknown','summary':'supported claim','evidenceRefs':['tool-action:existing-action-id'],'result':'optional structured result'}]},
+    'telemetry':{'operationId':'required stable ID','eventId':'optional owned event; default the run\'s endpoint','metrics':'declared in config.statistics; platform metrics are read-only','records':'declared records'}}
 CREATE_REQUIRED=('scope','requestId')
 UPDATE_REQUIRED=('endpointId','requestId','expectedRevision')
 MANAGEMENT_FIELDS={'scope','requestId','endpointId','name','description','enabled','expectedRevision','expectedControlRevision','reason','operation','graceSeconds'}
 
 
-def management_contracts(action):
+def management_contracts(action,schema=False):
     common={
         'requestId':'Required stable operation ID, string length 1..128. Reuse only for an identical retry.',
         'name':'Optional endpoint name; omitted means an empty name, including on update.',
         'description':'Optional endpoint description; omitted means an empty description, including on update.',
-        'config':'EndpointConfig object described by configSchema. Full replacement, not a patch; omitted fields use defaults.',
+        'config':'EndpointConfig object outlined in configFields. Full replacement, not a patch; omitted fields use defaults.',
         'reason':'Optional operation reason.'}
     contracts={
         'create':{'required':list(CREATE_REQUIRED),'fields':{**common,
-            'scope':'Required scopeSchema object. Use list with params.targets=true to find an owned folder/conversation ID.',
+            'scope':'Required object outlined in scopeFields. Use list with params.targets=true to find an owned folder/conversation ID.',
             'enabled':'Optional boolean, default false. Enabling requires nonempty config.processing.instructions.'},
             'example':{'action':'create','params':{
                 'requestId':'create-example-1','scope':{'type':'folder','id':'<folder ID from list>'},
@@ -50,12 +85,28 @@ def management_contracts(action):
             'rotation':{'operation':'rotate_key','required':['endpointId','requestId','operation'],
                 'expectedControlRevision':'Use endpoint.controlRevision from get; omission binds the current version at confirmation.',
                 'graceSeconds':'Optional integer 0..3600, default 0. Invokes the real user confirmation gate; no config or expectedRevision required.'}}}
+    scope,config=Scope.model_json_schema(by_alias=True),EndpointConfig.model_json_schema(by_alias=True)
+    shapes=({'scopeSchema':scope,'configSchema':config} if schema else
+            {'scopeFields':outline(scope),'configFields':outline(config),
+             'schemaNote':'One line per field: path: type = default \u2014 meaning. Nested objects are flattened by path; [] marks list items. '
+                          'describe with params.schema=true gives the full JSON Schemas (limits, formats, nested definitions).'})
     return {'contracts':{k:v for k,v in contracts.items() if not action or k==action},
-        'scopeSchema':Scope.model_json_schema(by_alias=True),
-        'configSchema':EndpointConfig.model_json_schema(by_alias=True),
+        **shapes,
         'parameterLayout':'Only action and params belong at the tool root. Put requestId, scope, name, enabled and config beside each other inside params, never inside config.',
         'targetRules':['A folder scope defaults to target.mode=newConversation. fixedConversation must select a conversation in that folder or its descendants.',
                        'A conversation scope must target that same conversation. Omit config.target for automatic fixedConversation selection, or set mode=fixedConversation and conversationId=scope.id.']}
+
+
+def describe(action=None,schema=False):
+    if action is None:
+        return {'actions':SUMMARIES,'note':'describe with params.action=<action> gives its contract and guidance; create and update add the config and scope field outlines '
+                '(params.schema=true: the full JSON Schemas). '
+                'Keys never reach the model; sensitive operations ask the user through the real confirmation.'}
+    if action not in ACTIONS:
+        raise WebhookError('unknown_action',f'describe has no action {action!r}; use one of these',details={'actions':list(ACTIONS)})
+    guidance=guide_for(GUIDE,action)
+    contract=management_contracts(action,schema) if action in ('create','update') else {'contract':CONTRACTS[action]}
+    return {'action':action,**contract,**({'guidance':guidance} if guidance else {})}
 
 
 def validate_management_params(action,params):
@@ -88,12 +139,7 @@ async def dispatch(service,action,params,ctx):
     a=await one(service.db.conn,'SELECT * FROM webhook_assignments WHERE conversation_uuid=? AND root_turn_uuid=?',(ctx.conversation_uuid,ctx.run_root_turn_uuid))
     if a: ctx.webhook_assignment_id=a['assignment_id']
     if action=='describe':
-        contract=management_contracts(params.get('action')) if params.get('action') in (None,'create','update') else {}
-        return {'actions':list(ACTIONS),'requested':params.get('action'),'guidance':GUIDANCE,**contract,'protocol':{
-            'wait':{'op':'register | await | cancel','register':{'requestId':'stable ID','endpointId':'owned endpoint','match':{'all':[{'path':'body.orderId','op':'eq','value':'123'}]},'afterSeq':'optional task-start cursor override','timeoutSeconds':'positive seconds or null','collection':'optional batching settings'},'await':{'waitId':'registered ID'}},
-            'report':{'receiptId':'stable ID','results':[{'eventId':'owned and delivered event','outcome':'completed | skipped | failed | unknown','summary':'supported claim','evidenceRefs':['tool-action:existing-action-id'],'result':'optional structured result'}]},
-            'management':'get before update; expectedRevision/expectedControlRevision + stable requestId; sensitive operations invoke the real user confirmation gate; keys never returned to model',
-            'telemetry':'operationId + declared metrics/records; platform metrics are read-only'}}
+        return describe(params.get('action'),params.get('schema') is True)
     if action=='list':
         return await queries.targets(service,owner,params) if params.get('targets') else await service.list(owner,params)
     if action=='get':
@@ -186,5 +232,5 @@ def register_webhook_tool(registry,service):
                         details={'field':key,'expectedPath':f'params.{key}'})
             return dumps(await dispatch(service,args.get('action'),args.get('params',{}),current_tool_context()))
         except WebhookError as exc: return ToolOutcome(dumps(exc.payload),'failed','not_started')
-    registry.add('Webhook','Manage authorized external triggers; register/await external events, report owned outcomes, query observations. Call describe before create/update; it returns the action contracts and design guidance. Identity is supplied by runtime; keys never enter model context. Amended receipts keep endpoint/config/control versions fixed; deletion may reduce stopRunning or stop scope and affected resources may finish, never expand. Rotation parameters stay exact.',
+    registry.add('Webhook','Manage authorized external triggers; register/await external events, report owned outcomes, query observations. describe gives an index of the actions; describe {action} gives one action\'s contract and guidance: read it for create or update before calling them. Identity is supplied by runtime; keys never enter model context. Amended receipts keep endpoint/config/control versions fixed; deletion may reduce stopRunning or stop scope and affected resources may finish, never expand. Rotation parameters stay exact.',
                       {'type':'object','properties':{'action':{'type':'string','enum':list(ACTIONS)},'params':{'type':'object','description':'Action-specific parameters; call describe with params.action=create or update for contracts and examples. For create, scope and requestId go directly inside params, beside config, not inside config.'}},'required':['action'],'additionalProperties':False},handler,visibility={'main','agent'},effect_scope='external_event')

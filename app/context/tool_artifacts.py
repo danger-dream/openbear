@@ -17,6 +17,7 @@ from app.context.window import (
 )
 from app.llm.base import Message
 from app.utils import estimate_tokens
+from app.tools.agent_actions import canonical_tool
 
 # These conclusions/decisions are protected parent inputs, not ordinary evidence.
 # Keep their existing preflight/paging contract rather than hiding it behind Read.
@@ -79,7 +80,8 @@ def externalize_tool_results(
             if (call is None or not meta.get("id") or meta.get("tool_result_artifact")
                     or meta.get("kind") in PINNED_KINDS | {"runtime", "required_runtime"}):
                 continue
-            name = str(call.get("name") if isinstance(call, dict) else call.name)
+            name = canonical_tool(str(call.get("name") if isinstance(call, dict) else call.name),
+                                  call.get("arguments") if isinstance(call, dict) else call.arguments)
             if name in _PROTECTED_TOOLS or _decision_exchange(call, group):
                 continue
             content = original.get("content")

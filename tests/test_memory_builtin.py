@@ -282,3 +282,21 @@ async def test_bootstrap_keeps_default_display_name(db, tmp_path, monkeypatch):
     row = await cur.fetchone()
     assert row is not None
     assert "**UserName**: 老大" in row["content"]
+
+
+async def test_render_logs_keep_the_last_month_a_batch_at_a_time(db):
+    from app.db.engine import now_ts
+    from app.memory import builtin
+    mem = BuiltinMemoryClient(db)
+    old = now_ts() - (builtin.RENDER_LOG_DAYS + 1) * 86400
+    await db.conn.executemany("INSERT INTO memory_render_logs (ts, output) VALUES (?, 'x')", [(old,)] * 250)
+    await db.conn.execute("INSERT INTO memory_render_logs (ts, output) VALUES (?, 'recent')", (now_ts() - 86400,))
+    await db.conn.commit()
+
+    async def counts():
+        cur = await db.conn.execute("SELECT SUM(ts<?), SUM(ts>=?) FROM memory_render_logs", (now_ts() - builtin.RENDER_LOG_DAYS * 86400,) * 2)
+        return tuple(await cur.fetchone())
+    await mem.render_system_prompt()
+    assert await counts() == (50, 2)
+    await mem.render_system_prompt()
+    assert await counts() == (0, 3)

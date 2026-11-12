@@ -6,7 +6,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../../browserTestServ
 import {createRequire} from 'node:module';
 export const require = createRequire(import.meta.url);
 export let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../../testing/playwright.cjs')); } catch {}
 export const shots = process.env.OPENBEAR_MESH_SHOTS || '';
 export const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:mesh-test"></script></body></html>';
 export const entry = `import {createApp, h, KeepAlive, ref} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import '/src/style.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
@@ -29,15 +29,16 @@ export async function startMeshBrowser(t) {
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false} = {}) {
+  async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false, v3 = false} = {}) {
     if (routes) reach = true;
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: 1, colorScheme: dark ? 'dark' : 'light', hasTouch: width < 760, isMobile: width < 760});
     t.after(() => context.close());
-    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall}), items = SERVERS();
+    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall, v3}), items = SERVERS();
     if (punch) items.push(server('office', 'Office', {region: 'CN'}), server('cafe', 'Cafe', {region: 'SG'}), server('nas', 'NAS', {region: 'CN'}));
     if (reach) items.push(server('sg', 'SG', {region: 'SG'}), server('toy', 'TOY', {region: 'CN'}), server('lab', 'Lab', {region: 'CN'}));
     page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(([isDark, state, alive]) => { window.__dark = isDark; window.__keepAlive = alive; sessionStorage.setItem('openbear.servers.tabs', state); }, [dark, JSON.stringify({tabs, active}), keepAlive]);
+    // v3: the mesh pages; otherwise the classic board.
+    await page.addInitScript(([isDark, state, alive, classic]) => { window.__dark = isDark; window.__keepAlive = alive; localStorage.setItem('openbear.mesh.classic', classic); sessionStorage.setItem('openbear.servers.tabs', state); }, [dark, JSON.stringify({tabs, active}), keepAlive, v3 ? '0' : '1']);
     // slowGets(ms): GET /mesh answers as it stands when asked, but only `ms` later.
     let slow = 0;
     if (init) await page.addInitScript(init);
@@ -59,7 +60,7 @@ export async function startMeshBrowser(t) {
     });
     await page.goto(fixture.base + '/__test');
     await waitForBrowserReady(page, page.locator('#app > *').first(), errors);
-    if (active === 'mesh' && !missing) { await page.locator('.vue-flow__node').first().waitFor(); await settled(page); }
+    if (active === 'mesh' && !missing) { await page.locator(v3 ? '.m3-tabs' : '.vue-flow__node').first().waitFor(); await settled(page); }
     const puts = () => calls.filter(c => c.method === 'PUT' && c.path === '/api/servers/mesh/draft');
     return {page, calls, mesh, puts, last: () => puts().at(-1)?.body, slowGets: ms => { slow = ms; },
       layoutPuts: () => calls.filter(c => c.method === 'PUT' && c.path === '/api/servers/mesh/layout'),

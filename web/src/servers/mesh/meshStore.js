@@ -27,6 +27,8 @@ let revision = 0;
 const snapshot = () => JSON.stringify(mesh.work);
 // The rule under the pointer, in the board's legend or the panel's list: the board highlights its members.
 export const ruleHover = reactive({id: ''});
+// What the overview panel has open: kept while the panel comes and goes with the selection.
+export const folds = reactive({rules: false, autoRules: false, proxies: false});
 export const unsaved = () => Boolean(mesh.work) && snapshot() !== synced.value;
 
 function adopt(data, force = false) {
@@ -46,10 +48,10 @@ function adopt(data, force = false) {
   }
 }
 
-export function refresh() {
-  if (loading) return loading;
+export function refresh(fresh = false) {
+  if (loading) return fresh ? loading.then(() => refresh(true)) : loading;
   const mine = revision;
-  loading = MeshApi.state().then(data => { if (mine === revision && !saving && !layoutSending) adopt(data); }).catch(e => {
+  loading = MeshApi.state(fresh).then(data => { if (mine === revision && !saving && !layoutSending) adopt(data); }).catch(e => {
     if (e?.response?.status === 404) mesh.unavailable = true;
     else mesh.loadError = meshError(e);
   }).finally(() => { loading = null; });
@@ -186,12 +188,12 @@ export async function reinstallMesh(m) {
 // Marks a member for removal after asking; it leaves the mesh when applied.
 export async function removeFromMesh(m) {
   try {
-    await ElMessageBox.confirm(`应用后「${m.name}」将无法访问网格，机器上的组网服务会被卸载。`, '从组网移除', {confirmButtonText: '移除', cancelButtonText: '取消', type: 'warning'});
+    await ElMessageBox.confirm(`应用后「${m.name}」将无法访问网格，节点上的组网服务会被卸载。`, '从组网移除', {confirmButtonText: '移除', cancelButtonText: '取消', type: 'warning'});
   } catch { return false; }
   const result = await act(() => MeshApi.removeMember(m.serverId));
   // One never applied leaves the draft at once.
   const gone = result && !(mesh.data?.members || []).some(x => x.serverId === m.serverId);
-  if (result) ElMessage.success(gone ? '已移出组网，机器上的组网服务会被卸载' : '已标记为待移除，应用后生效');
+  if (result) ElMessage.success(gone ? '已移出组网，节点上的组网服务会被卸载' : '已标记为待移除，应用后生效');
   return Boolean(result);
 }
 

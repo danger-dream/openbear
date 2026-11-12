@@ -416,3 +416,22 @@ async def test_cdp_multiplexes_events_and_errors_without_replay():
     finally:
         await cdp.close()
         await server.close()
+
+
+async def test_snapshot_document_identity_changes_on_reload_and_subframe_epoch(engine):
+    obj, page = engine
+    frame = snapshot_frame(page)
+    first = await obj.execute('snapshot', {'targetId': page.target})
+    second = await obj.execute('snapshot', {'targetId': page.target})
+    assert first['documentId'] == second['documentId']
+    # Same URL with a different loader is a real document reload.
+    page.update_frame({'id': frame.id, 'loaderId': 'new-loader', 'url': frame.url}, page.session)
+    reloaded = await obj.execute('snapshot', {'targetId': page.target})
+    assert reloaded['url'] == first['url'] and reloaded['documentId'] != first['documentId']
+    child = Frame(page, 'child', parent=frame.id, session=page.session)
+    page.frames[child.id] = child
+    child.invalidate()
+    after_child = await obj.execute('snapshot', {'targetId': page.target})
+    assert after_child['documentId'] != reloaded['documentId']
+    rebuilt = Page(obj, page.target)
+    assert rebuilt.document_id != page.document_id

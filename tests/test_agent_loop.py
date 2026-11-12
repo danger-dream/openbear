@@ -2212,3 +2212,62 @@ async def test_timing_sample_counts_track_only_observed_successful_controller_st
     assert result.connect_samples == 1
     assert result.first_token_samples == 2
     assert result.connect_ms_sum == 12
+
+
+async def test_merged_agent_actions_follow_the_earlier_tool_rules_records_and_cards():
+    from app.tools.agent_actions import merge_agent_tools
+    reg = ToolRegistry()
+    waits = []
+
+    async def _agent(_args):
+        return '{"ok":true,"status":"running","detached":true,"taskUuid":"task-1"}'
+
+    async def _read(_args):
+        return "done"
+
+    async def _wait(args):
+        waits.append(args)
+        return '{"ok":true,"summary":{"running":1}}'
+
+    reg.add("Agent", "agent", {"type": "object", "properties": {"prompt": {"type": "string"}}}, _agent)
+    reg.add("Read", "read", {"type": "object", "properties": {}}, _read)
+    reg.add("AgentWait", "wait", {"type": "object", "properties": {"mode": {"type": "string"}}}, _wait)
+    merge_agent_tools(reg, "Agent", "agents", {"start": "start one", "wait": "wait for them"})
+    assert reg.names(scope="main") == ["Agent", "Read"]
+
+    class Cards(RecordRenderer):
+        def __init__(self):
+            super().__init__()
+            self.started, self.results = [], []
+
+        async def on_tool_start(self, call_id, name, arguments, line):
+            self.started.append((name, json.loads(arguments)))
+
+        async def on_tool_result(self, call_id, name, arguments, result, duration_ms):
+            self.results.append(name)
+
+    call = lambda i, name, args: ToolCall(id=i, name=name, arguments=json.dumps(args))
+    backend = FakeBackend([
+        [StreamEvent(kind="tool_call", tool_calls=[call("a1", "Agent", {"prompt": "x"})]), StreamEvent(kind="finish", finish_reason="tool_calls")],
+        [StreamEvent(kind="tool_call", tool_calls=[call("r1", "Read", {}), call("w1", "Agent", {"action": "wait", "mode": "event_only"})]),
+         StreamEvent(kind="finish", finish_reason="tool_calls")],
+        [StreamEvent(kind="tool_call", tool_calls=[call("w2", "Agent", {"action": "wait", "mode": "event_only"})]), StreamEvent(kind="finish", finish_reason="tool_calls")],
+        [StreamEvent(kind="tool_call", tool_calls=[call("w3", "Agent", {"action": "wait", "prompt": "misplaced"})]), StreamEvent(kind="finish", finish_reason="tool_calls")],
+        [StreamEvent(kind="tool_call", tool_calls=[call("w4", "AgentWait", {"mode": "review_after"})]), StreamEvent(kind="finish", finish_reason="tool_calls")],
+        [StreamEvent(kind="content", text="done"), StreamEvent(kind="finish", finish_reason="stop")],
+    ])
+    renderer = Cards()
+    await Agent(backend, reg).run([{"role": "user", "content": "x"}], renderer, model="m")
+
+    # Batched with a foreground tool, the merged wait is refused like AgentWait; alone it runs the wait, and so does the earlier name.
+    # Another action's field is dropped and named in the result.
+    assert waits == [{"mode": "event_only"}, {}, {"mode": "review_after"}]
+    tool_messages = {m["tool_call_id"]: m for m in backend.seen_convos[-1] if m.get("role") == "tool"}
+    assert "foreground_work_in_same_batch" in tool_messages["w1"]["content"]
+    assert json.loads(tool_messages["w3"]["content"])["ignoredFields"] == ["prompt"]
+    # Cards and records name the earlier tool, with its own arguments.
+    assert ("AgentWait", {"mode": "event_only"}) in renderer.started and ("Agent", {"prompt": "x"}) in renderer.started
+    assert renderer.results.count("AgentWait") == 4 and tool_messages["w2"]["name"] == "AgentWait"
+    # The model's own transcript keeps the call as it made it.
+    assistant_calls = [c for m in backend.seen_convos[-1] if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
+    assert any(c.name == "Agent" and '"action": "wait"' in c.arguments for c in assistant_calls)

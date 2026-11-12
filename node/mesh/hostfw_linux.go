@@ -208,11 +208,18 @@ func serviceEnabled(unit string) bool {
 // found, comma-separated (ufw or iptables, docker, firewalld, nftables), and
 // the issues.
 func (f *hostFirewalls) report(iptables bool) {
+	var rules string
+	if iptables {
+		rules, _ = f.x("iptables", "-w", "-S")
+	}
+	f.reportRules(rules, iptables)
+}
+
+func (f *hostFirewalls) reportRules(rules string, iptables bool) {
 	var kinds []string
 	var issues []FirewallIssue
 	if iptables {
-		out, _ := f.x("iptables", "-w", "-S")
-		kinds = append(kinds, iptablesKinds(out, f.fd.running, ufwEnabled())...)
+		kinds = append(kinds, iptablesKinds(rules, f.fd.running, ufwEnabled())...)
 	}
 	// Found by its signs, its program missing.
 	for _, m := range f.missing {
@@ -816,7 +823,7 @@ func nftComment(rules [][]string) string {
 
 func (n *nftables) apply(w firewallWant) {
 	n.err = ""
-	n.sync(w)
+	n.sync(w, false)
 	n.applied = true
 }
 
@@ -824,7 +831,7 @@ func (n *nftables) heal(w firewallWant) []string {
 	if !n.applied {
 		return nil
 	}
-	return n.sync(w)
+	return n.sync(w, true)
 }
 
 // sync puts the rules in each of the user's chains that deny by default,
@@ -832,80 +839,118 @@ func (n *nftables) heal(w firewallWant) []string {
 // other looked-at chain (rules an earlier version put in a chain that lets
 // through all but what it picks out, or in another tool's): the chains it
 // had to change. Run by apply, so on start too.
-func (n *nftables) sync(w firewallWant) []string {
+func (n *nftables) sync(w firewallWant, batch bool) []string {
 	n.found, n.err = false, ""
 	if !n.present {
 		return nil
 	}
-	cs, err := n.chains()
-	if err != nil {
-		// nft there but not answering: not taken for no ruleset.
-		n.err = err.Error()
-		return nil
+	var cs []nftChain
+	var snapshot map[nftChainKey][]nftRule
+	var batched bool
+	if batch {
+		cs, snapshot, batched = readNFT(n.x)
+	}
+	if !batched {
+		var err error
+		cs, err = n.chains()
+		if err != nil {
+			n.err = err.Error()
+			return nil
+		}
 	}
 	var fixed []string
 	for _, c := range cs {
 		if !looked(c) {
 			continue
 		}
-		out, err := n.x("nft", "-j", "-a", "list", "chain", c.Family, c.Table, c.Name)
-		if err != nil {
-			continue
-		}
-		rules := parseNFTRules(out)
-		if otherTool(c) || !deniesByDefault(c, rules) {
-			if slices.ContainsFunc(rules, nftRule.ours) {
-				n.remove(c, rules)
-				fixed = append(fixed, "nftables "+c.Family+" "+c.Table+" "+c.Name+" (out)")
+		rules := snapshot[c.key()]
+		if !batched {
+			out, err := n.x("nft", "-j", "-a", "list", "chain", c.Family, c.Table, c.Name)
+			if err != nil {
+				continue
 			}
-			continue
+			rules = parseNFTRules(out)
 		}
-		want := nftRules(c.Hook, n.iface, w)
-		mark := nftComment(want)
-		end := banEnd(rules)
-		held := len(rules) >= end+len(want)
-		for i, r := range rules {
-			if r.ours() != (i >= end && i < end+len(want)) || r.ours() && r.Comment != mark {
-				held = false
+		fixed = append(fixed, n.syncChain(c, rules, w, batched)...)
+	}
+	return fixed
+}
+
+func (n *nftables) syncChain(c nftChain, rules []nftRule, w firewallWant, recheck bool) []string {
+	var fixed []string
+	if otherTool(c) || !deniesByDefault(c, rules) {
+		if slices.ContainsFunc(rules, nftRule.ours) {
+			if recheck {
+				return n.recheckChain(c, w)
 			}
+			n.remove(c, rules)
+			fixed = append(fixed, "nftables "+c.Family+" "+c.Table+" "+c.Name+" (out)")
 		}
+		return fixed
+	}
+	want := nftRules(c.Hook, n.iface, w)
+	mark := nftComment(want)
+	end := banEnd(rules)
+	held := len(rules) >= end+len(want)
+	for i, r := range rules {
+		if r.ours() != (i >= end && i < end+len(want)) || r.ours() && r.Comment != mark {
+			held = false
+		}
+	}
+	if held {
 		n.found = true
-		if held {
-			continue
-		}
-		n.remove(c, rules)
-		where := []string{"nft", "insert", "rule", c.Family, c.Table, c.Name}
-		if end > 0 {
-			// Added right after the last rule that bans, each in front of the one added before.
-			seen := 0
-			for _, r := range rules {
-				if !r.ours() {
-					if seen++; seen == end {
-						where = []string{"nft", "add", "rule", c.Family, c.Table, c.Name, "position", strconv.Itoa(r.Handle)}
-						break
-					}
+		return fixed
+	}
+	if recheck {
+		return n.recheckChain(c, w)
+	}
+	n.found = true
+	n.remove(c, rules)
+	where := []string{"nft", "insert", "rule", c.Family, c.Table, c.Name}
+	if end > 0 {
+		// Added right after the last rule that bans, each in front of the one added before.
+		seen := 0
+		for _, r := range rules {
+			if !r.ours() {
+				if seen++; seen == end {
+					where = []string{"nft", "add", "rule", c.Family, c.Table, c.Name, "position", strconv.Itoa(r.Handle)}
+					break
 				}
 			}
 		}
-		failed := false
-		for i := len(want) - 1; i >= 0; i-- {
-			args := append(slices.Clone(where), want[i]...)
-			if _, err := n.x(append(args, "comment", strconv.Quote(mark))...); err != nil {
-				n.err = c.Family + " " + c.Table + " " + c.Name + ": " + err.Error()
-				failed = true
-				break
-			}
-		}
-		if failed {
-			// Partly in, it would be put back every heal: none rather.
-			if out, err := n.x("nft", "-j", "-a", "list", "chain", c.Family, c.Table, c.Name); err == nil {
-				n.remove(c, parseNFTRules(out))
-			}
-			continue
-		}
-		fixed = append(fixed, "nftables "+c.Family+" "+c.Table+" "+c.Name)
 	}
+	failed := false
+	for i := len(want) - 1; i >= 0; i-- {
+		args := append(slices.Clone(where), want[i]...)
+		if _, err := n.x(append(args, "comment", strconv.Quote(mark))...); err != nil {
+			n.err = c.Family + " " + c.Table + " " + c.Name + ": " + err.Error()
+			failed = true
+			break
+		}
+	}
+	if failed {
+		// Partly in, it would be put back every heal: none rather.
+		if out, err := n.x("nft", "-j", "-a", "list", "chain", c.Family, c.Table, c.Name); err == nil {
+			n.remove(c, parseNFTRules(out))
+		}
+		return fixed
+	}
+	fixed = append(fixed, "nftables "+c.Family+" "+c.Table+" "+c.Name)
 	return fixed
+}
+
+// Re-read policy, position and handles before a repair, not just the rules.
+func (n *nftables) recheckChain(c nftChain, w firewallWant) []string {
+	out, err := n.x("nft", "-j", "-a", "list", "chain", c.Family, c.Table, c.Name)
+	if err != nil {
+		return nil
+	}
+	for _, fresh := range parseNFTChains(out) {
+		if fresh.key() == c.key() && looked(fresh) {
+			return n.syncChain(fresh, parseNFTRules(out), w, false)
+		}
+	}
+	return nil
 }
 
 // remove takes this data plane's rules out of a chain, by their handles.

@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -244,7 +245,7 @@ func TestSiteRelayAnswersAMembersEntryOffer(t *testing.T) {
 	if m.directs["X"] != nil {
 		t.Fatal("made punch state for a member not allowed to attach here")
 	}
-	m.receive(offerFrom(t, "SG", "T", Offer{From: "M", To: "T", Session: "s", Gen: 1, Candidates: []string{"lan:10.20.20.253:51820"}}))
+	m.receive(offerFrom(t, "SG", "T", Offer{From: "M", To: "T", Session: "s", Gen: 1, Candidates: []string{"lan:10.20.20.53:51820"}}))
 	d := m.directs["M"]
 	if d == nil || d.kind != punchSite || d.driver {
 		t.Fatalf("site state %+v", d)
@@ -582,17 +583,17 @@ func TestViaOf(t *testing.T) {
 		netip.MustParseAddrPort("100.100.100.100:51998"): "public",
 	}}
 	for addr, want := range map[string]string{
-		"10.20.20.7:51998":            "lan",    // offered, on this node's network
-		"10.20.20.9:51998":            "lan",    // configured, on it
-		"10.10.10.251:51999":          "routed", // offered, through a VPN
-		"10.20.20.2:51998":            "routed", // on this network, but a router's that masquerades for the peer
-		"10.10.10.254:51998":          "routed", // likewise, elsewhere
-		"192.0.2.79:51820":            "public", // offered as LAN, an internet address
-		"192.0.2.34:43173":            "public", // offered
-		"192.0.2.34:40000":            "public", // the peer's NAT, not offered
-		"100.100.100.100:5199":        "routed", // carrier-grade NAT space
-		"203.0.113.9:51998":           "public", // anything else on the internet
-		"[::ffff:10.10.10.254]:51998": "routed",
+		"10.20.20.7:51998":              "lan",    // offered, on this node's network
+		"10.20.20.9:51998":              "lan",    // configured, on it
+		"10.10.10.251:51999":            "routed", // offered, through a VPN
+		"10.20.20.2:51998":              "routed", // on this network, but a router's that masquerades for the peer
+		"192.168.10.254:51998":          "routed", // likewise, elsewhere
+		"192.0.2.79:51820":              "public", // offered as LAN, an internet address
+		"192.0.2.34:43173":              "public", // offered
+		"192.0.2.34:40000":              "public", // the peer's NAT, not offered
+		"100.100.100.100:5199":          "routed", // carrier-grade NAT space
+		"203.0.113.9:51998":             "public", // anything else on the internet
+		"[::ffff:192.168.10.254]:51998": "routed",
 	} {
 		if got := m.viaOf(d, netip.MustParseAddrPort(addr)); got != want {
 			t.Errorf("%s: %s, want %s", addr, got, want)
@@ -1281,4 +1282,24 @@ func (b *reflectingBackend) Reflect(_ context.Context, server netip.AddrPort, _ 
 		return a, nil
 	}
 	return netip.AddrPort{}, context.DeadlineExceeded
+}
+
+func TestTunnelsAreNoLAN(t *testing.T) {
+	mac := net.HardwareAddr{2, 0, 0, 0, 0, 1}
+	for _, c := range []struct {
+		ifc  net.Interface
+		want bool
+	}{
+		{net.Interface{Name: "eth0", Flags: net.FlagUp | net.FlagBroadcast, HardwareAddr: mac}, true},
+		{net.Interface{Name: "eth1", Flags: net.FlagBroadcast, HardwareAddr: mac}, false},
+		{net.Interface{Name: "lo", Flags: net.FlagUp | net.FlagLoopback}, false},
+		// WireGuard and a proxy's TUN: point-to-point, no hardware address.
+		{net.Interface{Name: "wg_gc_sg_cn2gia", Flags: net.FlagUp | net.FlagPointToPoint}, false},
+		{net.Interface{Name: "utun", Flags: net.FlagUp | net.FlagPointToPoint | net.FlagMulticast}, false},
+		{net.Interface{Name: "sgcn2gia", Flags: net.FlagUp}, false},
+	} {
+		if got := lanInterface(c.ifc); got != c.want {
+			t.Errorf("%s: %v", c.ifc.Name, got)
+		}
+	}
 }

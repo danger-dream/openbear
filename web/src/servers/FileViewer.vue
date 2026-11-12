@@ -75,7 +75,7 @@ onMounted(load);
 onBeforeUnmount(() => { if (url.value.startsWith('blob:')) URL.revokeObjectURL(url.value); });
 </script>
 <template>
-  <el-dialog :model-value="true" :fullscreen="phone" width="min(1100px, 94vw)" append-to-body :close-on-click-modal="false" :before-close="close"
+  <el-dialog :model-value="true" :fullscreen="phone" width="min(1100px, 94vw)" append-to-body :close-on-click-modal="true" :before-close="close"
     :class="['admin-dialog', 'instance-dialog', 'instance-ui', 'servers-ui', 'fv-dialog', phone ? 'is-phone' : '']" :aria-label="`文件 ${path}`">
     <template #header>
       <div class="fv-head">

@@ -266,6 +266,9 @@ test('instances on a mesh address and host firewalls: read-only automatic rules 
   await h.saved(d => d.rules.length === 1, 'a rule of the user\'s');
   await h.page.keyboard.press('Escape');
   await panel.getByRole('button', {name: '编辑第 1 条规则'}).waitFor();
+  // With a rule of the user's the automatic ones fold away behind it.
+  assert.equal(await auto.count(), 0);
+  await panel.getByRole('button', {name: '展开自动放行（1 条，不能编辑）'}).click();
   assert.equal(await auto.locator('li').count(), 1);
   // The automatic row lines up with the user's rule text.
   // The Linux member: its firewalls as a status row, one hint per thing they may not let through.
@@ -276,7 +279,7 @@ test('instances on a mesh address and host firewalls: read-only automatic rules 
   const hints = panel.locator('.mesh-hints summary');
   assert.deepEqual((await hints.allInnerTexts()).filter(x => !/内存|路由/.test(x)), ['组网网卡在 firewalld 的 work 区域', '没能放行发往容器的组网连接']);
   await hints.filter({hasText: 'work 区域'}).click();
-  await panel.getByText(/obmesh0 是在这台机器上手动指定到 work 区域的，组网没有改动它/).waitFor();
+  await panel.getByText(/obmesh0 是在这个节点上手动指定到 work 区域的，组网没有改动它/).waitFor();
   assert.equal(await panel.getByText('macOS 防火墙已开启').count(), 0, 'no macOS hint for a Linux member');
   await h.close();
   for (const dark of [true, false]) {
@@ -292,7 +295,7 @@ test('instances on a mesh address and host firewalls: read-only automatic rules 
     const sheet = q.page.locator('.mesh-inspect-sheet');
     await sheet.locator('.mesh-stats dt', {hasText: '主机防火墙'}).waitFor();
     await sheet.locator('.mesh-hints summary', {hasText: 'work 区域'}).tap();
-    await sheet.getByText(/obmesh0 是在这台机器上手动指定到 work 区域的/).waitFor();
+    await sheet.getByText(/obmesh0 是在这个节点上手动指定到 work 区域的/).waitFor();
     await q.close();
   }
 });
@@ -375,7 +378,7 @@ test('missing mesh service: the state on the board, the bar and the panel; reins
   const running = notice.getByRole('button', {name: '正在重新安装…'});
   await running.waitFor();
   assert.equal(await running.isDisabled(), true);
-  assert.match(await notice.innerText(), /正在机器上安装，最多约 3 分钟/);
+  assert.match(await notice.innerText(), /正在节点上安装，最多约 3 分钟/);
   assert.equal(await notice.locator('.mesh-missing-error').count(), 0, 'the earlier reason goes once it is tried again');
   await page.locator('.el-message', {hasText: '已在「Home」上重新安装组网服务，正在把新密钥下发给其他成员'}).waitFor({timeout: 10000});
   await notice.waitFor({state: 'detached', timeout: 10000});
@@ -404,7 +407,7 @@ test('missing mesh service: the state on the board, the bar and the panel; reins
   assert.equal(await r.page.locator('.mesh-stage .mesh-bar').getAttribute('data-kind'), 'missing');
   assert.doesNotMatch(await r.page.locator('.mesh-summary').innerText(), /失败/);
   // Nothing selected: the panel lists it.
-  assert.match(await r.page.locator('.mesh-changes').innerText(), /1 台的组网服务不见了\s*Home：组网服务不见了，已跳过/);
+  assert.match(await r.page.locator('.mesh-changes').innerText(), /1 台的组网服务不见了\s*(?:\p{Regional_Indicator}{2})?Home：组网服务不见了，已跳过/u);
   await r.close();
 
   // An entry through a relay whose service is gone.
@@ -478,7 +481,8 @@ test('leaving the mesh tab or the servers page stops every reading; coming back 
   await page.locator('.sv-tabs [role=tab]', {hasText: '组网'}).click();
   await settle(page, 1500);
   let back = meshCalls(h, since);
-  for (const want of ['GET /', 'GET /members/mac', 'GET /routes?src=mac', 'GET /members/mac/trend?range=1h']) assert.ok(back.includes(want), `${want} at once on return: ${back}`);
+  // Back on screen, the mesh is read with the nodes asked for their interfaces and routes first.
+  for (const want of ['GET /?fresh=1', 'GET /members/mac', 'GET /routes?src=mac', 'GET /members/mac/trend?range=1h']) assert.ok(back.includes(want), `${want} at once on return: ${back}`);
   await h.close();
 
   // The whole servers page put away (another page of the app): the same, a link's line record included.
@@ -496,7 +500,7 @@ test('leaving the mesh tab or the servers page stops every reading; coming back 
   await page.evaluate(() => window.__showServers(true));
   await settle(page, 1500);
   back = meshCalls(h, since);
-  for (const want of ['GET /', 'GET /members/home', 'GET /members/home/trend?range=1h']) assert.ok(back.includes(want), `${want} at once on return: ${back}`);
+  for (const want of ['GET /?fresh=1', 'GET /members/home', 'GET /members/home/trend?range=1h']) assert.ok(back.includes(want), `${want} at once on return: ${back}`);
   // A line's record: read when the link is selected, again at once when the page comes back.
   await label(page, '2 · TCP').click();
   await inspector(page).locator('.mesh-line-ranges').waitFor();
@@ -510,6 +514,6 @@ test('leaving the mesh tab or the servers page stops every reading; coming back 
   await page.evaluate(() => window.__showServers(true));
   await settle(page, 1500);
   back = meshCalls(h, since);
-  assert.ok(back.includes(lineTrend) && back.includes('GET /'), `the line's record and the mesh at once on return: ${back}`);
+  assert.ok(back.includes(lineTrend) && back.includes('GET /?fresh=1'), `the line's record and the mesh at once on return: ${back}`);
   await h.close();
 });

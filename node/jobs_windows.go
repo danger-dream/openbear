@@ -126,6 +126,9 @@ func watchJob(cmd *exec.Cmd) (func(force bool), func()) {
 	return func(bool) { windows.TerminateJobObject(job, 1) }, func() { windows.CloseHandle(job) }
 }
 
+// groupAlive: a stop ends the job object, and everything in it with it.
+func groupAlive(int) bool { return false }
+
 // jobStderr turns the CLIXML that Windows PowerShell writes to a redirected
 // stderr back into text as it arrives.
 func jobStderr(out *jobLog) (io.Writer, func()) {

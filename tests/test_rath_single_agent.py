@@ -29,6 +29,7 @@ from app.task_memory import (
 )
 from app.tools.base import ToolRegistry
 from app.tools.task_memory import register_task_memory_tool
+from app.tools.agent_actions import schema_tool_names
 
 
 @pytest.fixture
@@ -1700,7 +1701,7 @@ async def test_single_agent_budget_pause_can_continue_same_task(env, monkeypatch
     assert backend.calls == 2
     assert output["status"] == "needs_openbear_control"
     assert output["reason"] == "agent_task_budget_exceeded"
-    assert output["detail"]["continueTool"]["name"] == "AgentMessage"
+    assert output["detail"]["continueTool"]["name"] == "Agent" and output["detail"]["continueTool"]["arguments"]["action"] == "message"
     task = await dao.get_task(task_uuid)
     assert task is not None
     assert task.status == "needs_openbear_control"
@@ -1831,20 +1832,20 @@ async def test_direct_agent_keeps_control_ack_stable_across_interventions(env):
         plan_protocol_enabled=False,
     )
 
-    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    names = schema_tool_names(await runner._allowed_tool_schemas())
     assert names == {"Read", "AgentControlAck"}
 
     runner.steers.append({"controlUuid": "c-1", "message": "补一个缺口"})
-    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    names = schema_tool_names(await runner._allowed_tool_schemas())
     assert names == {"Read", "AgentControlAck"}
 
     runner.steers.clear()
     runner._pending_control_acks.add("c-1")
-    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    names = schema_tool_names(await runner._allowed_tool_schemas())
     assert names == {"Read", "AgentControlAck"}
 
     runner._pending_control_acks.clear()
-    names = {s["name"] for s in await runner._allowed_tool_schemas()}
+    names = schema_tool_names(await runner._allowed_tool_schemas())
     assert names == {"Read", "AgentControlAck"}
 
 

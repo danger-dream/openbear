@@ -57,11 +57,12 @@ type Message struct {
 // state}]} and the next hop it uses for each destination. Routes is nil
 // when the origin left them out to stay within the size limit.
 type advert struct {
-	origin string
-	seq    uint64
-	links  map[string]advLink
-	routes map[string]string // destination -> next hop
-	at     time.Time         // received
+	origin  string
+	seq     uint64
+	links   map[string]advLink
+	members map[string]advLink
+	routes  map[string]string // destination -> next hop
+	at      time.Time         // received
 	// format, raw and sig: as the origin wrote and signed it, which is
 	// what is forwarded.
 	format Format
@@ -74,13 +75,14 @@ type advLink struct {
 	state string
 }
 
-// On the wire: {"o":origin,"s":seq,"l":[[peer,cost,"u"|"d"|"s"]...],"r":[[dest]|[dest,nextHop]...]}.
+// On the wire: {"o":origin,"s":seq,"l":[[peer,cost,"u"|"d"|"s"]...],"m":[[member,cost,"u"|"d"|"s"]...],"r":[[dest]|[dest,nextHop]...]}.
 // A route through the destination itself is just [dest].
 type wireAdvert struct {
-	Origin string            `json:"o"`
-	Seq    uint64            `json:"s"`
-	Links  []json.RawMessage `json:"l"`
-	Routes []json.RawMessage `json:"r,omitempty"`
+	Origin  string            `json:"o"`
+	Seq     uint64            `json:"s"`
+	Links   []json.RawMessage `json:"l"`
+	Members []json.RawMessage `json:"m,omitempty"`
+	Routes  []json.RawMessage `json:"r,omitempty"`
 }
 
 var stateCode = map[string]string{StateUp: "u", StateDown: "d", StateSuppressed: "s"}
@@ -95,6 +97,15 @@ const compactVersion = 2
 func sortedLinks(a *advert) []string {
 	out := make([]string, 0, len(a.links))
 	for p := range a.links {
+		out = append(out, p)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func sortedMembers(a *advert) []string {
+	out := make([]string, 0, len(a.members))
+	for p := range a.members {
 		out = append(out, p)
 	}
 	slices.Sort(out)
@@ -117,6 +128,21 @@ func encodeJSON(a *advert, order []string, withRoutes bool) []byte {
 		fmt.Fprintf(&b, `[%s,%s,"%s"]`, quote(p), formatCost(cost), stateCode[l.state])
 	}
 	b.WriteByte(']')
+	if len(a.members) > 0 {
+		b.WriteString(`,"m":[`)
+		for i, p := range sortedMembers(a) {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			l := a.members[p]
+			cost := l.cost
+			if l.state != StateUp {
+				cost = 0
+			}
+			fmt.Fprintf(&b, `[%s,%s,"%s"]`, quote(p), formatCost(cost), stateCode[l.state])
+		}
+		b.WriteByte(']')
+	}
 	if withRoutes && a.routes != nil {
 		b.WriteString(`,"r":[`)
 		first := true
@@ -192,6 +218,28 @@ func encodeCompact(a *advert, num map[string]uint32, order []string, withRoutes 
 			b = binary.AppendUvarint(b, v)
 		}
 	}
+	if len(a.members) > 0 {
+		members := sortedMembers(a)
+		var mbytes []byte
+		mbytes = binary.AppendUvarint(mbytes, uint64(len(members)))
+		for _, p := range members {
+			n, ok := num[p]
+			if !ok {
+				mbytes = nil
+				break
+			}
+			l := a.members[p]
+			mbytes = binary.AppendUvarint(mbytes, uint64(n))
+			mbytes = append(mbytes, stateByte[l.state])
+			if l.state == StateUp {
+				mbytes = binary.AppendUvarint(mbytes, uint64(math.Round(l.cost*10)))
+			}
+		}
+		if len(mbytes) > 0 {
+			b = append(b, 2)
+			b = append(b, mbytes...)
+		}
+	}
 	out := make([]byte, base64.RawStdEncoding.EncodedLen(len(b)))
 	base64.RawStdEncoding.Encode(out, b)
 	return out, true
@@ -210,18 +258,19 @@ func formatCost(c float64) string {
 // builder collects a decoded advertisement and checks it against the
 // relays this one knows: the same rules for both formats.
 type builder struct {
-	a     *advert
-	known map[string]bool
+	a      *advert
+	known  map[string]bool
+	leaves map[string]bool
 }
 
-func newBuilder(origin string, seq uint64, links, routes int, known map[string]bool) (*builder, error) {
+func newBuilder(origin string, seq uint64, links, routes int, known, leaves map[string]bool) (*builder, error) {
 	if !known[origin] || seq == 0 {
 		return nil, errors.New("advert from an unknown relay")
 	}
-	if links > len(known) || routes > len(known) {
+	if links > len(known) || routes > len(known)+len(leaves) {
 		return nil, errors.New("advert lists more relays than there are")
 	}
-	return &builder{a: &advert{origin: origin, seq: seq, links: map[string]advLink{}}, known: known}, nil
+	return &builder{a: &advert{origin: origin, seq: seq, links: map[string]advLink{}, members: map[string]advLink{}}, known: known, leaves: leaves}, nil
 }
 
 func (b *builder) link(peer string, cost float64, state string) error {
@@ -235,11 +284,25 @@ func (b *builder) link(peer string, cost float64, state string) error {
 	return nil
 }
 
+func (b *builder) member(peer string, cost float64, state string) error {
+	if state == "" || math.IsNaN(cost) || cost < 0 || cost > maxAdvertCost || peer == b.a.origin {
+		return errors.New("advert member link is invalid")
+	}
+	if !b.leaves[peer] {
+		return nil
+	}
+	if _, dup := b.a.members[peer]; dup {
+		return errors.New("advert repeats a member link")
+	}
+	b.a.members[peer] = advLink{cost: round1(cost), state: state}
+	return nil
+}
+
 func (b *builder) route(dest, nh string) error {
 	if b.a.routes == nil {
 		b.a.routes = map[string]string{}
 	}
-	if !b.known[dest] || !b.known[nh] || dest == b.a.origin || nh == b.a.origin {
+	if (!b.known[dest] && !b.leaves[dest]) || (!b.known[nh] && !(nh == dest && b.leaves[dest])) || dest == b.a.origin || nh == b.a.origin {
 		return errors.New("advert route is invalid")
 	}
 	if _, dup := b.a.routes[dest]; dup {
@@ -251,12 +314,12 @@ func (b *builder) route(dest, nh string) error {
 
 // decodeJSON parses and checks a FormatJSON advertisement; it does not
 // judge the sequence number.
-func decodeJSON(raw []byte, known map[string]bool) (*advert, error) {
+func decodeJSON(raw []byte, known, leaves map[string]bool) (*advert, error) {
 	var w wireAdvert
 	if err := json.Unmarshal(raw, &w); err != nil {
 		return nil, fmt.Errorf("advert: %w", err)
 	}
-	b, err := newBuilder(w.Origin, w.Seq, len(w.Links), len(w.Routes), known)
+	b, err := newBuilder(w.Origin, w.Seq, len(w.Links), len(w.Routes), known, leaves)
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +334,23 @@ func decodeJSON(raw []byte, known map[string]bool) (*advert, error) {
 			return nil, errors.New("advert link is invalid")
 		}
 		if err := b.link(peer, cost, codeState[fmt.Sprint(f[2])]); err != nil {
+			return nil, err
+		}
+	}
+	if len(w.Members) > len(leaves)+len(known)+256 {
+		return nil, errors.New("advert lists too many members")
+	}
+	for _, l := range w.Members {
+		var f []any
+		if err := json.Unmarshal(l, &f); err != nil || len(f) != 3 {
+			return nil, errors.New("advert member link is not [member, cost, state]")
+		}
+		peer, _ := f[0].(string)
+		cost, okCost := f[1].(float64)
+		if !okCost {
+			return nil, errors.New("advert member link is invalid")
+		}
+		if err := b.member(peer, cost, codeState[fmt.Sprint(f[2])]); err != nil {
 			return nil, err
 		}
 	}
@@ -302,7 +382,7 @@ var errNewerFormat = errors.New("compact advert of a later version")
 
 // decodeCompact parses and checks a FormatCompact advertisement; ids maps
 // control host numbers to the relays this one knows.
-func decodeCompact(raw []byte, ids map[uint32]string, known map[string]bool) (*advert, error) {
+func decodeCompact(raw []byte, ids map[uint32]string, known, leaves map[string]bool) (*advert, error) {
 	data := make([]byte, base64.RawStdEncoding.DecodedLen(len(raw)))
 	n, err := base64.RawStdEncoding.Decode(data, raw)
 	if err == nil && n > 0 && data[0] > compactVersion {
@@ -326,6 +406,14 @@ func decodeCompact(raw []byte, ids map[uint32]string, known map[string]bool) (*a
 			return "", false
 		}
 		id, ok := ids[uint32(v)]
+		return id, ok && known[id]
+	}
+	nodeID := func() (string, bool) {
+		v, ok := next()
+		if !ok || v > math.MaxUint32 {
+			return "", false
+		}
+		id, ok := ids[uint32(v)]
 		return id, ok
 	}
 	origin, ok1 := relay()
@@ -334,7 +422,7 @@ func decodeCompact(raw []byte, ids map[uint32]string, known map[string]bool) (*a
 	if !ok1 || !ok2 || !ok3 {
 		return nil, errors.New("advert from an unknown relay")
 	}
-	b, err := newBuilder(origin, seq, int(min(links, uint64(len(known)+1))), 0, known)
+	b, err := newBuilder(origin, seq, int(min(links, uint64(len(known)+1))), 0, known, leaves)
 	if err != nil {
 		return nil, err
 	}
@@ -365,12 +453,12 @@ func decodeCompact(raw []byte, ids map[uint32]string, known map[string]bool) (*a
 	case 0:
 	case 1:
 		count, ok := next()
-		if !ok || count > uint64(len(known)) {
+		if !ok || count > uint64(len(known)+len(leaves)) {
 			return nil, errors.New("advert lists more relays than there are")
 		}
 		b.a.routes = map[string]string{}
 		for range count {
-			dest, ok1 := relay()
+			dest, ok1 := nodeID()
 			hv, ok2 := next()
 			nh, found := dest, ok2
 			if ok2 && hv != 0 {
@@ -385,6 +473,33 @@ func decodeCompact(raw []byte, ids map[uint32]string, known map[string]bool) (*a
 		}
 	default:
 		return nil, errCompact
+	}
+	if len(data) > 0 && data[0] == 2 {
+		data = data[1:]
+		mcount, ok := next()
+		if !ok || mcount > uint64(len(leaves)+len(known)+256) {
+			return nil, errCompact
+		}
+		for range mcount {
+			v, ok := next()
+			if !ok || v > math.MaxUint32 || len(data) == 0 {
+				return nil, errCompact
+			}
+			state, ok := byteState[data[0]]
+			data = data[1:]
+			var cost uint64
+			if ok && state == StateUp {
+				cost, ok = next()
+			}
+			if !ok {
+				return nil, errCompact
+			}
+			if peer, knownID := ids[uint32(v)]; knownID {
+				if err := b.member(peer, float64(cost)/10, state); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	if len(data) != 0 {
 		return nil, errCompact

@@ -20,3 +20,5 @@ func (u *uploads) edit(json.RawMessage) (any, error) {
 }
 
 func fileError(err error) error { return err }
+
+func (a *Agent) recoverUploads() {}

@@ -3,6 +3,7 @@
 package node
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"regexp"
@@ -133,3 +134,42 @@ func TestTerminalOutputWaitsForAcknowledgement(t *testing.T) {
 }
 
 func containsDone(s string) bool { return regexp.MustCompile(`flood-done`).MatchString(s) }
+
+// A term.close that arrives while the tunnel still connects calls the dial off: no terminal is
+// opened behind the controller's back, and the controller hears it closed.
+func TestTerminalClosedWhileItsTunnelConnects(t *testing.T) {
+	keep := tunnelDial
+	defer func() { tunnelDial = keep }()
+	dialing := make(chan struct{})
+	tunnelDial = func(ctx context.Context, _ string) (console, error) {
+		close(dialing)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	f := newFake()
+	done := make(chan string, 1)
+	upstream := f.serve(t, func(ch *channel, _ map[string]any) {
+		next(t, ch, "hello")
+		ch.send(map[string]any{"t": "term.open", "sid": 5, "dial": "198.51.100.1:22"})
+		<-dialing
+		ch.send(map[string]any{"t": "term.close", "sid": 5})
+		done <- next(t, ch, "term.closed")["reason"].(string)
+		ch.conn.Read()
+	})
+	defer upstream.Close()
+	a := f.agent(upstream.URL, Capabilities{Exec: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	go a.Run(ctx)
+	select {
+	case reason := <-done:
+		if reason != "closed" {
+			t.Fatalf("closed while connecting: %q", reason)
+		}
+	case <-ctx.Done():
+		t.Fatal("the close was lost while the tunnel connected")
+	}
+	if n := a.active.Load(); n != 0 {
+		t.Fatalf("%d terminals left open", n)
+	}
+}

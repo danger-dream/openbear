@@ -19,14 +19,24 @@ export const member = (serverId, name, role, extra = {}) => ({serverId, name, pl
 // A small stand-in for the controller's mesh API: a draft, validation with
 // paths, installs that take a moment, a board layout, trends, and a rollout
 // that advances one step per GET. `old` leaves out what newer controllers add.
-export function fakeMesh({failing = '', upgrades = false, old = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false} = {}) {
+export function fakeMesh({failing = '', upgrades = false, old = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, v3 = false} = {}) {
   if (routes) reach = true;
   const doc = {
-    settings: {prefix: '100.96.0.0/16', mtu: 1400, ports: {udp: 51999, tcp: 52000, tls: 52001}, health: {}},
+    settings: {prefix: '100.96.0.0/16', mtu: 1400, ports: {udp: 51999, tcp: 52000, tls: 52001}, health: {},
+      ...(v3 ? {autoLinks: {enabled: true, perNode: 2, gainRatio: 0.25, gainMs: 25, holdRounds: 3, dropAfterS: 1800}} : {})},
     members: [member('berlin', 'Berlin', 'relay', {address: '100.96.0.1'}), member('lax', 'LAX', 'relay', {address: '100.96.0.2', listen: {udp: 51999, tcp: 52000, tls: 0}}),
-      member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], entry: {mode: 'failover', autoReturn: true, candidates: [{id: 'c1', relay: 'berlin', transport: 'udp'}, {id: 'c2', relay: 'lax', transport: 'tcp'}]}})],
+      member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], ...(v3 ? {direct: true} : {}),
+        entry: {mode: v3 ? 'upstreams' : 'failover', autoReturn: true, candidates: [{id: 'c1', relay: 'berlin', transport: 'udp'},
+          {id: 'c2', relay: 'lax', transport: 'tcp', ...(v3 ? {origin: 'auto', reason: '去 LAX 比经 Berlin 快 42 ms（实测 152 ms vs 194 ms）', since: Date.now() - 600000} : {})}]}})],
     relayLinks: {mode: 'full', pairs: []}, directLinks: [], rules: [],
+    // v3: a controller with line rules, exit groups, connection limits and fixed paths (the new mesh pages).
+    ...(v3 ? {lineRules: [], exitGroups: [], limits: [], paths: []} : {}),
   };
+  const rollbacks = [];
+  // What a v3 controller works out by itself, as GET /mesh auto says it.
+  const autoNow = () => ({listen: Object.fromEntries(doc.members.map(m => [m.serverId, {value: m.role === 'relay' ? {udp: 51999, tcp: 52000, tls: 0} : {udp: 51999, tcp: 0, tls: 0},
+    reason: m.role === 'relay' ? '公网中转常开 UDP 和 TCP，新节点接入时用' : '成员只开 UDP'}])),
+    relayMode: Object.fromEntries(doc.members.filter(m => m.role === 'relay').map(m => [m.serverId, {value: 'public', reason: '可达性检测：公网可达'}])), pairs: {}, candidates: {}});
   // A rule for every member and every gateway network: never an arrow, listed in the legend.
   const ruleSide = (o = {}) => ({all: false, allSubnets: false, members: [], tags: [], prefixes: [], subnets: [], ...o});
   if (allSubnets) doc.rules.push({id: 'r-all', action: 'allow', src: ruleSide({all: true, allSubnets: true}), dst: ruleSide({all: true}), proto: 'icmp', ports: [], note: ''});
@@ -233,11 +243,121 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
     if (everyone.length) out.push(...everyone.map(r => ({kind: 'rule.add', text: `新增访问规则：所有成员 → 所有成员 · ${r.proto === 'icmp' ? 'ICMP' : r.proto.toUpperCase()}`})));
     else if (JSON.stringify(applied.rules) !== JSON.stringify(doc.rules)) out.push({kind: 'rules', text: '修改访问规则'});
     if (JSON.stringify(applied.directLinks) !== JSON.stringify(doc.directLinks)) out.push({kind: 'links', text: '修改直连'});
+    if (Array.isArray(doc.limits) && JSON.stringify(applied.limits) !== JSON.stringify(doc.limits)) out.push({kind: 'limits', text: '修改连接限制'});
+    if (Array.isArray(doc.paths) && JSON.stringify(applied.paths) !== JSON.stringify(doc.paths)) out.push({kind: 'paths', text: '修改自建路线'});
     if (JSON.stringify(applied.settings) !== JSON.stringify(doc.settings)) out.push({kind: 'settings', text: '修改网格设置'});
     return out;
   }
+  const REGIONS = {berlin: 'DE', lax: 'US', home: 'CN', mac: 'CN', win: 'DE', old: 'JP', sg: 'SG', toy: 'CN', lab: 'CN', office: 'CN', cafe: 'SG', nas: 'CN'};
+  function checkLimits(d, errors) {
+    const byId = new Map((d.members || []).map(m => [m.serverId, m]));
+    const sideMatch = (sel, m) => {
+      if (!m) return false;
+      const kind = sel?.kind || 'any';
+      if (kind === 'any') return true;
+      if (kind === 'region') { const hit = (sel.regions || []).includes(m.region || REGIONS[m.serverId] || ''); return sel.not ? !hit : hit; }
+      if (kind === 'tag') return (sel.tags || []).some(t => (m.tags || []).includes(t));
+      if (kind === 'machines') return (sel.ids || []).includes(m.serverId);
+      return false;
+    };
+    const crosses = (k, a, b) => (sideMatch(k.a, a) && sideMatch(k.b, b)) || (sideMatch(k.a, b) && sideMatch(k.b, a));
+    (d.limits || []).forEach((k, li) => {
+      if (!k.relayEnd && !k.transports?.length && !k.via && !k.manualOnly) {
+        errors.push({path: `limits[${li}]`, error: 'limit_without_condition', message: `连接限制「${k.name || li + 1}」至少要勾一项跨界条件`});
+        return;
+      }
+      if (k.on === false) return;
+      const checkConn = (a, b, transport, origin, path) => {
+        const ma = byId.get(a), mb = byId.get(b);
+        if (!ma || !mb || !crosses(k, ma, mb)) return;
+        if (k.relayEnd && ma.role !== 'relay' && mb.role !== 'relay')
+          errors.push({path, error: 'limit_violation', message: `违反连接限制「${k.name}」：两端至少有一台须是中转`});
+        if (k.transports?.length && !k.transports.includes(transport))
+          errors.push({path, error: 'limit_violation', message: `违反连接限制「${k.name}」：只允许 ${k.transports.map(t => t.toUpperCase()).join('、')} 协议`});
+        if (Array.isArray(k.via) && !k.via.includes(a) && !k.via.includes(b))
+          errors.push({path, error: 'limit_violation', message: `违反连接限制「${k.name}」：只能经过指定节点`});
+        if (k.manualOnly && origin === 'auto')
+          errors.push({path, error: 'limit_violation', message: `违反连接限制「${k.name}」：只允许手动建立`});
+      };
+      (d.members || []).forEach((m, i) => (m.entry?.candidates || []).forEach((c, j) => checkConn(m.serverId, c.relay, c.transport, c.origin, `members[${i}].entry.candidates[${j}]`)));
+      (d.relayLinks?.pairs || []).forEach((p, i) => checkConn(p.a, p.b, p.transport, p.origin, `relayLinks.pairs[${i}]`));
+      (d.directLinks || []).forEach((p, i) => checkConn(p.a, p.b, p.transport, p.origin, `directLinks[${i}]`));
+    });
+  }
+  const sideMatchesMember = (sel, m) => {
+    if (!m || m.removing) return false;
+    const kind = sel?.kind || 'any';
+    if (kind === 'any') return true;
+    if (kind === 'region') { const hit = (sel.regions || []).includes(m.region || REGIONS[m.serverId] || ''); return sel.not ? !hit : hit; }
+    if (kind === 'tag') return (sel.tags || []).some(t => (m.tags || []).includes(t));
+    if (kind === 'machines') return (sel.ids || []).includes(m.serverId);
+    return false;
+  };
+  let customPathsView = null;
+  // As mesh_paths.view: each own route's links from its source to its destination, its problems, its place
+  // among its pair's routes and, once applied, where it is each way (_states: {to, back} set by a test).
+  function buildPathsView(d = doc) {
+    if (customPathsView) return customPathsView(d);
+    if (!Array.isArray(d.paths)) return undefined;
+    const byId = new Map((d.members || []).filter(m => !m.removing).map(m => [m.serverId, m]));
+    const pk = (a, b) => a < b ? `${a}|${b}` : `${b}|${a}`;
+    const relayRtt = (a, b) => LINES.find(l => l.kind === 'relay' && pk(l.a, l.b) === pk(a, b))?.rttMs ?? 45;
+    const linked = (a, b) => {
+      const ma = byId.get(a), mb = byId.get(b);
+      if (!ma || !mb) return false;
+      if (ma.role === 'relay' && mb.role === 'relay') return d.relayLinks?.mode === 'full' || (d.relayLinks?.pairs || []).some(p => pk(p.a, p.b) === pk(a, b));
+      const [m, r] = ma.role === 'relay' ? [mb, ma] : [ma, mb];
+      return r.role === 'relay' && (m.entry?.candidates || []).some(c => c.relay === r.serverId);
+    };
+    const ranks = new Map();
+    return d.paths.map(p => {
+      const nodes = [p.from, ...(p.via || []), p.to], key = pk(p.from, p.to);
+      ranks.set(key, (ranks.get(key) || 0) + 1);
+      const segments = nodes.slice(1).map((b, i) => {
+        const a = nodes[i], exists = linked(a, b), relay = byId.get(a)?.role === 'relay' && byId.get(b)?.role === 'relay';
+        return {a, b, kind: relay ? 'relay' : 'upstream', exists, rttMs: exists ? (relay ? relayRtt(a, b) : 15) : null, ...(relay ? {} : {member: byId.get(a)?.role === 'relay' ? b : a})};
+      });
+      const problems = [];
+      for (const s of segments.filter(x => !x.exists)) {
+        const name = id => byId.get(id)?.name || id;
+        if (s.kind === 'relay') problems.push({error: 'path_link_missing', message: `${name(s.a)} 和 ${name(s.b)} 之间没有线路`});
+        else problems.push({error: s.member === p.from ? 'path_no_source' : 'path_no_destination', message: `${s.member === p.from ? '起点' : '终点'} ${name(s.member)} 的入口中转里没有 ${name(s.member === s.a ? s.b : s.a)}`});
+      }
+      for (const end of [p.from, p.to]) {
+        const m = byId.get(end);
+        if (m && m.role !== 'relay' && m.entry?.mode !== 'upstreams') problems.push({error: end === p.from ? 'path_no_source' : 'path_no_destination', message: `${end === p.from ? '起点' : '终点'} ${m.name} 的入口中转要改成「同时连上」才能作为路线的一端`});
+      }
+      const used = p.on !== false && !problems.length;
+      const isApplied = (applied.paths || []).some(ap => ap.id === p.id && JSON.stringify(ap) === JSON.stringify(p));
+      const st = s => ({state: s, since: now - 120000, ...(s === 'waiting' ? {until: now + 90000} : {})});
+      const states = used ? {to: p._states?.to ? st(p._states.to) : isApplied ? st('pinned') : {state: 'unknown'}, back: p._states?.back ? st(p._states.back) : isApplied ? st('pinned') : {state: 'unknown'}} : undefined;
+      return {id: p.id, from: p.from, to: p.to, via: [...(p.via || [])], on: p.on !== false, rank: ranks.get(key), label: nodes.map(id => byId.get(id)?.name || id).join(' → '),
+        segments, problems, used, single: [], back: true, ...(states ? {states} : {})};
+    });
+  }
+  function checkPaths(d, errors) {
+    if (!Array.isArray(d.paths)) return;
+    const byId = new Map((d.members || []).map(m => [m.serverId, m]));
+    const allowedKeys = new Set(['id', 'on', 'from', 'to', 'via', '_states']);
+    const pairs = new Map();
+    d.paths.forEach((p, i) => {
+      if (Object.keys(p || {}).some(k => !allowedKeys.has(k))) errors.push({path: `paths[${i}]`, error: 'invalid_path', message: '自建路线格式不正确'});
+      const via = Array.isArray(p.via) ? p.via : [];
+      if (via.length < 1 || via.length > 8) errors.push({path: `paths[${i}].via`, error: 'invalid_path_via', message: '途经中转须是 1～8 台'});
+      else if (new Set(via).size !== via.length) errors.push({path: `paths[${i}].via`, error: 'path_via_repeated', message: '同一台中转不能经过两次'});
+      else if (via.some(id => byId.get(id)?.role !== 'relay')) errors.push({path: `paths[${i}].via`, error: 'path_via_not_relay', message: '途经节点只能是中转'});
+      for (const side of ['from', 'to']) if (typeof p[side] !== 'string' || !p[side]) errors.push({path: `paths[${i}].${side}`, error: 'path_side_empty', message: '起点和终点不能为空'});
+      const key = [p.from, p.to].sort().join('|');
+      pairs.set(key, (pairs.get(key) || 0) + 1);
+      if (pairs.get(key) > 3) errors.push({path: `paths[${i}]`, error: 'path_pair_full', message: '同一对节点最多 3 条自建路线'});
+    });
+  }
+  // As GET /mesh/path/options: set by a test, else the path in use alone.
+  let bestOf = null;
   function validate(d) {
     const errors = [];
+    checkLimits(d, errors);
+    checkPaths(d, errors);
     d.members.forEach((m, i) => (m.entry?.candidates || []).forEach((c, j) => {
       const relay = d.members.find(x => x.serverId === c.relay);
       if (!(relay?.listen?.[c.transport] > 0)) errors.push({path: `members[${i}].entry.candidates[${j}]`, error: 'mesh_entry_listen', message: `${relay?.name} 没有开启 ${c.transport.toUpperCase()} 监听`});
@@ -274,11 +394,14 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
     nodes, eligible: eligible(), apply: rollout ? JSON.parse(JSON.stringify(rollout)) : {running: false, revision, progress: []}, errors: [], ...(reach ? {warnings: warnings()} : {}), ...(routes && !oldRoutes ? {exports: exportsNow()} : {}), ...(lines ? {lines: LINES} : {}),
     // The gateway on Berlin reaching an instance on Home's mesh address, as the controller adds it.
     ...(firewall ? {autoRules: [{kind: 'instance', proto: 'tcp', serverId: 'home', gateway: 'berlin', instanceId: 'i-edge', name: 'Edge-Fra', port: 18970, src: '100.96.0.1/32', dst: '100.96.0.3/32'}]} : {}),
-    ...(old ? {} : {layout: JSON.parse(JSON.stringify(layout)), installing: JSON.parse(JSON.stringify(installing))})});
+    ...(old ? {} : {layout: JSON.parse(JSON.stringify(layout)), installing: JSON.parse(JSON.stringify(installing))}),
+    ...(v3 ? {auto: autoNow(), pathsView: buildPathsView(doc), autoLinks: {suggestions: [], lastChange: {at: Date.now() - 300000, text: '为 Home 新增上游 LAX（实测快 42 ms）'}}} : {})});
   const trend = range => Array.from({length: 30}, (_, i) => ({at: Date.now() - (30 - i) * 120000, rttMs: i === 20 ? null : 140 + (i % 7) * 6, timeoutRate: i === 20 ? 1 : 0, switches: i === 20 ? 1 : 0,
     reconnects: i === 12 ? 1 : 0, rssBytes: 200e6 + i * 1e6, cpuPercent: 2 + (i % 5) * 0.4, rxBytes: 1e6 * i, txBytes: 5e5 * i, range}));
+  const extra = {peers: [], events: []};
   return {
-    doc, nodes, layout, failing: id => { failing = id; }, setPath: fn => { pathOf = fn; }, setReinstall: outcome => { reinstallOutcome = outcome; },
+    // extra: more peers and events for Home's detail, set by a test.
+    doc, nodes, layout, rollbacks, extra, failing: id => { failing = id; }, setPath: fn => { pathOf = fn; }, setPathsView: fn => { customPathsView = fn; }, setBest: fn => { bestOf = fn; }, setReinstall: outcome => { reinstallOutcome = outcome; },
     async handle(method, path, body, query = '') {
       if (method === 'GET' && path === '') { step(); return [200, view()]; }
       if (method === 'GET' && path === '/path') {
@@ -288,6 +411,36 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
         if (![src, dst].every(id => applied.members.some(m => m.serverId === id))) return [404, {ok: false, error: 'mesh_member_not_found'}];
         const r = pathOf(src, dst);
         return r.status ? [r.status, {ok: false, error: r.error}] : [200, {ok: true, ...r}];
+      }
+      if (method === 'GET' && path === '/path/options') {
+        if (old || noPath) return [404, {ok: false, error: 'not_found'}];
+        const q = new URLSearchParams(query), src = q.get('src'), dst = q.get('dst');
+        if (!src || !dst || src === dst) return [400, {ok: false, error: 'invalid_mesh_path'}];
+        if (bestOf) return [200, {ok: true, ...bestOf(src, dst)}];
+        const r = pathOf(src, dst), nodes = (r.hops || []).map(h => h.node);
+        return [200, {ok: true, routes: nodes.length > 1 ? [{nodes, segments: r.hops.slice(1).map((h, i) => ({a: nodes[i], b: h.node, exists: true, rttMs: h.rttMs})), rttMs: r.rttMs, own: null}] : [], own: []}];
+      }
+      if (method === 'POST' && path === '/path/measure') {
+        if (old || noPath) return [404, {ok: false, error: 'not_found'}];
+        const nodes = body?.nodes, byId = new Map(doc.members.filter(m => !m.removing).map(m => [m.serverId, m]));
+        if (!Array.isArray(nodes) || nodes.length < 2 || new Set(nodes).size !== nodes.length) return [400, {ok: false, error: 'invalid_mesh_path'}];
+        if (!nodes.every(id => byId.has(id))) return [404, {ok: false, error: 'mesh_member_not_found'}];
+        // As Mesh.measure: a link of the draft by its line's round trip (or 15 ms), one not linked yet measured now (38 ms).
+        const pk = (a, b) => a < b ? `${a}|${b}` : `${b}|${a}`;
+        const linked = (a, b) => {
+          const [ma, mb] = [byId.get(a), byId.get(b)];
+          if (ma.role === 'relay' && mb.role === 'relay') return doc.relayLinks?.mode === 'full' || (doc.relayLinks?.pairs || []).some(p => pk(p.a, p.b) === pk(a, b));
+          const [m, r] = ma.role === 'relay' ? [mb, ma] : [ma, mb];
+          return r.role === 'relay' && (m.entry?.candidates || []).some(c => c.relay === r.serverId);
+        };
+        const segments = nodes.slice(1).map((b, i) => {
+          const a = nodes[i];
+          if (byId.get(a).role !== 'relay' && byId.get(b).role !== 'relay') return {a, b, exists: false, rttMs: null, loss: null, how: 'none', why: '两台都不是中转，路线中间只能经过中转'};
+          return linked(a, b) ? {a, b, exists: true, rttMs: LINES.find(l => pk(l.a, l.b) === pk(a, b))?.rttMs ?? 15, loss: 0, how: 'report'}
+            : {a, b, exists: false, rttMs: 38, loss: 0, how: 'probe'};
+        });
+        const rtts = segments.map(x => x.rttMs);
+        return [200, {ok: true, segments, rttMs: rtts.some(r => r == null) ? null : Math.round(rtts.reduce((n, r) => n + r, 0) * 10) / 10}];
       }
       if (method === 'GET' && path === '/routes') {
         if (!routes || oldRoutes) return [404, {ok: false, error: 'not_found'}];
@@ -300,7 +453,13 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
         const errors = validate(body);
         if (errors.length) return [400, {ok: false, error: 'mesh_invalid', errors}];
         Object.assign(doc, JSON.parse(JSON.stringify(body)));
+        if (Array.isArray(doc.paths)) doc.paths.forEach((p, i) => { if (!p.id) p.id = `p${i + 1}`; });
         doc.members.forEach((m, i) => { if (!m.address) m.address = `100.96.0.${10 + i}`; });
+        // As mesh_proxy.ensure_secrets and clean_member: an exit's password, a LAN port's, each port's id.
+        for (const m of doc.members) {
+          if (m.proxy?.exit && !m.proxy.exit.password) m.proxy.exit.password = `${m.serverId}-pw`;
+          (m.proxy?.ports || []).forEach((p, i) => { if (!p.id) p.id = `p${i + 1}`; if (p.listen === 'lan' && !p.password) p.password = 'lan-pw'; });
+        }
         return [200, view()];
       }
       if (method === 'PUT' && path === '/layout') {
@@ -340,7 +499,11 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
         return [200, view()];
       }
       if (method === 'POST' && path === '/discard') { Object.assign(doc, JSON.parse(JSON.stringify(applied))); return [200, view()]; }
-      if (method === 'POST' && path === '/rollback') { revision++; rollout = {running: true, revision, progress: doc.members.map(m => ({serverId: m.serverId, state: 'pending', error: ''}))}; failing = ''; return [200, view()]; }
+      if (v3 && method === 'GET' && path === '/revisions') return [200, {ok: true, revisions: [{revision, at: Date.now() - 60000, reason: 'apply', status: 'applied', current: true, changes: ['修改 Home 的标签']},
+        {revision: revision - 1, at: Date.now() - 3600000, reason: 'facts', status: 'applied', current: false, changes: []}]}];
+      if (v3 && method === 'POST' && path === '/probe') return [200, {ok: true, serverId: body.serverId, results: [
+        {relay: 'berlin', rttMs: 12.5, loss: 0, udp: 'ok', tcp: 'closed', tls: 'closed'}, {relay: 'lax', rttMs: 160, loss: 0.02, udp: 'timeout', tcp: 'ok', tls: 'closed'}]}];
+      if (method === 'POST' && path === '/rollback') { rollbacks.push(body || {}); revision++; rollout = {running: true, revision, progress: doc.members.map(m => ({serverId: m.serverId, state: 'pending', error: ''}))}; failing = ''; return [200, view()]; }
       if (method === 'GET' && /^\/members\/[\w-]+\/trend$/.test(path)) return old ? [404, {ok: false, error: 'not_found'}] : [200, {ok: true, range: '1h', points: trend('1h'), ...(lines ? {rtt: /\/(berlin|lax)\//.test(path) ? {kind: 'links', peers: [path.includes('/berlin/') ? 'lax' : 'berlin']} : {kind: 'entry', peers: ['lax']}} : {})}];
       if (method === 'GET' && /^\/lines\/[^/]+\/trend$/.test(path)) {
         if (!lines) return [404, {ok: false, error: 'not_found'}];
@@ -364,11 +527,11 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
             ...(secure ? {counters: {droppedPlain: 1}, e2e: {sessions: 64, limit: 64, innerMtu: 1348, droppedExhausted: 4, droppedQueue: 0, droppedSource: 0, droppedBad: 2},
               security: {signing: {verified: 120, rejected: 5, byHop: {berlin: 5}}, claims: {expired: 0}}} : {}),
             peers: [{id: 'lax', kind: 'entry', active: true, transport: 'tcp', endpoint: '198.51.100.3:52000', localAddr: '10.0.0.5:40112', lastHandshakeUnixNano: String((Date.now() - 20000) * 1e6), rxBytes: 5e6, txBytes: 2e6, rttMs: 152.3, reconnects: 2},
-              {id: 'berlin', kind: 'entry', active: false, transport: 'udp', endpoint: '198.51.100.6:51999', lastHandshakeUnixNano: '0', rxBytes: 0, txBytes: 0, rttMs: null}, ...(live.home || [])]} : null,
+              {id: 'berlin', kind: 'entry', active: false, transport: 'udp', endpoint: '198.51.100.6:51999', lastHandshakeUnixNano: '0', rxBytes: 0, txBytes: 0, rttMs: null}, ...(live.home || []), ...extra.peers]} : null,
           events: id === 'home' ? [...(gone === 'home' ? goneEvents : []), {seq: 17, at: Date.now() - 120000, kind: 'peer.reconnect', detail: 'berlin'}, {seq: 18, at: Date.now() - 60000, kind: 'path.failed', detail: 'c1: probe timeout'},
             ...(upgrades ? [{seq: 18, at: Date.now() - 30000, kind: 'upgrade.failed', detail: 'data plane upgrade did not get ready; rolled back'}] : []), ...punchEvents,
             ...(secure ? [{seq: 19, at: Date.now() - 300000, kind: 'sign.rejected', detail: 'offer in the name of lax from berlin: bad signature'},
-              {seq: 20, at: Date.now() - 30000, kind: 'entry.suspect', detail: 'lax answers probes but 3 end-to-end probes through it to berlin in a row went unanswered; reported only (fixed mode)'}] : [])] : []}];
+              {seq: 20, at: Date.now() - 30000, kind: 'entry.suspect', detail: 'lax answers probes but 3 end-to-end probes through it to berlin in a row went unanswered; reported only (fixed mode)'}] : []), ...extra.events] : []}];
       }
       return [404, {ok: false, error: 'not_found'}];
     },

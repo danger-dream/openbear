@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	meshproxy "openbear/node/mesh/proxy"
 	"openbear/node/mesh/sign"
 	"openbear/node/mesh/wire"
 )
@@ -67,12 +68,30 @@ type Config struct {
 	// Routing is how a relay chooses next hops to other relays.
 	Routing *Routing `json:"routing,omitempty"`
 	// RelayLinks are every link between two relays of the mesh, each pair
-	// once; relays only. Routing takes no other link from advertisements.
+	// once; relays and routed members. Routing takes no other link from advertisements.
 	RelayLinks [][2]string `json:"relayLinks,omitempty"`
+	// MemberLinks are every link between a relay and a routed member (or two
+	// members for this node), each pair once.
+	MemberLinks [][2]string `json:"memberLinks,omitempty"`
+	// Proxy is this node's part of the exit proxy: its entry, its exit or
+	// both; absent when it is neither. Older nodes ignore it.
+	Proxy *meshproxy.Config `json:"proxy,omitempty"`
+	// Probe lists candidate peers this node measures periodically without
+	// opening a tunnel (probes.go). Older nodes ignore it.
+	Probe *ProbeConfig `json:"probe,omitempty"`
+	// Paths are the fixed paths this node is on (fixedpath.go). Older nodes
+	// ignore it; the controller sends it to nodes that report the feature.
+	Paths []FixedPath `json:"paths,omitempty"`
 
 	// keys are this node's signing and end-to-end keys, which the engine
 	// running the config gives it (keys.go); not in config.json.
 	keys *nodeKeys
+	// standby is a member's choice of gateway for the subnets backups stand
+	// by for (standby.go), which the engine gives every config it runs.
+	standby *standbyGateways
+	// underlay is what this machine's interfaces leave of the network's MTU
+	// (underlay.go), which the engine finds for every config it applies.
+	underlay underlay
 }
 
 // Routing: mode dynamic (the default) follows measured link costs, static
@@ -92,13 +111,20 @@ type Network struct {
 	ID            string       `json:"id"`
 	Prefix        netip.Prefix `json:"prefix"`
 	ControlPrefix netip.Prefix `json:"controlPrefix"`
-	MTU           int          `json:"mtu"`
+	// MTU is that of the paths that carry small packets, all but the large
+	// ones TCPJumbo opens.
+	MTU int `json:"mtu"`
+	// TCPJumbo: a Linux node takes and sends packets of up to
+	// wire.LargeMTU bytes where every hop is TCP or TLS between nodes that
+	// do (large.go). Older nodes ignore it.
+	TCPJumbo bool `json:"tcpJumbo,omitempty"`
 }
 
 type Self struct {
 	ID              string     `json:"id"`
 	Name            string     `json:"name"`
 	Role            string     `json:"role"`
+	Leaf            bool       `json:"leaf,omitempty"`
 	Address         netip.Addr `json:"address"`
 	ControlAddress  netip.Addr `json:"controlAddress"`
 	Listen          Listen     `json:"listen"`
@@ -111,6 +137,10 @@ type Self struct {
 	// these, and a relay installs only these into its OS (relays still
 	// forward every subnet).
 	GatewayRoutes *[]netip.Prefix `json:"gatewayRoutes,omitempty"`
+	// Takeover are gateway subnets routed into the mesh even where this
+	// machine has a route of its own for them: Linux keeps what they
+	// replace and puts it back when they go. Older nodes ignore it.
+	Takeover []netip.Prefix `json:"takeover,omitempty"`
 }
 
 type Listen struct {
@@ -122,12 +152,21 @@ type Listen struct {
 type Gateway struct {
 	Subnets    []netip.Prefix `json:"subnets"`
 	Masquerade bool           `json:"masquerade"`
+	// SNAT: what the subnets send into the mesh leaves with this node's mesh
+	// address, so the far side needs no route back to them. Older nodes
+	// ignore it.
+	SNAT bool `json:"snat,omitempty"`
+	// Backup: this node stands by for subnets another gateway announces,
+	// which relays send here only while that gateway cannot be reached. Its
+	// subnets are not its to announce, so they may be another node's.
+	Backup bool `json:"backup,omitempty"`
 }
 
 type Node struct {
 	ID             string     `json:"id"`
 	Name           string     `json:"name"`
 	Role           string     `json:"role"`
+	Leaf           bool       `json:"leaf,omitempty"`
 	Address        netip.Addr `json:"address"`
 	ControlAddress netip.Addr `json:"controlAddress"`
 	PublicKey      string     `json:"publicKey"`
@@ -138,7 +177,10 @@ type Node struct {
 	SignKey string         `json:"signKey"`
 	E2EKey  string         `json:"e2eKey"`
 	Subnets []netip.Prefix `json:"subnets,omitempty"`
-	Relays  []string       `json:"relays,omitempty"`
+	// StandbySubnets: a backup gateway's, carried by it only while no node
+	// announcing them is reachable (subnetsOf).
+	StandbySubnets []netip.Prefix `json:"standbySubnets,omitempty"`
+	Relays         []string       `json:"relays,omitempty"`
 }
 
 type Link struct {
@@ -245,7 +287,8 @@ func (c *Config) node(id string) *Node {
 	return nil
 }
 
-func (c *Config) isRelay() bool { return c.Self.Role == roleRelay }
+func (c *Config) isRelay() bool  { return c.Self.Role == roleRelay }
+func (c *Config) isRouted() bool { return c.isRelay() || c.Self.Leaf || c.Routing != nil }
 
 // roleOf answers for this node too.
 func (c *Config) roleOf(id string) string {
@@ -261,6 +304,11 @@ func (c *Config) roleOf(id string) string {
 func (c *Config) check() error {
 	if c.Revision < 0 {
 		return errors.New("revision must not be negative")
+	}
+	if c.Proxy != nil {
+		if err := c.Proxy.Check(); err != nil {
+			return err
+		}
 	}
 	n := c.Network
 	if err := checkSubnet("network.prefix", n.Prefix); err != nil {
@@ -322,7 +370,9 @@ func (c *Config) check() error {
 			if err := c.checkAnnounced(fmt.Sprintf("self.gateway.subnets[%d]", i), p, announced); err != nil {
 				return err
 			}
-			announced = append(announced, p)
+			if !s.Gateway.Backup {
+				announced = append(announced, p)
+			}
 		}
 	}
 
@@ -371,6 +421,11 @@ func (c *Config) check() error {
 			}
 			announced = append(announced, p)
 		}
+		for j, p := range nd.StandbySubnets {
+			if err := c.checkAnnounced(fmt.Sprintf("%s.standbySubnets[%d]", at, j), p, nil); err != nil {
+				return err
+			}
+		}
 		if nd.Role == roleRelay && len(nd.Relays) > 0 {
 			return fmt.Errorf("%s is a relay but lists relays to attach to", at)
 		}
@@ -398,8 +453,12 @@ func (c *Config) check() error {
 		linked[l.Peer] = true
 		switch l.Kind {
 		case kindRelay:
-			if s.Role != roleRelay || peer.Role != roleRelay {
+			if peer.Role != roleRelay || (s.Role != roleRelay && !c.isRouted()) {
 				return fmt.Errorf("%s: a relay link joins two relays", at)
+			}
+		case kindMember:
+			if s.Role != roleRelay || peer.Role != roleMember {
+				return fmt.Errorf("%s: a member link joins a relay and a member", at)
 			}
 		case kindDirect:
 			if s.Role != roleMember || peer.Role != roleMember {
@@ -462,18 +521,26 @@ func (c *Config) check() error {
 			}
 		}
 	}
+	if len(s.Takeover) > 64 {
+		return errors.New("self.takeover has more than 64 prefixes")
+	}
+	for i, p := range s.Takeover {
+		if err := checkSubnet(fmt.Sprintf("self.takeover[%d]", i), p); err != nil {
+			return err
+		}
+	}
 	if err := c.checkRelayLinks(linked); err != nil {
 		return err
 	}
 	if r := c.Routing; r != nil {
-		if s.Role != roleRelay {
+		if s.Role != roleRelay && !s.Leaf {
 			return errors.New("routing is for relays; this node is a member")
 		}
 		if r.Mode != "" && r.Mode != "dynamic" && r.Mode != "static" {
 			return fmt.Errorf("routing.mode %q is neither dynamic nor static", r.Mode)
 		}
 		for peer, b := range r.Bias {
-			if !linked[peer] || c.roleOf(peer) != roleRelay {
+			if !linked[peer] || (c.roleOf(peer) != roleRelay && c.roleOf(peer) != roleMember) {
 				return fmt.Errorf("routing.bias: %q is not a linked relay", peer)
 			}
 			if math.IsNaN(b) || b < -10000 || b > 10000 {
@@ -505,13 +572,19 @@ func (c *Config) check() error {
 			return err
 		}
 	}
+	if err := c.Probe.Check(); err != nil {
+		return err
+	}
+	if err := c.checkPaths(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // checkRelayLinks: relayLinks name relays, each pair once, and hold every
 // relay link of this one.
 func (c *Config) checkRelayLinks(linked map[string]bool) error {
-	if len(c.RelayLinks) > 0 && !c.isRelay() {
+	if len(c.RelayLinks) > 0 && !c.isRelay() && !c.isRouted() {
 		return errors.New("relayLinks is for relays; this node is a member")
 	}
 	if len(c.RelayLinks) > 4096 {

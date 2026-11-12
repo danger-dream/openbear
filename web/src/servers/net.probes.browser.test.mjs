@@ -4,12 +4,13 @@
 // testing/netBrowser.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
+import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, showTab, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
 
 test('server network layout: ping, tcping, trace, mesh targets', {skip: !chromium, timeout: 300000}, async t => {
   const {setup} = await startNetBrowser(t);
   await t.test('ping and tcping: polled every second, rows with timeouts, refusals and unreachables, the summary, stop', {timeout: 90000}, async t => {
     const h = await setup(t);
+    await showTab(h.page, '工具');
     const root = probe(h.page);
     await root.locator('.net-form').waitFor();
     // TCPing: refused and unreachable, no TTL.
@@ -25,6 +26,7 @@ test('server network layout: ping, tcping, trace, mesh targets', {skip: !chromiu
 
   await t.test('trace: hops in a table, no answer as *, several addresses on a hop, places filled in without moving rows', {timeout: 90000}, async t => {
     const h = await setup(t);
+    await showTab(h.page, '工具');
     const root = probe(h.page);
     await root.locator('.net-form').waitFor();
     await run(h, {mode: '路由追踪', target: 'example.com'});
@@ -59,9 +61,10 @@ test('server network layout: ping, tcping, trace, mesh targets', {skip: !chromiu
 
   await t.test('mesh targets: the path in place of the trace table, the end-to-end ping, stale, a gateway network; "经过" under ping', {timeout: 90000}, async t => {
     const h = await setup(t);
+    await showTab(h.page, '工具');
     const root = probe(h.page);
     await root.locator('.net-form').waitFor();
-    await h.page.locator('.mesh-card').waitFor();
+    await h.page.locator('.mesh-card').waitFor({state: 'attached'});
     const pid = await run(h, {mode: '路由追踪', target: '100.96.0.2', count: '4'});
     const path = root.locator('.net-mesh-path');
     await path.waitFor();
@@ -82,9 +85,10 @@ test('server network layout: ping, tcping, trace, mesh targets', {skip: !chromiu
 
     // From LAX02 to a host behind home's gateway: the tail after the gateway, and a stale report.
     const g = await setup(t, {tabs: ['lax'], active: 'lax'});
+    await showTab(g.page, '工具');
     const gr = probe(g.page);
     await gr.locator('.net-form').waitFor();
-    await g.page.locator('.mesh-card').waitFor();
+    await g.page.locator('.mesh-card').waitFor({state: 'attached'});
     await run(g, {mode: '路由追踪', target: '10.10.10.1', count: '3', root: gr});
     await gr.locator('.net-mesh-path').waitFor();
     await gr.getByText('数据不完整：有的线路没有上报，路径和延迟可能不准').waitFor();

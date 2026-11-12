@@ -9,11 +9,27 @@ defineOptions({inheritAttrs: false});
 const d = computed(() => props.data);
 const nets = computed(() => d.value.subnets || []);
 const role = computed(() => [d.value.relay && (d.value.site ? '站点中转' : '中转'), d.value.gateway && '网关'].filter(Boolean));
+// A member drawn inside its relay is one line: what is wrong with it if anything, else its round trip.
+const note = computed(() => {
+  const x = d.value;
+  if (x.removing) return {text: '待移除', tone: 'bad'};
+  if (x.problems) return {text: '需修改', tone: 'bad'};
+  if (x.alert) return {text: x.alert[1], tone: x.alert[0]};
+  if (x.badge) return {text: x.badge[1], tone: x.badge[0]};
+  return {text: x.rtt || '', tone: ''};
+});
 </script>
 <template>
   <div class="mesh-node" :data-tone="d.tone" :data-selected="d.selected || undefined" :data-source="d.source || undefined" :data-target="d.target || undefined"
     :data-installing="d.installing || undefined" :data-removing="d.removing || undefined" :data-relay="d.relay || undefined" :data-dim="d.dim || undefined" :data-path="d.onPath || undefined"
-    :data-compact="d.compact || undefined" :title="d.title">
+    :data-compact="d.compact || undefined" :data-chip="d.chip || undefined" :title="d.chip ? [d.title, d.address, d.alert?.[2], d.badge?.[2]].filter(Boolean).join('\n') : d.title">
+    <div v-if="d.chip" class="mesh-node-title">
+      <span v-if="d.flag" class="sv-flag" aria-hidden="true">{{ d.flag }}</span>
+      <strong>{{ d.name }}</strong>
+      <span v-if="note.text" class="mesh-chip-note" :data-tone="note.tone || undefined">{{ note.text }}</span>
+      <span class="pb-dot" :data-tone="d.tone" aria-hidden="true"></span>
+    </div>
+    <template v-else>
     <div class="mesh-node-title">
       <span v-if="d.flag" class="sv-flag" aria-hidden="true">{{ d.flag }}</span>
       <strong>{{ d.name }}</strong>
@@ -36,6 +52,7 @@ const role = computed(() => [d.value.relay && (d.value.site ? '站点中转' : '
     <div v-if="nets.length" class="mesh-node-nets" :title="nets.join('\n')">
       <Cloud :size="12" aria-hidden="true" /><span class="mono">{{ nets[0] }}</span><span v-if="nets.length > 1">+{{ nets.length - 1 }}</span>
     </div>
+    </template>
     <template v-if="d.ports">
       <i v-for="side in ['top', 'right', 'bottom', 'left']" :key="side" class="mesh-port nodrag nopan" :data-side="side" title="拖到另一台服务器上连线"></i>
     </template>

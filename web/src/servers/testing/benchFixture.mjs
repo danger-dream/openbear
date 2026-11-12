@@ -34,6 +34,7 @@ export const CATALOG = {ok: true,
       options: [{key: 'region', label: '检测地区', type: 'choice', default: 'auto', choices: [['auto', '自动'], ['jp', '日本'], ['sea', '东南亚'], ['na', '北美'], ['eu', '欧洲']]}], warnings: []},
   ],
   suite: {name: '综合评测', summary: '四项一起跑。', duration: '约 20～30 分钟', warnings: [{text: '会用系统包管理器安装缺少的依赖（合并）。'}, {text: '压力测试会占满资源。'}], options: [{key: 'family', label: '协议', type: 'choice', default: '4', choices: [['4', '仅 IPv4'], ['46', 'IPv4 + IPv6']]}], tests: ['ipcheck', 'netcheck', 'netroute']},
+  openwrt: {tests: ['unlock'], reason: 'OpenWrt 上只能运行 Service Unlock。'},
 };
 export const T = Date.parse('2026-10-30T15:00:00Z');
 export const run = (id, serverId, test, createdMs, extra = {}) => ({id, serverId, test, name: CATALOG.tests.find(t => t.id === test).name, category: CATALOG.tests.find(t => t.id === test).category,
@@ -66,8 +67,8 @@ export function fakeBench() {
     if (method === 'GET' && path === '/catalog') return [200, CATALOG];
     if (method === 'GET' && path === '/runs') return [200, {ok: true, runs: state.runs.slice().sort((a, b) => b.createdMs - a.createdMs)}];
     if (method === 'POST' && path === '/runs') {
-      const tests = body.suite ? CATALOG.suite.tests : [body.test];
-      const created = tests.map((test, i) => run(`n${state.next++}`, body.serverId, test, Date.now() + i, {state: i ? 'queued' : 'running', options: body.options || {}, label: '', endedMs: null}));
+      const tests = [...(body.suite ? CATALOG.suite.tests.map(test => ({test, options: body.options})) : body.test ? [{test: body.test, options: body.options}] : []), ...body.tests || []];
+      const created = tests.map(({test, options}, i) => run(`n${state.next++}`, body.serverId, test, Date.now() + i, {state: i ? 'queued' : 'running', options: options || {}, label: '', endedMs: null}));
       state.runs.push(...created);
       return [200, {ok: true, runs: created}];
     }

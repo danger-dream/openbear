@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -420,6 +421,15 @@ func browserOnProfile(proc, profile string, uid int) bool {
 		}
 	}
 	return false
+}
+
+// glibcLoader is the dynamic loader Chrome for Testing is linked against;
+// musl systems (OpenWrt, Alpine) have none, so a download could never run.
+var glibcLoader = map[string]string{"amd64": "/lib64/ld-linux-x86-64.so.2", "arm64": "/lib/ld-linux-aarch64.so.1"}[runtime.GOARCH]
+
+func chromeRunsHere() bool {
+	_, err := os.Stat(glibcLoader)
+	return glibcLoader != "" && err == nil
 }
 
 // checkLibraries reports shared libraries a downloaded Chrome needs but the

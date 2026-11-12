@@ -5,7 +5,7 @@ import {createInstancesBackend} from './instancesFixture.mjs';
 import {createRequire} from 'node:module';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:instance-test"></script></body></html>';
 const entry = `import {createApp} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import 'element-plus/theme-chalk/dark/css-vars.css'; import '/src/style.css'; import '/src/dark-theme.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
 const view = window.__view;

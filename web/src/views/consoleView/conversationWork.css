@@ -1,5 +1,5 @@
 /* Local names express process roles; the shared root owns both appearances. */
-.conversation-work, .context-usage-popover, .context-usage-trigger {
+.conversation-work, .context-usage-popover, .context-usage-trigger, .run-status-popover {
 	--work-text: var(--ob-text);
 	--work-muted: var(--ob-text-subtle);
 	--work-faint: var(--ob-text-muted);

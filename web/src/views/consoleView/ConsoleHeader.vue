@@ -196,7 +196,7 @@ const runStatusText = computed(() => props.status && props.status !== "就绪" ?
 	}
 
 	.header-mobile-navigation { display: flex; flex: 0 0 44px; }
-	.header-mobile-actions { display: flex; flex: 0 0 88px; }
+	.header-mobile-actions { display: flex; flex: 0 0 auto; }
 	.header-title-stack { position: relative; padding-right: 12px; }
 	.header-subtitle { display: none; }
 	.header-title-row { flex: 1; overflow: hidden; }

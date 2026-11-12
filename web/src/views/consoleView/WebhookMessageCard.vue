@@ -47,7 +47,7 @@ watch([tab, selected, open], () => { copied.value = false; });
     </span>
     <el-icon class="event-envelope-arrow"><ArrowRight/></el-icon>
   </button>
-  <el-dialog v-model="open" title="事件来信" width="min(850px, calc(100vw - 24px))" append-to-body class="mobile-viewport-dialog event-letter-dialog" :close-on-click-modal="false" destroy-on-close>
+  <el-dialog v-model="open" title="事件来信" width="min(850px, calc(100vw - 24px))" append-to-body class="mobile-viewport-dialog event-letter-dialog" destroy-on-close>
     <div class="event-letter-head"><strong>{{ view.name }}</strong><span>{{ arrival }} · #{{ view.shortId }}</span></div>
     <div class="event-letter-toolbar">
       <div class="event-letter-tabs" role="tablist" aria-label="事件内容">

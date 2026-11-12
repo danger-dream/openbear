@@ -311,19 +311,17 @@ async def test_agent_history_and_continuation_tool_descriptions_match_runtime_bo
     schemas = {schema["name"]: schema for schema in reg.schemas()}
     agent = schemas["Agent"]
     assert "no business tools" in agent["description"]
-    for name in ("Agent", "AgentContinue"):
-        tools = schemas[name]["parameters"]["properties"]["tools"]["description"]
-        assert "no business tools" in tools and "AgentHistory" in tools and "protocol tools" in tools
-    continuation = schemas["AgentContinue"]["description"]
-    assert "actual retained context" in continuation and "No prior memory report" in continuation
+    tools = agent["parameters"]["properties"]["tools"]["description"]
+    assert "no business tools" in tools and "AgentHistory" in tools and "protocol tools" in tools
+    lines = {line[2:].split(" ", 1)[0]: line for line in agent["description"].split("\n") if line.startswith("- ")}
+    continuation = lines["continue"]
+    assert "actual retained context" in continuation and "no prior memory report" in continuation
     assert "permissions are not inherited or unioned" in continuation
-    info = schemas["AgentInfo"]["description"]
+    info = lines["info"]
     assert "authoritative planRuntime" in info and "version-checked" in info
-    for name in ("History", "AgentHistory"):
-        description = schemas[name]["description"]
-        assert "concrete missing fact" in description and "not current task progress" in description
-        assert "not mechanically after every window rotation" in description
-    assert "AgentInfo" in schemas["History"]["description"]
+    description = schemas["AgentHistory"]["description"]
+    assert "concrete missing fact" in description and "not current task progress" in description
+    assert "not mechanically after every window rotation" in description
     assert "Other Agents and parent conversations are inaccessible" in schemas["AgentHistory"]["description"]
     assert "AgentHistory" not in schemas["Agent"]["parameters"]["properties"]["tools"]["items"]["enum"]
     assert "History" not in reg.names(scope="agent")

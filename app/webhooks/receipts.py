@@ -6,6 +6,10 @@ import json
 from app.webhooks.contracts import WebhookError, digest, dumps
 from app.webhooks.repository import insert, many, one, uid
 
+# A run that failed before any tool ran changed nothing outside: its events go back for another
+# run after these pauses of the endpoint (seconds), then fail plainly. No review either way.
+UNSTARTED_RETRY_S = (60, 300, 900)
+
 
 async def receipt(s,conn,event_id,*,source,request_key,outcome=None,disposition=None,member=None,attempt=None,run_id=None,result=None,summary='',reason=None,evidence=None,expected_version=None):
     content=dict(eventId=event_id,source=source,outcome=outcome,disposition=disposition,result=result,summary=summary,reason=reason,evidence=evidence or [])
@@ -91,6 +95,16 @@ async def candidate(s,assignment_id,*,abnormal=None,final_text='',finalize=True,
             return {'action':'repair','eventIds':[m['event_id'] for m in missing]}
         if not finalize:
             return {'action':'close','outcome':'protocol_incomplete' if missing else 'ready'}
+        retried,backoff=set(),0
+        if abnormal=='failed' and a['origin_kind']=='webhook' and not await one(conn,"SELECT 1 FROM runtime_actions x JOIN webhook_runtime_links l USING(run_id) WHERE l.assignment_id=? AND x.kind!='model' LIMIT 1",(assignment_id,)):
+            for m in missing:
+                tried=(await one(conn,'SELECT COUNT(*) n FROM webhook_assignment_events WHERE event_id=? AND released_at_ms IS NOT NULL',(m['event_id'],)))['n']
+                await receipt(s,conn,m['event_id'],source='framework',request_key='disposition:'+m['assignment_event_id'],outcome='failed',member=m['assignment_event_id'],reason='failed')
+                if tried<len(UNSTARTED_RETRY_S):
+                    retried.add(m['assignment_event_id']); backoff=max(backoff,UNSTARTED_RETRY_S[tried])
+            missing=[]
+            if len(retried)==len(members):
+                abnormal='retried'
         for m in missing:
             disposition='cancelled' if abnormal=='cancelled' else 'not_delivered' if m['delivered_at_ms'] is None else 'protocol_incomplete'
             await dispose_member(s,conn,m,disposition,abnormal)
@@ -101,14 +115,30 @@ async def candidate(s,assignment_id,*,abnormal=None,final_text='',finalize=True,
         snapshot={'usage':await usage(s,conn,assignment_id=assignment_id),'conversationId':a['conversation_uuid'],'rootTurnId':a['root_turn_uuid'],'materials':[await s.event_material(conn,m['event_id']) for m in members], 'assignmentId':assignment_id,'initialBatchId':a['initial_batch_id'],'events':results,'finalText':final_text,'outcome':outcome,
                   'runs':await many(conn,'SELECT * FROM webhook_runtime_links WHERE assignment_id=?',(assignment_id,))}
         await conn.execute("UPDATE webhook_assignments SET state='finalized',finalized_at_ms=?,terminal_reason=?,final_snapshot_json=?,row_version=row_version+1 WHERE assignment_id=?",(s.clock(),outcome,dumps(snapshot),assignment_id))
+        owner=(await s.endpoint_row(conn,a['origin_endpoint_id'],deleted=True))['owner_chat_id'] if retried else None
         for m in members:
+            if m['assignment_event_id'] in retried:
+                # Released only now: membership ends with a finalized assignment.
+                op=uid()
+                await insert(conn,'webhook_control_operations',operation_id=op,owner_chat_id=owner,request_id='auto-retry:'+m['assignment_event_id'],endpoint_id=a['origin_endpoint_id'],
+                             action='retry',request_sha256=digest({'assignmentEventId':m['assignment_event_id']}),actor_ref='framework',
+                             reason=f'run failed before any tool ran; retried after {backoff}s',selection_json=dumps({'eventId':m['event_id']}),created_at_ms=s.clock())
+                await conn.execute('UPDATE webhook_assignment_events SET released_at_ms=?,release_operation_id=? WHERE assignment_event_id=?',(s.clock(),op,m['assignment_event_id']))
+                await conn.execute("UPDATE webhook_events SET route_state='eligible',route_version=route_version+1 WHERE event_id=?",(m['event_id'],))
+                continue
             await conn.execute("UPDATE webhook_events SET route_state='terminal',terminal_at_ms=COALESCE(terminal_at_ms,?),terminal_reason=COALESCE(terminal_reason,?),review_required=MAX(review_required,?) WHERE event_id=?",(s.clock(),outcome,int(outcome=='protocol_incomplete' or any(r['event_id']==m['event_id'] and r['review_required'] for r in results)),m['event_id']))
         if a['origin_kind']=='webhook':
             _,c=await s.revision(conn,a['origin_endpoint_id'],a['origin_revision'])
             e=await s.endpoint_row(conn,a['origin_endpoint_id'],deleted=True)
-            if outcome in ('protocol_incomplete','interrupted') or any(r['review_required'] for r in results):
-                blockers=json.loads(e['model_blockers_json']); blockers['review:'+assignment_id]={'source':'review','assignmentId':assignment_id,'setAtMs':s.clock()}
-                await conn.execute('UPDATE webhook_endpoints SET model_blockers_json=?,control_version=control_version+1 WHERE endpoint_id=?',(dumps(blockers),a['origin_endpoint_id']))
+            review=outcome in ('protocol_incomplete','interrupted') or any(r['review_required'] for r in results)
+            blockers=json.loads(e['model_blockers_json'])
+            if review:
+                blockers['review:'+assignment_id]={'source':'review','assignmentId':assignment_id,'setAtMs':s.clock()}
+            if retried:
+                # A backoff, not a hold: it ends by itself (WebhookService.model_blockers).
+                blockers['retry']={'source':'retry','untilMs':max(s.clock()+backoff*1000,(blockers.get('retry') or {}).get('untilMs') or 0)}
+            if review or retried:
+                await conn.execute('UPDATE webhook_endpoints SET model_blockers_json=?,control_version=control_version+? WHERE endpoint_id=?',(dumps(blockers),int(review),a['origin_endpoint_id']))
             if c.post.enabled and outcome in c.post.on_outcomes and e['deleted_at_ms'] is None:
                 # Queueing is not launching; current controls are rechecked by the worker.
                 await insert(conn,'webhook_stage_jobs',job_id=uid(),stage='post',assignment_id=assignment_id,endpoint_id=a['origin_endpoint_id'],revision=a['origin_revision'],

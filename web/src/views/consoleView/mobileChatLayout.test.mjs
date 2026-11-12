@@ -230,7 +230,7 @@ async function renderTools(runtime){
   const app=createSSRApp({render(){tree=compiled.call(this,bindings,[]);return tree;}});
   app.component('ElPopover',{inheritAttrs:false,props:['visible'],render(){const children=[...(this.$slots.reference?.()||[]),...(this.visible?(this.$slots.default?.()||[]):[])];slots.push(...children);return children;}});
   app.component('ElDrawer',{inheritAttrs:false,props:['modelValue'],emits:['opened'],render(){const children=this.modelValue?(this.$slots.default?.()||[]):[];slots.push(...children);return children;}});
-  for(const name of ['ChatLineRound','CollectionTag','DataAnalysis','EditPen','Lock','Money','MoreFilled','Timer','Unlock','Hide','Search','ListChecks'])app.component(name,{render:()=>h('svg')});
+  for(const name of ['ChatLineRound','CollectionTag','DataAnalysis','EditPen','Lock','Money','MoreFilled','Timer','Unlock','Hide','Search','ListChecks','StickyNote'])app.component(name,{render:()=>h('svg')});
   const html=await renderToString(app);return{html,nodes:walk([tree,...slots])};
 }
 

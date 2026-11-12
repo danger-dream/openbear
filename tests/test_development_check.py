@@ -39,3 +39,52 @@ def test_failed_python_dependency_validation_does_not_settle(tmp_path):
     lane = check.Lane('python')
     lane.complete = False
     assert 'uv.lock' not in check.settle(plan, SimpleNamespace(), {'python': lane}, {})
+
+
+STUCK = '''
+import asyncio
+import pytest
+
+
+async def never():
+    await asyncio.Event().wait()
+
+
+@pytest.fixture
+async def closing():
+    yield
+    await asyncio.gather(asyncio.create_task(never(), name='never-ends'))
+
+
+async def test_stuck(closing):
+    pass
+
+
+def test_after():
+    pass
+'''
+
+
+def test_a_stuck_test_process_is_ended_with_its_tasks_and_the_run_finishes(tmp_path, monkeypatch):
+    monkeypatch.setattr(check, 'STALL_S', 2)
+    (tmp_path / 'test_case.py').write_text(STUCK)
+    (tmp_path / 'pytest.ini').write_text('[pytest]\nasyncio_mode = auto\n')
+    progress, log, stuck = tmp_path / 'progress', tmp_path / 'p.log', []
+    progress.mkdir()
+    env = {**check.base_env(), 'PYTHONPATH': str(check.ROOT), 'CHECK_PROGRESS_DIR': str(progress)}
+    cmd = check.pytest_cmd(tmp_path / 'j.xml', 2, str(tmp_path / 'test_case.py'), '--rootdir', str(tmp_path), '-c', str(tmp_path / 'pytest.ini'))
+    assert check.run(cmd, check.ROOT, env, log, check.time.monotonic() + 90, progress=progress, stuck=stuck) is not None
+    assert stuck == ['test_case.py::test_stuck（teardown）']
+    text = log.read_text()
+    # The stuck task down to the line it waits on, not just its outermost frame.
+    assert '卡住的测试进程' in text and 'never-ends' in text and 'test_case.py:7 never' in text
+    lane = check.Lane('python')
+    check.read_junit(tmp_path / 'j.xml', lane, tmp_path)
+    assert lane.passed == 1 and [f.title for f in lane.failures] == ['test_case.py::test_stuck']
+
+
+def test_a_run_ended_by_the_deadline_reports_what_it_finished(tmp_path):
+    log = tmp_path / 'p.log'
+    # pytest -q under xdist, killed in the middle of a progress line.
+    log.write_text('8 workers [150 items]\n\n' + '.' * 72 + ' [ 50%]\n.F.')
+    assert check._counted(log) == (75, 150)

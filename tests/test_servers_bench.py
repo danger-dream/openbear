@@ -63,7 +63,7 @@ class BenchNode:
             self.count += 1
             job_id = f'job{self.count:04d}'
             self.jobs[job_id] = {'id': job_id, 'command': params['command'], 'state': 'running', 'exitCode': None,
-                                 'startedAt': 1793115000000, 'endedAt': None, 'server': server_id, 'log': ''}
+                                 'startedAt': 1793115000000, 'endedAt': None, 'durationMs': 0, 'server': server_id, 'log': ''}
             return {'ok': True, 'result': self.jobs[job_id]}
         if method == 'job.list':
             return {'ok': True, 'result': {'jobs': [j for j in self.jobs.values() if j['server'] == server_id]}}
@@ -186,7 +186,9 @@ def test_catalogue_options_and_commands():
 
     command = catalog.command('netroute', catalog.options('netroute', {'province': '内蒙古'}), '/var/tmp/openbear-bench/runs/abc')
     assert command.startswith("export OB_BENCH_DIR=/var/tmp/openbear-bench/net.check.place-v0.1.0 OB_BENCH_OUT=/var/tmp/openbear-bench/runs/abc")
-    assert 'sha256sum -c --quiet .openbear-files.sha256' in command and f'exit {catalog.CHECKSUM_FAILED}' in command
+    # BusyBox's sha256sum (OpenWrt, Alpine) has no --quiet; the output goes nowhere anyway.
+    assert 'sha256sum -c .openbear-files.sha256 >/dev/null 2>&1' in command and f'exit {catalog.CHECKSUM_FAILED}' in command
+    assert '--quiet' not in command and '--quiet' not in catalog.unlock_command()
     assert command.endswith('bash "$OB_BENCH_DIR/net.sh" -y -p -4 -R \'内蒙古\' -S 123')
     assert catalog.command('unlock', {'region': 'auto'}, '/x').endswith('"$OB_BENCH_DIR/bin/service-unlock" --machine > "$OB_BENCH_OUT/envelope.json"')
 
@@ -291,6 +293,8 @@ async def test_a_run_pushes_runs_collects_and_cleans_up(env, monkeypatch):  # no
     modes = {p['path']: p['mode'] for _, m, p in node.calls if m == 'fs.write'}
     assert modes[f'{base}/ip.sh'] == '755' and modes[f'{base}/main/ref/iso3166.json'] == '644'
     assert job['command'].endswith('bash "$OB_BENCH_DIR/ip.sh" -y -p')
+    # It measures the machine's own line, past a transparent proxy as the node's checks go.
+    assert next(p for _, m, p in node.calls if m == 'job.start')['bypass'] is True
     # The node has the job before the run notes it: wait for the run's own state.
     await run_state(env, run['id'], 'running')
     # Running runs cannot be deleted.
@@ -350,6 +354,28 @@ async def test_one_run_at_a_time_and_the_suite(env, monkeypatch):  # noqa: F811
     assert 'ip.sh' in second['command']
     hw = await run_state(env, suite[0]['id'], 'done')
     assert hw['sections'][0]['label'] == ''  # the hardware check has no protocol choice
+
+
+async def test_several_tests_at_once_alone_or_beside_the_suite(env, monkeypatch):  # noqa: F811
+    node, sid = await bench_env(env, monkeypatch)
+    runs = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'tests': [
+        {'test': 'unlock', 'options': {'region': 'jp'}}, {'test': 'ipcheck'}]}))['runs']
+    assert [(r['test'], r['options'], r['suite'], r['state']) for r in runs] == [
+        ('unlock', {'region': 'jp'}, '', 'queued'), ('ipcheck', {'family': '4', 'report': False}, '', 'queued')]
+    both = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'suite': True, 'options': {'family': '46'},
+                                                              'tests': [{'test': 'geekbench5'}]}))['runs']
+    assert [r['test'] for r in both] == ['hwcheck', 'ipcheck', 'netcheck', 'netroute', 'geekbench5']
+    # The suite's four share one suite id; a test beside it is its own run.
+    assert len({r['suite'] for r in both[:4]}) == 1 and both[4]['suite'] == ''
+    for body, status in [({'serverId': sid, 'tests': []}, 400), ({'serverId': sid, 'tests': 'ipcheck'}, 400),
+                         ({'serverId': sid, 'test': 'ipcheck', 'tests': [{'test': 'unlock'}]}, 400),
+                         ({'serverId': sid, 'tests': [{'test': 'unlock'}], 'options': {}}, 400),
+                         ({'serverId': sid, 'tests': [{'test': 'unlock', 'extra': 1}]}, 400),
+                         ({'serverId': sid, 'tests': [{'test': 'unlock'}, {'test': 'unlock'}]}, 400),
+                         ({'serverId': sid, 'suite': True, 'tests': [{'test': 'ipcheck'}]}, 400),
+                         ({'serverId': sid, 'tests': [{'test': 'nope'}]}, 404)]:
+        await api(env, 'POST', '/api/servers/bench/runs', body, status=status)
+    assert len((await api(env, 'GET', '/api/servers/bench/runs'))['runs']) == 7, 'a refused request queues nothing'
 
 
 async def test_stopping_queued_and_running_runs(env, monkeypatch):  # noqa: F811
@@ -424,6 +450,39 @@ async def test_unsupported_platforms_and_bad_requests(env, monkeypatch):  # noqa
     await api(env, 'GET', '/api/servers/bench/runs/missing', status=404)
     catalogue = await api(env, 'GET', '/api/servers/bench/catalog')
     assert catalogue['suite']['name'] == '综合评测' and catalogue['tests'][0]['version'] == 'v0.1.0'
+    assert catalogue['openwrt']['tests'] == ['unlock'] and 'Service Unlock' in catalogue['openwrt']['reason']
+
+
+async def test_an_openwrt_router_runs_service_unlock_alone_and_keeps_no_package(env, monkeypatch):  # noqa: F811
+    node, sid = await bench_env(env, monkeypatch, arch='arm64')
+    env.servers.hub.sessions[sid].info['openwrt'] = True
+    for body in [{'serverId': sid, 'test': 'ipcheck'}, {'serverId': sid, 'suite': True},
+                 {'serverId': sid, 'tests': [{'test': 'unlock'}, {'test': 'geekbench5'}]}]:
+        assert (await api(env, 'POST', '/api/servers/bench/runs', body, status=409))['error'] == 'bench_openwrt_unsupported'
+    assert not node.started(), 'nothing of a refused request is queued'
+    run = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    job = await a_job(node)
+    base = catalog.package_dir('unlock')
+    assert f'{base}/{bench_module.LISTING}' in node.files[sid]
+    node.finish(job, files={'envelope.json': json.dumps({'terminal': 'Netflix  Yes\n', 'report': {'n': 1}})})
+    assert (await run_state(env, run['id'], 'done', 'failed'))['state'] == 'done'
+    # /var/tmp is a RAM disk there: the package goes with the run's directory.
+    await until(lambda: asyncio.sleep(0, result=not any(p.startswith(base + '/') for p in node.files[sid])))
+
+
+async def test_geekbench_that_could_not_run_fails(env, monkeypatch):  # noqa: F811
+    node, sid = await bench_env(env, monkeypatch)
+    run = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'geekbench5'}))['runs'][0]
+    job = await a_job(node)
+    # run.sh writes its report whatever happened; 127: a glibc program on a musl system.
+    node.finish(job, files={'report-4.ansi': 'Geekbench 5\n单核成绩：未取得\n', 'result-4.json': '{"url":"","single":"","multi":"","oom":false}'},
+                log='run.sh: line 33: geekbench5: required file not found\n', code=127)
+    failed = await run_state(env, run['id'], 'done', 'failed')
+    assert (failed['state'], failed['error'], failed['exitCode']) == ('failed', 'bench_script_failed', 127)
+    again = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'geekbench5'}))['runs'][0]
+    job = await a_job(node, 2)
+    node.finish(job, files={'report-4.ansi': 'Geekbench 5\n单核成绩：1000\n', 'result-4.json': '{"url":"https://browser.geekbench.com/v5/cpu/1","single":"1000"}'})
+    assert (await run_state(env, again['id'], 'done', 'failed'))['state'] == 'done'
 
 
 async def test_a_restart_follows_the_job_it_left_running(env, monkeypatch):  # noqa: F811
@@ -462,7 +521,7 @@ async def test_the_servers_tool_runs_reads_and_removes_benchmarks(env, monkeypat
     call = await _tool(env, 790, 'conv-bench')
     described = await call('describe', topic='bench')
     assert described['actions'] == ['bench_catalog', 'bench_runs', 'bench_start', 'bench_wait', 'bench_get', 'bench_stop', 'bench_delete']
-    assert 'bench_*' in (await call('describe'))['contracts']
+    assert 'bench' in (await call('describe'))['topics']
     assert {t['id'] for t in (await call('bench_catalog'))['tests']} == set(catalog.TESTS)
 
     assert (await call('bench_start', test='ipcheck'))['error'] == 'server_id_required'
@@ -600,3 +659,256 @@ def test_colours_never_leave_pieces_of_a_sequence():
     out = screen('\x1b[36m\x1b[32mA\x1b[1mB\x1b[22mC\x1b[0mD\x1b[7;44mE\x1b[27;49mF\x1b[38;2;1;2;3mG\n')
     assert out == '\x1b[32mA\x1b[0m\x1b[1;32mB\x1b[0m\x1b[32mC\x1b[0mD\x1b[7;44mE\x1b[0mF\x1b[38;2;1;2;3mG\x1b[0m\n'
     assert re.sub(r'\x1b\[[0-9;]*m', '', out) == 'ABCDEFG\n'
+
+
+async def test_stopping_while_the_report_is_collected_from_a_node_gone_away(env, monkeypatch):  # noqa: F811
+    """The job ended and the node went away before its report was read: 停止 gives the report up (rather than
+    answering ok and leaving the run waiting hours for the node) and the server's queue moves on."""
+    node, sid = await bench_env(env, monkeypatch)
+    first = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    second = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'tcpquality'}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, first['id'], 'running')
+    async with env.db.write_transaction(label='t') as conn:
+        await conn.execute("UPDATE server_nodes SET info_json=? WHERE server_id=?", (json.dumps({'info': {'platform': 'linux', 'arch': 'amd64'}}), sid))
+    held, original = [], node.call
+
+    async def call(server_id, method, params, timeout):
+        result = await original(server_id, method, params, timeout)
+        if method == 'job.status' and node.jobs[params['id']]['state'] != 'running' and server_id in env.servers.hub.sessions:
+            held.append(env.servers.hub.sessions.pop(server_id))
+        return result
+    env.servers.hub.call = call
+    node.finish(job, files={'envelope.json': json.dumps({'terminal': 'ok\n', 'report': {}})})
+    await run_state(env, first['id'], 'collecting')
+    await asyncio.sleep(0.2)
+    assert (await api(env, 'GET', f'/api/servers/bench/runs/{first["id"]}'))['run']['state'] == 'collecting', 'waiting for the node'
+    stopping = (await api(env, 'POST', f'/api/servers/bench/runs/{first["id"]}/stop'))['run']
+    assert stopping['stopping'] and stopping['state'] == 'collecting'
+    stopped = await run_state(env, first['id'], 'stopped')
+    assert stopped['endedMs'] and not stopped['sections']
+    assert (await run_state(env, second['id'], 'preparing'))['state'] == 'preparing', 'the next run is no longer held up'
+    env.servers.hub.call = original
+    env.servers.hub.sessions[sid] = held[0]
+    job = await a_job(node, 2)
+    node.finish(job, log='TcpQuality\n')
+    assert (await run_state(env, second['id'], 'done', 'failed'))['state'] in ('done', 'failed')
+
+
+# ----- time limits -----
+def test_each_test_has_a_time_limit_by_what_it_runs():
+    """Several times the longest run seen of each (production, 2026-11: unlock 14 s, ipcheck 171 s, hwcheck 178 s,
+    geekbench5 149 s, netroute 411 s, netcheck low 471 s / full 664 s), never under a quarter of an hour."""
+    seen_s = {'unlock': 14, 'ipcheck': 171, 'hwcheck': 178, 'geekbench5': 149, 'netroute': 411, 'netcheck': 664, 'tcpquality': 16}
+    for test in catalog.TESTS:
+        minutes = catalog.time_limit(test, catalog.options(test, {}))
+        assert minutes >= 15 and minutes * 60 >= 5 * seen_s[test], test
+    assert catalog.time_limit('unlock', {'region': 'auto'}) == 15
+    assert catalog.time_limit('ipcheck', {'family': '4'}) == 30
+    assert catalog.time_limit('ipcheck', {'family': '46'}) == 60
+    assert catalog.time_limit('netcheck', {'family': '4', 'mode': 'low'}) == 60
+    assert catalog.time_limit('netcheck', {'family': '46', 'mode': 'full'}) == 240
+    assert catalog.time_limit('hwcheck', {'report': True}) == 120
+    assert [catalog.time_limit('tcpquality', {'mode': m}) for m in catalog.TCPQ_MODES] == [60, 60, 30, 30, 60, 90, 180]
+    assert (catalog.limit_words(15), catalog.limit_words(120)) == ('15 分钟', '2 小时')
+
+
+async def test_a_run_past_its_limit_is_stopped_and_the_queue_moves_on(env, monkeypatch):  # noqa: F811
+    """A job that hangs past its test's limit, by the node's own count of its running time, is stopped on the
+    node and the run ends as interrupted with the limit as its reason; the next run of the server goes on
+    and ends as it would, one under its limit is left running."""
+    node, sid = await bench_env(env, monkeypatch)
+    hung = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    after = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'tcpquality', 'options': {'mode': 'route-v4'}}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, hung['id'], 'running')
+    job['durationMs'] = 15 * 60000 - 1000
+    polled = len(node.calls)
+    await until(lambda: asyncio.sleep(0, len(node.calls) > polled + 5))
+    assert job['state'] == 'running' and (await api(env, 'GET', f'/api/servers/bench/runs/{hung["id"]}'))['run']['state'] == 'running'
+    job['durationMs'] = 15 * 60000
+    ended = await run_state(env, hung['id'], 'interrupted')
+    assert job['state'] == 'stopped'
+    assert (ended['error'], ended['detail'], ended['stopping']) == ('bench_timeout', '超过 15 分钟未完成，已自动停止', False)
+    # The next one runs as usual, its own limit (30 minutes) not reached.
+    second = await a_job(node, 2)
+    second['durationMs'] = 20 * 60000
+    node.finish(second, log='\x1b[2J回程线路\n')
+    done = await run_state(env, after['id'], 'done', 'failed')
+    assert (done['state'], done['error'], done['detail']) == ('done', '', '')
+
+
+async def test_a_run_past_its_limit_with_its_node_away_frees_the_queue(env, monkeypatch):  # noqa: F811
+    """The limit passes while the node is away: the run ends at once rather than waiting hours for the node,
+    and its job is stopped once the node is back, before the next run's job starts."""
+    node, sid = await bench_env(env, monkeypatch)
+    hung = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    after = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'tcpquality', 'options': {'mode': 'route-v4'}}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, hung['id'], 'running')
+    async with env.db.write_transaction(label='t') as conn:
+        await conn.execute("UPDATE server_nodes SET info_json=? WHERE server_id=?", (json.dumps({'info': {'platform': 'linux', 'arch': 'amd64'}}), sid))
+    job['durationMs'] = 15 * 60000 - 200
+    polled = len(node.calls)
+    await until(lambda: asyncio.sleep(0, len(node.calls) > polled + 2))
+    session = env.servers.hub.sessions.pop(sid)
+    ended = await run_state(env, hung['id'], 'interrupted')
+    assert (ended['error'], ended['detail']) == ('bench_timeout', '超过 15 分钟未完成，已中断，等待节点上线后停止作业')
+    assert job['state'] == 'running' and len(node.started()) == 1
+    await api(env, 'DELETE', f'/api/servers/bench/runs/{hung["id"]}', status=409)
+    env.servers.hub.sessions[sid] = session
+    second = await a_job(node, 2)
+    assert job['state'] == 'stopped'
+    methods = [(m, p.get('id')) for _, m, p in node.calls if m in ('job.stop', 'job.start')]
+    assert methods[0] == methods[-1] == ('job.start', None)
+    assert methods[1:-1] and all(m == ('job.stop', job['id']) for m in methods[1:-1])
+    assert (await api(env, 'GET', f'/api/servers/bench/runs/{hung["id"]}'))['run']['detail'] == '超过 15 分钟未完成，已自动停止'
+    node.finish(second, log='回程线路\n')
+    assert (await run_state(env, after['id'], 'done', 'failed'))['state'] == 'done'
+
+
+async def test_a_run_stopped_at_its_limit_whose_node_goes_away_while_collecting(env, monkeypatch):  # noqa: F811
+    """Stopped at its limit, then the node went away before its report was read: the run is not held up for
+    the node either, and still ends as interrupted at its limit rather than stopped by the user."""
+    node, sid = await bench_env(env, monkeypatch)
+    hung = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, hung['id'], 'running')
+    held, original = [], node.call
+
+    async def call(server_id, method, params, timeout):
+        result = await original(server_id, method, params, timeout)
+        if method == 'job.status' and node.jobs[params['id']]['state'] == 'stopped' and server_id in env.servers.hub.sessions:
+            held.append(env.servers.hub.sessions.pop(server_id))
+        return result
+    env.servers.hub.call = call
+    job['durationMs'] = 15 * 60000
+    ended = await run_state(env, hung['id'], 'interrupted', 'stopped')
+    assert held and (ended['state'], ended['error'], ended['detail']) == ('interrupted', 'bench_timeout', '超过 15 分钟未完成，已自动停止')
+
+
+async def test_timeout_stop_is_resumed_after_restart_even_after_a_long_disconnection(env, monkeypatch):
+    node, sid = await bench_env(env, monkeypatch)
+    bench = env.servers.bench
+    run = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, run['id'], 'running')
+    tasks = list(bench.workers.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await bench._set(run['id'], state='interrupted', error=bench_module.TIMED_OUT, stop=bench_module.ASKED)
+    session = env.servers.hub.sessions.pop(sid)
+    # The interrupted run is no longer in a queue. Startup must recover its pending stop separately.
+    monkeypatch.setattr(bench_module, 'AWAY_LIMIT_S', 0)
+    await bench.start()
+    await asyncio.sleep(0.2)
+    assert job['state'] == 'running'
+    env.servers.hub.sessions[sid] = session
+    async def saved_stop():
+        row = await bench._get(run['id'])
+        return row['stop'] == bench_module.SENT
+    await until(saved_stop)
+    assert job['state'] == 'stopped'
+    kept = (await api(env, 'GET', f'/api/servers/bench/runs/{run["id"]}'))['run']
+    assert kept['state'] == 'interrupted' and kept['detail'] == '超过 15 分钟未完成，已自动停止'
+
+
+async def test_queue_time_is_not_running_time_and_old_reports_are_kept(env, monkeypatch):
+    node, sid = await bench_env(env, monkeypatch)
+    bench = env.servers.bench
+    first = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'tcpquality'}))['runs'][0]
+    job = await a_job(node)
+    second = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    await bench._set(second['id'], created_ms=1)
+    node.finish(job, log='retained report\n')
+    done = await run_state(env, first['id'], 'done')
+    await bench._set(first['id'], created_ms=1, started_ms=1, ended_ms=2)
+    next_job = await a_job(node, 2)
+    await run_state(env, second['id'], 'running')
+    await asyncio.sleep(0.1)
+    assert next_job['state'] == 'running'
+    node.finish(next_job, files={'envelope.json': json.dumps({'terminal': 'ok\n', 'report': {}})})
+    await run_state(env, second['id'], 'done')
+    await bench.start()
+    kept = (await api(env, 'GET', f'/api/servers/bench/runs/{first["id"]}'))['run']
+    assert kept['sections'] == done['sections'] and kept['log'] == done['log']
+
+
+@pytest.mark.parametrize('stage', ['preparing', 'starting_before', 'starting_after', 'running', 'collecting'])
+async def test_stop_server_quiesces_every_phase_before_returning(env, monkeypatch, stage):
+    node, sid = await bench_env(env, monkeypatch)
+    bench = env.servers.bench
+    reached, release = asyncio.Event(), asyncio.Event()
+    original_start = env.servers.job_start
+
+    if stage.startswith('starting'):
+        async def start(*args, **kwargs):
+            result = await original_start(*args, **kwargs) if stage == 'starting_after' else None
+            reached.set()
+            await release.wait()
+            return result or await original_start(*args, **kwargs)
+        monkeypatch.setattr(env.servers, 'job_start', start)
+    elif stage == 'preparing':
+        async def push(*args):
+            reached.set()
+            await release.wait()
+        monkeypatch.setattr(bench, '_push', push)
+    elif stage == 'collecting':
+        async def gather(*args):
+            reached.set()
+            await release.wait()
+        monkeypatch.setattr(bench, '_gather', gather)
+
+    first = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    second = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'tcpquality'}))['runs'][0]
+    if stage in ('running', 'collecting'):
+        job = await a_job(node)
+        await run_state(env, first['id'], 'running')
+        if stage == 'collecting':
+            node.finish(job, files={'envelope.json': json.dumps({'terminal': 'ok\n', 'report': {}})})
+        else:
+            reached.set()
+    await asyncio.wait_for(reached.wait(), 5)
+    owner = (await bench._get(first['id']))['owner']
+    stopping = asyncio.create_task(bench.stop_server(owner, sid))
+    await until(lambda: asyncio.sleep(0, sid in bench.paused))
+    if stage.startswith('starting'):
+        await asyncio.sleep(0.05)
+        assert not stopping.done(), 'must await the outstanding start receipt, not just cancel its waiter'
+    await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}, status=409)
+    release.set()
+    result = await asyncio.wait_for(stopping, 5)
+    assert result['ok'] and set(result['runs']) == {first['id'], second['id']}
+    assert sid not in bench.workers
+    assert all(j['state'] != 'running' for j in node.started())
+    assert len(node.started()) == (0 if stage == 'preparing' else 1)
+    for run in (first, second):
+        assert (await bench._get(run['id']))['state'] == 'stopped'
+    bench._kick(sid)
+    await asyncio.sleep(0.05)
+    assert sid not in bench.workers and len(node.started()) <= 1
+    bench.resume_server(sid)
+    await asyncio.sleep(0.05)
+    assert len(node.started()) <= 1, 'cancelled queue entries never start after the fence is released'
+
+
+async def test_stop_server_does_not_confirm_a_job_that_is_still_running(env, monkeypatch):
+    node, sid = await bench_env(env, monkeypatch)
+    bench = env.servers.bench
+    run = (await api(env, 'POST', '/api/servers/bench/runs', {'serverId': sid, 'test': 'unlock'}))['runs'][0]
+    job = await a_job(node)
+    await run_state(env, run['id'], 'running')
+    row = await bench._get(run['id'])
+    original = env.servers.job_stop
+
+    async def not_stopped(*args, **kwargs):
+        return {'ok': True, 'stopped': False, 'job': {'state': 'running'}}
+    monkeypatch.setattr(env.servers, 'job_stop', not_stopped)
+    with pytest.raises(catalog.InstanceError, match='bench_run_active'):
+        await bench.stop_server(row['owner'], sid)
+    assert sid in bench.paused and sid not in bench.workers and job['state'] == 'running'
+    monkeypatch.setattr(env.servers, 'job_stop', original)
+    await bench.stop_server(row['owner'], sid)
+    assert job['state'] == 'stopped'
+    bench.resume_server(sid)

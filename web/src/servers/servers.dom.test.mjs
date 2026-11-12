@@ -4,7 +4,7 @@
 // servers.*.browser.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {setup, names, tab, expectFocused} from './testing/serversDom.mjs';
+import {setup, names, showTab, tab, expectFocused} from './testing/serversDom.mjs';
 import {sleep} from '../testing/domPage.mjs';
 import {server, GB, day, many, uninstalledLast, versions, RELEASE, MESH_ON, onMesh, card, meshOption, off, fact} from './testing/serversBackend.mjs';
 
@@ -27,8 +27,17 @@ test('desktop board: summary filters, update notice, sparklines, list view', asy
   assert.deepEqual(await names(h.page), ['Hotel-HK', 'Papa-HK.T1']);
   await h.page.getByRole('button', {name: '显示全部'}).click();
   const papa = h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'});
-  assert.deepEqual(await papa.locator('.pb-tag').allInnerTexts(), ['¥37.79/月', '余 8 天', 'Tier 1', 'steal 23%', '可更新']);
-  assert.equal(await papa.locator('.pb-tag').filter({hasText: 'steal'}).getAttribute('data-tone'), 'bad');
+  // What it is filed under at the bottom; what needs a look as marks by the name.
+  assert.deepEqual(await papa.locator('.pb-tag').allInnerTexts(), ['¥37.79/月', 'Tier 1']);
+  assert.deepEqual(await papa.locator('.pb-mark').evaluateAll(l => l.map(m => m.getAttribute('aria-label'))), ['可更新', 'steal 23%']);
+  assert.equal(await papa.locator('.pb-mark[data-mark=steal]').getAttribute('data-tone'), 'bad');
+  // The figures as pairs, row by row.
+  assert.deepEqual(await papa.locator('.pb-cell').evaluateAll(l => l.map(c => c.dataset.cell)), ['cpu', 'mem', 'disk', 'traffic', 'rx', 'tx', 'rxSum', 'txSum', 'latency', 'loss', 'expiry', 'uptime']);
+  assert.match(await papa.locator('[data-cell=expiry]').innerText(), /到期\s*余 8 天/);
+  assert.equal(await papa.locator('[data-cell=expiry]').getAttribute('data-tone'), 'warn');
+  assert.match(await papa.locator('[data-cell=traffic]').innerText(), /流量\s*500 \/ 500 GB/);
+  assert.equal(await papa.locator('[data-cell=traffic]').getAttribute('data-tone'), 'bad');
+  assert.match(await papa.locator('[data-cell=cpu]').innerText(), /CPU\s*2 核\s*64%/);
   await h.page.waitForFunction(() => document.querySelectorAll('.pb-spark path.is-rx').length >= 4, null, {timeout: 15000});
   await h.page.locator('.pb-notice').getByText('2 台服务器的节点可以更新到本地构建 0.13.1').waitFor();
   await h.page.locator('.pb-notice').getByRole('button', {name: '全部更新'}).click();
@@ -45,28 +54,52 @@ test('desktop board: summary filters, update notice, sparklines, list view', asy
   await h.close();
 });
 
-test('desktop detail: gauges, live charts, renew, logs and removing with uninstall', async t => {
+test('desktop detail: summary cards, live charts, renew, logs and removing with uninstall', async t => {
   const h = await setup(t);
   await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
   const detail = h.page.locator('.sv-detail:visible');
-  assert.deepEqual(await detail.locator('.sv-gauge strong').allInnerTexts(), ['13%', '41%', '82%', '0%']);
-  assert.equal(await detail.locator('.sv-gauge').nth(2).getAttribute('data-tone'), 'warn');
-  assert.match(await detail.locator('.sv-tiles').innerText(), /写 1\.2 MB\/s[\s\S]*TCP 120 · UDP 8[\s\S]*steal 0\.4%/);
-  await detail.locator('.sv-chart svg').first().waitFor();
-  assert.equal(await detail.locator('.sv-ranges [aria-selected=true]').first().innerText(), '实时');
-  assert.deepEqual(await detail.locator('.sv-chart figcaption > span:first-child').allInnerTexts(), ['CPU', '内存', '网络', '磁盘读写', '负载', '连接数']);
-  assert.ok(h.calls.some(c => c.path.endsWith('/metrics') && c.query.range === 'live'));
+  const card = kind => detail.locator(`.ov-card[data-kind=${kind}]`);
+  await card('cpu').waitFor();
+  assert.deepEqual(await detail.locator('.ov-figure > strong:not(.ov-rates)').allInnerTexts(), ['13%', '41%', '82%']);
+  assert.equal(await card('disk').getAttribute('data-tone'), 'warn');
+  assert.match(await card('cpu').innerText(), /2 核 · 负载 0\.50 \/ 0\.40 \/ 0\.30\s*steal 0\.4% · iowait 1\.2%/);
+  assert.match(await card('mem').innerText(), /交换未启用/);
+  assert.match(await card('disk').innerText(), /读 50\.8 KB\/s · 写 1\.2 MB\/s/);
+  assert.match(await card('net').innerText(), /↓\s*[\d.]+ [KM]B\/s\s*↑\s*[\d.]+ [KM]B\/s\s*本期 2\.5 TB \/ 10\.0 TB\s*下行 2\.5 TB · 上行 853 GB/);
+  await detail.locator('[data-chart=load] svg').waitFor();
+  assert.equal(await detail.locator('.dt-ranges [aria-selected=true]').innerText(), '实时');
+  assert.deepEqual(await detail.locator('[data-chart=load] .tc-legend button').allInnerTexts(), ['CPU', '内存', 'steal', 'iowait', '负载']);
+  assert.deepEqual(await detail.locator('[data-chart=load] .tc-legend [aria-pressed=false]').allInnerTexts(), ['iowait', '负载']);
+  assert.deepEqual(await detail.locator('[data-chart=bandwidth] .tc-legend button').allInnerTexts(), ['下行', '上行']);
+  assert.ok(h.calls.some(c => c.path.endsWith('/metrics') && c.query.range === 'live' && !c.query.after));
+  // After the first read, only what is new since the last sample held.
+  for (let i = 0; i < 40 && !h.calls.some(c => c.path.endsWith('/metrics') && c.query.after); i++) await new Promise(r => setTimeout(r, 50));
+  assert.ok(h.calls.some(c => c.path.endsWith('/metrics') && c.query.range === 'live' && Number(c.query.after) > 0));
   assert.match(await detail.locator('.sv-system').innerText(), /节点 [\d.]+ · 占用 11\.8 MB 内存[\s\S]*CPU\s*2 核[\s\S]*IPv4\s*198\.51\.100\.5/);
-  // The cards in their order.
-  const cards = await detail.locator('.sv-cards > section, section.net-probe').evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
-  assert.deepEqual(cards, ['系统', '账单', '网络地址', '本期流量', '网络测试', '浏览器', '命令记录']);
+  // The cards of each tab in their order.
+  const cards = panel => detail.locator(`[data-panel=${panel}]`).locator('.sv-cards > section, section.net-probe, .dt-system section, [data-part=billing]')
+    .evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
+  assert.deepEqual(await cards('overview'), []);
+  assert.deepEqual(await cards('net'), ['三网回程', '网络地址']);
+  assert.deepEqual(await cards('system'), ['系统', '账单']);
+  assert.deepEqual(await cards('tools'), ['网络测试', '浏览器', '命令记录']);
+  assert.match(await detail.locator('.dt-period').innerText(), /已用\s*2\.5 TB \/ 10\.0 TB\s*取大（上下行较大的一方）[\s\S]*下行 · 上行\s*2\.5 TB · 853 GB[\s\S]*预计本期[\s\S]*按目前速度/);
+  await showTab(detail, '系统');
   assert.match(await detail.locator('.sv-price').innerText(), /\$375\.91 \/ 年\s*约 \$31\.33\/月\s*年付\s*手动续费/);
-  assert.match(await detail.locator('.sv-traffic').innerText(), /2\.5 TB\s*\/ 10\.0 TB\s*取大（上下行较大的一方）[\s\S]*下行 2\.5 TB\s*上行 853 GB/);
-  assert.match(await detail.locator('.sv-traffic').innerText(), /按目前速度，本期约/);
+  await showTab(detail, '工具');
   const logs = detail.locator('.sv-logs');
   assert.match(await logs.innerText(), /AI\s+systemctl status nginx --no-pager\s+成功/);
+  // A command a conversation ran names it and opens it; the rest show no source.
+  const origin = logs.locator('li').filter({hasText: 'systemctl status nginx'}).locator('.sv-log-origin');
+  assert.match(await origin.innerText(), /^排查 nginx 502/);
+  assert.match(await origin.getAttribute('title'), /^来自会话：排查 nginx 502/);
+  await h.page.evaluate(() => { window.__opened = []; window.addEventListener('openbear:open-conversation', e => window.__opened.push(e.detail.conversationUuid)); });
+  await origin.click();
+  assert.deepEqual(await h.page.evaluate(() => window.__opened), ['conv-nginx']);
+  assert.equal(await logs.locator('li').filter({hasText: 'df -h /data'}).locator('.sv-log-origin').count(), 0);
   await logs.getByRole('tab', {name: '终端记录'}).click();
   await logs.getByText('192.0.2.1 · 会话已结束').waitFor();
+  await showTab(detail, '系统');
   await detail.locator('.ix-card').filter({hasText: '账单'}).getByRole('button', {name: '续费'}).click();
   assert.ok(h.calls.some(c => c.path === '/api/servers/local/renew' && c.method === 'POST'));
   await detail.locator('.ix-more').click();
@@ -84,6 +117,7 @@ test('background jobs: list, output panel with earlier output, stop; phone sheet
   const h = await setup(t, {tweak: withJobs});
   await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
   const detail = h.page.locator('.sv-detail:visible');
+  await showTab(detail, '工具');
   const card = detail.locator('.sv-jobs');
   await card.locator('.sv-job-list > li').first().waitFor();
   assert.deepEqual(await card.locator('.sv-job-state').allInnerTexts(), ['运行中', '成功', '已中断']);
@@ -109,7 +143,7 @@ test('background jobs: list, output panel with earlier output, stop; phone sheet
   // A node build without background jobs gets no such card.
   await tab(h.page, '探针').click();
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
-  await h.page.locator('.sv-detail:visible .sv-gauge').first().waitFor();
+  await h.page.locator('.sv-detail:visible [data-part=browser]').waitFor();
   assert.equal(await h.page.locator('.sv-detail:visible .sv-jobs').count(), 0);
   await h.close();
 });
@@ -136,6 +170,7 @@ test('detail: a node past the target is not offered an update; a downgrade is as
     }});
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
     const detail = h.page.locator('.sv-detail:visible');
+    await showTab(detail, '系统');
     await detail.getByText('比目标 0.13.1 新，不会自动降级').waitFor();
     assert.equal(await detail.locator('.pb-notice[data-node-state]').count(), 0);
     await detail.locator('.ix-more').click();
@@ -175,6 +210,7 @@ test('node browser: status card, turning it on with an existing address, restart
     delta.browserState = {enabled: true, online: true, state: 'ready', source: 'download', product: 'Chrome/156.0.8078.47', headless: true, endpoint: '', epoch: 'e1'};
   }});
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+  await showTab(h.page.locator('.sv-detail:visible'), '工具');
   let card = browserCard(h.page.locator('.sv-detail:visible'));
   await card.getByText('运行中').waitFor();
   assert.match(await card.innerText(), /Chrome\/156\.0\.8078\.47[\s\S]*自动下载的测试版 Chrome[\s\S]*无头模式/);
@@ -189,6 +225,7 @@ test('node browser: status card, turning it on with an existing address, restart
     h = await setup(t, {width, height: width < 500 ? 844 : 900});
     await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
     const detail = h.page.locator('.sv-detail:visible');
+    await showTab(detail, '工具');
     card = browserCard(detail);
     await card.getByText('未开启', {exact: false}).waitFor();
     await card.getByRole('button', {name: '开启'}).click();
@@ -212,6 +249,7 @@ test('node browser: status card, turning it on with an existing address, restart
       error: 'browser_not_runnable: /opt/google/chrome/chrome'};
   }});
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+  await showTab(h.page.locator('.sv-detail:visible'), '工具');
   card = browserCard(h.page.locator('.sv-detail:visible'));
   await card.getByText('启动失败').waitFor();
   assert.match(await card.innerText(), /节点没法运行这台机器上的 \/opt\/google\/chrome\/chrome[\s\S]*改用下载的测试版 Chrome/);
@@ -232,6 +270,7 @@ test('node browser: status card, turning it on with an existing address, restart
     delta.browserState = {enabled: true, online: true, state: 'failed', error: 'browser_account_unavailable'};
   }});
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+  await showTab(h.page.locator('.sv-detail:visible'), '工具');
   card = browserCard(h.page.locator('.sv-detail:visible'));
   await card.getByText('启动失败').waitFor();
   assert.match(await card.innerText(), /不会降级为 root 或关闭沙箱[\s\S]*连接已有的浏览器[\s\S]*改用下载的测试版不能解决账户问题/);
@@ -240,6 +279,7 @@ test('node browser: status card, turning it on with an existing address, restart
   // The local server's Browser tool already uses the configured default browser.
   h = await setup(t);
   await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
+  await showTab(h.page.locator('.sv-detail:visible'), '工具');
   card = browserCard(h.page.locator('.sv-detail:visible'));
   await card.getByText('本机不需要开启', {exact: false}).waitFor();
   assert.equal(await card.getByRole('button').count(), 0);
@@ -249,6 +289,7 @@ test('node browser: status card, turning it on with an existing address, restart
   h = await setup(t);
   // A node that refuses commands is switched on where it runs.
   await h.page.locator('.pb-card').filter({hasText: 'Bravo-FRA'}).click();
+  await showTab(h.page.locator('.sv-detail:visible'), '工具');
   card = browserCard(h.page.locator('.sv-detail:visible'));
   await card.getByText('关闭了命令执行', {exact: false}).waitFor();
   assert.equal(await card.getByRole('button').count(), 0);
@@ -420,8 +461,8 @@ test('windows and macOS nodes: metrics per platform, drives and backslash paths,
   }});
   // Windows has no load average: its card shows the process count.
   const win = h.page.locator('.pb-card').filter({hasText: 'Delta-JP'});
-  assert.match(await win.locator('.pb-load').innerText(), /进程\s*310/);
-  assert.match(await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).locator('.pb-load').innerText(), /负载\s*0\.5 \| 0\.4 \| 0\.3/);
+  assert.equal(await win.locator('[data-cell=cpu]').getAttribute('title'), '310 个进程');
+  assert.equal(await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).locator('[data-cell=cpu]').getAttribute('title'), '负载 0.5 / 0.4 / 0.3 · 310 个进程');
   // Windows and macOS carry a mark right after the name; Linux, the usual case, has none.
   const mark = win.locator('.pb-head .sv-platform');
   assert.equal(await mark.getAttribute('data-platform'), 'windows');
@@ -436,9 +477,11 @@ test('windows and macOS nodes: metrics per platform, drives and backslash paths,
 
   await win.click();
   let detail = h.page.locator('.sv-detail:visible');
-  await detail.locator('.sv-chart svg').first().waitFor();
-  assert.deepEqual(await detail.locator('.sv-tile > span').allInnerTexts(), ['网络', '磁盘读写', '连接']);
-  assert.deepEqual(await detail.locator('.sv-chart figcaption > span:first-child').allInnerTexts(), ['CPU', '内存', '网络', '磁盘读写', '连接数']);
+  await detail.locator('[data-chart=load] svg').waitFor();
+  // Windows: no load average, steal or iowait; disk reads and writes are there.
+  assert.match(await detail.locator('.ov-card[data-kind=cpu]').innerText(), /2 核 · 310 个进程/);
+  assert.match(await detail.locator('.ov-card[data-kind=disk]').innerText(), /读 .* · 写 /);
+  assert.deepEqual(await detail.locator('[data-chart=load] .tc-legend button').allInnerTexts(), ['CPU', '内存']);
   assert.equal(await detail.locator('h2 .sv-platform').getAttribute('data-platform'), 'windows');
   assert.match(await detail.locator('.sv-system').innerText(), /Windows 10 Enterprise LTSC 2019 \(1809\)/);
 
@@ -493,10 +536,14 @@ test('windows and macOS nodes: metrics per platform, drives and backslash paths,
   await tab(h.page, '探针').click();
   await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
   detail = h.page.locator('.sv-detail:visible');
+  await showTab(detail, '系统');
   await detail.getByText('macOS 26.2').waitFor();
-  assert.deepEqual(await detail.locator('.sv-tile > span').allInnerTexts(), ['网络', '负载', '连接']);
-  await detail.locator('.sv-chart svg').first().waitFor();
-  assert.deepEqual(await detail.locator('.sv-chart figcaption > span:first-child').allInnerTexts(), ['CPU', '内存', '网络', '负载', '连接数']);
+  await showTab(detail, '概览');
+  assert.match(await detail.locator('.ov-card[data-kind=cpu]').innerText(), /负载 0\.50 \/ 0\.40 \/ 0\.30\s*310 个进程/);
+  assert.match(await detail.locator('.ov-card[data-kind=disk]').innerText(), /根分区/);
+  await detail.locator('[data-chart=load] svg').waitFor();
+  assert.deepEqual(await detail.locator('[data-chart=load] .tc-legend button').allInnerTexts(), ['CPU', '内存', '负载']);
+  assert.equal(await detail.locator('[data-chart=io]').count(), 0);
   await detail.getByRole('button', {name: '文件', exact: true}).click();
   await sheet.getByText('完全磁盘访问权限', {exact: false}).waitFor();
   assert.equal(h.calls.filter(c => c.path.endsWith('/files')).at(-1).query.path, '/Users');
@@ -540,12 +587,11 @@ test('cards: spec icons, tags without billing, no empty expiry text, long-term p
   const card = name => h.page.locator('.pb-card').filter({hasText: name});
   const bero = card('Bravo-FRA');
   assert.deepEqual(await bero.locator('.pb-tag').allInnerTexts(), ['欧洲']);
-  assert.equal(await bero.locator('.pb-foot > span').first().innerText(), '');
-  assert.deepEqual(await bero.locator('.pb-spec > span').allInnerTexts(), ['2 核', '2.0 GB', '20.0 GB']);
-  assert.equal(await bero.locator('.pb-spec svg').count(), 3);
+  assert.equal(await bero.locator('[data-cell=expiry] .pb-cell-value').innerText(), '—');
+  assert.deepEqual(await bero.locator('.pb-cell-name small').allInnerTexts(), ['2 核', '2.0 GB', '20.0 GB']);
+  assert.equal(await bero.locator('.pb-cell-name svg').count(), 10);
   const delta = card('Delta-JP');
-  assert.ok((await delta.locator('.pb-tag').allInnerTexts()).includes('长期'));
-  assert.equal(await delta.locator('.pb-foot > span').first().innerText(), '长期');
+  assert.equal(await delta.locator('[data-cell=expiry] .pb-cell-value').innerText(), '长期');
   // A card without tags.
   const row = ['Edge-SG.Game', 'Papa-HK.T1', 'GoldenCloud-1212'];
   assert.equal(await card(row[0]).locator('.pb-tag').count(), 0);
@@ -556,7 +602,8 @@ test('profile: tags beside the group, the merchant\'s renewal page, a start date
   const h = await setup(t);
   await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
   const detail = h.page.locator('.sv-detail:visible');
-  await detail.getByRole('button', {name: '编辑'}).first().click();
+  await showTab(detail, '系统');
+  await detail.locator('[data-part=billing]').getByRole('button', {name: '编辑'}).click();
   const editor = h.page.getByRole('dialog', {name: '编辑「Papa-HK.T1」'});
   // No start date: one cycle (a month) before the expiry, following the expiry until one is typed.
   const expires = await editor.getByLabel('到期日期').inputValue(), [y, m, d] = expires.split('-').map(Number);
@@ -570,6 +617,20 @@ test('profile: tags beside the group, the merchant\'s renewal page, a start date
   await editor.getByText('开始日期按到期日往前推一个周期自动填写').waitFor({state: 'hidden'});
   await editor.getByLabel('到期日期').fill('2027-04-30');
   assert.equal(await editor.getByLabel('开始日期').inputValue(), '2027-01-15', 'typed: kept');
+  // +1月 … +1年 count from the expiry, a day the month lacks becoming its last; with no expiry, from today.
+  const expiry = editor.getByLabel('到期日期'), plus = name => editor.getByRole('group', {name: '延长到期日'}).getByRole('button', {name});
+  await plus('+1月').click();
+  assert.equal(await expiry.inputValue(), '2027-05-30');
+  await expiry.fill('2027-01-31');
+  await plus('+1月').click();
+  assert.equal(await expiry.inputValue(), '2027-02-28');
+  await plus('+6月').click();
+  assert.equal(await expiry.inputValue(), '2027-08-28');
+  await expiry.fill('');
+  await plus('+1年').click();
+  const [ty, tm, td] = day(0).split('-');
+  assert.equal(await expiry.inputValue(), `${Number(ty) + 1}-${tm}-${tm === '02' && td === '29' ? '28' : td}`);
+  await expiry.fill('2027-04-30');
   // Tags: Enter, a comma and leaving the field each add one; the same one twice stays once.
   const tags = editor.getByLabel('添加标签');
   await tags.fill('独服'); await tags.press('Enter');
@@ -594,14 +655,90 @@ test('profile: tags beside the group, the merchant\'s renewal page, a start date
   await h.close();
 });
 
+test('editor: the latency targets are changed in the detail page; saving the editor leaves them as they are', async t => {
+  const h = await setup(t, {tweak: items => { items.find(i => i.id === 'srv-delta').profile.latency = {targets: ['yn-ct', 's:srv-papa'], card: ['s:srv-papa']}; }});
+  await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+  const detail = h.page.locator('.sv-detail:visible');
+  await showTab(detail, '系统');
+  await detail.locator('[data-part=billing]').getByRole('button', {name: '编辑'}).click();
+  const editor = h.page.getByRole('dialog', {name: '编辑「Delta-JP」'});
+  assert.match(await editor.locator('.ob-field').filter({hasText: '延迟'}).innerText(), /测哪些目标，在详情页「网络」→「延迟与丢包」的「编辑」里改。/);
+  await editor.getByLabel('服务器名称').fill('Delta-JP 2');
+  await editor.getByRole('button', {name: '保存'}).click();
+  await editor.waitFor({state: 'detached'});
+  const patch = h.calls.find(c => c.path === '/api/servers/srv-delta' && c.method === 'PATCH').body;
+  assert.equal(patch.name, 'Delta-JP 2');
+  assert.equal('latency' in patch.profile, false);
+  await h.close();
+});
+
+test('profile: tags offered from other servers, picked with the mouse or the keyboard', async t => {
+  const h = await setup(t, {tweak: items => { items.find(i => i.id === 'srv-delta').profile.tags = ['ATT', '杜甫']; }});
+  await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
+  await h.page.locator('.sv-detail:visible').getByRole('button', {name: '编辑'}).first().click();
+  const editor = h.page.getByRole('dialog', {name: '编辑「Papa-HK.T1」'});
+  const tags = editor.getByRole('combobox', {name: '添加标签'});
+  // Enter on a highlighted suggestion adds it, not the letters typed so far.
+  await tags.pressSequentially('AT');
+  const list = h.page.getByRole('listbox');
+  assert.deepEqual(await list.getByRole('option').allInnerTexts(), ['ATT']);
+  await tags.press('ArrowDown');
+  await tags.press('Enter');
+  await tags.click();
+  await list.getByRole('option', {name: '杜甫'}).click();
+  assert.deepEqual(await editor.locator('.sv-tags-edit .sv-chip').allInnerTexts(), ['ATT', '杜甫']);
+  assert.equal(await tags.inputValue(), '');
+  await h.close();
+});
+
+test('本期流量: calibrated from the network card to the provider\'s figure as used or remaining, then cleared', async t => {
+  const h = await setup(t);
+  const G = 1024 ** 3;
+  const open = async name => {
+    await tab(h.page, '探针').click();
+    await h.page.locator('.pb-card').filter({hasText: name}).click();
+    return h.page.locator('.sv-detail:visible');
+  };
+  const detail = await open('Delta-JP');
+  const net = detail.locator('.ov-card[data-kind=net]');
+  await net.getByRole('button', {name: '校准'}).click();
+  const dialog = h.page.getByRole('dialog', {name: '校准本期流量'});
+  // It starts from what is shown; remaining is what is left of the 750 GB.
+  assert.equal(await dialog.getByLabel('本期已用').inputValue(), '4');
+  await dialog.getByLabel('校准方式').selectOption('remaining');
+  assert.equal(await dialog.getByLabel('本期剩余').inputValue(), '746');
+  await dialog.getByLabel('本期剩余').fill('700');
+  await dialog.getByRole('button', {name: '校准', exact: true}).click();
+  await dialog.waitFor({state: 'hidden'});
+  await detail.locator('.dt-period').getByText(/按服务商数值校准为 50(\.0)? GB/).waitFor();
+  assert.deepEqual(h.calls.find(c => c.path === '/api/servers/srv-delta/traffic/calibration' && c.method === 'PUT').body, {remaining: 700 * G});
+  assert.match(await net.locator('[data-period]').innerText(), /^本期 50(\.0)? GB/);
+  await detail.locator('.dt-period').getByRole('button', {name: '取消校准'}).click();
+  await detail.getByText('按服务商数值校准为').waitFor({state: 'detached'});
+  assert.ok(h.calls.some(c => c.path === '/api/servers/srv-delta/traffic/calibration' && c.method === 'DELETE'));
+  // Without a limit only what has been used can be entered.
+  const bravo = await open('Bravo-FRA');
+  await bravo.locator('.ov-card[data-kind=net]').getByRole('button', {name: '校准'}).click();
+  await dialog.getByLabel('本期已用').waitFor();
+  assert.equal(await dialog.getByLabel('校准方式').count(), 0);
+  await dialog.getByLabel('本期已用').fill('');
+  await dialog.getByRole('button', {name: '校准', exact: true}).click();
+  await dialog.getByText('请填写流量数值。').waitFor();
+  await dialog.getByRole('button', {name: '取消'}).click();
+  await dialog.waitFor({state: 'hidden'});
+  await h.close();
+});
+
 test('traffic modes: editor fields per mode and how cards show them', async t => {
   const h = await setup(t, {tweak: items => {
     Object.assign(items.find(i => i.id === 'srv-delta').traffic, {mode: 'metered', limit: 0, price: 0.075, cost: 1.88});
     Object.assign(items.find(i => i.id === 'srv-bravo').traffic, {mode: 'unlimited', limit: 0});
   }});
   const card = name => h.page.locator('.pb-card').filter({hasText: name});
-  assert.equal(await card('Delta-JP').locator('.pb-traffic small').innerText(), '本期约 ¥1.88 · ¥0.075/GB');
-  assert.equal(await card('Bravo-FRA').locator('.pb-traffic small').innerText(), '不限流量');
+  assert.match(await card('Delta-JP').locator('[data-cell=traffic]').innerText(), /流量费\s*≈ ¥1\.88/);
+  assert.equal(await card('Delta-JP').locator('[data-cell=traffic]').getAttribute('title'), '本期约 ¥1.88 · ¥0.075/GB');
+  assert.match(await card('Bravo-FRA').locator('[data-cell=traffic]').innerText(), /流量\s*30\.0 GB \/ ∞/);
+  assert.equal(await card('Bravo-FRA').locator('[data-cell=traffic]').getAttribute('title'), '不限流量');
   await card('Papa-HK.T1').click();
   const detail = h.page.locator('.sv-detail:visible');
   await detail.getByRole('button', {name: '编辑'}).first().click();
@@ -761,12 +898,12 @@ test('node versions: state tags, summary with 全部更新, build and source in 
   const h = await setup(t, {tweak: versions, release: RELEASE});
   const notice = h.page.locator('.pb-notice[data-node-update=summary]');
   await notice.getByText('2 台服务器的节点可以更新到 1.2.0，其中 1 台需要更新才能使用组网、网络测试').waitFor();
-  const tagOf = name => h.page.locator('.pb-card').filter({hasText: name}).locator('.pb-tag[data-node-state]');
-  assert.equal(await tagOf('Papa-HK.T1').innerText(), '需更新');
+  const tagOf = name => h.page.locator('.pb-card').filter({hasText: name}).locator('.pb-mark[data-node-state]');
+  assert.equal(await tagOf('Papa-HK.T1').getAttribute('aria-label'), '需更新');
   assert.equal(await tagOf('Papa-HK.T1').getAttribute('data-tone'), 'warn');
   assert.equal(await tagOf('Papa-HK.T1').getAttribute('title'), '更新后才能使用组网、网络测试');
-  assert.equal(await tagOf('Delta-JP').innerText(), '可更新');
-  assert.equal(await tagOf('GoldenCloud').innerText(), '构建不一致');
+  assert.equal(await tagOf('Delta-JP').getAttribute('aria-label'), '可更新');
+  assert.equal(await tagOf('GoldenCloud').getAttribute('aria-label'), '构建不一致');
   // Current and newer-than-target nodes carry no tag in the list.
   assert.equal(await tagOf('Edge-SG.Game').count(), 0);
   assert.equal(await tagOf('Bravo-FRA').count(), 0);
@@ -851,11 +988,11 @@ test('phone: Windows detail, drives and paths, install command switch, PowerShel
     const w = items.find(i => i.id === 'srv-delta');
     Object.assign(w.node.info, {platform: 'windows', os: 'Windows 10 Enterprise LTSC 2019 (1809)', kernel: '10.0.17763.9376'});
   }});
-  assert.match(await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).locator('.pb-load').innerText(), /进程/);
+  assert.match(await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).locator('[data-cell=cpu]').getAttribute('title'), /进程/);
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
   let detail = h.page.locator('.sv-detail:visible');
-  await detail.locator('.sv-gauge').first().waitFor();
-  assert.deepEqual(await detail.locator('.sv-tile > span').allInnerTexts(), ['网络', '磁盘读写', '连接']);
+  await detail.locator('.ov-card').first().waitFor();
+  assert.match(await detail.locator('.ov-card[data-kind=cpu]').innerText(), /310 个进程/);
   await detail.getByRole('button', {name: '文件'}).click();
   const sheet = h.page.locator('.sv-files-drawer');
   await sheet.getByText('E:', {exact: true}).waitFor();
@@ -894,7 +1031,7 @@ test('phone: compact cards and list, detail actions, file sheet, terminal keys',
   await h.page.getByRole('button', {name: '列表视图'}).click();
   await h.page.locator('.pl-row').filter({hasText: 'Edge-SG.Game'}).click();
   const detail = h.page.locator('.sv-detail:visible');
-  await detail.locator('.sv-gauge').first().waitFor();
+  await detail.locator('.ov-card').first().waitFor();
   assert.equal(await detail.getByRole('button', {name: '执行命令'}).isVisible(), false);
   await detail.locator('.ix-more').click();
   await h.page.getByRole('menuitem', {name: '执行命令…'}).click();
@@ -935,7 +1072,8 @@ test('phone: compact cards and list, detail actions, file sheet, terminal keys',
 test('dark phone: offline card, edit sheet with 16px inputs and sort order', async t => {
   const h = await setup(t, {width: 360, height: 780, dark: true});
   const offline = h.page.locator('.pb-card[data-state=offline]');
-  await offline.getByText('2 小时前离线', {exact: true}).waitFor();
+  await offline.locator('[data-cell=uptime]').getByText('2 小时前', {exact: true}).waitFor();
+  assert.match(await offline.locator('[data-cell=uptime]').innerText(), /离线\s*2 小时前/);
   await offline.click();
   await h.page.locator('.sv-detail:visible .ix-more').click();
   await h.page.getByRole('menuitem', {name: '编辑…'}).click();

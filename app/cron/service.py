@@ -18,6 +18,7 @@ from app.cron.schedule import next_state, preview_details
 from app.cron.holidays import MissingCalendar
 from app.cron.holiday_sync import HolidayStore
 from app.webhooks.contracts import digest, dumps, iso
+from app.webhooks.receipts import UNSTARTED_RETRY_S
 from app.webhooks.repository import insert, many, one, uid
 from app.webhooks.scripts import resolve_environment
 
@@ -403,12 +404,39 @@ class CronService:
                         allowed = not self.holidays.snapshot.is_day_off(datetime.fromtimestamp(due / 1000, ZoneInfo(cfg.schedule.timezone)).date())
                     except MissingCalendar:
                         allowed = False
-                if allowed:
-                    run = await self.accept_run(conn, row, due, 'scheduled', f'scheduled:{row["job_id"]}:{due}')
+                trigger = 'retry' if row['schedule_state'] == 'retrying' else 'scheduled'
+                going = list(self.tasks)
+                if allowed and going and await one(conn, f"SELECT 1 FROM cron_runs WHERE job_id=? AND run_id IN ({','.join('?' * len(going))}) LIMIT 1", (row['job_id'], *going)):
+                    # Never pile up behind a run that is still going; the skip stays visible in the history.
+                    run = await self.accept_run(conn, row, due, trigger, f'{trigger}:{row["job_id"]}:{due}')
+                    await conn.execute("UPDATE cron_runs SET status='skipped',outcome='skipped',phase='finished',error='上一次执行还没结束，本次跳过',finished_at_ms=?,notification_state='suppressed' WHERE run_id=?", (now, run['run_id']))
+                elif allowed:
+                    run = await self.accept_run(conn, row, due, trigger, f'{trigger}:{row["job_id"]}:{due}')
                     accepted.append(run)
                 next_at, state = next_state(cfg.schedule, max(now, due), self.holidays.snapshot)
                 await conn.execute('UPDATE cron_jobs SET next_run_at_ms=?,schedule_state=? WHERE job_id=?', (next_at, state, row['job_id']))
         for row in accepted: self.launch(row)
+
+    async def retry_unstarted(self, run):
+        """After a run that failed before anything ran outside, its job runs again after a backoff
+        (UNSTARTED_RETRY_S), unless its next regular run comes first. The backoff in seconds, or None."""
+        if run['trigger_kind'] not in ('scheduled', 'retry'):
+            return None
+        async with self.db.write_transaction(label='cron-retry') as conn:
+            job = await one(conn, 'SELECT * FROM cron_jobs WHERE job_id=? AND enabled=1 AND deleted_at_ms IS NULL', (run['job_id'],))
+            if not job:
+                return None
+            kinds = [r['trigger_kind'] for r in await many(conn, "SELECT trigger_kind FROM cron_runs WHERE job_id=? AND started_at_ms<=? AND status!='skipped' ORDER BY started_at_ms DESC, run_id DESC LIMIT ?",
+                                                         (run['job_id'], run['started_at_ms'], len(UNSTARTED_RETRY_S) + 1))]
+            tried = next((i for i, kind in enumerate(kinds) if kind != 'retry'), len(kinds))
+            if tried >= len(UNSTARTED_RETRY_S):
+                return None
+            at = self.clock() + UNSTARTED_RETRY_S[tried] * 1000
+            if job['next_run_at_ms'] is not None and job['next_run_at_ms'] <= at:
+                return None
+            await conn.execute("UPDATE cron_jobs SET next_run_at_ms=?,schedule_state='retrying' WHERE job_id=?", (at, run['job_id']))
+        self.wake.set()
+        return UNSTARTED_RETRY_S[tried]
 
     @staticmethod
     def run_public(r, detail=False):

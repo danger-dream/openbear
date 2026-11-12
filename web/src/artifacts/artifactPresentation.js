@@ -22,6 +22,8 @@ export function artifactPresentation(metadata) {
 	let category = "file", label = "文件", badge = extension || "FILE";
 	if (format.kind === "html") { category = "html"; label = "HTML 页面"; badge = "HTML"; }
 	else if (format.kind === "image") { category = "image"; label = "图片"; badge = extension || "IMAGE"; }
+	else if (format.kind === "audio") { category = "audio"; label = "音频"; badge = extension || "AUDIO"; }
+	else if (format.kind === "video") { category = "video"; label = "视频"; badge = extension || "VIDEO"; }
 	else if (format.kind === "markdown") { category = "markdown"; label = "Markdown"; badge = "MD"; }
 	else if (format.sourceOnly) { category = "code"; label = "SVG 源码"; badge = "SVG"; }
 	else {
@@ -34,7 +36,7 @@ export function artifactPresentation(metadata) {
 			label = category === "data" ? "数据 / 配置" : "代码"; badge = format.label;
 		} else if (format.kind === "text") { category = "text"; label = "文本"; badge = extension || "TXT"; }
 	}
-	const previewable = ["html", "image", "markdown", "text", "code"].includes(format.kind);
-	const action = !metadata ? "查看附件" : format.kind === "image" ? "查看大图" : format.kind === "html" ? "页面 / 源码" : format.kind === "markdown" ? "阅读文档" : format.kind === "code" ? "查看源码" : format.kind === "text" ? "查看文本" : "下载查看";
+	const previewable = ["html", "image", "audio", "video", "markdown", "text", "code"].includes(format.kind);
+	const action = !metadata ? "查看附件" : format.kind === "image" ? "查看大图" : format.kind === "audio" ? "播放音频" : format.kind === "video" ? "播放视频" : format.kind === "html" ? "页面 / 源码" : format.kind === "markdown" ? "阅读文档" : format.kind === "code" ? "查看源码" : format.kind === "text" ? "查看文本" : "下载查看";
 	return {category, label: metadata ? label : "附件", badge: metadata ? badge : "FILE", action, previewable};
 }

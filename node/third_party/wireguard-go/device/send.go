@@ -47,11 +47,11 @@ import (
 type QueueOutboundElement struct {
 	metadata conn.SendMetadata
 	pending  bool
-	buffer   *[MaxMessageSize]byte // slice holding the packet data
-	packet   []byte                // slice of "buffer" (always!)
-	nonce    uint64                // nonce for encryption
-	keypair  *Keypair              // keypair for encryption
-	peer     *Peer                 // related peer
+	buffer   *messageBuffer // slice holding the packet data
+	packet   []byte         // slice of "buffer" (always!)
+	nonce    uint64         // nonce for encryption
+	keypair  *Keypair       // keypair for encryption
+	peer     *Peer          // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -60,7 +60,7 @@ type QueueOutboundElementsContainer struct {
 }
 
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
-	var buffer *[MaxMessageSize]byte
+	var buffer *messageBuffer
 	if device.resources != nil {
 		buffer = device.resources.tx.get(device.resources.stop)
 		if buffer == nil {
@@ -244,6 +244,27 @@ func (peer *Peer) keepKeyFreshSending() {
 }
 
 func (device *Device) RoutineReadFromTUN() {
+	device.readFromTUN(device.BatchSize(), func(bufs [][]byte, sizes []int, offset int, metadata []conn.SendMetadata) (int, error) {
+		if reader, ok := device.tun.device.(conn.MetadataReader); ok {
+			return reader.ReadWithMetadata(bufs, sizes, offset, metadata)
+		}
+		return device.tun.device.Read(bufs, sizes, offset)
+	}, device.NewOutboundElement, false)
+}
+
+// routineReadLargeFromTUN reads what the TUN's LargeReader hands it into the
+// large pool's buffers.
+func (device *Device) routineReadLargeFromTUN(reader conn.LargeReader) {
+	batch := max(1, min(device.BatchSize(), device.resources.limits.LargeBatchSize, device.resources.limits.LargeTxBuffers))
+	read := reader.ReadLarge
+	swap, adopt := reader.(conn.LargeSwapReader)
+	if adopt {
+		read = swap.ReadLargeSwap
+	}
+	device.readFromTUN(batch, read, device.newLargeOutboundElement, adopt)
+}
+
+func (device *Device) readFromTUN(batchSize int, read func(bufs [][]byte, sizes []int, offset int, metadata []conn.SendMetadata) (int, error), newElement func() *QueueOutboundElement, adopt bool) {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
 		device.state.stopping.Done()
@@ -253,7 +274,6 @@ func (device *Device) RoutineReadFromTUN() {
 	device.log.Verbosef("Routine: TUN reader - started")
 
 	var (
-		batchSize   = device.BatchSize()
 		readErr     error
 		elems       = make([]*QueueOutboundElement, batchSize)
 		bufs        = make([][]byte, batchSize)
@@ -276,22 +296,28 @@ func (device *Device) RoutineReadFromTUN() {
 	for {
 		for i := range elems {
 			if elems[i] == nil {
-				elems[i] = device.NewOutboundElement()
+				elems[i] = newElement()
 				if elems[i] == nil {
 					return
 				}
-				bufs[i] = elems[i].buffer[:]
+				bufs[i] = elems[i].buffer.Data
 			}
 		}
 		// read packets
 		clear(metadata)
-		if reader, ok := device.tun.device.(conn.MetadataReader); ok {
-			count, readErr = reader.ReadWithMetadata(bufs, sizes, offset, metadata)
-		} else {
-			count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		count, readErr = read(bufs, sizes, offset, metadata)
+		// A LargeSwapReader transfers backing storage into the existing pool
+		// element, whose identity and owner map remain unchanged. Do this even
+		// on read errors, before any element can be returned to its pool.
+		if adopt {
+			for i := 0; i < count; i++ {
+				elems[i].buffer.Data = bufs[i]
+			}
 		}
 		for i := 0; i < count; i++ {
-			if sizes[i] < 1 {
+			// The buffer must hold the packet padded and sealed, as
+			// encryption appends in place.
+			if sizes[i] < 1 || sizes[i] > len(bufs[i])-offset-chacha20poly1305.Overhead-(PaddingMultiple-1) {
 				continue
 			}
 
@@ -318,6 +344,9 @@ func (device *Device) RoutineReadFromTUN() {
 
 			default:
 				device.log.Verbosef("Received packet with unknown IP version")
+			}
+			if k := elem.metadata.Peer; peer != nil && k != ([32]byte{}) {
+				peer = device.LookupPeer(NoisePublicKey(k))
 			}
 
 			if peer == nil {
@@ -523,7 +552,7 @@ func (device *Device) RoutineEncryption(id int) {
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
 			// populate header fields
-			header := elem.buffer[:MessageTransportHeaderSize]
+			header := elem.buffer.Data[:MessageTransportHeaderSize]
 
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]

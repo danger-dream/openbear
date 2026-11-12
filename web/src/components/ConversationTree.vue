@@ -11,6 +11,7 @@ import { userStorage } from '../sessionBoundary.js';
 import { MOBILE_VIEWPORT_QUERY } from "../mobileViewport.js";
 import ModelSettings from "./ModelSettings.vue";
 import PromptPolicyEditor from "./PromptPolicyEditor.vue";
+import FolderExtensionDefaults from "./FolderExtensionDefaults.vue";
 import PromptImpactDialog from "./PromptImpactDialog.vue";
 import {normalizePromptPolicy, promptPolicyFlags} from "./promptPolicy.js";
 import "./conversationTreeProperties.css";
@@ -131,6 +132,9 @@ const propertiesDialog = ref(false);
 const propertiesLoading = ref(false);
 const propertiesSaving = ref(false);
 const propertiesTab = ref("context");
+const folderExtensions = ref({inherit: true, enabled: [], autoAllow: false});
+const folderExtensionsBaseline = ref(""), folderExtensionCatalog = ref([]), folderExtensionInherited = ref(null), folderExtensionsLoaded = ref(false);
+const folderExtensionsCanInherit = ref(false);
 const webhookEditor = ref(null);
 const webhookVisited = ref(false);
 const propertyModelOptions = ref([]);
@@ -1312,11 +1316,24 @@ async function showProperties(row, initialTab = 'context') {
   const folderId = propertiesForm.folderId;
   propertiesDialog.value = true;
   propertiesLoading.value = true;
-  const [propertiesResult, optionsResult] = await Promise.allSettled([
+  const [propertiesResult, optionsResult, extensionsResult] = await Promise.allSettled([
     Api.conversationFolderProperties(folderId),
     Api.rathOptions(),
+    Api.folderExtensions(folderId),
   ]);
   if (request !== propertiesRequestGeneration || !propertiesDialog.value) return;
+  if (extensionsResult.status === "fulfilled") {
+    const data = extensionsResult.value;
+    folderExtensionCatalog.value = data.extensions || [];
+    folderExtensionInherited.value = data.inherited || null;
+    // A top-level folder or the temporary node has nothing above it to inherit from: it edits its own setting.
+    folderExtensionsCanInherit.value = typeof data.canInherit === "boolean" ? data.canInherit : !propertiesForm.temporary && !!propertiesForm.parentId;
+    const own = data.default?.own ? data.default : null;
+    folderExtensions.value = {inherit: !own && folderExtensionsCanInherit.value,
+      enabled: [...((own || data.inherited)?.enabled || [])], autoAllow: !!(own || data.inherited)?.autoAllow};
+    folderExtensionsBaseline.value = JSON.stringify(folderExtensions.value);
+    folderExtensionsLoaded.value = true;
+  }
   try {
     if (propertiesResult.status === "rejected") throw propertiesResult.reason;
     const data = propertiesResult.value;
@@ -1457,6 +1474,7 @@ function runDefaultsValidationError() {
 }
 function resetPropertiesForm(row) {
   propertiesRunDefaultsBaseline.value = {};
+  folderExtensionsLoaded.value = false;
   Object.assign(propertiesForm, {
     folderId: row.systemNode === "temporary" ? "__temporary" : String(row.folderId || ""),
     temporary: row.systemNode === "temporary",
@@ -1529,6 +1547,12 @@ async function saveProperties() {
     const choice = await chooseImpact("保存", impact);
     if (choice === null || request !== propertiesRequestGeneration || !propertiesDialog.value) return;
     const result = await Api.updateConversationFolderProperties(folderId, { ...payload, updateSnapshots: choice === true });
+    // Saved only with the rest of the dialog, after its impact is confirmed.
+    if (folderExtensionsLoaded.value && JSON.stringify(folderExtensions.value) !== folderExtensionsBaseline.value) {
+      const value = folderExtensions.value;
+      await Api.updateFolderExtensions(folderId, value.inherit ? {inherit: true} : {enabled: value.enabled, autoAllow: value.autoAllow});
+      folderExtensionsBaseline.value = JSON.stringify(value);
+    }
     window.dispatchEvent(new CustomEvent("openbear:folder-properties-changed", { detail: { folderId } }));
     // Saving another tab must not destroy trigger edits (or an in-flight Key response).
     if (request === propertiesRequestGeneration) {
@@ -2016,6 +2040,7 @@ onBeforeUnmount(() => {
         <nav class="property-segmented" role="tablist" aria-label="属性设置分类" @keydown="navigatePropertiesTab">
           <button id="folder-properties-tab-context" type="button" role="tab" data-tab="context" :aria-selected="propertiesTab === 'context'" aria-controls="folder-properties-panel-context" :tabindex="propertiesTab === 'context' ? 0 : -1" @click="propertiesTab = 'context'">{{ propertiesForm.temporary ? '注入上下文' : '目录上下文' }}</button>
           <button id="folder-properties-tab-defaults" type="button" role="tab" data-tab="defaults" :aria-selected="propertiesTab === 'defaults'" aria-controls="folder-properties-panel-defaults" :tabindex="propertiesTab === 'defaults' ? 0 : -1" @click="propertiesTab = 'defaults'">默认模型</button>
+          <button v-if="folderExtensionsLoaded || !propertiesForm.temporary" id="folder-properties-tab-extensions" type="button" role="tab" data-tab="extensions" :aria-selected="propertiesTab === 'extensions'" aria-controls="folder-properties-panel-extensions" :tabindex="propertiesTab === 'extensions' ? 0 : -1" @click="propertiesTab = 'extensions'">扩展</button>
           <button v-if="!propertiesForm.temporary" id="folder-properties-tab-trigger" type="button" role="tab" data-tab="trigger" :aria-selected="propertiesTab === 'trigger'" aria-controls="folder-properties-panel-trigger" :tabindex="propertiesTab === 'trigger' ? 0 : -1" @click="propertiesTab = 'trigger'">触发器</button>
         </nav>
       </template>
@@ -2023,13 +2048,6 @@ onBeforeUnmount(() => {
         <div class="property-panels">
           <section v-show="propertiesTab === 'context'" id="folder-properties-panel-context" role="tabpanel" aria-labelledby="folder-properties-tab-context">
             <div class="property-tab-panel context-properties">
-              <section v-if="!propertiesForm.temporary" class="property-section">
-                <label class="property-field">
-                  <span>不显示在最近会话</span>
-                  <el-switch v-model="propertiesForm.hideFromRecent" aria-label="不显示在最近会话" :disabled="propertiesSaving" />
-                  <small>此目录及其子目录的会话不显示在最近会话，运行和未读状态不受影响。<template v-if="propertiesForm.hiddenFromRecentByAncestor">上级目录已启用隐藏。</template></small>
-                </label>
-              </section>
               <section v-if="!propertiesForm.temporary" class="property-section" aria-labelledby="folder-workspace-label">
                 <label class="property-field">
                   <span id="folder-workspace-label">本节点工作目录 <em>清空即继承</em></span>
@@ -2049,6 +2067,21 @@ onBeforeUnmount(() => {
               <ModelSettings :model-value="propertiesForm.runDefaults" :effective="appliedRunDefaults" :inherited="inheritedRunDefaults" :models="propertyModelOptions" inheritable :inherit-label="propertiesForm.temporary ? '使用系统默认' : '继承目录'" :disabled="propertiesLoading || !propertyModelsLoaded || propertiesSaving" @change="setRunDefault" />
             </div>
           </section>
+          <section v-if="folderExtensionsLoaded || !propertiesForm.temporary" v-show="propertiesTab === 'extensions'" id="folder-properties-panel-extensions" role="tabpanel" aria-labelledby="folder-properties-tab-extensions">
+            <div class="property-tab-panel">
+              <section v-if="!propertiesForm.temporary" class="property-section">
+                <label class="property-switch">
+                  <span class="property-switch-text">
+                    <span>不显示在最近会话</span>
+                    <small>此目录及其子目录的会话不显示在最近会话，运行和未读状态不受影响。<template v-if="propertiesForm.hiddenFromRecentByAncestor">上级目录已启用隐藏。</template></small>
+                  </span>
+                  <el-switch v-model="propertiesForm.hideFromRecent" aria-label="不显示在最近会话" :disabled="propertiesSaving" />
+                </label>
+              </section>
+              <FolderExtensionDefaults v-if="folderExtensionsLoaded" v-model="folderExtensions" :catalog="folderExtensionCatalog" :inherited="folderExtensionInherited" :inherited-from="folderPath(folderExtensionInherited?.from)" :can-inherit="folderExtensionsCanInherit" :disabled="propertiesLoading || propertiesSaving" />
+              <el-alert v-else-if="!propertiesLoading" title="扩展设置暂时无法读取，重新打开属性再试" type="warning" :closable="false" show-icon />
+            </div>
+          </section>
           <section v-if="webhookVisited && propertiesDialog && !propertiesForm.temporary" v-show="propertiesTab === 'trigger'" id="folder-properties-panel-trigger" role="tabpanel" aria-labelledby="folder-properties-tab-trigger" class="wh-fill">
             <WebhookEditor ref="webhookEditor" :scope="{type:'folder', id:propertiesForm.folderId}" :title="propertiesForm.name" :active="propertiesTab === 'trigger'" @cancel="closeProperties" />
           </section>
@@ -2056,7 +2089,10 @@ onBeforeUnmount(() => {
       </div>
       <template #footer>
         <div class="property-footer">
-          <div class="property-footer-meta" v-if="propertiesTab === 'defaults'">
+          <div class="property-footer-meta" v-if="propertiesTab === 'extensions'">
+            <span class="property-footer-note" title="默认扩展只影响以后新建的会话，不改已有会话的扩展；不显示在最近会话保存后立即生效。"><el-icon><InfoFilled /></el-icon>扩展仅新会话生效</span>
+          </div>
+          <div class="property-footer-meta" v-else-if="propertiesTab === 'defaults'">
             <span class="property-footer-note" :title="propertiesForm.temporary ? '每项独立设置，未设置时使用原有默认；只影响以后新建的临时会话，不影响项目目录。' : '每项独立向上继承；跟随主模型、模型默认和跟随主会话都是明确设置，不等于继承。仅影响以后新建的会话，不会批量更改已有会话。'"><el-icon><InfoFilled /></el-icon>仅新会话生效</span>
             <el-button link :disabled="!hasLocalRunDefaults || propertiesLoading || !propertyModelsLoaded || propertiesSaving" @click="clearRunDefaults">{{ propertiesForm.temporary ? '全部使用原有默认' : '全部恢复继承' }}</el-button>
           </div>

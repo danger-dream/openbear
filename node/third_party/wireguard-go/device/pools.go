@@ -67,6 +67,10 @@ func (device *Device) PopulatePools() {
 		l := device.resources.limits
 		out := 2*(l.TxBuffers+l.KeepaliveBuffers+l.MaxPeers) + l.BatchSize
 		in := 2*(l.RxBuffers+l.MaxPeers) + l.BatchSize
+		if device.resources.largeTx != nil {
+			out += 2*l.LargeTxBuffers + l.LargeBatchSize
+			in += 2*l.LargeRxBuffers + l.LargeBatchSize
+		}
 		device.pool.inboundElementsContainer = fixedPool(in, func() any { return &QueueInboundElementsContainer{elems: make([]*QueueInboundElement, 0, l.BatchSize)} })
 		device.pool.outboundElementsContainer = fixedPool(out, func() any {
 			return &QueueOutboundElementsContainer{elems: make([]*QueueOutboundElement, 0, l.BatchSize)}
@@ -84,7 +88,7 @@ func (device *Device) PopulatePools() {
 		return &QueueOutboundElementsContainer{elems: s}
 	})
 	device.pool.messageBuffers = NewWaitPool(PreallocatedBuffersPerPool, func() any {
-		return new([MaxMessageSize]byte)
+		return newMessageBuffer(MaxMessageSize)
 	})
 	device.pool.inboundElements = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new(QueueInboundElement)
@@ -122,14 +126,14 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 	device.pool.outboundElementsContainer.Put(c)
 }
 
-func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
+func (device *Device) GetMessageBuffer() *messageBuffer {
 	if device.resources != nil {
 		return device.resources.rx.get(device.resources.stop)
 	}
-	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)
+	return device.pool.messageBuffers.Get().(*messageBuffer)
 }
 
-func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
+func (device *Device) PutMessageBuffer(msg *messageBuffer) {
 	if device.resources != nil {
 		device.resources.owners[msg].free <- msg
 		return

@@ -5,10 +5,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setup, clipboard} from './testing/netDom.mjs';
-import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, fakeMesh, fakeNet, press, probe, rowTexts, run, server, waitFor} from './testing/netBackend.mjs';
+import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, fakeMesh, fakeNet, press, probe, rowTexts, run, server, showTab, waitFor} from './testing/netBackend.mjs';
 
 test('addresses on the detail page: grouped by interface, tags, the exit behind NAT, copy, refresh; offline and too old', async t => {
   const h = await setup(t);
+  await showTab(h.page, '网络');
   const box = addresses(h.page);
   await box.locator('.net-iface').first().waitFor();
   const groups = await box.locator('.net-iface').evaluateAll(list => list.map(el => el.innerText.replace(/\s+/g, ' ').trim()));
@@ -16,10 +17,10 @@ test('addresses on the detail page: grouped by interface, tags, the exit behind 
   assert.match(await box.locator('.net-exit:not([data-proxy])').innerText(), /公网出口\s*192\.0\.2\.117\s*国内服务看到的地址，不在本机网卡上/);
   // Traffic abroad leaves from a proxy: that exit too, said so.
   assert.match(await box.locator('.net-exit[data-proxy]').innerText(), /出国出口\s*192\.0\.2\.92\s*经代理\s*国外服务看到的地址：去国外的流量经过代理/);
-  // Addresses come after the system and the bill; the test card after the server's other cards, across the page.
-  const order = await h.page.locator('.sv-detail:visible').locator('.sv-cards > section, section.net-probe').evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
-  assert.deepEqual(order.slice(0, 3), ['系统', '账单', '网络地址']);
-  assert.ok(order.indexOf('网络测试') > order.indexOf('动态域名') && order.indexOf('网络测试') < order.indexOf('浏览器'), order.join(' '));
+  // Addresses on 网络 among the network's cards; the test first on 工具, before the browser.
+  const order = panel => h.page.locator(`.sv-detail:visible [data-panel=${panel}]`).locator('.sv-cards > section, section.net-probe').evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
+  assert.ok((await order('net')).includes('网络地址'), (await order('net')).join(' '));
+  assert.deepEqual((await order('tools')).slice(0, 2), ['网络测试', '浏览器']);
   // A tap copies the address (without its prefix length) and says so.
   await box.getByRole('button', {name: /10\.10\.10\.251\/24/}).click();
   await h.page.locator('.el-message', {hasText: '已复制 10.10.10.251'}).waitFor();
@@ -32,11 +33,13 @@ test('addresses on the detail page: grouped by interface, tags, the exit behind 
 
   // Too old a node, and an offline one (not even asked).
   const old = await setup(t, {tabs: ['old', 'win'], active: 'old'});
+  await showTab(old.page, '网络');
   await addresses(old.page).getByText('节点版本过旧，升级节点后可用').waitFor();
   await old.page.locator('.sv-tab', {hasText: 'Win-Box'}).click();
   const win = old.page.locator('.sv-detail').nth(1);
   await win.locator('section.net-addresses').getByText('节点离线').waitFor();
   assert.equal(old.of('GET', /\/win\/net\/addresses$/).length, 0);
+  await showTab(old.page, '工具');
   assert.equal(await win.locator('section.net-probe .net-go').isDisabled(), true);
   await win.locator('section.net-probe').getByText('节点离线，上线后才能测试。').waitFor();
   // Starting a test on a node too old for it.
@@ -49,6 +52,7 @@ test('addresses on the detail page: grouped by interface, tags, the exit behind 
 
 test('the form: TCPing needs a port, targets checked, ranges per mode, the controller naming a field, busy', async t => {
   const h = await setup(t);
+  await showTab(h.page, '工具');
   const root = probe(h.page);
   await root.locator('.net-form').waitFor();
   // Defaults: Ping. The detail page is wide: mode, target and start on one line, the options out under it, nothing to unfold.
@@ -126,6 +130,7 @@ test('the form: TCPing needs a port, targets checked, ranges per mode, the contr
 
 test('ping and tcping: polled every second, rows with timeouts, refusals and unreachables, the summary, stop', async t => {
   const h = await setup(t);
+  await showTab(h.page, '工具');
   const root = probe(h.page);
   await root.locator('.net-form').waitFor();
   const pid = await run(h, {target: 'example.com', count: '30'});
@@ -186,6 +191,7 @@ test('ping and tcping: polled every second, rows with timeouts, refusals and unr
 
 test('trace: hops in a table, no answer as *, several addresses on a hop, places filled in without moving rows', async t => {
   const h = await setup(t);
+  await showTab(h.page, '工具');
   const root = probe(h.page);
   await root.locator('.net-form').waitFor();
   await run(h, {mode: '路由追踪', target: 'example.com'});
@@ -225,9 +231,10 @@ test('trace: hops in a table, no answer as *, several addresses on a hop, places
 
 test('mesh targets: the path in place of the trace table, the end-to-end ping, stale, a gateway network; "经过" under ping', async t => {
   const h = await setup(t);
+  await showTab(h.page, '工具');
   const root = probe(h.page);
   await root.locator('.net-form').waitFor();
-  await h.page.locator('.mesh-card').waitFor();
+  await h.page.locator('.mesh-card').waitFor({state: 'attached'});
   const pid = await run(h, {mode: '路由追踪', target: '100.96.0.2', count: '4'});
   const path = root.locator('.net-mesh-path');
   await path.waitFor();
@@ -260,9 +267,10 @@ test('mesh targets: the path in place of the trace table, the end-to-end ping, s
 
   // From LAX02 to a host behind home's gateway: the tail after the gateway, and a stale report.
   const g = await setup(t, {tabs: ['lax'], active: 'lax'});
+  await showTab(g.page, '工具');
   const gr = probe(g.page);
   await gr.locator('.net-form').waitFor();
-  await g.page.locator('.mesh-card').waitFor();
+  await g.page.locator('.mesh-card').waitFor({state: 'attached'});
   await run(g, {mode: '路由追踪', target: '10.10.10.1', count: '3', root: gr});
   await gr.locator('.net-mesh-path').waitFor();
   assert.equal(await gr.locator('.net-path-line').innerText(), 'LAX02 → VLINE（UDP 0.6 ms）→ TOY（TCP 167 ms）→ 家（打洞 2.4 ms）→ 10.10.10.1（经网关，局域网）');
@@ -325,8 +333,10 @@ for (const theme of ['light', 'dark']) {
     const {page} = h;
     const root = probe(page);
     const box = addresses(page);
+    await showTab(page, '网络');
     await box.locator('.net-iface').first().waitFor();
     await box.scrollIntoViewIfNeeded();
+    await showTab(page, '工具');
     // Inputs at 16px (no zoom on focus); the buttons easy to tap.
     await root.scrollIntoViewIfNeeded();
     const target = root.getByRole('combobox', {name: '目标'});
@@ -410,6 +420,7 @@ for (const theme of ['light', 'dark']) {
 
 test('leaving stops a running test: another tab, the page kept alive, the server tab closed', async t => {
   const h = await setup(t, {tabs: ['home', 'vm'], active: 'home'});
+  await showTab(h.page, '工具');
   const root = probe(h.page);
   await root.locator('.net-form').waitFor();
   let pid = await run(h, {target: 'example.com', count: '100'});
@@ -487,8 +498,10 @@ test('mesh member panel: local addresses on the status page, the test tab, a pat
 test('dark desktop: the same views', async t => {
   const h = await setup(t, {dark: true});
   const root = probe(h.page);
+  await showTab(h.page, '网络');
   await addresses(h.page).locator('.net-iface').first().waitFor();
   await addresses(h.page).scrollIntoViewIfNeeded();
+  await showTab(h.page, '工具');
   await run(h, {mode: '路由追踪', target: 'example.com'});
   await root.locator('table.net-trace tbody tr').nth(3).waitFor();
   await root.locator('.net-geo-wait').first().waitFor();

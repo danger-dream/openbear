@@ -127,7 +127,9 @@ export function summaryParts(s) {
 export const GEO_SCOPES = {private: '私有地址', cgnat: 'CGNAT', mesh: '组网', linklocal: '链路本地', other: ''};
 // geoSkipped: over the server's lookup quota, so never asked for; shown as 未查询.
 export const geoPending = a => a?.scope === 'public' && !a.geo && !a.geoSkipped;
-export const hopsWaitingForGeo = hops => (Array.isArray(hops) ? hops : []).some(h => (h?.addrs || []).some(geoPending));
+// geoLooking false: the lookup has ended without finding it (未查到 at once, nothing to wait for).
+export const geoLooking = a => geoPending(a) && a.geoLooking !== false;
+export const hopsWaitingForGeo = hops => (Array.isArray(hops) ? hops : []).some(h => (h?.addrs || []).some(geoLooking));
 // AS number and operator. A missing AS number (null, 0) or a private one (what a lookup gives for a backbone like CN2
 // it does not know, with "Unknown" as the operator) is left out; with no operator either, the country's name.
 const realAsn = asn => { const n = Number(asn); return Number.isInteger(n) && n > 0 && !(n >= 64512 && n <= 65534) && !(n >= 4200000000 && n <= 4294967294) && n !== 23456 ? n : 0; };

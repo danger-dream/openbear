@@ -194,23 +194,29 @@ func TestStreamSurvivesReconnect(t *testing.T) {
 		}
 	}
 
-	px.cut()
-	deadline := time.Now().Add(5 * time.Second)
-	for px.count() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatal("A did not reconnect")
+	// Each connection of A's has a companion through the proxy too.
+	connected := func(want int, what string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for px.count() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %d connections", what, px.count())
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
+	connected(2, "A's companion")
+	px.cut()
+	connected(4, "A did not reconnect")
 	// Idle past the 10 s the relay gives a new connection to carry
 	// WireGuard's answer: only the handshake on reconnect and the keepalives
 	// can confirm it.
 	time.Sleep(12 * time.Second)
-	if c := px.count(); c != 2 {
+	if c := px.count(); c != 4 {
 		t.Fatalf("A connected %d times: the relay closed the new connection", c)
 	}
 	ping(2, "12 s after the reconnect")
-	if c := px.count(); c != 2 {
+	if c := px.count(); c != 4 {
 		t.Fatalf("A connected %d times", c)
 	}
 }

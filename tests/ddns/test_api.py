@@ -56,7 +56,8 @@ async def test_accounts_records_and_their_shapes(env):  # noqa: F811
     rid = data['records'][0]['id']
     await e.ddns.idle()
     data, text = await call(e, 'GET', '/api/ddns')
-    assert set(data) == {'ok', 'accounts', 'records', 'providers', 'nodes', 'issues'} and token not in text
+    assert set(data) == {'ok', 'accounts', 'records', 'providers', 'nodes', 'issues', 'features'} and token not in text
+    assert data['features'] == {'providerOptions': True}
     assert data['records'][0]['state'] == 'ok' and data['issues'] == 0 and any(p['type'] == 'fake' for p in data['providers'])
     assert set(data['nodes'][0]) == NODE_KEYS and data['nodes'][0]['region'] == 'SG'
     data, _ = await call(e, 'PATCH', f'/api/ddns/records/{rid}', {'ttl': 300, 'options': {'proxied': True}})

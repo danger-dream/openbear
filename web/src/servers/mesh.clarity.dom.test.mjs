@@ -13,7 +13,7 @@ async function open(t, {width = 1440, height = 1000, dark = false, broken = fals
   const h = await mountPage(t, {width, height, dark, load: n => import(`../views/ServersView.vue?fresh=${n}`),
     session: {'openbear.servers.tabs': JSON.stringify({tabs: [], active: 'mesh'})},
     // The panel folded away on the desktop: the board as wide as it gets.
-    local: {'openbear.mesh.folded': JSON.stringify({palette: true, panel: true})},
+    local: {'openbear.mesh.folded': JSON.stringify({palette: true, panel: true}), 'openbear.mesh.classic': '1'},
     handle: async (method, path) => {
       let status = 200, data = {ok: true};
       if (path === '/api/servers/mesh' && method === 'GET') data = view;

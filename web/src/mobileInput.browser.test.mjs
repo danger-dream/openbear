@@ -4,7 +4,7 @@ import {createRequire} from 'node:module';
 import {startBrowserTestServer} from './browserTestServer.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('./testing/playwright.cjs')); } catch {}
 
 const entry = `
 import '/src/monaco-worker.js';

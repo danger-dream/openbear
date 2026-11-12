@@ -11,4 +11,5 @@ RUN test "$PYTHON_VERSION" = 3.11 -o "$PYTHON_VERSION" = 3.12 -o "$PYTHON_VERSIO
  && uv python install "$PYTHON_VERSION" \
  && uv venv --python "$PYTHON_VERSION" /opt/baseline-venv
 ENV PATH=/opt/baseline-venv/bin:$PATH
+LABEL openbear.release.keep=1
 WORKDIR /

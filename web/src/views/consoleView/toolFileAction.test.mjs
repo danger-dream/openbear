@@ -37,4 +37,7 @@ test("other tools, running or failed calls, batches, groups and local conversati
 	assert.equal(toolFileIdentityFor(event("Read", {opId: ""}), conversation), null);
 	assert.equal(toolFileIdentityFor(event("Read"), "local:draft"), null);
 	assert.equal(toolFileIdentityFor(event("Read"), ""), null);
+	const several = event("Read");
+	several.calls[0].arguments = JSON.stringify({reads: [{path: "/tmp/a.txt"}, {path: "/tmp/b.txt"}]});
+	assert.equal(toolFileIdentityFor(several, conversation), null);
 });

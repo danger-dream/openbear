@@ -387,6 +387,20 @@ test('phone timeline gives width back to prose and only hides a full-description
   assert.equal(css('AgentActivityList.vue', '.activity-row', desktop)['grid-template-columns'], '48px 12px minmax(0, 1fr)');
 });
 
+test('historical Agent events show one date heading while preserving the narrow time rail', t => {
+  const date = new Date(); date.setDate(date.getDate() - 1); date.setHours(10, 15, 20, 0);
+  const expected = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+  const root = mount(t, 'AgentActivityList.vue', {lines: [
+    {key:'a',kind:'event',ts:date.getTime()/1000,message:'历史一'},
+    {key:'b',kind:'event',ts:date.getTime()/1000+1,message:'历史二'},
+  ]});
+  const headings = walk(root).filter(n => hasClass(n, 'activity-date'));
+  assert.equal(headings.length, 1);assert.equal(text(headings[0]), expected);
+  assert.match(text(root), /10:15:20/);assert.match(text(root), /10:15:21/);
+  assert.equal(css('AgentActivityList.vue', '.activity-row', desktop)['grid-template-columns'], '48px 12px minmax(0, 1fr)');
+  assert.equal(css('AgentActivityList.vue', '.activity-date', phone)['margin-left'], '16px');
+});
+
 test('phone tool detail owns vertical scrolling while Agent cards and other payloads retain their scroll, including keyboard and landscape', () => {
   for (const env of [phone, {...phone, width: 320, mobileHeight: 320}, {...phone, width: 430, mobileHeight: 280}, {...phone, width: 844, mobileHeight: 280}]) {
     for (const [f, sel] of [['AgentEventCard.vue', '.agent-tool-detail'], ['ConsoleToolEvent.vue', '.tool-detail']]) {

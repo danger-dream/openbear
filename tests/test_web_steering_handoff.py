@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -77,6 +78,59 @@ async def test_message_queued_after_last_boundary_gets_its_own_turn(web_env, mon
         answer = next(o for o in operations if o["opType"] == "assistant_message" and o["payload"].get("text") == "SECOND")
         assert late_op["turnUuid"] == answer["turnUuid"]
         assert sum(1 for o in operations if o["opType"] == "user_message" and o["payload"].get("text") == "LATE question") == 1
+    finally:
+        await server.runs.cancel_all_and_wait()
+        steering.clear(chat)
+
+
+async def test_an_interjection_carries_its_attachments_to_the_model_and_the_timeline(web_env, monkeypatch, tmp_path):  # noqa: F811
+    from app.media.attachments import InboundMedia
+    server = web_env.server
+    backend = FakeStreamBackend([[StreamEvent(kind="content", text="FIRST"), StreamEvent(kind="finish", finish_reason="stop")],
+                                 [StreamEvent(kind="content", text="SECOND"), StreamEvent(kind="finish", finish_reason="stop")]])
+    _setup(server, monkeypatch, backend)
+    row = await server._create_web_conversation(123, title="steer attachments", model="openai/gpt")
+    chat, conv_uuid = int(row["internal_chat_id"]), str(row["conversation_uuid"])
+    live = server._live_for(row)
+    steering.clear(chat)
+    image, notes = tmp_path / "shot.png", tmp_path / "notes.txt"
+    image.write_bytes(b"png"); notes.write_text("line one")
+    media = [InboundMedia(kind="image", upload_type="websocket_upload", file_name="shot.png", mime_type="image/png", size=3, path=str(image)),
+             InboundMedia(kind="file", upload_type="websocket_upload", file_name="notes.txt", mime_type="text/plain", size=8, path=str(notes), text_excerpt="line one")]
+
+    async def register(path, *, conversation, turn_uuid="", op_id="", source_url=""):
+        return {"artifactUuid": f"art-{Path(path).name}", "contentUrl": f"/a/{Path(path).name}", "inlinePreview": True}
+
+    monkeypatch.setattr(server, "_register_web_artifact_from_path", register)
+    late, published = {}, []
+    original_touch, original_publish = server._touch_web_conversation, live.publish
+
+    async def touch(conversation_uuid, **kwargs):
+        if kwargs.get("current_status") == "就绪" and not late:
+            late["result"] = await server._start_or_steer_web_conversation(row, "", media, live)
+        return await original_touch(conversation_uuid, **kwargs)
+
+    async def publish(event, **kwargs):
+        published.append(event)
+        return await original_publish(event, **kwargs)
+
+    monkeypatch.setattr(server, "_touch_web_conversation", touch)
+    monkeypatch.setattr(live, "publish", publish)
+    try:
+        await server._start_or_steer_web_conversation(row, "FIRST question", [], live)
+        await _wait_idle(server, chat)
+        assert late["result"]["queued"] is True
+        # What the composer receives names the attachments without their paths or extracted text.
+        assert "media" not in late["result"]["pendingSteering"][0]
+        assert [a["fileName"] for a in late["result"]["pendingSteering"][0]["attachments"]] == ["shot.png", "notes.txt"]
+        assert all("media" not in item for e in published if e.get("type") == "pending_steering" for item in e.get("items") or [])
+        content = [m["content"] for m in backend.seen_convos[1] if m["role"] == "user"][-1]
+        assert isinstance(content, list) and {"type": "image", "path": str(image), "mime_type": "image/png", "name": "shot.png"} in content
+        text = next(block["text"] for block in content if block["type"] == "text")
+        assert text.startswith("请根据我发送的附件内容回答。") and "line one" in text and "shot.png" in text
+        operations = await server._web_operations(conv_uuid)
+        message = next(o for o in operations if o["opId"] == f"msg:{late['result']['pendingSteering'][0]['messageUuid']}")
+        assert [a["fileName"] for a in message["payload"]["attachments"]] == ["shot.png", "notes.txt"]
     finally:
         await server.runs.cancel_all_and_wait()
         steering.clear(chat)

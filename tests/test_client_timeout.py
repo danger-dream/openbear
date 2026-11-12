@@ -305,3 +305,28 @@ async def test_normal_slow_stream_not_killed():
     got = await _drain(client)
     assert [d for _, d in got] == [{"k": 1}, {"k": 2}, {"k": 3}]
     await client.close()
+
+
+async def test_configured_timeouts_apply_to_later_streams_not_open_ones():
+    client = HTTPClient(connect_timeout_s=10.0, first_byte_timeout_s=1.0, idle_timeout_s=0.05)
+    try:
+        _patch_stream(client, _FakeStreamResponse([
+            (0.0, 'data: {"k":1}'), (0.15, 'data: {"k":2}'), (0.0, "data: [DONE]"),
+        ]))
+        stream = client.post_sse("http://x", {}, {}, protocol="chat")
+        assert (await anext(stream))[0] == "__openbear_metrics__"
+        assert await anext(stream) == ("", {"k": 1})
+        client.configure_timeouts(connect_timeout_s=25.0, first_byte_timeout_s=1.0,
+                                  idle_timeout_s=5.0, total_timeout_s=0.0)
+        with pytest.raises(OpenBearLLMError, match="0s 无数据"):
+            await anext(stream)
+
+        captured: dict = {}
+        _patch_stream(client, _FakeStreamResponse([
+            (0.0, 'data: {"k":1}'), (0.15, 'data: {"k":2}'), (0.0, "data: [DONE]"),
+        ]), captured)
+        assert [d for _, d in await _drain(client)] == [{"k": 1}, {"k": 2}]
+        assert captured["timeout"].connect == 25.0
+        assert client.raw.timeout.connect == 25.0 and client.raw.timeout.read == 300.0
+    finally:
+        await client.close()

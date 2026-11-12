@@ -5,7 +5,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../browserTestServer.
 import {createRequire} from 'node:module';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 const shots = process.env.OPENBEAR_MESH_SHOTS || '';
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:mesh-forms-test"></script></body></html>';
 const entry = `import {createApp} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import '/src/style.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
@@ -22,14 +22,14 @@ test('mesh member settings and rule sides: tags, help tooltips, address, ports, 
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false} = {}) {
+  async function setup(t, {width = 1440, height = 900, dark = false, clashes = false} = {}) {
     const phone = width < 760;
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: 1, colorScheme: dark ? 'dark' : 'light', hasTouch: phone, isMobile: phone});
     t.after(() => context.close());
-    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh();
+    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh({clashes});
     const items = [server('berlin', 'Berlin'), server('lax', 'LAX', {region: 'US'}), server('home', 'Home', {region: 'CN'})];
     page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(([isDark]) => { window.__dark = isDark; sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); }, [dark]);
+    await page.addInitScript(([isDark]) => { window.__dark = isDark; localStorage.setItem('openbear.mesh.classic', '1'); sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); }, [dark]);
     await page.route(/^https:\/\/(open\.er-api\.com|api\.frankfurter\.dev)\//, route => route.fulfill({status: 503, body: ''}));
     await page.route('**/api/**', async route => {
       const req = route.request(), url = new URL(req.url()), path = url.pathname, method = req.method();
@@ -172,7 +172,7 @@ test('mesh member settings and rule sides: tags, help tooltips, address, ports, 
     // IP masquerade, explained in a tooltip; off, it says what the router needs.
     const masq = panel.getByRole('checkbox', {name: '地址转换（IP 伪装）'});
     await panel.getByRole('button', {name: '地址转换：说明'}).hover();
-    await tip(page, '局域网里的设备看到的来源是网关这台机器的地址，所以不用在路由器上加回程路由').waitFor();
+    await tip(page, '局域网里的设备看到的来源是网关这个节点的地址，所以不用在路由器上加回程路由').waitFor();
     await shot(page, 'desktop-light-masquerade');
     await masq.uncheck();
     await h.saved(d => memberOf(d, 'home').gateway.masquerade === false, 'masquerade off');
@@ -183,7 +183,7 @@ test('mesh member settings and rule sides: tags, help tooltips, address, ports, 
 
   await t.test('phone, light and dark: tooltips by tap, tag suggestions, 16px inputs, rule sides in the sheet', {timeout: 150000}, async t => {
     for (const dark of [false, true]) {
-      const h = await setup(t, {width: 390, height: 844, dark});
+      const h = await setup(t, {width: 390, height: 844, dark, clashes: true});
       const {page} = h;
       await node(page, 'home').tap();
       const sheet = page.locator('.mesh-inspect-sheet');
@@ -228,6 +228,15 @@ test('mesh member settings and rule sides: tags, help tooltips, address, ports, 
       await nets.scrollIntoViewIfNeeded();
       await shot(page, `phone-${dark ? 'dark' : 'light'}-gateway`);
       await sheet.getByRole('button', {name: '地址转换：说明'}).tap();
+      // A route the machine has: taken over unless kept, a tap keeps it, its note wrapping under it within the width.
+      const take = sheet.getByRole('checkbox', {name: '接管 10.20.0.0/16'});
+      await take.scrollIntoViewIfNeeded();
+      const takeRow = await sheet.locator('.mesh-takeover').boundingBox();
+      assert.ok(takeRow.height >= 36 && takeRow.width <= 390, `takeover row ${takeRow.width}x${takeRow.height}`);
+      await take.tap();
+      await h.saved(d => memberOf(d, 'home').keepRoutes?.join() === '10.20.0.0/16', 'phone keep');
+      await sheet.locator('.mesh-takeover').evaluate(el => el.scrollIntoView({block: 'center'}));
+      await shot(page, `phone-${dark ? 'dark' : 'light'}-takeover`);
       // The port in use is said under the port, and nothing goes sideways.
       await sheet.locator('.mesh-listen-note[data-port=udp]', {hasText: 'dnsmasq'}).scrollIntoViewIfNeeded();
       await shot(page, `phone-${dark ? 'dark' : 'light'}-ports`);
@@ -242,10 +251,10 @@ test('mesh member settings and rule sides: tags, help tooltips, address, ports, 
       await box2.waitFor();
       const ruleSheet = p.page.locator('.mesh-sheet', {has: box2});
       await ruleSheet.getByRole('combobox', {name: '目标：添加成员或标签'}).selectOption('members:lax');
-      await ruleSheet.getByText('LAX 只包括这台机器，不包括它的网段').waitFor();
+      await ruleSheet.getByText('LAX 只包括这个节点，不包括它的网段').waitFor();
       await box2.tap();
       await p.saved(d => d.rules[0]?.dst.allSubnets, 'phone dst all gateway networks');
-      await ruleSheet.getByText('LAX 只包括这台机器，不包括它的网段').waitFor({state: 'detached'});
+      await ruleSheet.getByText('LAX 只包括这个节点，不包括它的网段').waitFor({state: 'detached'});
       const row = await ruleSheet.locator('.mesh-side-all').nth(3).boundingBox();
       assert.ok(row.height >= 36, `box row ${row.height}px`);
       assert.ok(await ruleSheet.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'rule editor fits the width');

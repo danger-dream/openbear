@@ -169,6 +169,20 @@ def test_parse_sha256sums():
         updater().parse_sha256sums("abc123  openbear-0.2.0.zip\n", "openbear-0.2.0.zip")
 
 
+def test_a_package_is_checked_by_its_own_validator(tmp_path: Path):
+    def validator(root: Path, marker: str) -> Path:
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "release_validation.py").write_text(f"MARKER = {marker!r}\n", encoding="utf-8")
+        return root
+
+    installed = validator(tmp_path / "install", "installed")
+    staging = validator(tmp_path / "staging", "package")
+    u = updater()
+    assert u._load_release_validation(installed, staging).MARKER == "package"
+    # Without one in the package: the validator next to the updater.
+    assert hasattr(u._load_release_validation(installed, tmp_path / "no-validator"), "validate_release_tree")
+
+
 def test_data_dir_from_config(tmp_path: Path):
     config = type("C", (), {"storage": type("S", (), {"db_path": str(tmp_path / "db" / "openbear.db")})()})()
     assert data_dir_from_config(config) == tmp_path / "db"
@@ -183,7 +197,7 @@ def _retained_package(tmp_path: Path, meta: bytes, *, wrapped: bool = False) -> 
     binary = package / "gateway/bin/openbear-gateway-linux-amd64"
     binary.write_bytes(b"ELF")
     binary.chmod(0o755)
-    for rel in ("gateway/README.md", "Dockerfile", ".dockerignore", "docs/instances.md"):
+    for rel in ("gateway/README.md", "Dockerfile", ".dockerignore", "docs/instances.md", "benchmark-package/README.md"):
         (package / rel).parent.mkdir(parents=True, exist_ok=True)
         (package / rel).write_text(f"package {rel}")
     return package

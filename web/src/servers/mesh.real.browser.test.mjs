@@ -6,7 +6,7 @@ import {createRequire} from 'node:module';
 import {startBrowserTestServer, waitForBrowserReady} from '../browserTestServer.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 
 // A review of the mesh page against responses exported from a running controller.
 // OPENBEAR_MESH_REAL names the export directory (mesh.json, routes-<id>.json, member-<id>.json,
@@ -115,7 +115,7 @@ test('mesh page with exported real data: every node, tab, link, the rules layer,
     const page = await context.newPage(), errors = [], mesh = realMesh({edge}), items = mesh.items;
     page.setDefaultTimeout(6000);
     page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(isDark => { window.__dark = isDark; sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); }, dark);
+    await page.addInitScript(isDark => { window.__dark = isDark; localStorage.setItem('openbear.mesh.classic', '1'); sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); }, dark);
     await page.route(/^https:\/\/(open\.er-api\.com|api\.frankfurter\.dev)\//, route => route.fulfill({status: 503, body: ''}));
     await page.route('**/api/**', async route => {
       const req = route.request(), url = new URL(req.url()), path = url.pathname, method = req.method();

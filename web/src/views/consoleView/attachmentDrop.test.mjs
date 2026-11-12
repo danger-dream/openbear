@@ -119,8 +119,8 @@ test('plain text, links and internal reference/tree drags remain untouched', t =
 	assert.equal(hasDraggedFiles(null), false);
 });
 
-test('running and context editing refuse file drops with a reason, even when state changes during the drag', t => {
-	for (const [key, message] of [['running', '运行中暂不能添加附件'], ['contextEditorOpen', '请先关闭上下文编辑器再添加附件']]) {
+test('context editing refuses file drops with a reason, even when it starts during the drag', t => {
+	for (const [key, message] of [['contextEditorOpen', '请先关闭上下文编辑器再添加附件']]) {
 		const h = harness(t), hover = drag({types: ['Files']});
 		h.view().props.onDragenterCapture(hover);
 		h[key].value = true;

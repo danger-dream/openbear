@@ -1823,6 +1823,20 @@ test("tool summary projects a collapsed card without materializing lazy result d
   assert.equal(tool.operation.detailLoaded, false);
 });
 
+test("a collapsed card's result digest reaches its call while the result body stays lazy", () => {
+  const digest = '{"ok":true,"summary":{"count":3,"finished":3,"succeeded":3},"items":[{"serverId":"a","state":"done"}]}';
+  const projected = projectOperationMessages([
+    {opId: "msg:digest", opType: "user_message", turnId: "turn-digest", displaySeq: 1, status: "completed", lifecycle: "terminal",
+      payload: {role: "user", text: "传文件"}},
+    {opId: "tool:digest", opType: "tool", turnId: "turn-digest", displaySeq: 2, status: "completed", lifecycle: "terminal",
+      detailAvailable: true, detailLoaded: false,
+      payload: {toolCallId: "digest", name: "Servers", previewArguments: '{"action":"upload_file","params":{"group":"测试机"}}', resultState: "ok", resultDigest: digest}},
+  ]);
+  const tool = projected.find((message) => Array.isArray(message.localTimeline))?.localTimeline.find((event) => event.kind === "tool");
+  assert.equal(tool.calls[0].resultDigest, digest);
+  assert.equal(tool.result, null);
+});
+
 test("TaskMemory summary carries action and target facts through lazy projection", () => {
   const projected = projectOperationMessages([
     {

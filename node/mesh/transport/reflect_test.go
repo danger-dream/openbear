@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"openbear/node/mesh/wire"
 )
 
 func reflectRequestBytes(id byte, size int) []byte {
@@ -127,7 +128,8 @@ func TestPunchEndpointSendsOnlyHandshakesToEveryAddress(t *testing.T) {
 	}
 	for i, c := range sinks {
 		got := replies(t, c, 200*time.Millisecond)
-		if len(got) != 1 || len(got[0]) != 5+148 || string(got[0][:4]) != preamble || got[0][4] != 0 {
+		// A peer whose range is not known yet gets this node's oldest.
+		if head := preambleFor(wire.ProtocolMin); len(got) != 1 || len(got[0]) != 5+148 || string(got[0][:4]) != string(head[:]) || got[0][4] != 0 {
 			t.Fatalf("address %d got %d packets", i, len(got))
 		}
 	}

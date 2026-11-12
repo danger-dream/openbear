@@ -9,6 +9,7 @@ import {createAttachmentDraftStorage, planAttachmentDraftRecord} from './attachm
 import {initialConversationTitle} from '../../conversationTitle.js';
 import {applyOperationFrame, deriveOperationRunState, projectOperationMessages, shouldApplyOperationFrame, isRootRunTerminalFrame, isTerminalOperationFrame} from '../../timelineProjection.js';
 import {createMemoryAttachmentDraftDriver} from './attachmentDraftMemoryDriver.mjs';
+import {extensionDraft, forgetExtensionDraft, setExtensionDraft} from './extensionDrafts.js';
 
 // Run the actual ConsoleView submission/recovery functions, not a second model
 // of the implementation. Vue rendering and HTTP are isolated side-effect seams.
@@ -98,7 +99,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     attachmentDrafts: createAttachmentDraftStorage({driver: attachmentDriver}),
     noteVisibleOutput: noop, clearActiveRun: noop, lockAutoScroll: noop, scrollBottom: async () => {},
     emit: (event, uuid) => {if (event === "conversation-created") props.conversationUuid = uuid;},
-    nextTick: async () => {}, completeLocalRunConfig: () => ({}), ensureLocalRunDefaults: async () => {}, forgetLocalDraftChoices: noop, updatePromptSuggestions: noop,
+    nextTick: async () => {}, completeLocalRunConfig: () => ({}), ensureLocalRunDefaults: async () => {}, forgetLocalDraftChoices: noop, extensionDraft, forgetExtensionDraft, updatePromptSuggestions: noop,
     Api: {
       createConversation: createConversation || (async () => ({conversation: {conversationUuid: "conv-created"}})),
       uploadConversationFiles: async (_uuid, files) => files.map((file) => ({uploadId: `uploaded-${file.name}`})),
@@ -228,6 +229,20 @@ test('an in-flight model source save blocks the next send until the saved source
   assert.equal(h.sends().length,1);
 });
 
+test("a running conversation takes an interjection with only an image attached", async () => {
+  const h = harness();
+  h.context.running.value = true;
+  h.context.rootTurnRunning.value = true;
+  h.context.draft.value = "";
+  h.context.Api.uploadConversationFiles = async () => [{uploadId: "shot"}];
+  h.context.pendingAttachments.value = [{id: "img", file: {name: "shot.png", size: 1024}}];
+  assert.equal(h.run("canSend.value"), true);
+  await h.run("send()");
+  assert.equal(h.sends().length, 1);
+  assert.deepEqual(h.sends()[0].files, [{uploadId: "shot"}]);
+  assert.equal(h.context.messages.value.length, 0, "an interjection is not shown as a new turn");
+});
+
 test('one accepted send uses only one parent directory-refresh path, never component plus global notification',async()=>{
   const h=harness(),componentEvents=[],globalEvents=[];
   h.context.emit=(name)=>componentEvents.push(name);
@@ -268,6 +283,19 @@ test("reference nodes survive lost acknowledgement alongside a newly typed draft
   await h.advance(15000);
   assert.deepEqual(referencesInText(h.context.draft.value).map(ref=>ref.id), ['17','target-chat']);
   assert.equal(h.sends().length,1);
+});
+
+test("extensions chosen in a draft go with the request that creates the conversation, then the draft is dropped", async () => {
+  let sent;
+  const h = harness({local:true,createConversation:async data=>{sent=data;return {conversation:{conversationUuid:'created-with-extensions'}};}});
+  setExtensionDraft('local:new', {enabled:['servers','workitems'], autoAllow:true});
+  await h.run('send()');
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.extensions)), {enabled:['servers','workitems'], autoAllow:true});
+  assert.equal(extensionDraft('local:new'), null);
+  let untouched;
+  const plain = harness({local:true,createConversation:async data=>{untouched=data;return {conversation:{conversationUuid:'created-plain'}};}});
+  await plain.run('send()');
+  assert.equal(Object.hasOwn(untouched, 'extensions'), false);  // the server applies the folder default
 });
 
 test("a new conversation title uses capsule labels rather than reference URLs", async () => {

@@ -20,7 +20,9 @@ const sections = computed(() => props.run.sections || []);
 const tabbed = computed(() => !props.compact && sections.value.length > 1);
 const running = computed(() => isActive(props.run));
 const meta = computed(() => [runTime(props.run.createdMs), props.run.label, props.run.package, took(props.run, props.now)].filter(Boolean).join(' · '));
-const failure = computed(() => props.run.state === 'failed' || props.run.state === 'interrupted' ? errorText(props.run.error || 'bench_internal') : '');
+const failure = computed(() => props.run.state !== 'failed' && props.run.state !== 'interrupted' ? ''
+  // Stopped at its time limit: the reason names the limit.
+  : props.run.error === 'bench_timeout' && props.run.detail ? props.run.detail : errorText(props.run.error || 'bench_internal'));
 const links = computed(() => sections.value.filter(s => s.link).map(s => ({label: s.label ? `${s.label} 在线报告` : '在线报告', href: s.link})));
 
 // The job's last lines as a terminal would show them: each line from its last carriage return.
@@ -57,9 +59,10 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); });
         <el-button v-else size="small" :loading="busy" class="dd-danger" @click="emit('delete', run)">删除</el-button>
       </div>
     </header>
-    <p v-if="failure" class="dd-note bn-note" data-tone="bad">{{ failure }}<template v-if="run.detail">（{{ run.detail }}）</template></p>
+    <p v-if="failure" class="dd-note bn-note" data-tone="bad">{{ failure }}<template v-if="run.detail && run.detail !== failure">（{{ run.detail }}）</template></p>
     <template v-if="running">
-      <p class="instance-muted bn-wait" role="status">{{ run.state === 'queued' ? '排队中：这台服务器上前面还有评测，结束后自动开始。' : run.state === 'running' ? '正在运行，下面是节点上的最新输出。' : '正在准备，稍等。' }}</p>
+      <p class="instance-muted bn-wait" role="status">{{ run.state === 'queued' ? '排队中：这台服务器上前面还有评测，结束后自动开始。' : run.state === 'running' ? '正在运行，下面是节点上的最新输出。'
+        : run.state === 'collecting' ? (run.stopping ? '评测已结束：节点在线就照常收完报告，断线了就不再等它回来。' : '评测已结束，正在收集报告。') : '正在准备，稍等。' }}</p>
       <pre v-if="live" class="bn-term bn-live" v-html="ansiHtml(live)"></pre>
       <p v-else-if="liveError" class="instance-muted">{{ liveError }}</p>
     </template>

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app.agent.transcript_repair import is_role_alternation_bridge
 from app.llm._response_text_order import TextOutputOrder
 from app.llm.base import (
     AgentResult,
@@ -65,6 +66,10 @@ def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
                 # exact output order; serializing text/tool_calls again would create
                 # duplicate assistant turns and break the continuation prefix.
                 out.extend(dict(item) for item in native_items if isinstance(item, dict))
+                continue
+            # Responses accepts adjacent user items; the strict-alternation
+            # bridge only invites the model to imitate it.
+            if not m.get("tool_calls") and is_role_alternation_bridge(m.get("content")):
                 continue
             if m.get("content"):
                 out.append({
@@ -353,11 +358,23 @@ class OpenAIResponsesBackend(LLMBackend):
                             details=dict(provider_billing),
                         )
                         final_usage = None
-                    parsed = read_error(data, event_name="response.failed")
+                    # The failed response echoes the request (tools, instructions,
+                    # input); its schema descriptions are not error text.
+                    error = resp.get("error") or data.get("error")
+                    parsed = read_error(
+                        {"type": "response.failed", "status": data.get("status"), "error": error},
+                        event_name="response.failed",
+                    ) if error else None
                     if parsed:
                         yield parsed.stream_event()
                     else:
-                        yield StreamEvent(kind="error", error="responses failed")
+                        details = resp.get("incomplete_details") or {}
+                        reason = details.get("reason") if isinstance(details, dict) else ""
+                        yield StreamEvent(
+                            kind="error",
+                            error=f"responses failed without error details: {reason}" if reason
+                            else "responses failed without error details",
+                        )
                     return
             err = error_event(data, event_name=ev_name)
             if err:

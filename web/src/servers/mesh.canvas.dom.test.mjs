@@ -188,6 +188,7 @@ test('canvas: without lines from the controller the link says so; rules for ever
 test('keyboard and the server card: Delete on a node asks first, Esc clears, the card opens the node on the board', async t => {
   const h = await setup(t, {tabs: ['home'], active: 'home'});
   const {page} = h;
+  await page.locator('.sv-detail:visible .dt-tabs').getByRole('tab', {name: '网络', exact: true}).click();
   const card = page.locator('.sv-detail:visible .mesh-card');
   await card.getByText('100.96.0.3').waitFor();
   await card.getByRole('button', {name: '在组网中查看'}).click();
@@ -208,6 +209,7 @@ test('keyboard and the server card: Delete on a node asks first, Esc clears, the
 test('the server card off the mesh: why it cannot join under the title, the join at the head\'s right like every card\'s actions', async t => {
   const h = await setup(t, {tabs: ['old', 'mac'], active: 'old'});
   const {page} = h;
+  await page.locator('.sv-detail:visible .dt-tabs').getByRole('tab', {name: '网络', exact: true}).click();
   const old = page.locator('.sv-detail:visible .mesh-card');
   await old.getByText('未加入组网：节点版本过旧，需要先更新').waitFor();
   assert.equal(await old.locator('.ix-card-head').getByRole('button', {name: '加入组网'}).isDisabled(), true);
@@ -218,5 +220,66 @@ test('the server card off the mesh: why it cannot join under the title, the join
   await card.locator('.ix-card-head').getByRole('button', {name: '正在加入…'}).waitFor();
   await page.locator('.el-message', {hasText: '已加入草稿'}).waitFor({timeout: 8000});
   assert.deepEqual(h.calls.find(c => c.path === '/api/servers/mesh/members' && c.method === 'POST').body, {serverIds: ['mac']});
+  await h.close();
+});
+
+test('canvas: members drawn inside their relay, servers grouped by country with the lines between groups merged, both undone in one step; right-angled lines', async t => {
+  const h = await setup(t, {lines: true});
+  const {page} = h;
+  const toolbar = page.locator('.mesh-toolbar'), edge = id => page.locator(`[data-id="${id}"] .mesh-edge`), menu = page.locator('.mesh-view-menu');
+  // The view settings sit behind one toolbar button; a click elsewhere closes them.
+  const views = async () => { if (!(await menu.count()) || !(await menu.isVisible())) await toolbar.getByRole('button', {name: '视图'}).click(); await menu.waitFor(); return menu; };
+  const placed = () => JSON.stringify(Object.fromEntries(Object.entries(h.mesh.layout).map(([id, p]) => [id, [Math.round(p.x), Math.round(p.y)]])));
+  // Off at first: no groups, Home a card of its own with its line to LAX.
+  assert.equal(await page.locator('.mesh-zone-head').count(), 0);
+  assert.equal(await node(page, 'home').locator('.mesh-node[data-chip]').count(), 0);
+  await label(page, '2 · TCP').waitFor();
+  const first = placed();
+  // Inside: Home is a line in LAX, the relay it enters by now; that entry's line goes, the standby to Berlin stays.
+  assert.equal(await toolbar.getByRole('button', {name: '视图'}).getAttribute('aria-pressed'), 'false');
+  await (await views()).getByRole('checkbox', {name: '成员收进中转'}).check();
+  await node(page, 'home').locator('.mesh-node[data-chip]').waitFor();
+  assert.equal(await menu.getByRole('checkbox', {name: '成员收进中转'}).isChecked(), true);
+  assert.equal(await toolbar.getByRole('button', {name: '视图'}).getAttribute('aria-pressed'), 'true');
+  await until(page, async () => await edge('entry:home:c2').count() === 0, 'the line in use goes');
+  assert.equal(await edge('entry:home:c1').count(), 1);
+  assert.equal(await page.locator('.mesh-cluster').count(), 1);
+  assert.ok(await node(page, 'home').locator('.mesh-chip-note').innerText());
+  // Arranged at once (and saved), with the way back.
+  await until(page, async () => placed() !== first, 'arranged and saved');
+  const inside = placed();
+  // By country: Berlin alone, LAX with Home in it; the relay link and Home's standby entry between them are one line.
+  await (await views()).getByRole('combobox', {name: '分组方式'}).selectOption('region');
+  await until(page, async () => await page.locator('.mesh-zone-head').count() === 2, 'two groups');
+  assert.deepEqual((await texts(page.locator('.mesh-zone-head'))).map(s => s.replace(/^\S+\s/, '')), ['德国 1 台', '美国 2 台']);
+  const merged = page.locator('.mesh-bundle');
+  assert.match(await merged.innerText(), /^2 条/);
+  assert.equal(await edge('relay:berlin~lax').count(), 0);
+  await merged.click();
+  assert.equal(await merged.innerText(), '收起 2 条');
+  await edge('relay:berlin~lax').waitFor();
+  await merged.click();
+  await until(page, async () => await edge('relay:berlin~lax').count() === 0, 'merged again');
+  // Pointing at Berlin brings its own lines out of the merged one.
+  await node(page, 'berlin').hover();
+  await edge('relay:berlin~lax').waitFor();
+  await node(page, 'berlin').dispatchEvent('mouseleave'); await node(page, 'berlin').dispatchEvent('pointerleave');
+  // Undo: the places and the view before the grouping.
+  await (await views()).getByRole('button', {name: '撤销排列'}).click();
+  await until(page, async () => await page.locator('.mesh-zone-head').count() === 0, 'groups gone');
+  assert.equal(await menu.getByRole('combobox', {name: '分组方式'}).inputValue(), 'none');
+  assert.equal(await node(page, 'home').locator('.mesh-node[data-chip]').count(), 1);
+  await until(page, async () => placed() === inside, 'places back');
+  assert.equal(await menu.getByRole('button', {name: '撤销排列'}).count(), 0);
+  // Right-angled lines: the curve between Berlin and LAX becomes straight runs and corners; the places stay.
+  const way = () => edge('relay:berlin~lax').locator('.mesh-edge-line').getAttribute('d');
+  assert.doesNotMatch(await way(), / L /);
+  await (await views()).getByRole('checkbox', {name: '直角连线'}).check();
+  await until(page, async () => / L /.test(await way()), 'right-angled');
+  assert.equal(placed(), inside);
+  // Remembered on this browser.
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('openbear.mesh.view'))), {group: 'none', contain: true, lines: 'ortho'});
+  await page.reload();
+  await node(page, 'home').locator('.mesh-node[data-chip]').waitFor();
   await h.close();
 });

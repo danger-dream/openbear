@@ -20,4 +20,6 @@ func launchBrowser(context.Context, string, string) (*launched, error) {
 	return nil, errors.New("starting a browser is not supported on this system; set an existing browser endpoint")
 }
 
+func chromeRunsHere() bool { return true }
+
 func checkLibraries(string) error { return nil }

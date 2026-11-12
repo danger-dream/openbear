@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/netip"
 	"openbear/node/mesh/health"
+	meshproxy "openbear/node/mesh/proxy"
 	meshrouting "openbear/node/mesh/routing"
 	"os"
 	"path/filepath"
@@ -32,19 +33,22 @@ const statusSchema = 1
 const relaySessionWindow = 3 * device.RekeyAfterTime
 
 type Status struct {
-	Schema          int                    `json:"schema"`
-	PID             int                    `json:"pid"`
-	Version         string                 `json:"version"`
-	StartedAt       int64                  `json:"startedAt"`
-	ConfigRevision  int64                  `json:"configRevision"`
-	AppliedRevision int64                  `json:"appliedRevision"`
-	Error           string                 `json:"error"`
-	Ready           bool                   `json:"ready"`
-	Iface           string                 `json:"iface"`
-	TLSCertificate  string                 `json:"tlsCertificate"`
-	Peers           []PeerStatus           `json:"peers"`
-	Entry           *EntryStatus           `json:"entry,omitempty"`
-	Owners          map[string]OwnerStatus `json:"owners,omitempty"`
+	Schema          int    `json:"schema"`
+	PID             int    `json:"pid"`
+	Version         string `json:"version"`
+	StartedAt       int64  `json:"startedAt"`
+	ConfigRevision  int64  `json:"configRevision"`
+	AppliedRevision int64  `json:"appliedRevision"`
+	Error           string `json:"error"`
+	Ready           bool   `json:"ready"`
+	Iface           string `json:"iface"`
+	// OwnMTU, while this machine's interface toward its UDP peers takes less
+	// than the network's MTU (underlay.go).
+	OwnMTU         *OwnMTUStatus          `json:"ownMtu,omitempty"`
+	TLSCertificate string                 `json:"tlsCertificate"`
+	Peers          []PeerStatus           `json:"peers"`
+	Entry          *EntryStatus           `json:"entry,omitempty"`
+	Owners         map[string]OwnerStatus `json:"owners,omitempty"`
 	// SkippedRoutes overlap a network of this machine and are not routed.
 	SkippedRoutes []string `json:"skippedRoutes"`
 	// GatewayRoutes are the gateway subnets routed into the mesh in this
@@ -57,10 +61,12 @@ type Status struct {
 	HostFirewall string `json:"hostFirewall"`
 	// HostFirewallIssues is what the host firewall may not let through
 	// (Linux; hostfw_linux.go).
-	HostFirewallIssues []FirewallIssue `json:"hostFirewallIssues,omitempty"`
-	Counters           CounterStatus   `json:"counters"`
-	Resources          ResourceStatus  `json:"resources"`
-	Events             []Event         `json:"events"`
+	HostFirewallIssues []FirewallIssue   `json:"hostFirewallIssues,omitempty"`
+	Counters           CounterStatus     `json:"counters"`
+	ReceiveDrops       ReceiveDropStatus `json:"receiveDrops"`
+	LargeBuffers       LargeBufferStatus `json:"largeBuffers"`
+	Resources          ResourceStatus    `json:"resources"`
+	Events             []Event           `json:"events"`
 	// Reachability is how this node's UDP socket looks from outside.
 	Reachability *ReachabilityStatus `json:"reachability,omitempty"`
 	// Routing is a relay's links to other relays and its next hops.
@@ -80,6 +86,12 @@ type Status struct {
 	ConfigSchemas [2]int `json:"configSchemas"`
 	// Protocols is [min, max] of the mesh node-to-node protocols it speaks.
 	Protocols [2]int `json:"protocols"`
+	// Proxy is the exit proxy's entry and exit, while the node is either.
+	Proxy *meshproxy.Status `json:"proxy,omitempty"`
+	// Probes are the latest lightweight candidate measurements (probes.go).
+	Probes []ProbeResult `json:"probes,omitempty"`
+	// Paths are the fixed paths' pairs this node is the source of (fixedpath.go).
+	Paths []PathStatus `json:"paths,omitempty"`
 }
 
 // RoutingStatus: a cost is null where it is infinite, for a link down or
@@ -199,6 +211,8 @@ type PeerStatus struct {
 	Protocol int `json:"protocol,omitempty"`
 	// Redial: a link this node dials over TCP or TLS (health/redial.go).
 	Redial *RedialStatus `json:"redial,omitempty"`
+	// PathMTU is the longest packet the link carries (large.go).
+	PathMTU int `json:"pathMtu,omitempty"`
 }
 
 // RedialStatus is what status shows of redialing a TCP or TLS link or entry
@@ -297,16 +311,53 @@ type CounterStatus struct {
 	// DroppedPlain: what a relay would have forwarded that is not end to
 	// end, and plain packets for this node not from their peer's node.
 	DroppedPlain uint64 `json:"droppedPlain"`
+	// DroppedTooBig: packets longer than their path takes (large.go).
+	DroppedTooBig uint64 `json:"droppedTooBig"`
+}
+
+// ReceiveDropStatus: what arrived and was dropped before the device took it
+// in, by where (transport.ReceiveDrops, device.ReceiveDrops).
+type ReceiveDropStatus struct {
+	Queue         uint64 `json:"queue"`
+	TooLong       uint64 `json:"tooLong"`
+	StalePath     uint64 `json:"stalePath"`
+	NoBuffer      uint64 `json:"noBuffer"`
+	NoLargeBuffer uint64 `json:"noLargeBuffer"`
+	Decrypt       uint64 `json:"decrypt"`
+	Replay        uint64 `json:"replay"`
+	StaleKey      uint64 `json:"staleKey"`
+}
+
+// LargeBufferStatus: what became of large packet buffers, received
+// (transport.LargeReceiveCounts) and sent (meshtun.go). Swapped: packets
+// WireGuard took over in the buffer they were read into; Copied: packets of
+// the large path it took as a copy instead; Reused: packets read into a spare
+// buffer WireGuard gave back; Allocated: into a new one for want of a spare;
+// Discarded: buffers left to the GC, the spares being full.
+type LargeBufferStatus struct {
+	RxSwapped   uint64 `json:"rxSwapped"`
+	RxCopied    uint64 `json:"rxCopied"`
+	RxReused    uint64 `json:"rxReused"`
+	RxAllocated uint64 `json:"rxAllocated"`
+	RxDiscarded uint64 `json:"rxDiscarded"`
+	TxSwapped   uint64 `json:"txSwapped"`
+	TxCopied    uint64 `json:"txCopied"`
+	TxReused    uint64 `json:"txReused"`
+	TxAllocated uint64 `json:"txAllocated"`
+	TxDiscarded uint64 `json:"txDiscarded"`
 }
 
 type ResourceStatus struct {
 	Profile        string `json:"profile,omitempty"`
 	PendingProfile string `json:"pendingProfile,omitempty"`
 	RSSBytes       uint64 `json:"rssBytes"`
-	HeapBytes      uint64 `json:"heapBytes"`
-	QueueBytes     int    `json:"queueBytes"`
-	Conns          int    `json:"conns"`
-	Goroutines     int    `json:"goroutines"`
+	// LimitBytes is the resident memory the controller alarms at
+	// (memoryAlarm); absent before a config applied it.
+	LimitBytes uint64 `json:"limitBytes,omitempty"`
+	HeapBytes  uint64 `json:"heapBytes"`
+	QueueBytes int    `json:"queueBytes"`
+	Conns      int    `json:"conns"`
+	Goroutines int    `json:"goroutines"`
 	// CPUPercent is of one core over the last status interval.
 	CPUPercent float64 `json:"cpuPercent"`
 }
@@ -349,6 +400,9 @@ func (e *engine) status() Status {
 	_, state := deviceState(e.dev)
 	local := e.bind.localAddrs()
 	s := Status{Iface: e.name, TLSCertificate: e.bind.certificate(), Peers: []PeerStatus{}}
+	if u := e.cfg.underlay; u.limit > 0 {
+		s.OwnMTU = &OwnMTUStatus{Iface: u.iface, IfaceMTU: u.mtu, MTU: e.cfg.ownMTU() - e2eOverhead}
+	}
 	s.Resources.Profile = e.resourceStart
 	if e.resourceStart != "" && resourceProfile(e.cfg) != e.resourceStart {
 		s.Resources.PendingProfile = resourceProfile(e.cfg)
@@ -481,9 +535,25 @@ func (e *engine) status() Status {
 	c := e.tun.stats
 	s.Counters = CounterStatus{Delivered: c.Delivered.Load(), Forwarded: c.Forwarded.Load(), DroppedACL: c.DroppedACL.Load(),
 		DroppedNotRelay: c.DroppedNotRelay.Load(), DroppedTTL: c.DroppedTTL.Load(), DroppedNoRoute: c.DroppedNoRoute.Load(),
-		DroppedQueue: c.DroppedQueue.Load(), DroppedBad: c.DroppedBad.Load(), DroppedPlain: c.DroppedPlain.Load()}
+		DroppedQueue: c.DroppedQueue.Load(), DroppedBad: c.DroppedBad.Load(), DroppedPlain: c.DroppedPlain.Load(), DroppedTooBig: c.DroppedTooBig.Load()}
+	td, dd := e.bind.ReceiveDrops(), e.dev.ReceiveDrops()
+	s.ReceiveDrops = ReceiveDropStatus{Queue: td.Queue, TooLong: td.TooLong, StalePath: td.Stale,
+		NoBuffer: dd.NoBuffer, NoLargeBuffer: dd.NoLargeBuffer, Decrypt: dd.Decrypt, Replay: dd.Replay, StaleKey: dd.StaleKey}
+	lr := e.bind.LargeReceive()
+	s.LargeBuffers = LargeBufferStatus{RxSwapped: lr.Swapped, RxCopied: lr.Copied, RxReused: lr.Reused, RxAllocated: lr.Allocated, RxDiscarded: lr.Discarded,
+		TxSwapped: c.LargeSwapped.Load(), TxCopied: c.LargeCopied.Load(), TxReused: c.LargeReused.Load(), TxAllocated: c.LargeAllocated.Load(), TxDiscarded: c.LargeDiscarded.Load()}
+	view, r := e.tun.paths.view.Load(), e.tun.route.Load()
+	for i := range s.Peers {
+		s.Peers[i].PathMTU = view.linkMTU(s.Peers[i].ID)
+	}
 	if e.e2e != nil {
 		s.E2E = e.e2e.status()
+		for i := range s.E2E.Peers {
+			p := &s.E2E.Peers[i]
+			if z := r.nodes.byID[p.ID]; r.nodes != nil && z != nil {
+				p.PathMTU = view.pathMTU(p.ID, r.hop(z.addr))
+			}
+		}
 	}
 	s.Resources.QueueBytes = e.sched.queuedBytes()
 	s.Resources.Conns = len(local)
@@ -497,7 +567,10 @@ func (e *engine) status() Status {
 			s.GatewayRoutes = append(s.GatewayRoutes, r.String())
 		}
 	}
-	if r := e.router(); r != nil && e.cfg.isRelay() {
+	if ps := e.pins.status(); len(ps) > 0 {
+		s.Paths = ps
+	}
+	if r := e.router(); r != nil && e.cfg.isRouted() {
 		s.Routing = routingStatus(r)
 		// An idle link has no data-plane handshake or packet to show for
 		// itself; the router's probes over the control plane do.
@@ -579,6 +652,7 @@ func fillProcess(s *Status, started time.Time, events *eventLog) {
 	s.Protocols = [2]int{protocol.Min, protocol.Max}
 	s.Resources.HeapBytes = m.HeapInuse
 	s.Resources.RSSBytes = residentBytes()
+	s.Resources.LimitBytes = memoryLimit.Load()
 	s.Resources.Goroutines = runtime.NumGoroutine()
 	s.Events = events.snapshot()
 	if s.Peers == nil {

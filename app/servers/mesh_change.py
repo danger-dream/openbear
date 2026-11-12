@@ -10,6 +10,7 @@ import uuid
 from app.instances.contracts import InstanceError
 from app.instances.servers import LOCAL
 from app.servers.mesh_config import config_hash
+from app.servers import front as fronts
 from app.servers.onboarding import resolve
 from app.webhooks.repository import many, one
 
@@ -116,7 +117,8 @@ async def run(mesh, owner, plan):
     try:
         access = mesh.access_of(plan['doc'], await mesh.mesh_capable(owner))
         async def prepare(sid):
-            if sid == LOCAL:
+            # A front keeps its exits' accesses: the node moves to these when the change goes live.
+            if sid == LOCAL or fronts.is_front(change['profiles'].get(sid)):
                 url, backup = await mesh.service.onboarding.addresses(owner, sid)
             else:
                 points = resolve(change['settings'], change['profiles'].get(sid), mesh.access_point(access, sid))

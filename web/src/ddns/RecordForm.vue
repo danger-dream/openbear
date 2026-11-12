@@ -4,16 +4,17 @@ import { ChevronRight } from '@lucide/vue';
 import { noAutofill } from '../servers/serverHelpers.js';
 import { DdnsApi } from './ddnsApi.js';
 import NodePicker from './NodePicker.vue';
-import { accountLabel, choice, createBody, DEFAULT_STUN, DEFAULT_URLS, emptyForm, errorMessage, FAILOVER, INTERVALS, lines, METHODS, nodeOf,
+import { accountLabel, choice, createBody, DEFAULT_STUN, emptyForm, errorMessage, FAILOVER, INTERVALS, METHODS, nodeOf,
   patchBody, previewBody, previewCounts, providerOf, recordToForm, rowKey, TTLS, V6_MODES } from './ddnsHelpers.js';
 
 // 添加解析 / 编辑解析: node → domains → record types → preview → save; the rest is under 高级选项.
 const props = defineProps({nodes: {type: Array, required: true}, accounts: {type: Array, required: true}, providers: {type: Array, required: true},
-  record: {type: Object, default: null}, serverId: {type: String, default: ''}});
+  record: {type: Object, default: null}, serverId: {type: String, default: ''}, providerOptions: {type: Boolean, default: false}});
 const emit = defineEmits(['saved', 'cancel']);
 const edit = computed(() => Boolean(props.record));
 const firstNode = () => (props.nodes.find(n => n.serverId === props.serverId) || props.nodes.find(n => n.online && n.ddns) || props.nodes[0] || null);
 const form = reactive(props.record ? recordToForm(props.record) : emptyForm(firstNode()?.serverId || '', firstNode()));
+if (!props.record && props.providerOptions) form.providerOptions = Object.fromEntries(props.providers.map(p => [p.type, {}]));
 const fixedRecord = form.method === 'fixed';
 const preview = ref(null), previewing = ref(false), previewError = ref(''), confirmed = ref(new Set()), accountIds = reactive({});
 const saving = ref(false), error = ref(''), advanced = ref(edit.value);
@@ -24,10 +25,11 @@ const v6Known = computed(() => node.value?.v6 || preview.value?.detected?.v6?.va
 const rows = computed(() => preview.value?.rows || []);
 const counts = computed(() => previewCounts(rows.value, confirmed.value));
 const recordAccount = computed(() => props.accounts.find(a => a.id === props.record?.accountId) || null);
+const previewAccountIds = ref([]);
 // Accounts the rows will be written to: their provider options and TTL ranges apply.
 const targetAccounts = computed(() => {
   if (edit.value) return recordAccount.value ? [recordAccount.value] : [];
-  const ids = new Set(rows.value.filter(r => r.action !== 'error').map(r => accountIds[r.name] || r.accountId).filter(Boolean));
+  const ids = new Set(previewAccountIds.value);
   return props.accounts.filter(a => ids.has(a.id));
 });
 const optionFields = computed(() => {
@@ -35,9 +37,8 @@ const optionFields = computed(() => {
   for (const account of targetAccounts.value) {
     const provider = providerOf(props.providers, account.type);
     for (const f of provider.options || []) {
-      const seen = out.get(f.key);
-      if (seen) { if (!seen.providers.includes(provider.name)) seen.providers.push(provider.name); }
-      else out.set(f.key, {...f, providers: [provider.name]});
+      const id = form.providerOptions ? `${provider.type}:${f.key}` : f.key;
+      if (!out.has(id)) out.set(id, {...f, id, provider: provider.name, values: form.providerOptions ? form.providerOptions[provider.type] : form.options});
     }
   }
   return [...out.values()];
@@ -62,8 +63,6 @@ const blocked = computed(() => warnings.value.some(([tone]) => tone === 'bad'));
 const formProblem = computed(() => {
   if (form.method !== 'fixed' && !form.serverId) return '先选择节点';
   if (form.method === 'fixed' && !form.fixed.trim()) return '填写固定值';
-  if (form.method === 'url' && !lines(form.urls).length) return '填写至少一个查询地址';
-  if (form.method === 'stun' && !lines(form.stun).length) return '填写至少一个 STUN 服务器';
   if (form.method === 'cmd' && !form.cmd.trim()) return '填写命令';
   if (form.types.includes('AAAA') && form.v6Mode !== 'first' && !String(form.v6Value).trim()) return '填写 IPv6 地址选择规则';
   return '';
@@ -86,8 +85,11 @@ const howHint = computed(() => {
 });
 const methods = computed(() => ['auto', 'url', 'nic', 'stun', 'cmd', 'conn', ...(fixedRecord ? ['fixed'] : [])]);
 
-const ACTIONS = {new: ['busy', '新建'], same: ['ok', '无需修改'], takeover: ['warn', '需要接管确认'], exists: ['warn', '已由 OpenBear 管理'], error: ['bad', '出错']};
+const ACTIONS = {new: ['busy', '新建'], same: ['ok', '无需修改'], takeover: ['warn', '需要接管确认'], exists: ['warn', '已由 OpenBear 管理'], error: ['bad', '出错'],
+  choose: ['warn', '选择账户']};
 const rowAccounts = row => (row.accounts || []).map(a => props.accounts.find(x => x.id === a.id) || a);
+// Several accounts manage the name and none is chosen yet: the row asks for one.
+const choosing = row => row.action === 'error' && row.errorCode === 'account_ambiguous' && rowAccounts(row).length > 1;
 function confirm(row, on) {
   const next = new Set(confirmed.value);
   if (on) next.add(rowKey(row)); else next.delete(rowKey(row));
@@ -97,7 +99,6 @@ function chooseAccount(row, id) { accountIds[row.name] = id; schedule(0); }
 
 function setMethod(method) {
   form.method = method;
-  if (method === 'url' && !form.urls.trim()) form.urls = DEFAULT_URLS.join('\n');
   if (method === 'stun' && !form.stun.trim()) form.stun = DEFAULT_STUN.join('\n');
 }
 function schedule(ms = 600) {
@@ -120,6 +121,7 @@ async function runPreview() {
     const data = await DdnsApi.preview(body);
     if (mine !== round) return;
     preview.value = data;
+    previewAccountIds.value = (data.rows || []).filter(r => r.action !== 'error').map(r => accountIds[r.name] || r.accountId).filter(Boolean);
     // A confirmation stays only while the same row still asks for one.
     const asking = new Set((data.rows || []).filter(r => r.action === 'takeover').map(rowKey));
     confirmed.value = new Set([...confirmed.value].filter(k => asking.has(k)));
@@ -128,7 +130,7 @@ async function runPreview() {
   } finally { if (mine === round) previewing.value = false; }
 }
 watch(v6Unsupported, no => { if (no && !edit.value) form.types = form.types.filter(t => t !== 'AAAA'); });
-watch(optionFields, fields => { for (const f of fields) if (!(f.key in form.options)) form.options[f.key] = ''; }, {immediate: true});
+watch(optionFields, fields => { for (const f of fields) if (!(f.key in f.values)) f.values[f.key] = ''; }, {immediate: true});
 watch(() => form.serverId, (id, before) => {
   if (edit.value || id === before) return;
   const n = nodeOf(props.nodes, id);
@@ -136,7 +138,7 @@ watch(() => form.serverId, (id, before) => {
   if (form.backupId === id) form.backupId = '';
 });
 watch(() => [form.serverId, form.names, form.types.join(), form.method, form.urls, form.iface, form.bindIface, form.stun, form.cmd, form.fixed, form.v6Mode, form.v6Value, form.v6Temporary,
-  JSON.stringify(form.options)], () => schedule(), {immediate: true, flush: 'sync'});
+  JSON.stringify(form.options), JSON.stringify(form.providerOptions)], () => schedule(), {immediate: true, flush: 'sync'});
 onBeforeUnmount(() => { round++; clearTimeout(timer); });
 
 async function save() {
@@ -147,7 +149,7 @@ async function save() {
       const data = await DdnsApi.updateRecord(props.record.id, patchBody(form));
       emit('saved', {message: '已保存，正在按新的设置同步', record: data.record});
     } else {
-      const data = await DdnsApi.addRecords(createBody(form, rows.value, confirmed.value, accountIds));
+      const data = await DdnsApi.addRecords(createBody(form, rows.value, confirmed.value, accountIds, props.accounts));
       const saved = data.records?.length || 0, skipped = data.skipped || [];
       const why = skipped.map(s => `${s.name}（${s.type}）${SKIP_REASONS[s.reason] || s.message || '没有保存'}`).join('；');
       emit('saved', {message: `已保存 ${saved} 条，正在写入服务商${skipped.length ? `；${skipped.length} 条没有保存：${why}` : ''}`, records: data.records || []});
@@ -210,10 +212,11 @@ defineExpose({busy: saving});
         <template v-else-if="rows.length">
           <div v-for="row in rows" :key="rowKey(row)" class="dd-pr" :data-action="row.action">
             <span class="dd-pr-name">{{ row.name }} · {{ row.type }}</span>
-            <span class="ix-pill" :data-tone="ACTIONS[row.action]?.[0]">{{ ACTIONS[row.action]?.[1] || row.action }}</span>
-            <span v-if="row.action === 'error'" class="dd-pr-meta dd-bad-text">{{ row.error || '无法保存' }}{{ !(row.accounts || []).length ? '。先在左侧添加能管理这个域的服务商账户' : '' }}</span>
+            <span class="ix-pill" :data-tone="ACTIONS[choosing(row) ? 'choose' : row.action]?.[0]">{{ ACTIONS[choosing(row) ? 'choose' : row.action]?.[1] || row.action }}</span>
+            <span v-if="row.action === 'error' && !choosing(row)" class="dd-pr-meta dd-bad-text">{{ row.error || '无法保存' }}{{ !(row.accounts || []).length ? '。先在左侧添加能管理这个域的服务商账户' : '' }}</span>
             <span v-else class="dd-pr-meta">
               <select v-if="rowAccounts(row).length > 1" class="dd-pr-account" :value="accountIds[row.name] || row.accountId" :aria-label="`${row.name} 写入的账户`" @change="chooseAccount(row, $event.target.value)">
+                <option v-if="!(accountIds[row.name] || row.accountId)" value="" disabled>{{ row.error || '选择写入的账户' }}</option>
                 <option v-for="a in rowAccounts(row)" :key="a.id" :value="a.id">{{ accountLabel(a, providers) }}</option>
               </select>
               <template v-else>{{ accountLabel(rowAccounts(row)[0] || accounts.find(a => a.id === row.accountId), providers) }}</template>
@@ -242,10 +245,10 @@ defineExpose({busy: saving});
           <small v-if="howHint" class="instance-muted">{{ howHint }}</small>
         </div>
         <label v-if="form.method === 'url'" class="dd-field dd-full"><span>查询地址（每行一个，依次尝试）</span>
-          <textarea v-model="form.urls" v-bind="noAutofill" class="mono" rows="2" spellcheck="false" autocapitalize="off"></textarea>
+          <textarea v-model="form.urls" v-bind="noAutofill" class="mono" rows="2" spellcheck="false" autocapitalize="off" placeholder="留空：使用默认查询地址（IPv4、IPv6 各用各的）"></textarea>
           <small class="instance-muted">不走代理，按 IPv4 / IPv6 分别连接</small></label>
         <label v-if="form.method === 'stun'" class="dd-field dd-full"><span>STUN 服务器（每行一个）</span>
-          <textarea v-model="form.stun" v-bind="noAutofill" class="mono" rows="2" spellcheck="false" autocapitalize="off"></textarea></label>
+          <textarea v-model="form.stun" v-bind="noAutofill" class="mono" rows="2" spellcheck="false" autocapitalize="off" :placeholder="`留空：使用默认的 ${DEFAULT_STUN.join('、')}`"></textarea></label>
         <label v-if="form.method === 'url' || form.method === 'stun'" class="dd-field"><span>绑定网卡（可选）</span>
           <input v-model="form.bindIface" v-bind="noAutofill" class="mono" placeholder="例如 eth0" autocapitalize="off" /></label>
         <label v-if="form.method === 'nic'" class="dd-field"><span>网卡</span>
@@ -264,12 +267,13 @@ defineExpose({busy: saving});
           <small v-if="ttlHint" class="instance-muted">{{ ttlHint }}</small></label>
         <label class="dd-field"><span>同名多条记录时</span>
           <select v-model="form.multi"><option value="one">只管理接管的那一条</option><option value="all">全部改成同一个值</option></select></label>
-        <label v-for="f in optionFields" :key="f.key" class="dd-field"><span>{{ f.label }}<template v-if="optionFields.length && targetAccounts.length > 1">（{{ f.providers.join('、') }}）</template></span>
-          <select v-model="form.options[f.key]">
+        <label v-for="f in optionFields" :key="f.id" class="dd-field"><span>{{ f.label }}<template v-if="targetAccounts.length > 1">（{{ f.provider }}）</template></span>
+          <select v-if="f.kind === 'bool' || f.kind === 'select'" v-model="f.values[f.key]">
             <option value="">{{ f.kind === 'bool' ? '保持记录原样' : '不设置' }}</option>
             <template v-if="f.kind === 'bool'"><option value="on">开启</option><option value="off">关闭</option></template>
             <option v-for="o in (f.options || []).map(choice)" v-else :key="o.value" :value="o.value">{{ o.label }}</option>
           </select>
+          <input v-else v-model.trim="f.values[f.key]" v-bind="noAutofill" class="mono" maxlength="200" autocapitalize="off" placeholder="留空：不设置" />
           <small v-if="f.hint" class="instance-muted">{{ f.hint }}</small></label>
         <label class="dd-field"><span>被外部改动时</span>
           <select v-model="form.onDrift"><option value="revert">告警并改回（默认）</option><option value="alert">只告警</option></select></label>

@@ -45,6 +45,10 @@ type Device struct {
 		port          uint16 // listening port
 		fwmark        uint32 // mark value (0 = disabled)
 		brokenRoaming bool
+
+		// unbinding is closed when the bind's receive routines are to stop:
+		// one waiting for a buffer to come back stops waiting.
+		unbinding chan struct{}
 	}
 
 	staticIdentity struct {
@@ -87,9 +91,12 @@ type Device struct {
 	}
 
 	resources *deviceResources
-	ipcMutex  sync.RWMutex
-	closed    chan struct{}
-	log       *Logger
+	rxDrops   struct {
+		noBuffer, noLargeBuffer, decrypt, replay, staleKey atomic.Uint64
+	}
+	ipcMutex sync.RWMutex
+	closed   chan struct{}
+	log      *Logger
 }
 
 // deviceState represents the state of a Device.
@@ -325,6 +332,11 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.state.stopping.Add(1)      // RoutineReadFromTUN
 	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
 	go device.RoutineReadFromTUN()
+	if reader, ok := tunDevice.(conn.LargeReader); ok && device.resources != nil && device.resources.largeTx != nil {
+		device.state.stopping.Add(1)
+		device.queue.encryption.wg.Add(1)
+		go device.routineReadLargeFromTUN(reader)
+	}
 	go device.RoutineTUNEventReader()
 
 	return device
@@ -442,6 +454,10 @@ func closeBindLocked(device *Device) error {
 	if netc.bind != nil {
 		err = netc.bind.Close()
 	}
+	if netc.unbinding != nil {
+		close(netc.unbinding)
+		netc.unbinding = nil
+	}
 	netc.stopping.Wait()
 	return err
 }
@@ -527,12 +543,31 @@ func (device *Device) BindUpdate() error {
 	device.peers.RUnlock()
 
 	// start receiving routines
+	unbinding := make(chan struct{})
+	netc.unbinding = unbinding
 	device.net.stopping.Add(len(recvFns))
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
-	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+	priority, large := -1, -1
+	if p, ok := netc.bind.(conn.PriorityReceiver); ok {
+		priority = p.PriorityReceiveIndex()
+	}
+	if l, ok := netc.bind.(conn.LargeReceiver); ok {
+		large = l.LargeReceiveIndex()
+	}
+	// With the large pool, the large receive function may hand messages over
+	// in buffers of its own (conn.LargeSwapReceiver), which its routine adopts.
+	var swap conn.ReceiveFunc
+	if s, ok := netc.bind.(conn.LargeSwapReceiver); ok && large >= 0 && large < len(recvFns) && device.resources != nil && device.resources.largeRx != nil {
+		swap = s.LargeSwapReceive()
+	}
+	for i, fn := range recvFns {
+		adopt := i == large && swap != nil
+		if adopt {
+			fn = swap
+		}
+		go device.RoutineReceiveIncoming(batchSize, fn, device.receivePool(i == priority, i == large), adopt, unbinding)
 	}
 
 	device.log.Verbosef("UDP bind has been updated")

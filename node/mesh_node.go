@@ -27,21 +27,26 @@ import (
 	"openbear/node/mesh/transport"
 )
 
-// The mesh data plane runs as its own service from a copy of this binary in
-// the mesh directory, so updating the node never restarts it and, on Windows,
-// never holds the file a node update renames.
+// The mesh data plane is this program run as its own service ("mesh run"), so
+// updating the node never restarts it; the controller restarts it onto a node
+// update's build afterwards (mesh.upgrade), relays one at a time. On Linux the
+// service runs the node's own file, which an update replaces without touching
+// a running data plane; on Windows and macOS it runs a copy in the mesh
+// directory, so it never holds the file a node update renames (meshCopies).
 //
-//	bin/openbear-mesh  the copy the service runs
+//	bin/openbear-mesh  the copy the service runs (Windows, macOS)
 //	config.json        written by mesh.apply, read by the data plane
 //	applied.json       the data plane's copy of the config it last applied
-//	status.json        written by the data plane every second
+//	status.json        written by the data plane every second (on OpenWrt in RAM, see mesh.StatusPath)
 //	keys/              private keys (wg.key, control.key, e2e.key: WireGuard;
 //	                   sign.key: Ed25519); only the public halves leave
 //	install.json       what mesh.install did, for upgrade and uninstall
 
-// meshDirFor follows jobsDir: an installed Linux node keeps it under /var/lib.
+// meshDirFor follows jobsDir: an installed Linux node keeps it under /var/lib,
+// except on OpenWrt, whose /var is a RAM disk: the keys and config stay beside
+// the node's config on flash (status.json goes to RAM, see mesh.StatusPath).
 func meshDirFor(config string) string {
-	if config == DefaultConfigPath && runtime.GOOS == "linux" {
+	if config == DefaultConfigPath && runtime.GOOS == "linux" && !mesh.OpenWrt() {
 		return "/var/lib/openbear-node/mesh"
 	}
 	return filepath.Join(filepath.Dir(config), "mesh")
@@ -110,6 +115,8 @@ func (a *Agent) meshCall(ctx context.Context, method string, raw json.RawMessage
 	switch method {
 	case "mesh.prepare", "mesh.activate", "mesh.confirm", "mesh.abort":
 		return a.meshChangeCall(method, raw)
+	case "mesh.probe":
+		return meshProbe(ctx, raw)
 	}
 	if what := h.takesDown(method, raw); what != "" {
 		var release func()
@@ -151,6 +158,10 @@ func (h *meshHost) path(name ...string) string {
 	return filepath.Join(append([]string{h.dir}, name...)...)
 }
 
+// meshCopies: the data plane runs a copy of this program (binary) rather than the node's own
+// file; tests set it.
+var meshCopies = runtime.GOOS != "linux"
+
 func (h *meshHost) binary() string {
 	name := "openbear-mesh"
 	if runtime.GOOS == "windows" {
@@ -179,7 +190,7 @@ func (h *meshHost) saveRecord(r map[string]any) error {
 
 func (h *meshHost) readStatus() (meshStatus, bool) {
 	var s meshStatus
-	data, err := os.ReadFile(h.path("status.json"))
+	data, err := os.ReadFile(mesh.StatusPath(h.dir))
 	return s, err == nil && json.Unmarshal(data, &s) == nil
 }
 
@@ -196,8 +207,8 @@ func (h *meshHost) status() map[string]any {
 	out := map[string]any{"installed": r != nil, "service": h.service.state(), "dataVersion": version, "dataBuild": dataBuild,
 		"publicKey": publicKeyOf(h.path("keys", "wg.key")), "controlKey": publicKeyOf(h.path("keys", "control.key")),
 		"signKey": signPublicOf(h.path("keys", "sign.key")), "e2eKey": publicKeyOf(h.path("keys", "e2e.key")),
-		"localPrefixes": h.localPrefixes(), "localAddresses": h.localAddresses(), "status": nil}
-	data, err := os.ReadFile(h.path("status.json"))
+		"localPrefixes": h.localPrefixes(), "localAddresses": h.localAddresses(), "hostRoutes": mesh.HostRoutes(h.dir, "obmesh0"), "status": nil}
+	data, err := os.ReadFile(mesh.StatusPath(h.dir))
 	if err == nil && json.Valid(data) {
 		out["status"] = json.RawMessage(data)
 	} else {
@@ -245,7 +256,7 @@ func (h *meshHost) install() (any, error) {
 		return nil, err
 	}
 	keys := h.path("keys")
-	for _, dir := range []string{h.dir, h.path("bin"), keys} {
+	for _, dir := range []string{h.dir, keys} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fileError(err)
 		}
@@ -272,23 +283,33 @@ func (h *meshHost) install() (any, error) {
 	if r == nil {
 		r = map[string]any{"schema": 1, "installedAt": time.Now().UnixMilli()}
 	}
-	bin := h.binary()
-	if _, err := os.Stat(bin); errors.Is(err, os.ErrNotExist) {
-		exe, err := h.exe()
-		if err != nil {
-			return nil, errors.New("executable_unknown")
-		}
-		if err = copyExecutable(exe, bin); err != nil {
+	exe, err := h.exe()
+	if err != nil {
+		return nil, errors.New("executable_unknown")
+	}
+	bin := exe
+	if meshCopies {
+		bin = h.binary()
+		if err = os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
 			return nil, fileError(err)
 		}
-		r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, h.build(), mesh.ConfigSchemas()
-	} else if err != nil {
-		return nil, fileError(err)
-	} else if _, ok := r["dataBuild"]; !ok {
-		// A copy from an install that stopped before writing its record.
-		if sum, _ := fileHash(bin); sum != "" && sum == h.build() {
-			r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, sum, mesh.ConfigSchemas()
+		if _, err := os.Stat(bin); errors.Is(err, os.ErrNotExist) {
+			if err = copyExecutable(exe, bin); err != nil {
+				return nil, fileError(err)
+			}
+			r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, h.build(), mesh.ConfigSchemas()
+		} else if err != nil {
+			return nil, fileError(err)
+		} else if _, ok := r["dataBuild"]; !ok {
+			// A copy from an install that stopped before writing its record.
+			if sum, _ := fileHash(bin); sum != "" && sum == h.build() {
+				r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, sum, mesh.ConfigSchemas()
+			}
 		}
+	} else if _, ok := r["dataBuild"]; !ok {
+		// A data plane already running (from an older install's copy) keeps its build until
+		// mesh.upgrade restarts it.
+		r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, h.build(), mesh.ConfigSchemas()
 	}
 	r["platform"] = runtime.GOOS
 	if _, ok := r["wintun"]; !ok {
@@ -301,8 +322,10 @@ func (h *meshHost) install() (any, error) {
 		return nil, fileError(err)
 	}
 	version, _ := r["dataVersion"].(string)
-	return map[string]any{"publicKey": public, "controlKey": control, "signKey": signKey, "e2eKey": e2eKey, "platform": runtime.GOOS, "dataVersion": version,
-		"localPrefixes": h.localPrefixes(), "localAddresses": h.localAddresses(), "configSchemas": h.configSchemas(r, nil)}, nil
+	dataBuild, _ := r["dataBuild"].(string)
+	return map[string]any{"publicKey": public, "controlKey": control, "signKey": signKey, "e2eKey": e2eKey, "platform": runtime.GOOS, "dataVersion": version, "dataBuild": dataBuild,
+		"localPrefixes": h.localPrefixes(), "localAddresses": h.localAddresses(), "hostRoutes": mesh.HostRoutes(h.dir, "obmesh0"),
+		"configSchemas": h.configSchemas(r, nil)}, nil
 }
 
 // apply writes the controller's config as given and waits for the data plane
@@ -405,8 +428,9 @@ func certificateView(c transport.Certificate) map[string]any {
 	return map[string]any{"id": c.ID, "fingerprint": c.FingerprintSHA256, "notBefore": c.NotBefore.UnixMilli(), "notAfter": c.NotAfter.UnixMilli()}
 }
 
-// upgrade replaces the data plane's copy when this node's build differs from
-// it, and goes back to the old copy if the new one does not come up.
+// upgrade brings the data plane to this node's build when it runs another: it
+// restarts the service onto the node's own file, or replaces the data plane's
+// copy and goes back to the old one if the new one does not come up.
 func (h *meshHost) upgrade(ctx context.Context) (any, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -423,10 +447,13 @@ func (h *meshHost) upgrade(ctx context.Context) (any, error) {
 	if err != nil || build == "" {
 		return nil, errors.New("executable_unknown")
 	}
-	bin := h.binary()
-	if current, _ := fileHash(bin); current == build {
+	if !h.upgrades(build) {
 		return map[string]any{"from": from, "to": from, "changed": false}, nil
 	}
+	if !meshCopies {
+		return h.restartOnto(ctx, r, exe, build)
+	}
+	bin := h.binary()
 	// This build's data plane signs and encrypts end to end with keys an
 	// older install does not have.
 	signKey, e2eKey, err := h.ensureSecurityKeys()
@@ -482,6 +509,63 @@ func (h *meshHost) upgrade(ctx context.Context) (any, error) {
 		}
 	}
 	os.Remove(old)
+	r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, build, mesh.ConfigSchemas()
+	if err = h.saveRecord(r); err != nil {
+		return nil, fileError(err)
+	}
+	return map[string]any{"from": from, "to": Version, "changed": true, "configSchemas": mesh.ConfigSchemas(), "signKey": signKey, "e2eKey": e2eKey}, nil
+}
+
+// upgrades says whether the data plane runs another build than build: its copy's, or the one
+// recorded when its service was last started onto the node's file (an older install's copy
+// still there counts as another).
+func (h *meshHost) upgrades(build string) bool {
+	if meshCopies {
+		current, _ := fileHash(h.binary())
+		return current != build
+	}
+	running, _ := h.record()["dataBuild"].(string)
+	_, copied := os.Stat(h.path("bin"))
+	return running != build || copied == nil
+}
+
+// restartOnto restarts the data plane onto the node's own file, which a node update replaced;
+// the service of an older install, which ran a copy, is pointed at it first and the copy goes.
+// There is no copy to go back to: a build that does not come up is reported, and the
+// controller tries it once more before it gives that build up.
+func (h *meshHost) restartOnto(ctx context.Context, r map[string]any, exe, build string) (any, error) {
+	from, _ := r["dataVersion"].(string)
+	signKey, e2eKey, err := h.ensureSecurityKeys()
+	if err != nil {
+		return nil, fileError(err)
+	}
+	readable := configReadable(h.path("config.json"))
+	if err = h.service.install(exe, h.dir); err != nil {
+		return nil, errors.New("service_failed: " + err.Error())
+	}
+	before, _ := h.readStatus()
+	running := h.service.state() == "running"
+	if running {
+		if err = h.service.stop(); err != nil {
+			return nil, errors.New("service_failed: " + err.Error())
+		}
+		waitExit(before.Pid, h.exitWait)
+	}
+	os.RemoveAll(h.path("bin"))
+	// The record names the build only once it came up: a failed start leaves the old one, so the
+	// next mesh.upgrade starts it again rather than taking it for done.
+	if _, err = os.Stat(h.path("config.json")); err == nil {
+		wasReady := running && before.Ready && readable
+		ok := false
+		if h.service.start() == nil {
+			_, ok = h.wait(ctx, h.readyWait, func(s meshStatus) bool {
+				return s.Pid > 0 && s.Pid != before.Pid && (s.Ready || !wasReady)
+			})
+		}
+		if !ok {
+			return nil, errors.New("upgrade_not_ready")
+		}
+	}
 	r["dataVersion"], r["dataBuild"], r["configSchemas"] = Version, build, mesh.ConfigSchemas()
 	if err = h.saveRecord(r); err != nil {
 		return nil, fileError(err)
@@ -551,8 +635,14 @@ func (h *meshHost) remove() error {
 		}
 	}
 	waitExit(before.Pid, h.exitWait)
+	// A data plane that was not running cleans up nothing as it goes.
+	mesh.Sweep(h.dir)
 	if r["wintun"] == true {
 		removeWintun(h.dir)
+	}
+	os.Remove(mesh.StatusPath(h.dir))
+	if run := filepath.Dir(mesh.StatusPath(h.dir)); run != h.dir {
+		os.Remove(run)
 	}
 	var err error
 	// Windows may still hold the copy for a moment after the service stopped.
@@ -605,7 +695,7 @@ func (a *Agent) addMeshReport(report map[string]any) func() {
 	if h.record() == nil {
 		return func() {}
 	}
-	data, err := os.ReadFile(h.path("status.json"))
+	data, err := os.ReadFile(mesh.StatusPath(h.dir))
 	var status map[string]json.RawMessage
 	if err != nil || json.Unmarshal(data, &status) != nil || status == nil {
 		return func() {}

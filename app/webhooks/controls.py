@@ -18,6 +18,17 @@ async def impact(s,conn,eid):
     return dict(pendingEvents=count['n'],activeWaits=len(waits),runningStages=jobs+assignments,waitIds=[w['wait_id'] for w in waits],stopped=[],unconfirmed=[])
 
 
+async def discard_backlog(conn,eid=None):
+    """What a deleted endpoint (eid, or every deleted one) still held for dispatch: its batches,
+    whose events are already terminal, and the review holds on those events."""
+    deleted='SELECT endpoint_id FROM webhook_endpoints WHERE deleted_at_ms IS NOT NULL AND (? IS NULL OR endpoint_id=?)'
+    await conn.execute(f"UPDATE webhook_batches SET state='empty' WHERE state IN ('collecting','sealed') AND endpoint_id IN ({deleted})",(eid,eid))
+    await conn.execute(f'UPDATE webhook_events SET review_required=0 WHERE review_required=1 AND terminal_at_ms IS NOT NULL AND endpoint_id IN ({deleted})',(eid,eid))
+    for e in await many(conn,f"SELECT endpoint_id,model_blockers_json FROM webhook_endpoints WHERE endpoint_id IN ({deleted}) AND model_blockers_json LIKE '%review:%'",(eid,eid)):
+        blockers={k:v for k,v in json.loads(e['model_blockers_json']).items() if not k.startswith('review:')}
+        await conn.execute('UPDATE webhook_endpoints SET model_blockers_json=? WHERE endpoint_id=?',(dumps(blockers),e['endpoint_id']))
+
+
 async def tool_constraints(conn, eid, info, action, request):
     """Known Webhook effects, never counts or guessed fields from an external tool."""
     events = await many(conn, 'SELECT event_id FROM webhook_events WHERE endpoint_id=? AND (terminal_at_ms IS NULL OR review_required=1)', (eid,))
@@ -100,7 +111,7 @@ async def control(s,owner,eid,submitted,*,action=None):
                 if action=='pause': blockers['manual:model']={'source':'manual','setAtMs':now}
                 else:
                     blockers.pop('manual:model',None)
-                    blockers={k:v for k,v in blockers.items() if v.get('source')!='stop'}
+                    blockers={k:v for k,v in blockers.items() if v.get('source') not in ('stop','retry')}
                 await conn.execute('UPDATE webhook_endpoints SET model_blockers_json=? WHERE endpoint_id=?',(dumps(blockers),eid))
             else:
                 await conn.execute('UPDATE webhook_endpoints SET paused=?,pause_reason=? WHERE endpoint_id=?',(int(action=='pause'),'manual' if action=='pause' else None,eid))
@@ -122,6 +133,7 @@ async def control(s,owner,eid,submitted,*,action=None):
                 await conn.execute("UPDATE webhook_stage_jobs SET state='cancelled',terminal_at_ms=? WHERE endpoint_id=? AND state IN ('pending','held')",(now,eid))
                 await conn.execute("UPDATE webhook_batch_members SET invalidated_at_ms=?,invalidated_reason='deleted' WHERE invalidated_at_ms IS NULL AND event_id IN (SELECT event_id FROM webhook_events WHERE endpoint_id=?)",(now,eid))
                 await conn.execute("UPDATE webhook_events SET route_state='terminal',terminal_at_ms=?,terminal_reason='endpoint_deleted' WHERE endpoint_id=? AND route_state IN ('pre','eligible','batch','hold','match_conflict')",(now,eid))
+                await discard_backlog(conn,eid)
             else:
                 column='model_blockers_json' if scope=='current' else 'dispatch_blockers_json'; blockers=json.loads(e[column])
                 conversations=[r['conversation_uuid'] for r in info['runningStages'] if 'conversation_uuid' in r]

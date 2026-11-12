@@ -27,6 +27,7 @@ from app.tools.allowlist import AGENT_DELEGATION_TOOL_NAMES
 from app.tools.base import ToolRegistry, ToolRuntimeContext
 from app.web_admin import WebAdminServer
 from app.web_operations import reduce_operation_payload
+from app.tools.agent_actions import schema_tool_names
 
 
 @pytest.fixture
@@ -409,34 +410,16 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
         model_selection=_FakeSelection(),
     )
 
-    assert set(reg.names(scope="main")) == {
-        "Agent",
-        "AgentContinue",
-        "AgentInfo",
-        "AgentMessage",
-        "AgentStop",
-        "AgentWait",
-        "AgentPlanDecision",
-    }
-    assert set(reg.names()) == {
-        "Agent",
-        "AgentContinue",
-        "AgentInfo",
-        "AgentMessage",
-        "AgentStop",
-        "AgentWait",
-        "AgentPlanDecision",
-        "AgentPlanSubmit",
-        "AgentPlanProgress",
-        "AgentPlanReplan",
-        "AgentControlAck",
-    }
-    assert set(reg.names(scope="agent")) == {
-        "AgentPlanSubmit",
-        "AgentPlanProgress",
-        "AgentPlanReplan",
-        "AgentControlAck",
-    }
+    # The model sees one merged tool per side; the earlier tools stay registered and callable behind them.
+    assert set(reg.names(scope="main")) == {"Agent"}
+    assert set(reg.names(scope="agent")) == {"AgentPlan"}
+    assert set(reg.names()) == {"Agent", "AgentPlan"}
+    assert {action: tool.name for action, tool in reg.merged("Agent").actions.items()} == {
+        "start": "Agent", "continue": "AgentContinue", "message": "AgentMessage", "stop": "AgentStop",
+        "wait": "AgentWait", "info": "AgentInfo", "plan": "AgentPlanDecision"}
+    assert {action: tool.name for action, tool in reg.merged("AgentPlan").actions.items()} == {
+        "submit": "AgentPlanSubmit", "progress": "AgentPlanProgress", "replan": "AgentPlanReplan", "ack": "AgentControlAck"}
+    assert {"AgentContinue", "AgentWait", "AgentPlanSubmit", "AgentControlAck"} <= set(reg._tools)
     canonical_tools = sorted(AGENT_DELEGATION_TOOL_NAMES)
     assert set(canonical_tools) == {
         "Bash", "Browser", "Edit", "Process", "Read", "TaskMemory", "Webhook", "Write",
@@ -447,14 +430,21 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     # Structural contract only. Wording of descriptions is validated by the
     # behavioral delegation evals (evals/agent_delegation), not by keyword
     # assertions that pass regardless of actual model behavior.
-    assert agent_schema["parameters"]["required"] == ["prompt", "tools"]
+    assert agent_schema["parameters"]["required"] == []  # start is the default action
+    assert agent_schema["parameters"]["properties"]["action"]["enum"] == ["start", "continue", "message", "stop", "wait", "info", "plan"]
+    # A field several actions share says what it means for each of them.
+    to = agent_schema["parameters"]["properties"]["to"]["description"]
+    assert all(action in to for action in ("continue", "info", "message", "stop")) and "short id" in to
+    task = agent_schema["parameters"]["properties"]["taskUuid"]["description"]
+    assert "plan" in task and "info" in task
+    assert "ignoredFields" in agent_schema["description"]
     assert agent_schema["parameters"]["properties"]["tools"]["items"]["enum"] == []  # no business tools registered in this fixture
     assert agent_schema["parameters"]["properties"]["attachments"]["items"]["type"] == "string"
     plan_mode_schema = agent_schema["parameters"]["properties"]["planMode"]
     assert plan_mode_schema["enum"] == ["direct", "managed"]
     assert plan_mode_schema["default"] == "direct"
 
-    plan_schema = agent_schemas["AgentPlanSubmit"]["parameters"]["properties"]["plan"]
+    plan_schema = agent_schemas["AgentPlan"]["parameters"]["properties"]["plan"]
     assert plan_schema["required"] == ["title", "objective", "steps", "finalOutputs"]
     assert set(plan_schema["properties"]) == {
         "title",
@@ -478,15 +468,14 @@ async def test_agent_registry_exposes_only_controller_agent_tools(agent_tool_env
     tool_request_schema = plan_schema["properties"]["toolRequests"]
     assert tool_request_schema["items"]["properties"]["name"]["enum"] == []  # no business tools registered in this fixture
     assert (
-        main_schemas["AgentPlanDecision"]["parameters"]["properties"]["grantedTools"]["items"]["enum"]
+        main_schemas["Agent"]["parameters"]["properties"]["grantedTools"]["items"]["enum"]
         == []  # no business tools registered in this fixture
     )
     assert "TaskMemory" in canonical_tools
 
-    message_schema = main_schemas["AgentMessage"]
-    expected_schema = message_schema["parameters"]["properties"]["expectedPlanVersion"]
+    expected_schema = main_schemas["Agent"]["parameters"]["properties"]["expectedPlanVersion"]
     assert expected_schema["minimum"] == 0
-    assert "expectedPlanVersion" not in message_schema["parameters"]["required"]
+    assert "expectedPlanVersion" not in reg._tools["AgentMessage"].parameters["required"]
 
 
 def _agent_message_plan(step_id: str = "s1") -> dict:
@@ -633,7 +622,7 @@ async def test_agent_plan_mode_defaults_direct_and_managed_requires_controller_r
     assert direct_task.input["planMode"] == "direct"
     assert _task_public(direct_task)["planMode"] == "direct"
     assert "Agent Plan 强制执行协议" not in backend.calls[0]["system"]
-    assert {tool["name"] for tool in backend.calls[0]["tools"]} == {"Read", "AgentControlAck"}
+    assert schema_tool_names(backend.calls[0]["tools"]) == {"Read", "AgentControlAck"}
 
     managed_raw = await reg.dispatch(
         "Agent",
@@ -682,7 +671,7 @@ class _BlockedRecoveryBackend:
         )
 
     async def complete(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
-        names = {str(item.get("name") or "") for item in tools or []}
+        names = schema_tool_names(tools or [])
         self.calls.append({"messages": list(messages), "names": names, "system": system})
         number = len(self.calls)
         if number == 1:
@@ -1695,7 +1684,7 @@ async def test_agent_uses_web_preset_and_agent_scoped_tools(agent_tool_env):
     assert data["ok"] is True
     assert data["agentSession"]["agentKey"] == "code-reviewer"
     assert "你是代码审查员" in backend.calls[0]["system"]
-    tool_names = {tool["name"] for tool in backend.calls[0]["tools"]}
+    tool_names = schema_tool_names(backend.calls[0]["tools"])
     assert tool_names == {"Read", "AgentControlAck"}
 
 
@@ -1974,7 +1963,7 @@ async def test_rath_manager_rejects_steer_for_waiting_openbear_control(agent_too
     )
     manager = AgentControlService(dao)
 
-    with pytest.raises(RuntimeError, match="AgentMessage"):
+    with pytest.raises(RuntimeError, match=r"Agent\(action=message\)"):
         await manager.steer(task_uuid, "继续")
     assert await dao.pending_controls(task_uuid) == []
 

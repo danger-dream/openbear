@@ -2,7 +2,7 @@
 import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ChatLineRound, CollectionTag, DataAnalysis, EditPen, Hide, Lock, Money, MoreFilled, Search, Timer, Unlock} from "@element-plus/icons-vue";
 import {useMessageVisibility} from './messageVisibility.js';
-import {ListChecks} from "@lucide/vue";
+import {ListChecks, StickyNote} from "@lucide/vue";
 import {useWorkItems} from "./workItems.js";
 const visibility = useMessageVisibility();
 const workItems = useWorkItems();
@@ -20,8 +20,10 @@ const props = defineProps({
 	tokenParts: {type: Object, default: () => ({})},
 	durationText: {type: String, default: "0s"},
 	costText: {type: String, default: "$0.0000"},
+	notesEnabled: {type: Boolean, default: false},
+	notesCount: {type: Number, default: 0},
 });
-const emit = defineEmits(["open-hidden", "open-search", "open-memory", "open-work-items", "open-context", "toggle-scroll-lock", "scroll-to-turn"]);
+const emit = defineEmits(["open-hidden", "open-search", "open-memory", "open-work-items", "open-notes", "open-context", "toggle-scroll-lock", "scroll-to-turn"]);
 const phone = ref(false);
 const menuOpen = ref(false);
 const navigationOpen = ref(false);
@@ -52,6 +54,7 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 <template>
 	<div v-if="phone" class="mobile-conversation-tools">
 		<button type="button" class="mobile-more-button" aria-label="搜索此会话" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="emit('open-search')"><Search/></button>
+		<button v-if="props.notesEnabled" type="button" class="mobile-more-button" :aria-label="props.notesCount ? `打开便签，共 ${props.notesCount} 条` : '打开便签'" @click="emit('open-notes')"><StickyNote class="mobile-lucide" :stroke-width="1.7"/></button>
 		<button type="button" class="mobile-more-button" :aria-label="workItemsSummary.attention ? `更多会话操作，${workItemsSummary.attention} 项任务等你定` : '更多会话操作'" aria-haspopup="dialog" :aria-expanded="menuOpen" @click="menuOpen = !menuOpen"><MoreFilled/><i v-if="workItemsSummary.attention" class="mobile-more-dot" aria-hidden="true"></i></button>
 		<el-drawer v-model="menuOpen" direction="btt" size="auto" title="会话工具" class="mobile-conversation-menu mobile-viewport-sheet" append-to-body>
 			<div class="mobile-sheet-grip" aria-hidden="true"></div>
@@ -76,6 +79,7 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 			</section>
 			<div class="mobile-tool-actions">
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-work-items')"><ListChecks class="mobile-lucide" :stroke-width="1.7"/><span>任务</span><small v-if="workItemsSummary.total" :class="{'mobile-attention': workItemsSummary.attention}">{{ workItemsSummary.attention ? `${workItemsSummary.attention} 项等你定` : `${workItemsSummary.done}/${workItemsSummary.total}` }}</small></button>
+				<button v-if="props.notesEnabled" type="button" @click="chooseAction('open-notes')"><StickyNote class="mobile-lucide" :stroke-width="1.7"/><span>便签</span><small v-if="props.notesCount">{{ props.notesCount }}</small></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-hidden')"><Hide/><span>隐藏内容</span><small v-if="props.hiddenCount">{{ props.hiddenCount }}</small></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-memory')"><CollectionTag/><span>任务记忆</span></button>
 				<button type="button" :disabled="!props.conversationUuid || props.conversationUuid.startsWith('local:')" @click="chooseAction('open-context')"><EditPen/><span>编辑上下文</span></button>

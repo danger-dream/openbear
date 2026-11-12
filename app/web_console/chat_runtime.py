@@ -4,11 +4,16 @@ from __future__ import annotations
 import inspect
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
-from app.agents.supervision import restore_review_state, review_observation
+from app.agents.supervision import (
+    POLL_SECONDS, RUNNING_STATUSES, OversightSettings, digest_has_progress, digest_highlights,
+    in_long_single_step, progress_digest, requires_assessment, restore_review_state, review_due_at_ms,
+    review_observation, scan_alerts, task_brief,
+)
 from app.context.configuration import conversation_strategy
 from app.context.editor import branch_settings, EditedToolRegistry
 from app.context.prompts import effective_context_prompt
 from app.context.prompt_policy import PromptToolRegistry, policy_tool_names
+from app.extensions import ExtensionToolRegistry, split_usage
 from app.context.user_message_template import build_message_variables, render_user_message_suffix, append_user_message_suffix
 from app.context.resume import restore_controller_run_inputs
 from app.context.runtime import ContextManager
@@ -71,6 +76,11 @@ class WebAdminChatRunMixin:
         user_saved = False
         turn_succeeded = False
         controller_notification_ids: set[str] = set()
+        # Same set object: AgentWait adds to it as it claims notifications.
+        notification_hold = self._hold_web_task_notification_claims(controller_notification_ids)
+        notification_payload_hold = self._hold_web_task_notification_claims(
+            set(self._web_task_notification_ids(task_notification_payload)) if task_notification_payload else set()
+        )
         result = RunResult()
         model_cost: dict[str, Any] = {}
         base_model_cost: dict[str, Any] = {}
@@ -175,14 +185,27 @@ class WebAdminChatRunMixin:
                 return append_user_message_suffix(content, render_user_message_suffix(template_settings, variables))
 
             def steer_model_text(text, items):
+                # An interjection's attachments reach the model as a new turn's do: summary text plus image blocks.
+                media = [InboundMedia(**m) for item in items if isinstance(item, dict) for m in item.get('media') or []]
+                content = build_llm_content(build_llm_text_with_media(text, media), media) if media else text
                 humans = [item for item in items if isinstance(item, dict) and item.get('source') in {'web', 'telegram'}]
                 if not humans:
-                    return text
-                return message_with_suffix(text, source=humans[-1]['source'],
-                    message_id=str(humans[-1].get('messageUuid') or humans[-1].get('id') or ''))
+                    return content
+                return message_with_suffix(content, source=humans[-1]['source'],
+                    message_id=str(humans[-1].get('messageUuid') or humans[-1].get('id') or ''),
+                    attachments=[{'name': m.file_name, 'type': m.mime_type, 'kind': m.kind, 'size': m.size} for m in media])
 
             if not edited_context:
                 system = effective_context_prompt(system, await conversation_strategy(self.db, conversation_uuid, self.config.context_management.default_strategy))
+                extensions = getattr(self, 'extensions', None)
+                # A prompt policy with its own tool list owns the tools; extensions do not filter it.
+                if extensions is not None and conversation_uuid and not active_policy['overrideSystemPrompt']:
+                    # Extension usage blocks leave the system prompt and travel with their tools.
+                    system, usage = split_usage(system)
+                    if usage:
+                        extensions.last_usage = usage
+                    await extensions.state(conversation_uuid)
+                    run_tools = ExtensionToolRegistry(run_tools, extensions, conversation_uuid, usage)
             # The live render is only a candidate; the frozen value below is the
             # actual system input for this run. Never log either prompt body.
             log.info(
@@ -341,7 +364,7 @@ class WebAdminChatRunMixin:
                 llm_text += (
                     "\n\n<background-agent-control-context>\n"
                     "当前 Web conversation 仍有 detached Rath/Agent task 在后台运行。用户最新消息先视为发给主会话；它可能是在讨论后台任务、要求你判断是否转告某个 Agent，也可能是独立新需求。\n"
-                    "处理规则：不要把用户消息无条件转发给 Agent。只有当用户明确要控制后台任务时才用 AgentMessage / AgentStop；如果有多个后台任务且目标不明确，先用一句话向用户确认目标。用户表达停止、撤回、上下文错误、任务不该继续时，用 AgentStop，不要用 OpenBearControl 停止 Agent task。若用户指令实质改变了已批准 Plan 的 objective、scope、约束、证据要求或执行方法，必须先根据 planRuntime.activePlanVersion 调用 AgentPlanDecision(action=request_replan)，成功关闭旧 Plan 的执行权限后再调用 AgentMessage；禁止只发 AgentMessage 而让旧 Plan 继续执行。\n"
+                    "处理规则：不要把用户消息无条件转发给 Agent。只有当用户明确要控制后台任务时才用 Agent(action=message) / Agent(action=stop)；如果有多个后台任务且目标不明确，先用一句话向用户确认目标。用户表达停止、撤回、上下文错误、任务不该继续时，用 Agent(action=stop)，不要用 OpenBearControl 停止 Agent task。若用户指令实质改变了已批准 Plan 的 objective、scope、约束、证据要求或执行方法，必须先根据 planRuntime.activePlanVersion 调用 Agent(action=plan, decision=request_replan)，成功关闭旧 Plan 的执行权限后再调用 Agent(action=message)；禁止只发 Agent(action=message) 而让旧 Plan 继续执行。\n"
                     + json.dumps(background_control_payload, ensure_ascii=False, indent=2, default=str)
                     + "\n</background-agent-control-context>"
                 )
@@ -691,6 +714,7 @@ class WebAdminChatRunMixin:
                             context_window=ctx_window,
                             live=True,
                             ledger_usage=ledger_usage,
+                            elapsed_ms=int((time.monotonic() - stage_marks[0][1]) * 1000),
                         ),
                     })
 
@@ -709,6 +733,12 @@ class WebAdminChatRunMixin:
                     root_turn_uuid=root_turn_uuid,
                 )
             ) if self.agent_dao is not None and conversation_uuid else {}
+            oversight_settings = OversightSettings.from_config(self.config.agents)
+            oversight_workspace = str(getattr(self, "workspace_dir", "") or "")
+            # Agents whose progress a review showed; the next AgentWait must judge them.
+            pending_assessments: dict[str, str] = {}
+            # Per-Agent digest lines of the latest wake, for the supervision card.
+            supervision_card: dict[str, Any] = {}
 
             async def _scoped_agent_tasks(*, include_terminal: bool = True) -> list[Any]:
                 if self.agent_dao is None:
@@ -728,6 +758,11 @@ class WebAdminChatRunMixin:
             ) -> dict[str, Any]:
                 tasks = await _scoped_agent_tasks(include_terminal=True)
                 snapshots: list[dict[str, Any]] = []
+                alerts: list[dict[str, Any]] = []
+                card_agents: list[dict[str, Any]] = []
+                needs_assessment: dict[str, str] = {}
+                now_ms = int(time.time() * 1000)
+                unchanged_cursors: dict[str, list[Any]] = {}
                 next_review_state: dict[str, dict[str, Any]] = {}
                 terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
                 counts = {"running": 0, "waitingControl": 0, "terminal": 0, "total": len(tasks)}
@@ -847,6 +882,60 @@ class WebAdminChatRunMixin:
                     observation, next_state = review_observation(
                         task, review_events, plan_runtime, previous, now_ms=int(time.time() * 1000),
                     )
+                    next_review_state[task_uuid] = next_state
+                    for key in ("reviewedAtMs", "digestSeq", "alertSeq", "raisedAlerts"):
+                        if key in previous:
+                            next_state[key] = previous[key]
+                    oversight: dict[str, Any] = {}
+                    if status in RUNNING_STATUSES:
+                        through = int(review_events["highWater"] or 0)
+                        digest = await progress_digest(
+                            self.db, task, after_seq=int(previous.get("digestSeq") or 0), through_seq=through,
+                        )
+                        digest["brief"] = await task_brief(self.db, task)
+                        task_alerts = await scan_alerts(
+                            self.db, task, previous, oversight_settings, workspace=oversight_workspace,
+                        )
+                        due = review_due_at_ms(task, previous, oversight_settings, in_long_step=False)
+                        progressed = digest_has_progress(digest)
+                        if progressed or (due is not None and now_ms >= due):
+                            next_state["reviewedAtMs"] = now_ms
+                        next_state["digestSeq"] = through
+                        next_state["alertSeq"] = through
+                        next_state["raisedAlerts"] = [
+                            *list(previous.get("raisedAlerts") or [])[-200:], *(item["key"] for item in task_alerts),
+                        ]
+                        oversight["progress"] = digest
+                        if task_alerts:
+                            oversight["alerts"] = [
+                                {key: value for key, value in item.items() if key not in {"key", "taskUuid", "title"}}
+                                for item in task_alerts
+                            ]
+                            alerts.extend({key: value for key, value in item.items() if key != "key"}
+                                          for item in task_alerts)
+                        if progressed and requires_assessment(wake_reason):
+                            needs_assessment[task_uuid] = str(getattr(task, "title", "") or "")
+                        highlights = digest_highlights(digest)
+                        if highlights or task_alerts:
+                            card_agents.append({
+                                "taskUuid": task_uuid, "title": str(getattr(task, "title", "") or ""),
+                                "highlights": highlights,
+                                "note": str(digest.get("agentNote") or "")[:160],
+                                "alerts": [item["message"] for item in task_alerts],
+                            })
+                    if (
+                        status in terminal_statuses
+                        and status == previous.get("status")
+                        and not observation["hasActivity"]
+                        and not observation["eventPage"]["hasMore"]
+                        and not events
+                    ):
+                        # Unchanged terminal Agents are only counted; the
+                        # cursor keeps a later wait from treating them as new.
+                        unchanged_cursors[task_uuid] = [
+                            int(next_state["lastEventSeq"] or 0), int(next_state["observedEventSeq"] or 0), status,
+                        ]
+                        continue
                     snapshots.append({
                         **observation,
                         "taskUuid": task_uuid,
@@ -860,6 +949,7 @@ class WebAdminChatRunMixin:
                         # in every status snapshot would re-inject old conclusions
                         # after a later Agent generation and double the batch size.
                         "result": {},
+                        **oversight,
                         "recentEvents": [
                             {
                                 "seq": event.seq,
@@ -877,7 +967,6 @@ class WebAdminChatRunMixin:
                             for event in events
                         ],
                     })
-                    next_review_state[task_uuid] = next_state
                 last_agent_review.clear()
                 last_agent_review.update(next_review_state)
                 deduped_notifications = self._dedupe_web_task_notifications(notifications)
@@ -886,18 +975,93 @@ class WebAdminChatRunMixin:
                     self._controller_task_notification(item) for item in deduped_notifications
                 ]
                 review_pending = any(item["eventPage"]["hasMore"] for item in snapshots)
+                if requires_assessment(wake_reason):
+                    pending_assessments.update(needs_assessment)
+                supervision_card["agents"] = card_agents
                 return {
                     "wakeReason": wake_reason,
+                    **({"alerts": alerts} if alerts else {}),
+                    **({"assessmentsRequired": {
+                        "agents": [{"taskUuid": key, "title": value} for key, value in needs_assessment.items()],
+                        "message": "Your next Agent(action=wait) must pass assessments: one {agent, verdict: continue|correct|stop, basis} per listed Agent, judged from its progress digest.",
+                    }} if needs_assessment else {}),
                     "rootTurnUuid": root_turn_uuid,
                     "reviewPending": review_pending,
-                    **({"message": "Recorded Agent facts remain. Call AgentWait again to read the next page immediately, even if all Agents are terminal; this does not arm a new wait."}
+                    **({"message": "Recorded Agent facts remain. Call Agent(action=wait) again to read the next page immediately, even if all Agents are terminal; this does not arm a new wait."}
                        if review_pending else {}),
                     "summary": counts,
                     "agents": snapshots,
+                    **({"unchangedAgents": {
+                        "count": len(unchanged_cursors),
+                        "note": "Terminal Agents with no change since the last Agent(action=wait) are omitted; use Agent(action=info, op=get) for their snapshot.",
+                        "cursors": unchanged_cursors,
+                    }} if unchanged_cursors else {}),
                     "notifications": controller_notifications,
                     "resultOutputTokens": sum(tokens for tokens, _count in result_budgets),
                     "resultCount": sum(count for _tokens, count in result_budgets),
                 }
+
+            async def _review_cap_at() -> float | None:
+                """Earliest review deadline of the running Agents (epoch seconds)."""
+                dues = []
+                for task in await _scoped_agent_tasks(include_terminal=False):
+                    state = last_agent_review.get(task.task_uuid, {})
+                    long_step = await in_long_single_step(self.db, task.task_uuid, state)
+                    due = review_due_at_ms(task, state, oversight_settings, in_long_step=long_step)
+                    if due is not None:
+                        dues.append(due)
+                return min(dues) / 1000 if dues else None
+
+            async def _has_new_alerts() -> bool:
+                # Detection only; the snapshot that reports an alert marks it raised.
+                for task in await _scoped_agent_tasks(include_terminal=False):
+                    if task.status in RUNNING_STATUSES and await scan_alerts(
+                        self.db, task, last_agent_review.get(task.task_uuid, {}), oversight_settings,
+                        workspace=oversight_workspace,
+                    ):
+                        return True
+                return False
+
+            async def _sleep_until_wake(requested_at: float | None) -> str:
+                """Sleep until an event, the requested review, a review deadline or an alert."""
+                while True:
+                    cap_at = await _review_cap_at()
+                    now = time.time()
+                    if requested_at is not None and now >= requested_at:
+                        return "review_due"
+                    if cap_at is not None and now >= cap_at:
+                        return "review_cap"
+                    timeout = POLL_SECONDS
+                    for deadline in (requested_at, cap_at):
+                        if deadline is not None:
+                            timeout = min(timeout, max(0.01, deadline - now))
+                    try:
+                        await asyncio.wait_for(controller_wake.wait(), timeout=timeout)
+                        return "task_notification"
+                    except TimeoutError:
+                        pass
+                    if await _has_new_alerts():
+                        return "supervision_alert"
+
+            async def _resolve_assessments(raw: Any) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+                """Match assessments to scoped Agents; report required ones still missing."""
+                tasks = await _scoped_agent_tasks(include_terminal=True)
+                resolved: list[dict[str, str]] = []
+                for item in raw if isinstance(raw, list) else []:
+                    ref = str(item.get("agent") or "").strip().lower() if isinstance(item, dict) else ""
+                    matches = [task for task in tasks if ref and (
+                        task.task_uuid.lower().startswith(ref) or str(task.agent_session_uuid or "").lower() == ref
+                        or str(task.title or "").strip().lower() == ref)]
+                    if len(matches) != 1:
+                        continue
+                    resolved.append({"taskUuid": matches[0].task_uuid, "title": str(matches[0].title or ""),
+                                     "verdict": str(item.get("verdict") or ""), "basis": str(item.get("basis") or "")[:500]})
+                judged = {item["taskUuid"] for item in resolved}
+                still_running = {task.task_uuid for task in tasks if task.status not in {
+                    "completed", "failed", "cancelled", "interrupted"}}
+                missing = [{"taskUuid": task_uuid, "title": title} for task_uuid, title in pending_assessments.items()
+                           if task_uuid not in judged and task_uuid in still_running]
+                return resolved, missing
 
             async def _agent_wait(wait_request: dict[str, Any]) -> str:
                 if not conversation_uuid or self.agent_dao is None:
@@ -932,6 +1096,15 @@ class WebAdminChatRunMixin:
                     # Drain recorded facts, not another timed supervision cycle.
                     snapshot = await _aggregate_agent_snapshot(wake_reason="event_backlog", notifications=[])
                     return json.dumps({"ok": True, "skipped": True, **snapshot}, ensure_ascii=False, default=str)
+                assessments, missing = await _resolve_assessments(wait_request.get("assessments"))
+                if missing:
+                    return json.dumps({
+                        "ok": False,
+                        "error": "assessments_required",
+                        "missing": missing,
+                        "message": "The last review showed new progress for these Agents. Call Agent(action=wait) again with assessments: [{agent, verdict: continue|correct|stop, basis}] for each of them; act on correct/stop with Agent(action=message) or Agent(action=stop) first.",
+                    }, ensure_ascii=False)
+                pending_assessments.clear()
                 if not active and not queued_notifications:
                     # No active Agent means there is no supervision cycle to show.
                     # Return the durable snapshot to the model without emitting a
@@ -941,7 +1114,7 @@ class WebAdminChatRunMixin:
                         "ok": True,
                         "skipped": True,
                         "alreadyTerminal": True,
-                        **({"message": "All scoped Agents are already terminal. Do not call AgentWait again; integrate their results and continue the root task as needed."}
+                        **({"message": "All scoped Agents are already terminal. Do not call Agent(action=wait) again; integrate their results and continue the root task as needed."}
                            if not snapshot["reviewPending"] else {}),
                         **snapshot,
                     }, ensure_ascii=False, default=str)
@@ -950,7 +1123,27 @@ class WebAdminChatRunMixin:
                 # one immutable supervision cycle. Its start and wake events share
                 # this id; later real waits get a new chronological position.
                 wait_cycle_uuid = str(uuid.uuid4())
-                planned_review_at_ms = int((time.time() + review_after_s) * 1000) if mode == "review_after" and review_after_s > 0 else 0
+                started_at = time.time()
+                requested_at = started_at + review_after_s if mode == "review_after" and review_after_s > 0 else None
+                cap_at = await _review_cap_at()
+                review_schedule: dict[str, Any] = {}
+                if cap_at is not None and (requested_at is None or cap_at < requested_at):
+                    review_schedule = {
+                        "requestedSeconds": int(review_after_s) if requested_at else None,
+                        "appliedSeconds": max(0, int(cap_at - started_at)),
+                        "capped": True,
+                        "reason": (
+                            f"An Agent must be reviewed within {int(oversight_settings.first_review_s)} s of its start "
+                            f"and then at most every {int(oversight_settings.max_review_interval_s)} s."
+                        ),
+                    }
+                    review_after_s = float(review_schedule["appliedSeconds"])
+                elif requested_at is not None and review_after_s > oversight_settings.max_review_interval_s:
+                    review_schedule = {
+                        "requestedSeconds": int(review_after_s), "appliedSeconds": int(review_after_s), "capped": False,
+                        "reason": "Every running Agent is inside one tool call that began before its last review; the cap returns as soon as that call ends.",
+                    }
+                planned_review_at_ms = int((time.time() + review_after_s) * 1000) if review_after_s > 0 and (mode == "review_after" or review_schedule) else 0
                 status_text = "等待 Agent 事件" if mode == "event_only" else f"计划 {int(review_after_s)} 秒后统一复查 Agent"
                 agents_waiting = len(active) - len(collab_waiting)
                 if collab_waiting:
@@ -970,18 +1163,17 @@ class WebAdminChatRunMixin:
                     "reviewAfterSeconds": review_after_s,
                     "plannedReviewAtMs": planned_review_at_ms,
                     "taskCounts": {"running": len(active)},
+                    "assessments": assessments,
+                    "agents": [],
                 })
                 await self._touch_web_conversation(conversation_uuid, current_status=status_text)
 
                 wake_reason = "task_notification"
                 if not queued_requires_wake and not review_backlog and not steering.has_pending(chat_id):
-                    if mode == "review_after" and review_after_s > 0:
-                        try:
-                            await asyncio.wait_for(controller_wake.wait(), timeout=review_after_s)
-                        except TimeoutError:
-                            wake_reason = "review_due"
+                    if await _has_new_alerts():
+                        wake_reason = "supervision_alert"
                     else:
-                        await controller_wake.wait()
+                        wake_reason = await _sleep_until_wake(requested_at)
                 controller_wake.clear()
                 collab_service = getattr(self, "collab", None)
                 if steering.has_pending(chat_id):
@@ -1039,6 +1231,14 @@ class WebAdminChatRunMixin:
                     status_text = "统一复查时间已到" if collab_waiting else "Agent 统一复查时间已到"
                     status_value = "completed"
                     active_value = False
+                elif wake_reason == "review_cap":
+                    status_text = "已到复查时限，主控复查 Agent 进展"
+                    status_value = "completed"
+                    active_value = False
+                elif wake_reason == "supervision_alert":
+                    status_text = "Agent 出现需要关注的情况，已唤醒主控"
+                    status_value = "completed"
+                    active_value = False
                 elif any(str(item.get("kind") or "") == "task-notification-collab" for item in notifications):
                     status_text = "会话请求有新进展"
                     status_value = "completed"
@@ -1063,7 +1263,12 @@ class WebAdminChatRunMixin:
                     "reviewAfterSeconds": review_after_s,
                     "wakeReason": wake_reason,
                     "taskCounts": summary,
+                    "agents": list(supervision_card.get("agents") or []),
                 })
+                if review_schedule:
+                    snapshot["reviewSchedule"] = review_schedule
+                if assessments:
+                    snapshot["assessmentsRecorded"] = len(assessments)
                 if wake_reason == "user_interruption":
                     # Real text remains in steering and is persisted/injected by the
                     # normal loop boundary. Return its stable queue id as the formal
@@ -1159,6 +1364,11 @@ class WebAdminChatRunMixin:
                      native=restored_controller_anchor is not None,
                      **{name: int((at - stage_marks[index][1]) * 1000)
                         for index, (name, at) in enumerate(stage_marks[1:])})
+            # Live stats estimate the first request's cached share from the previous one.
+            prior_usage = await messages.usage_totals(chat_id)
+            result.live_output.note_prompt(Usage(
+                input_tokens=prior_usage.last_input_tokens, cache_read_tokens=prior_usage.last_cache_read_tokens,
+                cache_write_tokens=prior_usage.last_cache_write_tokens))
             result = await agent.run(
                 convo, renderer, model=model_id, system=system,
                 max_tokens=max_tokens,
@@ -1323,6 +1533,8 @@ class WebAdminChatRunMixin:
             if conversation_uuid:
                 await self._touch_web_conversation(conversation_uuid, status="error", current_status="出错", last_error=f"{type(exc).__name__}: {exc}")
         finally:
+            self._release_web_task_notification_claims(notification_hold)
+            self._release_web_task_notification_claims(notification_payload_hold)
             if instance_binding:
                 from app.instances.security import _AUDIT, _REFERENCE_AUTH
                 try:

@@ -10,10 +10,12 @@ import ServerCard from './ServerCard.vue';
 import { dragEdgeScroll } from './dragEdgeScroll.js';
 import { nodeStateTag, updateAllText, updateSummary } from './nodeVersions.js';
 import { bytes, daysLeft, expiryTone, flag, monthly, percent, rate, regionName, safeError, spendInCny, tone, noAutofill } from './serverHelpers.js';
+import { latencyTone, lossText, lossTone, ms, pingTitle } from './detail/detailHelpers.js';
+import PingStrip from './PingStrip.vue';
 
 const props = defineProps({items: {type: Array, required: true}, now: {type: Number, required: true}, loading: Boolean,
-  spark: {type: Object, default: () => ({})}, build: {type: Object, default: () => ({})}, fx: {type: Object, default: null}});
-const emit = defineEmits(['open', 'terminal', 'add', 'changed', 'reordered']);
+  spark: {type: Object, default: () => ({})}, pings: {type: Object, default: () => ({})}, build: {type: Object, default: () => ({})}, fx: {type: Object, default: null}});
+const emit = defineEmits(['open', 'terminal', 'desktop', 'bgp', 'add', 'changed', 'reordered']);
 const VIEW = 'openbear.servers.view';
 const group = ref(''), region = ref(''), sort = ref('default'), query = ref(''), quick = ref(''), updating = ref(false);
 const view = ref(localStorage.getItem(VIEW) === 'list' ? 'list' : 'cards');
@@ -126,6 +128,9 @@ async function saveOrder(ids) {
 }
 onBeforeUnmount(() => stopEdgeScroll());
 const pct = (u) => u?.total ? Math.round(percent(u.used, u.total)) : 0;
+// The table's 延迟 and 丢包 columns, there while any server is measured.
+const pinged = computed(() => Object.keys(props.pings).length > 0);
+const pingOf = item => props.pings[item.id] || null;
 const trafficPct = i => i.traffic?.limit ? Math.round(percent(i.traffic.used, i.traffic.limit)) : null;
 </script>
 <template>
@@ -187,15 +192,18 @@ const trafficPct = i => i.traffic?.limit ? Math.round(percent(i.traffic.used, i.
     <draggable v-else-if="view === 'cards'" :model-value="shown" item-key="id" class="pb-grid" handle=".pb-grip" :animation="160" ghost-class="so-ghost" :scroll="false"
       :disabled="!sortable || savingOrder" :move="sameSection" @update:model-value="dropped" @start="dragStart" @end="dragEnd">
       <template #item="{element: item}">
-        <ServerCard :item="item" :now="now" :spark="spark[item.id]" :sortable="sortable" @open="emit('open', $event)" @terminal="emit('terminal', $event)" />
+        <ServerCard :item="item" :now="now" :spark="spark[item.id]" :ping="pings[item.id] || null" :sortable="sortable" @open="emit('open', $event)" @terminal="emit('terminal', $event)"
+          @desktop="emit('desktop', $event)" @bgp="(item, anchor) => emit('bgp', item, anchor)" />
       </template>
     </draggable>
-    <draggable v-else :model-value="shown" item-key="id" class="pl" role="table" aria-label="服务器列表" handle=".pb-grip" :animation="160" ghost-class="so-ghost" :scroll="false"
+    <draggable v-else :model-value="shown" item-key="id" class="pl" :class="{'has-ping': pinged}" role="table" aria-label="服务器列表" handle=".pb-grip" :animation="160" ghost-class="so-ghost" :scroll="false"
       :disabled="!sortable || savingOrder" :move="sameSection" @update:model-value="dropped" @start="dragStart" @end="dragEnd">
       <template #header>
         <div class="pl-head" role="row">
           <span role="columnheader">服务器</span><span role="columnheader">CPU</span><span role="columnheader">内存</span><span role="columnheader">硬盘</span>
-          <span role="columnheader">网速</span><span role="columnheader">本期流量</span><span role="columnheader">到期</span><span role="columnheader">价格</span>
+          <span role="columnheader">网速</span><span role="columnheader">本期流量</span>
+          <template v-if="pinged"><span role="columnheader">延迟</span><span role="columnheader">丢包</span></template>
+          <span role="columnheader">到期</span><span role="columnheader">价格</span>
         </div>
       </template>
       <template #item="{element: item}">
@@ -218,6 +226,14 @@ const trafficPct = i => i.traffic?.limit ? Math.round(percent(i.traffic.used, i.
         </template>
         <span v-else class="pl-off" role="cell">{{ item.node ? '离线' : '未安装节点' }}</span>
         <span class="pl-traffic" :class="{'has-limit': trafficPct(item) !== null}" role="cell" :data-tone="trafficPct(item) === null ? '' : tone(trafficPct(item))"><span class="pl-used">{{ item.traffic ? bytes(item.traffic.used) : '—' }}</span><small v-if="trafficPct(item) !== null">{{ trafficPct(item) }}%</small></span>
+        <template v-if="pinged">
+          <span v-for="kind in ['latency', 'loss']" :key="kind" class="pl-ping" role="cell" :data-ping="kind" :title="pingOf(item) ? pingTitle(pingOf(item), kind) : null"
+            :data-tone="!pingOf(item) ? null : kind === 'latency' ? latencyTone(pingOf(item).avg) : lossTone(pingOf(item).loss)">
+            <template v-if="pingOf(item)"><b>{{ kind === 'latency' ? (pingOf(item).avg == null ? '—' : ms(pingOf(item).avg)) : lossText(pingOf(item).loss) }}</b>
+              <PingStrip :cells="pingOf(item).cells" :kind="kind" /></template>
+            <b v-else>—</b>
+          </span>
+        </template>
         <span class="pl-expiry" role="cell" :data-tone="expiryTone(item.profile.billing, new Date(now))">{{ expiry(item) === null ? (item.profile.billing?.cycle === -1 ? '一次性' : '—') : expiry(item) < 0 ? `过期 ${-expiry(item)} 天` : expiry(item) > 36500 ? '长期' : `${expiry(item)} 天` }}</span>
         <span class="pl-price" role="cell">{{ monthly(item.profile.billing) ? money(item.profile.billing.currency || '', monthly(item.profile.billing)) + '/月' : '—' }}</span>
       </div>

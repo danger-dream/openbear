@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import ValidationError
 
+from app.browser.contract import ACTIONS
 from app.browser.config import BrowserConfig
 from app.browser.service import BrowserService
 from app.browser.worker import WorkerError
@@ -251,8 +252,9 @@ async def test_server_node_browsers_are_described_only_on_a_controller(service):
     instance = spec()
     assert "node" not in instance["parameters"]["properties"]["params"]["properties"]
     assert "server node" not in instance["description"]
-    described = json.dumps(await service.call({"action": "describe"}, ctx()))
-    assert "node?" not in described and "server node" not in described
+    described = await service.call({"action": "describe"}, ctx())
+    assert set(described["actions"]) == set(ACTIONS) and all(len(line) < 120 for line in described["actions"].values())
+    assert "node?" not in json.dumps(described) and "server node" not in json.dumps(described)
 
     service.nodes = SimpleNamespace(any_browser=False)
     controller = spec()

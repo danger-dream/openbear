@@ -360,7 +360,6 @@ class WebAdminConversationTreeMixin:
             f"""
             SELECT conversation_uuid,COUNT(*) AS active_count,
                    SUM(CASE WHEN lifecycle='paused' THEN 1 ELSE 0 END) AS paused_count,
-                   SUM(CASE WHEN lifecycle='waiting_control' THEN 1 ELSE 0 END) AS waiting_control_count,
                    SUM(CASE WHEN op_type='user_interaction' AND lifecycle='active' THEN 1 ELSE 0 END) AS pending_interaction_count,
                    MAX(CASE WHEN op_type IN ('run','agent','user_interaction') THEN created_at_ms ELSE 0 END) AS active_started_at_ms
             FROM web_operations
@@ -374,7 +373,6 @@ class WebAdminConversationTreeMixin:
             str(row["conversation_uuid"]): {
                 "activeCount": int(row["active_count"] or 0),
                 "pausedCount": int(row["paused_count"] or 0),
-                "waitingControlCount": int(row["waiting_control_count"] or 0),
                 "pendingInteractionCount": int(row["pending_interaction_count"] or 0),
                 "activeStartedAtMs": int(row["active_started_at_ms"] or 0),
             }
@@ -490,7 +488,7 @@ class WebAdminConversationTreeMixin:
             cur = await self.db.conn.execute(
                 f"""
                 SELECT chat_id, COUNT(*) AS active_count,
-                       SUM(CASE WHEN status IN ('paused','needs_openbear_control') THEN 1 ELSE 0 END) AS waiting_count,
+                       SUM(CASE WHEN status='paused' THEN 1 ELSE 0 END) AS waiting_count,
                        MAX(started_at) AS started_at
                 FROM rath_tasks
                 WHERE chat_id IN ({placeholders})
@@ -540,9 +538,10 @@ class WebAdminConversationTreeMixin:
             activity = activity_fields(row)
             if not running and not activity["activityUnread"] and conv_uuid not in recent_times:
                 continue
+            # An Agent waiting for controller adjudication belongs to the
+            # controller, not the user; it stays running, never waiting.
             needs_attention = bool(
-                pending or int(facts.get("waitingControlCount") or 0)
-                or int(facts.get("pendingInteractionCount") or 0)
+                pending or int(facts.get("pendingInteractionCount") or 0)
                 or int(facts.get("pausedCount") or 0) or rath_waiting.get(chat_id, 0)
             )
             folder_path = self._tree_folder_path(str(row.get("folder_uuid") or ""), folders)

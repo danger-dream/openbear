@@ -35,6 +35,9 @@ def test_reported_addresses_are_ip_literals_and_ipv4_public():
         assert hub_module.clean_info({'ipv6': bad})['ipv6'] == '', bad
     # Written out in canonical form.
     assert hub_module.clean_info({'ipv6': '2001:4860:0:0:0:0:0:1'})['ipv6'] == '2001:4860::1'
+    # OpenWrt's flag only as itself, and only when set.
+    assert hub_module.clean_info({'openwrt': True})['openwrt'] is True
+    assert 'openwrt' not in hub_module.clean_info({'openwrt': 'yes'}) and 'openwrt' not in hub_module.clean_info({})
 
 
 def test_an_unusable_endpoint_or_reflector_is_left_out_not_the_config():
@@ -174,6 +177,10 @@ async def test_location_is_looked_up_at_most_once_per_interval_per_node(env, mon
         looked.append(ip)
         return {'ip': ip, 'country': 'DE'}
     monkeypatch.setattr(service_module.geo, 'lookup', lookup)
+
+    async def networks(http, ips):
+        return {}
+    monkeypatch.setattr(service_module.geo, 'fetch_networks', networks)
     sid = (await api(e, 'POST', '/api/servers', {'name': 'g'}))['item']['id']
     async with e.db.write_transaction(label='test') as conn:
         await conn.execute('INSERT INTO server_nodes(server_id,owner,public_key,info_json,enrolled_ms) VALUES(?,?,?,?,1)', (sid, 123, 'g', '{}'))
@@ -185,6 +192,37 @@ async def test_location_is_looked_up_at_most_once_per_interval_per_node(env, mon
     # The next lookup waits out the interval, then takes the address the node has by then.
     assert looked == ['45.32.100.1', '45.32.100.3']
 
+
+async def test_the_network_of_both_addresses_is_looked_up_once_per_change(env, monkeypatch):  # noqa: F811
+    e = env
+    monkeypatch.setattr(service_module, 'GEO_EVERY_S', 0)
+    asked = []
+
+    async def lookup(http, ip):
+        return {'ip': ip, 'country': 'DE'}
+
+    async def networks(http, ips):
+        asked.append(list(ips))
+        return {ip: {'country': 'DE', 'countryName': 'Germany', 'asn': 3214, 'org': 'xTom GmbH'} for ip in ips}
+    monkeypatch.setattr(service_module.geo, 'lookup', lookup)
+    monkeypatch.setattr(service_module.geo, 'fetch_networks', networks)
+    sid = (await api(e, 'POST', '/api/servers', {'name': 'n'}))['item']['id']
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute('INSERT INTO server_nodes(server_id,owner,public_key,info_json,enrolled_ms) VALUES(?,?,?,?,1)', (sid, 123, 'n', '{}'))
+
+    async def hello(info):
+        await e.servers.node_hello(sid, info, {}, 'test')
+        await asyncio.sleep(0.05)
+        return (await api(e, 'GET', f'/api/servers/{sid}'))['item']['node']
+    node = await hello({'ipv4': '45.32.100.1', 'ipv6': '2a0e:6901::1'})
+    assert asked == [['45.32.100.1', '2a0e:6901::1']]
+    assert node['network'] == {'ips': ['45.32.100.1', '2a0e:6901::1'], 'v4': {'country': 'DE', 'countryName': 'Germany', 'asn': 3214, 'org': 'xTom GmbH'},
+                               'v6': {'country': 'DE', 'countryName': 'Germany', 'asn': 3214, 'org': 'xTom GmbH'}}
+    await hello({'ipv4': '45.32.100.1', 'ipv6': '2a0e:6901::1'})
+    assert len(asked) == 1, 'the same addresses are not looked up again'
+    # A new address is looked up again; one the node did not report keeps its last value.
+    node = await hello({'ipv4': '45.32.100.9'})
+    assert asked[-1] == ['45.32.100.9', '2a0e:6901::1'] and node['network']['ips'][0] == '45.32.100.9'
 
 # ----- S14: job_wait -----
 async def test_job_wait_asks_at_most_once_per_round_while_output_keeps_coming(monkeypatch):

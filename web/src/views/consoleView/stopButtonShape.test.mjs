@@ -22,7 +22,7 @@ const renderControl=compile(`${stopBranch.loc.source}\n${sendBranch.loc.source}`
 const render=compile(button.loc.source);
 function harness(storage=new Map(), initialProps={}){
   const timers=new Map(), emitted=[], stops=[];let sequence=0;
-  const props=reactive({conversationUuid:'a',running:true,draft:'',canSend:false,...initialProps});
+  const props=reactive({conversationUuid:'a',running:true,draft:'',canSend:false,pendingAttachments:[],...initialProps});
   const context=vm.createContext({userStorage,props,ref,watch:(...args)=>{const stop=watch(...args);stops.push(stop);return stop;},emit:(...args)=>emitted.push(args),
     window:{localStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)},setTimeout:(fn,ms)=>{timers.set(++sequence,{fn,ms});return sequence;},clearTimeout:id=>timers.delete(id)}});
   vm.runInContext(actual,context);
@@ -106,6 +106,8 @@ test('saved shape applies on the first idle render and throughout send/stop bran
     {running:true,draft:'',canSend:false},
     {running:true,draft:'补充内容',canSend:true},
     {running:true,draft:'  ',canSend:false},
+    // An image alone is an interjection to send, not a reason to stop.
+    {running:true,draft:'',canSend:true,pendingAttachments:[{id:'img'}]},
     {running:false,draft:'',canSend:false},
   ];
   for(const shape of ['circle','square']){
@@ -116,9 +118,9 @@ test('saved shape applies on the first idle render and throughout send/stop bran
       try{
         assert.equal(instance.bindings.stopButtonShape,shape,'preference is available synchronously, before first render');
         for(const state of [initialProps,...states]){
-          Object.assign(instance.props,state);
+          Object.assign(instance.props,{pendingAttachments:[],...state});
           const {html,events}=await instance.renderControl();
-          const stopping=state.running&&!state.draft.trim();
+          const stopping=state.running&&!state.draft.trim()&&!state.pendingAttachments?.length;
           assert.equal(/is-round/.test(html),shape==='circle',JSON.stringify(state));
           assert.equal(/stop-button/.test(html),stopping);
           if(stopping){

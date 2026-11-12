@@ -5,6 +5,7 @@ package node
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,9 +41,14 @@ type Collector struct {
 	ioAt     time.Time
 	block    map[string]bool
 	blockAt  time.Time
+	// listening counts listening TCP sockets; tests that fake /proc leave it nil.
+	listening func() (int, bool)
+	listen    int
+	listenOK  bool
+	listenAt  time.Time
 }
 
-func NewCollector() *Collector { return &Collector{root: "/"} }
+func NewCollector() *Collector { return &Collector{root: "/", listening: tcpListening} }
 
 func (c *Collector) path(p string) string { return filepath.Join(c.root, p) }
 
@@ -56,8 +62,10 @@ func (c *Collector) Info() Info {
 	info.Hostname, _ = os.Hostname()
 	info.Kernel = strings.TrimSpace(string(c.read("proc/sys/kernel/osrelease")))
 	info.OS = osName(c.read("etc/os-release"))
-	info.CPU = cpuModel(c.read("proc/cpuinfo"))
+	info.CPU = cmp.Or(cpuModel(c.read("proc/cpuinfo")), armCPU(c.read("proc/cpuinfo"), c.read("proc/device-tree/compatible")))
 	info.Virtualization = c.virtualization()
+	_, err := os.Stat(c.path("etc/openwrt_release"))
+	info.OpenWrt = err == nil
 	mem := meminfo(c.read("proc/meminfo"))
 	info.MemTotal, info.SwapTotal = mem["MemTotal"], mem["SwapTotal"]
 	info.DiskTotal, _ = c.disks()
@@ -97,6 +105,54 @@ func cpuModel(b []byte) string {
 		}
 	}
 	return ""
+}
+
+// armCores names ARM Ltd cores by their "CPU part" (implementer 0x41).
+var armCores = map[string]string{
+	"0xd03": "Cortex-A53", "0xd04": "Cortex-A35", "0xd05": "Cortex-A55", "0xd07": "Cortex-A57", "0xd08": "Cortex-A72",
+	"0xd09": "Cortex-A73", "0xd0a": "Cortex-A75", "0xd0b": "Cortex-A76", "0xd0c": "Neoverse-N1", "0xd0d": "Cortex-A77",
+	"0xd40": "Neoverse-V1", "0xd41": "Cortex-A78", "0xd44": "Cortex-X1", "0xd46": "Cortex-A510", "0xd47": "Cortex-A710",
+	"0xd48": "Cortex-X2", "0xd49": "Neoverse-N2", "0xd4d": "Cortex-A715", "0xd4e": "Cortex-X3", "0xd4f": "Neoverse-V2",
+	"0xd80": "Cortex-A520", "0xd81": "Cortex-A720", "0xd82": "Cortex-X4",
+}
+
+var socVendors = map[string]string{"rockchip": "Rockchip", "brcm": "Broadcom", "allwinner": "Allwinner", "amlogic": "Amlogic",
+	"mediatek": "MediaTek", "qcom": "Qualcomm", "fsl": "NXP", "nxp": "NXP", "marvell": "Marvell", "starfive": "StarFive"}
+
+// armCPU describes an ARM board's processor, whose cpuinfo has no model name: the SoC from the
+// device tree's most generic compatible entry, then the cores by kind, e.g.
+// "Rockchip RK3588 (4× Cortex-A76 + 4× Cortex-A55)".
+func armCPU(cpuinfo, compatible []byte) string {
+	counts, order := map[string]int{}, []string{}
+	for _, line := range strings.Split(string(cpuinfo), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "CPU part" {
+			name := armCores[strings.ToLower(strings.TrimSpace(v))]
+			if name == "" {
+				name = "ARM " + strings.TrimSpace(v)
+			}
+			if counts[name] == 0 {
+				order = append(order, name)
+			}
+			counts[name]++
+		}
+	}
+	var cores []string
+	for _, name := range order {
+		cores = append(cores, strconv.Itoa(counts[name])+"× "+name)
+	}
+	soc := ""
+	if entries := strings.Split(strings.TrimRight(string(compatible), "\x00"), "\x00"); len(entries) > 0 {
+		if vendor, chip, ok := strings.Cut(entries[len(entries)-1], ","); ok && socVendors[vendor] != "" {
+			soc = socVendors[vendor] + " " + strings.ToUpper(chip)
+		}
+	}
+	switch {
+	case soc != "" && len(cores) > 0:
+		return soc + " (" + strings.Join(cores, " + ") + ")"
+	case len(cores) > 0:
+		return strings.Join(cores, " + ")
+	}
+	return soc
 }
 
 func (c *Collector) virtualization() string {
@@ -285,6 +341,33 @@ func (c *Collector) sockets() (tcp, udp int) {
 	return
 }
 
+// tcpStates: established connections from the kernel's TCP counters (CurrEstab), and listening
+// sockets from a socket-diag query that returns only those, at most every 15 seconds.
+func (c *Collector) tcpStates(now time.Time) (estab, listen *int) {
+	lines := strings.Split(string(c.read("proc/net/snmp")), "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		names, values := strings.Fields(lines[i]), strings.Fields(lines[i+1])
+		if len(names) == 0 || names[0] != "Tcp:" || len(values) != len(names) || values[0] != "Tcp:" {
+			continue
+		}
+		for j, name := range names {
+			if n, err := strconv.Atoi(values[j]); name == "CurrEstab" && err == nil {
+				estab = &n
+			}
+		}
+		break
+	}
+	if c.listening != nil && now.Sub(c.listenAt) >= 15*time.Second {
+		c.listen, c.listenOK = c.listening()
+		c.listenAt = now
+	}
+	if c.listenOK {
+		n := c.listen
+		listen = &n
+	}
+	return
+}
+
 // wholeDisk reports block devices backed by hardware or a hypervisor disk;
 // partitions, loop, device-mapper and md devices would double count.
 func (c *Collector) wholeDisk(name string) bool {
@@ -363,6 +446,7 @@ func (c *Collector) Sample() Sample {
 	}
 	c.ioR, c.ioW, c.ioAt = read, write, now
 	s.TCP, s.UDP = c.sockets()
+	s.TCPEstab, s.TCPListen = c.tcpStates(now)
 	s.Processes = c.processes()
 	if f := strings.Fields(string(c.read("proc/uptime"))); len(f) > 0 {
 		up, _ := strconv.ParseFloat(f[0], 64)

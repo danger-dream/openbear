@@ -17,6 +17,7 @@ import (
 	"openbear/node"
 	"openbear/node/browser"
 	"openbear/node/mesh"
+	"openbear/node/mesh/bypass"
 )
 
 const usage = `openbear-node connects this machine to an OpenBear controller.
@@ -62,6 +63,9 @@ func run(args []string) error {
 	case "browser-engine":
 		// Same length-prefixed stdin/stdout protocol as app/browser/pyworker.
 		return browser.Serve(ctx, os.Stdin, os.Stdout)
+	case "bypass-run":
+		// Started by the node for a command that bypasses a transparent proxy; see node/bypass_run_linux.go.
+		return node.RunBypassed(args[1:])
 	case "job-run":
 		// Started by the node for one background job; see node/jobs.go.
 		if len(args) != 2 {
@@ -76,6 +80,10 @@ func run(args []string) error {
 			return errors.New("usage: openbear-node mesh run --dir DIR")
 		}
 		mesh.Version = node.Version
+		// Every socket of the data plane, so a transparent proxy's rules let them be (package bypass).
+		if err := bypass.SetProcess(); err != nil {
+			log.Printf("mesh: bypass group: %v", err)
+		}
 		return meshRun(ctx, *dir)
 	case "version", "--version":
 		fmt.Printf("openbear-node %s (protocol v%d)\n", node.Version, node.ProtocolVersion)
@@ -98,10 +106,20 @@ func run(args []string) error {
 		noExec := fs.Bool("no-exec", false, "refuse commands, file access and remote updates from the controller")
 		noTerminal := fs.Bool("no-terminal", false, "refuse web terminal sessions")
 		browser := fs.Bool("browser", false, "let the controller drive a browser on this machine, with its network and logins")
+		pin := fs.String("pin", "", "SHA-256 of the certificate --url presents instead of a CA-signed one (an exit's front access)")
+		backupPin := fs.String("backup-pin", "", "the same for --backup")
+		front := fs.Bool("front", false, "this machine is a front: the node asks nothing beyond its exits by itself")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		c, err := node.Enroll(ctx, *url, *backup, *code, *fingerprint, node.Capabilities{Exec: !*noExec, Terminal: !*noTerminal, Browser: *browser})
+		access := node.EnrollAccess{Front: *front}
+		if *pin != "" {
+			access.Pins = []string{*pin}
+		}
+		if *backupPin != "" {
+			access.BackupPins = []string{*backupPin}
+		}
+		c, err := node.Enroll(ctx, *url, *backup, *code, *fingerprint, node.Capabilities{Exec: !*noExec, Terminal: !*noTerminal, Browser: *browser}, access)
 		if err != nil {
 			return err
 		}

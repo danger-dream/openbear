@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {ref, nextTick} from 'vue';
 import {createAttachmentDraftStorage} from './attachmentDraftStorage.js';
+import {forgetExtensionDraft} from './extensionDrafts.js';
 import {draftEnvironment, mountDraftConsole, settleDraftConsole, deferred, draftFile, draftNames} from './consoleDraftLifecycleHarness.mjs';
 
 const TEXT_KEY = 'openbear.console.drafts.v1';
@@ -68,7 +69,7 @@ function appDeletion(env, {mounted = null, confirm = async () => true} = {}) {
   const row = {conversationUuid: 'local:new', local: true, folderId: '', title: '新会话'};
   const focused = [], notices = [], deletes = [];
   const attachmentDrafts = createAttachmentDraftStorage({driver: env.driver});
-  const context = vm.createContext({userStorage,
+  const context = vm.createContext({userStorage, forgetExtensionDraft,
     window: env.window, consoleViewRef: ref(mounted), attachmentDrafts,
     conversations: ref([row]), activeConversationUuid: ref('local:new'), selectedFolderId: ref(''),
     deletingConversations: new Set(), conversationTreeRef: ref({forgetConversation() {}}),

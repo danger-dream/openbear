@@ -63,7 +63,7 @@ type e2eSubnet struct {
 	n *e2eNode
 }
 
-func e2eTableFor(c *Config) (*e2eTable, error) {
+func e2eTableFor(c *Config, a Attachment) (*e2eTable, error) {
 	t := &e2eTable{self: c.Self.Address, byAddr: map[netip.Addr]*e2eNode{}, byID: map[string]*e2eNode{}}
 	for i := range c.Nodes {
 		n := &c.Nodes[i]
@@ -71,7 +71,7 @@ func e2eTableFor(c *Config) (*e2eTable, error) {
 		if err != nil {
 			return nil, fmt.Errorf("node %s: e2eKey: %w", n.ID, err)
 		}
-		e := &e2eNode{id: n.ID, key: k, addr: n.Address, prefixes: sortPrefixes(memberPrefixes(c, n))}
+		e := &e2eNode{id: n.ID, key: k, addr: n.Address, prefixes: sortPrefixes(memberPrefixes(c, a, n))}
 		t.byAddr[n.Address], t.byID[n.ID] = e, e
 		for _, p := range e.prefixes {
 			if p != host(n.Address) {
@@ -169,10 +169,10 @@ func e2eTrials(l e2eLimits) int { return max(4, l.device.MaxPeers/4) }
 
 const e2eTrialGrace = 5 * time.Second
 
-// newE2E starts the inner device with privateKey (base64) for c. send
+// newE2E starts the inner device with privateKey (base64) for c and a. send
 // takes an outer packet to the scheduler; deliver takes decrypted packets,
 // at offset in bufs.
-func newE2E(c *Config, privateKey string, send func(b []byte, hash uint64), deliver func(bufs [][]byte, offset int), events func(kind, detail string)) (*e2eSessions, error) {
+func newE2E(c *Config, a Attachment, privateKey string, send func(b []byte, hash uint64), deliver func(bufs [][]byte, offset int), events func(kind, detail string)) (*e2eSessions, error) {
 	key, err := keyHex(privateKey)
 	if err != nil {
 		return nil, errors.New("keys/e2e.key is not a base64 32-byte key")
@@ -180,7 +180,7 @@ func newE2E(c *Config, privateKey string, send func(b []byte, hash uint64), deli
 	l := e2eLimitsFor(c)
 	s := &e2eSessions{limits: l, events: events, peers: map[string]*e2ePeer{}, tokens: l.burst, trialTokens: l.burst / 2, proofs: make(chan e2eProof, 256), now: time.Now}
 	s.filled = s.now()
-	s.tun = newInnerTUN(c.Network.MTU-e2eOverhead, l.queue, deliver)
+	s.tun = newInnerTUN(c.ownMTU()-e2eOverhead, l.queue, deliver)
 	s.bind = newInnerBind(c.Self.Address, l, send)
 	s.tun.authenticated = s.prove
 	wl := newWGLog(func(msg string) { events("e2e.error", msg) })
@@ -192,7 +192,7 @@ func newE2E(c *Config, privateKey string, send func(b []byte, hash uint64), deli
 		s.dev.Close()
 		return nil, err
 	}
-	if err := s.configure(c); err != nil {
+	if err := s.configure(c, a); err != nil {
 		s.dev.Close()
 		return nil, err
 	}
@@ -203,15 +203,17 @@ func newE2E(c *Config, privateKey string, send func(b []byte, hash uint64), deli
 	return s, nil
 }
 
-// configure moves the sessions to c: peers of nodes gone or rekeyed are
-// removed, the others take their new prefixes.
-func (s *e2eSessions) configure(c *Config) error {
-	t, err := e2eTableFor(c)
+// configure moves the sessions to c and what a says: peers of nodes gone
+// or rekeyed are removed, the others take their new prefixes.
+func (s *e2eSessions) configure(c *Config, a Attachment) error {
+	t, err := e2eTableFor(c, a)
 	if err != nil {
 		return err
 	}
 	s.bind.setSelf(c.Self.Address, t)
-	s.tun.setMTU(c.Network.MTU - e2eOverhead)
+	// The inner device pads to its MTU at most: what it seals then fits this
+	// node's links.
+	s.tun.setMTU(c.ownMTU() - e2eOverhead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.limits.device.MaxPeers = e2eLimitsFor(c).device.MaxPeers
@@ -427,6 +429,14 @@ func (s *e2eSessions) sendControl(b []byte, n *e2eNode) {
 	}
 }
 
+// sendPath sends b, a probe of a fixed path, to n over the path of rank; it is
+// not counted as traffic.
+func (s *e2eSessions) sendPath(b []byte, n *e2eNode, rank int) {
+	if s.peer(n, true, true) && !s.tun.queue(b, s.bind.endpointOf(n.id), pathFlow|uint64(rank)) {
+		s.stats.DroppedQueue.Add(1)
+	}
+}
+
 // receive takes the payload of an outer packet from n. Without a session for
 // n only a handshake initiation is taken: the data of a session from before
 // this node restarted cannot be read by a new one, and would only hold trials
@@ -472,6 +482,9 @@ type E2EPeerStatus struct {
 	RxBytes               uint64 `json:"rxBytes"`
 	TxBytes               uint64 `json:"txBytes"`
 	IdleMs                int64  `json:"idleMs"`
+	// PathMTU is the longest packet the path to the node carries, end to
+	// end (large.go).
+	PathMTU int `json:"pathMtu,omitempty"`
 }
 
 func (s *e2eSessions) status() *E2EStatus {
@@ -501,6 +514,21 @@ func (s *e2eSessions) status() *E2EStatus {
 		Sent: s.stats.Sent.Load(), Received: s.stats.Received.Load(), DroppedExhausted: s.stats.DroppedExhausted.Load(),
 		DroppedQueue: s.stats.DroppedQueue.Load(), DroppedSource: s.stats.DroppedSource.Load(), DroppedBad: s.stats.DroppedBad.Load(),
 		InnerMTU: int(s.tun.mtu.Load())}
+}
+
+// inUse are the nodes whose sessions carried data within d.
+func (s *e2eSessions) inUse(d time.Duration) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	s.applyProofs(now)
+	var out []string
+	for id, p := range s.peers {
+		if p.proven && now.Sub(time.Unix(0, p.used.Load())) < d {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // handshake is the last handshake with node id, 0 for none or no session.

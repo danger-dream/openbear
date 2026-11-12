@@ -42,7 +42,7 @@ async def _ready(e, sid):
 async def test_node_transfer_tool_large_round_trip_overwrite_and_artifact(transfer_env):
     e = transfer_env
     described = await e.transfer_tool('describe', topic='files')
-    assert set(described['contracts']) == {'upload_file', 'download_file', 'transfer_status', 'transfer_cancel'}
+    assert set(described['contracts']) == {'upload_file', 'download_file', 'transfer_status', 'transfer_cancel', 'transfers'}
     assert 'localPath' in described['contracts']['upload_file']
     source, remote = e.tmp / 'source.bin', e.tmp / 'node' / 'target.bin'
     content = bytes(range(256)) * (5 * 4096 + 7)
@@ -107,7 +107,7 @@ async def test_upload_failure_cancel_and_unknown_commit(transfer_env, monkeypatc
         return await original(owner, sid, feature, method, params, **kw)
 
     monkeypatch.setattr(e.servers, '_call_newer', call)
-    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(target), overwrite=True)
+    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(target), overwrite=True, waitSeconds=0)
     if failure in {'cancel', 'cleanup_lost'}:
         await asyncio.wait_for(entered.wait(), 10)
         cancelled = await e.transfer_tool('transfer_cancel', transferId=started['transfer']['id'])
@@ -154,7 +154,7 @@ async def test_download_failure_preserves_target_and_cleans_temporary(transfer_e
         return part
 
     monkeypatch.setattr(e.servers, 'read_file', read)
-    started = await e.transfer_tool('download_file', remotePath=str(source), localPath=str(target))
+    started = await e.transfer_tool('download_file', remotePath=str(source), localPath=str(target), waitSeconds=0)
     if failure == 'cancel':
         await asyncio.wait_for(entered.wait(), 10)
         await e.transfer_tool('transfer_cancel', transferId=started['transfer']['id'])
@@ -190,7 +190,7 @@ async def test_transfer_gates_owner_paths_old_node_and_commit_cancellation(trans
         return await original(owner, sid, feature, method, params, **kw)
 
     monkeypatch.setattr(e.servers, '_call_newer', call)
-    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(dest))
+    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(dest), waitSeconds=0)
     await asyncio.wait_for(entered.wait(), 10)
     key = started['transfer']['id']
     with pytest.raises(InstanceError, match='transfer_not_found'):
@@ -217,7 +217,7 @@ async def test_transfer_progress_shutdown_and_automatic_permissions(transfer_env
         return await original(owner, sid, feature, method, params, **kw)
 
     monkeypatch.setattr(e.servers, '_call_newer', call)
-    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(target))
+    started = await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(target), waitSeconds=0)
     await asyncio.wait_for(entered.wait(), 10)
     key = started['transfer']['id']
     progress = (await e.transfer_tool('transfer_status', transferId=key))['transfer']
@@ -234,3 +234,108 @@ async def test_transfer_progress_shutdown_and_automatic_permissions(transfer_env
     await closing
     assert (await e.transfer_done(started))['state'] == 'cancelled'
     assert not target.exists() and not list(e.tmp.glob('*.obupload-*'))
+
+
+async def test_batch_transfers_over_servers_and_files_with_one_answer(transfer_env, node_binary):
+    e = transfer_env
+    first = e.transfer_sid
+    second = (await api(e, 'POST', '/api/servers', {'name': 'transfer node/2'}))['item']['id']
+    await start_node(e, node_binary, second)
+    await wait_for(lambda: _ready(e, second))
+    one, two = e.tmp / 'one.txt', e.tmp / 'two.txt'
+    one.write_bytes(b'one')
+    two.write_bytes(b'two!')
+    spread = e.tmp / 'spread'
+    files = [{'localPath': str(one), 'remotePath': str(spread / '{serverId}' / 'one.txt')}, {'localPath': str(two), 'remotePath': str(spread / '{serverId}' / 'two.txt')}]
+    # Waits for the result by default: finished transfers come back finished.
+    sent = await e.transfer_tool('upload_file', serverIds=[first, second], files=files, mkdirs=True)
+    assert sent['ok'] and sent['batchId'] and sent['untrustedData'], sent
+    assert sent['summary'] == {'count': 4, 'states': {'done': 4}, 'finished': 4, 'succeeded': 4, 'bytes': 14, 'totalBytes': 14, 'percent': 100.0}
+    assert [(i['serverId'], i['remotePath']) for i in sent['items']] == [
+        (first, str(spread / first / 'one.txt')), (second, str(spread / second / 'one.txt')),
+        (first, str(spread / first / 'two.txt')), (second, str(spread / second / 'two.txt'))]
+    assert all(i['transferId'] and i['startedBy']['current'] and i['startedBy']['conversationUuid'] == 'conv-transfer' for i in sent['items'])
+    assert (spread / second / 'two.txt').read_bytes() == b'two!'
+
+    # The same path from both servers lands in one local file each.
+    got = e.tmp / 'got'
+    assert (await e.transfer_tool('download_file', serverIds=[first, second], remotePath=str(spread / first / 'one.txt'),
+                                  localPath=str(got / 'one.txt')))['error'] == 'server_placeholder_required'
+    fetched = await e.transfer_tool('download_file', serverIds=[first, second], files=[
+        {'remotePath': str(spread / '{serverId}' / 'one.txt'), 'localPath': str(got / '{server}-one.txt')}], mkdirs=True)
+    assert fetched['summary']['succeeded'] == 2, fetched
+    assert [i['localPath'] for i in fetched['items']] == [str(got / 'transfer-node-one.txt'), str(got / 'transfer_node_2-one.txt')]
+    assert (got / 'transfer_node_2-one.txt').read_bytes() == b'one'
+    assert (await e.transfer_tool('upload_file', files=[{'localPath': str(one), 'remotePath': '/tmp/x'}, {'localPath': str(two), 'remotePath': '/tmp/x'}]))[
+        'error'] == 'duplicate_destination'
+
+    batch = await e.transfer_tool('transfer_status', serverId=None, batchId=sent['batchId'])
+    assert batch['selection'] == 'batch' and batch['summary']['succeeded'] == 4
+    picked = await e.transfer_tool('transfer_status', serverId=None, transferIds=[sent['items'][0]['transferId'], 'missing'])
+    assert not picked['ok'] and picked['notFound'] == ['missing'] and len(picked['items']) == 1
+    nothing = await e.transfer_tool('transfer_status', serverId=None)
+    assert nothing['selection'] == 'unfinished_in_this_conversation' and nothing['items'] == [] and nothing['note']
+    listed = await e.transfer_tool('transfers', serverId=None, direction='download', startedBy='current')
+    assert listed['count'] == 2 and {i['serverId'] for i in listed['items']} == {first, second}
+    assert (await e.transfer_tool('transfers', serverId=None, serverIds=[second], state='done'))['count'] == 3
+    assert (await e.transfer_tool('transfers', serverId=None, state='bogus'))['error'] == 'invalid_state'
+    log = (await api(e, 'GET', f'/api/servers/{second}'))['item']['execLog']
+    assert log[0]['command'].startswith('文件传输 download') and log[0]['conversationUuid'] == 'conv-transfer'
+
+
+async def test_batch_beyond_the_running_limit_queues_and_cancels_together(transfer_env, monkeypatch):
+    from app.servers import transfers as transfers_module
+    e = transfer_env
+    monkeypatch.setattr(transfers_module, 'RUNNING_MAX', 1)
+    original = e.servers._call_newer
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def call(owner, sid, feature, method, params, **kw):
+        if method == 'fs.transfer' and params.get('done'):
+            entered.set()
+            await resume.wait()
+        return await original(owner, sid, feature, method, params, **kw)
+
+    monkeypatch.setattr(e.servers, '_call_newer', call)
+    files = []
+    for n in range(3):
+        (e.tmp / f'q{n}').write_bytes(b'q' * (n + 1))
+        files.append({'localPath': str(e.tmp / f'q{n}'), 'remotePath': str(e.tmp / 'queued' / f'q{n}')})
+    sent = await e.transfer_tool('upload_file', files=files, mkdirs=True, waitSeconds=0)
+    assert sent['ok'] and [i.get('waitingForSlot', False) for i in sent['items']] == [False, True, True], sent
+    assert sent['items'][2]['state'] == 'queued'
+    # One alone past the limit is refused, as before.
+    assert (await e.transfer_tool('upload_file', localPath=str(e.tmp / 'q0'), remotePath=str(e.tmp / 'alone')))['error'] == 'too_many_transfers'
+    await asyncio.wait_for(entered.wait(), 10)
+    assert len((await e.transfer_tool('transfer_status', serverId=None))['items']) == 3
+    cancelled = await e.transfer_tool('transfer_cancel', serverId=None, transferIds=[sent['items'][2]['transferId']])
+    assert cancelled['cancelRequested'] == 1 and cancelled['items'][0]['cancelRequested']
+    resume.set()
+    ended = await e.transfer_tool('transfer_status', serverId=None, batchId=sent['batchId'], waitSeconds=60)
+    assert ended['summary']['states'] == {'done': 2, 'cancelled': 1} and ended['summary']['finished'] == 3, ended
+    assert not (e.tmp / 'queued' / 'q2').exists() and (e.tmp / 'queued' / 'q1').read_bytes() == b'qq'
+
+
+async def test_receipts_and_their_origin_survive_a_controller_restart(transfer_env):
+    e = transfer_env
+    transfers = e.servers.transfers
+    source, remote = e.tmp / 'kept.bin', e.tmp / 'node' / 'kept.bin'
+    source.write_bytes(b'kept across a restart')
+    done = await e.transfer_done(await e.transfer_tool('upload_file', localPath=str(source), remotePath=str(remote), mkdirs=True))
+    assert done['state'] == 'done'
+    # One still moving when the controller went away without a clean shutdown: nothing recorded its end.
+    await transfers.save({**transfers.jobs[done['id']], 'id': 'cut-off', 'state': 'transferring', 'endedAtMs': None})
+    # A new controller process: nothing in memory, the receipts come back from the database.
+    transfers.jobs.clear()
+    await transfers.load()
+    kept = (await e.transfer_tool('transfer_status', transferId=done['id']))['transfer']
+    assert kept['state'] == 'done' and kept['verified'] and kept['sha256'] == done['sha256']
+    assert kept['startedBy']['kind'] == 'conversation' and kept['startedBy']['conversationUuid'] == 'conv-transfer'
+    cut = (await e.transfer_tool('transfer_status', transferId='cut-off'))['transfer']
+    assert cut['state'] == 'unknown' and cut['error'] == 'controller_restarted' and cut['effectState'] == 'unknown'
+    listed = await e.transfer_tool('transfers')
+    assert {i['transferId'] for i in listed['items']} == {done['id'], 'cut-off'}
+    # The unknown verdict is stored too: a second restart reads the same.
+    transfers.jobs.clear()
+    await transfers.load()
+    assert transfers.jobs['cut-off']['state'] == 'unknown' and transfers.jobs['cut-off']['endedAtMs'] == cut['endedAtMs']

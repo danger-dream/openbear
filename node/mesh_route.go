@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"time"
+
+	"openbear/node/mesh"
 )
 
 // meshStale: a status.json older than this is from a data plane that hangs
@@ -90,7 +92,7 @@ func networkPrefix(config []byte) (netip.Prefix, bool) {
 // up: status.json is fresh, from a live process, ready, and the interface it
 // names, once seen, is still there.
 func (h *meshHost) up() (bool, string) {
-	path := h.path("status.json")
+	path := mesh.StatusPath(h.dir)
 	info, err := os.Stat(path)
 	if err != nil {
 		return false, "no data plane status"
@@ -148,10 +150,8 @@ func (h *meshHost) takesDown(method string, raw json.RawMessage) string {
 	}
 	switch method {
 	case "mesh.upgrade":
-		if build := h.build(); build != "" && h.service.state() == "running" {
-			if current, _ := fileHash(h.binary()); current != build {
-				return "the mesh upgrade"
-			}
+		if build := h.build(); build != "" && h.service.state() == "running" && h.upgrades(build) {
+			return "the mesh upgrade"
 		}
 	case "mesh.uninstall":
 		if h.service.state() == "running" {

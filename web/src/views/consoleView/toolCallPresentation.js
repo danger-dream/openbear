@@ -17,7 +17,15 @@ const TOOL_LABELS = {
 	mcp__parrot__video_generate: '生成视频', mcp__parrot__video_status: '视频进度',
 	InstanceControl: '实例管理', Servers: '服务器',
 	ConversationRequest: '会话请求', ConversationGroup: '小组',
+	RequestExtension: '扩展', AgentPlan: '计划',
 };
+// Built-in extension keys; an MCP server's key is mcp:<server>.
+const EXTENSION_LABELS = {workitems: '任务面板', agents: 'Agent 协作', conversations: '会话协作', browser: '浏览器',
+	servers: '服务器', instances: '实例', automation: '自动化'};
+export function extensionLabel(key) {
+	const value = String(key || '');
+	return EXTENSION_LABELS[value] || (value.startsWith('mcp:') ? value.slice(4) : value);
+}
 const REQUEST_OUTCOMES = {completed: '完成', needs_input: '需要补充', rejected: '拒绝'};
 
 function conversationRequestSummary(data) {
@@ -59,11 +67,29 @@ const count = value => value !== '' && value != null && typeof value !== 'boolea
 const targetLabel = value => ({current: '当前对话', current_run: '当前任务', current_task: '当前任务', conversation: '指定对话', explicit: '指定对话', all: '全部', root: '主控', main: '主浏览器', isolated: '独立浏览器'})[value] || text(value, 48);
 const limitHint = (value, unit = '条') => count(value) !== null ? `最多 ${count(value)} ${unit}` : '';
 
-function historySummary(data) {
+const HISTORY_SCOPES = {current: '当前对话', others: '其他对话', all: '全部对话', conversation: '指定对话', explicit: '指定对话', current_run: '当前任务', current_task: '当前任务'};
+
+// The range a History call actually covers: search defaults to all conversations, every other action to the current one.
+// AgentHistory only ever reads the Agent's own records, so it keeps the current-conversation default.
+function historyScope(data, agent) {
+	if (data.currentTask) return '当前任务';
+	if (data.conversationUuid || data.conversation_uuid) return '指定对话';
+	const scope = text(data.scope).toLowerCase();
+	if (!scope) return !agent && data.action === 'search' ? '全部对话' : '当前对话';
+	return HISTORY_SCOPES[scope] || '指定对话';
+}
+
+function readsSummary(reads) {
+	if (!Array.isArray(reads) || !reads.length) return '';
+	const names = reads.map(entry => String(entry?.path || '').split(/[\\/]/).pop()).filter(Boolean);
+	const shown = names.length > 3 ? `${names.slice(0, 3).join('、')} 等` : names.join('、');
+	return join(`读取 ${reads.length} 个文件或片段`, shown);
+}
+
+function historySummary(data, agent = false) {
 	const action = text(data.action);
 	const execution = data.source === 'execution';
-	const scope = data.currentTask ? '当前任务' : data.conversationUuid || data.conversation_uuid
-		? '指定对话' : targetLabel(data.scope) || '当前对话';
+	const scope = historyScope(data, agent);
 	const subject = `${scope}的${execution ? '执行记录' : '历史'}`;
 	if (action === 'search') return join(`搜索${subject}${data.query ? `：${quoted(data.query)}` : ''}`, limitHint(data.limit));
 	if (action === 'list') return join('列出对话历史', limitHint(data.limit));
@@ -109,7 +135,9 @@ function pageAddress(value) {
 	} catch { /* Retain a supplied non-URL target as text. */ }
 	return text(value, 80);
 }
-const BROWSER_ACTIONS = {status:'浏览器状态',page:'页面管理',snapshot:'页面快照',capture:'页面截图',find:'页面查找',act:'页面交互',navigate:'页面导航',wait:'等待条件',files:'文件操作',dialog:'对话框',console:'控制台日志',network:'网络请求',evaluate:'页面脚本',recover:'浏览器恢复',describe:'工具用法'};
+const BROWSER_ACTIONS = {status:'浏览器状态',page:'页面管理',snapshot:'页面快照',capture:'页面截图',find:'页面查找',act:'页面交互',navigate:'页面导航',wait:'等待条件',steps:'连续操作',files:'文件操作',dialog:'对话框',console:'控制台日志',network:'网络请求',evaluate:'页面脚本',recover:'浏览器恢复',describe:'工具用法'};
+// What act/navigate/steps report about the page afterwards; the default summary needs no words.
+const BROWSER_OBSERVE = {snapshot:'并返回页面快照', none:'不查看页面变化'};
 const ELEMENT_ACTIONS = {click:'点击',fill:'填写',type:'输入',press:'按键',check:'勾选',select:'选择',hover:'悬停',drag:'拖动',scroll:'滚动',resize:'调整窗口尺寸',emulate:'模拟设备'};
 function elementTarget(value) {
 	const target = text(value, 60);
@@ -122,8 +150,30 @@ function nodeBrowser(value) {
 	return node ? `“${text(serverName(node) || node, 40)}”的浏览器` : '';
 }
 
+// A steps entry is one act/wait/navigate call written flat: {action, ...its params}.
+function browserSteps(params) {
+	const steps = Array.isArray(params.steps) ? params.steps.map(object) : [];
+	if (!steps.length) return '连续执行页面操作';
+	const parts = steps.slice(0, 3).map(({action, ...rest}) => browserAction(text(action), rest));
+	return `连续执行 ${steps.length} 步：${parts.join(' → ')}${steps.length > 3 ? ' 等' : ''}`;
+}
+
+function browserWaitFor(value) {
+	const condition = object(value);
+	if (condition.text) return `等页面${['hidden','detached'].includes(condition.state) ? '不再显示' : '出现'}${quoted(condition.text)}后`;
+	if (condition.url) return `等打开 ${pageAddress(condition.url)} 后`;
+	if (condition.target) return `等 ${elementTarget(condition.target)} 就绪后`;
+	return condition.expression ? '等条件满足后' : '';
+}
+
 function browserSummary(data) {
-	const action = text(data.action), params = object(data.params), op = text(params.op);
+	const action = text(data.action), params = object(data.params);
+	const summary = browserAction(action, params);
+	return ['act', 'navigate', 'steps'].includes(action) && BROWSER_OBSERVE[params.observe] ? join(summary, BROWSER_OBSERVE[params.observe]) : summary;
+}
+
+function browserAction(action, params) {
+	const op = text(params.op);
 	const address = pageAddress(params.url), node = nodeBrowser(params.node);
 	switch (action) {
 		case 'status': return '查看浏览器状态';
@@ -163,7 +213,8 @@ function browserSummary(data) {
 		case 'files': return ({upload:'上传文件',drop:'拖放文件到页面',list:'查看下载列表',save:'保存下载文件',cancel:'取消文件下载'})[op] || join('页面文件操作', op);
 		case 'console': return '查看页面控制台日志';
 		case 'network': return params.id ? join('查看指定网络请求', ({'request-headers':'请求头','response-headers':'响应头','request-body':'请求正文','response-body':'响应正文'})[params.part] || text(params.part)) : '查看页面网络请求';
-		case 'evaluate': return '执行页面脚本';
+		case 'steps': return browserSteps(params);
+		case 'evaluate': return `${browserWaitFor(params.waitFor)}执行页面脚本`;
 		case 'recover': {
 			if (node && op === 'connection') return `恢复${node}的连接`;
 			if (node && op === 'restart') return `重启${node}`;
@@ -211,7 +262,7 @@ function remoteCommand(command) {
 function instanceSummary(data) {
 	const p = object(data.params);
 	switch (data.action) {
-		case 'describe': return '查看实例工具用法';
+		case 'describe': return text(p.action) ? `查看实例工具 ${text(p.action, 30)} 的用法` : '查看实例工具用法';
 		case 'list': return '查看实例列表';
 		case 'status': return p.instanceId ? '查看实例状态' : '查看本次部署目标';
 		case 'operations': return '查看部署记录';
@@ -267,6 +318,50 @@ function serverTargets(p) {
 	if (ids.length && named.length === ids.length && ids.length <= 3) return named.map(n => `“${text(n, 24)}”`).join('、');
 	return ids.length ? `${ids.length} 台服务器` : '指定服务器';
 }
+// Several servers at once: serverIds, a group or all.
+const manyServers = p => p.all === true || Boolean(text(p.group)) || Array.isArray(p.serverIds);
+const spaced = value => /^\d/.test(value) ? ` ${value}` : value;
+const JOB_STATES = {running: '正在运行', exited: '已结束', stopped: '已停止', interrupted: '中断'};
+const TRANSFER_STATES = {active: '未结束', queued: '排队中', checking: '校验中', transferring: '传输中', committing: '提交中', cancelling: '取消中',
+	done: '已完成', failed: '失败', cancelled: '已取消', unknown: '结果未知'};
+const stateList = (value, labels) => (Array.isArray(value) ? value : value ? [value] : []).map(s => labels[s] || text(s, 16)).filter(Boolean).join('、');
+// jobs: [{serverId, jobId}] as “的 3 个后台任务” on the server(s) they are on.
+function jobRefs(p, verb) {
+	const refs = p.jobs.filter(r => r && typeof r === 'object');
+	const servers = [...new Set(refs.map(r => r.serverId).filter(Boolean))];
+	const where = servers.length === 1 ? serverRef(servers[0]) : servers.length ? ` ${servers.length} 台服务器上` : '';
+	return `${verb}${where}的 ${refs.length} 个后台任务`;
+}
+function jobsQuery(p) {
+	const states = stateList(p.state, JOB_STATES);
+	const what = p.startedBy === 'current' ? `本会话启动的${states ? `${states}的任务` : '后台任务'}` : states ? `${states}的任务` : '的后台任务';
+	const filters = [text(p.commandContains) ? `命令含 ${text(p.commandContains, 40)}` : '', p.since != null && p.since !== '' ? `自 ${text(String(p.since), 30)}` : ''];
+	if (!manyServers(p) && !states && p.startedBy !== 'current' && !filters.some(Boolean)) return `查看${serverRef(p.serverId)}的后台任务`;
+	return join(`查询${spaced(manyServers(p) ? serverTargets(p) : serverRef(p.serverId))}${what}`, ...filters);
+}
+// One transfer as before; files, several servers, ids, a batch or this conversation's unfinished ones otherwise.
+function transferSummary(action, p) {
+	const on = serverRef(p.serverId), purpose = text(p.purpose);
+	if (action === 'upload_file' || action === 'download_file') {
+		const files = Array.isArray(p.files) ? p.files.filter(f => f && typeof f === 'object') : null;
+		const targets = manyServers(p) ? serverTargets(p) : on, n = files ? files.length : 1;
+		const path = text((files ? files[0]?.remotePath : p.remotePath), 80);
+		if (action === 'upload_file') return join(n > 1 ? `批量上传 ${n} 个文件到${spaced(targets)}` : `上传文件到${spaced(targets)}`, n > 1 ? '' : path, purpose);
+		return join(n > 1 ? `从${spaced(targets)}批量下载 ${n} 个文件` : `从${spaced(targets)}下载文件`, n > 1 ? '' : path, purpose);
+	}
+	if (action === 'transfers') {
+		return join(`查看${p.startedBy === 'current' ? '本会话的' : ''}文件传输记录`, manyServers(p) || p.serverId ? (manyServers(p) ? serverTargets(p) : on) : '',
+			{upload: '上传', download: '下载'}[p.direction] || '', stateList(p.state, TRANSFER_STATES));
+	}
+	const verb = action === 'transfer_status' ? '查询' : '取消';
+	const tail = action === 'transfer_status' ? '的进度' : '';
+	const wait = action === 'transfer_status' && count(p.waitSeconds) ? `等待全部结束（最多 ${p.waitSeconds} 秒）` : '';
+	if (Array.isArray(p.transferIds)) return join(`${verb} ${p.transferIds.length} 个文件传输${tail}`, wait);
+	if (text(p.batchId)) return join(`${verb}一批文件传输${tail}`, text(p.batchId, 20), wait);
+	if (!p.transferId && !p.serverId) return join(`${verb}本会话未结束的文件传输${action === 'transfer_status' ? '进度' : ''}`, wait);
+	return action === 'transfer_status' ? join(`查询${on}的文件传输进度`, text(p.transferId, 40)) : join(`取消${on}的文件传输`, text(p.transferId, 40));
+}
+const DESCRIBE_TOPICS = {bench: '查看评测用法', commands: '查看命令与后台任务用法', files: '查看文件传输用法', mesh_all: '查看组网用法', ddns: '查看动态域名用法'};
 const pathsOf = p => (Array.isArray(p.paths) ? p.paths : p.path ? [p.path] : []).filter(v => typeof v === 'string');
 const pathList = paths => paths.length === 1 ? text(paths[0], 80) : paths.length ? `${text(paths[0], 60)} 等 ${paths.length} 项` : '';
 
@@ -288,7 +383,10 @@ function serversSummary(data) {
 	const p = object(data.params), on = serverRef(p.serverId);
 	const purpose = text(p.purpose);
 	switch (data.action) {
-		case 'describe': return p.topic === 'bench' ? '查看评测用法' : p.topic === 'files' ? '查看文件传输用法' : '查看服务器工具用法';
+		case 'describe': {
+			const topic = p.action ?? p.topic;
+			return DESCRIBE_TOPICS[topic] || (text(topic) ? `查看服务器工具 ${text(topic, 30)} 的用法` : '查看服务器工具用法');
+		}
 		case 'list': return join('查看服务器列表', p.group ? `“${text(p.group, 30)}”分组` : '');
 		case 'get': return `查看${on}的详情`;
 		case 'metrics': return join(`查看${on}的监控数据`, METRIC_RANGES[p.range || '1h'] || text(p.range));
@@ -302,18 +400,17 @@ function serversSummary(data) {
 		case 'edit_file': return join(`修改${on}上的文件`, text(p.path, 80), Array.isArray(p.edits) ? `${p.edits.length} 处` : '', purpose);
 		case 'file_op': return join(fileOpSummary(p), purpose);
 		case 'file_op_status': return `查询${on}上文件操作的进度`;
-		case 'upload_file': return join(`上传文件到${on}`, text(p.remotePath, 80), purpose);
-		case 'download_file': return join(`从${on}下载文件`, text(p.remotePath, 80), purpose);
-		case 'transfer_status': return join(`查询${on}的文件传输进度`, text(p.transferId, 40));
-		case 'transfer_cancel': return join(`取消${on}的文件传输`, text(p.transferId, 40));
+		case 'upload_file': case 'download_file': case 'transfer_status': case 'transfer_cancel': case 'transfers': return transferSummary(data.action, p);
 		case 'job_start': {
 			const command = firstLine(p.command);
-			return join(purpose || `在${on}上启动后台任务`, command ? text(command, 80) : '');
+			const wait = text(p.until) ? `等到输出匹配 ${text(p.until, 40)}` : count(p.waitSeconds) ? `等待结束（最多 ${p.waitSeconds} 秒）` : '';
+			return join(purpose || `在${on}上启动后台任务`, command ? text(command, 80) : '', wait);
 		}
-		case 'jobs': return `查看${on}的后台任务`;
-		case 'job_status': return join(`查看${on}的后台任务`, text(p.jobId, 40));
-		case 'job_wait': return join(`等待${on}的后台任务`, text(p.jobId, 40), text(p.until) ? `直到输出匹配 ${text(p.until, 40)}` : '');
-		case 'job_stop': return join(`停止${on}的后台任务`, text(p.jobId, 40));
+		case 'jobs': return jobsQuery(p);
+		case 'job_status': return Array.isArray(p.jobs) ? jobRefs(p, '查看') : join(`查看${on}的后台任务`, text(p.jobId, 40));
+		case 'job_wait': return join(Array.isArray(p.jobs) ? jobRefs(p, '等待') : `等待${on}的后台任务`, Array.isArray(p.jobs) ? '' : text(p.jobId, 40),
+			Array.isArray(p.jobs) && p.mode === 'any' ? '任一完成即返回' : '', text(p.until) ? `直到输出匹配 ${text(p.until, 40)}` : '');
+		case 'job_stop': return Array.isArray(p.jobs) ? jobRefs(p, '停止') : join(`停止${on}的后台任务`, text(p.jobId, 40));
 		case 'update_node': return `更新${p.all === true ? '全部服务器' : serverTargets(p)}的节点`;
 		case 'edit': {
 			const fields = [p.name != null ? '名称' : '', ...Object.keys(object(p.profile)).map(k => PROFILE_FIELDS[k] || k)].filter(Boolean);
@@ -381,10 +478,10 @@ export function toolActionSummary(name, value) {
 	if (!Object.keys(data).length) return '';
 	let summary = '';
 	if (name === 'Bash') summary = text(data.description) || text(String(data.command || '').split(/\r?\n/, 1)[0]);
-	else if (name === 'Read') summary = text(data.description || data.path);
+	else if (name === 'Read') summary = text(data.description || data.path) || readsSummary(data.reads);
 	else if (name === 'Write') summary = text(data.path);
 	else if (name === 'Edit') summary = Array.isArray(data.edits) ? `批量编辑 ${data.edits.length} 段` : text(data.path);
-	else if (name === 'History' || name === 'AgentHistory') summary = historySummary(data);
+	else if (name === 'History' || name === 'AgentHistory') summary = historySummary(data, name === 'AgentHistory');
 	else if (name === 'Memory') summary = memorySummary(data);
 	else if (name === 'Browser') summary = browserSummary(data);
 	else if (name === 'OpenBearControl') summary = controlSummary(data);
@@ -400,5 +497,6 @@ export function toolActionSummary(name, value) {
 	else if (name === 'ConversationRequest') summary = conversationRequestSummary(data);
 	else if (name === 'ConversationGroup') summary = conversationGroupSummary(data);
 	else if (name === 'mcp__parrot__video_status') summary = join('查询视频生成进度', text(data.request_id, 36));
+	else if (name === 'RequestExtension') summary = join(`申请开启扩展：${extensionLabel(data.extension) || '未指定'}`, text(data.reason, 80));
 	return text(summary, 160);
 }

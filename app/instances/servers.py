@@ -10,7 +10,9 @@ import getpass
 import json
 import os
 import re
+import shlex
 import signal
+import sys
 import tempfile
 import time
 import uuid
@@ -24,6 +26,7 @@ from app.webhooks.repository import many, one
 LOCAL = 'local'
 # The node method that makes HTTP requests on its own loopback.
 HTTP_FEATURE = 'http.local'
+BRIDGE = Path(__file__).with_name('ssh_bridge.py')
 PUBLIC_IP_SOURCES = ('https://api.ip.sb/ip', 'https://4.icanhazip.com', 'https://ipv4.icanhazip.com')
 _IPV4 = re.compile(r'(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}')
 _HOST = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9.:-]*')
@@ -44,6 +47,8 @@ for u in https://api.ip.sb/ip https://4.icanhazip.com; do
   ip=$( (curl -4fsS --max-time 6 "$u" || wget -4qO- -T 6 "$u") 2>/dev/null | tr -d '[:space:]'); [ -n "$ip" ] && break
 done; echo "ip=$ip"
 '''
+# A front (前置机) reaches nothing beyond its exits: no echo service is asked, its public IP stays unknown.
+FRONT_PROBE = PROBE[:PROBE.index('for u in ')] + 'echo "ip="\n'
 # Windows OpenSSH runs commands with cmd (or PowerShell when configured); an
 # encoded PowerShell command reads the same under both.
 _WINDOWS_PROBE = r'''
@@ -61,6 +66,8 @@ foreach ($u in 'https://api.ip.sb/ip', 'https://4.icanhazip.com') {
 '''
 WINDOWS_PROBE = ('powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '
                  + base64.b64encode(_WINDOWS_PROBE.encode('utf-16-le')).decode())
+FRONT_WINDOWS_PROBE = ('powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '
+                       + base64.b64encode((_WINDOWS_PROBE[:_WINDOWS_PROBE.index("$ip = ''")] + '"ip="\n').encode('utf-16-le')).decode())
 SYSTEMS = {'Linux': 'linux', 'Darwin': 'darwin', 'Windows': 'windows'}
 PORT_CHECK = r'''
 p=%d
@@ -180,7 +187,7 @@ class Servers:
             raise InstanceError('invalid_server_auth')
         return {'name': name.strip(), 'host': host, 'port': port, 'username': username, 'auth': merged['auth']}
 
-    async def save(self, owner, data, identity=None):
+    async def save(self, owner, data, identity=None, via=None):
         self.service.require_controller()
         if identity == LOCAL:
             raise InstanceError('local_server_fixed', 409)
@@ -228,7 +235,7 @@ class Servers:
             secret.setdefault('knownHosts', stored['knownHosts'])  # Keep the pinned host key.
         item['keyLabel'] = self._key_label(secret)
         item.update({k: prior[k] for k in ('publicIp', 'os', 'docker', 'status', 'checkedAtMs', 'error') if k in prior})
-        target = {**item, **secret}
+        target = {**item, **secret, **({'via': via} if via else await self._via(owner, identity))}
         if not row or any(prior.get(k) != item.get(k) for k in ('host', 'port', 'username', 'auth')) or secret != stored:
             # Saving always proves the connection once, as the UI promises.
             result = await self.test_target(target, secret.get('knownHosts', ''))
@@ -308,7 +315,28 @@ class Servers:
             if channel:
                 raise InstanceError('node_exec_disabled' if channel['online'] else 'node_offline', 409)
             raise InstanceError('server_ssh_unavailable', 409)
-        return {'id': identity, 'local': False, 'channel': 'ssh', **item, **secret}
+        return {'id': identity, 'owner': owner, 'local': False, 'channel': 'ssh', **item, **secret, **await self._via(owner, identity)}
+
+    async def _via(self, owner, identity):
+        """{'via': exits} for a front, whose SSH goes only through them; {} otherwise."""
+        servers = getattr(self.service.host, 'servers', None)
+        via = await servers.front.via(owner, identity) if servers and identity else []
+        return {'via': via} if via else {}
+
+    async def via_of(self, owner, via):
+        """{'via': exits} for a login that is to go through these exits (a front being added); each
+        must be one of the owner's servers."""
+        if via in (None, []):
+            return {}
+        known = {s['id'] for s in await self.all(owner)}
+        if not isinstance(via, list) or not 1 <= len(via) <= 2 or any(not isinstance(v, str) or v not in known for v in via):
+            raise InstanceError('invalid_front_exit')
+        return {'via': list(dict.fromkeys(via))}
+
+    def _tunnel(self, target):
+        """_ssh's tunnel argument for a front's target; {} for any other."""
+        servers = getattr(self.service.host, 'servers', None)
+        return {'tunnel': servers.front.opener(target['via']) if servers else None} if target.get('via') else {}
 
     async def channel(self, owner, identity):
         """How instance and gateway commands reach the server right now, and as whom."""
@@ -397,14 +425,17 @@ class Servers:
                 raise InstanceError('sudo_password_unavailable')
             stdin = (target['password'] + '\n').encode()
             command = "sudo -S -p '' -- sh -c " + _quote(command)
-        result = await _ssh(self.db, target, command, stdin=stdin, timeout=timeout)
+        result = await _ssh(self.db, target, command, stdin=stdin, timeout=timeout, **self._tunnel(target))
         await self.remember_host_key(target['id'], result['knownHosts'])
         return result
 
     async def test_target(self, target, known=''):
-        result = await _ssh(self.db, {**target, 'knownHosts': known or target.get('knownHosts', '')}, PROBE, timeout=40)
+        tunnel = self._tunnel(target)
+        probe = FRONT_PROBE if target.get('via') else PROBE
+        result = await _ssh(self.db, {**target, 'knownHosts': known or target.get('knownHosts', '')}, probe, timeout=40, **tunnel)
         if not (result['ok'] and 'system=' in result['stdout']):
-            windows = await _ssh(self.db, {**target, 'knownHosts': result['knownHosts']}, WINDOWS_PROBE, timeout=60)
+            windows = await _ssh(self.db, {**target, 'knownHosts': result['knownHosts']}, FRONT_WINDOWS_PROBE if target.get('via') else WINDOWS_PROBE,
+                                 timeout=60, **tunnel)
             if windows['ok'] and 'system=Windows' in windows['stdout']:
                 result = windows
         if not result['ok']:
@@ -437,7 +468,7 @@ class Servers:
         if item.get('auth') == 'none':
             raise InstanceError('server_ssh_unavailable', 409)
         try:
-            result = await self.test_target({**item, **secret})
+            result = await self.test_target({**item, **secret, **await self._via(owner, identity)})
             item.update(result['facts'])
             secret['knownHosts'] = result['knownHosts']
         except InstanceError as exc:
@@ -536,8 +567,60 @@ async def _process(args, *, stdin=b'', timeout=120, env=None):
             'truncated': stdout[1] or stderr[1]}
 
 
-async def _ssh(db, target, command, *, stdin=b'', timeout=120):
-    """Fixed target only: no user SSH config, agent, forwarding or proxy command."""
+class _Sink:
+    """Stands in for the browser socket of a tunnel terminal: the exit's bytes go to the bridge."""
+
+    def __init__(self, writer):
+        self.writer = writer
+
+    async def send_bytes(self, data):
+        self.writer.write(data)
+        await self.writer.drain()
+
+    async def send_json(self, value):
+        pass
+
+    async def close(self):
+        self.writer.close()
+
+
+def _target_address(target):
+    host = str(target['host'])
+    return f'[{host}]:{target["port"]}' if ':' in host else f'{host}:{target["port"]}'
+
+
+@contextlib.asynccontextmanager
+async def _tunnel_socket(root, target, tunnel):
+    """A unix socket in the run's private directory; each connection to it is a TCP connection
+    to the target that the front's exit makes (tunnel(address, sink))."""
+    path = root / 'exit.sock'
+
+    async def bridge(reader, writer):
+        try:
+            terminal = await tunnel(_target_address(target), _Sink(writer))
+        except (InstanceError, LookupError, PermissionError, ConnectionError, TimeoutError, RuntimeError):
+            writer.close()
+            return
+        try:
+            while data := await reader.read(65536):
+                await terminal.input(data)
+        except (ConnectionError, RuntimeError):
+            pass
+        finally:
+            await terminal.close()
+    server = await asyncio.start_unix_server(bridge, path=str(path))
+    try:
+        yield path
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _ssh(db, target, command, *, stdin=b'', timeout=120, tunnel=None):
+    """Fixed target only: no user SSH config, agent or forwarding. A front's (target['via']) goes
+    through the TCP connection its exit makes, tunnel(address, sink), and never directly."""
+    if target.get('via') and tunnel is None:
+        raise InstanceError('front_exit_offline', 409)
     secrets_seen = [target.get('password', ''), target.get('privateKey', '')]
     with tempfile.TemporaryDirectory(prefix='openbear-ssh-') as directory:
         root = Path(directory)
@@ -547,29 +630,31 @@ async def _ssh(db, target, command, *, stdin=b'', timeout=120):
         askpass = root / 'askpass'
         askpass.write_text('#!/bin/sh\nexec /usr/bin/printenv OPENBEAR_SSH_SECRET\n')
         askpass.chmod(0o700)
-        args = ['ssh', '-F', '/dev/null', '-T', '-p', str(target['port']), '-l', target['username'],
-                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=' + str(known),
-                '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=10',
-                '-o', 'ServerAliveCountMax=2', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
-                '-o', 'PermitLocalCommand=no', '-o', 'ProxyCommand=none', '-o', 'ClearAllForwardings=yes',
-                '-o', 'NumberOfPasswordPrompts=1']
-        secret = target.get('password', '')
-        pem = target.get('privateKey', '')
-        if target.get('keyRef'):
-            pem, secret, _ = await keys.resolve(db, target['keyRef'])
-            secrets_seen += [pem, secret]
-        if pem:
-            key = root / 'identity'
-            fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'w') as handle:
-                handle.write(pem)
-            args += ['-i', str(key), '-o', 'PasswordAuthentication=no']
-        else:
-            args += ['-o', 'PubkeyAuthentication=no']
-        args += ['--', target['host'], command]
-        env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'DISPLAY': ':0', 'SSH_ASKPASS': str(askpass),
-               'SSH_ASKPASS_REQUIRE': 'force', 'OPENBEAR_SSH_SECRET': secret}
-        result = await _process(args, stdin=stdin, timeout=timeout, env=env)
+        async with (_tunnel_socket(root, target, tunnel) if target.get('via') else contextlib.nullcontext()) as socket_path:
+            proxy = ' '.join(shlex.quote(p) for p in (sys.executable, '-I', str(BRIDGE), str(socket_path))) if socket_path else 'none'
+            args = ['ssh', '-F', '/dev/null', '-T', '-p', str(target['port']), '-l', target['username'],
+                    '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=' + str(known),
+                    '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=10',
+                    '-o', 'ServerAliveCountMax=2', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+                    '-o', 'PermitLocalCommand=no', '-o', 'ProxyCommand=' + proxy, '-o', 'ClearAllForwardings=yes',
+                    '-o', 'NumberOfPasswordPrompts=1']
+            secret = target.get('password', '')
+            pem = target.get('privateKey', '')
+            if target.get('keyRef'):
+                pem, secret, _ = await keys.resolve(db, target['keyRef'])
+                secrets_seen += [pem, secret]
+            if pem:
+                key = root / 'identity'
+                fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'w') as handle:
+                    handle.write(pem)
+                args += ['-i', str(key), '-o', 'PasswordAuthentication=no']
+            else:
+                args += ['-o', 'PubkeyAuthentication=no']
+            args += ['--', target['host'], command]
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'DISPLAY': ':0', 'SSH_ASKPASS': str(askpass),
+                   'SSH_ASKPASS_REQUIRE': 'force', 'OPENBEAR_SSH_SECRET': secret}
+            result = await _process(args, stdin=stdin, timeout=timeout, env=env)
         result['knownHosts'] = known.read_text()
     scrub = Scrubber([s for s in secrets_seen if s])
     for field in ('stdout', 'stderr'):

@@ -7,6 +7,7 @@ import { ruleSentence } from './meshHelpers.js';
 import MeshChanges from './MeshChanges.vue';
 import MeshLink from './MeshLink.vue';
 import MeshMember from './MeshMember.vue';
+import MeshProxies from './MeshProxies.vue';
 import MeshRule from './MeshRule.vue';
 import MeshRules from './MeshRules.vue';
 import MeshSettings from './MeshSettings.vue';
@@ -14,7 +15,7 @@ import MeshSettings from './MeshSettings.vue';
 // The properties panel: the mesh when nothing is selected, else the selected
 // node, link or rule. On phones it sits in a bottom sheet with its own title.
 const props = defineProps({sel: {type: Object, default: null}, phone: Boolean, items: {type: Array, default: () => []}, installing: {type: Array, default: () => []}, shownPath: {type: String, default: ''}});
-const emit = defineEmits(['select', 'open-server', 'connect', 'path', 'show-path', 'remove']);
+const emit = defineEmits(['select', 'open-server', 'connect', 'path', 'show-path', 'remove', 'pin-path']);
 const members = computed(() => mesh.work?.members || []);
 const member = computed(() => props.sel?.kind === 'node' ? members.value.find(m => m.serverId === props.sel.id) || null : null);
 const installing = computed(() => props.sel?.kind === 'node' && !member.value ? props.installing.find(x => x.serverId === props.sel.id) : null);
@@ -49,13 +50,17 @@ const title = computed(() => selectionTitle(props.sel, mesh.work, props.installi
           <h3>访问规则<span class="instance-muted">{{ mesh.work.rules.length ? `${mesh.work.rules.length} 条` : '' }}</span></h3>
           <MeshRules :phone="phone" @select="id => emit('select', {kind: 'rule', id})" />
         </section>
+        <section class="mesh-section" aria-label="出口代理">
+          <h3>出口代理</h3>
+          <MeshProxies @member="id => emit('select', {kind: 'node', id, tab: 'proxy'})" />
+        </section>
         <section class="mesh-section" aria-label="网格设置">
           <h3>网格设置</h3>
           <MeshSettings />
         </section>
       </template>
       <MeshMember v-else-if="member" :key="member.serverId" :member="member" :phone="phone" :items="items" :region="regionOf(member.serverId)" :tab="sel.tab || ''" :shown-path="shownPath"
-        @open-server="emit('open-server', $event)" @removed="emit('select', null)" @select="emit('select', $event)" @connect="emit('connect', $event)" @path="emit('path', $event)" @show-path="emit('show-path', $event)" />
+        @open-server="emit('open-server', $event)" @removed="emit('select', null)" @select="emit('select', $event)" @connect="emit('connect', $event)" @path="emit('path', $event)" @show-path="emit('show-path', $event)" @pin-path="emit('pin-path', $event)" />
       <div v-else-if="installing" class="mesh-installing-note">
         <p><span class="ob-dot" data-tone="warn">正在安装组网服务</span></p>
         <p class="instance-muted">已用 {{ Math.max(0, Math.round((now - (installing.startedAt || now)) / 1000)) }} 秒。装好后加入草稿，应用后连入网格。</p>

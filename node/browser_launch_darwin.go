@@ -139,6 +139,8 @@ func consoleUser() int {
 	return int(st.Uid)
 }
 
+func chromeRunsHere() bool { return true }
+
 func checkLibraries(string) error { return nil }
 
 type closerFunc func() error

@@ -333,7 +333,7 @@ def register_task_memory_tool(registry: ToolRegistry, dao: TaskMemoryDAO) -> Non
     handler = TaskMemoryTool(dao)
     registry.add(
         "TaskMemory",
-        "Conversation-scoped reference material and continuing preferences (an Agent's own notes for that instance), kept across window changes. Not for progress, logs, Plan copies, test results, or completion/deployment reports. Short bodies (<=500 chars) are auto-injected: use them directly. list/search return locators only; get longer bodies when needed. Update a changed preference in place; delete obsolete notes with their revision. Agents can read shared conversation notes but not modify them.",
+        "Conversation-scoped reference material and continuing preferences (an Agent's own notes for that instance), kept across window changes. Short bodies (<=500 chars) are auto-injected: use them directly. list/search return locators only; get longer bodies when needed. update, delete and restore take the revision. Agents can read shared conversation notes but not modify them.",
         {
             "type": "object",
             "properties": {

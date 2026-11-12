@@ -76,6 +76,7 @@ def test_release_source_and_binary_allowlists_are_separate(tmp_path):
 def test_updater_ships_gateway_artifacts_without_restarting_gateway():
     updater = load("gateway_update_policy", ROOT / "scripts/updater.py")
     assert "gateway/bin" in updater.REPLACE_DIRS
+    assert "benchmark-package" in updater.REPLACE_DIRS
     assert "gateway/README.md" in updater.REPLACE_FILES
     assert updater.classify_path("gateway/bin/openbear-gateway-linux-amd64") == "noop"
     assert "gateway/state" not in updater.REPLACE_DIRS

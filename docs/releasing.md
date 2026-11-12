@@ -22,8 +22,11 @@
 .venv/bin/python scripts/release.py start 0.9.4 \
   --notes /absolute/path/release-notes.md \
   --files app/changed.py tests/test_changed.py \
-  --approve-container-cgroup
+  --approve-container-cgroup --detach
+.venv/bin/python scripts/release.py wait <运行ID>
 ```
+
+完整发布超过单次工具调用能阻塞的时间，所以用 `--detach` 启动：它在新会话里运行同一条命令，等这次运行登记好自己的进程（或已经退出）就返回，打印运行 ID、进程号、日志位置和下一条 `wait` 命令；启动当场失败（如锁被占用）时直接返回非零并附上输出。随后用 `wait <运行ID>` 等结果：它只读状态，按运行记录里的进程号加内核启动时间判断这次运行是否还活着，进程一退出就返回，默认最多等 540 秒；退出码 0 已完成、1 失败、2 暂停待决定、3 仍在运行（再 `wait` 一次即可）。不要自己写 `pgrep`、`sleep` 轮询——`pgrep -f` 会匹配到等待命令本身，曾让每次等待都空耗到超时。`resume`、`node start`、`node resume` 同样支持 `--detach`，节点运行用 `node wait`。
 
 示例版本仅用于说明，不是下一版的发布授权。无源码改动、只发布已提交内容时可以使用空的 `--files`。不要提前手工升版：本机平时是开发版号，要发布的 beta、rc 或正式版号由入口写入——它调用现有 `bump_version.py` 同步本机的五处版本文件，保留提交钩子并提交，随后冻结候选。版本号规则见下节。
 
@@ -42,7 +45,7 @@
 - 先后顺序：先比 X.Y.Z；X.Y.Z 相同时正式版 > rc > beta > dev；同一类再比 N。例：`1.0.1 > 1.0.1-rc.1 > 1.0.1-beta.2 > 1.0.1-beta.1 > 1.0.1-dev.9`。不用标准 semver 排序（它把 dev 排在 beta 前面）。
 - 开发版只在本地使用，**永远不发布**：两条线的 `start` 与预检都拒绝 `-dev.N`。目标版本必须比这条线上已发布的全部版本（`v*` 或 `node-v*` tag，含 beta／rc）都新；GitHub 上意外出现的开发版 tag 不计入。本机当前的开发版号不是下限，例如本机已是 `1.3.0-dev.1` 时仍可发布 `1.2.0-beta.2` 或 `1.2.0`。
 - beta 和 rc 在 GitHub 上是预发布（prerelease），从不标为 Latest；主控正式版是普通发布并标为 Latest；节点任何版本都不标 Latest。主控 beta／rc 的升级验收仍从最新正式版（`/releases/latest`）开始，即默认用户实际安装的版本。
-- 发布公开后，脚本把本机版本改成下一个次版本的 `dev.1`，并单独做一次只含版本文件的本地提交（`release: start <版本> development`／`release: start node <版本> development`），**不推送**。发正式版和发 beta、rc 都一样：发完 `1.1.0` 或 `1.2.0-beta.1`，分别改成 `1.2.0-dev.1`、`1.3.0-dev.1`。开发版号不会出现在 tag 或 Release 中，但会出现在之后推送的公开源码历史里。若版本文件有未提交的改动、本机版本已被改成别的值或 HEAD 在中途移动，脚本不强改，以退出码 2 停下；处理后 `resume` 只补做这一步，不再重新发布。
+- 发布公开后，脚本把本机版本改成下一个补丁版本的 `dev.1`，并单独做一次只含版本文件的本地提交（`release: start <版本> development`／`release: start node <版本> development`），**不推送**。发正式版和发 beta、rc 都一样：发完 `1.1.0` 或 `1.2.0-beta.1`，分别改成 `1.1.1-dev.1`、`1.2.1-dev.1`；下一次发补丁版、次版本还是 beta／rc，在发布时由脚本写入。开发版号不会出现在 tag 或 Release 中，但会出现在之后推送的公开源码历史里。若版本文件有未提交的改动、本机版本已被改成别的值或 HEAD 在中途移动，脚本不强改，以退出码 2 停下；处理后 `resume` 只补做这一步，不再重新发布。
 - 开发期间每次构建，dev 序号自动加 1：节点是每次运行 `scripts/build_node.py`（只改 `node/VERSION`）；主控是每次前端构建 `npm run build`（`web/package.json` 的 `prebuild` 运行 `web/scripts/bump-dev-version.mjs`，只用 Node，同步五处版本文件）。只改后端、没有构建前端时，主控序号不变。beta、rc、正式版构建（包括发布容器里的构建）不加号；五处版本不一致时前端构建报错，只复制了部分文件的构建（如 Dockerfile 的前端阶段）保持原号。从源码安装不算开发构建：`scripts/install.sh` 以 `OPENBEAR_SKIP_DEV_BUMP=1 npm run build` 构建，版本号不变；其他场景的 `npm run build` 照常加号。更新器安装发行包自带的 `web/dist`，不构建前端。
 - `uv.lock` 中项目自身版本写 uv 的 PEP 440 规范写法（`1.2.0b1`、`1.2.0rc1`、`1.2.0.dev3`），其余四处写原样；`bump_version.py --check` 与发行包校验按此比较。
 - 节点是可选功能：主控预检查看 GitHub 上有没有与这个主控兼容（协议范围与 `REQUIRED_FEATURES`）且主控用户会收到的节点版本（按 `node-v` 前缀读全部 tag，再按 tag 取 Release，和主控挑节点的方式一致），没有时只在输出和 `report.json` 的 `nodeCompatibility` 中给警告，不阻止发布。
@@ -61,16 +64,18 @@
 ## 固定执行链
 
 1. 核实本轮授权、工具链与 GitHub 权限；目标须为 beta、rc 或正式版，且比已有的全部 `v*` 版本新；锁定真实上一正式版、对应 tag 的源码提交和公开历史衔接点；检查有无兼容的已发布节点版本（只警告）。
-2. 在本机同步版本、提交审阅过的修改；只从该提交导出允许公开的同源内容。公开提交可以有不同 SHA，但不能包含本机私有开发历史、真实配置或运行数据。
+2. 在本机同步版本、提交审阅过的修改；只从该提交导出允许公开的同源内容。公开提交可以有不同 SHA，但不能包含本机私有开发历史、真实配置或运行数据。导出后立即把公开提交推到公开仓库的临时分支 `release-candidate/<run>-<提交前 12 位>`（阶段 `candidate-push`），让 GitHub 的推送规则（密钥扫描、推送权限）在第一分钟就作出判断，而不是等测试和验收都结束后在公开 `main` 上才拒绝；被拒时运行暂停，错误里附 GitHub 给出的原因（密钥扫描会写明文件位置和放行入口），处理后 `resume`。候选更换时删除旧的临时分支；发布完成后，或对运行执行 `cleanup` 时（需要 `GH_TOKEN`），删除本运行创建的全部临时分支，不触碰其他分支。
 3. 自动准备／复用匹配锁文件的独立 Python 3.11、3.12、3.13 环境和统一 Node 依赖。
-4. 按上一正式版源码与候选的实际内容分类。三版后端和前端分别执行或复用匹配的通过证据；证据缺失时自动补测。核对用例集合、通过／跳过／失败及未处理后台异常。既有真实上游和私有数据库条件跳过保留；评测真实环境测试只允许 `test_servers_bench_live` 中原因是 `set OPENBEAR_BENCH_LIVE=1 to run a real benchmark` 的跳过，不在发布矩阵中执行真实外部评测；需要 Go 或 Chrome 的节点集成测试（`test_servers`、`test_servers_transfers`、`test_node_browser`、`test_browser_engine_parity`）在测试镜像里按缺少工具链跳过，需要已构建网关程序的 `test_gateway_update`、`test_instance_hardening` 用例（`gateway/bin/` 是构建产物，不在导出源码中）按缺少网关程序跳过，`test_servers_hardening` 中需要 `ssh-keygen` 的用例按缺少该命令跳过，节点自身的 Go 测试由节点发布在 Go 容器里执行；其他意外跳过停止放行。
-5. 前端测试通过后即可构建，不必等独立的后端测试；前端源码、依赖和构建输入未变时复用上一正式包的前端产物。**所有必要测试和构建都通过后**才打包唯一 ZIP 与四项资产。不会向正在使用的 `web/dist` 写入。
+4. 按上一正式版源码与候选的实际内容分类。三版后端和前端分别执行或复用匹配的通过证据；证据缺失时自动补测。核对用例集合、通过／跳过／失败及未处理后台异常。既有真实上游和私有数据库条件跳过保留；评测真实环境测试只允许 `test_servers_bench_live` 中原因是 `set OPENBEAR_BENCH_LIVE=1 to run a real benchmark` 的跳过，不在发布矩阵中执行真实外部评测；需要 Go 或 Chrome 的节点集成测试（`test_servers`、`test_servers_desktop`、`test_servers_front`、`test_servers_transfers`、`test_node_browser`、`test_browser_engine_parity`、`test_browser_observe_steps`）在测试镜像里按缺少工具链跳过，需要已构建网关程序的 `test_gateway_update`、`test_instance_hardening` 用例（`gateway/bin/` 是构建产物，不在导出源码中）按缺少网关程序跳过，`test_servers_hardening` 中需要 `ssh-keygen` 的用例按缺少该命令跳过，节点自身的 Go 测试由节点发布在 Go 容器里执行；其他意外跳过停止放行，三个版本中的全部意外跳过在同一次报错里一并列出。发布容器里每个 Python 测试限时 120 秒（`pytest-timeout`，signal 方式；最慢的正常测试约 11 秒）：卡住的测试单独失败并带出用例名和堆栈，不再把整个阶段拖到容器超时；这个插件只装在发布测试镜像里（`images/python-env.sh` 固定版本），开发期的 `check.py` 不受影响。
+   - 偶发失败：一次全量里失败不超过 10 个、日志里没有未处理异步异常时，失败的用例在同一镜像里单独、串行重跑一次（`--lf`）。重跑通过的记为不稳定，写进运行状态 `flakyTests`、报告和 `wait` 输出，不拦发布；同一个用例在两个及以上 Python 版本都不稳定时按真失败拦下（只在负载下出现的真 bug，如 0.15.0 的终端消息顺序，正是这样表现的）。重跑仍失败、有未处理异步异常、失败超过 10 个，或 pytest 以非 0 退出却没有失败用例时，直接拦下。
+   - 续跑：本阶段上一次结果可用（同一镜像）时，先只跑上次失败的用例和自上次完整运行以来改过的测试模块，失败立即停下、不再跑全量。它们通过后：改动全部是 `tests/` 下的 `test_*.py`（产品代码、`conftest.py`、测试辅助模块、测试数据、pytest 与依赖配置均未变，且上次完整运行没有未处理异步异常）时，其余用例沿用上次完整运行的结果；否则再跑全量。测试模块未改、上次失败、这次单独跑通过的用例同样记为不稳定。沿用的结果保留上次的 JUnit 路径与 SHA256（`reusedJunit`），经证据校验。
+5. 前端测试通过后即可构建，不必等独立的后端测试；前端源码、依赖和构建输入未变时复用上一正式包的前端产物。**所有必要测试和构建都通过后**才打包唯一 ZIP 与四项资产。不会向正在使用的 `web/dist` 写入。网关二进制按 `gateway/` 源码、Go 镜像和构建脚本缓存在 `.release-runs/cache/gateway/`：网关未变的候选直接复用已测试过的二进制（核对字节数和 SHA256），不再重复 `go test -race` 与交叉编译；需要重编时挂载持久 Go 构建缓存 `.release-runs/cache/go-build/gateway/`。
 6. 包内 HTTP／WebSocket 冒烟、A、B 三者并行，任意失败均阻止公开发布。
 7. A：新临时容器运行实际安装器，真实 systemd 启动服务并验证业务与资源。
 8. B：另一个容器安装真实上一正式版，建立完整合法数据种子，通过旧 updater 的 transient unit 升级到与 A 相同的 ZIP，验证保留、实际前端标识及刷新／重启分支；重启分支须有可读数据库备份，仅前端更新须保持服务进程身份不变。
-9. 快进推送同源公开源码，创建 annotated tag 和草稿 Release；上传四项原始资产，下载核对字节数／SHA256 后公开并验证下载入口。正式版验证已是 Latest；beta／rc 以预发布公开（`make_latest=false`），验证没有变成 Latest。
+9. 快进推送同源公开源码，创建 annotated tag 和草稿 Release（推送 main 和 tag 后，在 60 秒内每 3 秒向 GitHub 查询一次：GitHub 接口的返回会比成功的推送晚几秒，新 tag 甚至会先返回 404；超时仍不一致才暂停）；上传四项原始资产，下载核对字节数／SHA256 后公开并验证下载入口。正式版验证已是 Latest；beta／rc 以预发布公开（`make_latest=false`），验证没有变成 Latest。
 10. 定向回收本轮临时资源，自动输出状态、阶段耗时和结果报告。
-11. 本机版本改为下一个次版本的 `dev.1` 并做一次本地提交（不推送）。
+11. 本机版本改为下一个补丁版本的 `dev.1` 并做一次本地提交（不推送）。
 
 开发期的 `scripts/check.py` 观察 Python 依赖配置及评测资源：实质依赖变更交给 testmon 选择，项目自身版本号变化不触发 Python 重跑；评测资源变化映射到包校验、运行合同与打包测试，不强制跑全集。
 
@@ -114,6 +119,8 @@
 }
 ```
 
+发布镜像一律带标签 `openbear.release.keep=1`：环境阶段 `docker commit` 出的依赖镜像自动带上标签并命名为 `openbear-release-cache:*`（无名镜像连不带 `-a` 的 `docker image prune` 都会删掉）；维护者准备的三个 Python 基础镜像（`images/Dockerfile.python` 已含标签）、systemd 镜像及其底座镜像也必须带上，缺少时预检打印警告。清理发布机 Docker 只用 `docker image prune -a --filter "label!=openbear.release.keep"`，不要用不带过滤的 `docker image prune -a` 或 `docker system prune -a`；被清掉的 `golang`、`node` 公共基础镜像在下次发布时自动拉取。依赖缓存记录指向的镜像已不存在时，环境阶段删除该记录并重新准备，不再报错。
+
 通过 `--environment /absolute/path/.release-environment.json` 传入。缺失基础镜像明确报错，不静默换 Python、Docker 安全边界或把宿主改造成测试环境。匹配的依赖缓存放在 `.release-runs/cache/`；仅项目版本字段变化可以复用，实际依赖及安装补丁变化不可冒用旧缓存。当前已知的自包含 npm 安装补丁按 `web/scripts/` 跟踪，普通界面改动不会重新安装同一套 node_modules；未知安装生命周期命令按完整 web 输入保守处理。
 
 源码／原始资产只读挂载到容器，再复制到容器自身工作区。测试默认限制 CPU、内存和进程数；测试网络关闭。systemd 验收只调整其自身 cgroup 子树，核验宿主挂载不变，不使用 privileged、宿主 PID／网络、宿主完整可写 cgroup 或 docker.sock。
@@ -122,7 +129,8 @@
 
 ```bash
 .venv/bin/python scripts/release.py status <运行ID>
-.venv/bin/python scripts/release.py resume <运行ID> --approve-container-cgroup
+.venv/bin/python scripts/release.py resume <运行ID> --approve-container-cgroup --detach
+.venv/bin/python scripts/release.py wait <运行ID>
 ```
 
 使用核心 CLI 的 `status <运行ID> --summary` 或独立适配脚本的 `status <运行ID>` 读取失败摘要。摘要包含失败用例、断言／堆栈摘录、日志位置、已通过阶段和恢复参数；仅在摘要不能回答具体问题时，才读取对应原始日志。核心 CLI 的原 `status` 完整状态仍可用于深入诊断。解决具体问题后恢复同一次运行，不重新 `start` 同一版本，不删除状态绕过门禁。
@@ -180,9 +188,10 @@
 ```bash
 .venv/bin/python scripts/release.py node start 1.0.1 \
   --notes /absolute/path/node-notes.md \
-  --files node/node.go node/browser/cdp.go
+  --files node/node.go node/browser/cdp.go --detach
+.venv/bin/python scripts/release.py node wait <节点运行ID>
 .venv/bin/python scripts/release.py node status <节点运行ID>
-.venv/bin/python scripts/release.py node resume <节点运行ID> [--files 修正文件 ...]
+.venv/bin/python scripts/release.py node resume <节点运行ID> [--files 修正文件 ...] --detach
 .venv/bin/python scripts/release.py node cleanup <节点运行ID>
 ```
 
@@ -199,11 +208,11 @@
 
 1. 校验版本格式，拒绝开发版；预检核实 GitHub 推送权限，目标 tag／Release 不存在，且版本**比远端已有的全部 `node-v*` 版本新**（按版本号规则比较，非版本形状的 tag 与开发版 tag 忽略）。有上一节点版本时自动补上 `node-v旧...node-v新` 的 Full Changelog（正式版从上一正式版算起）。
 2. 写入 `node/VERSION`，连同 `--files` 明确列出的文件在本机 `main` 提交（`release: prepare node <版本>`）。未列出的改动、非公开路径同样拒绝。首次发布时若已提交的 `node/VERSION` 恰为目标版本且没有改动，直接以当前 HEAD 为候选，不做空提交。
-3. 用与主控相同的导出机制生成公开源码（节点源码必须在其中），后续 tag 指向这个公开提交。导出的是本机 `main` 上全部允许公开的已提交内容，不只 `node/`；内容与公开 `main` 完全相同（例如主控刚发布过同一份源码）时不做空提交，直接给公开 `main` 当前提交打 tag。
-4. 在与网关构建相同的 Go 基础镜像（`GO_BASE`）中：联网只做 `go mod download`／`go mod verify`，结果按镜像与 `go.mod`／`go.sum` 缓存在 `.release-runs/cache/go-node/`；测试和构建均断网运行，执行 `go test -race ./...`。
+3. 用与主控相同的导出机制生成公开源码（节点源码必须在其中），后续 tag 指向这个公开提交；导出后同样先推临时分支 `release-candidate/<run>-<提交前 12 位>`，规则与主控相同。导出的是本机 `main` 上全部允许公开的已提交内容，不只 `node/`；内容与公开 `main` 完全相同（例如主控刚发布过同一份源码）时不做空提交，直接给公开 `main` 当前提交打 tag。
+4. 在与网关构建相同的 Go 基础镜像（`GO_BASE`）中：联网只做 `go mod download`／`go mod verify`，结果按镜像与 `go.mod`／`go.sum` 缓存在 `.release-runs/cache/go-node/`；测试和构建均断网运行，执行 `go test -race ./...`。节点阶段逐个单独执行、不与主控矩阵并行，测试和构建容器给 6 核；测试容器在去掉全部特权后只加回 `CHOWN`、`FOWNER`、`DAC_OVERRIDE`，让把目录移交给其他账号的测试像服务器上的 root 节点一样真实执行（只加前两项时这些测试会执行但因无法进入移交后的目录而失败）。测试失败时，按包取出失败的顶层测试，单独用 `-count=2` 重跑；两次都通过记为不稳定、放行并列入报告（`flakyTests`）。输出含 DATA RACE、行首 `panic:`（包括测试超时）、编译或准备失败、包失败却找不到失败测试，或失败超过 10 个时不重跑，直接拦下。
 5. 断网交叉构建四个目标：`CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w -X openbear/node.Version=<版本>'`。校验文件头与目标平台一致（ELF／Mach-O／PE 及架构），运行 linux-amd64 产物的 `version` 子命令确认报出本版本（因此发布机需为 amd64），再生成 `manifest.json`。
 6. 发布前再次确认本机 HEAD 与候选文件未变。沿用主控发布的同一条推送路径：快进推送公开 main、推送 annotated tag、建草稿 Release（beta／rc 为预发布）、上传五个附件、逐个下载核对字节数和 SHA256，然后公开（`make_latest=false`）并检查下载入口。
-7. `node/VERSION` 改为下一个次版本的 `dev.1` 并做一次本地提交（不推送），规则同主控。
+7. `node/VERSION` 改为下一个补丁版本的 `dev.1` 并做一次本地提交（不推送），规则同主控。
 
 节点发布**不打 ZIP，也不跑 A/B 安装验收**；也不会改动主控版本文件。主控发布也不改 `node/VERSION`。
 
@@ -217,4 +226,4 @@
 
 ## 给模型的简短规范
 
-> 发布能力只保留为独立维护脚本，不注册产品工具。核心入口是 `.venv/bin/python scripts/release.py`；可选 `scripts/release_local.py` 提供前台适配和摘要。凭据仅通过维护进程环境传入，容器权限只按已获得的本轮授权传参。正常阶段连续推进；失败看摘要、修正具体问题并 resume 同一运行，不重新 start，不降低验证门禁，不手工升版、重复全测或另跑演练。发布不更新在线前端、不重启本机服务。公开源码及注释不包含私有维护资料。服务器节点用 `scripts/release.py node start|status|resume|cleanup` 单独发布（tag `node-v<版本>`、五个固定附件、永不 Latest），主控 ZIP 不带节点程序。版本只发 beta、rc 或正式版（`X.Y.Z-beta.N`／`X.Y.Z-rc.N`／`X.Y.Z`，由脚本写入），须比该线已发布的都新，比较一律用 `app/versioning.py`；beta／rc 是 GitHub 预发布；发布后本机自动改为下一个次版本的 `dev.1` 并本地提交，不推送。
+> 发布能力只保留为独立维护脚本，不注册产品工具。核心入口是 `.venv/bin/python scripts/release.py`；可选 `scripts/release_local.py` 提供前台适配和摘要。凭据仅通过维护进程环境传入，容器权限只按已获得的本轮授权传参。正常阶段连续推进；失败看摘要、修正具体问题并 resume 同一运行，不重新 start，不降低验证门禁，不手工升版、重复全测或另跑演练。发布不更新在线前端、不重启本机服务。公开源码及注释不包含私有维护资料。服务器节点用 `scripts/release.py node start|status|resume|cleanup` 单独发布（tag `node-v<版本>`、五个固定附件、永不 Latest），主控 ZIP 不带节点程序。版本只发 beta、rc 或正式版（`X.Y.Z-beta.N`／`X.Y.Z-rc.N`／`X.Y.Z`，由脚本写入），须比该线已发布的都新，比较一律用 `app/versioning.py`；beta／rc 是 GitHub 预发布；发布后本机自动改为下一个补丁版本的 `dev.1` 并本地提交，不推送。

@@ -70,6 +70,7 @@ class Caps:
     delete: bool = True
     multi: bool = True       # several records may share one name and type
     whole_zone: bool = False  # every write rewrites the whole zone: writes to one zone must not overlap
+    zone_serial: bool = False  # refuses a write to a zone while another one to it is running
 
     def public(self):
         return {'zones': self.zones, 'read': self.read, 'byId': self.by_id, 'ttlMin': self.ttl_min, 'ttlMax': self.ttl_max,
@@ -175,6 +176,8 @@ class Provider:
         value = ttl if ttl else self.settings.get('ttl')
         if not value:
             return None
+        if self.caps.ttl_auto and int(value) == 1:
+            return 1
         return max(self.caps.ttl_min, min(self.caps.ttl_max, int(value)))
 
     async def request(self, method, url, *, ok=(200, 201, 202, 204), **kwargs):

@@ -32,7 +32,7 @@ function sync(index) {
     </div>
     <div class="bn-compare-cols" :style="{'--bn-cols': phone ? 1 : runs.length}">
       <div v-for="(r, i) in runs" v-show="!phone || shown === i" :key="r.id" :ref="el => { boxes[i] = el; }" class="bn-compare-col" @scroll="sync(i)">
-        <BenchReport :run="r" :server="serverOf(r)" :now="now" :active="active" compact />
+        <BenchReport :run="r" :server="serverOf(r)" :now="now" :active="active && (!phone || shown === i)" compact />
       </div>
     </div>
   </div>

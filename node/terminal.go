@@ -16,6 +16,9 @@ const (
 	// terminal sharing this connection.
 	outputWindow = 256 << 10
 	inputBacklog = 1 << 20
+	// A tunnel carries SSH, which keeps up to its channel window (2 MiB in OpenSSH) in flight
+	// unacknowledged: an exit whose link onwards is slower than the controller's must hold it.
+	tunnelBacklog = 4 << 20
 )
 
 // console is one shell attached to a pseudo terminal.
@@ -32,15 +35,16 @@ type terminal struct {
 	input chan []byte
 	quit  chan struct{}
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	window int
-	queued int
-	reason string
+	mu      sync.Mutex
+	cond    *sync.Cond
+	window  int
+	queued  int
+	backlog int
+	reason  string
 }
 
-func newTerminal(con console) *terminal {
-	t := &terminal{con: con, input: make(chan []byte, 1024), quit: make(chan struct{}), window: outputWindow}
+func newTerminal(con console, backlog int) *terminal {
+	t := &terminal{con: con, input: make(chan []byte, 1024), quit: make(chan struct{}), window: outputWindow, backlog: backlog}
 	t.cond = sync.NewCond(&t.mu)
 	return t
 }
@@ -88,7 +92,7 @@ func (t *terminal) ack(n int) {
 // keeps arriving is closed once its backlog passes the limit.
 func (t *terminal) write(data []byte) {
 	t.mu.Lock()
-	over := t.queued+len(data) > inputBacklog
+	over := t.queued+len(data) > t.backlog
 	if !over {
 		t.queued += len(data)
 	}
@@ -125,40 +129,101 @@ func (t *terminal) pumpInput() {
 type terminals struct {
 	mu   sync.Mutex
 	open map[uint32]*terminal
+	// dialing holds the tunnels still connecting, which a term.close or the session's end calls off.
+	dialing map[uint32]context.CancelFunc
+	ended   bool
 }
 
-func newTerminals() *terminals { return &terminals{open: map[uint32]*terminal{}} }
+// tunnelDial connects a terminal's tunnel; tests put others.
+var tunnelDial = dialTunnel
+
+func newTerminals() *terminals {
+	return &terminals{open: map[uint32]*terminal{}, dialing: map[uint32]context.CancelFunc{}}
+}
 
 func (a *Agent) termOpen(ctx context.Context, ch *channel, ts *terminals, m envelope) {
 	closed := func(reason string) { ch.send(map[string]any{"t": "term.closed", "sid": m.Sid, "reason": reason}) }
+	if m.Dial != "" {
+		// Reaching another machine from this one is what running commands here allows.
+		if !a.config().Capabilities.Exec {
+			closed("capability_disabled")
+			return
+		}
+		dctx, cancel := context.WithCancel(ctx)
+		ts.mu.Lock()
+		if ts.ended || ts.takenLocked(m.Sid) {
+			ts.mu.Unlock()
+			cancel()
+			closed("too_many_terminals")
+			return
+		}
+		ts.dialing[m.Sid] = cancel
+		ts.mu.Unlock()
+		// Dialed off the session loop, which must keep reading meanwhile.
+		go func() {
+			con, err := tunnelDial(dctx, m.Dial)
+			ts.mu.Lock()
+			delete(ts.dialing, m.Sid)
+			ts.mu.Unlock()
+			called := dctx.Err() != nil
+			cancel()
+			if err != nil {
+				if !called {
+					closed("connect_failed")
+				} else if ctx.Err() == nil {
+					closed("closed")
+				}
+				return
+			}
+			if called {
+				con.Hangup()
+				con.Wait()
+				if ctx.Err() == nil {
+					closed("closed")
+				}
+				return
+			}
+			a.attachTerminal(ctx, ch, ts, m.Sid, con, tunnelBacklog, closed)
+		}()
+		return
+	}
 	if !a.config().Capabilities.Terminal {
 		closed("capability_disabled")
 		return
 	}
-	ts.mu.Lock()
-	if _, exists := ts.open[m.Sid]; exists || len(ts.open) >= maxTerminals {
-		ts.mu.Unlock()
+	if ts.taken(m.Sid) {
 		closed("too_many_terminals")
 		return
 	}
 	con, err := startShell(m.Cols, m.Rows)
 	if err != nil {
-		ts.mu.Unlock()
 		closed("start_failed")
 		return
 	}
-	t := newTerminal(con)
-	ts.open[m.Sid] = t
+	a.attachTerminal(ctx, ch, ts, m.Sid, con, inputBacklog, closed)
+}
+
+func (a *Agent) attachTerminal(ctx context.Context, ch *channel, ts *terminals, sid uint32, con console, backlog int, closed func(string)) {
+	ts.mu.Lock()
+	if ts.ended || ts.takenLocked(sid) {
+		ts.mu.Unlock()
+		con.Hangup()
+		con.Wait()
+		closed("too_many_terminals")
+		return
+	}
+	t := newTerminal(con, backlog)
+	ts.open[sid] = t
 	ts.mu.Unlock()
 	a.active.Add(1)
-	ch.send(map[string]any{"t": "term.opened", "sid": m.Sid})
+	ch.send(map[string]any{"t": "term.opened", "sid": sid})
 	go t.pumpInput()
 	go func() {
-		sid := binary.BigEndian.AppendUint32(nil, m.Sid)
+		prefix := binary.BigEndian.AppendUint32(nil, sid)
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := con.Read(buf)
-			if n > 0 && (!t.acquire(n) || ch.write(kindTerminal, sid, buf[:n]) != nil) {
+			if n > 0 && (!t.acquire(n) || ch.write(kindTerminal, prefix, buf[:n]) != nil) {
 				break
 			}
 			if err != nil {
@@ -168,7 +233,7 @@ func (a *Agent) termOpen(ctx context.Context, ch *channel, ts *terminals, m enve
 		t.stop("exited")
 		con.Wait()
 		ts.mu.Lock()
-		delete(ts.open, m.Sid)
+		delete(ts.open, sid)
 		ts.mu.Unlock()
 		a.active.Add(-1)
 		if ctx.Err() == nil {
@@ -178,6 +243,30 @@ func (a *Agent) termOpen(ctx context.Context, ch *channel, ts *terminals, m enve
 			closed(reason)
 		}
 	}()
+}
+
+func (ts *terminals) taken(sid uint32) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.takenLocked(sid)
+}
+
+func (ts *terminals) takenLocked(sid uint32) bool {
+	_, exists := ts.open[sid]
+	_, dialing := ts.dialing[sid]
+	return exists || dialing || len(ts.open)+len(ts.dialing) >= maxTerminals
+}
+
+// close ends the terminal sid, or calls off its tunnel while it still connects.
+func (ts *terminals) close(sid uint32) {
+	ts.mu.Lock()
+	t, cancel := ts.open[sid], ts.dialing[sid]
+	ts.mu.Unlock()
+	if t != nil {
+		t.stop("closed")
+	} else if cancel != nil {
+		cancel()
+	}
 }
 
 func (ts *terminals) get(sid uint32) *terminal {
@@ -198,9 +287,12 @@ func (ts *terminals) input(frame []byte) {
 
 func (ts *terminals) closeAll() {
 	ts.mu.Lock()
-	open := ts.open
-	ts.open = map[uint32]*terminal{}
+	open, dialing := ts.open, ts.dialing
+	ts.open, ts.dialing, ts.ended = map[uint32]*terminal{}, map[uint32]context.CancelFunc{}, true
 	ts.mu.Unlock()
+	for _, cancel := range dialing {
+		cancel()
+	}
 	for _, t := range open {
 		t.stop("node_disconnected")
 	}

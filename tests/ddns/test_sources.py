@@ -382,3 +382,53 @@ async def test_a_node_runs_at_most_64_probes(env, monkeypatch):  # noqa: F811
         {'name': 'p9.example.com', 'type': 'A', 'accountId': account['id']}]})
     await e.ddns.idle()
     assert len(result['records']) == 1 and len(e.nodes.watched(sid)[-1]) == 2
+
+
+async def test_auto_ipv6_previews_and_starts_with_the_address_the_user_selects(env):  # noqa: F811
+    e = env
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    account = await add_account(e)
+
+    def answer(params):
+        second = params['v6Select']['mode'] == 'index' and params['v6Select']['value'] == '2'
+        return {'results': [{'method': m, 'value': ('2001:db8::2' if second else '2001:db8::1') if m == 'nic' else '', 'error': '' if m == 'nic' else 'no_address',
+                             'detail': ''} for m in params['methods']], 'interfaces': []}
+    e.nodes.probe[sid] = answer
+    source = {'method': 'auto', 'params': {'v6Select': {'mode': 'index', 'value': '2'}}}
+    preview = await e.ddns.preview(OWNER, {'serverId': sid, 'names': ['v6.example.com'], 'types': ['AAAA'], 'source': source})
+    assert preview['detected']['v6']['value'] == '2001:db8::2' and preview['detected']['v6']['method'] == 'nic'
+    result = await e.ddns.create_records(OWNER, {'serverId': sid, 'source': source, 'rows': [{'name': 'v6.example.com', 'type': 'AAAA', 'accountId': account['id']}]})
+    await e.ddns.idle()
+    rec = await record(e, result['records'][0]['id'])
+    assert rec['desired'] == '2001:db8::2' and fakeprovider.store('tok').values('v6.example.com', 'AAAA') == ['2001:db8::2']
+    assert e.nodes.watched(sid)[-1][0]['v6Select'] == {'mode': 'index', 'value': '2', 'allowTemporary': False}
+    # The default selection: the diagnosis alone.
+    probes = len([c for c in e.nodes.calls if c[1] == 'ddns.probe'])
+    plain = await e.ddns.preview(OWNER, {'serverId': sid, 'names': ['w.example.com'], 'types': ['AAAA'], 'source': {'method': 'auto'}})
+    assert plain['detected']['v6']['value'] == '2001:db8::1' and len([c for c in e.nodes.calls if c[1] == 'ddns.probe']) == probes + 1
+
+
+async def test_a_private_address_no_longer_allowed_is_not_written_again(env):  # noqa: F811
+    e = env
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    account = await add_account(e)
+    rid = (await url_record(e, sid, account, value='10.0.0.7', policy={'allowPrivate': True}))['records'][0]['id']
+    api = fakeprovider.store('tok')
+    assert api.values('home.example.com') == ['10.0.0.7']
+    await report(e, sid, key_of(e, sid), '10.0.0.7')
+    await e.ddns.update_record(OWNER, rid, {'policy': {'allowPrivate': False}})
+    await e.ddns.idle()
+    # What the provider holds stays.
+    assert (await record(e, rid))['state'] == 'no_address' and api.values('home.example.com') == ['10.0.0.7']
+    api.records.clear()
+    advance(e, ddns_module.CHECK_S)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    await e.ddns.sync_now(OWNER, rid)
+    assert api.values('home.example.com') == [] and not [c for c in api.writes() if c[0] == 'create' and c[2] == '10.0.0.7'][1:]
+    assert (await record(e, rid))['state'] == 'no_address'
+    # A public address is written as usual.
+    await report(e, sid, key_of(e, sid), '198.51.100.9')
+    assert api.values('home.example.com') == ['198.51.100.9'] and (await record(e, rid))['state'] == 'ok'

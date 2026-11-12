@@ -1,13 +1,19 @@
+<!-- for: create -->
 When the user wants something done at a future time or on a recurring basis, you can recommend the scheduling feature. Do not wait for the user to name “scheduling” or Cron explicitly. Recognize suitable scenarios from their objective: a future reminder, a daily information digest, periodic status checks, weekly reports, or other repeated work. When the user is performing these steps manually, explain how a scheduled task could replace that repetition and help configure it within the established authorization.
 
+<!-- for: create update -->
 Choose a one-time execution, a fixed interval, or a calendar-based schedule according to the actual need. Do not turn a one-off request into a recurring task. Reuse the directory, time, timezone and notification preferences already established; ask only when missing information would materially change the result.
 
+<!-- for: create update -->
 Cron tasks belong to a real directory, and each execution creates a new conversation there. Task instructions should independently explain what to do, which materials to use, the authorized scope and the expected result. They must not depend on temporary assumptions from the current conversation that were never included in the task configuration.
 
+<!-- for: create update set_enabled run -->
 Runs are unattended. By default a run may only read servers and instances (Servers and InstanceControl read actions); `allowServerChanges` lets it change them too. Leave it false unless the user explicitly asks for scheduled changes to servers or instances, and tell the user the risk: nobody watches the run, and content returned by a server can mislead it into a change. The permission follows where a turn came from: turns that continue a run (results of its Agents and background tasks, ConversationRequests and instance operations it started) have the run's permission, never more. A scheduled or Webhook run, including those turns, cannot turn it on, and cannot change, enable or run a task or endpoint that already has it.
 
+<!-- for: create update -->
 Frequent schedules accumulate many run conversations. `conversationRetention` (`keepLast`, `keepDays`) deletes this task's run conversations once they exceed either limit; pinned, archived, moved and human-continued conversations are kept. Deletion is permanent, so mention the option for frequent tasks but set it only when the user agrees that older run conversations need not be kept.
 
+<!-- for: create update -->
 When designing a task, also identify fixed steps that would benefit from pre- and post-execution scripts:
 - Pre-execution scripts can prepare directories and files, download or organize materials, initialize the working environment, and perform routine data processing so the model starts with the necessary conditions already in place.
 - Post-execution scripts can organize or archive outputs, write back results in a predetermined format, remove temporary files, shut down environments created for the task, and perform other routine cleanup.
@@ -16,6 +22,8 @@ The purpose of these scripts is to move stable, repetitive, explicitly programma
 
 Cron pre-execution scripts receive no external-event parameters and do not have to produce data for the model to analyze; preparing the environment alone is a useful purpose. When materials need to be handed to the model, use script output and file references. Configure post-execution conditions, timeouts, failure handling and retries according to the task. If a script owns cleanup, consider cleanup after failure or timeout rather than only after success. The model should build on work the scripts have already completed instead of repeating the same preparation or cleanup.
 
+<!-- for: update set_enabled run stop delete preview -->
 Consult describe and the current configuration contract for exact parameters. Before modifying an existing task, get its current configuration and preserve unrelated settings. Use preview when the interpretation of a calendar rule is uncertain. Distinguish the effects of each operation: set_enabled changes future scheduling, run starts one immediate execution, stop targets an existing run, and delete removes the task definition while retaining history. Disabling or deleting a schedule does not mean a current execution has stopped, and an immediate run does not change the regular schedule.
 
+<!-- for: run runs stop set_enabled -->
 Executions may overlap, and service recovery does not automatically replay executions missed during downtime. A saved or enabled schedule, or an accepted execution request, is not evidence that the business task has completed. Consult the corresponding execution records when the result needs verification.

@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"openbear/node/mesh"
 )
 
 func testStore(t *testing.T) *jobStore {
@@ -105,6 +107,37 @@ func TestJobStopEndsTheWholeProcessGroup(t *testing.T) {
 	}
 	if again := jobCall(t, s, "job.stop", map[string]any{"id": id}); again["stopped"] != false {
 		t.Fatalf("stopping a finished job: %v", again)
+	}
+}
+
+// The shell dies of the TERM at once; a child that ignores it holds on. The
+// stop is not done, nor the job recorded as stopped, until the child is gone too.
+func TestJobStopWaitsForAChildThatIgnoresTerm(t *testing.T) {
+	s := testStore(t)
+	dir := t.TempDir()
+	job := jobCall(t, s, "job.start", map[string]any{"command": `sh -c 'trap "" TERM; echo $$ > child; sleep 300; :' & wait`, "cwd": dir})
+	id := job["id"].(string)
+	var child int
+	for i := 0; i < 100 && child == 0; i++ {
+		b, _ := os.ReadFile(filepath.Join(dir, "child"))
+		child, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		time.Sleep(50 * time.Millisecond)
+	}
+	if child == 0 {
+		t.Fatal("job did not start")
+	}
+	pgid, ok := liveProcess(filepath.Join(s.dir, id), "child")
+	if !ok {
+		t.Fatal("the job's shell is not recorded")
+	}
+	r := jobCall(t, s, "job.stop", map[string]any{"id": id})
+	got := r["job"].(map[string]any)
+	if r["stopped"] != true || got["state"] != "stopped" {
+		t.Fatalf("stop: %v", r)
+	}
+	if !ended(child) || groupAlive(pgid) {
+		syscall.Kill(-pgid, syscall.SIGKILL)
+		t.Fatalf("stopped, but the child that ignored TERM still runs (exit %v)", got["exitCode"])
 	}
 }
 
@@ -260,5 +293,24 @@ func TestShellFillsInAnEmptyHome(t *testing.T) {
 	r, err := Exec(t.Context(), json.RawMessage(`{"command":"echo \"$HOME|$USER|$LOGNAME\"","shell":"sh"}`))
 	if err != nil || strings.HasPrefix(r.Stdout, "|") || strings.Contains(r.Stdout, "||") {
 		t.Fatalf("environment not filled in: %q %v", r.Stdout, err)
+	}
+}
+
+func TestOpenWrtCommandsSkipTheLoginBanner(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("no bash here")
+	}
+	home := t.TempDir()
+	os.WriteFile(filepath.Join(home, ".profile"), []byte("echo BANNER\n"), 0o644)
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "/opt/custom/bin")
+	keep := mesh.OpenWrtRelease
+	defer func() { mesh.OpenWrtRelease = keep }()
+	mesh.OpenWrtRelease = filepath.Join(home, "openwrt_release")
+	os.WriteFile(mesh.OpenWrtRelease, []byte("DISTRIB_ID='Kwrt'\n"), 0o644)
+	r, err := Exec(t.Context(), json.RawMessage(`{"command":"[[ 1 == 1 ]] && echo \"$PATH\""}`))
+	if err != nil || r.ExitCode != 0 || r.Shell != "/bin/bash" || strings.Contains(r.Stdout, "BANNER") ||
+		r.Stdout != "/opt/custom/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" {
+		t.Fatalf("OpenWrt: %+v %v", r, err)
 	}
 }

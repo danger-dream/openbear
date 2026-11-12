@@ -379,7 +379,7 @@ SPECS: dict[str, SettingSpec] = {
     "rath.enabled": _s(
         "rath.enabled",
         "启用子 Agent",
-        "启用 Agent、AgentMessage、AgentWait 等子任务协作能力。关闭后需要重启 OpenBear。",
+        "启用 Agent 子任务协作能力（派发、续派、指导、停止、等待等）。关闭后需要重启 OpenBear。",
         "bool",
         "rath",
         "需要重启",
@@ -473,6 +473,46 @@ SPECS: dict[str, SettingSpec] = {
         "下一轮生效",
         min_value=1,
         max_value=100,
+    ),
+    "rath.supervisionFirstReviewS": _s(
+        "rath.supervisionFirstReviewS", "首次复查时限",
+        "Agent 启动后主控最迟多久复查一次进展；等待 Agent（wait）的时间超过它会被压到这个时限。",
+        "int", "rath_supervision", "下一轮生效", min_value=30, max_value=3600, unit="秒",
+    ),
+    "rath.supervisionMaxReviewIntervalS": _s(
+        "rath.supervisionMaxReviewIntervalS", "最长复查间隔",
+        "两次复查之间最多间隔多久；Agent 正处在复查前就开始的单个长工具调用里时可以更长。",
+        "int", "rath_supervision", "下一轮生效", min_value=60, max_value=7200, unit="秒",
+    ),
+    "rath.supervisionRepeatFailures": _s(
+        "rath.supervisionRepeatFailures", "连续失败唤醒次数",
+        "同一工具连续失败达到这个次数时唤醒主控。",
+        "int", "rath_supervision", "下一轮生效", min_value=2, max_value=20, unit="次",
+    ),
+    "rath.supervisionLoopRepeats": _s(
+        "rath.supervisionLoopRepeats", "原地打转唤醒次数",
+        "最近 40 次工具调用里同一条命令或同一处编辑重复达到这个次数时唤醒主控。",
+        "int", "rath_supervision", "下一轮生效", min_value=2, max_value=20, unit="次",
+    ),
+    "rath.supervisionStallMinutes": _s(
+        "rath.supervisionStallMinutes", "停滞唤醒时长",
+        "Agent 这么久没有任何模型或工具活动时唤醒主控；正在执行的工具调用不算停滞。",
+        "int", "rath_supervision", "下一轮生效", min_value=1, max_value=240, unit="分钟",
+    ),
+    "rath.supervisionBudgetAlertPercent": _s(
+        "rath.supervisionBudgetAlertPercent", "预算提醒比例",
+        "工具调用数、模型调用数、运行时长或费用达到各自上限的这个比例时唤醒主控。",
+        "int", "rath_supervision", "下一轮生效", min_value=10, max_value=100, unit="%",
+    ),
+    "rath.supervisionDurationBudgetMinutes": _s(
+        "rath.supervisionDurationBudgetMinutes", "单个 Agent 时长预算",
+        "只用于提醒，不会停止 Agent；0 表示不提醒。",
+        "int", "rath_supervision", "下一轮生效", min_value=0, max_value=1440, unit="分钟",
+    ),
+    "rath.supervisionCostBudgetUsd": _s(
+        "rath.supervisionCostBudgetUsd", "单个 Agent 费用预算",
+        "只用于提醒，不会停止 Agent；0 表示不提醒。",
+        "float", "rath_supervision", "下一轮生效", min_value=0, max_value=1000, unit="美元",
     ),
     "rath.planDraftPrompt": _s(
         "rath.planDraftPrompt",
@@ -773,6 +813,22 @@ SPECS: dict[str, SettingSpec] = {
         "interface",
         "下一轮生效",
     ),
+    "ui.notesEnabled": _s(
+        "ui.notesEnabled",
+        "启用便签功能",
+        "在对话右侧与手机端显示便签入口、助手消息底栏摘录按钮及选中文字右键菜单；关闭后隐藏全部入口，已有便签数据保留。便签仅展示给你自己，不进入系统提示词或模型工具。",
+        "bool",
+        "notes",
+        "立即生效",
+    ),
+    "ui.notesSelectionPopover": _s(
+        "ui.notesSelectionPopover",
+        "启用划词功能",
+        "开启便签功能后，在对话消息中选中文字时自动显示快捷记入便签悬浮框；关闭时仅保留选中文字右键菜单与消息底栏按钮。",
+        "bool",
+        "notes",
+        "立即生效",
+    ),
     "features.instances": _s(
         "features.instances", "启用实例",
         "显示“实例”菜单，并把 InstanceControl 工具开放给模型。这个工具的说明较长，开启后每轮对话会多占用一些 token。关闭只隐藏菜单和工具，已有实例的守护与通知照常运行。",
@@ -995,6 +1051,19 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "rath.planMaxFinalOutputs",
         ],
     ),
+    "rath_supervision": (
+        "Agent 监督",
+        [
+        "rath.supervisionFirstReviewS",
+        "rath.supervisionMaxReviewIntervalS",
+        "rath.supervisionRepeatFailures",
+        "rath.supervisionLoopRepeats",
+        "rath.supervisionStallMinutes",
+        "rath.supervisionBudgetAlertPercent",
+        "rath.supervisionDurationBudgetMinutes",
+        "rath.supervisionCostBudgetUsd",
+        ],
+    ),
     "rath_prompts": (
         "Agent Plan 提示词",
         [
@@ -1083,6 +1152,13 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "ui.showTurnStats",
         ],
     ),
+    "notes": (
+        "对话便签",
+        [
+        "ui.notesEnabled",
+        "ui.notesSelectionPopover",
+        ],
+    ),
     "features": (
         "按需开启",
         [
@@ -1113,6 +1189,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
             "timeouts",
             "compaction",
             "rath",
+            "rath_supervision",
             "rath_prompts",
         ],
     ),
@@ -1139,7 +1216,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
         ["web"],
     ),
     "webhooks": ("外部触发", "消息接收、排队、脚本与数据保留", list(_WEBHOOK_GROUPS)),
-    "interface": ("界面显示", "回答内容和运行统计的默认呈现方式", ["interface"]),
+    "interface": ("界面显示", "回答内容、运行统计与对话便签的默认呈现方式", ["interface", "notes"]),
 }
 
 

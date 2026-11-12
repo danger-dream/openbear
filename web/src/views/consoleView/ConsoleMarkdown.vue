@@ -4,6 +4,7 @@ import {renderMarkdown} from "./markdown.js";
 import {vMarkdownHtml} from "./markdownDom.js";
 import {artifactFromUrl, openArtifactPreview} from "../../artifacts/artifactFiles.js";
 import {onArtifactDownload} from "../../artifacts/artifactDownload.js";
+import ImageLightbox from "../../artifacts/ImageLightbox.vue";
 import {referenceFromUrl, referenceKey} from "../../references/codec.js";
 
 const props = defineProps({
@@ -230,11 +231,11 @@ function onMarkdownClick(event) {
 			return;
 		}
 	}
-	if (!img) return;
+	if (!img || img.dataset?.artifactMediaUpgraded) return;
 	event.preventDefault();
 	event.stopPropagation();
 	const root = event.currentTarget;
-	const images = Array.from(root?.querySelectorAll?.("img") || []);
+	const images = Array.from(root?.querySelectorAll?.("img") || []).filter((item) => !item.dataset?.artifactMediaUpgraded && !item.closest?.(".artifact-card"));
 	const urls = images.map((item) => item.currentSrc || item.src).filter(Boolean);
 	const src = img.currentSrc || img.src || "";
 	if (!src) return;
@@ -246,11 +247,11 @@ function onMarkdownClick(event) {
 
 <template>
 	<component :is="componentTag" class="bear-md" v-markdown-html="{html, artifactCards}" @click="onMarkdownClick" @keydown="($event.key === 'Enter' || $event.key === ' ') && $event.target?.closest?.('[data-reference]') && onMarkdownClick($event)"></component>
-	<el-image-viewer v-if="imageViewerOpen"
-	                 :url-list="imageViewerUrls"
-	                 :initial-index="imageViewerIndex"
-	                 hide-on-click-modal
-	                 @close="imageViewerOpen = false"/>
+	<ImageLightbox v-if="imageViewerOpen"
+	               :url-list="imageViewerUrls"
+	               :initial-index="imageViewerIndex"
+	               hide-on-click-modal
+	               @close="imageViewerOpen = false"/>
 </template>
 
 <style scoped>

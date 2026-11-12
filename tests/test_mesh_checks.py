@@ -11,7 +11,7 @@ import pytest
 
 from app.servers import mesh as mesh_module
 from app.servers import mesh_model as model
-from app.servers.mesh_config import build, config_hash, exports, gateway_routes
+from app.servers.mesh_config import build, config_hash, exports, gateway_routes, route_plan
 from tests.test_mesh_config import facts, member, own_keys
 from tests.test_mesh_rules_all import clean_rules, everyone, mesh, rule
 from tests.test_mesh_service import Nodes, connect, server, settled
@@ -77,11 +77,52 @@ def test_all_subnets_expands_to_every_gateway_subnet_and_follows_them():
     configs = build(d, facts(), 'net', 1)
     assert configs['r2']['rules'][0]['src'] == ['100.96.0.2/32', '172.16.5.0/24', '192.168.1.0/24', '10.20.20.0/24']
     assert configs['gw']['rules'][0]['dst'] == ['192.168.1.0/25', '192.168.1.0/24']
-    # local already routing a subnet elsewhere is left without it, and warned.
-    d = mesh(rule({'all': True}, {'allSubnets': True}), extra=(member('local'),))
+    # local already routing a subnet elsewhere and keeping that route is left without it, and warned.
+    d = mesh(rule({'all': True}, {'allSubnets': True}), extra=(member('local', keepRoutes=['10.20.20.0/24']),))
     held = {**facts(), 'local': {**facts()['m1'], **own_keys('local'), 'hostRoutes': [{'net': '10.20.0.0/16', 'dev': 'wg9'}]}}
     assert gateway_routes(d, held)['local'] == ['192.168.1.0/24']
     assert [w['error'] for w in model.hints(d, held)] == ['mesh_gateway_route_conflict']
+
+
+def test_a_route_of_the_machine_is_taken_over_unless_kept():
+    d = mesh(rule({'all': True}, {'allSubnets': True}), extra=(member('local'),))
+    held = {**facts(), 'local': {**facts()['m1'], **own_keys('local'), 'hostRoutes': [{'net': '10.20.20.0/24', 'dev': 'wg9'}]}}
+    local = next(m for m in d['members'] if m['serverId'] == 'local')
+    routes, skipped, taken = route_plan(d, held)
+    assert routes['local'] == ['10.20.20.0/24', '192.168.1.0/24'] and skipped == {} and taken == {'local': [('10.20.20.0/24', '10.20.20.0/24', 'wg9')]}
+    configs = build(d, held, 'net', 1)
+    assert configs['local']['self']['takeover'] == ['10.20.20.0/24'] and configs['local']['self']['gatewayRoutes'] == routes['local']
+    assert 'takeover' not in configs['m1']['self']
+    assert not [w for w in model.hints(d, held) if w['error'] == 'mesh_gateway_route_conflict']
+    # Kept: the machine's route stays, the node gets nothing to take over, and the warning says how to take it.
+    local['keepRoutes'] = ['10.20.20.0/24']
+    routes, skipped, taken = route_plan(d, held)
+    assert routes['local'] == ['192.168.1.0/24'] and skipped == {'local': [('10.20.20.0/24', '10.20.20.0/24', 'wg9')]} and taken == {}
+    assert 'takeover' not in build(d, held, 'net', 1)['local']['self']
+    assert '勾上接管' in next(w['message'] for w in model.hints(d, held) if w['error'] == 'mesh_gateway_route_conflict')
+    # The machine is on that network itself: never taken over, and nothing to warn about.
+    local['keepRoutes'] = []
+    on = {**held, 'local': {**held['local'], 'localPrefixes': ['10.20.20.0/24'], 'hostRoutes': [{'net': '10.20.20.0/24', 'dev': 'eth1'}]}}
+    routes, skipped, taken = route_plan(d, on)
+    assert routes['local'] == ['192.168.1.0/24'] and skipped == {'local': [('10.20.20.0/24', '10.20.20.0/24', 'eth1')]} and taken == {}
+    assert not [w for w in model.hints(d, on) if w['error'] == 'mesh_gateway_route_conflict']
+    # A container bridge's wide network holds back no subnet strictly inside it; OpenWrt's br-lan does.
+    local['keepRoutes'] = ['10.20.20.0/24']
+    bridges = {**held, 'local': {**held['local'], 'localPrefixes': ['192.168.0.0/16'],
+                                 'hostRoutes': [{'net': '192.168.0.0/16', 'dev': 'br-0a1b2c3d4e5f'}, {'net': '10.20.0.0/16', 'dev': 'docker0'}]}}
+    assert route_plan(d, bridges)[:2] == ({**routes, 'local': ['10.20.20.0/24', '192.168.1.0/24']}, {})
+    lan = {**held, 'local': {**held['local'], 'localPrefixes': ['192.168.0.0/16'], 'hostRoutes': [{'net': '192.168.0.0/16', 'dev': 'br-lan'}]}}
+    assert route_plan(d, lan)[0]['local'] == ['10.20.20.0/24']
+    with pytest.raises(model.MeshInvalid) as bad:
+        model.clean_doc({'members': [{'serverId': 'local', 'keepRoutes': ['nope']}]}, d)
+    assert [(e['path'], e['error']) for e in bad.value.errors] == [('members[0].keepRoutes', 'invalid_keep_routes')]
+    # A member stored before the field reads as keeping nothing; the old opt-in list goes.
+    local['keepRoutes'] = []
+    stored = copy.deepcopy(d)
+    for m in stored['members']:
+        del m['keepRoutes']
+        m['takeover'] = ['10.20.20.0/24']
+    assert model.upgrade(stored) == d
 
 
 async def test_all_subnets_in_changes_and_the_network_test(env):  # noqa: F811
@@ -150,6 +191,12 @@ def test_gateway_subnet_suggestions_come_from_the_machines_lans():
     assert model.subnet_suggestions({}, '100.96.0.0/16') == []
 
 
+def test_networks_docker_made_are_not_suggested():
+    # Docker's own bridges take whole /16s from 172.17.0.0 to 172.31.0.0; a LAN cut smaller in that range stays.
+    f = {'localPrefixes': ['172.18.0.0/16', '172.31.0.0/16', '172.20.5.0/24', '172.31.8.0/21', '172.16.0.0/16', '192.168.13.0/24']}
+    assert model.subnet_suggestions(f, '100.96.0.0/16') == ['172.20.5.0/24', '172.31.8.0/21', '172.16.0.0/16', '192.168.13.0/24']
+
+
 # ----- listen ports on the machine -----
 def ports_nodes(e, held):
     """Nodes answering net.ports from held {(sid, proto, port): (process, pid, ours)}."""
@@ -196,14 +243,15 @@ async def test_listen_ports_in_use_warn_on_save_and_refuse_apply(env):  # noqa: 
     ports = [w for w in saved['warnings'] if w['error'].startswith('mesh_port')]
     assert ports == [{'path': 'members[1].listen.udp', 'error': 'mesh_port_in_use',
                       'message': '公司-Windows 的 UDP 端口 52020 已被 svchost.exe（PID 4242） 占用，组网服务无法监听它。请换一个端口，或先停掉占用它的程序'}]
-    assert calls == [(win, {'tcp': [], 'udp': [52020]})]
+    # Berlin, now a public relay with its ports left to the mesh, opens TCP for newcomers too.
+    assert sorted(calls, key=str) == sorted([(r1, {'tcp': [52000], 'udp': [51999]}), (win, {'tcp': [], 'udp': [52020]})], key=str)
     # Kept for a while: saving again or reading the overview asks nothing.
     await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
     await api(e, 'GET', '/api/servers/mesh')
-    assert len(calls) == 1
+    assert len(calls) == 2
     # Applying checks again, now: still held, so refused as an error and nothing goes out.
     refused = await api(e, 'POST', '/api/servers/mesh/apply', status=400)
-    assert refused['error'] == 'mesh_invalid' and [x['error'] for x in refused['errors']] == ['mesh_port_in_use'] and len(calls) == 3
+    assert refused['error'] == 'mesh_invalid' and [x['error'] for x in refused['errors']] == ['mesh_port_in_use'] and len(calls) == 4
     assert not nodes.sent('mesh.apply')
     # Freed (or moved to a free port): it goes out.
     del held[(win, 'udp', 52020)]
@@ -278,7 +326,8 @@ async def test_a_silent_node_never_holds_up_the_overview(env, monkeypatch):  # n
     assert time.monotonic() - started < 0.3 and all(unchecked(v) == [] for v in views) and calls == [a, a]
     # Saving meanwhile waits for that same check rather than asking a second time.
     members = views[0]['members']
-    members[0]['role'] = 'relay'
+    # Its ports set by hand as they are, so the check under way covers them (left to the mesh, a relay also opens TCP).
+    members[0].update(role='relay', auto=[])
     saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
     assert unchecked(saved) == [silence] and calls == [a, a]
     view, took = await overview()

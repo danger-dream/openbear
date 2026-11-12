@@ -6,7 +6,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../../../browserTestS
 import {createContextSaveBackend} from './saveFixture.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../../../testing/playwright.cjs')); } catch {}
 const shots = process.env.OPENBEAR_CONTEXT_SHOTS || '';
 const html = '<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="app" style="height:100dvh;position:relative"></div><script type="module" src="/@id/__x00__virtual:context-save-test"></script></body></html>';
 const entry = `import '/src/monaco-worker.js';import '/src/theme.js';import {createApp,h,ref} from 'vue';import ElementPlus from 'element-plus';import 'element-plus/dist/index.css';import '/src/style.css';import '/src/mobile-inputs.css';import '/src/mobile-overlays.css';import ContextEditor from '/src/views/consoleView/ContextEditor.vue';

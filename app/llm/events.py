@@ -55,6 +55,7 @@ class StreamEvent:
       - "tool_input" 参数生成活动（details，仅工具名/字节数/时间，不含参数，不可执行）
       - "tool_call"  完整工具调用集合（tool_calls）
       - "usage"      用量（usage）
+      - "usage_preview" 调用开始时已知的提示用量（usage）；仅供实时展示，最终以 "usage" 为准
       - "finish"     结束（finish_reason: stop|tool_calls|length|...）
       - "error"      错误（error）
       - "metrics"    传输层指标（connect_ms）

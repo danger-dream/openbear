@@ -89,6 +89,9 @@ class FakeDocker:
         self.containers = {}
         self.calls = []
         self.created = []
+        self.missing = set()
+        self.pytest_runs = []  # queued (junit, returncode, lastfailed) per pytest container
+        self.pytest_scripts = []
         self.interrupt = None
         self.error_text = ""
         self.smoke_lifecycle = {"fullStartup": True, "ready": True, "cleanShutdown": True}
@@ -111,7 +114,7 @@ class FakeDocker:
         self.calls.append(args)
         if args[1:3] == ["image", "inspect"]:
             ref = args[3]
-            image = ref if ref.startswith("sha256:") else self.images.get(ref)
+            image = None if ref in self.missing else ref if ref.startswith("sha256:") else self.images.get(ref)
             return self.response(args, kwargs, 0 if image else 1, image or "", "" if image else "No such image")
         if args[1] == "pull":
             self.images[args[2]] = "sha256:" + "f" * 64
@@ -153,9 +156,17 @@ class FakeDocker:
             if out:
                 for name in re.findall(r"/out/([a-zA-Z0-9_.-]*toolchain[a-zA-Z0-9_.-]*\.json)", script):
                     put(out / name, json.dumps({"node": "v20.20.2", "npm": "11.11.0", "python": "3.12.9", "git": "git version 2.47", "bash": "GNU bash", "pytest-xdist": "3.8.0", "execnet": "2.1.2"}))
+            if "go test -race ./..." in script:
+                for arch in ("amd64", "arm64"):
+                    (out / f"openbear-gateway-linux-{arch}").write_bytes(b"\x7fELF" + script.encode()[:64] + arch.encode())
+                put(out / "toolchain.txt", "go version go1.24.4 linux/amd64\n")
             if "python -m pytest" in script:
-                put(out / "junit.xml", self.junit)
-                return self.response(args, kwargs, self.test_returncode, "2 tests\n" + self.error_text)
+                junit, code, failed = self.pytest_runs.pop(0) if self.pytest_runs else (self.junit, self.test_returncode, None)
+                self.pytest_scripts.append(script)
+                put(out / re.search(r"--junitxml=/out/(\S+)", script)[1], junit)
+                if failed is not None:
+                    put(out / re.search(r"cache_dir=/out/(\S+)", script)[1] / "v/cache/lastfailed", json.dumps(dict.fromkeys(failed, True)))
+                return self.response(args, kwargs, code, "2 tests\n" + self.error_text)
             if "node --test --test-concurrency=2" in script:
                 return self.response(args, kwargs, self.test_returncode, self.tap + self.error_text)
             if "npm run build -- --outDir /out/dist" in script:
@@ -207,6 +218,18 @@ def test_env_matching_shared_node_cache_and_three_independent_abis(config, docke
     assert len([c for c in docker.calls if c[1] == "commit"]) == before
 
 
+def test_cache_images_are_named_kept_and_prepared_again_once_pruned(config, docker):
+    env = prepare(config, docker)
+    commits = [c for c in docker.calls if c[1] == "commit"]
+    assert len(commits) == 4
+    assert all(c[2:4] == ["--change", f"LABEL {build.KEEP_LABEL}=1"] and c[-1].startswith("openbear-release-cache:") for c in commits)
+    docker.missing.update([env["pythonImages"]["311"], env["nodeImage"]])
+    again = prepare(config, docker)
+    assert len([c for c in docker.calls if c[1] == "commit"]) == 6
+    assert again["pythonImages"]["311"] != env["pythonImages"]["311"] and again["nodeImage"] != env["nodeImage"]
+    assert again["pythonImages"]["312"] == env["pythonImages"]["312"]
+
+
 def test_cross_run_concurrent_env_creation_has_single_atomic_cache(config, docker):
     other = dict(config, runId="second-run", runDir=config["runDir"].with_name("second-run"))
     docker.configs[other["runId"]] = other
@@ -231,7 +254,7 @@ def test_node_cache_corruption_is_not_reused(config, docker):
 def test_recipe_uses_candidate_frozen_lock_extra_tools_and_real_postinstall():
     text = (build.IMAGES / "python-env.sh").read_text()
     assert 'uv sync --frozen --extra dev --python "$base_python"' in text
-    assert "pytest-xdist==3.8.0 execnet==2.1.2" in text
+    assert "pytest-xdist==3.8.0 execnet==2.1.2 pytest-timeout==2.4.0" in text
     assert "rm -rf /opt/testenv" in text and "--inexact" not in text
     node = (build.IMAGES / "node-env.sh").read_text()
     assert "npm ci --include=dev" in node and "--ignore-scripts" not in node
@@ -277,6 +300,9 @@ def test_tests_copy_source_readonly_shared_node_no_network_and_report_counts(con
     assert executed["mounts"]["/inputs/node"] == Path(env["nodeDir"])
     assert all("readonly" in a for a in args if "dst=/inputs/" in a)
     assert "cp -a --no-preserve=ownership /inputs/source/. /work/source/" in executed["script"]
+    if "python -m pytest" in executed["script"]:
+        # A hung test fails on its own, with its stack, instead of stalling the whole stage.
+        assert f"--timeout={build.TEST_TIMEOUT} --timeout-method=signal" in executed["script"]
     assert "ln -s /inputs/node/node_modules" in executed["script"]
     assert result["counts"]["skipped"] == 1
     assert result["toolchain"]["node"] == "v20.20.2"
@@ -388,6 +414,72 @@ def test_package_actual_candidate_classifier_validator_unique_zip_and_smoke(conf
     refused = stage(config, "package")
     assert not refused["ok"]
     assert build.sha256(assets / "openbear-1.2.4.zip") == result["zipSha256"]
+
+
+def another_run(config, docker, tmp_path, name):
+    raw = {k: str(v) if isinstance(v, Path) else v for k, v in config.items()}
+    run = build.validate_config({**raw, "runId": name, "runDir": str(tmp_path / name)})
+    docker.configs[name] = run
+    return run
+
+
+def test_gateway_is_built_once_per_gateway_source_and_reused_by_later_candidates(config, docker, tmp_path):
+    put(config["sourceDir"] / "gateway/go.mod", "module openbear/gateway\n")
+    put(config["sourceDir"] / "gateway/main.go", "package main\n")
+
+    def gateway_builds():
+        return [c for c in docker.created if "go test -race ./..." in c["script"]]
+
+    def package_run(name):
+        run = another_run(config, docker, tmp_path, name)
+        prepare(run, docker)
+        assert stage(run, "build")["ok"]
+        result = stage(run, "package")
+        assert result["ok"], result
+        with zipfile.ZipFile(run["runDir"] / "assets/openbear-1.2.4.zip") as archive:
+            return {n: archive.read(n) for n in archive.namelist() if n.startswith("gateway/bin/")}
+
+    first = package_run("run-first")
+    assert len(gateway_builds()) == 1
+    assert set(first) == {"gateway/bin/manifest.json", "gateway/bin/openbear-gateway-linux-amd64", "gateway/bin/openbear-gateway-linux-arm64"}
+    assert gateway_builds()[0]["mounts"]["/gocache"] == config["cacheDir"] / "go-build/gateway"
+
+    put(config["sourceDir"] / "app/other.py", "# candidate changed outside gateway/\n")
+    put(config["sourceDir"] / "tests/test_other.py", "# test-only change\n")
+    assert package_run("run-second") == first
+    assert len(gateway_builds()) == 1
+
+    put(config["sourceDir"] / "gateway/main.go", "package main // changed\n")
+    package_run("run-third")
+    assert len(gateway_builds()) == 2
+
+
+def test_containers_drop_every_capability_unless_a_stage_adds_one_back(config, docker):
+    prepare(config, docker)
+    default = docker.created[0]["args"]
+    assert default[default.index("--cpus") + 1] == "2" and "--cap-add" not in default
+    stage_ = build.Stage(config, "env")
+    stage_.out.mkdir(parents=True)
+    stage_.log_path.touch()
+    stage_.run_container(build.NODE_BASE, "true", [], cpus=6, caps=("CHOWN", "FOWNER"))
+    args = docker.created[-1]["args"]
+    assert args[args.index("--cpus") + 1] == "6"
+    assert args.index("--cap-drop") < args.index("--cap-add")
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--cap-add"] == ["CHOWN", "FOWNER"]
+
+
+def test_tampered_gateway_cache_is_refused(config, docker, tmp_path):
+    put(config["sourceDir"] / "gateway/go.mod", "module openbear/gateway\n")
+    prepare(config, docker)
+    assert stage(config, "build")["ok"]
+    assert stage(config, "package")["ok"]
+    cached = next((config["cacheDir"] / "gateway").glob("*/openbear-gateway-linux-amd64"))
+    cached.write_bytes(b"\x7fELF tampered")
+    run = another_run(config, docker, tmp_path, "run-tampered")
+    prepare(run, docker)
+    assert stage(run, "build")["ok"]
+    refused = stage(run, "package")
+    assert not refused["ok"] and "gateway cache content changed" in refused["error"]
 
 
 @pytest.mark.parametrize("missing", ["fullStartup", "ready", "cleanShutdown"])
@@ -581,3 +673,190 @@ def test_cli_failure_nonzero_and_result(config, docker, tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["stage"] == "env" and report["ok"] is False
     assert Path(report["log"]).is_file()
+
+
+def junit(*cases):
+    body = "".join(f'<testcase classname="{module}" name="{name}">'
+                   + ('<failure message="boom"/>' if status == "failed" else "") + "</testcase>"
+                   for module, name, status in cases)
+    return f'<testsuites><testsuite tests="{len(cases)}" errors="0">{body}</testsuite></testsuites>'
+
+
+def two_modules(config):
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): pass\n")
+    put(config["sourceDir"] / "tests/test_other.py", "def test_b(): pass\n")
+
+
+def statuses(result):
+    return {c["id"]: (c["status"], bool(c.get("flaky"))) for c in result["testCases"]}
+
+
+A, B = "tests/test_real.py::test_a", "tests/test_other.py::test_b"
+
+
+def test_a_failure_that_passes_alone_is_flaky_and_the_stage_passes(config, docker):
+    two_modules(config)
+    prepare(config, docker)
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "failed"), ("tests.test_other", "test_b", "passed")), 1, [A]),
+                          (junit(("tests.test_real", "test_a", "passed")), 0, [])]
+    result = stage(config, "py311")
+    assert result["ok"], result
+    assert result["flaky"] == ["tests.test_real::test_a"] and result["counts"]["failed"] == 0
+    assert statuses(result)["tests.test_real::test_a"] == ("passed", True)
+    rerun = docker.pytest_scripts[-1]
+    assert "--lf" in rerun and "-n 2" not in rerun and "--junitxml=/out/rerun.xml" in rerun
+    assert result["outputs"]["rerunJunit"].endswith("rerun.xml") and result["complete"]
+
+
+@pytest.mark.parametrize("why", ["unhandled", "mass"])
+def test_async_exceptions_and_mass_failures_are_not_rerun(config, docker, why):
+    two_modules(config)
+    prepare(config, docker)
+    if why == "unhandled":
+        docker.error_text = "Unclosed client session\n"
+        cases = [("tests.test_real", "test_a", "failed")]
+    else:
+        cases = [("tests.test_real", f"test_{i}", "failed") for i in range(build.RERUN_LIMIT + 1)]
+    docker.pytest_runs = [(junit(*cases), 1, [A])]
+    result = stage(config, "py311")
+    assert not result["ok"]
+    assert len(docker.pytest_scripts) == 1
+
+
+def test_a_nonzero_exit_without_failed_tests_is_a_failure(config, docker):
+    two_modules(config)
+    prepare(config, docker)
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed")), 3, [])]
+    result = stage(config, "py311")
+    assert not result["ok"] and "without a failed test" in result["error"]
+
+
+def fail_test_a_twice(config, docker):
+    two_modules(config)
+    prepare(config, docker)
+    failing = junit(("tests.test_real", "test_a", "failed"), ("tests.test_other", "test_b", "passed"))
+    docker.pytest_runs = [(failing, 1, [A]), (junit(("tests.test_real", "test_a", "failed")), 1, [A])]
+    first = stage(config, "py311")
+    assert not first["ok"] and first["complete"] and first["failedNodeIds"] == [A]
+    docker.pytest_scripts.clear()
+    return first
+
+
+def test_fixing_only_a_test_module_reruns_it_alone_and_keeps_the_other_results(config, docker):
+    fail_test_a_twice(config, docker)
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): assert True  # fixed\n")
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed")), 0, [])]
+    second = stage(config, "py311")
+    assert second["ok"], second
+    assert len(docker.pytest_scripts) == 1 and docker.pytest_scripts[0].rstrip().endswith("tests/test_real.py")
+    assert "--junitxml=/out/fast.xml" in docker.pytest_scripts[0]
+    assert statuses(second) == {"tests.test_real::test_a": ("passed", False), "tests.test_other::test_b": ("passed", False)}
+    assert second["plan"]["reuse"] and second["outputs"]["reusedJunit"]
+
+
+def test_a_product_change_runs_the_fast_set_then_everything(config, docker):
+    fail_test_a_twice(config, docker)
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): assert True  # fixed\n")
+    put(config["sourceDir"] / "app/other.py", "# product fix\n")
+    everything = junit(("tests.test_real", "test_a", "passed"), ("tests.test_other", "test_b", "passed"))
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed")), 0, []), (everything, 0, [])]
+    second = stage(config, "py311")
+    assert second["ok"], second
+    assert ["fast.xml" in s for s in docker.pytest_scripts] == [True, False]
+    assert "--junitxml=/out/junit.xml" in docker.pytest_scripts[1] and not second["plan"]["reuse"]
+
+
+@pytest.mark.parametrize("shared", ["tests/conftest.py", "tests/fake_node.py", "tests/data/sample.json"])
+def test_a_change_to_shared_test_inputs_is_not_reused(config, docker, shared):
+    fail_test_a_twice(config, docker)
+    put(config["sourceDir"] / shared, "# shared by many test modules\n")
+    everything = junit(("tests.test_real", "test_a", "passed"), ("tests.test_other", "test_b", "passed"))
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed")), 0, []), (everything, 0, [])]
+    second = stage(config, "py311")
+    assert second["ok"] and len(docker.pytest_scripts) == 2 and not second["plan"]["reuse"]
+
+
+def test_a_failing_fast_set_stops_at_once_and_the_next_fix_still_reuses_the_complete_run(config, docker):
+    first = fail_test_a_twice(config, docker)
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): assert False  # wrong fix\n")
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "failed")), 1, [A])]
+    second = stage(config, "py311")
+    assert not second["ok"] and "full run skipped" in second["error"] and len(docker.pytest_scripts) == 1
+    assert not second["complete"] and second["base"].endswith(first["attempt"] + "/result.json")
+    docker.pytest_scripts.clear()
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): assert True  # right fix\n")
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed")), 0, [])]
+    third = stage(config, "py311")
+    assert third["ok"] and len(docker.pytest_scripts) == 1
+    assert statuses(third) == {"tests.test_real::test_a": ("passed", False), "tests.test_other::test_b": ("passed", False)}
+
+
+def test_a_failure_in_an_unchanged_module_that_passes_on_resume_is_flaky(config, docker):
+    two_modules(config)
+    prepare(config, docker)
+    failing = junit(("tests.test_real", "test_a", "failed"), ("tests.test_other", "test_b", "failed"))
+    docker.pytest_runs = [(failing, 1, [A, B]), (failing, 1, [A, B])]
+    assert not stage(config, "py311")["ok"]
+    docker.pytest_scripts.clear()
+    put(config["sourceDir"] / "tests/test_real.py", "def test_a(): assert True  # fixed\n")
+    docker.pytest_runs = [(junit(("tests.test_real", "test_a", "passed"), ("tests.test_other", "test_b", "passed")), 0, [])]
+    second = stage(config, "py311")
+    assert second["ok"], second
+    assert docker.pytest_scripts[0].rstrip().endswith(f"{B} tests/test_real.py")
+    assert statuses(second) == {"tests.test_real::test_a": ("passed", False), "tests.test_other::test_b": ("passed", True)}
+    assert second["flaky"] == ["tests.test_other::test_b"]
+
+
+@pytest.mark.parametrize('consumer', [
+    'from tests.test_shared import fixture',
+    'import tests.test_shared as shared',
+    'from tests import test_shared',
+    'from .test_shared import fixture',
+    'from . import test_shared',
+    'import test_shared',
+    'from tests.test_shared import *',
+    'import importlib as loader\nloader.import_module("tests.test_shared")',
+    '__import__("tests.test_shared")',
+    'pytest_plugins = ["tests.test_shared"]',
+])
+def test_shared_test_modules_and_uncertain_imports_disable_reuse(tmp_path, consumer):
+    put(tmp_path / 'tests/test_shared.py', 'fixture = 2\n')
+    put(tmp_path / 'tests/test_consumer.py', consumer)
+    assert not build.independent_test_changes(tmp_path, ['tests/test_shared.py', 'tests/test_consumer.py'], {'tests/test_shared.py'})
+
+
+def test_shared_test_nested_relative_and_missing_inputs_disable_reuse(tmp_path):
+    put(tmp_path / 'tests/test_shared.py', 'fixture = 2\n')
+    put(tmp_path / 'tests/nested/test_consumer.py', 'from ..test_shared import fixture\n')
+    assert not build.independent_test_changes(tmp_path, ['tests/test_shared.py', 'tests/nested/test_consumer.py'], {'tests/test_shared.py'})
+
+
+def test_a_test_module_nothing_else_names_keeps_reuse(tmp_path):
+    put(tmp_path / 'tests/test_shared.py', 'fixture = 2\n')
+    put(tmp_path / 'tests/test_other.py', 'import importlib\nvalue = eval("1")\n')
+    assert build.independent_test_changes(tmp_path, ['tests/test_shared.py', 'tests/test_other.py'], {'tests/test_shared.py'})
+
+
+def test_imported_test_helper_change_runs_consumers_and_blocks_release(config, docker):
+    two_modules(config)
+    put(config['sourceDir'] / 'tests/test_other.py', 'from tests.test_real import shared\ndef test_b(): assert shared == 1\n')
+    put(config['sourceDir'] / 'tests/test_real.py', 'shared = 1\ndef test_a(): assert False\n')
+    prepare(config, docker)
+    failing = junit(('tests.test_real', 'test_a', 'failed'), ('tests.test_other', 'test_b', 'passed'))
+    docker.pytest_runs = [(failing, 1, [A]), (junit(('tests.test_real', 'test_a', 'failed')), 1, [A])]
+    first = stage(config, 'py311')
+    assert not first['ok'] and first['complete']
+    docker.pytest_scripts.clear()
+    # Only the provider changes; its own test now passes but the unchanged
+    # consumer fails with the new shared value. FakeDocker records the real
+    # stage selection; no Docker daemon or publication is invoked.
+    put(config['sourceDir'] / 'tests/test_real.py', 'shared = 2\ndef test_a(): assert True\n')
+    docker.pytest_runs = [
+        (junit(('tests.test_real', 'test_a', 'passed')), 0, []),
+        (junit(('tests.test_real', 'test_a', 'passed'), ('tests.test_other', 'test_b', 'failed')), 1, [B]),
+        (junit(('tests.test_other', 'test_b', 'failed')), 1, [B]),
+    ]
+    second = stage(config, 'py311')
+    assert not second['ok'] and not second['plan']['reuse']
+    assert '--junitxml=/out/junit.xml' in docker.pytest_scripts[1]
+    assert second['failedNodeIds'] == [B]

@@ -362,6 +362,10 @@ func (c *Control) Commit(peer string, path Path) error {
 func (c *Control) Deactivate(peer string, path Path) error {
 	return c.bind.Deactivate(peer, transport.PathRef(path))
 }
+func (c *Control) Committed(peer string, path Path) bool {
+	ref, ok := c.bind.ActivePath(peer)
+	return ok && Path(ref) == path
+}
 func (c *Control) Release(path Path) error {
 	if path.ID == "" {
 		return nil

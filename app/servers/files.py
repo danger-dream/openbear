@@ -25,7 +25,7 @@ PROTECTED = frozenset({
     '/', '/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib32', '/lib64', '/libx32', '/media', '/mnt', '/opt', '/proc', '/root',
     '/run', '/sbin', '/srv', '/sys', '/tmp', '/usr', '/var', '/usr/bin', '/usr/sbin', '/usr/lib', '/usr/local', '/usr/local/bin',
     '/var/lib', '/var/log', '/etc/ssh', '/etc/systemd', '/etc/openbear-node', '/usr/local/bin/openbear-node',
-    '/etc/systemd/system/openbear-node.service',
+    '/etc/systemd/system/openbear-node.service', '/etc/init.d/openbear-node',
     # macOS
     '/Applications', '/Library', '/Library/LaunchDaemons', '/Library/LaunchDaemons/com.openbear.node.plist', '/System', '/Users',
     '/Volumes', '/private', '/private/etc', '/private/tmp', '/private/var', '/cores',
@@ -87,6 +87,32 @@ def archive_kind(target):
     return next((kind for ext, kind in ARCHIVES if lower.endswith(ext)), None)
 
 
+# BusyBox tar (OpenWrt, Alpine) neither tells the compression of what it extracts nor has -J or -j:
+# gzip goes with -z, the rest through their own program, and without it the tool is missing.
+BUSYBOX_TAR = 'tar --help 2>&1 | grep -q BusyBox'
+PIPEFAIL = '(set -o pipefail) 2>/dev/null && set -o pipefail; '
+COMPRESSORS = {'.tar.gz': 'gz', '.tgz': 'gz', '.tar.xz': 'xz', '.txz': 'xz', '.tar.bz2': 'bz2', '.tbz2': 'bz2', '.tar.zst': 'zst'}
+DECOMPRESS = {'xz': ('xz -dc', 'unxz -c'), 'bz2': ('bzip2 -dc', 'bunzip2 -c'), 'zst': ('zstd -dc', 'unzstd -c')}
+
+
+def compression(target):
+    lower = target.lower()
+    return next((c for ext, c in COMPRESSORS.items() if lower.endswith(ext)), '')
+
+
+def extract_tar(archive, dest):
+    comp, plain = compression(archive), f'tar -xf {q(archive)} -C {q(dest)}'
+    if not comp:
+        return plain
+    if comp == 'gz':
+        return f'if {BUSYBOX_TAR}; then tar -xzf {q(archive)} -C {q(dest)}; else {plain}; fi'
+    tools = DECOMPRESS[comp]
+    piped = ''.join(f'{"if" if i == 0 else "elif"} command -v {tool.split()[0]} >/dev/null 2>&1; then {tool} {q(archive)} | tar -xf - -C {q(dest)}; '
+                    for i, tool in enumerate(tools))
+    gnu = f'command -v {tools[0].split()[0]} >/dev/null 2>&1 || exit {NO_TOOL}; {plain}'
+    return f'if {BUSYBOX_TAR}; then {PIPEFAIL}{piped}else exit {NO_TOOL}; fi; else {gnu}; fi'
+
+
 def free(target):
     """Shell test that stops with EXISTS when something is already there."""
     return f'if [ -e {q(target)} ] || [ -L {q(target)} ]; then exit {EXISTS}; fi; '
@@ -138,6 +164,11 @@ def command(op, data, platform='linux'):
             local = ' '.join(q('./' + m) for m in members)
             body = (f'cd {q(parent)} && if command -v zip >/dev/null 2>&1; then zip -qry {q(target)} {local}; '
                     f'elif command -v python3 >/dev/null 2>&1; then python3 -m zipfile -c {q(target)} {local}; else exit {NO_TOOL}; fi')
+        elif fmt == 'tar.xz' and platform != 'darwin':
+            listed = ' '.join(q(m) for m in members)
+            busybox = f'{PIPEFAIL}tar -cf - -C {q(parent)} -- {listed} | xz -c > {q(target)} || {{ rc=$?; rm -f -- {q(target)}; exit $rc; }}'
+            body = (f'command -v xz >/dev/null 2>&1 || exit {NO_TOOL}; '
+                    f'if {BUSYBOX_TAR}; then {busybox}; else tar -cJf {q(target)} -C {q(parent)} -- {listed}; fi')
         else:
             body = f'tar -c{"z" if fmt == "tar.gz" else "J"}f {q(target)} -C {q(parent)} -- ' + ' '.join(q(m) for m in members)
         return free(target) + body, LONG
@@ -150,8 +181,10 @@ def command(op, data, platform='linux'):
         if kind == 'zip':
             body = (f'if command -v unzip >/dev/null 2>&1; then unzip -qo {q(archive)} -d {q(dest)}; '
                     f'elif command -v python3 >/dev/null 2>&1; then python3 -m zipfile -e {q(archive)} {q(dest)}; else exit {NO_TOOL}; fi')
-        else:
+        elif platform == 'darwin':
             body = f'tar -xf {q(archive)} -C {q(dest)}'
+        else:
+            body = extract_tar(archive, dest)
         return f'mkdir -p -- {q(dest)} && ' + body, LONG
     raise InstanceError('invalid_file_op')
 

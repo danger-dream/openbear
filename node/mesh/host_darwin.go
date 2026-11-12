@@ -80,6 +80,9 @@ func (h *darwinHost) ready() bool { return h.up }
 // close leaves routes to the interface, which goes away with them.
 func (h *darwinHost) close() {}
 
+// Sweep: a data plane here leaves nothing on the machine once it is gone.
+func Sweep(string) {}
+
 // residentBytes approximates the RSS with the memory the Go runtime holds:
 // the current RSS needs task_info, which a cgo-free build cannot call, and
 // getrusage only has the peak. Code and shared libraries are not counted.

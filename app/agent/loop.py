@@ -28,6 +28,7 @@ from app.runtime.lifecycle import RunSession, ObserverProxy
 from app.runtime.tool_result import ToolOutcome
 from app.context.window import source_of
 from app.agent.tool_call_hooks import normalize_tool_calls
+from app.tools.agent_actions import canonical_call, canonical_tool
 from app.agent.transcript_repair import (
     MISSING_TOOL_RESULT_TEXT,
     is_role_alternation_bridge,
@@ -187,7 +188,7 @@ def _redundant_agent_wait_result() -> str:
         "summary": {"running": 0, "waitingControl": 0},
         "message": (
             "All scoped Agents are already terminal and their completion was already consumed. "
-            "Do not call AgentWait again; integrate the results and continue the root task as needed."
+            "Do not call Agent(action=wait) again; integrate the results and continue the root task as needed."
         ),
     }, ensure_ascii=False)
 
@@ -714,6 +715,12 @@ class Agent:
                         result.halted_reason = 'receipt_repair_incomplete'
                         return RuntimeDecision.complete(result)
                     tool_context.receipt_repair_calls += 1
+                else:
+                    # Extensions switched on or off since the last request change the tools from this request on.
+                    changed = getattr(self._tools, "schemas_if_changed", None)
+                    refreshed = changed(scope="main") if callable(changed) else None
+                    if refreshed is not None:
+                        tool_schemas[:] = refreshed
                 round_no += 1
                 result.rounds = round_no
                 await renderer.on_status("正在思考 …")
@@ -788,6 +795,7 @@ class Agent:
                         result.model_retry += 1
                     attempts_started += 1
                     result.model_calls += 1
+                    result.live_output.start_call(result.context_estimated_input_tokens)
 
                 async def finish_bridge_preview(*, allow_marker=False):
                     nonlocal full_text, signature, native_output_items, native_round_replayable, open_rendered
@@ -807,6 +815,7 @@ class Agent:
 
                 async def observe(event, partial, outcome):
                     nonlocal full_text, reasoning_text, open_rendered, encrypted_reasoning_text, tool_input_active
+                    result.live_output.observe(event)
                     full_text, reasoning_text = partial.text, partial.reasoning
                     new_output = bool(event.text) and (
                         event.kind in {"content", "reasoning"}
@@ -846,6 +855,8 @@ class Agent:
                     response = outcome.response
                     usage = response.usage
                     result.usage.merge(usage)
+                    # Same step as the merge: live stats never count this call twice.
+                    result.live_output.end_call(usage if outcome.prompt_usage_reported else None)
                     if window_runtime is not None:
                         await window_runtime.observe_usage(usage if outcome.prompt_usage_reported else None,
                                                           ticket=outcome.request.metadata.get("ticket"))
@@ -1059,25 +1070,27 @@ class Agent:
 
             async def execute_tool(host_self, tc):
                 nonlocal convo, round_no, open_rendered, emergency_overflow_tries, empty_retry, reasoning_only_retry, agent_terminal_snapshot_consumed, async_agent_tool_result_seen, agent_wait_reminder_sent, agent_wait_required, last_agent_wait_delay_s, full_text, reasoning_text, signature, pending, finish, produced_any, native_output_items, native_round_replayable, detached_agent_count, delivered_agent_output_tokens, delivered_agent_result_count, batch_tool_images
-                result.tools_used.append(tc.name)
-                is_interaction = is_user_interaction_tool(tc.name)
+                # A merged Agent call is handled, shown and recorded as the earlier tool it stands for.
+                kind, kind_arguments = canonical_call(tc.name, tc.arguments)
+                result.tools_used.append(kind)
+                is_interaction = is_user_interaction_tool(kind)
                 # 普通工具直接显示调用意图；用户交互工具会弹独立卡片，
                 # 完成后再把干净结果写回主消息，避免聊天里留下两份杂乱信息。
-                audit_arguments = redact_tool_arguments_for_audit(tc.name, tc.arguments)
-                tool_line = format_tool_line(tc.name, audit_arguments)
+                audit_arguments = redact_tool_arguments_for_audit(kind, kind_arguments)
+                tool_line = format_tool_line(kind, audit_arguments)
                 web_tool_start = getattr(renderer, "on_tool_start", None)
                 if callable(web_tool_start):
-                    maybe = web_tool_start(tc.id, tc.name, audit_arguments, tool_line)
+                    maybe = web_tool_start(tc.id, kind, audit_arguments, tool_line)
                     if inspect.isawaitable(maybe):
                         await maybe
                 else:
                     await renderer.on_tool(tool_line)
                 open_rendered = True
                 if is_interaction:
-                    await renderer.on_status(format_user_interaction_wait_line(tc.name, audit_arguments))
-                elif running_status := format_tool_running_status_line(tc.name, audit_arguments):
+                    await renderer.on_status(format_user_interaction_wait_line(kind, audit_arguments))
+                elif running_status := format_tool_running_status_line(kind, audit_arguments):
                     await renderer.on_status(running_status)
-                log.info("执行工具", 轮次=round_no, 工具=tc.name, 参数=audit_arguments[:200])
+                log.info("执行工具", 轮次=round_no, 工具=kind, 参数=audit_arguments[:200])
                 tool_t0 = time.monotonic()
                 structured_progress = getattr(renderer, "on_tool_progress", None)
                 text_progress = getattr(renderer, "on_tool_update", None)
@@ -1088,7 +1101,7 @@ class Agent:
                 # progress to a subsequent AgentWait and creates zombie Web
                 # agent_control operations.
                 progress_tool_call_id = tc.id
-                progress_tool_name = tc.name
+                progress_tool_name = kind
                 progress_tool_arguments = audit_arguments
 
                 async def _structured_progress(
@@ -1141,24 +1154,24 @@ class Agent:
                 # has precise batch/redundancy guards because waiting is valid only
                 # when no direct foreground work remains.
                 has_foreground_tool_in_batch = any(
-                    other.name not in _AGENT_ORCHESTRATION_TOOLS
+                    canonical_tool(other.name, other.arguments) not in _AGENT_ORCHESTRATION_TOOLS
                     for other in pending
                     if other.id != tc.id
                 )
-                if tc.name == "AgentWait" and has_foreground_tool_in_batch:
+                if kind == "AgentWait" and has_foreground_tool_in_batch:
                     tool_result = json.dumps({
                         "ok": False,
                         "error": "foreground_work_in_same_batch",
-                        "message": "Finish the ordinary foreground tools first; call AgentWait only in a later model step when no direct user work remains.",
+                        "message": "Finish the ordinary foreground tools first; call Agent(action=wait) only in a later model step when no direct user work remains.",
                     }, ensure_ascii=False)
-                elif tc.name == "AgentWait" and agent_terminal_snapshot_consumed and not agent_wait_required:
+                elif kind == "AgentWait" and agent_terminal_snapshot_consumed and not agent_wait_required:
                     # The model may ask to "confirm" completion repeatedly. Once
                     # this root turn consumed an all-terminal snapshot, do not
                     # dispatch another wait cycle or create another visible Web
                     # supervision operation.
                     tool_result = _redundant_agent_wait_result()
                 else:
-                    if tc.name == "AgentWait":
+                    if kind == "AgentWait":
                         await session.phase("agent_wait", waiting=True)
                     tool_result = await self._tools.dispatch(
                         tc.name,
@@ -1170,26 +1183,26 @@ class Agent:
                 session.tool_outcome = dispatch_context.tool_outcome or ToolOutcome(tool_result, "completed", "not_started")
                 batch_tool_images.extend(session.tool_outcome.images)
                 tool_duration_ms = int((time.monotonic() - tool_t0) * 1000)
-                _apply_agent_tool_usage(result, tc.name, tool_result)
-                delivery_tokens, delivery_count = _agent_result_delivery_budget(tc.name, tool_result)
+                _apply_agent_tool_usage(result, kind, tool_result)
+                delivery_tokens, delivery_count = _agent_result_delivery_budget(kind, tool_result)
                 delivered_agent_output_tokens += delivery_tokens
                 delivered_agent_result_count += delivery_count
-                audit_tool_result = redact_tool_result_for_audit(tc.name, tool_result, tc.arguments)
+                audit_tool_result = redact_tool_result_for_audit(kind, tool_result, kind_arguments)
                 # The raw payload remains available to accounting and
                 # controller context. Renderer/audit projection uses only the
                 # redacted copy above; controller transcript remains unchanged.
-                controller_tool_result = project_agent_tool_result_for_controller(tc.name, tool_result)
+                controller_tool_result = project_agent_tool_result_for_controller(kind, tool_result)
                 convo.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "name": tc.name,
+                    "name": kind,
                     "content": controller_tool_result,
                 })
                 # Persist exactly what future controller turns may replay,
                 # never the internal Agent telemetry envelope.
                 if persister is not None:
                     await persister.save_tool_result(
-                        tool_call_id=tc.id, name=tc.name, content=controller_tool_result,
+                        tool_call_id=tc.id, name=kind, content=controller_tool_result,
                         duration_ms=tool_duration_ms)
                 await _archive_context(convo)
                 await session.finish_tool(outcome=dispatch_context.tool_outcome or
@@ -1197,19 +1210,19 @@ class Agent:
                     result_ref=str(source_of(convo[-1]).get("id") or f"tool:{tc.id}"))
                 web_tool_result = getattr(renderer, "on_tool_result", None)
                 if callable(web_tool_result):
-                    maybe = web_tool_result(tc.id, tc.name, audit_arguments, audit_tool_result, tool_duration_ms)
+                    maybe = web_tool_result(tc.id, kind, audit_arguments, audit_tool_result, tool_duration_ms)
                     if inspect.isawaitable(maybe):
                         await maybe
                     open_rendered = True
                 elif is_interaction:
-                    await renderer.on_tool(format_user_interaction_result_line(tc.name, audit_arguments, audit_tool_result))
+                    await renderer.on_tool(format_user_interaction_result_line(kind, audit_arguments, audit_tool_result))
                     open_rendered = True
-                elif result_line := format_tool_result_line(tc.name, audit_arguments, audit_tool_result, tool_duration_ms):
+                elif result_line := format_tool_result_line(kind, audit_arguments, audit_tool_result, tool_duration_ms):
                     await renderer.on_tool_update(result_line)
                     open_rendered = True
-                if _agent_tool_terminal_payload(tc.name, tool_result):
+                if _agent_tool_terminal_payload(kind, tool_result):
                     agent_terminal_snapshot_consumed = True
-                detached_payload = _detached_agent_tool_payload(tc.name, tool_result)
+                detached_payload = _detached_agent_tool_payload(kind, tool_result)
                 if detached_payload:
                     detached_agent_count += 1
                     async_agent_tool_result_seen = True
@@ -1217,11 +1230,11 @@ class Agent:
                     # A newly running/resumed Agent starts a fresh supervision
                     # generation and unlocks AgentWait for this same root turn.
                     agent_terminal_snapshot_consumed = False
-                if tc.name == "AgentWait":
+                if kind == "AgentWait":
                     wait_payload = _json_obj(tool_result)
                     if bool(wait_payload.get("ok")):
                         try:
-                            parsed_wait_args = json.loads(tc.arguments or "{}")
+                            parsed_wait_args = json.loads(kind_arguments or "{}")
                         except Exception:
                             parsed_wait_args = {}
                         last_agent_wait_delay_s = float((parsed_wait_args if isinstance(parsed_wait_args, dict) else {}).get("reviewAfterSeconds") or 0.0)
@@ -1359,7 +1372,7 @@ class Agent:
                                 "content": (
                                     "<controller-agent-wait-protocol internal=\"true\">\n"
                                     "当前 root turn 仍有后台 Agent。若还有直接用户工作，继续完成它；"
-                                    "若已无前台工作，请调用 AgentWait，选择 event_only 或由你决定的 review_after。"
+                                    "若已无前台工作，请调用 Agent(action=wait)，选择 event_only 或由你决定的 review_after。"
                                     "统一复查全部 scoped Agents；健康推进时优先比上次等待更久，介入、停滞或临近预算时缩短/重置。"
                                     f"上次 review_after 秒数：{last_agent_wait_delay_s:g}。"
                                     "不要结束 root turn，也不要用 Process/Bash sleep 监控 Agent。\n"

@@ -31,9 +31,17 @@ const (
 	probeMax      = 1300
 )
 
+// probeLarge asks whether a path end to end carries large packets
+// (large.go), answered by a short probeLargeReply; probePath whether a fixed
+// path does, the rank of the path first in the id (fixedpath.go), answered
+// over the way back of that rank.
 const (
-	probeRequest = 1
-	probeReply   = 2
+	probeRequest    = 1
+	probeReply      = 2
+	probeLarge      = 3
+	probeLargeReply = 4
+	probePath       = 5
+	probePathReply  = 6
 )
 
 // entryProbe is a member's probing of its entry.
@@ -81,7 +89,26 @@ func (t *meshTUN) probe(p ipv4, r *routing) {
 		if z != nil && e != nil {
 			e.sendControl(probePacket(r.nodes.self, p.src, probeReply, id, len(p.b)), z)
 		}
+	case probeLarge:
+		z, e := r.nodes.byAddr[p.src], t.e2e.Load()
+		if z != nil && e != nil {
+			e.sendControl(probePacket(r.nodes.self, p.src, probeLargeReply, id, 0), z)
+		}
+	case probeLargeReply:
+		if z := r.nodes.byAddr[p.src]; z != nil {
+			t.paths.answered(z.id, id)
+		}
+	case probePath:
+		z, e := r.nodes.byAddr[p.src], t.e2e.Load()
+		if z != nil && e != nil {
+			e.sendPath(probePacket(r.nodes.self, p.src, probePathReply, id, 0), z, int(id[0]))
+		}
+	case probePathReply:
+		r.pins.answer(r.nodes.self, p.src, int(id[0]), binary.BigEndian.Uint32(id[1:5]))
 	case probeReply:
+		if z := r.nodes.byAddr[p.src]; z != nil && r.gateways != nil {
+			r.gateways.answered(z.id, id)
+		}
 		if ep := t.entryProbe; ep != nil {
 			ep.mu.Lock()
 			if ep.waiting && bytes.Equal(ep.id[:], id[:]) && r.nodes.byAddr[p.src] != nil && r.nodes.byAddr[p.src].id == ep.target {

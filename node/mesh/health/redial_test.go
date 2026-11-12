@@ -364,3 +364,42 @@ func TestRedialEntryCandidate(t *testing.T) {
 		t.Fatal("the accepting end redialed")
 	}
 }
+
+// A link that answered and then gives nothing, its probes failing while its
+// connection stays open, is redialed after deadAfter without waiting for
+// bad periods, and every deadEvery while it lasts; answers again end that.
+func TestRedialDeadPath(t *testing.T) {
+	l := newRedialLab(t, DefaultRedialParams(), t.TempDir())
+	l.p.lastOK = l.now
+	l.p.track.stats.Failures = l.m.cfg.Parameters.ConsecutiveFailures
+	tick := func(seconds int) {
+		for range seconds {
+			l.m.redialTick(l.now)
+			if l.p.trend != nil && l.p.trend.inflight {
+				l.m.redialed((<-l.m.input).(redialDone), l.now)
+			}
+			l.now = l.now.Add(time.Second)
+		}
+	}
+	tick(int(deadAfter / time.Second))
+	if len(l.b.redials) != 0 {
+		t.Fatalf("redialed before %s", deadAfter)
+	}
+	tick(1)
+	if len(l.b.redials) != 1 || !strings.Contains(strings.Join(l.events, "\n"), "link.redial link:S reason=dead") {
+		t.Fatalf("redials %v, events %v", l.b.redials, l.events)
+	}
+	tick(int(deadEvery/time.Second) - 1)
+	if len(l.b.redials) != 1 {
+		t.Fatal("redialed again within deadEvery")
+	}
+	tick(1)
+	if len(l.b.redials) != 2 {
+		t.Fatal("not redialed again while still dead")
+	}
+	l.p.lastOK, l.p.track.stats.Failures = l.now, 0
+	tick(int(2 * deadEvery / time.Second))
+	if len(l.b.redials) != 2 {
+		t.Fatal("redialed a path that answers")
+	}
+}

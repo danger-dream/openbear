@@ -637,9 +637,9 @@ def build_runner(tmp_path, version="1.0.1", protocol=3):
 
 
 def fake_container(binaries=FAKE, reported="openbear-node {version} (protocol v{protocol})", calls=None):
-    def contain(self, stage, script, mounts, *, online=False):
+    def contain(self, stage, script, mounts, *, online=False, cpus=2, caps=()):
         if calls is not None:
-            calls.append({"stage": stage.stage, "script": script, "mounts": mounts, "online": online})
+            calls.append({"stage": stage.stage, "script": script, "mounts": mounts, "online": online, "cpus": cpus, "caps": caps})
         out = stage.out / "assets"
         out.mkdir()
         for name, data in binaries.items():
@@ -655,6 +655,7 @@ def test_build_produces_five_assets_and_build_node_manifest(tmp_path, monkeypatc
     runner, deps = build_runner(tmp_path)
     result = runner.build_binaries(deps)
     assert list(result["assets"]) == EXPECTED_ASSETS
+    assert calls[0]["cpus"] == 6 and calls[0]["caps"] == ()
     assets = runner.directory / "assets"
     assert sorted(p.name for p in assets.iterdir()) == sorted(EXPECTED_ASSETS)
     text = (assets / "manifest.json").read_text()
@@ -743,8 +744,8 @@ def test_verified_build_is_restored_after_candidate_supersedes_assets(tmp_path, 
 def test_container_stages_use_offline_go_image_and_cached_modules(tmp_path, monkeypatch):
     calls = []
 
-    def contain(self, stage, script, mounts, *, online=False):
-        calls.append({"stage": stage.stage, "script": script, "mounts": mounts, "online": online})
+    def contain(self, stage, script, mounts, *, online=False, cpus=2, caps=()):
+        calls.append({"stage": stage.stage, "script": script, "mounts": mounts, "online": online, "cpus": cpus, "caps": caps})
         if stage.stage == "node-deps":
             put(stage.out / "gomod/cache/download/golang.org/x/sys/@v/v0.38.0.zip", "zip")
         else:
@@ -760,6 +761,9 @@ def test_container_stages_use_offline_go_image_and_cached_modules(tmp_path, monk
     deps_call, test_call = calls
     assert deps_call["online"] and deps_call["script"] == node_release.DEPS_SCRIPT
     assert not test_call["online"] and test_call["script"] == node_release.TEST_SCRIPT
+    # Ownership-handover tests really run (not skip) and get most of the host.
+    assert test_call["cpus"] == 6 and test_call["caps"] == ("CHOWN", "FOWNER", "DAC_OVERRIDE")
+    assert deps_call["cpus"] == 2 and deps_call["caps"] == ()
     assert (Path(deps["dir"]) / "gomod", "/inputs/gomod", True) in test_call["mounts"]
     (Path(deps["dir"]) / "gomod/cache/download/golang.org/x/sys/@v/v0.38.0.zip").chmod(0o644)
     (Path(deps["dir"]) / "gomod/cache/download/golang.org/x/sys/@v/v0.38.0.zip").write_text("changed")
@@ -815,6 +819,7 @@ def test_whole_node_run_resumes_without_rebuilding_or_republishing(tmp_path, mon
         return {"ok": True, "url": "https://example.invalid/node-v1.0.1", "latest": False}
 
     monkeypatch.setattr(node_release, "publish", publisher)
+    monkeypatch.setattr("release_support.runner.push_candidate", lambda *_: calls.update(["candidate-push"]) or {"ok": True})
     first = Runner(tmp_path, directory, value, github=SimpleNamespace(token=TOKEN), command=DockerCommands())
     with pytest.raises(ReleaseError, match="outcome may be unknown"):
         first.run()
@@ -823,7 +828,7 @@ def test_whole_node_run_resumes_without_rebuilding_or_republishing(tmp_path, mon
     resumed = Runner(tmp_path, directory, saved, github=SimpleNamespace(token=TOKEN), command=DockerCommands())
     resumed.run()
     assert resumed.value["completed"] and resumed.value["published"]
-    assert calls == {"preflight": 2, "deps": 1, "test": 1, "build": 1, "publish": 2}
+    assert calls == {"preflight": 2, "candidate-push": 1, "deps": 1, "test": 1, "build": 1, "publish": 2}
     again = Runner(tmp_path, directory, load(directory / "state.json"), github=SimpleNamespace(token=TOKEN), command=DockerCommands())
     again.run()
     assert calls["publish"] == 2 and calls["preflight"] == 2
@@ -834,3 +839,71 @@ def test_whole_node_run_resumes_without_rebuilding_or_republishing(tmp_path, mon
     assert sorted(p.name for p in (directory / "assets").iterdir()) == sorted(EXPECTED_ASSETS)
     attempts = list((directory / "results/node-build/attempts").iterdir())
     assert attempts and all((a / "stage.log").is_file() and not (a / "assets").exists() for a in attempts)
+
+
+GO_FAILURE = """--- FAIL: TestHealthRealDataAndRelayRecovery (15.70s)
+    health_integration_test.go:62: health integration condition timed out
+FAIL
+FAIL\topenbear/node/mesh\t251.641s
+ok  \topenbear/node/mesh/clock\t1.045s
+--- FAIL: TestEncryptedControlPrepareCommitAndHotFailover (8.12s)
+    control_test.go:129: health condition timed out
+    --- FAIL: TestEncryptedControlPrepareCommitAndHotFailover/sub (0.01s)
+FAIL
+FAIL\topenbear/node/mesh/health\t16.350s
+FAIL
+"""
+
+
+def test_failed_go_tests_are_read_per_package_and_anything_else_is_not_retried():
+    assert node_release.failed_go_tests(GO_FAILURE) == {"openbear/node/mesh": ["TestHealthRealDataAndRelayRecovery"],
+                                                        "openbear/node/mesh/health": ["TestEncryptedControlPrepareCommitAndHotFailover"]}
+    for blocked in (GO_FAILURE + "WARNING: DATA RACE\n",
+                    "panic: test timed out after 10m0s\nFAIL\topenbear/node\t600.1s\n",
+                    "# openbear/node\n./x.go:3: undefined: y\nFAIL\topenbear/node [build failed]\n",
+                    "FAIL\topenbear/node\t1.0s\n"):
+        assert node_release.failed_go_tests(blocked) is None
+    script = node_release.rerun_script(node_release.failed_go_tests(GO_FAILURE))
+    assert "go test -race -count=2 -run '^(TestHealthRealDataAndRelayRecovery)$' openbear/node/mesh\n" in script
+    assert script.startswith(node_release.PREPARE + node_release.OFFLINE)
+
+
+def node_test_with(tmp_path, monkeypatch, outcomes):
+    calls = []
+
+    def contain(self, stage, script, mounts, *, online=False, cpus=2, caps=()):
+        calls.append({"stage": stage.stage, "script": script, "cpus": cpus, "caps": caps})
+        if stage.stage == "node-deps":
+            put(stage.out / "gomod/cache/download/golang.org/x/sys/@v/v0.38.0.zip", "zip")
+            return
+        (stage.out / "toolchain.txt").write_text("go version go1.24.4 linux/amd64\n")
+        output = outcomes.pop(0)
+        with stage.log_path.open("a") as log:
+            log.write(output or "ok  \topenbear/node\t1.0s\n")
+        if output:
+            raise ReleaseError(f"{stage.stage}: container exited 1; log: {stage.log_path}")
+
+    monkeypatch.setattr(node_release.NodeRunner, "contain", contain)
+    runner, _ = build_runner(tmp_path)
+    runner.cache = (tmp_path / "cache").resolve()
+    deps = runner.deps()
+    return runner, deps, calls
+
+
+def test_a_go_test_that_passes_twice_on_its_own_is_released_as_flaky(tmp_path, monkeypatch):
+    runner, deps, calls = node_test_with(tmp_path, monkeypatch, [GO_FAILURE, None])
+    result = runner.test(deps)
+    assert result["ok"] and result["flaky"] == ["openbear/node/mesh.TestHealthRealDataAndRelayRecovery",
+                                                "openbear/node/mesh/health.TestEncryptedControlPrepareCommitAndHotFailover"]
+    rerun = calls[-1]
+    assert "-count=2 -run '^(TestEncryptedControlPrepareCommitAndHotFailover)$' openbear/node/mesh/health" in rerun["script"]
+    assert rerun["caps"] == node_release.TEST_CAPS and rerun["cpus"] == node_release.NODE_CPUS
+
+
+@pytest.mark.parametrize("outcomes", [[GO_FAILURE, GO_FAILURE], [GO_FAILURE + "WARNING: DATA RACE\n"]])
+def test_a_go_test_that_fails_again_or_races_blocks(tmp_path, monkeypatch, outcomes):
+    expected_runs = len(outcomes)
+    runner, deps, calls = node_test_with(tmp_path, monkeypatch, outcomes)
+    with pytest.raises(ReleaseError):
+        runner.test(deps)
+    assert len([c for c in calls if c["stage"] == "node-test"]) == expected_runs

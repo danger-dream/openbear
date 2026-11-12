@@ -20,6 +20,7 @@ from app.context.user_message_template import (
 )
 from app.context.window import mark_source
 from app.db.dao import MessageDAO, SummaryDAO
+from app.extensions import catalog as extension_catalog
 from app.llm.base import Message
 from app.logging import get_logger
 from app.memory.client import MemoryClient
@@ -105,6 +106,7 @@ def build_system_prompt_params(
     return {
         "toolNames": all_tool_names,
         "toolSummaries": all_tool_summaries,
+        "extensionCatalog": [{"key": e.key, "label": e.label, "about": e.about} for e in extension_catalog(all_tool_names)],
         "tools": {
             "allowlist": all_tool_names,
             "summaries": all_tool_summaries,

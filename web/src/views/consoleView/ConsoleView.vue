@@ -28,6 +28,11 @@ import TurnMinimap from "./TurnMinimap.vue";
 import TaskMemoryDrawer from "./TaskMemoryDrawer.vue";
 import WorkItemsDrawer from "./WorkItemsDrawer.vue";
 import {WORK_ITEMS_KEY, createWorkItemsStore} from "./workItems.js";
+import ConversationNotes from "./ConversationNotes.vue";
+import ConversationNotesSelection from "./ConversationNotesSelection.vue";
+import {createUserNotesStore} from "./notesStore.js";
+import {notesSettings} from "../../notesSettings.js";
+import {extensionDraft, forgetExtensionDraft} from "./extensionDrafts.js";
 import ContextEditor from "./ContextEditor.vue";
 import {chooseActiveTurnIndex} from "./activeTurn.js";
 import {
@@ -261,6 +266,9 @@ provide(TASK_MEMORY_CHANGED_EVENT_KEY, taskMemoryChangedEvent);
 const workItems = createWorkItemsStore();
 provide(WORK_ITEMS_KEY, workItems);
 const workItemReturn = ref(null);
+const noteReturn = ref(null);
+let pendingCrossConversationNoteLocate = null;
+let noteHighlightTimer = 0;
 const toolDetailCache = createToolDetailCache();
 provide(TOOL_DETAIL_CACHE_KEY, toolDetailCache);
 const collabRequests = createCollabRequestStore(Api);
@@ -385,6 +393,23 @@ const operationStatsPayloads = computed(() => orderedOpIds.value
 .filter((op) => op?.opType === "stats" && op.payload)
 .map((op) => op.payload));
 const latestStatsPayload = computed(() => operationStatsPayloads.value.at(-1) || null);
+// Only a live report describes the run in progress; a finished turn's stats must not stand in for it.
+const liveRunStats = computed(() => (latestStatsPayload.value?.live ? latestStatsPayload.value : null));
+// The run timer in this browser's own time. The server reports how long the run
+// has gone on, so a browser clock set apart from the server's cannot freeze or
+// inflate it. A late snapshot reports less time than has passed: keep the earliest start.
+const liveClockStartedAt = ref(0);
+watch(liveRunStats, (stats) => {
+	const elapsed = Number(stats?.elapsedMs);
+	if (stats?.elapsedMs == null || !Number.isFinite(elapsed) || elapsed < 0) return;
+	const start = Date.now() - elapsed;
+	if (!liveClockStartedAt.value || start < liveClockStartedAt.value) liveClockStartedAt.value = start;
+});
+watch(() => [running.value, activeRunId.value], ([isRunning, runId], [, previousRunId] = []) => {
+	if (!isRunning || runId !== previousRunId) liveClockStartedAt.value = 0;
+});
+const runClockStartedAt = computed(() => liveClockStartedAt.value
+	|| (runStartedAt.value ? Math.min(Number(runStartedAt.value), Date.now()) : 0));
 const usage = computed(() => {
 	const base = chatState.value?.usage || {};
 	const stats = latestStatsPayload.value || lastStats.value || null;
@@ -430,6 +455,7 @@ const turns = computed(() => reuseTurns(withTransientIdleThinking(attachTurnStat
 const activeRunTurnIndex = computed(() => findActiveTurnIndex(turns.value, {activeRootTurnId: activeRunTurnUuid.value, activeRunId: activeRunId.value}));
 const activeTurn = computed(() => turns.value[Math.min(Math.max(0, activeTurnIndex.value), Math.max(0, turns.value.length - 1))] || null);
 const activeConversationUuid = computed(() => props.conversationUuid || chatState.value?.conversationUuid || "");
+const userNotes = createUserNotesStore(activeConversationUuid, {enabledRef: computed(() => notesSettings.enabled)});
 const messageVisibility = createMessageVisibility({
 	conversationUuid: activeConversationUuid, operations: operationsById, api: Api,
 	preserveSelectionPosition: () => window.matchMedia('(max-width: 760px)').matches,
@@ -578,7 +604,7 @@ const totalCostUsd = computed(() => Number(sessionLedgerUsage.value.cost_usd || 
 const totalCostDisplay = computed(() => fmtCost(totalCostUsd.value));
 const canSend = computed(() => {
 	if (sendPending.value || modelMutating.value || compacting.value || attachmentRestoring.value) return false;
-	if (running.value) return Boolean(draft.value.trim()) && pendingAttachments.value.length === 0;
+	// An interjection carries its attachments to the model like a new turn does.
 	return Boolean(draft.value.trim() || pendingAttachments.value.length);
 });
 const modelGroups = computed(() => {
@@ -682,6 +708,7 @@ function discardConversationDraft(conversationUuid) {
 	const key = String(conversationUuid || "");
 	if (!key) return;
 	clearDraftForConversation(key);
+	forgetExtensionDraft(key);
 	if (key.startsWith("local:")) forgetLocalDraftChoices();
 	// Deleting a conversation invalidates the read even if it is still off screen.
 	attachmentHydrations.delete(draftKey(key));
@@ -708,10 +735,12 @@ async function persistForProperties() {
 		const sourceUuid = String(props.conversationUuid || '');
 		await ensureLocalRunDefaults();
 		if (props.conversationUuid !== sourceUuid || outboundSends.current) throw new Error('草稿状态已变化，请重试');
-		const created = await Api.createConversation({title:'新会话',runConfig:completeLocalRunConfig(),folderId:props.folderId || ''});
+		const extensions = extensionDraft(sourceUuid);
+		const created = await Api.createConversation({title:'新会话',runConfig:completeLocalRunConfig(),folderId:props.folderId || '',...(extensions ? {extensions} : {})});
 		const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid;
 		if (!uuid) throw new Error('conversation_create_failed');
 		forgetLocalDraftChoices();
+		forgetExtensionDraft(sourceUuid);
 		migrateAttachmentDraft(sourceUuid, uuid);
 		if (props.conversationUuid === sourceUuid) {
 			localToServerTransitionUuid.value = uuid;
@@ -1241,8 +1270,7 @@ async function answerPendingConfirmation(item, answer = {}) {
 }
 
 const attachmentDragActive = ref(false);
-const attachmentDropBlockedReason = computed(() => running.value ? "运行中暂不能添加附件"
-	: contextEditorOpen.value ? "请先关闭上下文编辑器再添加附件" : "");
+const attachmentDropBlockedReason = computed(() => contextEditorOpen.value ? "请先关闭上下文编辑器再添加附件" : "");
 const attachmentDrop = createAttachmentDropHandlers({
 	onFiles(files) {
 		files.forEach(addAttachment);
@@ -3173,6 +3201,68 @@ function returnToWorkItem() {
 	if (target) workItems.open(target.number);
 }
 
+function highlightNoteNode(node) {
+	if (!node) return;
+	window.clearTimeout(noteHighlightTimer);
+	scroller.value?.querySelector('.note-hit-highlight')?.classList.remove('note-hit-highlight');
+	node.classList.add('note-hit-highlight');
+	noteHighlightTimer = window.setTimeout(() => {
+		node.classList.remove('note-hit-highlight');
+		noteHighlightTimer = 0;
+	}, 2800);
+}
+
+async function locateFromNotes(target) {
+	if (!target?.opId) return;
+	const targetUuid = String(target.conversationUuid || activeConversationUuid.value || '');
+	if (targetUuid && targetUuid !== String(activeConversationUuid.value || '')) {
+		pendingCrossConversationNoteLocate = {...target, conversationUuid: targetUuid};
+		window.dispatchEvent(new CustomEvent('openbear:open-conversation', {detail: {conversationUuid: targetUuid}}));
+		return;
+	}
+	const located = await locateSearchResult({opId: target.opId});
+	if (located) {
+		highlightNoteNode(searchResultNode(target.opId));
+		workItemReturn.value = null;
+		noteReturn.value = {
+			label: target.turnNumber ? `便签定位的第 ${target.turnNumber} 轮消息` : '便签定位的消息',
+			reopenMobile: Boolean(target.reopenMobile),
+		};
+	} else {
+		noteReturn.value = null;
+	}
+}
+
+function returnToNotes() {
+	const shouldReopen = Boolean(noteReturn.value?.reopenMobile);
+	void returnFromSearch();
+	if (shouldReopen) userNotes.openPanel({mobile: true});
+}
+
+async function handleCaptureTurnNote(payload) {
+	if (!payload?.quote || !notesSettings.enabled) return;
+	try {
+		await userNotes.createNote({
+			scope: 'session',
+			opId: payload.opId,
+			turnUuid: payload.turnUuid,
+			turnNumber: payload.turnNumber,
+			quote: payload.quote,
+		});
+		ElMessage.success('已记入本会话便签');
+	} catch (error) {
+		ElMessage.error(apiError(error));
+	}
+}
+
+async function insertNoteTextToDraft(text) {
+	const snippet = String(text || '').trim();
+	if (!snippet) return;
+	const current = String(draft.value || '');
+	draft.value = current.trim() ? `${current.replace(/\s+$/, '')}\n\n${snippet}` : snippet;
+	await focusComposer();
+}
+
 async function returnFromSearch() {
 	const position = searchReturnPosition.value;
 	if (!position || position.uuid !== String(activeConversationUuid.value || '')) return;
@@ -3456,6 +3546,8 @@ function normalizePendingSteering(items = []) {
 			id: String(item?.id || item?.messageUuid || item?.turnUuid || `${Date.now()}-${Math.random()}`),
 			text: String(item?.visibleText || item?.text || item?.content || "").trim(),
 			...(item?.referenceBundleId ? {referenceBundleId: item.referenceBundleId, references: item.references || []} : {}),
+			attachments: (Array.isArray(item?.attachments) ? item.attachments : [])
+				.map((attachment) => String(attachment?.fileName || attachment?.name || attachment?.file_name || "").trim()).filter(Boolean),
 			submittedAtMs: Number(item?.submittedAtMs || 0) || Date.now(),
 		}))
 		.filter((item) => item.text);
@@ -3464,6 +3556,17 @@ function normalizePendingSteering(items = []) {
 function updatePendingSteering(items = []) {
 	pendingSteering.value = normalizePendingSteering(items);
 }
+
+// Offered under the latest reply only while nothing else is running or waiting for the user.
+// One shared empty list keeps run-state churn from re-rendering the transcript.
+const NO_PROMPT_SUGGESTIONS = Object.freeze([]);
+const transcriptPromptSuggestions = computed(() => (
+	running.value || pendingConfirmations.value.length || pendingSteering.value.length || !visiblePromptSuggestions.value.length
+		? NO_PROMPT_SUGGESTIONS : visiblePromptSuggestions.value
+));
+watch(() => transcriptPromptSuggestions.value.join("\n"), (items) => {
+	if (items) void scrollBottom();
+}, {flush: "post"});
 
 function updatePromptSuggestions(data, conversationUuid = activeConversationUuid.value) {
 	const items = (Array.isArray(data?.items) ? data.items : []).map((item) => String(item || "").trim()).filter(Boolean);
@@ -3849,11 +3952,13 @@ async function ensureServerConversationForSend(firstText, pending) {
 	if (pending.localRunConfig === null && props.conversationUuid !== pending.conversationUuid)
 		throw new Error("本地会话默认配置尚未读取完成，草稿和附件已保留");
 	const title = initialConversationTitle(referenceDisplayText(firstText || "新会话"));
-	const created = await Api.createConversation({title, runConfig: pending.localRunConfig || completeLocalRunConfig(), folderId: pending.localFolderId});
+	const extensions = extensionDraft(pending.conversationUuid);
+	const created = await Api.createConversation({title, runConfig: pending.localRunConfig || completeLocalRunConfig(), folderId: pending.localFolderId, ...(extensions ? {extensions} : {})});
 	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
 	if (!uuid) throw new Error("conversation_create_failed");
 	forgetLocalDraftChoices();
+	forgetExtensionDraft(pending.conversationUuid);
 	const sourceUuid = pending.conversationUuid;
 	pending.conversationUuid = uuid;
 	const stillViewingSource = props.conversationUuid === sourceUuid;
@@ -4123,10 +4228,6 @@ async function send({text: composed = null} = {}) {
 		ElMessage.warning(isComposed ? "引用目录尚未连接，请稍后再试" : "引用目录尚未连接，请稍后发送；草稿已保留");
 		return false;
 	}
-	if (!isComposed && running.value && pendingAttachments.value.length) {
-		ElMessage.warning("运行中暂不追加附件，可以先停止或等当前轮完成");
-		return false;
-	}
 	// Only a live controller takes input as an interjection. With background
 	// Agents alone the server starts a new turn, so show it as one.
 	const wasRunning = rootTurnRunning.value || foregroundRunning.value;
@@ -4360,7 +4461,14 @@ watch(() => props.conversationUuid, next => collabRequests.reset(next), {immedia
 watch(activeConversationUuid, next => workItems.setConversation(next), {immediate: true});
 // The server owns whether a focused turn is still running; re-read it at each start and stop.
 watch(running, () => workItems.schedule(300));
-watch(searchReturnPosition, value => { if (!value) workItemReturn.value = null; });
+watch(searchReturnPosition, value => { if (!value) { workItemReturn.value = null; noteReturn.value = null; } });
+watch([activeConversationUuid, loading], ([uuid, busy]) => {
+	if (!busy && pendingCrossConversationNoteLocate && pendingCrossConversationNoteLocate.conversationUuid === uuid) {
+		const pendingTarget = pendingCrossConversationNoteLocate;
+		pendingCrossConversationNoteLocate = null;
+		void locateFromNotes(pendingTarget);
+	}
+});
 
 
 watch(() => props.folderId, (next, prev) => {
@@ -4487,7 +4595,7 @@ onBeforeUnmount(() => {
 				:title-identity="activeConversationUuid"
 				:conversation-path="props.conversationPath"
 				:running="running"
-				:run-started-at="runStartedAt"
+				:run-started-at="runClockStartedAt"
 				:status="status"
 				:context-display="contextDisplay"
 				:tokens-text="totalTokensDisplay"
@@ -4509,10 +4617,13 @@ onBeforeUnmount(() => {
 						:active-turn-index="activeTurnIndex"
 						:auto-scroll-locked="autoScrollLocked"
 						:hidden-count="hiddenMessageCount"
+						:notes-enabled="notesSettings.enabled"
+						:notes-count="userNotes.badgeCount.value"
 						@open-hidden="messageVisibility.managing.value = true"
 						@open-search="searchOpen = true"
 						@open-memory="taskMemoryDrawer?.open()"
 						@open-work-items="workItems.open()"
+						@open-notes="userNotes.openPanel({mobile: true})"
 						@open-context="contextEditor?.open()"
 						@toggle-scroll-lock="toggleAutoScrollLock"
 						@scroll-to-turn="scrollToTurnIndex"
@@ -4534,8 +4645,9 @@ onBeforeUnmount(() => {
 						</div>
 					</div>
 					<div v-if="searchReturnPosition" class="search-return-bar" role="status">
-					<span>{{ searchLocating ? '正在定位历史消息…' : workItemReturn?.label ? `正在查看${workItemReturn.label}` : '正在查看定位的历史消息' }}</span>
+					<span>{{ searchLocating ? '正在定位历史消息…' : workItemReturn?.label ? `正在查看${workItemReturn.label}` : noteReturn?.label ? `正在查看${noteReturn.label}` : '正在查看定位的历史消息' }}</span>
 					<button v-if="workItemReturn" type="button" @click="returnToWorkItem">返回任务</button>
+					<button v-else-if="noteReturn?.reopenMobile" type="button" @click="returnToNotes">返回便签</button>
 					<button v-else type="button" @click="returnFromSearch">返回原位置</button>
 					<button type="button" @click="returnToLatestFromSearch">最新消息</button>
 				</div>
@@ -4590,6 +4702,12 @@ onBeforeUnmount(() => {
 						:detail-key="detailKey"
 						:is-detail-open="isDetailOpen"
 						:active-tool-result-index="activeToolResultIndex"
+						:prompt-suggestions="transcriptPromptSuggestions"
+						:prompt-suggestions-collapsed="Boolean(String(draft || '').trim())"
+						:notes-enabled="notesSettings.enabled && !isLocalConversation"
+						@pick-suggestion="pickPromptSuggestion"
+						@dismiss-suggestions="dismissPromptSuggestions"
+						@note-turn="handleCaptureTurnNote"
 						@details-toggle="onDetailsToggle"
 						@reasoning-toggle="onReasoningDetailsToggle"
 						@locate-turn="opId => locateSearchResult({opId})"
@@ -4605,9 +4723,11 @@ onBeforeUnmount(() => {
 				<button type="button" class="scroll-bottom-button" aria-label="回到最新消息" title="回到最新消息" @click.stop="returnToLatestFromSearch"><ArrowDown aria-hidden="true"/></button>
 			</div>
 			<MessageVisibilityBar v-show="!contextEditorOpen"/>
+			<ConversationNotesSelection v-if="!contextEditorOpen" :scroller="scroller"/>
 			<ConversationSearch :conversation-uuid="activeConversationUuid" v-model:open="searchOpen" @locate="locateSearchResult"/>
 			<ContextEditor v-if="!isLocalConversation" ref="contextEditor" :conversation-uuid="activeConversationUuid" :busy="running" @open-change="contextEditorOpen = $event" @created="emit('conversation-created', $event.conversationUuid)" @saved="load(); emit('conversations-refresh')"/>
 			<aside class="console-controls" v-show="!contextEditorOpen" :inert="contextEditorOpen" aria-label="会话工具与导航">
+				<ConversationNotes @locate="locateFromNotes" @insert-text="insertNoteTextToDraft"/>
 				<el-tooltip v-if="!isLocalConversation" :content="hiddenMessageCount ? `隐藏内容 · ${hiddenMessageCount} 条` : '隐藏内容'" placement="left" :show-after="260">
 					<button type="button" class="hidden-content-toggle" :class="{populated: hiddenMessageCount > 0}" :aria-label="`管理隐藏内容，${hiddenMessageCount} 条`" @click="messageVisibility.managing.value = true">
 						<Hide/><span v-if="hiddenMessageCount" class="hidden-content-count">{{ hiddenMessageCount > 99 ? '99+' : hiddenMessageCount }}</span>
@@ -4649,6 +4769,7 @@ onBeforeUnmount(() => {
 				ref="composer"
 				v-model:draft="draft"
 				:conversation-uuid="activeConversationUuid"
+				:folder-id="props.folderId || ''"
 				v-model:model-query="modelQuery"
 				:pending-attachments="pendingAttachments"
 				:attachment-previews="attachmentPreviews"
@@ -4657,7 +4778,6 @@ onBeforeUnmount(() => {
 				:confirmation-submitting="confirmationSubmitting"
 				:confirmation-errors="confirmationErrors"
 				:pending-steering="pendingSteering"
-				:prompt-suggestions="visiblePromptSuggestions"
 				:model-menu-open="modelMenuOpen"
 				:model-groups="modelGroups"
 				:current-model="currentModel"
@@ -4677,6 +4797,8 @@ onBeforeUnmount(() => {
 				:agent-supports-thinking="agentSupportsThinking"
 				:agent-fast-supported="agentFastSupported"
 				:agent-default-thinking-label="agentDefaultThinkingLabel"
+				:run-started-at="runClockStartedAt"
+				:run-stats="liveRunStats"
 				:running="running"
 				:can-send="canSend"
 				:context-strategy="contextStrategy"
@@ -4711,8 +4833,6 @@ onBeforeUnmount(() => {
 				@send="send"
 				@stop="stop"
 				@answer-confirmation="answerPendingConfirmation"
-				@pick-suggestion="pickPromptSuggestion"
-				@dismiss-suggestions="dismissPromptSuggestions"
 				@close-menus="closeComposerMenus"
 				@height-change="onComposerHeightChange"
 			/>
@@ -4736,6 +4856,7 @@ onBeforeUnmount(() => {
 .search-return-bar { position: absolute; z-index: 25; top: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; max-width: calc(100% - 16px); padding: 6px 9px; border: 1px solid var(--ob-chat-line); border-radius: 9px; box-shadow: var(--ob-shadow-panel); background: var(--ob-chat-bg); color: var(--ob-chat-muted); font-size: 12px; white-space: nowrap; }
 .search-return-bar button { min-height: 32px; padding: 0 7px; border: 0; border-radius: 6px; background: var(--ob-chat-selected); color: var(--ob-chat-text); cursor: pointer; }
 .console-scroll :deep(.search-hit-highlight) { outline: 2px solid var(--ob-blue); outline-offset: 3px; border-radius: 8px; }
+.console-scroll :deep(.note-hit-highlight) { outline: 2px solid rgb(var(--ob-warning-rgb) / .78); outline-offset: 4px; border-radius: 8px; background: rgb(var(--ob-warning-rgb) / .08); transition: background-color .3s ease, outline-color .3s ease; }
 @media (max-width: 760px) { .search-return-bar { top: 6px; gap: 3px; font-size: 11px; } .search-return-bar button { padding-inline: 5px; } }
 .hidden-content-toggle {
 	position: fixed; right: var(--console-float-rail-right); top: calc(var(--console-float-rail-top) - 2 * (var(--console-float-control-size) + var(--console-float-control-gap)));
@@ -4766,7 +4887,11 @@ onBeforeUnmount(() => {
 		+ var(--console-float-control-size) * 2
 		+ var(--console-float-control-gap) * 2
 	);
-	--console-float-rail-bottom: calc(var(--console-composer-height, 135px) + 50px);
+	--console-float-minimap-max-height: calc(8 * .42rem + 7 * .22rem + .84rem);
+	--console-float-rail-bottom: min(
+		calc(var(--console-composer-height, 135px) + 50px),
+		max(0px, calc(100vh - var(--console-float-minimap-top) - var(--console-float-minimap-max-height) - var(--console-float-control-gap) - var(--console-float-control-size)))
+	);
 	font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 

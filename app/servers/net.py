@@ -226,6 +226,9 @@ class NetTools:
                 a['geo'] = self.networks.get(a['ip']) if a['scope'] == 'public' else None
                 if a['ip'] in skipped:
                     a['geoSkipped'] = True
+                elif a['scope'] == 'public' and a['geo'] is None:
+                    # Still being looked up, or looked up and not found: the page waits only for the first.
+                    a['geoLooking'] = a['ip'] in self.networks.pending
         path = await self._path(owner, live, server_id, rec['mesh']) if rec and rec['mesh'] else None
         return {'ok': True, **result, 'hops': hops, 'requestedMode': rec['requestedMode'] if rec else result.get('mode'), 'meshPath': path}
 

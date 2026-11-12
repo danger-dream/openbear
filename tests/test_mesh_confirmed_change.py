@@ -38,7 +38,9 @@ class ConfirmedNodes:
             if self.status_gate:
                 await self.status_gate.wait()
             c = self.changes[sid]
-            return {'ok': True, 'result': {'change': c, 'status': {'appliedRevision': c['revision'], 'ready': sid not in self.absent, 'error': ''}}}
+            # Besides its change, what a node says of itself (its interfaces, config schemas), as Nodes answers.
+            node = (await self.nodes.call(sid, method, params, timeout))['result']
+            return {'ok': True, 'result': {**node, 'change': c, 'status': {'appliedRevision': c['revision'], 'ready': sid not in self.absent, 'error': ''}}}
         if method == 'mesh.confirm':
             assert all(c['state'] in ('active', 'confirmed') for c in self.changes.values())
             assert not self.absent

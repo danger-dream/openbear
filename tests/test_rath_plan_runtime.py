@@ -13,6 +13,7 @@ from app.agents.plan import AgentPlanCoordinator, register_agent_plan_tools
 from app.agents.schemas import AgentDefinition
 from app.agents.execution import AgentExecutor
 from app.tools.base import ToolRegistry
+from app.tools.agent_actions import schema_tool_names
 
 INITIAL_PLAN = {
     "title": "Initial plan",
@@ -79,7 +80,7 @@ class PlanRuntimeBackend:
         )
 
     async def complete(self, messages, *, model, system="", tools=None, max_tokens=8192, **opts):
-        names = [str(item.get("name") or "") for item in tools or []]
+        names = sorted(schema_tool_names(tools or []))
         runtime_messages = [
             str(item.get("content") or "")
             for item in messages
@@ -91,7 +92,9 @@ class PlanRuntimeBackend:
             assert set(names) == {"AgentPlanSubmit", "AgentControlAck"}
             assert '"phase":"drafting"' not in system
             assert runtime_messages and '"phase":"drafting"' in runtime_messages[-1]
-            return self._call("submit-initial", "AgentPlanSubmit", {"plan": INITIAL_PLAN})
+            # The merged AgentPlan form; later calls use the earlier names, which stay callable.
+            assert [t["name"] for t in tools] == ["AgentPlan"] and tools[0]["parameters"]["properties"]["action"]["enum"] == ["submit", "ack"]
+            return self._call("submit-initial", "AgentPlan", {"action": "submit", "plan": INITIAL_PLAN})
         if number == 2:
             assert set(names) == {"Read", "AgentPlanProgress", "AgentPlanReplan", "AgentControlAck"}
             assert '"phase":"executing"' not in system
@@ -114,8 +117,8 @@ class PlanRuntimeBackend:
             assert set(names) == {"Read", "AgentPlanProgress", "AgentPlanReplan", "AgentControlAck"}
             return self._call(
                 "start-r1",
-                "AgentPlanProgress",
-                {"action": "start", "stepId": "r1"},
+                "AgentPlan",
+                {"action": "progress", "op": "start", "stepId": "r1"},
             )
         if number == 5:
             assert set(names) == {"Read", "AgentPlanProgress", "AgentPlanReplan", "AgentControlAck"}
@@ -392,7 +395,7 @@ async def test_runtime_refuses_final_answer_before_plan_submission(tmp_path):
         assert output["reason"] == "agent_task_budget_exceeded"
         assert len(backend.calls) == 2
         assert all(
-            {item.get("name") for item in call["tools"]} == {"AgentPlanSubmit", "AgentControlAck"}
+            schema_tool_names(call["tools"]) == {"AgentPlanSubmit", "AgentControlAck"}
             for call in backend.calls
         )
         second_user_messages = [

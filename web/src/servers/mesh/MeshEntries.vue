@@ -40,9 +40,9 @@ function enable(relay, transport) {
 }
 function setTransport(c, t) { if (c.transport !== t) { c.transport = t; void save(); } }
 function setMode(mode) { if (entry.value.mode !== mode) { entry.value.mode = mode; void save(); } }
-// With a site relay among the entries there must be a public one to reach it through first.
-const needsBootstrap = computed(() => entry.value.candidates.some(c => isSite(relayOf(c.relay)))
-  && !entry.value.candidates.some(c => isRelay(relayOf(c.relay)) && !isSite(relayOf(c.relay))));
+// A site relay off this member's LAN is punched through a public entry first; only the server knows
+// which machines share a LAN, so its check says when one is missing.
+const needsBootstrap = computed(() => (mesh.errors || []).some(e => e.path === `${base.value}.candidates` && e.error === 'mesh_entry_needs_bootstrap'));
 function add() {
   const used = new Set(entry.value.candidates.map(c => c.relay));
   const relay = relays.value.find(r => !used.has(r.serverId)) || relays.value[0];

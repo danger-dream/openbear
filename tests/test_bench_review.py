@@ -37,10 +37,11 @@ async def test_stop_recovers_lost_start_receipt_before_releasing_queue(env, monk
     await asyncio.wait_for(sent.wait(), 5)
     assert node.started()[0]['state'] == 'running'
     if restart:
-        tasks = list(bench.workers.values())
+        tasks = list(bench.workers.values()) + list(bench.starts.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        bench.starts.clear()  # A process restart loses the pending RPC, not the node's job.
         # An N-1 preparing row has no marker yet.
         await bench._set(run['id'], job_state='')
         kick = bench._kick

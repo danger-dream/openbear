@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -335,13 +336,14 @@ func TestProtocolSamplesCoverEveryOneOnce(t *testing.T) {
 	sort.Strings(names)
 	// Each one is checked below; a new sample needs a check of its own here too.
 	want := []string{"browser", "call:browser.artifact", "call:browser.artifact/outside", "call:browser.call", "call:browser.call/not_started",
-		"call:browser.cdp", "call:browser.cdp/not_forwarded", "call:browser.config", "call:browser.restart", "call:browser.start",
+		"call:browser.cdp", "call:browser.cdp/not_forwarded", "call:browser.config", "call:browser.restart", "call:browser.start", "call:browser.update",
 		"call:browser.status", "call:browser.upload", "enroll:fingerprint", "call:config.url", "call:config.url/unchanged", "call:exec", "call:exec/timeout", "call:fs.edit", "call:fs.edit/crlf",
 		"call:fs.edit/failures", "call:fs.edit/not_text", "call:fs.list", "call:fs.read", "call:fs.read/missing", "call:fs.stat", "call:fs.write",
 		"call:fs.write/partial", "call:job.list", "call:job.start", "call:job.status", "call:job.stop", "call:no.such.method", "call:ping",
 		"call:uninstall", "call:update", "enroll:error", "enroll:request", "enroll:response", "entry", "info", "job", "msg:auth", "msg:auth.params",
 		"msg:call", "msg:challenge", "msg:close", "msg:config", "msg:hello", "msg:reply", "msg:reply/error", "msg:report", "msg:term.ack",
-		"msg:term.close", "msg:term.closed", "msg:term.open", "msg:term.opened", "msg:term.resize", "msg:welcome", "refusal:capability_disabled"}
+		"msg:term.close", "msg:term.closed", "msg:term.open", "msg:term.opened", "msg:term.resize", "msg:welcome", "refusal:capability_disabled",
+		"call:front.serve", "frontAccess", "msg:term.open/dial"}
 	sort.Strings(want)
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("samples changed: have %v\nchecked %v", names, want)
@@ -464,6 +466,7 @@ func TestProtocolSamplesCalls(t *testing.T) {
 		callSample(t, ch, "call:config.url/unchanged", subs)
 		callSample(t, ch, "call:ping", subs)
 		callSample(t, ch, "call:no.such.method", subs)
+		callSample(t, ch, "call:front.serve", subs)
 		callSample(t, ch, "call:uninstall", subs)
 		ch.conn.Read() // the node ends the session after its reply
 	})
@@ -568,7 +571,46 @@ func TestProtocolSamplesTerminal(t *testing.T) {
 		if control["term.closed"]["reason"] != "closed" || control["term.closed"]["sid"] != 8.0 {
 			t.Errorf("term.closed after term.close: %v", control["term.closed"])
 		}
+		echo, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer echo.Close()
+		go func() {
+			if c, err := echo.Accept(); err == nil {
+				io.Copy(c, c)
+				c.Close()
+			}
+		}()
+		ch.send(message("msg:term.open/dial", map[string]any{"sid": 9, "dial": echo.Addr().String()}))
+		output(t, ch, 9, "term.opened", control)
+		termInput(ch, 9, "dialed-9")
+		output(t, ch, 9, "dialed-9", nil)
+		ch.send(message("msg:term.close", map[string]any{"sid": 9}))
+		output(t, ch, 9, "term.closed", control)
 	})
+}
+
+func TestProtocolSamplesFrontAccess(t *testing.T) {
+	f := sampledFakeController(t)
+	done := make(chan struct{})
+	s := f.serve(t, func(ch *channel, _ map[string]any) {
+		defer close(done)
+		hello := next(t, ch, "hello")
+		mustMatch(t, "hello of an exit", hello, sample(t, "msg:hello", nil))
+		mustMatch(t, "frontAccess", hello["frontAccess"], sample(t, "frontAccess", nil))
+		revoke(ch)
+	})
+	defer s.Close()
+	a := f.agent(s.URL, Capabilities{Exec: true})
+	a.ConfigPath = filepath.Join(t.TempDir(), "config.json")
+	a.Config.FrontPort = freePort(t)
+	defer a.serveFront(0)
+	if err := a.serveFront(a.Config.FrontPort); err != nil {
+		t.Fatal(err)
+	}
+	runSession(t, a)
+	<-done
 }
 
 func TestProtocolSamplesEnroll(t *testing.T) {
@@ -619,6 +661,19 @@ func browserSample(t *testing.T, a *Agent, name string, subs map[string]string) 
 	mustMatch(t, name+" result", result, s["result"])
 	out, _ := generic(t, result).(map[string]any)
 	return out
+}
+
+func TestProtocolSampleBrowserUpdate(t *testing.T) {
+	a, h := browserAgent(t)
+	newChromeSite(t, "131.0.6778.85", fakeChrome(t, true))
+	installedAt(t, h.dir, "131.0.6778.85")
+	if out := browserSample(t, a, "call:browser.update", nil); out["upToDate"] != true || out["latest"] != "131.0.6778.85" {
+		t.Fatalf("browser.update: %v", out)
+	}
+	a.Config.Capabilities.Browser = false
+	if _, err := a.browserCall(t.Context(), envelope{Method: "browser.update", Params: json.RawMessage(`{"check":true}`)}); err == nil || err.Error() != "capability_disabled" {
+		t.Fatalf("with the browser off: %v", err)
+	}
 }
 
 func TestProtocolSamplesBrowser(t *testing.T) {

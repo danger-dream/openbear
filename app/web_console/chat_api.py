@@ -1,12 +1,15 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+import dataclasses
+
 from app.agent.native_continuation import validate_model_context
 from app.agents import live_state as agent_live_state
 from app.context.configuration import CONTEXT_STRATEGIES, normalize_strategy
 from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers
 from app.interaction_data import redact_result
 from app.references import ReferenceError, effective_reference_text
+from app.extensions import ExtensionError
 from app.task_memory import TaskMemoryDAO, task_memory_changed_public_event
 from app.web_console.message_visibility import visibility_snapshot
 from app.web_console.activity import clear_deleted_completion
@@ -360,6 +363,13 @@ class WebAdminChatHandlersMixin:
             normalized = self._normalize_web_run_defaults({**self._web_defaults_storage(selected), "revision": 0, "updated_at": 0})
 
         storage = self._web_defaults_storage(normalized)
+        extensions = await self._extensions_for_new(session.chat_id, folder_uuid)
+        if body.get("extensions") is not None and getattr(self, "extensions", None) is not None:
+            # Chosen in the composer before the conversation existed.
+            try:
+                extensions = self.extensions.chosen(body["extensions"])
+            except ExtensionError as exc:
+                return web.json_response(exc.payload, status=400)
         row = await self._create_web_conversation(
             session.chat_id,
             title=title,
@@ -368,6 +378,7 @@ class WebAdminChatHandlersMixin:
             folder_uuid=folder_uuid,
             persist_defaults=persist_defaults,
             defaults_seed=self._web_defaults_storage(global_defaults) if folder_defaults else None,
+            extensions=extensions,
         )
         live = self._live_for(row)
         await self.audit("web.conversation.create", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row["conversation_uuid"], "internalChatId": row["internal_chat_id"]})
@@ -873,7 +884,10 @@ class WebAdminChatHandlersMixin:
                 system = edited_context['system'] if edited_context else (await messages.get_system_snapshot(chat_id) or await self._build_system_prompt_for_chat(conversation_uuid=conv_uuid))
                 cur = await self.db.conn.execute("SELECT COALESCE(MAX(id),0) AS n FROM messages WHERE chat_id=?", (chat_id,))
                 high_water = int((await cur.fetchone())["n"])
-                compact_tools = edited_context['tools'] if edited_context else self.tools.schemas(scope='main')
+                if edited_context:
+                    compact_tools = edited_context['tools']
+                else:
+                    system, compact_tools = await self._conversation_request_inputs(conv_uuid, system)
                 if active_policy['overrideSystemPrompt']:
                     from app.context.prompt_policy import policy_tool_names
                     allowed = set(policy_tool_names(active_policy))
@@ -1317,10 +1331,12 @@ class WebAdminChatHandlersMixin:
                         retain_tokens=self.config.context_management.retain_tokens,
                         dialogue_tokens=self.config.context_management.dialogue_tokens, max_output_tokens=max_output,
                     )
+                    restart_system, restart_tools = await self._conversation_request_inputs(
+                        conv_uuid, await dao.get_system_snapshot(internal_chat_id) or "")
                     restart_messages = await controller_restart_selection(
                         dao, internal_chat_id, first_message_id, policy=policy,
-                        system=await dao.get_system_snapshot(internal_chat_id) or "",
-                        tools=self.tools.schemas(scope="main") if self.tools else [],
+                        system=restart_system,
+                        tools=restart_tools,
                         reference_store=self._reference_store(), conversation_uuid=conv_uuid,
                         backend=backend, model=model,
                     )
@@ -1582,6 +1598,8 @@ class WebAdminChatHandlersMixin:
             )
             from app.work_items import WorkItemsDAO
             await WorkItemsDAO(self.db).hard_delete_conversation(conv_uuid, conn=self.db.conn)
+            from app.notes import UserNotesDAO
+            await UserNotesDAO(self.db).hard_delete_conversation(conv_uuid, conn=self.db.conn)
             await self.db.conn.execute("DELETE FROM rath_agent_sessions WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM sessions WHERE chat_id=?", (internal_chat_id,))
             await self.db.conn.execute("DELETE FROM web_conversations WHERE conversation_uuid=?", (conv_uuid,))
@@ -2024,8 +2042,6 @@ class WebAdminChatHandlersMixin:
         # round open after its controller exits. Only a live controller can
         # consume steering; otherwise start one below with the existing task
         # context and leave earlier queued messages for it to adopt.
-        if self.runs is not None and self.runs.is_running(internal_chat_id) and media:
-            return {"ok": False, "error": "attachments_while_running_not_supported"}
         try:
             reference_bundle_id, reference_manifest = await self._prepare_reference_bundle(row, text, f"msg:{user_message_uuid}", existing_keys=reference_order)
         except ReferenceError as exc:
@@ -2044,9 +2060,8 @@ class WebAdminChatHandlersMixin:
             # Keep this runner across publishing/acceptance awaits. A later
             # registry lookup hides completed tasks and would miss the handoff.
             runner = getattr(self.runs, "task", lambda _chat_id: None)(internal_chat_id)
-            if media:
-                return {"ok": False, "error": "attachments_while_running_not_supported"}
             root_turn_uuid = str(active_round.get("rootTurnUuid") or "").strip() or await self._latest_visible_root_turn_uuid(conv_uuid) or turn_uuid
+            attachments_public = await self._web_media_attachments_public(row, media or [], turn_uuid=root_turn_uuid, op_id=f"msg:{user_message_uuid}")
             if telegram_submission_id:
                 await self.web_task_telegram.enable_direct_reply(row, root_turn_uuid)
             # Composer interruptions always target the main controller.  The
@@ -2059,6 +2074,7 @@ class WebAdminChatHandlersMixin:
                 "rootTurnUuid": root_turn_uuid,
                 "messageUuid": user_message_uuid,
                 "text": visible_user_text,
+                **({"attachments": attachments_public} if attachments_public else {}),
                 "status": "已追加到当前轮",
                 "activeReasons": active_round.get("activeReasons") if isinstance(active_round.get("activeReasons"), list) else [],
             })
@@ -2068,7 +2084,7 @@ class WebAdminChatHandlersMixin:
                 await session.accept_control(user_message_uuid, source_ref=f"input:{user_message_uuid}")
             item = steering.enqueue(
                 internal_chat_id,
-                text,
+                text if (text or "").strip() else visible_user_text,
                 visibleText=visible_user_text,
                 turnUuid=root_turn_uuid,
                 rootTurnUuid=root_turn_uuid,
@@ -2076,6 +2092,9 @@ class WebAdminChatHandlersMixin:
                 source=source,
                 referenceBundleId=reference_bundle_id,
                 references=reference_manifest,
+                # Injected at the loop boundary as this message's model content, as a new turn's attachments are.
+                media=[dataclasses.asdict(m) for m in media] if media else None,
+                attachments=attachments_public or None,
             )
             # Wake the sleeping controller immediately. The message remains in
             # the steering queue and is consumed by the same Agent.run/root turn
@@ -2086,12 +2105,12 @@ class WebAdminChatHandlersMixin:
             if runner is not None:
                 # add_done_callback also works if acceptance outlasted the runner.
                 runner.add_done_callback(lambda finished: self._schedule_steering_handoff(row, finished))
-            pending_items = steering.pending_items(internal_chat_id)
+            pending_items = steering.public_pending_items(internal_chat_id)
             await live.publish({
                 "type": "pending_steering",
                 "action": "snapshot",
                 "items": pending_items,
-                "addedItem": item or {},
+                "addedItem": steering.public(item) if item else {},
                 "rootTurnUuid": root_turn_uuid,
             })
             await self._touch_web_conversation(conv_uuid, current_status="已追加到当前轮")
@@ -2184,7 +2203,7 @@ class WebAdminChatHandlersMixin:
                 "activeBackgroundTasks": background_tasks_payload,
                 "routing": (
                     "User interruption belongs to the main OpenBear conversation first. "
-                    "Do not forward it blindly. Use AgentMessage/AgentStop only when the user clearly wants "
+                    "Do not forward it blindly. Use Agent(action=message) or Agent(action=stop) only when the user clearly wants "
                     "to control a specific background task; if multiple tasks match ambiguously, ask a brief clarification."
                 ),
             }
@@ -2229,7 +2248,7 @@ class WebAdminChatHandlersMixin:
             references = first.get("references") or []
             bundle_id = str(first.get("referenceBundleId") or "")
             live = self._live_for(current)
-            await live.publish({"type": "pending_steering", "action": "snapshot", "items": rest})
+            await live.publish({"type": "pending_steering", "action": "snapshot", "items": [steering.public(item) for item in rest]})
             webhooks = getattr(self, 'webhooks', None)
             if webhooks is not None:
                 await webhooks.accept_human_conversation(int(current['owner_chat_id']), conv_uuid)
@@ -2250,6 +2269,7 @@ class WebAdminChatHandlersMixin:
                     "turnUuid": turn_uuid,
                     "messageUuid": message_uuid,
                     "text": str(first.get("visibleText") or first.get("text") or ""),
+                    **({"attachments": first["attachments"]} if first.get("attachments") else {}),
                     **({"references": references, "referenceBundleId": bundle_id} if references else {}),
                 })
                 if self._web_stopping:
@@ -2263,7 +2283,7 @@ class WebAdminChatHandlersMixin:
                     internal_chat_id,
                     str(first.get("text") or ""),
                     renderer,
-                    media=[],
+                    media=[InboundMedia(**m) for m in first.get("media") or []],
                     conversation=current,
                     background_control_payload=background_control_payload,
                     root_turn_uuid=turn_uuid,
@@ -2541,7 +2561,7 @@ class WebAdminChatHandlersMixin:
                     "messageVisibility": await visibility_snapshot(self.db, conv_uuid_for_log),
                     "frameSeq": last_sent_frame_seq,
                     "pendingConfirmations": self._pending_web_confirmations(conv_uuid_for_log),
-                    "pendingSteering": steering.pending_items(internal_chat_id_for_log),
+                    "pendingSteering": steering.public_pending_items(internal_chat_id_for_log),
                     "promptSuggestions": self._prompt_suggestions_public(
                         await self._conversation_row(owner_chat_id_for_log, conv_uuid_for_log)
                     ),

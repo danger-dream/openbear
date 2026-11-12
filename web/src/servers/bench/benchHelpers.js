@@ -1,4 +1,4 @@
-// 评测: the tree of servers, categories, tests and runs; reports (ANSI) as HTML; states and warnings.
+// 评测: the tree of servers, their tests and runs; reports (ANSI) as HTML; states and warnings.
 
 export const STATES = {queued: '排队中', preparing: '准备中', running: '运行中', collecting: '收集结果', done: '完成', failed: '失败', stopped: '已停止', interrupted: '中断'};
 export const ACTIVE = new Set(['queued', 'preparing', 'running', 'collecting']);
@@ -8,7 +8,14 @@ export const stateText = run => run.stopping ? '正在停止' : STATES[run.state
 export const stateTone = state => ({done: 'ok', failed: 'bad', interrupted: 'bad', stopped: 'idle', queued: 'idle'})[state] || 'busy';
 
 const pad = n => String(n).padStart(2, '0');
-// 2026.10.30 23:14, the way a run is named in the tree.
+// 10.30 23:14 in the tree, with the year when it is not this one's.
+export function shortRunTime(ms, now = Date.now()) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const day = `${pad(d.getMonth() + 1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return d.getFullYear() === new Date(now).getFullYear() ? day : `${d.getFullYear()}.${day}`;
+}
+// 2026.10.30 23:14, the way a run is named.
 export function runTime(ms) {
   if (!ms) return '';
   const d = new Date(ms);
@@ -34,14 +41,16 @@ export function buildTree(servers, runs, catalog) {
     if (!byServer.has(run.serverId)) byServer.set(run.serverId, []);
     byServer.get(run.serverId).push(run);
   }
-  const tests = catalog?.tests || [];
+  const order = (catalog?.categories || []).map(c => c.id);
+  // Tests in the order of their categories, then the catalog's.
+  const tests = (catalog?.tests || []).map((test, i) => ({test, i})).filter(({test}) => order.includes(test.category))
+    .sort((a, b) => order.indexOf(a.test.category) - order.indexOf(b.test.category) || a.i - b.i).map(({test}) => test);
   return servers.filter(s => byServer.has(s.id)).map(server => {
     const own = (byServer.get(server.id) || []).slice().sort((a, b) => b.createdMs - a.createdMs);
-    const categories = (catalog?.categories || []).map(category => ({
-      ...category,
-      tests: tests.filter(t => t.category === category.id).map(test => ({test, runs: own.filter(r => r.test === test.id)})).filter(t => t.runs.length),
-    })).filter(c => c.tests.length);
-    return {server, eligible: eligible(server), runs: own.length, active: own.filter(isActive).length, categories};
+    // Each test with its newest run, and the earlier ones the row folds away.
+    const rows = tests.map(test => ({test, runs: own.filter(r => r.test === test.id)})).filter(t => t.runs.length)
+      .map(t => ({...t, latest: t.runs[0], older: t.runs.slice(1)}));
+    return {server, eligible: eligible(server), runs: own.length, active: own.filter(isActive).length, latestMs: own[0]?.createdMs || 0, tests: rows};
   });
 }
 

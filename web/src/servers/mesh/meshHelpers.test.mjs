@@ -73,6 +73,23 @@ test('reachability and routing: verdicts, candidate health, relay link measures,
   const mac = {serverId: 'mac', entry: {mode: 'failover', candidates: [{id: 'm1', relay: 'toy'}, {id: 'm2', relay: 'lax'}]}}, members = [mac, {serverId: 'lax', name: 'LAX'}, {serverId: 'toy', name: 'TOY'}];
   assert.deepEqual(h.nodeAlerts(data, mac, members).map(a => [a.code, a.text]), [['mesh_standby_unhealthy', 'LAX 备用：超时']]);
   assert.deepEqual(h.nodeAlerts({nodes: {mac: {summary: {entryHealth: []}}}}, mac, members), []);
+  // An exit seen differently: an alert only where the member's own public address matters (hole punching).
+  const split = {nodes: {mac: {summary: {entryHealth: [], reachability: {verdict: 'punchable', consistent: false}}}}};
+  const relays = [{serverId: 'toy', role: 'relay', relayMode: 'public'}, {serverId: 'lax', role: 'relay', relayMode: 'public'}];
+  const work = links => ({members: [mac, ...relays], directLinks: links});
+  assert.deepEqual(h.nodeAlerts(split, mac, members).map(a => a.code), ['mesh_exit_inconsistent']);
+  assert.deepEqual(h.nodeAlerts(split, mac, members, null, work([])), []);
+  assert.deepEqual(h.nodeAlerts(split, mac, members, null, work([{a: 'mac', b: 'lax', transport: 'udp'}])).map(a => a.code), ['mesh_exit_inconsistent']);
+  assert.equal(h.needsPublicAddr(work([{a: 'mac', b: 'lax', transport: 'tcp'}]), split, mac), false);
+  // The controller's own alerts (a detour, worked out across nodes) come with their text and badge.
+  const detour = {nodes: {mac: {alerts: [{code: 'mesh_detour', message: '组网连接在绕路：HK 看到它从 192.0.2.252（Hinet 的地址）连过来'}], summary: {entryHealth: []}}}};
+  assert.deepEqual(h.nodeAlerts(detour, mac, members).map(a => [a.code, a.text]), [['mesh_detour', '组网连接在绕路：HK 看到它从 192.0.2.252（Hinet 的地址）连过来']]);
+  assert.deepEqual(h.ALERT_BADGES.mesh_detour, ['warn', '连接绕路']);
+  // Entering a site relay: punched, unless it is reached on the member's LAN.
+  const site = {members: [mac, {serverId: 'toy', role: 'relay', relayMode: 'site'}, relays[1]], directLinks: []};
+  assert.equal(h.needsPublicAddr(site, split, mac), true);
+  assert.equal(h.needsPublicAddr(site, {nodes: {mac: {summary: {entryHealth: [{id: 'm1', state: 'active', via: 'lan'}]}}}}, mac), false);
+  assert.equal(h.needsPublicAddr(site, split, {serverId: 'toy', role: 'relay', relayMode: 'site'}), true);
   assert.equal(h.candLine({state: 'failing', lastError: 'tls pin mismatch', lastOkAt: 0}), '连不上：TLS 证书指纹不符 · 从没连上过');
   // Relay links: the worse end; a negative cost (bias) is a cost, null is unreachable.
   const routing = (links) => ({summary: {routing: links === null ? null : {mode: 'dynamic', links, routes: []}}});
@@ -117,7 +134,7 @@ test('routes and gateway networks: rows from GET /mesh/routes, who gets each net
   // exports: by gateway and network; an empty list means nobody, a missing field says nothing.
   const data = {exports: [{gateway: 'home', subnet: '10.10.10.0/24', nodes: ['sg', 'mac']}, {gateway: 'home', subnet: '192.168.50.0/24', nodes: []}]};
   assert.equal(exportText(exportsOf(data, 'home', '10.10.10.0/24'), members), '下发给：SG、Mac');
-  assert.equal(exportText(exportsOf(data, 'home', '192.168.50.0/24'), members), '没有机器能访问（要在访问规则的目标里写上这个网段）');
+  assert.equal(exportText(exportsOf(data, 'home', '192.168.50.0/24'), members), '没有节点能访问（要在访问规则的目标里写上这个网段）');
   assert.equal(exportsOf({}, 'home', '10.10.10.0/24'), null);
 });
 
@@ -133,6 +150,12 @@ test('real-data review: events read in Chinese, routine records, cold standbys, 
     '向 VM 发起握手失败：连接已经关闭（之后 1 分钟内还有 7 条相同的没有记录）');
   assert.equal(ev('route.changed', 'toy: toy -> home (better)'), '到 TOY：直达 → 经 Home（新线路更快）');
   assert.equal(ev('route.changed', 'toy: none -> toy (better)'), '到 TOY：无路可走 → 直达（新线路更快）');
+  // An own route going down, the next one taken, the routes when none is left, an earlier one back.
+  assert.equal(ev('pin.switch', 'toy: 0 -> 1'), '到 TOY：改走自建路线第 1 条');
+  assert.equal(ev('pin.switch', 'toy: 1 -> 2 down sg home'), '到 TOY：第 1 条不通（SG 和 Home 之间断开），改走第 2 条');
+  assert.equal(ev('pin.switch', 'toy: 2 -> 0 down home toy'), '到 TOY：第 2 条不通（Home 和 TOY 之间断开），没有别的自建路线可用，改走自动选路');
+  assert.equal(ev('pin.switch', 'toy: 2 -> 1'), '到 TOY：第 1 条恢复稳定，切回第 1 条');
+  assert.equal(ev('pin.switch', 'toy: 1 -> 0 silent'), '到 TOY：第 1 条不通（各段线路都在，但包过不去），没有别的自建路线可用，改走自动选路');
   assert.equal(ev('owner.changed', 'mac -> toy seq=43'), 'Mac 现在经 TOY 接入');
   assert.equal(ev('config.applied', 'revision 52'), '第 52 版');
   assert.equal(ev('start', 'obmesh0 up, revision 38, 6 peers, 0 learned addresses restored'), '第 38 版配置，6 个对端');
@@ -254,6 +277,8 @@ test('every event kind the data plane and the controller record reads in Chinese
     ['entry.unavailable', 'no ready entry', ['没有可用入口', '没有可用的入口', '']],
     ['entry.prepare', 'c1 seq=12: initial', ['准备切换入口', '第 1 个入口（Berlin · UDP）：首次选定', '']],
     ['state.error', 'open /var/lib/x: permission denied', ['状态没保存', '入口状态没能保存到磁盘：系统不允许（权限或防火墙限制）', 'raw']],
+    ['mtu.own', "eth0 1400: this node's own packets up to 1264 bytes, the network's 1348", ['本机组网包上限', '本机网卡 eth0 的 MTU 是 1400，装不下组网的满尺寸包：本机发出的组网包上限调到 1264 字节（全网 1348）', '']],
+    ['mtu.own', "none: this node's own packets up to the network's 1348 bytes", ['本机组网包上限', '本机网卡装得下组网的满尺寸包，本机发出的组网包上限回到全网的 1348 字节', '']],
     ['route.error', 'route update failed', ['系统路由出错', '更新系统路由失败：路由更新失败', '']],
     ['route.error', 'exit status 2: RTNETLINK answers: File exists', ['系统路由出错', '更新系统路由失败', 'raw']],
     ['routing.error', `advertisement from ${id(1)}: advert link is invalid`, ['选路出错', '收到 Berlin 的路由通告有误，已忽略', 'raw']],
@@ -270,7 +295,7 @@ test('every event kind the data plane and the controller record reads in Chinese
     ['start', 'obmesh0 up, revision 65, 5 peers, 2 learned addresses restored', ['组网服务启动', '第 65 版配置，5 个对端，恢复了 2 个记下的对端地址', '']],
     ['upgrade.failed', 'data plane upgrade to build c4ec3ff88e29 did not get ready; rolled back', ['组网服务升级失败，已回退', '新版本启动后没有就绪，已回到原来的版本', 'raw']],
     ['link.suppressed', `${id(1)}: penalty 1200`, ['线路暂停使用', '到 Berlin 的中转链路反复断开，暂停用于选路', '']],
-    ['route.changed', `${id(9)}: ${id(1)} -> none (down)`, ['换路', '到 已移出组网的机器：经 Berlin → 无路可走（原线路断开）', '']],
+    ['route.changed', `${id(9)}: ${id(1)} -> none (down)`, ['换路', '到 已移出组网的节点：经 Berlin → 无路可走（原线路断开）', '']],
     ['something.new', 'raw words', ['其他事件', '', 'raw']],
   ];
   for (const [kind, detail, want] of cases) assert.deepEqual(v(kind, detail), want, `${kind}: ${detail}`);
@@ -297,7 +322,7 @@ test('a member whose mesh service is gone: its state, its rollout step, its even
   const back = eventView({kind: 'mesh.reinstall', detail: ''}, {serverId: 'a', name: 'EdgeES'}, []);
   assert.deepEqual([back.label, back.tone], ['重新安装组网服务', 'ok']);
   // The controller's own words: which member's key it reported, kept whole.
-  const copied = eventView({kind: 'mesh.key_conflict', detail: '上报的端到端密钥和「Berlin」的相同，没有采用。多半是从那台机器的系统快照或模板克隆出来的'},
+  const copied = eventView({kind: 'mesh.key_conflict', detail: '上报的端到端密钥和「Berlin」的相同，没有采用。多半是从那个节点的系统快照或模板克隆出来的'},
     {serverId: 'a', name: 'EdgeES'}, []);
   assert.deepEqual([copied.label, copied.tone], ['上报了其他成员的密钥', 'bad']);
   assert.match(copied.raw, /「Berlin」/);
@@ -338,6 +363,9 @@ test('a line\'s record reads the controller summary: availability in percent, la
     [['试连成功率', '83.3%', 'warn'], ['试连失败', '1 次', 'warn'], ['有抽测的时间', '6 分钟']]);
   // An end without a local address (a standby entry not connected) says only where it goes.
   assert.equal(lineEnd({local: '', public: '', remote: '198.51.100.6:51999', dialer: true}, 'udp').route, '经 UDP 连到 198.51.100.6:51999');
+  // The path MTU only when the end reports one.
+  assert.equal(lineEnd({local: '', public: '', remote: '198.51.100.6:51999', dialer: true}, 'udp').mtu, null);
+  assert.equal(lineEnd({local: '', public: '', remote: '198.51.100.6:52000', dialer: true, mtu: 9000}, 'tcp').mtu, 9000);
   const members = [{serverId: 'lax', name: 'LAX'}, {serverId: 'berlin', name: 'Berlin'}];
   assert.equal(trendRttText({kind: 'entry', peers: ['lax']}, members), '到 LAX（入口）的延迟');
   assert.equal(trendRttText({kind: 'links', peers: ['berlin', 'lax']}, members), '到 Berlin、LAX 的中转链路平均延迟');
@@ -400,7 +428,7 @@ test('signature, end-to-end and entry security events read in Chinese with what 
   const v = (kind, detail) => { const x = h.eventView({kind, detail}, members[2], members, keys); return [x.label, x.text, x.raw ? 'raw' : '', x.tone]; };
 
   assert.deepEqual(v('sign.rejected', 'offer in the name of m2 from r1: bad signature (3 more since the last one)'),
-    ['签名校验失败', 'Berlin 转来的以 家 名义的打洞地址签名不对，已丢弃（之后 1 分钟内还有 3 条）。偶尔一次可能是对方刚重装、新密钥还没下发到这里；持续出现说明转发它的机器可能被篡改，检查那台机器。', '', 'bad']);
+    ['签名校验失败', 'Berlin 转来的以 家 名义的打洞地址签名不对，已丢弃（之后 1 分钟内还有 3 条）。偶尔一次可能是对方刚重装、新密钥还没下发到这里；持续出现说明转发它的节点可能被篡改，检查那个节点。', '', 'bad']);
   assert.match(v('sign.rejected', 'commit in the name of m1 from m1: bad signature')[1], /^公司 发来的接入声明签名不对，已丢弃。/);
   assert.match(v('sign.rejected', 'owner notice in the name of m1/r2 from r1: bad signature')[1], /^Berlin 转来的公司 经 LAX 接入的接入通告签名不对/);
   assert.match(v('sign.rejected', 'routing advertisement in the name of its origin from r2: bad signature')[1], /^LAX 转来的路由通告签名不对/);
@@ -410,7 +438,7 @@ test('signature, end-to-end and entry security events read in Chinese with what 
   assert.deepEqual(v('owner.claim_expired', '2 stored claims without valid signatures dropped'),
     ['旧接入记录作废', '作废了 2 条没有有效签名的接入记录，相关成员会自动重新接入。升级后或成员重装后出现一次属于正常。', '', 'off']);
   assert.deepEqual(v('e2e.exhausted', 'all 64 end-to-end sessions in use in the last 2m0s; packets for m2 dropped (5 refused since the last report)'),
-    ['端到端会话已满', '64 个端到端会话都在用，发往 家 的包已丢弃，不会改用明文，上次记录以来又拒绝了 5 次。经常出现说明这台机器同时通信的对端太多。', '', 'bad']);
+    ['端到端会话已满', '64 个端到端会话都在用，发往 家 的包已丢弃，不会改用明文，上次记录以来又拒绝了 5 次。经常出现说明这个节点同时通信的对端太多。', '', 'bad']);
   assert.match(v('e2e.exhausted', 'more than 20 new end-to-end sessions a second; packets for m2 dropped')[1], /^每秒新建的端到端会话超过 20 个，发往 家 的包已丢弃/);
   assert.deepEqual(v('e2e.error', 'peer(E2Ee…9ZzM) - Failed to send handshake initiation: no buffer space available').slice(0, 2),
     ['端到端加密出错', '向 家 发起握手失败：系统发送缓冲区已满']);
@@ -424,15 +452,15 @@ test('signature, end-to-end and entry security events read in Chinese with what 
   assert.match(v('entry.suspect', suspect + 'reported only: r2 is not a ready candidate to tell the entry from it')[1], /没有切换：LAX 不是就绪的备用入口/);
 
   assert.deepEqual(v('reach.mismatch', 'reflected [198.51.100.9:4000] not offered; relays saw 203.0.113.7 by r1,r2'),
-    ['出口地址对不上', '反射器报的出口地址 198.51.100.9:4000 和中转在已认证线路上看到的对不上，没有用来打洞（Berlin、LAX 看到 203.0.113.7）。持续出现说明某个反射器谎报地址，或这台机器有多条出口。', '', 'warn']);
+    ['出口地址对不上', '反射器报的出口地址 198.51.100.9:4000 和中转在已认证线路上看到的对不上，没有用来打洞（Berlin、LAX 看到 203.0.113.7）。持续出现说明某个反射器谎报地址，或这个节点有多条出口。', '', 'warn']);
   assert.match(v('reach.mismatch', 'reflected [] not offered; relays saw 203.0.113.7 by r1; 203.0.113.8 by r2')[1], /^各中转看到的出口地址不一致（Berlin 看到 203\.0\.113\.7；LAX 看到 203\.0\.113\.8）/);
 
   assert.deepEqual(v('routing.unknown_link', 'r1 advertises links the mesh does not have, ignored: [m1 r2]'),
-    ['通告了不存在的链路', 'Berlin 的路由通告里有组网里没有的链路 Berlin—公司、Berlin—LAX，已忽略，不会经它们选路。刚改过中转链路时偶尔出现属于正常；持续出现说明这台中转的配置没更新，或被篡改，检查那台机器。', '', 'warn']);
+    ['通告了不存在的链路', 'Berlin 的路由通告里有组网里没有的链路 Berlin—公司、Berlin—LAX，已忽略，不会经它们选路。刚改过中转链路时偶尔出现属于正常；持续出现说明这台中转的配置没更新，或被篡改，检查那个节点。', '', 'warn']);
   assert.equal(v('routing.unknown_link', 'something new')[2], 'raw');
   assert.ok(h.SECURITY_EVENTS.includes('routing.unknown_link'));
   assert.deepEqual(v('routing.clock', "r2's clock is 2m5s off this relay's"),
-    ['中转时钟不准', 'LAX 的时钟比这里快 2 分 5 秒。不影响选路和签名校验，但会让两边的日志和事件时间对不上，建议检查这两台机器的时间同步（NTP）。', '', 'warn']);
+    ['中转时钟不准', 'LAX 的时钟比这里快 2 分 5 秒。不影响选路和签名校验，但会让两边的日志和事件时间对不上，建议检查这两个节点的时间同步（NTP）。', '', 'warn']);
   assert.match(v('routing.clock', "r2's clock is -1h0m0s off this relay's")[1], /^LAX 的时钟比这里慢 1 小时。/);
   assert.match(v('routing.clock', "r2's clock is -1m30s off this relay's")[1], /^LAX 的时钟比这里慢 1 分 30 秒。/);
   assert.equal(v('routing.clock', 'odd')[2], 'raw');
@@ -476,4 +504,87 @@ test('host firewalls a Linux node found, what they may not let through, and the 
   assert.equal(firewallIssue({code: 'firewall_tool_missing', detail: 'ufw: iptables'}).text, '找不到 iptables，没能调整 ufw');
   const members = [{serverId: 'gw', name: '网关机'}, {serverId: 'm2', name: 'EdgeHost'}];
   assert.deepEqual(autoRuleWords({gateway: 'gw', serverId: 'm2', port: 18970}, members), ['允许', '网关机', '访问', 'EdgeHost', 'TCP 18970']);
+});
+
+test('an exit is named after its member, uniquely among exits, and a proxy with neither part is none', async () => {
+  const {proxyName, proxyUrl, withProxy} = await import('./meshHelpers.js');
+  const a = {serverId: 'a', name: 'Edge-Fra', proxy: {exit: {user: 'edge-fra'}, ports: []}};
+  const members = [a, {serverId: 'b', name: 'Edge Fra'}, {serverId: 'c', name: '家-临时服务器', address: '100.96.0.3'}];
+  assert.equal(proxyName(a, members), 'edge-fra');
+  assert.equal(proxyName(members[1], members), 'edge-fra-2');
+  assert.equal(proxyName(members[2], members), 'exit3');
+  assert.match(proxyName({serverId: 'd', name: 'X'.repeat(40)}, members), /^[a-z0-9][a-z0-9._-]{0,31}$/);
+  assert.equal(withProxy({proxy: {exit: {user: 'x'}, ports: []}}, 'exit', null), null);
+  assert.deepEqual(withProxy({proxy: null}, 'ports', [{port: 1080}]), {exit: null, ports: [{port: 1080}]});
+  assert.equal(proxyUrl('socks5h', 'home', 'p@ss', '127.0.0.1', 1080), 'socks5h://home:p%40ss@127.0.0.1:1080');
+  assert.equal(proxyUrl('socks5h', 'home', 'p@ss', '127.0.0.1', 1080, {masked: true}), 'socks5h://home:••••@127.0.0.1:1080');
+});
+
+test('an exit turned on gets its own proxy and no group; off, it leaves every group and the ports leading to it lead nowhere', async () => {
+  const {newProxyPort, portTarget, setExit} = await import('./meshHelpers.js');
+  const a = {serverId: 'a', name: 'LA', proxy: null}, b = {serverId: 'b', name: 'JP', proxy: null};
+  const e = {serverId: 'e', name: 'Home', proxy: {exit: null, ports: [{id: 'p1', port: 1080, exit: 'a', group: '', select: 'order', pinned: ''},
+    {id: 'p2', port: 1081, exit: '', group: 'g', select: 'manual', pinned: 'a'}]}};
+  const work = {members: [a, b, e], exitGroups: [{id: 'g', name: '美国', members: []}]};
+  setExit(work, a, true);
+  setExit(work, b, true);
+  assert.deepEqual(a.proxy, {exit: {user: 'la', password: '', port: 1081, subnets: false, lan: false, interface: '', source: ''}, ports: []});
+  assert.equal(work.exitGroups[0].members.length, 0);
+  work.exitGroups[0].members.push('a', 'b');
+  assert.equal(portTarget(work, e.proxy.ports[1]), '美国 · LA');
+  setExit(work, a, false);
+  assert.deepEqual(work.exitGroups[0].members, ['b']);
+  assert.equal(a.proxy, null);
+  assert.deepEqual(e.proxy.ports.map(p => [p.exit, p.pinned]), [['', ''], ['', '']]);
+  // A new port takes the first port free on its node.
+  assert.equal(newProxyPort(e).port, 1082);
+});
+
+test('the draft carries line rules, exit groups, limits and paths only when the controller sends them', async () => {
+  const {draftOf, entryLine, errorMessage} = await import('./meshHelpers.js');
+  const {blankLimit, canPinRoute, fixedRouteInfo, hmText, limitReach, limitSentence} = await import('./meshAuto.js');
+  assert.deepEqual(Object.keys(draftOf({members: []})), ['settings', 'members', 'relayLinks', 'directLinks', 'rules']);
+  const d = draftOf({members: [], lineRules: [], exitGroups: [{id: 'g1'}], limits: [{id: 'k1'}], paths: [{id: 'p1'}]});
+  assert.deepEqual(d.limits, [{id: 'k1'}]);
+  assert.deepEqual(d.paths, [{id: 'p1'}]);
+  const members = [
+    {serverId: 'berlin', name: 'Berlin', role: 'relay', region: 'DE'},
+    {serverId: 'lax', name: 'LAX', role: 'relay', region: 'US'},
+    {serverId: 'home', name: 'Home', role: 'member', region: 'CN', entry: {mode: 'upstreams', candidates: [{id: 'c1', relay: 'berlin', transport: 'udp'}, {id: 'c2', relay: 'lax', transport: 'tcp'}]}},
+  ];
+  assert.deepEqual(entryLine(members[2], members, {entry: {candidate: 'c2', relay: 'lax', transport: 'tcp'}}), {text: '当前 LAX · TCP +1', tone: ''});
+  const limit = {...blankLimit(), name: '国内跨境限制', a: {kind: 'region', regions: ['CN'], not: false}, b: {kind: 'region', regions: ['CN'], not: true},
+    relayEnd: true, transports: ['tcp', 'tls'], via: ['berlin'], manualOnly: true};
+  const reach = limitReach(limit, [{a: 'berlin', b: 'lax'}], [], members, id => members.find(m => m.serverId === id)?.region || '');
+  assert.equal(reach.entries, 2);
+  assert.equal(reach.lines.length, 0);
+  assert.equal(reach.total, 2);
+  assert.match(limitSentence(limit, id => id, r => r), /至少一端是中转；只允许 TCP、TLS；只能经过 berlin；只允许手动建立/);
+
+  // Own routes as the path query reports them, and which paths can become one.
+  const untilTs = new Date(2026, 10, 11, 14, 32).getTime();
+  assert.equal(hmText(untilTs), '14:32');
+  assert.deepEqual(fixedRouteInfo({state: 'pinned', rank: 2, back: false}), {tone: 'ok', text: '按自建路线第 2 条'});
+  assert.deepEqual(fixedRouteInfo({state: 'fallback', rank: 1, back: true}), {tone: 'warn', text: '自建路线都不通，正走自动选路（回程）'});
+  assert.deepEqual(fixedRouteInfo({state: 'waiting', rank: 1, until: untilTs, back: false}), {tone: 'warn', text: '自建路线刚恢复，14:32 起切回'});
+  assert.deepEqual(fixedRouteInfo({state: 'starting', rank: 1, back: false}), {tone: 'info', text: '自建路线正在连接'});
+  const isRelayId = id => members.find(m => m.serverId === id)?.role === 'relay';
+  assert.equal(canPinRoute({hops: [{node: 'home'}, {node: 'berlin'}, {node: 'lax'}], stale: false}, isRelayId), true);
+  assert.equal(canPinRoute({hops: [{node: 'home'}, {node: 'lax'}], stale: false}, isRelayId), false);
+  assert.equal(canPinRoute({hops: [{node: 'home'}, {node: 'berlin'}, {node: 'lax'}], stale: true}, isRelayId), false);
+  assert.equal(canPinRoute({hops: [{node: 'home'}, {node: 'berlin'}, {node: 'lax'}], fixed: {state: 'pinned'}}, isRelayId), false);
+  // Off its own routes (all down), the pair can take this one as another.
+  assert.equal(canPinRoute({hops: [{node: 'home'}, {node: 'berlin'}, {node: 'lax'}], fixed: {state: 'fallback'}}, isRelayId), true);
+  assert.equal(errorMessage({path: 'paths[0]', error: 'path_link_missing'}), '路线上有两台中转之间没有线路');
+  assert.equal(errorMessage({path: 'paths[3]', error: 'path_pair_full'}), '同一对节点最多 3 条自建路线');
+});
+
+test('a member moving between the gateways of a LAN reads in Chinese', async () => {
+  const {eventView} = await import('./meshHelpers.js');
+  const members = [{serverId: 'p', name: 'Home-GW'}, {serverId: 'b', name: 'Home-NAS'}];
+  const v = detail => { const x = eventView({kind: 'gateway.standby', detail}, {serverId: 'm', name: 'Laptop'}, members); return [x.label, x.text, x.raw, x.tone]; };
+  assert.deepEqual(v('192.168.1.0/24: p -> b (unanswered)'), ['切换局域网网关', '网关 Home-GW 没有回应，访问 192.168.1.0/24 改经备用网关 Home-NAS', '', 'warn']);
+  assert.deepEqual(v('192.168.1.0/24: b -> p (returned)'), ['切换局域网网关', 'Home-GW 恢复回应，访问 192.168.1.0/24 切回经它，不再经 Home-NAS', '', 'ok']);
+  // A detail of another shape is kept as it was.
+  assert.deepEqual(v('192.168.1.0/24 moved'), ['切换局域网网关', '改经另一个网关访问局域网', '192.168.1.0/24 moved', 'warn']);
 });

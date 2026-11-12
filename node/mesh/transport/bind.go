@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -31,7 +32,13 @@ type Options struct {
 	// Protocol is the mesh protocol range this node speaks (package wire);
 	// zero is this build's.
 	Protocol wire.Range
-	Logf     func(format string, args ...any)
+	// LargeFrames: the data device gets a pool of large buffers and the
+	// bind a queue and receive function for them, and streams of
+	// wire.LargeFrames or later take frames of up to wire.LargeMTU.
+	// SendLarge: this node says it takes them, and sends them to a peer that
+	// says so too (SetPeerLarge) over such a stream.
+	LargeFrames, SendLarge bool
+	Logf                   func(format string, args ...any)
 }
 
 type PathStats struct {
@@ -41,7 +48,9 @@ type PathStats struct {
 	DialAttempts, Reconnects, RxBytes, TxBytes        uint64
 	Dropped, RxQueueBytes, TxBufferedBytes            uint64
 	// Redials counts the connections Redial moved the path to.
-	Redials           uint64
+	Redials uint64
+	// Companion: control and handshakes go over a second connection.
+	Companion         bool
 	SocketBufferBytes int
 	ObservedAt        time.Time
 }
@@ -100,25 +109,58 @@ type Bind struct {
 	nextID        uint64
 	events        chan PathEvent
 	droppedEvents uint64
+	largeCh       chan struct{}
 	reflectLimit  reflectLimiter
 	reflectWait   map[[8]byte]*reflectWaiter
 	reflectIDs    map[[8]byte]reflectSeen
 	reflectFrom   map[netip.Addr]time.Time
 	tests         map[[8]byte]byte
 	stunWait      map[[12]byte]*stunWaiter
+	rxDrops       struct{ queue, tooLong, stale atomic.Uint64 }
+	// largeRx counts what became of large receive buffers (spares.go).
+	largeRx struct{ swapped, copied, reused, allocated, discarded atomic.Uint64 }
+}
+
+// ReceiveDrops counts the frames the receive side dropped on their way to
+// the device: Queue for want of room in the receive queue, TooLong for not
+// fitting the device's buffer, Stale for a path moved on meanwhile.
+type ReceiveDrops struct{ Queue, TooLong, Stale uint64 }
+
+func (b *Bind) ReceiveDrops() ReceiveDrops {
+	return ReceiveDrops{Queue: b.rxDrops.queue.Load(), TooLong: b.rxDrops.tooLong.Load(), Stale: b.rxDrops.stale.Load()}
 }
 
 type bindRun struct {
-	ctx                              context.Context
-	cancel                           context.CancelFunc
-	wg                               sync.WaitGroup
-	rx                               chan received
-	control                          *controlRun
-	controlBytes                     int
-	listeners                        map[string]*listener
-	udp                              *udpSocket
-	sessions                         map[*session]bool
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	rx     chan received
+	// urgent has the data plane's handshakes that came over a companion,
+	// for the device's priority receive function.
+	urgent chan received
+	// large has the data frames too long for the device's other buffers,
+	// for its large receive function; nil without LargeFrames. spares are
+	// the large buffers frames are read into, largeSwap the large receive
+	// function that hands them over (spares.go); both nil without large.
+	large        chan received
+	spares       chan []byte
+	largeSwap    conn.ReceiveFunc
+	control      *controlRun
+	controlBytes int
+	listeners    map[string]*listener
+	udp          *udpSocket
+	sessions     map[*session]bool
+	// tokens name the accepted streams a companion may join.
+	tokens                           map[[32]byte]*session
 	unauth, queuedBytes, socketBytes int
+	companions                       int
+	// overPaths: the sessions let in past the path limit, waiting to say
+	// they are companions (accept); they are no paths of their own.
+	overPaths int
+	// rxWaiters stream readers wait for room in rx; rxWake wakes one when
+	// a packet leaves it.
+	rxWaiters int
+	rxWake    chan struct{}
 }
 
 type listener struct {
@@ -154,11 +196,17 @@ type endpoint struct {
 	cancel    context.CancelFunc
 	done      chan struct{}
 	wake      chan struct{}
+	// gsoRetryAfter: UDP segmentation is not tried again on gsoSocket
+	// until then.
+	gsoSocket     *udpSocket
+	gsoRetryAfter time.Time
 }
 
 type received struct {
 	data    []byte
 	plane   uint8
+	urgent  bool
+	pooled  bool // data is a large buffer, the bind's until handed on (spares.go)
 	ref     PathRef
 	at      time.Time
 	ep      *endpoint
@@ -171,7 +219,7 @@ func New(opt Options) (*Bind, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Bind{opt: opt, paths: map[string]*endpoint{}, pins: map[string]pinSet{}, peers: map[string]*peerPaths{}, ids: map[string]*endpoint{}, events: make(chan PathEvent, 256), reflectWait: map[[8]byte]*reflectWaiter{},
+	return &Bind{opt: opt, paths: map[string]*endpoint{}, pins: map[string]pinSet{}, peers: map[string]*peerPaths{}, ids: map[string]*endpoint{}, events: make(chan PathEvent, 256), largeCh: make(chan struct{}, 1), reflectWait: map[[8]byte]*reflectWaiter{},
 		reflectIDs: map[[8]byte]reflectSeen{}, reflectFrom: map[netip.Addr]time.Time{}, tests: map[[8]byte]byte{}, stunWait: map[[12]byte]*stunWaiter{}}, nil
 }
 
@@ -268,7 +316,14 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	}
 	b.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &bindRun{ctx: ctx, cancel: cancel, rx: make(chan received, 256), listeners: map[string]*listener{}, sessions: map[*session]bool{}}
+	r := &bindRun{ctx: ctx, cancel: cancel, rx: make(chan received, 256), urgent: make(chan received, 32), rxWake: make(chan struct{}, 1), listeners: map[string]*listener{}, sessions: map[*session]bool{}, tokens: map[[32]byte]*session{}}
+	if opt.largeFrames() {
+		r.large = make(chan received, 64)
+		r.spares = make(chan []byte, LargeSpares)
+		r.largeSwap = func(p [][]byte, s []int, e []conn.Endpoint) (int, error) {
+			return b.receiveQueue(r, r.ctx, r.large, p, s, e, true)
+		}
+	}
 	abort := func(err error) ([]conn.ReceiveFunc, uint16, error) {
 		cancel()
 		if r.udp != nil {
@@ -320,7 +375,44 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	go b.refreshNames(r)
 	actualPort := udpPort(r.udp)
 	b.mu.Unlock()
-	return []conn.ReceiveFunc{func(p [][]byte, s []int, e []conn.Endpoint) (int, error) { return b.receive(r, p, s, e) }}, uint16(actualPort), nil
+	fns := []conn.ReceiveFunc{
+		func(p [][]byte, s []int, e []conn.Endpoint) (int, error) { return b.receive(r, p, s, e) },
+		func(p [][]byte, s []int, e []conn.Endpoint) (int, error) {
+			return b.receiveFrom(r, r.ctx, r.urgent, p, s, e)
+		},
+	}
+	if r.large != nil {
+		fns = append(fns, func(p [][]byte, s []int, e []conn.Endpoint) (int, error) {
+			return b.receiveFrom(r, r.ctx, r.large, p, s, e)
+		})
+	}
+	return fns, uint16(actualPort), nil
+}
+
+// PriorityReceiveIndex is the receive function of the urgent queue.
+func (b *Bind) PriorityReceiveIndex() int { return 1 }
+
+// LargeReceiveIndex is the receive function of the large queue.
+func (b *Bind) LargeReceiveIndex() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.run == nil || b.run.large == nil {
+		return -1
+	}
+	return 2
+}
+
+// LargeSwapReceive (conn.LargeSwapReceiver) is the large queue's receive
+// function for a device that adopts the buffers it hands over: a frame read
+// into a large buffer goes to WireGuard in it, and the buffer it displaces
+// becomes a spare (spares.go). Nil without the large queue.
+func (b *Bind) LargeSwapReceive() conn.ReceiveFunc {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.run == nil || b.run.large == nil {
+		return nil
+	}
+	return b.run.largeSwap
 }
 
 func (b *Bind) startEndpoint(r *bindRun, ep *endpoint) {
@@ -359,7 +451,7 @@ func (b *Bind) Close() error {
 		l.Close()
 	}
 	for s := range r.sessions {
-		s.conn.Close()
+		closeConn(s.conn)
 	}
 	for key, ep := range b.paths {
 		ep.stats.State = "closed"
@@ -388,6 +480,11 @@ drainedControl:
 		select {
 		case p := <-r.rx:
 			b.releasePacket(r, p)
+		case p := <-r.urgent:
+			b.releasePacket(r, p)
+		case p := <-r.large:
+			b.releasePacket(r, p)
+			b.dropFrame(r, p)
 		default:
 			return nil
 		}
@@ -438,7 +535,7 @@ func (b *Bind) releaseTargets(targets map[*endpoint]bool) {
 			waits = append(waits, ep.done)
 		}
 		if ep.current != nil {
-			ep.current.conn.Close()
+			closeConn(ep.current.conn)
 			waits = append(waits, ep.current.done)
 		}
 	}
@@ -494,7 +591,7 @@ func (b *Bind) Stats() []PathStats {
 	return out
 }
 
-func (b *Bind) BatchSize() int { return 1 }
+func (b *Bind) BatchSize() int { return b.deviceLimits(0).BatchSize }
 func (b *Bind) SetMark(mark uint32) error {
 	if mark != 0 {
 		return errors.New("mesh transport does not support socket marks")

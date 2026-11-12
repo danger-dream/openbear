@@ -13,12 +13,18 @@ import itertools
 import json
 import re
 
-from app.servers import compat
+from app.servers import compat, mesh_auto, mesh_limits, mesh_proxy
 
 # The config.json schemas this controller writes, (min, max).
 SCHEMA = compat.CONFIG_SCHEMA
 # What a data plane from before configSchemas reads.
 LEGACY_SCHEMAS = (1, 1)
+MEMBERS_ROUTING_FEATURE = 'mesh.routing.members'
+STANDBY_FEATURE = 'mesh.standby'
+# The data plane probes its routes end to end and follows their sources' marks (fixedpath.go); a route over a node without it is left out.
+PATHS_FEATURE = 'mesh.routing.paths.probe'
+# The data plane takes a pair's routes in order, the next when one goes down; without it, the first alone.
+PATHS_BACKUP_FEATURE = 'mesh.routing.paths.backup'
 TRANSPORTS = ('udp', 'tcp', 'tls')
 HEALTH = {'activeIntervalMs': 1000, 'standbyIntervalMs': 2000, 'coldRetryMs': 30000, 'initialTimeoutMs': 3000, 'minTimeoutMs': 2000,
           'maxTimeoutMs': 10000, 'consecutiveFailures': 3, 'readySuccesses': 3, 'handshakeGraceMs': 6000, 'returnHealthyMs': 60000,
@@ -57,10 +63,34 @@ def is_site(member):
     return member['role'] == 'relay' and member.get('relayMode') == 'site'
 
 
+def has_feature(facts, sid, feature):
+    features = (facts.get(sid) or {}).get('features')
+    return bool(features and feature in features)
+
+
+def member_relays(m, live):
+    """The relays a member enters by: its upstreams, in their order."""
+    if m['role'] != 'member':
+        return []
+    return list(dict.fromkeys(c['relay'] for c in m['entry']['candidates'] if live.get(c['relay'], {}).get('role') == 'relay'))
+
+
+def routed_member(m, live, facts):
+    """A member that routes as a leaf: upstreams, and it and every relay in the mesh run a data
+    plane that takes members into the routes (an older relay refuses compact adverts with member
+    tails). Any other member keeps its single entry."""
+    if m['role'] != 'member' or m['entry']['mode'] != 'upstreams':
+        return False
+    upstreams = member_relays(m, live)
+    relays = [sid for sid, x in live.items() if x['role'] == 'relay']
+    return bool(upstreams) and all(has_feature(facts, sid, MEMBERS_ROUTING_FEATURE) for sid in (m['serverId'], *relays))
+
+
 def endpoint_host(member, facts):
     """Where others reach the member: what the user entered, else the IPv4 its node reports.
-    A site relay has none: the IPv4 the panel has for a machine behind a proxy is the proxy's."""
-    if is_site(member):
+    A site relay has none: the IPv4 the panel has for a machine behind a proxy is the proxy's;
+    nor does a member that is not announced (announce false), which only dials or punches."""
+    if is_site(member) or member.get('announce') is False:
         return ''
     host = member['publicEndpoint'] or (facts.get(member['serverId']) or {}).get('ipv4', '')
     return host if valid_host(host) else ''
@@ -71,13 +101,20 @@ def punch_host(member, facts):
     entered, else the public IP its own reachability check found (verdict public, seen the
     same by every observer). Never the panel's IPv4: behind a proxy that is the proxy's, and
     WireGuard handshakes would go to a third party. Without either, reflectors find the way."""
+    if member.get('announce') is False:
+        return ''
     host = member['publicEndpoint'] or (facts.get(member['serverId']) or {}).get('publicIp', '')
     return host if valid_host(host) else ''
 
 
+def public_port(member, transport):
+    """The port others dial for transport: a port mapping's when the user gave one, else the one listened on."""
+    return (member.get('publicPorts') or {}).get(transport) or member['listen'][transport]
+
+
 def punch_endpoint(member, facts):
     host = punch_host(member, facts)
-    return endpoint('udp', host, member['listen']['udp']) if host and member['listen']['udp'] else ''
+    return endpoint('udp', host, public_port(member, 'udp')) if host and member['listen']['udp'] else ''
 
 
 def can_dial(target, transport, facts):
@@ -92,24 +129,45 @@ def endpoint(transport, host, port):
     return f'{transport}://{address(host, port)}'
 
 
-def dial_target(target, transport, facts):
-    """(endpoint, tlsPins) to dial the member over transport, or None while that cannot be
-    written: no address known (yet), or TLS without a pinned certificate. A config never
-    carries tcp://:port, which the node refuses whole; the draft check reports the cause."""
-    host = endpoint_host(target, facts)
+def front_exits(facts, sid):
+    """{exit: address} of a front (前置机), which is to reach nothing beyond its exits and
+    reaches each at that address (a provider's line); {} for any other member."""
+    return {e['serverId']: e['address'] for e in (facts.get(sid) or {}).get('front') or []}
+
+
+def dial_target(target, transport, facts, host=''):
+    """(endpoint, tlsPins) to dial the member over transport, at host when given (a front
+    dialing its exit), or None while that cannot be written: no address known (yet), or TLS
+    without a pinned certificate. A config never carries tcp://:port, which the node refuses
+    whole; the draft check reports the cause."""
+    # A front reaches its exit at the provider line's address, on the port the exit listens on.
+    port = target['listen'][transport] if host else public_port(target, transport)
+    host = host or endpoint_host(target, facts)
     pins = tls_pins(facts, target['serverId']) if transport == 'tls' else []
     if not host or not target['listen'][transport] or transport == 'tls' and not pins:
         return None
-    return endpoint(transport, host, target['listen'][transport]), pins
+    return endpoint(transport, host, port), pins
 
 
 def reflectors(members, facts, first=(), exclude=None):
     """UDP addresses of the relays that can show a node its public address: public relays
     listening on UDP, except the node itself, those in first in its order, then the others
     by id."""
-    usable = {m['serverId']: m for m in members if m['role'] == 'relay' and m['serverId'] != exclude and can_dial(m, 'udp', facts)}
+    # A front answers nobody's reachability check: it is to reach nothing beyond its exits.
+    usable = {m['serverId']: m for m in members if m['role'] == 'relay' and m['serverId'] != exclude and can_dial(m, 'udp', facts)
+              and not front_exits(facts, m['serverId'])}
     order = [sid for sid in dict.fromkeys(first) if sid in usable] + sorted(sid for sid in usable if sid not in first)
-    return list(dict.fromkeys(address(endpoint_host(usable[sid], facts), usable[sid]['listen']['udp']) for sid in order))[:REFLECTORS_KEPT]
+    return list(dict.fromkeys(address(endpoint_host(usable[sid], facts), public_port(usable[sid], 'udp')) for sid in order))[:REFLECTORS_KEPT]
+
+
+def front_reflectors(member, live, facts):
+    """A front's reflectors: its exits listening on UDP, at the addresses it reaches them by, and
+    none unless it has UDP itself (a front without it opens no UDP socket at all)."""
+    if not member['listen']['udp']:
+        return []
+    exits = front_exits(facts, member['serverId'])
+    return [address(host, live[sid]['listen']['udp']) for sid, host in exits.items()
+            if sid in live and live[sid]['role'] == 'relay' and live[sid]['listen']['udp']]
 
 
 def tls_pins(facts, server_id):
@@ -148,18 +206,22 @@ def _live(doc):
 
 def relay_pairs(doc, facts):
     """Relay-to-relay links in effect. Custom: the listed pairs. Full: every pair of relays,
-    a listed pair overriding the default for its two relays."""
+    a listed pair overriding the default for its two relays, the line rules steering the default."""
     live = {m['serverId']: m for m in _live(doc)}
     relays = sorted(sid for sid, m in live.items() if m['role'] == 'relay')
     listed = {}
     for pair in doc['relayLinks']['pairs']:
         if pair['a'] != pair['b'] and pair['a'] in relays and pair['b'] in relays:
             listed.setdefault(frozenset((pair['a'], pair['b'])), pair)
-    if doc['relayLinks']['mode'] == 'custom':
+    # Auto mode lists the links it chose (mesh_auto.auto_pairs) as custom mode lists the user's.
+    if doc['relayLinks']['mode'] in ('custom', 'auto'):
         return [effective(p, live) for p in listed.values()]
-    out = []
+    out, rules = [], (doc.get('lineRules') or []) if doc.get('_fullLineRules', True) else []
+    limits = doc.get('limits') or []
     for a, b in itertools.combinations(relays, 2):
-        out.append(effective(listed.get(frozenset((a, b))) or _default_pair(live[a], live[b], facts), live))
+        pair = listed.get(frozenset((a, b))) or within_limits(_default_pair(live[a], live[b], facts, rules), live, facts, limits)
+        if pair:
+            out.append(effective(pair, live))
     return out
 
 
@@ -175,7 +237,59 @@ def effective(pair, live):
     return out
 
 
-def _default_pair(a, b, facts):
+def node_entry_mode(m):
+    """(mode, autoReturn) a member's node runs its entry with. Upstreams are all to be connected at
+    once; until data planes route over several, a node runs them as an ordered failover that
+    returns to the first."""
+    if m['entry']['mode'] == 'upstreams':
+        return 'failover', True
+    return m['entry']['mode'], m['entry']['autoReturn']
+
+
+def within_limits(pair, live, facts, limits):
+    """A link the mesh made itself, kept to the connection limits: as it is when it keeps to them,
+    else on the first transport they allow that the passive end can be dialed on, else None. A
+    link of a site relay or a front keeps the transport and dialer it must have, or goes."""
+    if not pair or not limits:
+        return pair
+    a, b = live[pair['a']], live[pair['b']]
+    allowed = mesh_limits.transports_for(limits, a, b, facts)
+    if pair['transport'] in allowed:
+        return pair
+    if is_site(a) or is_site(b) or front_exits(facts, a['serverId']) or front_exits(facts, b['serverId']):
+        return None
+    for transport in allowed:
+        for dialer, target in (('a', b), ('b', a)):
+            if can_dial(target, transport, facts):
+                return {**pair, 'transport': transport, 'dialer': dialer}
+    return None
+
+
+def _default_pair(a, b, facts, rules=()):
+    """Full mode's link of two relays, with the line rules on it (mesh_auto.full_pair); None for a
+    front and a public relay other than its exit, which it is not to reach."""
+    pair = plain_pair(a, b, facts)
+    return pair and mesh_auto.full_pair(pair, a, b, facts, rules)
+
+
+def plain_pair(a, b, facts):
+    """_default_pair without the line rules. A front dials its exit, a site relay the front; TLS first."""
+    for front, other, side in ((a, b, 'a'), (b, a, 'b')):
+        exits = front_exits(facts, front['serverId'])
+        if not exits:
+            continue
+        if other['serverId'] in exits:
+            for transport in ('tls', 'tcp', 'udp'):
+                # Over UDP the front needs its own socket, which only a UDP listener gives it.
+                if other['listen'][transport] and (transport != 'udp' or front['listen']['udp']):
+                    return {'a': a['serverId'], 'b': b['serverId'], 'transport': transport, 'cost': 1, 'dialer': side}
+            return None
+        if not is_site(other):
+            return None
+        for transport in ('tls', 'tcp', 'udp'):
+            if front['listen'][transport]:
+                return {'a': a['serverId'], 'b': b['serverId'], 'transport': transport, 'cost': 1, 'dialer': 'b' if side == 'a' else 'a'}
+        return None
     for transport in TRANSPORTS:
         for dialer, target in (('a', b), ('b', a)):
             if can_dial(target, transport, facts):
@@ -278,6 +392,8 @@ def node_rules(doc, server_id, facts=None):
         instances.setdefault(a['src'], set()).add(a['port'])
     for src in sorted(instances):
         out.append({'src': [src], 'dst': [f"{me['address']}/32"], 'proto': 'tcp', 'ports': [[p, p] for p in sorted(instances[src])]})
+    # An exit's proxy for every member, its tunnel port for the ports leading to it, also whatever the user's rules say.
+    out += mesh_proxy.rules_for(doc, server_id, live)
     for rule in doc['rules']:
         dst = rule['dst']
         targets = [f"{me['address']}/32"] if named(dst, me) else []
@@ -308,40 +424,54 @@ def _in_gateways(net, gateways):
     return [net if net.subnet_of(g) else g for g in gateways if net.overlaps(g)]
 
 
+_BRIDGES = ('docker', 'virbr', 'cni', 'flannel', 'podman', 'lxdbr', 'lxcbr', 'vmnet', 'vboxnet')
+
+
+def virtual_bridge(dev):
+    """A container or VM bridge (docker0, Docker's br-<id>, virbr0 and the like), as the node's
+    virtualBridge: its network is the host's alone and often wide (172.17.0.0/16), so a gateway
+    subnet strictly inside it is somewhere else. OpenWrt's br-lan is a real LAN."""
+    return dev.startswith(_BRIDGES) or bool(re.fullmatch(r'br-[0-9a-f]{12}', dev))
+
+
 def _held(f):
-    """[(network, interface)] a node's own machine already routes: known only where facts carry
-    its routing table (hostRoutes, the controller's machine), with its interface networks."""
+    """[(network, interface, own)] a node's own machine already routes: known only where facts carry
+    its routing table (hostRoutes), with its interface networks. own: the machine is on that
+    network itself, which is never taken over."""
     if f.get('hostRoutes') is None:
         return []
-    out = [(ipaddress.ip_network(r['net']), r['dev']) for r in f['hostRoutes']]
+    local = set()
     for raw in f.get('localPrefixes') or []:
         with contextlib.suppress(TypeError, ValueError):
-            out.append((ipaddress.ip_network(raw, strict=False), ''))
-    return out
+            local.add(ipaddress.ip_network(raw, strict=False))
+    out = [(net, r['dev'], net in local) for r in f['hostRoutes'] for net in [ipaddress.ip_network(r['net'])]]
+    return out + [(net, '', True) for net in sorted(local - {net for net, _, _ in out})]
 
 
 def route_conflicts(doc, facts):
     """{serverId: [(route, held, interface)]}: gateway routes left off a node because its machine
-    already routes part of them elsewhere (a VPN, a container bridge); installing them would take
-    that traffic into the mesh."""
-    return gateway_routes(doc, facts, conflicts=True)
+    already routes part of them elsewhere (a VPN, a container bridge) and it does not take them
+    over; installing them would take that traffic into the mesh."""
+    return route_plan(doc, facts)[1]
 
 
-def routes_and_conflicts(doc, facts):
-    """(gateway_routes, route_conflicts) worked out once, for a caller that needs both."""
-    return gateway_routes(doc, facts, conflicts=None)
+def gateway_routes(doc, facts=None):
+    """route_plan's routes."""
+    return route_plan(doc, facts)[0]
 
 
-def gateway_routes(doc, facts=None, *, conflicts=False):
-    """{serverId: [CIDR]} for every member not being removed: the gateway subnets it gets a
+def route_plan(doc, facts=None):
+    """(routes, skipped, taken). routes: {serverId: [CIDR]} for every member not being removed: the gateway subnets it gets a
     route to. A node is a rule's source when the rule's src names it (members, tags, a prefix
     holding its mesh address) or, for a gateway, holds part of its own subnets: it then gets
     the rule's dst.subnets. A node is a rule's destination when the dst names it or, for a
     gateway, takes in part of its own subnets: it then gets the rule's src.prefixes inside
     gateway subnets, to answer them.
     Subnets a gateway announces itself are never in its own list, nor (with facts) any its machine
-    already routes elsewhere; conflicts=True returns those instead, as route_conflicts, and
-    conflicts=None both, as routes_and_conflicts."""
+    already routes elsewhere, unless strictly inside a container bridge's network, is taken over: routed all
+    the same, the node replacing the machine's route and putting it back when it goes; taken,
+    {serverId: [(route, held, interface)]}, has those. Skipped, in the same form, has the ones left
+    alone: the machine is on that network itself, or the member keeps its route (keepRoutes)."""
     live = {m['serverId']: m for m in _live(doc)}
     own = {sid: _nets((m['gateway'] or {}).get('subnets', [])) for sid, m in live.items()}
     gateways = [net for nets in own.values() for net in nets]
@@ -360,15 +490,28 @@ def gateway_routes(doc, facts=None, *, conflicts=False):
             if named(dst, m) or any(s.overlaps(g) for s in subnets for g in mine):
                 routes += [part for p in prefixes for part in _in_gateways(p, gateways)]
         out[sid] = _tidy(r for r in routes if not any(r.subnet_of(g) for g in mine))
-    skipped = {}
+    skipped, taken = {}, {}
     for sid in out:
         held = _held((facts or {}).get(sid) or {})
-        if held:
-            clash = {r: [(n, dev) for n, dev in held if n.version == 4 and ipaddress.ip_network(r).overlaps(n)] for r in out[sid]}
-            skipped[sid] = [(r, str(n), dev) for r, found in clash.items() for n, dev in found[:1]]
-            out[sid] = [r for r in out[sid] if not clash[r]]
-    skipped = {sid: v for sid, v in skipped.items() if v}
-    return (out, skipped) if conflicts is None else skipped if conflicts else out
+        if not held:
+            continue
+        keep, kept = set(live[sid].get('keepRoutes') or []), []
+        for r in out[sid]:
+            net = ipaddress.ip_network(r)
+            # The machine's own networks first: they decide whether it can be taken over.
+            found = sorted(((n, dev, own) for n, dev, own in held if n.version == 4 and net.overlaps(n)
+                            and not (virtual_bridge(dev) and net.prefixlen > n.prefixlen)), key=lambda x: not x[2])
+            if not found:
+                kept.append(r)
+                continue
+            n, dev, own = found[0]
+            if r not in keep and not own:
+                kept.append(r)
+                taken.setdefault(sid, []).append((r, str(n), dev))
+            else:
+                skipped.setdefault(sid, []).append((r, str(n), dev))
+        out[sid] = kept
+    return out, skipped, taken
 
 
 def exports(doc, routes=None):
@@ -378,6 +521,8 @@ def exports(doc, routes=None):
     live = _live(doc)
     out = []
     for g in live:
+        if (g['gateway'] or {}).get('backup'):
+            continue
         for subnet in (g['gateway'] or {}).get('subnets', []):
             net = ipaddress.ip_network(subnet)
             nodes = [m['serverId'] for m in live if m['serverId'] != g['serverId']
@@ -426,7 +571,7 @@ def _link(pair, me, peer, kind, live, facts):
         if target_endpoint:
             link['endpoint'] = target_endpoint
     elif dial:
-        target = dial_target(live[peer], pair['transport'], facts)
+        target = dial_target(live[peer], pair['transport'], facts, front_exits(facts, me).get(peer, ''))
         if target:
             link['endpoint'] = target[0]
             if pair['transport'] == 'tls':
@@ -492,6 +637,7 @@ def build(doc, facts, network_id, revision):
     left out of every other config, as if removed: only it is cut off, and every other node
     gets a config it accepts. Its own config names only the members with keys; nobody
     answers it until a reissue with its keys."""
+    doc = mesh_auto.resolve(doc, facts)
     left = sorted(keyless(_live(doc), facts))
     if not left:
         return _build(doc, facts, network_id, revision)
@@ -508,23 +654,74 @@ def _build(doc, facts, network_id, revision):
     pairs = relay_pairs(doc, facts)
     hops = next_hops(relays, pairs)
     network = {'id': network_id, 'prefix': s['prefix'], 'controlPrefix': s['controlPrefix'], 'mtu': s['mtu']}
+    if s.get('tcpJumbo'):
+        network['tcpJumbo'] = True
     health = {**HEALTH, **s['health']}
     reachability = {'stun': list((s.get('reachability') or {}).get('stun', []))}
 
     def relays_of(m):
-        if m['role'] != 'member':
-            return []
-        return list(dict.fromkeys(c['relay'] for c in m['entry']['candidates'] if live.get(c['relay'], {}).get('role') == 'relay'))
+        return member_relays(m, live)
+
+    def has_members_routing(sid):
+        return has_feature(facts, sid, MEMBERS_ROUTING_FEATURE)
+
+    def _member_upstream_link(m, c, target):
+        link = {'peer': c['relay'], 'kind': 'relay', 'dial': True}
+        if is_site(target):
+            link['punch'] = True
+            target_endpoint = lan_endpoint(m, target, facts) or punch_endpoint(target, facts)
+            if target_endpoint:
+                link['endpoint'] = target_endpoint
+            return link
+        dialed = dial_target(target, c['transport'], facts, front_exits(facts, m['serverId']).get(c['relay'], ''))
+        if dialed:
+            link['endpoint'] = dialed[0]
+            if c['transport'] == 'tls':
+                link['tlsPins'] = dialed[1]
+        else:
+            link['dial'] = False
+        return link
+
+    def _relay_member_link(relay_member, m):
+        link = {'peer': m['serverId'], 'kind': 'member', 'dial': False}
+        if is_site(relay_member):
+            link['punch'] = True
+            target_endpoint = punch_endpoint(m, facts)
+            if target_endpoint:
+                link['endpoint'] = target_endpoint
+        return link
+
+    routed = {sid for sid, m in live.items() if routed_member(m, live, facts)}
 
     def name(sid):
         return (facts.get(sid) or {}).get('name') or sid
-    routes = gateway_routes(doc, facts)
+    routes, _, taken = route_plan(doc, facts)
+
+    def knows_standby(sid):
+        features = (facts.get(sid) or {}).get('features')
+        return features is None or STANDBY_FEATURE in features
+
+    def subnets(m, standby):
+        gw = m['gateway'] or {}
+        if standby and not knows_standby(m['serverId']):
+            return []
+        return list(gw.get('subnets', [])) if bool(gw.get('backup')) == standby else []
+
+    def self_gateway(sid, m):
+        gw = m['gateway']
+        if not gw or (gw.get('backup') and not knows_standby(sid)):
+            return None
+        return {k: v for k, v in gw.items() if k != 'name'}
     nodes = {sid: {'id': sid, 'name': name(sid), 'role': m['role'], 'address': m['address'], 'controlAddress': m['controlAddress'],
                    'publicKey': (facts.get(sid) or {}).get('publicKey', ''), 'controlKey': (facts.get(sid) or {}).get('controlKey', ''),
                    # Others accept what it signs, and reach it end to end, only with these (build
                    # leaves out a member without them).
                    'signKey': (facts.get(sid) or {}).get('signKey') or '', 'e2eKey': (facts.get(sid) or {}).get('e2eKey') or '',
-                   'subnets': list((m['gateway'] or {}).get('subnets', [])), 'relays': relays_of(m)}
+                   'subnets': subnets(m, False), 'relays': relays_of(m),
+                   # A backup gateway's subnets: relays send them to it while no gateway announcing them
+                   # is reachable. Older nodes ignore it and keep to the one that announces them.
+                   **({'standbySubnets': subnets(m, True)} if subnets(m, True) else {}),
+                   **({'leaf': True} if sid in routed else {})}
              for sid, m in live.items()}
     # Without a common one (the draft check reports it) the newest is written, and delivery
     # skips the members that cannot read it.
@@ -532,9 +729,14 @@ def _build(doc, facts, network_id, revision):
     # Every relay link of the mesh, each pair once: a relay's router takes no other link from
     # what other relays advertise.
     relay_links = sorted({tuple(sorted((p['a'], p['b']))) for p in pairs if p['a'] in live and p['b'] in live and p['a'] != p['b']})
+    member_links = sorted({tuple(sorted((r, sid))) for sid in routed for r in relays_of(live[sid])})
+    from app.servers import mesh_autolinks  # it imports helpers from this module
+    # Measuring candidates serves auto links alone: nothing to measure while they are off.
+    probes_by_node = mesh_autolinks.probe_targets(doc, facts) if mesh_autolinks.enabled(doc) and any(has_members_routing(sid) for sid in live) else {}
     configs = {}
     for sid, m in live.items():
         relay = m['role'] == 'relay'
+        leaf = sid in routed
         links, bias = [], {}
         for pair in (pairs if relay else doc['directLinks']):
             if sid in (pair['a'], pair['b']) and pair['a'] != pair['b']:
@@ -543,7 +745,21 @@ def _build(doc, facts, network_id, revision):
                     links.append(_link(pair, sid, peer, 'relay' if relay else 'direct', live, facts))
                     bias[peer] = pair.get('bias', 0)
         entry = None
-        if not relay:
+        if relay:
+            for m_sid in sorted(routed):
+                if sid in relays_of(live[m_sid]):
+                    links.append(_relay_member_link(m, live[m_sid]))
+                    bias[m_sid] = 0
+        elif leaf:
+            seen_relays = set()
+            for c in m['entry']['candidates']:
+                target = live.get(c['relay'])
+                if not target or target['role'] != 'relay' or c['relay'] in seen_relays:
+                    continue
+                seen_relays.add(c['relay'])
+                links.append(_member_upstream_link(m, c, target))
+                bias[c['relay']] = c.get('bias', 0)
+        else:
             candidates = []
             for c in m['entry']['candidates']:
                 target = live.get(c['relay'])
@@ -558,7 +774,7 @@ def _build(doc, facts, network_id, revision):
                         candidate['endpoint'] = target_endpoint
                     candidates.append(candidate)
                     continue
-                dialed = dial_target(target, c['transport'], facts)
+                dialed = dial_target(target, c['transport'], facts, front_exits(facts, sid).get(c['relay'], ''))
                 if not dialed:
                     # Left out until a reissue with the address; the member's other candidates stay.
                     continue
@@ -566,14 +782,17 @@ def _build(doc, facts, network_id, revision):
                 if c['transport'] == 'tls':
                     candidate['tlsPins'] = dialed[1]
                 candidates.append(candidate)
-            entry = {'mode': m['entry']['mode'], 'candidates': candidates, 'autoReturn': m['entry']['autoReturn']}
+            mode, auto_return = node_entry_mode(m)
+            entry = {'mode': mode, 'candidates': candidates, 'autoReturn': auto_return}
         configs[sid] = {
             'schema': schema, 'revision': revision, 'network': network,
             'self': {'id': sid, 'name': name(sid), 'role': m['role'], 'address': m['address'], 'controlAddress': m['controlAddress'],
-                     'listen': dict(m['listen']), 'gateway': dict(m['gateway']) if m['gateway'] else None,
+                     'listen': dict(m['listen']), 'gateway': self_gateway(sid, m),
                      'uploadLimitMbps': m['uploadLimitMbps'], 'resources': m['role'],
                      # Gateway subnets this node routes to: only those the rules let it reach or answer.
-                     'gatewayRoutes': routes[sid]},
+                     'gatewayRoutes': routes[sid],
+                     **({'leaf': True} if leaf else {}),
+                     **({'takeover': [r for r, _, _ in taken[sid]]} if sid in taken else {})},
             'nodes': [nodes[other] for other in sorted(nodes) if other != sid],
             'links': sorted(links, key=lambda link: link['peer']),
             'entry': entry,
@@ -581,11 +800,24 @@ def _build(doc, facts, network_id, revision):
             'rules': node_rules(doc, sid, facts),
             'health': health,
             # Every node checks its reachability: entry relays, or for a relay its linked ones, asked first.
-            'reflectors': reflectors(live.values(), facts, sorted(bias) if relay else [c['relay'] for c in m['entry']['candidates']], sid),
-            'reachability': reachability,
+            # A front asks only its exits, and only over the UDP it was given, and no STUN server.
+            'reflectors': front_reflectors(m, live, facts) if front_exits(facts, sid) else
+            reflectors(live.values(), facts, sorted(bias) if relay else [c['relay'] for c in m['entry']['candidates']], sid),
+            'reachability': {'stun': []} if front_exits(facts, sid) else reachability,
         }
-        if relay:
+        proxy = mesh_proxy.config(doc, sid, live, facts)
+        if proxy:
+            configs[sid]['proxy'] = proxy
+        if has_members_routing(sid) and probes_by_node.get(sid, {}).get('targets'):
+            configs[sid]['probe'] = probes_by_node[sid]
+        if relay or leaf:
             # nextHops stay the start and the static mode; bias shifts the measured cost of each link.
             configs[sid]['routing'] = {'mode': 'dynamic', 'bias': dict(sorted(bias.items()))}
             configs[sid]['relayLinks'] = [list(p) for p in relay_links]
+            if member_links:
+                configs[sid]['memberLinks'] = [list(p) for p in member_links]
+    from app.servers import mesh_paths  # it imports helpers from this module
+    for sid, paths in mesh_paths.configs(doc, facts).items():
+        if sid in configs:
+            configs[sid]['paths'] = paths
     return configs

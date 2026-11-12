@@ -36,6 +36,8 @@ LINKS = re.compile(r'https://(?:Report\.Check\.Place|tcpquality\.ibsgss\.uk/r|br
 SUMMARY = ('id', 'server_id', 'test', 'package', 'suite', 'state', 'stop', 'job_id', 'exit_code', 'error', 'detail', 'created_ms', 'started_ms', 'ended_ms')
 # stop: 0, ASKED once the user asked, SENT once the node was told to end the job.
 ASKED, SENT = 1, 2
+# The error of a run stopped at its time limit (catalog.time_limit), set as it is told to stop.
+TIMED_OUT = 'bench_timeout'
 
 
 def now_ms():
@@ -75,8 +77,16 @@ class Benchmarks:
         self.service = service
         self.workers = {}  # server id -> the task working through its queue
         self.pending = set()  # servers whose queue changed while their worker was looking
+        self.paused = set()  # lifecycle operations keep scheduling closed until resume_server
+        self.starts = {}  # run id -> an in-flight job.start, shielded until its receipt is known
         self.digests = {}  # local file -> (size, mtime, sha256)
         self.cache = None
+        self.measurements = {}  # shared with full unlock, including package cleanup
+
+    def measurement_lock(self, server_id):
+        # Semaphore.locked() includes queued waiters, so a non-waiting full check cannot
+        # slip in while a benchmark is being woken for the released slot.
+        return self.measurements.setdefault(server_id, asyncio.Semaphore(1))
 
     @property
     def db(self):
@@ -89,6 +99,9 @@ class Benchmarks:
             await conn.execute("UPDATE server_bench_runs SET job_state='starting' WHERE state='preparing' AND job_id=''")
         for row in await many(self.db.conn, f"SELECT DISTINCT server_id FROM server_bench_runs WHERE state IN {WAITING}"):
             self._kick(row['server_id'])
+        for row in await many(self.db.conn, "SELECT * FROM server_bench_runs WHERE state='interrupted' AND error=? AND stop=? AND job_id!=''",
+                              (TIMED_OUT, ASKED)):
+            self.service.spawn(self._stop_later(row))
 
     # ----- the page's calls -----
     def catalog(self):
@@ -112,7 +125,12 @@ class Benchmarks:
         return run_view(row)
 
     async def create(self, owner, data):
-        if not isinstance(data, dict) or set(data) - {'serverId', 'test', 'suite', 'options'}:
+        if not isinstance(data, dict) or set(data) - {'serverId', 'test', 'tests', 'suite', 'options'}:
+            raise InstanceError('invalid_request')
+        extra = data.get('tests')
+        # Several tests at once, beside the suite or on their own; each is still its own run.
+        if extra is not None and (not isinstance(extra, list) or not extra or 'test' in data
+                                  or any(not isinstance(t, dict) or set(t) - {'test', 'options'} for t in extra)):
             raise InstanceError('invalid_request')
         server_id = data.get('serverId')
         if not isinstance(server_id, str) or not server_id:
@@ -125,19 +143,29 @@ class Benchmarks:
             plan = [(t, catalog.options(t, {'family': family} if any(o['key'] == 'family' for o in catalog.TESTS[t]['options']) else {}))
                     for t in catalog.SUITE['tests']]
             suite = secrets.token_hex(6)
+        elif extra is not None:
+            if 'options' in data:
+                raise InstanceError('invalid_request')
+            plan, suite = [], ''
         else:
             plan = [(data.get('test'), catalog.options(data.get('test'), data.get('options')))]
             suite = ''
+        for item in extra or []:
+            plan.append((item.get('test'), catalog.options(item.get('test'), item.get('options'))))
+        if len({test for test, _ in plan}) != len(plan):
+            raise InstanceError('bench_duplicate_test')
         for test, _ in plan:
             await self._platform(server_id, test)
         created, base = [], now_ms()
         async with self.db.write_transaction(label='bench-create') as conn:
+            if server_id in self.paused:
+                raise InstanceError('bench_run_active', 409)
             for index, (test, opts) in enumerate(plan):
                 run_id = secrets.token_hex(8)
                 tool = catalog.TESTS[test]['package']
                 await conn.execute('INSERT INTO server_bench_runs(id,owner,server_id,test,options_json,package,suite,state,created_ms) VALUES(?,?,?,?,?,?,?,?,?)',
-                                   (run_id, owner, server_id, test, json.dumps(opts, ensure_ascii=False), f'{tool} {catalog.PACKAGES[tool]}', suite,
-                                    'queued', base + index))
+                                   (run_id, owner, server_id, test, json.dumps(opts, ensure_ascii=False), f'{tool} {catalog.PACKAGES[tool]}',
+                                    suite if test in catalog.SUITE['tests'] else '', 'queued', base + index))
                 created.append(run_id)
         self._kick(server_id)
         rows = [await self._row(owner, run_id) for run_id in created]
@@ -152,11 +180,69 @@ class Benchmarks:
             await self._set(run_id, stop=ASKED)
             if row['state'] == 'running' and row['job_id']:
                 await self._stop_job(row)
+        elif row['state'] == 'collecting' and not row['stop']:
+            # The job has ended; what is left to stop is waiting for a node that went away while its report was read.
+            await self._set(run_id, stop=ASKED)
         return {'ok': True, 'run': run_view(await self._row(owner, run_id))}
+
+    async def stop_server(self, owner, server_id):
+        """Quiesce before deleting/uninstalling a server. Scheduling stays closed after return (or failure)
+        until resume_server. An exception means a remote stop is NOT confirmed: the caller must not
+        describe it as stopped or discard the node on that basis."""
+        await self.service.registry.get(owner, server_id)
+        self.paused.add(server_id)
+        self.pending.discard(server_id)
+        task = self.workers.get(server_id)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        async with self.db.write_transaction(label='bench-stop-server') as conn:
+            rows = await many(conn, f"SELECT * FROM server_bench_runs WHERE owner=? AND server_id=? "
+                              f"AND (state IN {WAITING} OR (error=? AND stop=?)) ORDER BY created_ms",
+                              (owner, server_id, TIMED_OUT, ASKED))
+            for row in rows:
+                await conn.execute('UPDATE server_bench_runs SET stop=? WHERE id=?', (ASKED, row['id']))
+        stopped = []
+        for row in rows:
+            # Cancelling the worker must not cancel an already-sent start. Wait for its receipt before
+            # listing/stopping jobs, or the job could appear just after the node was removed.
+            starting = self.starts.get(row['id'])
+            if starting and not starting.cancelled():
+                try:
+                    result = await asyncio.shield(starting)
+                except InstanceError:
+                    self.starts.pop(row['id'], None)
+                    raise
+                row['job_id'] = result['job']['id']
+                self.starts.pop(row['id'], None)
+                await self._set(row['id'], job_id=row['job_id'])
+            elif not row['job_id'] and row['job_state'] == 'starting':
+                found = await self._find_job(owner, server_id, self._out_dir(row))
+                if found:
+                    row['job_id'] = found['id']
+                    await self._set(row['id'], job_id=row['job_id'])
+            if row['job_id']:
+                try:
+                    result = await self.service.job_stop(owner, server_id, row['job_id'], source='bench', log=self._label(row, '停止'))
+                    if result.get('job', {}).get('state') not in {'stopped', 'exited', 'interrupted'}:
+                        raise InstanceError('bench_run_active', 409)
+                except InstanceError as exc:
+                    if exc.error != 'job_not_found':
+                        raise
+            state = 'interrupted' if row['error'] == TIMED_OUT else 'stopped'
+            await self._set(row['id'], state=state, stop=SENT, ended_ms=row['ended_ms'] or now_ms())
+            stopped.append(row['id'])
+        return {'ok': True, 'runs': stopped}
+
+    def resume_server(self, server_id):
+        """Release the lifecycle fence after an aborted removal, or after detaching a retained server."""
+        self.paused.discard(server_id)
+        self._kick(server_id)
 
     async def delete(self, owner, run_id):
         row = await self._row(owner, run_id)
-        if row['state'] in WAITING:
+        if row['state'] in WAITING or row['error'] == TIMED_OUT and row['stop'] == ASKED:
+            # The pending stop must remain recoverable while the node is offline.
             raise InstanceError('bench_run_active', 409)
         async with self.db.write_transaction(label='bench-delete') as conn:
             await conn.execute('DELETE FROM server_bench_runs WHERE id=? AND owner=?', (run_id, owner))
@@ -186,6 +272,8 @@ class Benchmarks:
 
     # ----- the queue -----
     def _kick(self, server_id):
+        if server_id in self.paused:
+            return
         self.pending.add(server_id)
         task = self.workers.get(server_id)
         if not task or task.done():
@@ -194,12 +282,17 @@ class Benchmarks:
     async def _work(self, server_id):
         try:
             while True:
+                if server_id in self.paused:
+                    return
                 self.pending.discard(server_id)
                 row = await one(self.db.conn, f"""SELECT * FROM server_bench_runs WHERE server_id=? AND state IN {WAITING}
                                                  ORDER BY state='queued', created_ms LIMIT 1""", (server_id,))
                 if not row:
                     if server_id in self.pending:
                         continue
+                    # A full unlock check put off while the queue ran goes now rather than at its next round.
+                    if server_id in self.service.unlock_full.deferred:
+                        self.service.unlock_full.soon(server_id)
                     return
                 try:
                     await self._advance(row)
@@ -217,6 +310,13 @@ class Benchmarks:
                 del self.workers[server_id]
 
     async def _advance(self, row):
+        async with self.measurement_lock(row['server_id']):
+            # A queued run may have been stopped/deleted while full unlock held the slot.
+            fresh = await self._get(row['id'])
+            if fresh and fresh['state'] in WAITING:
+                await self._advance_locked(fresh)
+
+    async def _advance_locked(self, row):
         if row['state'] in ('queued', 'preparing'):
             await self._launch(row)
             row = await self._get(row['id'])
@@ -226,7 +326,7 @@ class Benchmarks:
         if row and row['state'] == 'collecting':
             await self._collect(row)
 
-    async def _platform(self, server_id, test):
+    async def _info(self, server_id):
         session = self.service.hub.sessions.get(server_id)
         info, caps = (session.info, session.caps) if session else (None, None)
         if info is None:
@@ -235,12 +335,18 @@ class Benchmarks:
                 raise InstanceError('node_not_enrolled', 404)
             stored = json.loads(row['info_json'] or '{}')
             info, caps = stored.get('info') or {}, stored.get('caps')
+        return info or {}, caps
+
+    async def _platform(self, server_id, test):
+        info, caps = await self._info(server_id)
         if (caps or {}).get('exec') is False:
             raise InstanceError('bench_exec_disabled', 409)
         platform = f'{info.get("platform") or "linux"}/{info.get("arch") or ""}'
         tool = catalog.TESTS[test]['package']
         if platform not in packages.manifest(tool, catalog.PACKAGES[tool]).get('platforms', []):
             raise InstanceError('bench_platform_unsupported', 409)
+        if info.get('openwrt') and test not in catalog.OPENWRT_TESTS:
+            raise InstanceError('bench_openwrt_unsupported', 409)
         return platform
 
     @staticmethod
@@ -280,6 +386,18 @@ class Benchmarks:
     async def _launch(self, row):
         owner, server_id, test, run_id = row['owner'], row['server_id'], row['test'], row['id']
         await self._set(run_id, state='preparing')
+        starting = self.starts.get(run_id)
+        if starting and not starting.cancelled():
+            try:
+                job = (await asyncio.shield(starting))['job']
+            except InstanceError as exc:
+                self.starts.pop(run_id, None)
+                if exc.error not in NODE_AWAY:
+                    raise
+            else:
+                self.starts.pop(run_id, None)
+                await self._adopt(run_id, job)
+                return
         if row['job_state'] == 'starting':
             found, job = await self._patiently(run_id, lambda: self._find_job(owner, server_id, self._out_dir(row)))
             if not found:
@@ -303,7 +421,19 @@ class Benchmarks:
             await self._set(run_id, job_state='starting')
             if (await self._get(run_id))['stop']:
                 return None
-            return (await self.service.job_start(owner, server_id, command, source='bench', log=self._label(row, '运行')))['job']
+            await self._stop_leftovers(server_id)
+            # Like the node's own checks, the tests measure the machine's line, not a proxy's.
+            if server_id in self.paused:
+                return None
+            task = self.service.spawn(self.service.job_start(owner, server_id, command, source='bench', log=self._label(row, '运行'), bypass=True))
+            self.starts[run_id] = task
+            # A cancelled waiter must not leave an unobserved exception from the RPC task.
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            try:
+                return (await asyncio.shield(task))['job']
+            finally:
+                if task.done() and not asyncio.current_task().cancelling():
+                    self.starts.pop(run_id, None)
         started, job = await self._patiently(run_id, start)
         if not started:
             return
@@ -329,8 +459,38 @@ class Benchmarks:
                 return False
             if exc.error != 'job_not_found':
                 raise
-        await self._set(row['id'], stop=SENT)
+        fresh = await self._get(row['id'])
+        detail = {}
+        if fresh and fresh['error'] == TIMED_OUT:
+            minutes = catalog.time_limit(row['test'], json.loads(row['options_json'] or '{}'))
+            detail['detail'] = f'超过 {catalog.limit_words(minutes)}未完成，已自动停止'
+        await self._set(row['id'], stop=SENT, **detail)
         return True
+
+    async def _stop_leftovers(self, server_id):
+        """End the jobs of runs that reached their time limit while their node was away, before
+        another run measures beside them."""
+        for left in await many(self.db.conn, "SELECT * FROM server_bench_runs WHERE server_id=? AND state='interrupted' AND error=? AND stop=? AND job_id!=''",
+                               (server_id, TIMED_OUT, ASKED)):
+            if not await self._stop_job(left):
+                raise InstanceError('node_offline', 503)
+
+    async def _stop_later(self, row):
+        while True:
+            fresh = await self._get(row['id'])
+            if not fresh or fresh['stop'] != ASKED:
+                return
+            try:
+                if await self._stop_job(fresh):
+                    return
+            except InstanceError:
+                log.warning('benchmark run %s: its job could not be stopped', row['id'], exc_info=True)
+            # Unlike report collection, stopping a timed-out job must survive a long disconnection.
+            await asyncio.sleep(AWAY_POLL_S)
+
+    async def _time_out(self, row, minutes):
+        await self._set(row['id'], stop=ASKED, error=TIMED_OUT, detail=f'超过 {catalog.limit_words(minutes)}未完成，已自动停止')
+        await self._stop_job(row)
 
     async def _digest(self, path):
         stat = path.stat()
@@ -364,7 +524,7 @@ class Benchmarks:
             return
         started, size = now_ms(), 0
         for rel, path, mode in files:
-            size += await self._upload(owner, server_id, f'{base}/{rel}', path.read_bytes(), f'{mode:o}')
+            size += await self._upload(owner, server_id, f'{base}/{rel}', await asyncio.to_thread(path.read_bytes), f'{mode:o}')
         await self._upload(owner, server_id, f'{base}/{LISTING}', listing.encode(), '644')
         await self.service._log(owner, server_id, 'bench', f'评测：推送 {tool} {version}（{len(files)} 个文件，{size / 1e6:.1f} MB）', started,
                                 {'exitCode': 0, 'outcome': 'ok'})
@@ -391,18 +551,36 @@ class Benchmarks:
 
     async def _wait(self, row):
         owner, server_id = row['owner'], row['server_id']
+        minutes = catalog.time_limit(row['test'], json.loads(row['options_json'] or '{}'))
+        # How long the job has run: by the node's own clock while it answers (its clock may not be
+        # this one's), counted on from its last answer while it does not.
+        seen = None
+
+        def ran_ms():
+            return seen[0] + (time.monotonic() - seen[1]) * 1000 if seen else now_ms() - row['started_ms']
         away = None
         while True:
-            if (await self._get(row['id']))['stop'] == ASKED:
+            fresh = await self._get(row['id'])
+            if fresh['stop'] == ASKED:
                 await self._stop_job(row)
             try:
                 job = (await self.service.job_status(owner, server_id, row['job_id'], limit=1))['job']
             except InstanceError as exc:
                 if exc.error == 'job_not_found':
-                    await self._set(row['id'], state='interrupted', error='bench_job_lost', ended_ms=now_ms())
+                    await self._set(row['id'], state='interrupted', error=TIMED_OUT if fresh['error'] == TIMED_OUT else 'bench_job_lost',
+                                    ended_ms=now_ms())
                     return
                 if exc.error not in NODE_AWAY:
                     raise
+                if not fresh['stop'] and ran_ms() >= minutes * 60000:
+                    await self._time_out(row, minutes)
+                    fresh = await self._get(row['id'])
+                if fresh['error'] == TIMED_OUT:
+                    # Not held up for the node: its job is stopped once it is back.
+                    await self._set(row['id'], state='interrupted', ended_ms=now_ms(),
+                                    detail=f'超过 {catalog.limit_words(minutes)}未完成，已中断，等待节点上线后停止作业')
+                    self.service.spawn(self._stop_later(fresh))
+                    return
                 away = away or time.monotonic()
                 if not await self._away(away):
                     await self._set(row['id'], state='interrupted', error=exc.error, ended_ms=now_ms())
@@ -413,6 +591,11 @@ class Benchmarks:
                 await self._set(row['id'], state='collecting', job_state=job['state'], exit_code=job['exitCode'],
                                 ended_ms=job.get('endedAtMs') or now_ms())
                 return
+            if isinstance(job.get('durationMs'), int):
+                seen = (job['durationMs'], time.monotonic())
+            if not fresh['stop'] and ran_ms() >= minutes * 60000:
+                await self._time_out(row, minutes)
+                continue
             await asyncio.sleep(POLL_S)
 
     async def _collect(self, row):
@@ -423,6 +606,11 @@ class Benchmarks:
             except InstanceError as exc:
                 if exc.error not in NODE_AWAY:
                     raise
+                fresh = await self._get(row['id'])
+                if fresh['stop']:
+                    # Stopped: the report is given up rather than waited for, freeing the server's queue.
+                    await self._set(row['id'], state='interrupted' if fresh['error'] == TIMED_OUT else 'stopped')
+                    return
                 away = away or time.monotonic()
                 if not await self._away(away):
                     await self._set(row['id'], state='interrupted', error=exc.error)
@@ -467,11 +655,15 @@ class Benchmarks:
             await self._clean(row, listing=True)
             await self._set(run_id, state='queued', job_id='', job_state='', exit_code=None, started_ms=0, ended_ms=0, attempts=1)
             return
-        if fresh['stop'] and fresh['job_state'] == 'stopped':
+        timed_out = fresh['error'] == TIMED_OUT
+        if timed_out and fresh['job_state'] == 'stopped':
+            state, error = 'interrupted', TIMED_OUT
+        elif fresh['stop'] and fresh['job_state'] == 'stopped':
             state, error = 'stopped', ''
         elif corrupt:
             state, error = 'failed', 'bench_package_corrupt'
-        elif spec['collect'] == 'log' and row['exit_code'] != 0:
+        elif (spec['collect'] == 'log' or test == 'geekbench5') and row['exit_code'] != 0:
+            # Geekbench's report is written whatever it did; its exit says whether it ran (127: it cannot here).
             state, error = 'failed', 'bench_script_failed'
         elif sections:
             state, error = 'done', ''
@@ -479,14 +671,20 @@ class Benchmarks:
             state, error = 'failed', 'bench_package_corrupt' if corrupt else 'bench_no_report'
         links = [s['link'] for s in sections if s.get('link')]
         kept = (await _screen(raw_log, clears='mark')).encode()[-KEEP_LOG:].decode('utf-8', 'ignore')
+        # One that ended on its own just as it was told to stop at its limit is not said to have been stopped.
         await self._set(run_id, state=state, error=error, sections=pack(sections) if sections else None, log=pack(kept),
-                        links_json=json.dumps(links, ensure_ascii=False))
-        await self._clean(row, listing=corrupt)
+                        links_json=json.dumps(links, ensure_ascii=False), **({'detail': ''} if timed_out and error != TIMED_OUT else {}))
+        if test == 'unlock' and state == 'done':
+            await self.service.unlock_full.adopt(owner, server_id, sections[0].get('json'), row['ended_ms'] or now_ms())
+        await self._clean(row, listing=corrupt, package=bool((await self._info(server_id))[0].get('openwrt')))
 
-    async def _clean(self, row, *, listing=False):
-        """Remove the run's directory from the node (and the package's file list, so it is pushed again)."""
+    async def _clean(self, row, *, listing=False, package=False):
+        """Remove the run's directory from the node (and the package's file list, so it is pushed again;
+        or the whole package, off an OpenWrt node's RAM disk)."""
         command = f'rm -rf {shlex.quote(self._out_dir(row))}'
-        if listing:
+        if package:
+            command += f' {shlex.quote(catalog.package_dir(row["test"]))}'
+        elif listing:
             command += f' {shlex.quote(catalog.package_dir(row["test"]) + "/" + LISTING)}'
         try:
             await self.service.exec(row['owner'], row['server_id'], command, timeout=30, shell='sh', source='bench', log=self._label(row, '清理'))

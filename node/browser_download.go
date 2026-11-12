@@ -45,20 +45,38 @@ func downloadedBrowser(dir string) string {
 	return exe
 }
 
+// chromeClient fetches the version list and the archives.
+var chromeClient = &http.Client{Timeout: 0}
+
 // downloadChrome installs the current stable Chrome for Testing into dir and
 // removes older ones. progress gets the bytes downloaded so far.
 func downloadChrome(ctx context.Context, dir string, progress func(int64)) error {
+	version, link, err := latestChrome(ctx)
+	if err != nil {
+		return err
+	}
+	exe, err := installChrome(ctx, dir, version, link, progress, nil)
+	if err != nil {
+		return err
+	}
+	pruneChrome(dir)
+	// Kept installed either way: once the libraries are added it starts
+	// without another download.
+	return checkLibraries(exe)
+}
+
+// latestChrome is the current stable Chrome for Testing for this machine and where it is.
+func latestChrome(ctx context.Context) (version, link string, err error) {
 	platform := chromePlatform()
 	if platform == "" {
-		return fmt.Errorf("no Chrome for Testing build for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return "", "", fmt.Errorf("no Chrome for Testing build for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
-	client := &http.Client{Timeout: 0}
 	listCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(listCtx, http.MethodGet, chromeVersionsURL, nil)
-	resp, err := client.Do(req)
+	resp, err := chromeClient.Do(req)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	var listing struct {
 		Channels map[string]struct {
@@ -72,57 +90,126 @@ func downloadChrome(ctx context.Context, dir string, progress func(int64)) error
 	err = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&listing)
 	resp.Body.Close()
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return errors.New("cannot read the Chrome for Testing version list")
+		return "", "", errors.New("cannot read the Chrome for Testing version list")
 	}
 	stable := listing.Channels["Stable"]
-	link := ""
 	for _, d := range stable.Downloads["chrome"] {
 		if d.Platform == platform {
 			link = d.URL
 		}
 	}
-	if stable.Version == "" || !strings.HasPrefix(link, "https://") || strings.ContainsAny(stable.Version, `/\`) {
-		return errors.New("no stable Chrome for Testing build for " + platform)
+	if stable.Version == "" || !strings.HasPrefix(link, "https://") || strings.ContainsAny(stable.Version, `/\`) || strings.Contains(stable.Version, "..") {
+		return "", "", errors.New("no stable Chrome for Testing build for " + platform)
 	}
-	if err = os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	return stable.Version, link, nil
+}
+
+// installChrome unpacks version beside what is installed and only then points
+// chrome.json at it; check may refuse the unpacked browser first. Older
+// versions stay until pruneChrome.
+func installChrome(ctx context.Context, dir, version, link string, progress func(int64), check func(exe string) error) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
 	archive := filepath.Join(dir, "chrome-download.zip")
 	defer os.Remove(archive)
-	if err = fetchFile(ctx, client, link, archive, progress); err != nil {
-		return err
+	if err := fetchFile(ctx, chromeClient, link, archive, progress); err != nil {
+		return "", err
 	}
-	target := filepath.Join(dir, "chrome-"+stable.Version)
+	target := filepath.Join(dir, "chrome-"+version+"-"+randomHex(6))
 	staging := target + ".partial"
 	os.RemoveAll(staging)
-	if err = unzip(archive, staging); err != nil {
+	if err := unzip(archive, staging); err != nil {
 		os.RemoveAll(staging)
-		return err
+		return "", err
 	}
 	exe := findChromeIn(staging)
 	if exe == "" {
 		os.RemoveAll(staging)
-		return errors.New("the download has no browser executable")
+		return "", errors.New("the download has no browser executable")
 	}
-	os.RemoveAll(target)
-	if err = os.Rename(staging, target); err != nil {
-		return err
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(staging)
+		return "", err
+	}
+	info, err := os.Stat(exe)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		os.RemoveAll(staging)
+		return "", errors.New("the downloaded browser executable is invalid")
+	}
+	if check != nil {
+		if err := check(exe); err != nil {
+			os.RemoveAll(staging)
+			return "", err
+		}
+	}
+	if err := os.Rename(staging, target); err != nil {
+		os.RemoveAll(staging)
+		return "", err
 	}
 	exe = filepath.Join(target, strings.TrimPrefix(exe, staging+string(filepath.Separator)))
 	rel, _ := filepath.Rel(dir, exe)
-	data, _ := json.Marshal(chromeInstall{Version: stable.Version, Executable: rel})
-	if err = os.WriteFile(filepath.Join(dir, "chrome.json"), data, 0o644); err != nil {
-		return err
+	data, _ := json.Marshal(chromeInstall{Version: version, Executable: rel})
+	// Replaced whole: a browser starting meanwhile reads the old one or the new one.
+	next := filepath.Join(dir, ".chrome.json.new")
+	if err := os.WriteFile(next, data, 0o644); err != nil {
+		os.RemoveAll(target)
+		os.Remove(next)
+		return "", err
+	}
+	if err := os.Rename(next, filepath.Join(dir, "chrome.json")); err != nil {
+		os.RemoveAll(target)
+		os.Remove(next)
+		return "", err
+	}
+	return exe, nil
+}
+
+// pruneChrome removes the downloaded versions chrome.json no longer names,
+// with what an interrupted download left. Not while a browser may still run
+// from one of them.
+func pruneChrome(dir string) {
+	keep := ""
+	if data, err := os.ReadFile(filepath.Join(dir, "chrome.json")); err == nil {
+		var c chromeInstall
+		if json.Unmarshal(data, &c) == nil {
+			keep = strings.SplitN(filepath.ToSlash(c.Executable), "/", 2)[0]
+		}
 	}
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "chrome-") && e.IsDir() && e.Name() != filepath.Base(target) {
+		if strings.HasPrefix(e.Name(), "chrome-") && e.IsDir() && e.Name() != keep {
 			os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}
-	// Kept installed either way: once the libraries are added it starts
-	// without another download.
-	return checkLibraries(exe)
+}
+
+// installedChrome is the version of the downloaded Chrome, "" when there is none.
+func installedChrome(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "chrome.json"))
+	var c chromeInstall
+	if err != nil || json.Unmarshal(data, &c) != nil {
+		return ""
+	}
+	return c.Version
+}
+
+// newerChrome tells whether version a is after b, comparing their numbers.
+func newerChrome(a, b string) bool {
+	x, y := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(x) || i < len(y); i++ {
+		var m, n int
+		if i < len(x) {
+			m, _ = strconv.Atoi(x[i])
+		}
+		if i < len(y) {
+			n, _ = strconv.Atoi(y[i])
+		}
+		if m != n {
+			return m > n
+		}
+	}
+	return false
 }
 
 // fetchStall ends a download that has received nothing for this long, so a

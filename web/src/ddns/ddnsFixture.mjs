@@ -38,16 +38,18 @@ const RECORDS = () => [
 
 // The controller's /api/ddns, as far as the page uses it.
 export function fakeDdns() {
-  const state = {accounts: JSON.parse(JSON.stringify(ACCOUNTS)), records: RECORDS(), next: 10};
-  const view = () => ({ok: true, accounts: state.accounts, records: state.records, providers: PROVIDERS, nodes: NODES, issues: 3});
+  const state = {accounts: JSON.parse(JSON.stringify(ACCOUNTS)), records: RECORDS(), providers: [...PROVIDERS], features: {providerOptions: true}, next: 10};
+  const view = () => ({ok: true, accounts: state.accounts, records: state.records, providers: state.providers, nodes: NODES, issues: 3, features: state.features});
   const preview = body => {
     const rows = [];
     for (const name of body.names) for (const type of body.types) {
       const zone = name.split('.').slice(-2).join('.');
-      const accounts = state.accounts.filter(a => a.zones.includes(zone)).map(a => ({id: a.id, alias: a.alias, type: a.type}));
+      // As the controller: an account chosen is the one candidate; several and none chosen is an error row listing them.
+      const accounts = state.accounts.filter(a => a.zones.includes(zone) && (!body.accountIds?.[name] || a.id === body.accountIds[name])).map(a => ({id: a.id, alias: a.alias, type: a.type}));
       const value = type === 'A' ? NODES.find(n => n.serverId === body.serverId)?.v4 : '2001:db8:1f0::51';
-      const base = {name, type, zone, accounts, accountId: body.accountIds?.[name] || accounts[0]?.id || '', remote: null, remoteCount: 0, value, error: '', errorCode: ''};
+      const base = {name, type, zone, accounts, accountId: accounts.length === 1 ? accounts[0].id : '', remote: null, remoteCount: 0, value, error: '', errorCode: ''};
       if (!accounts.length) rows.push({...base, action: 'error', error: '没有能管理这个域的服务商账户', errorCode: 'zone_not_found'});
+      else if (accounts.length > 1) rows.push({...base, action: 'error', error: '有多个账户能管理这个域名，请选择一个', errorCode: 'account_ambiguous'});
       else if (name.startsWith('take')) rows.push({...base, action: 'takeover', remote: '192.0.2.200', remoteCount: name.startsWith('take2') ? 2 : 1});
       else if (name.startsWith('same')) rows.push({...base, action: 'same', remote: value});
       else if (state.records.some(r => r.name === name && r.type === type)) rows.push({...base, action: 'exists'});

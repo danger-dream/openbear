@@ -450,7 +450,8 @@ def test_a_refused_enroll_starts_the_node_that_was_installed_again(tmp_path, shi
     systemctl.chmod(0o755)
     conf = tmp_path / 'config.json'
     script = (install.script().replace('/usr/local/bin/openbear-node', str(fake)).replace('CONF=/etc/openbear-node/config.json', f'CONF={conf}')
-              .replace('systemctl start openbear-node', f'{systemctl} start openbear-node'))
+              .replace('systemctl "$1" openbear-node', f'{systemctl} "$1" openbear-node'))
+    assert str(systemctl) in script, 'the stand-in replaces the real systemctl'
 
     def enroll():
         return subprocess.run(['sh', '-s', '--', '--url', 'http://127.0.0.1:9', '--code', 'old', '--stage', 'enroll'],

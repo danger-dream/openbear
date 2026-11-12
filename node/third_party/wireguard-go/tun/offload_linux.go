@@ -394,6 +394,9 @@ func checksumValid(pkt []byte, iphLen, proto uint8, isV6 bool) bool {
 	}
 	lenForPseudo := uint16(len(pkt) - int(iphLen))
 	cSum := pseudoHeaderChecksumNoFold(proto, pkt[srcAddrAt:srcAddrAt+addrSize], pkt[srcAddrAt+addrSize:srcAddrAt+addrSize*2], lenForPseudo)
+	if proto == unix.IPPROTO_TCP {
+		return ^tcpPacketChecksum(pkt[iphLen:], cSum) == 0
+	}
 	return ^checksum(pkt[iphLen:], cSum) == 0
 }
 
@@ -966,7 +969,12 @@ func gsoSplit(in []byte, hdr virtioNetHdr, outBuffs [][]byte, sizes []int, outOf
 		transportHeaderLen := int(hdr.hdrLen - hdr.csumStart)
 		lenForPseudo := uint16(transportHeaderLen + segmentDataLen)
 		transportCSumNoFold := pseudoHeaderChecksumNoFold(protocol, in[srcAddrOffset:srcAddrOffset+addrLen], in[srcAddrOffset+addrLen:srcAddrOffset+addrLen*2], lenForPseudo)
-		transportCSum := ^checksum(out[hdr.csumStart:totalLen], transportCSumNoFold)
+		var transportCSum uint16
+		if protocol == unix.IPPROTO_TCP {
+			transportCSum = ^tcpPacketChecksum(out[hdr.csumStart:totalLen], transportCSumNoFold)
+		} else {
+			transportCSum = ^checksum(out[hdr.csumStart:totalLen], transportCSumNoFold)
+		}
 		binary.BigEndian.PutUint16(out[hdr.csumStart+hdr.csumOffset:], transportCSum)
 
 		nextSegmentDataAt += int(hdr.gsoSize)

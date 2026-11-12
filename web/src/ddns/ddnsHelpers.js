@@ -10,10 +10,11 @@ const STATE_TONES = {
   offline: 'idle', paused: 'idle', no_address: 'idle',
 };
 export function stateTone(state) { return STATE_TONES[state] || 'idle'; }
-// Paused is the owner's own choice and busy states settle by themselves; everything else needs a look.
+// Paused is the owner's own choice and busy states settle by themselves; everything else needs a look,
+// a sync failing and waiting to be retried too (the controller counts it among the issues).
 export function needsAttention(record) {
   const tone = stateTone(record?.state);
-  return tone === 'warn' || tone === 'bad' || (tone === 'idle' && record?.state !== 'paused');
+  return tone === 'warn' || tone === 'bad' || (tone === 'idle' && record?.state !== 'paused') || (record?.state === 'pending' && record?.failCount > 0);
 }
 // Errors the controller does not retry on its own (contract §1, PERMANENT).
 export const PERMANENT_ERRORS = new Set(['auth_failed', 'forbidden', 'zone_not_found', 'bad_request', 'unsupported']);
@@ -101,6 +102,11 @@ export function recordMatches(record, query, {nodes, accounts, providers} = {}) 
 export function recordUsesServer(record, serverId) {
   return Boolean(serverId) && (record?.source?.serverId === serverId || record?.backup?.serverId === serverId);
 }
+// Names that stand for the machine itself: their main source is it. A backup source's name points
+// at the main one while that is up, and A and AAAA of one name are one name.
+export function serverDomains(records, serverId) {
+  return [...new Set((records || []).filter(r => serverId && r?.source?.kind === 'node' && r.source.serverId === serverId && r.name).map(r => r.name))];
+}
 export function filterRecords(records, {account = 'all', filter = 'all', query = '', server = ''} = {}, context = {}) {
   return (records || []).filter(r => (account === 'all' || r.accountId === account)
     && (filter === 'all' || needsAttention(r))
@@ -117,7 +123,6 @@ export function eventTone(kind) {
 export function lines(text) { return String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean); }
 
 // ---- the record form (add and edit share it) ----
-export const DEFAULT_URLS = ['https://api.ipify.org', 'https://4.icanhazip.com'];
 export const DEFAULT_STUN = ['stun.cloudflare.com:3478', 'stun.l.google.com:19302'];
 export const INTERVALS = [[null, '默认（网卡 15 秒，接口 / STUN 60 秒）'], [30, '30 秒'], [60, '1 分钟'], [120, '2 分钟'], [300, '5 分钟']];
 export const TTLS = [[null, '服务商默认'], [60, '60 秒'], [120, '2 分钟'], [300, '5 分钟'], [600, '10 分钟'], [3600, '1 小时']];
@@ -170,8 +175,10 @@ export function previewBody(form, accountIds = {}) {
   const source = formSource(form);
   // The line chosen decides which record at the provider the preview finds.
   const options = formOptions(form);
+  const optionsByProvider = Object.fromEntries(Object.entries(form.providerOptions || {}).map(([type, values]) => [type, formOptions({options: values})]));
   return {serverId: form.serverId, names: lines(form.names), types: [...form.types], source: {method: source.method, params: source.params}, accountIds: {...accountIds},
-    ...(Object.keys(options).length ? {options} : {})};
+    ...(Object.keys(options).length ? {options} : {}),
+    ...(Object.keys(optionsByProvider).length ? {optionsByProvider} : {})};
 }
 export const rowKey = row => `${row.name} ${row.type}`;
 // What a preview will save: new rows, rows already holding the value, and takeovers the owner ticked.
@@ -186,10 +193,15 @@ export function previewCounts(rows, confirmed = new Set()) {
   return out;
 }
 // A row with the same value already there is taken over without a question: nothing on the provider changes.
-export function createBody(form, rows, confirmed = new Set(), accountIds = {}) {
+export function createBody(form, rows, confirmed = new Set(), accountIds = {}, accounts = []) {
   const chosen = (rows || []).filter(r => r.action === 'new' || r.action === 'same' || (r.action === 'takeover' && confirmed.has(rowKey(r))));
   return {serverId: form.method === 'fixed' ? '' : form.serverId, ...formSettings(form),
-    rows: chosen.map(r => ({name: r.name, type: r.type, accountId: accountIds[r.name] || r.accountId, confirmTakeover: r.action !== 'new'}))};
+    rows: chosen.map(r => {
+      const accountId = accountIds[r.name] || r.accountId;
+      const provider = accounts.find(a => a.id === accountId)?.type;
+      return {name: r.name, type: r.type, accountId, confirmTakeover: r.action !== 'new',
+        ...(form.providerOptions ? {options: formOptions({options: form.providerOptions[provider] || {}})} : {})};
+    })};
 }
 export function patchBody(form) { return formSettings(form); }
 

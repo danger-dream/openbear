@@ -4,7 +4,9 @@ package node
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf16"
@@ -69,6 +71,15 @@ func driveRoots() ([]string, error) {
 }
 
 func keepOwner(string, fs.FileInfo) {}
+
+// fileIdentity names the open file by volume and file index.
+func fileIdentity(f *os.File, _ fs.FileInfo) string {
+	var d windows.ByHandleFileInformation
+	if windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &d) != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x:%x%08x", d.VolumeSerialNumber, d.FileIndexHigh, d.FileIndexLow)
+}
 
 func platformFileError(err error) string {
 	switch {

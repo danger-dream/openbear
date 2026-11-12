@@ -167,25 +167,41 @@ test('site relays and relay links: relay mode and its recommendation, punched li
   await h.saved(d => memberOf(d, 'toy').relayMode === 'site', 'site relay again');
   await label(page, '打洞 · 2.6 ms').waitFor();
 
-  // Lab is behind NAT: made a relay it starts as a site relay with UDP, and needs a public relay to link to.
+  // Lab is behind NAT: made a relay it starts as a site relay with UDP, and its entry through SG becomes a relay link it dials.
   await node(page, 'lab').click();
   await panel.getByRole('tab', {name: '配置'}).click();
   await panel.getByRole('checkbox', {name: /作为中转/}).check();
   body = await h.saved(d => memberOf(d, 'lab').role === 'relay', 'lab relay');
   assert.equal(memberOf(body, 'lab').relayMode, 'site');
   assert.equal(memberOf(body, 'lab').listen.udp, 51999);
+  assert.deepEqual(body.relayLinks.pairs.slice(4), [{a: 'lab', b: 'sg', transport: 'udp', cost: 1, dialer: 'a'}]);
+  await page.getByText('它原来的入口改成了中转互联：SG').waitFor();
+  assert.equal(await panel.getByText('站点中转至少要连一台公网中转，用来交换打洞地址').count(), 0);
+  // Back to a member the link is its entry again. Without it, made a relay, it needs a public relay to link to.
+  await panel.getByRole('checkbox', {name: /作为中转/}).uncheck();
+  body = await h.saved(d => memberOf(d, 'lab').role === 'member' && memberOf(d, 'lab').listen.udp === 51999, 'lab member again');
+  assert.equal(body.relayLinks.pairs.length, 4);
+  assert.deepEqual(memberOf(body, 'lab').entry.candidates.map(c => [c.relay, c.transport]), [['sg', 'udp']]);
+  await panel.getByRole('tab', {name: '入口'}).click();
+  await panel.getByRole('button', {name: '删除第 1 个入口'}).click();
+  await h.saved(d => memberOf(d, 'lab').entry.candidates.length === 0, 'lab without its entry');
+  await panel.getByRole('tab', {name: '配置'}).click();
+  await panel.getByRole('checkbox', {name: /作为中转/}).check();
+  body = await h.saved(d => memberOf(d, 'lab').role === 'relay' && !memberOf(d, 'lab').entry?.candidates.length, 'lab relay, alone');
+  assert.equal(body.relayLinks.pairs.length, 4);
   await panel.getByText('站点中转至少要连一台公网中转，用来交换打洞地址').waitFor();
   assert.equal(await panel.getByText('站点中转至少要连一台公网中转，用来交换打洞地址').count(), 1, 'said once');
   await node(page, 'lab').locator('.pb-tag', {hasText: '需修改'}).waitFor();
   // Two site relays may be linked: by punching.
 
-  // An entry through a site relay needs a public one too: Win without its SG entry.
+  // An entry through a site relay off the member's LAN needs a public one too, as the server's check
+  // says (the fake backend knows no LANs): Win without its SG entry.
   await node(page, 'win').click();
   await panel.getByRole('tab', {name: '入口'}).click();
   await panel.getByRole('button', {name: '删除第 2 个入口'}).click();
   await h.saved(d => memberOf(d, 'win').entry.candidates.length === 1, 'win without SG');
-  await panel.getByText('入口里有站点中转时，还要有一个公网中转入口：先经它连上，再和站点中转打洞').waitFor();
-  assert.equal(await panel.getByText('入口里有站点中转时，还要有一个公网中转入口：先经它连上，再和站点中转打洞').count(), 1, 'said once');
+  await panel.getByText('入口里的站点中转不在这个节点的局域网里，还要有一个公网中转入口：先经它连上，再和站点中转打洞').waitFor();
+  assert.equal(await panel.getByText('入口里的站点中转不在这个节点的局域网里，还要有一个公网中转入口：先经它连上，再和站点中转打洞').count(), 1, 'said once');
   await h.close();
 });
 
@@ -249,7 +265,7 @@ test('routes: standby entries drawn faint, LAN or internet on punched entries, t
   // The gateway: each network says who gets it, by the rules in the draft.
   await node(page, 'home').click();
   const exports = panel.locator('.mesh-exports');
-  assert.deepEqual(await texts(exports.locator('.mesh-export')), ['10.10.10.0/24 下发给：LAX', '192.168.50.0/24 没有机器能访问（要在访问规则的目标里写上这个网段）']);
+  assert.deepEqual(await texts(exports.locator('.mesh-export')), ['10.10.10.0/24 下发给：LAX', '192.168.50.0/24 没有节点能访问（要在访问规则的目标里写上这个网段）']);
   assert.equal(await panel.locator('.mesh-member-role').innerText(), '站点中转 · 网关');
   // Editing the rule changes it at once.
   await page.keyboard.press('Escape');
@@ -264,7 +280,7 @@ test('routes: standby entries drawn faint, LAN or internet on punched entries, t
   await panel.getByRole('button', {name: '删除规则'}).click();
   await h.saved(d => d.rules.length === 0, 'rule removed');
   await node(page, 'home').click();
-  assert.deepEqual(await texts(exports.locator('small')), ['没有机器能访问（要在访问规则的目标里写上这个网段）', '没有机器能访问（要在访问规则的目标里写上这个网段）']);
+  assert.deepEqual(await texts(exports.locator('small')), ['没有节点能访问（要在访问规则的目标里写上这个网段）', '没有节点能访问（要在访问规则的目标里写上这个网段）']);
   // A member only in the draft has no routes yet.
   h.mesh.doc.members.push(member('lab2', 'Lab-2', 'member', {address: '100.96.0.9', entry: {mode: 'fixed', autoReturn: true, candidates: []}}));
   await page.getByRole('button', {name: '选中 Lab-2'}).click({timeout: 8000});

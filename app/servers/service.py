@@ -29,13 +29,24 @@ from app.instances.contracts import InstanceError
 from app.instances.servers import LOCAL, _ssh
 from app.servers import compat, geo, install, releases, remote
 from app.servers import files as file_ops
+from app.servers import front as fronts
+from app.servers import ip_quality
+from app.servers import latency as latencies
 from app.servers import profile as profiles
 from app.servers import reminders as reminder_rules
 from app.servers.bench import Benchmarks
+from app.servers.bgp import Bgp
+from app.servers.checks import DOMESTIC, clean_switches, server_region
+from app.servers.front import Fronts
+from app.servers.ip_intel import IpIntel
+from app.servers.route import RouteChecks, retier
+from app.servers.unlock import UnlockChecks
+from app.servers.unlock_full import FullUnlock
 from app.servers.browser import NodeBrowsers
+from app.servers.desktop import DesktopManager
 from app.servers.hub import ADDRESS_FIELDS, REPORT_INTERVAL, NodeHub, clean_ip
 from app.servers.mesh import PUBLIC_IPS, Mesh
-from app.servers.metrics import RANGES, MetricsStore
+from app.servers.metrics import DISK_RANGES, RANGES, TRAFFIC_UNITS, MetricsStore, clean_retention
 from app.servers.net import NetTools
 from app.servers.onboarding import (
     MESH_ACCESS,
@@ -54,6 +65,10 @@ DEFAULT_TIMEZONE = 'Asia/Shanghai'
 TERMINAL_IDLE_S = 30 * 60
 TERMINAL_POLL_S = 60  # how often an idle terminal is looked at
 EXEC_LOG_KEEP = 200
+# host.top, host.details and host.kill: the busiest processes, the machine in detail, ending a process.
+HOST_FEATURE = 'host'
+PROCESS_SORTS = ('cpu', 'mem', 'io', 'conn', 'net')
+PROCESS_LIMIT = 10
 BATCH_PARALLEL = 8
 FILE_CHUNK = 1024 * 1024
 EDIT_LIMIT = 4 * 1024 * 1024
@@ -61,6 +76,9 @@ MAX_EDITS = 100
 JOB_WAIT_MAX = 300
 JOB_COMMAND_MAX = 8000
 JOB_STDIN_MAX = 1024 * 1024
+JOB_ORIGIN_KEEP = 500
+# Stopping a node's jobs and the server's benchmarks before it is deleted or uninstalled takes at most this long altogether.
+WORK_STOP_TIMEOUT = 30
 # Output kept in memory while job_wait looks for a pattern; a match must fit in it.
 JOB_MATCH_WINDOW = 256 * 1024
 # job_wait asks the node at most this often, even while every answer brings more output.
@@ -86,6 +104,13 @@ AUTO_UPDATE_DELAY = 30
 AUTO_UPDATE_RETRY = 6 * 3600
 # Update states a node can be brought out of by installing the target build.
 UPDATABLE = frozenset({'required', 'available', 'mismatch'})
+
+
+def stale_location(stored, info):
+    """Whether the flag's country or the addresses' network (ASN, operator) was looked up for
+    other addresses than the node reports now."""
+    ip, ips = info.get('ipv4') or info.get('ipv6'), [info.get('ipv4') or '', info.get('ipv6') or '']
+    return bool(ip) and ((stored.get('geo') or {}).get('ip') != ip or (stored.get('network') or {}).get('ips') != ips)
 
 
 def short_build(build):
@@ -170,6 +195,11 @@ def node_source(built, facts):
     return {'dev': 'dev', 'beta': 'prerelease', 'rc': 'prerelease'}.get(version.stage, 'release')
 
 
+def _listed_order(item):
+    # Servers without a node always come after those with one.
+    return not item['node'], not item['local'] and 'sort' not in item['profile'], item['profile'].get('sort', 0), item['name'].lower()
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -239,6 +269,7 @@ class ServerService:
         self.tasks = set()
         self.geo_pending = set()
         self.geo_at = {}  # server id -> monotonic time of its last location lookup
+        self.network_gate = asyncio.Semaphore(4)
         self.access_applying = set()
         self.http = None
         self.identity = None
@@ -252,6 +283,15 @@ class ServerService:
         self.ddns = Ddns(self)
         self.net = NetTools(self)
         self.bench = Benchmarks(self)
+        self.unlock = UnlockChecks(self)
+        self.unlock_full = FullUnlock(self)
+        self.route = RouteChecks(self)
+        self.ipchecks = ip_quality.IpChecks(self)
+        self.front = Fronts(self)
+        self.latency = latencies.Latency(self)
+        self.bgp = Bgp(self)
+        self.intel = IpIntel(self)
+        self.desktop = DesktopManager(self)
         # Node updates under way, relays updating one at a time, and builds that would not
         # go onto a node automatically: (server id, sha256) -> when it last failed.
         self.node_updates = set()
@@ -267,9 +307,12 @@ class ServerService:
         self.instances.require_controller()
         await self.registry.migrate()
         await migrate(self.db)
+        await self.transfers.load()
         await self._load_identity()
+        self._metrics_settings(await self.settings())
         await self.metrics.start()
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), cookie_jar=aiohttp.DummyCookieJar(), trust_env=False)
+        await self.latency.start()
         self.reminders.start()
         await self.browsers.refresh()
         await self.mesh.start()
@@ -279,6 +322,12 @@ class ServerService:
         if not os.environ.get('PYTEST_CURRENT_TEST') and os.environ.get('OPENBEAR_DISABLE_UPDATE_CHECK') != '1':
             self.spawn(releases.loop(self.servers_enabled))
             self.spawn(self._auto_update_loop())
+        if not os.environ.get('PYTEST_CURRENT_TEST'):
+            self.spawn(self.unlock.loop())
+            self.spawn(self.unlock_full.loop())
+            self.spawn(self.route.loop())
+            self.spawn(self.ipchecks.loop())
+            self.spawn(self._disk_loop())
 
     # ----- switches (system settings) -----
     def _config(self, section):
@@ -328,6 +377,7 @@ class ServerService:
                                         'latest': last.get('latest', ''), 'incompatible': last.get('incompatible', ''), 'lacking': last.get('lacking', ''),
                                         'checkedAtMs': last.get('checkedAtMs', 0), 'error': last.get('error', ''),
                                         'prerelease': self.prerelease(), 'autoUpdate': self.auto_update_enabled(), 'localProblem': install.local_problem(),
+                                        'localVersion': install.local_manifest().get('version', ''),
                                         'required': [{'name': f, 'label': releases.FEATURE_LABELS.get(f, f)} for f in releases.REQUIRED_FEATURES]}}
 
     async def _load_identity(self):
@@ -370,11 +420,20 @@ class ServerService:
             points = [{'id': 'default', 'name': '默认', 'url': value['nodeUrl']}] if value.get('nodeUrl') else []
         default = value.get('defaultAccess') or (points[0]['id'] if points else '')
         return {'accessPoints': points, 'defaultAccess': default, 'timezone': value.get('timezone') or DEFAULT_TIMEZONE,
-                'reminders': reminder_rules.clean({}, value.get('reminders'))}
+                'reminders': reminder_rules.clean({}, value.get('reminders')), 'checks': clean_switches({}, value.get('checks')),
+                'frontPort': value.get('frontPort') or fronts.DEFAULT_PORT, 'retention': clean_retention({}, value.get('retention')),
+                'latency': latencies.clean_settings({}, value.get('latency')),
+                'ipcheckDays': value['ipcheckDays'] if value.get('ipcheckDays') in ip_quality.EVERY_DAYS else 7}
 
-    async def settings_view(self, owner):
-        """settings with meshAccess, the built-in access point over the mesh (worked out, not stored)."""
-        return {**await self.settings(), 'meshAccess': (await self.mesh.access(owner))[0]}
+    def _metrics_settings(self, settings):
+        self.metrics.zone = ZoneInfo(settings['timezone'])
+        self.metrics.retention = dict(settings['retention'])
+
+    async def settings_view(self, owner, value=None):
+        """settings with meshAccess, the built-in access point over the mesh, what latency targets there are, and
+        what IP 情报 reads with (worked out, not stored)."""
+        return {**(value or await self.settings()), 'meshAccess': (await self.mesh.access(owner))[0], 'latencyCatalog': self.latency.view(),
+                'ipIntel': await self.intel.view(owner)}
 
     async def mesh_point(self, owner, server_id):
         """The mesh access point as resolve() takes it for one server, or None when it cannot use it now."""
@@ -391,7 +450,10 @@ class ServerService:
                 raise InstanceError('mesh_access_requires_member', 409)
 
     async def save_settings(self, data, owner=None):
-        if not isinstance(data, dict) or set(data) - {'accessPoints', 'defaultAccess', 'timezone', 'reminders'}:
+        if not isinstance(data, dict) or set(data) - {'accessPoints', 'defaultAccess', 'timezone', 'reminders', 'checks', 'frontPort', 'retention', 'latency', 'ipIntel', 'ipcheckDays'}:
+            raise InstanceError('invalid_server_settings')
+        intel = data.get('ipIntel')
+        if intel is not None and (not isinstance(intel, dict) or set(intel) - {'httpblKey'}):
             raise InstanceError('invalid_server_settings')
         value = await self.settings()
         before = copy.deepcopy(value)
@@ -400,17 +462,47 @@ class ServerService:
                                                                          data.get('defaultAccess', value['defaultAccess']), node_url)
         if 'reminders' in data:
             value['reminders'] = reminder_rules.clean(data['reminders'], value['reminders'])
+        if 'checks' in data:
+            value['checks'] = clean_switches(data['checks'], value['checks'])
+        if 'frontPort' in data:
+            if type(data['frontPort']) is not int or not 1 <= data['frontPort'] <= 65535:
+                raise InstanceError('invalid_front_port')
+            if data['frontPort'] != before['frontPort']:
+                await self.front.check_port_change()
+            value['frontPort'] = data['frontPort']
         if 'timezone' in data:
             try:
                 ZoneInfo(str(data['timezone']))
             except (ZoneInfoNotFoundError, ValueError):
                 raise InstanceError('invalid_timezone') from None
             value['timezone'] = str(data['timezone'])
+        if 'retention' in data:
+            try:
+                value['retention'] = clean_retention(data['retention'], value['retention'])
+            except ValueError as exc:
+                raise InstanceError(str(exc)) from None
+        if 'latency' in data:
+            value['latency'] = latencies.clean_settings(data['latency'], value['latency'])
+        if 'ipcheckDays' in data:
+            if data['ipcheckDays'] not in ip_quality.EVERY_DAYS or type(data['ipcheckDays']) is not int:
+                raise InstanceError('invalid_ipcheck_days')
+            value['ipcheckDays'] = data['ipcheckDays']
+        # Kept in the vault, not the settings: written first, so a bad key leaves the rest unsaved too.
+        if intel and 'httpblKey' in intel:
+            await self.intel.save_httpbl_key(intel['httpblKey'])
         async with self.db.write_transaction(label='server-settings') as conn:
             await conn.execute('INSERT OR REPLACE INTO server_settings VALUES(1,?)', (dumps(value),))
+        self._metrics_settings(value)
+        if before['retention'] != value['retention']:
+            self.metrics.prune_soon()
+        # A front measures its exits on the front port.
+        if (before['latency'], before['frontPort']) != (value['latency'], value['frontPort']):
+            self.latency.soon_all()
         if owner is not None and (before['accessPoints'], before['defaultAccess']) != (value['accessPoints'], value['defaultAccess']):
             await self._access_moved(owner, before, value)
-        return {'ok': True, 'settings': {**value, 'meshAccess': (await self.mesh.access(owner))[0]} if owner is not None else value}
+        if owner is not None and before['frontPort'] != value['frontPort']:
+            self.front.soon(owner)
+        return {'ok': True, 'settings': await self.settings_view(owner, value) if owner is not None else value}
 
     async def _access_moved(self, owner, before, after):
         """Nodes whose addresses new access points change are pending, as after a change on the
@@ -455,12 +547,23 @@ class ServerService:
         rx, tx = await self.metrics.traffic_since(server_id, start_ts)
         kind = t.get('type') or 'max'
         used = profiles.traffic_used(kind, rx, tx)
+        # A calibration holds for its period and way of counting: what was entered, plus what was counted since.
+        cal, calibrated = prof.get('trafficCalibration') or {}, None
+        if cal.get('period') == start.isoformat() and cal.get('type') == kind:
+            # What the period had counted when calibrated, to the byte: minutes are whole, the calibration is not.
+            # One saved before that was kept (or under another time zone) counts from the minute after it.
+            if cal.get('start') == start_ts and isinstance(cal.get('counted'), list):
+                since = max(rx - cal['counted'][0], 0), max(tx - cal['counted'][1], 0)
+            else:
+                since = await self.metrics.traffic_since(server_id, cal['at'])
+            used = cal['used'] + profiles.traffic_used(kind, *since)
+            calibrated = {'atMs': cal['at'] * 1000, 'used': cal['used']}
         price = (t.get('price') or 0) if mode == 'metered' else 0
-        return {'periodStart': start.isoformat(), 'resetDay': reset, 'rx': rx, 'tx': tx, 'type': kind, 'mode': mode, 'used': used,
+        return {'periodStart': start.isoformat(), 'resetDay': reset, 'rx': rx, 'tx': tx, 'type': kind, 'mode': mode, 'used': used, 'calibrated': calibrated,
                 'limit': (t.get('limit') or 0) if mode in ('billing', 'fixed') else 0,
                 **({'price': price, 'cost': round(used / 1024 ** 3 * price, 2)} if mode == 'metered' else {})}
 
-    async def _item(self, server, prof, node, zone, settings, access, built=None, withdrawn=None):
+    async def _item(self, server, prof, node, zone, settings, access, built=None, withdrawn=None, meshes=None):
         sid = server['id']
         local = sid == LOCAL
         ssh = None
@@ -483,15 +586,24 @@ class ServerService:
                     'newBuild': outdated and latest == version,
                     'build': short_build(facts['build']), 'source': node_source(built, facts), 'update': update,
                     'caps': (live or {}).get('caps') or stored.get('caps', {}),
-                    'info': stored.get('info', {}), 'geo': stored.get('geo'),
+                    'info': stored.get('info', {}), 'geo': stored.get('geo'), 'network': stored.get('network'),
+                    # A check switched off, a server in mainland China or a front: its results are kept, not shown.
+                    **{key: ({k: v for k, v in ((retier(stored.get(key)) if key == 'route' else stored.get(key)) or {}).items() if k != 'v'} or None)
+                       if settings['checks'][key] and server_region(prof, stored) != DOMESTIC and not fronts.is_front(prof) else None
+                       for key in ('unlock', 'route')},
                     'endpoint': session.endpoint if session else '', 'onBackup': bool(session and session.on_backup),
                     'joinPending': await self._join_view(node['owner'], stored.get('joinPending'))}
-        primary, backup = (None, None) if local else resolve(settings, prof, self.mesh.access_point(access, sid))
+        if fronts.is_front(prof):
+            # A front's addresses are its exits' accesses (primary, backup), whatever the access points.
+            points = [await self.front.point(e, settings['frontPort']) for e in fronts.exits(prof)]
+            primary, backup = points[0], points[1] if len(points) > 1 else None
+        else:
+            primary, backup = (None, None) if local else resolve(settings, prof, self.mesh.access_point(access, sid))
         # Only a hint: a lost mesh path then leaves the node no other way to reach the controller.
         warnings = ['mesh_no_backup'] if primary and primary['id'] == MESH_ACCESS and not backup else []
         return {'id': sid, 'name': (prof.get('alias') or '本机') if local else server['name'], 'local': local, 'ssh': ssh,
                 'usedBy': server.get('usedBy', []), 'profile': prof, 'node': view,
-                'region': prof.get('region') or (stored.get('geo') or {}).get('country', ''),
+                'region': server_region(prof, stored), 'meshAddress': (meshes or {}).get(sid, ''),
                 'traffic': await self._traffic(sid, prof, zone) if node else None,
                 'access': {'primary': primary, 'backup': backup, 'pending': bool(stored.get('accessPending')),
                            'meshEligible': not mesh_reason(sid, access), 'meshReason': mesh_reason(sid, access), 'warnings': warnings},
@@ -512,41 +624,108 @@ class ServerService:
         await self.follow_prerelease()
         prof, nodes, zone, settings = await self._profiles(owner), await self._nodes(owner), await self.zone(), await self.settings()
         built, withdrawn = install.manifest(), releases.withdrawn()
-        access = await self.mesh.access(owner)
-        items = [await self._item(s, prof.get(s['id'], {}), nodes.get(s['id']), zone, settings, access, built, withdrawn) for s in servers]
-        # Servers without a node always come after those with one.
-        items.sort(key=lambda i: (i['node'] is None, not i['local'] and 'sort' not in i['profile'], i['profile'].get('sort', 0), i['name'].lower()))
-        return {'ok': True, 'items': items, 'settings': {**settings, 'meshAccess': access[0]}, 'node': (await self.node_release(follow=False))['release']}
+        access, meshes = await self.mesh.access(owner), await self.mesh.addresses(owner)
+        items = [await self._item(s, prof.get(s['id'], {}), nodes.get(s['id']), zone, settings, access, built, withdrawn, meshes) for s in servers]
+        items.sort(key=_listed_order)
+        return {'ok': True, 'items': items, 'settings': {**settings, 'meshAccess': access[0], 'latencyCatalog': self.latency.view(), 'ipIntel': await self.intel.view(owner)},
+                'node': (await self.node_release(follow=False))['release']}
+
+    async def brief(self, owner):
+        """The servers in the listing's order with only what picking them by id, group or being online takes:
+        {id, name, local, profile, node (whether it has one), live}; no traffic, versions or accesses."""
+        servers, prof, nodes = await self.registry.all(owner), await self._profiles(owner), await self._nodes(owner)
+        items = []
+        for s in servers:
+            sid, p = s['id'], prof.get(s['id'], {})
+            items.append({'id': sid, 'name': (p.get('alias') or '本机') if sid == LOCAL else s['name'], 'local': sid == LOCAL, 'profile': p,
+                          'node': sid in nodes, 'live': self.hub.live(sid)})
+        items.sort(key=_listed_order)
+        return items
 
     async def get(self, owner, server_id):
         server = await self.registry.get(owner, server_id)
         prof = (await self._profiles(owner)).get(server_id, {})
         node = await one(self.db.conn, 'SELECT * FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner))
         await self.follow_prerelease()
-        item = await self._item(server, prof, node, await self.zone(), await self.settings(), await self.mesh.access(owner))
+        item = await self._item(server, prof, node, await self.zone(), await self.settings(), await self.mesh.access(owner),
+                                meshes=await self.mesh.addresses(owner))
         rows = await many(self.db.conn, 'SELECT started_ms,ended_ms,ip,reason FROM server_terminal_log WHERE server_id=? AND owner=? ORDER BY started_ms DESC LIMIT 10', (server_id, owner))
         item['terminalLog'] = [{'startedAtMs': r['started_ms'], 'endedAtMs': r['ended_ms'], 'ip': r['ip'], 'reason': r['reason']} for r in rows]
-        rows = await many(self.db.conn, 'SELECT source,command,started_ms,duration_ms,exit_code,outcome FROM server_exec_log WHERE server_id=? AND owner=? ORDER BY id DESC LIMIT 20', (server_id, owner))
+        rows = await many(self.db.conn, 'SELECT source,command,started_ms,duration_ms,exit_code,outcome,conversation_uuid,conversation_title FROM server_exec_log '
+                                        'WHERE server_id=? AND owner=? ORDER BY id DESC LIMIT 20', (server_id, owner))
         item['execLog'] = [{'source': r['source'], 'command': r['command'], 'startedAtMs': r['started_ms'], 'durationMs': r['duration_ms'],
-                            'exitCode': r['exit_code'], 'outcome': r['outcome']} for r in rows]
+                            'exitCode': r['exit_code'], 'outcome': r['outcome'],
+                            **({'conversationUuid': r['conversation_uuid'], 'conversationTitle': r['conversation_title']} if r['conversation_uuid'] else {})}
+                           for r in rows]
         return item
 
     async def live(self, owner):
         owned = {r['server_id'] for r in await many(self.db.conn, 'SELECT server_id FROM server_nodes WHERE owner=?', (owner,))}
         return {'ok': True, 'at': now_ms(), 'items': {sid: self.hub.live(sid) for sid in list(self.hub.sessions) if sid in owned}}
 
-    async def series(self, owner, server_id, span):
+    async def series(self, owner, server_id, span, after=0):
+        """after (live only): just the samples after that unix time, for a page adding to what it has."""
         if span != 'live' and span not in RANGES:
             raise InstanceError('invalid_range')
         await self.registry.get(owner, server_id)
         if span == 'live':
-            return {'ok': True, **self._recent(server_id)}
+            return {'ok': True, **self._recent(server_id, after)}
         return {'ok': True, **await self.metrics.series(server_id, span)}
 
-    def _recent(self, server_id):
+    async def traffic_stats(self, owner, server_id, unit):
+        if unit not in TRAFFIC_UNITS:
+            raise InstanceError('invalid_unit')
+        await self.registry.get(owner, server_id)
+        return {'ok': True, **await self.metrics.traffic_stats(server_id, unit)}
+
+    async def disks(self, owner, server_id, span):
+        """Partitions and their use over a span; sampled now when the last hourly sample is missing or old."""
+        if span not in DISK_RANGES:
+            raise InstanceError('invalid_range')
+        await self.registry.get(owner, server_id)
+        if (await self.metrics.disk_sampled(server_id) or 0) <= time.time() - 3600 and server_id in self.hub.sessions:
+            with contextlib.suppress(InstanceError, ConnectionError, TimeoutError, LookupError):
+                await self._sample_disks(server_id)
+        return {'ok': True, **await self.metrics.disks(server_id, span)}
+
+    async def storage(self):
+        return {'ok': True, 'retention': (await self.settings())['retention'], **await self.metrics.storage()}
+
+    async def ip_quality(self, owner, server_id):
+        await self.registry.get(owner, server_id)
+        return await ip_quality.latest(self.db.conn, owner, server_id, ips=(await self.ipchecks._kept(server_id)).get('ips'))
+
+    async def compact_storage(self):
+        """立即清理并压缩: what the days kept no longer cover goes, and the file gives its free pages back."""
+        await self.metrics.prune()
+        return await self.storage()
+
+    async def _sample_disks(self, server_id):
+        session = self.hub.sessions.get(server_id)
+        if not session or HOST_FEATURE not in session.features:
+            return
+        reply = await self.hub.call(server_id, 'host.details', {}, 45)
+        mounts = (reply.get('result') or {}).get('mounts') if reply.get('ok') else None
+        if isinstance(mounts, list):
+            await self.metrics.write_disks(server_id, mounts)
+
+    async def _disk_loop(self):
+        """Each online node's partitions once an hour, a few nodes at a time."""
+        gate = asyncio.Semaphore(3)
+
+        async def one_node(server_id):
+            async with gate:
+                with contextlib.suppress(Exception):
+                    if (await self.metrics.disk_sampled(server_id) or 0) <= time.time() - 3600:
+                        await self._sample_disks(server_id)
+        while True:
+            await asyncio.sleep(600)
+            await asyncio.gather(*(one_node(sid) for sid in list(self.hub.sessions)))
+
+    def _recent(self, server_id, after=0):
         """The last ten minutes of live samples, kept in memory by the hub."""
         session = self.hub.sessions.get(server_id)
-        samples = list(session.recent) if session else []
+        samples = [s for s in session.recent if s[0] > after] if session else []
         pct = lambda u: round(u['used'] * 100 / u['total'], 2) if u['total'] else 0  # noqa: E731
         points = {'t': [t for t, _ in samples]}
         for key, pick in (('cpu', lambda m: m['cpu']), ('steal', lambda m: m['steal']), ('iowait', lambda m: m['iowait']),
@@ -575,13 +754,21 @@ class ServerService:
         ssh = data.get('ssh')
         if ssh is not None and not isinstance(ssh, dict):
             raise InstanceError('invalid_server')
+        front = None
         if data.get('profile'):
+            cleaned = profiles.clean(data['profile'])
             # A server being added is not in the mesh yet.
-            await self._check_mesh_access(owner, None, profiles.clean(data['profile']))
-        result = await self.registry.save(owner, {**(ssh or {'auth': 'none'}), 'name': data.get('name')})
+            await self._check_mesh_access(owner, None, cleaned)
+            front = cleaned.get('front')
+            await self.front.check(owner, None, front)
+        # A front's login is proved through its exits, as it is always used.
+        via = [e['serverId'] for e in front['exits']] if front else None
+        result = await self.registry.save(owner, {**(ssh or {'auth': 'none'}), 'name': data.get('name')}, via=via)
         server_id = result['item']['id']
         if data.get('profile'):
             await self._save_profile(owner, server_id, data['profile'])
+        if front:
+            self.front.soon(owner)
         return {'ok': True, 'item': await self.get(owner, server_id)}
 
     async def update(self, owner, server_id, data):
@@ -603,17 +790,19 @@ class ServerService:
         merged = profiles.clean(patch, current) if patch else current
         if 'access' in patch:
             await self._check_mesh_access(owner, server_id, {'access': merged['access']})
+        if 'front' in patch:
+            await self.front.check(owner, server_id, merged.get('front'))
+            if server_id == LOCAL and merged.get('front'):
+                raise InstanceError('invalid_front')
         result, pending = {'ok': True}, None
         enrolled = server_id != LOCAL and await one(self.db.conn, 'SELECT 1 FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner))
-        settings = await self.settings() if enrolled else None
-        mesh = await self.mesh_point(owner, server_id) if enrolled else None
-        primary, backup = resolve(settings, merged, mesh) if enrolled else (None, None)
-        if enrolled and (primary, backup) != resolve(settings, current, mesh):
+        wanted = await self.onboarding.access(owner, server_id, merged, strict=False) if enrolled else None
+        if enrolled and wanted != await self.onboarding.access(owner, server_id, current, strict=False):
             pending = True
             if apply == 'now' and server_id in self.hub.sessions:
-                if not primary:
-                    raise InstanceError('node_url_required', 409)
-                push = await self.onboarding.push_one(owner, server_id, (primary['url'], backup['url'] if backup else ''))
+                if not wanted['url']:
+                    raise InstanceError('front_exit_not_ready' if wanted['front'] else 'node_url_required', 409)
+                push = await self.onboarding.push_one(owner, server_id, wanted)
                 # A lost connection may have moved the node; it is settled on reconnect.
                 if not push['ok'] and push['error'] != 'node_connection_lost':
                     raise InstanceError(push['error'], 409)
@@ -622,6 +811,12 @@ class ServerService:
             await self.registry.save(owner, {'name': data['name']}, server_id)
         if patch:
             await self._write_profile(owner, server_id, merged)
+        if fronts.exits(merged) != fronts.exits(current):
+            self.front.soon(owner)
+            self.mesh._reconcile_soon(owner)
+        # What it measures follows its own list, its country and whether it is a front.
+        if any(merged.get(k) != current.get(k) for k in ('latency', 'region', 'front')):
+            self.latency.soon(server_id)
         if pending is not None:
             await self.mark_access_pending(server_id, pending)
             result['accessPending'] = pending
@@ -659,20 +854,38 @@ class ServerService:
                 await self._write_profile(owner, server_id, profiles.clean({'sort': index}, current.get(server_id, {})))
         return await self.list(owner)
 
-    async def delete(self, owner, server_id):
-        """Cut off and forgotten first; the mesh drops it afterwards, without waiting on its node."""
+    async def delete(self, owner, server_id, *, stop_work=True):
+        """Stop work before forgetting the server. A duplicate registration being settled is only
+        detached: its machine may still be the original server's."""
         if server_id == LOCAL:
             raise InstanceError('local_server_fixed', 409)
-        await self.registry.delete(owner, server_id)
-        async with self.db.write_transaction(label='server-forget') as conn:
-            for table in ('server_profiles', 'server_nodes', 'server_enrollments', 'server_terminal_log', 'server_exec_log', 'mesh_layout'):
-                await conn.execute(f'DELETE FROM {table} WHERE server_id=? AND owner=?', (server_id, owner))
-        await self.hub.disconnect(server_id)
-        self.spawn(self.mesh.leave(owner, server_id))
-        await self.bench.forget_server(owner, server_id)
-        await self.metrics.forget(server_id)
-        self.installs.pop(server_id, None)
-        return {'ok': True}
+        await self.registry.get(owner, server_id)
+        # Refused before anything on the node is stopped.
+        if (await self.registry.usage(owner)).get(server_id):
+            raise InstanceError('server_in_use', 409)
+        forgotten = False
+        try:
+            work = await self._stop_work(owner, server_id) if stop_work else None
+            front = fronts.is_front((await self._profiles(owner)).get(server_id))
+            await self.registry.delete(owner, server_id)
+            forgotten = True
+            async with self.db.write_transaction(label='server-forget') as conn:
+                for table in ('server_profiles', 'server_nodes', 'server_enrollments', 'server_terminal_log', 'server_exec_log', 'server_job_origins', 'mesh_layout',
+                              'server_unlock_full', 'server_desktop_configs'):
+                    await conn.execute(f'DELETE FROM {table} WHERE server_id=? AND owner=?', (server_id, owner))
+            await self.hub.disconnect(server_id)
+            self.spawn(self.mesh.leave(owner, server_id))
+            await self.bench.forget_server(owner, server_id)
+            await self.metrics.forget(server_id)
+            self.latency.sent.pop(server_id, None)
+            self.spawn(self.latency.moved(server_id))
+            self.installs.pop(server_id, None)
+            if front:
+                self.front.soon(owner)
+            return {'ok': True, **({'work': work} if work else {})}
+        finally:
+            if stop_work and not forgotten:
+                self.bench.resume_server(server_id)
 
     # ----- enrollment (see onboarding.py) -----
     async def enrollment(self, owner, server_id, *, browser=False):
@@ -688,21 +901,103 @@ class ServerService:
         return await self.onboarding.install(owner, server_id, browser=browser, force=force)
 
     async def revoke(self, owner, server_id, *, uninstall=False):
-        """The node is cut off and forgotten first; the mesh drops it afterwards, without waiting on it."""
+        """An uninstall stops work first. A plain revoke only detaches the node."""
         await self.registry.get(owner, server_id)
+        row = await one(self.db.conn, 'SELECT info_json FROM server_nodes WHERE owner=? AND server_id=?', (owner, server_id))
+        duplicate = bool(row and json.loads(row['info_json']).get('joinPending'))
+        # A pending duplicate may be the original machine, with its original jobs.
+        uninstall = uninstall and not duplicate
         uninstalled = False
-        if uninstall and server_id in self.hub.sessions:
+        try:
+            work = await self._stop_work(owner, server_id) if uninstall else None
+            if uninstall and work and not work['offline'] and server_id in self.hub.sessions:
+                try:
+                    await self._node_call(owner, server_id, 'uninstall', {}, timeout=20)
+                    uninstalled = True
+                except InstanceError:
+                    pass  # Work was stopped; revoking still cuts the node off if uninstall failed.
+            async with self.db.write_transaction(label='server-node-revoke') as conn:
+                await conn.execute('DELETE FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner))
+                await conn.execute('DELETE FROM server_enrollments WHERE server_id=? AND owner=?', (server_id, owner))
+            await self.hub.disconnect(server_id)
+            self.spawn(self.mesh.leave(owner, server_id))
+            return {'ok': True, 'uninstalled': uninstalled, **({'work': work} if work else {}),
+                    **({'note': '重复登记仅注销，不停止或卸载原机器上的节点和任务'} if duplicate else {}),
+                    'item': await self.get(owner, server_id)}
+        finally:
+            # This server record stays and can enroll a new node later. Also reopen scheduling
+            # when stopping failed and its current node/management records were preserved.
+            if uninstall:
+                self.bench.resume_server(server_id)
+
+    async def _stop_work(self, owner, server_id):
+        """Fence benchmark producers, then confirm the node jobs stopped within one budget.
+        Online uncertainty aborts removal. A node already offline is detached with an explicit warning.
+        The caller releases the benchmark fence if removal is aborted or the server record is retained."""
+        enrolled = await one(self.db.conn, 'SELECT 1 FROM server_nodes WHERE owner=? AND server_id=?', (owner, server_id))
+        online = server_id in self.hub.sessions
+        report = {'offline': not online, 'stopped': [], 'failed': []}
+        if not online:
+            report['note'] = '节点离线，没能停止它上面仍在运行的任务'
+        deadline = asyncio.get_running_loop().time() + WORK_STOP_TIMEOUT
+
+        async def attempt(kind, item_id, label, stop):
             try:
-                await self._node_call(owner, server_id, 'uninstall', {}, timeout=20)
-                uninstalled = True
-            except InstanceError:
-                pass  # Revoking still cuts the node off; its files stay behind.
-        async with self.db.write_transaction(label='server-node-revoke') as conn:
-            await conn.execute('DELETE FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner))
-            await conn.execute('DELETE FROM server_enrollments WHERE server_id=? AND owner=?', (server_id, owner))
-        await self.hub.disconnect(server_id)
-        self.spawn(self.mesh.leave(owner, server_id))
-        return {'ok': True, 'uninstalled': uninstalled, 'item': await self.get(owner, server_id)}
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError
+                async with asyncio.timeout_at(deadline):
+                    await stop()
+            except TimeoutError:
+                error = 'timeout'
+            except InstanceError as exc:
+                error = exc.error
+            except Exception as exc:
+                error = type(exc).__name__
+            else:
+                return
+            report['failed'].append({'kind': kind, 'id': item_id, 'label': label, 'error': error})
+
+        async def stop_benchmarks():
+            result = await self.bench.stop_server(owner, server_id)
+            if result.get('ok') is not True:
+                raise InstanceError('bench_run_active', 409)
+            report['stopped'].extend({'kind': 'bench', 'id': rid, 'label': rid} for rid in result['runs'])
+
+        await attempt('bench', '', '停止评测及在途启动', stop_benchmarks)
+        if not online and server_id in self.hub.sessions:
+            online = True
+            report['offline'] = False
+            report.pop('note', None)
+        if not online:
+            return report if enrolled or report['stopped'] or report['failed'] else None
+
+        jobs = []
+
+        async def list_jobs():
+            session = self.hub.sessions.get(server_id)
+            # Pre-jobs nodes cannot have these independent tasks. Only their explicit
+            # feature absence permits skipping: an advertised jobs API failing must
+            # still abort removal (including unsupported_method/node_update_required).
+            if session is not None and 'jobs' not in session.features:
+                return
+            jobs.extend((await self.jobs_list(owner, server_id))['jobs'])
+
+        await attempt('jobs', '', '列出后台任务', list_jobs)
+
+        async def stop_job(job):
+            result = await self.job_stop(owner, server_id, job['id'], log=f'强制停止后台任务 {job["id"]}（移除节点前）：{job["command"]}')
+            if result.get('job', {}).get('state') not in {'exited', 'stopped', 'interrupted'}:
+                raise InstanceError('job_stop_unconfirmed', 409)
+            report['stopped'].append({'kind': 'job', 'id': job['id'], 'label': job['command'][:200]})
+
+        for job in jobs:
+            if job['state'] == 'running':
+                await attempt('job', job['id'], job['command'][:200], lambda: stop_job(job))
+        if report['failed']:
+            error = InstanceError('server_work_stop_failed', 409)
+            error.errors = report['failed']
+            raise error
+        return report
 
     # ----- billing -----
     async def set_expiry(self, owner, server_id, date, day):
@@ -718,6 +1013,34 @@ class ServerService:
         base = dt.date.fromisoformat(billing['expiresAt']) if billing.get('expiresAt') else dt.datetime.now(await self.zone()).date()
         day = billing.get('billingDay') or base.day
         await self.set_expiry(owner, server_id, profiles.add_cycle(base, billing['cycle'], day).isoformat(), day)
+        return {'ok': True, 'item': await self.get(owner, server_id)}
+
+    async def calibrate_traffic(self, owner, server_id, data):
+        """This period's usage as the provider shows it, {used} or {remaining} in bytes; None clears it.
+        Counted on from now until the period or the way it is counted changes."""
+        await self.registry.get(owner, server_id)
+        if not await one(self.db.conn, 'SELECT 1 FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner)):
+            raise InstanceError('node_required', 409)
+        current = (await self._profiles(owner)).get(server_id, {})
+        merged = {k: v for k, v in current.items() if k != 'trafficCalibration'}
+        if data is not None:
+            if not isinstance(data, dict) or set(data) not in ({'used'}, {'remaining'}):
+                raise InstanceError('invalid_traffic_calibration')
+            value = data.get('used', data.get('remaining'))
+            if type(value) is not int or not 0 <= value <= 2**60:
+                raise InstanceError('invalid_traffic_calibration')
+            zone = await self.zone()
+            traffic = await self._traffic(server_id, merged, zone)
+            if 'remaining' in data:
+                if not traffic['limit']:
+                    raise InstanceError('traffic_limit_required', 409)
+                if value > traffic['limit']:
+                    raise InstanceError('invalid_traffic_calibration')
+                value = traffic['limit'] - value
+            start_ts = int(dt.datetime.combine(dt.date.fromisoformat(traffic['periodStart']), dt.time(), zone).timestamp())
+            merged['trafficCalibration'] = {'period': traffic['periodStart'], 'type': traffic['type'], 'at': int(time.time()), 'used': value,
+                                            'start': start_ts, 'counted': [traffic['rx'], traffic['tx']]}
+        await self._write_profile(owner, server_id, merged)
         return {'ok': True, 'item': await self.get(owner, server_id)}
 
     # ----- node maintenance -----
@@ -920,6 +1243,8 @@ class ServerService:
         if session is not None:
             top = getattr(session, 'protocol', 1)
             identity = {'build': session.build, 'features': sorted(session.features), 'protocol': top, 'protocolMin': getattr(session, 'protocol_min', top)}
+            if fronts.FEATURE in session.features:
+                identity['frontAccess'] = getattr(session, 'front_access', {})
         value = {**stored, 'info': info, 'caps': caps, 'version': version, **identity}
         if value != stored:
             await self._merge_node_info(server_id, {'info': info, 'caps': caps, 'version': version, **identity})
@@ -934,15 +1259,24 @@ class ServerService:
             stored['accessPending'] = True
         if stored.get('accessPending'):
             self._apply_access_soon(server_id)
-        ip = info.get('ipv4') or info.get('ipv6')
-        if ip and (stored.get('geo') or {}).get('ip') != ip and server_id not in self.geo_pending:
+        if stale_location(stored, info) and server_id not in self.geo_pending:
             self.geo_pending.add(server_id)
             self.spawn(self._locate(server_id))
         self.mesh.node_hello(server_id)
+        await self.front.node_hello(server_id)
         # Its probes live only in the node's memory: sent again on every hello.
         self.ddns.node_hello(server_id)
+        self.latency.node_hello(server_id)
+        before = stored.get('info') or {}
+        if (info.get('ipv4'), info.get('ipv6')) != (before.get('ipv4'), before.get('ipv6')):
+            self.spawn(self.latency.moved(server_id))
         # 自动更新节点: one that was offline when its update came catches up now.
         self._auto_soon(server_id)
+        # A new server, or a new address that may be served or routed differently: checked at once.
+        zone = await self.zone()
+        for checks in (self.unlock, self.unlock_full, self.route, self.ipchecks):
+            if checks.capable(server_id) and checks.due(server_id, stored, info, zone):
+                checks.soon(server_id)
 
     async def _merge_node_info(self, server_id, patch):
         async with self.db.write_transaction(label='server-node-info') as conn:
@@ -960,13 +1294,23 @@ class ServerService:
             row = await one(self.db.conn, 'SELECT info_json FROM server_nodes WHERE server_id=?', (server_id,))
             stored = json.loads(row['info_json']) if row else {}
             info = stored.get('info') or {}
-            ip = info.get('ipv4') or info.get('ipv6')
-            if not ip or (stored.get('geo') or {}).get('ip') == ip:
+            if not stale_location(stored, info):
                 return
             self.geo_at[server_id] = time.monotonic()
-            found = await geo.lookup(self.http, ip)
-            if found:
-                await self._merge_node_info(server_id, {'geo': found})
+            ip, ips, patch = info.get('ipv4') or info.get('ipv6'), [info.get('ipv4') or '', info.get('ipv6') or ''], {}
+            if (stored.get('geo') or {}).get('ip') != ip:
+                found = await geo.lookup(self.http, ip)
+                if found:
+                    patch['geo'] = found
+            if (stored.get('network') or {}).get('ips') != ips:
+                wanted = [v for v in ips if geo.public_address(v)]
+                # Every node says hello at once after a restart: a few lookups at a time.
+                async with self.network_gate:
+                    found = await geo.fetch_networks(self.http, wanted) if wanted else {}
+                if found or not wanted:
+                    patch['network'] = {'ips': ips, 'v4': found.get(ips[0]), 'v6': found.get(ips[1])}
+            if patch:
+                await self._merge_node_info(server_id, patch)
         finally:
             self.geo_pending.discard(server_id)
 
@@ -993,13 +1337,13 @@ class ServerService:
             terminal = await self.hub.open_terminal(server_id, ws, cols, rows)
         except (LookupError, PermissionError) as exc:
             return await refuse(str(exc))
-        await ws.send_json({'type': 'status', 'state': 'open'})
-        terminal.ready.set()
-        async with self.db.write_transaction(label='server-terminal-open') as conn:
-            cursor = await conn.execute('INSERT INTO server_terminal_log(owner,server_id,started_ms,ip) VALUES(?,?,?,?)', (owner, server_id, now_ms(), (request.remote or '')[:64]))
-            log_id = cursor.lastrowid
-        last_input, reason = time.monotonic(), ''
+        last_input, reason, log_id = time.monotonic(), '', None
         try:
+            await ws.send_json({'type': 'status', 'state': 'open'})
+            terminal.ready.set()
+            async with self.db.write_transaction(label='server-terminal-open') as conn:
+                cursor = await conn.execute('INSERT INTO server_terminal_log(owner,server_id,started_ms,ip) VALUES(?,?,?,?)', (owner, server_id, now_ms(), (request.remote or '')[:64]))
+                log_id = cursor.lastrowid
             while not terminal.closed:
                 try:
                     message = await ws.receive(timeout=TERMINAL_POLL_S)
@@ -1028,9 +1372,11 @@ class ServerService:
             # shell must still be stopped and the session logged.
             async def end():
                 await terminal.close(reason or 'closed')
-                async with self.db.write_transaction(label='server-terminal-close') as conn:
-                    await conn.execute('UPDATE server_terminal_log SET ended_ms=?,reason=? WHERE id=?', (now_ms(), terminal.reason, log_id))
-                await refuse(terminal.reason)
+                if log_id is not None:
+                    async with self.db.write_transaction(label='server-terminal-close') as conn:
+                        await conn.execute('UPDATE server_terminal_log SET ended_ms=?,reason=? WHERE id=?', (now_ms(), terminal.reason, log_id))
+                with contextlib.suppress(ConnectionError, RuntimeError):
+                    await refuse(terminal.reason)
             await asyncio.shield(self.spawn(end()))
         return ws
 
@@ -1089,15 +1435,20 @@ class ServerService:
             raise InstanceError(error, {'not_found': 404, 'permission_denied': 403, 'capability_disabled': 403}.get(error, 409))
         return reply.get('result') if isinstance(reply.get('result'), dict) else {}
 
-    async def _log(self, owner, server_id, source, command, started, result):
+    async def _log(self, owner, server_id, source, command, started, result, origin=None):
+        """origin: {conversationUuid, title, turnUuid} of the tool call that did it."""
+        origin = origin or {}
         async with self.db.write_transaction(label='server-exec-log') as conn:
-            await conn.execute('INSERT INTO server_exec_log(owner,server_id,source,command,started_ms,duration_ms,exit_code,outcome) VALUES(?,?,?,?,?,?,?,?)',
+            await conn.execute('INSERT INTO server_exec_log(owner,server_id,source,command,started_ms,duration_ms,exit_code,outcome,'
+                               'conversation_uuid,conversation_title,turn_uuid) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                                (owner, server_id, source, command[:2000], started, int(result.get('durationMs') or now_ms() - started),
-                                result.get('exitCode'), result.get('outcome', '')))
+                                result.get('exitCode'), result.get('outcome', ''), origin.get('conversationUuid') or '',
+                                (origin.get('title') or '')[:200], origin.get('turnUuid') or ''))
             await conn.execute('DELETE FROM server_exec_log WHERE server_id=? AND id NOT IN (SELECT id FROM server_exec_log WHERE server_id=? ORDER BY id DESC LIMIT ?)',
                                (server_id, server_id, EXEC_LOG_KEEP))
 
-    async def exec(self, owner, server_id, command, *, timeout=120, cwd='', stdin='', source='web', log=None, shell='', ssh_fallback=False):
+    async def exec(self, owner, server_id, command, *, timeout=120, cwd='', stdin='', source='web', log=None, shell='', ssh_fallback=False, origin=None,
+                   bypass=False):
         """Run one command; every attempt is logged (command text, never output). shell='sh'
         keeps the controller's own machine-read commands on plain /bin/sh. With ssh_fallback a
         server whose node is not connected runs it over its saved SSH login instead."""
@@ -1107,13 +1458,14 @@ class ServerService:
             target = await self._ssh_target(owner, server_id) if ssh_fallback else None
             if not target:
                 raise InstanceError(error, status)
-            return await self._exec_ssh(owner, server_id, target, command, timeout=timeout, cwd=cwd, stdin=stdin, source=source, log=log)
+            return await self._exec_ssh(owner, server_id, target, command, timeout=timeout, cwd=cwd, stdin=stdin, source=source, log=log, origin=origin)
         if not node:
             return await over_ssh('node_not_enrolled', 404)
         if server_id not in self.hub.sessions:
             return await over_ssh('node_offline', 409)
         started = now_ms()
-        params = {'command': command, 'timeout': timeout, 'cwd': cwd, 'stdin': stdin, **({'shell': shell} if shell else {})}
+        # bypass: past a transparent proxy on the node, as its own checks go (a node before it ignores it).
+        params = {'command': command, 'timeout': timeout, 'cwd': cwd, 'stdin': stdin, **({'shell': shell} if shell else {}), **({'bypass': True} if bypass else {})}
         try:
             reply = await self.hub.call(server_id, 'exec', params, timeout + 15)
         except LookupError:
@@ -1131,7 +1483,7 @@ class ServerService:
                           'outcome': 'timeout' if timed_out else 'ok' if value.get('exitCode') == 0 else 'failed',
                           **{k: value.get(k) for k in ('exitCode', 'stdout', 'stderr', 'truncated', 'timedOut', 'durationMs')},
                           **({'shell': value['shell']} if isinstance(value.get('shell'), str) and value['shell'] else {})}
-        await self._log(owner, server_id, source, log or command, started, result)
+        await self._log(owner, server_id, source, log or command, started, result, origin)
         return result
 
     async def _ssh_target(self, owner, server_id):
@@ -1145,7 +1497,7 @@ class ServerService:
                 return None
             raise
 
-    async def _exec_ssh(self, owner, server_id, target, command, *, timeout, cwd, stdin, source, log):
+    async def _exec_ssh(self, owner, server_id, target, command, *, timeout, cwd, stdin, source, log, origin=None):
         """One run over SSH, never retried: after a drop or a timeout the result is unknown."""
         if stdin:
             # The script itself travels on the remote shell's stdin.
@@ -1153,10 +1505,10 @@ class ServerService:
         platform = await self.registry.platform(target)
         line, body = remote.script(command, platform, cwd)
         started = now_ms()
-        raw = await _ssh(self.db, target, line, stdin=body, timeout=timeout)
+        raw = await _ssh(self.db, target, line, stdin=body, timeout=timeout, **({'tunnel': self.front.opener(target['via'])} if target.get('via') else {}))
         await self.registry.remember_host_key(server_id, raw.get('knownHosts', ''))
         result = {**remote.result(raw, platform), 'durationMs': now_ms() - started}
-        await self._log(owner, server_id, f'{source}-ssh', log or command, started, result)
+        await self._log(owner, server_id, f'{source}-ssh', log or command, started, result, origin)
         return result
 
     # ----- the node's browser -----
@@ -1186,6 +1538,9 @@ class ServerService:
 
     async def restart_browser(self, owner, server_id):
         return {'ok': True, 'browser': await self._node_call(owner, server_id, 'browser.restart', {}, timeout=60)}
+
+    async def update_browser(self, owner, server_id, data, *, source='web', origin=None):
+        return await self.browsers.update(owner, server_id, data, source=source, origin=origin)
 
     # ----- the node as the instances' and gateway's command channel -----
     async def node_channels(self, owner, server_id=None):
@@ -1347,6 +1702,51 @@ class ServerService:
         return {'ok': True, 'path': path, 'size': size}
 
     # ----- node methods newer than protocol 1 -----
+    async def _host_call(self, owner, server_id, method, params, *, timeout):
+        """A host.* call: the process list and the details need no command execution, so an older node
+        is told apart by its features whatever its consent."""
+        session = self.hub.sessions.get(server_id)
+        if session and HOST_FEATURE not in session.features:
+            raise InstanceError('node_update_required', 409)
+        try:
+            return await self._node_call(owner, server_id, method, params, timeout=timeout)
+        except InstanceError as exc:
+            if exc.error == 'unsupported_method':
+                raise InstanceError('node_update_required', 409) from None
+            raise
+
+    async def processes(self, owner, server_id, sort):
+        """The busiest processes by sort, and for net the traffic by interface and by container."""
+        if sort not in PROCESS_SORTS:
+            raise InstanceError('invalid_sort')
+        await self.registry.get(owner, server_id)
+        return {'ok': True, **await self._host_call(owner, server_id, 'host.top', {'sort': sort, 'limit': PROCESS_LIMIT}, timeout=20)}
+
+    async def unlock_check(self, owner, server_id):
+        """Check the services now (详情页「重新检测」); the full check follows by itself."""
+        return await self.unlock.run_now(owner, server_id)
+
+    async def route_check(self, owner, server_id):
+        """Trace the routes back to China now (详情页「重新检测」)."""
+        return await self.route.run_now(owner, server_id)
+
+    async def host_details(self, owner, server_id):
+        await self.registry.get(owner, server_id)
+        return {'ok': True, 'details': await self._host_call(owner, server_id, 'host.details', {}, timeout=45)}
+
+    async def kill_process(self, owner, server_id, data, *, source='web'):
+        """End a process; the node waits for it to go and refuses pid 1 and itself. name only labels the log line."""
+        pid, force, name = data.get('pid'), data.get('force', False), data.get('name', '')
+        if type(pid) is not int or pid < 1 or type(force) is not bool or not isinstance(name, str):
+            raise InstanceError('invalid_pid')
+        await self.registry.get(owner, server_id)
+        started = now_ms()
+        result = await self._host_call(owner, server_id, 'host.kill', {'pid': pid, 'force': force}, timeout=30)
+        exited = bool(result.get('exited'))
+        await self._log(owner, server_id, source, f"{'强制结束' if force else '结束'}进程 {name[:80] or pid}（PID {pid}）" + ('' if exited else '，未退出'),
+                        started, {'exitCode': 0 if exited else None, 'outcome': 'ok' if exited else 'failed'})
+        return {'ok': True, 'pid': pid, 'exited': exited}
+
     async def _call_newer(self, owner, server_id, feature, method, params, *, timeout=60):
         """A node call that an older node build lacks: refused up front, never emulated."""
         session = self.hub.sessions.get(server_id)
@@ -1404,9 +1804,9 @@ class ServerService:
         log = log if isinstance(log, dict) else {}
         return {'data': str(log.get('data') or ''), **{k: int(log.get(k) or 0) for k in ('offset', 'next', 'size', 'first')}}
 
-    async def job_start(self, owner, server_id, command, *, cwd='', stdin='', source='web', log=None):
+    async def job_start(self, owner, server_id, command, *, cwd='', stdin='', source='web', log=None, origin=None, bypass=False):
         """Start a command that runs on apart from this connection; returns at once. log: what the
-        command record says instead of the command itself."""
+        command record says instead of the command itself; origin as in _log, kept with the job."""
         if not isinstance(command, str) or not command.strip() or len(command) > JOB_COMMAND_MAX:
             raise InstanceError('command_required')
         if not isinstance(cwd, str) or len(cwd) > 4096 or not isinstance(stdin, str) or len(stdin.encode()) > JOB_STDIN_MAX:
@@ -1414,16 +1814,36 @@ class ServerService:
         await self.registry.get(owner, server_id)
         started = now_ms()
         try:
-            result = await self._call_newer(owner, server_id, 'jobs', 'job.start', {'command': command, 'cwd': cwd, 'stdin': stdin}, timeout=30)
+            result = await self._call_newer(owner, server_id, 'jobs', 'job.start', {'command': command, 'cwd': cwd, 'stdin': stdin, **({'bypass': True} if bypass else {})}, timeout=30)
         except InstanceError as exc:
             if exc.error not in {'node_offline', 'node_not_enrolled', 'node_update_required'}:
                 await self._log(owner, server_id, source, log or f'后台任务：{command}', started,
-                                {'outcome': 'unknown' if exc.error == 'node_connection_lost' else 'refused'})
+                                {'outcome': 'unknown' if exc.error == 'node_connection_lost' else 'refused'}, origin)
             raise
         job = self._job_view(result)
         await self._log(owner, server_id, source, f'{log}（后台任务 {job["id"]}）' if log else f'后台任务 {job["id"]}：{command}', started,
-                        {'outcome': 'started'})
+                        {'outcome': 'started'}, origin)
+        if job['id']:
+            await self._job_origin(owner, server_id, job['id'], source, origin or {})
         return {'ok': True, 'job': job}
+
+    async def _job_origin(self, owner, server_id, job_id, source, origin):
+        async with self.db.write_transaction(label='server-job-origin') as conn:
+            await conn.execute('INSERT OR REPLACE INTO server_job_origins(server_id,job_id,owner,source,conversation_uuid,conversation_title,turn_uuid,created_ms) '
+                               'VALUES(?,?,?,?,?,?,?,?)', (server_id, job_id, owner, source, origin.get('conversationUuid') or '',
+                                                         (origin.get('title') or '')[:200], origin.get('turnUuid') or '', now_ms()))
+            # A node keeps 50 finished jobs per server; this leaves room for long-running ones besides.
+            await conn.execute('DELETE FROM server_job_origins WHERE server_id=? AND job_id NOT IN (SELECT job_id FROM server_job_origins '
+                               'WHERE server_id=? ORDER BY created_ms DESC LIMIT ?)', (server_id, server_id, JOB_ORIGIN_KEEP))
+
+    async def job_origins(self, owner, server_ids):
+        """{(server_id, job_id): {source, conversationUuid, title, turnUuid}} for the jobs started through job_start."""
+        ids = list(server_ids)
+        if not ids:
+            return {}
+        rows = await many(self.db.conn, f'SELECT * FROM server_job_origins WHERE owner=? AND server_id IN ({",".join("?" * len(ids))})', (owner, *ids))
+        return {(r['server_id'], r['job_id']): {'source': r['source'], 'conversationUuid': r['conversation_uuid'], 'title': r['conversation_title'],
+                                                'turnUuid': r['turn_uuid']} for r in rows}
 
     async def jobs_list(self, owner, server_id):
         await self.registry.get(owner, server_id)
@@ -1440,7 +1860,7 @@ class ServerService:
         result = await self._call_newer(owner, server_id, 'jobs', 'job.status', params, timeout=30)
         return {'ok': True, 'job': self._job_view(result.get('job')), 'log': self._job_log(result.get('log'))}
 
-    async def job_stop(self, owner, server_id, job_id, *, source='web', log=None):
+    async def job_stop(self, owner, server_id, job_id, *, source='web', log=None, origin=None):
         """End the job's whole process group (Windows: process tree)."""
         if not isinstance(job_id, str) or not re.fullmatch(r'[a-z0-9]{6,40}', job_id):
             raise InstanceError('job_not_found', 404)
@@ -1448,7 +1868,8 @@ class ServerService:
         result = await self._call_newer(owner, server_id, 'jobs', 'job.stop', {'id': job_id}, timeout=45)
         job = self._job_view(result.get('job'))
         if result.get('stopped'):
-            await self._log(owner, server_id, source, log or f'停止后台任务 {job_id}：{job["command"]}', started, {'exitCode': job['exitCode'], 'outcome': 'ok'})
+            await self._log(owner, server_id, source, log or f'停止后台任务 {job_id}：{job["command"]}', started, {'exitCode': job['exitCode'], 'outcome': 'ok'},
+                            origin)
         return {'ok': True, 'stopped': bool(result.get('stopped')), 'job': job}
 
     async def job_wait(self, owner, server_id, job_id, *, until=None, offset=0, timeout=60, tail=8000):

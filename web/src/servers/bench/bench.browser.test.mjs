@@ -5,7 +5,7 @@ import {createRequire} from 'node:module';
 import {startBrowserTestServer, waitForBrowserReady} from '../../browserTestServer.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../../testing/playwright.cjs')); } catch {}
 const shots = process.env.OPENBEAR_BENCH_SHOTS || '';
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:bench-test"></script></body></html>';
 const entry = `import {createApp, h} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import 'element-plus/theme-chalk/dark/css-vars.css'; import '/src/style.css'; import '/src/dark-theme.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
@@ -70,12 +70,22 @@ test('评测 tab: tree, reports, comparison, the form, phone and dark', {skip: !
   const shot = async (page, name) => { if (shots) { await page.evaluate(() => Promise.all(document.getAnimations().filter(a => a.effect?.getComputedTiming().endTime !== Infinity).map(a => a.finished.catch(() => {})))); await page.screenshot({path: `${shots}/${name}.png`}); } };
   const server = (page, id) => page.locator(`li[data-server="${id}"]`);
   const runRow = (page, id) => page.locator(`li[data-run="${id}"] .bn-row-main`);
+  // Servers open folded, a test's earlier runs too.
+  const expand = (page, id) => server(page, id).locator('.bn-row-server .bn-row-main').click();
+  const earlier = (page, id, test) => server(page, id).locator(`li[data-test="${test}"] .bn-older`).click();
+  // Every row of the tree on one line and inside it.
+  const rowsFit = page => page.locator('.bn-nodes .bn-row').evaluateAll(rows => rows.filter(r => r.scrollWidth > r.clientWidth + 1 || r.getBoundingClientRect().height > 44).map(r => r.textContent));
 
   // In the servers page and the app's shell: a report box fits the pane and scrolls inside it, a long one included.
   await t.test('desktop: the tree, a report, comparison and deletion', async t => {
     const {page, calls, close} = await setup(t);
-    // Servers with runs open; Windows cannot run tests and has none, so it is not listed.
+    // Servers with runs, folded but the one running a test; Windows cannot run tests and has none, so it is not listed.
     await shot(page, 'desktop-intro');
+    await expand(page, 'sg');
+    await earlier(page, 'sg', 'ipcheck');
+    await expand(page, 'us');
+    assert.deepEqual(await rowsFit(page), []);
+    await shot(page, 'desktop-tree');
 
     await runRow(page, 'r2').click();
     const report = page.locator('.bn-main .bn-report');
@@ -130,7 +140,8 @@ test('评测 tab: tree, reports, comparison, the form, phone and dark', {skip: !
     await picker.click();
     await panel.locator('.ss-option', {hasText: 'RFCHost-JP2.T1'}).dispatchEvent('pointerdown');
     await panel.waitFor({state: 'hidden'});
-    await form.getByLabel('评测项目').selectOption('netcheck');
+    await form.getByRole('checkbox', {name: '综合评测', exact: true}).uncheck();
+    await form.getByRole('checkbox', {name: 'Net.Check.Place', exact: true}).check();
     await form.locator('.dd-choices label', {hasText: '完整模式'}).click();
     await shot(page, 'desktop-form');
     await page.getByTestId('bn-start').click();
@@ -155,7 +166,8 @@ test('评测 tab: tree, reports, comparison, the form, phone and dark', {skip: !
     await page.getByTestId('bn-new').click();
     const sheet = page.getByRole('dialog', {name: '运行评测'});
     await sheet.locator('.bn-form').waitFor();
-    await sheet.getByLabel('评测项目').selectOption('netroute');
+    await sheet.getByRole('checkbox', {name: '综合评测', exact: true}).uncheck();
+    await sheet.getByRole('checkbox', {name: 'Net.Check.Place 回程路由', exact: true}).check();
     assert.ok(await sheet.getByLabel('省份').evaluate(el => parseFloat(getComputedStyle(el).fontSize) >= 16), 'no zoom on focus');
     await noOverflow(page, 'form');
     await shot(page, 'phone-form');
@@ -166,6 +178,7 @@ test('评测 tab: tree, reports, comparison, the form, phone and dark', {skip: !
     await t.test(`${name}: a report inside the servers page fits and scrolls`, async t => {
       const {page, close} = await setup(t, {width, height, page: true});
       await page.locator('.bn-nodes').waitFor();
+      await expand(page, 'sg');
       await runRow(page, 'r7').click();
       const term = page.locator('.bn-main .bn-term').first();
       await term.waitFor();
@@ -191,7 +204,10 @@ test('评测 tab: tree, reports, comparison, the form, phone and dark', {skip: !
   for (const dark of [false, true]) {
     await t.test(`phone${dark ? ', dark' : ''}: the tree alone, sheets for reports and the comparison`, async t => {
       const {page, close} = await setup(t, {width: 390, height: 844, dark});
+      await expand(page, 'sg');
+      await earlier(page, 'sg', 'ipcheck');
       await noOverflow(page, 'tree');
+      assert.deepEqual(await rowsFit(page), []);
       const box = await runRow(page, 'r2').boundingBox();
       assert.ok(box.height >= 40, 'rows are easy to tap');
       await shot(page, `phone-tree${dark ? '-dark' : ''}`);

@@ -209,6 +209,16 @@ func (c *Collector) network() (rx, tx uint64) {
 			}
 		}
 	}
+	ifaceCounters(func(index int, irx, itx uint64) {
+		if strings.HasPrefix(c.names[index], "en") {
+			rx, tx = rx+irx, tx+itx
+		}
+	})
+	return
+}
+
+// ifaceCounters calls each with every interface's byte counters since boot, by its index.
+func ifaceCounters(each func(index int, rx, tx uint64)) {
 	rib, err := syscall.RouteRIB(syscall.NET_RT_IFLIST2, 0)
 	if err != nil {
 		return
@@ -220,13 +230,10 @@ func (c *Collector) network() (rx, tx uint64) {
 		}
 		if rib[3] == unix.RTM_IFINFO2 && size >= unix.SizeofIfMsghdr2 {
 			m := (*unix.IfMsghdr2)(unsafe.Pointer(&rib[0]))
-			if strings.HasPrefix(c.names[int(m.Index)], "en") {
-				rx, tx = rx+m.Data.Ibytes, tx+m.Data.Obytes
-			}
+			each(int(m.Index), m.Data.Ibytes, m.Data.Obytes)
 		}
 		rib = rib[size:]
 	}
-	return
 }
 
 func (c *Collector) processes() int {

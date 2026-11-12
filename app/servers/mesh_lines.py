@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 
+from app.servers.mesh_config import node_entry_mode
 from app.servers.mesh_status import direct_up, entry_rtt, fresh_status, records
 
 MINUTE_RETENTION = 2 * 86400
@@ -100,7 +101,8 @@ def catalogue(doc, configs):
             if sid not in live:
                 continue
             for link in configs[sid].get('links', []):
-                if link.get('kind') == kind and link['peer'] in live:
+                # A member on upstreams lists its relays as relay links too; those are its entry lines.
+                if link.get('kind') == kind and link['peer'] in live and (kind != 'relay' or live[sid]['role'] == live[link['peer']]['role'] == 'relay'):
                     yield sid, link
     for kind in ('relay', 'direct'):
         found = {}
@@ -137,7 +139,7 @@ def catalogue(doc, configs):
                     out.setdefault(line_id, {'id': line_id, 'kind': 'entry', 'a': m['serverId'], 'b': c['relay'], 'transport': c['transport'],
                                              'punch': bool(sent.get('punch')), 'dial': {'a': True, 'b': False},
                                              'endpoint': {'a': _strip(sent.get('endpoint', '')), 'b': ''},
-                                             'candidate': c['id'], 'mode': m['entry']['mode'], 'order': order})
+                                             'candidate': c['id'], 'mode': node_entry_mode(m)[0], 'order': order})
     return list(out.values())
 
 
@@ -181,6 +183,15 @@ def measure(line, statuses, now, fresh_ms, roles=None):
         status = fresh(line['a'])
         if not status:
             return None
+        if status.get('routing') and not status.get('entry'):
+            link = next((link for link in (status['routing'].get('links') or []) if link['peer'] == line['b']), None)
+            if link:
+                return {'reporter': line['a'], 'up': link['state'] == 'up', 'rttMs': link['rttMs'] or None,
+                        'lossRate': link['loss'], 'role': 'active', 'seen': True}
+            peer = next((p for p in records(status, line['b']) if p['kind'] == 'relay'), None)
+            if peer:
+                return {'reporter': line['a'], 'up': peer['active'], 'rttMs': peer['rttMs'] or None if peer['active'] else None,
+                        'lossRate': peer['timeoutRate'] if peer['active'] else None, 'role': 'active', 'seen': True}
         role = (roles or _entry_roles(status, [line])).get(line['id'], 'cold')
         entry = status.get('entry') or {}
         c = next((c for c in entry.get('candidates', []) if c['relay'] == line['b'] and c['transport'] == line['transport']), None) \
@@ -223,7 +234,8 @@ def measure(line, statuses, now, fresh_ms, roles=None):
 def _end(line, end, statuses, now, role):
     """One end of a line as its own report shows it: local (the address it is bound to), public
     (its public mapping as STUN or a relay saw it, for udp), remote (where it sends to the other
-    end) and dialer (whether it opens the connection). None when it has no fresh report."""
+    end), dialer (whether it opens the connection) and, when its report has it, mtu (the longest
+    packet the line carries). None when it has no fresh report."""
     me, other = (line['a'], line['b']) if end == 'a' else (line['b'], line['a'])
     status = fresh_status(statuses, me, now, VIEW_FRESH_MS)
     if not status:
@@ -240,8 +252,11 @@ def _end(line, end, statuses, now, role):
         peer = None  # The record's path is through a relay, not this link.
     # remoteAddr is the address actually in use; endpoint may still be the configured host name.
     remote = (peer.get('remoteAddr') or peer['endpoint']) if peer else configured
-    return {'local': peer['localAddr'] if peer else '', 'public': public, 'remote': remote,
-            'dialer': line['dial'][end] or line['punch']}
+    out = {'local': peer['localAddr'] if peer else '', 'public': public, 'remote': remote,
+           'dialer': line['dial'][end] or line['punch']}
+    if peer and peer.get('pathMtu'):
+        out['mtu'] = peer['pathMtu']
+    return out
 
 
 def view(lines, statuses, now):

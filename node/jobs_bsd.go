@@ -9,3 +9,6 @@ import "syscall"
 func processStart(pid int) (string, bool) {
 	return "-", syscall.Kill(pid, 0) == nil
 }
+
+// groupAlive tells whether the group still has a process (zombies included).
+func groupAlive(pgid int) bool { return syscall.Kill(-pgid, 0) != syscall.ESRCH }

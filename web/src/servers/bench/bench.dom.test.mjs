@@ -12,9 +12,9 @@ process.env.TZ = 'Asia/Shanghai';
 // What a running run's job log answers (as in the browser test).
 const JOB = {ok: true, job: {id: 'x', state: 'running'}, log: {data: '正在安装依赖…\r依赖已就绪   \n三网 TCP 大包延迟 \x1b[32m进行中\x1b[0m 12/31\r三网 TCP 大包延迟 \x1b[32m进行中\x1b[0m 29/31\n', offset: 0, next: 1, size: 1, first: 0}};
 
-async function setup(t, {width = 1440, height = 900, dark = false, page: whole = false} = {}) {
+async function setup(t, {width = 1440, height = 900, dark = false, page: whole = false, local = {}} = {}) {
   const bench = fakeBench();
-  const h = await mountPage(t, {width, height, dark,
+  const h = await mountPage(t, {width, height, dark, local,
     load: n => whole ? import(`../../views/ServersView.vue?fresh=${n}`) : import(`./BenchView.vue?fresh=${n}`),
     root: (View, h) => whole
       ? {render: () => h('div', {class: 'app-shell h-full flex', style: 'height:100vh'}, [h('aside', {style: 'width:220px;flex:none'}), h('main', {class: 'app-main flex-1 min-w-0 flex flex-col'}, [h(View)])])}
@@ -35,6 +35,9 @@ async function setup(t, {width = 1440, height = 900, dark = false, page: whole =
 }
 const server = (page, id) => page.locator(`li[data-server="${id}"]`);
 const runRow = (page, id) => page.locator(`li[data-run="${id}"] .bn-row-main`);
+// Servers open folded, a test's earlier runs too; the time leaves out this year.
+const expand = (page, id) => server(page, id).locator('.bn-row-server .bn-row-main').click();
+const earlier = (page, id, test) => server(page, id).locator(`li[data-test="${test}"] .bn-older`).click();
 
 test('terminal detail failures retry while summaries stay unchanged', async t => {
   const {page, bench, close} = await setup(t);
@@ -49,6 +52,25 @@ test('terminal detail failures retry while summaries stay unchanged', async t =>
   bench.state.runs.find(r => r.id === 'r5').state = 'done';
   await page.locator('.bn-main .bn-term').filter({hasText: '网络质量体检报告'}).waitFor({timeout: 15000});
   assert.ok(failures >= 2, 'unchanged terminal summary still retries the failed detail');
+  await close();
+});
+
+test('a timed-out report shows its limit and interruption reason', async t => {
+  const {page, bench, calls, close} = await setup(t);
+  await runRow(page, 'r5').click();
+  await page.locator('.bn-main .bn-live').waitFor();
+  Object.assign(bench.state.runs.find(r => r.id === 'r5'), {
+    state: 'interrupted', error: 'bench_timeout', detail: '超过 1 小时未完成，已自动停止', endedMs: T,
+  });
+  const note = page.locator('.bn-main .bn-note');
+  await note.waitFor({timeout: 15000});
+  assert.equal(await note.innerText(), '超过 1 小时未完成，已自动停止');
+  assert.equal(await page.locator('.bn-main .bn-rep-head .ix-pill').innerText(), '中断');
+  if (!await runRow(page, 'r5').count()) await expand(page, 'jp');
+  assert.equal(await runRow(page, 'r5').locator('.ix-pill').innerText(), '中断');
+  const count = calls.filter(c => /\/jobs\//.test(c.path)).length;
+  await page.waitForTimeout(3500);
+  assert.equal(calls.filter(c => /\/jobs\//.test(c.path)).length, count);
   await close();
 });
 
@@ -70,13 +92,27 @@ test('desktop: a running report stops asking the node once the tab is left', asy
 
 test('desktop: the tree, a report, comparison and deletion', async t => {
   const {page, calls, close} = await setup(t);
-  // Servers with runs open; Windows cannot run tests and has none, so it is not listed.
+  // Servers with runs, folded but the one running a test; Windows cannot run tests and has none, so it is not listed.
   assert.deepEqual(await page.locator('.bn-row-server .bn-name').allInnerTexts(), ['OVH.SG', 'RFCHost-JP2.T1', 'Misaka-Los Angeles LAX02 一个很长很长的服务器名字']);
   assert.match(await server(page, 'jp').locator('.bn-row-server .bn-count').innerText(), /1 项进行中/);
-  assert.deepEqual(await server(page, 'sg').locator('.bn-row-cat .bn-name').allInnerTexts(), ['IP 质量', '网络质量', '硬件性能']);
-  assert.equal(await server(page, 'sg').locator('li[data-run]').count(), 4);
-  assert.match(await runRow(page, 'r2').innerText(), /2026\.10\.30 22:00\s*IPv4 \+ IPv6/);
+  assert.equal(await runRow(page, 'r5').count(), 1, 'open while it runs a test');
+  assert.match(await server(page, 'sg').locator('.bn-row-server .bn-count').innerText(), /^4 条 · 最近 (2026\.)?10\.30 22:30$/);
+  assert.equal(await server(page, 'sg').locator('li[data-run]').count(), 0, 'folded');
+  // A row a test, in the categories' order, with its newest run; the earlier ones fold under it.
+  await expand(page, 'sg');
+  assert.deepEqual(await server(page, 'sg').locator('.bn-row-test .bn-name').allInnerTexts(), ['IP.Check.Place', 'Net.Check.Place', 'Geekbench 5']);
+  assert.equal(await page.locator('.bn-row-cat').count(), 0);
+  // The run's label is the row's title; the earlier runs' rows show theirs.
+  assert.match(await runRow(page, 'r2').innerText(), /^IP\.Check\.Place\s*(2026\.)?10\.30 22:00$/);
+  assert.equal(await runRow(page, 'r2').getAttribute('title'), 'IP.Check.Place · 2026.10.30 22:00 · IPv4 + IPv6');
+  assert.equal(await runRow(page, 'r1').count(), 0);
+  assert.match(await server(page, 'sg').locator('li[data-test="ipcheck"] .bn-older').innerText(), /更早 1 次/);
+  assert.equal(await server(page, 'sg').locator('li[data-test="netcheck"] .bn-older').count(), 0);
+  await earlier(page, 'sg', 'ipcheck');
+  assert.match(await runRow(page, 'r1').innerText(), /(2026\.)?10\.18 23:00/);
+  await expand(page, 'us');
   assert.equal(await runRow(page, 'r6').locator('.ix-pill').innerText(), '失败');
+  const opened = window.localStorage.getItem('openbear.servers.bench.expanded');
   assert.match(await page.locator('.bn-intro').innerText(), /服务器评测/);
 
   await runRow(page, 'r2').click();
@@ -119,6 +155,14 @@ test('desktop: the tree, a report, comparison and deletion', async t => {
   await page.locator('li[data-run="r1"]').waitFor({state: 'detached'});
   assert.ok(calls.some(c => c.method === 'DELETE' && c.path === '/api/servers/bench/runs/r1'));
   await close();
+
+  // What was open is open on the next visit, the earlier runs too; what was folded stays so.
+  const again = await setup(t, {local: {'openbear.servers.bench.expanded': opened}});
+  await runRow(again.page, 'r1').waitFor();
+  await runRow(again.page, 'r6').waitFor();
+  await expand(again.page, 'sg');
+  assert.equal(await runRow(again.page, 'r2').count(), 0);
+  await again.close();
 });
 
 test('desktop: starting a test, warnings, a running run', async t => {
@@ -144,8 +188,11 @@ test('desktop: starting a test, warnings, a running run', async t => {
   await picker.click();
   await panel.locator('.ss-option', {hasText: 'RFCHost-JP2.T1'}).dispatchEvent('pointerdown');
   await panel.waitFor({state: 'hidden'});
-  assert.equal(await form.getByLabel('评测项目').inputValue(), 'suite');
-  await form.getByLabel('评测项目').selectOption('netcheck');
+  const check = name => form.getByRole('checkbox', {name, exact: true});
+  assert.equal(await check('综合评测').isChecked(), true, 'the suite is chosen by default');
+  assert.equal(await check('IP.Check.Place').isDisabled(), true, 'a test inside the suite is shown as included');
+  await check('综合评测').uncheck();
+  await check('Net.Check.Place').check();
   assert.deepEqual(await form.locator('.bn-warnings li').allInnerTexts(), ['会安装依赖。']);
   await form.locator('.dd-choices label', {hasText: '完整模式'}).click();
   assert.match(await form.locator('.bn-warnings').innerText(), /消耗大量流量/);
@@ -164,11 +211,38 @@ test('desktop: starting a test, warnings, a running run', async t => {
   await page.getByTestId('bn-new').click();
   await form.waitFor();
   assert.deepEqual(await form.locator('.bn-warnings li').allInnerTexts(), ['会用系统包管理器安装缺少的依赖（合并）。', '压力测试会占满资源。'], 'the suite warns once of each thing');
-  assert.match(await form.locator('.dd-field', {hasText: '评测项目'}).innerText(), /耗时：约 20～30 分钟/);
+  assert.match(await form.locator('.bn-item', {hasText: '综合评测'}).innerText(), /耗时：约 20～30 分钟/);
   await page.getByTestId('bn-start').click();
   await form.waitFor({state: 'detached'});
   const suite = calls.filter(c => c.method === 'POST' && c.path === '/api/servers/bench/runs').at(-1);
   assert.deepEqual(suite.body, {serverId: 'sg', suite: true, options: {family: '4'}});
+
+  // Several tests at once: the suite and more beside it, each its own run in the server's queue.
+  await page.getByTestId('bn-new').click();
+  await form.waitFor();
+  await check('Geekbench 5').check();
+  await check('Service Unlock').check();
+  assert.match(await form.getByTestId('bn-count').innerText(), /共 5 个评测/);
+  assert.deepEqual(await form.locator('.bn-warnings li').allInnerTexts(), ['会用系统包管理器安装缺少的依赖（合并）。', '压力测试会占满资源。', '成绩会上传到 Geekbench 官网。']);
+  await page.getByTestId('bn-start').click();
+  await form.waitFor({state: 'detached'});
+  const more = calls.filter(c => c.method === 'POST' && c.path === '/api/servers/bench/runs').at(-1);
+  assert.deepEqual(more.body, {serverId: 'sg', suite: true, options: {family: '4'}, tests: [{test: 'geekbench5', options: {}}, {test: 'unlock', options: {region: 'auto'}}]});
+
+  // Two tests with the same option set it once.
+  await page.getByTestId('bn-new').click();
+  await form.waitFor();
+  await check('综合评测').uncheck();
+  await check('IP.Check.Place').check();
+  await check('Net.Check.Place').check();
+  const common = form.locator('.bn-item', {hasText: '共用选项'});
+  assert.match(await common.innerText(), /对IP\.Check\.Place、Net\.Check\.Place都生效/);
+  await common.locator('.dd-choices label', {hasText: 'IPv4 + IPv6'}).click();
+  assert.equal(await form.locator('.bn-item', {hasText: '三网延迟与回程'}).getByText('协议').count(), 0, 'the shared option is not asked again per test');
+  await page.getByTestId('bn-start').click();
+  await form.waitFor({state: 'detached'});
+  const pair = calls.filter(c => c.method === 'POST' && c.path === '/api/servers/bench/runs').at(-1);
+  assert.deepEqual(pair.body, {serverId: 'sg', tests: [{test: 'ipcheck', options: {family: '46', report: false}}, {test: 'netcheck', options: {family: '46', mode: 'low'}}]});
   await close();
 });
 
@@ -177,7 +251,8 @@ test('phone: the form as a sheet', async t => {
   await page.getByTestId('bn-new').click();
   const sheet = page.getByRole('dialog', {name: '运行评测'});
   await sheet.locator('.bn-form').waitFor();
-  await sheet.getByLabel('评测项目').selectOption('netroute');
+  await sheet.getByRole('checkbox', {name: '综合评测', exact: true}).uncheck();
+  await sheet.getByRole('checkbox', {name: 'Net.Check.Place 回程路由', exact: true}).check();
   assert.equal(await sheet.getByLabel('省份').evaluate(el => el.tagName), 'SELECT', 'long choices are a list');
   await close();
 });
@@ -186,6 +261,7 @@ for (const [width, height, name] of [[1440, 900, 'desktop'], [1180, 760, 'laptop
   test(`${name}: a report inside the servers page fits and scrolls`, async t => {
     const {page, close} = await setup(t, {width, height, page: true});
     await page.locator('.bn-nodes').waitFor();
+    await expand(page, 'sg');
     await runRow(page, 'r7').click();
     const term = page.locator('.bn-main .bn-term').first();
     await term.waitFor();
@@ -200,12 +276,14 @@ for (const dark of [false, true]) {
   test(`phone${dark ? ', dark' : ''}: the tree alone, sheets for reports and the comparison`, async t => {
     const {page, close} = await setup(t, {width: 390, height: 844, dark});
     assert.equal(await page.locator('.bn-main').count(), 0, 'no right pane on a phone');
+    await expand(page, 'sg');
     await runRow(page, 'r2').click();
     const sheet = page.getByRole('dialog', {name: '评测报告'});
     await sheet.locator('.bn-section').first().waitFor();
     const term = sheet.locator('.bn-term').first();
     await sheet.getByRole('button', {name: '关闭'}).click();
     await sheet.waitFor({state: 'hidden'});
+    await earlier(page, 'sg', 'ipcheck');
     await page.locator('li[data-run="r1"] .bn-pick input').check();
     await page.locator('li[data-run="r2"] .bn-pick input').check();
     await page.locator('li[data-run="r3"] .bn-pick input').check();
@@ -219,3 +297,25 @@ for (const dark of [false, true]) {
     await close();
   });
 }
+
+test('an OpenWrt router: only the tests it can run, with the reason', async t => {
+  const wrt = {...linux('wrt', 'Home-Kwrt', 'CN', 'arm64'), node: {exec: true, online: true, info: {platform: 'linux', arch: 'arm64', openwrt: true, ipv4: '198.51.100.20'}}};
+  const {page, calls, errors, close} = await mountPage(t, {
+    load: n => import(`./BenchRunForm.vue?fresh=${n}`),
+    root: (View, h) => ({render: () => h('div', {class: 'instance-ui servers-ui'}, [h(View, {catalog: CATALOG, servers: [wrt, SERVERS[0]], preset: {serverId: 'wrt'}})])}),
+    handle: async () => [200, {ok: true, runs: []}]});
+  await page.getByTestId('bn-openwrt').waitFor();
+  assert.equal(await page.getByTestId('bn-openwrt').innerText(), 'OpenWrt 上只能运行 Service Unlock。');
+  const box = name => page.getByRole('checkbox', {name});
+  assert.equal(await box('综合评测').isChecked(), false, 'the suite is not picked for it');
+  assert.equal(await box('综合评测').isDisabled(), true);
+  for (const name of ['IP.Check.Place', 'Net.Check.Place 回程路由', 'Geekbench 5']) assert.equal(await box(name).isDisabled(), true, name);
+  assert.equal(await box('Service Unlock').isDisabled(), false);
+  await box('Service Unlock').check();
+  await page.getByTestId('bn-start').click();
+  await page.waitForTimeout(50);
+  const posted = calls.find(c => c.method === 'POST' && c.path === '/api/servers/bench/runs');
+  assert.deepEqual(posted.body, {serverId: 'wrt', test: 'unlock', options: {region: 'auto'}});
+  assert.deepEqual(errors, []);
+  await close();
+});

@@ -161,7 +161,8 @@ async def execute(s, row):
         when = datetime.fromtimestamp(row['scheduled_at_ms']/1000, ZoneInfo(config.schedule.timezone)).strftime('%m-%d %H:%M')
         conversation = await s.host._create_web_conversation(row['owner_chat_id'], folder_uuid=row['folder_id'],
             title=f'[定时] {row["job_name"]} · {when}', conversation_uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, 'openbear:cron:'+run_id)),
-            run_config=s.host._web_defaults_storage(effective), origin_kind='cron', origin_ref=run_id)
+            run_config=s.host._web_defaults_storage(effective), origin_kind='cron', origin_ref=run_id,
+            extensions=await s.host._extensions_for_unattended(row['owner_chat_id'], row['folder_id'], config.extensions))
         row = {**row, 'conversation_uuid': conversation['conversation_uuid']}
         await patch(s, run_id, conversation_uuid=conversation['conversation_uuid'], status='running')
         # This one owner covers pre/model/post. Existing conversation stop reaches it.
@@ -245,12 +246,21 @@ async def execute(s, row):
     except Exception as exc:
         post_ok = False; error = '\n'.join(v for v in (error, str(exc)) if v)
     status = 'post_failed' if not post_ok and config.post.on_error == 'fail' and outcome not in ('cancelled', 'interrupted') else outcome
+    # No script ran: if no tool ran either, nothing happened outside and the job may simply run again.
+    unscripted = (status == 'failed' and conversation is not None and not config.pre.enabled
+                  and not (config.post.enabled and outcome in config.post.on_outcomes))
 
     async def finalize():
         # Business work (including post) has ended. Preserve that known outcome
         # even if a late stop races with its commit or presentation; never replay.
+        nonlocal error
+        backoff = None
+        if unscripted and not await one(s.db.conn, "SELECT 1 FROM runtime_actions a JOIN runtime_runs r USING(run_id) WHERE r.root_turn_uuid=? AND a.kind!='model' LIMIT 1", (root,)):
+            backoff = await s.retry_unstarted(row)
+        if backoff:
+            error = '\n'.join(v for v in (error, f'没有执行任何操作，{backoff} 秒后自动重试') if v)
         await patch(s, run_id, status=status, phase='finished', outcome=outcome, error=error, final_text=final_text,
-                    finished_at_ms=s.clock(), notification_state='pending' if conversation else 'unavailable')
+                    finished_at_ms=s.clock(), notification_state='suppressed' if backoff else 'pending' if conversation else 'unavailable')
         if conversation:
             await s.host._touch_web_conversation(conversation['conversation_uuid'], status='idle' if status in ('completed', 'cancelled') else 'error',
                 current_status='定时任务完成' if status == 'completed' else '定时任务：'+status, last_error=error)

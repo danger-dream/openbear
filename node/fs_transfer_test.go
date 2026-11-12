@@ -148,3 +148,38 @@ func TestTransferNoReplaceIsAtomicAndEmptyFilesWork(t *testing.T) {
 		t.Fatal("hashed directory")
 	}
 }
+
+// A file read in chunks says which file each chunk came from: the same while it
+// grows, another once a new file took its name (an atomic save, a log rotation).
+func TestFileReadNamesTheFileItCameFrom(t *testing.T) {
+	u := newUploads()
+	path := filepath.Join(t.TempDir(), "app.log")
+	os.WriteFile(path, []byte("AAAABBBB"), 0o644)
+	read := func(offset int) map[string]any {
+		t.Helper()
+		r, err := fileCall(t, u, "fs.read", map[string]any{"path": path, "offset": offset, "limit": 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	first := read(0)
+	if id, _ := first["file"].(string); id == "" {
+		t.Fatalf("no file identity: %v", first)
+	}
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	f.WriteString("more")
+	f.Close()
+	if grown := read(4); grown["file"] != first["file"] {
+		t.Fatalf("an appended file reads as another: %v then %v", first["file"], grown["file"])
+	}
+	temp := path + ".new"
+	os.WriteFile(temp, []byte("CCCCDDDD"), 0o644)
+	if err := os.Rename(temp, path); err != nil {
+		t.Fatal(err)
+	}
+	replaced := read(4)
+	if data, _ := base64.StdEncoding.DecodeString(replaced["data"].(string)); string(data) != "DDDD" || replaced["file"] == first["file"] {
+		t.Fatalf("a replaced file reads as the same one: %v then %v", first["file"], replaced["file"])
+	}
+}

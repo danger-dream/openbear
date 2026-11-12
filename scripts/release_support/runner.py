@@ -11,7 +11,7 @@ from pathlib import Path
 from . import build, candidate, node_compat, scope, versions
 from .common import Commands, ReleaseError, State, atomic_json, fingerprint, load, process_ticks, sha
 from .github import GitHub
-from .publication import asset_metadata, publish
+from .publication import asset_metadata, delete_candidates, publish, push_candidate
 
 TEST_STAGES = ("py311", "py312", "py313", "frontend")
 DEFAULT_IMAGES = {"pythonImages": {v: f"openbear-release-python:{version}" for v, version in
@@ -57,9 +57,12 @@ def verified_build(result, root=None, identity=None):
 # ssh-keygen; the matrix images carry none of them, and gateway/bin is a build output
 # outside the exported source. The node's own tests run in the node release's Go container.
 NODE_TOOLCHAIN_SKIPS = (("tests.test_servers::", "Go toolchain is not available"),
+                        ("tests.test_servers_desktop::", "Go toolchain is not available"),
+                        ("tests.test_servers_front::", "Go toolchain is not available"),
                         ("tests.test_servers_transfers::", "Go toolchain is not available"),
                         ("tests.test_node_browser::", "needs Chrome"),
                         ("tests.test_browser_engine_parity::", "needs google-chrome and Go"),
+                        ("tests.test_browser_observe_steps::", "needs google-chrome and Go"),
                         ("tests.test_gateway_update::", "needs the built gateway program"),
                         ("tests.test_instance_hardening::", "gateway binary not built"),
                         ("tests.test_servers_hardening::", "ssh-keygen is not available"))
@@ -68,6 +71,7 @@ NODE_TOOLCHAIN_SKIPS = (("tests.test_servers::", "Go toolchain is not available"
 def matrix_contract(results):
     backends = [results[name] for name in TEST_STAGES[:3]]
     suites = []
+    unexpected = {}
     for result in backends:
         cases = result["testCases"]
         ids = [item["id"] for item in cases]
@@ -84,15 +88,30 @@ def matrix_contract(results):
                             or (name.startswith("tests.test_servers_bench_live::") and reason.endswith("set OPENBEAR_BENCH_LIVE=1 to run a real benchmark"))
                             or any(name.startswith(module) and why in reason for module, why in NODE_TOOLCHAIN_SKIPS))
                 if not approved:
-                    raise ReleaseError(f"Unexpected conditional skip requires review: {name}: {case.get('skipReason')}")
+                    unexpected[name] = reason
             elif case["status"] != "passed":
                 raise ReleaseError("Backend test result was not passed: " + case["id"])
         suites.append({item["id"]: (item["status"], item.get("skipReason", "")) for item in cases})
+    if unexpected:
+        # Every one at once: reporting only the first costs a whole matrix run per skip.
+        raise ReleaseError(f"Unexpected conditional skips require review ({len(unexpected)}):\n"
+                           + "\n".join(f"- {name}: {reason}" for name, reason in unexpected.items()))
     if suites[0] != suites[1] or suites[1] != suites[2]:
         raise ReleaseError("Python versions did not execute identical test collections/statuses")
     if not all(result.get("ok") for result in results.values()):
         raise ReleaseError("A matrix stage failed")
-    return {"ok": True, "sameBackendTestCases": True, "casesPerPython": len(suites[0]), "results": results}
+    flaky = {}
+    for name in TEST_STAGES[:3]:
+        for case in results[name]["testCases"]:
+            if case.get("flaky"):
+                flaky.setdefault(case["id"], []).append(name)
+    # A timing flake shows up in one version; the same test failing in several is a real
+    # bug that only appears under load, even if every rerun passed.
+    repeated = {case: names for case, names in flaky.items() if len(names) > 1}
+    if repeated:
+        raise ReleaseError(f"Tests failed in several Python versions; their reruns passed but this counts as a real failure ({len(repeated)}):\n"
+                           + "\n".join(f"- {case}: {', '.join(names)}" for case, names in sorted(repeated.items())))
+    return {"ok": True, "sameBackendTestCases": True, "casesPerPython": len(suites[0]), "flaky": flaky, "results": results}
 
 
 class Runner:
@@ -184,12 +203,30 @@ class Runner:
                 raise ReleaseError("Previous formal tag does not resolve to a commit")
             self.value["previousSourceCommit"] = ref["sha"]
             self.state.save()
-        resolved = {}
+        resolved, unprotected = {}, []
         for name, image in {**self.value["environment"]["pythonImages"], "systemd": self.value["environment"]["systemdImage"]}.items():
             metadata = json.loads(self.command(["docker", "image", "inspect", image], "image-inspect"))[0]
             resolved[name] = metadata["Id"]
+            if build.KEEP_LABEL not in ((metadata.get("Config") or {}).get("Labels") or {}):
+                unprotected.append(image)
+        if unprotected:
+            print(f"Warning: release images without the {build.KEEP_LABEL} label are removed by a filtered prune: "
+                  + ", ".join(unprotected), flush=True)
         self.value["images"] = resolved
         self.state.save()
+
+    def push_candidate(self):
+        commit = self.value["candidate"]["publicCommit"]
+        return self.state.execute("candidate-push", {"commit": commit, "repository": self.value["repository"]},
+            lambda: push_candidate(self.directory, self.state, self.command, self.github))
+
+    def remove_candidates(self):
+        if not self.value.get("candidateBranches"):
+            return []
+        if not self.github.token:
+            print("Candidate branches kept (provide GH_TOKEN to delete them): " + ", ".join(self.value["candidateBranches"]), flush=True)
+            return []
+        return delete_candidates(self.state, self.github)
 
     def previous_assets(self):
         previous = self.value["previous"]
@@ -378,6 +415,10 @@ class Runner:
             operations["frontend-checks"] = lambda: execute("frontend-checks")
         results = self.parallel(operations)
         matrix = matrix_contract(results)
+        self.value["flakyTests"] = matrix["flaky"]
+        self.state.save()
+        if matrix["flaky"]:
+            print("Flaky (failed once, passed on rerun; released, fix later): " + ", ".join(sorted(matrix["flaky"])), flush=True)
         matrix["reusedStages"] = [name for name, result in results.items()
                                   if result.get("evidenceReuse") or self.value["stages"][name].get("lastReusedAt")]
         return (matrix, built) if with_build else matrix
@@ -394,7 +435,7 @@ class Runner:
                   "wallSeconds": round(elapsed, 3), "scriptActiveSeconds": round(active, 3),
                   "outsideScriptSeconds": round(max(0, elapsed - active), 3), "lastError": value.get("lastError"),
                   "publication": stages.get("publication", {}).get("result"), "cleanup": value.get("cleanup"),
-                  "scope": value.get("scope"), "nodeCompatibility": value.get("nodeCompatibility"),
+                  "scope": value.get("scope"), "nodeCompatibility": value.get("nodeCompatibility"), "flakyTests": value.get("flakyTests") or {},
                   "development": value.get("development"),
                   "developmentInstance": "No online dist update or service restart is performed by this entrypoint."}
         atomic_json(self.directory / "report.json", result)
@@ -404,6 +445,7 @@ class Runner:
     def finish_cleanup(self):
         self.value["cleanup"] = self.cleanup_owned()
         if self.value.get("published"):
+            delete_candidates(self.state, self.github)
             for name in ("source", "build", "package", "previous-assets"):
                 path = self.directory / name
                 if path.exists() and not path.is_symlink():
@@ -418,7 +460,7 @@ class Runner:
             self.value.setdefault("completedAt", time.time())
 
     def develop(self):
-        """After publication: the local version becomes the next minor's dev.1 (one local commit, never pushed).
+        """After publication: the local version becomes the next patch's dev.1 (one local commit, never pushed).
         Runs started before this rule (no startsDevelopment) are left as they finished."""
         if not self.value.get("startsDevelopment"):
             return None
@@ -463,6 +505,7 @@ class Runner:
             identity = self.value["candidate"]
             self.state.execute("source", identity["sourceFingerprint"], lambda: candidate.export(self.repo, self.directory, self.state, self.command),
                 valid=lambda result: candidate.source_matches(self.directory / "source", identity))
+            self.push_candidate()
             previous = self.state.execute("previous-assets", self.value["previous"]["id"], self.previous_assets,
                 valid=lambda result: asset_metadata(self.directory / "previous-assets", result["assets"]))
             self.value["scope"] = self.state.execute("scope", {"candidate": identity["sourceFingerprint"],

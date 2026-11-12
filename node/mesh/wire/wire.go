@@ -20,9 +20,24 @@ package wire
 // and notices, conflicts, routing advertisements, punch signalling) and
 // carries members' traffic end to end. It does not speak version 1: a mesh
 // is upgraded as a whole, and nodes left on version 1 stop talking to it.
+//
+// Version 3 gives a TCP or TLS stream a companion connection for control
+// and handshakes (transport/companion.go); messages and datagrams are as
+// in version 2.
+//
+// Version 4 lets a node say in its control messages that it takes large
+// frames: on a TCP or TLS stream of version 4 between two that do, a data
+// frame may hold a packet of up to LargeMTU bytes. Nothing else changes.
 const (
-	Protocol    = 2
+	Protocol    = 4
 	ProtocolMin = 2
+)
+
+// LargeFrames is the first version with large frames, and LargeMTU the
+// largest packet one holds.
+const (
+	LargeFrames = 4
+	LargeMTU    = 9000
 )
 
 // Range is the versions one node speaks.

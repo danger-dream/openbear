@@ -9,7 +9,7 @@ import pytest
 from app.instances.contracts import InstanceError
 from app.servers import compat, mesh_lines, mesh_path, mesh_status
 from app.servers import mesh as mesh_module
-from app.servers.mesh_config import build
+from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build
 from app.servers.metrics import MetricsStore
 from tests.test_mesh_config import doc, facts, member
 from tests.test_mesh_service import mesh_setup, settled
@@ -53,6 +53,28 @@ def reports(*, m1_state='active', c2='ready', link='up', at=NOW):
 
 def by_id(lines):
     return {line['id']: line for line in lines}
+
+
+def test_a_member_on_upstreams_has_its_entry_lines_and_no_relay_lines():
+    d = doc(member('r1', 'relay'), member('r2', 'relay'),
+            member('m1', entry={'mode': 'upstreams', 'autoReturn': True, 'candidates': [
+                {'id': 'c1', 'relay': 'r1', 'transport': 'udp'}, {'id': 'c2', 'relay': 'r2', 'transport': 'udp'}]}))
+    configs = build(d, {sid: {**f, 'features': [MEMBERS_ROUTING_FEATURE]} for sid, f in facts().items()}, 'net', 1)
+    # It routes over its relays, so its config lists them as relay links.
+    assert {link['peer'] for link in configs['m1']['links'] if link.get('kind') == 'relay'} == {'r1', 'r2'}
+    lines = mesh_lines.catalogue(d, configs)
+    assert sorted(line['id'] for line in lines if 'm1' in (line['a'], line['b'])) == ['entry:m1|r1|udp', 'entry:m1|r2|udp']
+    assert [(line['a'], line['b']) for line in lines if line['kind'] == 'relay'] == [('r1', 'r2')]
+
+
+def test_a_line_end_shows_the_path_mtu_it_reports():
+    d, configs = layout()
+    lines = mesh_lines.catalogue(d, configs)
+    st = reports()
+    st['r1']['status']['peers'][0]['pathMtu'] = 9000
+    view = by_id(mesh_lines.view(lines, st, NOW))
+    assert view['relay:r1|r2']['ends']['a']['mtu'] == 9000
+    assert 'mtu' not in view['entry:m1|r1|udp']['ends']['a']
 
 
 def test_the_lines_of_a_mesh_and_how_they_look_from_both_ends():

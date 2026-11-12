@@ -1,5 +1,6 @@
 <script setup>
 import {computed, nextTick, ref, watch} from "vue";
+import {groupConversationTimes, useConversationDay} from '../../conversationTime.js';
 import {ElMessage} from "element-plus";
 import {Bot as AgentProcessIcon, ChevronRight as ProcessChevron} from '@lucide/vue';
 import {ArrowRight, Cpu, Document, Loading, Operation} from "@element-plus/icons-vue";
@@ -54,6 +55,7 @@ const props = defineProps({
 	retryActionPending: {type: Object, default: () => ({})},
 });
 const emit = defineEmits(["retry-now", "cancel-retry"]);
+const conversationDay = useConversationDay();
 
 const workspaceLoading = ref(false);
 const workspaceError = ref("");
@@ -284,7 +286,7 @@ const monitorDisplayLines = computed(() => {
 		return leftTs - rightTs || Number(left.seq || 0) - Number(right.seq || 0);
 	});
 });
-const monitorCards = computed(() => buildAgentMonitorTimeline(monitorDisplayLines.value, workspaceData.value || {}));
+const monitorCards = computed(() => groupConversationTimes(buildAgentMonitorTimeline(monitorDisplayLines.value, workspaceData.value || {}), conversationDay.value));
 const activityCount = computed(() => activityDisplayLines.value.length);
 const monitorCount = computed(() => monitorDisplayLines.value.length);
 const monitorDisplayTotal = computed(() => Math.max(monitorTotal.value, monitorCount.value));
@@ -996,8 +998,10 @@ watch(agentPushKey, (value, oldValue) => {
 							</div>
 							<div v-if="activityError" class="activity-error"><span>{{ activityError }}</span><button type="button" @click="loadActivity({force: true})">重试</button></div>
 							<div v-if="monitorCards.length" class="monitor-timeline">
-								<article v-for="card in monitorCards" :key="card.key" class="monitor-card" :class="`tone-${card.tone}`">
-									<div class="monitor-rail"><time>{{ card.timeLabel }}</time><span class="monitor-dot"></span></div>
+								<template v-for="card in monitorCards" :key="card.key">
+								<div v-if="card.dateHeading" class="monitor-date"><time :datetime="card.dateHeading">{{ card.dateHeading }}</time></div>
+								<article class="monitor-card" :class="`tone-${card.tone}`">
+									<div class="monitor-rail"><time :title="card.timestampTitle || undefined">{{ card.displayTime }}</time><span class="monitor-dot"></span></div>
 									<div class="monitor-card-body">
 										<div class="monitor-card-heading"><span>{{ card.category }}</span><strong>{{ card.title }}</strong></div>
 										<p v-if="card.description">{{ card.description }}</p>
@@ -1005,6 +1009,7 @@ watch(agentPushKey, (value, oldValue) => {
 										<div v-if="card.badges.length" class="monitor-badges"><span v-for="badge in card.badges" :key="badge">{{ badge }}</span></div>
 									</div>
 								</article>
+								</template>
 							</div>
 							<div v-else-if="!activityLoading" class="tab-empty">暂无监控事件。</div>
 						</div>
@@ -1150,7 +1155,7 @@ html.dark .agent-retry-toolbar button { border-color: var(--ob-border); }
 .instance-session-summary { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
 .instance-session-summary > span { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 5px; overflow: hidden; border: 1px solid var(--ob-border); border-radius: 8px; background: var(--ob-surface); padding: 5px 7px; color: var(--ob-text); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .instance-session-summary b, .instance-assignment-facts b, .instance-assignment-tools > b { color: var(--ob-text-muted); font-size: 9px; font-weight: 650; }
-.instance-assignment-list { display: grid; min-height: 0; flex: 1 1 auto; align-content: start; gap: 7px; overflow-x: hidden; overflow-y: auto; padding-right: 4px; scrollbar-color: var(--ob-scrollbar) transparent; scrollbar-width: thin; }
+.instance-assignment-list { display: grid; grid-auto-rows: max-content; min-height: 0; flex: 1 1 auto; align-content: start; gap: 7px; overflow-x: hidden; overflow-y: auto; padding-right: 4px; scrollbar-color: var(--ob-scrollbar) transparent; scrollbar-width: thin; }
 .instance-assignment { --assignment-accent: var(--ob-blue); overflow: hidden; border: 1px solid var(--ob-border); border-left: 3px solid var(--assignment-accent); border-radius: 0 10px 10px 0; background: rgb(var(--ob-surface-rgb) / 0.88); padding: 9px 10px; }
 .instance-assignment.is-current { box-shadow: inset 0 0 0 1px rgb(var(--ob-blue-rgb) / 0.1); }
 .instance-assignment.tone-running { --assignment-accent: var(--ob-blue); }
@@ -1179,6 +1184,7 @@ html.dark .agent-retry-toolbar button { border-color: var(--ob-border); }
 .tab-empty { display: grid; min-height: 150px; flex: 1 1 auto; place-items: center; border: 1px dashed var(--ob-border); border-radius: 12px; color: var(--ob-text-muted); font-size: 12px; }
 .monitor-timeline { position: relative; padding: 2px 0 4px 4px; }
 .monitor-timeline::before { content: ""; position: absolute; left: 62px; top: 15px; bottom: 18px; width: 1px; background: linear-gradient(var(--ob-blue-soft), var(--ob-text-muted) 30%, var(--ob-success-soft)); }
+.monitor-date { margin: 8px 0 2px 67px; color: var(--ob-text-subtle); font-size: 10.5px; line-height: 1.4; font-variant-numeric: tabular-nums; }
 .monitor-card { display: grid; grid-template-columns: 48px 12px minmax(0, 1fr); gap: 7px; align-items: start; position: relative; padding: 5px 0 8px; }
 .monitor-rail { display: contents; }
 .monitor-rail time { padding-top: 9px; color: var(--ob-text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; }
@@ -1282,6 +1288,7 @@ html.dark .agent-retry-toolbar button { border-color: var(--ob-border); }
 	.mobile-meta-open .agent-tab-panel { display: none; }
 	.monitor-card { grid-template-columns: 8px minmax(0, 1fr); gap: 3px 8px; }
 	.monitor-timeline::before { left: 7px; }
+	.monitor-date { margin-left: 16px; }
 	.monitor-rail time { grid-column: 2; grid-row: 1; padding-top: 0; }
 	.monitor-dot { grid-column: 1; grid-row: 1; margin-top: 4px; }
 	.monitor-card-body { grid-column: 2; grid-row: 2; padding: 8px; }

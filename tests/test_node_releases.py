@@ -295,19 +295,27 @@ async def test_the_daily_check_survives_a_failing_check(github, monkeypatch):
     assert len(calls) == 2 and sleeps == [3600, 3600]
 
 
-async def test_a_local_build_wins_over_releases(github, tmp_path, monkeypatch):
+async def test_a_local_build_wins_over_releases_unless_it_is_older(github, tmp_path, monkeypatch):
     github.release('node-v2.0.0', *_build('2.0.0'))
     await releases.check()
     local = tmp_path / 'local-build'
     local.mkdir()
-    manifest, data = _build('1.0.0')
+    manifest, data = _build('2.1.0-dev.1')
     (local / 'manifest.json').write_text(json.dumps(manifest))
     (local / NAME).write_bytes(data)
     monkeypatch.setattr(installer, 'BIN', local)
     assert installer.manifest()['source'] == 'local' and installer.binary(NAME) == local / NAME
+    # The same version as the release still counts as the development checkout's own.
+    (local / 'manifest.json').write_text(json.dumps(_build('2.0.0')[0]))
+    assert installer.manifest()['source'] == 'local' and installer.local_problem() == ''
     # A development build without a features list still counts: older build scripts did not write one.
-    (local / 'manifest.json').write_text(json.dumps(_build('1.1.0-dev.3', features=None)[0]))
-    assert installer.manifest()['version'] == '1.1.0-dev.3' and installer.local_problem() == ''
+    (local / 'manifest.json').write_text(json.dumps(_build('2.1.0-dev.3', features=None)[0]))
+    assert installer.manifest()['version'] == '2.1.0-dev.3' and installer.local_problem() == ''
+    # A build left from before the release gives way to it: 1.1.0-dev.23 is older than 2.0.0.
+    (local / 'manifest.json').write_text(json.dumps(_build('1.1.0-dev.23')[0]))
+    assert installer.local_problem() == 'older'
+    assert installer.manifest()['source'] == 'github' and installer.manifest()['version'] == '2.0.0'
+    assert installer.binary(NAME) is None  # the release binary is fetched on first use, never the stale local one
 
 
 @pytest.mark.parametrize('local_build, reason', [

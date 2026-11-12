@@ -21,6 +21,7 @@ try {
       .replace(/import \{ArrowRight\} from "@element-plus\/icons-vue";/g, "const ArrowRight = {render: () => null};")
       .replace(/import (ConsoleMarkdown|ToolArgumentsView) from "[^"\n]+";/g, "const $1 = {render: () => null};")
       .replace(/from "\.\/AgentActivityList.vue"/g, 'from "./AgentActivityList.mjs"')
+      .replace(/from ['"]\.\.\/\.\.\/conversationTime\.js['"]/g, `from ${JSON.stringify(new URL('../../conversationTime.js', import.meta.url).href)}`)
       .replace(/from "\.\/([^"\n]+\.js)"/g, (_, file) => `from ${JSON.stringify(new URL(file, import.meta.url).href)}`);
     await writeFile(join(temp, `${name}.mjs`), compiled);
   }

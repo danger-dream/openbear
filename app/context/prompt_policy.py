@@ -73,14 +73,48 @@ class PromptToolRegistry:
         self.file_state = getattr(registry, 'file_state', None)
 
     def schemas(self, scope=None):
-        return [s for s in self.registry.schemas(scope=scope) if s.get('name', s.get('function', {}).get('name')) in self.allowed]
+        from app.tools.agent_actions import CONTROLLER, phase_schemas
+        out = []
+        for schema in self.registry.schemas(scope=scope):
+            name = schema.get('name', schema.get('function', {}).get('name'))
+            if name == 'Agent' and 'Agent' in self.allowed:
+                # The merged tool itself, as today's selection stores it: every action.
+                out.append(schema)
+            elif name == 'Agent' and 'action' in schema.get('parameters', {}).get('properties', {}):
+                # The earlier tools' names select their own actions of the merged tool.
+                offered = schema['parameters']['properties']['action'].get('enum', [])
+                allowed = {CONTROLLER[a] for a in offered if a in CONTROLLER} & self.allowed
+                for narrowed in phase_schemas([schema], allowed):
+                    narrowed = copy.deepcopy(narrowed)
+                    if 'Agent' not in allowed:
+                        narrowed['parameters']['required'] = list(dict.fromkeys([
+                            *narrowed['parameters'].get('required', []), 'action']))
+                    out.append(narrowed)
+            elif name in self.allowed:
+                out.append(schema)
+        return out
 
     async def dispatch(self, name, arguments, **kwargs):
-        if name not in self.allowed:
+        from app.tools.agent_actions import CONTROLLER
+        error = ''
+        if name == 'Agent' and 'Agent' not in self.allowed:
+            # Fail closed before the registry's tolerant JSON repair: the bytes
+            # checked here must select exactly the action that gets dispatched.
+            try:
+                args = json.loads(arguments.strip() or '{}') if isinstance(arguments, str) else None
+            except (TypeError, ValueError):
+                args = None
+            action = str(args.get('action') or 'start') if isinstance(args, dict) else ''
+            if CONTROLLER.get(action) not in self.allowed:
+                actions = [a for a, target in CONTROLLER.items() if target in self.allowed]
+                error = f'error: Agent action 不在当前会话允许列表中: {action or "invalid_arguments"}; allowed actions: {actions}'
+        elif name not in self.allowed:
+            error = 'error: 工具不在当前会话允许列表中: ' + name
+        if error:
             from app.runtime.tool_result import ToolOutcome
             from app.tools.base import current_tool_context
             context = kwargs.get('context') or current_tool_context()
-            result = ToolOutcome('error: 工具不在当前会话允许列表中: ' + name, 'failed', 'not_started')
+            result = ToolOutcome(error, 'failed', 'not_started')
             context.tool_outcome = result
             return result.content
         return await self.registry.dispatch(name, arguments, **kwargs)
@@ -95,6 +129,9 @@ def filter_prompt_tools(params, value):
         return params
     out = copy.deepcopy(params)
     allowed = set(policy_tool_names(value))
+    from app.tools.agent_actions import CONTROLLER
+    if allowed.intersection(CONTROLLER.values()):
+        allowed.add('Agent')
     for name in ('toolNames', 'builtinToolNames', 'mcpToolNames'):
         out[name] = [n for n in out.get(name, []) if n in allowed]
     for name in ('toolSummaries', 'builtinToolSummaries', 'mcpToolSummaries'):

@@ -6,7 +6,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../../browserTestServ
 import {createRequire} from 'node:module';
 export const require = createRequire(import.meta.url);
 export let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../../testing/playwright.cjs')); } catch {}
 export const shots = process.env.OPENBEAR_NET_SHOTS || '';
 export const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:net-test"></script></body></html>';
 export const entry = `import {createApp, h, KeepAlive, ref} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import '/src/style.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
@@ -17,8 +17,8 @@ const Other = {name: 'OtherPage', render: () => h('div', {id: 'other-page'}, 'ä¼
 const root = {render: () => h(KeepAlive, {include: ['ServersView']}, [shown.value ? h(component) : h(Other)])};
 const app=createApp(root); app.use(ElementPlus); for (const [key,icon] of Object.entries(Icons)) app.component(key,icon); app.mount('#app');`;
 
-import {GB, server, SERVERS, fakeMesh, GEO, ADDRESSES, MESH_ADDR, fakeNet, addresses, probe, press, waitFor, run, rowTexts} from './netBackend.mjs';
-export {GB, server, SERVERS, fakeMesh, GEO, ADDRESSES, MESH_ADDR, fakeNet, addresses, probe, press, waitFor, run, rowTexts};
+import {GB, server, SERVERS, fakeMesh, GEO, ADDRESSES, MESH_ADDR, fakeNet, addresses, probe, press, showTab, waitFor, run, rowTexts} from './netBackend.mjs';
+export {GB, server, SERVERS, fakeMesh, GEO, ADDRESSES, MESH_ADDR, fakeNet, addresses, probe, press, showTab, waitFor, run, rowTexts};
 
 // Starts Vite and Chromium for one test file (closed after it) and returns {setup}.
 export async function startNetBrowser(t) {
@@ -36,7 +36,7 @@ export async function startNetBrowser(t) {
     await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: fixture.base});
     const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh(), net = fakeNet(mesh), items = SERVERS();
     page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(([isDark, state]) => { window.__dark = isDark; sessionStorage.setItem('openbear.servers.tabs', state); }, [dark, JSON.stringify({tabs, active})]);
+    await page.addInitScript(([isDark, state]) => { window.__dark = isDark; localStorage.setItem('openbear.mesh.classic', '1'); sessionStorage.setItem('openbear.servers.tabs', state); }, [dark, JSON.stringify({tabs, active})]);
     await page.route(/^https:\/\/(open\.er-api\.com|api\.frankfurter\.dev)\//, route => route.fulfill({status: 503, body: ''}));
     await page.route('**/api/**', async route => {
       const req = route.request(), url = new URL(req.url()), path = url.pathname, method = req.method();

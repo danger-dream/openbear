@@ -1,0 +1,616 @@
+{
+ "schema_version": 1,
+ "network": {
+  "mode": "direct",
+  "address_family": "system-selected",
+  "timeout_seconds": 6,
+  "timeout_scope": "request including redirects and body",
+  "workers": 4
+ },
+ "results": [
+  {
+   "id": "chatgpt_web",
+   "platform": "ChatGPT",
+   "name": "ChatGPT (web)",
+   "status": "available",
+   "detail": "",
+   "region": null
+  },
+  {
+   "id": "youtube_premium_access",
+   "platform": "YouTube Premium",
+   "name": "YouTube Premium",
+   "status": "available",
+   "detail": "",
+   "region": null
+  },
+  {
+   "id": "netflix_access",
+   "platform": "Netflix",
+   "name": "Netflix",
+   "status": "available",
+   "detail": "full catalogue",
+   "region": "ES"
+  },
+  {
+   "id": "claude_access",
+   "platform": "Claude",
+   "name": "Claude",
+   "status": "available",
+   "detail": "",
+   "region": "ES"
+  },
+  {
+   "id": "tiktok_access",
+   "platform": "TikTok",
+   "name": "TikTok",
+   "status": "available",
+   "detail": "",
+   "region": null
+  },
+  {
+   "id": "gemini_access",
+   "platform": "Gemini",
+   "name": "Gemini",
+   "status": "available",
+   "detail": "",
+   "region": "ESP"
+  }
+ ],
+ "services": [
+  {
+   "id": "google",
+   "name": "Google",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "google_captcha",
+   "name": "Google Search captcha",
+   "type": "blocked",
+   "status": "observed",
+   "value": "no",
+   "detail": "yes = captcha/block observed; no = marker not observed"
+  },
+  {
+   "id": "youtube",
+   "name": "YouTube",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "youtube_premium",
+   "name": "YouTube Premium",
+   "type": "availability",
+   "status": "observed",
+   "value": "yes",
+   "detail": "service availability observation; not a login/playback test"
+  },
+  {
+   "id": "youtube_music",
+   "name": "YouTube Music",
+   "type": "availability",
+   "status": "observed",
+   "value": "yes",
+   "detail": "service availability observation; not a login/playback test"
+  },
+  {
+   "id": "twitch",
+   "name": "Twitch",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "chatgpt",
+   "name": "ChatGPT",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "netflix",
+   "name": "Netflix",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "spotify",
+   "name": "Spotify",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "spotify_signup",
+   "name": "Spotify signup",
+   "type": "availability",
+   "status": "observed",
+   "value": "no",
+   "detail": "legacy anonymous signup endpoint explicitly rejected this request as a proxy (status320); actual registration/login not tested"
+  },
+  {
+   "id": "deezer",
+   "name": "Deezer",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "reddit",
+   "name": "Reddit",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "reddit_guest",
+   "name": "Reddit guest access",
+   "type": "availability",
+   "status": "observed",
+   "value": "yes",
+   "detail": "service availability observation; not a login/playback test"
+  },
+  {
+   "id": "prime",
+   "name": "Amazon Prime Video",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "apple",
+   "name": "Apple",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "steam",
+   "name": "Steam",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "playstation",
+   "name": "PlayStation",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "tiktok",
+   "name": "TikTok",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "ookla",
+   "name": "Ookla Speedtest",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "jetbrains",
+   "name": "JetBrains",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  },
+  {
+   "id": "bing",
+   "name": "Microsoft (Bing)",
+   "type": "country",
+   "status": "observed",
+   "value": "ES",
+   "detail": "served region; not an access verdict"
+  }
+ ],
+ "ai_endpoints": [
+  {
+   "id": "openai",
+   "name": "OpenAI",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "anthropic",
+   "name": "Anthropic",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "gemini",
+   "name": "Google Gemini",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "deepseek",
+   "name": "DeepSeek",
+   "status": "reachable",
+   "detail": "authentication endpoint responded without credentials; model calls not tested"
+  },
+  {
+   "id": "qwen_intl",
+   "name": "Qwen (Singapore)",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "qwen_cn",
+   "name": "Qwen (Beijing)",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "moonshot",
+   "name": "Kimi / Moonshot",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  },
+  {
+   "id": "zhipu",
+   "name": "Zhipu GLM",
+   "status": "reachable",
+   "detail": "answered, credentials not supplied"
+  }
+ ],
+ "extra_checks": [
+  {
+   "id": "MediaUnlockTest_Dazn",
+   "name": "Dazn",
+   "scope": "global",
+   "family": 4,
+   "status": "available",
+   "region": "ES",
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_DisneyPlus",
+   "name": "Disney+",
+   "scope": "global",
+   "family": 4,
+   "status": "available",
+   "region": "ES",
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_PrimeVideo",
+   "name": "Amazon Prime Video (access)",
+   "scope": "global",
+   "family": 4,
+   "status": "available",
+   "region": "ES",
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_TVBAnywhere",
+   "name": "TVBAnywhere+",
+   "scope": "global",
+   "family": 4,
+   "status": "available",
+   "region": null,
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "WebTest_Wikipedia_Editable",
+   "name": "Wikipedia Editability",
+   "scope": "global",
+   "family": 4,
+   "status": "available",
+   "region": null,
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "GameTest_SDGGGE",
+   "name": "SD Gundam G Generation Eternal",
+   "scope": "global",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "unsupported for safety: Upstream request binds an explicit user_id to opaque x-token and encrypted consent payload; cannot establish anonymous-client provenance without real credentials; not copied or invoked"
+  },
+  {
+   "id": "MediaUnlockTest_ParamountPlus",
+   "name": "Paramount+",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "international refusal page"
+  },
+  {
+   "id": "MediaUnlockTest_DiscoveryPlus",
+   "name": "Discovery+",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "missing source flow field token"
+  },
+  {
+   "id": "MediaUnlockTest_SonyLiv",
+   "name": "SonyLiv",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "Get \"https://www.sonyliv.com/\": stream error: stream ID 1; INTERNAL_ERROR; received from peer"
+  },
+  {
+   "id": "MediaUnlockTest_HBOMax",
+   "name": "HBO Max",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source territory list excludes caller"
+  },
+  {
+   "id": "MediaUnlockTest_SkyShowTime",
+   "name": "SkyShowTime",
+   "scope": "eu",
+   "family": 4,
+   "status": "available",
+   "region": "ES",
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_BritBox",
+   "name": "BritBox",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal destination"
+  },
+  {
+   "id": "MediaUnlockTest_RakutenTV",
+   "name": "Rakuten TV",
+   "scope": "eu",
+   "family": 4,
+   "status": "available",
+   "region": "ES",
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_MegogoTV",
+   "name": "Megogo TV",
+   "scope": "eu",
+   "family": 4,
+   "status": "available",
+   "region": null,
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_SetantaSports",
+   "name": "Setanta Sports",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal value"
+  },
+  {
+   "id": "GameTest_MathsSpot",
+   "name": "MathsSpot Roblox",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "missing source flow field apiPath"
+  },
+  {
+   "id": "MediaUnlockTest_HotStar",
+   "name": "HotStar",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "geo/site territory mismatch"
+  },
+  {
+   "id": "MediaUnlockTest_SkyGo",
+   "name": "Sky Go",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "neither source sign-in nor refusal"
+  },
+  {
+   "id": "MediaUnlockTest_ITVHUB",
+   "name": "ITV Hub",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "neither source positive nor refusal marker"
+  },
+  {
+   "id": "MediaUnlockTest_Channel4",
+   "name": "Channel 4",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "HTTP source refusal"
+  },
+  {
+   "id": "MediaUnlockTest_Channel5",
+   "name": "Channel 5",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "unrecognized source field"
+  },
+  {
+   "id": "MediaUnlockTest_BBCiPLAYER",
+   "name": "BBC iPLAYER",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal wording"
+  },
+  {
+   "id": "MediaUnlockTest_AcornTV",
+   "name": "Acorn TV",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "neither source positive nor refusal marker"
+  },
+  {
+   "id": "MediaUnlockTest_Shudder",
+   "name": "Shudder",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "no source conclusion marker"
+  },
+  {
+   "id": "MediaUnlockTest_CanalPlus",
+   "name": "Canal+",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "Get \"http://www.canalplus.com/othercountry/\": unsafe redirect"
+  },
+  {
+   "id": "MediaUnlockTest_Molotov",
+   "name": "Molotov",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal: false"
+  },
+  {
+   "id": "MediaUnlockTest_Joyn",
+   "name": "Joyn",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal marker"
+  },
+  {
+   "id": "MediaUnlockTest_SKY_DE",
+   "name": "SKY DE",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal: CLIENT_GEO"
+  },
+  {
+   "id": "MediaUnlockTest_ZDF",
+   "name": "ZDF",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "HTTP source refusal"
+  },
+  {
+   "id": "MediaUnlockTest_NLZIET",
+   "name": "NLZIET",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "neither source positive nor refusal marker"
+  },
+  {
+   "id": "MediaUnlockTest_videoland",
+   "name": "videoland",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "malformed source JSON"
+  },
+  {
+   "id": "MediaUnlockTest_NPO_Start_Plus",
+   "name": "NPO Start Plus",
+   "scope": "eu",
+   "family": 4,
+   "status": "error",
+   "region": null,
+   "detail": "missing source flow field token"
+  },
+  {
+   "id": "MediaUnlockTest_MoviStarPlus",
+   "name": "Movistar+",
+   "scope": "eu",
+   "family": 4,
+   "status": "available",
+   "region": null,
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_RaiPlay",
+   "name": "Rai Play",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source video refusal"
+  },
+  {
+   "id": "MediaUnlockTest_Sky_CH",
+   "name": "SKY CH",
+   "scope": "eu",
+   "family": 4,
+   "status": "available",
+   "region": null,
+   "detail": "source positive criterion matched"
+  },
+  {
+   "id": "MediaUnlockTest_Amediateka",
+   "name": "Amediateka",
+   "scope": "eu",
+   "family": 4,
+   "status": "blocked",
+   "region": null,
+   "detail": "source refusal destination"
+  }
+ ],
+ "selection": {
+  "region": "eu",
+  "extra_family_requested": "auto",
+  "extra_family": 4,
+  "extra_source_commit": "b6d4a6f9a87fc6eae6d3e62d0092ececcec8e844",
+  "requested_region": "auto",
+  "detected_country": "ES",
+  "detection_source": "https://www.cloudflare.com/cdn-cgi/trace",
+  "resolution_reason": "country_mapped"
+ }
+}

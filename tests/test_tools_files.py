@@ -228,3 +228,28 @@ async def test_write_preserves_crlf_without_prior_read(tmp_path):
     assert "backup_path:" in out
     assert b"\r\n" in f.read_bytes()
 
+
+
+async def test_read_many_files_in_one_call_with_a_shared_budget(tmp_path):
+    reg = ToolRegistry()
+    register_file_tools(reg, store=FileStateStore(), output_limit_bytes=2048)
+    a, b, big = tmp_path / "a.py", tmp_path / "b.txt", tmp_path / "big.txt"
+    a.write_text("\n".join(f"a-{i}" for i in range(10)) + "\n", encoding="utf-8")
+    b.write_text("bee\n", encoding="utf-8")
+    big.write_text("x" * 60 + "\n" + "\n".join("y" * 60 for _ in range(100)) + "\n", encoding="utf-8")
+    out = await reg.dispatch("Read", json.dumps({"reads": [
+        {"path": str(a), "offset": 2, "limit": 2}, {"path": str(tmp_path / "missing.txt")}, {"path": str(b)},
+        {"path": str(big)}, {"path": str(a)}]}))
+    assert out.startswith('<reads count="5" budget_bytes="2048">')
+    assert "a-2" in out and "a-3" in out and "a-4" not in out.split("missing.txt")[0]
+    assert "[reads[2] " in out and "文件不存在" in out
+    assert "bee" in out
+    assert "达到输出上限" in out  # big.txt gets only what is left of the budget
+    assert "[reads[5] " in out and "skipped: shared output budget used up" in out
+    # Each entry records read state like a single read: the same range again is deduplicated.
+    again = await reg.dispatch("Read", json.dumps({"path": str(b)}))
+    assert "文件未变化" in again
+    assert (await reg.dispatch("Read", json.dumps({"path": str(a), "reads": [{"path": str(b)}]}))).startswith("error: give either")
+    assert (await reg.dispatch("Read", json.dumps({"reads": []}))).startswith("error: reads must be")
+    single = await reg.dispatch("Read", json.dumps({"path": str(b), "force": True}))
+    assert single.startswith("<file ") and "bee" in single

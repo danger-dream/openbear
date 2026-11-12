@@ -49,10 +49,12 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable
+	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable, groStorage, groBufs
 	toWrite     []int
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
+	groStorage  []byte
+	groBufs     [][]byte
 }
 
 func (tun *NativeTun) File() *os.File {
@@ -332,6 +334,38 @@ func (tun *NativeTun) nameSlow() (string, error) {
 	return unix.ByteSliceToString(ifr[:]), nil
 }
 
+// groBatch and groSlot size the workspace Write coalesces in when the
+// caller's buffers are too short to grow into a coalesced packet, as a
+// device's fixed pool of MTU-sized ones: a full-size slot per packet.
+const (
+	groBatch = 32
+	groSlot  = 65535
+)
+
+// groWorkspace returns bufs, or copies of them in the workspace, which is
+// allocated on first use and called for under writeOpMu.
+func (tun *NativeTun) groWorkspace(bufs [][]byte) [][]byte {
+	if len(bufs) < 2 || len(bufs) > groBatch || cap(bufs[0]) >= groSlot {
+		return bufs
+	}
+	for _, p := range bufs {
+		if len(p) > groSlot {
+			return bufs
+		}
+	}
+	if tun.groStorage == nil {
+		tun.groStorage = make([]byte, groBatch*groSlot)
+		tun.groBufs = make([][]byte, groBatch)
+	}
+	for i, p := range bufs {
+		start := i * groSlot
+		b := tun.groStorage[start : start+len(p) : start+groSlot]
+		copy(b, p)
+		tun.groBufs[i] = b
+	}
+	return tun.groBufs[:len(bufs)]
+}
+
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
 	defer func() {
@@ -345,6 +379,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	)
 	tun.toWrite = tun.toWrite[:0]
 	if tun.vnetHdr {
+		bufs = tun.groWorkspace(bufs)
 		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.udpGSO, &tun.toWrite)
 		if err != nil {
 			return 0, err

@@ -10,6 +10,9 @@ import (
 	"net"
 	"slices"
 	"time"
+
+	"openbear/node/mesh/bypass"
+	"openbear/node/mesh/wire"
 )
 
 // A redial moves a dialed TCP or TLS path to a new connection, from
@@ -81,7 +84,7 @@ func (b *Bind) Redial(ctx context.Context, ref PathRef) (Redialed, error) {
 	defer stop()
 
 	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
-	c, err := d.DialContext(ctx, "tcp", ep.remoteAddr().String())
+	c, err := bypass.DialMesh(ctx, d, ep.remoteAddr().String())
 	if err != nil {
 		return Redialed{}, err
 	}
@@ -91,7 +94,7 @@ func (b *Bind) Redial(ctx context.Context, ref PathRef) (Redialed, error) {
 		return Redialed{}, err
 	}
 	b.mu.Lock()
-	if b.run != r || ep.retired || len(r.sessions) >= b.opt.limits().paths || r.socketBytes+cost > b.opt.limits().socketBytes {
+	if b.run != r || ep.retired || len(r.sessions)-r.overPaths >= b.opt.limits().paths || r.socketBytes+cost > b.opt.limits().socketBytes {
 		b.mu.Unlock()
 		c.Close()
 		return Redialed{}, ErrBackpressure
@@ -123,6 +126,9 @@ func (b *Bind) Redial(ctx context.Context, ref PathRef) (Redialed, error) {
 		fingerprint = hex.EncodeToString(h[:])
 	}
 	v, err := exchangeVersions(c, b.protocol())
+	if err == nil && v >= companionVersion {
+		s.token, err = dialHello(c)
+	}
 	if !closeOnCancel() || err != nil {
 		if err == nil {
 			err = context.Canceled
@@ -142,6 +148,7 @@ func (b *Bind) Redial(ctx context.Context, ref PathRef) (Redialed, error) {
 		return fail(err)
 	}
 	s.version = v
+	s.peerLarge = old.peerLarge && v >= wire.LargeFrames
 	s.ready = true
 	s.replaced = false
 	old.replaced = true

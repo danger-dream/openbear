@@ -1,24 +1,31 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { relativeTime } from '../instances/instanceHelpers.js';
 import PlatformMark from './PlatformMark.vue';
 import { nodeStateTag } from './nodeVersions.js';
-import { bytes, daysLeft, flag, percent, platformOf, rate, regionName, sparkPath, tone, uptime } from './serverHelpers.js';
+import { CELL_ICONS, latencyTone, lossText, lossTone, ms, pingTitle } from './detail/detailHelpers.js';
+import PingStrip from './PingStrip.vue';
+import { useVisible } from './detail/useVisible.js';
+import { addressNetworks, asnText, bytes, canDesktop as checkDesktop, daysLeft, flag, percent, platformOf, rate, regionName, routeView, sparkPath, tone, unlockServices } from './serverHelpers.js';
 
-// sortable: the flag is the handle the board drags the card by.
-const props = defineProps({item: {type: Object, required: true}, now: {type: Number, required: true}, spark: {type: Object, default: null}, sortable: Boolean});
-const emit = defineEmits(['open', 'terminal']);
-const m = computed(() => props.item.live?.m || null);
+// A server on the board: its name with what needs attention beside it, then its figures as pairs in two
+// aligned columns (name on the left, value on the right, a bar under those that fill up), and what it is
+// filed under at the bottom. sortable: the flag is the handle the board drags the card by.
+// ping: its last half hour of latency (one cell a minute), when that is measured.
+const props = defineProps({item: {type: Object, required: true}, now: {type: Number, required: true}, spark: {type: Object, default: null},
+  ping: {type: Object, default: null}, sortable: Boolean});
+const emit = defineEmits(['open', 'terminal', 'desktop', 'bgp']);
+// Off screen a card keeps what it last showed and is not redrawn with every live sample; it reads them
+// again as it comes back near the screen.
+const root = ref(null);
+const {visible} = useVisible(root, {margin: 200});
+const held = ref({m: props.item.live?.m || null, spark: props.spark});
+watch(visible, on => { if (!on) held.value = {m: props.item.live?.m || null, spark: props.spark && {rx: [...props.spark.rx], tx: [...props.spark.tx]}}; });
+const m = computed(() => (visible.value ? props.item.live?.m : held.value.m) || null);
+const sparkNow = computed(() => visible.value ? props.spark : held.value.spark);
 const info = computed(() => props.item.node?.info || {});
-// Windows has no load average; the card shows its process count instead.
-const windows = computed(() => platformOf(props.item) === 'windows');
 const billing = computed(() => props.item.profile.billing || {});
 const state = computed(() => !props.item.node ? 'none' : m.value ? 'online' : 'offline');
-const bars = computed(() => [
-  ['CPU', m.value ? m.value.cpu : 0],
-  ['内存', m.value ? percent(m.value.mem.used, m.value.mem.total) : 0],
-  ['硬盘', m.value ? percent(m.value.disk.used, m.value.disk.total) : 0],
-].map(([label, value]) => [label, Math.round(value)]));
 const price = computed(() => {
   const b = billing.value;
   if (b.cycle === -1) return b.price ? `${b.currency}${b.price} 一次性` : '';
@@ -28,84 +35,141 @@ const price = computed(() => {
 });
 const days = computed(() => billing.value.cycle === -1 ? null : daysLeft(billing.value.expiresAt, new Date(props.now)));
 // Past a hundred years an expiry date only means the plan does not expire.
-const daysTag = computed(() => days.value === null ? '' : days.value < 0 ? `过期 ${-days.value} 天` : days.value > 36500 ? '长期' : `余 ${days.value} 天`);
+const expiry = computed(() => {
+  const d = days.value;
+  if (billing.value.cycle === -1) return {text: '一次性', tone: null};
+  if (d === null) return {text: '—', tone: null};
+  if (d > 36500) return {text: '长期', tone: null};
+  return {text: d < 0 ? `过期 ${-d} 天` : `余 ${d} 天`, tone: d <= 3 ? 'bad' : d <= 10 ? 'warn' : null};
+});
 const traffic = computed(() => props.item.traffic);
-const used = computed(() => traffic.value?.limit ? Math.round(percent(traffic.value.used, traffic.value.limit)) : null);
-const ring = computed(() => `${Math.min(100, used.value || 0) * 0.942} 94.2`);
 const typeLabel = computed(() => ({sum: '双向', up: '上行', down: '下行', max: '取大', min: '取小'})[traffic.value?.type] || '');
-const trafficNote = computed(() => {
-  const t = traffic.value, cur = billing.value.currency || '';
-  if (!t) return '';
-  if (t.mode === 'metered') return `本期约 ${cur}${(t.cost || 0).toFixed(2)} · ${cur}${t.price}/GB`;
-  if (t.mode === 'unlimited') return '不限流量';
-  return t.limit ? `共 ${bytes(t.limit)}（${typeLabel.value}）` : '';
-});
-const statusText = computed(() => {
-  if (state.value === 'online') return `在线 ${uptime(m.value.uptime)}`;
-  if (state.value === 'offline') return props.item.node.lastSeenAtMs ? `${relativeTime(props.item.node.lastSeenAtMs, props.now)}离线` : '尚未连接';
-  return '未安装节点';
-});
-const versionTag = computed(() => nodeStateTag(props.item.node));
-const hasTags = computed(() => Boolean(price.value || daysTag.value || props.item.profile.group || props.item.profile.tags?.length || steal.value || versionTag.value));
-const expiryLabel = computed(() => billing.value.cycle === -1 ? '一次性付费' : billing.value.expiresAt && days.value <= 36500 ? `到期 ${billing.value.expiresAt}` : days.value > 36500 ? '长期' : '');
-const canTerminal = computed(() => state.value === 'online' && props.item.node.caps?.terminal !== false);
+// "4.0 / 750 GB": the unit once when both are in the same one.
+function pair(used, limit) {
+  const a = bytes(used), b = bytes(limit), [av, au] = a.split(' '), [bv, bu] = b.split(' ');
+  return au === bu ? `${av} / ${bv} ${bu}` : `${a} / ${b}`;
+}
 const steal = computed(() => m.value && m.value.steal >= 5 ? Math.round(m.value.steal) : 0);
-// Both directions share one scale so their heights compare.
-const lines = computed(() => {
-  const s = props.spark;
-  if (!s || s.rx.length < 2) return null;
-  const top = Math.max(1, ...s.rx, ...s.tx);
-  return {rx: sparkPath(s.rx, 100, 22, top), tx: sparkPath(s.tx, 100, 22, top)};
+const versionTag = computed(() => nodeStateTag(props.item.node));
+const routes = computed(() => (routeView(props.item.node)?.carriers || []).filter(c => c.line));
+const canTerminal = computed(() => state.value === 'online' && props.item.node.caps?.terminal !== false);
+const canDesktop = computed(() => state.value === 'online' && checkDesktop(props.item));
+// The first address's ASN and operator; the title has each address's.
+const network = computed(() => {
+  const list = addressNetworks(props.item.node, props.item.profile?.region);
+  const asn = asnText(list.find(e => e.asn || e.org));
+  return asn ? {asn, title: list.map(e => `IPv${e.family} ${e.ip} · ${asnText(e) || '运营商未知'}`).join('\n')} : null;
 });
+const unlock = computed(() => {
+  const found = unlockServices(props.item.node, props.item.profile?.region);
+  if (!found) return null;
+  const at = `检测于 ${relativeTime(found.at, props.now)}`;
+  return {...found, items: found.items.map(s => ({...s, title: `${s.label}\n${at}`}))};
+});
+const span = seconds => { const d = Math.floor(seconds / 86400), h = Math.floor(seconds / 3600); return d ? `${d} 天` : h ? `${h} 小时` : `${Math.max(1, Math.floor(seconds / 60))} 分钟`; };
+// Each direction on its own scale, with room above its peak: they sit in cells of their own, beside their figures.
+const spark = values => values?.length > 1 ? sparkPath(values, 100, 14, Math.max(1, ...values) * 1.25) : '';
+
+// The pairs, row by row: each cell {key, label, value} with what it has of note, bar, tone, title, spark and strip.
+const cells = computed(() => {
+  const live = m.value, i = info.value, t = traffic.value, rows = [];
+  const pct = u => live ? Math.round(percent(u.used, u.total)) : null;
+  const cpu = live ? Math.round(live.cpu) : null, mem = live ? pct(live.mem) : null, disk = live ? pct(live.disk) : null;
+  rows.push([
+    {key: 'cpu', label: 'CPU', note: i.cores ? `${i.cores} 核` : '', value: cpu === null ? '—' : `${cpu}%`, bar: cpu, tone: cpu === null ? null : tone(cpu),
+      title: live ? (platformOf(props.item) === 'windows' ? `${live.processes} 个进程` : `负载 ${live.load.join(' / ')} · ${live.processes} 个进程`) : ''},
+    {key: 'mem', label: '内存', note: i.memTotal ? bytes(i.memTotal) : '', value: mem === null ? '—' : `${mem}%`, bar: mem, tone: mem === null ? null : tone(mem),
+      title: live ? `${bytes(live.mem.used)} / ${bytes(live.mem.total)}` : ''},
+  ]);
+  const used = t?.limit ? Math.round(percent(t.used, t.limit)) : null;
+  const trafficCell = !t ? {key: 'traffic', label: '流量', value: '—'}
+    : t.mode === 'metered' ? {key: 'traffic', label: '流量费', value: `≈ ${billing.value.currency || ''}${(t.cost || 0).toFixed(2)}`, title: `本期约 ${billing.value.currency || ''}${(t.cost || 0).toFixed(2)} · ${billing.value.currency || ''}${t.price}/GB`}
+      : t.mode === 'unlimited' ? {key: 'traffic', label: '流量', value: `${bytes(t.used)} / ∞`, title: '不限流量'}
+        : t.limit ? {key: 'traffic', label: '流量', value: pair(t.used, t.limit), bar: used, tone: tone(used), title: `本期已用 ${used}%（${typeLabel.value}）`}
+          : {key: 'traffic', label: '流量', value: bytes(t.used), title: '未设额度'};
+  rows.push([
+    {key: 'disk', label: '硬盘', note: i.diskTotal ? bytes(i.diskTotal) : '', value: disk === null ? '—' : `${disk}%`, bar: disk, tone: disk === null ? null : tone(disk),
+      title: live ? `${bytes(live.disk.used)} / ${bytes(live.disk.total)}` : ''},
+    trafficCell,
+  ]);
+  const s = sparkNow.value;
+  rows.push([
+    {key: 'rx', label: '下行', value: live ? rate(live.net.rxRate) : '—', spark: live ? spark(s?.rx) : ''},
+    {key: 'tx', label: '上行', value: live ? rate(live.net.txRate) : '—', spark: live ? spark(s?.tx) : ''},
+  ]);
+  rows.push([
+    {key: 'rxSum', label: '本期下行', value: t ? bytes(t.rx) : '—'},
+    {key: 'txSum', label: '本期上行', value: t ? bytes(t.tx) : '—'},
+  ]);
+  const p = props.ping;
+  if (p) {
+    rows.push([
+      {key: 'latency', label: '延迟', note: p.group || '', value: p.avg == null ? '—' : ms(p.avg), tone: latencyTone(p.avg), strip: {cells: p.cells, kind: 'latency'}, title: pingTitle(p, 'latency')},
+      {key: 'loss', label: '丢包', note: p.group || '', value: lossText(p.loss), tone: lossTone(p.loss), strip: {cells: p.cells, kind: 'loss'}, title: pingTitle(p, 'loss')},
+    ]);
+  }
+  const node = props.item.node;
+  rows.push([
+    {key: 'expiry', label: '到期', value: expiry.value.text, tone: expiry.value.tone, title: billing.value.expiresAt && days.value <= 36500 ? `${billing.value.expiresAt} 到期` : ''},
+    state.value === 'online' ? {key: 'uptime', label: '在线', value: span(live.uptime)}
+      : {key: 'uptime', label: '离线', value: node?.lastSeenAtMs ? relativeTime(node.lastSeenAtMs, props.now) : '尚未连接', tone: 'bad'},
+  ]);
+  return rows;
+});
+// What needs a look, as marks beside the name.
+const marks = computed(() => [
+  versionTag.value && {key: 'update', icon: 'update', tone: versionTag.value.tone || 'info', text: versionTag.value.text, title: versionTag.value.title || versionTag.value.text, state: versionTag.value.state},
+  steal.value && {key: 'steal', icon: 'steal', tone: steal.value >= 20 ? 'bad' : 'warn', text: `steal ${steal.value}%`, title: `steal ${steal.value}%：CPU 被宿主机其他虚拟机占用的比例，持续偏高说明母鸡超售`},
+].filter(Boolean));
+const statusText = computed(() => state.value === 'online' ? '在线' : state.value === 'offline' ? '离线' : '未安装节点');
+const hasFoot = computed(() => Boolean(price.value || props.item.profile.group || props.item.profile.tags?.length || routes.value.length || unlock.value));
 </script>
 <template>
-  <article class="pb-card" :data-state="state" tabindex="0" role="button" :aria-label="`${item.name} 详情`" @click="emit('open', item)" @keydown.enter.self="emit('open', item)">
+  <article ref="root" class="pb-card" :data-state="state" tabindex="0" role="button" :aria-label="`${item.name} 详情`" @click="emit('open', item)" @keydown.enter.self="emit('open', item)">
     <header class="pb-head">
       <span class="sv-flag pb-flag" :class="{'pb-grip': sortable}" :title="sortable ? `${regionName(item.region) ? `${regionName(item.region)} · ` : ''}拖动调整顺序` : regionName(item.region)" aria-hidden="true">{{ flag(item.region) || '🖥' }}</span>
-      <span class="pb-title"><strong class="pb-name" :title="item.name">{{ item.name }}</strong><PlatformMark :item="item" /></span>
+      <span class="pb-title"><strong class="pb-name" :title="item.name">{{ item.name }}</strong><PlatformMark :item="item" />
+        <span v-for="mk in marks" :key="mk.key" class="pb-mark" :data-tone="mk.tone" :data-mark="mk.key" :data-node-state="mk.state || null" :title="mk.title" role="img" :aria-label="mk.text">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path v-for="d in CELL_ICONS[mk.icon]" :key="d" :d="d" /></svg></span>
+        <span v-if="item.node?.joinPending" class="pb-tag" data-tone="warn" data-join-pending :title="item.node.joinPending.name ? `和「${item.node.joinPending.name}」像是同一台，打开详情确认` : '打开详情确认'">待确认接入</span>
+      </span>
+      <button v-if="canDesktop" type="button" class="pb-icon pb-desktop" title="打开远程桌面" aria-label="打开远程桌面" @click.stop="emit('desktop', item)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2" /><path d="M8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
+      </button>
       <button v-if="canTerminal" type="button" class="pb-icon" title="打开终端" aria-label="打开终端" @click.stop="emit('terminal', item)">&gt;_</button>
       <span class="pb-dot" :data-tone="{online: 'ok', offline: 'bad', none: 'off'}[state]" :title="statusText" aria-hidden="true"></span>
     </header>
-    <div v-if="hasTags || item.node" class="pb-tags">
-      <span v-if="item.node?.joinPending" class="pb-tag" data-tone="warn" data-join-pending :title="item.node.joinPending.name ? `和「${item.node.joinPending.name}」像是同一台，打开详情确认` : '打开详情确认'">待确认接入</span>
-      <span v-if="price" class="pb-tag">{{ price }}</span>
-      <span v-if="daysTag" class="pb-tag" :data-tone="days <= 3 ? 'bad' : days <= 10 ? 'warn' : 'ok'">{{ daysTag }}</span>
-      <span v-if="item.profile.group" class="pb-tag is-plain">{{ item.profile.group }}</span>
-      <span v-for="tag in item.profile.tags || []" :key="tag" class="pb-tag is-plain">{{ tag }}</span>
-      <span v-if="steal" class="pb-tag" :data-tone="steal >= 20 ? 'bad' : 'warn'" title="CPU 被宿主机其他虚拟机占用的比例，持续偏高说明母鸡超售">steal {{ steal }}%</span>
-      <span v-if="versionTag" class="pb-tag" :class="{'is-plain': !versionTag.tone}" :data-tone="versionTag.tone || null" :data-node-state="versionTag.state" :title="versionTag.title">{{ versionTag.text }}</span>
+    <button v-if="network" type="button" class="pb-asn" :title="`${network.title}\n点开看 BGP 上游`" data-network @click.stop="emit('bgp', item, $event.currentTarget)"
+      ><svg viewBox="0 0 24 24" aria-hidden="true"><path v-for="d in CELL_ICONS.bgp" :key="d" :d="d" /></svg><span class="pb-asn-org">{{ network.asn }}</span></button>
+    <div v-if="item.node" class="pb-cells">
+      <template v-for="(row, r) in cells" :key="r">
+        <div v-for="c in row" :key="c.key" class="pb-cell" :data-cell="c.key" :data-tone="c.tone || null" :title="c.title || null">
+          <span class="pb-cell-name"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-for="d in CELL_ICONS[c.key]" :key="d" :d="d" /></svg>{{ c.label }}<small v-if="c.note">{{ c.note }}</small></span>
+          <b class="pb-cell-value">{{ c.value }}</b>
+          <i v-if="c.bar != null" class="pb-cell-bar" aria-hidden="true"><b :style="{width: `${Math.min(c.bar, 100)}%`}" /></i>
+          <PingStrip v-else-if="c.strip" :cells="c.strip.cells" :kind="c.strip.kind" />
+          <svg v-else-if="c.spark" class="pb-spark" viewBox="0 0 100 14" preserveAspectRatio="none" aria-hidden="true"><path :d="c.spark" :class="c.key === 'rx' ? 'is-rx' : 'is-tx'" vector-effect="non-scaling-stroke" /></svg>
+        </div>
+      </template>
     </div>
-    <template v-if="item.node">
-      <p class="pb-spec">
-        <span title="CPU 核心"><svg viewBox="0 0 24 24" aria-hidden="true"><rect width="16" height="16" x="4" y="4" rx="2" /><rect width="6" height="6" x="9" y="9" rx="1" /><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2" /></svg>{{ info.cores ? `${info.cores} 核` : '—' }}</span>
-        <span title="内存"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 19v-3M10 19v-3M14 19v-3M18 19v-3M8 11V9M16 11V9M12 11V9M2 15h20M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v1.1a2 2 0 0 0 0 3.837V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5.1a2 2 0 0 0 0-3.837Z" /></svg>{{ info.memTotal ? bytes(info.memTotal) : '—' }}</span>
-        <span title="硬盘"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12H2M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zM6 16h.01M10 16h.01" /></svg>{{ info.diskTotal ? bytes(info.diskTotal) : '—' }}</span>
-      </p>
-      <div class="pb-bars">
-        <div v-for="[label, value] in bars" :key="label" class="pb-bar" :data-tone="m ? tone(value) : 'off'">
-          <span>{{ label }}</span><i class="sv-bar" :style="{'--v': value + '%'}" aria-hidden="true"></i><b>{{ m ? value + '%' : '—' }}</b>
-        </div>
-      </div>
-      <dl class="pb-facts">
-        <div class="pb-net"><dt>网络</dt><dd>
-          <svg v-if="lines && m" class="pb-spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"><path :d="lines.rx" class="is-rx" vector-effect="non-scaling-stroke" /><path :d="lines.tx" class="is-tx" vector-effect="non-scaling-stroke" /></svg>
-          <span class="pb-rates">↑ {{ m ? rate(m.net.txRate) : '—' }}<span>↓ {{ m ? rate(m.net.rxRate) : '—' }}</span></span>
-        </dd></div>
-        <div v-if="traffic" class="pb-traffic">
-          <dt>流量</dt>
-          <dd>
-            <svg v-if="used !== null" class="pb-ring" viewBox="0 0 36 36" :data-tone="tone(used)" aria-hidden="true"><circle cx="18" cy="18" r="15" /><circle cx="18" cy="18" r="15" :stroke-dasharray="ring" /><text x="18" y="21">{{ used }}%</text></svg>
-            <span class="pb-traffic-text">↑ {{ bytes(traffic.tx) }} ↓ {{ bytes(traffic.rx) }}<small v-if="trafficNote">{{ trafficNote }}</small></span>
-          </dd>
-        </div>
-        <div v-if="windows" class="pb-load"><dt>进程</dt><dd>{{ m ? m.processes : '—' }}</dd></div>
-        <div v-else class="pb-load"><dt>负载</dt><dd>{{ m ? m.load.join(' | ') : '—' }}</dd></div>
-      </dl>
+    <template v-else>
+      <p class="pb-empty">安装节点后上报运行状态 · 点击安装</p>
+      <div class="pb-cells"><div class="pb-cell" data-cell="expiry" :data-tone="expiry.tone || null"><span class="pb-cell-name"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-for="d in CELL_ICONS.expiry" :key="d" :d="d" /></svg>到期</span><b class="pb-cell-value">{{ expiry.text }}</b></div></div>
     </template>
-    <p v-else class="pb-empty">安装节点后上报运行状态 · 点击安装</p>
-    <footer class="pb-foot">
-      <span>{{ expiryLabel }}</span>
-      <span :class="{'ob-bad': state === 'offline'}">{{ statusText }}</span>
+    <footer v-if="hasFoot" class="pb-foot">
+      <div v-if="price || item.profile.group || item.profile.tags?.length || routes.length" class="pb-tags">
+        <span v-if="price" class="pb-tag" data-price>{{ price }}</span>
+        <span v-if="item.profile.group" class="pb-tag is-plain">{{ item.profile.group }}</span>
+        <span v-for="tag in item.profile.tags || []" :key="tag" class="pb-tag is-plain">{{ tag }}</span>
+        <span v-for="c in routes" :key="c.id" class="pb-tag sv-route-tag" :data-tier="c.tier" :data-route="c.id" :title="c.title">{{ c.name }} {{ c.line }}</span>
+      </div>
+      <p v-if="unlock" class="pb-unlock" data-unlock>
+        <span v-for="svc in unlock.items" :key="svc.id" class="sv-svc" :data-service="svc.id" :data-state="svc.state" :title="svc.title" :aria-label="svc.title"
+          :style="{'--svc': svc.color, '--svc-dark': svc.dark || svc.color}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path :d="svc.path" :fill-rule="svc.evenodd ? 'evenodd' : null" /></svg>
+          <b v-if="svc.mark" :data-tone="svc.mark.tone">{{ svc.mark.text }}</b>
+        </span>
+      </p>
     </footer>
   </article>
 </template>

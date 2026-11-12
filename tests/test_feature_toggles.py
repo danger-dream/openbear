@@ -173,6 +173,18 @@ async def test_switching_applies_to_the_next_turn_without_restart(controller):
     assert svc.browser.nodes is None
 
 
+async def test_model_timeout_settings_apply_to_the_next_request_without_restart(controller):
+    svc = controller.svc
+    store = svc.config_store
+    for path, value in (("agent.llmConnectTimeoutS", 18.0), ("agent.llmFirstByteTimeoutS", 300.0),
+                        ("agent.llmIdleTimeoutS", 360.0), ("agent.llmTotalTimeoutS", 1800.0)):
+        svc.apply_config(await store.update_path(path, value))
+    http = svc.http
+    assert (http._connect_timeout_s, http._first_byte_timeout_s, http._idle_timeout_s,
+            http._total_timeout_s) == (18.0, 300.0, 360.0, 1800.0)
+    assert http.raw.timeout.connect == 18.0
+
+
 async def test_settings_api_toggles_tools(controller):
     svc = controller.svc
     await svc._decide_optional_features()

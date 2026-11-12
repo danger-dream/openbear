@@ -149,6 +149,9 @@ class WebAdminChatStateMixin:
         return self.interactions.pending_for(str(conversation_uuid or ""))
 
     async def _interaction_changed(self, event: str, item: dict[str, Any]) -> None:
+        hub = getattr(self, "global_realtime", None)
+        if hub is not None:
+            hub.invalidate_tree()
         conv_uuid = str(item.get("conversationUuid") or "")
         live = self._web_live_streams.get(conv_uuid)
         if live is not None:
@@ -530,7 +533,7 @@ class WebAdminChatStateMixin:
             })
         operation_facts["activeRathTaskCount"] = len(background_tasks)
         operation_facts["activeRathTaskUuids"] = [str(task.get("taskUuid") or "") for task in background_tasks if task.get("taskUuid")]
-        pending_steering = steering.pending_items(chat_id)
+        pending_steering = steering.public_pending_items(chat_id)
         exact_context_tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=session_uuid, expected_model=model_label)
         context_trigger_tokens = self._model_rollover_trigger_tokens(model_label)
         context_usage = {
@@ -774,7 +777,8 @@ class WebAdminChatStateMixin:
     def _run_stats_json(self, result: RunResult, *, cost_usd: float, model: str,
                         think_level: str, context_window: int, live: bool = False,
                         ledger_usage: dict[str, Any] | None = None,
-                        ledger_cost_usd: float | None = None) -> dict[str, Any]:
+                        ledger_cost_usd: float | None = None,
+                        elapsed_ms: int | None = None) -> dict[str, Any]:
         # `contextTokens` means the latest OpenBear controller prompt size shown
         # in the per-turn stats panel.  Child Agent cumulative usage stays in
         # `expertUsage`; mixing it into context makes the value look larger than
@@ -843,6 +847,12 @@ class WebAdminChatStateMixin:
             "costUsd": cost_usd + result.expert_cost_usd,
             "haltedReason": result.halted_reason,
         }
+        if live:
+            stats["liveTps"] = round(result.live_output.tokens_per_second(), 1)
+            stats["inflightUsage"] = result.live_output.in_flight_usage()
+            if elapsed_ms is not None:
+                # Measured on the server clock, so a skewed browser clock cannot distort the run timer.
+                stats["elapsedMs"] = max(0, int(elapsed_ms))
         if ledger_usage is not None:
             # Absolute durable session total, not a delta. `ledgerRevision` is the
             # latest model_calls.id for the current session epoch, so concurrent

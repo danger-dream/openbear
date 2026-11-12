@@ -53,6 +53,8 @@ class Model(BaseModel):
 SERVER_CHANGES = ('Default false: runs of this task may only read servers and instances (Servers and InstanceControl read actions). '
                   'true lets its unattended runs change them as well (commands, file writes, node and instance operations). '
                   'Set it only when the user explicitly asks; the user turns it on in the page knowing the risk.')
+EXTENSIONS = ('Extension keys (system prompt extension catalog) its runs start with. Omitted: the folder\'s extension default when '
+              'one is set, otherwise every extension. A run cannot ask the user for more unless the folder allows it automatically.')
 
 
 class Ingress(Model):
@@ -180,6 +182,7 @@ class Processing(Model):
     result_schema: dict | None = None
     script_scheduling: Literal['independent', 'serial'] = 'independent'
     allow_server_changes: bool = Field(False, strict=True, description=SERVER_CHANGES)
+    extensions: list[str] | None = Field(None, description=EXTENSIONS)
 
 
 class Identity(Model):

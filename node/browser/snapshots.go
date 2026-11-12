@@ -153,6 +153,7 @@ func (s *snapshotState) collect(ctx context.Context, frame *Frame, root *Node, d
 // snapshot is snapshots.snapshot: an aria snapshot across frames (OOPIFs
 // included) with refs versioned by a fresh snapshot id.
 func snapshot(ctx context.Context, page *Page, action string, params *Obj) (any, error) {
+	documentID := page.documentID
 	s := &snapshotState{page: page, params: params, refs: map[string]refEntry{}, epochs: newOmap[string, int]()}
 	var root *Node
 	if truthy(params.Def("target", nil)) {
@@ -192,6 +193,9 @@ func snapshot(ctx context.Context, page *Page, action string, params *Obj) (any,
 		rendered, err := frame.run(ctx, "function(data){return this.__renderSnapshot(data)}", data)
 		if err != nil {
 			return "", err
+		}
+		if page.documentID != documentID {
+			return "", browserError(ctx, "document_changed: take a new snapshot", "", nil)
 		}
 		return asStr(rendered), nil
 	}()
@@ -250,7 +254,7 @@ func snapshot(ctx context.Context, page *Page, action string, params *Obj) (any,
 			page.refs[ref] = entry
 		}
 	}
-	result := O("snapshotId", version, "text", text, "truncated", truncated, "url", page.url())
+	result := O("snapshotId", version, "text", text, "truncated", truncated, "url", page.url(), "documentId", documentID)
 	if len(s.warnings) > 0 {
 		result.Set("warnings", s.warnings)
 	}

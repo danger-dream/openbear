@@ -408,6 +408,44 @@ def test_tls_pins_are_required_only_when_applying():
     assert errors(d, facts(tls=TLS), applying=True) == set()
 
 
+def test_tcp_jumbo_is_a_switch_sent_to_nodes_only_when_on():
+    d = sample()
+    assert 'tcpJumbo' not in build(d, facts(), 'net-1', 7)['m1']['network']
+    on = model.clean_doc({'settings': {'tcpJumbo': True}}, d)
+    assert on['settings']['tcpJumbo'] is True and on['settings']['mtu'] == d['settings']['mtu']
+    assert all(c['network']['tcpJumbo'] is True and c['network']['mtu'] == 1400 for c in build(on, facts(), 'net-1', 7).values())
+    # Leaving it out keeps it; off is stored as absent, as before the setting existed.
+    assert model.clean_doc({'settings': {'mtu': 1380}}, on)['settings']['tcpJumbo'] is True
+    off = model.clean_doc({'settings': {'tcpJumbo': False}}, on)
+    assert 'tcpJumbo' not in off['settings'] and off['settings'] == d['settings']
+    with pytest.raises(model.MeshInvalid) as raised:
+        model.clean_doc({'settings': {'tcpJumbo': 'yes'}}, d)
+    assert [(e['path'], e['error']) for e in raised.value.errors] == [('settings.tcpJumbo', 'invalid_tcp_jumbo')]
+    # The small packets' MTU keeps its limit.
+    with pytest.raises(model.MeshInvalid):
+        model.clean_doc({'settings': {'tcpJumbo': True, 'mtu': 9000}}, d)
+
+
+def test_gateway_snat_is_sent_to_the_gateway_only_when_on():
+    d = sample()
+    sent = lambda gateway: {'members': [{'serverId': m['serverId'], **({'gateway': gateway} if m['serverId'] == 'gw' else {})} for m in d['members']]}
+    on = model.allocate(model.clean_doc(sent({'subnets': ['192.168.1.0/24'], 'masquerade': True, 'snat': True}), d))
+    assert build(on, facts(), 'net-1', 7)['gw']['self']['gateway'] == {'subnets': ['192.168.1.0/24'], 'masquerade': True, 'snat': True}
+    # A node from before it would leave it out: kept in the draft, refused at apply.
+    f = facts()
+    f['gw']['features'] = frozenset({'mesh'})
+    assert ('members[3].gateway.snat', 'gateway_snat_needs_update') in errors(on, f)
+    assert 'gateway_snat_needs_update' in model.APPLY_ERRORS
+    f['gw']['features'] = frozenset({'mesh', 'mesh.standby'})
+    assert not {e for _, e in errors(on, f)} & {'gateway_snat_needs_update'}
+    # Off is stored as absent, so a gateway saved before the switch existed is unchanged.
+    off = model.allocate(model.clean_doc(sent({'subnets': ['192.168.1.0/24'], 'masquerade': True, 'snat': False}), on))
+    assert off['members'] == d['members']
+    with pytest.raises(model.MeshInvalid) as raised:
+        model.clean_doc(sent({'subnets': ['192.168.1.0/24'], 'snat': 'yes'}), d)
+    assert [(e['path'], e['error']) for e in raised.value.errors] == [('members[3].gateway', 'invalid_gateway')]
+
+
 def test_shape_errors_carry_paths_and_ids_are_filled():
     d = base()
     data = {'members': [{'serverId': 'r1'}, {'serverId': 'r2'}, {'serverId': 'm1', 'entry': {'candidates': [{'relay': 'r1', 'transport': 'quic'}]}},
@@ -487,6 +525,15 @@ def test_end_to_end_and_signature_status_is_cleaned():
     assert old['e2e'] is None and old['security'] is None and old['counters']['droppedPlain'] == 0
 
 
+def test_path_mtu_and_too_big_drops_are_kept():
+    status = mesh_status.clean_status({'counters': {'droppedTooBig': 4},
+                                       'peers': [{'id': 'r1', 'kind': 'entry', 'pathMtu': 9000}, {'id': 'r2', 'kind': 'entry'},
+                                                 {'id': 'r3', 'kind': 'entry', 'pathMtu': 'x'}]})
+    assert status['counters']['droppedTooBig'] == 4
+    assert [p.get('pathMtu') for p in status['peers']] == [9000, None, None]
+    assert mesh_status.clean_status(status) == status
+
+
 def test_a_dialed_paths_redial_state_is_kept():
     redial = {'baselineMs': 74.04, 'level': 2, 'redials': 3, 'lastAt': 1793205000000, 'nextAt': 1793206200000, 'degradedMinutes': 1, 'extra': 'x'}
     status = mesh_status.clean_status({
@@ -505,6 +552,16 @@ def test_memory_level_against_the_role_limit(role, rss, level):
     memory = mesh_status.summary(mesh_status.clean_status({'resources': {'rssBytes': rss}}), role)['memory']
     assert memory == {'rssBytes': rss, 'limitBytes': (256 if role == 'relay' else 160) * 1024 ** 2, 'level': level}
     assert mesh_status.summary(None, role)['memory']['level'] == ''
+
+
+def test_memory_level_against_the_reported_limit():
+    """A node reports the limit its machine's memory gives; the summary and the alert use it."""
+    status = mesh_status.clean_status({'resources': {'rssBytes': 300 * 1024 ** 2, 'limitBytes': 512 * 1024 ** 2}})
+    assert mesh_status.summary(status, 'member')['memory'] == {'rssBytes': 300 * 1024 ** 2, 'limitBytes': 512 * 1024 ** 2, 'level': ''}
+    status['resources']['rssBytes'] = 420 * 1024 ** 2
+    assert mesh_status.summary(status, 'member')['memory']['level'] == 'near'
+    assert mesh_status.memory_limit(status, 'member') == 512 * 1024 ** 2
+    assert mesh_status.memory_limit({'resources': {'rssBytes': 1}}, 'relay') == 256 * 1024 ** 2
 
 
 # ----- punched UDP direct links -----
@@ -693,6 +750,27 @@ def test_site_relay_checks(change, expected):
     assert errors(d, facts(ipv4=SITE_IPV4)) == expected
 
 
+def test_an_entry_by_a_site_relay_on_the_members_lan_needs_no_public_relay():
+    """m1 on TOY's network enters by TOY alone, at its LAN address: no public relay to signal through."""
+    d = site_doc()
+    d['members'][4]['entry'].update(candidates=[{'id': 'c1', 'relay': 'r3', 'transport': 'udp'}])
+    f = facts(ipv4=SITE_IPV4)
+    assert errors(d, f) == {('members[4].entry.candidates', 'mesh_entry_needs_bootstrap')}
+    f['r3']['localAddresses'], f['m1']['localAddresses'] = ['10.20.20.7/24'], ['10.20.20.9/24']
+    assert errors(d, f) == set()
+    assert build(d, f, 'net', 1)['m1']['entry']['candidates'] == [{'id': 'c1', 'relay': 'r3', 'punch': True, 'endpoint': 'udp://10.20.20.7:51999'}]
+    # A public relay may still be added as another way in.
+    d['members'][4]['entry']['candidates'].append({'id': 'c2', 'relay': 'r1', 'transport': 'tcp'})
+    assert errors(d, f) == set()
+    # A site relay elsewhere is punched through the one on the LAN once that is up.
+    d['members'][4]['entry'].update(candidates=[{'id': 'c1', 'relay': 'gw', 'transport': 'udp'}, {'id': 'c2', 'relay': 'r3', 'transport': 'udp'}])
+    assert errors(d, f) == set()
+    # Off that network, or on a container bridge alone, a public relay is needed again.
+    for mine in (['192.168.56.1/24'], ['172.17.0.1/16']):
+        f['m1']['localAddresses'] = mine
+        assert errors(d, f) == {('members[4].entry.candidates', 'mesh_entry_needs_bootstrap')}
+
+
 def test_punching_between_two_symmetric_nats_is_only_a_warning():
     d = site_doc()
     d['directLinks'] = [{'a': 'm1', 'b': 'm2', 'transport': 'udp', 'dialer': 'a'}]
@@ -740,7 +818,7 @@ def test_same_nat_by_public_ip_or_overlapping_private_networks():
     # Seen at one public IP by their reachability checks (any verdict), whatever their networks.
     f['m1']['natIp'], f['m2']['natIp'] = '192.0.2.117', '192.0.2.117'
     assert model.same_nat('m1', 'm2', f) and model.same_nat('m2', 'm1', f)
-    f['m2']['natIp'] = '42.243.99.118'
+    f['m2']['natIp'] = '192.0.2.118'
     assert not model.same_nat('m1', 'm2', f)
     f['m1']['natIp'] = f['m2']['natIp'] = ''
     assert not model.same_nat('m1', 'm2', f)
@@ -942,6 +1020,58 @@ def test_alerts_for_failing_standby_candidates_and_a_rewritten_exit():
     assert exit_watch.observe(now + 5000, 'm1', 'Mac', 'member', True, split, []) == []
     late = now + mesh_status.ALERT_COOLDOWN_MS
     assert [k.split(':')[0] for k, _, _ in exit_watch.observe(late, 'm1', 'Mac', 'member', True, split, [])] == ['mesh_exit_inconsistent']
+    # A member that punches nothing: its exit seen differently changes nothing, and is not alerted.
+    quiet_watch = mesh_status.Watch()
+    for minute in range(3):
+        assert quiet_watch.observe(now + minute * 60_000, 'm1', 'Mac', 'member', True, split, [], punches=False) == []
+
+
+def test_a_members_connection_seen_from_another_machines_address_is_a_detour():
+    peer = lambda sid, addr, active=True: {'id': sid, 'kind': 'member', 'active': active, 'transport': 'tcp', 'endpoint': addr, 'remoteAddr': addr}
+    facts = {
+        # A VPS with its own public network whose proxy exits at a NAT'd member's address (Town via Hinet).
+        'town': {'name': 'Town', 'localPrefixes': ['45.32.101.0/24', '198.18.0.0/30'], 'ipv4': '45.32.102.252'},
+        'hinet': {'name': 'Hinet', 'localPrefixes': ['192.168.13.0/24'], 'ipv4': '45.32.102.252'},
+        # Behind one NAT with their router (a relay): seen at its address, as they should be.
+        'kwrt': {'name': 'Kwrt', 'localPrefixes': ['10.20.20.0/24'], 'ipv4': '45.32.103.244'},
+        'mac': {'name': 'Mac', 'localPrefixes': ['10.20.20.0/24'], 'ipv4': '45.32.103.244'},
+        # A desktop at home whose proxy exits at a public relay's own address.
+        'pc': {'name': 'PC', 'localPrefixes': ['192.168.1.0/24'], 'ipv4': '45.32.104.79'},
+        'sg': {'name': 'SG', 'localPrefixes': ['45.32.104.0/24'], 'ipv4': '45.32.104.79'},
+        'hk': {'name': 'HK', 'localPrefixes': ['10.0.10.0/24'], 'ipv4': '45.32.105.38'},
+        'ovh': {'name': 'OVH', 'localPrefixes': ['45.32.106.0/24'], 'ipv4': '45.32.106.25'},
+    }
+    statuses = {'hk': {'peers': [peer('town', '45.32.102.252:45972'), peer('ovh', '45.32.106.25:51999')]},
+                'tw': {'peers': [peer('hinet', '45.32.102.252:51999')]},
+                'kwrt': {'peers': [peer('mac', '10.20.20.1:57394')]},
+                'jp': {'peers': [peer('mac', '45.32.103.244:41000'), peer('pc', '45.32.104.79:52011'), peer('gone', '9.9.9.9:1', active=False)]}}
+    same_lan = lambda a, b: model.same_lan(a, b, facts)
+    found = mesh_status.detours(statuses, facts, {'kwrt', 'sg', 'hk'}, same_lan)
+    # Hinet is seen at its own exit, which Town's proxy uses too: only Town goes round, and through Hinet.
+    assert found == {'town': {'relay': 'hk', 'seen': '45.32.102.252', 'via': 'hinet'}, 'pc': {'relay': 'jp', 'seen': '45.32.104.79', 'via': 'sg'}}
+    names = lambda sid: facts.get(sid, {}).get('name') or sid.upper()
+    alert = mesh_status.detour_alert(found['town'], names)
+    assert alert['code'] == 'mesh_detour'
+    assert alert['message'].startswith('组网连接在绕路：HK 看到它从 45.32.102.252（Hinet 的地址）连过来')
+    # Nobody else seen there: still a detour for a machine with its own public network, through no one named.
+    alone = mesh_status.detours({'hk': statuses['hk']}, {k: v for k, v in facts.items() if k != 'hinet'}, {'hk'}, same_lan)
+    assert alone == {'town': {'relay': 'hk', 'seen': '45.32.102.252', 'via': ''}}
+    assert '看到它从 45.32.102.252连过来' in mesh_status.detour_alert(alone['town'], names)['message']
+
+
+def test_only_hole_punching_needs_a_nodes_own_public_address():
+    entry = lambda *cands: {'links': [], 'entry': {'candidates': list(cands)}}
+    # Dialled entries and links: no.
+    assert not mesh_status.needs_public_addr({'links': [{'peer': 'r1', 'kind': 'relay', 'dial': True, 'endpoint': 'tcp://45.32.100.1:52000'}],
+                                             'entry': None})
+    assert not mesh_status.needs_public_addr(entry({'id': 'c1', 'relay': 'r1', 'endpoint': 'tcp://45.32.100.244:52000'}))
+    # A site relay on the member's LAN, punched at its LAN address: no; anywhere else: yes.
+    assert not mesh_status.needs_public_addr(entry({'id': 'c1', 'relay': 'kwrt', 'punch': True, 'endpoint': 'udp://192.168.10.1:51998'}))
+    assert mesh_status.needs_public_addr(entry({'id': 'c1', 'relay': 'kwrt', 'punch': True, 'endpoint': 'udp://45.32.100.117:51998'}))
+    assert mesh_status.needs_public_addr(entry({'id': 'c1', 'relay': 'kwrt', 'punch': True}))
+    # A punched direct or relay link: yes. No config yet: it may.
+    assert mesh_status.needs_public_addr({'links': [{'peer': 'm2', 'kind': 'direct', 'dial': True, 'punch': True}], 'entry': None})
+    assert mesh_status.needs_public_addr(None)
 
 
 # ----- the path between two nodes -----

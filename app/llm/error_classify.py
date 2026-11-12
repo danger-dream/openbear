@@ -70,11 +70,19 @@ _CLASSIFICATION_ALIASES = {
     "monthly_spending_limit_reached": BILLING,
     "credit_exhausted": BILLING,
     "credits_exhausted": BILLING,
+    "balance_exhausted": BILLING,
     "permission": AUTH_PERMANENT,
     "forbidden": AUTH_PERMANENT,
     "invalid_request": FORMAT,
     "invalid_request_error": FORMAT,
     "upstream": SERVER_ERROR,
+    # Gemini sampling/stream-truncation failures (finishReason): the same request may succeed.
+    "gemini_malformed_function_call": SERVER_ERROR,
+    "gemini_unexpected_tool_call": SERVER_ERROR,
+    "gemini_malformed_response": SERVER_ERROR,
+    "upstream_stream_incomplete": SERVER_ERROR,
+    "malformed_function_call": SERVER_ERROR,
+    "unexpected_tool_call": SERVER_ERROR,
 }
 _CLIENT_REQUEST_RETRY_SCOPES = frozenset({
     "client", "request", "client_request", "client/request", "whole_request",
@@ -236,9 +244,31 @@ def _is_model_not_found_text(low: str) -> bool:
     )
 
 
+def _is_gemini_sampling_failure_text(low: str) -> bool:
+    return (
+        "malformed_function_call" in low
+        or "unexpected_tool_call" in low
+        or "gemini_malformed_response" in low
+        or "upstream_stream_incomplete" in low
+        or "ended without finishreason" in low
+    )
+
+
+def is_gemini_sampling_failure(message: str | None, code: str | None = "") -> bool:
+    """Gemini ended this sample abnormally; the request itself was valid."""
+    return _is_gemini_sampling_failure_text(f"{code or ''} {message or ''}".lower())
+
+
+def is_malformed_tool_call(message: str | None, code: str | None = "") -> bool:
+    """Gemini rejected its own emitted tool call (MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL)."""
+    low = f"{code or ''} {message or ''}".lower()
+    return "malformed_function_call" in low or "unexpected_tool_call" in low
+
+
 def _is_server_error_text(low: str) -> bool:
     return (
-        "internal server error" in low
+        _is_gemini_sampling_failure_text(low)
+        or "internal server error" in low
         or "internal_error" in low
         or "server_error" in low
         or "service unavailable" in low
@@ -294,6 +324,8 @@ def classify_error(message: str | None, status: int = 0) -> str:
                 return RATE_LIMIT
             if _is_billing_text(low):
                 return BILLING
+            if _is_gemini_sampling_failure_text(low):
+                return SERVER_ERROR
             return FORMAT
         if status >= 500:
             # Gateways may keep their transport 5xx while embedding the actionable

@@ -52,7 +52,11 @@ _RESOURCE_EXTENSIONS = (
     "js|mjs|css|wasm|json|ttf|otf|eot|woff|woff2|svg|png|jpe?g|gif|webp|ico|map"
 )
 _QUOTED_RESOURCE_RE = re.compile(
-    rf"(?P<quote>['\"])(?P<ref>(?:/assets/|\./|\.\./)[^'\"\\\s]+\.(?:{_RESOURCE_EXTENSIONS})(?:[?#][^'\"\\\s]*)?)(?P=quote)",
+    rf"(?P<quote>['\"])(?P<ref>(?:/assets/|\./|\.\./)[^'\"\\\s]+\.(?:{_RESOURCE_EXTENSIONS})(?:[?#][^'\"\\\s]*)?)(?P=quote)(?!\s*:)",
+    re.I,
+)
+_NEW_URL_RESOURCE_RE = re.compile(
+    rf"new\s+URL\(\s*(?P<quote>['\"])(?P<ref>[^'\"\\\s]+\.(?:{_RESOURCE_EXTENSIONS})(?:[?#][^'\"\\\s]*)?)(?P=quote)\s*,\s*import\.meta\.url\s*\)",
     re.I,
 )
 _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^)'\"\s]+)\1\s*\)", re.I)
@@ -263,6 +267,9 @@ def _text_resource_references(path: Path, text: str) -> Iterable[str]:
     if suffix in {".js", ".mjs", ".css"}:
         for match in _QUOTED_RESOURCE_RE.finditer(text):
             yield match.group("ref")
+    if suffix in {".js", ".mjs"}:
+        for match in _NEW_URL_RESOURCE_RE.finditer(text):
+            yield match.group("ref")
 
 
 def _validate_pwa_png(path: Path, size: int) -> None:
@@ -392,6 +399,13 @@ def validate_frontend_resources(dist: Path) -> dict[str, Any]:
         checked.add(rel)
         if not candidate.is_file():
             missing.add(rel)
+        elif candidate.suffix.lower() == ".wasm":
+            try:
+                head = candidate.open("rb").read(8)
+            except OSError as exc:
+                raise ReleaseValidationError(f"无法读取前端资源 {candidate}: {exc}") from exc
+            if head != b"\x00asm\x01\x00\x00\x00":
+                raise ReleaseValidationError(f"前端 Wasm 资源无效: {rel}")
 
     for ref in direct:
         check(index, ref)

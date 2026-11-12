@@ -20,7 +20,8 @@ async function call(method, path, body, timeout = 30000) {
 }
 
 export const MeshApi = {
-  state: () => call('GET', ''),
+  // fresh: the nodes are asked for their interfaces and routes first (the page coming on screen); polls go by what they reported last.
+  state: (fresh = false) => call('GET', fresh ? '?fresh=1' : ''),
   saveDraft: draft => call('PUT', '/draft', draft),
   // Installs run while the request is open; progress also shows in state().nodes.
   addMembers: serverIds => call('POST', '/members', {serverIds}, 300000),
@@ -29,7 +30,12 @@ export const MeshApi = {
   reinstall: id => call('POST', `/members/${encodeURIComponent(id)}/reinstall`, undefined, 300000),
   apply: () => call('POST', '/apply', {}, 60000),
   discard: () => call('POST', '/discard', {}),
-  rollback: () => call('POST', '/rollback', {}, 60000),
+  // Without a revision, the previous one; with one, that kept revision, applied as a new one.
+  rollback: (revision = null) => call('POST', '/rollback', revision == null ? {} : {revision}, 60000),
+  // The kept revisions, newest first: {revisions: [{revision, at, reason, status, current, changes}]}.
+  revisions: () => call('GET', '/revisions'),
+  // A server about to join measures every relay: {results: [{relay, rttMs, loss, udp, tcp, tls}]}, each ok|timeout|refused|closed|punch|unknown.
+  probe: serverId => call('POST', '/probe', {serverId}, 40000),
   member: id => call('GET', `/members/${encodeURIComponent(id)}`),
   // Where nodes sit on the board; not part of the draft. null removes a position.
   saveLayout: positions => call('PUT', '/layout', {positions}),
@@ -38,6 +44,10 @@ export const MeshApi = {
   lineTrend: (lineId, range) => call('GET', `/lines/${encodeURIComponent(lineId)}/trend?range=${encodeURIComponent(range)}`),
   // The current path from one node to another, from what the nodes last reported: {hops: [{node, via}], rttMs, stale}.
   path: (src, dst) => call('GET', `/path?src=${encodeURIComponent(src)}&dst=${encodeURIComponent(dst)}`),
+  // The k best paths by the latest reports and the pair's own routes in the draft: {routes: [{nodes, segments, rttMs, own}], own: [{id, rank, on, nodes, segments, rttMs, place}]}.
+  pathOptions: (src, dst, k = 10) => call('GET', `/path/options?src=${encodeURIComponent(src)}&dst=${encodeURIComponent(dst)}&k=${k}`),
+  // A route laid out in the editor, link by link: reported, or measured now from one end: {segments: [{a, b, exists, rttMs, loss, how, why?}], rttMs}.
+  measure: nodes => call('POST', '/path/measure', {nodes}, 40000),
   // Every route from one node: {routes: [{dst, hops, rttMs, stale}], subnets: [{subnet, gateway, hops, rttMs, stale}]}.
   routes: src => call('GET', `/routes?src=${encodeURIComponent(src)}`),
 };

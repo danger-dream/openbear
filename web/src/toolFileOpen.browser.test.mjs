@@ -5,7 +5,7 @@ import {startBrowserTestServer} from './browserTestServer.mjs';
 import {createToolFileBackend, uuid} from './toolFileOpenFixture.mjs';
 const require=createRequire(import.meta.url);
 let chromium;
-try {({chromium}=require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core'));} catch {}
+try {({chromium}=require('./testing/playwright.cjs'));} catch {}
 const shots=process.env.OPENBEAR_SCREENSHOT_DIR || '';
 // Let open/close transitions settle so a screenshot shows the final state.
 const capture=async(page,path)=>{if(!shots)return;await page.waitForTimeout(500);await page.screenshot({path:`${shots}/${path}`});};

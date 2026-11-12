@@ -12,14 +12,34 @@ import (
 	"time"
 )
 
-type policyBackend struct{ commits, releases, deactivates, warms int }
+type policyBackend struct {
+	commits, releases, deactivates, warms int
+	active                                map[string]Path // what Commit chose, by peer
+}
 
 func (b *policyBackend) Prepare(context.Context, Candidate) (Path, error) {
 	return Path{}, errors.New("unreachable")
 }
-func (b *policyBackend) Send(string, Path, uint64, []byte) error         { return nil }
-func (b *policyBackend) Commit(string, Path) error                       { b.commits++; return nil }
-func (b *policyBackend) Deactivate(string, Path) error                   { b.deactivates++; return nil }
+func (b *policyBackend) Send(string, Path, uint64, []byte) error { return nil }
+func (b *policyBackend) Commit(peer string, path Path) error {
+	b.commits++
+	if b.active == nil {
+		b.active = map[string]Path{}
+	}
+	b.active[peer] = path
+	return nil
+}
+func (b *policyBackend) Deactivate(peer string, path Path) error {
+	b.deactivates++
+	if b.active[peer] == path {
+		delete(b.active, peer)
+	}
+	return nil
+}
+func (b *policyBackend) Committed(peer string, path Path) bool {
+	p, ok := b.active[peer]
+	return ok && p == path
+}
 func (b *policyBackend) Release(Path) error                              { b.releases++; return nil }
 func (b *policyBackend) Remove(string) error                             { return nil }
 func (b *policyBackend) Handshake(string, Path) error                    { return nil }
@@ -261,6 +281,23 @@ func TestRoutineRefreshIsNotPendingPropagation(t *testing.T) {
 	m.broadcast(n, "")
 	if got := m.pendingNotices(time.Now()); got != 1 {
 		t.Fatalf("a refresh of a claim never answered hides it: %d", got)
+	}
+	if !m.notices["R2:x"].expires.Equal(o.expires) {
+		t.Fatalf("refresh extended unanswered notice expiry from %v to %v", o.expires, m.notices["R2:x"].expires)
+	}
+
+	// On a relay, a down neighbor link neither receives broadcasts nor holds
+	// pending notices when it goes down.
+	m.cfg.Role = "relay"
+	m.cfg.Links = []Link{{Peer: "R2", Dial: true}}
+	m.links["R2"] = &candidateState{config: Candidate{ID: "link:R2", Peer: "R2"}, preparing: true, track: newTracker(m.cfg.Parameters, time.Now())}
+	m.tick(time.Now())
+	if len(m.notices) != 0 || m.pendingNotices(time.Now().Add(noticeGrace)) != 0 {
+		t.Fatalf("down relay link kept pending notices: %+v", m.notices)
+	}
+	m.broadcast(n, "")
+	if len(m.notices) != 0 {
+		t.Fatalf("broadcast queued notice for down relay link: %+v", m.notices)
 	}
 }
 

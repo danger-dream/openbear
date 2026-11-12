@@ -112,9 +112,13 @@ class RuntimeBridge:
             if len(self.active-self.waiting_assignments)>=self.s.config.concurrency.auto_model_runs: return
             if a['assignment_id'] not in self.active: await self.resume_unstarted(a)
         batches=await many(self.s.db.conn,"SELECT * FROM webhook_batches WHERE state='sealed' ORDER BY sealed_at_ms,batch_id")
+        blocked={}
         for b in batches:
             if len(self.active-self.waiting_assignments)>=self.s.config.concurrency.auto_model_runs: break
-            await self.dispatch_batch(b)
+            # An endpoint's own blockers hold all its batches: look them up once a round.
+            if b['endpoint_id'] not in blocked:
+                blocked[b['endpoint_id']]=bool(self.s.blockers(await self.s.endpoint_row(self.s.db.conn,b['endpoint_id'],deleted=True),model=True))
+            if not blocked[b['endpoint_id']]: await self.dispatch_batch(b)
 
     async def dispatch_batch(self,b):
         s=self.s; h=self.host
@@ -150,7 +154,8 @@ class RuntimeBridge:
                     if not folder: return
                     effective=await s.target_run_defaults(e['owner_chat_id'],e['binding_uuid'],c)
                     conv_id=str(uuid.uuid5(uuid.NAMESPACE_URL,'openbear:webhook:batch:'+b['batch_id']))
-                    row=await h._create_web_conversation(e['owner_chat_id'],conversation_uuid=conv_id,title=conversation_title(json.loads(revision_row['config_json']).get('name'),valid[0]['received_at_ms'],b['batch_id']),folder_uuid=e['binding_uuid'],run_config=h._web_defaults_storage(effective),create_lock_held=True,origin_kind='webhook',origin_ref=aid)
+                    row=await h._create_web_conversation(e['owner_chat_id'],conversation_uuid=conv_id,title=conversation_title(json.loads(revision_row['config_json']).get('name'),valid[0]['received_at_ms'],b['batch_id']),folder_uuid=e['binding_uuid'],run_config=h._web_defaults_storage(effective),create_lock_held=True,origin_kind='webhook',origin_ref=aid,
+                        extensions=await h._extensions_for_unattended(e['owner_chat_id'],e['binding_uuid'],c.processing.extensions))
                 root=uid(); cursor=(await one(conn,'SELECT COALESCE(MAX(receive_seq),0) n FROM webhook_events'))['n']
                 await insert(conn,'webhook_assignments',assignment_id=aid,origin_kind='webhook',conversation_uuid=row['conversation_uuid'],internal_chat_id=row['internal_chat_id'],root_turn_uuid=root,
                              initial_batch_id=b['batch_id'],origin_endpoint_id=b['endpoint_id'],origin_revision=b['revision'],task_start_cursor=cursor,authorization_snapshot_json=dumps({'instructions':c.processing.instructions,'owner':e['owner_chat_id'],'endpointId':b['endpoint_id']}),created_at_ms=s.clock())

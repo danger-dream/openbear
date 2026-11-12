@@ -4,21 +4,23 @@
 // testing/netBrowser.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
+import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, showTab, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
 
 test('server network layout: addresses on the detail page, the test form', {skip: !chromium, timeout: 300000}, async t => {
   const {setup} = await startNetBrowser(t);
   await t.test('addresses on the detail page: grouped by interface, tags, the exit behind NAT, copy, refresh; offline and too old', {timeout: 90000}, async t => {
     const h = await setup(t);
+    await showTab(h.page, '网络');
     const box = addresses(h.page);
     await box.locator('.net-iface').first().waitFor();
     const groups = await box.locator('.net-iface').evaluateAll(list => list.map(el => el.innerText.replace(/\s+/g, ' ').trim()));
     // Traffic abroad leaves from a proxy: that exit too, said so.
-    // Addresses come after the system and the bill; the test card after the server's other cards, across the page.
-    const order = await h.page.locator('.sv-detail:visible').locator('.sv-cards > section, section.net-probe').evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
-    const grid = await h.page.locator('.sv-detail:visible .sv-cards').first().boundingBox();
+    // On 工具 the test card spans the width of the cards under it.
+    await showTab(h.page, '工具');
+    const grid = await h.page.locator('.sv-detail:visible [data-panel=tools] .sv-cards').boundingBox();
     const card = await probe(h.page).boundingBox();
     assert.ok(Math.abs(card.width - grid.width) < 2, 'the test card spans the grid');
+    await showTab(h.page, '网络');
     // A tap copies the address (without its prefix length) and says so.
     await box.getByRole('button', {name: /10\.10\.10\.251\/24/}).click();
     await h.page.locator('.el-message', {hasText: '已复制 10.10.10.251'}).waitFor();
@@ -30,10 +32,12 @@ test('server network layout: addresses on the detail page, the test form', {skip
 
     // Too old a node, and an offline one (not even asked).
     const old = await setup(t, {tabs: ['old', 'win'], active: 'old'});
+    await showTab(old.page, '网络');
     await addresses(old.page).getByText('节点版本过旧，升级节点后可用').waitFor();
     await old.page.locator('.sv-tab', {hasText: 'Win-Box'}).click();
     const win = old.page.locator('.sv-detail').nth(1);
     await win.locator('section.net-addresses').getByText('节点离线').waitFor();
+    await showTab(old.page, '工具');
     await win.locator('section.net-probe').getByText('节点离线，上线后才能测试。').waitFor();
     // Starting a test on a node too old for it.
     await old.page.locator('.sv-tab', {hasText: 'Old-VPS'}).click();
@@ -45,6 +49,7 @@ test('server network layout: addresses on the detail page, the test form', {skip
 
   await t.test('the form: TCPing needs a port, targets checked, ranges per mode, the controller naming a field, busy', {timeout: 90000}, async t => {
     const h = await setup(t);
+    await showTab(h.page, '工具');
     const root = probe(h.page);
     await root.locator('.net-form').waitFor();
     // Defaults: Ping. The detail page is wide: mode, target and start on one line, the options out under it, nothing to unfold.

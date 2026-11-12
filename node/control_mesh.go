@@ -272,6 +272,17 @@ func (a *Agent) sessionDown(ch *channel) {
 	}
 }
 
+// lifetime is Run's context, for what goes on between sessions; a session's own where Run is not
+// in use (tests calling handlers directly).
+func (a *Agent) lifetime(session context.Context) context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.life != nil {
+		return a.life
+	}
+	return session
+}
+
 // currentChannel is the channel of the session up now, if any.
 func (a *Agent) currentChannel() *channel {
 	a.mu.Lock()

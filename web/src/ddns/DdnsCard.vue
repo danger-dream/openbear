@@ -1,4 +1,6 @@
 <script setup>
+import { Link } from '@element-plus/icons-vue';
+import CardIcon from '../servers/detail/CardIcon.vue';
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ChevronRight } from '@lucide/vue';
 import { DdnsApi } from './ddnsApi.js';
@@ -32,7 +34,7 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); });
 </script>
 <template>
   <section v-if="data && (list.length || isNode)" :class="panel ? 'dd-card dd-card-panel' : 'ix-card dd-card'" aria-label="动态域名">
-    <header :class="panel ? 'dd-panel-head' : 'ix-card-head'"><component :is="panel ? 'h4' : 'h3'">动态域名</component><span class="ob-grow" />
+    <header :class="panel ? 'dd-panel-head' : 'ix-card-head'"><component :is="panel ? 'h4' : 'h3'"><CardIcon v-if="!panel" :icon="Link" tone="orange" />动态域名</component><span class="ob-grow" />
       <button v-if="list.length" type="button" class="ix-text-button" @click="open({})">全部查看</button>
       <button v-else type="button" class="ix-text-button" @click="open({add: true})">添加解析</button>
     </header>

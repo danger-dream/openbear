@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -14,9 +15,18 @@ import time
 from pathlib import Path
 
 from app.instances.contracts import InstanceError
+from app.webhooks.repository import many
 
 CHUNK = 1024 * 1024
 TERMINAL = {'done', 'failed', 'cancelled', 'unknown'}
+# Transfers moving at once; a batch's others wait their turn, a single start beyond it is refused.
+RUNNING_MAX = 8
+WAITING_MAX = 200
+WAIT_MAX = 300
+# Ended receipts are answered for a day, a controller restart included.
+RECEIPT_MS = 86400000
+# In-memory working state, never stored with a receipt.
+LIVE_KEYS = {'task', 'cancel', 'waiting'}
 DIGEST = re.compile(r'^[0-9a-f]{64}$')
 
 
@@ -50,7 +60,9 @@ class Transfers:
         self.service = service
         self.jobs = {}
 
-    async def start(self, owner, server_id, direction, params):
+    async def start(self, owner, server_id, direction, params, *, origin=None, batch='', queue=False):
+        """origin: the conversation that asked, kept in the receipt. queue: past RUNNING_MAX wait for
+        a free place (state queued, waitingForSlot) instead of refusing too_many_transfers."""
         local = local_path(params.get('localPath'))
         remote = params.get('remotePath')
         if not isinstance(remote, str) or '\0' in remote or not (remote.startswith('/') or re.match(r'^[A-Za-z]:[\\/]', remote)):
@@ -85,22 +97,54 @@ class Transfers:
             total = None
         # Keep active work; only completed receipts age out.
         for key, job in list(self.jobs.items()):
-            if job['state'] in TERMINAL and now_ms() - job['endedAtMs'] > 86400000:
+            if job['state'] in TERMINAL and now_ms() - job['endedAtMs'] > RECEIPT_MS:
                 del self.jobs[key]
-        if sum(j['state'] not in TERMINAL for j in self.jobs.values()) >= 8:
+        with contextlib.suppress(Exception):
+            async with self.service.db.write_transaction(label='server-transfers-expire') as conn:
+                await conn.execute('DELETE FROM server_transfers WHERE ended_ms IS NOT NULL AND ended_ms<?', (now_ms() - RECEIPT_MS,))
+        unfinished = sum(j['state'] not in TERMINAL for j in self.jobs.values())
+        if unfinished >= (RUNNING_MAX + WAITING_MAX if queue else RUNNING_MAX):
             raise InstanceError('too_many_transfers', 409)
         key = secrets.token_hex(12)
         job = {'id': key, 'owner': owner, 'serverId': server_id, 'direction': direction,
                'localPath': str(local), 'remotePath': remote, 'overwrite': params.get('overwrite', False),
                'mkdirs': params.get('mkdirs', False), 'mode': mode, 'state': 'queued', 'bytes': 0, 'total': total,
                'sha256': '', 'verified': False, 'error': '', 'cleanupPending': False,
-               'createdAtMs': now_ms(), 'endedAtMs': None, 'cancel': False}
+               'createdAtMs': now_ms(), 'endedAtMs': None, 'cancel': False, 'origin': origin,
+               'waiting': unfinished >= RUNNING_MAX, **({'batchId': batch} if batch else {})}
         self.jobs[key] = job
+        await self.save(job)
         job['task'] = self.service.spawn(self.run(job))
         return {'ok': True, 'transfer': self.view(job)}
 
+    async def save(self, job):
+        receipt = {k: v for k, v in job.items() if k not in LIVE_KEYS}
+        with contextlib.suppress(Exception):
+            async with self.service.db.write_transaction(label='server-transfer') as conn:
+                await conn.execute('INSERT OR REPLACE INTO server_transfers(id,owner,server_id,state,created_ms,ended_ms,receipt_json) VALUES(?,?,?,?,?,?,?)',
+                                   (job['id'], job['owner'], job['serverId'], job['state'], job['createdAtMs'], job['endedAtMs'],
+                                    json.dumps(receipt, ensure_ascii=False)))
+
+    async def load(self):
+        """Bring back the last day's receipts. A transfer cut off by the restart is not resumed: whether its
+        commit happened is not known, so it reads unknown and its destination needs checking before a retry."""
+        rows = await many(self.service.db.conn, 'SELECT receipt_json FROM server_transfers WHERE ended_ms IS NULL OR ended_ms>=? ORDER BY created_ms',
+                          (now_ms() - RECEIPT_MS,))
+        for row in rows:
+            try:
+                job = json.loads(row['receipt_json'])
+            except ValueError:
+                continue
+            job.update(task=None, cancel=False, waiting=False)
+            if job['state'] not in TERMINAL:
+                job.update(state='unknown', error='controller_restarted', endedAtMs=now_ms())
+                await self.save(job)
+            self.jobs.setdefault(job['id'], job)
+
     def view(self, job):
-        result = {k: v for k, v in job.items() if k not in {'owner', 'task', 'cancel', 'mkdirs', 'mode'}}
+        result = {k: v for k, v in job.items() if k not in {'owner', 'task', 'cancel', 'mkdirs', 'mode', 'origin', 'waiting'}}
+        if job['waiting'] and job['state'] not in TERMINAL:
+            result['waitingForSlot'] = True
         result['cancellable'] = job['state'] not in TERMINAL | {'committing', 'cancelling'}
         result['effectState'] = 'unknown' if job['state'] == 'unknown' else 'observed' if job['state'] == 'done' else 'pending' if job['state'] not in TERMINAL else 'not_committed'
         if job['direction'] == 'download' and job['state'] == 'done':
@@ -121,11 +165,17 @@ class Transfers:
 
     async def status(self, owner, server_id, key, wait=0):
         job = self.get(owner, server_id, key)
-        if type(wait) is not int or not 0 <= wait <= 60:
+        if type(wait) is not int or not 0 <= wait <= WAIT_MAX:
             raise InstanceError('invalid_wait')
-        if wait and job['state'] not in TERMINAL:
-            await asyncio.wait({job['task']}, timeout=wait)
+        await self.settle([job], wait)
         return {'ok': True, 'transfer': self.view(job)}
+
+    @staticmethod
+    async def settle(jobs, wait):
+        """Wait up to wait seconds for every one of jobs to end."""
+        tasks = {j['task'] for j in jobs if j['state'] not in TERMINAL}
+        if wait and tasks:
+            await asyncio.wait(tasks, timeout=wait)
 
     async def cancel(self, owner, server_id, key):
         job = self.get(owner, server_id, key)
@@ -158,8 +208,22 @@ class Transfers:
             raise InstanceError('invalid_file_hash', 502)
         return value
 
+    def turn(self, job):
+        """Whether a waiting job may start now: a place is free and it is the oldest waiting."""
+        running = sum(j['state'] not in TERMINAL and not j['waiting'] for j in self.jobs.values())
+        first = next((j for j in self.jobs.values() if j['waiting'] and j['state'] not in TERMINAL), None)
+        return running < RUNNING_MAX and first is job
+
     async def run(self, job):
+        began = False
         try:
+            while job['waiting']:
+                self.check_cancel(job)
+                if self.turn(job):
+                    job['waiting'] = False
+                    break
+                await asyncio.sleep(0.2)
+            began = True
             self.check_cancel(job)
             if job['direction'] == 'upload':
                 await self.upload(job)
@@ -176,16 +240,17 @@ class Transfers:
             job['error'] = 'transfer_failed'
             job['state'] = 'unknown' if job['state'] == 'committing' else 'failed'
         finally:
-            if job['direction'] == 'upload' and job['state'] != 'done':
+            if job['direction'] == 'upload' and job['state'] != 'done' and began:
                 try:
                     await self.call(job, 'fs.cancel', {'path': job['remotePath'], 'upload': job['id']}, timeout=10)
                 except (Exception, asyncio.CancelledError):
                     job['cleanupPending'] = True
             job['endedAtMs'] = now_ms()
+            await self.save(job)
             with contextlib.suppress(Exception):
                 await self.service._log(job['owner'], job['serverId'], 'ai',
                                         f"文件传输 {job['direction']} {job['remotePath']}（{job['bytes']} 字节）", job['createdAtMs'],
-                                        {'exitCode': 0 if job['state'] == 'done' else 1, 'outcome': job['state']})
+                                        {'exitCode': 0 if job['state'] == 'done' else 1, 'outcome': job['state']}, job['origin'])
 
     async def upload(self, job):
         local = Path(job['localPath'])

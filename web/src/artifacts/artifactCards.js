@@ -60,6 +60,7 @@ export function prepareArtifactCards(target) {
 		const slot = target.ownerDocument.createElement("span");
 		slot.dataset.artifactImagePath = `${identity.key}:${occurrence}`;
 		slot.dataset.artifactHref = identity.contentUrl;
+		slot.dataset.artifactLabel = (image.getAttribute("alt") || "").trim();
 		image.after(slot);
 	}
 }
@@ -79,7 +80,7 @@ export function syncArtifactCards(root, appContext) {
 		const image = slot.hasAttribute("data-artifact-image-path");
 		const previous = mounted.get(slot);
 		if (previous?.href === href && previous?.label === label && previous?.image === image) continue;
-		const vnode = image ? createVNode(ArtifactImagePath, {href}) : createVNode(ArtifactCard, {href, label});
+		const vnode = image ? createVNode(ArtifactImagePath, {href, label}) : createVNode(ArtifactCard, {href, label});
 		if (appContext) vnode.appContext = appContext;
 		render(vnode, slot);
 		mounted.set(slot, {href, label, image});

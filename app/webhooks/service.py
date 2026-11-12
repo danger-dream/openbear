@@ -16,6 +16,23 @@ from app.webhooks.contracts import EndpointConfig, Scope, WebhookError, Webhooks
 from app.webhooks.repository import insert, many, one, uid
 
 
+class Wake(asyncio.Event):
+    """set() also sets each listening loop's own event, so one loop clearing its flag never
+    swallows another's wake-up."""
+    def __init__(self):
+        super().__init__(); self.listeners=set()
+
+    def set(self):
+        super().set()
+        for event in self.listeners: event.set()
+
+    def listen(self):
+        event=asyncio.Event(); self.listeners.add(event); return event
+
+    def forget(self,event):
+        self.listeners.discard(event)
+
+
 class WebhookService:
     def __init__(self, db, *, config=None, pepper: bytes, host=None, clock=None):
         if not pepper:
@@ -27,7 +44,7 @@ class WebhookService:
             info=b'openbear:webhooks:credential-encryption:v1').derive(pepper))
         self._config = config or WebhooksConfig()
         self.clock = clock or (lambda: int(time.time()*1000))
-        self.wake = asyncio.Event()
+        self.wake = Wake()
         self.worker = self.bridge = None
         self.rate_windows = {}
         self.confirmations = {}
@@ -181,8 +198,12 @@ class WebhookService:
         if not e['enabled']: reasons.append('disabled')
         if e['deleted_at_ms'] is not None: reasons.append('deleted')
         if e['paused']: reasons.append('manual')
-        if model: reasons.extend(json.loads(e['model_blockers_json']))
+        if model: reasons.extend(self.model_blockers(e))
         return reasons
+
+    def model_blockers(self,e):
+        """Model blockers in force: a retry backoff (untilMs) ends by itself."""
+        return [k for k,v in json.loads(e['model_blockers_json']).items() if not (v.get('untilMs') and v['untilMs']<=self.clock())]
 
     async def target_blockers(self,conn,e,config):
         table,key=('web_conversation_folders','folder_uuid') if e['binding_kind']=='folder' else ('web_conversations','conversation_uuid')
@@ -219,11 +240,11 @@ class WebhookService:
         pending=await one(conn,'SELECT COUNT(*) n FROM webhook_events WHERE endpoint_id=? AND (terminal_at_ms IS NULL OR review_required=1)',(eid,))
         waits=await one(conn,"SELECT COUNT(*) n FROM webhook_waits WHERE endpoint_id=? AND state IN ('registered','collecting','sealed')",(eid,))
         credential=await self.current_credential(conn,eid)
-        reasons=self.blockers(e)+await self.target_blockers(conn,e,c); model_reasons=list(json.loads(e['model_blockers_json']))
+        reasons=self.blockers(e)+await self.target_blockers(conn,e,c); model_reasons=self.model_blockers(e)
         if c.target.conversation_id and await self.conversation_stopped(conn,e['owner_chat_id'],c.target.conversation_id): model_reasons.append('conversationStopped')
         base=self.config.public_base_url or (getattr(getattr(self.host,'config',None),'web',None) and self.host.config.web.custom_url) or ''
         return dict(id=eid,scope={'type':e['binding_kind'],'id':e['binding_uuid']},name=meta.get('name',''),description=meta.get('description',''),config=c.wire(),target=c.target.wire(),
-                    enabled=bool(e['enabled']),revision=e['current_revision'],controlRevision=e['control_version'],effectiveStatus='deleted' if e['deleted_at_ms'] is not None else 'globalDisabled' if not self.config.enabled else 'disabled' if not e['enabled'] else 'paused' if reasons else 'receiving',
+                    enabled=bool(e['enabled']),revision=e['current_revision'],controlRevision=e['control_version'],effectiveStatus='deleted' if e['deleted_at_ms'] is not None else 'globalDisabled' if not self.config.enabled else 'disabled' if not e['enabled'] else 'paused' if reasons else 'needs_review' if any(r.startswith('review:') for r in model_reasons) else 'receiving',
                     pauseReasons=reasons+model_reasons,dispatchPaused=bool(reasons),modelPaused=bool(reasons or model_reasons),pendingEvents=pending['n'],activeWaits=waits['n'],url=base.rstrip('/')+'/webhook/'+eid,
                     credential={'hasCredential':bool(credential),'recoverable':bool(credential and credential['encrypted_key'] is not None),'prefix':credential['key_prefix'] if credential else None,'createdAt':iso(credential['created_at_ms']) if credential else None,'expiresAt':iso(credential['expires_at_ms']) if credential else None},
                     createdAt=iso(e['created_at_ms']),updatedAt=iso(e['updated_at_ms']))

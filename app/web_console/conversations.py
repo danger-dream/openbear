@@ -9,6 +9,7 @@ from app.conversation_titles import (
     render_naming_transcript,
     select_naming_turns,
 )
+from app.extensions import split_usage
 from app.lifecycle import wait_for_startup
 from app.llm.events import Usage
 from app.model_cost import usage_cost_usd
@@ -206,6 +207,30 @@ class WebAdminConversationsMixin:
         )
         return float((insert_at + 1) * self._DISPLAY_ORDER_STEP)
 
+    async def _extensions_for_new(self, owner_chat_id: int, folder_uuid: str) -> dict[str, Any] | None:
+        service = getattr(self, "extensions", None)
+        return await service.for_new(owner_chat_id, folder_uuid) if service is not None else None
+
+    async def _extensions_for_unattended(self, owner_chat_id: int, folder_uuid: str, declared: list[str] | None) -> dict[str, Any] | None:
+        service = getattr(self, "extensions", None)
+        return await service.for_unattended(owner_chat_id, folder_uuid, declared) if service is not None else None
+
+    async def _extensions_copy(self, conversation_uuid: str) -> dict[str, Any] | None:
+        service = getattr(self, "extensions", None)
+        return await service.copy_of(conversation_uuid) if service is not None else None
+
+    async def _conversation_request_inputs(self, conversation_uuid: str, system: str) -> tuple[str, list[dict[str, Any]]]:
+        """The system prompt and tools a model request of this conversation gets, as the controller run builds them."""
+        schemas = self.tools.schemas(scope="main") if self.tools else []
+        service = getattr(self, "extensions", None)
+        if service is None or not conversation_uuid:
+            return system, schemas
+        active_policy = getattr(self, "_active_prompt_policy", None)
+        if callable(active_policy) and (await active_policy(conversation_uuid))["overrideSystemPrompt"]:
+            return system, schemas
+        system, usage = split_usage(system)
+        return system, await service.filter_schemas(conversation_uuid, schemas, usage)
+
     async def _create_web_conversation(
         self,
         owner_chat_id: int,
@@ -221,6 +246,7 @@ class WebAdminConversationsMixin:
         create_lock_held: bool = False,
         origin_kind: str = "user",
         origin_ref: str = "",
+        extensions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         conv_uuid = conversation_uuid or str(uuid.uuid4())
         config = run_config if isinstance(run_config, dict) else {}
@@ -274,6 +300,8 @@ class WebAdminConversationsMixin:
                             "INSERT OR IGNORE INTO sessions (chat_id, created_at, updated_at) VALUES (?,?,?)",
                             (internal, ts, ts),
                         )
+                        if getattr(self, "extensions", None) is not None:
+                            await self.extensions.insert_initial(conn, conv_uuid, extensions)
                         await conn.execute(
                             """
                             UPDATE sessions
@@ -613,6 +641,7 @@ class WebAdminConversationsMixin:
             model=str(source.get("model") or ""),
             run_config={"context_strategy": str(source.get("context_strategy") or "sliding_window")},
             folder_uuid=str(source.get("folder_uuid") or ""),
+            extensions=await self._extensions_copy(old_uuid),
         )
         new_uuid = str(new_row.get("conversation_uuid") or "")
         new_internal = int(new_row.get("internal_chat_id") or 0)
@@ -1061,7 +1090,7 @@ class WebAdminConversationsMixin:
 
         # 新 Web 时间线以独立 internal_chat_id 为准，不再把 旧主会话
         # 包装成 Web 默认会话；否则清理 Web 历史后又会把旧主会话带回前端。
-        return await self._create_web_conversation(owner_chat_id)
+        return await self._create_web_conversation(owner_chat_id, extensions=await self._extensions_for_new(owner_chat_id, ""))
 
     async def _web_operation_facts_for_conversations(self, conversation_uuids: list[str]) -> dict[str, dict[str, Any]]:
         ids = [str(x or "") for x in conversation_uuids if str(x or "")]
@@ -2165,6 +2194,23 @@ class WebAdminConversationsMixin:
             claimed = {str(row["notification_uuid"] or "") for row in await cur.fetchall()}
         return token, claimed
 
+    def _hold_web_task_notification_claims(self, held: set[str]) -> object:
+        """Register claims owned by a live run of this process until it releases them.
+
+        A run acknowledges its claims only when it ends, which may be long after
+        the 900 s expiry. Expiry exists for claims whose owner is gone; a live
+        owner is never expired. A crashed process loses this registry, and
+        startup recovery resets all of its claims.
+        """
+        token = object()
+        if not hasattr(self, "_web_held_notification_claims"):
+            self._web_held_notification_claims = {}
+        self._web_held_notification_claims[token] = held
+        return token
+
+    def _release_web_task_notification_claims(self, token: object) -> None:
+        getattr(self, "_web_held_notification_claims", {}).pop(token, None)
+
     async def _pause_web_task_notifications(self, notification_uuids: set[str], error: str) -> None:
         await pause_notifications(self.db, notification_uuids, error)
 
@@ -2241,6 +2287,10 @@ class WebAdminConversationsMixin:
             else:
                 claim_where = "state='processing' AND kind!='webhook-result' AND claimed_at>0 AND claimed_at<=?"
                 claim_params = (ts, ts - 900)
+                held = sorted(set().union(*getattr(self, "_web_held_notification_claims", {}).values()))
+                if held:
+                    claim_where += f" AND notification_uuid NOT IN ({','.join('?' for _ in held)})"
+                    claim_params = (*claim_params, *held)
             await self.db.conn.execute(
                 f"UPDATE web_task_notifications SET state='pending', claim_token='', claimed_at=0, next_attempt_at=0, updated_at=? WHERE {claim_where}",
                 claim_params,

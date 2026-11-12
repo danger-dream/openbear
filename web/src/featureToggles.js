@@ -1,4 +1,5 @@
 import { reactive, readonly } from 'vue';
+import { applyNotesSettings, resetNotesSettingsForTest } from './notesSettings.js';
 
 // Optional pages behind a settings switch (系统设置 → 可选功能).
 export const FEATURE_SETTINGS = Object.freeze({ instances: 'features.instances', servers: 'features.servers' });
@@ -20,6 +21,7 @@ export function featureEnabledIn(values, key) {
 export function applyFeatureSettings(values) {
   for (const key of Object.keys(FEATURE_SETTINGS)) state[key] = featureEnabledIn(values, key);
   state.known = true;
+  applyNotesSettings(values);
 }
 
 // Without readable settings keep every page reachable rather than hide one by mistake.
@@ -39,4 +41,5 @@ export function featurePageState(key) {
 
 export function resetFeatureTogglesForTest() {
   Object.assign(state, { known: false, instances: true, servers: true });
+  resetNotesSettingsForTest();
 }

@@ -127,6 +127,41 @@ test('mesh board layout: rules, events, security', {skip: !chromium, timeout: 30
     }
   });
 
+  await t.test('a long rule list: the first four, the rest behind a toggle, opened again to add one; desktop and phone', {timeout: 120000}, async t => {
+    for (const [width, height] of [[1440, 900], [390, 844]]) {
+      const h = await setup(t, {width, height});
+      const {page} = h, phone = width < 760;
+      if (phone) await page.locator('.mesh-dock').getByRole('button', {name: '网格设置与访问规则'}).tap();
+      const panel = phone ? page.locator('.mesh-overview-sheet') : inspector(page);
+      const press = l => phone ? l.tap() : l.click();
+      // From a rule's editor back to the overview: Esc, or on a phone close the sheet, drop the selection and open the overview.
+      const back = async () => {
+        if (!phone) return page.keyboard.press('Escape');
+        await page.locator('.mesh-sheet').getByRole('button', {name: '关闭', exact: true}).tap();
+        await page.locator('.mesh-dock').getByRole('button', {name: '取消选择'}).tap();
+        await page.locator('.mesh-dock').getByRole('button', {name: '网格设置与访问规则'}).tap();
+      };
+      await press(panel.getByRole('button', {name: '允许所有成员互相 ping'}));
+      for (let i = 0; i < 5; i++) {
+        await back();
+        await press(panel.getByRole('button', {name: '＋ 添加规则'}));
+      }
+      await h.saved(d => d.rules.length === 6, 'six rules');
+      await back();
+      const shown = () => panel.locator('.mesh-rules > .mesh-rule-list > li:visible').count();
+      // Adding opened the whole list; folded, the first four and a toggle for the rest.
+      assert.equal(await shown(), 6);
+      await press(panel.getByRole('button', {name: '收起', exact: true}));
+      assert.equal(await shown(), 4);
+      const more = panel.getByRole('button', {name: '展开其余 2 条'});
+      if (phone) assert.ok((await more.boundingBox()).height >= 40, 'the toggle is a phone-sized target');
+      await press(more);
+      assert.equal(await shown(), 6);
+      await noOverflow(page);
+      await h.close();
+    }
+  });
+
   await t.test('events: repeats with when they began, a relay\'s flapping route as one row, raw tunnel errors in Chinese with the original aside; desktop and phone', {timeout: 150000}, async t => {
     const h = await setup(t, {noisy: true});
     const {page} = h;

@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from "vue";
 import ConsoleView from "./views/consoleView/ConsoleView.vue";
 import {createAttachmentDraftStorage} from "./views/consoleView/attachmentDraftStorage.js";
+import {forgetExtensionDraft} from "./views/consoleView/extensionDrafts.js";
 import { defineLazyView } from "./lazyView.js";
 import { installMobileViewport } from "./mobileViewport.js";
 import {installPushNavigation, installPushPresence} from "./pwa/pushClient.js";
@@ -802,6 +803,7 @@ function discardConversationDraft(conversationUuid) {
     consoleViewRef.value.discardConversationDraft(conversationUuid);
     return;
   }
+  forgetExtensionDraft(conversationUuid);
   // The console may be unmounted while a settings page is open. Remove only
   // this conversation's persisted text and files, leaving other drafts intact.
   try {

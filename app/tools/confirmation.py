@@ -15,13 +15,8 @@ from dataclasses import replace
 from app.runtime.tool_result import ToolOutcome
 
 APPROVAL_ARGUMENT = "_openbearApprovalId"
-GATED_TOOLS = {"OpenBearControl", "Browser", "Cron", "Webhook", "InstanceControl", "Servers"}
-APPROVAL_DESCRIPTION = (
-    "Only after this tool returns amendments_required: apply all user conditions, "
-    "then resubmit within its approvalPolicy with approvalId here. "
-    "One use, current turn only; never a different target or broader effects. "
-    "Generic MCP receipts require identical business arguments; changed arguments need a fresh tool confirmation without this ID."
-)
+GATED_TOOLS = {"OpenBearControl", "Browser", "Cron", "Webhook", "InstanceControl", "Servers", "RequestExtension"}
+APPROVAL_DESCRIPTION = "approvalId from this tool's amendments_required result; rules in the system prompt."
 
 
 def argument_digest(value):

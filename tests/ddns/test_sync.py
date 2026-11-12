@@ -1,5 +1,6 @@
 """Converging records at the fake provider: creation and takeover, the periodic check,
 outside changes, deletion, update-only providers, errors and retries, alerts."""
+import asyncio
 import json
 
 from app.ddns import service as ddns_module
@@ -450,3 +451,98 @@ async def test_a_type_the_provider_cannot_update_is_refused_before_it_is_saved(e
     assert [r['type'] for r in out['records']] == ['A'] and [(s['type'], s['error']) for s in out['skipped']] == [('AAAA', 'type_unsupported')]
     await e.ddns.idle()
     assert (await e.ddns.account_view(OWNER, acct['id']))['state'] != 'error'
+
+
+async def test_a_ttl_change_that_failed_once_is_written_by_the_retry(env):  # noqa: F811
+    """Only the TTL changes and the sync it starts meets a network error: the retry still writes it."""
+    e = env
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    account = await add_account(e)
+    rid = (await url_record(e, sid, account, ttl=300))['records'][0]['id']
+    api = fakeprovider.store('tok')
+    assert [r.ttl for r in api.records.values()] == [300]
+    api.fail('network')
+    advance(e, 60)
+    await e.ddns.update_record(OWNER, rid, {'ttl': 600})
+    await e.ddns.idle()
+    assert (await record(e, rid))['state'] == 'pending' and [r.ttl for r in api.records.values()] == [300]
+    advance(e, ddns_module.RETRY_MIN_S)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    assert (await record(e, rid))['state'] == 'ok' and [r.ttl for r in api.records.values()] == [600]
+    # Written once: the periodic check after it compares the value only.
+    writes = len(api.writes())
+    advance(e, ddns_module.CHECK_S)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    assert len(api.writes()) == writes
+
+
+async def test_an_update_only_provider_retries_a_ttl_change(env):  # noqa: F811
+    e = env
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    account = await add_account(e, token='push', kind='fakepush')
+    rid = (await url_record(e, sid, account))['records'][0]['id']
+    api = fakeprovider.store('push')
+    api.fail('network')
+    advance(e, 60)
+    await e.ddns.update_record(OWNER, rid, {'ttl': 600})
+    await e.ddns.idle()
+    assert (await record(e, rid))['state'] == 'pending'
+    advance(e, ddns_module.RETRY_MIN_S)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    assert [c[0] for c in api.calls].count('update') == 3 and (await record(e, rid))['state'] == 'ok'
+    advance(e, 3600)
+    await sync(e, rid)
+    assert [c[0] for c in api.calls].count('update') == 3
+
+
+async def test_cloudflare_automatic_ttl_is_compared_as_written():
+    from app.ddns.providers import get
+    from app.ddns.providers.base import Record
+    cf = get('cloudflare')({'token': 't'}, {}, client=object())
+    rec = {'ttl': 1, 'options': {}}
+    assert ddns_module.Ddns._attrs_differ(Record('r', 'a.example.com', 'A', '192.0.2.1', 60), rec, cf)
+    assert not ddns_module.Ddns._attrs_differ(Record('r', 'a.example.com', 'A', '192.0.2.1', 1), rec, cf)
+
+
+async def test_a_slow_zone_refresh_is_not_started_again(env, monkeypatch):  # noqa: F811
+    e = env
+    await add_account(e)
+    api = fakeprovider.store('tok')
+    release = asyncio.Event()
+    check = fakeprovider.FakeProvider.check
+
+    async def slow(self):
+        await release.wait()
+        return await check(self)
+    monkeypatch.setattr(fakeprovider.FakeProvider, 'check', slow)
+    advance(e, ddns_module.ZONES_S)
+    for _ in range(3):
+        await e.ddns.tick()
+        await asyncio.sleep(0)
+        advance(e, ddns_module.TICK_S)
+    release.set()
+    await e.ddns.idle()
+    assert [c[0] for c in api.calls] == ['check', 'check']
+    advance(e, ddns_module.ZONES_S)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    assert [c[0] for c in api.calls] == ['check', 'check', 'check']
+
+
+async def test_old_address_detections_are_dropped(env):  # noqa: F811
+    e = env
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    await add_account(e)
+    e.nodes.probe[sid] = probe_result(url='198.51.100.7')
+    await e.ddns.preview(OWNER, {'serverId': sid, 'names': ['y.example.com'], 'source': {'method': 'url'}})
+    assert len(e.ddns.detected) == 1
+    advance(e, 3600)
+    await e.ddns.tick()
+    await e.ddns.idle()
+    assert e.ddns.detected == {}

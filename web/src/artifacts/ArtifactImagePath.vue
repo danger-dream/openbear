@@ -1,23 +1,39 @@
 <script setup>
-import {computed, onBeforeUnmount, onMounted, ref} from "vue";
+import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
 import {copyTextToClipboard} from "../utils/clipboard.js";
+import ArtifactCard from "./ArtifactCard.vue";
 import {onArtifactDownload} from "./artifactDownload.js";
-import {artifactFromUrl, artifactRecord, artifactSharedPath, loadArtifactMetadata} from "./artifactFiles.js";
+import {artifactFormat, artifactFromUrl, artifactRecord, artifactSharedPath, loadArtifactMetadata} from "./artifactFiles.js";
 
-const props = defineProps({href: {type: String, required: true}});
+const props = defineProps({href: {type: String, required: true}, label: {type: String, default: ""}});
 const identity = artifactFromUrl(props.href);
 const record = identity ? artifactRecord(identity) : null;
 const sharedPath = computed(() => artifactSharedPath(record?.metadata));
+const isMediaArtifact = computed(() => ["video", "audio"].includes(artifactFormat(record?.metadata).kind));
 const root = ref(null);
 let observer;
 function load() { observer?.disconnect(); if (record) void loadArtifactMetadata(record).catch(() => {}); }
+function syncMediaUpgrade(upgraded) {
+	const slot = root.value?.parentElement;
+	const img = slot?.previousElementSibling;
+	if (!img || img.tagName !== "IMG") return;
+	if (upgraded) {
+		img.style.display = "none";
+		img.dataset.artifactMediaUpgraded = "1";
+	} else {
+		img.style.display = "";
+		delete img.dataset.artifactMediaUpgraded;
+	}
+}
+watch(isMediaArtifact, val => { void nextTick(() => syncMediaUpgrade(val)); }, {immediate: true});
 onMounted(() => {
+	syncMediaUpgrade(isMediaArtifact.value);
 	if (typeof IntersectionObserver === "undefined") return load();
 	observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) load(); }, {rootMargin: "160px"});
 	observer.observe(root.value);
 });
-onBeforeUnmount(() => observer?.disconnect());
+onBeforeUnmount(() => { observer?.disconnect(); syncMediaUpgrade(false); });
 async function copyPath() {
 	if (!sharedPath.value) return;
 	try { await copyTextToClipboard(sharedPath.value); ElMessage.success("工作区路径已复制"); }
@@ -26,7 +42,10 @@ async function copyPath() {
 </script>
 
 <template>
-	<span ref="root" class="artifact-image-actions">
+	<div v-if="isMediaArtifact" ref="root" class="md-artifact-slot">
+		<ArtifactCard :href="href" :label="label"/>
+	</div>
+	<span v-else ref="root" class="artifact-image-actions">
 		<a :href="identity?.downloadUrl" download title="下载原图片" aria-label="下载原图片" @click.stop="onArtifactDownload($event, identity)">下载</a>
 		<button v-if="sharedPath" type="button" :aria-label="`复制工作区路径：${sharedPath}`" title="复制工作区路径" @click.stop="copyPath">复制路径</button>
 	</span>

@@ -68,7 +68,7 @@ func (a *healthAttachment) RelayNextHop(dest string) (string, bool, bool) {
 
 // routerConfig is what the relay router needs of c.
 func routerConfig(c *Config) meshrouting.Config {
-	rc := meshrouting.Config{Self: c.Self.ID, NextHops: maps.Clone(c.NextHops), Numbers: map[string]uint32{}}
+	rc := meshrouting.Config{Self: c.Self.ID, Leaf: !c.isRelay(), NextHops: maps.Clone(c.NextHops), Numbers: map[string]uint32{}}
 	// Compact advertisements name relays by their control address's host
 	// number, the same on every relay of a config.
 	base := c.Network.ControlPrefix.Addr().As4()
@@ -77,22 +77,47 @@ func routerConfig(c *Config) meshrouting.Config {
 		return binary.BigEndian.Uint32(v[:]) - binary.BigEndian.Uint32(base[:])
 	}
 	rc.Numbers[c.Self.ID] = number(c.Self.ControlAddress)
+	leaves := map[string]bool{}
 	for _, n := range c.Nodes {
-		if n.Role == roleRelay && n.ID != c.Self.ID {
+		if n.ID == c.Self.ID {
+			continue
+		}
+		if n.Role == roleRelay {
 			rc.Relays = append(rc.Relays, n.ID)
+			rc.Numbers[n.ID] = number(n.ControlAddress)
+		} else if n.Leaf {
+			leaves[n.ID] = true
 			rc.Numbers[n.ID] = number(n.ControlAddress)
 		}
 	}
 	for _, l := range c.Links {
-		if c.roleOf(l.Peer) == roleRelay {
-			rc.Links = append(rc.Links, l.Peer)
+		rc.Links = append(rc.Links, l.Peer)
+		if c.roleOf(l.Peer) == roleMember {
+			if n := c.node(l.Peer); n != nil {
+				leaves[n.ID] = true
+				rc.Numbers[n.ID] = number(n.ControlAddress)
+			}
 		}
 	}
+	for _, p := range c.MemberLinks {
+		for _, id := range p {
+			if id != c.Self.ID && c.roleOf(id) == roleMember {
+				if n := c.node(id); n != nil {
+					leaves[n.ID] = true
+					rc.Numbers[n.ID] = number(n.ControlAddress)
+				}
+			}
+		}
+	}
+	for id := range leaves {
+		rc.Leaves = append(rc.Leaves, id)
+	}
+	slices.Sort(rc.Leaves)
 	if r := c.Routing; r != nil {
 		rc.Mode = r.Mode
 		rc.Bias = maps.Clone(r.Bias)
 	}
-	rc.Network, rc.RelayLinks = c.Network.ID, slices.Clone(c.RelayLinks)
+	rc.Network, rc.RelayLinks, rc.MemberLinks = c.Network.ID, slices.Clone(c.RelayLinks), slices.Clone(c.MemberLinks)
 	rc.Keys = map[string]ed25519.PublicKey{}
 	for _, n := range c.Nodes {
 		if key, err := sign.ParsePublic(n.SignKey); err == nil && n.Role == roleRelay {
@@ -133,7 +158,7 @@ func (a *healthAttachment) Direct(peer string) bool {
 
 func healthConfig(c *Config) health.Config {
 	h := health.Config{Network: c.Network.ID, Self: c.Self.ID, Role: c.Self.Role, Revision: c.Revision, Address: c.Self.ControlAddress, MTU: c.Network.MTU, Parameters: health.Defaults(),
-		Prefix: c.Network.Prefix, Port: c.Self.Listen.UDP, Reflectors: slices.Clone(c.Reflectors), NextHops: maps.Clone(c.NextHops), Protocol: protocol}
+		Prefix: c.Network.Prefix, Port: c.Self.Listen.UDP, Reflectors: slices.Clone(c.Reflectors), NextHops: maps.Clone(c.NextHops), Protocol: protocol, LargeFrames: c.largePackets()}
 	if c.Reachability != nil {
 		h.STUN = slices.Clone(c.Reachability.STUN)
 	}
@@ -183,7 +208,7 @@ func (e *engine) initHealth(c *Config) error {
 		return err
 	}
 	var r *meshrouting.Router
-	if c.isRelay() {
+	if c.isRouted() {
 		r = meshrouting.New(routerConfig(c), nil, e.events.add)
 	}
 	e.attach.(*healthAttachment).router.Store(r)

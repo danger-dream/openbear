@@ -2,10 +2,12 @@
 import { computed, onBeforeUnmount, ref } from 'vue';
 import { EdgeLabelRenderer } from '@vue-flow/core';
 import { edgeGeometry } from './meshGraph.js';
+import { elbow, pointAt, roundedPath } from './meshRoute.js';
 
 // A link drawn between the borders of two nodes (not fixed handles), bent when
 // several links join the same two nodes. The label is a button that selects it.
-// A quiet link (not in use) is thin and faint with no label; pointing at it shows it as usual.
+// A quiet link (not in use) is thin and faint with no label; pointing at it shows it as usual. So does a
+// label left out for want of room.
 const props = defineProps({id: {type: String, required: true}, sourceNode: {type: Object, required: true}, targetNode: {type: Object, required: true},
   data: {type: Object, default: () => ({})}});
 defineOptions({inheritAttrs: false});
@@ -14,17 +16,23 @@ function box(node) {
   const w = node.dimensions?.width || 0, h = node.dimensions?.height || 0;
   return {w, h, cx: x + w / 2, cy: y + h / 2};
 }
+// A right-angled line keeps the way worked out for it while its ends stay where they were; moved, it is
+// a plain elbow until the way round is worked out again.
+const sameBox = (r, b) => r && Math.abs(r.x + r.w / 2 - b.cx) < 1 && Math.abs(r.y + r.h / 2 - b.cy) < 1 && Math.abs(r.w - b.w) < 1 && Math.abs(r.h - b.h) < 1;
 const geo = computed(() => {
   const a = box(props.sourceNode), b = box(props.targetNode);
   if (!a.w || !b.w) return null;
-  const {s, c, t, label} = edgeGeometry(a, b, props.data.offset, props.data.labelAt ?? 0.5);
-  const path = `M ${s.x} ${s.y} Q ${c.x} ${c.y} ${t.x} ${t.y}`;
   const arrow = (tip, from) => {
     const ux = tip.x - from.x, uy = tip.y - from.y, l = Math.hypot(ux, uy) || 1, nx = ux / l, ny = uy / l;
     return `M ${tip.x} ${tip.y} L ${tip.x - nx * 8 - ny * 4} ${tip.y - ny * 8 + nx * 4} L ${tip.x - nx * 8 + ny * 4} ${tip.y - ny * 8 - nx * 4} Z`;
   };
-  return {path, label,
-    end: props.data.arrow === 'end' || props.data.arrow === 'both' ? arrow(t, c) : '', start: props.data.arrow === 'both' ? arrow(s, c) : ''};
+  const ends = (s, sNext, t, tPrev) => ({end: props.data.arrow === 'end' || props.data.arrow === 'both' ? arrow(t, tPrev) : '', start: props.data.arrow === 'both' ? arrow(s, sNext) : ''});
+  if (props.data.ortho) {
+    const route = props.data.route, points = route && sameBox(route.from, a) && sameBox(route.to, b) ? route.points : elbow(a, b);
+    return {path: roundedPath(points), label: pointAt(points, props.data.labelAt ?? route?.labelAt ?? 0.5), ...ends(points[0], points[1], points.at(-1), points.at(-2))};
+  }
+  const {s, c, t, label} = edgeGeometry(a, b, props.data.offset, props.data.labelAt ?? 0.5);
+  return {path: `M ${s.x} ${s.y} Q ${c.x} ${c.y} ${t.x} ${t.y}`, label, ...ends(s, c, t, c)};
 });
 // Pointing at the line or its label; leaving waits a moment, so moving from the line onto its label keeps it up.
 const hover = ref(false);
@@ -42,10 +50,10 @@ const quiet = computed(() => Boolean(props.data.quiet) && !hover.value);
     <path v-if="geo.end" class="mesh-edge-arrow" :d="geo.end" />
     <path v-if="geo.start" class="mesh-edge-arrow" :d="geo.start" />
   </g>
-  <EdgeLabelRenderer v-if="geo && data.label && !data.labelHidden && !quiet">
+  <EdgeLabelRenderer v-if="geo && data.label && (!data.labelHidden || hover) && !quiet">
     <button type="button" class="mesh-edge-label nodrag nopan" :data-kind="data.kind" :data-look="data.look || undefined" :data-live="data.live || undefined" :data-selected="data.selected || undefined" :data-dim="data.dim || undefined" :data-flash="data.flash || undefined"
       :data-path="data.onPath || undefined" :data-edge="id"
       :style="{transform: `translate(-50%, -50%) translate(${geo.label.x}px, ${geo.label.y}px)`}" :aria-label="data.aria || data.label" :title="data.title || ''" @click.stop="data.select?.()"
-      @mouseenter="enter" @mouseleave="leave">{{ data.label }}</button>
+      @mouseenter="enter" @mouseleave="leave">{{ hover ? data.label : data.labelText || data.label }}</button>
   </EdgeLabelRenderer>
 </template>

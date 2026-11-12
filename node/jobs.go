@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"openbear/node/mesh/bypass"
 )
 
 // A background job lives in its own directory under the jobs directory,
@@ -61,6 +63,8 @@ type jobSpec struct {
 	StartedAt int64  `json:"startedAt"`
 	LogLimit  int64  `json:"logLimit"`
 	Stdin     bool   `json:"stdin,omitempty"`
+	// Bypass: the command runs past a transparent proxy (bypassedCommand), asked for while it was in place.
+	Bypass bool `json:"bypass,omitempty"`
 }
 
 type jobExit struct {
@@ -152,6 +156,7 @@ func (s *jobStore) start(raw json.RawMessage) (any, error) {
 		Command string `json:"command"`
 		Cwd     string `json:"cwd"`
 		Stdin   string `json:"stdin"`
+		Bypass  bool   `json:"bypass"`
 	}
 	if json.Unmarshal(raw, &p) != nil || strings.TrimSpace(p.Command) == "" || len(p.Command) > jobCommandMax || len(p.Stdin) > jobStdinMax {
 		return nil, errors.New("invalid_params")
@@ -181,7 +186,7 @@ func (s *jobStore) start(raw json.RawMessage) (any, error) {
 	}
 	now := time.Now()
 	spec := jobSpec{ID: strconv.FormatInt(now.UnixMilli(), 36) + randomHex(4), Command: p.Command, Cwd: p.Cwd, Shell: jobShell(),
-		StartedAt: now.UnixMilli(), LogLimit: jobLogLimit, Stdin: p.Stdin != ""}
+		StartedAt: now.UnixMilli(), LogLimit: jobLogLimit, Stdin: p.Stdin != "", Bypass: p.Bypass && bypass.Active()}
 	dir := filepath.Join(s.dir, spec.ID)
 	if err = os.Mkdir(dir, 0o700); err != nil {
 		return nil, fileError(err)
@@ -518,6 +523,36 @@ func (l *jobLog) Close() error {
 	return l.f.Close()
 }
 
+// stopGroup ends a job being stopped: TERM, then KILL after jobStopGrace.
+// The shell can end long before what it started (a child that traps TERM
+// and cleans up, or ignores it), so it is the group, not the shell, that
+// has to be gone.
+func stopGroup(pid int, terminate func(force bool), shellDone <-chan struct{}) {
+	terminate(false)
+	grace := time.NewTimer(jobStopGrace)
+	defer grace.Stop()
+	select {
+	case <-shellDone:
+	case <-grace.C:
+		terminate(true)
+		return
+	}
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for groupAlive(pid) {
+		select {
+		case <-grace.C:
+			terminate(true)
+			// A kill lands when the process next runs; a little time for that.
+			for end := time.Now().Add(2 * time.Second); groupAlive(pid) && time.Now().Before(end); {
+				time.Sleep(20 * time.Millisecond)
+			}
+			return
+		case <-tick.C:
+		}
+	}
+}
+
 // RunJob is the runner ("openbear-node job-run DIR"): it runs the job in
 // dir and records how it ended. ctx ends when the runner is told to stop.
 func RunJob(ctx context.Context, dir string) error {
@@ -545,6 +580,9 @@ func RunJob(ctx context.Context, dir string) error {
 		return finish(-1, "")
 	}
 	defer cleanup()
+	if spec.Bypass {
+		bypassedCommand(cmd)
+	}
 	cmd.Dir = spec.Cwd
 	if spec.Stdin {
 		in, err := os.Open(filepath.Join(dir, "stdin"))
@@ -567,8 +605,9 @@ func RunJob(ctx context.Context, dir string) error {
 	if token, ok := processStart(cmd.Process.Pid); ok {
 		writeAtomic(dir, "child", []byte(fmt.Sprintf("%d %s\n", cmd.Process.Pid, token)))
 	}
-	done := make(chan struct{})
+	done, settled := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(settled)
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -581,17 +620,14 @@ func RunJob(ctx context.Context, dir string) error {
 					continue
 				}
 			}
-			terminate(false)
-			select {
-			case <-done:
-			case <-time.After(jobStopGrace):
-				terminate(true)
-			}
+			stopGroup(cmd.Process.Pid, terminate, done)
 			return
 		}
 	}()
 	err = cmd.Wait()
 	close(done)
+	// A stopped job is recorded as ended only once its whole group is.
+	<-settled
 	flush()
 	if cmd.ProcessState == nil {
 		return finish(-1, "")

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"os"
 	"time"
+
+	"openbear/node/mesh"
 )
 
 type meshChange struct {
@@ -163,7 +165,7 @@ func (h *meshHost) finishMeshRestore(c *meshChange) error {
 		}
 		var status meshStatus
 		applied, _ := os.ReadFile(h.path("applied.json"))
-		data, err := os.ReadFile(h.path("status.json"))
+		data, err := os.ReadFile(mesh.StatusPath(h.dir))
 		if !bytes.Equal(applied, c.Previous) || h.service.state() != "running" || json.Unmarshal(c.Previous, &head) != nil || err != nil || json.Unmarshal(data, &status) != nil || status.AppliedRevision != head.Revision || status.Error != "" || !status.Ready {
 			return nil
 		}
@@ -303,8 +305,8 @@ func (a *Agent) meshChangeCall(method string, raw json.RawMessage) (any, error) 
 		case "mesh.confirm":
 			if c.State != "confirmed" {
 				var status meshStatus
-				data, err := os.ReadFile(h.path("status.json"))
-				info, statErr := os.Stat(h.path("status.json"))
+				data, err := os.ReadFile(mesh.StatusPath(h.dir))
+				info, statErr := os.Stat(mesh.StatusPath(h.dir))
 				if c.State != "active" || h.service.state() != "running" || statErr != nil || time.Since(info.ModTime()) > meshStale || err != nil || json.Unmarshal(data, &status) != nil || status.AppliedRevision != c.Revision || status.Error != "" || !status.Ready {
 					return nil, errors.New("mesh_change_not_applied")
 				}

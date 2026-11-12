@@ -11,7 +11,7 @@ import re
 
 from app.instances.contracts import InstanceError
 from app.instances.servers import LOCAL
-from app.servers import mesh_config
+from app.servers import mesh_auto, mesh_autolinks, mesh_config, mesh_limits, mesh_paths, mesh_proxy
 from app.servers.mesh_config import (
     BRIDGE_NETS,
     HEALTH,
@@ -22,6 +22,7 @@ from app.servers.mesh_config import (
     effective,
     endpoint_host,
     is_site,
+    lan_endpoint,
     next_hops,
     punch_host,
     reflectors,
@@ -42,9 +43,16 @@ MAX_STUN = 8
 BIAS_SPAN = 10000
 RELAY_MODES = ('public', 'site')
 MEMBER_KEYS = {'serverId', 'role', 'relayMode', 'address', 'controlAddress', 'publicEndpoint', 'listen', 'tags', 'gateway', 'uploadLimitMbps', 'entry',
-               'removing'}
+               'proxy', 'keepRoutes', 'takeover', 'removing', 'auto', 'announce', 'publicPorts', 'direct'}
+ENTRY_MODES = ('upstreams', 'fixed', 'failover')
+LINK_ORIGINS = ('manual', 'auto')
+DOC_KEYS = {'settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups', 'limits', 'paths'}
+LINK_MODES = ('full', 'custom', 'auto')
+MAX_TAKEOVER = 64
+# A node that reads gateway.backup and standbySubnets: older ones refuse a backup's config as overlapping.
+STANDBY_FEATURE = 'mesh.standby'
 # Read-only fields GET adds to each member; a draft sent back with them is accepted.
-VIEW_KEYS = {'name', 'platform', 'publicEndpointAuto', 'subnetSuggestions'}
+VIEW_KEYS = {'name', 'platform', 'publicEndpointAuto', 'subnetSuggestions', 'front', 'region'}
 # Never behind a gateway: this host, link-local, multicast and reserved space.
 SPECIAL_NETS = tuple(ipaddress.ip_network(n) for n in ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '224.0.0.0/4', '240.0.0.0/4'))
 MIN_SUBNET_PREFIX = 8
@@ -72,17 +80,19 @@ def control_prefix(prefix):
 
 def default_settings():
     return {'prefix': DEFAULT_PREFIX, 'controlPrefix': control_prefix(DEFAULT_PREFIX), 'mtu': DEFAULT_MTU, 'ports': dict(DEFAULT_PORTS),
-            'health': dict(HEALTH), 'reachability': {'stun': []}}
+            'health': dict(HEALTH), 'reachability': {'stun': []}, 'proxy': mesh_proxy.default_settings(),
+            'autoLinks': mesh_autolinks.default_settings()}
 
 
 def empty_doc():
-    return {'settings': default_settings(), 'members': [], 'relayLinks': {'mode': 'full', 'pairs': []}, 'directLinks': [], 'rules': []}
+    return {'settings': default_settings(), 'members': [], 'relayLinks': {'mode': 'full', 'pairs': []}, 'directLinks': [], 'rules': [],
+            'lineRules': [], 'exitGroups': [], 'limits': [], 'paths': []}
 
 
 def new_member(server_id, settings):
     return {'serverId': server_id, 'role': 'member', 'relayMode': 'public', 'address': '', 'controlAddress': '', 'publicEndpoint': '',
             'listen': {'udp': settings['ports']['udp'], 'tcp': 0, 'tls': 0}, 'tags': [], 'gateway': None, 'uploadLimitMbps': None,
-            'entry': {'mode': 'fixed', 'candidates': [], 'autoReturn': True}, 'removing': False}
+            'entry': {'mode': 'upstreams', 'candidates': [], 'autoReturn': True}, 'proxy': None, 'keepRoutes': [], 'removing': False, 'direct': True}
 
 
 def active(doc):
@@ -92,9 +102,24 @@ def active(doc):
 def upgrade(doc):
     """Fields added after a document was stored, with their defaults, so an old document
     compares equal to the same one saved again."""
+    # Stored documents without this marker predate rules on implicit full-mode links. Reconcile must not opt them in.
+    if doc.get('lineRules') and doc['relayLinks']['mode'] == 'full':
+        doc.setdefault('_fullLineRules', False)
     doc['settings'].setdefault('reachability', {'stun': []})
+    doc['settings'].setdefault('proxy', mesh_proxy.default_settings())
+    # A mesh from before auto links keeps the links it has until the user turns them on.
+    doc['settings'].setdefault('autoLinks', {**mesh_autolinks.default_settings(), 'enabled': False})
+    doc.setdefault('lineRules', [])
+    doc.setdefault('limits', [])
+    doc.setdefault('paths', [])
+    mesh_proxy.upgrade(doc)
     for m in doc['members']:
         m.setdefault('relayMode', 'public')
+        m.setdefault('proxy', None)
+        # Routes clashing with the machine's own are taken over unless kept (keepRoutes); the old opt-in list says nothing more.
+        m.pop('takeover', None)
+        m.setdefault('keepRoutes', [])
+        m.setdefault('direct', True)
     for pair in doc['relayLinks']['pairs']:
         pair.setdefault('bias', 0)
     for rule in doc['rules']:
@@ -128,7 +153,7 @@ def _net(value):
 def clean_doc(data, prior):
     """Types and shape over the prior draft; references and conflicts are validate's job."""
     errors = Errors()
-    if not isinstance(data, dict) or set(data) - {'settings', 'members', 'relayLinks', 'directLinks', 'rules'}:
+    if not isinstance(data, dict) or set(data) - DOC_KEYS:
         raise MeshInvalid([{'path': '', 'error': 'invalid_draft', 'message': '草稿格式不正确'}])
     settings = _settings(data.get('settings', prior['settings']), prior['settings'], errors)
     members = _members(data.get('members', prior['members']), prior['members'], settings, errors)
@@ -136,15 +161,24 @@ def clean_doc(data, prior):
         for m in members:
             m['address'] = m['controlAddress'] = ''
     doc = {'settings': settings, 'members': members, 'relayLinks': _relay_links(data.get('relayLinks', prior['relayLinks']), errors),
-           'directLinks': _direct_links(data.get('directLinks', prior['directLinks']), errors), 'rules': _rules(data.get('rules', prior['rules']), errors)}
+           'directLinks': _direct_links(data.get('directLinks', prior['directLinks']), errors), 'rules': _rules(data.get('rules', prior['rules']), errors),
+           'lineRules': mesh_auto.clean_line_rules(data.get('lineRules', prior.get('lineRules', [])), errors),
+           'exitGroups': mesh_proxy.clean_groups(data.get('exitGroups', prior.get('exitGroups', [])), errors),
+           'limits': mesh_limits.clean(data.get('limits', prior.get('limits', [])), errors),
+           'paths': mesh_paths.clean(data.get('paths', prior.get('paths', [])), errors)}
+    if '_fullLineRules' in prior:
+        doc['_fullLineRules'] = prior['_fullLineRules']
+    if '_autoLinksState' in prior:
+        doc['_autoLinksState'] = copy.deepcopy(prior['_autoLinksState'])
     if errors:
         raise MeshInvalid(errors)
+    mesh_proxy.ensure_secrets(doc)
     return doc
 
 
 def _settings(raw, prior, errors):
     out = copy.deepcopy(prior)
-    if not isinstance(raw, dict) or set(raw) - {'prefix', 'controlPrefix', 'mtu', 'ports', 'health', 'reachability'}:
+    if not isinstance(raw, dict) or set(raw) - {'prefix', 'controlPrefix', 'mtu', 'tcpJumbo', 'ports', 'health', 'reachability', 'proxy', 'autoLinks'}:
         errors.add('settings', 'invalid_settings', '设置格式不正确')
         return out
     if 'prefix' in raw:
@@ -160,6 +194,15 @@ def _settings(raw, prior, errors):
             errors.add('settings.mtu', 'invalid_mtu', 'MTU 须在 1280～1420 之间')
         else:
             out['mtu'] = raw['mtu']
+    if 'tcpJumbo' in raw:
+        # Large packets (9000 bytes) where every hop is TCP or TLS between Linux nodes that take them;
+        # mtu stays that of every other path. Off is stored as absent, as before the setting existed.
+        if not isinstance(raw['tcpJumbo'], bool):
+            errors.add('settings.tcpJumbo', 'invalid_tcp_jumbo', 'TCP 直连大包须是开或关')
+        elif raw['tcpJumbo']:
+            out['tcpJumbo'] = True
+        else:
+            out.pop('tcpJumbo', None)
     if 'ports' in raw:
         ports = raw['ports']
         if not isinstance(ports, dict) or set(ports) - set(TRANSPORTS):
@@ -194,6 +237,12 @@ def _settings(raw, prior, errors):
                 else:
                     servers.append(server)
             out['reachability'] = {'stun': list(dict.fromkeys(servers))}
+    if 'proxy' in raw:
+        out['proxy'] = mesh_proxy.clean_settings(raw['proxy'], out.get('proxy') or mesh_proxy.default_settings(), errors)
+    if 'autoLinks' in raw:
+        out['autoLinks'] = mesh_autolinks.clean_settings(raw['autoLinks'], out.get('autoLinks') or mesh_autolinks.default_settings(), errors)
+    else:
+        out.setdefault('autoLinks', mesh_autolinks.default_settings())
     return out
 
 
@@ -277,9 +326,28 @@ def _member(raw, p, before, errors):
         # Pasted addresses often carry a space or a line break at either end.
         value = value.strip() if isinstance(value, str) else value
         if not isinstance(value, str) or value and not (_ip(value) or _HOST.fullmatch(value) or _v6(value)):
-            errors.add(f'{p}.publicEndpoint', 'invalid_endpoint', '对外地址须是 IP 或域名，不带端口；留空表示自动')
+            errors.add(f'{p}.publicEndpoint', 'invalid_endpoint', '对外地址须是 IP 或域名，端口映射在「对外端口」里填；留空表示自动')
         else:
             m['publicEndpoint'] = value.strip()
+    if 'announce' in raw:
+        # False: others never dial it; it dials them, or punches.
+        if type(raw['announce']) is not bool:
+            errors.add(f'{p}.announce', 'invalid_announce', '对外宣告须是开或关')
+        elif raw['announce']:
+            m.pop('announce', None)
+        else:
+            m['announce'] = False
+    if 'publicPorts' in raw:
+        # A port mapping: the port others dial for each transport, when it is not the one listened on.
+        ports = raw['publicPorts']
+        if not isinstance(ports, dict) or set(ports) - set(TRANSPORTS) or not all(_int(v, 0, 65535) for v in ports.values()):
+            errors.add(f'{p}.publicPorts', 'invalid_port', '对外端口须在 1～65535 之间，0 表示和监听端口相同')
+        elif any(ports.values()):
+            m['publicPorts'] = {t: v for t, v in ports.items() if v}
+        else:
+            m.pop('publicPorts', None)
+    if 'auto' in raw:
+        m['auto'] = mesh_auto.clean_auto(raw['auto'], mesh_auto.MEMBER_AUTO, p, errors)
     if 'listen' in raw:
         listen = raw['listen']
         if not isinstance(listen, dict) or set(listen) - set(TRANSPORTS):
@@ -306,6 +374,21 @@ def _member(raw, p, before, errors):
             m['uploadLimitMbps'] = value
     if 'entry' in raw:
         m['entry'] = _entry(raw['entry'], f'{p}.entry', m['entry'], errors)
+    if 'direct' in raw:
+        if type(raw['direct']) is not bool:
+            errors.add(f'{p}.direct', 'invalid_member', '可直连须是开或关')
+        else:
+            m['direct'] = raw['direct']
+    if 'proxy' in raw:
+        m['proxy'] = mesh_proxy.clean_member(raw['proxy'], f'{p}.proxy', errors)
+    if 'keepRoutes' in raw:
+        # Gateway subnets left on a route of the machine's own instead of taken over (mesh_config.route_plan).
+        raw_keep = raw['keepRoutes']
+        nets = [_net(v) for v in raw_keep] if isinstance(raw_keep, list) and len(raw_keep) <= MAX_TAKEOVER else None
+        if nets is None or not all(nets):
+            errors.add(f'{p}.keepRoutes', 'invalid_keep_routes', f'保留原路由的网段须是 IPv4 网段，最多 {MAX_TAKEOVER} 个')
+        else:
+            m['keepRoutes'] = sorted({str(n) for n in nets}, key=lambda s: ipaddress.ip_network(s))
     if 'removing' in raw:
         if type(raw['removing']) is not bool:
             errors.add(f'{p}.removing', 'invalid_member', '格式不正确')
@@ -324,9 +407,14 @@ def _v6(value):
 def _gateway(raw, p, errors):
     if raw is None:
         return None
-    if not isinstance(raw, dict) or set(raw) - {'subnets', 'masquerade'} or type(raw.get('masquerade', True)) is not bool:
+    if not isinstance(raw, dict) or set(raw) - {'subnets', 'masquerade', 'snat', 'name', 'backup'} or type(raw.get('masquerade', True)) is not bool \
+            or type(raw.get('snat', False)) is not bool or type(raw.get('backup', False)) is not bool:
         errors.add(p, 'invalid_gateway', '网关格式不正确')
         return None
+    name = raw.get('name', '')
+    if not isinstance(name, str) or len(name.strip()) > 40:
+        errors.add(f'{p}.name', 'invalid_gateway_name', '局域网名称最多 40 字')
+        name = ''
     subnets = raw.get('subnets')
     if not isinstance(subnets, list) or not 1 <= len(subnets) <= 32:
         errors.add(f'{p}.subnets', 'invalid_subnets', '网关至少要有一个网段，最多 32 个')
@@ -342,7 +430,10 @@ def _gateway(raw, p, errors):
             errors.add(f'{p}.subnets[{k}]', 'invalid_subnet', '不能是本机回环、链路本地（169.254.0.0/16）、组播或保留地址段')
         else:
             out.append(str(net))
-    return {'subnets': out, 'masquerade': raw.get('masquerade', True)}
+    # snat: what the subnets send into the mesh leaves with the gateway's own mesh address. backup: it
+    # stands by for the same subnets of another gateway and takes them while that one is unreachable.
+    return {'subnets': out, 'masquerade': raw.get('masquerade', True), **({'snat': True} if raw.get('snat') else {}),
+            **({'name': name.strip()} if name.strip() else {}), **({'backup': True} if raw.get('backup') else {})}
 
 
 def _entry(raw, p, prior, errors):
@@ -350,8 +441,8 @@ def _entry(raw, p, prior, errors):
         errors.add(p, 'invalid_entry', '入口格式不正确')
         return prior
     out = {'mode': raw.get('mode', prior['mode']), 'candidates': [], 'autoReturn': raw.get('autoReturn', prior['autoReturn'])}
-    if out['mode'] not in ('fixed', 'failover'):
-        errors.add(f'{p}.mode', 'invalid_entry_mode', '模式只能是 fixed 或 failover')
+    if out['mode'] not in ENTRY_MODES:
+        errors.add(f'{p}.mode', 'invalid_entry_mode', '模式只能是 upstreams、fixed 或 failover')
     if type(out['autoReturn']) is not bool:
         errors.add(f'{p}.autoReturn', 'invalid_entry', '格式不正确')
     candidates = raw.get('candidates', prior['candidates'])
@@ -360,11 +451,22 @@ def _entry(raw, p, prior, errors):
         return out
     for j, c in enumerate(candidates):
         q = f'{p}.candidates[{j}]'
-        if (not isinstance(c, dict) or set(c) - {'id', 'relay', 'transport'} or not isinstance(c.get('relay'), str)
+        if (not isinstance(c, dict) or set(c) - {'id', 'relay', 'transport', 'auto', 'origin', 'reason', 'since'} or not isinstance(c.get('relay'), str)
                 or c.get('transport', 'udp') not in TRANSPORTS or 'id' in c and not (isinstance(c['id'], str) and _ID.fullmatch(c['id']))):
             errors.add(q, 'invalid_candidate', '入口候选须指定中转和传输方式（udp、tcp、tls）')
             continue
-        out['candidates'].append({'id': c.get('id', ''), 'relay': c['relay'], 'transport': c.get('transport', 'udp')})
+        item = {'id': c.get('id', ''), 'relay': c['relay'], 'transport': c.get('transport', 'udp'),
+                **({'auto': auto} if (auto := mesh_auto.clean_auto(c.get('auto'), mesh_auto.CANDIDATE_AUTO, q, errors)) else {})}
+        origin = c.get('origin', 'manual')
+        if origin not in LINK_ORIGINS:
+            errors.add(f'{q}.origin', 'invalid_candidate', '来源只能是 manual 或 auto')
+        elif origin == 'auto':
+            reason, since = c.get('reason', ''), c.get('since', 0)
+            if not isinstance(reason, str) or len(reason) > 500 or type(since) is not int or since < 0:
+                errors.add(f'{q}.reason', 'invalid_candidate', '自动连接的原因最多 500 字，开始时间须是毫秒时间戳')
+            else:
+                item.update(origin='auto', reason=reason, since=since)
+        out['candidates'].append(item)
     used = {c['id'] for c in out['candidates'] if c['id']}
     if len(used) != len([c for c in out['candidates'] if c['id']]):
         errors.add(f'{p}.candidates', 'candidate_id_duplicate', '入口候选的 id 重复')
@@ -393,18 +495,31 @@ def _pair(raw, q, keys, errors):
     out['dialer'] = raw.get('dialer', 'a')
     if 'bias' in keys:
         out['bias'] = raw.get('bias', 0)
+    if 'auto' in keys and (auto := mesh_auto.clean_auto(raw.get('auto'), mesh_auto.PAIR_AUTO, q, errors)):
+        out['auto'] = auto
+    # Made by the mesh (auto link building): why and since when. Links made by hand carry nothing.
+    origin = raw.get('origin', 'manual')
+    if origin not in LINK_ORIGINS:
+        errors.add(f'{q}.origin', 'invalid_link', '来源只能是 manual 或 auto')
+    elif origin == 'auto':
+        reason, since = raw.get('reason', ''), raw.get('since', 0)
+        if not isinstance(reason, str) or len(reason) > 500 or type(since) is not int or since < 0:
+            errors.add(f'{q}.reason', 'invalid_link', '自动线路的原因最多 500 字，开始时间须是毫秒时间戳')
+        else:
+            out.update(origin='auto', reason=reason, since=since)
     return out
 
 
 def _relay_links(raw, errors):
-    if not isinstance(raw, dict) or set(raw) - {'mode', 'pairs'} or raw.get('mode', 'full') not in ('full', 'custom'):
+    if not isinstance(raw, dict) or set(raw) - {'mode', 'pairs'} or raw.get('mode', 'full') not in LINK_MODES:
         errors.add('relayLinks', 'invalid_relay_links', '中转连接格式不正确')
         return {'mode': 'full', 'pairs': []}
     pairs = raw.get('pairs', [])
     if not isinstance(pairs, list) or len(pairs) > MAX_LINKS:
         errors.add('relayLinks.pairs', 'invalid_relay_links', '中转连接格式不正确')
         return {'mode': raw.get('mode', 'full'), 'pairs': []}
-    out = [_pair(p, f'relayLinks.pairs[{i}]', {'a', 'b', 'transport', 'cost', 'dialer', 'bias'}, errors) for i, p in enumerate(pairs)]
+    out = [_pair(p, f'relayLinks.pairs[{i}]', {'a', 'b', 'transport', 'cost', 'dialer', 'bias', 'auto', 'origin', 'reason', 'since'}, errors)
+           for i, p in enumerate(pairs)]
     return {'mode': raw.get('mode', 'full'), 'pairs': [p for p in out if p]}
 
 
@@ -412,7 +527,7 @@ def _direct_links(raw, errors):
     if not isinstance(raw, list) or len(raw) > MAX_LINKS:
         errors.add('directLinks', 'invalid_direct_links', '直连格式不正确')
         return []
-    out = [_pair(p, f'directLinks[{i}]', {'a', 'b', 'transport', 'dialer'}, errors) for i, p in enumerate(raw)]
+    out = [_pair(p, f'directLinks[{i}]', {'a', 'b', 'transport', 'dialer', 'origin', 'reason', 'since'}, errors) for i, p in enumerate(raw)]
     return [p for p in out if p]
 
 
@@ -527,8 +642,10 @@ def allocate(doc):
 
 # ----- references and conflicts -----
 def strip(doc, server_id):
-    """Drop everything that points at one member: entry candidates, links and rule references.
-    A rule left with no source or no target was only about that member and goes too."""
+    """Drop everything that points at one member: entry candidates, links, rule references, exit
+    group places and proxy ports leading to it. A rule left with no source or no target was only
+    about that member and goes too; a port left leading nowhere or pinned to nothing waits for the
+    user to choose again (as turning its exit off does)."""
     for m in doc['members']:
         m['entry']['candidates'] = [c for c in m['entry']['candidates'] if c['relay'] != server_id]
     doc['relayLinks']['pairs'] = [p for p in doc['relayLinks']['pairs'] if server_id not in (p['a'], p['b'])]
@@ -540,12 +657,15 @@ def strip(doc, server_id):
         if any(rule['src'].values()) and any(rule['dst'].values()):
             rules.append(rule)
     doc['rules'] = rules
+    mesh_proxy.strip(doc, server_id)
+    mesh_paths.strip(doc, server_id)
     return doc
 
 
 def unstrip(doc, before, server_id):
     """What strip(before, server_id) took out, back into doc where what it needs is still there:
-    an undone removal keeps the entry candidates, links and rule references it had."""
+    an undone removal keeps the entry candidates, links, rule references, group places and the
+    ports that led to it."""
     present = {m['serverId'] for m in doc['members'] if not m['removing']}
     prior = {m['serverId']: m for m in before['members']}
 
@@ -587,6 +707,8 @@ def unstrip(doc, before, server_id):
             back[side]['members'] = [v for v in back[side]['members'] if v in present]
         doc['rules'].insert(min(i, len(doc['rules'])), back)
         current[back['id']] = back
+    mesh_proxy.unstrip(doc, before, server_id, present)
+    mesh_paths.unstrip(doc, before, server_id, present)
     return doc
 
 
@@ -632,6 +754,7 @@ def validate(doc, facts, *, applying=False, applied=None):
     net, ctrl = ipaddress.ip_network(s['prefix']), ipaddress.ip_network(s['controlPrefix'])
     live = {m['serverId']: m for m in active(doc)}
     index = {m['serverId']: i for i, m in enumerate(doc['members'])}
+    limits = doc.get('limits') or []
 
     def name(sid):
         return (facts.get(sid) or {}).get('name') or sid
@@ -704,28 +827,50 @@ def validate(doc, facts, *, applying=False, applied=None):
                     errors.add(q, 'endpoint_missing', f'{name(c["relay"])} 没有可用的对外地址')
                 elif applying and c['transport'] == 'tls' and not _pins(facts, c['relay']):
                     errors.add(q, 'tls_fingerprint_missing', f'还没有取到 {name(c["relay"])} 的 TLS 证书指纹，节点需要在线')
+                if relay and relay['role'] == 'relay' and (found := mesh_limits.violation(limits, m, relay, c['transport'], facts, c.get('origin') == 'auto')):
+                    errors.add(q, 'limit_violation', mesh_limits.message(found, m, relay, facts))
                 if (c['relay'], c['transport']) in used:
                     errors.add(q, 'candidate_duplicate', '入口候选重复')
                 used.add((c['relay'], c['transport']))
-            kinds = {is_site(live[c['relay']]) for c in m['entry']['candidates'] if live.get(c['relay'], {}).get('role') == 'relay'}
-            if True in kinds and False not in kinds:
+            entry_relays = [live[c['relay']] for c in m['entry']['candidates'] if live.get(c['relay'], {}).get('role') == 'relay']
+            # A site relay on the member's LAN is dialed at its LAN address from the start; one
+            # elsewhere is punched through another candidate that is up.
+            if any(is_site(r) for r in entry_relays) and not any(not is_site(r) or lan_endpoint(m, r, facts) for r in entry_relays):
                 errors.add(f'{p}.entry.candidates', 'mesh_entry_needs_bootstrap',
-                           '入口候选里有站点中转时，还必须有一个公网中转候选（经它交换打洞地址，也作备用入口）')
+                           '入口里的站点中转都不在这个节点的局域网里时，还必须有一个公网中转候选（经它交换打洞地址，也作备用入口）')
 
     _check_schemas(live, facts, index, errors, name)
 
-    gateways = []
+    gateways, backups = [], []
     for sid, m in live.items():
+        features = (facts.get(sid) or {}).get('features')
+        if (m['gateway'] or {}).get('snat') and features is not None and STANDBY_FEATURE not in features:
+            # Source NAT came with standby gateways: an older node leaves it out.
+            errors.add(f'members[{index[sid]}].gateway.snat', 'gateway_snat_needs_update', f'{name(sid)} 的节点版本不支持入网源地址转换，请先在服务器页更新节点')
         for k, raw in enumerate((m['gateway'] or {}).get('subnets', [])):
             q = f'members[{index[sid]}].gateway.subnets[{k}]'
             subnet = ipaddress.ip_network(raw)
             if subnet.overlaps(net):
                 errors.add(q, 'gateway_overlaps_mesh', f'网关网段不能和网格地址段 {net} 重叠')
+            if m['gateway'].get('backup'):
+                backups.append((subnet, sid, q))
+                continue
             for other, owner in gateways:
                 if subnet.overlaps(other):
                     errors.add(q, 'gateway_overlap', f'和 {name(owner)} 的网段 {other} 重叠')
                     break
             gateways.append((subnet, sid))
+    # A backup gateway stands by for exactly what a gateway announces, nothing that half overlaps it.
+    for subnet, sid, q in backups:
+        features = (facts.get(sid) or {}).get('features')
+        if (applying and features is None) or (features is not None and STANDBY_FEATURE not in features):
+            errors.add(q, 'gateway_backup_needs_update', f'{name(sid)} 的节点版本不支持备用网关，请先在服务器页更新节点')
+        if not any(subnet == other and owner != sid for other, owner in gateways):
+            errors.add(q, 'gateway_backup_without_primary', '备用网关的网段须和另一台首选网关宣告的网段完全一致')
+        else:
+            clash = next(((other, owner) for other, owner in gateways if subnet != other and subnet.overlaps(other)), None)
+            if clash:
+                errors.add(q, 'gateway_overlap', f'和 {name(clash[1])} 的网段 {clash[0]} 重叠')
 
     relays = [sid for sid, m in live.items() if m['role'] == 'relay']
     seen = set()
@@ -738,6 +883,9 @@ def validate(doc, facts, *, applying=False, applied=None):
             errors.add(q, 'link_duplicate', '连接重复')
         else:
             _check_relay_link(effective(pair, live), live, facts, q, errors, name, applying)
+            automatic = pair.get('origin') == 'auto' or doc['relayLinks']['mode'] == 'auto' and set(pair.get('auto') or []) >= set(mesh_auto.PAIR_AUTO)
+            if found := mesh_limits.violation(limits, live[pair['a']], live[pair['b']], pair['transport'], facts, automatic):
+                errors.add(q, 'limit_violation', mesh_limits.message(found, live[pair['a']], live[pair['b']], facts))
         seen.add(key)
     pairs = relay_pairs(doc, facts)
     if doc['relayLinks']['mode'] == 'full':
@@ -764,10 +912,13 @@ def validate(doc, facts, *, applying=False, applied=None):
             errors.add(q, 'direct_not_members', '直连的两端都必须是普通成员')
         elif key in seen:
             errors.add(q, 'link_duplicate', '直连重复')
-        elif pair['transport'] == 'udp':
-            _check_punch(pair, live, facts, q, errors)
         else:
-            _check_dial(pair, live, facts, q, errors, name, applying)
+            if pair['transport'] == 'udp':
+                _check_punch(pair, live, facts, q, errors)
+            else:
+                _check_dial(pair, live, facts, q, errors, name, applying)
+            if found := mesh_limits.violation(limits, live[pair['a']], live[pair['b']], pair['transport'], facts, pair.get('origin') == 'auto'):
+                errors.add(q, 'limit_violation', mesh_limits.message(found, live[pair['a']], live[pair['b']], facts))
         seen.add(key)
 
     tags = {t for m in live.values() for t in m['tags']}
@@ -789,6 +940,8 @@ def validate(doc, facts, *, applying=False, applied=None):
             errors.add(f'{q}.dst', 'rule_dst_empty', '目标不能为空')
         if rule['ports'] and rule['proto'] not in ('tcp', 'udp'):
             errors.add(f'{q}.ports', 'rule_ports_need_proto', '只有 TCP 和 UDP 规则可以限定端口')
+    mesh_proxy.validate(doc, facts, live, index, name, errors)
+    mesh_paths.validate(doc, facts, errors)
     return errors
 
 
@@ -813,7 +966,7 @@ def hints(doc, facts, conflicts=None, applied=None):
             elif not overlap_blocks(sid, doc, applied):
                 out.add(f'members[{index[sid]}]', 'mesh_prefix_overlap',
                         f'{name(sid)} 上报本机网段 {other}，和组网地址段 {doc["settings"]["prefix"]} 重叠：它访问这段地址可能走错路，'
-                        f'其他成员照常。确有其事时请换一个组网地址段，或调整那台机器的网络。')
+                        f'其他成员照常。确有其事时请换一个组网地址段，或调整那个节点的网络。')
         # Instances listening on a mesh address the draft takes from their server, or whose gateway's server leaves.
         kept = {(a['serverId'], a['instanceId']) for a in mesh_config.instance_access(doc, facts)}
         for a in mesh_config.instance_access(applied, facts):
@@ -855,9 +1008,12 @@ def hints(doc, facts, conflicts=None, applied=None):
             gateway = next((g for g in live.values() if any(net.overlaps(ipaddress.ip_network(s)) for s in (g['gateway'] or {}).get('subnets', []))), None)
             behind = f'{name(gateway["serverId"])} 的网关网段 ' if gateway else '网段 '
             via = f'（经 {dev}）' if dev else ''
+            # On that network itself, the machine reaches it directly: nothing to warn about.
+            if held in ((facts.get(sid) or {}).get('localPrefixes') or []):
+                continue
             out.add(f'members[{index[sid]}]', 'mesh_gateway_route_conflict',
-                    f'{name(sid)} 本机已有 {held} 的路由{via}，和{behind}{route} 重叠。组网不在 {name(sid)} 上装 {route} 的路由，'
-                    f'它访问这个网段仍走原来的路由，其他组网流量照常。')
+                    f'{name(sid)} 保留了本机原有的 {held} 路由{via}，没有接管{behind}{route}：它访问这个网段仍走原来的路由，其他组网流量照常。'
+                    f'要改走组网，在 {name(sid)} 的「路由冲突」里勾上接管。')
     for sid in live:
         by = {}
         for field, other in ((facts.get(sid) or {}).get('keyConflict') or {}).items():
@@ -875,22 +1031,32 @@ def hints(doc, facts, conflicts=None, applied=None):
         if not all(mesh_config._key32(f.get(k)) for k in ('publicKey', 'controlKey')):
             out.add(f'members[{index[sid]}]', 'mesh_keys_invalid',
                     f'{name(sid)} 记录的组网公钥或控制密钥不是 32 字节的密钥：其余成员的配置都不包含它，它连不上组网，'
-                    f'其他成员照常。请检查这台机器，再对它「重装组网」。')
+                    f'其他成员照常。请检查这个节点，再对它「重装组网」。')
         elif r[0] <= ours[1] and ours[0] <= r[1] and not f.get('keyConflict'):
             out.add(f'members[{index[sid]}]', 'mesh_keys_missing',
                     f'{name(sid)} 还没有上报签名密钥和端到端密钥：在它上报之前，其余成员的配置都不包含它，它暂时连不上组网，'
                     f'其他成员照常。它上线后会自动补上。')
+    mesh_paths.hints(doc, facts, out)
     return out
+
+
+DOCKER_POOL = ipaddress.ip_network('172.16.0.0/12')
+
+
+def _docker_network(net):
+    """A network from Docker's default address pools: a /16 from 172.17.0.0 to 172.31.0.0, one per bridge it makes."""
+    return net.prefixlen == 16 and net.subnet_of(DOCKER_POOL) and net.network_address.packed[1] >= 17
 
 
 def subnet_suggestions(f, prefix):
     """The LAN networks a member's machine is on (its node's localPrefixes), as gateway subnets
-    it could announce: private (RFC 1918), not a default container bridge, not a single address,
+    it could announce: private (RFC 1918), not a container bridge, not a single address,
     not overlapping the mesh prefix."""
     mesh = ipaddress.ip_network(prefix)
     out = []
     for net in _lans(f):
-        if net.prefixlen <= 30 and not net.overlaps(mesh) and not any(net.overlaps(b) for b in BRIDGE_NETS):
+        if (net.prefixlen <= 30 and not net.overlaps(mesh) and not any(net.overlaps(b) for b in BRIDGE_NETS)
+                and not _docker_network(net)):
             out.append(str(net))
     return list(dict.fromkeys(out))
 
@@ -1026,6 +1192,9 @@ def _pins(facts, sid):
 
 # Members whose data plane has to be updated (or the controller): refused at apply, not when the draft is saved.
 SCHEMA_ERRORS = frozenset({'config_schema_node_outdated', 'config_schema_controller_outdated', 'config_schema_mismatch'})
+# Problems the draft keeps and apply refuses: a data plane to update, a fixed path the mesh cannot carry now.
+APPLY_ERRORS = (SCHEMA_ERRORS | mesh_paths.APPLY_ERRORS | mesh_proxy.APPLY_ERRORS
+                | {'gateway_backup_needs_update', 'gateway_snat_needs_update'})
 
 
 def schema_span(r):

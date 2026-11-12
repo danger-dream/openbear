@@ -47,6 +47,10 @@ type rtLab struct {
 	procs map[string]*exec.Cmd
 	keys  map[string][4]string // wg priv, wg pub, control priv, control pub
 	hops  map[string]map[string]string
+	// configure, env and wrap, when set, adjust a node's config, add to its
+	// environment and go before its command (taskset, say).
+	configure func(id string, c *Config)
+	env, wrap map[string][]string
 }
 
 func rtSkip(t *testing.T) {
@@ -187,6 +191,9 @@ func (l *rtLab) config(id string) *Config {
 	for _, k := range l.links {
 		c.RelayLinks = append(c.RelayLinks, [2]string{k.a, k.b})
 	}
+	if l.configure != nil {
+		l.configure(id, c)
+	}
 	return c
 }
 
@@ -202,8 +209,9 @@ func (l *rtLab) start() {
 		}
 		os.WriteFile(filepath.Join(l.dirs[id], "config.json"), raw, 0o600)
 		log, _ := os.Create(filepath.Join(l.dirs[id], "mesh.log"))
-		cmd := exec.Command("ip", "netns", "exec", l.ns[id], self, "-test.run", "^TestNetnsNode$", "-test.v")
-		cmd.Env = append(os.Environ(), "OBLAB_MESH_DIR="+l.dirs[id])
+		args := append(slices.Clone(l.wrap[id]), "ip", "netns", "exec", l.ns[id], self, "-test.run", "^TestNetnsNode$", "-test.v")
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Env = append(append(os.Environ(), "OBLAB_MESH_DIR="+l.dirs[id]), l.env[id]...)
 		cmd.Stdout, cmd.Stderr = log, log
 		if err := cmd.Start(); err != nil {
 			l.t.Fatal(err)

@@ -65,17 +65,39 @@ class Worker:
                 await conn.execute('UPDATE webhook_assignment_events SET delivered_at_ms=NULL,delivery_command_id=NULL WHERE assignment_id=?',(a['assignment_id'],))
                 await conn.execute("UPDATE webhook_phase_spans SET ended_at_ms=started_at_ms,end_reason='interrupted_before_execution' WHERE assignment_id=? AND ended_at_ms IS NULL",(a['assignment_id'],))
             await conn.execute("UPDATE web_task_notifications SET state='paused',last_error='interrupted delivery; verify channel state',claim_token='' WHERE kind='webhook-result' AND state='processing'")
+            from app.webhooks.controls import discard_backlog
+            await discard_backlog(conn)
 
     async def run(self):
         await wait_for_startup(self)
         self.last_prune = self.s.clock()
-        while not self.closing:
-            self.s.wake.clear()
-            try: await self.tick()
-            except asyncio.CancelledError: raise
-            except Exception: log.exception('Webhook discovery failure; durable work retained')
-            try: await asyncio.wait_for(self.s.wake.wait(),.1)
-            except TimeoutError: pass
+        wake=self.s.wake.listen()
+        try:
+            while not self.closing:
+                wake.clear(); pause=1.0
+                try: await self.tick(); pause=await self.pause()
+                except asyncio.CancelledError: raise
+                except Exception: log.exception('Webhook discovery failure; durable work retained')
+                try: await asyncio.wait_for(wake.wait(),pause)
+                except TimeoutError: pass
+        finally: self.s.wake.forget(wake)
+
+    async def pause(self):
+        """Seconds until the next deadline a tick serves. New and finished work wake the loop; what
+        frees up without a wake (a target conversation going idle) waits at most a second."""
+        s=self.s; now=s.clock()
+        row=await one(s.db.conn,"""SELECT MIN(t) t FROM (
+                SELECT MIN(idle_deadline_ms) t FROM webhook_batches WHERE state='collecting' AND idle_deadline_ms>?
+                UNION ALL SELECT MIN(max_deadline_ms) FROM webhook_batches WHERE state='collecting' AND max_deadline_ms>?
+                UNION ALL SELECT MIN(expires_at_ms) FROM webhook_events WHERE terminal_at_ms IS NULL AND expires_at_ms>? AND route_state IN ('pre','eligible','batch','hold')
+                UNION ALL SELECT MIN(deadline_ms) FROM webhook_waits WHERE state IN ('registered','collecting','sealed') AND deadline_ms>?
+                UNION ALL SELECT MIN(last_claimed_at_ms+idle_ms) FROM webhook_waits WHERE state='collecting' AND last_claimed_at_ms+idle_ms>?
+                UNION ALL SELECT MIN(first_claimed_at_ms+collect_max_ms) FROM webhook_waits WHERE state='collecting' AND first_claimed_at_ms+collect_max_ms>?
+                UNION ALL SELECT MIN(next_attempt_at_ms) FROM webhook_stage_jobs WHERE state='pending' AND next_attempt_at_ms>?
+                UNION ALL SELECT MIN(next_attempt_at_ms) FROM webhook_telemetry_operations WHERE state='pending' AND next_attempt_at_ms>?
+                UNION ALL SELECT MIN(json_extract(model_blockers_json,'$.retry.untilMs')) FROM webhook_endpoints WHERE json_extract(model_blockers_json,'$.retry.untilMs')>?)""",(now,)*9)
+        due=min(t for t in (row['t'] if row else None,self.last_prune+60000) if t is not None)
+        return min(1.0,max(.01,(due-now)/1000))
 
     async def tick(self):
         s=self.s

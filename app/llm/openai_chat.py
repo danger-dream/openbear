@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app.agent.transcript_repair import is_role_alternation_bridge
 from app.llm.base import (
     AgentResult,
     LLMBackend,
@@ -40,13 +41,19 @@ def _is_gpt_model(model: str) -> bool:
     return str(model or "").strip().lower().startswith("gpt-")
 
 
-def _to_chat_messages(messages: list[Message], system: str) -> list[dict[str, Any]]:
+def _to_chat_messages(messages: list[Message], system: str, model: str = "") -> list[dict[str, Any]]:
     """中性消息 → OpenAI Chat messages。"""
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
+    # Gemini accepts adjacent user turns; the strict-alternation bridge only
+    # invites it to imitate the placeholder. Other Chat upstreams may need it.
+    drop_bridge = "gemini" in str(model or "").lower()
     for m in messages:
         role = m["role"]
+        if (drop_bridge and role == "assistant" and not m.get("tool_calls")
+                and is_role_alternation_bridge(m.get("content"))):
+            continue
         if role == "assistant" and m.get("tool_calls"):
             out.append({
                 "role": "assistant",
@@ -140,7 +147,7 @@ class OpenAIChatBackend(LLMBackend):
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _to_chat_messages(messages, system),
+            "messages": _to_chat_messages(messages, system, model),
             "stream": stream,
             "max_tokens": max_tokens,
         }

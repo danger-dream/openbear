@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"openbear/node/mesh/bypass"
 )
 
 // Exec runs one shell command in its own process group so a timeout or a
@@ -36,6 +38,9 @@ func Exec(ctx context.Context, raw json.RawMessage) (ExecResult, error) {
 	}
 	cmd := shellCommand(shell, p.Command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if p.Bypass && bypass.Active() {
+		bypassedCommand(cmd)
+	}
 	cmd.Dir = p.Cwd
 	cmd.Stdin = strings.NewReader(p.Stdin)
 	// The stdin copy is the only I/O Wait itself waits for.

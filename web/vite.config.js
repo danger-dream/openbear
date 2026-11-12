@@ -32,6 +32,53 @@ const buildIdentity = {
   },
 };
 
+// @novnc/novnc 1.7.0 has a single top-level await in core/util/browser.js to probe
+// WebCodecs H.264 decode support. Resolving it asynchronously keeps browserTargets
+// (safari15 / chrome87) compatible without blocking module evaluation.
+const noVncCompat = {
+  name: "openbear-novnc-compat",
+  transform(code, id) {
+    if (id.includes("/@novnc/novnc/") && id.endsWith("/core/util/browser.js") && code.includes("await _checkWebCodecsH264DecodeSupport()")) {
+      return {
+        code: code.replace(
+          "supportsWebCodecsH264Decode = await _checkWebCodecsH264DecodeSupport();",
+          "_checkWebCodecsH264DecodeSupport().then(v => { supportsWebCodecsH264Decode = v; }).catch(() => {});",
+        ),
+        map: null,
+      };
+    }
+    if (id.includes("/@novnc/novnc/") && id.endsWith("/core/util/cursor.js") && code.includes("this._target.style.cursor = 'none';")) {
+      return {
+        code: code.replace("this._target.style.cursor = 'none';", "this._target.style.cursor = 'default';"),
+        map: null,
+      };
+    }
+  },
+};
+
+// Installed updaters check every quoted "./x.js"-style string in the bundle as a file
+// next to the chunk; up to 0.15.0 they also count an object key, and wasm-bindgen
+// names the Wasm import namespace "./rdp_client_bg.js" this way. As a computed key
+// split in two it is the same property, and no longer a reference those check.
+const QUOTED_RESOURCE_KEY = /([{,]\s*)(["'])((?:\.\/|\.\.\/|\/assets\/)[^'"\\\s]+)(\.(?:js|mjs|css|wasm|json|ttf|otf|eot|woff|woff2|svg|png|jpe?g|gif|webp|ico|map))\2(\s*:)/gi;
+
+export function splitResourceKeys(code) {
+  return code.replace(QUOTED_RESOURCE_KEY, (_, before, q, stem, ext, colon) => `${before}[${q}${stem}${q}+${q}${ext}${q}]${colon}`);
+}
+
+// After minification, which would fold the halves back together.
+const resourceKeys = {
+  name: "openbear-resource-keys",
+  enforce: "post",
+  renderChunk: {
+    order: "post",
+    handler(code) {
+      const out = splitResourceKeys(code);
+      return out === code ? null : {code: out, map: null};
+    },
+  },
+};
+
 // A gateway serves each instance's build below its own /_i/<instance>/ prefix.
 // Compiled JS and CSS locate their assets relative to their own URL, so they
 // follow whichever prefix loaded the page; index.html keeps root URLs, which
@@ -41,7 +88,7 @@ export function renderBuiltUrl(filename, {hostType}) {
 }
 
 export default defineConfig({
-  plugins: [vue(), buildIdentity],
+  plugins: [vue(), buildIdentity, noVncCompat, resourceKeys],
   experimental: { renderBuiltUrl },
   define: {
     __OPENBEAR_BUILD_ID__: JSON.stringify(buildInfo.buildId),

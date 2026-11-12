@@ -175,6 +175,50 @@ async def test_error_event_partial_text_tail_and_no_native_mixing():
 
 
 @pytest.mark.asyncio
+async def test_retry_tail_drops_an_interrupted_bridge_marker_echo():
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT
+
+    backend = FakeStream([
+        [StreamEvent("content", text=ROLE_ALTERNATION_BRIDGE_TEXT[:30]), fault()],
+        [StreamEvent("content", text="actual answer"), StreamEvent("finish", finish_reason="stop")],
+    ])
+    tails = []
+
+    def prepare(tail):
+        tails.append(copy.deepcopy(tail))
+        return req(backend, [{"role": "user", "content": "origin"}, *tail])
+
+    result = await driver().call(prepare, lambda outcome: None)
+    assert result.response.text == "actual answer"
+    assert [m["role"] for m in tails[1]] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_retry_asks_for_simpler_arguments():
+    from app.runtime.model_call import _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION, _RECOVERY_INSTRUCTION
+
+    malformed = fault("gemini_malformed_function_call: Gemini generation ended with MALFORMED_FUNCTION_CALL",
+                      status=400, retryable=True, reason="server_error")
+    backend = FakeStream([
+        [StreamEvent("content", text="checking logs"), malformed],
+        [fault()],
+        [StreamEvent("tool_call", tool_calls=[ToolCall("c1", "Bash", '{"command":"ls"}')]),
+         StreamEvent("finish", finish_reason="tool_calls")],
+    ])
+    tails = []
+
+    def prepare(tail):
+        tails.append(copy.deepcopy(tail))
+        return req(backend, [{"role": "user", "content": "origin"}, *tail])
+
+    result = await driver().call(prepare, lambda outcome: None)
+    assert [call.name for call in result.response.tool_calls] == ["Bash"]
+    assert tails[1] == [{"role": "assistant", "content": "checking logs"},
+                        {"role": "user", "content": _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION}]
+    assert tails[2][-1] == {"role": "user", "content": _RECOVERY_INSTRUCTION}
+
+
+@pytest.mark.asyncio
 async def test_reasoning_accumulation_switch_and_no_unsigned_tail():
     backend = FakeStream([
         [StreamEvent("reasoning", text="old", signature="old-sig"), fault()],

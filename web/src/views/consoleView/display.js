@@ -317,7 +317,8 @@ function toolPreviewFromCall(call, rawResult = "") {
 	const argsText = callArguments(call);
 	const previewArguments = String(call.previewArguments || "").trim();
 	const summaryPreview = String(call.preview || "").trim();
-	const resultText = String(rawResult || "");
+	// A collapsed card has no result body yet; its digest still says how the call came out.
+	const resultText = String(rawResult || call.resultDigest || "");
 	const sourceArguments = argsText || previewArguments;
 	const toolName = callName(call);
 	const cached = toolCallPreviewMemo.get(call);

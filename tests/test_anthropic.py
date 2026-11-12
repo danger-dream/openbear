@@ -69,6 +69,27 @@ async def test_anthropic_stream_cumulative_usage_updates(updates, expected):
         await client.close()
 
 
+async def test_anthropic_reports_the_prompt_usage_as_soon_as_the_message_starts():
+    lines = _ev("message_start", {"message": {"usage": {
+        "input_tokens": 12, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}}})
+    lines += _ev("content_block_start", {"index": 0, "content_block": {"type": "text"}})
+    lines += _ev("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "好"}})
+    lines += _ev("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}})
+    lines += _ev("message_stop", {})
+    client = make_client(lambda r: sse_response(lines))
+    try:
+        backend = AnthropicBackend(client, "https://x/v1", "k")
+        events = [event async for event in backend.stream([{"role": "user", "content": "hi"}], model="claude")]
+    finally:
+        await client.close()
+    kinds = [event.kind for event in events]
+    assert kinds.index("usage_preview") < kinds.index("content")
+    preview = events[kinds.index("usage_preview")].usage
+    assert (preview.input_tokens, preview.cache_read_tokens, preview.cache_write_tokens, preview.output_tokens) == (12, 3, 2, 0)
+    final = events[kinds.index("usage")].usage
+    assert final.output_tokens == 4 and preview.output_tokens == 0, "the preview is a snapshot, not the live accumulator"
+
+
 async def test_anthropic_stream_thinking_with_signature():
     """thinking_delta + signature_delta → reasoning + signature 落到 result。"""
     lines = []

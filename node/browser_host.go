@@ -101,6 +101,10 @@ type browserHost struct {
 	startCancel    context.CancelFunc
 	downloadCancel context.CancelFunc
 	downloading    chan struct{}
+	update         map[string]any // the last update of the downloaded Chrome, as browser.status shows it
+	updating       bool
+	updateCancel   context.CancelFunc
+	updateDone     chan struct{}
 }
 
 func (a *Agent) browserHost() *browserHost {
@@ -127,6 +131,16 @@ func (h *browserHost) statusLocked() map[string]any {
 	}
 	if h.state == "installing" {
 		out["downloaded"] = h.progress
+	}
+	if version := installedChrome(h.dir); version != "" {
+		out["chromeVersion"] = version
+	}
+	if h.update != nil {
+		update := map[string]any{}
+		for k, v := range h.update {
+			update[k] = v
+		}
+		out["update"] = update
 	}
 	return out
 }
@@ -395,6 +409,9 @@ func (h *browserHost) executable(c BrowserConfig) (string, string, error) {
 		}
 	}
 	if exe := downloadedBrowser(h.dir); exe != "" {
+		if !chromeRunsHere() {
+			return "", "", errors.New("browser_unsupported_libc")
+		}
 		// Reported, not downloaded again: installing the libraries fixes it.
 		if err := checkLibraries(exe); err != nil {
 			return "", "", err
@@ -408,6 +425,9 @@ func (h *browserHost) executable(c BrowserConfig) (string, string, error) {
 			exe = real
 		}
 		return "", "", errors.New("browser_not_runnable: " + exe)
+	}
+	if !chromeRunsHere() {
+		return "", "", errors.New("browser_unsupported_libc")
 	}
 	return "", "", nil
 }
@@ -448,6 +468,140 @@ func (h *browserHost) download(generation uint64) {
 			h.agent.Logger.Printf("browser download failed: %v", err)
 		}
 	}()
+}
+
+// updateChrome checks for a newer stable Chrome for Testing than the downloaded
+// one and, unless only checking, installs it in the background; browser.status
+// follows it under "update". A browser running the old one keeps running it
+// unless restart asks for it to be restarted on the new one.
+func (h *browserHost) updateChrome(ctx context.Context, raw json.RawMessage) (any, error) {
+	var p struct {
+		Check   bool `json:"check"`
+		Restart bool `json:"restart"`
+	}
+	if len(raw) > 0 && json.Unmarshal(raw, &p) != nil {
+		return nil, errors.New("invalid_params")
+	}
+	current := installedChrome(h.dir)
+	if current == "" {
+		return nil, errors.New("browser_not_downloaded")
+	}
+	h.mu.Lock()
+	busy := h.downloading != nil || h.updating
+	h.mu.Unlock()
+	if busy {
+		return nil, errors.New("browser_installing")
+	}
+	version, link, err := latestChrome(ctx)
+	if err != nil {
+		return nil, errors.New("browser_update_check_failed: " + err.Error())
+	}
+	out := map[string]any{"current": current, "latest": version, "upToDate": !newerChrome(version, current)}
+	if p.Check || out["upToDate"] == true {
+		return out, nil
+	}
+	h.mu.Lock()
+	if h.downloading != nil || h.updating {
+		h.mu.Unlock()
+		return nil, errors.New("browser_installing")
+	}
+	// Another check may have completed an update while this request fetched the list.
+	current = installedChrome(h.dir)
+	if !newerChrome(version, current) {
+		h.mu.Unlock()
+		return map[string]any{"current": current, "latest": version, "upToDate": true}, nil
+	}
+	h.updating = true
+	updateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	h.updateCancel, h.updateDone = cancel, make(chan struct{})
+	h.update = map[string]any{"state": "downloading", "version": version, "from": current, "downloaded": int64(0)}
+	h.mu.Unlock()
+	go h.installUpdate(updateCtx, version, link, p.Restart)
+	out["started"] = true
+	return out, nil
+}
+
+func (h *browserHost) installUpdate(ctx context.Context, version, link string, restart bool) {
+	h.mu.Lock()
+	cancel, done := h.updateCancel, h.updateDone
+	h.mu.Unlock()
+	defer cancel()
+	defer close(done)
+	_, err := installChrome(ctx, h.dir, version, link, func(n int64) {
+		h.mu.Lock()
+		h.update["downloaded"] = n
+		h.mu.Unlock()
+	}, checkLibraries)
+	h.mu.Lock()
+	if err != nil {
+		h.updating = false
+		// What was installed stays and keeps being used.
+		h.update = map[string]any{"state": "failed", "version": version, "error": err.Error()}
+		h.mu.Unlock()
+		h.agent.Logger.Printf("browser update to %s failed: %v", version, err)
+		return
+	}
+	running := h.engine != nil && h.source == "download" || h.starting != nil
+	if !running {
+		// A desktop browser can survive the node process. Only an explicit restart
+		// lets us discard old versions without breaking that browser's resources.
+		h.update = map[string]any{"state": "done", "version": version, "restartNeeded": false}
+		h.updating = false
+		h.mu.Unlock()
+		return
+	}
+	h.update = map[string]any{"state": "done", "version": version, "restartNeeded": true}
+	if !restart {
+		h.updating = false
+		h.mu.Unlock()
+		return
+	}
+	h.update["state"] = "restarting"
+	h.mu.Unlock()
+	h.stop()
+	status, startErr := h.ensure(ctx)
+	if startErr == nil && h.reused() {
+		h.stop()
+		status, startErr = h.ensure(ctx)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.updating = false
+	h.update["state"], h.update["restarted"] = "done", true
+	if startErr != nil {
+		h.update["error"] = startErr.Error()
+	} else if status["state"] != "ready" {
+		h.update["error"] = status["error"]
+	} else {
+		h.update["restartNeeded"] = false
+		pruneChrome(h.dir)
+	}
+}
+
+func (h *browserHost) cancelUpdate() {
+	h.mu.Lock()
+	cancel, done := h.updateCancel, h.updateDone
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+}
+
+// chromeRestarted follows an explicit restart, not an attachment to a browser
+// left running by an earlier node process.
+func (h *browserHost) chromeRestarted() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.updating || h.downloading != nil || h.source != "download" {
+		return
+	}
+	if h.update != nil && h.update["state"] == "done" {
+		h.update["restartNeeded"] = false
+		h.update["restarted"] = true
+		delete(h.update, "error")
+	}
+	pruneChrome(h.dir)
 }
 
 func (h *browserHost) acquire() error {

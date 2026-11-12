@@ -50,7 +50,7 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
         "type": "object",
         "properties": {
             "id": {"type": "string", "description": "本轮问卷内唯一的问题 ID"},
-            "type": {"type": "string", "enum": ["choice", "open"], "description": "choice 为选项题且用户始终可补充自由文字，open 为开放题"},
+            "type": {"type": "string", "enum": ["choice", "open"], "description": "choice 选项题（可另写文字），open 开放题"},
             "question": {"type": "string", "description": "问题正文"},
             "description": {"type": "string", "description": "问题补充说明"},
             "required": {"type": "boolean", "description": "是否必答，默认 true"},
@@ -69,9 +69,9 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
     }
     reg.add(
         "UserInteraction",
-        "Ask the user via a shared Web/TG interaction for an unresolved decision or a required confirmation, not to repeat a clear instruction or existing authorization within its scope. Do not add a preliminary confirmation for the same action when its execution tool supplies the required gate. Supports confirm, select, prompt, questionnaire. Choices always permit text-only or options plus original text; user text takes precedence over conflicting selections. decision=feedback grants no authority; decision=confirm_with_changes explicitly authorizes the proposal amended by the user's full text. Apply those conditions before execution; do not ask again merely because an answer contains text. Ask only for material ambiguity or expanded scope. Telegram delivery/reply follows user settings; sensitive answers are Web-only.",
+        "Ask the user through a shared Web/TG interaction (confirm, select, prompt, questionnaire) for an unresolved decision or a required confirmation, not to repeat a clear instruction or existing authorization within its scope; ask only for material ambiguity or expanded scope, and never pre-confirm an action whose execution tool supplies its own gate. It is never the confirmation for a restart, stop or other OpenBearControl action, requested or not: OpenBearControl asks the user itself, so call it directly. Every choice also accepts text alone or with options, and that text wins over conflicting selections. decision=feedback grants no authority; decision=confirm_with_changes explicitly authorizes the proposal as amended by the user's full text: apply those conditions before executing, without asking again just because the answer has text. Telegram delivery/reply follows user settings; sensitive answers are Web-only.",
         {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["confirm", "select", "prompt", "questionnaire"], "description": "Interaction action"},
+            "action": {"type": "string", "enum": ["confirm", "select", "prompt", "questionnaire"]},
             "title": {"type": "string", "description": "标题"},
             "body": {"type": "string", "description": "正文说明"},
             "type": {"type": "string", "enum": ["none", "success", "info", "warning", "danger"], "description": "提示类型"},
@@ -83,11 +83,11 @@ def register_user_interaction_tools(reg: ToolRegistry, manager: UserInteractionM
             "options": {"type": "array", "items": {"oneOf": [
                 {"type": "string"},
                 {"type": "object", "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label"]},
-            ]}, "description": "select 的选项列表；用户始终可以只写文字或选择后补充，原文和选择一起回传"},
+            ]}, "description": "select 的选项；用户的文字与选择一起回传"},
             "multiple": {"type": "boolean", "description": "select 是否允许多选；questionnaire 请在每个 choice 问题中设置"},
             "sensitive": {"type": "boolean", "description": "整条交互是否敏感；敏感内容不发往 TG，答案原文只提交给当前任务，公开日志脱敏"},
             "defaultValue": {"type": "string", "description": "prompt 的输入初始值；只有用户实际提交才算回答，超时不采用"},
-            "questions": {"type": "array", "items": question_schema, "description": "questionnaire 的问题列表；choice 固有支持选项之外的自由文字补充"},
+            "questions": {"type": "array", "items": question_schema, "description": "questionnaire 的问题列表"},
         }, "required": ["action", "title", "body"]},
         _user_interaction,
         visibility={"main"},

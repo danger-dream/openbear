@@ -1,9 +1,12 @@
 package transport
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
+	"sync"
 
 	"openbear/node/mesh/wire"
 )
@@ -39,6 +42,36 @@ func maxDatagram(mtu int) int { return max(148, (mtu+15)&^15+32) }
 const receiveMTU = 1420
 
 func receiveLimit(mtu int) int { return maxDatagram(max(mtu, receiveMTU)) }
+
+// largeLimit is the longest data frame a stream of wire.LargeFrames or
+// later carries between two nodes that take large frames: a packet of
+// wire.LargeMTU bytes and what padding to a network MTU below it adds.
+var largeLimit = maxDatagram(wire.LargeMTU + 15)
+
+// largeFrames: the bind has the queue and the device the buffers for
+// large frames, which only the 2048-byte buffers leave room for.
+func (o Options) largeFrames() bool { return o.LargeFrames && o.MTU <= receiveMTU }
+
+// streamReceiveLimit is the longest frame s takes. Called with b.mu held.
+func (b *Bind) streamReceiveLimit(s *session) int {
+	if b.opt.largeFrames() && s.version >= wire.LargeFrames {
+		return largeLimit
+	}
+	return receiveLimit(b.opt.MTU)
+}
+
+// sendLimit is the longest data frame that goes out on ss, ep's stream,
+// or on ep itself when it is UDP: a large one only over a stream of
+// wire.LargeFrames or later whose other end has said it takes them
+// (session.peerLarge). What the other end takes on a stream does not
+// change while it lasts, so a frame sealed for it before the peer or this
+// node stopped asking for large packets still goes. Called with b.mu held.
+func (b *Bind) sendLimit(ep *endpoint, ss *session) int {
+	if ep.transport != "udp" && ss != nil && ss.version >= wire.LargeFrames && ss.peerLarge && b.opt.largeFrames() {
+		return largeLimit
+	}
+	return maxDatagram(b.opt.MTU)
+}
 
 func readPreamble(r io.Reader) error {
 	_, err := readPreambleVersion(r)
@@ -101,10 +134,36 @@ func writePlaneFrame(w io.Writer, p []byte, limit int, plane uint8) error {
 	var h [3]byte
 	binary.BigEndian.PutUint16(h[:2], uint16(len(p)+1))
 	h[2] = plane
+	switch c := w.(type) {
+	case *net.TCPConn:
+		return writeVector(c, net.Buffers{h[:], p}, len(h)+len(p))
+	case *tls.Conn:
+		// One record, not one for the header and one for the payload.
+		buf := frameBuffers.Get().(*[]byte)
+		frame := append(append((*buf)[:0], h[:]...), p...)
+		err := writeAll(c, frame)
+		*buf = frame
+		frameBuffers.Put(buf)
+		return err
+	}
 	if err := writeAll(w, h[:]); err != nil {
 		return err
 	}
 	return writeAll(w, p)
+}
+
+// frameBuffers hold a frame laid out whole for a TLS write.
+var frameBuffers = sync.Pool{New: func() any { return new([]byte) }}
+
+// writeVector writes v, total bytes, in one vectored write. A short write
+// is an error: the caller closes the stream, a prefix of a frame having
+// gone out.
+func writeVector(c *net.TCPConn, v net.Buffers, total int) error {
+	n, err := v.WriteTo(c)
+	if err == nil && n != int64(total) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 func writeAll(w io.Writer, p []byte) error {

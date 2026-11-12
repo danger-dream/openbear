@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +144,8 @@ type Agent struct {
 	next   error // what Run does after the session that a call ended
 	backup bool  // connected through Config.Backup
 	ch     *channel
+	// life is Run's context: what outlives a session (the latency probes) ends with it.
+	life context.Context
 	// handover is closed once the next session said hello (leaveMesh).
 	handover chan struct{}
 	// held counts operations taking the mesh down; meanwhile no session
@@ -154,6 +158,7 @@ type Agent struct {
 	ipMu       sync.Mutex
 	ipv4, ipv6 string
 	ipv4Proxy  string
+	meshIPv4   string
 	ipAt       time.Time
 
 	busy    chan struct{}
@@ -180,7 +185,12 @@ type Agent struct {
 	probeOnce sync.Once
 	probes    *probeManager // tests set their own
 
+	latencyOnce sync.Once
+	latency     *latencyWatcher // tests set their own
+
 	ddns ddnsWatcher
+
+	front frontAccess
 }
 
 type envelope struct {
@@ -196,6 +206,8 @@ type envelope struct {
 	Cols     int             `json:"cols,omitempty"`
 	Rows     int             `json:"rows,omitempty"`
 	N        int             `json:"n,omitempty"`
+	// Dial, in term.open, makes the terminal a TCP connection to host:port.
+	Dial string `json:"dial,omitempty"`
 	// Protocol and ProtocolMin, in the session config, are the controller's
 	// range; a controller from before them sends neither.
 	Protocol    int `json:"protocol,omitempty"`
@@ -236,8 +248,18 @@ func (a *Agent) finish(next error) {
 // keeps failing (see switchAfter) moves to the other one, if configured; a
 // controller that is starting is waited for on the same address first.
 func (a *Agent) Run(ctx context.Context) error {
+	a.mu.Lock()
+	a.life = ctx
+	a.mu.Unlock()
 	a.build() // read before connecting, so it never delays the hello
+	a.recoverUploads()
 	a.resumeMeshChange()
+	go a.watchProxy(ctx)
+	if port := a.config().FrontPort; port > 0 {
+		if err := a.serveFront(port); err != nil {
+			a.Logger.Printf("front access on port %d: %s", port, a.frontStatus()["error"])
+		}
+	}
 	backoff := time.Second
 	var lastErr string
 	var lastLog time.Time
@@ -267,6 +289,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		switch next {
 		case ErrUninstalled:
 			if a.browser != nil {
+				a.browser.cancelUpdate()
 				a.browser.stop()
 			}
 			return next
@@ -376,7 +399,7 @@ func (a *Agent) dial(ctx context.Context, c Config, hello map[string]any) (*Conn
 	if a.overMesh(c.URL) {
 		timeout = meshDialTimeout
 	}
-	conn, err := Dial(ctx, endpoint(base, "/api/server-nodes/v1/connect", true), header, timeout)
+	conn, err := Dial(ctx, endpoint(base, "/api/server-nodes/v1/connect", true), header, timeout, c.tlsFor(base))
 	if err != nil {
 		return nil, nil, none, signedUpgradeRefusal(err, controller, c.NodeID, nonce)
 	}
@@ -561,9 +584,7 @@ func (a *Agent) session(parent context.Context) error {
 				t.ack(message.N)
 			}
 		case "term.close":
-			if t := ts.get(message.Sid); t != nil {
-				t.stop("closed")
-			}
+			ts.close(message.Sid)
 		}
 	}
 }
@@ -573,19 +594,29 @@ func (a *Agent) sendHello(ch *channel, address string, onBackup bool) error {
 	a.ipMu.Lock()
 	info.IPv4, info.IPv6, info.IPv4Proxy = a.ipv4, a.ipv6, a.ipv4Proxy
 	a.ipMu.Unlock()
-	return ch.send(map[string]any{"t": "hello", "info": info, "caps": a.config().Capabilities, "version": Version,
+	hello := map[string]any{"t": "hello", "info": info, "caps": a.config().Capabilities, "version": Version,
 		"build": a.build(), "endpoint": address, "backup": onBackup, "features": Features,
-		"protocol": ProtocolVersion, "protocolMin": ProtocolMin})
+		"protocol": ProtocolVersion, "protocolMin": ProtocolMin, "front": a.config().Front}
+	if status := a.frontStatus(); status != nil {
+		hello["frontAccess"] = status
+	}
+	return ch.send(hello)
 }
+
+const (
+	ipRefreshCooldown = time.Minute
+	ipRefreshInterval = 30 * time.Minute
+)
 
 // refreshIPs looks up the public addresses off the connection path and sends a
 // new hello only when they changed.
 func (a *Agent) refreshIPs(ctx context.Context, ch *channel, force bool) {
 	a.ipMu.Lock()
-	fresh := !a.ipAt.IsZero() && !force
+	fresh := !a.ipAt.IsZero() && time.Since(a.ipAt) < ipRefreshCooldown && !force
 	old4, old6, oldProxy := a.ipv4, a.ipv6, a.ipv4Proxy
 	a.ipMu.Unlock()
-	if fresh {
+	// A front reaches nothing beyond its exits: no echo service is asked, its public address stays unknown.
+	if fresh || a.config().Front {
 		return
 	}
 	if v4, v6, proxy := a.publicIPs(ctx); v4 != old4 || v6 != old6 || proxy != oldProxy {
@@ -598,7 +629,7 @@ func (a *Agent) report(ctx context.Context, ch *channel, interval time.Duration)
 	a.Collector.Sample() // prime the CPU and network deltas
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	refresh := time.NewTicker(6 * time.Hour)
+	refresh := time.NewTicker(ipRefreshInterval)
 	defer refresh.Stop()
 	for {
 		select {
@@ -609,6 +640,9 @@ func (a *Agent) report(ctx context.Context, ch *channel, interval time.Duration)
 		case <-ticker.C:
 			report := map[string]any{"t": "report", "m": a.Collector.Sample()}
 			sent := a.addMeshReport(report)
+			if a.meshPublicIPChanged(report) {
+				go a.refreshIPs(ctx, ch, true)
+			}
 			if ch.send(report) != nil {
 				ch.conn.Close()
 				return
@@ -616,6 +650,36 @@ func (a *Agent) report(ctx context.Context, ch *channel, interval time.Duration)
 			sent()
 		}
 	}
+}
+
+func (a *Agent) meshPublicIPChanged(report map[string]any) bool {
+	status, ok := report["mesh"].(map[string]json.RawMessage)
+	if !ok {
+		return false
+	}
+	var reach struct {
+		PublicAddr string `json:"publicAddr"`
+		Consistent bool   `json:"consistent"`
+	}
+	if json.Unmarshal(status["reachability"], &reach) != nil || !reach.Consistent || reach.PublicAddr == "" {
+		return false
+	}
+	host := reach.PublicAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 {
+		host = strings.Trim(host[:i], "[]")
+	}
+	addr, ok := ddnsParse(host, false)
+	if !ok {
+		return false
+	}
+	ip := addr.String()
+	a.ipMu.Lock()
+	defer a.ipMu.Unlock()
+	if ip == a.meshIPv4 {
+		return false
+	}
+	a.meshIPv4 = ip
+	return !a.ipAt.IsZero() && ip != a.ipv4 && ip != a.ipv4Proxy
 }
 
 func (a *Agent) call(ctx context.Context, ch *channel, m envelope) {
@@ -638,7 +702,7 @@ func (a *Agent) call(ctx context.Context, ch *channel, m envelope) {
 	if ch.send(reply) == nil && next != nil {
 		a.finish(next)
 	}
-	if m.Method == "browser.config" && err == nil {
+	if (m.Method == "browser.config" || m.Method == "front.serve") && err == nil {
 		c, onBackup := a.current()
 		a.sendHello(ch, c.URL, onBackup)
 	}
@@ -680,11 +744,21 @@ func (a *Agent) dispatch(ctx context.Context, m envelope) (result any, next erro
 		result, err = a.ddnsCall(ctx, m)
 		return result, nil, err
 	}
+	// Latency is monitoring that looks outward, like the network tests.
+	if strings.HasPrefix(m.Method, "latency.") {
+		result, err = a.latencyCall(ctx, m)
+		return result, nil, err
+	}
+	// Process lists and system details are monitoring; ending a process checks consent itself.
+	if strings.HasPrefix(m.Method, "host.") {
+		result, err = a.hostCall(ctx, m)
+		return result, nil, err
+	}
 	// Updating replaces the program that runs commands, so it needs the same consent.
 	if !a.config().Capabilities.Exec {
 		switch m.Method {
 		case "exec", "update", "fs.list", "fs.stat", "fs.read", "fs.write", "fs.edit", "fs.transfer", "fs.hash", "fs.cancel",
-			"job.start", "job.list", "job.status", "job.stop",
+			"job.start", "job.list", "job.status", "job.stop", "front.serve",
 			"mesh.status", "mesh.install", "mesh.apply", "mesh.tls", "mesh.upgrade", "mesh.uninstall",
 			"mesh.prepare", "mesh.activate", "mesh.confirm", "mesh.abort":
 			return nil, nil, errors.New("capability_disabled")
@@ -711,8 +785,10 @@ func (a *Agent) dispatch(ctx context.Context, m envelope) (result any, next erro
 		result, err = a.uploads.edit(m.Params)
 	case "job.start", "job.list", "job.status", "job.stop":
 		result, err = a.jobs().handle(m.Method, m.Params)
+	case "front.serve":
+		result, err = a.frontServe(m.Params)
 	case "mesh.status", "mesh.install", "mesh.apply", "mesh.tls", "mesh.upgrade", "mesh.uninstall",
-		"mesh.prepare", "mesh.activate", "mesh.confirm", "mesh.abort":
+		"mesh.prepare", "mesh.activate", "mesh.confirm", "mesh.abort", "mesh.probe":
 		result, err = a.meshCall(ctx, m.Method, m.Params)
 	default:
 		err = errors.New("unsupported_method")
@@ -747,13 +823,19 @@ func (a *Agent) browserCall(ctx context.Context, m envelope) (any, error) {
 		return h.artifact(m.Params)
 	case "browser.upload":
 		return h.upload(m.Params)
+	case "browser.update":
+		return h.updateChrome(ctx, m.Params)
 	case "browser.restart":
 		h.stop()
 		status, err := h.ensure(ctx)
 		// Nothing was attached yet and ensure took over a leftover window: restart that one too.
 		if err == nil && h.reused() {
 			h.stop()
-			return h.ensure(ctx)
+			status, err = h.ensure(ctx)
+		}
+		if err == nil && status["state"] == "ready" {
+			h.chromeRestarted()
+			status = h.status()
 		}
 		return status, err
 	}
@@ -772,6 +854,10 @@ func (a *Agent) changeURL(ctx context.Context, raw json.RawMessage) (map[string]
 	var p struct {
 		URL    string `json:"url"`
 		Backup string `json:"backup"`
+		// Pins and BackupPins: the certificates the addresses present instead of CA-signed ones (front.go).
+		Pins       []string `json:"pins"`
+		BackupPins []string `json:"backupPins"`
+		Front      *bool    `json:"front"`
 	}
 	if json.Unmarshal(raw, &p) != nil {
 		return nil, errors.New("invalid_params")
@@ -788,12 +874,24 @@ func (a *Agent) changeURL(ctx context.Context, raw json.RawMessage) (map[string]
 		}
 		backup = spare.String()
 	}
-	c := a.config()
-	if base.String() == c.URL && backup == c.Backup {
-		return map[string]any{"url": c.URL, "backup": c.Backup, "changed": false}, nil
+	urlPins, err := cleanPins(p.Pins)
+	if err != nil {
+		return nil, errors.New("invalid_pins")
 	}
+	backupPins, err := cleanPins(p.BackupPins)
+	if err != nil {
+		return nil, errors.New("invalid_pins")
+	}
+	c := a.config()
 	trial := c
 	trial.URL, trial.Backup = base.String(), backup
+	trial.setPins(urlPins, backupPins)
+	if p.Front != nil {
+		trial.Front = *p.Front
+	}
+	if trial.URL == c.URL && trial.Backup == c.Backup && trial.Front == c.Front && maps.EqualFunc(trial.Pins, c.Pins, slices.Equal) {
+		return map[string]any{"url": c.URL, "backup": c.Backup, "changed": false}, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	reachable := func(address string) bool {
@@ -816,7 +914,7 @@ func (a *Agent) changeURL(ctx context.Context, raw json.RawMessage) (map[string]
 		}
 	}
 	a.mu.Lock()
-	a.Config.URL, a.Config.Backup, a.backup = trial.URL, trial.Backup, false
+	a.Config.URL, a.Config.Backup, a.Config.Pins, a.Config.Front, a.backup = trial.URL, trial.Backup, trial.Pins, trial.Front, false
 	a.mu.Unlock()
 	return map[string]any{"url": trial.URL, "backup": trial.Backup, "backupReachable": backupOK, "changed": true}, nil
 }

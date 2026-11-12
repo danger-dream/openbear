@@ -153,6 +153,11 @@ async def test_bash_blocks_long_sleep_when_default_long():
     register_bash_tool(reg, default_timeout_s=120.0)
     out = await reg.dispatch("Bash", json.dumps({"command": "sleep 5"}))
     assert "blocked long sleep" in out
+    # The hint gives waits that can be used as-is and are not blocked themselves.
+    assert "Servers job_wait" in out and "Agent(action=wait)" in out
+    examples = [line.split(": ", 1)[1] for line in out.splitlines() if line.startswith("- ")]
+    assert len(examples) == 4 and all(example.startswith("timeout ") for example in examples)
+    assert not any(bash._detect_blocked_sleep(example) for example in examples)
 
 
 async def test_bash_discovers_nvm_node_path(tmp_path, monkeypatch):

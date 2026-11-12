@@ -1893,11 +1893,12 @@ class AgentPlanTools:
             "turnUuid": str(task.turn_uuid or ctx.turn_uuid or ""),
             "runRootTurnUuid": str(task.run_root_turn_uuid or ctx.run_root_turn_uuid or ""),
             "decisionTool": {
-                "name": "AgentPlanDecision",
+                "name": "Agent",
                 "arguments": {
+                    "action": "plan",
                     "taskUuid": task_uuid,
                     "expectedPlanVersion": version,
-                    "action": "approve|revise|cancel",
+                    "decision": "approve|revise|cancel",
                 },
             },
             "resultOutputTokens": 0,
@@ -2128,6 +2129,7 @@ class AgentPlanTools:
 
 
 def register_agent_plan_tools(registry: ToolRegistry, coordinator: AgentPlanCoordinator) -> None:
+    from app.tools.agent_actions import merge_agent_tools
     tools = AgentPlanTools(coordinator)
 
     def string_array_schema(*, item_limit: int, limit: int = 100) -> dict[str, Any]:
@@ -2276,8 +2278,7 @@ def register_agent_plan_tools(registry: ToolRegistry, coordinator: AgentPlanCoor
                     "type": "array",
                     "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)},
                     "description": (
-                        "For action=approve only: additional Plan-requested tools approved by the controller. "
-                        "Omit or use [] to deny all requests; when denying any request, explain why in reason."
+                        "approve only: the Plan-requested tools you grant; [] denies all, and a denial needs its reason."
                     ),
                 },
                 "userInstructionId": {"type": "string"},
@@ -2403,3 +2404,9 @@ def register_agent_plan_tools(registry: ToolRegistry, coordinator: AgentPlanCoor
         visibility={"agent", "runtime"},
         preserve_result=True,
     )
+    merge_agent_tools(registry, "AgentPlan", "Your Plan protocol with the OpenBear controller. action selects the operation; only the actions of your current phase are offered.", {
+        "submit": "submit the complete initial Plan, notify the controller, release the execution slot and wait for its decision.",
+        "progress": "op=start the current approved step before using execution tools in it; update or complete it with durable evidence; block it; or finalize to pass the finalization gate.",
+        "replan": "submit a complete replacement for all remaining Plan work and wait for the controller's approval.",
+        "ack": "acknowledge one applied OpenBear control before using any other tool.",
+    })

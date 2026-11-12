@@ -83,6 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_agent_wait_review
 CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time
   ON messages(chat_id, created_at)
   WHERE role='user' AND COALESCE(task_uuid,'')='';
+-- History's execution search starts its scan at the first message of its time range.
+CREATE INDEX IF NOT EXISTS idx_messages_created
+  ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_task
   ON messages(task_uuid, id);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_turn

@@ -25,6 +25,15 @@ type Config struct {
 	ControllerKey string        `json:"controllerKey"`
 	Capabilities  Capabilities  `json:"capabilities"`
 	Browser       BrowserConfig `json:"browser,omitzero"`
+	// Pins are, per address (URL or Backup), the SHA-256 (hex) of the TLS
+	// certificate it must present instead of a CA-signed one: an exit's front
+	// access serves a self-signed one (front.go).
+	Pins map[string][]string `json:"pins,omitempty"`
+	// Front: this machine is to reach nothing beyond its exits, so the node
+	// asks no service abroad by itself.
+	Front bool `json:"front,omitempty"`
+	// FrontPort: this node is an exit and serves its fronts' access there; 0 = none.
+	FrontPort int `json:"frontPort,omitempty"`
 }
 
 // BrowserConfig chooses the browser behind Capabilities.Browser. With no
@@ -57,6 +66,12 @@ func LoadConfig(path string) (Config, error) {
 		if _, err = ControllerURL(c.Backup); err != nil {
 			return c, err
 		}
+	}
+	if err = checkPins(c.Pins); err != nil {
+		return c, err
+	}
+	if c.FrontPort < 0 || c.FrontPort > 65535 {
+		return c, errors.New("config frontPort is invalid")
 	}
 	if c.NodeID == "" || len(c.NodeID) > 128 {
 		return c, errors.New("config has no nodeId; run enroll first")

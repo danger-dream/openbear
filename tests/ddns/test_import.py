@@ -2,7 +2,7 @@
 registered under the ddns-go provider names the sample uses."""
 import pytest
 
-from app.ddns import importer
+from app.ddns import importer, model
 from app.ddns.model import DdnsError
 from app.ddns.providers.base import REGISTRY, Field
 from tests.ddns import fakeprovider
@@ -180,3 +180,19 @@ dnsconf:
     assert by['rainyun']['credentials'] == {'key': 'RY-API-KEY'} and by['dynadot']['credentials'] == {}
     assert any('API Key' in w and w.startswith('dd：') for w in out['warnings'])
     assert not any(w.startswith('ry：凭据按顺序') for w in out['warnings'])
+
+
+def test_the_http_interface_of_a_group_binds_its_interface_queries(cloudflare):
+    """A multi-homed host: ddns-go asks its interfaces out of eth1, so do the imported records."""
+    text = SAMPLE.replace('httpinterface: ""', 'httpinterface: eth1').replace('enable: false', 'enable: true').replace('- ""\n      dns', '- v6.example.com\n      dns')
+    parsed = importer.parse(text)
+    recs = {r['type']: r for r in parsed['records']}
+    assert recs['A']['method'] == 'url' and recs['A']['params']['bindIface'] == 'eth1'
+    assert recs['AAAA']['method'] == 'nic' and recs['AAAA']['params']['bindIface'] == ''
+    assert importer.parse(SAMPLE)['records'][0]['params']['bindIface'] == ''
+    # A Windows card's name has spaces; what is no card's name is left out, as ddns-go leaves it.
+    win = importer.parse(text.replace('httpinterface: eth1', 'httpinterface: "Ethernet 2"'))['records'][0]
+    assert win['params']['bindIface'] == 'Ethernet 2' and model.clean_params(win['params'], 'url')['bindIface'] == 'Ethernet 2'
+    bad = importer.parse(text.replace('httpinterface: eth1', 'httpinterface: "http://127.0.0.1:7890"'))
+    assert bad['records'][0]['params']['bindIface'] == '' and any('httpinterface' in w and '已忽略' in w for w in bad['warnings'])
+    model.clean_params(bad['records'][0]['params'], 'url')

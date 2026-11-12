@@ -10,6 +10,7 @@ import './serversStubs.mjs';
 import {mountApp} from '../../testing/mountApp.mjs';
 import {sleep, settle, scaleTimers} from '../../testing/domPage.mjs';
 import {fakeMesh, fakeNet, SERVERS} from './netBackend.mjs';
+import {detailTab} from '../detail/detailTab.js';
 import './flowLayout.mjs';
 
 const SCALE = 10;
@@ -48,6 +49,9 @@ export async function setup(t, {width = 1440, height = 900, dark = false, tabs =
   window.sessionStorage.clear();
   window.localStorage.clear();
   window.sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs, active}));
+  window.localStorage.setItem('openbear.mesh.classic', '1');
+  // Shared by every server's detail page in this process: each test starts on 概览.
+  detailTab.value = 'overview';
   clipboard.text = '';
   const ServersView = await loadView();
   // Kept alive like in the app, so leaving the page and coming back can be checked.

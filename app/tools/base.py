@@ -213,6 +213,8 @@ class Tool:
     read_only: bool = False
     concurrent_safe: bool = False
     effect_scope: str = "unknown"
+    # False: callable, but left out of names, summaries and schemas (an earlier tool behind a merged one).
+    listed: bool = True
 
     def schema(self) -> dict[str, Any]:
         return {
@@ -220,6 +222,48 @@ class Tool:
             "description": self.description,
             "parameters": self.parameters,
         }
+
+
+@dataclass
+class MergedTool:
+    actions: dict[str, Tool]
+    default: str | None
+    inner: dict[str, str]
+
+    def target(self, args: dict[str, Any]) -> tuple[str, Tool | None]:
+        action = str(args.get("action") or self.default or "")
+        return action, self.actions.get(action)
+
+    def inner_arguments(self, tool: Tool, args: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in args.items() if k != "action"}
+        field = self.inner.get(tool.name)
+        if field and field in out:
+            out["action"] = out.pop(field)
+        return out
+
+    def resolve(self, name: str, args: dict[str, Any]) -> tuple[Tool, dict[str, Any], list[str]] | str:
+        """The selected tool, its own arguments and the fields it does not take, or an unknown-action error."""
+        action, tool = self.target(args)
+        if tool is None:
+            return json.dumps({"ok": False, "error": "unknown_action", "tool": name, "action": action,
+                               "actions": list(self.actions)}, ensure_ascii=False)
+        inner = self.inner_arguments(tool, args)
+        # The merged schema offers every action's fields, so another action's field is dropped rather than
+        # refused; missing fields are left to the selected tool, which names them in its own errors.
+        accepted = set(tool.parameters.get("properties", {}))
+        ignored = sorted(set(inner) - accepted)
+        return tool, {k: v for k, v in inner.items() if k in accepted}, ignored
+
+
+def with_ignored_fields(content: str, ignored: list[str]) -> str:
+    """A result that says which given fields its action did not take."""
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError):
+        value = None
+    if isinstance(value, dict):
+        return json.dumps({**value, "ignoredFields": ignored}, ensure_ascii=False)
+    return f"{content}\n[ignoredFields: {', '.join(ignored)}]"
 
 
 class ToolRegistry:
@@ -232,6 +276,7 @@ class ToolRegistry:
         self.mcp_manager: Any = None
         self.mcp_tool_identities: dict[str, tuple[str, str]] = {}
         self.current_registry: Callable[[], ToolRegistry] | None = None
+        self._merged: dict[str, MergedTool] = {}
 
     def register(self, tool: Tool) -> None:
         from app.tools.confirmation import with_amended_confirmation
@@ -249,11 +294,37 @@ class ToolRegistry:
                            read_only=read_only, concurrent_safe=concurrent_safe,
                            effect_scope=effect_scope))
 
+    def merge(self, name: str, description: str, actions: dict[str, str], *, default: str | None = None,
+              inner: dict[str, str] | None = None, fields: dict[str, dict[str, Any]] | None = None) -> None:
+        """One tool whose `action` selects one of these registered tools; they stay callable but unlisted.
+
+        inner names the field that carries a selected tool's own `action`; fields replaces the
+        merged definition of a field. Field definitions are shared, not copied, with the tools.
+        """
+        inner = inner or {}
+        chosen = {action: self._tools[target] for action, target in actions.items()}
+        properties: dict[str, Any] = {"action": {"type": "string", "enum": list(actions)}}
+        for action, tool in chosen.items():
+            for key, spec in tool.parameters.get("properties", {}).items():
+                properties.setdefault(inner.get(tool.name, key) if key == "action" else key, spec)
+        properties.update(fields or {})
+        for tool in chosen.values():
+            if tool.name != name:
+                self._tools[tool.name] = replace(tool, listed=False)
+        base = chosen[default] if default else next(iter(chosen.values()))
+        self._merged[name] = MergedTool(chosen, default, inner)
+        self._tools[name] = replace(base, name=name, description=description, listed=True, parameters={
+            "type": "object", "properties": properties, "required": [] if default else ["action"], "additionalProperties": False})
+
+    def merged(self, name: str) -> MergedTool | None:
+        return self._merged.get(name)
+
     def _visible_tools(self, scope: str | None = None, source: str | None = None) -> list[Tool]:
+        listed = [t for t in self._tools.values() if t.listed]
         if not scope:
-            tools = list(self._tools.values())
+            tools = listed
         else:
-            tools = [t for t in self._tools.values() if scope in t.visibility]
+            tools = [t for t in listed if scope in t.visibility]
         if source is not None:
             tools = [t for t in tools if t.source == source]
         return tools
@@ -327,6 +398,15 @@ class ToolRegistry:
             outcome = ToolOutcome("error: 工具参数必须是 JSON 对象", "failed", "not_started")
             execution_context.tool_outcome = outcome
             return outcome
+        ignored: list[str] = []
+        merged = self._merged.get(name)
+        if merged is not None:
+            resolved = merged.resolve(name, args)
+            if isinstance(resolved, str):
+                outcome = ToolOutcome(resolved, "failed", "not_started")
+                execution_context.tool_outcome = outcome
+                return outcome
+            tool, args, ignored = resolved
         execution_context.preserve_user_answer = False
         image_start = len(execution_context.tool_images)
         token = _TOOL_CONTEXT.set(execution_context)
@@ -356,7 +436,7 @@ class ToolRegistry:
             # A legacy string may contain arbitrary error-looking text or JSON;
             # neither provides evidence of business success or effect safety.
             outcome = ToolOutcome(result, "completed", "reported")
-        content = outcome.content
+        content = with_ignored_fields(outcome.content, ignored) if ignored else outcome.content
         if len(content) > max_chars and not tool.preserve_result and not execution_context.preserve_user_answer:
             log.info("工具结果智能截断", 工具=name, 原长=len(content), 上限=max_chars)
             content = truncate_tool_result(content, max_chars)

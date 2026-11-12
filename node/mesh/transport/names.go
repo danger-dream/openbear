@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"time"
+
+	"openbear/node/mesh/bypass"
 )
 
 // Endpoints may name their host: a relay on a dynamic address behind DDNS.
@@ -74,7 +76,8 @@ func hasRoute(ip netip.Addr) bool {
 	if ip.Is6() {
 		network = "udp6"
 	}
-	c, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, 9)))
+	d := net.Dialer{Control: bypass.MeshControl}
+	c, err := d.Dial(network, netip.AddrPortFrom(ip, 9).String())
 	if err != nil {
 		return false
 	}

@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func processCPU() (time.Duration, bool) {
@@ -13,6 +15,11 @@ func processCPU() (time.Duration, bool) {
 		return 0, false
 	}
 	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano()), true
+}
+
+func machineMemory() uint64 {
+	n, _ := unix.SysctlUint64("hw.memsize")
+	return n
 }
 
 // The application firewall can block the TCP and TLS listeners; it is

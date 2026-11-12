@@ -229,7 +229,7 @@ async def test_choosing_the_mesh_access_point_is_checked(env, monkeypatch, tmp_p
     assert saved['accessPush']['ok'] and fake.urls() == [(ids['m2'], meshed['meshAccess']['url'], DIRECT)]
 
 
-async def test_controller_port_open_and_its_own_routes_kept(env, monkeypatch, tmp_path):  # noqa: F811
+async def test_controller_port_open_and_its_own_routes_taken_over_or_kept(env, monkeypatch, tmp_path):  # noqa: F811
     e = env
     port = e.servers.host.config.web.port
     fake, nodes, ids, state = await mesh_access_setup(e, monkeypatch, tmp_path)
@@ -241,27 +241,39 @@ async def test_controller_port_open_and_its_own_routes_kept(env, monkeypatch, tm
     assert len(local['rules']) == 1
     assert all(not any(r['dst'] == [f'{address[LOCAL]}/32'] for r in nodes.configs[sid]['rules']) for sid in others if sid in nodes.configs)
     assert all(nodes.configs[ids[k]]['rules'] == [] for k in ('r1', 'r2', 'm1', 'm2'))
-    # 10.10.10.0/24 goes over wg9 on the controller's machine: it is not routed into the mesh there.
-    assert local['self']['gatewayRoutes'] == [] and nodes.configs[ids['m1']]['self']['gatewayRoutes'] == ['10.10.10.0/24']
+    # 10.10.10.0/24 goes over wg9 on the controller's machine: taken over, it is routed into the mesh there too,
+    # the node replacing wg9's route and putting it back later.
+    assert local['self']['gatewayRoutes'] == ['10.10.10.0/24'] and local['self']['takeover'] == ['10.10.10.0/24']
+    assert nodes.configs[ids['m1']]['self']['gatewayRoutes'] == ['10.10.10.0/24'] and 'takeover' not in nodes.configs[ids['m1']]['self']
     # The gateway still answers the controller's machine.
     assert sorted(nodes.configs[ids['home']]['rules'][0]['src']) == sorted([f'{address[LOCAL]}/32', f'{address[ids["m1"]]}/32'])
     index = [m['serverId'] for m in state['members']].index(LOCAL)
-    warning = next(w for w in state['warnings'] if w['error'] == 'mesh_gateway_route_conflict')
-    assert warning == {'path': f'members[{index}]', 'error': 'mesh_gateway_route_conflict',
-                       'message': '本机 本机已有 10.10.10.0/24 的路由（经 wg9），和家里 的网关网段 10.10.10.0/24 重叠。组网不在 本机 上装 10.10.10.0/24 的路由，'
-                                  '它访问这个网段仍走原来的路由，其他组网流量照常。'}
+    assert not [w for w in state['warnings'] if w['error'] == 'mesh_gateway_route_conflict']
+    assert state['routeClashes'] == {LOCAL: [{'route': '10.10.10.0/24', 'held': '10.10.10.0/24', 'dev': 'wg9', 'taken': True, 'fixed': False}]}
     assert state['errors'] == []
-    exports = state['exports']
-    assert exports == [{'gateway': ids['home'], 'subnet': '10.10.10.0/24', 'nodes': [ids['m1']]}]
-    # A gateway subnet inside a bridge's network is held back the same way, from the interface list.
+    assert sorted(state['exports'][0]['nodes']) == sorted([ids['m1'], LOCAL])
+    # A gateway subnet strictly inside a container bridge's network is not held back: that network is the machine's own.
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][[m['serverId'] for m in draft['members']].index(ids['home'])]['gateway'] = {'subnets': ['10.10.10.0/24', '172.17.5.0/24']}
     draft['rules'][0]['dst']['subnets'] = ['10.10.10.0/24', '172.17.5.0/24']
     saved = await api(e, 'PUT', '/api/servers/mesh/draft', {k: draft[k] for k in ('members', 'rules')})
-    held = [w['message'] for w in saved['warnings'] if w['error'] == 'mesh_gateway_route_conflict']
-    assert len(held) == 2 and '172.17.0.0/16 的路由（经 docker0）' in held[1]
+    assert LOCAL in next(x for x in saved['exports'] if x['subnet'] == '172.17.5.0/24')['nodes']
+    # Kept, wg9's route stays: the mesh does not route 10.10.10.0/24 on the controller's machine, and says how to take it.
+    draft = await api(e, 'GET', '/api/servers/mesh')
+    draft['members'][index]['keepRoutes'] = ['10.10.10.0/24']
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    warning = next(w for w in saved['warnings'] if w['error'] == 'mesh_gateway_route_conflict')
+    assert warning == {'path': f'members[{index}]', 'error': 'mesh_gateway_route_conflict',
+                       'message': '本机 保留了本机原有的 10.10.10.0/24 路由（经 wg9），没有接管家里 的网关网段 10.10.10.0/24：它访问这个网段仍走原来的路由，'
+                                  '其他组网流量照常。要改走组网，在 本机 的「路由冲突」里勾上接管。'}
     # Routes on other machines are not known: nothing is held back there.
     assert all(w['path'] == f'members[{index}]' for w in saved['warnings'] if w['error'] == 'mesh_gateway_route_conflict')
+    assert saved['routeClashes'] == {LOCAL: [{'route': '10.10.10.0/24', 'held': '10.10.10.0/24', 'dev': 'wg9', 'taken': False, 'fixed': False}]}
+    assert '修改 本机 的保留原路由' in [c['text'] for c in saved['draft']['changes'] if c['kind'] == 'member.update']
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    await settled(e)
+    assert 'takeover' not in nodes.configs[LOCAL]['self']
+    assert nodes.configs[LOCAL]['self']['gatewayRoutes'] == ['172.17.5.0/24']
     # A route of the controller's machine into the mesh's own range blocks it, as an interface would.
     monkeypatch.setattr(mesh_module, 'ROUTE_TABLE', route_table(tmp_path, [*ROUTES, ('tailscale0', '100.96.8.0/24')]))
     err = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']}, status=400)

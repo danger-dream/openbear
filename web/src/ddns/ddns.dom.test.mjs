@@ -13,8 +13,9 @@ import {fakeDdns, handleApi} from './ddnsFixture.mjs';
 const View = (await import('./DdnsView.vue')).default, Card = (await import('./DdnsCard.vue')).default;
 await import('../instances/instances.css'); await import('../servers/servers.css');
 
-async function setup(t, {width = 1440, height = 900, card = '', focus = null} = {}) {
+async function setup(t, {width = 1440, height = 900, card = '', focus = null, prepare = null} = {}) {
   const ddns = fakeDdns(), calls = [];
+  prepare?.(ddns.state);
   const handler = request => {
     calls.push({path: request.path, query: request.url.search, method: request.method, body: request.body});
     const [status, json] = handleApi(ddns, request.method, request.path, request.body, request.url.searchParams);
@@ -194,10 +195,10 @@ test('desktop: the node picker, warnings, preview with takeovers, save, edit', a
   await pr.nth(1).getByRole('checkbox').check();
   await d.getByTestId('dd-save').click();
   const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'save');
-  assert.deepEqual(saved.body.rows, [{name: 'www.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: false}, {name: 'take.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true},
-    {name: 'same.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true}], 'a record already holding the value is adopted without a question');
+  assert.deepEqual(saved.body.rows, [{name: 'www.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: false, options: {proxied: true}}, {name: 'take.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}},
+    {name: 'same.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}}], 'a record already holding the value is adopted without a question');
   assert.deepEqual({backup: saved.body.backup, ttl: saved.body.ttl, options: saved.body.options, policy: saved.body.policy},
-    {backup: {serverId: 'hk', afterS: 900}, ttl: 300, options: {proxied: true, line: 'telecom'}, policy: {multi: 'one', allowPrivate: true, onDrift: 'alert'}});
+    {backup: {serverId: 'hk', afterS: 900}, ttl: 300, options: {}, policy: {multi: 'one', allowPrivate: true, onDrift: 'alert'}});
   await d.waitFor({state: 'hidden'});
   await page.locator('.el-message').filter({hasText: '已保存 3 条'}).waitFor();
   await rows(page).filter({hasText: 'take.example.com'}).waitFor();
@@ -213,9 +214,64 @@ test('desktop: the node picker, warnings, preview with takeovers, save, edit', a
   await d.getByTestId('dd-save').click();
   const patch = await called(c => c.method === 'PATCH' && c.path === '/api/ddns/records/r1', 'edit');
   assert.equal(patch.body.source.method, 'url');
-  assert.deepEqual(patch.body.source.params.urls, ['https://api.ipify.org', 'https://4.icanhazip.com']);
+  assert.deepEqual(patch.body.source.params.urls, [], 'left empty: the controller\'s own defaults, one list for IPv4 and one for IPv6');
   assert.deepEqual(patch.body.options, {proxied: false});
   assert.ok(!calls.some(c => c.method === 'POST' && c.path === '/api/ddns/records' && c !== saved));
+  await close();
+});
+
+test('desktop: two accounts for one zone: the row asks which one, then saves to it', async t => {
+  const {page, called, close} = await setup(t, {prepare: state => state.accounts.push({...state.accounts[0], id: 'a_cf2', alias: '迁移账号', records: 0, issues: 0})});
+  await page.getByRole('button', {name: '添加解析'}).click();
+  const d = dialog(page);
+  await d.waitFor();
+  await d.getByRole('textbox', {name: /域名/}).fill('new.example.com');
+  await d.getByRole('checkbox', {name: /IPv6（AAAA）/}).uncheck();
+  const pr = d.locator('.dd-pr[data-action]');
+  await pr.first().locator('select').waitFor();
+  assert.equal(await pr.first().locator('.ix-pill').innerText(), '选择账户');
+  const select = d.getByRole('combobox', {name: 'new.example.com 写入的账户'});
+  assert.equal(await select.locator('option:not([disabled])').count(), 2);
+  assert.equal(await d.getByTestId('dd-save').isDisabled(), true);
+  await select.selectOption('a_cf2');
+  await called(c => c.path === '/api/ddns/preview' && c.body.accountIds['new.example.com'] === 'a_cf2', 'preview with the account');
+  await d.locator('.dd-pr[data-action="new"]').waitFor();
+  await d.getByTestId('dd-save').click();
+  const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'save');
+  assert.deepEqual(saved.body.rows, [{name: 'new.example.com', type: 'A', accountId: 'a_cf2', confirmTakeover: false, options: {}}]);
+  await close();
+});
+
+test('desktop: a line typed as text (DNS.LA), and a URL record keeping the default list', async t => {
+  const prepare = state => {
+    state.providers.push({type: 'dnsla', name: 'DNS.LA', tier: 'A', fields: [{key: 'api_id', label: 'API ID', kind: 'text'}],
+      options: [{key: 'line', label: '线路 ID', kind: 'text', optional: true, default: '', hint: '留空为默认线路'}], caps: {ttlMin: 60, ttlMax: 86400}});
+    state.accounts.push({...state.accounts[1], id: 'a_la', type: 'dnsla', alias: 'DNS.LA', zones: ['example.dev'], records: 0, issues: 0});
+  };
+  const {page, called, close} = await setup(t, {prepare});
+  await page.getByRole('button', {name: '添加解析'}).click();
+  const d = dialog(page);
+  await d.waitFor();
+  await d.getByRole('textbox', {name: /域名/}).fill('x.example.dev');
+  await d.getByRole('checkbox', {name: /IPv6（AAAA）/}).uncheck();
+  await d.locator('.dd-adv > summary').click();
+  const line = d.getByRole('textbox', {name: /线路 ID/});
+  await line.waitFor();
+  await line.fill('ln-123');
+  await called(c => c.path === '/api/ddns/preview' && c.body.optionsByProvider?.dnsla?.line === 'ln-123', 'preview on the line');
+  await d.locator('.dd-pr[data-action="new"]').waitFor();
+  await d.getByTestId('dd-save').click();
+  assert.deepEqual((await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'save')).body.rows[0].options, {line: 'ln-123'});
+  await d.waitFor({state: 'hidden'});
+  // la.example.com takes its addresses from the URL method with the controller's default URLs: saved as it is.
+  await rows(page).filter({hasText: 'la.example.com'}).click();
+  await page.locator('.dd-drawer').getByRole('button', {name: '编辑'}).click();
+  await d.waitFor();
+  await d.getByRole('combobox', {name: 'TTL'}).selectOption({label: '10 分钟'});
+  assert.equal(await d.getByTestId('dd-save').isDisabled(), false);
+  await d.getByTestId('dd-save').click();
+  const patch = await called(c => c.method === 'PATCH' && c.path === '/api/ddns/records/r4', 'edit');
+  assert.deepEqual([patch.body.source.method, patch.body.source.params.urls, patch.body.ttl], ['url', [], 600]);
   await close();
 });
 
@@ -332,5 +388,44 @@ test('a link: to a machine narrows the list, to a record opens it, to add opens 
   await page.locator('.dd-chip').filter({hasText: '香港 HK1'}).waitFor();
   await page.getByRole('button', {name: '不再按这台机器筛选'}).click();
   assert.equal(await rows(page).count(), 6);
+  await close();
+});
+
+test('mixed providers keep same-named line controls separate through preview and save', async t => {
+  const {page, called, close} = await setup(t, {width: 390, prepare: state => {
+    Object.assign(state.accounts.find(a => a.type === 'dnspod'), {zones: ['example.org'], state: 'ok'});
+  }});
+  await page.getByRole('button', {name: '添加解析'}).click();
+  const d = page.locator('.dd-sheet');
+  await d.getByRole('textbox', {name: /域名/}).fill('new.example.cn\nnew.example.org');
+  await d.getByRole('checkbox', {name: /IPv6（AAAA）/}).uncheck();
+  await d.locator('summary').click();
+  const ali = d.getByRole('combobox', {name: '解析线路（阿里云）'});
+  const dp = d.getByRole('combobox', {name: '解析线路（DNSPod）'});
+  await ali.selectOption('telecom');
+  await dp.selectOption('联通');
+  await called(c => c.path === '/api/ddns/preview' && c.body.optionsByProvider?.aliyun?.line === 'telecom'
+    && c.body.optionsByProvider?.dnspod?.line === '联通', 'separate provider preview');
+  assert.equal(await ali.inputValue(), 'telecom');
+  assert.equal(await dp.inputValue(), '联通');
+  await d.locator('.dd-pr[data-action="new"]').nth(1).waitFor();
+  await d.getByTestId('dd-save').click();
+  const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'mixed save');
+  assert.deepEqual(saved.body.rows.map(r => [r.accountId, r.options]), [['a_ali', {line: 'telecom'}], ['a_dp', {line: '联通'}]]);
+  await close();
+});
+
+test('an older controller still gets the original preview and create request shapes', async t => {
+  const {page, called, close} = await setup(t, {prepare: state => { state.features = {}; }});
+  await page.getByRole('button', {name: '添加解析'}).click();
+  const d = dialog(page);
+  await d.getByRole('textbox', {name: /域名/}).fill('new.example.com');
+  await d.getByRole('checkbox', {name: /IPv6（AAAA）/}).uncheck();
+  const preview = await called(c => c.path === '/api/ddns/preview' && c.body.names.includes('new.example.com'), 'legacy preview');
+  assert.equal('optionsByProvider' in preview.body, false);
+  await d.locator('.dd-pr[data-action="new"]').waitFor();
+  await d.getByTestId('dd-save').click();
+  const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'legacy save');
+  assert.equal('options' in saved.body.rows[0], false);
   await close();
 });

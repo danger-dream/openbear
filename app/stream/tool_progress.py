@@ -20,6 +20,7 @@ _TOOL_EMOJI = {
     "AgentInfo": "📋",
     "AgentMessage": "▶️",
     "AgentStop": "🛑",
+    "RequestExtension": "🧩",
     "Memory": "🧠",
     "UserInteraction": "👤",
 }

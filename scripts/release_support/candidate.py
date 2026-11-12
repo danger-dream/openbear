@@ -22,7 +22,8 @@ PUBLIC_ROOTS = {".githooks", ".gitignore", ".gitattributes", ".dockerignore", "D
 # (node/bin, openbear-node-*) are never public source.
 NODE_FILES = {"node/go.mod", "node/go.sum", "node/VERSION", "node/LICENSE",
               "node/mesh/routing/testdata/sim-links.json", "node/mesh/testdata/contract_configs.py", "node/mesh/testdata/hostfw_container.sh",
-              "node/third_party/wireguard-go/.gitignore", "node/third_party/wireguard-go/Makefile", "node/third_party/wireguard-go/tests/netns.sh"}
+              "node/third_party/wireguard-go/.gitignore", "node/third_party/wireguard-go/Makefile", "node/third_party/wireguard-go/tests/netns.sh",
+              "node/third_party/wireguard-go/tun/LICENSE.checksum-upstream", "node/third_party/wireguard-go/tun/checksum_fast_generated_amd64.s"}
 NODE_RESOURCES = ("node/browser/resources/", "node/mesh/wintun/")
 NODE_VENDORED = "node/third_party/"
 VENDORED_FILES = {"go.mod", "go.sum", "LICENSE"}
@@ -292,7 +293,7 @@ def export(repo: Path, directory: Path, state, command, *, label: str | None = N
 
 
 def start_development(repo: Path, state, command, versioning: Versioning = APP_VERSIONING) -> dict:
-    """After publication: the local version becomes the next minor's dev.1 in one local
+    """After publication: the local version becomes the next patch's dev.1 in one local
     commit of the version files only. It is never pushed; a later release commit replaces
     it with that release's version before anything is exported."""
     value = state.value

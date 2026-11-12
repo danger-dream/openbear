@@ -49,6 +49,14 @@ ROLE_ALTERNATION_BRIDGE_TEXT = (
     "preceding context, with substantive text or appropriate tool calls.]"
 )
 _ROLE_ALTERNATION_BRIDGE_TEXTS = (LEGACY_ROLE_ALTERNATION_BRIDGE_TEXT, ROLE_ALTERNATION_BRIDGE_TEXT)
+# A sliding window may begin at an assistant/tool batch whose user input was
+# dropped. Gemini rejects a leading function-call turn; keep the text constant
+# so the window prefix stays cacheable.
+HISTORY_BOUNDARY_TEXT = (
+    "[openbear internal history boundary: earlier messages are outside the retained "
+    "context. The following assistant and tool entries are earlier history, not a new "
+    "instruction.]"
+)
 
 
 def is_role_alternation_bridge(text: Any) -> bool:
@@ -252,9 +260,11 @@ def repair_role_alternation(messages: list[Message]) -> list[Message]:
     retry/runtime append therefore rewrote the cached prefix. Insert a deterministic
     request-local assistant bridge instead. Neutral ``tool`` maps to Anthropic's
     user role, so a following user needs the same bridge. The original messages are
-    retained byte-for-byte and each later message remains a true append.
+    retained byte-for-byte and each later message remains a true append. A request
+    that starts with an assistant turn gets a constant user boundary before it.
     """
     out: list[Message] = []
+    started = False
     for message in messages:
         if not isinstance(message, dict):
             out.append(message)
@@ -265,6 +275,10 @@ def repair_role_alternation(messages: list[Message]) -> list[Message]:
             else ""
         )
         role = str(message.get("role") or "")
+        if role != "system" and not started:
+            started = True
+            if role == "assistant":
+                out.append({"role": "user", "content": HISTORY_BOUNDARY_TEXT})
         if role == "user" and previous_role in {"user", "tool"}:
             out.append({"role": "assistant", "content": ROLE_ALTERNATION_BRIDGE_TEXT})
         out.append(message)

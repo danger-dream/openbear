@@ -71,6 +71,28 @@ test("Read preserves explicit zero and false values", () => {
 	assert.equal(tag(view, "强制读取"), "否");
 });
 
+test("Read lists every file of reads[]", () => {
+	const view = buildToolArgumentsView("Read", {reads: [{path: "app/a.py", offset: 10, limit: 20}, {path: "app/b.py"}]});
+	assert.equal(view.summary, "读取 2 个文件或片段");
+	assert.equal(tag(view, "文件数"), "2 个");
+	assert.deepEqual(view.rows.map((item) => item.value), ["app/a.py（自第 10 行 20 行）", "app/b.py"]);
+	assert.equal(view.blocks.length, 0);
+});
+
+test("History shows the range a call actually covers", () => {
+	assert.equal(tag(buildToolArgumentsView("History", {action: "search", query: "x"}), "范围"), "全部对话");
+	assert.equal(tag(buildToolArgumentsView("History", {action: "search", scope: "others", query: "x"}), "范围"), "其他对话");
+	assert.equal(tag(buildToolArgumentsView("History", {action: "read"}), "范围"), "当前对话");
+	const execution = buildToolArgumentsView("History", {action: "search", source: "execution", query: "x", since: "7d", order: "oldest"});
+	assert.equal(tag(execution, "来源"), "执行记录");
+	assert.equal(tag(execution, "起始时间"), "7d");
+	assert.equal(tag(execution, "排序"), "旧的在前");
+	assert.equal(execution.blocks.length, 0);
+	const named = buildToolArgumentsView("History", {action: "search", scope: "conv-9", query: "x"});
+	assert.equal(tag(named, "范围"), "指定对话");
+	assert.equal(tag(named, "对话 ID"), "conv-9");
+});
+
 test("Write infers code language from the target path", () => {
 	const view = buildToolArgumentsView("Write", {path: "app/worker.py", content: "print('ok')\n"});
 	assert.equal(block(view, "写入内容").language, "python");
@@ -327,4 +349,13 @@ test("tool registry and path language mapping stay deterministic", () => {
 	assert.equal(languageForToolPath("Dockerfile"), "dockerfile");
 	assert.equal(languageForToolPath("src/view.tsx"), "typescript");
 	assert.equal(languageForToolPath("README.unknown"), "");
+});
+
+test("an extension request names the extension and how it came out", () => {
+	const args = JSON.stringify({extension: "browser", reason: "open a page"});
+	assert.equal(toolArgumentsSummary("RequestExtension", args), "申请开启扩展：浏览器");
+	assert.equal(toolArgumentsSummary("RequestExtension", args, JSON.stringify({ok: true, status: "enabled", approvedBy: "user"})), "申请开启扩展：浏览器 · 已同意");
+	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "servers"}), JSON.stringify({ok: true, status: "enabled", approvedBy: "auto_allow"})), "申请开启扩展：服务器 · 自动允许");
+	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "mcp:parrot"}), JSON.stringify({ok: false, status: "declined"})), "申请开启扩展：parrot · 未同意");
+	assert.equal(toolArgumentsSummary("RequestExtension", args, JSON.stringify({ok: false, error: "user_confirmation_unavailable"})), "申请开启扩展：浏览器 · 无人确认");
 });

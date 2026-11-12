@@ -270,9 +270,10 @@ def default_params():
 
 
 def _iface(value):
+    """A network card's name; Windows ones have spaces inside (Ethernet 2)."""
     if value in (None, ''):
         return ''
-    if not isinstance(value, str) or len(value) > 64 or any(c.isspace() or ord(c) < 32 for c in value):
+    if not isinstance(value, str) or len(value) > 64 or value != value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value):
         fail('invalid_iface')
     return value
 

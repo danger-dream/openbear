@@ -222,27 +222,31 @@ async function extract(entry) {
 }
 
 const UPLOAD_LIMIT = 4 * 1024 ** 3;
-async function send(file, overwrite = false) {
-  const target = join(path.value, file.name);
+// dir and server are where the files were chosen: browsing on during the upload does not move the rest.
+async function send(file, dir, server, overwrite = false) {
+  const target = join(dir, file.name);
   const task = reactive({name: file.name, size: file.size, done: 0, state: 'running', error: ''});
   uploads.value = [task, ...uploads.value.filter(u => u.state === 'running')].slice(0, 6);
   // The controller refuses larger uploads from Content-Length before any data is sent.
   if (file.size > UPLOAD_LIMIT) { task.state = 'failed'; task.error = errorText('body_too_large'); return; }
   try {
-    await Api.uploadServerFile(props.serverId, target, file, {overwrite, onProgress: e => { task.done = e.loaded; }});
+    await Api.uploadServerFile(server, target, file, {overwrite, onProgress: e => { task.done = e.loaded; }});
     task.state = 'done';
   } catch (e) {
     if (e?.response?.data?.error === 'file_exists' && !overwrite) {
       uploads.value = uploads.value.filter(u => u !== task);
       try { await ElMessageBox.confirm(`「${file.name}」已存在，要覆盖吗？`, '覆盖文件', {confirmButtonText: '覆盖', cancelButtonText: '取消', type: 'warning'}); }
       catch { return; }
-      return send(file, true);
+      return send(file, dir, server, true);
     }
     task.state = 'failed'; task.error = safeError(e);
   }
-  void go(path.value);
+  if (alive && props.serverId === server && path.value === dir) void go(path.value);
 }
-async function upload(files) { for (const file of files) await send(file); }
+async function upload(files) {
+  const dir = path.value, server = props.serverId;
+  for (const file of files) await send(file, dir, server);
+}
 function chosen(event) { upload([...event.target.files]); event.target.value = ''; }
 function dropped(event) { dragging.value = false; if (event.dataTransfer?.files?.length) upload([...event.dataTransfer.files]); }
 const icon = entry => entry.dir ? Folder : entry.type === 'link' ? Link : Document;

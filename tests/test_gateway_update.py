@@ -266,7 +266,8 @@ async def test_instance_control_reports_and_updates_the_gateway(env, gw):  # noq
     ctx = ToolRuntimeContext(chat_id=conversation['internal_chat_id'], conversation_uuid=conversation['conversation_uuid'])
     status = await dispatch(e.instances, 'gateway_status', {}, ctx)
     assert status['build'] == OLD and status['updateAvailable'] is True and status['autoUpdate'] is False
-    assert 'gateway_update' in (await dispatch(e.instances, 'describe', {}, ctx))['contracts']
+    assert 'gateway_update' in (await dispatch(e.instances, 'describe', {}, ctx))['actions']
+    assert 'reinstall' in (await dispatch(e.instances, 'describe', {'action': 'gateway_update'}, ctx))['contract']
     with pytest.raises(InstanceError, match='gateway_update_takes_no_params'):
         await dispatch(e.instances, 'gateway_update', {'serverId': 'elsewhere'}, ctx)
     cron = ToolRuntimeContext(chat_id=conversation['internal_chat_id'], conversation_uuid=conversation['conversation_uuid'], source='cron')

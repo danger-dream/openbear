@@ -419,3 +419,33 @@ async def test_trace_status_is_cut_to_size_and_lookups_keep_to_a_quota_per_serve
     await api(e, 'GET', f'/api/servers/{r2}/net/probes/{pid}')
     await idle()
     assert len(asked) == 11
+
+
+async def test_trace_status_says_which_places_are_still_being_looked_up(env):  # noqa: F811
+    """A slow lookup is still under way after the trace ends (the page keeps reading); one that found nothing
+    says so at once (未查到, nothing to wait for)."""
+    e = env
+    fake, ids, _ = await mesh_net(e)
+    release = asyncio.Event()
+
+    async def fetch(ips):
+        await release.wait()
+        return {'8.8.8.8': {'country': 'US', 'countryName': 'United States', 'asn': 15169, 'org': 'Google LLC'}}
+    networks = e.servers.net.networks
+    networks.fetch = fetch
+    r2 = ids['r2']
+    pid = (await api(e, 'POST', f'/api/servers/{r2}/net/probes', {'mode': 'trace', 'target': '8.8.8.8'}))['id']
+    fake.status[(r2, pid)].update(state='done', hops=[
+        {'ttl': 1, 'addrs': [{'ip': '1.0.0.9', 'name': ''}], 'sent': 1, 'received': 1, 'lossPct': 0.0, 'reached': False},
+        {'ttl': 2, 'addrs': [{'ip': '8.8.8.8', 'name': ''}], 'sent': 1, 'received': 1, 'lossPct': 0.0, 'reached': True}])
+    path = f'/api/servers/{r2}/net/probes/{pid}'
+    first = [h['addrs'][0] for h in (await api(e, 'GET', path))['hops']]
+    assert [(a['geo'], a['geoLooking']) for a in first] == [(None, True), (None, True)]
+    release.set()
+    for _ in range(100):
+        if not networks.pending:
+            break
+        await asyncio.sleep(0.01)
+    missed, found = [h['addrs'][0] for h in (await api(e, 'GET', path))['hops']]
+    assert missed['geo'] is None and missed['geoLooking'] is False
+    assert found['geo']['asn'] == 15169 and 'geoLooking' not in found

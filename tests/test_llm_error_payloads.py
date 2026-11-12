@@ -73,6 +73,7 @@ def _structured_payload(
         ("insufficient_quota", 429, BILLING),
         ("monthly spending limit", 403, BILLING),
         ("credits exhausted", 403, BILLING),
+        ("balance_exhausted", 429, BILLING),
     ],
 )
 def test_actual_parrot_classifications_map_without_message_guessing(
@@ -254,6 +255,48 @@ def test_malformed_body_falls_back_without_exposing_authorization_or_credentials
     assert exc.user_message() == "❌ 上游服务异常,稍后重试～"
 
 
+_DRIVE_UPLOAD_FAILED = (
+    '{"type": "response.failed", "response": {"id": "resp_1", "object": "response", '
+    '"status": "failed", "error": {"code": "server_error", '
+    '"message": "Internal server error: AI Studio DriveUpload 返回 HTTP 502: \n \n'
+)
+
+
+def test_nested_failed_response_with_raw_newlines_reaches_its_502():
+    inner = _DRIVE_UPLOAD_FAILED + '<html><title>502 Bad Gateway</title></html>"}}}'
+    envelope = {"error": {"message": inner, "type": "invalid_request_error"}}
+
+    normalized = normalize_error_payload(envelope, transport_status=400)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="chat"))
+
+    assert normalized.upstream_status == normalized.status == 502
+    assert normalized.reason == SERVER_ERROR and normalized.retryable is True
+    assert "response.failed" not in exc.user_message()
+    assert "AI Studio DriveUpload 返回 HTTP 502" in exc.user_message()
+
+
+def test_truncated_nested_json_under_invalid_request_keeps_its_502_and_no_raw_summary():
+    envelope = {"error": {"message": _DRIVE_UPLOAD_FAILED + "…", "type": "invalid_request_error"}}
+
+    normalized = normalize_error_payload(envelope, transport_status=400)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="chat"))
+
+    assert normalized.upstream_status == normalized.status == 502
+    assert normalized.reason == SERVER_ERROR and normalized.retryable is True
+    assert normalized.summary == ""
+    assert exc.user_message() == "❌ 上游服务异常,稍后重试～"
+
+
+def test_invalid_request_with_a_502_only_in_its_text_stays_final():
+    payload = {"type": "error", "error": {"type": "invalid_request_error",
+                                          "message": "messages.502.content.0.text: field required"}}
+
+    normalized = normalize_error_payload(payload)
+
+    assert normalized.status == 0
+    assert normalized.reason == FORMAT and normalized.retryable is False
+
+
 def test_sse_error_event_propagates_normalized_status_reason_summary_and_details():
     payload = _structured_payload(
         status=429,
@@ -275,6 +318,107 @@ def test_sse_error_event_propagates_normalized_status_reason_summary_and_details
     exc = OpenBearLLMError.from_stream_event(event, protocol="responses")
     assert exc.reason == RATE_LIMIT
     assert exc.user_message() == event.summary
+
+
+@pytest.mark.parametrize("error", [
+    {"type": "invalid_request_error", "message": "Invalid schema for function"},
+    None,
+])
+def test_echoed_request_tool_schema_is_not_read_as_error_message(error):
+    tool = {"type": "function", "name": "ConversationGroup", "parameters": {
+        "type": "object", "properties": {"group": {"type": "object", "properties": {
+            "workspaceDir": {"type": "string",
+                             "description": "absolute path; omit for a new isolated group directory"},
+        }}}}}
+    payload = {"type": "response.failed", "response": {
+        "status": "failed", "error": error, "instructions": "system", "tools": [tool],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}], "output": [],
+    }}
+
+    event = error_event(payload, event_name="response.failed")
+
+    assert event is not None
+    assert "isolated group directory" not in event.error
+    if error:
+        assert event.error == "invalid_request_error: Invalid schema for function"
+
+
+def test_gemini_malformed_function_call_is_a_retryable_server_error():
+    payload = {"type": "response.failed", "response": {"status": "failed", "error": {
+        "code": "gemini_malformed_function_call",
+        "message": "Gemini generation ended with MALFORMED_FUNCTION_CALL: Function call is empty - no input to parse.",
+    }, "output": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]}]}}
+
+    event = error_event(payload, event_name="response.failed")
+    exc = OpenBearLLMError.from_stream_event(event, protocol="responses")
+
+    assert event.reason == SERVER_ERROR and event.retryable is True
+    assert exc.retryable is True and "MALFORMED_FUNCTION_CALL" in exc.user_message()
+    assert classify_error("Gemini finishReason MALFORMED_FUNCTION_CALL", 400) == SERVER_ERROR
+    assert classify_error("Invalid value for 'tool_choice'", 400) == FORMAT
+
+
+def test_gemini_response_without_finish_reason_is_a_retryable_server_error():
+    payload = {"type": "response.failed", "response": {"status": "failed", "error": {
+        "code": "upstream_stream_incomplete",
+        "message": "Gemini response ended without finishReason",
+    }, "output": []}}
+
+    event = error_event(payload, event_name="response.failed")
+    exc = OpenBearLLMError.from_stream_event(event, protocol="responses")
+
+    assert event is not None
+    assert event.reason == SERVER_ERROR and event.retryable is True
+    assert exc.reason == SERVER_ERROR and exc.retryable is True
+    assert "Gemini response ended without finishReason" in exc.user_message()
+    assert classify_error("Gemini response ended without finishReason") == SERVER_ERROR
+    assert classify_error("Gemini response ended without finishReason", 400) == SERVER_ERROR
+
+
+@pytest.mark.parametrize("message", [
+    "Gemini generation ended with MALFORMED_FUNCTION_CALL: Malformed function call: thought\n"
+    "call:default_api:Bash{command: docker logs ...}",
+    "gemini_unexpected_tool_call: Gemini generation ended with UNEXPECTED_TOOL_CALL",
+    "Gemini response ended without finishReason",
+])
+@pytest.mark.parametrize("status", [200, 400])
+def test_gemini_sampling_failure_in_invalid_request_envelope_is_retryable(message, status):
+    # Parrot's Chat/Anthropic error frame types a request-scoped 400 as invalid_request_error.
+    payload = {"error": {"message": message, "type": "invalid_request_error", "code": None, "param": None}}
+
+    normalized = normalize_error_payload(payload, transport_status=status)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="chat"))
+
+    assert normalized.reason == SERVER_ERROR and normalized.retryable is True
+    assert exc.reason == SERVER_ERROR and exc.retryable is True
+
+
+def test_gemini_sampling_failure_keeps_the_structured_retry_contract():
+    def payload(*, retryable: bool, retry_scope: str) -> dict:
+        body = _structured_payload(
+            status=400, classification="invalid_request",
+            summary="Upstream 400 invalid_request: Gemini generation ended with MALFORMED_FUNCTION_CALL",
+            message="Gemini generation ended with MALFORMED_FUNCTION_CALL: Malformed function call: thought",
+            retryable=retryable, retry_scope=retry_scope, code="gemini_malformed_function_call",
+        )
+        body["error"]["type"] = "invalid_request_error"
+        return body
+
+    granted = normalize_error_payload(payload(retryable=True, retry_scope="request"), transport_status=400)
+    final = normalize_error_payload(payload(retryable=False, retry_scope="request"), transport_status=400)
+
+    assert granted.reason == SERVER_ERROR and granted.retryable is True
+    assert granted.code == "gemini_malformed_function_call"
+    assert final.retryable is False
+
+
+def test_ordinary_invalid_request_envelope_stays_a_final_format_error():
+    payload = {"error": {"message": "Invalid JSON payload: unknown field 'foo'",
+                         "type": "invalid_request_error", "code": None}}
+
+    normalized = normalize_error_payload(payload, transport_status=400)
+
+    assert normalized.reason == FORMAT and normalized.retryable is False
 
 
 async def _client_with_handler(handler) -> HTTPClient:
@@ -327,3 +471,14 @@ async def test_http_sse_non_2xx_propagates_transport_and_structured_root():
         assert exc.summary == "触发上游限流，请稍后重试"
     finally:
         await client.close()
+
+
+def test_parrot_workbuddy_credits_exhausted_is_billing_not_a_rate_limit():
+    # Parrot's actual 402 for WorkBuddy 14018 (root status 429), as received on 2026-11-05.
+    payload = {"error": {"message": "Upstream 429 balance_exhausted: WorkBuddy account quota exhausted", "type": "server_error",
+                         "code": "14018", "param": None, "details": {
+                             "summary": "Upstream 429 balance_exhausted: WorkBuddy account quota exhausted",
+                             "root_cause": {"status": 429, "classification": "balance_exhausted", "code": "14018",
+                                            "message": "WorkBuddy account quota exhausted", "retryable": False, "retry_scope": "none"}}}}
+    normalized = normalize_error_payload(payload, transport_status=402)
+    assert normalized.reason == BILLING and normalized.retryable is False

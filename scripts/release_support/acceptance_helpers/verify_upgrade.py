@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify preserved old values without exporting any database or configuration bodies."""
+import ast
 import hashlib
 import json
 import pathlib
@@ -12,8 +13,21 @@ output = pathlib.Path(sys.argv[2])
 mode = sys.argv[3] if len(sys.argv) > 3 else 'restart'
 if mode not in {'restart', 'refresh'}:
     raise ValueError('expected restart or refresh verification mode')
-# Optional feature switches a release writes once on first start (app/features.py).
-FEATURE_SWITCHES = {'instances', 'servers'}
+
+
+def feature_switches():
+    """Optional feature switches the upgraded release writes once on first start, read
+    from its own app/features.py so a newly added switch needs no edit here."""
+    path = root / 'app/features.py'
+    if not path.is_file():
+        return set()
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'FEATURES' for t in node.targets):
+            return set(ast.literal_eval(node.value))
+    raise ValueError('app/features.py does not declare FEATURES')
+
+
+FEATURE_SWITCHES = feature_switches()
 
 
 def config_preserved(p, expected):

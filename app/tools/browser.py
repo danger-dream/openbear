@@ -33,7 +33,7 @@ def register_browser_tool(registry, service):
 
     registry.add(
         "Browser",
-        "Remote browser service with its existing logins; no local browser is launched. Every page operation uses an explicit page handle; start with page {op:new,url?} or page {op:list}." + node_note + " Core: snapshot/find return refs; act {op:click|fill|type|press|check|select|hover|drag|scroll|resize|emulate, target?, text?, key?, checked?, values?, to?} where target is a ref or css=selector; navigate {url, op?:goto|back|reload}; capture {fullPage?, view?} (view=true also returns the image to you); wait {text|target|url|timeMs}; dialog. Use describe {action} for files/network/console/evaluate/recover and full parameters. Results: failed = executed and failed; not_started = rejected; unknown = effects unconfirmed, do not replay blindly. After page_not_ready use recover probe, not repeated snapshots. evaluate runs in the page and may have external effects. Destructive recovery has its own confirmation gate; on amendments_required apply the user's conditions and resubmit the same operation with _openbearApprovalId. URLs and localhost resolve in the browser's network, not OpenBear's.",
+        "Remote browser service with its existing logins; no local browser is launched. Every page operation uses an explicit page handle; start with page {op:new,url?} or page {op:list}." + node_note + " Core: snapshot/find return refs; act {op:click|fill|type|press|check|select|hover|drag|scroll|resize|emulate, target?, text?, key?, checked?, values?, to?} where target is a ref or css=selector; navigate {url, op?:goto|back|reload}; capture {fullPage?, view?} (view=true also returns the image to you); wait {text|target|url|timeMs}; dialog. act/navigate return observation of the page afterwards (observe: summary default = title, url, changed, and changed interactive elements with usable refs; snapshot = full snapshot; none), so a follow-up snapshot is usually unnecessary. steps {steps:[{action:act|wait|navigate, ...its params}], observe?} runs several in one call and stops at the first step not completed. evaluate {expression, waitFor?:{text|target|url|expression, timeoutMs?}} waits first; on timeout the expression does not run. Argument errors include usage with the accepted fields and an example. Use describe {action} for files/network/console/evaluate/recover and full parameters. Results: failed = executed and failed; not_started = rejected; unknown = effects unconfirmed, do not replay blindly. After page_not_ready use recover probe, not repeated snapshots. evaluate runs in the page and may have external effects. Destructive recovery has its own confirmation gate; on amendments_required apply the user's conditions and resubmit the same operation with _openbearApprovalId. URLs and localhost resolve in the browser's network, not OpenBear's.",
         {
             "type": "object",
             "properties": {
@@ -46,7 +46,7 @@ def register_browser_tool(registry, service):
                     "type": "integer",
                     "minimum": 1,
                     "maximum": max_timeout_ms,
-                    "description": f"Total deadline in milliseconds including connection, page creation and navigation. Defaults: {action_timeout_ms} for actions, {navigation_timeout_ms} for navigation or page creation with a URL. Maximum {max_timeout_ms}; accepted requests are also capped at runtime, and this argument cannot extend the system limit. Queue waiting also has its own cap.",
+                    "description": f"Total ms including connection and navigation: default {action_timeout_ms} for actions, {navigation_timeout_ms} for navigation or a new page with a URL; it cannot extend the system limit.",
                 },
                 "params": {
                     "type": "object",
@@ -63,6 +63,9 @@ def register_browser_tool(registry, service):
                         "interactive": {"type": "boolean"},
                         "fullPage": {"type": "boolean"},
                         "view": {"type": "boolean"},
+                        "observe": {"type": "string", "enum": ["summary", "snapshot", "none"]},
+                        "steps": {"type": "array", "items": {"type": "object"}},
+                        "waitFor": {"type": "object"},
                     },
                     "additionalProperties": True,
                 },

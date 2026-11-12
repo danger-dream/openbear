@@ -17,7 +17,7 @@ for (const [category, extensions] of Object.entries(families)) test(`common file
 		const presentation = artifactPresentation(meta);
 		assert.equal(presentation.category, category, ext);
 		assert.ok(presentation.badge.length > 0);
-		assert.equal(presentation.previewable, ["html", "image", "markdown", "text", "code"].includes(artifactFormat(meta).kind), ext);
+		assert.equal(presentation.previewable, ["html", "image", "audio", "video", "markdown", "text", "code"].includes(artifactFormat(meta).kind), ext);
 	}
 });
 
@@ -29,12 +29,20 @@ test("extensionless files can use MIME and compound archives retain their actual
 });
 
 test("presentation never advertises nonexistent PDF, Office or media preview", () => {
-	for (const ext of ["pdf", "docx", "xlsx", "pptx", "zip", "mp3", "mp4", "woff2", "bin"]) {
+	for (const ext of ["pdf", "docx", "xlsx", "pptx", "zip", "mkv", "avi", "wmv", "woff2", "bin"]) {
 		const p = artifactPresentation({fileName: `file.${ext}`});
 		assert.equal(p.previewable, false, ext); assert.equal(p.action, "下载查看", ext);
 	}
 	assert.equal(artifactPresentation({fileName: "a.csv", mimeType: "text/csv"}).action, "查看文本");
 	assert.equal(artifactPresentation({fileName: "a.md"}).action, "阅读文档");
+});
+
+test("browser-playable audio and video are offered for playback, keeping their own category", () => {
+	for (const [meta, category, action] of [[{fileName: "a.mp3"}, "audio", "播放音频"], [{fileName: "录音.m4a", mimeType: "audio/mp4"}, "audio", "播放音频"], [{fileName: "voice.webm", mimeType: "audio/webm"}, "audio", "播放音频"], [{fileName: "clip.mp4", mimeType: "video/mp4"}, "video", "播放视频"], [{fileName: "IMG_0001.MOV", mimeType: "video/quicktime"}, "video", "播放视频"]]) {
+		const p = artifactPresentation(meta);
+		assert.deepEqual([p.category, p.previewable, p.action], [category, true, action], meta.fileName);
+	}
+	assert.equal(artifactPresentation({fileName: "movie.mkv", mimeType: "video/x-matroska"}).category, "video");
 });
 
 test("active HTML/SVG cannot become thumbnail images due to their label or MIME", () => {

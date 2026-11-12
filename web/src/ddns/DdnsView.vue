@@ -186,7 +186,7 @@ onBeforeUnmount(() => { media?.removeEventListener?.('change', syncPhone); docum
     </DdnsSheet>
     <DdnsSheet :model-value="sheet === 'record'" :phone="phone" :title="editing ? '编辑解析' : '添加解析'" :sub="editing ? `${editing.name} · ${editing.type}` : '选节点、填域名，其余由系统自动判断'" :busy="busy"
       @update:model-value="v => { if (!v) closeSheet('record'); }" @closed="sheetClosed('record')">
-      <RecordForm v-if="mounted.record && data" ref="recordRef" :key="stamp.record" :nodes="nodes" :accounts="accounts" :providers="providers" :record="editing" :server-id="addFor" @saved="done" @cancel="closeSheet()" />
+      <RecordForm v-if="mounted.record && data" ref="recordRef" :key="stamp.record" :nodes="nodes" :accounts="accounts" :providers="providers" :record="editing" :server-id="addFor" :provider-options="data.features?.providerOptions === true" @saved="done" @cancel="closeSheet()" />
     </DdnsSheet>
     <DdnsSheet :model-value="sheet === 'account'" :phone="phone" :title="settingsFor ? '服务商设置' : '添加服务商'" sub="凭据只保存在主控的凭据库里，不会下发到节点" width="600px" :busy="busy"
       @update:model-value="v => { if (!v) closeSheet('account'); }" @closed="sheetClosed('account')">

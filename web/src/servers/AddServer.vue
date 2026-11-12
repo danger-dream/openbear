@@ -6,19 +6,20 @@ import { Api } from '../api.js';
 import { HOST_PATTERN, HOST_TITLE, USER_PATTERN, USER_TITLE, ok, relativeTime } from '../instances/instanceHelpers.js';
 import SshAuth from '../instances/SshAuth.vue';
 import AccessPicker from './AccessPicker.vue';
+import FrontExits from './FrontExits.vue';
 import InstallCommand from './InstallCommand.vue';
 import InstallConflict from './InstallConflict.vue';
 import InstallProgress from './InstallProgress.vue';
 import SuggestInput from './SuggestInput.vue';
 import { dateTime, noAutofill, safeError } from './serverHelpers.js';
 
-const props = defineProps({settings: {type: Object, required: true}, groups: {type: Array, default: () => []}});
+const props = defineProps({settings: {type: Object, required: true}, groups: {type: Array, default: () => []}, servers: {type: Array, default: () => []}});
 const emit = defineEmits(['open', 'changed', 'settings', 'guide', 'close']);
-const MODES = [['ssh', 'SSH 安装'], ['batch', '批量 SSH'], ['command', '安装命令'], ['code', '注册码']];
+const MODES = [['ssh', 'SSH 安装'], ['batch', '批量 SSH'], ['command', '安装命令'], ['code', '注册码'], ['front', '前置机']];
 const mode = ref('ssh'), busy = ref(false), error = ref('');
 const form = reactive({name: '', host: '', port: 22, username: 'root', auth: 'key', group: '', access: {primary: '', backup: ''},
-  lines: '', defaultPort: 22, codeName: '', expires: 0, uses: 0, browser: false});
-const login = ref(null), batchLogin = ref(null);
+  lines: '', defaultPort: 22, codeName: '', expires: 0, uses: 0, browser: false, exits: [{serverId: '', address: ''}]});
+const login = ref(null), batchLogin = ref(null), frontLogin = ref(null);
 const created = ref(null), command = ref(null), job = ref(null), codes = ref([]), fresh = ref('');
 let timer, alive = true;
 const BATCH_LIMIT = 50;
@@ -71,6 +72,25 @@ async function installViaSsh() {
   } catch (e) { error.value = safeError(e); }
   finally { busy.value = false; }
 }
+// A front: its login is the front as its exit reaches it, proved and used only through the exits.
+async function installFront() {
+  if (busy.value) return;
+  error.value = ''; busy.value = true;
+  try {
+    const item = ok(await Api.createServer({name: form.name.trim() || form.host.trim(),
+      profile: {...(form.group.trim() ? {group: form.group.trim()} : {}), front: {exits: form.exits.map(e => ({serverId: e.serverId, address: e.address.trim()}))}},
+      ssh: {host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...frontLogin.value.credentials()}})).item;
+    frontLogin.value.clear();
+    emit('changed');
+    created.value = item;
+    created.value = {...item, install: ok(await Api.installServerNode(item.id, {})).install};
+    poll(async () => {
+      try { created.value = ok(await Api.server(item.id)).item; } catch { return true; }
+      if (created.value.install?.state !== 'running') { emit('changed'); return false; }
+    });
+  } catch (e) { error.value = safeError(e); }
+  finally { busy.value = false; }
+}
 // force: replace a node this controller does not know (machine_has_other_node), already confirmed.
 async function retry(force = false) {
   if (!created.value || busy.value) return;
@@ -114,13 +134,26 @@ async function forceItem(item) {
 }
 // The server this machine is already connected as.
 function openExisting(id) { if (id) emit('open', {id}); }
+// The server made by a try whose command never came (no node build yet, a lost request):
+// trying again asks for its command, it does not add the server once more.
+let unshown = null;
 async function makeCommand() {
   if (busy.value || !form.name.trim()) return;
   error.value = ''; busy.value = true;
   try {
-    const item = ok(await Api.createServer({name: form.name.trim(), profile: profile()})).item;
-    emit('changed');
+    const wanted = JSON.stringify({name: form.name.trim(), profile: profile()});
+    let item = unshown?.item;
+    if (!item) {
+      item = ok(await Api.createServer({name: form.name.trim(), profile: profile()})).item;
+      unshown = {item, wanted};
+      emit('changed');
+    } else if (unshown.wanted !== wanted) {
+      item = ok(await Api.updateServer(item.id, {name: form.name.trim(), profile: {group: form.group.trim(), access: {...form.access}}})).item;
+      unshown = {item, wanted};
+      emit('changed');
+    }
     const enrollment = ok(await Api.serverEnrollment(item.id, {browser: form.browser}));
+    unshown = null;
     command.value = {item, ...enrollment, registered: false, online: false};
     poll(async () => {
       let current;
@@ -128,7 +161,11 @@ async function makeCommand() {
       command.value = {...command.value, item: current, registered: Boolean(current.node && current.node.enrolledAtMs >= enrollment.issuedAtMs - 1000), online: Boolean(current.live)};
       if (command.value.online) { emit('changed'); return false; }
     });
-  } catch (e) { error.value = safeError(e); }
+  } catch (e) {
+    // Deleted meanwhile: the next try starts over.
+    if (e?.response?.status === 404) unshown = null;
+    error.value = safeError(e);
+  }
   finally { busy.value = false; }
 }
 async function loadCodes() {
@@ -152,7 +189,7 @@ async function copy(text, label = '命令') {
   try { await navigator.clipboard.writeText(text); ElMessage.success(`已复制${label}`); }
   catch { ElMessage.warning('浏览器不允许复制，请手动选择文字'); }
 }
-function again() { stop(); created.value = null; command.value = null; job.value = null; form.name = ''; form.host = ''; form.lines = ''; }
+function again() { stop(); created.value = null; command.value = null; job.value = null; form.name = ''; form.host = ''; form.lines = ''; form.exits = [{serverId: '', address: ''}]; }
 const codeState = c => c.revokedAtMs ? '已作废' : c.active ? '可用' : c.maxUses && c.uses >= c.maxUses ? '次数已用完' : '已过期';
 // A machine that already runs a node says so in its own line under the item.
 const CONFLICTS = {machine_has_node: '已作为另一台接入', machine_has_other_node: '已装有其他节点'};
@@ -174,8 +211,8 @@ onBeforeUnmount(() => { alive = false; stop(); });
       <div class="instance-actions"><el-button size="small" @click="emit('settings')">去设置</el-button></div>
     </div>
 
-    <!-- SSH: the controller logs in and installs, step by step. -->
-    <template v-if="mode === 'ssh'">
+    <!-- SSH: the controller logs in and installs, step by step; a front's SSH goes through its exit. -->
+    <template v-if="mode === 'ssh' || mode === 'front'">
       <div v-if="created" class="as-result">
         <p class="as-title"><strong>{{ created.name }}</strong><span class="instance-muted">{{ created.ssh?.host }}:{{ created.ssh?.port }}</span></p>
         <InstallProgress :install="created.install" :busy="busy" @open="openExisting" @force="retry(true)" />
@@ -186,6 +223,27 @@ onBeforeUnmount(() => { alive = false; stop(); });
           <el-button type="primary" @click="emit('open', created)">打开服务器</el-button>
         </div>
       </div>
+      <form v-else-if="mode === 'front'" class="instance-form" autocomplete="off" @submit.prevent="installFront">
+        <div class="ob-fields" :class="{busy}">
+          <div class="ob-field"><span>出口</span><FrontExits v-model="form.exits" :servers="servers" /></div>
+          <div class="ob-field"><span>地址</span>
+            <div class="ob-ctl">
+              <div class="ob-inline"><input v-model="form.host" v-bind="noAutofill" required maxlength="253" :pattern="HOST_PATTERN" :title="HOST_TITLE" class="mono" placeholder="出口登录前置机用的地址" aria-label="前置机地址" /><input v-bind="noAutofill" v-model.number="form.port" class="mono ob-port" type="number" inputmode="numeric" min="1" max="65535" required aria-label="SSH 端口" /></div>
+              <small>OpenBear 经出口登录前置机安装节点，不会直接连它。填出口能连到的地址，比如前置机的专线内网地址。</small>
+            </div>
+          </div>
+          <label class="ob-field"><span>用户</span><input v-model="form.username" v-bind="noAutofill" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
+          <SshAuth ref="frontLogin" v-model="form.auth" @error="error = $event" />
+          <label class="ob-field"><span>名称</span><input v-model="form.name" v-bind="noAutofill" maxlength="60" placeholder="留空用地址" aria-label="服务器名称" /></label>
+          <label class="ob-field"><span>分组</span><SuggestInput v-model="form.group" :options="groups" maxlength="40" placeholder="可选" aria-label="分组" /></label>
+        </div>
+        <p v-if="error" role="alert" class="instance-error">{{ error }}</p>
+        <div class="instance-form-footer">
+          <span class="ob-hint">经出口测试 SSH，再把节点程序推送过去安装；前置机不跑解锁检测和三网回程。</span>
+          <el-button :disabled="busy" @click="emit('close')">取消</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="!form.exits.every(e => e.serverId && e.address.trim())">保存并安装</el-button>
+        </div>
+      </form>
       <form v-else class="instance-form" autocomplete="off" @submit.prevent="installViaSsh">
         <div class="ob-fields" :class="{busy}">
           <div class="ob-field"><span>地址</span>

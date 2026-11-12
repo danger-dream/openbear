@@ -460,7 +460,7 @@ func TestTransitSourcesOnlyFromRelays(t *testing.T) {
 		peers = append(peers, peerSpec{ID: name, Kind: kind, Key: k})
 	}
 	tun := &meshTUN{}
-	tun.route.Store(routingFor(c, peers))
+	tun.route.Store(routingFor(c, newStaticAttachment(c), peers, nil))
 	key := func(name string) [32]byte {
 		b, _ := base64.StdEncoding.DecodeString(l.nodes[name].pub)
 		return [32]byte(b)
@@ -476,7 +476,11 @@ func TestTransitSourcesOnlyFromRelays(t *testing.T) {
 		{"R2", "10.20.0.9", false},
 		{"R2", "100.96.255.2", false},
 		{"R2", "192.168.1.1", false},
-		{"A", "100.96.0.11", false},
+		// A member speaks for itself alone, also where the routes reach it
+		// through another relay: a fixed path may bring its packets here.
+		{"A", "100.96.0.11", true},
+		{"A", "100.96.0.2", false},
+		{"A", "10.20.0.9", false},
 	} {
 		if got := tun.AuthorizeSource(key(tc.from), netip.MustParseAddr(tc.src).AsSlice()); got != tc.want {
 			t.Errorf("from %s src %s: %v, want %v", tc.from, tc.src, got, tc.want)
@@ -486,7 +490,7 @@ func TestTransitSourcesOnlyFromRelays(t *testing.T) {
 	// is linked to directly.
 	c.Self.Role = roleMember
 	peers[0].Kind, peers[1].Kind = kindEntry, kindDirect
-	tun.route.Store(routingFor(c, peers))
+	tun.route.Store(routingFor(c, newStaticAttachment(c), peers, nil))
 	if !tun.AuthorizeSource(key("R2"), netip.MustParseAddr("100.96.0.11").AsSlice()) ||
 		tun.AuthorizeSource(key("R2"), netip.MustParseAddr("10.20.0.9").AsSlice()) {
 		t.Error("a member's entry: only nodes' addresses")

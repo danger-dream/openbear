@@ -82,6 +82,6 @@ defineExpose({focus: () => picker.value?.focus()});
       <input v-model="net" v-bind="noAutofill" class="mono" :class="{invalid: problem}" :placeholder="side.all ? (nets === 'subnets' ? '另加网关网段，回车添加' : '另加网段，回车添加') : nets === 'subnets' ? '或网关网段，回车添加' : '或网段，回车添加'" :aria-label="`${label}：添加网段`" @keydown.enter.prevent="addNet" @blur="addNet" />
     </div>
     <small v-if="problem" class="ob-bad">{{ problem }}</small>
-    <small v-else-if="bareGateways.length" class="instance-muted">{{ bareGateways.map(m => m.name).join('、') }} 只包括这台机器，不包括它的网段；要开放网段请在这里添加。</small>
+    <small v-else-if="bareGateways.length" class="instance-muted">{{ bareGateways.map(m => m.name).join('、') }} 只包括这个节点，不包括它的网段；要开放网段请在这里添加。</small>
   </div>
 </template>

@@ -8,16 +8,83 @@ Latest.
 from __future__ import annotations
 
 import base64
+import time
 import urllib.parse
 from pathlib import Path
 
 from .common import ReleaseError, clean_environment, sha
 
 
+CANDIDATE_BRANCH = "release-candidate/"
+CONFIRM_SECONDS, CONFIRM_INTERVAL = 60, 3
+
+
 def asset_metadata(directory: Path, expected: dict) -> bool:
     return bool(expected) and all((directory / name).is_file()
         and (directory / name).stat().st_size == item["bytes"]
         and sha((directory / name).read_bytes()) == item["sha256"] for name, item in expected.items())
+
+
+def confirm_ref(github, path: str, expected: str) -> bool:
+    """GitHub's REST view of a ref trails a successful push by seconds (a new tag can
+    even 404); poll before concluding the push did not land."""
+    deadline = time.monotonic() + CONFIRM_SECONDS
+    while True:
+        ref = github.api(path, missing=True)
+        if ref and ref["object"]["sha"] == expected:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(CONFIRM_INTERVAL)
+
+
+def run_git(command, github, source: Path, *args, auth=False, check=True, label="publish-git"):
+    env = clean_environment()
+    if auth:
+        encoded = base64.b64encode(("x-access-token:" + github.token).encode()).decode()
+        env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                   GIT_CONFIG_VALUE_0="Authorization: Basic " + encoded,
+                   GIT_CONFIG_KEY_1="credential.helper", GIT_CONFIG_VALUE_1="", GIT_TERMINAL_PROMPT="0")
+    return command(["git", *args], label, cwd=source, env=env, check=check)
+
+
+def push_candidate(directory: Path, state, command, github) -> dict:
+    """Push the frozen public commit to a throwaway branch right after export, so
+    GitHub's push rules (secret scanning, permissions) refuse it in the first minute
+    instead of after every test and acceptance stage."""
+    value = state.value
+    commit = value["candidate"]["publicCommit"]
+    branch = CANDIDATE_BRANCH + value["runId"] + "-" + commit[:12]
+    branches = value.setdefault("candidateBranches", [])
+    if branch not in branches:
+        branches.append(branch)
+        state.save()
+    try:
+        run_git(command, github, directory / "source", "push", "origin", f"{commit}:refs/heads/{branch}", auth=True, label="candidate-push")
+    except ReleaseError as exc:
+        lines = [line for line in getattr(exc, "output", "").splitlines() if line.strip()]
+        raise ReleaseError("GitHub refused the release candidate push; publication would be refused the same way. "
+                           "Resolve GitHub's reason below (a secret-scanning block names the file and offers an unblock), then resume.\n"
+                           + "\n".join(lines[-40:]), code=2) from None
+    delete_candidates(state, github, keep=branch)
+    return {"ok": True, "branch": branch, "commit": commit}
+
+
+def delete_candidates(state, github, *, keep=None) -> list[str]:
+    """Remove this run's throwaway candidate branches except `keep`; returns those removed."""
+    value = state.value
+    removed = []
+    for branch in list(value.get("candidateBranches", [])):
+        if branch == keep:
+            continue
+        if not branch.startswith(CANDIDATE_BRANCH + value["runId"] + "-"):
+            raise ReleaseError("Refusing to delete a branch this run did not create: " + branch, code=2)
+        if github.api("/git/ref/heads/" + branch, missing=True):
+            github.api("/git/refs/heads/" + branch, method="DELETE")
+        value["candidateBranches"].remove(branch)
+        removed.append(branch)
+        state.save()
+    return removed
 
 
 def publish(directory: Path, state, command, github, *, tag=None, name=None, assets=None, latest=True, prerelease=False) -> dict:
@@ -35,13 +102,7 @@ def publish(directory: Path, state, command, github, *, tag=None, name=None, ass
         raise ReleaseError("Release asset bytes differ from the accepted ZIP")
 
     def git(*args, auth=False, check=True):
-        env = clean_environment()
-        if auth:
-            encoded = base64.b64encode(("x-access-token:" + github.token).encode()).decode()
-            env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
-                       GIT_CONFIG_VALUE_0="Authorization: Basic " + encoded,
-                       GIT_CONFIG_KEY_1="credential.helper", GIT_CONFIG_VALUE_1="", GIT_TERMINAL_PROMPT="0")
-        return command(["git", *args], "publish-git", cwd=source, env=env, check=check)
+        return run_git(command, github, source, *args, auth=auth, check=check)
 
     if git("rev-parse", "HEAD") != commit or git("status", "--porcelain", "--untracked-files=all"):
         raise ReleaseError("Public checkout changed after acceptance")
@@ -76,14 +137,14 @@ def publish(directory: Path, state, command, github, *, tag=None, name=None, ass
         raise ReleaseError("Remote tag exists with a different object; never overwrite", code=2)
     if remote != commit:
         git("push", "origin", commit + ":refs/heads/main", auth=True)
-        if github.api("/git/ref/heads/main")["object"]["sha"] != commit:
-            raise ReleaseError("Cannot confirm public-source push", code=2)
+        if not confirm_ref(github, "/git/ref/heads/main", commit):
+            raise ReleaseError(f"Cannot confirm public-source push within {CONFIRM_SECONDS}s", code=2)
     value["publicSourcePushed"] = True
     state.save()
     if not remote_tag:
         git("push", "origin", "refs/tags/" + tag, auth=True)
-    if github.api("/git/ref/tags/" + tag)["object"]["sha"] != object_id:
-        raise ReleaseError("Cannot confirm annotated tag push", code=2)
+    if not confirm_ref(github, "/git/ref/tags/" + tag, object_id):
+        raise ReleaseError(f"Cannot confirm annotated tag push within {CONFIRM_SECONDS}s", code=2)
     state.value["tagObject"] = object_id
     state.save()
 

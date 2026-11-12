@@ -49,7 +49,7 @@ func TestCompactAdvertHolds32Relays(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Format != FormatCompact {
 		t.Fatalf("%d messages: %+v", len(msgs), msgs)
 	}
-	a, err := decodeCompact(msgs[0].Raw, r.ids, r.known)
+	a, err := decodeCompact(msgs[0].Raw, r.ids, r.known, r.leaves)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestCompactAdvertHolds32Relays(t *testing.T) {
 		if len(m) == 0 {
 			break
 		}
-		if a, _ := decodeCompact(m[0].Raw, r.ids, r.known); a == nil || a.routes == nil {
+		if a, _ := decodeCompact(m[0].Raw, r.ids, r.known, r.leaves); a == nil || a.routes == nil {
 			break
 		}
 		most = n
@@ -103,12 +103,12 @@ func TestCompactDecodeChecks(t *testing.T) {
 	if !ok {
 		t.Fatal("not encoded")
 	}
-	a, err := decodeCompact(raw, ids, known)
+	a, err := decodeCompact(raw, ids, known, nil)
 	if err != nil || a.origin != "C" || a.seq != good.seq || !maps.Equal(a.links, good.links) || !maps.Equal(a.routes, good.routes) {
 		t.Fatalf("%+v %v", a, err)
 	}
 	noRoutes, _ := encodeCompact(good, num, order, false)
-	if a, err := decodeCompact(noRoutes, ids, known); err != nil || a.routes != nil {
+	if a, err := decodeCompact(noRoutes, ids, known, nil); err != nil || a.routes != nil {
 		t.Fatalf("without routes: %+v %v", a, err)
 	}
 	bin, _ := base64.RawStdEncoding.DecodeString(string(raw))
@@ -131,7 +131,7 @@ func TestCompactDecodeChecks(t *testing.T) {
 		"bad route flag":    enc([]byte{2, 1, 1, 0, 2}),
 	}
 	for name, raw := range bad {
-		if _, err := decodeCompact(raw, ids, known); err == nil {
+		if _, err := decodeCompact(raw, ids, known, nil); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

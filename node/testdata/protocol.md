@@ -84,18 +84,25 @@ The node's first sealed message, and again when its addresses or browser change.
 ```json
 {"t": "hello", "info": "<ref:info>", "caps": {"exec": "<bool>", "terminal": "<bool>", "browser": "<bool>"},
  "version": "<string>", "build": "<hex64>", "endpoint": "<string>", "backup": "<bool>",
- "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer"],
- "protocol": 1, "protocolMin": 1}
+ "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "host", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe"],
+ "protocol": 1, "protocolMin": 1, "front?": "<bool>", "frontAccess?": "<ref:frontAccess>"}
+```
+
+### frontAccess
+An exit's access for its fronts (front.go): only while it serves one.
+```json
+{"port": "<int>", "fingerprint": "<string>", "listening": "<bool>", "error": "<string>"}
 ```
 
 ### msg:report
-Every config.interval seconds. `mesh` only on a mesh member.
+Every config.interval seconds. `mesh` only on a mesh member. `tcpEstab` and `tcpListen` where the
+system tells them cheaply (Linux both, Windows established only).
 ```json
 {"t": "report", "m": {"cpu": "<number>", "steal": "<number>", "iowait": "<number>",
   "mem": {"total": "<int>", "used": "<int>"}, "swap": {"total": "<int>", "used": "<int>"},
   "load": ["<number>", "<number>", "<number>"], "disk": {"total": "<int>", "used": "<int>"},
   "io": {"readRate": "<int>", "writeRate": "<int>"}, "net": {"rx": "<int>", "tx": "<int>", "rxRate": "<int>", "txRate": "<int>"},
-  "tcp": "<int>", "udp": "<int>", "processes": "<int>", "uptime": "<int>", "boot": "<int>", "nodeRss": "<int>"},
+  "tcp": "<int>", "udp": "<int>", "tcpEstab?": "<int>", "tcpListen?": "<int>", "processes": "<int>", "uptime": "<int>", "boot": "<int>", "nodeRss": "<int>"},
  "mesh?": "<any>"}
 ```
 
@@ -123,6 +130,12 @@ A refusal inside the channel (4403 revoked), which a node takes as authentic.
 ### msg:term.open
 ```json
 {"t": "term.open", "sid": "<int>", "cols": "<int>", "rows": "<int>"}
+```
+
+### msg:term.open/dial
+A terminal that is a TCP connection from the node to host:port (a front's SSH through its exit).
+```json
+{"t": "term.open", "sid": "<int>", "dial": "<string>"}
 ```
 
 ### msg:term.opened
@@ -221,9 +234,10 @@ One chunk of an upload (the controller always sends uploads); the file appears w
 ```
 
 ### call:fs.read
+`file` names the file the chunk was read from (device and inode, or volume and file index); a reader in chunks stops when it changes. Nodes from before it omit it.
 ```json
 {"params": {"path": "<dir>/upload.txt", "offset": 1, "limit": 1048576},
- "result": {"data": "ZWxsbw==", "size": 5, "offset": 1, "read": 4, "eof": true, "mode": "0644", "mtime": "<int>"}}
+ "result": {"data": "ZWxsbw==", "size": 5, "offset": 1, "read": 4, "eof": true, "mode": "0644", "mtime": "<int>", "file?": "<string>"}}
 ```
 
 ### call:fs.read/missing
@@ -311,12 +325,19 @@ sha256, replaces itself and reconnects running it; for the build it already runs
 ### call:config.url
 The node proves the new address with a probe handshake before saving it, then reconnects there.
 ```json
-{"params": {"url": "<url2>", "backup": "<url>"}, "result": {"url": "<url2>", "backup": "<url>", "backupReachable": true, "changed": true}}
+{"params": {"url": "<url2>", "backup": "<url>", "pins": [], "backupPins": [], "front": false},
+ "result": {"url": "<url2>", "backup": "<url>", "backupReachable": true, "changed": true}}
 ```
 
 ### call:config.url/unchanged
 ```json
-{"params": {"url": "<url>", "backup": ""}, "result": {"url": "<url>", "backup": "", "changed": false}}
+{"params": {"url": "<url>", "backup": "", "pins": [], "backupPins": [], "front": false}, "result": {"url": "<url>", "backup": "", "changed": false}}
+```
+
+### call:front.serve
+The node serves its fronts' access on port (0: stops), keeps it across restarts and says hello again.
+```json
+{"params": {"port": 0}, "result": {"port": 0}}
 ```
 
 ### call:uninstall
@@ -334,7 +355,8 @@ refused with capability_disabled.
 ### browser
 ```json
 {"enabled": "<bool>", "state": "<string>", "source": "<string>", "product": "<string>", "headless": "<bool>", "epoch": "<string>",
- "endpoint": "<string>", "download": "<bool>", "downloadsUnavailable?": true, "error?": "<string>", "downloaded?": "<int>"}
+ "endpoint": "<string>", "download": "<bool>", "downloadsUnavailable?": true, "error?": "<string>", "downloaded?": "<int>",
+ "chromeVersion?": "<string>", "update?": "<any>"}
 ```
 
 ### call:browser.config
@@ -356,6 +378,16 @@ A browser that cannot be started is a state, not an error.
 ### call:browser.restart
 ```json
 {"params": {}, "result": "<ref:browser>"}
+```
+
+### call:browser.update
+Feature browser.update. The downloaded Chrome for Testing against the current stable one; without
+check a newer one is installed in the background, and browser.status shows it under update:
+{state: downloading|restarting|done|failed, version, downloaded?, error?, restartNeeded?, restarted?}. A browser
+running the old one is restarted on the new one only with restart. browser_not_downloaded when
+there is no downloaded Chrome.
+```json
+{"params": {"check?": "<bool>", "restart?": "<bool>"}, "result": {"current": "<string>", "latest": "<string>", "upToDate": "<bool>", "started?": true}}
 ```
 
 ### call:browser.call/not_started

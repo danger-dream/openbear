@@ -64,7 +64,7 @@ func batchSink(t *testing.T, protocol string) (string, string, func() (uint8, []
 			c = tls.Server(c, &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13})
 		}
 		accepted <- c
-		if err := exchangePreamble(c); err != nil {
+		if err := acceptPreamble(c); err != nil {
 			c.Close()
 		}
 	}()
@@ -138,7 +138,10 @@ func TestBatchSendPreservesOrderAndContinuesAfterError(t *testing.T) {
 						t.Fatalf("packet %d: plane=%d data=%x", i, gotPlane, got)
 					}
 				}
-				bad := make([]byte, maxDatagram(1400)+1)
+				// Longer than any frame: one only too long for this path, a
+				// large frame sealed for a stream it no longer has, is
+				// dropped without an error instead.
+				bad := make([]byte, largeLimit+1)
 				if err := sender.Send([][]byte{packets[0], bad, packets[1]}, ep); !errors.Is(err, ErrFrame) {
 					t.Fatalf("batch error: %v", err)
 				}

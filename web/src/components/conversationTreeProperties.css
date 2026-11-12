@@ -49,6 +49,13 @@
 .folder-properties-dialog .property-section { display:flex; min-width:0; flex-direction:column; gap:9px; padding:15px 16px; border:1px solid var(--fp-line); border-radius:11px; background:var(--fp-group); }
 .folder-properties-dialog .property-field { display:block; min-width:0; }
 .folder-properties-dialog .property-field > span { display:block; margin-bottom:10px; color:var(--fp-text); font-size:14px; font-weight:550; line-height:1.5; }
+.folder-properties-dialog .property-section-head h3 { margin:0; color:var(--fp-text); font-size:14px; font-weight:600; line-height:1.5; }
+.folder-properties-dialog .property-section-head { margin-bottom:4px; }
+.folder-properties-dialog .property-section-head p { margin:2px 0 0; color:var(--fp-secondary); font-size:13px; line-height:1.5; }
+.folder-properties-dialog .property-switch { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; column-gap:20px; min-width:0; cursor:pointer; }
+.folder-properties-dialog .property-switch-text { display:flex; min-width:0; flex-direction:column; gap:2px; }
+.folder-properties-dialog .property-switch-text > span { color:var(--fp-text); font-size:14px; font-weight:550; line-height:1.5; }
+.folder-properties-dialog .property-switch-text small { color:var(--fp-secondary); font-size:13px; line-height:1.5; overflow-wrap:anywhere; }
 .folder-properties-dialog .property-field em { display:block; margin-top:2px; color:var(--fp-secondary); font-size:13px; font-style:normal; font-weight:400; }
 .folder-properties-dialog .el-input,.folder-properties-dialog .el-select { font-family:inherit; font-size:14px; }
 .folder-properties-dialog .el-input__wrapper { min-height:36px; border-radius:7px; background:var(--fp-group); box-shadow:inset 0 1px 2px rgb(var(--ob-shadow-rgb) / .035),0 0 0 1px var(--fp-control-line); }

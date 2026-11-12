@@ -1,6 +1,6 @@
 <script setup>
 import { nextTick, ref } from "vue";
-import { ElImageViewer } from "element-plus";
+import ElImageViewer from "../artifacts/ImageLightbox.vue";
 import BearLogo from "./BearLogo.vue";
 import { assetUrl } from "../assetBase.js";
 

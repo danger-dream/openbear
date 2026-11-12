@@ -16,6 +16,7 @@ import zipfile
 from pathlib import Path
 
 PREFIX = "gateway/bin/"
+PREFIXES = (PREFIX, "benchmark-package/")
 FILES = ("gateway/README.md", "Dockerfile", ".dockerignore", "docs/instances.md")
 
 
@@ -32,7 +33,7 @@ def main() -> int:
             if node_content(name):
                 errors.append(f"package ships node content: {name}")
                 continue
-            if info.is_dir() or not (name.startswith(PREFIX) or name in FILES):
+            if info.is_dir() or not (name.startswith(PREFIXES) or name in FILES):
                 continue
             installed = root / name
             if not installed.is_file():

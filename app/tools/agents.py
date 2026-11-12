@@ -120,6 +120,19 @@ def _events_public(events) -> list[dict[str, Any]]:
     ]
 
 
+OWNED_PATHS_SCHEMA: dict[str, Any] = {
+    "type": "array", "items": {"type": "string"}, "maxItems": 20,
+    "description": "Files or directories (absolute or workspace-relative) this package may change; edits outside them "
+                   "raise an out_of_scope alert in wait, nothing is blocked. Omit to skip the check.",
+}
+
+
+def _owned_paths(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value[:20] if str(item or "").strip()]
+
+
 def _task_public(
     task: AgentTask | None,
     *,
@@ -915,6 +928,7 @@ class AgentTools(AgentContinuationTools):
             preset_ceiling=preset_ceiling,
             attachment_refs=[str(item["ref"]) for item in attachments],
             original_prompt=str(args.get("prompt") or args.get("instruction") or args.get("task") or ""),
+            owned_paths=_owned_paths(args.get("ownedPaths")),
         )
         return _json(output)
 
@@ -1045,10 +1059,26 @@ class AgentTools(AgentContinuationTools):
                     "message": "reviewAfterSeconds must be positive in review_after mode.",
                 })
             review_after_s = min(86_400.0, max(10.0, raw_delay))
+        raw_assessments = args.get("assessments")
+        if raw_assessments is None:
+            raw_assessments = []
+        if not isinstance(raw_assessments, list):
+            return _json({"ok": False, "error": "invalid_assessments",
+                          "message": "assessments must be an array of {agent, verdict, basis}."})
+        assessments = []
+        for item in raw_assessments:
+            verdict = str((item or {}).get("verdict") or "").strip().lower() if isinstance(item, dict) else ""
+            agent = str(item.get("agent") or "").strip() if isinstance(item, dict) else ""
+            basis = str(item.get("basis") or "").strip() if isinstance(item, dict) else ""
+            if not agent or verdict not in {"continue", "correct", "stop"} or not basis:
+                return _json({"ok": False, "error": "invalid_assessments",
+                              "message": "Each assessment needs agent, verdict (continue, correct or stop) and a one-line basis."})
+            assessments.append({"agent": agent, "verdict": verdict, "basis": basis})
         return await ctx.agent_wait({
             "mode": mode,
             "reviewAfterSeconds": review_after_s,
             "reason": reason,
+            **({"assessments": assessments} if assessments else {}),
         })
 
     async def continue_task(self, args: dict[str, Any]) -> str:
@@ -1939,6 +1969,7 @@ class AgentTools(AgentContinuationTools):
         continuation_request_id: str = "",
         attachment_refs: list[str] | None = None,
         original_prompt: str = "",
+        owned_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         ctx = current_tool_context()
         resolved_chat_id = ctx.chat_id if chat_id is None else int(chat_id or 0)
@@ -2006,6 +2037,7 @@ class AgentTools(AgentContinuationTools):
                 "presetToolCeiling": list(preset_ceiling or []),
                 "attachmentRefs": list(attachment_refs or []),
                 "originalPrompt": original_prompt or instruction,
+                **({"ownedPaths": list(owned_paths)} if owned_paths else {}),
             },
             parent_session_uuid=resolved_openbear_session_uuid,
             agent_session_uuid=agent_session.session_uuid,
@@ -2338,6 +2370,9 @@ class AgentTools(AgentContinuationTools):
         return dict(output)
 
 
+from app.tools.agent_actions import merge_agent_tools  # noqa: E402
+
+
 def register_agent_tools(
     reg: ToolRegistry,
     *,
@@ -2377,15 +2412,16 @@ def register_agent_tools(
             "attachments": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Full source material: @doc/<name>, @mem/<ref>, or a local file path. Each is copied to a task-local file with Read granted. Do not substitute a summary. @secret/ is rejected.",
+                "description": "Source material copied to task-local files the child can Read: @doc/<name>, @mem/<ref> or a local path, not a summary; @secret/ is rejected.",
             },
             "planMode": {
                 "type": "string",
                 "enum": [_AGENT_PLAN_MODE_DIRECT, _AGENT_PLAN_MODE_MANAGED],
                 "default": _AGENT_PLAN_MODE_DIRECT,
-                "description": "direct (default) runs immediately. managed adds Plan approval/progress gates; use it only when checkpoints are requested, the package includes destructive or external actions, or multi-Agent dependencies require it.",
+                "description": "direct (default) runs at once; managed adds Plan approval and progress gates, for requested checkpoints, destructive or external actions, or multi-Agent dependencies.",
             },
             "inheritFromTaskUuid": {"type": "string", "description": "managed only: inject a prior task's durable Plan facts and evidence; it is not retained model context."},
+            "ownedPaths": OWNED_PATHS_SCHEMA,
         }, "required": ["prompt", "tools"]},
         tools.agent,
         visibility={"main", "runtime"},
@@ -2408,9 +2444,8 @@ def register_agent_tools(
                 "type": "integer",
                 "minimum": 0,
                 "description": (
-                    "Optimistic CAS for Plan-managed tasks: required and >0 when a visible Plan version exists, "
-                    "and must equal pendingPlanVersion or activePlanVersion (replan_required uses active). "
-                    "Legacy/Plan-disabled tasks without Plan state may omit it or use 0."
+                    "Plan-managed tasks: pendingPlanVersion or activePlanVersion from info (active for replan_required); "
+                    "omit or 0 without a Plan."
                 ),
             },
         }, "required": ["message", "reasonCode", "reason"]},
@@ -2430,15 +2465,41 @@ def register_agent_tools(
     )
     reg.add(
         "AgentWait",
-        "Suspend this same main-controller root turn only when no direct foreground user work remains and scoped Agents are still active. Choose event_only to wait for an interruption/important Agent event, or review_after to schedule one model-selected aggregate review of all scoped Agents. If the previous result says reviewPending, call again to read the next recorded page immediately, even for terminal Agents; this does not arm another wait. Never use Process or Bash sleep as an Agent timer.",
+        "Suspend this same main-controller root turn only when no direct foreground user work remains and scoped Agents are still active. Choose event_only to wait for an interruption/important Agent event, or review_after to schedule one aggregate review of all scoped Agents. "
+        "Either mode is bounded by the review deadlines in settings (default: first review within 300 s of an Agent's start, then at most every 900 s); a longer reviewAfterSeconds is cut to the deadline and reviewSchedule says so. "
+        "The deadline is lifted only while every running Agent is inside one tool call that began before its last review. "
+        "The wait also ends early with wakeReason=supervision_alert when an Agent fails the same tool repeatedly, repeats the same command or edit, stalls, edits outside its ownedPaths, runs a command with external effect (git push, systemctl, docker, ssh/scp, rm -rf, external write requests, publishing), nears a budget, or has its context compacted; alerts lists what happened. Alerts only wake you: the Agent is never paused or blocked. "
+        "Each running Agent carries progress (tool counts, files changed, commands, external effects, failures, compactions, token/cost delta, its latest own note) and brief (objective and completion criteria). Judge from that digest, not from elapsed time. "
+        "After a review_due, review_cap or supervision_alert result, the next AgentWait must pass assessments for every Agent in assessmentsRequired; otherwise it returns assessments_required. "
+        "Unchanged terminal Agents are only counted in unchangedAgents; use AgentInfo for them. If the previous result says reviewPending, call again to read the next recorded page immediately, even for terminal Agents; this does not arm another wait. Never use Process or Bash sleep as an Agent timer.",
         {"type": "object", "properties": {
-            "mode": {"type": "string", "enum": ["event_only", "review_after"], "description": "event_only waits without a timer; review_after wakes once after the model-selected delay unless an important event interrupts it first."},
-            "reviewAfterSeconds": {"type": "number", "minimum": 10, "maximum": 86400, "description": "Required only for review_after. Choose based on task scale/risk/progress; progressively lengthen healthy reviews and shorten after intervention or stalled progress."},
+            "mode": {"type": "string", "enum": ["event_only", "review_after"], "description": "event_only waits for an event, an alert or the next review deadline; review_after also wakes after reviewAfterSeconds."},
+            "reviewAfterSeconds": {"type": "number", "minimum": 10, "maximum": 86400, "description": "review_after only: shorter after a correction, failures or an unclear direction, up to the deadline when on track; longer values are cut to it."},
             "reason": {"type": "string", "description": "Brief rationale for this wait/review choice, used in the same timeline status card."},
+            "assessments": {"type": "array", "description": "Your judgement of the last review for each Agent in assessmentsRequired, shown on the supervision card.",
+                            "items": {"type": "object", "properties": {
+                                "agent": {"type": "string", "description": "Agent task id, short id or title."},
+                                "verdict": {"type": "string", "enum": ["continue", "correct", "stop"], "description": "continue: on track; correct: you are guiding it with message; stop: you are stopping it."},
+                                "basis": {"type": "string", "description": "One line citing the digest facts behind the verdict."},
+                            }, "required": ["agent", "verdict", "basis"]}},
         }, "required": ["mode"]},
         tools.agent_wait,
         visibility={"main", "runtime"},
         preserve_result=True,
     )
     register_agent_plan_tools(reg, tools.plan)
+    merge_agent_tools(reg, "Agent", "Delegate work to independent Agents and supervise them. action selects the operation (default start); fields of other actions are ignored and named in the result (ignoredFields), and a missing required field is reported with its action's error.", {
+        "start": "a NEW independent Agent instance and its first task. The child sees only the prompt, attachments, shared TaskMemory and granted tools, not this conversation; [] tools means no business tools. It usually returns running/detached: do not poll or redo the work.",
+        "continue": "give the SAME instance a new task after its round ended; restores its actual retained context and private memory, and no prior memory report is needed. Pass the COMPLETE tools array: permissions are not inherited or unioned. Use message for an unfinished task.",
+        "message": "a narrow intervention to an active task with its concrete basis; the Agent must accept, reject, appeal or ask before continuing. A material change to an approved Plan first needs plan with decision=request_replan.",
+        "stop": "stop a scoped task.",
+        "wait": "suspend this root turn while scoped Agents run and no foreground work remains. event_only wakes on an event, an alert or the next review deadline; review_after also after reviewAfterSeconds, cut to the deadline (by default 300 s after an Agent starts, then every 900 s). An alert (wakeReason=supervision_alert) reports repeated failures or commands, a stall, edits outside ownedPaths, a command with external effect, a budget or a compaction; the Agent is never paused. After review_due, review_cap or supervision_alert the next wait must pass assessments for every Agent in assessmentsRequired. When the result says reviewPending, call again to read the next recorded page.",
+        "info": "instances, rounds, results, capabilities and the authoritative planRuntime (phase, Plan versions for version-checked plan decisions, steps, evidence). op=get gives the current round in full (includeHistory or taskUuid for earlier ones); tool_calls the last limit calls with arguments and result previews. Read-only, not a polling timer.",
+        "plan": "approve, revise, cancel or request_replan a Plan version (taskUuid and expectedPlanVersion from info); grantedTools count only on the first approval.",
+    }, fields={
+        "reason": {"type": "string", "description": "message: the factual basis; stop: why; wait: the rationale shown on the card; plan: the decision's reason."},
+        "to": {"type": "string", "description": "continue: the exact agentId (or a legacy task UUID to adopt only that task); info: an exact agentId or task UUID for get and tool_calls; message, stop: a task id, short id, title or preset key, omitted only when exactly one scoped Agent task is active."},
+        "taskUuid": {"type": "string", "description": "plan: the task whose Plan version is decided (required); info: an earlier round to return in full (get) or to read (tool_calls)."},
+        "requestId": {"type": "string", "description": "continue, plan: optional idempotency key; reuse it only to retry the same request."},
+    })
     refresh_agent_tool_enums(reg)

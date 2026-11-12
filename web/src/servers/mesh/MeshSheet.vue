@@ -4,7 +4,9 @@ import { Close } from '@element-plus/icons-vue';
 
 // The phone's bottom sheet, as on the servers page: it follows a downward drag
 // on its header and slides out from where it was let go while the overlay fades with it.
-const props = defineProps({modelValue: Boolean, title: {type: String, default: ''}, phoneSize: {type: String, default: 'auto'}, panelClass: {type: String, default: ''}});
+// leave: asked before any way of closing (the drag, the button, the overlay); false keeps the sheet up.
+const props = defineProps({modelValue: Boolean, title: {type: String, default: ''}, phoneSize: {type: String, default: 'auto'}, panelClass: {type: String, default: ''},
+  leave: {type: Function, default: null}});
 const emit = defineEmits(['update:modelValue', 'closed']);
 const closing = ref(false), offset = ref(0), dragging = ref(false);
 let gesture = null;
@@ -12,6 +14,10 @@ const style = computed(() => offset.value ? {'--mesh-drag-y': `${offset.value}px
 watch(() => props.modelValue, open => { if (open) { closing.value = false; offset.value = 0; } });
 
 function close() { gesture = null; dragging.value = false; closing.value = true; }
+async function request() {
+  if (props.leave && !(await props.leave())) { cancel(); return; }
+  close();
+}
 function closed() {
   if (closing.value) emit('update:modelValue', false);
   closing.value = false; offset.value = 0;
@@ -38,17 +44,17 @@ function move(event) {
 function cancel() { gesture = null; dragging.value = false; offset.value = 0; }
 function end() {
   if (!gesture) return;
-  if (offset.value >= 88 || (offset.value > 24 && gesture.speed > 0.5)) close(); else cancel();
+  if (offset.value >= 88 || (offset.value > 24 && gesture.speed > 0.5)) void request(); else cancel();
 }
 </script>
 <template>
   <el-drawer :model-value="modelValue && !closing" direction="btt" :size="phoneSize" :title="title" :with-header="false" append-to-body destroy-on-close
     :class="['instance-ui', 'servers-ui', 'mesh-sheet', 'mobile-asset-sheet', 'mobile-viewport-sheet', panelClass, {'is-dragging': dragging}]" modal-class="mesh-sheet-overlay" :style="style"
-    @update:model-value="v => { if (!v) close(); }" @closed="closed">
+    :before-close="leave ? () => void request() : undefined" @update:model-value="v => { if (!v) close(); }" @closed="closed">
     <header class="mesh-sheet-head" @pointerdown="start" @pointermove="move" @pointerup="end" @pointercancel="cancel">
       <i class="mobile-asset-grip" aria-hidden="true"></i>
       <h2>{{ title }}</h2>
-      <button type="button" class="mesh-sheet-close" aria-label="关闭" @click="close"><el-icon><Close /></el-icon></button>
+      <button type="button" class="mesh-sheet-close" aria-label="关闭" @click="request"><el-icon><Close /></el-icon></button>
     </header>
     <div class="mesh-sheet-body"><slot /></div>
   </el-drawer>

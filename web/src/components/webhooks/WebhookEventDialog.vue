@@ -129,7 +129,7 @@ async function retryNotification(assignment) {
 }
 </script>
 <template>
-  <el-dialog :model-value="modelValue" title="事件处理详情" width="min(900px, calc(100vw - 24px))" append-to-body class="mobile-viewport-dialog wh-event-dialog" :close-on-click-modal="false" :close-on-press-escape="!busy" :show-close="!busy" @update:model-value="emit('update:modelValue',$event)">
+  <el-dialog :model-value="modelValue" title="事件处理详情" width="min(900px, calc(100vw - 24px))" append-to-body class="mobile-viewport-dialog wh-event-dialog" :close-on-click-modal="!busy" :close-on-press-escape="!busy" :show-close="!busy" @update:model-value="emit('update:modelValue',$event)">
     <el-skeleton v-if="loading" :rows="7" animated />
     <div v-if="error" class="wh-alert" role="alert">{{ error }}<el-button :disabled="busy" @click="load">重新读取</el-button></div>
     <template v-if="event">

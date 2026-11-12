@@ -104,7 +104,22 @@ def install(app, host, service):
         return await service.install(o, r.match_info['id'], browser=browser_flag(data), force=data.get('force', False))
     async def revoke(r, o): return await service.revoke(o, r.match_info['id'], uninstall=r.query.get('uninstall') == '1')
     async def settle_join(r, o): return await service.settle_join(o, r.match_info['id'], await body(r))
-    async def metrics(r, o): return await service.series(o, r.match_info['id'], r.query.get('range', '1h'))
+    async def metrics(r, o):
+        after = r.query.get('after', '0')
+        return await service.series(o, r.match_info['id'], r.query.get('range', '1h'), int(after) if after.isdigit() else 0)
+    async def traffic_stats(r, o): return await service.traffic_stats(o, r.match_info['id'], r.query.get('unit', 'day'))
+    async def disks(r, o): return await service.disks(o, r.match_info['id'], r.query.get('range', '7d'))
+    async def storage(r, o): return await service.storage()
+    async def compact_storage(r, o): return await service.compact_storage()
+    async def latency_summary(r, o): return await service.latency.summary(o)
+    async def latency_refresh(r, o): return await service.latency.refresh()
+    async def latency(r, o): return await service.latency.series(o, r.match_info['id'], r.query.get('range', '24h'))
+    async def ip_quality(r, o): return await service.ip_quality(o, r.match_info['id'])
+    async def ip_intel(r, o): return await service.intel.report(o, r.match_info['id'])
+    async def ip_ports(r, o): return await service.intel.scan(o, r.match_info['id'])
+    def family(value): return int(value) if str(value) in ('4', '6') else 0
+    async def bgp(r, o): return await service.bgp.view(o, r.match_info['id'], family(r.query.get('family', '4')))
+    async def bgp_refresh(r, o): return await service.bgp.view(o, r.match_info['id'], family((await body(r)).get('family', 4)), fresh=True)
     async def reminders(r, o): return {'ok': True, 'items': await service.reminders.recent(o)}
     async def test_reminder(r, o): return await service.reminders.test(o)
     async def batch(r, o): return await service.exec_batch(o, await body(r))
@@ -113,6 +128,8 @@ def install(app, host, service):
     async def push_url(r, o): return await service.push_node_url(o)
     async def update_one(r, o): return await service.update_node(o, r.match_info['id'], downgrade=(await body(r)).get('downgrade') is True)
     async def renew(r, o): return await service.renew(o, r.match_info['id'])
+    async def calibrate(r, o): return await service.calibrate_traffic(o, r.match_info['id'], await body(r))
+    async def uncalibrate(r, o): return await service.calibrate_traffic(o, r.match_info['id'], None)
     async def files(r, o): return await service.list_files(o, r.match_info['id'], r.query.get('path', '/'))
     async def file_op(r, o): return await service.file_op(o, r.match_info['id'], await body(r))
     async def file_job(r, o): return await service.file_op_job(o, r.match_info['id'], r.match_info['job'])
@@ -127,6 +144,9 @@ def install(app, host, service):
     async def browser(r, o): return await service.browser_status(o, r.match_info['id'])
     async def set_browser(r, o): return await service.set_browser(o, r.match_info['id'], await body(r))
     async def restart_browser(r, o): return await service.restart_browser(o, r.match_info['id'])
+    async def update_browser(r, o): return await service.update_browser(o, r.match_info['id'], await body(r))
+    async def desktop_config(r, o): return await service.desktop.get_config(o, r.match_info['id'])
+    async def save_desktop_config(r, o): return await service.desktop.save_config(o, r.match_info['id'], await body(r))
     async def jobs(r, o): return await service.jobs_list(o, r.match_info['id'])
 
     async def job_status(r, o):
@@ -134,21 +154,36 @@ def install(app, host, service):
         return await service.job_status(o, r.match_info['id'], r.match_info['job'], offset=int(offset) if offset else None,
                                         limit=min(int(limit), 256 * 1024) if limit else None)
     async def job_stop(r, o): return await service.job_stop(o, r.match_info['id'], r.match_info['job'])
-    async def mesh(r, o): return await service.mesh.view(o)
+    async def mesh(r, o): return await service.mesh.view(o, fresh=r.query.get('fresh') == '1')
     async def mesh_draft(r, o): return await service.mesh.save_draft(o, await body(r))
     async def mesh_add(r, o): return await service.mesh.add(o, await body(r))
     async def mesh_remove(r, o): return await service.mesh.remove(o, r.match_info['sid'])
     async def mesh_reinstall(r, o): return await service.mesh.reinstall(o, r.match_info['sid'])
     async def mesh_apply(r, o): return await service.mesh.apply(o)
     async def mesh_discard(r, o): return await service.mesh.discard(o)
-    async def mesh_rollback(r, o): return await service.mesh.rollback(o)
+    async def mesh_rollback(r, o): return await service.mesh.rollback(o, await body(r))
+    async def mesh_revisions(r, o): return await service.mesh.revisions(o)
+    async def mesh_probe(r, o): return await service.mesh.probe(o, await body(r))
     async def mesh_member(r, o): return await service.mesh.member(o, r.match_info['sid'])
     async def mesh_trend(r, o): return await service.mesh.trend(o, r.match_info['sid'], r.query.get('range', '1h'))
     async def mesh_line_trend(r, o): return await service.mesh.line_trend(o, r.match_info['line'], r.query.get('range', '24h'))
     async def mesh_layout(r, o): return await service.mesh.save_layout(o, await body(r))
     async def mesh_path(r, o): return await service.mesh.path(o, r.query.get('src', ''), r.query.get('dst', ''))
     async def mesh_routes(r, o): return await service.mesh.routes(o, r.query.get('src', ''))
+    async def mesh_path_measure(r, o):
+        data = await body(r)
+        return await service.mesh.measure(o, data.get('nodes') if isinstance(data, dict) else None)
+
+    async def mesh_path_options(r, o):
+        k = r.query.get('k', '10')
+        return await service.mesh.path_options(o, r.query.get('src', ''), r.query.get('dst', ''), int(k) if k.isdigit() else 0)
     async def net_addresses(r, o): return await service.net.addresses(o, r.match_info['id'])
+    async def processes(r, o): return await service.processes(o, r.match_info['id'], r.query.get('sort', 'cpu'))
+    async def kill_process(r, o): return await service.kill_process(o, r.match_info['id'], await body(r))
+    async def host_details(r, o): return await service.host_details(o, r.match_info['id'])
+    async def unlock_check(r, o): return await service.unlock_check(o, r.match_info['id'])
+    async def unlock_full(r, o): return await service.unlock_full.view(o, r.match_info['id'])
+    async def route_check(r, o): return await service.route_check(o, r.match_info['id'])
     async def net_probe(r, o): return await service.net.start(o, r.match_info['id'], await body(r))
     async def net_probe_status(r, o): return await service.net.status(o, r.match_info['id'], r.match_info['pid'])
     async def net_probe_stop(r, o): return await service.net.stop(o, r.match_info['id'], r.match_info['pid'])
@@ -164,6 +199,8 @@ def install(app, host, service):
         ('GET', '/commands', commands), ('POST', '/commands', add_command), ('PUT', '/commands/order', order_commands),
         ('PATCH', '/commands/{cid}', edit_command), ('DELETE', '/commands/{cid}', delete_command),
         ('PUT', '/settings', save_settings), ('GET', '/reminders', reminders), ('POST', '/reminders/test', test_reminder),
+        ('GET', '/storage', storage), ('POST', '/storage/compact', compact_storage),
+        ('GET', '/latency', latency_summary), ('POST', '/latency/refresh', latency_refresh),
         ('POST', '/exec', batch), ('GET', '/exec/{job}', job), ('POST', '/node-update', update_all), ('POST', '/node-url', push_url),
         ('POST', '/access-points/test', test_access), ('GET', '/registration-codes', codes), ('POST', '/registration-codes', add_code),
         ('DELETE', '/registration-codes/{code}', revoke_code), ('POST', '/batch-install', batch_install), ('GET', '/batch-install/{job}', batch_status),
@@ -172,16 +209,24 @@ def install(app, host, service):
         ('POST', '/mesh/apply', mesh_apply), ('POST', '/mesh/discard', mesh_discard), ('POST', '/mesh/rollback', mesh_rollback),
         ('POST', '/mesh/members/{sid}/reinstall', mesh_reinstall), ('GET', '/mesh/members/{sid}', mesh_member), ('GET', '/mesh/members/{sid}/trend', mesh_trend),
         ('GET', '/mesh/lines/{line}/trend', mesh_line_trend), ('PUT', '/mesh/layout', mesh_layout),
-        ('GET', '/mesh/path', mesh_path), ('GET', '/mesh/routes', mesh_routes),
+        ('GET', '/mesh/path', mesh_path), ('GET', '/mesh/path/options', mesh_path_options), ('POST', '/mesh/path/measure', mesh_path_measure), ('GET', '/mesh/routes', mesh_routes), ('GET', '/mesh/revisions', mesh_revisions),
+        ('POST', '/mesh/probe', mesh_probe),
         ('GET', '/bench/catalog', bench_catalog), ('GET', '/bench/runs', bench_runs), ('POST', '/bench/runs', bench_create),
         ('GET', '/bench/runs/{run}', bench_run), ('POST', '/bench/runs/{run}/stop', bench_stop), ('DELETE', '/bench/runs/{run}', bench_delete),
         ('GET', '/{id}', get), ('PATCH', '/{id}', update), ('DELETE', '/{id}', delete), ('POST', '/{id}/enrollment', enrollment),
         ('POST', '/{id}/install', node_install), ('DELETE', '/{id}/node', revoke), ('POST', '/{id}/join', settle_join), ('GET', '/{id}/metrics', metrics),
         ('POST', '/{id}/node/update', update_one), ('POST', '/{id}/renew', renew), ('GET', '/{id}/files', files),
+        ('PUT', '/{id}/traffic/calibration', calibrate), ('DELETE', '/{id}/traffic/calibration', uncalibrate),
+        ('GET', '/{id}/traffic', traffic_stats), ('GET', '/{id}/disks', disks), ('GET', '/{id}/latency', latency), ('GET', '/{id}/ip-quality', ip_quality),
+        ('GET', '/{id}/ip-intel', ip_intel), ('POST', '/{id}/ip-intel/ports', ip_ports),
+        ('GET', '/{id}/bgp', bgp), ('POST', '/{id}/bgp/refresh', bgp_refresh),
         ('POST', '/{id}/files/op', file_op), ('GET', '/{id}/files/op/{job}', file_job),
         ('GET', '/{id}/browser', browser), ('PUT', '/{id}/browser', set_browser), ('POST', '/{id}/browser/restart', restart_browser),
+        ('POST', '/{id}/browser/update', update_browser),
+        ('GET', '/{id}/desktop/config', desktop_config), ('PUT', '/{id}/desktop/config', save_desktop_config),
         ('GET', '/{id}/jobs', jobs), ('GET', '/{id}/jobs/{job}', job_status), ('POST', '/{id}/jobs/{job}/stop', job_stop),
         ('GET', '/{id}/net/addresses', net_addresses), ('POST', '/{id}/net/probes', net_probe),
+        ('GET', '/{id}/processes', processes), ('POST', '/{id}/processes/kill', kill_process), ('GET', '/{id}/details', host_details), ('POST', '/{id}/unlock', unlock_check), ('GET', '/{id}/unlock-full', unlock_full), ('POST', '/{id}/route', route_check),
         ('GET', '/{id}/net/probes/{pid}', net_probe_status), ('DELETE', '/{id}/net/probes/{pid}', net_probe_stop),
     ]:
         app.router.add_route(method, '/api/servers' + path, wrap(fn))
@@ -195,6 +240,24 @@ def install(app, host, service):
             return failure(exc)
         return await service.terminal(request, owner, request.match_info['id'])
     app.router.add_get('/api/servers/{id}/terminal', terminal)
+
+    async def desktop_vnc(request):
+        try:
+            owner = owner_of(request)
+            await service.registry.get(owner, request.match_info['id'])
+        except InstanceError as exc:
+            return failure(exc)
+        return await service.desktop.vnc_ws(request, owner, request.match_info['id'])
+    app.router.add_get('/api/servers/{id}/desktop/vnc', desktop_vnc)
+
+    async def desktop_rdp(request):
+        try:
+            owner = owner_of(request)
+            await service.registry.get(owner, request.match_info['id'])
+        except InstanceError as exc:
+            return failure(exc)
+        return await service.desktop.rdp_ws(request, owner, request.match_info['id'])
+    app.router.add_get('/api/servers/{id}/desktop/rdp', desktop_rdp)
 
     async def download(request):
         path = request.query.get('path', '')
@@ -221,6 +284,9 @@ def install(app, host, service):
         if size and not pseudo:
             response.content_length = size
         limit = size or UNSIZED_DOWNLOAD_LIMIT
+        # The file the first chunk came from; one put in its place mid-way (an atomic save, a log rotation)
+        # would splice two versions into one download. A node from before it does not say.
+        identity = first.get('file')
         await response.prepare(request)
         chunk, offset, complete = first, 0, False
         while True:
@@ -235,6 +301,8 @@ def install(app, host, service):
             try:
                 chunk = await service.read_file(owner, server_id, path, offset)
             except InstanceError:
+                break
+            if identity is not None and chunk.get('file') != identity:
                 break
         # After the headers are sent a failure can only cut the download short: the connection is
         # closed so the browser sees it short of its length or unfinished, not as a whole file.

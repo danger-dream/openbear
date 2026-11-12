@@ -84,7 +84,7 @@ function turnNavLabel(turn, index = 0) {
 	display: grid;
 	grid-auto-rows: .42rem;
 	gap: .22rem;
-	max-height: calc(8 * .42rem + 7 * .22rem + .84rem);
+	max-height: var(--console-float-minimap-max-height, calc(8 * .42rem + 7 * .22rem + .84rem));
 	overflow-y: auto;
 	overscroll-behavior: contain;
 	scrollbar-width: none;

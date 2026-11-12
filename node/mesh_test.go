@@ -141,7 +141,15 @@ func TestMeshMethodsCheckCapabilityAndParams(t *testing.T) {
 	}
 }
 
+// meshCopying runs the test with the data plane on a copy of the program, as on Windows and macOS.
+func meshCopying(t *testing.T, on bool) {
+	keep := meshCopies
+	t.Cleanup(func() { meshCopies = keep })
+	meshCopies = on
+}
+
 func TestMeshInstallIsIdempotent(t *testing.T) {
+	meshCopying(t, true)
 	h, f, exe := testMesh(t)
 	a := meshAgent(h, Capabilities{Exec: true})
 	first, err := meshDispatch(t, a, "mesh.install", "{}")
@@ -206,7 +214,7 @@ func TestMeshLocalPrefixesSkipLoopbackAndMesh(t *testing.T) {
 	ifaces := []meshIface{
 		{name: "lo", flags: net.FlagUp | net.FlagLoopback, addrs: []net.Addr{cidr("127.0.0.1/8"), cidr("::1/128")}},
 		{name: "eth0", flags: net.FlagUp, addrs: []net.Addr{cidr("172.17.5.9/16"), cidr("10.20.20.7/24"), cidr("fe80::1/64")}},
-		{name: "eth1", flags: net.FlagUp, addrs: []net.Addr{cidr("10.20.20.8/24"), &net.IPAddr{IP: net.ParseIP("192.168.9.9")}}},
+		{name: "eth1", flags: net.FlagUp, addrs: []net.Addr{cidr("10.20.20.9/24"), &net.IPAddr{IP: net.ParseIP("192.168.9.9")}}},
 		{name: "br0", flags: net.FlagUp, addrs: []net.Addr{&net.IPNet{IP: net.ParseIP("10.20.0.1"), Mask: net.CIDRMask(112, 128)}}},
 		{name: "obmesh0", flags: net.FlagUp, addrs: []net.Addr{cidr("100.96.0.2/16"), cidr("100.96.255.2/24")}},
 		{name: "utun3", flags: net.FlagUp, addrs: []net.Addr{cidr("100.96.0.3/32")}},
@@ -430,6 +438,7 @@ func TestMeshTLSActivationRewritesTheConfig(t *testing.T) {
 }
 
 func TestMeshUpgradeReplacesTheCopyOrRollsBack(t *testing.T) {
+	meshCopying(t, true)
 	h, f, exe := testMesh(t)
 	a := meshAgent(h, Capabilities{Exec: true})
 	if _, err := meshDispatch(t, a, "mesh.install", ""); err != nil {
@@ -461,6 +470,106 @@ func TestMeshUpgradeReplacesTheCopyOrRollsBack(t *testing.T) {
 	}
 	if _, err := os.Stat(siblingPath(h.binary(), "old")); !os.IsNotExist(err) {
 		t.Fatalf("old copy left behind: %v", err)
+	}
+}
+
+// On Linux the service runs the node's own file: a node update replaces it under a running data
+// plane, which mesh.upgrade restarts onto the new build, with nothing to go back to.
+func TestMeshRunsTheNodesOwnProgramOnLinux(t *testing.T) {
+	meshCopying(t, false)
+	h, f, exe := testMesh(t)
+	a := meshAgent(h, Capabilities{Exec: true})
+	if _, err := meshDispatch(t, a, "mesh.install", ""); err != nil {
+		t.Fatal(err)
+	}
+	unit, _ := os.ReadFile(h.service.(*systemdService).unit)
+	if !strings.Contains(string(unit), "ExecStart="+exe+" mesh run --dir "+h.dir+"\n") {
+		t.Fatalf("the unit must run the node's own program:\n%s", unit)
+	}
+	if _, err := os.Stat(h.path("bin")); !os.IsNotExist(err) {
+		t.Fatalf("no copy: %v", err)
+	}
+	first := h.build()
+	if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != first {
+		t.Fatalf("dataBuild: %v", status["dataBuild"])
+	}
+	if r, err := meshDispatch(t, a, "mesh.upgrade", ""); err != nil || r["changed"] != false || f.called("stop") != 0 {
+		t.Fatalf("same build must not restart: %v %v", r, err)
+	}
+
+	// A node update: the file changes, the running data plane keeps its build until the upgrade.
+	os.WriteFile(h.path("config.json"), []byte(`{"revision":1}`), 0o600)
+	f.active = true
+	writeStatus(t, h, map[string]any{"pid": 999990, "ready": true})
+	os.WriteFile(exe, []byte("build 2"), 0o755)
+	if _, err := meshDispatch(t, a, "mesh.install", ""); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != first || h.takesDown("mesh.upgrade", nil) == "" {
+		t.Fatalf("the running data plane is still the first build: %v", status["dataBuild"])
+	}
+	f.onStart = func() { writeStatus(t, h, map[string]any{"pid": 999991, "ready": true}) }
+	r, err := meshDispatch(t, a, "mesh.upgrade", "")
+	if err != nil || r["changed"] != true || r["to"] != Version || f.called("stop") != 1 || f.called("start") != 1 {
+		t.Fatalf("upgrade: %v %v %v", r, err, f.calls)
+	}
+	if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != h.build() {
+		t.Fatalf("dataBuild after the upgrade: %v", status["dataBuild"])
+	}
+
+	// A build that does not come up is not recorded: asked again, the upgrade starts it again
+	// rather than answering that it is done.
+	upgraded := h.build()
+	os.WriteFile(exe, []byte("build 3"), 0o755)
+	f.onStart = func() {}
+	if _, err := meshDispatch(t, a, "mesh.upgrade", ""); err == nil || err.Error() != "upgrade_not_ready" {
+		t.Fatalf("an upgrade that never gets ready must fail: %v", err)
+	}
+	if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != upgraded {
+		t.Fatalf("a build that did not come up must not be recorded: %v", status["dataBuild"])
+	}
+	starts := f.called("start")
+	if _, err := meshDispatch(t, a, "mesh.upgrade", ""); err == nil || f.called("start") != starts+1 {
+		t.Fatalf("a retry must start it again: %v %v", err, f.calls)
+	}
+	f.onStart = func() { writeStatus(t, h, map[string]any{"pid": 999992, "ready": true}) }
+	if r, err := meshDispatch(t, a, "mesh.upgrade", ""); err != nil || r["changed"] != true {
+		t.Fatalf("once it comes up the upgrade is done: %v %v", r, err)
+	}
+	if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != h.build() {
+		t.Fatalf("dataBuild: %v", status["dataBuild"])
+	}
+}
+
+// An install from before, whose service runs a copy, moves onto the node's own file with its
+// next upgrade, even of the same build, and the copy goes.
+func TestMeshUpgradeMovesAnOlderInstallOffItsCopy(t *testing.T) {
+	meshCopying(t, true)
+	h, f, exe := testMesh(t)
+	a := meshAgent(h, Capabilities{Exec: true})
+	if _, err := meshDispatch(t, a, "mesh.install", ""); err != nil {
+		t.Fatal(err)
+	}
+	meshCopying(t, false)
+	os.WriteFile(h.path("config.json"), []byte(`{"revision":1}`), 0o600)
+	f.active = true
+	writeStatus(t, h, map[string]any{"pid": 999990, "ready": true})
+	if h.takesDown("mesh.upgrade", nil) == "" {
+		t.Fatal("moving off the copy restarts the data plane")
+	}
+	f.onStart = func() { writeStatus(t, h, map[string]any{"pid": 999991, "ready": true}) }
+	if r, err := meshDispatch(t, a, "mesh.upgrade", ""); err != nil || r["changed"] != true {
+		t.Fatalf("upgrade: %v %v", r, err)
+	}
+	unit, _ := os.ReadFile(h.service.(*systemdService).unit)
+	if !strings.Contains(string(unit), "ExecStart="+exe+" mesh run") {
+		t.Fatalf("the unit must run the node's own program:\n%s", unit)
+	}
+	if _, err := os.Stat(h.path("bin")); !os.IsNotExist(err) {
+		t.Fatalf("the copy must go: %v", err)
+	}
+	if r, err := meshDispatch(t, a, "mesh.upgrade", ""); err != nil || r["changed"] != false {
+		t.Fatalf("then there is nothing to do: %v %v", r, err)
 	}
 }
 
@@ -592,5 +701,118 @@ func TestMeshStatusReportsConfigSchemas(t *testing.T) {
 	writeStatus(t, h, map[string]any{"pid": 1, "configSchemas": []int{1, 2}})
 	if got := schemas(); !slices.Equal(got.([]any), []any{float64(1), float64(2)}) {
 		t.Fatalf("status.json says 1..2, got %v", got)
+	}
+}
+
+func TestMeshDirStaysOnFlashOnOpenWrt(t *testing.T) {
+	keep := mesh.OpenWrtRelease
+	defer func() { mesh.OpenWrtRelease = keep }()
+	mesh.OpenWrtRelease = filepath.Join(t.TempDir(), "openwrt_release")
+	if got := meshDirFor(DefaultConfigPath); got != "/var/lib/openbear-node/mesh" {
+		t.Fatalf("Linux: %s", got)
+	}
+	os.WriteFile(mesh.OpenWrtRelease, nil, 0o644)
+	if got := meshDirFor(DefaultConfigPath); got != "/etc/openbear-node/mesh" {
+		t.Fatalf("OpenWrt: %s", got)
+	}
+}
+
+// fakeProcd stands in for an init script and ubus, as procd answers them.
+type fakeProcd struct {
+	mu      sync.Mutex
+	calls   []string
+	running bool
+}
+
+func (f *fakeProcd) run(name string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, filepath.Base(name)+" "+strings.Join(args, " "))
+	switch {
+	case name == "ubus" && f.running:
+		return `{"openbear-mesh":{"instances":{"instance1":{"running":true,"pid":42}}}}`, nil
+	case name == "ubus":
+		return "{}", nil
+	case args[0] == "start":
+		f.running = true
+	case args[0] == "stop":
+		f.running = false
+	}
+	return "", nil
+}
+
+func TestProcdMeshService(t *testing.T) {
+	root := t.TempDir()
+	f := &fakeProcd{}
+	s := &procdService{script: filepath.Join(root, "openbear-mesh"), name: "openbear-mesh", run: f.run, poll: time.Millisecond}
+	if s.state() != "absent" {
+		t.Fatal(s.state())
+	}
+	if err := s.install("/usr/local/bin/it's", "/etc/openbear-node/mesh"); err != nil {
+		t.Fatal(err)
+	}
+	script, _ := os.ReadFile(s.script)
+	for _, want := range []string{"#!/bin/sh /etc/rc.common\n", "USE_PROCD=1", "[ -f '/etc/openbear-node/mesh/config.json' ] || return 0",
+		`procd_set_param command '/usr/local/bin/it'\''s' mesh run --dir '/etc/openbear-node/mesh'`, "procd_set_param respawn 3600 5 0"} {
+		if !strings.Contains(string(script), want) {
+			t.Fatalf("script lacks %q:\n%s", want, script)
+		}
+	}
+	if info, _ := os.Stat(s.script); info.Mode().Perm() != 0o755 || s.state() != "stopped" {
+		t.Fatalf("mode %v state %s", info.Mode(), s.state())
+	}
+	if s.start() != nil || s.state() != "running" || s.stop() != nil || s.state() != "stopped" {
+		t.Fatalf("start/stop: %v", f.calls)
+	}
+	s.start()
+	if err := s.remove(); err != nil || s.state() != "absent" || f.running {
+		t.Fatalf("remove: %v %s %v", err, s.state(), f.calls)
+	}
+	if got := strings.Join(f.calls, "|"); !strings.Contains(got, "openbear-mesh enable") || !strings.Contains(got, "openbear-mesh disable") {
+		t.Fatalf("calls %s", got)
+	}
+}
+
+func TestMeshServiceFollowsTheInitSystem(t *testing.T) {
+	keep := initComm
+	defer func() { initComm = keep }()
+	initComm = filepath.Join(t.TempDir(), "comm")
+	os.WriteFile(initComm, []byte("systemd\n"), 0o644)
+	if _, ok := newMeshService("").(*systemdService); !ok {
+		t.Fatal("systemd machine without a systemd service")
+	}
+	os.WriteFile(initComm, []byte("procd\n"), 0o644)
+	if s, ok := newMeshService("").(*procdService); !ok || s.script != "/etc/init.d/openbear-mesh" {
+		t.Fatalf("procd: %#v", newMeshService(""))
+	}
+}
+
+func TestInServiceUnderSystemdAndProcd(t *testing.T) {
+	keep, keepComm, keepPids := procSelfCgroup, initComm, procdPids
+	defer func() { procSelfCgroup, initComm, procdPids = keep, keepComm, keepPids }()
+	procSelfCgroup = filepath.Join(t.TempDir(), "cgroup")
+	initComm = filepath.Join(t.TempDir(), "comm")
+	os.WriteFile(initComm, []byte("systemd\n"), 0o644)
+	procdPids = func() []int { return []int{os.Getpid()} }
+	for cgroup, want := range map[string]bool{
+		"0::/system.slice/openbear-node.service\n":      true,
+		"0::/services/openbear-node/instance1\n":        true,
+		"0::/user.slice/user-0.slice/session-3.scope\n": false,
+		"0::/services/openbear-mesh/instance1\n":        false,
+	} {
+		os.WriteFile(procSelfCgroup, []byte(cgroup), 0o644)
+		if inService() != want {
+			t.Errorf("%q: %v", cgroup, !want)
+		}
+	}
+	// A procd without cgroups: the instance procd runs is this process, or is not.
+	os.WriteFile(initComm, []byte("procd\n"), 0o644)
+	os.WriteFile(procSelfCgroup, nil, 0o644)
+	if !inService() {
+		t.Error("procd runs this process: in service")
+	}
+	procdPids = func() []int { return []int{os.Getpid() + 1} }
+	if inService() {
+		t.Error("procd runs another process: not in service")
 	}
 }

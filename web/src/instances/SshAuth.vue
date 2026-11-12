@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { Api } from '../api.js';
 import { ok, safeError } from './instanceHelpers.js';
 
-// How to log in over SSH: a key from the vault, a password, or an uploaded key.
+// How to log in over SSH: a key from the vault (凭证库), a password, or an uploaded key.
 const props = defineProps({modelValue: {type: String, default: 'key'}, editing: {type: Object, default: null}});
 const emit = defineEmits(['update:modelValue', 'error']);
 const keys = ref([]), keyChoice = ref(''), passField = ref(''), fileName = ref('');
@@ -13,11 +13,6 @@ const auth = computed({get: () => props.modelValue, set: value => emit('update:m
 const usable = computed(() => keys.value.filter(k => k.usable && !k.likelyTls));
 const tls = computed(() => keys.value.filter(k => k.usable && k.likelyTls));
 const unusable = computed(() => keys.value.filter(k => !k.usable));
-const groups = computed(() => {
-  const out = {};
-  for (const key of usable.value) (out[key.secret] ||= []).push(key);
-  return out;
-});
 const selected = computed(() => keys.value.find(k => keyId(k) === keyChoice.value));
 const keyId = key => `${key.secret}\u0000${key.field}`;
 const keyLabel = key => [key.field, key.type, key.encrypted ? '有密码' : ''].filter(Boolean).join(' · ');
@@ -61,16 +56,15 @@ onBeforeUnmount(clear);
   <div class="ob-field"><span>认证</span>
     <div class="ob-ctl">
       <div class="ob-radios" role="radiogroup" aria-label="认证方式">
-        <label><input v-model="auth" type="radio" value="key" />密钥库中的私钥</label>
+        <label><input v-model="auth" type="radio" value="key" />凭证库中的私钥</label>
         <label><input v-model="auth" type="radio" value="password" />密码</label>
         <label><input v-model="auth" type="radio" value="upload" />上传私钥</label>
       </div>
       <template v-if="auth === 'key'">
-        <select :value="keyChoice" aria-label="密钥库中的 SSH 私钥" @change="choose($event.target.value)">
-          <option v-if="!keys.length" value="" disabled>密钥库中没有找到 SSH 私钥</option>
-          <optgroup v-for="(items, secret) in groups" :key="secret" :label="secret">
-            <option v-for="key in items" :key="keyId(key)" :value="keyId(key)">{{ keyLabel(key) }}</option>
-          </optgroup>
+        <!-- The credential's name in each option: a closed select shows only the option. -->
+        <select :value="keyChoice" aria-label="凭证库中的 SSH 私钥" @change="choose($event.target.value)">
+          <option v-if="!keys.length" value="" disabled>凭证库中没有找到 SSH 私钥</option>
+          <option v-for="key in usable" :key="keyId(key)" :value="keyId(key)">{{ key.secret }} · {{ keyLabel(key) }}</option>
           <optgroup v-if="tls.length" label="可能不是 SSH 私钥">
             <option v-for="key in tls" :key="keyId(key)" :value="keyId(key)">{{ key.secret }} · {{ keyLabel(key) }} · 同一凭证里有证书，像是网站 HTTPS 私钥</option>
           </optgroup>
@@ -91,7 +85,7 @@ onBeforeUnmount(clear);
       <template v-else>
         <input type="file" aria-label="私钥文件" @change="readKey" />
         <small v-if="fileName">已选：{{ fileName }}</small>
-        <label class="ob-check"><input v-model="saveKey" type="checkbox" />同时保存到密钥库，其他服务器可以直接选</label>
+        <label class="ob-check"><input v-model="saveKey" type="checkbox" />同时保存到凭证库，其他服务器可以直接选</label>
       </template>
     </div>
   </div>

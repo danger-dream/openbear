@@ -347,3 +347,17 @@ func TestASnapWrapperIsNoCandidate(t *testing.T) {
 		}
 	}
 }
+
+func TestNoChromeDownloadWithoutGlibc(t *testing.T) {
+	keep := glibcLoader
+	defer func() { glibcLoader = keep }()
+	glibcLoader = filepath.Join(t.TempDir(), "ld-linux.so")
+	h := &browserHost{dir: t.TempDir()}
+	if exe, _, err := h.executable(BrowserConfig{Download: true}); exe != "" || err == nil || err.Error() != "browser_unsupported_libc" {
+		t.Fatalf("exe %q err %v", exe, err)
+	}
+	os.WriteFile(glibcLoader, nil, 0o755)
+	if exe, _, err := h.executable(BrowserConfig{Download: true}); exe != "" || err != nil {
+		t.Fatalf("with glibc: exe %q err %v, want a download", exe, err)
+	}
+}

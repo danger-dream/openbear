@@ -8,8 +8,10 @@ import {createServersBackend} from './serversBackend.mjs';
 
 const require = createRequire(import.meta.url);
 export let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../../testing/playwright.cjs')); } catch {}
 export const shots = process.env.OPENBEAR_SERVER_SHOTS || '';
+// OpenStreetMap's tiles (IpMap.vue) never fetched: one plain tile for every one asked for, or none ('fail').
+const TILE = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mN48eYjAAWFAsa2OaO7AAAAAElFTkSuQmCC', 'base64');
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:servers-test"></script></body></html>';
 const entry = `import {createApp, h, KeepAlive, ref} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import '/src/style.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css';
 if (window.__dark) document.documentElement.classList.add('dark');
@@ -27,8 +29,8 @@ export async function startServersBrowser(t, {entries = ['/src/servers/TerminalW
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], touch = false} = {}) {
-    const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: 1, colorScheme: dark ? 'dark' : 'light', acceptDownloads: true, hasTouch: touch, isMobile: touch});
+  async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], touch = false, scale = 1, tiles = 'ok'} = {}) {
+    const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: scale, colorScheme: dark ? 'dark' : 'light', acceptDownloads: true, hasTouch: touch, isMobile: touch});
     await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: serverFixture.base});
     t.after(() => context.close());
     const page = await context.newPage(), errors = [];
@@ -43,6 +45,7 @@ export async function startServersBrowser(t, {entries = ['/src/servers/TerminalW
       ? {status: answer.status ?? 200, contentType: 'application/json', headers: answer.headers, body: JSON.stringify(answer.json)}
       : {status: answer.status ?? 200, headers: answer.headers, body: answer.body ?? ''});
     await page.route(/^https:\/\/(open\.er-api\.com|api\.frankfurter\.dev)\//, route => fulfill(route, backend.external({url: new URL(route.request().url())})));
+    await page.route(/^https:\/\/tile\.openstreetmap\.org\//, route => tiles === 'fail' ? route.abort() : route.fulfill({status: 200, contentType: 'image/png', body: TILE}));
     await page.route('**/api/**', async route => {
       const req = route.request(), url = new URL(req.url()), raw = req.postDataBuffer();
       const body = raw && req.headers()['content-type']?.includes('json') ? JSON.parse(raw.toString()) : null;
@@ -78,3 +81,5 @@ export async function until(condition, {timeout = 5000} = {}) {
 }
 // Two animation frames: the page has rendered what it was just given.
 export const frames = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+// A tab of a server's detail page: 概览, 网络, 系统 or 工具.
+export const showTab = (detail, name) => detail.locator('.dt-tabs').getByRole('tab', {name, exact: true}).click();

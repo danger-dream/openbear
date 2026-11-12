@@ -69,6 +69,7 @@ from app.task_memory import (
     task_memory_runtime_metadata,
     without_task_memory_runtime_messages,
 )
+from app.tools.agent_actions import canonical_call, phase_schemas, schema_tool_names
 from app.tools.allowlist import (
     agent_delegation_names,
     agent_phase_tool_names,
@@ -578,7 +579,7 @@ class AgentExecutor(AgentTaskContext):
 
     @staticmethod
     def _tool_budget_kind(name: str) -> str:
-        return "plan_tool" if str(name or "") in (PLAN_TOOL_NAMES | {"AgentControlAck"}) else "tool"
+        return "plan_tool" if str(name or "") in (PLAN_TOOL_NAMES | {"AgentControlAck", "AgentPlan"}) else "tool"
 
     def _select_tool_calls_with_budget(
         self,
@@ -861,7 +862,7 @@ class AgentExecutor(AgentTaskContext):
             "message": (
                 f"{self.agent.name} 已在硬运行安全边界暂停。"
                 "请 OpenBear 只根据已批准 Plan、durable evidence、真实 blocker、scope 与安全状态判断是否继续。"
-                "如果仍有必要工作，请调用 AgentMessage 给出窄化指导；"
+                "如果仍有必要工作，请调用 Agent(action=message) 给出窄化指导；"
                 "续跑会复用已保存的上下文与 Plan 状态，不会重头开始。"
             ),
             "progressPreview": last_text[:1200],
@@ -871,8 +872,9 @@ class AgentExecutor(AgentTaskContext):
             "droppedDanglingToolCalls": dropped_pairs,
             "pendingToolCalls": pending[:10],
             "continueTool": {
-                "name": "AgentMessage",
+                "name": "Agent",
                 "arguments": {
+                    "action": "message",
                     "to": self.task_uuid,
                     "message": "说明是否继续、继续时只补哪些缺口；不要要求从头重查。",
                 },
@@ -1047,7 +1049,7 @@ class AgentExecutor(AgentTaskContext):
             "role": "user",
             "content": (
                 "\n".join(blocks)
-                + "\n这些是 OpenBear 主控制器的结构化干预。先对每个 id 调用 AgentControlAck，"
+                + "\n这些是 OpenBear 主控制器的结构化干预。先对每个 id 调用 AgentPlan(action=ack)，"
                 "明确 accepted、rejected、appeal 或 needs_clarification；全部回执完成前不得调用其他工具。"
             ),
             _AGENT_RUNTIME_METADATA_KEY: {"kind": "agent_control"},
@@ -1491,7 +1493,7 @@ class AgentExecutor(AgentTaskContext):
                 messages.append({
                     "role": "user",
                     "content": (
-                        "暂停边界前尚未执行的工具调用已撤销。请先完成 AgentControlAck，"
+                        "暂停边界前尚未执行的工具调用已撤销。请先完成 AgentPlan(action=ack)，"
                         "再根据最新控制意见与 Plan 状态判断是否需要重新发起这些工具。"
                     ),
                 })
@@ -1633,7 +1635,7 @@ class AgentExecutor(AgentTaskContext):
         if reason == "agent_task_budget_exceeded":
             output_text = (
                 f"{summary}\n\n{message}\n\n"
-                "本次 Rath Agent task 已在硬运行安全边界暂停。OpenBear 只能根据 Plan、证据、真实阻塞、范围与安全状态决定是否调用 AgentMessage 继续；续跑会恢复已保存状态，不会从头开始。"
+                "本次 Rath Agent task 已在硬运行安全边界暂停。OpenBear 只能根据 Plan、证据、真实阻塞、范围与安全状态决定是否调用 Agent(action=message) 继续；续跑会恢复已保存状态，不会从头开始。"
             )
         elif reason == "agent_context_overflow_unrecoverable":
             output_text = (
@@ -1850,11 +1852,11 @@ class AgentExecutor(AgentTaskContext):
         return f"""{identity}
 
 【Agent Plan 强制执行协议（稳定前缀）】
-1. 初次工作先提交完整 AgentPlanSubmit；审批前不得调用业务工具或宣称已执行。
+1. 初次工作先用 AgentPlan(action=submit) 提交完整 Plan；审批前不得调用业务工具或宣称已执行。
 2. Plan 可用 toolRequests 申请启动时未授权的基础工具。每项必须包含 name、reason、neededForSteps；可申请白名单：{whitelist}。能力说明：{whitelist_help} 不要申请启动时已授权工具。
-3. 只有主控制器在初始 AgentPlanDecision(action=approve) 中明确列入 grantedTools 的申请才会生效。首次审批后工具集合冻结；Replan 不得扩权。
-4. 执行已批准 Plan 时，先用 AgentPlanProgress(action=start) 进入步骤，再调用业务工具；update/complete 必须记录真实 durable evidence，全部必做步骤完成后调用 finalize。
-5. 收到 <agent-control> 后，先调用 AgentControlAck，明确 accepted、rejected、appeal 或 needs_clarification，再做任何其他工具调用。不得把“消息已进入上下文”冒充 Agent 已同意。
+3. 只有主控制器在初始审批（decision=approve）中明确列入 grantedTools 的申请才会生效。首次审批后工具集合冻结；Replan 不得扩权。
+4. 执行已批准 Plan 时，先用 AgentPlan(action=progress, op=start) 进入步骤，再调用业务工具；update/complete 必须记录真实 durable evidence，全部必做步骤完成后用 op=finalize 收尾。
+5. 收到 <agent-control> 后，先调用 AgentPlan(action=ack)，明确 accepted、rejected、appeal 或 needs_clarification，再做任何其他工具调用。不得把“消息已进入上下文”冒充 Agent 已同意。
 6. 最新动态状态由追加式 <agent-plan-runtime> XML 提供。较新 revision 覆盖较旧字段；full 是完整快照。delta 只修改列出的字段，其余状态沿用之前 revision；其中 steps/completedHistory 按 (planVersion, stepId)、evidence 按 evidenceUuid 做 upsert，pendingControls 每次出现时整数组替换。未列出的条目或字段保持不变。
 7. 不得伪造证据，不得把准备执行写成已完成，不得在 Plan 门禁未通过时宣布任务结束。
 """.strip()
@@ -2463,15 +2465,11 @@ class AgentExecutor(AgentTaskContext):
             approved=approved, ceiling=getattr(self, "_round_input", {}).get("presetToolCeiling") or [],
             available=agent_delegation_names(self.tools),
         )
-        schemas = [
-            schema
-            for schema in self.tools.schemas(scope="agent")
-            if str(schema.get("name") or "") in allowed
-        ]
+        schemas = phase_schemas(self.tools.schemas(scope="agent"), allowed)
         if self.plan_protocol_enabled and phase in {"executing", "finalizing"}:
             if self._frozen_execution_tool_schemas is None:
                 self._frozen_execution_tool_schemas = json.loads(json.dumps(schemas, ensure_ascii=False))
-            return json.loads(json.dumps([schema for schema in self._frozen_execution_tool_schemas if schema["name"] in allowed], ensure_ascii=False))
+            return json.loads(json.dumps(phase_schemas(self._frozen_execution_tool_schemas, allowed), ensure_ascii=False))
         return schemas
 
     def _gate_repeated(self, key: str) -> int:
@@ -2485,8 +2483,8 @@ class AgentExecutor(AgentTaskContext):
         if gate == "control_ack":
             message = (
                 f"{self.agent.name} 已连续 {self._gate_repeat_count} 次被“尚未回执主控补充说明”拦下，"
-                "待回执控制仍未清除。先用 AgentInfo 核对该控制的回执状态；确认已回执却仍被拦时是框架问题，"
-                "应停止该轮并用 AgentContinue 换新一轮，不要再追加控制。"
+                "待回执控制仍未清除。先用 Agent(action=info) 核对该控制的回执状态；确认已回执却仍被拦时是框架问题，"
+                "应停止该轮并用 Agent(action=continue) 换新一轮，不要再追加控制。"
             )
         else:
             message = (
@@ -2532,23 +2530,23 @@ class AgentExecutor(AgentTaskContext):
             return ""
         if phase == "drafting":
             return (
-                "你尚未提交初始 Plan，当前不能结束任务。请先分析任务并调用 AgentPlanSubmit；"
+                "你尚未提交初始 Plan，当前不能结束任务。请先分析任务并调用 AgentPlan(action=submit)；"
                 "批准前不得调用业务工具或声称已经执行。"
             )
         if phase == "revising":
             return (
                 "主控制器要求修改 Plan，当前不能结束任务。请按 controllerGuidance 修订完整 Plan，"
-                "然后再次调用 AgentPlanSubmit。"
+                "然后再次调用 AgentPlan(action=submit)。"
             )
         if phase == "replan_required":
             return (
-                "当前 Plan 已被要求重规划，不能继续旧方案或结束任务。请调用 AgentPlanReplan，"
+                "当前 Plan 已被要求重规划，不能继续旧方案或结束任务。请调用 AgentPlan(action=replan)，"
                 "提交覆盖全部剩余工作的完整替代 Plan。"
             )
         if phase == "executing":
             return (
-                "任务尚未通过 Plan 完成门禁。请继续执行已批准 Plan：先用 AgentPlanProgress start 标记步骤，"
-                "完成时提交 criteria 与 evidence；全部必需步骤完成后调用 finalize。只有 finalize 成功后才能输出最终报告。"
+                "任务尚未通过 Plan 完成门禁。请继续执行已批准 Plan：先用 AgentPlan(action=progress, op=start) 标记步骤，"
+                "完成时提交 criteria 与 evidence；全部必需步骤完成后用 op=finalize 收尾。只有 finalize 成功后才能输出最终报告。"
             )
         return f"Plan 当前处于 {phase}，尚不能输出最终报告；请等待或完成当前 Plan 控制流程。"
 
@@ -2561,11 +2559,14 @@ class AgentExecutor(AgentTaskContext):
         tool_call_id: str = "",
     ) -> str:
         self._last_tool_outcome = ToolOutcome("", "denied", "not_started", False)
+        # Gates, events and counters go by the earlier tool an AgentPlan call stands for.
+        called_name, called_arguments = name, arguments
+        name, arguments = canonical_call(name, arguments)
         if self.tools is None:
             await self.emit("tool_call_denied", agent_key=self.agent.agent_key, summary=f"工具不可用：{name}")
             return f"error: 工具不可用：{name}"
         schemas = await self._allowed_tool_schemas()
-        allowed = {str(schema.get("name") or "") for schema in schemas}
+        allowed = schema_tool_names(schemas)
         await self.checkpoint("before_tool_call", agent_key=self.agent.agent_key)
         if self.steers and name != "AgentControlAck":
             return _json_compact({
@@ -2627,7 +2628,7 @@ class AgentExecutor(AgentTaskContext):
             return _json_compact({
                 "ok": False,
                 "error": "plan_step_not_started",
-                "message": "Call AgentPlanProgress(action=start) before using an execution tool.",
+                "message": "Call AgentPlan(action=progress, op=start) before using an execution tool.",
                 "tool": name,
             })
         await self.dao.update_task(
@@ -2649,8 +2650,8 @@ class AgentExecutor(AgentTaskContext):
         )
         started = time.monotonic()
         result = await self.tools.dispatch(
-            name,
-            arguments,
+            called_name,
+            called_arguments,
             max_chars=self.tool_result_max_chars,
             context=(media_context := ToolRuntimeContext(
                 chat_id=self.chat_id,

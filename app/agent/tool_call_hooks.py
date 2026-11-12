@@ -8,6 +8,7 @@ persisted, streamed to Web, or dispatched.
 from __future__ import annotations
 
 from app.llm.events import ToolCall
+from app.tools.agent_actions import canonical_tool
 
 _LONG_AGENT_TOOLS = {"Agent", "AgentContinue", "AgentMessage"}
 
@@ -39,7 +40,7 @@ def normalize_tool_calls(calls: list[ToolCall]) -> list[ToolCall]:
         if key in seen:
             continue
         seen.add(key)
-        if call.name in _LONG_AGENT_TOOLS:
+        if canonical_tool(call.name, call.arguments) in _LONG_AGENT_TOOLS:
             long_agent.append(call)
         else:
             normal.append(call)

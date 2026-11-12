@@ -185,3 +185,25 @@ def test_public_symlink_outside_release_is_rejected(release, tmp_path):
     path.symlink_to(outside)
     with pytest.raises(validator.ReleaseValidationError, match="越界"):
         validator.validate_release_tree(release, "1.2.3")
+
+
+def test_wasm_import_object_key_is_ignored_and_new_url_wasm_asset_is_required(release):
+    dist = add_pwa(release)
+    wasm = dist / "assets/rdp_client_bg-Cus49fJ-.wasm"
+    wasm.write_bytes(b"\x00asm\x01\x00\x00\x00" + b"\x00" * 16)
+    (dist / "assets/rdp_client-CFZA0jxr.js").write_text(
+        'function imports(){return{__proto__:null,"./rdp_client_bg.js":{}};}\n'
+        'const u = new URL(""+new URL("rdp_client_bg-Cus49fJ-.wasm",import.meta.url).href,import.meta.url);\n'
+        'export { imports, u };\n'
+    )
+    assert validator.validate_release_tree(release, "1.2.3")["ok"]
+
+    # Corrupt Wasm header is rejected.
+    wasm.write_bytes(b"not-wasm")
+    with pytest.raises(validator.ReleaseValidationError, match="Wasm 资源无效"):
+        validator.validate_release_tree(release, "1.2.3")
+
+    # Missing Wasm binary referenced via new URL(..., import.meta.url) is rejected.
+    wasm.unlink()
+    with pytest.raises(validator.ReleaseValidationError, match="rdp_client_bg-Cus49fJ-.wasm"):
+        validator.validate_release_tree(release, "1.2.3")

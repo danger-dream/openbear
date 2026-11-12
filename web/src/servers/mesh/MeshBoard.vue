@@ -3,21 +3,24 @@ import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref,
 import { useVueFlow, VueFlow } from '@vue-flow/core';
 import '@vue-flow/core/dist/style.css';
 import { ElMessage } from 'element-plus';
-import { ArrowUpRight, Cable, Link2, Maximize, Minus, MousePointer2, Network, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, ShieldCheck, X } from '@lucide/vue';
-import { flag } from '../serverHelpers.js';
+import { ArrowUpRight, Boxes, Cable, CornerDownRight, LayoutGrid, Link2, Maximize, Minus, MousePointer2, Network, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, ShieldCheck, Undo2, X } from '@lucide/vue';
+import { flag, regionName } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { directPeers, install, layout, loadPeers, mesh, meshError, meshErrorText, place, removeFromMesh, ruleHover, save, saveLayout, summaryPeers } from './meshStore.js';
 import { ALERT_BADGES, codeText, directLabel, directLive, directReason, errorMessage, errorsUnder, HOP_VIA, isPunched, isRelay, isSite, LINK_STATES, msText, nameOf, needsPunch, nodeAlerts, nodeState,
   LINE_STATES, lineOf, lossText, MISSING_TEXT, PROGRESS, progressOf, protoText, reachOf, relayInUse, relayMetric, routedLinks, rtt, ruleSentence, sameExit, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningsUnder } from './meshHelpers.js';
 import { addLink, alignTo, avoidBend, customRelayLinks, DRAG_TYPE, drawnRule, edgeGeometry, entryHow, entryLook, legendText, lineIdOf, linkKindLabel, nextSlot, pathEdges, phoneLayout, planLink, punchedRelayLink, relayPairs, ruleEnds, ruleNodes, SNAP_PX,
   selectionTitle, standbyNote, TOOLS } from './meshGraph.js';
+import { canPinRoute, fixedRouteInfo } from './meshAuto.js';
+import { arrange, borderPoint, bundlesOf, chipPlaces, clusterBox, containerOf, continentOf, GROUPINGS, NETS_H, zoneBox } from './meshGroups.js';
+import { elbow, pointAt, roundedPath, routeOrtho } from './meshRoute.js';
 import MeshChanges from './MeshChanges.vue';
 import MeshEdge from './MeshEdge.vue';
 import MeshInspector from './MeshInspector.vue';
 import MeshNode from './MeshNode.vue';
 import MeshServers from './MeshServers.vue';
 import MeshSheet from './MeshSheet.vue';
-import { usePoll } from './usePoll.js';
+import { useMeshVisible, usePoll } from './usePoll.js';
 
 // The mesh as a board: servers on the left, the network in the middle, the
 // selection's properties on the right. Phones get the same board with touch
@@ -25,7 +28,7 @@ import { usePoll } from './usePoll.js';
 const props = defineProps({phone: Boolean, active: Boolean, items: {type: Array, default: () => []}, focus: {type: Object, default: null}});
 // Whether the mesh page is on screen: a network test in the member panel stops when it is left.
 provide('meshActive', computed(() => props.active));
-const emit = defineEmits(['open-server', 'apply']);
+const emit = defineEmits(['open-server', 'apply', 'pin-path']);
 const flow = useVueFlow('openbear-mesh');
 const NODE_W = 184, NODE_H = 64, PHONE_W = 150, PHONE_H = 52, PHONE_MIN_ZOOM = 0.9;
 const TOOL_ICONS = {select: MousePointer2, entry: ArrowUpRight, relay: Network, direct: Link2, rule: ShieldCheck};
@@ -70,9 +73,51 @@ watch(() => ids.value.join(','), () => {
   }
 }, {immediate: true});
 
+// How the desktop board groups servers, remembered on this browser: members drawn inside the relay they
+// enter by, servers gathered by country or by the group set on the servers page.
+const VIEW_KEY = 'openbear.mesh.view';
+function readView() {
+  try { const v = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}'); return {group: GROUPINGS.some(([k]) => k === v?.group) ? v.group : 'none', contain: v?.contain === true, lines: v?.lines === 'ortho' ? 'ortho' : 'curve'}; }
+  catch { return {group: 'none', contain: false, lines: 'curve'}; }
+}
+const view = reactive(readView());
+watch(() => ({...view}), v => { try { localStorage.setItem(VIEW_KEY, JSON.stringify(v)); } catch { /* private mode */ } });
+const grouping = computed(() => props.phone ? 'none' : view.group);
+// Lines at right angles round what is in their way, instead of curves.
+const ortho = computed(() => !props.phone && view.lines === 'ortho');
+// Members inside a relay: {member: {relay, candidate}}, the entry it uses now or else its first.
+const containers = computed(() => {
+  const out = new Map();
+  if (props.phone || !view.contain) return out;
+  const relays = new Set(members.value.filter(isRelay).map(m => m.serverId));
+  for (const m of members.value) {
+    const c = containerOf(m, relays, data.value?.nodes?.[m.serverId]?.summary?.entry);
+    if (c) out.set(m.serverId, c);
+  }
+  return out;
+});
+// Each relay's members, by name.
+const carried = computed(() => {
+  const out = new Map();
+  for (const [id, c] of containers.value) out.set(c.relay, [...(out.get(c.relay) || []), id]);
+  for (const list of out.values()) list.sort((a, b) => nameOf(members.value, a).localeCompare(nameOf(members.value, b), 'zh'));
+  return out;
+});
+const sizeOf = id => { const d = flow.findNode(id)?.dimensions; return {w: d?.width || NODE_W, h: d?.height || NODE_H}; };
+const hasNets = id => Boolean(members.value.find(m => m.serverId === id)?.gateway?.subnets?.length);
+// A member inside a relay goes where the relay is; its own saved place waits for it to stand alone again.
+const chipPos = computed(() => {
+  const out = {};
+  for (const [relay, list] of carried.value) {
+    const p = layout.positions[relay];
+    if (p) chipPlaces(p, sizeOf(relay).h, list.length, hasNets(relay)).forEach((q, i) => { out[list[i]] = q; });
+  }
+  return out;
+});
+
 // Phones show their own top-down layout (moves stay on this page); desktops the saved one.
 const phonePlaces = computed(() => props.phone ? {...phoneLayout(ids.value, relayId), ...phoneMoved} : {});
-const posOf = id => (props.phone ? phonePlaces.value[id] : layout.positions[id]) || null;
+const posOf = id => (props.phone ? phonePlaces.value[id] : chipPos.value[id] || layout.positions[id]) || null;
 const nodeSize = () => props.phone ? [PHONE_W, PHONE_H] : [NODE_W, NODE_H];
 
 // ---- what the board draws ----
@@ -101,13 +146,13 @@ const nodeLooks = computed(() => {
   const onPath = pathNodes.value, next = new Map(), out = new Map();
   members.value.forEach((m, index) => {
     const [tone, label] = nodeState(data.value, m.serverId);
-    const reach = reachOf(data.value, m.serverId), verdict = verdictBadge(reach), alerts = m.removing ? [] : nodeAlerts(data.value, m, members.value);
+    const reach = reachOf(data.value, m.serverId), verdict = verdictBadge(reach), alerts = m.removing ? [] : nodeAlerts(data.value, m, members.value, null, work.value);
     const alert = alerts[0] ? (ALERT_BADGES[alerts[0].code] || ['bad', codeText(alerts[0].code) || alerts[0].code]) : null;
     out.set(m.serverId, reuse(lookCache, next, m.serverId, {name: m.name, flag: flag(regionOf(m.serverId)), address: m.address, relay: isRelay(m), site: isSite(m), gateway: Boolean(m.gateway), subnets: m.gateway?.subnets || [],
         tone, title: `${m.name} · ${label}`, rtt: isRelay(m) ? '' : rtt(data.value?.nodes?.[m.serverId]?.summary), badge: badgeOf(m), removing: m.removing,
         reach: verdict && !m.removing ? [...verdict, `可达性：${verdict[1]}。${VERDICT_NOTES[reach.verdict] || VERDICT_NOTES.unknown}`] : null,
         alert: alert ? [alert[0], alert[1], alerts.map(a => a.text).join('\n')] : null,
-        problems: errorsUnder(mesh.errors, `members[${index}]`).length, selected: selected === m.serverId, source: from === m.serverId || pathPick.value?.from === m.serverId,
+        problems: errorsUnder(mesh.errors, `members[${index}]`).length, selected: selected === m.serverId, source: from === m.serverId || pathPick.value?.from === m.serverId, chip: containers.value.has(m.serverId),
         target: target === m.serverId ? (dragLine.value.plan?.error ? 'bad' : 'ok') : '', ports: !props.phone && tool.value === 'select' && !m.removing,
         onPath: Boolean(onPath?.has(m.serverId)), dim: dimmedNode(m.serverId, onPath), compact: props.phone}));
   });
@@ -126,7 +171,8 @@ const nodes = computed(() => {
   for (const id of ids.value) {
     const data = looks.get(id);
     if (!data) continue;
-    const pos = posOf(id) || {x: 0, y: 0}, draggable = member.has(id) ? (props.phone ? selected === id : tool.value === 'select') : !props.phone, old = nodeCache.get(id);
+    // A member inside a relay moves with the relay.
+    const pos = posOf(id) || {x: 0, y: 0}, draggable = member.has(id) ? (props.phone ? selected === id : tool.value === 'select' && !containers.value.has(id)) : !props.phone, old = nodeCache.get(id);
     const node = old && old.data === data && old.draggable === draggable && old.position.x === pos.x && old.position.y === pos.y ? old
       : {id, type: 'mesh', position: {x: pos.x, y: pos.y}, draggable, data};
     next.set(id, node); list.push(node);
@@ -160,7 +206,7 @@ function relayLook(id, a, b, pair, selected, path = '') {
   // The controller's warnings (mesh_punch_impossible) or, from older ones, what the board sees itself.
   const warn = [...(path ? warningsUnder(data.value, path) : []), punched && !Array.isArray(data.value?.warnings) && bothSymmetric(a, b, live) ? codeText('mesh_punch_impossible') : ''];
   const notes = [...new Set([why, ...warn, bias ? `偏好 ${bias > 0 ? '+' : ''}${bias} ms` : ''].filter(Boolean))];
-  return {label, look, live: live?.state || '', title: notes.join('；'), method: punched ? '打洞' : '拨号'};
+  return {label, look, live: live?.state || '', title: notes.join('；'), method: punched ? '打洞' : '拨号', rttMs: metric?.rttMs ?? live?.rttMs ?? null};
 }
 // What carries traffic, worked out once per GET /mesh: the links between relays the relays route
 // through, and every line's state and role.
@@ -190,24 +236,28 @@ const edgeRaw = computed(() => {
   const push = (id, source, target, d) => present.has(source) && present.has(target) && source !== target && out.push({id, source, target, type: 'mesh', data: {...d, selected: d.selected ?? id === selId}});
   for (const m of members.value) {
     if (isRelay(m)) continue;
+    const held = containers.value.get(m.serverId);
     (m.entry?.candidates || []).forEach((c, i) => {
-      const look = entryLook(w, data.value, mesh.errors, m, i), relayName = nameOf(members.value, c.relay);
+      // Drawn inside that relay: the line would only join the two.
+      if (held?.relay === c.relay && held.candidate === c.id) return;
+      const look = entryLook(w, data.value, mesh.errors, m, i), relayName = nameOf(members.value, c.relay), line = usage.value.lines.get(`entry:${m.serverId}|${c.relay}|${c.transport}`);
       // Entries to a site relay say LAN or internet once through, punching until then; a failing standby says why on the line.
       const how = entryHow(look, c.transport), id = `entry:${m.serverId}:${c.id}`;
       // Standbys carry nothing: drawn quiet, back to normal while the line (or one of its ends) is in focus.
-      const quiet = entryQuiet(look, usage.value.lines.get(`entry:${m.serverId}|${c.relay}|${c.transport}`)) && id !== selId;
-      push(id, m.serverId, c.relay, {kind: 'entry', look: look.look, quiet, arrow: 'end', label: [`${i + 1}`, how, look.failing].filter(Boolean).join(' · '), flash: flash.value === id,
+      const quiet = entryQuiet(look, line) && id !== selId;
+      push(id, m.serverId, c.relay, {kind: 'entry', look: look.look, quiet, arrow: 'end', label: [`${i + 1}`, how, look.failing].filter(Boolean).join(' · '), flash: flash.value === id, rttMs: line?.rttMs ?? null,
         title: look.problem || (look.failing ? `${relayName} ${look.role}：${look.failing}` : [look.opened ? `${look.role}，经${look.via || '打洞'}接入` : LOOK_TITLES[look.look], look.standby ? standbyNote(look) : ''].filter(Boolean).join('；')),
         aria: `${m.name} 的第 ${i + 1} 个入口：${relayName} · ${how}，${look.problem || (look.failing ? `${look.role}，${look.failing}` : look.role)}${look.standby ? `，${standbyNote(look)}` : ''}`});
     });
   }
   for (const [a, b] of relayPairs(w)) {
     const id = `relay:${[a, b].sort().join('~')}`, r = relayLook(id, a, b, null, id === selId);
-    push(id, a, b, {kind: 'relay', look: r.look || 'auto', live: r.live, quiet: id !== selId && relayQuiet(r, pairLine(a, b), a, b), label: r.label, title: r.title, aria: `中转互联（${r.method}，自动）：${nameOf(members.value, a)} 和 ${nameOf(members.value, b)}${r.title ? `，${r.title}` : ''}`});
+    push(id, a, b, {kind: 'relay', look: r.look || 'auto', live: r.live, quiet: id !== selId && relayQuiet(r, pairLine(a, b), a, b), label: r.label, title: r.title, rttMs: r.rttMs, aria: `中转互联（${r.method}，自动）：${nameOf(members.value, a)} 和 ${nameOf(members.value, b)}${r.title ? `，${r.title}` : ''}`});
   }
-  if (w.relayLinks?.mode === 'custom') (w.relayLinks.pairs || []).forEach((p, i) => {
+  // Custom and automatic links are listed; in full mode a listed pair only overrides one drawn above.
+  if ((w.relayLinks?.mode || 'full') !== 'full') (w.relayLinks.pairs || []).forEach((p, i) => {
     const id = `pair:${i}`, r = relayLook(id, p.a, p.b, p, id === selId, `relayLinks.pairs[${i}]`), bad = errorsUnder(mesh.errors, `relayLinks.pairs[${i}]`).map(errorMessage);
-    push(id, p.a, p.b, {kind: 'relay', look: bad.length ? 'bad' : r.look, live: bad.length ? '' : r.live, quiet: !bad.length && id !== selId && relayQuiet(r, pairLine(p.a, p.b), p.a, p.b), label: r.label, title: bad.join('；') || r.title, flash: flash.value === id,
+    push(id, p.a, p.b, {kind: 'relay', look: bad.length ? 'bad' : r.look, live: bad.length ? '' : r.live, quiet: !bad.length && id !== selId && relayQuiet(r, pairLine(p.a, p.b), p.a, p.b), label: r.label, title: bad.join('；') || r.title, flash: flash.value === id, rttMs: r.rttMs,
       aria: `中转互联（${r.method}）：${nameOf(members.value, p.a)} 和 ${nameOf(members.value, p.b)}${bad.length ? `，${bad.join('；')}` : r.title ? `，${r.title}` : ''}`});
   });
   // Punched (UDP) direct links follow what their ends report: direct, punching or relayed.
@@ -216,7 +266,7 @@ const edgeRaw = computed(() => {
     const punch = needsPunch(data.value, p.a, p.b);
     const live = !errors.length && isPunched(p) ? directLive(directPeers(p.a, id), directPeers(p.b, id), p.a, p.b) : null, why = live ? directReason(live, punch) : '';
     const hopeless = [...warningsUnder(data.value, `directLinks[${i}]`), isPunched(p) && !Array.isArray(data.value?.warnings) && bothSymmetric(p.a, p.b, live) ? codeText('mesh_punch_impossible') : ''];
-    push(id, p.a, p.b, {kind: 'direct', look: errors.length ? 'bad' : '', live: live?.state || '', flash: flash.value === id,
+    push(id, p.a, p.b, {kind: 'direct', look: errors.length ? 'bad' : '', live: live?.state || '', flash: flash.value === id, rttMs: live?.rttMs ?? null,
       label: live ? directLabel(live, id === selId, punch) : `直连 · ${transportLabel(p.transport)}`, title: errors.join('；') || [...new Set([why, ...hopeless].filter(Boolean))].join('；'),
       aria: `直连：${nameOf(members.value, p.a)} 和 ${nameOf(members.value, p.b)}${errors.length ? `，${errors.join('；')}` : why ? `，${why}` : ''}`});
   });
@@ -252,8 +302,19 @@ const edgeRaw = computed(() => {
     e.data.offset = lane * 34 * sign;
     e.data.labelAt = Math.min(0.78, Math.max(0.22, 0.5 + lane * 0.2 * sign));
   });
+  // Two members inside one relay: their line goes round the left of the box (the farther down the
+  // second, the same side), quiet until one of them is in focus.
+  for (const e of out) {
+    const relay = sameBox(e.source, e.target);
+    if (!relay) continue;
+    const list = carried.value.get(relay), away = Math.sign(list.indexOf(e.target) - list.indexOf(e.source)) || 1;
+    e.data.offset = (e.data.offset || 0) + away * 156;
+    if (!e.data.selected) e.data.quiet = true;
+  }
   return out;
 });
+// The relay two members are both drawn in, if they are.
+function sameBox(a, b) { const x = containers.value.get(a)?.relay; return x && x === containers.value.get(b)?.relay ? x : ''; }
 // The node pointed at (desktop) or else selected, with the nodes it links to: its links come forward
 // with their labels, the rest steps back. A shown path or a rule in focus comes first.
 const hoverNode = ref('');
@@ -285,6 +346,167 @@ const edgeBase = computed(() => {
     return {...e, data: d};
   });
 });
+
+// ---- groups ----
+// Which group each server is drawn in (none while not grouped); a member inside a relay goes with the relay.
+const zoneOfNode = computed(() => {
+  const out = new Map(), mode = grouping.value;
+  if (mode === 'none') return out;
+  const item = id => props.items.find(i => i.id === id);
+  const key = id => mode === 'region' ? String(item(id)?.region || '').toUpperCase() : mode === 'continent' ? continentOf(item(id)?.region) : String(item(id)?.profile?.group || '').trim();
+  for (const id of ids.value) out.set(id, key(containers.value.get(id)?.relay || id));
+  return out;
+});
+const zoneTitle = key => grouping.value === 'region' ? (key ? `${flag(key)} ${regionName(key)}`.trim() : '地区未知') : key || (grouping.value === 'continent' ? '地区未知' : '未分组');
+// What the board lays out: a relay with the members inside it, or a server on its own.
+const unitBoxes = computed(() => {
+  const out = new Map();
+  for (const id of ids.value) {
+    const p = posOf(id);
+    if (!p || containers.value.has(id)) continue;
+    const {w, h} = sizeOf(id), n = carried.value.get(id)?.length || 0, nets = hasNets(id);
+    out.set(id, n ? {...clusterBox(p, w, h, n, nets), cluster: true} : {x: p.x, y: p.y, w, h: h + (nets ? NETS_H : 0)});
+  }
+  return out;
+});
+const clusterList = computed(() => [...unitBoxes.value].filter(([, b]) => b.cluster).map(([id, b]) => ({id, ...b})));
+const zoneBoxes = computed(() => {
+  if (grouping.value === 'none') return [];
+  const by = new Map(), count = new Map();
+  for (const [id, box] of unitBoxes.value) { const k = zoneOfNode.value.get(id); by.set(k, [...(by.get(k) || []), box]); }
+  for (const k of zoneOfNode.value.values()) count.set(k, (count.get(k) || 0) + 1);
+  return [...by].map(([key, boxes]) => ({key, title: zoneTitle(key), count: count.get(key) || 0, ...zoneBox(boxes)})).sort((a, b) => (a.key < b.key ? -1 : 1));
+});
+// The links between two groups go as one line with how many there are and the fastest in use; pointing
+// at or selecting a server shows its own, clicking the line shows them all.
+const openBundles = reactive(new Set());
+const bundling = computed(() => {
+  const hidden = new Set();
+  if (grouping.value === 'none') return {list: [], hidden};
+  const list = bundlesOf(edgeBase.value, id => zoneOfNode.value.get(id)), near = nodeFocus.value?.id || '', byId = new Map(edgeBase.value.map(e => [e.id, e]));
+  for (const b of list) {
+    if (openBundles.has(b.key)) continue;
+    for (const id of b.edges) {
+      const e = byId.get(id);
+      if (!(e.data.selected || e.data.flash || e.data.onPath || e.source === near || e.target === near)) hidden.add(id);
+    }
+  }
+  return {list, hidden, byId};
+});
+const edgeShown = computed(() => { const hidden = bundling.value.hidden; return hidden.size ? edgeBase.value.filter(e => !hidden.has(e.id)) : edgeBase.value; });
+// Right-angled lines, worked out when the lines or the boxes change, not while one is dragged (its lines
+// are drawn as plain elbows until it is dropped) nor when one is pointed at. A line merged into the line
+// between two groups gets no way of its own: shown for a moment, it is a plain elbow.
+const boxesNow = () => new Map(ids.value.map(id => [id, boxOf(id)]).filter(([, b]) => b).map(([id, b]) => [id, {x: b.cx - b.w / 2, y: b.cy - b.h / 2, w: b.w, h: b.h}]));
+let routeSpots = new Map(), routeKey = '';
+const routes = computed(() => {
+  if (!ortho.value) return new Map();
+  if (dragging.value) return routeSpots;
+  const zone = id => zoneOfNode.value.get(id), merged = e => e.data.kind !== 'rule' && zone(e.source) !== undefined && zone(e.source) !== zone(e.target)
+    && !openBundles.has([zone(e.source), zone(e.target)].sort().join('\n'));
+  const list = edgeRaw.value.filter(e => !merged(e)).map(e => ({id: e.id, source: e.source, target: e.target})), boxes = boxesNow();
+  const key = JSON.stringify([list, [...boxes]]);
+  if (key !== routeKey) { routeKey = key; routeSpots = routeOrtho(list, boxes); }
+  return routeSpots;
+});
+const edgeRouted = computed(() => {
+  if (!ortho.value) return edgeShown.value;
+  const r = routes.value;
+  return edgeShown.value.map(e => { const route = r.get(e.id) || null; return {...e, data: {...e.data, ortho: true, route, labelAt: route ? route.labelAt : 0.5}}; });
+});
+// Right-angled lines between groups go round the other groups.
+let bundleSpots = new Map(), bundleKey = '';
+const bundleRoutes = computed(() => {
+  if (!ortho.value || dragging.value) return ortho.value ? bundleSpots : new Map();
+  const boxes = new Map(zoneBoxes.value.map(z => [z.key, {x: z.x, y: z.y, w: z.w, h: z.h}])), list = bundling.value.list.map(b => ({id: b.key, source: b.a, target: b.b}));
+  const key = JSON.stringify([list, [...boxes]]);
+  if (key !== bundleKey) { bundleKey = key; bundleSpots = routeOrtho(list, boxes, {step: 16, pad: 16}); }
+  return bundleSpots;
+});
+const bundleLines = computed(() => {
+  const boxes = new Map(zoneBoxes.value.map(z => [z.key, z])), {list, byId} = bundling.value, quietBoard = Boolean(path.value?.hops?.length || focus.value), ways = bundleRoutes.value;
+  const cards = [...unitBoxes.value.values()], placed = [];
+  // A label goes where it covers no server and no other label, as near the middle of its line as it can.
+  const clear = (p, w) => !cards.some(c => p.x + w / 2 > c.x - 4 && p.x - w / 2 < c.x + c.w + 4 && p.y + 11 > c.y - 4 && p.y - 11 < c.y + c.h + 4)
+    && !placed.some(o => Math.abs(o.x - p.x) < (o.w + w) / 2 + 4 && Math.abs(o.y - p.y) < 24);
+  return list.map(b => {
+    const A = boxes.get(b.a), B = boxes.get(b.b);
+    if (!A || !B) return null;
+    const s = borderPoint(A, {x: B.x + B.w / 2, y: B.y + B.h / 2}), t = borderPoint(B, {x: A.x + A.w / 2, y: A.y + A.h / 2}), open = openBundles.has(b.key), way = ways.get(b.key);
+    const label = open ? `收起 ${b.edges.length} 条` : `${b.edges.length} 条${b.best ? ` · 最快 ${msText(b.best)}` : ''}`;
+    // Lines that carry nothing go quiet, as each of them would: no label until a server at an end is in focus.
+    const quiet = b.quiet && !open, w = [...label].reduce((n, ch) => n + (ch.charCodeAt(0) > 255 ? 11 : 6.6), 0) + 18;
+    const at = way ? k => pointAt(way.points, k) : k => ({x: s.x + (t.x - s.x) * k, y: s.y + (t.y - s.y) * k}), mid = way ? way.labelAt : 0.5;
+    const spot = [mid, mid - 0.1, mid + 0.1, mid - 0.2, mid + 0.2, 0.3, 0.7, 0.12, 0.88].filter(k => k > 0 && k < 1).map(at).find(p => clear(p, w)) || at(mid);
+    if (!quiet) placed.push({...spot, w});
+    return {key: b.key, x1: s.x, y1: s.y, x2: t.x, y2: t.y, d: way ? roundedPath(way.points, 10) : '', mx: spot.x, my: spot.y, lw: w, open, quiet, bad: b.bad, dim: quietBoard, width: quiet ? 1.2 : Math.min(9, 1.5 + b.edges.length), label,
+      title: `${zoneTitle(b.a)} 和 ${zoneTitle(b.b)} 之间：\n${b.edges.map(id => byId.get(id)?.data.aria || '').filter(Boolean).join('\n')}\n点击${open ? '收起' : '展开每一条'}`};
+  }).filter(Boolean);
+});
+function toggleBundle(key) { if (openBundles.has(key)) openBundles.delete(key); else openBundles.add(key); }
+// The groups are drawn under the board and their titles over it, both moving and scaling with it.
+const layerStyle = computed(() => { const v = flow.viewport.value || {x: 0, y: 0, zoom: 1}; return {transform: `translate(${v.x}px, ${v.y}px) scale(${v.zoom})`}; });
+const boxStyle = b => ({left: `${b.x}px`, top: `${b.y}px`, width: `${b.w}px`, height: `${b.h}px`});
+
+// A group's title moves the whole group.
+let zoneDrag = null;
+function zoneDown(e, z) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const moving = [...unitBoxes.value.keys()].filter(id => zoneOfNode.value.get(id) === z.key && layout.positions[id]);
+  zoneDrag = {x: e.clientX, y: e.clientY, zoom: flow.viewport.value?.zoom || 1, start: Object.fromEntries(moving.map(id => [id, {...layout.positions[id]}])), moved: false};
+  window.addEventListener('pointermove', zoneMove); window.addEventListener('pointerup', zoneUp); window.addEventListener('pointercancel', zoneUp);
+}
+function zoneMove(e) {
+  const d = zoneDrag;
+  if (!d || (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 3)) return;
+  d.moved = true; dragging.value = true;
+  const dx = (e.clientX - d.x) / d.zoom, dy = (e.clientY - d.y) / d.zoom;
+  for (const [id, p] of Object.entries(d.start)) place(id, {x: p.x + dx, y: p.y + dy});
+}
+function zoneUp() {
+  window.removeEventListener('pointermove', zoneMove); window.removeEventListener('pointerup', zoneUp); window.removeEventListener('pointercancel', zoneUp);
+  const d = zoneDrag;
+  zoneDrag = null;
+  if (d?.moved) { dragging.value = false; arranged.value = null; saveLayout(); }
+}
+
+// Arranging: linked servers next to each other, each group in one place, linked groups side by side.
+// The places before stay for one undo.
+const arranged = ref(null);
+function arrangeNow(before = null) {
+  const unitOf = id => containers.value.get(id)?.relay || id, units = [], links = [];
+  for (const [id, box] of unitBoxes.value) {
+    const p = posOf(id);
+    units.push({id, w: box.w, h: box.h, zone: zoneOfNode.value.get(id) ?? '', dx: p.x - box.x, dy: p.y - box.y});
+  }
+  for (const e of edgeRaw.value) if (e.data.kind !== 'rule') links.push([unitOf(e.source), unitOf(e.target), e.data.quiet ? 0.5 : 1]);
+  // Right-angled lines need room between the boxes to run in.
+  const result = arrange(units, links, {grouped: grouping.value !== 'none', ...(ortho.value ? {gap: 72, zoneGap: 120} : {})});
+  arranged.value = {positions: Object.fromEntries(ids.value.map(id => [id, layout.positions[id] ? {...layout.positions[id]} : null])), view: before || {...view}};
+  for (const u of units) { const p = result.units[u.id]; if (p) place(u.id, {x: p.x + u.dx, y: p.y + u.dy}); }
+  // A member inside a relay keeps a place beside it for when it stands alone again.
+  for (const [id, p] of Object.entries(chipPos.value)) place(id, p);
+  saveLayout(0);
+  void nextTick(() => fit());
+}
+function undoArrange() {
+  const a = arranged.value;
+  if (!a) return;
+  arranged.value = null;
+  Object.assign(view, a.view);
+  for (const [id, p] of Object.entries(a.positions)) if (p) place(id, p);
+  saveLayout(0);
+  void nextTick(() => fit());
+}
+// Another grouping is arranged at once (its boxes would overlap in the old places), once the board has
+// drawn the members where they now go.
+function setView(patch) {
+  const before = {...view};
+  Object.assign(view, patch);
+  openBundles.clear();
+  void nextTick(() => arrangeNow(before));
+}
 // Where every node's box is now (the size it was drawn at, else the default).
 function boxOf(id) {
   const [w0, h0] = nodeSize(), p = posOf(id), d = flow.findNode(id)?.dimensions, w = d?.width || w0, h = d?.height || h0;
@@ -304,6 +526,8 @@ const linkedPairs = computed(() => {
 let arcSpots = new Map(), arcKey = '';
 const arcs = computed(() => {
   if (dragging.value) return arcSpots;
+  // Right-angled lines find their own way round.
+  if (ortho.value) return new Map();
   const pairs = JSON.parse(linkedPairs.value), all = ids.value.map(id => [id, boxOf(id)]).filter(([, b]) => b);
   const key = JSON.stringify([pairs, all]);
   if (key === arcKey) return arcSpots;
@@ -311,7 +535,8 @@ const arcs = computed(() => {
   const boxes = new Map(all), next = new Map();
   for (const [pair, n] of pairs) {
     const [a, b] = pair.split('|'), A = boxes.get(a), B = boxes.get(b);
-    if (!A || !B) continue;
+    // Lines inside one relay's box already go round it.
+    if (!A || !B || sameBox(a, b)) continue;
     // A phone's two columns leave no room for wide bows: those links stay straight, as before.
     const bend = avoidBend(A, B, all.filter(([id]) => id !== a && id !== b).map(([, x]) => x), 10 + (n - 1) * 17, props.phone ? 112 : undefined);
     if (bend) next.set(pair, bend);
@@ -327,16 +552,17 @@ let labelSpots = new Map(), labelKey = '';
 const labelPlaces = computed(() => {
   if (dragging.value) return labelSpots;
   // Worked out again only when the links or the boxes they avoid are not as they were (a poll mostly leaves both).
-  const list = edgeBase.value, bows = arcs.value, [w0, h0] = nodeSize();
+  const list = edgeRouted.value, bows = arcs.value, [w0, h0] = nodeSize();
+  const frames = [...unitBoxes.value.values()], taken = bundleLines.value.filter(b => !b.quiet).map(b => ({x: b.mx, y: b.my, width: b.lw}));
   const key = JSON.stringify([props.phone, w0, h0, list.map(e => [e.id, e.source, e.target, e.data]), [...bows],
-    ids.value.map(id => { const p = posOf(id), d = flow.findNode(id)?.dimensions; return [id, p?.x, p?.y, d?.width, d?.height]; })]);
-  if (key !== labelKey) { labelKey = key; labelSpots = spreadLabels(list, bows); }
+    ids.value.map(id => { const p = posOf(id), d = flow.findNode(id)?.dimensions; return [id, p?.x, p?.y, d?.width, d?.height]; }), frames, taken]);
+  if (key !== labelKey) { labelKey = key; labelSpots = spreadLabels(list, bows, frames, taken); }
   return labelSpots;
 });
 let edgeCache = new Map(), shownEdges = [];
 const edges = computed(() => {
   const places = labelPlaces.value, bows = arcs.value, next = new Map(), list = [];
-  for (const e of edgeBase.value) {
+  for (const e of edgeRouted.value) {
     const data = {...e.data, offset: (e.data.offset || 0) + arcOf(e, bows), labelHidden: false, ...places.get(e.id)};
     const key = `${e.source}>${e.target}:${JSON.stringify(data)}`, old = edgeCache.get(e.id);
     let edge = old?.key === key ? old.edge : null;
@@ -350,35 +576,44 @@ const edges = computed(() => {
   return sameList(list, shownEdges) ? shownEdges : (shownEdges = list);
 });
 
-// Links that cross (two site relays each dialling the other's public relay) put their
-// labels in the same place: a later label slides along its own line to a free spot.
-// Returns {edge id: {labelAt, labelHidden}}.
-function spreadLabels(list, bows) {
+// A label covers no server, no relay's box with its members and no other label (those between groups
+// included): it slides along its line to the free spot nearest the middle, else says only the round
+// trip, else is left out until the line is pointed at. The selection and the path keep theirs anyway.
+// Returns {edge id: {labelAt, labelText, labelHidden}}.
+const shortLabel = text => { const last = String(text).split(' · ').at(-1); return last !== text && /\d\s*ms$/.test(last) ? last : ''; };
+const SPOTS = [0.5, ...Array.from({length: 14}, (_, i) => [0.5 - (i + 1) * 0.03, 0.5 + (i + 1) * 0.03]).flat()];
+function spreadLabels(list, bows, frames = [], taken = []) {
   const out = new Map();
   const char = props.phone ? 12 : 11;
-  // Where MeshEdge draws the label (bent, bowed and arched links included).
-  const spot = (e, k) => { const a = boxOf(e.source), b = boxOf(e.target); return a && b ? edgeGeometry(a, b, (e.data.offset || 0) + arcOf(e, bows), k).label : null; };
-  const placed = [], boxes = ids.value.map(boxOf).filter(Boolean);
+  // Where MeshEdge draws the label (bent, bowed and arched links included, or along a right-angled line).
+  const spot = (e, k) => {
+    const a = boxOf(e.source), b = boxOf(e.target);
+    if (!a || !b) return null;
+    if (e.data.ortho) return pointAt(e.data.route?.points || elbow(a, b), k);
+    return edgeGeometry(a, b, (e.data.offset || 0) + arcOf(e, bows), k).label;
+  };
+  const placed = [...taken], boxes = [...ids.value.map(boxOf).filter(Boolean), ...frames.map(f => ({cx: f.x + f.w / 2, cy: f.y + f.h / 2, w: f.w, h: f.h}))];
   // What matters most gets a place first: the selection, the path, problems, then the rest; what steps back comes last.
   const weight = e => e.data.selected || e.data.flash ? 0 : e.data.onPath ? 1 : e.data.dim ? 4 : ['bad', 'suppressed', 'failing'].includes(e.data.look) ? 2 : 3;
   for (const e of [...list].sort((a, b) => weight(a) - weight(b))) {
     // A quiet line shows no label (pointing at it brings it up where it is).
     if (!e.data.label || e.data.quiet) continue;
-    const width = [...e.data.label].reduce((n, ch) => n + (ch.charCodeAt(0) > 255 ? char : char * 0.6), 0) + 16;
+    const widthOf = text => [...text].reduce((n, ch) => n + (ch.charCodeAt(0) > 255 ? char : char * 0.6), 0) + 16;
     // Clear of the labels already placed and of every node (the ends included).
-    const clear = p => !placed.some(o => Math.abs(o.x - p.x) < (o.width + width) / 2 + 4 && Math.abs(o.y - p.y) < 26)
+    const clear = (p, width) => p && !placed.some(o => Math.abs(o.x - p.x) < (o.width + width) / 2 + 4 && Math.abs(o.y - p.y) < 26)
       && !boxes.some(b => Math.abs(b.cx - p.x) < (b.w + width) / 2 + 2 && Math.abs(b.cy - p.y) < b.h / 2 + 14);
-    let k = e.data.labelAt, p = spot(e, k);
-    if (!p) continue;
-    if (!clear(p)) {
-      const free = [0.34, 0.66, 0.42, 0.58, 0.26, 0.74, 0.2, 0.8, 0.14, 0.86].map(x => [x, spot(e, x)]).find(([, q]) => clear(q));
-      if (free) [k, p] = free;
-      // A phone has no room to spare: with nowhere to go the label is left out (the line still shows the
-      // state and selects on a tap; selecting brings the label back first).
-      else if (props.phone && weight(e) > 2) { out.set(e.id, {labelHidden: true}); continue; }
+    const mid = e.data.labelAt ?? 0.5, ks = [mid, ...SPOTS.slice(1).map(x => x - 0.5 + mid).filter(x => x > 0.04 && x < 0.96)];
+    const find = text => { const width = widthOf(text); for (const k of ks) { const p = spot(e, k); if (clear(p, width)) return {k, p, width}; } return null; };
+    const short = shortLabel(e.data.label), full = find(e.data.label), got = full || (short && find(short));
+    if (!got) {
+      if (!spot(e, mid)) continue;
+      // The selection and the path keep their label where it is; a phone keeps problems too (it has no pointer).
+      if (weight(e) > (props.phone ? 2 : 1)) { out.set(e.id, {labelHidden: true}); continue; }
+      placed.push({...spot(e, mid), width: widthOf(e.data.label)});
+      continue;
     }
-    if (k !== e.data.labelAt) out.set(e.id, {labelAt: k});
-    placed.push({...p, width});
+    if (got.k !== e.data.labelAt || !full) out.set(e.id, {labelAt: got.k, ...(full ? {} : {labelText: short})});
+    placed.push({...got.p, width: got.width});
   }
   return out;
 }
@@ -397,7 +632,7 @@ function stopPath() {
 }
 function showPath(src, dst, seed = null) {
   pathPick.value = null;
-  path.value = {src, dst, subnet: seed?.subnet || '', hops: seed?.hops || [], rttMs: seed?.rttMs ?? null, stale: Boolean(seed?.stale), loading: !seed, seeded: Boolean(seed), error: '', unsupported: false};
+  path.value = {src, dst, subnet: seed?.subnet || '', hops: seed?.hops || [], rttMs: seed?.rttMs ?? null, stale: Boolean(seed?.stale), fixed: seed?.fixed || null, loading: !seed, seeded: Boolean(seed), error: '', unsupported: false};
   void pathPoll.run();
 }
 // A row of a node's routes: that path on the board at once (from the list), then kept fresh. On a phone the sheet steps aside.
@@ -415,7 +650,7 @@ const pathPoll = usePoll(async current => {
     if (!current()) return;
     // Each hop: how it is reached from the one before (the source's via is '') and that segment's rtt.
     const hops = Array.isArray(r?.hops) ? r.hops.filter(h => h?.node).map(h => ({node: h.node, via: h.via || '', rttMs: Number.isFinite(h.rttMs) ? h.rttMs : null})) : [];
-    Object.assign(p, {hops, rttMs: Number.isFinite(r?.rttMs) ? r.rttMs : null, stale: Boolean(r?.stale), loading: false, error: ''});
+    Object.assign(p, {hops, rttMs: Number.isFinite(r?.rttMs) ? r.rttMs : null, stale: Boolean(r?.stale), fixed: r?.fixed || null, loading: false, error: ''});
   } catch (e) {
     if (!current()) return;
     // An older controller has no such endpoint; a member only in the draft has no path yet.
@@ -433,6 +668,17 @@ const pathTotal = computed(() => {
   if (!p?.hops.length || pathBroken.value) return '';
   return p.rttMs === null ? '总延迟未知' : `总延迟约 ${msText(p.rttMs)}`;
 });
+const pathFixed = computed(() => fixedRouteInfo(path.value?.fixed));
+const canPinBoardPath = computed(() => {
+  const p = path.value;
+  if (!p || p.subnet || pathBroken.value) return false;
+  return canPinRoute(p, id => isRelay(members.value.find(m => m.serverId === id)));
+});
+function pinBoardPath() {
+  const p = path.value;
+  if (!canPinBoardPath.value) return;
+  emit('pin-path', {src: p.src, dst: p.dst, via: p.hops.slice(1, -1).map(h => h.node)});
+}
 // The rule in focus (pointed at in the legend or the panel, else selected) and the members it touches.
 const focus = computed(() => {
   const rules = work.value?.rules || [], s = sel.value;
@@ -486,7 +732,7 @@ const peek = computed(() => {
   if (s.kind === 'node') {
     const m = members.value.find(x => x.serverId === s.id);
     if (!m) return installing.value.some(x => x.serverId === s.id) ? {title, rows: [{text: '正在安装组网服务', tone: 'warn', dot: true}]} : null;
-    const [tone, label] = nodeState(data.value, m.serverId), badge = badgeOf(m), alerts = m.removing ? [] : nodeAlerts(data.value, m, members.value);
+    const [tone, label] = nodeState(data.value, m.serverId), badge = badgeOf(m), alerts = m.removing ? [] : nodeAlerts(data.value, m, members.value, null, work.value);
     const ms = isRelay(m) ? '' : rtt(data.value?.nodes?.[m.serverId]?.summary);
     return {title, flag: flag(regionOf(m.serverId)), rows: [
       {text: label, tone, dot: true, extra: [isSite(m) ? '站点中转' : isRelay(m) ? '中转' : '成员', m.address, ms ? `延迟 ${ms}` : ''].filter(Boolean).join(' · ')},
@@ -671,7 +917,7 @@ function nodeDrag(e) {
     if (props.phone) phoneMoved[n.id] = p; else place(n.id, p);
   }
 }
-function nodeDragStop(e) { nodeDrag(e); if (guides.value.length) guides.value = []; dragging.value = false; if (!props.phone) saveLayout(); }
+function nodeDragStop(e) { nodeDrag(e); if (guides.value.length) guides.value = []; dragging.value = false; if (!props.phone) { arranged.value = null; saveLayout(); } }
 // Guides in the canvas's own pixels, a little past the boxes they join.
 const guideLines = computed(() => {
   const v = flow.viewport.value || {x: 0, y: 0, zoom: 1}, sx = x => x * v.zoom + v.x, sy = y => y * v.zoom + v.y;
@@ -763,8 +1009,10 @@ async function removeSelected() {
   if (m && !m.removing && await removeFromMesh(m)) pick(null);
 }
 
+// active stays on while the servers page is put away (KeepAlive): keys typed elsewhere then are not the board's.
+const shown = useMeshVisible();
 function keydown(e) {
-  if (!props.active || props.phone || e.defaultPrevented) return;
+  if (!props.active || !shown.value || props.phone || e.defaultPrevented) return;
   // Typing keeps its keys; a checkbox or radio does not.
   const t = e.target;
   if (t?.closest?.('textarea, select, [contenteditable="true"], .el-overlay, .el-message-box')) return;
@@ -810,7 +1058,7 @@ const peerPoll = usePoll(() => loadPeers(punchEnds.value.split(',')), {interval:
 watch(punchEnds, () => void peerPoll.run(), {immediate: true});
 watch(() => installing.value.length, n => { clearInterval(clock); if (n) clock = setInterval(() => { now.value = Date.now(); }, 1000); }, {immediate: true});
 onMounted(() => window.addEventListener('keydown', keydown));
-onBeforeUnmount(() => { window.removeEventListener('keydown', keydown); portCancel(); clearInterval(clock); clearTimeout(noticeTimer); clearTimeout(flashTimer); clearTimeout(hoverTimer); stopPath(); });
+onBeforeUnmount(() => { window.removeEventListener('keydown', keydown); portCancel(); zoneUp(); clearInterval(clock); clearTimeout(noticeTimer); clearTimeout(flashTimer); clearTimeout(hoverTimer); stopPath(); });
 defineExpose({select, join, fit});
 </script>
 <template>
@@ -857,6 +1105,31 @@ defineExpose({select, join, fit});
           <button type="button" class="mesh-tb" aria-label="放大" title="放大" @click="flow.zoomIn({duration: 150})"><Plus :size="15" /></button>
           <button type="button" class="mesh-tb" aria-label="适应画面" title="适应画面" @click="fit()"><Maximize :size="15" /></button>
           <i class="mesh-tb-sep" aria-hidden="true"></i>
+          <!-- How the board is drawn: set once and seldom changed, so out of the way behind one button. -->
+          <el-popover trigger="click" placement="bottom-end" :width="260" popper-class="instance-ui servers-ui mesh-view-popper">
+            <template #reference>
+              <button type="button" class="mesh-tb is-text" :aria-pressed="view.group !== 'none' || view.contain || view.lines === 'ortho'" title="分组、成员收进中转、直角连线和自动排列"><LayoutGrid :size="15" /><span>视图</span></button>
+            </template>
+            <div class="mesh-view-menu" role="group" aria-label="视图">
+              <label class="mesh-view-row" title="把服务器按国家或地区、大洲或服务器页设置的分组画在一起；组和组之间的线合成一条">
+                <span>分组</span>
+                <select class="mesh-tb-select" :value="view.group" aria-label="分组方式" @change="setView({group: $event.target.value})">
+                  <option v-for="[key, label] in GROUPINGS" :key="key" :value="key">{{ label }}</option>
+                </select>
+              </label>
+              <label class="ob-check mesh-view-row" title="普通成员画在它当前入口中转的卡片里，不再单独画入口线">
+                <input type="checkbox" :checked="view.contain" @change="setView({contain: $event.target.checked})" /><Boxes :size="14" aria-hidden="true" /><span>成员收进中转</span>
+              </label>
+              <label class="ob-check mesh-view-row" title="连线横平竖直，绕开路上的服务器；从同一台出发的线共用一段主干">
+                <input type="checkbox" :checked="view.lines === 'ortho'" @change="view.lines = $event.target.checked ? 'ortho' : 'curve'" /><CornerDownRight :size="14" aria-hidden="true" /><span>直角连线</span>
+              </label>
+              <div class="mesh-view-actions">
+                <button type="button" class="mesh-tb is-text" title="按连线关系重新排列：连在一起的放在一起，每组放在一处" @click="arrangeNow()"><LayoutGrid :size="15" /><span>自动排列</span></button>
+                <button v-if="arranged" type="button" class="mesh-tb is-text" title="回到这次排列之前的位置和分组" @click="undoArrange"><Undo2 :size="15" /><span>撤销排列</span></button>
+              </div>
+            </div>
+          </el-popover>
+          <i class="mesh-tb-sep" aria-hidden="true"></i>
           <button type="button" class="mesh-tb is-text" :aria-pressed="showRules" title="在画板上显示访问规则" @click="showRules = !showRules"><ShieldCheck :size="15" /><span>访问规则</span></button>
           <button type="button" class="mesh-tb" :aria-label="folded.panel ? '展开属性面板' : '收起属性面板'" :title="folded.panel ? '展开属性面板' : '收起属性面板，画板更大'" :aria-expanded="!folded.panel"
             @click="folded.panel = !folded.panel"><PanelRightOpen v-if="folded.panel" :size="15" /><PanelRightClose v-else :size="15" /></button>
@@ -864,12 +1137,30 @@ defineExpose({select, join, fit});
       </header>
 
       <div ref="canvas" class="mesh-canvas" :style="grid" :class="{'is-dropping': dropping, 'is-tool': tool !== 'select' || linking}" @pointerdown.capture="portDown" @dragover="dragOver" @dragleave="dropping = false" @drop="drop">
+        <!-- Under the board: the groups, the relays' boxes around their members and the lines between groups. -->
+        <div v-if="zoneBoxes.length || clusterList.length" class="mesh-groups" :style="layerStyle" aria-hidden="true">
+          <div v-for="z in zoneBoxes" :key="z.key" class="mesh-zone" :style="boxStyle(z)"></div>
+          <div v-for="c in clusterList" :key="c.id" class="mesh-cluster" :data-selected="(sel?.kind === 'node' && (sel.id === c.id || containers.get(sel.id)?.relay === c.id)) || undefined" :style="boxStyle(c)"></div>
+          <svg v-if="bundleLines.length" class="mesh-bundles">
+            <template v-for="b in bundleLines" :key="b.key">
+              <path v-if="b.d" v-show="!b.open" :d="b.d" :stroke-width="b.width" :data-bad="b.bad || undefined" :data-dim="b.dim || undefined" :data-quiet="b.quiet || undefined" />
+              <line v-else v-show="!b.open" :x1="b.x1" :y1="b.y1" :x2="b.x2" :y2="b.y2" :stroke-width="b.width" :data-bad="b.bad || undefined" :data-dim="b.dim || undefined" :data-quiet="b.quiet || undefined" />
+            </template>
+          </svg>
+        </div>
         <VueFlow id="openbear-mesh" :nodes="nodes" :edges="edges" :min-zoom="0.25" :max-zoom="2" :elements-selectable="false" :nodes-connectable="false" :delete-key-code="null"
           :selection-key-code="null" :multi-selection-key-code="null" :zoom-on-double-click="false" :node-drag-threshold="phone ? 6 : 2" :pan-on-drag="true" :zoom-on-pinch="true"
           @node-click="nodeClick" @edge-click="edgeClick" @pane-click="paneClick" @node-mouse-enter="nodeEnter" @node-mouse-leave="nodeLeave" @node-drag-start="nodeDragStart" @node-drag="nodeDrag" @node-drag-stop="nodeDragStop" @nodes-initialized="initialized">
           <template #node-mesh="p"><MeshNode :id="p.id" :data="p.data" /></template>
           <template #edge-mesh="p"><MeshEdge :id="p.id" :source-node="p.sourceNode" :target-node="p.targetNode" :data="p.data" /></template>
         </VueFlow>
+        <!-- Over the board: a group's title (drag it to move the group) and what each line between groups holds. -->
+        <div v-if="zoneBoxes.length" class="mesh-groups-over" :style="layerStyle">
+          <button v-for="z in zoneBoxes" :key="z.key" type="button" class="mesh-zone-head nodrag nopan" :style="{left: `${z.x}px`, top: `${z.y}px`}" :title="`${z.title}：拖动可以整组移动`"
+            @pointerdown="zoneDown($event, z)">{{ z.title }}<span>{{ z.count }} 台</span></button>
+          <button v-for="b in bundleLines.filter(x => !x.quiet)" :key="b.key" type="button" class="mesh-bundle nodrag nopan" :data-open="b.open || undefined" :data-bad="b.bad || undefined" :data-dim="b.dim || undefined"
+            :style="{left: `${b.mx}px`, top: `${b.my}px`}" :title="b.title" :aria-expanded="b.open" @click="toggleBundle(b.key)">{{ b.label }}</button>
+        </div>
         <svg v-if="guideLines.length" class="mesh-guides" aria-hidden="true">
           <line v-for="(g, i) in guideLines" :key="i" :x1="g.x1" :y1="g.y1" :x2="g.x2" :y2="g.y2" />
         </svg>
@@ -906,7 +1197,14 @@ defineExpose({select, join, fit});
               </li>
             </ol>
             <p v-if="pathBroken" class="mesh-path-broken">在 {{ nameOf(members, path.hops.at(-1).node) }} 之后断开，现在到不了 {{ nameOf(members, path.dst) }}</p>
-            <p v-else class="mesh-path-total"><strong>{{ pathTotal }}</strong><span v-if="path.stale" class="ob-warn">数据不完整：有的线路没有上报，路径和延迟可能不准</span></p>
+            <p v-else class="mesh-path-total">
+              <strong>{{ pathTotal }}</strong>
+              <span v-if="path.stale" class="ob-warn">数据不完整：有的线路没有上报，路径和延迟可能不准</span>
+            </p>
+            <p v-if="!pathBroken && (pathFixed || canPinBoardPath)" class="mesh-path-fixed">
+              <span v-if="pathFixed" class="pb-tag" :data-tone="pathFixed.tone === 'off' ? undefined : pathFixed.tone">{{ pathFixed.text }}</span>
+              <button v-if="canPinBoardPath" type="button" class="ix-text-button" @click="pinBoardPath">加为自建路线</button>
+            </p>
             <p v-if="path.error" class="instance-muted">暂时读不到最新路径（{{ path.error }}），稍后重试。</p>
           </template>
         </section>
@@ -964,12 +1262,12 @@ defineExpose({select, join, fit});
     </section>
 
     <aside v-if="!phone && !folded.panel" class="mesh-inspector-col" aria-label="属性">
-      <MeshInspector :sel="sel" :shown-path="pathKey" :items="items" :installing="installing" @select="select" @open-server="emit('open-server', $event)" @connect="startLinking" @path="startPath" @show-path="showRoute" @remove="removeSelected" />
+      <MeshInspector :sel="sel" :shown-path="pathKey" :items="items" :installing="installing" @select="select" @open-server="emit('open-server', $event)" @connect="startLinking" @path="startPath" @show-path="showRoute" @pin-path="emit('pin-path', $event)" @remove="removeSelected" />
     </aside>
 
     <MeshSheet v-if="phone" :model-value="Boolean(sheet)" :title="sheetTitle" :phone-size="sheet === 'add' ? 'auto' : '86%'" :panel-class="`mesh-${sheet || 'inspect'}-sheet`" @update:model-value="v => { if (!v) sheet = ''; }">
       <MeshServers v-if="sheet === 'add'" :items="items" phone :installing="pending" @add="id => join(id)" @select="id => select({kind: 'node', id})" />
-      <MeshInspector v-else :sel="sheet === 'overview' ? null : sel" phone :shown-path="pathKey" :items="items" :installing="installing" @select="select" @open-server="emit('open-server', $event)" @connect="startLinking" @path="startPath" @show-path="showRoute" @remove="removeSelected" />
+      <MeshInspector v-else :sel="sheet === 'overview' ? null : sel" phone :shown-path="pathKey" :items="items" :installing="installing" @select="select" @open-server="emit('open-server', $event)" @connect="startLinking" @path="startPath" @show-path="showRoute" @pin-path="emit('pin-path', $event)" @remove="removeSelected" />
     </MeshSheet>
   </div>
 </template>

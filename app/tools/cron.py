@@ -6,12 +6,45 @@ from pydantic import ValidationError
 from app.cron.contracts import CronError, JobConfig
 from app.runtime.tool_result import ToolOutcome
 from app.tools.base import current_tool_context
+from app.tools.describe import guide_for, guide_sections
 from app.tools.servers import automatic_turn
 from app.webhooks.contracts import WebhookError, dumps
 from app.webhooks.repository import one
 
 ACTIONS = ('describe', 'list', 'get', 'create', 'update', 'delete', 'set_enabled', 'run', 'stop', 'runs', 'statistics', 'preview')
-GUIDANCE = (Path(__file__).resolve().parents[2] / 'prompts' / 'guides' / 'cron.md').read_text(encoding='utf-8')
+GUIDE = guide_sections((Path(__file__).resolve().parents[2] / 'prompts' / 'guides' / 'cron.md').read_text(encoding='utf-8'))
+SUMMARIES = {
+    'describe': 'this index; params.action=<action> gives that action\'s contract and guidance',
+    'list': 'tasks, optionally of one directory; folders=true lists the directories', 'get': 'one task with its config and revision',
+    'create': 'new task in a directory', 'update': 'replace a task\'s config, name and description (get first)',
+    'delete': 'delete a task (user confirmation); runs and their conversations are kept',
+    'set_enabled': 'turn future scheduling on or off', 'run': 'start one run now; the schedule is unchanged', 'stop': 'stop a run',
+    'runs': 'run history, or one run in detail', 'statistics': 'run counts and usage', 'preview': 'the next times a schedule fires',
+}
+CONTRACTS = {
+    'describe': {'action': 'optional: one action'},
+    'list': {'folderId': 'optional; omitted = all directories', 'folders': 'true returns available directories', 'limit': '1..100', 'offset': '0-based'},
+    'get': {'jobId': 'required'},
+    'create': {'folderId': 'required', 'name': 'required', 'description': 'optional', 'enabled': 'default false', 'config': 'configSchema', 'requestId': 'stable operation ID'},
+    'update': {'jobId': 'required', 'name': 'name', 'description': 'description', 'enabled': 'boolean', 'config': 'complete config, get first', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
+    'set_enabled': {'jobId': 'required', 'enabled': 'boolean; future schedule only', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
+    'run': {'jobId': 'required; immediate new conversation, schedule unchanged', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
+    'stop': {'runId': 'required; existing conversation stop, does not disable plan', 'requestId': 'stable ID'},
+    'delete': {'jobId': 'required', 'expectedRevision': 'from get', 'requestId': 'stable ID; real user gate, runs/conversations retained'},
+    'runs': {'runId': 'optional exact detail', 'jobId': 'optional', 'folderId': 'optional', 'limit': '1..100', 'offset': '0-based'},
+    'statistics': {'jobId': 'optional', 'folderId': 'optional', 'start': 'optional ISO', 'end': 'optional ISO'},
+    'preview': {'schedule': 'configSchema.schedule', 'count': 'default 5'},
+}
+
+
+def describe(action=None):
+    if action is None:
+        return {'actions': SUMMARIES, 'note': 'describe with params.action=<action> gives its contract and guidance; create, update and preview add configSchema'}
+    if action not in ACTIONS:
+        raise CronError('unknown_action', f'describe has no action {action!r}; use one of these', actions=list(ACTIONS))
+    guidance = guide_for(GUIDE, action)
+    return {'action': action, 'contract': CONTRACTS[action], **({'guidance': guidance} if guidance else {}),
+            **({'configSchema': JobConfig.model_json_schema(by_alias=True)} if action in ('create', 'update', 'preview') else {})}
 
 
 async def dispatch(s, action, params, ctx):
@@ -23,20 +56,7 @@ async def dispatch(s, action, params, ctx):
     if not conversation: raise CronError('host_identity_required', status=403)
     owner = conversation['owner_chat_id']
     if action == 'describe':
-        return {'actions': list(ACTIONS), 'guidance': GUIDANCE, 'configSchema': JobConfig.model_json_schema(by_alias=True),
-            'contracts': {
-                'list': {'folderId': 'optional; omitted = all directories', 'folders': 'true returns available directories', 'limit': '1..100', 'offset': '0-based'},
-                'get': {'jobId': 'required'},
-                'create': {'folderId': 'required', 'name': 'required', 'description': 'optional', 'enabled': 'default false', 'config': 'configSchema', 'requestId': 'stable operation ID'},
-                'update': {'jobId': 'required', 'name': 'name', 'description': 'description', 'enabled': 'boolean', 'config': 'complete config, get first', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
-                'set_enabled': {'jobId': 'required', 'enabled': 'boolean; future schedule only', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
-                'run': {'jobId': 'required; immediate new conversation, schedule unchanged', 'expectedRevision': 'from get', 'requestId': 'stable ID'},
-                'stop': {'runId': 'required; existing conversation stop, does not disable plan', 'requestId': 'stable ID'},
-                'delete': {'jobId': 'required', 'expectedRevision': 'from get', 'requestId': 'stable ID; real user gate, runs/conversations retained'},
-                'runs': {'runId': 'optional exact detail', 'jobId': 'optional', 'folderId': 'optional', 'limit': '1..100', 'offset': '0-based'},
-                'statistics': {'jobId': 'optional', 'folderId': 'optional', 'start': 'optional ISO', 'end': 'optional ISO'},
-                'preview': {'schedule': 'configSchema.schedule', 'count': 'default 5'},
-            }}
+        return describe(params.get('action'))
     if action == 'list': return await s.folders(owner) if params.get('folders') else await s.list(owner, params)
     if action == 'get': return await s.get(owner, params.get('jobId'))
     if action == 'runs': return await s.get_run(owner, params['runId']) if params.get('runId') else await s.runs(owner, params)
@@ -87,6 +107,6 @@ def register_cron_tool(registry, service):
             return ToolOutcome(dumps(exc.payload), 'failed', 'not_started')
         except (ValidationError, ValueError, TypeError) as exc:
             return ToolOutcome(dumps({'code': 'invalid_parameters', 'message': str(exc)}), 'failed', 'not_started')
-    registry.add('Cron', 'Manage authorized directory schedules. Each run starts a new conversation; no catch-up or queue. Call describe before create/update; it returns the contract and design guidance. set_enabled controls future scheduling; run starts once; stop reuses conversation stop. Owner identity is host-supplied. Amended delete receipts keep the same job and revision; existing runs may finish, but new/replacement active runs require fresh confirmation.',
+    registry.add('Cron', 'Manage authorized directory schedules. Each run starts a new conversation; no catch-up or queue. describe gives an index of the actions; describe {action} gives one action\'s contract and guidance: read it for create or update before calling them. set_enabled controls future scheduling; run starts once; stop reuses conversation stop. Owner identity is host-supplied. Amended delete receipts keep the same job and revision; existing runs may finish, but new/replacement active runs require fresh confirmation.',
         {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': list(ACTIONS)}, 'params': {'type': 'object'}}, 'required': ['action'], 'additionalProperties': False},
         handler, visibility={'main'}, effect_scope='scheduled_task')

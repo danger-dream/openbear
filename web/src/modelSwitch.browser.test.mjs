@@ -5,7 +5,7 @@ import {startBrowserTestServer} from './browserTestServer.mjs';
 import {createModelSwitchBackend} from './modelSwitchFixture.mjs';
 const require=createRequire(import.meta.url);
 let chromium;
-try {({chromium}=require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core'));} catch {}
+try {({chromium}=require('./testing/playwright.cjs'));} catch {}
 const entry=`import '/src/monaco-worker.js'; import '/src/theme.js'; import {createApp,h} from 'vue'; import ElementPlus from 'element-plus'; import * as Icons from '@element-plus/icons-vue'; import 'element-plus/dist/index.css'; import 'element-plus/theme-chalk/dark/css-vars.css'; import '/src/style.css'; import '/src/dark-theme.css'; import '/src/mobile-inputs.css'; import ConsoleView from '/src/views/consoleView/ConsoleView.vue'; window.createdConversations=[]; const app=createApp({render:()=>h(ConsoleView,{conversationUuid:'original',onConversationCreated:id=>window.createdConversations.push(id)})}); app.use(ElementPlus); for(const [name,component] of Object.entries(Icons))app.component(name,component);app.mount('#app');`;
 const html='<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><script>window.__OPENBEAR_AUTH_MODE__="controller"</script></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:model-switch-test"></script></body></html>';
 

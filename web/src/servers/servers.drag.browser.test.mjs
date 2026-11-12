@@ -34,7 +34,7 @@ test('servers page layout: dragging cards on the board, with a mouse and a finge
     assert.equal(await flag('Bravo-FRA').getAttribute('title'), '德国 · 拖动调整顺序');
     assert.equal(await flag('Bravo-FRA').evaluate(el => getComputedStyle(el).cursor), 'grab');
     // Dragging the card body does nothing; the flag moves it, and the order is saved at once.
-    await dragFlag(page, card(page, 'Bravo-FRA').locator('.pb-spec'), card(page, 'Edge-SG.Game'));
+    await dragFlag(page, card(page, 'Bravo-FRA').locator('.pb-cells'), card(page, 'Edge-SG.Game'));
     assert.equal(orders(h).length, 0, 'only the flag drags');
     await dragFlag(page, flag('Bravo-FRA'), card(page, 'Edge-SG.Game'));
     await page.waitForResponse(r => r.url().endsWith('/api/servers/order')).catch(() => {});

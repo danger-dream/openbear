@@ -478,6 +478,32 @@ test('parameter-aware translations survive live operation projection and lightwe
   }
 });
 
+// The list keeps a long call's arguments with every long string cut to its first 180 and last 60
+// characters (app/web_operations._shrunk_arguments; tests/test_web_operations_schema.py checks its output).
+const shrunk = value => typeof value === 'string' ? (value.length <= 241 ? value : `${value.slice(0, 180)}…${value.slice(-60)}`)
+  : Array.isArray(value) ? value.map(shrunk) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, shrunk(v)])) : value;
+
+test('a long call reads the same after history restoration, from its shortened arguments', async t => {
+  const script = 'set -e\n' + 'echo prepare\n'.repeat(80) + 'cd /srv/app && docker compose up -d';
+  for (const [name, args] of [
+    ['Servers', {action:'exec',params:{serverId:'srv-1',command:'systemctl status nginx --no-pager && ' + 'journalctl -u nginx -n 50 | grep error; '.repeat(20)}}],
+    ['Servers', {action:'exec',params:{serverIds:['srv-1','srv-2','srv-3','srv-4'],command:'apt-get update && ' + 'x'.repeat(900)}}],
+    ['InstanceControl', {action:'remote',instance:'toy',params:{command:script}}],
+    ['EditBatch', {path:'/srv/app/main.py',edits:Array.from({length:6},(_,i)=>({old_string:`old ${i} `.repeat(80),new_string:`new ${i} `.repeat(80)}))}],
+  ]) {
+    const raw = JSON.stringify(args);
+    assert.ok(raw.length > 512, `${name} is long`);
+    const op = {opId:`long-${name}-${raw.length}`,opType:'tool',turnUuid:'t',displaySeq:1,status:'running',lifecycle:'active',payload:{name,arguments:raw}};
+    const event = () => projectOperationMessages([op]).flatMap(m=>m.localTimeline||[]).find(e=>e.kind==='tool');
+    const props = reactive({event:event()});
+    const root = mount(t,'ConversationProcessEvent.vue',props);
+    const live = text(find(root,'process-kind')) + text(find(root,'process-preview'));
+    op.status='completed';op.lifecycle='terminal';op.payload.previewArguments=JSON.stringify(shrunk(args));delete op.payload.arguments;
+    props.event=event();await nextTick();
+    assert.equal(text(find(root,'process-kind')) + text(find(root,'process-preview')), live);
+  }
+});
+
 test('failed tool label shares the text baseline, while its icon remains centered', t => {
   const root=mount(t,'ConversationProcessEvent.vue',{event:{kind:'tool',calls:[{name:'Bash',arguments:JSON.stringify({description:'检查路径',command:'false'})}],operation:{status:'failed'}}});
   assert.equal(text(find(root,'process-kind')),'终端');

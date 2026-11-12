@@ -37,6 +37,7 @@ class Page:
         self.setup_tasks = {}
         self.failed_sessions = set()
         self.snapshot = ""
+        self.document_id = uuid.uuid4().hex
         self.refs = {}
         self.life = {}
         self.navigation_status = {}
@@ -72,6 +73,9 @@ class Page:
         return self.frames[self.main_id].url if self.main_id in self.frames else ""
 
     def invalidate_refs(self):
+        # Any frame epoch/context change invalidates cross-snapshot identity.
+        # A UUID also separates workers/pages recreated at the same URL.
+        self.document_id = uuid.uuid4().hex
         self.snapshot = ""
         self.refs.clear()
 

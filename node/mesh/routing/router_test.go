@@ -799,3 +799,111 @@ func TestForwardedAdvertKeepsRoutes(t *testing.T) {
 	}
 	t.Logf("B: %v", n.eventsOf("B", "route.changed"))
 }
+
+// TestLeafRouting checks that:
+//  1. Leaves are never used as transit hops in Dijkstra even if a path through a leaf is cheaper.
+//  2. Relays advertise links to leaves in "m" (and compact section 2) and route to leaves via the cheapest relay.
+//  3. A leaf router (Leaf: true) never sends or forwards advertisements, receives relay advertisements,
+//     and picks the upstream relay (or direct member link) with the shortest path to each destination.
+func TestLeafRouting(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	ms := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
+	nums := map[string]uint32{"A": 1, "B": 2, "M": 10, "N": 11}
+	relayLinks := [][2]string{{"A", "B"}}
+	memberLinks := [][2]string{{"A", "M"}, {"B", "M"}, {"A", "N"}, {"B", "N"}}
+
+	rA := New(signed(Config{
+		Self: "A", Relays: []string{"B"}, Leaves: []string{"M", "N"},
+		Links: []string{"B", "M", "N"}, Numbers: nums,
+		RelayLinks: relayLinks, MemberLinks: memberLinks,
+	}), func() time.Time { return now }, nil)
+
+	rB := New(signed(Config{
+		Self: "B", Relays: []string{"A"}, Leaves: []string{"M", "N"},
+		Links: []string{"A", "M", "N"}, Numbers: nums,
+		RelayLinks: relayLinks, MemberLinks: memberLinks,
+	}), func() time.Time { return now }, nil)
+
+	rM := New(signed(Config{
+		Self: "M", Leaf: true, Relays: []string{"A", "B"}, Leaves: []string{"N"},
+		Links: []string{"A", "B"}, Numbers: nums,
+		RelayLinks: relayLinks, MemberLinks: memberLinks,
+	}), func() time.Time { return now }, nil)
+
+	// Warm up links:
+	// A-B is 100ms, while A-M is 5ms and B-M is 5ms (path A-M-B would be 10ms if M could transit, which it must not).
+	// A-N is 80ms, B-N is 10ms.
+	for i := 0; i < warmSamples; i++ {
+		rA.Probe("B", ms(100))
+		rA.Probe("M", ms(5))
+		rA.Probe("N", ms(80))
+		rB.Probe("A", ms(100))
+		rB.Probe("M", ms(5))
+		rB.Probe("N", ms(10))
+		rM.Probe("A", ms(5))
+		rM.Probe("B", ms(5))
+	}
+
+	// Leaf router must never emit advertisements.
+	if msgs := rM.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"A", "B"}); len(msgs) != 0 {
+		t.Fatalf("leaf emitted adverts: %+v", msgs)
+	}
+
+	// Exchange advertisements between A, B, and M.
+	advA := rA.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B", "M"})
+	advB := rB.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"A", "M"})
+	if len(advA) == 0 || len(advB) == 0 {
+		t.Fatalf("expected relay adverts, got A=%d B=%d", len(advA), len(advB))
+	}
+	if _, _, err := rB.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000}); err != nil {
+		t.Fatalf("rB receive A: %v", err)
+	}
+	if _, _, err := rA.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000}); err != nil {
+		t.Fatalf("rA receive B: %v", err)
+	}
+	if fwd, _, err := rM.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000}); err != nil || len(fwd) != 0 {
+		t.Fatalf("rM receive A: fwd=%v err=%v", fwd, err)
+	}
+	if fwd, _, err := rM.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000}); err != nil || len(fwd) != 0 {
+		t.Fatalf("rM receive B: fwd=%v err=%v", fwd, err)
+	}
+
+	// 1. A->B must go directly to B (100ms), never through leaf M (5+5=10ms).
+	if nh, ok := rA.NextHop("B"); !ok || nh != "B" {
+		t.Fatalf("rA NextHop(B) = %q, %v; want B", nh, ok)
+	}
+	// 2. A->N: direct A-N is 80ms, via B is 100+10=110ms -> A chooses N directly.
+	if nh, ok := rA.NextHop("N"); !ok || nh != "N" {
+		t.Fatalf("rA NextHop(N) = %q, %v; want N", nh, ok)
+	}
+	// Make A-B 20ms so A-B-N is 20+10=30ms < 80ms.
+	now = now.Add(10 * time.Second)
+	for i := 0; i < rttMedian*2; i++ {
+		rA.Probe("B", ms(20))
+		rB.Probe("A", ms(20))
+	}
+	now = now.Add(switchHold + time.Second)
+	rA.Tick()
+	rB.Tick()
+	advA = rA.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"})
+	advB = rB.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"A"})
+	rB.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000})
+	rA.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000})
+	rM.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000})
+	rM.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000})
+
+	// Now A->N should route via B (20+10=30ms vs 80ms).
+	if nh, ok := rA.NextHop("N"); !ok || nh != "B" {
+		t.Fatalf("rA NextHop(N) = %q, %v; want B", nh, ok)
+	}
+	// 3. M->N: via A is 5+80=85ms (or 5+20+10=35ms), via B is 5+10=15ms -> M chooses B!
+	if nh, ok := rM.NextHop("N"); !ok || nh != "B" {
+		t.Fatalf("rM NextHop(N) = %q, %v; want B", nh, ok)
+	}
+	if nh, ok := rM.NextHop("A"); !ok || nh != "A" {
+		t.Fatalf("rM NextHop(A) = %q, %v; want A", nh, ok)
+	}
+	if nh, ok := rM.NextHop("B"); !ok || nh != "B" {
+		t.Fatalf("rM NextHop(B) = %q, %v; want B", nh, ok)
+	}
+}

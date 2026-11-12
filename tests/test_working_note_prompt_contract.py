@@ -43,7 +43,7 @@ async def test_new_prompt_version_can_render_without_rewriting_existing_snapshot
         )
         assert '[[ERROR:' not in rendered
         assert 'It is not a project archive, progress ledger, execution report' in rendered
-        assert 'use AgentInfo for the current state and History for original exchanges' in rendered
+        assert 'use Agent action=info for the current state and History for original exchanges' in rendered
         assert 'An auto-injected short body is usable directly' in rendered
         assert 'Keep at most one rolling status record' not in rendered
         assert 'Promptly record decisions' not in rendered

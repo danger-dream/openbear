@@ -109,7 +109,9 @@ class Commands:
         metadata.update(finishedAt=time.time(), returncode=process.returncode)
         atomic_json(receipt, metadata)
         if check and process.returncode:
-            raise ReleaseError(f"{label}: exit {process.returncode}; log: {log}")
+            error = ReleaseError(f"{label}: exit {process.returncode}; log: {log}")
+            error.output = text
+            raise error
         return text.rstrip("\n")
 
     @staticmethod

@@ -50,6 +50,15 @@ def pending_items(chat_id: int) -> list[dict[str, Any]]:
         return [dict(item) for item in _QUEUE.get(chat_id, [])]
 
 
+def public(item: dict[str, Any]) -> dict[str, Any]:
+    """An item as the composer shows it: its attachments by their public card, without paths or extracted text."""
+    return {k: v for k, v in item.items() if k != "media"}
+
+
+def public_pending_items(chat_id: int) -> list[dict[str, Any]]:
+    return [public(item) for item in pending_items(chat_id)]
+
+
 def drain_items(chat_id: int, *, item_ids: set[str] | None = None) -> list[dict[str, Any]]:
     """取出排队记录；恢复旧输入时只消费已持久化的指定项，保留新插话。"""
     with _LOCK:

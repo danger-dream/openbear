@@ -52,6 +52,8 @@ type peerPaths struct {
 	// protocol is the peer's mesh protocol range as SetPeerProtocol last
 	// gave it; zero while unknown.
 	protocol wire.Range
+	// large: the peer says it takes large frames (SetPeerLarge).
+	large bool
 }
 
 type pathEndpoint struct {
@@ -95,6 +97,7 @@ func (b *Bind) info(ep *endpoint, plane uint8, at time.Time) PathInfo {
 	return PathInfo{LastAuthenticated: ep.lastAuthenticated[plane], AuthenticatedPackets: ep.authenticatedPackets[plane], LastError: ep.stats.LastError, Ref: ref, PeerID: ep.peer, Endpoint: ep.key, Transport: ep.transport, LocalAddr: ep.stats.LocalAddr, RemoteAddr: ep.stats.RemoteAddr, Plane: plane, ReceivedAt: at, Connected: connected, Authenticated: ep.auth[plane], DataAuthenticated: ep.auth[0], ControlAuthenticated: ep.auth[1], Active: p != nil && p.active == ref}
 }
 func (b *Bind) event(e PathEvent) {
+	b.largeChanged()
 	select {
 	case b.events <- e:
 	default:
@@ -107,7 +110,7 @@ func (b *Bind) Resources() ResourceStats {
 	defer b.mu.Unlock()
 	s := ResourceStats{DroppedEvents: b.droppedEvents}
 	if r := b.run; r != nil {
-		s.Connections = len(r.sessions)
+		s.Connections = len(r.sessions) + r.companions
 		s.Unauthenticated = r.unauth
 		s.SocketBufferBytes = r.socketBytes
 		s.ReceiveBytes = r.queuedBytes
@@ -365,6 +368,17 @@ func (b *Bind) Deactivate(id string, expected PathRef) error {
 	return nil
 }
 
+// ActivePath is the path Commit chose for peer id, none before a Commit or
+// after Deactivate.
+func (b *Bind) ActivePath(id string) (PathRef, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if p := b.peers[id]; p != nil && p.active.ID != "" {
+		return p.active, true
+	}
+	return PathRef{}, false
+}
+
 func (b *Bind) ReleasePath(ref PathRef) error {
 	b.op.Lock()
 	defer b.op.Unlock()
@@ -516,11 +530,19 @@ func (b *Bind) authenticated(plane uint8, m conn.ReceiveMetadata) bool {
 	if ss == nil {
 		ss = ep.current
 	}
+	if ss != nil && ss.parent != nil {
+		ss = ss.parent
+	}
 	if ss != nil && !ss.authenticated {
 		ss.authenticated = true
 		if !ep.outbound {
 			b.run.unauth--
 		}
+	}
+	if ss != nil && ep.outbound && ss.version >= companionVersion && !ss.keep && ss.ready && !ss.replaced && !ss.closed.Load() {
+		ss.keep = true
+		b.run.wg.Add(1)
+		go b.keepCompanion(b.run, ss)
 	}
 	if first {
 		b.event(PathEvent{Kind: "authenticated", Path: b.info(ep, plane, p.receivedAt)})

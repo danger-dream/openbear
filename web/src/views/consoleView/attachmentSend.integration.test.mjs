@@ -8,6 +8,7 @@ import {parse} from '@vue/compiler-sfc';
 import {baseParse} from '@vue/compiler-dom';
 import {createOutboundSendTracker, restoreOutboundDraft, waitForSocketOpen, probeSocket} from './outboundSend.js';
 import {conversationWsUrl} from '../../api.js';
+import {extensionDraft, forgetExtensionDraft} from './extensionDrafts.js';
 
 const source = fs.readFileSync(new URL('./ConsoleView.vue', import.meta.url), 'utf8');
 const composer = fs.readFileSync(new URL('./ConsoleComposer.vue', import.meta.url), 'utf8');
@@ -48,7 +49,7 @@ function harness() {
     crypto:{randomUUID:()=> 'request-A'},
     composer:{value:{getReferenceOrder:()=> []}}, referencesInText:()=>[],referenceCatalog:{ready:true,connected:true},
     localAttachmentPayload:()=>[], noteVisibleOutput:noop, clearActiveRun:noop, lockAutoScroll:noop, closeComposerMenus:noop, adjustComposerHeight:noop,
-    scrollBottom:async()=>{}, ensureLocalRunDefaults:async()=>{throw Error('persisted conversation must not create new one');}, forgetLocalDraftChoices:noop, updatePromptSuggestions:noop,
+    scrollBottom:async()=>{}, ensureLocalRunDefaults:async()=>{throw Error('persisted conversation must not create new one');}, forgetLocalDraftChoices:noop, extensionDraft, forgetExtensionDraft, updatePromptSuggestions:noop,
     Api:{uploadConversationFiles:(uuid, files, options)=>{uploads.push({uuid,files,options}); return upload.promise;}},
     attachmentDrafts:{removeItems:async()=>true}, emit:noop,
     closeWs:noop, clearUiCaches:noop, resetOperationStore:noop, resetAgentAutoOpenBoundary:noop, resetTransientThinking:noop,

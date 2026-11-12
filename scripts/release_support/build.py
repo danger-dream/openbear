@@ -49,7 +49,28 @@ IMAGES = Path(__file__).resolve().parent / "images"
 NODE_BASE = "node:20.20.2-trixie"
 GO_BASE = "golang:1.24.4-bookworm"
 NODE_VERSION, NPM_VERSION = "v20.20.2", "11.11.0"
+GATEWAY_SCRIPT = """export PATH=/usr/local/go/bin:$PATH
+export GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off GOSUMDB=off GOCACHE=/gocache
+mkdir -p /work/gateway
+cp -a --no-preserve=ownership /inputs/gateway/. /work/gateway/
+cd /work/gateway
+chmod -R u+rwX .
+go version | grep -Eq '^go version go1\\.24\\.4 linux/(amd64|arm64)$'
+go version > /out/toolchain.txt
+go test -race ./...
+for arch in amd64 arm64; do
+  CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/openbear-gateway-linux-$arch ./cmd/openbear-gateway
+done
+/out/openbear-gateway-linux-$(go env GOARCH) --version
+"""
 LABEL = "openbear.release.run"
+# Release images carry this label; host cleanup prunes with --filter label!=<it>.
+KEEP_LABEL = "openbear.release.keep"
+# Per test, so one hung test fails with its stack instead of stalling the stage until
+# the container timeout; the slowest real test takes about 11 s in these containers.
+TEST_TIMEOUT = 120
+# More failures than this in one run are not timing flakes; they block without a rerun.
+RERUN_LIMIT = 10
 TOP_FILES = ("pyproject.toml", "uv.lock", "openbear.service", "openbear.json.example", "README.md")
 OPTIONAL_FILES = ("Dockerfile", ".dockerignore", "docs/instances.md")
 ANOMALIES = (
@@ -270,6 +291,51 @@ def parse_junit(path):
     return {"counts": counts, "testCases": cases}
 
 
+def case_counts(cases):
+    return {"tests": len(cases), **{status: sum(c["status"] == status for c in cases) for status in ("passed", "failed", "skipped")}}
+
+
+def is_test_module(name):
+    """tests/**/test_*.py only: conftest, helpers and data under tests/ are shared inputs."""
+    path = PurePosixPath(name)
+    return path.parts[0] == "tests" and path.name.startswith("test_") and path.suffix == ".py"
+
+
+def independent_test_changes(source, files, changed):
+    """Whether no other test file names a changed test module. One imported for its fixtures or
+    helpers changes what its importers test too; a mention in a comment only costs the reuse."""
+    if not changed:
+        return True
+    names = re.compile(r"\b(?:" + "|".join(re.escape(PurePosixPath(n).stem) for n in changed) + r")\b")
+    return not any(names.search((source / n).read_text(encoding="utf-8"))
+                   for n in files if n.endswith(".py") and n not in changed)
+
+
+def last_failed(cache):
+    try:
+        return sorted(read_json(Path(cache) / "v/cache/lastfailed"))
+    except (OSError, ValueError):
+        return []
+
+
+def case_module(case_id, files):
+    parts = case_id.split("::", 1)[0].split(".")
+    for end in range(len(parts), 0, -1):
+        if "/".join(parts[:end]) + ".py" in files:
+            return "/".join(parts[:end]) + ".py"
+    return None
+
+
+def reused_cases(base, fresh, changed, files):
+    """Base results for unchanged modules plus what ran now. A test that failed in the base
+    and passes now although its module did not change is flaky, not fixed."""
+    ran = {c["id"] for c in fresh}
+    failed = {c["id"] for c in base["testCases"] if c["status"] == "failed"}
+    kept = [c for c in base["testCases"] if c["id"] not in ran and case_module(c["id"], files) not in changed]
+    return kept + [{**c, "flaky": True} if c["id"] in failed and c["status"] == "passed" and case_module(c["id"], files) not in changed
+                   else c for c in fresh]
+
+
 def parse_frontend(text):
     values = {}
     for name in ("tests", "pass", "fail", "skipped", "cancelled"):
@@ -299,9 +365,9 @@ p = {"python": platform.python_version(), "executable": sys.executable,
      "implementation": platform.python_implementation(), "pythonABI": sys.implementation.cache_tag,
      "node": command("node", "--version"), "npm": command("npm", "--version"),
      "bash": command("bash", "--version").splitlines()[0], "git": command("git", "--version"),
-     "pytest-xdist": m.version("pytest-xdist"), "execnet": m.version("execnet")}
+     "pytest-xdist": m.version("pytest-xdist"), "execnet": m.version("execnet"), "pytest-timeout": m.version("pytest-timeout")}
 assert p["node"] == "v20.20.2" and p["npm"] == "11.11.0", p
-assert p["pytest-xdist"] == "3.8.0" and p["execnet"] == "2.1.2", p
+assert p["pytest-xdist"] == "3.8.0" and p["execnet"] == "2.1.2" and p["pytest-timeout"] == "2.4.0", p
 Path(sys.argv[2]).write_text(json.dumps(p))
 '''
 NODE_PROBE = r'''
@@ -348,7 +414,7 @@ class Stage:
         return identity
 
     @contextlib.contextmanager
-    def container(self, image, script, mounts, *, online=False, role="stage"):
+    def container(self, image, script, mounts, *, online=False, role="stage", cpus=2, caps=()):
         name = f"ob-release-{hashlib.sha256(self.config['runId'].encode()).hexdigest()[:12]}-{self.stage}-{self.attempt[:12]}-{uuid.uuid4().hex[:8]}"
         labels = {LABEL: self.config["runId"], "openbear.release.stage": self.stage,
                   "openbear.release.attempt": self.attempt}
@@ -356,7 +422,8 @@ class Stage:
         self.resources.append(resource)
         atomic_json(self.out / "resources.json", self.resources)  # before create, including interruption window
         args = ["docker", "create", "--name", name, "--network", "bridge" if online else "none",
-                "--cpus", "2", "--memory", "6g", "--pids-limit", "1024", "--cap-drop", "ALL",
+                "--cpus", str(cpus), "--memory", "6g", "--pids-limit", "1024", "--cap-drop", "ALL",
+                *[arg for cap in caps for arg in ("--cap-add", cap)],
                 "--security-opt", "no-new-privileges", "--user", "0:0", "--workdir", "/",
                 "--entrypoint", "/bin/bash", "--env", "PYTHONDONTWRITEBYTECODE=1",
                 "--env", "PATH=/opt/testenv/.venv/bin:/opt/baseline-venv/bin:/inputs/node/toolchain/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -389,14 +456,20 @@ class Stage:
                 resource["state"] = "absent"
             atomic_json(self.out / "resources.json", self.resources)
 
-    def run_container(self, image, script, mounts, *, online=False, timeout=600, commit=False, role="stage"):
-        with self.container(image, script, mounts, online=online, role=role) as name:
+    def run_container(self, image, script, mounts, *, online=False, timeout=600, commit=False, role="stage", cpus=2, caps=(), tag=None):
+        with self.container(image, script, mounts, online=online, role=role, cpus=cpus, caps=caps) as name:
             proc = self.command(["docker", "start", "--attach", name], timeout=timeout, check=False)
             require(proc.returncode == 0, f"container exited {proc.returncode}; see {self.log_path}")
             if commit:
-                identity = self.command(["docker", "commit", name], capture=True, timeout=180).stdout.strip()
+                # Named and labelled: an untagged commit is "dangling" and even a plain prune removes it.
+                args = ["docker", "commit", "--change", f"LABEL {KEEP_LABEL}=1", name] + ([tag] if tag else [])
+                identity = self.command(args, capture=True, timeout=180).stdout.strip()
                 return self.image_id(identity)
         return image
+
+    def image_present(self, reference):
+        return self.command(["docker", "image", "inspect", reference, "--format", "{{.Id}}"],
+                            capture=True, check=False, timeout=60).returncode == 0
 
     def dependency_data(self):
         data = normalize_dependencies(self.source)
@@ -429,6 +502,8 @@ class Stage:
         node_dir = owned(self.cache, f"node/{node_key}")
         with locked(owned(self.cache, f"locks/node-{node_key}.lock")):
             marker = owned(node_dir, "complete.json")
+            if marker.exists() and not self.image_present(read_json(marker)["image"]):
+                shutil.rmtree(node_dir)  # its image was pruned; the rest is derived and rebuilt below
             if marker.exists():
                 record = read_json(marker)
                 require(record["key"] == node_key, "Node cache key mismatch")
@@ -443,7 +518,7 @@ class Stage:
                 try:
                     node_id = self.run_container(node_base, "bash /recipes/node-env.sh",
                         [(self.source, "/inputs/source", True), (IMAGES, "/recipes", True), (temp, "/out", False)],
-                        online=True, timeout=900, commit=True, role="prepare-node")
+                        online=True, timeout=900, commit=True, role="prepare-node", tag=f"openbear-release-cache:node-{node_key[:16]}")
                     node_tools = self.probe(node_id, temp, role="prepared-node")
                     atomic_json(temp / "complete.json", {"key": node_key, "image": node_id, "base": node_base, "files": node_cache_files(temp)})
                     os.replace(temp, node_dir)
@@ -456,6 +531,8 @@ class Stage:
             directory = owned(self.cache, f"python/{key}")
             with locked(owned(self.cache, f"locks/python-{key}.lock")):
                 marker = owned(directory, "complete.json")
+                if marker.exists() and not self.image_present(read_json(marker)["image"]):
+                    shutil.rmtree(directory)  # only the marker of a pruned image; prepare it again
                 if marker.exists():
                     record = read_json(marker)
                     require(record["key"] == key and record["base"] == base, "Python cache key mismatch")
@@ -465,7 +542,7 @@ class Stage:
                     require(not directory.exists(), f"uncommitted Python cache: {directory}")
                     image = self.run_container(base, f"bash /recipes/python-env.sh 3.{version[1:]}",
                         [(self.source, "/inputs/source", True), (IMAGES, "/recipes", True)],
-                        online=True, timeout=900, commit=True, role="prepare-py" + version)
+                        online=True, timeout=900, commit=True, role="prepare-py" + version, tag=f"openbear-release-cache:py{version}-{key[:16]}")
                     tools[version] = self.probe(image, node_dir, "3." + version[1:], role="prepared-py" + version)
                     temp = owned(self.cache, f"python/.{key}.{self.attempt}")
                     temp.mkdir(parents=True)
@@ -510,34 +587,128 @@ class Stage:
             lines += ["node -e " + shlex.quote(NODE_PROBE) + " /out/toolchain.json"]
         return "\n".join(lines) + "\n"
 
+    def pytest(self, image, node, python, junit, cache, targets=(), *, last_failed=False):
+        """One pytest container; returns pytest's exit code. A container timeout still raises."""
+        args = ["python", "-m", "pytest", "-q"] + ([] if last_failed else ["-n", "2", "--dist=worksteal"])
+        args += [f"--junitxml=/out/{junit}", "-o", f"cache_dir=/out/{cache}", f"--timeout={TEST_TIMEOUT}", "--timeout-method=signal"]
+        args += ["--lf", "--lfnf=none"] if last_failed else []
+        script = self.execution_script(python=python) + "cd /work/source\n" + shlex.join([*args, *targets])
+        try:
+            self.run_container(image, script, [(self.source, "/inputs/source", True), (node, "/inputs/node", True), (self.out, "/out", False)])
+            return 0
+        except ReleaseError as exc:
+            match = re.search(r"container exited (\d+)", str(exc))
+            if not match:
+                raise
+            return int(match[1])
+
+    def test_inputs(self):
+        tests = {n: h for n, h in self.source_files.items() if n.startswith("tests/")}
+        return {"tests": tests, "product": digest_json({n: h for n, h in self.source_files.items() if not n.startswith(("tests/", ".git/"))})}
+
+    def rerun_plan(self, image, inputs):
+        """After a fix, run first what failed last time plus the changed test modules. When
+        only test modules changed since the last complete run (product, helpers, data and
+        config identical), that run's results for every other test stay valid and are kept."""
+        try:
+            latest = read_json(self.result_dir / "result.json")
+            base = latest if latest.get("complete") else read_json(latest["base"]) if latest.get("base") else None
+        except (OSError, ValueError, KeyError):
+            return None
+        if not base or any(item.get("stage") != self.stage or item.get("image") != image or "inputs" not in item for item in (latest, base)):
+            return None
+        before = base["inputs"]
+        changed = {n for n in before["tests"].keys() | inputs["tests"].keys() if before["tests"].get(n) != inputs["tests"].get(n)}
+        modules = {n for n in changed if n in inputs["tests"] and is_test_module(n)}
+        failed = {i for i in {*base.get("failedNodeIds", []), *latest.get("failedNodeIds", [])}
+                  if i.split("::", 1)[0] in inputs["tests"] and i.split("::", 1)[0] not in modules}
+        if not modules and not failed:
+            return None
+        reuse = (before["product"] == inputs["product"]
+                 and all(is_test_module(n) for n in changed) and not base.get("unhandled")
+                 and independent_test_changes(self.source, inputs["tests"], changed))
+        return {"targets": sorted(modules | failed), "reuse": reuse, "changed": changed, "base": base}
+
+    def python_tests(self, image, node, python):
+        inputs = self.test_inputs()
+        self.details.update(image=image, inputs=inputs, flaky=[], complete=False)
+        outputs = self.details["outputs"] = {"log": str(self.log_path)}
+        plan = self.rerun_plan(image, inputs)
+        cases = None
+        if plan:
+            base = plan["base"]
+            code = self.pytest(image, node, python, "fast.xml", "fast-cache", plan["targets"])
+            fast = parse_junit(self.out / "fast.xml")["testCases"] if (self.out / "fast.xml").exists() else []
+            self.details.update(base=str(Path(base["log"]).parent / "result.json"),
+                                plan={"targets": plan["targets"], "reuse": plan["reuse"], "exitCode": code, "base": base.get("attempt")})
+            if fast:
+                outputs.update(fastJunit=str(self.out / "fast.xml"), fastJunitSha256=sha256(self.out / "fast.xml"))
+            if code != 0 or not fast:
+                self.details.update(failedNodeIds=last_failed(self.out / "fast-cache"), testCases=fast, counts=case_counts(fast))
+                raise ReleaseError(f"tests that failed last time or changed since still fail (exit {code}); full run skipped")
+            if plan["reuse"]:
+                cases = reused_cases(base, fast, plan["changed"], inputs["tests"].keys() | base["inputs"]["tests"].keys())
+                outputs.update(junit=outputs["fastJunit"], junitSha256=outputs["fastJunitSha256"])
+                if base.get("outputs", {}).get("junit"):
+                    outputs.update(reusedJunit=base["outputs"]["junit"], reusedJunitSha256=base["outputs"]["junitSha256"])
+                self.details["failedNodeIds"] = []
+        if cases is None:
+            code = self.pytest(image, node, python, "junit.xml", "pytest-cache")
+            if not (self.out / "junit.xml").exists():
+                raise ReleaseError(f"pytest produced no JUnit (exit {code}); see {self.log_path}")
+            outputs.update(junit=str(self.out / "junit.xml"), junitSha256=sha256(self.out / "junit.xml"))
+            cases = parse_junit(self.out / "junit.xml")["testCases"]
+            failures = [c for c in cases if c["status"] == "failed"]
+            self.details.update(testCases=cases, counts=case_counts(cases), failedNodeIds=last_failed(self.out / "pytest-cache"))
+            if code and not failures:
+                raise ReleaseError(f"pytest exited {code} without a failed test; see {self.log_path}")
+            # A timing-sensitive failure runs again on its own; an asynchronous exception or
+            # a mass failure is not retried and blocks as before.
+            if code == 1 and len(failures) <= RERUN_LIMIT and not anomalies(self.log_path.read_text(errors="replace")):
+                self.pytest(image, node, python, "rerun.xml", "pytest-cache", last_failed=True)
+                if (self.out / "rerun.xml").exists():
+                    passed = {c["id"] for c in parse_junit(self.out / "rerun.xml")["testCases"] if c["status"] == "passed"}
+                    cases = [{**c, "status": "passed", "flaky": True} if c["status"] == "failed" and c["id"] in passed else c for c in cases]
+                    outputs.update(rerunJunit=str(self.out / "rerun.xml"), rerunJunitSha256=sha256(self.out / "rerun.xml"))
+                    self.details["failedNodeIds"] = last_failed(self.out / "pytest-cache")
+            elif code not in (0, 1):
+                raise ReleaseError(f"pytest exited {code}; see {self.log_path}")
+        self.details.update(testCases=cases, counts=case_counts(cases), complete=True,
+                            flaky=sorted(c["id"] for c in cases if c.get("flaky")))
+
     def tests(self):
         env, node = self.environment()
         python = self.stage[2:] if self.stage.startswith("py") else "312" if self.stage == "frontend-checks" else None
         image = self.image_id(env["pythonImages"][python] if python else env["nodeImage"])
-        command = ("cd /work/source\npython -m pytest -q -n 2 --dist=worksteal --junitxml=/out/junit.xml -o cache_dir=/out/pytest-cache"
-                   if python else "cd /work/source/web\nnode --test --test-concurrency=2")
-        if self.stage == "frontend-checks":
-            require(all((self.source / name).is_file() for name in FRONTEND_CHECKS), "declared frontend contract tests are missing; review the release policy")
-            command += " " + " ".join(map(shlex.quote, FRONTEND_CHECKS))
         failure = None
-        try:
-            self.run_container(image, self.execution_script(python=python) + command,
-                [(self.source, "/inputs/source", True), (node, "/inputs/node", True), (self.out, "/out", False)])
-        except (ReleaseError, subprocess.TimeoutExpired) as exc:
-            failure = exc
+        if python and self.stage != "frontend-checks":
+            try:
+                self.python_tests(image, node, python)
+            except (ReleaseError, subprocess.TimeoutExpired) as exc:
+                failure = exc
+        else:
+            command = ("cd /work/source\npython -m pytest -q -n 2 --dist=worksteal --junitxml=/out/junit.xml -o cache_dir=/out/pytest-cache"
+                       f" --timeout={TEST_TIMEOUT} --timeout-method=signal"
+                       if python else "cd /work/source/web\nnode --test --test-concurrency=2")
+            if self.stage == "frontend-checks":
+                require(all((self.source / name).is_file() for name in FRONTEND_CHECKS), "declared frontend contract tests are missing; review the release policy")
+                command += " " + " ".join(map(shlex.quote, FRONTEND_CHECKS))
+            try:
+                self.run_container(image, self.execution_script(python=python) + command,
+                    [(self.source, "/inputs/source", True), (node, "/inputs/node", True), (self.out, "/out", False)])
+            except (ReleaseError, subprocess.TimeoutExpired) as exc:
+                failure = exc
+            self.details["outputs"] = {"log": str(self.log_path)}
+            if python:
+                if (self.out / "junit.xml").exists():
+                    self.details.update(parse_junit(self.out / "junit.xml"))
+                    self.details["outputs"].update(junit=str(self.out / "junit.xml"), junitSha256=sha256(self.out / "junit.xml"))
+            else:
+                self.details["counts"] = parse_frontend(self.log_path.read_text(errors="replace"))
         # Parse actual output even on test failure, retaining full failed/skipped sets.
-        text = self.log_path.read_text(errors="replace")
-        self.details.update(image=image, unhandled=anomalies(text))
+        self.details.update(image=image, unhandled=anomalies(self.log_path.read_text(errors="replace")))
         if (self.out / "toolchain.json").exists():
             self.details["toolchain"] = read_json(self.out / "toolchain.json")
-        if python:
-            if (self.out / "junit.xml").exists():
-                self.details.update(parse_junit(self.out / "junit.xml"))
-        else:
-            self.details["counts"] = parse_frontend(text)
-        self.details["outputs"] = {"log": str(self.log_path)}
-        if python and (self.out / "junit.xml").exists():
-            self.details["outputs"].update(junit=str(self.out / "junit.xml"), junitSha256=sha256(self.out / "junit.xml"))
         if failure:
             raise failure
         require("counts" in self.details and self.details["counts"]["failed"] == 0
@@ -655,35 +826,49 @@ class Stage:
         env, _ = self.environment()
         require(env.get("goBase") == GO_BASE and env.get("goImage"), "gateway build environment is missing or stale")
         image = self.image_id(env["goImage"])
-        target = package / "gateway/bin"
-        target.mkdir(parents=True)
-        script = """export PATH=/usr/local/go/bin:$PATH
-export GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off GOSUMDB=off
-mkdir -p /work/gateway
-cp -a --no-preserve=ownership /inputs/gateway/. /work/gateway/
-cd /work/gateway
-chmod -R u+rwX .
-go version | grep -Eq '^go version go1\\.24\\.4 linux/(amd64|arm64)$'
-go version > /out/toolchain.txt
-go test -race ./...
-for arch in amd64 arm64; do
-  CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/openbear-gateway-linux-$arch ./cmd/openbear-gateway
-done
-/out/openbear-gateway-linux-$(go env GOARCH) --version
-"""
-        self.run_container(image, script, [(self.source / "gateway", "/inputs/gateway", True),
-                                           (target, "/out", False)], role="gateway-build")
-        files = {}
-        for arch in ("amd64", "arm64"):
-            binary = target / f"openbear-gateway-linux-{arch}"
-            require(binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF", "gateway binary is missing or invalid")
-            files[binary.name] = {"sha256": sha256(binary), "bytes": binary.stat().st_size}
-        toolchain = (target / "toolchain.txt").read_text().strip()
-        (target / "toolchain.txt").unlink()
+        # Tested binaries are a pure function of gateway/ and the Go image, so a
+        # candidate that only changed elsewhere reuses them instead of rebuilding.
+        inputs = {name: digest for name, digest in self.source_files.items() if name.startswith("gateway/")}
+        key = digest_json({"image": image, "script": GATEWAY_SCRIPT, "inputs": inputs})
+        directory = owned(self.cache, f"gateway/{key}")
+        with locked(owned(self.cache, f"locks/gateway-{key}.lock")):
+            marker = owned(directory, "complete.json")
+            reused = marker.exists()
+            if not reused:
+                require(not directory.exists(), f"uncommitted gateway cache: {directory}")
+                temp = owned(self.cache, f"gateway/.{key}.{self.attempt}")
+                temp.mkdir(parents=True)
+                go_cache = owned(self.cache, "go-build/gateway")
+                go_cache.mkdir(parents=True, exist_ok=True)
+                try:
+                    self.run_container(image, GATEWAY_SCRIPT, [(self.source / "gateway", "/inputs/gateway", True),
+                                                               (temp, "/out", False), (go_cache, "/gocache", False)], role="gateway-build")
+                    binaries = {}
+                    for arch in ("amd64", "arm64"):
+                        binary = temp / f"openbear-gateway-linux-{arch}"
+                        require(binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF", "gateway binary is missing or invalid")
+                        binaries[binary.name] = {"sha256": sha256(binary), "bytes": binary.stat().st_size}
+                    toolchain = (temp / "toolchain.txt").read_text().strip()
+                    (temp / "toolchain.txt").unlink()
+                    atomic_json(temp / "complete.json", {"key": key, "image": image, "toolchain": toolchain, "binaries": binaries})
+                    os.replace(temp, directory)
+                finally:
+                    if temp.exists():
+                        shutil.rmtree(temp)
+            record = read_json(marker)
+            require(record["key"] == key and record["image"] == image, "gateway cache key mismatch")
+            target = package / "gateway/bin"
+            target.mkdir(parents=True)
+            for name, item in record["binaries"].items():
+                cached = owned(directory, name)
+                require(cached.is_file() and cached.stat().st_size == item["bytes"] and sha256(cached) == item["sha256"],
+                        f"gateway cache content changed: {name}")
+                shutil.copy2(cached, target / name)
+        files, toolchain = record["binaries"], record["toolchain"]
         atomic_json(target / "manifest.json", {"schema": 1, "toolchain": toolchain, "image": image, "binaries": files})
         if (self.source / "gateway/README.md").is_file():
             shutil.copy2(self.source / "gateway/README.md", package / "gateway/README.md")
-        self.details["gateway"] = {"image": image, "toolchain": toolchain, "binaries": files}
+        self.details["gateway"] = {"image": image, "toolchain": toolchain, "binaries": files, "cacheKey": key, "reused": reused}
 
     def package(self):
         identity = self.package_identity()

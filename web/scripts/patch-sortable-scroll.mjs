@@ -39,6 +39,36 @@ export function patchInstalledSortable(requireFrom = import.meta.url) {
     return [target, source, patchScrollSource(source, path.basename(filename))];
   });
   for (const [target, original, patched] of edits) if (patched !== original) fs.writeFileSync(target, patched);
+  patchInstalledNoVnc(requireFrom);
+}
+
+const noVncMarker = '/* OpenBear: avoid top-level await in @novnc/novnc browser detection. */';
+export function patchInstalledNoVnc(requireFrom = import.meta.url) {
+  const require = createRequire(requireFrom);
+  let rfbPath;
+  try {
+    rfbPath = require.resolve('@novnc/novnc');
+  } catch {
+    return;
+  }
+  const browserPath = path.join(path.dirname(rfbPath), 'util', 'browser.js');
+  if (fs.existsSync(browserPath)) {
+    const source = fs.readFileSync(browserPath, 'utf8');
+    const needle = 'supportsWebCodecsH264Decode = await _checkWebCodecsH264DecodeSupport();';
+    if (!source.includes(noVncMarker) && source.includes(needle)) {
+      const patched = `${noVncMarker}\n${source.replace(needle, '_checkWebCodecsH264DecodeSupport().then(v => { supportsWebCodecsH264Decode = v; }).catch(() => {});')}`;
+      fs.writeFileSync(browserPath, patched);
+    }
+  }
+  const cursorPath = path.join(path.dirname(rfbPath), 'util', 'cursor.js');
+  if (fs.existsSync(cursorPath)) {
+    const source = fs.readFileSync(cursorPath, 'utf8');
+    const needle = "this._target.style.cursor = 'none';";
+    if (!source.includes(noVncMarker) && source.includes(needle)) {
+      const patched = `${noVncMarker}\n${source.replace(needle, "this._target.style.cursor = 'default';")}`;
+      fs.writeFileSync(cursorPath, patched);
+    }
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) patchInstalledSortable();

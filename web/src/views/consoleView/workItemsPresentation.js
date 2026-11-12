@@ -60,7 +60,7 @@ function parse(raw) {
 const ACTION_LABELS = {
 	create: "建任务", add: "加子项", update: "修改", note: "记录", decide: "记决策", correct: "记纠正", focus: "执行范围",
 	phase: "阶段", start: "开始", complete: "完成", block: "受阻", ask: "等你定", drop: "不做", reopen: "重新打开",
-	delete: "删除", get: "查看", list: "查看任务",
+	delete: "删除", get: "查看", list: "查看任务", ops: "多步",
 };
 const NOTE_LABELS = {investigation: "调查", proposal: "方案", note: "记录"};
 
@@ -71,11 +71,49 @@ function numbersOf(args) {
 	return args.number ? [String(args.number)] : [];
 }
 
+// ops steps with "$N" / "$N.k" replaced by what step N created, once the result says so.
+function opsSteps(args, result) {
+	const steps = (Array.isArray(args.ops) ? args.ops : []).filter(step => step && typeof step === "object");
+	const done = Array.isArray(result.completed) ? result.completed : [];
+	const created = steps.map((_, index) => {
+		const entry = done.find(item => item?.step === index + 1);
+		return Array.isArray(entry?.created) ? String(entry.created[0] || "") : "";
+	});
+	const resolve = value => {
+		const match = /^#?\$(\d+)((?:\.\d+)*)$/.exec(String(value ?? "").trim());
+		return match && created[Number(match[1]) - 1] ? created[Number(match[1]) - 1] + match[2] : value;
+	};
+	return steps.map((step, index) => {
+		const out = {...step};
+		if ("number" in out) out.number = resolve(out.number);
+		if (Array.isArray(out.items)) out.items = out.items.map(resolve);
+		if (Array.isArray(out.entries)) out.entries = out.entries.map(entry => entry && typeof entry === "object" ? {...entry, number: resolve(entry.number)} : entry);
+		if (Array.isArray(out.decisions)) out.decisions = out.decisions.map(entry => Array.isArray(entry?.items) ? {...entry, items: entry.items.map(resolve)} : entry);
+		const stepResult = done.find(item => item?.step === index + 1)
+			|| (result.failedStep?.step === index + 1 ? {...result.failedStep, ok: false} : {});
+		return {args: out, result: stepResult};
+	});
+}
+
+function opsPreview(args, result) {
+	const steps = opsSteps(args, result);
+	if (!steps.length) return result.ok === false ? `多步 · ${String(result.message || result.error || "未成功").slice(0, 60)}` : "多步";
+	const failed = result.ok === false ? Number(result.failedStep?.step || 0) : 0;
+	const shown = steps.filter((_, index) => !failed || index + 1 < failed).map(step => workItemToolPreview(step.args, step.result));
+	const line = shown.length > 3 ? `${shown.slice(0, 3).join(" → ")} 等 ${shown.length} 步` : shown.join(" → ");
+	if (result.ok !== false) return line;
+	const label = ACTION_LABELS[result.failedStep?.action] || result.failedStep?.action || "";
+	const reason = String(result.message || result.error || "未成功").slice(0, 60);
+	return [line, failed ? `第 ${failed} 步${label ? `「${label}」` : ""}未成功：${reason}` : reason].filter(Boolean).join(" · ");
+}
+
 // "#4.3 → 已完成", "执行范围 #4.4", "建任务 “修复安全问题”"; never claims an outcome the result lacks.
 export function workItemToolPreview(rawArguments, rawResult = "") {
 	const args = parse(rawArguments), result = parse(rawResult);
-	const action = String(args.action || "list");
-	const numbers = numbersOf(args).map(number => `#${number.replace(/^#/, "")}`);
+	const action = String(args.action || (Array.isArray(args.ops) ? "ops" : "list"));
+	if (action === "ops") return opsPreview(args, result);
+	// An ops step's "$1" not yet resolved stays as written.
+	const numbers = numbersOf(args).map(number => number.startsWith("$") ? number : `#${number.replace(/^#/, "")}`);
 	const list = numbers.length > 3 ? `${numbers.slice(0, 3).join("、")} 等 ${numbers.length} 项` : numbers.join("、");
 	if (result.ok === false) return [ACTION_LABELS[action] || action, list, String(result.message || result.error || "未成功").slice(0, 60)].filter(Boolean).join(" · ");
 	if (action === "create") return `建任务 “${String(args.title || "").slice(0, 60)}”${result.number ? ` #${result.number}` : ""}`;
@@ -94,10 +132,18 @@ export function workItemToolPreview(rawArguments, rawResult = "") {
 
 // The item a WorkItem call is about, for opening the panel at it.
 export function workItemCallNumber(rawArguments, rawResult = "") {
+	return workItemCallNumbers(rawArguments, rawResult)[0] || "";
+}
+
+// Every item a call names; for ops, each step's in order.
+function workItemCallNumbers(rawArguments, rawResult = "") {
 	const args = parse(rawArguments), result = parse(rawResult);
-	if (result.number) return String(result.number);
-	const numbers = numbersOf(args);
-	return numbers.length ? numbers[0].replace(/^#/, "") : "";
+	if (String(args.action || "") === "ops" || (!args.action && Array.isArray(args.ops))) {
+		return opsSteps(args, result).flatMap(step => workItemCallNumbers(step.args, step.result))
+			.filter(number => /^\d/.test(number));
+	}
+	if (result.number) return [String(result.number)];
+	return numbersOf(args).map(number => number.replace(/^#/, ""));
 }
 
 // Top-level tasks a turn's WorkItem calls touched, in first-seen order.
@@ -107,9 +153,12 @@ export function turnTaskNumbers(events, out = []) {
 		for (const call of event?.calls || []) {
 			if (call?.name !== "WorkItem") continue;
 			const args = parse(call.arguments || call.previewArguments);
-			const number = workItemCallNumber(args, event?.result?.content || "");
-			const top = topNumber(number);
-			if (top && !out.includes(top)) out.push(top);
+			const numbers = (String(args.action || "") === "ops" || (!args.action && Array.isArray(args.ops))) ? workItemCallNumbers(args, event?.result?.content || "")
+				: [workItemCallNumber(args, event?.result?.content || "")];
+			for (const number of numbers) {
+				const top = topNumber(number);
+				if (top && !out.includes(top)) out.push(top);
+			}
 		}
 	}
 	return out;

@@ -5,6 +5,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"openbear/node/mesh/bypass"
 )
 
 // localAddrOf is what status shows as a path's local address: the
@@ -56,7 +58,8 @@ func (c *sourceCache) of(remote netip.Addr, now time.Time) (netip.Addr, bool) {
 		}
 	}
 	s := source{at: now}
-	if conn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 9))); err == nil {
+	d := net.Dialer{Control: bypass.MeshControl}
+	if conn, err := d.Dial("udp", netip.AddrPortFrom(remote, 9).String()); err == nil {
 		if a, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 			s.addr = a.AddrPort().Addr().Unmap()
 			s.ok = s.addr.IsValid() && !s.addr.IsUnspecified()

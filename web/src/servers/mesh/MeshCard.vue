@@ -1,4 +1,6 @@
 <script setup>
+import { Share } from '@element-plus/icons-vue';
+import CardIcon from '../detail/CardIcon.vue';
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { install, mesh, meshErrorText, refresh } from './meshStore.js';
@@ -37,7 +39,7 @@ onBeforeUnmount(() => clearTimeout(timer));
 </script>
 <template>
   <section v-if="mesh.data" class="ix-card mesh-card" aria-label="组网">
-    <header class="ix-card-head"><h3>组网</h3><span class="ob-grow" />
+    <header class="ix-card-head"><h3><CardIcon :icon="Share" tone="success" />组网</h3><span class="ob-grow" />
       <button v-if="member" type="button" class="ix-text-button" @click="emit('open', serverId)">在组网中查看</button>
       <button v-else type="button" class="ix-text-button" :disabled="busy || Boolean(reason)" @click="join">{{ busy ? '正在加入…' : '加入组网' }}</button>
     </header>

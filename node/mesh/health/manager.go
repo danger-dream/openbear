@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"openbear/node/mesh/clock"
 	"openbear/node/mesh/transport"
+	"openbear/node/mesh/wire"
 	"reflect"
 	"slices"
 	"sync"
@@ -722,6 +723,9 @@ func (m *Manager) failed(p *candidateState, now time.Time) {
 	}
 	p.retry = now.Add(min(limit, jitter(p.backoff, .2)))
 	p.next = p.retry
+	if !m.reach.last.IsZero() && now.Sub(m.reach.last) >= reachAgain && m.reach.next.After(now) {
+		m.reach.next = now
+	}
 	m.entryLost(p, now)
 	m.noEntry()
 }
@@ -756,6 +760,7 @@ func (m *Manager) send(peer string, path Path, v message, id uint64) error {
 		// every relay link, each second, declare the range.
 		local := m.cfg.Protocol.Or()
 		v.Min, v.Max = local.Min, local.Max
+		v.LargeFrames = m.cfg.LargeFrames && local.Has(wire.LargeFrames)
 	}
 	v.Network = m.cfg.Network
 	v.Revision = m.cfg.Revision
@@ -953,6 +958,10 @@ func (m *Manager) tick(now time.Time) {
 	}
 	m.refresh(now)
 	for key, n := range m.notices {
+		if l, ok := m.relayLink(n.peer); !ok || !m.noticeLinkUp(l) {
+			delete(m.notices, key)
+			continue
+		}
 		if !now.Before(n.expires) {
 			m.emit("owner.unconfirmed", fmt.Sprintf("%s member=%s seq=%d: lease expired without ACK", n.peer, n.notice.Member, n.notice.Seq))
 			delete(m.notices, key)
@@ -998,6 +1007,7 @@ func (m *Manager) tick(now time.Time) {
 // trackTick expires p's probes and says whether that added failures.
 func (m *Manager) trackTick(p *candidateState, now time.Time) bool {
 	before := p.track.stats.Failures
+	localBefore := p.track.stats.LocalExpired
 	p.track.tick(now)
 	m.expire(p, now)
 	for id := range p.pending {
@@ -1012,7 +1022,7 @@ func (m *Manager) trackTick(p *candidateState, now time.Time) bool {
 			delete(p.echoes, id)
 		}
 	}
-	return p.track.stats.Failures > before
+	return p.track.stats.Failures > before || p.track.stats.LocalExpired > localBefore
 }
 
 // candidateStates follows what status shows of each entry candidate.
@@ -1144,6 +1154,10 @@ func (m *Manager) pathEvent(e PathEvent) {
 			m.certificateRejected(p)
 		}
 		if e.Closed {
+			if p.path.ID != "" && (p.config.ID != m.active || p.config.Punch) {
+				m.backend.Deactivate(p.config.Peer, p.path)
+				m.backend.Release(p.path)
+			}
 			p.reprepare = false
 			if p.trend != nil {
 				p.trend.swapped, p.trend.sawReclaim = time.Time{}, false
@@ -1166,6 +1180,10 @@ func (m *Manager) pathEvent(e PathEvent) {
 				m.start(p, time.Now())
 			}
 		}
+	}
+	if in, ok := m.inbound[e.Path]; ok && e.Closed {
+		m.backend.Deactivate(in.peer, e.Path)
+		m.backend.Release(e.Path)
 	}
 	delete(m.inbound, e.Path)
 }
@@ -1245,13 +1263,17 @@ func (m *Manager) receive(r Received) {
 			d.remoteUp = v.Direct && d.link != nil
 			v.Direct = d.local
 		}
-		if m.cfg.Role == "relay" && slices.Contains(m.store.state.Authorized[r.Peer], m.cfg.Self) {
+		if m.linked(r.Peer) {
+			// The dialing side prepares a link once; it has to be asked again
+			// whenever this side has not the path committed, or this side never
+			// sends over it: after this side restarts, or when it answered the
+			// prepare while the peer was not yet a link here (a member becoming
+			// a relay, whose new config reached it first) and committed nothing.
+			// A punched link's ends each commit the path they probe themselves.
+			v.Reclaim = !in.prepared || (m.directs[r.Peer] == nil && !m.backend.Committed(r.Peer, r.Path))
+		} else if m.cfg.Role == "relay" && slices.Contains(m.store.state.Authorized[r.Peer], m.cfg.Self) {
 			owner, ok := m.owners.owner(r.Peer, now)
 			v.Reclaim = !in.prepared || !ok || (owner == m.cfg.Self && in.sequence == 0)
-		} else if m.linked(r.Peer) {
-			// The dialing side prepares a link once; after this side restarts it
-			// has to be asked again, or this side never commits the path.
-			v.Reclaim = !in.prepared
 		}
 		m.send(r.Peer, r.Path, v, 0)
 		m.routePinged(r.Peer, v.Nonce, now)
@@ -1287,7 +1309,7 @@ func (m *Manager) receive(r Received) {
 		if d := m.directOf(p); d != nil {
 			d.remoteUp = v.Direct
 		}
-		if m.candidates[p.config.ID] == p {
+		if m.candidates[p.config.ID] == p || (m.cfg.Role != "relay" && m.owners.relays[p.config.Peer] && m.links[p.config.Peer] == p) {
 			m.observedBy(p.config.Peer, v.Observed, now)
 		}
 		if v.Echo != "" && len(v.Echo) <= 64 {
@@ -1535,20 +1557,37 @@ func (m *Manager) notice(member string, seq, refresh uint64, msig string) Notice
 	return n
 }
 
+func (m *Manager) noticeLinkUp(l Link) bool {
+	if l.Punch {
+		return m.directUp(l.Peer)
+	}
+	if m.cfg.Role != "relay" && m.links[l.Peer] == nil && len(m.inbound) == 0 {
+		return true
+	}
+	if rl := m.relay.links[l.Peer]; rl != nil && !rl.live {
+		return false
+	}
+	_, ok := m.peerPath(l.Peer)
+	return ok && m.routeLive(l)
+}
+
 func (m *Manager) broadcast(n Notice, except string) {
 	now := time.Now()
 	for _, l := range m.cfg.Links {
-		// A punched relay link not up gets the claims with the next refresh
+		// A relay link not up gets the claims with the next refresh
 		// after it is.
-		if !m.owners.relays[l.Peer] || l.Peer == except || (l.Punch && !m.directUp(l.Peer)) {
+		if !m.owners.relays[l.Peer] || l.Peer == except || !m.noticeLinkUp(l) {
 			continue
 		}
 		key := l.Peer + ":" + n.Member
-		since := now
+		since, expires := now, now.Add(time.Duration(n.LeaseMs)*time.Millisecond)
 		if old, ok := m.notices[key]; ok {
 			since = old.since
+			if old.notice.Owner == n.Owner && old.notice.Seq == n.Seq {
+				expires = old.expires
+			}
 		}
-		m.notices[key] = outboundNotice{notice: n, peer: l.Peer, next: now, expires: now.Add(time.Duration(n.LeaseMs) * time.Millisecond), since: since}
+		m.notices[key] = outboundNotice{notice: n, peer: l.Peer, next: now, expires: expires, since: since}
 	}
 }
 func (m *Manager) pendingNotices(now time.Time) int {

@@ -1,4 +1,4 @@
-import { computed, getCurrentInstance, inject, isRef, onBeforeUnmount, watch } from 'vue';
+import { computed, getCurrentInstance, inject, isRef, onBeforeUnmount, ref, watch } from 'vue';
 
 // Whether the mesh is on screen: the mesh tab is the one shown and the servers page is not put away
 // (KeepAlive). MeshView provides it; outside it (tests, a lone panel) the mesh counts as shown.
@@ -11,7 +11,9 @@ export const useMeshVisible = () => inject(MESH_VISIBLE, computed(() => true));
 // While `active` is false nothing more is scheduled; when it turns true it runs at once.
 // `fn(current)`: current() tells whether this run is still the latest (a later run() or the end of the
 // component makes it stale), so a late answer does not overwrite a newer one.
+// next: when the next run is due (ms since the epoch), 0 while one runs or none is scheduled.
 export function usePoll(fn, {interval, active = useMeshVisible()} = {}) {
+  const next = ref(0);
   const every = () => Number((typeof interval === 'function' ? interval() : interval) || 0);
   const shown = () => Boolean(isRef(active) ? active.value : typeof active === 'function' ? active() : active ?? true);
   let timer = null, round = 0, alive = true;
@@ -19,9 +21,10 @@ export function usePoll(fn, {interval, active = useMeshVisible()} = {}) {
     clearTimeout(timer); timer = null;
     const ms = every();
     if (alive && ms > 0 && shown()) timer = setTimeout(run, ms);
+    next.value = timer ? Date.now() + ms : 0;
   }
   async function run() {
-    clearTimeout(timer); timer = null;
+    clearTimeout(timer); timer = null; next.value = 0;
     const mine = ++round;
     if (!alive || !shown() || !every()) return;
     if (!document.hidden) {
@@ -33,5 +36,5 @@ export function usePoll(fn, {interval, active = useMeshVisible()} = {}) {
   function stop() { round++; clearTimeout(timer); timer = null; }
   watch(shown, now => { if (now) void run(); else { clearTimeout(timer); timer = null; } });
   if (getCurrentInstance()) onBeforeUnmount(() => { alive = false; stop(); });
-  return {run, schedule, stop};
+  return {run, schedule, stop, next};
 }

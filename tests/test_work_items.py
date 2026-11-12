@@ -430,7 +430,7 @@ async def test_files_open_only_from_the_record_and_never_secrets(db, api):
     await dao.transition(CONV, controller(), "1.2", "complete", summary="ok", evidence=[
         {"kind": "file", "path": str(root / "app.py")}, {"kind": "file", "path": str(root / "openbear.json")},
         {"kind": "report", "path": "workspace/artifacts/report.md"}, {"kind": "file", "path": str(other / "main.go")},
-        {"kind": "file", "path": "/etc/nginx/nginx.conf", "server": "BeroHost-Fra"}])
+        {"kind": "file", "path": "/etc/nginx/nginx.conf", "server": "Edge-FRA"}])
     base = f"/api/conversations/{CONV}/work-items/1.2/file"
     meta = await (await client.get(base, params={"ref": "item:0"})).json()
     assert meta["artifact"]["fileName"] == "app.py" and meta["artifact"]["projectFile"] is True
@@ -442,5 +442,94 @@ async def test_files_open_only_from_the_record_and_never_secrets(db, api):
     assert await (await client.get(base + "/content", params={"ref": "item:3"})).text() == "package main\n"
     assert (await client.get(base, params={"ref": "item:4"})).status == 404
     detail = await (await client.get(f"/api/conversations/{CONV}/work-items/1.2")).json()
-    assert detail["item"]["evidence"][4]["server"] == "BeroHost-Fra"
+    assert detail["item"]["evidence"][4]["server"] == "Edge-FRA"
     assert (await client.get(base, params={"ref": "item:9"})).status == 404
+
+
+async def ops_call(registry, ops, *, events=None):
+    async def publish(event):
+        events.append(event)
+
+    ctx = ToolRuntimeContext(conversation_uuid=CONV, turn_uuid=TURN, run_root_turn_uuid=TURN, source="web",
+                             tool_call_id="call-ops", conversation_event=publish if events is not None else None)
+    token = _TOOL_CONTEXT.set(ctx)
+    try:
+        return json.loads(await registry._tools["WorkItem"].handler({"action": "ops", "ops": ops}))
+    finally:
+        _TOOL_CONTEXT.reset(token)
+
+
+async def test_ops_create_decide_focus_start_in_one_call(db, registry):
+    await user_message(db, "msg:a", TURN, "把网关修了，就按这个方案做")
+    events = []
+    out = await ops_call(registry, [
+        {"action": "create", "title": "修网关", "children": ["改配置", "补测试"]},
+        {"action": "decide", "items": ["$1"]},
+        {"action": "focus", "items": ["$1"]},
+        {"action": "start", "number": "$1.1"},
+    ], events=events)
+    assert out["ok"] is True and [step["action"] for step in out["completed"]] == ["create", "decide", "focus", "start"]
+    assert out["completed"][0]["created"] == ["1", "1.1", "1.2"]
+    assert out["completed"][2]["focus"] == ["1"]
+    assert out["completed"][3]["items"][0]["number"] == "1.1" and out["completed"][3]["items"][0]["status"] == "进行中"
+    # One panel notification for the whole call.
+    assert len(events) == 1 and events[0]["action"] == "ops" and events[0]["numbers"][:3] == ["1", "1.1", "1.2"]
+
+
+async def test_ops_note_then_complete_and_complete_then_start(db, registry):
+    await user_message(db, "msg:a", TURN, "只做 #1 这一项")
+    await tool_call(registry, {"action": "create", "title": "修复", "children": ["a", "b", "c"]})
+    await tool_call(registry, {"action": "focus", "items": ["1"]})
+    await tool_call(registry, {"action": "start", "number": "1.1"})
+    evidence = [{"kind": "test", "text": "3 passed"}]
+    out = await ops_call(registry, [
+        {"action": "note", "number": "1.1", "kind": "investigation", "summary": "原因是锁外读取"},
+        {"action": "complete", "number": "1.1", "summary": "改到锁内", "evidence": evidence},
+    ])
+    assert out["ok"] is True and out["completed"][0]["recorded"] == "1.1"
+    assert out["completed"][1]["items"][0]["status"] == "已完成"
+    out = await ops_call(registry, [
+        {"action": "start", "number": "1.2"},
+        {"action": "complete", "number": "1.2", "summary": "好了", "evidence": evidence},
+        {"action": "start", "number": "1.3"},
+    ])
+    assert out["ok"] is True and [step["items"][0]["status"] for step in out["completed"]] == ["进行中", "已完成", "进行中"]
+
+
+async def test_ops_stop_at_the_first_failure_and_keep_earlier_steps(db, registry):
+    await user_message(db, "msg:a", TURN, "只做 #1.1")
+    await tool_call(registry, {"action": "create", "title": "修复", "children": ["a", "b"]})
+    await tool_call(registry, {"action": "focus", "items": ["1.1"]})
+    out = await ops_call(registry, [
+        {"action": "start", "number": "1.1"},
+        {"action": "start", "number": "1.2"},
+        {"action": "note", "number": "1.2", "summary": "never runs"},
+    ])
+    assert out["ok"] is False and out["error"] == "outside_focus"
+    assert out["failedStep"]["step"] == 2 and out["failedStep"]["action"] == "start"
+    assert [step["step"] for step in out["completed"]] == [1] and out["notRun"] == 1
+    assert (await WorkItemsDAO(db).get_row(CONV, "1.1"))["status"] == "doing"
+    # Each step keeps its own checks (phase=decided needs a quote); refs must name an earlier create/add.
+    bad_ref = await ops_call(registry, [{"action": "note", "number": "$1", "summary": "x"}])
+    assert bad_ref["error"] == "invalid_reference" and bad_ref["completed"] == []
+    no_quote = await ops_call(registry, [{"action": "phase", "number": "1", "phase": "decided"}])
+    assert no_quote["error"] == "quote_required"
+    nested = await ops_call(registry, [{"action": "ops", "ops": []}])
+    assert nested["error"] == "invalid_step"
+
+
+async def test_quotes_ignore_spacing_width_and_punctuation_and_show_the_closest_passage(db):
+    dao = WorkItemsDAO(db)
+    await user_message(db, "msg:a", TURN, "网关先别动。防火墙规则，按端口（22、443）收紧就行！")
+    source = await dao.resolve_source(CONV, controller(), {"quote": "防火墙规则 按端口(22,443)收紧就行"},
+                                      require_human=True, require_quote=True)
+    assert source.extra["quote"] == "防火墙规则 按端口(22,443)收紧就行"
+    assert await dao.resolve_source(CONV, controller(), {"quote": "按端口（２２、４４３）收紧"},
+                                    require_human=True, require_quote=True)
+    with pytest.raises(WorkItemError) as exc:
+        await dao.resolve_source(CONV, controller(), {"quote": "防火墙规则按端口全部放开"}, require_human=True, require_quote=True)
+    assert exc.value.code == "quote_not_found"
+    assert "防火墙规则，按端口" in exc.value.message
+    with pytest.raises(WorkItemError) as exc:
+        await dao.resolve_source(CONV, controller(), {"quote": "，。！"}, require_human=True, require_quote=True)
+    assert exc.value.code == "quote_not_found"

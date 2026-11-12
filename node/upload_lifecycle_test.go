@@ -223,3 +223,64 @@ func TestUploadCleanupWaitsAndRechecksIdleTime(t *testing.T) {
 		})
 	}
 }
+
+// A node restarted or updated in the middle of an upload loses its memory of
+// it; the next run removes the temp file that upload left, and nothing else.
+func TestUploadLeftByAnEarlierRunIsRemovedOnTheNextOne(t *testing.T) {
+	dir, records := t.TempDir(), filepath.Join(t.TempDir(), ".uploads")
+	first := newUploads()
+	first.recover(records)
+	path := filepath.Join(dir, "big.iso")
+	if err := uploadChunk(first, path, "upload0001", 0, "partial", false); err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(dir, ".big.iso.obupload-upload0001")
+	if _, err := os.Stat(temp); err != nil {
+		t.Fatal(err)
+	}
+	// Finished, cancelled and dropped uploads keep no record.
+	if err := uploadChunk(first, filepath.Join(dir, "done"), "upload0002", 0, "whole", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadChunk(first, filepath.Join(dir, "gone"), "upload0003", 0, "part", false); err != nil {
+		t.Fatal(err)
+	}
+	first.drop("upload0003")
+	// A user's file that only looks like a temp file, and a record naming a file it does not own.
+	alike := filepath.Join(dir, ".big.iso.obupload-upload0009")
+	os.WriteFile(alike, []byte("mine"), 0o600)
+	os.WriteFile(filepath.Join(records, "upload0008"), []byte(filepath.Join(dir, "big.iso")), 0o600)
+	os.WriteFile(path, []byte("keep"), 0o600)
+	names := func() (out []string) {
+		entries, _ := os.ReadDir(records)
+		for _, e := range entries {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+	if got := names(); len(got) != 2 || got[0] != "upload0001" || got[1] != "upload0008" {
+		t.Fatalf("records: %v", got)
+	}
+
+	next := newUploads() // the node's next run
+	next.recover(records)
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("the earlier run's temp file is still there: %v", err)
+	}
+	if b, _ := os.ReadFile(alike); string(b) != "mine" {
+		t.Fatal("a file without a record was removed")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "keep" {
+		t.Fatal("a record removed a file that is not a temp file")
+	}
+	if got := names(); len(got) != 0 {
+		t.Fatalf("records left: %v", got)
+	}
+	// The new run records its own uploads.
+	if err := uploadChunk(next, path, "upload0004", 0, "x", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(); len(got) != 1 || got[0] != "upload0004" {
+		t.Fatalf("records: %v", got)
+	}
+}

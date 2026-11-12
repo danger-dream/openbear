@@ -5,7 +5,7 @@ import {mkdirSync} from 'node:fs';
 import {startBrowserTestServer} from '../browserTestServer.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 const shots = process.env.OPENBEAR_SCREENSHOT_DIR || '';
 
 // The real composer, picker, inspector and transcript renderer; only /api is a fixture.

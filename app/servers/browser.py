@@ -4,7 +4,9 @@ the node's browser carries that machine's logins and network."""
 from __future__ import annotations
 
 import json
+import time
 
+from app.instances.contracts import InstanceError
 from app.webhooks.repository import many, one
 
 
@@ -26,6 +28,27 @@ class NodeBrowsers:
         # Whether any node offers a browser: shows the Browser tool without a local browser.
         self.any_browser = False
         self.on_change = None
+
+    async def update(self, owner, server_id, data, *, source='web', origin=None):
+        """The node's downloaded Chrome for Testing against the current stable one ({check: true}), or
+        moved to it: the node downloads it in the background and browser_status shows how far (update).
+        A browser running the old one is restarted on the new one only with restart: true; otherwise
+        it keeps running it until it is next started. Never done by itself, not even by a node update."""
+        if (not isinstance(data, dict) or set(data) - {'check', 'restart'} or type(data.get('check', False)) is not bool
+                or type(data.get('restart', False)) is not bool):
+            raise InstanceError('invalid_browser_update')
+        await self.service.registry.get(owner, server_id)
+        session = self.service.hub.sessions.get(server_id)
+        if session and 'browser.update' not in session.features:
+            raise InstanceError('node_update_required', 409)
+        params = {'check': data.get('check', False), 'restart': data.get('restart', False)}
+        result = await self.service._call_newer(owner, server_id, 'browser.update', 'browser.update', params, timeout=90)
+        update = {'current': str(result.get('current') or ''), 'latest': str(result.get('latest') or ''),
+                  'upToDate': result.get('upToDate') is True, 'started': result.get('started') is True}
+        if update['started']:
+            await self.service._log(owner, server_id, source, f"更新浏览器：测试版 Chrome {update['current']} → {update['latest']}"
+                                    f"{'，并重启浏览器' if params['restart'] else ''}", int(time.time() * 1000), {'exitCode': 0, 'outcome': 'started'}, origin)
+        return {'ok': True, 'update': update}
 
     def link(self, server_id):
         if server_id not in self.links:

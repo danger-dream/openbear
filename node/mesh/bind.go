@@ -35,6 +35,8 @@ type meshBind interface {
 	dialedStreams() map[string]string
 	// streamConns lists the TCP and TLS connections that are up.
 	streamConns() []streamConn
+	ReceiveDrops() transport.ReceiveDrops
+	LargeReceive() transport.LargeReceiveCounts
 }
 
 func newBind(dir string, c *Config) (meshBind, error) {
@@ -67,7 +69,7 @@ type streamBind struct {
 func (b *streamBind) options(c *Config) transport.Options {
 	return transport.Options{ListenUDP: c.Self.Listen.UDP, ListenTCP: c.Self.Listen.TCP, ListenTLS: c.Self.Listen.TLS,
 		TLSDir: filepath.Join(b.dir, "tls"), MTU: c.Network.MTU, ResourceProfile: resourceProfile(c), Reflector: c.isRelay() && c.Self.Listen.UDP != 0, UDP: c.wantsUDP(),
-		Protocol: protocol, Logf: func(format string, args ...any) { log.Printf("transport: "+format, args...) }}
+		Protocol: protocol, LargeFrames: largePool, SendLarge: c.largePackets(), Logf: func(format string, args ...any) { log.Printf("transport: "+format, args...) }}
 }
 
 // wantsUDP is whether the node keeps a UDP socket without a UDP listener:

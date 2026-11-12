@@ -9,9 +9,14 @@ import (
 	"openbear/node/mesh/health"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -30,10 +35,49 @@ func TestNetnsNode(t *testing.T) {
 	if v := os.Getenv("OBLAB_CONFIG_SCHEMAS"); v != "" {
 		fmt.Sscanf(v, "%d,%d", &configSchemas[0], &configSchemas[1])
 	}
+	// OBLAB_PIN_HOLD, a duration, stands in for how long a fixed path that went
+	// down has to stay up before it is used again.
+	if v, err := time.ParseDuration(os.Getenv("OBLAB_PIN_HOLD")); err == nil {
+		pinHold = v
+	}
+	// A relay that drops the packets it forwards marked with some ranks, its
+	// links up: OBLAB_DROP_RANKS names a file of those ranks, read every 200 ms.
+	if file := os.Getenv("OBLAB_DROP_RANKS"); file != "" {
+		var ranks atomic.Pointer[[]int]
+		ranks.Store(&[]int{})
+		go func() {
+			for ; ; time.Sleep(200 * time.Millisecond) {
+				raw, _ := os.ReadFile(file)
+				var list []int
+				for _, f := range strings.Fields(string(raw)) {
+					if n, err := strconv.Atoi(f); err == nil {
+						list = append(list, n)
+					}
+				}
+				ranks.Store(&list)
+			}
+		}()
+		dropForwarded = func(p ipv4) bool {
+			rank, marked := p.pathRank()
+			return marked && slices.Contains(*ranks.Load(), rank)
+		}
+	}
 	// A node on Windows' clock: OBLAB_CLOCK=windows.
 	if os.Getenv("OBLAB_CLOCK") == "windows" {
 		defer meshclock.Simulate(windowsClock())()
 	}
+	// SIGUSR1 writes a heap profile, heap-N.pprof, into the node's dir.
+	profiles := make(chan os.Signal, 1)
+	signal.Notify(profiles, syscall.SIGUSR1)
+	go func() {
+		for n := 1; ; n++ {
+			<-profiles
+			if f, err := os.Create(filepath.Join(dir, fmt.Sprintf("heap-%d.pprof", n))); err == nil {
+				pprof.Lookup("heap").WriteTo(f, 0)
+				f.Close()
+			}
+		}
+	}()
 	// Redialing on test time: OBLAB_REDIAL=fast.
 	if os.Getenv("OBLAB_REDIAL") == "fast" {
 		defer health.SetRedialParams(fastRedial())()

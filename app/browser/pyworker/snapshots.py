@@ -8,6 +8,7 @@ from .common import BrowserError, ProtocolError, operation
 
 
 async def snapshot(page, action, params):
+    document_id = page.document_id
     refs = {}
     warnings = []
     epochs = {}
@@ -83,6 +84,8 @@ async def snapshot(page, action, params):
         if any(page.frames[fid].epoch != epoch for fid, epoch in epochs.items()):
             raise BrowserError("document_changed: take a new snapshot")
         text = await frame.run("function(data){return this.__renderSnapshot(data)}", data)
+        if page.document_id != document_id:
+            raise BrowserError("document_changed: take a new snapshot")
     finally:
         if root:
             await root.release()
@@ -114,7 +117,8 @@ async def snapshot(page, action, params):
     visible = set(re.findall(r"\[ref=[^:]+:([^\]]+)\]", text))
     page.snapshot = version
     page.refs = {ref: value for ref, value in refs.items() if ref in visible}
-    result = {"snapshotId": version, "text": text, "truncated": truncated, "url": page.url}
+    result = {"snapshotId": version, "text": text, "truncated": truncated, "url": page.url,
+              "documentId": document_id}
     if warnings:
         result["warnings"] = warnings
     return result

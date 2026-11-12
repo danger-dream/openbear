@@ -22,11 +22,11 @@ type QueueHandshakeElement struct {
 	msgType  uint32
 	packet   []byte
 	endpoint conn.Endpoint
-	buffer   *[MaxMessageSize]byte
+	buffer   *messageBuffer
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer   *messageBuffer
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
@@ -69,7 +69,12 @@ func (peer *Peer) keepKeyFreshReceiving() {
  * Every time the bind is updated a new routine is started for
  * IPv4 and IPv6 (separately)
  */
-func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
+// RoutineReceiveIncoming with a pool of its own (the priority or the large
+// one) takes its buffers from it, and batches no more than that holds
+// beside one spare, nor, for the large one, more than LargeBatchSize.
+// adopt: recv may hand messages over in buffers of its own
+// (conn.LargeSwapReceiver), which become the read buffers' Data.
+func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc, pool *messagePool, adopt bool, unbinding <-chan struct{}) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
@@ -82,8 +87,14 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 	// receive datagrams until conn is closed
 
+	if pool != nil {
+		if pool == device.resources.largeRx {
+			maxBatchSize = min(maxBatchSize, device.resources.limits.LargeBatchSize)
+		}
+		maxBatchSize = max(1, min(maxBatchSize, cap(pool.free)-1))
+	}
 	var (
-		bufsArrs    = make([]*[MaxMessageSize]byte, maxBatchSize)
+		bufsArrs    = make([]*messageBuffer, maxBatchSize)
 		bufs        = make([][]byte, maxBatchSize)
 		err         error
 		sizes       = make([]int, maxBatchSize)
@@ -94,11 +105,28 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	)
 
 	for i := range bufsArrs {
-		bufsArrs[i] = device.GetMessageBuffer()
+		bufsArrs[i] = device.receiveBuffer(pool)
 		if bufsArrs[i] == nil {
 			return
 		}
-		bufs[i] = bufsArrs[i][:]
+		bufs[i] = bufsArrs[i].Data
+	}
+
+	// flush hands on what the batch has for each peer so far.
+	flush := func() {
+		for peer, elemsContainer := range elemsByPeer {
+			if peer.isRunning.Load() {
+				peer.queue.inbound.c <- elemsContainer
+				device.queue.decryption.c <- elemsContainer
+			} else {
+				for _, elem := range elemsContainer.elems {
+					device.PutMessageBuffer(elem.buffer)
+					device.PutInboundElement(elem)
+				}
+				device.PutInboundElementsContainer(elemsContainer)
+			}
+			delete(elemsByPeer, peer)
+		}
 	}
 
 	defer func() {
@@ -111,6 +139,15 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 	for {
 		count, err = recv(bufs, sizes, endpoints)
+		// A buffer recv handed over in place of one it read into becomes
+		// that one's Data, the messageBuffer and its pool owner unchanged,
+		// before anything below can use or return it; recv keeps the
+		// displaced slice. Also with an error.
+		if adopt {
+			for i := 0; i < count && i < len(bufs); i++ {
+				bufsArrs[i].Data = bufs[i]
+			}
+		}
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -136,7 +173,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check size of packet
 
-			packet := bufsArrs[i][:size]
+			packet := bufsArrs[i].Data[:size]
 			msgType := binary.LittleEndian.Uint32(packet[:4])
 
 			switch msgType {
@@ -159,18 +196,27 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				value := device.indexTable.Lookup(receiver)
 				keypair := value.keypair
 				if keypair == nil {
+					device.rxDrops.staleKey.Add(1)
 					continue
 				}
 
 				// check keypair expiry
 
 				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
+					device.rxDrops.staleKey.Add(1)
 					continue
 				}
 
-				next := device.nextMessageBuffer()
+				next := device.nextReceiveBuffer(pool)
 				if next == nil {
-					continue
+					// Every buffer is taken: rather than drop what the bind
+					// already handed over, pass on the batch so far and wait
+					// for one to come back. The bind holds what it has
+					// meanwhile, and a stream's sender slows down.
+					flush()
+					if next = device.waitReceiveBuffer(pool, unbinding); next == nil {
+						return
+					}
 				}
 				// create work element
 				peer := value.peer
@@ -189,7 +235,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
 				bufsArrs[i] = next
-				bufs[i] = bufsArrs[i][:]
+				bufs[i] = bufsArrs[i].Data
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -214,8 +260,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				continue
 			}
 
-			next := device.nextMessageBuffer()
+			next := device.nextReceiveBuffer(pool)
 			if next == nil {
+				device.dropNoBuffer(pool)
 				continue
 			}
 			select {
@@ -226,24 +273,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				endpoint: endpoints[i],
 			}:
 				bufsArrs[i] = next
-				bufs[i] = bufsArrs[i][:]
+				bufs[i] = bufsArrs[i].Data
 			default:
 				device.PutMessageBuffer(next)
 			}
 		}
-		for peer, elemsContainer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.queue.inbound.c <- elemsContainer
-				device.queue.decryption.c <- elemsContainer
-			} else {
-				for _, elem := range elemsContainer.elems {
-					device.PutMessageBuffer(elem.buffer)
-					device.PutInboundElement(elem)
-				}
-				device.PutInboundElementsContainer(elemsContainer)
-			}
-			delete(elemsByPeer, peer)
-		}
+		flush()
 	}
 }
 
@@ -476,10 +511,12 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		for i, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
+				device.rxDrops.decrypt.Add(1)
 				continue
 			}
 
 			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
+				device.rxDrops.replay.Add(1)
 				continue
 			}
 
@@ -539,7 +576,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			bufs = append(bufs, elem.buffer.Data[:MessageTransportOffsetContent+len(elem.packet)])
 			metadata = append(metadata, conn.ReceiveMetadata{PublicKey: [32]byte(peer.handshake.remoteStatic), Endpoint: elem.endpoint, MessageType: MessageTransportType})
 		}
 

@@ -96,6 +96,10 @@ test('results: failures by kind, the summary with one decimal below 10 ms, dns e
   // Over the server's lookup quota: never asked for, so nothing to wait for; the page says 未查询.
   assert.equal(h.geoPending({scope: 'public', geo: null, geoSkipped: true}), false);
   assert.equal(h.hopsWaitingForGeo([{addrs: [{scope: 'public', geo: null, geoSkipped: true}]}]), false);
+  // A slow lookup is waited for as long as the controller says it is under way; one that found nothing is 未查到 at once.
+  assert.equal(h.hopsWaitingForGeo([{addrs: [{scope: 'public', geo: null, geoLooking: true}]}]), true);
+  assert.equal(h.hopsWaitingForGeo([{addrs: [{scope: 'public', geo: null, geoLooking: false}]}]), false);
+  assert.equal(h.geoPending({scope: 'public', geo: null, geoLooking: false}), true, 'still shown as 未查到');
   const view = fs.readFileSync(new URL('./NetProbe.vue', import.meta.url), 'utf8');
   assert.equal((view.match(/a\.geoSkipped \? '未查询' : geoPending\(a\) \? '未查到'/g) || []).length, 2, 'both the phone list and the desktop table');
 });

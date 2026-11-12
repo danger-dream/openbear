@@ -114,6 +114,9 @@ type uploads struct {
 	locks   map[string]*uploadLock
 	janitor bool
 	editMu  sync.Mutex
+	// pending holds a file per unfinished upload naming its temp file, so the
+	// next run of the node removes what this one left (see recover).
+	pending string
 }
 
 type uploadLock struct {
@@ -156,6 +159,7 @@ func (u *uploads) handle(method string, raw json.RawMessage) (any, error) {
 			u.mu.Lock()
 			delete(u.open, p.Upload)
 			u.mu.Unlock()
+			u.forget(p.Upload)
 		}
 		return map[string]any{"cancelled": true}, nil
 	case "fs.stat":
@@ -243,8 +247,14 @@ func read(path string, offset, limit int64) (any, error) {
 		return nil, fileError(err)
 	}
 	eof := err == io.EOF || info.Size() > 0 && offset+int64(n) >= info.Size()
-	return map[string]any{"data": base64.StdEncoding.EncodeToString(buf[:n]), "size": info.Size(), "offset": offset,
-		"read": n, "eof": eof, "mode": fmt.Sprintf("%04o", info.Mode().Perm()), "mtime": info.ModTime().Unix()}, nil
+	result := map[string]any{"data": base64.StdEncoding.EncodeToString(buf[:n]), "size": info.Size(), "offset": offset,
+		"read": n, "eof": eof, "mode": fmt.Sprintf("%04o", info.Mode().Perm()), "mtime": info.ModTime().Unix()}
+	// Which file this chunk came from: a reader in chunks tells a file replaced
+	// under the same name (an atomic save, a log rotation) from one that grew.
+	if id := fileIdentity(f, info); id != "" {
+		result["file"] = id
+	}
+	return result, nil
 }
 
 func randomHex(n int) string {
@@ -355,6 +365,9 @@ func (u *uploads) write(path string, p fileParams) (any, error) {
 	}
 	up.touched = time.Now()
 	u.mu.Unlock()
+	if p.Offset == 0 {
+		u.remember(p.Upload, up.temp)
+	}
 	flags := os.O_WRONLY | os.O_APPEND
 	if p.Offset == 0 {
 		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
@@ -373,6 +386,8 @@ func (u *uploads) write(path string, p fileParams) (any, error) {
 	u.mu.Lock()
 	delete(u.open, p.Upload)
 	u.mu.Unlock()
+	// From here the temp file is published or removed before this returns.
+	u.forget(p.Upload)
 	if p.SHA256 != "" {
 		defer os.Remove(up.temp)
 		result, err := hashFile(up.temp)
@@ -451,6 +466,70 @@ func (u *uploads) dropLocked(id string) {
 	u.mu.Unlock()
 	if up != nil {
 		os.Remove(up.temp)
+		u.forget(id)
+	}
+}
+
+// recover removes the temp files of uploads a previous run of the node left
+// unfinished (a restart or an update in the middle of one), then records this
+// run's uploads in dir. Only the files those records name are touched, never
+// others that merely look alike.
+func (u *uploads) recover(dir string) {
+	u.mu.Lock()
+	u.pending = dir
+	u.mu.Unlock()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		id := e.Name()
+		if !uploadID.MatchString(id) {
+			continue
+		}
+		unlock := u.lock(id)
+		u.mu.Lock()
+		_, open := u.open[id]
+		u.mu.Unlock()
+		if !open {
+			data, err := os.ReadFile(filepath.Join(dir, id))
+			temp := string(data)
+			if name := filepath.Base(temp); err == nil && filepath.IsAbs(temp) && strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".obupload-"+id) {
+				os.Remove(temp)
+			}
+			os.Remove(filepath.Join(dir, id))
+		}
+		unlock()
+	}
+}
+
+// remember and forget keep the record of an unfinished upload; losing one
+// only costs the cleanup after a restart.
+func (u *uploads) remember(id, temp string) {
+	u.mu.Lock()
+	dir := u.pending
+	u.mu.Unlock()
+	if dir == "" || os.MkdirAll(dir, 0o700) != nil {
+		return
+	}
+	os.WriteFile(filepath.Join(dir, id), []byte(temp), 0o600)
+}
+
+func (u *uploads) forget(id string) {
+	u.mu.Lock()
+	dir := u.pending
+	u.mu.Unlock()
+	if dir != "" {
+		os.Remove(filepath.Join(dir, id))
+	}
+}
+
+// recoverUploads keeps upload records next to the jobs, which also outlive
+// the process; an agent with neither a config nor a jobs directory keeps none.
+func (a *Agent) recoverUploads() {
+	dir := a.jobDir
+	if dir == "" && a.ConfigPath != "" {
+		dir = jobsDir(a.ConfigPath)
+	}
+	if dir != "" {
+		a.uploads.recover(filepath.Join(dir, ".uploads"))
 	}
 }
 

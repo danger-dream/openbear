@@ -4,7 +4,7 @@
 // testing/netBrowser.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
+import {ADDRESSES, GB, GEO, MESH_ADDR, SERVERS, addresses, chromium, fakeMesh, fakeNet, noOverflow, press, probe, rowTexts, run, server, shot, shots, showTab, startNetBrowser, waitFor} from './testing/netBrowser.mjs';
 
 test('server network layout: phone, light', {skip: !chromium, timeout: 300000}, async t => {
   const {setup} = await startNetBrowser(t);
@@ -14,12 +14,14 @@ test('server network layout: phone, light', {skip: !chromium, timeout: 300000}, 
       const {page} = h;
       const root = probe(page);
       const box = addresses(page);
+      await showTab(page, '网络');
       await box.locator('.net-iface').first().waitFor();
       await box.scrollIntoViewIfNeeded();
       for (const height of await box.locator('.net-addr, .net-refresh').evaluateAll(l => l.map(el => el.getBoundingClientRect().height))) assert.ok(height >= 40, `address row or refresh ${height}px`);
       await noOverflow(page);
       await shot(page, `phone-${theme}-addresses`);
       // Inputs at 16px (no zoom on focus); the buttons easy to tap.
+      await showTab(page, '工具');
       await root.scrollIntoViewIfNeeded();
       const target = root.getByRole('combobox', {name: '目标'});
       assert.equal(await target.evaluate(el => getComputedStyle(el).fontSize), '16px');

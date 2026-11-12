@@ -84,11 +84,11 @@ def pep440(value) -> str:
 
 
 def next_dev(value) -> str:
-    """The development version after publishing value: the next minor's dev.1, whatever value's stage."""
+    """The development version after publishing value: the next patch's dev.1, whatever value's stage."""
     version = parse(value)
     if version is None:
         raise ValueError(f'not a version: {value!r}')
-    return str(Version(version.major, version.minor + 1, 0, 'dev', 1))
+    return str(Version(version.major, version.minor, version.patch + 1, 'dev', 1))
 
 
 def bump_dev(value) -> str:

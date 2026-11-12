@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from release_support.common import ReleaseError, State, load, sha
-from release_support.publication import publish
+from release_support import publication as publication_module
+from release_support.publication import delete_candidates, publish, push_candidate
 from release_support.github import GitHub
 
 
@@ -46,6 +47,7 @@ class FakeGitHub:
         self.lost = False
         self.create_calls = 0
         self.publish_calls = 0
+        self.branches = set()
 
     def maybe_lose(self, phase):
         if phase == self.lose and not self.lost:
@@ -55,6 +57,11 @@ class FakeGitHub:
     def api(self, path, method='GET', data=None, missing=False):
         if path == '/git/ref/heads/main':
             return {'object': {'sha': self.main}}
+        if path.startswith('/git/ref/heads/'):
+            return {'object': {'sha': 'x'}} if path.removeprefix('/git/ref/heads/') in self.branches else None
+        if path.startswith('/git/refs/heads/') and method == 'DELETE':
+            self.branches.remove(path.removeprefix('/git/refs/heads/'))
+            return None
         if path.startswith('/git/ref/tags/'):
             return {'object': {'sha': self.tag}} if self.tag else None
         if path.startswith('/releases/tags/'):
@@ -93,11 +100,30 @@ class FakeGitHub:
         return self.payloads[asset['name']]
 
 
+class LaggingGitHub(FakeGitHub):
+    """GitHub's REST ref view trails the push: stale reads before the new value appears."""
+
+    def __init__(self, stale_reads):
+        super().__init__()
+        self.stale_reads = stale_reads
+        self.stale = {}
+
+    def api(self, path, method='GET', data=None, missing=False):
+        if path == '/git/ref/heads/main' and self.main != 'base' and self.stale.setdefault(path, self.stale_reads) > 0:
+            self.stale[path] -= 1
+            return {'object': {'sha': 'base'}}
+        if path.startswith('/git/ref/tags/') and self.tag and self.stale.setdefault(path, self.stale_reads) > 0:
+            self.stale[path] -= 1
+            return None
+        return super().api(path, method=method, data=data, missing=missing)
+
+
 class FakeGit:
     def __init__(self, github, notes):
         self.github, self.notes = github, notes
         self.local_tag = False
         self.pushes = []
+        self.refuse = None
 
     def __call__(self, args, _label, **kwargs):
         if 'status' in args:
@@ -117,7 +143,13 @@ class FakeGit:
         if 'push' in args:
             assert kwargs['env'].get('GIT_CONFIG_COUNT') == '2'
             self.pushes.append(args[-1])
-            if args[-1] == 'candidate:refs/heads/main':
+            if '/release-candidate/' in args[-1]:
+                if self.refuse:
+                    error = ReleaseError('candidate-push: exit 1; log: x')
+                    error.output = self.refuse
+                    raise error
+                self.github.branches.add(args[-1].split(':refs/heads/', 1)[1])
+            elif args[-1] == 'candidate:refs/heads/main':
                 self.github.main = 'candidate'
             else:
                 self.github.tag = 'tag-object'
@@ -136,7 +168,7 @@ def publication(tmp_path):
         content = name.encode()
         (tmp_path / 'assets' / name).write_bytes(content)
         assets[name] = {'bytes': len(content), 'sha256': sha(content)}
-    state = State(tmp_path, {'candidate': {'localCommit': 'local', 'publicCommit': 'candidate'}, 'version': '1.0.1',
+    state = State(tmp_path, {'runId': '1.0.1-0123456789ab', 'candidate': {'localCommit': 'local', 'publicCommit': 'candidate'}, 'version': '1.0.1',
                             'publicBase': 'base', 'notes': notes, 'stages': {'package': {'result': {'assets': assets}}}})
     return tmp_path, state, notes
 
@@ -186,3 +218,63 @@ def test_foreign_asset_is_not_deleted_or_replaced(publication):
     with pytest.raises(ReleaseError, match='foreign or duplicate'):
         publish(directory, state, git, github)
     assert not github.publish_calls
+
+
+def test_candidate_branch_is_pushed_first_and_replaced_candidates_are_removed(publication):
+    directory, state, notes = publication
+    github = FakeGitHub()
+    git = FakeGit(github, notes)
+    first = push_candidate(directory, state, git, github)
+    assert first['branch'] == 'release-candidate/1.0.1-0123456789ab-candidate'
+    assert git.pushes == ['candidate:refs/heads/release-candidate/1.0.1-0123456789ab-candidate']
+    assert github.branches == {first['branch']} and github.main == 'base'
+    state.value['candidate']['publicCommit'] = 'fixedcandidate0'
+    second = push_candidate(directory, state, git, github)
+    assert second['branch'] == 'release-candidate/1.0.1-0123456789ab-fixedcandida'
+    assert github.branches == {second['branch']}
+    assert load(directory / 'state.json')['candidateBranches'] == [second['branch']]
+    assert delete_candidates(state, github) == [second['branch']]
+    assert github.branches == set() and state.value['candidateBranches'] == []
+
+
+def test_refused_candidate_push_pauses_with_githubs_reason(publication):
+    directory, state, notes = publication
+    github = FakeGitHub()
+    git = FakeGit(github, notes)
+    git.refuse = ('remote: error: GH013: Repository rule violations found for refs/heads/release-candidate/x.\n'
+                  'remote: - Push cannot contain secrets\n'
+                  'remote:   path: tests/ddns/test_provider_sign.py:12\n'
+                  ' ! [remote rejected] candidate -> release-candidate/x (push declined due to repository rule violations)\n')
+    with pytest.raises(ReleaseError) as refused:
+        push_candidate(directory, state, git, github)
+    assert refused.value.code == 2
+    assert 'Push cannot contain secrets' in str(refused.value) and 'tests/ddns/test_provider_sign.py:12' in str(refused.value)
+    assert github.main == 'base' and github.branches == set()
+
+
+def test_only_this_runs_candidate_branches_are_deleted(publication):
+    directory, state, notes = publication
+    github = FakeGitHub()
+    github.branches = {'release-candidate/other-run-candidate'}
+    state.value['candidateBranches'] = ['release-candidate/other-run-candidate']
+    with pytest.raises(ReleaseError, match='did not create'):
+        delete_candidates(state, github)
+    assert github.branches == {'release-candidate/other-run-candidate'}
+
+
+def test_pushes_are_confirmed_once_githubs_ref_view_catches_up(publication, monkeypatch):
+    monkeypatch.setattr(publication_module, 'CONFIRM_INTERVAL', 0)
+    directory, state, notes = publication
+    github = LaggingGitHub(stale_reads=3)
+    result = publish(directory, state, FakeGit(github, notes), github)
+    assert result['ok'] and github.main == 'candidate'
+    assert github.stale == {'/git/ref/heads/main': 0, '/git/ref/tags/v1.0.1': 0}
+
+
+def test_a_push_that_never_shows_up_still_pauses(publication, monkeypatch):
+    monkeypatch.setattr(publication_module, 'CONFIRM_SECONDS', 0)
+    directory, state, notes = publication
+    github = LaggingGitHub(stale_reads=10**6)
+    with pytest.raises(ReleaseError, match='Cannot confirm public-source push') as paused:
+        publish(directory, state, FakeGit(github, notes), github)
+    assert paused.value.code == 2 and not github.create_calls

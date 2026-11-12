@@ -19,16 +19,23 @@ async def owns_event(s,conversation,root):
 async def tick(s):
     if s.host is None: return
     async with s.db.webhook_transaction() as conn:
-        assignments=await many(conn,"""SELECT a.* FROM webhook_assignments a WHERE a.state='finalized' AND a.origin_kind='webhook' AND a.notification_key IS NULL
+        # A run whose events went back for another run has no result of its own to announce.
+        assignments=await many(conn,"""SELECT a.* FROM webhook_assignments a WHERE a.state='finalized' AND a.origin_kind='webhook' AND a.notification_key IS NULL AND a.terminal_reason IS NOT 'retried'
             AND NOT EXISTS(SELECT 1 FROM webhook_stage_jobs j WHERE j.assignment_id=a.assignment_id AND j.state IN ('pending','running','held','unknown')) LIMIT 100""")
         for a in assignments:
-            e=await s.endpoint_row(conn,a['origin_endpoint_id'],deleted=True); _,config=await s.revision(conn,a['origin_endpoint_id'],a['origin_revision'])
+            e=await s.endpoint_row(conn,a['origin_endpoint_id'],deleted=True); revision,config=await s.revision(conn,a['origin_endpoint_id'],a['origin_revision'])
+            # A run left for review holds the endpoint's model runs: say so whatever the policy.
+            review='review:'+a['assignment_id'] in json.loads(e['model_blockers_json'])
             post=await one(conn,"SELECT state FROM webhook_stage_jobs WHERE assignment_id=? AND stage='post'",(a['assignment_id'],))
             status='failed' if post and post['state']=='failed' else 'completed' if a['terminal_reason']=='normal' else 'interrupted' if a['terminal_reason'] in ('cancelled','interrupted') else 'failed'
-            silent=config.notifications.policy=='silent' or config.notifications.policy=='errorsDigest' and status=='completed'
+            silent=not review and (config.notifications.policy=='silent' or config.notifications.policy=='errorsDigest' and status=='completed')
             key='webhook:assignment:'+a['assignment_id']+':final'; now=s.clock()//1000
             payload={'assignmentId':a['assignment_id'],'rootTurnId':a['root_turn_uuid'],'status':status,'modelOutcome':a['terminal_reason'],'postState':post['state'] if post else 'notConfigured','summary':'Webhook '+status,'finalText':json.loads(a['final_snapshot_json']).get('finalText',''),'startedAtMs':a['created_at_ms']}
-            digest_policy=config.notifications.policy=='errorsDigest' and not silent
+            if review:
+                name=json.loads(revision['config_json']).get('name') or a['origin_endpoint_id']
+                payload['summary']='Webhook needs review'
+                payload['finalText']=f'Webhook 入口「{name}」有事件处理结果未知，已暂停自动模型处理。请在 Webhook 页面核实这些事件，核实后自动恢复。\n\n'+payload['finalText']
+            digest_policy=config.notifications.policy=='errorsDigest' and not silent and not review
             group=None
             if digest_policy:
                 group=await one(conn,"SELECT * FROM web_task_notifications WHERE kind='webhook-result' AND state='pending' AND next_attempt_at>? AND json_extract(payload_json,'$.digestEndpoint')=? AND json_extract(payload_json,'$.digestRevision')=? ORDER BY id LIMIT 1",(now,a['origin_endpoint_id'],a['origin_revision']))

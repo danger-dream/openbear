@@ -28,7 +28,7 @@ type fakeHost struct {
 	defZone  string
 	noBus    bool
 	failNFT  bool
-	listFail bool // nft -j list chains fails
+	listFail bool // nft list queries fail
 	versionV string
 }
 
@@ -93,7 +93,7 @@ func (f *fakeHost) exec(args ...string) (string, error) {
 	case "iptables":
 		return f.iptables(args[1:])
 	case "nft":
-		if f.failNFT && args[1] == "insert" || f.listFail && slices.Equal(args[1:], []string{"-j", "list", "chains"}) {
+		if f.failNFT && args[1] == "insert" || f.listFail && (slices.Equal(args[1:], []string{"-j", "list", "chains"}) || slices.Equal(args[1:], []string{"-j", "-a", "list", "ruleset"})) {
 			return fail()
 		}
 		return f.nftCmd(args[1:])
@@ -169,8 +169,10 @@ func (f *fakeHost) iptables(args []string) (string, error) {
 	err := errors.New("iptables: " + strings.Join(args, " "))
 	if len(args) == 1 && args[0] == "-S" {
 		var out []string
-		for _, name := range []string{"INPUT", "FORWARD", "OUTPUT"} {
-			out = append(out, "-P "+name+" "+cmp(f.policy[table+" "+name], "ACCEPT"))
+		for _, name := range []string{"INPUT", "FORWARD", "OUTPUT", "PREROUTING", "POSTROUTING"} {
+			if _, ok := chains[name]; ok {
+				out = append(out, "-P "+name+" "+cmp(f.policy[table+" "+name], "ACCEPT"))
+			}
 		}
 		for name := range chains {
 			if !slices.Contains([]string{"INPUT", "FORWARD", "OUTPUT", "PREROUTING", "POSTROUTING"}, name) {
@@ -240,6 +242,18 @@ func (f *fakeHost) chain(fam, table, name string) *fakeNFTChain {
 
 func (f *fakeHost) nftCmd(args []string) (string, error) {
 	switch {
+	case slices.Equal(args, []string{"-j", "-a", "list", "ruleset"}):
+		items := []any{map[string]any{"metainfo": map[string]any{"version": "1.0.6"}}}
+		for _, c := range f.nft {
+			out, _ := f.nftCmd([]string{"-j", "-a", "list", "chain", c.c.Family, c.c.Table, c.c.Name})
+			var doc struct {
+				Items []any `json:"nftables"`
+			}
+			json.Unmarshal([]byte(out), &doc)
+			items = append(items, doc.Items...)
+		}
+		raw, _ := json.Marshal(map[string]any{"nftables": items})
+		return string(raw), nil
 	case slices.Equal(args, []string{"-j", "list", "chains"}):
 		items := []any{map[string]any{"metainfo": map[string]any{"version": "1.0.6"}}}
 		for _, c := range f.nft {
@@ -456,6 +470,39 @@ func TestHostFirewallGatewayChainsUnchanged(t *testing.T) {
 	h.close()
 	if raw, _ := os.ReadFile(h.forwardFile); string(raw) != "0" {
 		t.Fatalf("ip_forward after close %q", raw)
+	}
+}
+
+// SNAT translates what the subnets send into the mesh, with or without the
+// translation of what the mesh sends into them.
+func TestHostFirewallGatewaySNAT(t *testing.T) {
+	lan := netip.MustParsePrefix("192.168.10.0/24")
+	for _, masquerade := range []bool{true, false} {
+		f := newFakeHost(t)
+		h := newLinuxHost("obmesh0", f.exec, f.has)
+		h.forwardFile = filepath.Join(t.TempDir(), "ip_forward")
+		os.WriteFile(h.forwardFile, []byte("0\n"), 0o644)
+		c := fwConfig
+		c.Gateway = &Gateway{Subnets: []netip.Prefix{lan}, Masquerade: masquerade, SNAT: true}
+		if err := h.apply(c); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"-s 192.168.10.0/24 -o obmesh0 -j MASQUERADE"}
+		if masquerade {
+			want = append([]string{"-s 100.96.0.0/16 -d 192.168.10.0/24 -j MASQUERADE"}, want...)
+		}
+		if got := f.ipt["nat"][chainNat]; !slices.Equal(got, want) {
+			t.Fatalf("masquerade %v: nat %q, want %q", masquerade, got, want)
+		}
+		// Turning it off takes the rule away again.
+		c.Gateway = &Gateway{Subnets: []netip.Prefix{lan}, Masquerade: masquerade}
+		if err := h.apply(c); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.ipt["nat"][chainNat]; slices.Contains(got, want[len(want)-1]) {
+			t.Fatalf("masquerade %v: SNAT rule kept after turning it off: %q", masquerade, got)
+		}
+		h.close()
 	}
 }
 
@@ -928,6 +975,60 @@ func TestNFTablesMeshAfterBans(t *testing.T) {
 	in.rules = slices.Insert(in.rules, 6, fakeNFTRule{handle: f.handle, text: "ip saddr @late drop"})
 	if fixed := h.heal(); !slices.Equal(fixed, []string{"nftables inet filter input"}) || texts(in)[3] != "ip saddr @late drop" || texts(in)[4] != `iifname "obmesh0" accept` {
 		t.Fatalf("heal after a later ban: %q %q", fixed, texts(in))
+	}
+}
+
+// A data plane killed while it was a gateway, and the mesh removed with none
+// to start after it: the sweep takes out every chain it left and puts
+// ip_forward and the routes it took over back.
+func TestSweepAfterAKilledGatewayLeavesNothing(t *testing.T) {
+	f := newFakeHost(t)
+	table := &routeTableHost{lines: []string{"192.168.10.0/24 dev wg0 scope link"}}
+	exec := func(args ...string) (string, error) {
+		if len(args) > 2 && args[0] == "ip" && args[2] == "route" {
+			return table.exec(args...)
+		}
+		return f.exec(args...)
+	}
+	dir := t.TempDir()
+	start := func() *linuxHost {
+		h := newLinuxHost("obmesh0", exec, f.has)
+		h.forwardFile, h.forwardState = filepath.Join(dir, "ip_forward"), filepath.Join(dir, "ip_forward.was")
+		h.routeFile, h.takenDir, h.taken = filepath.Join(dir, "none"), dir, loadTaken(dir)
+		return h
+	}
+	os.WriteFile(filepath.Join(dir, "ip_forward"), []byte("0\n"), 0o644)
+	lan := netip.MustParsePrefix("192.168.10.0/24")
+	gw := fwConfig
+	gw.Gateway = &Gateway{Subnets: []netip.Prefix{lan}, Masquerade: true}
+	gw.Routes, gw.Takeover = append(slices.Clone(gw.Routes), lan), []netip.Prefix{lan}
+	if err := start().apply(gw); err != nil { // and then killed: no close
+		t.Fatal(err)
+	}
+	if !slices.Contains(table.lines, "192.168.10.0/24 dev obmesh0 src "+gw.Address.String()) {
+		t.Fatalf("not taken over: %q", table.lines)
+	}
+	// Its interface goes with the process, and the mesh's routes with it.
+	table.lines = slices.DeleteFunc(table.lines, func(line string) bool { return strings.Contains(line, "obmesh0") })
+	start().sweep()
+	for table, chains := range f.ipt {
+		for name, rules := range chains {
+			if strings.HasPrefix(name, "OBMESH") || slices.ContainsFunc(rules, func(r string) bool { return strings.Contains(r, "OBMESH") }) {
+				t.Fatalf("%s %s left: %q", table, name, rules)
+			}
+		}
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, "ip_forward")); strings.TrimSpace(string(raw)) != "0" {
+		t.Fatalf("ip_forward not put back: %q", raw)
+	}
+	if !slices.Equal(table.lines, []string{"192.168.10.0/24 dev wg0 scope link"}) || len(loadTaken(dir)) != 0 {
+		t.Fatalf("routes %q, still taken %v", table.lines, loadTaken(dir))
+	}
+	// After a data plane that stopped cleanly there is nothing to do.
+	f.ipt["filter"]["INPUT"] = []string{"-j ACCEPT"}
+	start().sweep()
+	if got := f.ipt["filter"]["INPUT"]; !slices.Equal(got, []string{"-j ACCEPT"}) {
+		t.Fatalf("INPUT %q", got)
 	}
 }
 

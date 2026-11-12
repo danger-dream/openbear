@@ -4,7 +4,7 @@ release scripts run from the checkout without importing the app package).
 Only beta, rc and release versions are published. A target must be newer than every
 version already published on its line (tags v<version> or node-v<version>); beta and
 rc are GitHub pre-releases; after publishing, the local version moves to the next
-minor's dev.1.
+patch's dev.1.
 """
 from __future__ import annotations
 

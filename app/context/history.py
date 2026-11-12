@@ -77,3 +77,35 @@ class ControllerExecutionHistory:
         return {"event_id": event_id, "seq": message_id, "kind": row.role,
                 "turn_uuid": row.turn_uuid, "created_at": row.created_at,
                 "payload": serialize_messages(neutral_context([row.to_message()]))[0]}
+
+
+class OwnerExecutionEvents:
+    """Reads Controller events by ID from any conversation of one owner."""
+
+    def __init__(self, db: DB, *, owner_chat_id: int, exclude_chat_id: int = 0) -> None:
+        self.db = db
+        self.owner_chat_id = owner_chat_id
+        self.exclude_chat_id = exclude_chat_id
+
+    async def event_payload(self, event_id: str) -> dict[str, Any]:
+        try:
+            message_id = int(event_id.split(":", 1)[1]) if event_id.startswith("message:") else 0
+        except ValueError:
+            message_id = 0
+        if not message_id:
+            raise ContextHistoryUnavailable("invalid_controller_event_id")
+        cur = await self.db.conn.execute(
+            """SELECT m.chat_id, c.conversation_uuid, c.title, c.owner_chat_id, s.session_uuid
+               FROM messages m JOIN web_conversations c ON c.internal_chat_id=m.chat_id
+               LEFT JOIN sessions s ON s.chat_id=m.chat_id WHERE m.id=?""",
+            (message_id,),
+        )
+        row = await cur.fetchone()
+        if row is None or int(row["owner_chat_id"]) != self.owner_chat_id or int(row["chat_id"]) == self.exclude_chat_id:
+            raise ContextHistoryUnavailable("event_not_found_in_scope")
+        if not row["session_uuid"]:
+            raise ContextHistoryUnavailable("conversation_session_unavailable")
+        event = await ControllerExecutionHistory(
+            self.db, chat_id=int(row["chat_id"]), session_uuid=str(row["session_uuid"]),
+        ).event_payload(event_id)
+        return {**event, "conversationUuid": str(row["conversation_uuid"]), "conversationTitle": str(row["title"] or "")}

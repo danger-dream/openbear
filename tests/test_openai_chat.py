@@ -158,6 +158,20 @@ async def test_chat_messages_tool_roundtrip():
     assert out[3] == {"role": "tool", "tool_call_id": "c1", "content": "a.txt"}
 
 
+@pytest.mark.parametrize(("model", "kept"), [("gemini-4-carbon-high", False), ("claude-opus-5-5", True)])
+async def test_chat_messages_drop_role_bridge_only_for_gemini(model, kept):
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT, repair_role_alternation
+
+    messages = repair_role_alternation([
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "<work-items>state</work-items>"},
+    ])
+    out = _to_chat_messages(messages, "", model)
+
+    assert any(m.get("content") == ROLE_ALTERNATION_BRIDGE_TEXT for m in out) is kept
+    assert [m["content"] for m in out if m["role"] == "user"] == ["first", "<work-items>state</work-items>"]
+
+
 async def test_chat_messages_ignores_cross_protocol_reasoning():
     """跨协议切换安全性：历史里带 reasoning/signature（来自其他协议轮次）
     喂给 chat backend 时必须被安全忽略，不泄漏不兼容字段、不报错。"""

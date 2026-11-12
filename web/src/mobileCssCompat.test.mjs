@@ -72,8 +72,8 @@ test('all CSS color-mix and dvh sites retain modern values and add ordered, lega
       assert.match(result.css, /--el-mask-color:\s*rgb\(var\(--ob-bg-rgb\) \/ 0\.82\)/);
     }
   }
-  assert.equal(occurrences, 107, 'all 107 stylesheet color mixes are accounted for after removing two legacy channel-card accents (the 108th is the heatmap inline style)');
-  assert.equal(mixes, 104, `covered ${mixes} source CSS color-mix declarations after removing the two legacy channel-card declarations`);
+  assert.equal(occurrences, 109, 'all 109 stylesheet color mixes are accounted for, two of them the server detail page\'s contents bar and map caption (the 110th is the heatmap inline style)');
+  assert.equal(mixes, 106, `covered ${mixes} source CSS color-mix declarations, the server detail page\'s two among them`);
   assert.ok(heights >= 55, `covered ${heights} source CSS dvh declarations`);
 });
 

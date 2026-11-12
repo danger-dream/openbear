@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import {computed,nextTick,reactive,ref,watch,effectScope} from 'vue';
 import {compareTreeItems, treeItemId as rowId} from './conversationTreeInteractions.js';
 import {ledgerTokenParts,totalSessionDurationMs} from '../views/consoleView/ledgerUsage.js';
+import {conversationTimeParts} from '../conversationTime.js';
 import {startReferenceCatalog,stopReferenceCatalog,watchConversationOverview,applyConversationOverviewPacket} from '../references/catalog.js';
 import {activityReadRequests,activityLabel,activityState,isActivityWaiting,pendingConversationRows,pendingFolderCounts, folderActivityCounts} from '../conversationActivity.js';
 import {groupTreeRows,leadGroupStatus} from './conversationGroupsTree.js';
@@ -67,15 +68,18 @@ test('subscription nonce rejects switched/closed packets and reconnect re-subscr
 test('overview shares header token/duration functions and does not sum overlapping billing',async()=>{
  const source=fs.readFileSync(new URL('./ConversationOverview.vue',import.meta.url),'utf8');
  const props=reactive({open:false,row:null});let listener;const cancellations=[];const cleanup=[];const scope=effectScope();
- const env={computed,ref,watch,defineProps:()=>props,defineEmits:()=>()=>{},onBeforeUnmount:fn=>cleanup.push(fn),ledgerTokenParts,totalSessionDurationMs,
+ const day=ref('2026-11-04');const lastMessageAtMs=new Date(2026,10,3,23,50,9).getTime();
+ const env={computed,ref,watch,conversationTimeParts,useConversationDay:()=>day,defineProps:()=>props,defineEmits:()=>()=>{},onBeforeUnmount:fn=>cleanup.push(fn),ledgerTokenParts,totalSessionDurationMs,
   referenceCatalog:reactive({connected:true,ready:true,stale:false}),watchConversationOverview:(uuid,fn)=>{listener=fn;return ()=>cancellations.push(uuid);}};
- const context=vm.createContext(env);scope.run(()=>vm.runInContext(strip(source)+'\nglobalThis.card={data,error,fresh,tokenParts,duration,currentRunning,stateLabel};',context));const card=context.card;
+ const context=vm.createContext(env);scope.run(()=>vm.runInContext(strip(source)+'\nglobalThis.card={data,error,fresh,tokenParts,duration,currentRunning,stateLabel,lastMessage};',context));const card=context.card;
  try{
   props.row={conversationUuid:'a',running:true,currentStatus:'正在执行工具'};props.open=true;await nextTick();
   assert.equal(card.tokenParts.value,null);assert.equal(card.duration.value,null);
   assert.equal(card.currentRunning.value,true);assert.equal(card.stateLabel.value,'正在执行工具');
-  listener({overview:{conversationUuid:'a',usage:{input_tokens:100,output_tokens:20,cache_read_tokens:300,cache_write_tokens:40,cost_usd:1.25,stat_total_time_ms_sum:99999},duration:{timelineTotalDurationMs:12000,modelCallsMs:40,liveMs:0},calls:{model:9,tool:13},messageCount:4}});
+  listener({overview:{conversationUuid:'a',lastMessageAtMs,usage:{input_tokens:100,output_tokens:20,cache_read_tokens:300,cache_write_tokens:40,cost_usd:1.25,stat_total_time_ms_sum:99999},duration:{timelineTotalDurationMs:12000,modelCallsMs:40,liveMs:0},calls:{model:9,tool:13},messageCount:4}});
   assert.equal(card.tokenParts.value.input,440);assert.equal(card.duration.value,12000);
+  assert.equal(card.lastMessage.value.date,'2026-11-03');assert.equal(card.lastMessage.value.time,'23:50:09');
+  day.value='2026-11-03';assert.equal(card.lastMessage.value.date,'');
   props.open=false;await nextTick();assert.equal(card.data.value,null);assert.deepEqual(cancellations,['a']);
   props.open=true;await nextTick();assert.equal(card.data.value.usage.cost_usd,1.25);assert.equal(card.fresh.value,false);
   assert.equal(card.currentRunning.value,true);assert.equal(card.stateLabel.value,'正在执行工具');

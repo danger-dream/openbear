@@ -32,10 +32,16 @@ type hostConfig struct {
 	Prefix  netip.Prefix // the mesh, for routes and address translation
 	MTU     int
 	Routes  []netip.Prefix
-	UDP     int // actual WireGuard port
-	TCP     int
-	TLS     int
-	Gateway *Gateway
+	// RouteMTU, when set, is the MTU of Routes, below the interface's;
+	// Hosts are the nodes whose routes take more (large.go).
+	RouteMTU int
+	Hosts    []hostRoute
+	UDP      int // actual WireGuard port
+	TCP      int
+	TLS      int
+	Gateway  *Gateway
+	// Takeover: Routes installed over a route of this machine's own.
+	Takeover []netip.Prefix
 }
 
 func (h hostConfig) equal(o hostConfig) bool {
@@ -43,10 +49,11 @@ func (h hostConfig) equal(o hostConfig) bool {
 		if g == nil {
 			return ""
 		}
-		return fmt.Sprint(g.Subnets, g.Masquerade)
+		return fmt.Sprint(g.Subnets, g.Masquerade, g.SNAT)
 	}
 	return h.Address == o.Address && h.Prefix == o.Prefix && h.MTU == o.MTU && slices.Equal(h.Routes, o.Routes) &&
-		h.UDP == o.UDP && h.TCP == o.TCP && h.TLS == o.TLS && gw(h.Gateway) == gw(o.Gateway)
+		h.RouteMTU == o.RouteMTU && slices.Equal(h.Hosts, o.Hosts) && h.UDP == o.UDP && h.TCP == o.TCP && h.TLS == o.TLS && gw(h.Gateway) == gw(o.Gateway) &&
+		slices.Equal(h.Takeover, o.Takeover)
 }
 
 // engine is one running data plane: the WireGuard device, meshTUN and
@@ -60,6 +67,7 @@ type engine struct {
 	wire          map[string]string
 	hostCfg       hostConfig
 	hostDirty     bool
+	largeErr      string // the last error applying large packet routes
 	resourceStart string
 	listen        Listen // as the bind and device have it
 	skipped       []netip.Prefix
@@ -74,6 +82,11 @@ type engine struct {
 	health  *health.Manager
 	e2e     *e2eSessions
 	keys    *nodeKeys // keys.go; every config applied carries them
+	// gateways: a member's choice for subnets backups stand by for
+	// (standby.go); every config applied carries it.
+	gateways *standbyGateways
+	// pins: the fixed paths' pairs through this node and their states (fixedpath.go).
+	pins *pinRuns
 
 	mu        sync.Mutex
 	configMu  sync.Mutex
@@ -96,19 +109,33 @@ type entryTrack struct {
 	switches  int
 }
 
-func routingFor(c *Config, peers []peerSpec) *routing {
-	r := &routing{relay: c.isRelay(), local: localPrefixes(c), control: c.Network.ControlPrefix, transit: map[[32]byte]bool{}}
+func routingFor(c *Config, a Attachment, peers []peerSpec, pins *pinRuns) *routing {
+	r := &routing{relay: c.isRelay(), local: localPrefixes(c), control: c.Network.ControlPrefix, transit: map[[32]byte]bool{}, own: map[[32]byte][]netip.Prefix{}}
+	keys := map[string]string{}
 	for _, p := range peers {
+		keys[p.ID] = p.Key
 		r.routes = append(r.routes, p.Allowed...)
-		if k, err := hex.DecodeString(p.Key); (p.Kind == kindRelay || p.Kind == kindEntry) && err == nil && len(k) == 32 {
+		k, err := hex.DecodeString(p.Key)
+		if err != nil || len(k) != 32 {
+			continue
+		}
+		switch p.Kind {
+		case kindRelay, kindEntry:
 			r.transit[[32]byte(k)] = true
+		case kindMember:
+			if n := c.node(p.ID); n != nil {
+				r.own[[32]byte(k)] = nodePrefixes(c, a, n)
+			}
 		}
 	}
 	r.hops, r.peerOf = hopsOf(peers)
 	var err error
-	if r.nodes, err = e2eTableFor(c); err != nil {
+	if r.nodes, err = e2eTableFor(c, a); err != nil {
 		// check refuses such a config; none of its packets pass.
 		r.nodes = &e2eTable{self: c.Self.Address}
+	}
+	if !c.isRelay() && c.standby.any() {
+		r.gateways = c.standby
 	}
 	// What relays forward is end to end, from nodes' addresses. A member
 	// takes it from its entry also while it still routes the sender over a
@@ -117,6 +144,7 @@ func routingFor(c *Config, peers []peerSpec) *routing {
 	for i := range c.Nodes {
 		r.sources = append(r.sources, host(c.Nodes[i].Address))
 	}
+	r.pins = pins.tableFor(c, keys, r.nodes)
 	return r
 }
 
@@ -140,16 +168,17 @@ func startEngine(dir string, c *Config, privateKey string, dev tun.Device, host 
 		return nil, err
 	}
 	e := &engine{dir: dir, name: name, attach: attach, host: host, events: events, wire: map[string]string{}, hs: map[string]*handshakes{}, done: make(chan struct{}),
-		filter: newFilter(c.Rules), sched: schedulerFor(c), cfg: &Config{}, resourceStart: resourceProfile(c)}
+		filter: newFilter(c.Rules), sched: schedulerFor(c), cfg: &Config{}, resourceStart: resourceProfile(c), gateways: &standbyGateways{}, pins: newPinRuns()}
 	if e.keys, err = loadKeys(dir); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("mesh keys (made by mesh.upgrade): %w", err)
 	}
-	c.keys = e.keys
+	c.keys, c.standby = e.keys, e.gateways
+	e.gateways.configure(c)
 	e.sched.setRate(c.Self.UploadLimitMbps)
 	e.filter.setSites(sitesOf(c))
-	e.tun = newMeshTUN(dev, routingFor(c, nil), e.filter, e.sched, c.Network.MTU)
-	if e.e2e, err = newE2E(c, e.keys.e2e, e.tun.sendOuter, e.tun.deliverInner, e.events.add); err != nil {
+	e.tun = newMeshTUN(dev, routingFor(c, attach, nil, nil), e.filter, e.sched, c.Network.MTU)
+	if e.e2e, err = newE2E(c, attach, e.keys.e2e, e.tun.sendOuter, e.tun.deliverInner, e.events.add); err != nil {
 		e.tun.Close()
 		return nil, err
 	}
@@ -204,6 +233,11 @@ func startEngine(dir string, c *Config, privateKey string, dev tun.Device, host 
 		go e.watchStreams()
 	}
 	go e.watchConns()
+	go e.watchGateways()
+	go e.watchPins()
+	if largePool {
+		go e.watchLarge()
+	}
 	if e.health != nil && !c.isRelay() {
 		go e.probeEntry()
 	}
@@ -269,7 +303,7 @@ func (e *engine) watchStreams() {
 func (e *engine) applyConfig(next *Config) error {
 	e.configMu.Lock()
 	defer e.configMu.Unlock()
-	next.keys = e.keys
+	next.keys, next.standby = e.keys, e.gateways
 	if e.health != nil {
 		if err := e.health.ValidateConfig(healthConfig(next)); err != nil {
 			return err
@@ -300,7 +334,7 @@ func (e *engine) applyConfig(next *Config) error {
 	// member drops its own once the change took.
 	r := e.router()
 	created := false
-	if next.isRelay() {
+	if next.isRouted() {
 		if r == nil {
 			r, created = e.setRouter(meshrouting.New(routerConfig(next), nil, e.events.add)), true
 		} else {
@@ -312,11 +346,11 @@ func (e *engine) applyConfig(next *Config) error {
 		err = e.health.Configure(healthConfig(next))
 	}
 	switch {
-	case err == nil && !next.isRelay() && r != nil:
+	case err == nil && !next.isRouted() && r != nil:
 		e.setRouter(nil)
 	case err != nil && created:
 		e.setRouter(nil)
-	case err != nil && r != nil && next.isRelay() && prev.Schema != 0:
+	case err != nil && r != nil && next.isRouted() && prev.Schema != 0:
 		r.Configure(routerConfig(prev))
 	}
 	if err != nil && prev.Schema != 0 {
@@ -375,13 +409,14 @@ func (e *engine) recheckLocal() error {
 	if e.cfg == nil || e.cfg.Schema == 0 {
 		return nil
 	}
-	if _, skipped := withoutLocal(hostRoutes(e.cfg, e.peers), e.cfg.Network.Prefix, e.name); slices.Equal(skipped, e.skipped) {
+	if _, skipped := withoutLocal(hostRoutes(e.cfg, e.peers), e.cfg.Network.Prefix, e.name, e.heldRoutes(), e.cfg.Self.Takeover); slices.Equal(skipped, e.skipped) {
 		return nil
 	}
 	return e.applyLocked(e.cfg, false)
 }
 
 func (e *engine) applyLocked(next *Config, reconfigure bool) error {
+	e.gateways.configure(next)
 	peers, err := planPeers(next, e.attach)
 	if err != nil {
 		return err
@@ -391,6 +426,11 @@ func (e *engine) applyLocked(next *Config, reconfigure bool) error {
 		if err != nil {
 			return err
 		}
+	}
+	prevUnderlay := e.cfg.underlay
+	next.underlay = underlayFor(next, e.name)
+	if next.underlay != prevUnderlay {
+		e.events.add("mtu.own", next.underlay.describe(next.Network.MTU))
 	}
 	for _, p := range peers {
 		if p.Endpoint == "" {
@@ -455,24 +495,30 @@ func (e *engine) applyLocked(next *Config, reconfigure bool) error {
 	e.filter.setRules(next.Rules)
 	e.filter.setSites(sitesOf(next))
 	e.sched.setRate(next.Self.UploadLimitMbps)
-	if err := e.e2e.configure(next); err != nil {
+	if err := e.e2e.configure(next, e.attach); err != nil {
 		return fmt.Errorf("end-to-end sessions: %w", err)
 	}
 	e.tun.mtu.Store(int32(next.Network.MTU))
-	r := routingFor(next, peers)
+	large := next.largePackets()
+	e.tun.paths.configure(large, next.Network.MTU, next.ownMTU())
+	r := routingFor(next, e.attach, peers, e.pins)
 	old := e.tun.route.Swap(r)
 	e.e2e.rerouted(old, r)
 
 	listen, _ := deviceState(e.dev)
-	h := hostConfig{Address: next.Self.Address, Prefix: next.Network.Prefix, MTU: next.Network.MTU - e2eOverhead, Routes: hostRoutes(next, peers),
+	h := hostConfig{Address: next.Self.Address, Prefix: next.Network.Prefix, MTU: next.ownMTU() - e2eOverhead, Routes: hostRoutes(next, peers),
 		UDP: listen, TCP: next.Self.Listen.TCP, TLS: next.Self.Listen.TLS, Gateway: next.Self.Gateway}
+	if large {
+		h.MTU, h.RouteMTU, h.Hosts = largeInner, next.ownMTU()-e2eOverhead, largeRoutes(e.tun.paths.view.Load(), r)
+	}
 	var skipped []netip.Prefix
-	h.Routes, skipped = withoutLocal(h.Routes, next.Network.Prefix, e.name)
+	h.Routes, skipped = withoutLocal(h.Routes, next.Network.Prefix, e.name, e.heldRoutes(), next.Self.Takeover)
+	h.Takeover = slices.DeleteFunc(slices.Clone(h.Routes), func(r netip.Prefix) bool { return !slices.Contains(next.Self.Takeover, r) })
 	if !slices.Equal(skipped, e.skipped) {
 		if len(skipped) > 0 {
-			e.events.add("route.skipped", fmt.Sprintf("gateway subnets %v overlap this machine's networks; not routed into the mesh", skipped))
+			e.events.add("route.skipped", fmt.Sprintf("gateway subnets %v overlap this machine's networks or routes; not routed into the mesh", skipped))
 		} else {
-			e.events.add("route.skipped", fmt.Sprintf("gateway subnets %v no longer overlap this machine's networks; routed into the mesh", e.skipped))
+			e.events.add("route.skipped", fmt.Sprintf("gateway subnets %v no longer overlap this machine's networks or routes; routed into the mesh", e.skipped))
 		}
 		e.skipped = skipped
 	}
@@ -484,7 +530,20 @@ func (e *engine) applyLocked(next *Config, reconfigure bool) error {
 		e.hostCfg = h
 		e.hostDirty = false
 	}
+	if rh, ok := e.host.(routeHolder); ok {
+		for _, s := range rh.restored() {
+			e.events.add("route.takeover", s)
+		}
+	}
 	e.trackEntry(peers)
+	return nil
+}
+
+// heldRoutes are this machine's own routes, where its host can tell.
+func (e *engine) heldRoutes() []heldRoute {
+	if rh, ok := e.host.(routeHolder); ok {
+		return rh.held()
+	}
 	return nil
 }
 
@@ -633,17 +692,22 @@ func (e *engine) close() {
 		if e.control != nil {
 			e.control.Close()
 		}
+		// A large-route refresh under way finishes before the host is cleaned; a later one sees done.
+		e.mu.Lock()
 		e.host.close()
+		e.mu.Unlock()
 		e.dev.Close()
 		e.e2e.close()
 	})
 }
 
 // withoutLocal drops routes that overlap a network this machine is already
-// on, so a gateway subnet cannot capture the local LAN. The mesh prefix
-// itself is checked when the node joins.
-func withoutLocal(routes []netip.Prefix, mesh netip.Prefix, iface string) (kept, skipped []netip.Prefix) {
-	var local []netip.Prefix
+// on, so a gateway subnet cannot capture the local LAN, and those that
+// overlap one of its own routes (held) unless takeover names them. A subnet
+// strictly inside a container or VM bridge's network is kept. The mesh
+// prefix itself is checked when the node joins.
+func withoutLocal(routes []netip.Prefix, mesh netip.Prefix, iface string, held []heldRoute, takeover []netip.Prefix) (kept, skipped []netip.Prefix) {
+	var local []heldRoute
 	ifaces, _ := net.Interfaces()
 	for _, ifc := range ifaces {
 		if ifc.Name == iface {
@@ -657,11 +721,11 @@ func withoutLocal(routes []netip.Prefix, mesh netip.Prefix, iface string) (kept,
 			}
 			bits, _ := n.Mask.Size()
 			addr, _ := netip.AddrFromSlice(n.IP.To4())
-			local = append(local, netip.PrefixFrom(addr, bits).Masked())
+			local = append(local, heldRoute{netip.PrefixFrom(addr, bits).Masked(), ifc.Name})
 		}
 	}
 	for _, r := range routes {
-		if r != mesh && slices.ContainsFunc(local, r.Overlaps) {
+		if r != mesh && (clashes(r, local) || clashes(r, held) && !slices.Contains(takeover, r)) {
 			skipped = append(skipped, r)
 		} else {
 			kept = append(kept, r)

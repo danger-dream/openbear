@@ -1,5 +1,6 @@
 <script setup>
 import {computed,onBeforeUnmount,ref,watch} from 'vue';
+import {conversationTimeParts,useConversationDay} from '../conversationTime.js';
 import {ChatLineRound,Close} from '@element-plus/icons-vue';
 import FloatingPanel from '../references/FloatingPanel.vue';
 import {referenceCatalog,watchConversationOverview} from '../references/catalog.js';
@@ -10,6 +11,8 @@ import {formatOverviewDuration,vOverviewElapsed as vElapsed} from './conversatio
 const props=defineProps({open:Boolean,anchor:{default:null},row:{type:Object,default:null}});
 const emit=defineEmits(['close','enter','leave']);
 const data=ref(null),error=ref(''),fresh=ref(false);
+const conversationDay=useConversationDay();
+const lastMessage=computed(()=>conversationTimeParts(data.value?.lastMessageAtMs,conversationDay.value));
 // Instance-owned cache disappears with the logged-in tree. A reopen always
 // requests a fresh snapshot. Refreshes update the existing slots silently,
 // rather than inserting/removing status rows around the same figures.
@@ -84,6 +87,7 @@ onBeforeUnmount(release);
       <div><dt>缓存写入</dt><dd>{{data?.usage?fmtTokens(data.usage.cache_write_tokens):'—'}}</dd></div>
      </dl>
     </section>
+    <div class="overview-last-message"><span>最近消息</span><time v-if="lastMessage.time" :title="lastMessage.full"><span v-if="lastMessage.date" class="overview-message-date">{{lastMessage.date}}</span>{{lastMessage.time}}</time><span v-else>—</span></div>
     <div class="overview-duration"><span>累计耗时</span><strong data-overview-metric="duration">{{formatOverviewDuration(duration)}}</strong></div>
     <dl class="overview-counts">
      <div><dt>消息条数</dt><dd data-overview-metric="messages">{{data?fmtNum(data.messageCount):'—'}}</dd></div>
@@ -122,14 +126,17 @@ onBeforeUnmount(release);
 .overview-elapsed{flex:none;white-space:nowrap;font-size:11px;color:var(--overview-muted)}
 .overview-elapsed strong{font-weight:500;color:inherit}
 .overview-token-section{padding:10px 1px;border-top:1px solid var(--overview-line);border-bottom:1px solid var(--overview-line)}
-.overview-total,.overview-duration,.overview-cost{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
-.overview-total>span,.overview-duration>span,.overview-cost>span{font-size:12px;color:var(--overview-muted);white-space:nowrap}
+.overview-total,.overview-last-message,.overview-duration,.overview-cost{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
+.overview-total>span,.overview-last-message>span:first-child,.overview-duration>span,.overview-cost>span{font-size:12px;color:var(--overview-muted);white-space:nowrap}
 .overview-total strong,.overview-cost strong{font-size:16px;font-weight:600;line-height:1.5;letter-spacing:0}
 .overview-token-parts{display:grid;grid-template-columns:1fr 1fr;gap:3px 22px;margin:7px 0 0;font-size:11px}
 .overview-token-parts>div{display:flex;justify-content:space-between;align-items:baseline;gap:8px;min-width:0}
 .overview-token-parts dt{color:var(--overview-muted);white-space:nowrap}
 .overview-token-parts dd{margin:0;font-weight:500;text-align:right}
-.overview-duration{padding:10px 1px}
+.overview-last-message{padding:9px 1px 0}
+.overview-last-message time,.overview-last-message>span:last-child{font-size:12px;font-weight:500;text-align:right;white-space:nowrap}
+.overview-message-date{margin-right:.4em;color:var(--overview-muted);font-weight:400}
+.overview-duration{padding:5px 1px 10px}
 .overview-duration strong{font-size:12px;font-weight:500;text-align:right}
 .overview-counts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0;padding:8px 0 10px;border-bottom:1px solid var(--overview-line)}
 .overview-counts>div{min-width:0;padding-left:14px;border-left:1px solid var(--overview-line)}

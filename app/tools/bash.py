@@ -510,7 +510,15 @@ def make_bash_tool(default_timeout_s: float = 120.0, output_limit: int = 30000,
             return "error: timeout must be a finite number of seconds"
         sleep = _detect_blocked_sleep(command)
         if sleep and requested_timeout > 5:
-            return f"error: blocked long sleep detected ({sleep}); use a real command with a bounded timeout"
+            return (
+                f"error: blocked long sleep detected ({sleep}); wait for the actual condition with a bounded timeout instead, e.g.\n"
+                "- service up: timeout 60 bash -c 'until curl -fsS http://127.0.0.1:PORT/health >/dev/null; do sleep 1; done'\n"
+                "- log line: timeout 60 bash -c 'until grep -q \"READY\" app.log; do sleep 1; done'\n"
+                "- process exit: timeout 120 bash -c 'while kill -0 PID 2>/dev/null; do sleep 2; done'\n"
+                "- file appears: timeout 60 bash -c 'until [ -e path/to/file ]; do sleep 1; done'\n"
+                "A background job started with Servers job_start: Servers job_wait {serverId, jobId, until: \"regex\", "
+                "timeoutSeconds}. A transfer: Servers transfer_status. An Agent: Agent(action=wait)."
+            )
         timeout = max(1.0, min(requested_timeout, max_timeout_s))
         timeout_note = f"timeout: requested {requested_timeout:g}s; effective {timeout:g}s; maximum {max_timeout_s:g}s"
         cwd = args.get("cwd") or None
@@ -852,7 +860,7 @@ def register_bash_tool(reg: ToolRegistry, *, default_timeout_s: float = 120.0,
     )
     reg.add(
         "Process",
-        "Inspect or clean up legacy/recent Bash session records with list, poll, log, kill, or remove. New Bash calls are foreground-complete and normally do not require Process. Do not use Process as a timer.",
+        "Inspect or clean up legacy/recent Bash session records with list, poll, log, kill, or remove. New Bash calls are foreground-complete and normally do not require Process.",
         {
             "type": "object",
             "properties": {

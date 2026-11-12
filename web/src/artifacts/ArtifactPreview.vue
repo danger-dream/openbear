@@ -3,6 +3,8 @@ import {computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch} 
 import {ElDialog} from "element-plus";
 import ConsoleMarkdown from "../views/consoleView/ConsoleMarkdown.vue";
 import ArtifactDownload from "./ArtifactDownload.vue";
+import AudioPlayer from "./AudioPlayer.vue";
+import ImageLightbox from "./ImageLightbox.vue";
 import {onArtifactDownload} from "./artifactDownload.js";
 import {copyTextToClipboard} from "../utils/clipboard.js";
 import {htmlPreviewDocument} from "./htmlPreview.js";
@@ -16,7 +18,10 @@ const opened = ref(false), busy = ref(false), error = ref("");
 const selected = shallowRef(null), record = shallowRef(null), text = ref("");
 const mode = ref("preview"), wrap = ref(true), maximized = ref(false), mobile = ref(false);
 const body = ref(null), imageZoom = ref(null), imageWidth = ref(0), imageLoading = ref(false), imageFailed = ref(false), imageVersion = ref(0);
+const lightboxOpen = ref(false), lightboxUrls = ref([]), lightboxIndex = ref(0);
+const mediaElement = ref(null), mediaError = ref("");
 const format = computed(() => artifactFormat(record.value?.metadata));
+const isMedia = computed(() => ["audio", "video"].includes(format.value.kind));
 const toolFile = computed(() => Boolean(selected.value?.identity?.toolFile));
 const title = computed(() => toolFile.value
 	? record.value?.metadata?.fileName || selected.value?.label || "文件预览"
@@ -67,7 +72,7 @@ async function restorePosition() {
 async function loadSelected(force = false) {
 	const current = ++generation, active = record.value;
 	busy.value = true; error.value = ""; text.value = ""; saved = null;
-	imageZoom.value = null; imageWidth.value = 0; imageLoading.value = true; imageFailed.value = false; imageVersion.value++;
+	imageZoom.value = null; imageWidth.value = 0; imageLoading.value = true; imageFailed.value = false; mediaError.value = ""; imageVersion.value++;
 	try {
 		// A tool file is read from disk and may have changed since the last open.
 		const meta = await loadArtifactMetadata(active, {force: force || Boolean(active.identity.toolFile)});
@@ -104,7 +109,13 @@ function show(event) {
 	opened.value = true;
 	void loadSelected();
 }
-function close() { savePosition(); generation++; opened.value = false; }
+function close() { mediaElement.value?.pause(); savePosition(); generation++; opened.value = false; }
+// A browser reports an undecodable codec and an unreadable response the same way.
+function mediaFailed() { mediaError.value = "可能是当前浏览器不支持这个文件的编码，也可能是文件暂时读取失败。可以重新读取，或下载原文件用本地播放器打开。"; }
+function pauseOtherMedia(event) {
+	if (!(event.target instanceof HTMLMediaElement)) return;
+	for (const element of document.querySelectorAll("audio, video")) if (element !== event.target && !element.paused) element.pause();
+}
 function restoreFocus() {
 	// ElDialog emits this notification without a DOM event. Restore after its
 	// own focus-trap cleanup, and never steal focus after navigation/reopening.
@@ -131,8 +142,90 @@ async function loadDiff() {
 	}
 }
 function contentMode() { return hasPreview.value ? (saved?.mode && saved.mode !== "diff" ? saved.mode : "preview") : "source"; }
-function zoom(delta) { const current = imageZoom.value ?? Math.min(1, (body.value?.clientWidth || 800) / (imageWidth.value || 800)); imageZoom.value = Math.max(.1, Math.min(4, Math.round((current + delta) * 10) / 10)); }
+function baseFitZoom() { return Math.min(1, ((body.value?.clientWidth || 800) - 32) / (imageWidth.value || 800)); }
+function zoom(delta) { const current = imageZoom.value ?? baseFitZoom(); imageZoom.value = Math.max(.1, Math.min(5, Math.round((current + delta) * 10) / 10)); }
 function imageLoaded(event) { imageWidth.value = event.target.naturalWidth; imageLoading.value = false; }
+function openImageFullscreen() {
+	if (!selected.value?.identity?.contentUrl) return;
+	lightboxUrls.value = [selected.value.identity.contentUrl];
+	lightboxIndex.value = 0;
+	lightboxOpen.value = true;
+}
+function showImageLightbox(event) {
+	const urls = Array.isArray(event.detail?.urlList) ? event.detail.urlList.filter(Boolean) : [];
+	if (!urls.length) return;
+	lightboxUrls.value = urls;
+	lightboxIndex.value = Math.max(0, Math.min(Number(event.detail?.initialIndex) || 0, urls.length - 1));
+	lightboxOpen.value = true;
+}
+let stagePinchDist = 0, stagePinchStartZoom = 1, stageLastTapAt = 0, stageTapX = 0, stageTapY = 0, stageTouchMoved = false, stageTouchStartX = 0, stageTouchStartY = 0, stageScrollLeft = 0, stageScrollTop = 0;
+function onImageStageTouchStart(event) {
+	if (imageLoading.value || imageFailed.value) return;
+	const touches = event.touches;
+	if (!touches?.length) return;
+	if (touches.length >= 2) {
+		if (event.cancelable) event.preventDefault();
+		stageTouchMoved = true;
+		stagePinchDist = Math.max(12, Math.hypot(touches[1].clientX - touches[0].clientX, touches[1].clientY - touches[0].clientY));
+		stagePinchStartZoom = imageZoom.value ?? baseFitZoom();
+		return;
+	}
+	stageTouchMoved = false;
+	stageTouchStartX = touches[0].clientX;
+	stageTouchStartY = touches[0].clientY;
+	stageScrollLeft = body.value?.scrollLeft || 0;
+	stageScrollTop = body.value?.scrollTop || 0;
+}
+function onImageStageTouchMove(event) {
+	if (imageLoading.value || imageFailed.value) return;
+	const touches = event.touches;
+	if (!touches?.length) return;
+	if (touches.length >= 2) {
+		if (event.cancelable) event.preventDefault();
+		stageTouchMoved = true;
+		if (!stagePinchDist) {
+			stagePinchDist = Math.max(12, Math.hypot(touches[1].clientX - touches[0].clientX, touches[1].clientY - touches[0].clientY));
+			stagePinchStartZoom = imageZoom.value ?? baseFitZoom();
+		}
+		const dist = Math.max(12, Math.hypot(touches[1].clientX - touches[0].clientX, touches[1].clientY - touches[0].clientY));
+		imageZoom.value = Math.max(.1, Math.min(5, Math.round(stagePinchStartZoom * (dist / stagePinchDist) * 100) / 100));
+		return;
+	}
+	const dx = touches[0].clientX - stageTouchStartX, dy = touches[0].clientY - stageTouchStartY;
+	if (Math.hypot(dx, dy) > 6) stageTouchMoved = true;
+	if (stageTouchMoved && imageZoom.value != null && body.value) {
+		if (event.cancelable) event.preventDefault();
+		body.value.scrollLeft = stageScrollLeft - dx;
+		body.value.scrollTop = stageScrollTop - dy;
+	}
+}
+function onImageStageTouchEnd(event) {
+	if (event.touches?.length) return;
+	stagePinchDist = 0;
+	const changed = event.changedTouches?.[0];
+	if (!stageTouchMoved && changed) {
+		const now = Date.now();
+		if (now - stageLastTapAt <= 280 && Math.hypot(changed.clientX - stageTapX, changed.clientY - stageTapY) <= 32) {
+			stageLastTapAt = 0;
+			if (event.cancelable) event.preventDefault();
+			onImageStageDblClick();
+			return;
+		}
+		stageLastTapAt = now;
+		stageTapX = changed.clientX;
+		stageTapY = changed.clientY;
+	}
+}
+function onImageStageDblClick() {
+	if (imageLoading.value || imageFailed.value) return;
+	imageZoom.value = imageZoom.value == null ? Math.max(1.5, Math.min(3, Math.round(baseFitZoom() * 22) / 10)) : null;
+}
+function onImageStageWheel(event) {
+	if (imageLoading.value || imageFailed.value) return;
+	if (!event.ctrlKey && imageZoom.value == null) return;
+	event.preventDefault();
+	zoom((event.deltaY || event.deltaX) < 0 ? .2 : -.2);
+}
 async function onContentClick(event) {
 	const button = event.target.closest?.(".md-code-copy");
 	if (!button) return;
@@ -143,13 +236,13 @@ async function onContentClick(event) {
 	catch { button.textContent = "复制失败"; }
 }
 function mediaChanged() { mobile.value = Boolean(media?.matches); }
-watch(() => props.navigationKey, close);
-onMounted(() => { window.addEventListener("openbear:preview-artifact", show); media = window.matchMedia("(max-width: 760px)"); mediaChanged(); media.addEventListener("change", mediaChanged); });
-onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener("openbear:preview-artifact", show); media?.removeEventListener("change", mediaChanged); clearArtifactCache(); });
+watch(() => props.navigationKey, () => { lightboxOpen.value = false; close(); });
+onMounted(() => { window.addEventListener("openbear:preview-artifact", show); window.addEventListener("openbear:preview-images", showImageLightbox); document.addEventListener("play", pauseOtherMedia, true); media = window.matchMedia("(max-width: 760px)"); mediaChanged(); media.addEventListener("change", mediaChanged); });
+onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener("openbear:preview-artifact", show); window.removeEventListener("openbear:preview-images", showImageLightbox); document.removeEventListener("play", pauseOtherMedia, true); media?.removeEventListener("change", mediaChanged); clearArtifactCache(); });
 </script>
 
 <template>
-	<ElDialog :model-value="opened" class="artifact-preview-dialog" width="min(1120px, calc(100vw - 48px))" top="5vh" :fullscreen="fullscreen" append-to-body destroy-on-close :show-close="false" :close-on-click-modal="false" @update:model-value="value => { if (!value) close(); }" @close-auto-focus="restoreFocus">
+	<ElDialog :model-value="opened" class="artifact-preview-dialog" width="min(1120px, calc(100vw - 48px))" top="5vh" :fullscreen="fullscreen" append-to-body destroy-on-close :show-close="false" :close-on-click-modal="true" @update:model-value="value => { if (!value) close(); }" @close-auto-focus="restoreFocus">
 		<template #header="{titleId}">
 			<div class="artifact-preview-header">
 				<span class="artifact-preview-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10zM13 3v7h7M8 14h8M8 17h5"/></svg></span>
@@ -161,15 +254,15 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 				</div>
 			</div>
 		</template>
-		<div class="artifact-preview-toolbar">
+		<div v-if="!(mobile && format.kind === 'video' && !diffAvailable && !busy)" class="artifact-preview-toolbar">
 			<div v-if="diffAvailable && !busy" class="artifact-preview-tabs" role="group" aria-label="查看内容或改动"><button v-if="!fileMissing" type="button" :class="{active: mode !== 'diff'}" :aria-pressed="mode !== 'diff'" @click="switchMode(contentMode())">当前内容</button><button type="button" :class="{active: mode === 'diff'}" :aria-pressed="mode === 'diff'" @click="switchMode('diff')">这一项的改动</button></div>
 			<div v-if="hasPreview && !busy && !error && mode !== 'diff'" class="artifact-preview-tabs" role="group" aria-label="文档查看方式"><button type="button" :class="{active: mode === 'preview'}" :aria-pressed="mode === 'preview'" @click="switchMode('preview')">{{ format.kind === 'html' ? '页面预览' : '文档预览' }}</button><button type="button" :class="{active: mode === 'source'}" :aria-pressed="mode === 'source'" @click="switchMode('source')">源码</button></div>
 			<span v-else-if="!diffAvailable || busy" class="artifact-preview-type">{{ busy ? '正在读取附件' : format.label }}</span>
 			<span v-if="format.sourceOnly" class="artifact-preview-source-note">仅显示源码，不执行内容</span>
 			<label v-if="['text', 'code'].includes(format.kind) || hasPreview && mode === 'source'" class="artifact-preview-wrap"><input v-model="wrap" type="checkbox" @change="savePosition">自动换行</label>
-			<div v-if="format.kind === 'image' && !busy" class="artifact-preview-zoom"><button type="button" aria-label="缩小图片" :disabled="imageLoading || imageFailed" @click="zoom(-.2)">−</button><button type="button" :disabled="imageLoading || imageFailed" @click="imageZoom = null">{{ imageZoom == null ? '适应窗口' : `${Math.round(imageZoom * 100)}%` }}</button><button type="button" aria-label="放大图片" :disabled="imageLoading || imageFailed" @click="zoom(.2)">＋</button></div>
+			<div v-if="format.kind === 'image' && !busy" class="artifact-preview-zoom"><button type="button" aria-label="缩小图片" :disabled="imageLoading || imageFailed" @click="zoom(-.2)">−</button><button type="button" :disabled="imageLoading || imageFailed" @click="imageZoom = null">{{ imageZoom == null ? '适应窗口' : `${Math.round(imageZoom * 100)}%` }}</button><button type="button" aria-label="放大图片" :disabled="imageLoading || imageFailed" @click="zoom(.2)">＋</button><button type="button" aria-label="全屏手势看图" title="全屏手势看图" :disabled="imageLoading || imageFailed" @click="openImageFullscreen">全屏</button></div>
 		</div>
-		<div ref="body" class="artifact-preview-body" :class="{'is-image': format.kind === 'image', 'is-html': format.kind === 'html' && mode === 'preview' && !busy && !error}" :aria-busy="busy" @scroll="savePosition" @click="onContentClick">
+		<div ref="body" class="artifact-preview-body" :class="{'is-image': format.kind === 'image', 'is-media': isMedia, 'is-html': format.kind === 'html' && mode === 'preview' && !busy && !error}" :aria-busy="busy" @scroll="savePosition" @click="onContentClick">
 			<div v-if="busy" class="artifact-preview-empty" role="status"><span class="artifact-preview-spinner" aria-hidden="true"></span><strong>正在打开附件</strong><p>内容将在这里呈现，不会离开当前对话。</p></div>
 			<div v-else-if="error" class="artifact-preview-empty" role="alert"><strong>暂时无法预览</strong><p>{{ error }}</p><button type="button" @click="loadSelected(true)">重新读取</button></div>
 			<template v-else-if="mode === 'diff'">
@@ -180,7 +273,16 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 			</template>
 			<template v-else-if="format.kind === 'image'">
 				<div v-if="imageFailed" class="artifact-preview-empty" role="alert"><strong>图片未能加载</strong><p>可以重新读取，或下载原文件查看。</p><button type="button" @click="loadSelected(true)">重新读取</button></div>
-				<div v-else class="artifact-preview-image-stage" :class="{'is-fit': imageZoom == null}"><span v-if="imageLoading" class="artifact-preview-image-status" role="status">正在加载图片…</span><img :key="imageVersion" :src="selected.identity.contentUrl" :alt="record?.metadata?.fileName || title" :style="imageZoom == null ? {} : {width: `${Math.round(imageWidth * imageZoom)}px`}" @load="imageLoaded" @error="imageFailed = true; imageLoading = false"></div>
+				<div v-else class="artifact-preview-image-stage" :class="{'is-fit': imageZoom == null}" @touchstart="onImageStageTouchStart" @touchmove="onImageStageTouchMove" @touchend="onImageStageTouchEnd" @touchcancel="onImageStageTouchEnd" @dblclick="onImageStageDblClick" @wheel="onImageStageWheel"><span v-if="imageLoading" class="artifact-preview-image-status" role="status">正在加载图片…</span><img :key="imageVersion" :src="selected.identity.contentUrl" :alt="record?.metadata?.fileName || title" :style="imageZoom == null ? {} : {width: `${Math.round(imageWidth * imageZoom)}px`}" @load="imageLoaded" @error="imageFailed = true; imageLoading = false"></div>
+			</template>
+			<template v-else-if="isMedia">
+				<div v-if="mediaError" class="artifact-preview-empty" role="alert"><strong>{{ format.kind === 'video' ? '视频' : '音频' }}无法播放</strong><p>{{ mediaError }}</p><button type="button" @click="loadSelected(true)">重新读取</button><a :href="selected.identity.downloadUrl" download @click="onArtifactDownload($event, selected.identity)">下载原文件</a></div>
+				<div v-else-if="format.kind === 'video'" class="artifact-preview-video-stage"><video :key="imageVersion" ref="mediaElement" :src="selected.identity.contentUrl" controls playsinline autoplay preload="metadata" @error="mediaFailed"></video></div>
+				<div v-else class="artifact-preview-audio-stage">
+					<span class="artifact-preview-audio-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></span>
+					<strong>{{ record?.metadata?.fileName || title }}</strong>
+					<AudioPlayer :key="imageVersion" ref="mediaElement" :src="selected.identity.contentUrl" :label="title" autoplay @error="mediaFailed"/>
+				</div>
 			</template>
 			<div v-else-if="format.kind === 'unsupported'" class="artifact-preview-empty"><span class="artifact-preview-file-type">{{ format.label }}</span><strong>这个文件暂不支持站内预览</strong><p>原文件已保留，可以直接下载查看。</p><a :href="selected.identity.downloadUrl" download @click="onArtifactDownload($event, selected.identity)">下载原文件</a></div>
 			<div v-else-if="text.length === 0" class="artifact-preview-empty"><strong>这是一个空文件</strong><p>仍可通过右上角下载原文件。</p></div>
@@ -193,6 +295,7 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 		<div class="artifact-preview-footer"><span>{{ toolFile ? '本机文件' : '对话附件' }}<span v-if="!mobile"> · 只读预览</span></span><span :class="{'artifact-preview-file-changed': footerNote.changed}">{{ footerNote.text }}</span></div>
 	</ElDialog>
 	<ArtifactDownload :navigation-key="navigationKey"/>
+	<ImageLightbox v-if="lightboxOpen" :url-list="lightboxUrls" :initial-index="lightboxIndex" hide-on-click-modal @close="lightboxOpen = false"/>
 </template>
 
 <style>
@@ -242,6 +345,14 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 .artifact-preview-image-stage img { display: block; max-width: none; max-height: none; object-fit: contain; box-shadow: 0 5px 25px rgb(0 0 0 / 8%); }
 .artifact-preview-image-stage.is-fit { width: 100%; height: 100%; }
 .artifact-preview-image-stage.is-fit img { width: auto; max-width: 100%; max-height: 100%; min-height: 0; }
+.artifact-preview-body.is-media { background: var(--ob-bg); scrollbar-gutter: auto; }
+.artifact-preview-video-stage { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; padding: 20px; box-sizing: border-box; }
+.artifact-preview-video-stage video { display: block; width: 100%; max-width: 100%; max-height: 100%; border-radius: 8px; background: #000; object-fit: contain; }
+.artifact-preview-audio-stage { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; min-height: 100%; padding: 40px 24px; box-sizing: border-box; text-align: center; }
+.artifact-preview-audio-mark { display: grid; place-items: center; width: 64px; height: 64px; border-radius: 16px; background: var(--ob-violet-soft); color: var(--ob-violet); }
+.artifact-preview-audio-mark svg { width: 30px; height: 30px; }
+.artifact-preview-audio-stage strong { max-width: 100%; color: var(--ob-text-strong); font-size: 14px; font-weight: 580; overflow-wrap: anywhere; }
+.artifact-preview-audio-stage .audio-player { width: min(560px, 100%); }
 .artifact-preview-image-status { position: absolute; padding: 7px 12px; border-radius: 6px; background: var(--ob-surface); color: var(--ob-text-subtle); font-size: 12px; }
 .artifact-preview-footer { display: flex; flex: none; justify-content: space-between; gap: 12px; padding: 10px 24px; border-top: 1px solid var(--ob-border-soft); color: var(--ob-text-muted); font-size: 10px; line-height: 1.4; }
 .artifact-preview-footer .artifact-preview-file-changed { color: var(--ob-warning); }
@@ -261,6 +372,8 @@ onBeforeUnmount(() => { savePosition(); generation++; window.removeEventListener
 	.artifact-preview-body { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }
 	.artifact-preview-document { padding: 20px 20px 35px; font-size: 13px; }
 	.artifact-preview-source { padding: 18px 18px 35px; }
+	.artifact-preview-video-stage { padding: 0; }
+	.artifact-preview-video-stage video { border-radius: 0; }
 	.artifact-preview-footer { padding: 10px max(16px, env(safe-area-inset-right, 0px)) max(10px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left, 0px)); }
 }
 @media (prefers-reduced-motion: reduce) { .artifact-preview-spinner { animation: none; } }

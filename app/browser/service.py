@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import difflib
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,7 +17,7 @@ from pydantic import ValidationError
 
 from app.browser.cdp import CDP
 from app.browser.connection import probe_connection
-from app.browser.contract import ACTIONS, LOCAL_ACTIONS, Request
+from app.browser.contract import ACTIONS, LOCAL_ACTIONS, SUMMARIES, Request, StepError, usage
 from app.browser.worker import Worker, WorkerError
 from app.interaction_data import explicit_authorization
 
@@ -32,6 +34,16 @@ class Page:
     failure: dict | None = None
     failed_url: str = ""
     retry_at: float = 0
+    # Recent snapshot versions this service saw for the page: ref id -> the
+    # version-free lines from the root to that element. In memory only.
+    snapshots: dict = field(default_factory=dict)
+    latest: str = ""
+    document_id: str = ""
+    # Last full-page snapshot lines and URL, what an observation diffs against.
+    baseline: dict | None = None
+    # The URL the page last reported to a snapshot, find, observation or navigation: an action's observation
+    # tells a move to another document by it even when no full snapshot was taken before.
+    url: str = ""
 
 
 @dataclass
@@ -41,6 +53,9 @@ class CallBudget:
     page: Page | None = None
     dispatched: bool = False
     page_created: bool = False
+    scope: asyncio.Timeout | None = None
+    # The finished act/navigate/steps result being observed: it stands even if the observation runs out of time.
+    settled: dict | None = None
 
     def remaining(self):
         value = self.deadline - time.monotonic()
@@ -50,6 +65,101 @@ class CallBudget:
 
 
 call_budget = contextvars.ContextVar("browser_call_budget", default=None)
+
+VERSIONED_REF = re.compile(r"^(s[0-9a-f]{8}):(\S+)$")
+REF_VERSION = re.compile(r"\[ref=s[0-9a-f]{8}:")
+SNAPSHOT_REF = re.compile(r"\[ref=s[0-9a-f]{8}:([^\]]+)\]")
+ROLE_AND_NAME = re.compile(r'^\s*-\s+([\w-]+)(?:\s+"((?:[^"\\]|\\.)*)")?')
+INTERACTIVE_ROLES = {
+    "button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox",
+    "option", "menuitem", "menuitemcheckbox", "menuitemradio", "tab", "switch", "slider",
+    "spinbutton", "treeitem",
+}
+KEPT_VERSIONS = 8
+OBSERVE_ELEMENTS = 20
+OBSERVE_TEXT = 8
+OBSERVE_S = 10
+
+
+def _plain(line):
+    """A snapshot line without its version and focus marker, for comparing snapshots."""
+    return REF_VERSION.sub("[ref=", line).replace(" [active]", "")
+
+
+def _ref_paths(text):
+    """Each ref id with the role, name and ref of every element from the root down to it.
+
+    Values, states and focus are left out: the browser keeps an element's ref id
+    while its role and name stay the same.
+    """
+    paths, stack = {}, []
+    for line in text.split("\n"):
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        found = SNAPSHOT_REF.search(line)
+        role = ROLE_AND_NAME.match(line)
+        stack.append((indent, (role and role.groups(), found and found[1])))
+        if found:
+            paths[found[1]] = tuple(x for _, x in stack)
+    return paths
+
+
+def _interactive(line):
+    item = line.strip().removeprefix("- ")
+    role = re.match(r"[A-Za-z]+", item)
+    return "[ref=" in item and (
+        (role is not None and role[0] in INTERACTIVE_ROLES) or "[cursor=pointer]" in item
+    )
+
+
+def _summary(text, baseline, navigated):
+    """Interactive elements and text of what changed since the baseline lines."""
+    lines = [x for x in text.split("\n") if x.strip()]
+    result = {}
+    if baseline is None or navigated:
+        result["changed"] = True if navigated else None
+        if navigated:
+            result["navigated"] = True
+        region, words = lines, []
+    else:
+        current = [_plain(x) for x in lines]
+        region, removed = [], 0
+        matcher = difflib.SequenceMatcher(None, baseline, current, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in {"replace", "insert"}:
+                region.extend(lines[j1:j2])
+            if tag in {"replace", "delete"}:
+                removed += i2 - i1
+        result["changed"] = bool(region or removed)
+        if removed:
+            result["removed"] = removed
+        words = [
+            x.strip().removeprefix("- ")[:160]
+            for x in region
+            if not _interactive(x) and not x.strip().removeprefix("- ").startswith("/")
+        ]
+    elements = [x.strip().removeprefix("- ").removesuffix(":") for x in region if _interactive(x)]
+    if elements:
+        result["elements"] = elements[:OBSERVE_ELEMENTS]
+    if len(elements) > OBSERVE_ELEMENTS:
+        result["more"] = len(elements) - OBSERVE_ELEMENTS
+    if words:
+        result["text"] = words[:OBSERVE_TEXT]
+    if len(words) > OBSERVE_TEXT:
+        result["moreText"] = len(words) - OBSERVE_TEXT
+    return result
+
+
+def _truthy(source):
+    """A waitFor expression as one side-effect-free poll that answers true or false."""
+    source = source.strip()
+    if re.match(r"^(?:async\s+)?function\b", source):
+        source = "(" + source + "\n)"
+    return (
+        "async()=>{try{let v=(" + source + "\n);if(typeof v==='function')v=v();"
+        "return !!(await v)}catch(e){return false}}"
+    )
 
 
 @dataclass
@@ -277,6 +387,11 @@ class BrowserService:
                         "recovery_circuit_open: use recover connection", "not_started"
                     )
             inst.last_recovery = time.monotonic()
+            # Ref counters may restart even when the browser document survives.
+            for page in self.pages.values():
+                if page.instance == inst.id:
+                    page.snapshots.clear()
+                    page.latest, page.document_id = "", ""
             if inst.node:
                 # The node keeps downloads and artifacts in its own folders.
                 try:
@@ -379,15 +494,25 @@ class BrowserService:
         except asyncio.CancelledError:
             raise
         except ValidationError as exc:
-            return {
+            errors = exc.errors(include_input=False)
+            actions = ACTIONS if self.nodes is not None else LOCAL_ACTIONS
+            params = args.get("params") if isinstance(args.get("params"), dict) else {}
+            action, op = args.get("action"), params.get("op")
+            result = {
                 "status": "error",
                 "error": "invalid_browser_arguments",
-                "detail": [
-                    {"loc": list(e["loc"]), "msg": e["msg"]}
-                    for e in exc.errors(include_input=False)
-                ],
+                "detail": [{"loc": list(e["loc"]), "msg": e["msg"]} for e in errors],
                 "outcome": "not_started",
+                "usage": usage(
+                    action if isinstance(action, str) else None, op if isinstance(op, str) else None, actions
+                ),
             }
+            step = next(
+                (e["ctx"]["error"] for e in errors if isinstance(e.get("ctx", {}).get("error"), StepError)), None
+            )
+            if step is not None and step.action:
+                result["stepUsage"] = usage(step.action, step.op if isinstance(step.op, str) else None, actions)
+            return result
         except ValueError as exc:
             return {"status": "error", "error": str(exc), "outcome": "not_started"}
         except WorkerError as exc:
@@ -411,18 +536,27 @@ class BrowserService:
         if not timed:
             return await self._call(req, owner, ctx)
         navigation = req.action == "navigate" or (req.action == "page" and req.params.get("url"))
-        duration = min(
-            req.timeoutMs / 1000
-            if req.timeoutMs
-            else (self.cfg.navigation_timeout_s if navigation else self.cfg.action_timeout_s),
-            self.cfg.max_timeout_s,
-        )
+        if req.action == "steps" and not req.timeoutMs:
+            # Each step keeps the deadline it would have as its own call.
+            duration = min(sum(self._duration(step) for step in req.params["steps"]), self.cfg.max_timeout_s)
+        else:
+            duration = min(
+                req.timeoutMs / 1000
+                if req.timeoutMs
+                else (self.cfg.navigation_timeout_s if navigation else self.cfg.action_timeout_s),
+                self.cfg.max_timeout_s,
+            )
+        if req.action == "evaluate" and req.params.get("waitFor"):
+            duration = min(duration + self._wait_for_s(req), self.cfg.max_timeout_s)
         budget = CallBudget(time.monotonic() + duration, page=self.pages.get(req.page))
         token = call_budget.set(budget)
         try:
-            async with asyncio.timeout_at(budget.deadline):
+            async with asyncio.timeout_at(budget.deadline) as scope:
+                budget.scope = scope
                 return await self._call(req, owner, ctx)
         except TimeoutError:
+            if budget.settled is not None:
+                return {**budget.settled, "observation": {"error": "observe_timeout"}}
             preparing = budget.page_created and budget.phase != "execute_navigate"
             outcome = (
                 "failed"
@@ -476,10 +610,22 @@ class BrowserService:
         finally:
             call_budget.reset(token)
 
+    def _duration(self, req):
+        return min(
+            req.timeoutMs / 1000
+            if req.timeoutMs
+            else (self.cfg.navigation_timeout_s if req.action == "navigate" else self.cfg.action_timeout_s),
+            self.cfg.max_timeout_s,
+        )
+
+    def _wait_for_s(self, req):
+        timeout = req.params["waitFor"].get("timeoutMs")
+        return min(timeout / 1000 if timeout else self.cfg.action_timeout_s, self.cfg.max_timeout_s)
+
     @staticmethod
     def _can_mutate(req):
         return (
-            req.action in {"act", "navigate", "evaluate", "page"}
+            req.action in {"act", "navigate", "evaluate", "page", "steps"}
             or (req.action == "dialog" and req.params.get("op") == "handle")
             or (req.action == "files" and req.params.get("op") != "list")
         )
@@ -594,10 +740,10 @@ class BrowserService:
         a, p = req.action, req.params
         if a == "describe":
             actions = ACTIONS if self.nodes is not None else LOCAL_ACTIONS
-            return {
-                "status": "ok",
-                "actions": {p["action"]: actions[p["action"]]} if p.get("action") else actions,
-            }
+            if p.get("action"):
+                return {"status": "ok", "actions": {p["action"]: actions[p["action"]]},
+                        "usage": usage(p["action"], actions=actions)}
+            return {"status": "ok", "actions": SUMMARIES, "note": "describe {action} gives one action's full parameters and usage"}
         if a == "status":
             nodes = []
             if self.nodes is not None and not ctx.agent_session_uuid and not ctx.task_uuid:
@@ -647,23 +793,94 @@ class BrowserService:
         page, inst = await self._owned_page(req, owner, verify=False)
         if budget := call_budget.get():
             budget.page = page
-        if page.failure and a not in {"console", "network", "dialog"}:
+        steps = p["steps"] if a == "steps" else None
+        # Steps pass this gate one by one, exactly where each would run alone.
+        if steps is None and page.failure and a not in {"console", "network", "dialog"}:
             # A fresh, deliberate navigation can correct an address. Never silently
             # replay the failed navigation or let a snapshot enter the same timeout.
-            corrected = (
-                a == "navigate"
-                and p.get("op") == "goto"
-                and (p.get("url") != page.failed_url or time.monotonic() >= page.retry_at)
-                and page.failure.get("outcome") != "unknown"
-            )
-            if corrected:
-                page.failure = None
-                page.state = "ready"
-            else:
+            if not self._corrects_failure(req, page):
                 return self._blocked(page)
         await self._sync(inst)
         if page.id not in self.pages:
             raise ValueError("page_expired: browser or document target changed")
+        artifact = None
+        if steps is None:
+            p = self._gate(req, page)
+        locked = False
+        inst.active += 1
+        try:
+            # Dialog handling must be able to unblock an operation holding the page lock.
+            if a != "dialog":
+                if budget := call_budget.get():
+                    budget.phase = "page_queue"
+                try:
+                    await asyncio.wait_for(page.lock.acquire(), self.cfg.queue_timeout_s)
+                except TimeoutError:
+                    return {
+                        "status": "error",
+                        "error": "page_queue_timeout",
+                        "outcome": "not_started",
+                    }
+                locked = True
+                # Another operation may have failed while this one was queued.
+                if steps is None and page.failure and a not in {"console", "network"}:
+                    return self._blocked(page)
+            try:
+                if budget := call_budget.get():
+                    budget.phase = "initialize_worker"
+                await self._worker(inst)
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "error": "browser_worker_unavailable",
+                    "phase": "initialize_worker",
+                    "page": page.id,
+                    "detail": str(exc)[:300],
+                    "outcome": "not_started",
+                    "recovery": "Independent page list/recover remains available",
+                }
+            if steps is not None:
+                return await self._steps(req, page, inst, ctx)
+            # Under the page lock, so no other call's snapshot moves the refs meanwhile.
+            p = self._fresh_refs(page, p)
+            params, artifact = self._params(req, p, page)
+            if a == "evaluate" and p.get("waitFor"):
+                waited = await self._wait_for(req, p, page, inst)
+                if waited.get("status") != "ok":
+                    return waited
+            result = await self._execute(req, p, params, artifact, page, inst, ctx)
+            if a == "evaluate" and p.get("waitFor") and result.get("status") == "ok":
+                result["waitedMs"] = waited["waitedMs"]
+            if a in {"act", "navigate"} and result.get("status") == "ok":
+                observation = await self._observe(
+                    page, inst, p.get("observe", "summary"), result, navigated=a == "navigate", dialog=result.get("dialog")
+                )
+                if observation is not None:
+                    result["observation"] = observation
+            return result
+        finally:
+            inst.active -= 1
+            if locked:
+                page.lock.release()
+            if artifact and artifact.exists() and artifact.stat().st_size == 0:
+                artifact.unlink(missing_ok=True)
+
+    @staticmethod
+    def _corrects_failure(req, page):
+        corrected = (
+            req.action == "navigate"
+            and req.params.get("op") == "goto"
+            and (req.params.get("url") != page.failed_url or time.monotonic() >= page.retry_at)
+            and page.failure.get("outcome") != "unknown"
+        )
+        if corrected:
+            page.failure = None
+            page.state = "ready"
+        return corrected
+
+    def _gate(self, req, page):
+        """Per-request checks once the page is known live; returns the checked params."""
+        a, p = req.action, req.params
         if a == "evaluate" and not self.cfg.allow_evaluate:
             raise ValueError("evaluate_disabled")
         if page.state == "suspect" and a not in {
@@ -682,13 +899,15 @@ class BrowserService:
             if sum(x.stat().st_size for x in paths) > self.cfg.max_artifact_bytes:
                 raise ValueError("upload_too_large")
             p = {**p, "paths": [str(x) for x in paths]}
-        duration = min(
-            req.timeoutMs / 1000
-            if req.timeoutMs
-            else (self.cfg.navigation_timeout_s if a == "navigate" else self.cfg.action_timeout_s),
-            self.cfg.max_timeout_s,
-        )
-        params = {**p, "targetId": page.target, "timeoutMs": int(duration * 1000)}
+        return p
+
+    def _params(self, req, p, page):
+        a = req.action
+        params = {
+            **{k: v for k, v in p.items() if k not in {"observe", "waitFor"}},
+            "targetId": page.target,
+            "timeoutMs": int(self._duration(req) * 1000),
+        }
         if a in {"snapshot", "find"}:
             params["maxChars"] = min(
                 p.get("maxChars", self.cfg.snapshot_max_chars), self.cfg.snapshot_max_chars
@@ -703,93 +922,283 @@ class BrowserService:
                 ".png" if a == "capture" else ".json" if a == "evaluate" else ".bin"
             )
             params["outputPath"] = str(artifact)
-        locked = False
-        inst.active += 1
+        return params, artifact
+
+    async def _worker_lost(self, inst, exc):
+        responded = isinstance(exc, WorkerError) and exc.responded
+        if not responded or str(exc) == "browser_connection_lost":
+            inst.failures += 1
+            inst.last_recovery = time.monotonic()
+            await inst.worker.close()
+
+    async def _execute(self, req, p, params, artifact, page, inst, ctx, limit=None):
+        """Dispatch one validated request on a locked page with a ready worker."""
+        a = req.action
+        duration = params["timeoutMs"] / 1000
         try:
-            # Dialog handling must be able to unblock an operation holding the page lock.
-            if a != "dialog":
-                if budget := call_budget.get():
-                    budget.phase = "page_queue"
-                try:
-                    await asyncio.wait_for(page.lock.acquire(), self.cfg.queue_timeout_s)
-                except TimeoutError:
-                    return {
-                        "status": "error",
-                        "error": "page_queue_timeout",
-                        "outcome": "not_started",
-                    }
-                locked = True
-                # Another operation may have failed while this one was queued.
-                if page.failure and a not in {"console", "network"}:
-                    return self._blocked(page)
-            try:
-                if budget := call_budget.get():
-                    budget.phase = "initialize_worker"
-                await self._worker(inst)
-            except Exception as exc:
-                return {
-                    "status": "error",
-                    "error": "browser_worker_unavailable",
-                    "phase": "initialize_worker",
-                    "page": page.id,
-                    "detail": str(exc)[:300],
-                    "outcome": "not_started",
-                    "recovery": "Independent page list/recover remains available",
-                }
-            try:
-                if budget := call_budget.get():
-                    budget.phase = "execute_" + a
-                    duration = budget.remaining()
-                    # Reserve a small part of the SAME budget for IPC and an
-                    # independent, read-only diagnosis. Never grant a second deadline.
-                    reserve = min(1.2, duration * 0.2)
-                    params["timeoutMs"] = max(1, int((duration - reserve) * 1000))
-                    budget.dispatched = True
-                    duration -= reserve / 2
-                result = await inst.worker.call(a, params, timeout=duration)
-            except (TimeoutError, WorkerError, asyncio.CancelledError) as exc:
-                responded = isinstance(exc, WorkerError) and exc.responded
-                if not responded or str(exc) == "browser_connection_lost":
-                    inst.failures += 1
-                    inst.last_recovery = time.monotonic()
-                    await inst.worker.close()
-                # A normal navigation/DOM timeout is not a crashed worker.
-                if isinstance(exc, asyncio.CancelledError):
-                    page.state = "suspect"
-                    self._save_pages()
-                    raise
-                return await self._operation_error(req, page, inst, exc)
-            if a in {"snapshot", "find", "capture", "navigate", "prepare"}:
-                page.failure = None
-                page.state = "ready"
+            if budget := call_budget.get():
+                budget.phase = "execute_" + a
+                duration = budget.remaining() if limit is None else min(limit, budget.remaining())
+                # Reserve a small part of the SAME budget for IPC and an
+                # independent, read-only diagnosis. Never grant a second deadline.
+                reserve = min(1.2, duration * 0.2)
+                params["timeoutMs"] = max(1, int((duration - reserve) * 1000))
+                budget.dispatched = True
+                duration -= reserve / 2
+            result = await inst.worker.call(a, params, timeout=duration)
+        except (TimeoutError, WorkerError, asyncio.CancelledError) as exc:
+            await self._worker_lost(inst, exc)
+            # A normal navigation/DOM timeout is not a crashed worker.
+            if isinstance(exc, asyncio.CancelledError):
+                page.state = "suspect"
                 self._save_pages()
-            if result.get("artifact"):
-                actual = Path(result.pop("artifact")).resolve()
-                if artifact is None or actual != artifact.resolve() or not actual.is_file():
-                    raise RuntimeError("invalid_worker_artifact")
-                if actual.stat().st_size > self.cfg.max_artifact_bytes:
-                    actual.unlink()
-                    raise RuntimeError("artifact_too_large")
-                reference = "workspace/" + actual.relative_to(self.workspace).as_posix()
-                result["artifact"] = reference
-                result["link"] = f"[{actual.name}]({reference})"
-                if a == "capture" and p.get("view"):
-                    ctx.tool_images.append(
-                        {
-                            "type": "image",
-                            "path": str(actual),
-                            "mime_type": "image/png",
-                            "name": actual.name,
-                        }
-                    )
-                    result["imageInput"] = True
-            return {"status": "ok", "outcome": "completed", "page": page.id, **result}
-        finally:
-            inst.active -= 1
-            if locked:
-                page.lock.release()
-            if artifact and artifact.exists() and artifact.stat().st_size == 0:
-                artifact.unlink(missing_ok=True)
+                raise
+            return await self._operation_error(req, page, inst, exc)
+        if a in {"snapshot", "find", "capture", "navigate", "prepare"}:
+            page.failure = None
+            page.state = "ready"
+            self._save_pages()
+        if a == "navigate":
+            # A new document numbers its refs afresh; nothing earlier carries over.
+            page.snapshots.clear()
+            page.latest, page.baseline, page.document_id = "", None, ""
+            page.url = result.get("url") or page.url
+        if a in {"snapshot", "find"}:
+            whole = a == "snapshot" and not any(k in p for k in ("target", "depth", "interactive", "maxChars"))
+            self._remember(page, result, baseline=whole)
+        if result.get("artifact"):
+            actual = Path(result.pop("artifact")).resolve()
+            if artifact is None or actual != artifact.resolve() or not actual.is_file():
+                raise RuntimeError("invalid_worker_artifact")
+            if actual.stat().st_size > self.cfg.max_artifact_bytes:
+                actual.unlink()
+                raise RuntimeError("artifact_too_large")
+            reference = "workspace/" + actual.relative_to(self.workspace).as_posix()
+            result["artifact"] = reference
+            result["link"] = f"[{actual.name}]({reference})"
+            if a == "capture" and p.get("view"):
+                ctx.tool_images.append(
+                    {
+                        "type": "image",
+                        "path": str(actual),
+                        "mime_type": "image/png",
+                        "name": actual.name,
+                    }
+                )
+                result["imageInput"] = True
+        return {"status": "ok", "outcome": "completed", "page": page.id, **result}
+
+    def _remember(self, page, shot, *, baseline):
+        version, text = shot.get("snapshotId"), shot.get("text")
+        if not isinstance(version, str) or not isinstance(text, str):
+            return
+        # Python workers attest all frame epochs (including same-URL reloads).
+        # Older remote workers lack this field: at least reject URL changes.
+        document_id = shot.pop("documentId", "")
+        url = shot.get("url") or page.url
+        if (document_id != page.document_id
+                or (page.url and url and page.url.split("#", 1)[0] != url.split("#", 1)[0])):
+            page.snapshots.clear()
+        page.document_id = document_id
+        page.snapshots[version] = _ref_paths(text)
+        page.url = url
+        while len(page.snapshots) > KEPT_VERSIONS:
+            page.snapshots.pop(next(iter(page.snapshots)))
+        page.latest = version
+        if baseline:
+            page.baseline = {
+                "lines": [_plain(x) for x in text.split("\n") if x.strip()],
+                "url": shot.get("url", ""),
+            }
+
+    def _fresh_refs(self, page, p):
+        """Earlier refs whose element is unchanged in the latest snapshot use its version.
+
+        The worker accepts refs of its latest snapshot only, and every observation
+        takes a new one. A ref id keeps naming the same element while the role, name
+        and ref of that element and of all its ancestors are unchanged, so such an
+        earlier ref is moved to the latest version; anything else is left for the
+        worker to reject as stale.
+        """
+        latest = page.snapshots.get(page.latest)
+        if latest is None:
+            return p
+
+        def fresh(target):
+            found = VERSIONED_REF.match(target) if isinstance(target, str) else None
+            if not found or found[1] == page.latest:
+                return target
+            path = page.snapshots.get(found[1], {}).get(found[2])
+            return f"{page.latest}:{found[2]}" if path is not None and latest.get(found[2]) == path else target
+
+        p = {**p}
+        for key in ("target", "to"):
+            if key in p:
+                p[key] = fresh(p[key])
+        if p.get("fields"):
+            p["fields"] = [{**f, "target": fresh(f["target"])} for f in p["fields"]]
+        if p.get("waitFor", {}).get("target"):
+            p["waitFor"] = {**p["waitFor"], "target": fresh(p["waitFor"]["target"])}
+        return p
+
+    async def _observe(self, page, inst, mode, settled, *, navigated=False, dialog=None):
+        """What the page looks like after an act/navigate/steps; never changes its outcome (settled)."""
+        if mode == "none":
+            return None
+        if dialog:
+            return {"dialog": dialog, "skipped": "dialog_pending"}
+        if page.failure:
+            return {"skipped": "page_not_ready"}
+        allowance = min(self.cfg.action_timeout_s, OBSERVE_S)
+        if budget := call_budget.get():
+            # The action already finished; its own deadline must not cut this read short:
+            # the snapshot takes up to allowance + 0.5 s, the title then up to 2 s.
+            budget.phase, budget.settled = "observe", settled
+            budget.deadline = max(budget.deadline, time.monotonic() + allowance + 3.5)
+            if budget.scope is not None:
+                budget.scope.reschedule(budget.deadline)
+        params = {
+            "targetId": page.target,
+            "timeoutMs": int(allowance * 1000),
+            "maxChars": self.cfg.snapshot_max_chars,
+        }
+        try:
+            shot = await inst.worker.call("snapshot", params, timeout=allowance + 0.5)
+        except (TimeoutError, WorkerError) as exc:
+            await self._worker_lost(inst, exc)
+            return {"error": str(exc) or "observe_timeout"}
+        baseline, before = page.baseline, page.url
+        self._remember(page, shot, baseline=True)
+        if mode == "snapshot":
+            return shot
+        url = shot.get("url", "")
+        before = baseline["url"] if baseline is not None else before
+        moved = navigated or bool(before and url and before.split("#", 1)[0] != url.split("#", 1)[0])
+        result = {
+            "title": await self._title(page, inst),
+            "url": url,
+            "snapshotId": shot.get("snapshotId"),
+            **_summary(shot.get("text", ""), baseline["lines"] if baseline else None, moved),
+        }
+        if shot.get("truncated"):
+            result["truncated"] = True
+        return result
+
+    @staticmethod
+    async def _title(page, inst):
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(2):
+                for target in (await inst.cdp.call("Target.getTargets", timeout=2))["targetInfos"]:
+                    if target.get("targetId") == page.target:
+                        return target.get("title", "")
+        return None
+
+    async def _wait_for(self, req, p, page, inst):
+        """evaluate waitFor: the expression runs only once the condition holds."""
+        condition = p["waitFor"]
+        timeout = self._wait_for_s(req)
+        if budget := call_budget.get():
+            budget.phase = "wait_for"
+            timeout = max(0.05, min(timeout, budget.remaining() - 0.5))
+        started = time.monotonic()
+        deadline = started + timeout
+        base = {"targetId": page.target}
+        try:
+            if "expression" in condition:
+                probe = _truthy(condition["expression"])
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise WorkerError("action_timeout", "failed", responded=True)
+                    try:
+                        reply = await inst.worker.call(
+                            "evaluate",
+                            {**base, "expression": probe, "timeoutMs": int(min(left, 5) * 1000)},
+                            timeout=min(left, 5) + 1,
+                        )
+                    except WorkerError as exc:
+                        # A page too busy to answer one poll has not met the condition.
+                        if not (exc.responded and str(exc) == "action_timeout"):
+                            raise
+                        reply = {}
+                    if reply.get("value") is True:
+                        break
+                    await asyncio.sleep(min(0.15, max(0, deadline - time.monotonic())))
+            else:
+                await inst.worker.call(
+                    "wait",
+                    {**base, **{k: v for k, v in condition.items() if k != "timeoutMs"},
+                     "timeoutMs": int(timeout * 1000)},
+                    timeout=timeout + 1,
+                )
+        except (TimeoutError, WorkerError) as exc:
+            await self._worker_lost(inst, exc)
+            timed_out = isinstance(exc, WorkerError) and exc.responded and str(exc) == "action_timeout"
+            return {
+                "status": "error",
+                "error": "wait_for_timeout" if timed_out else "wait_for_failed",
+                **({} if timed_out else {"detail": str(exc)[:300] or "worker_timeout"}),
+                "outcome": "not_started",
+                "phase": "wait_for",
+                "page": page.id,
+                "waitedMs": int((time.monotonic() - started) * 1000),
+                "replayed": False,
+                "recovery": "The waitFor condition did not hold; the expression was not run."
+                if timed_out
+                else "The waitFor condition could not be checked; the expression was not run.",
+            }
+        return {"status": "ok", "waitedMs": int((time.monotonic() - started) * 1000)}
+
+    async def _steps(self, req, page, inst, ctx):
+        """Run validated act/wait/navigate steps in order under the held page lock."""
+        results, stopped, navigated = [], None, False
+        steps = req.params["steps"]
+        for index, step in enumerate(steps):
+            try:
+                result = await self._step(step, page, inst, ctx)
+            except ValueError as exc:
+                result = {"status": "error", "error": str(exc), "outcome": "not_started"}
+            result = {k: v for k, v in result.items() if k != "page"}
+            results.append({"action": step.action, **({"op": step.params["op"]} if "op" in step.params else {}), **result})
+            completed = result.get("status") == "ok" and result.get("outcome") == "completed"
+            navigated |= completed and step.action == "navigate"
+            # A dialog blocks every later step until it is handled explicitly.
+            if not completed or (index < len(steps) - 1 and (result.get("dialog") or result.get("pendingDialog"))):
+                stopped = index
+                break
+        dialog = results[-1].get("dialog")
+        summary = {"page": page.id, "steps": results}
+        if stopped is None:
+            summary = {"status": "ok", "outcome": "completed", **summary, "completedSteps": len(results)}
+        else:
+            last = results[stopped]
+            if last.get("outcome") == "completed":
+                outcome, error, done = "failed", "dialog_pending", stopped + 1
+            else:
+                outcome, error, done = last.get("outcome", "unknown"), last.get("error", "step_failed"), stopped
+                if outcome == "not_started" and stopped:
+                    outcome = "failed"
+            summary = {
+                "status": "error",
+                "error": error,
+                "outcome": outcome,
+                **summary,
+                "completedSteps": done,
+                "stoppedAt": stopped,
+            }
+        observation = await self._observe(
+            page, inst, req.params.get("observe", "summary"), summary, navigated=navigated, dialog=dialog
+        )
+        if observation is not None:
+            summary["observation"] = observation
+        return summary
+
+    async def _step(self, step, page, inst, ctx):
+        if page.failure and not self._corrects_failure(step, page):
+            return self._blocked(page)
+        p = self._fresh_refs(page, self._gate(step, page))
+        params, _ = self._params(step, p, page)
+        return await self._execute(step, p, params, None, page, inst, ctx, limit=self._duration(step))
 
     async def _page(self, req, owner, ctx):
         p, op = req.params, req.params["op"]
@@ -892,7 +1301,7 @@ class BrowserService:
                             action="navigate",
                             page=page.id,
                             timeoutMs=req.timeoutMs,
-                            params={"url": p["url"]},
+                            params={"url": p["url"], "observe": "none"},
                         ),
                         owner,
                         ctx,

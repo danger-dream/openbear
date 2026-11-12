@@ -1,10 +1,12 @@
 <script setup>
+import { Promotion } from '@element-plus/icons-vue';
+import CardIcon from './detail/CardIcon.vue';
 import { computed, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue';
 import { NetApi } from './netApi.js';
-import { countLabel, countRange, DEFAULTS, failureKind, FAMILIES, fieldError, GEO_SCOPES, geoPending, geoText, hopsWaitingForGeo, meshPathView, pctText, PROBE_MODES, PROBE_STATES,
+import { countLabel, countRange, DEFAULTS, failureKind, FAMILIES, fieldError, GEO_SCOPES, geoLooking, geoPending, geoText, hopsWaitingForGeo, meshPathView, pctText, PROBE_MODES, PROBE_STATES,
   hopPending, probeErrorText, probeRequest, resultText, summaryParts, targetOptions } from './netHelpers.js';
 import { flag, noAutofill, safeError } from './serverHelpers.js';
-import { mesh } from './mesh/meshStore.js';
+import { mesh, refresh as refreshMesh } from './mesh/meshStore.js';
 import { msText, nameOf } from './mesh/meshHelpers.js';
 import SuggestInput from './SuggestInput.vue';
 import { MOBILE_VIEWPORT_QUERY } from '../mobileViewport.js';
@@ -22,12 +24,15 @@ const form = reactive({mode: 'ping', target: '', port: '', family: 0, count: '',
 const errors = ref({}), startError = ref(''), note = ref(''), advanced = ref(null);
 // idle → starting → running → (stopping) → ended
 const phase = ref('idle'), status = ref(null), run = ref(null), showAll = ref(false), geoDone = ref(false);
-const ROWS = 10, GEO_TRIES = 3;
+// A lookup still under way after the test ends is read again each second for this many (one source may take 8 s, its fallback as long again).
+const ROWS = 10, GEO_TRIES = 30;
 let round = 0, timer, fails = 0, geoTries = 0;
 
 const busy = computed(() => ['starting', 'running', 'stopping'].includes(phase.value));
 const members = computed(() => mesh.work?.members || []);
 const options = computed(() => targetOptions(props.servers, props.serverId, members.value, {meshFirst: props.board}));
+// The mesh's members name its addresses in the suggestions and its paths: read here when no page has.
+watch(() => props.active && !mesh.data && !mesh.unavailable && !mesh.loadError, need => { if (need) void refreshMesh(); }, {immediate: true});
 const name = id => members.value.some(m => m.serverId === id) ? nameOf(members.value, id) : props.servers.find(s => s.id === id)?.name || id;
 
 const st = computed(() => status.value || {});
@@ -145,7 +150,7 @@ watch(() => props.online, value => { if (!value && busy.value) void stop(true); 
 const leave = () => { const r = run.value; if (r?.id && ['starting', 'running'].includes(phase.value)) { round++; void NetApi.stop(r.serverId, r.id, true).catch(() => {}); } };
 // On a phone the trace is a list of hops two lines each instead of the table (no sideways scrolling).
 const phone = ref(false);
-const inline = computed(() => props.card && !phone.value);
+const inline = computed(() => (props.card || props.board) && !phone.value);
 let media;
 const syncPhone = () => { phone.value = Boolean(media?.matches); };
 const geoTitle = geo => geo ? [...new Set([geo.countryName, geoText(geo)].filter(Boolean))].join(' · ') : '';
@@ -161,7 +166,7 @@ onBeforeUnmount(() => { window.removeEventListener('pagehide', leave); media?.re
 </script>
 <template>
   <section :class="card ? 'ix-card net-probe' : 'net-probe'" aria-label="网络测试">
-    <header v-if="card" class="ix-card-head"><h3>网络测试</h3><span class="instance-muted">从这台服务器发起，测到目标的延迟和路线</span></header>
+    <header v-if="card" class="ix-card-head"><h3><CardIcon :icon="Promotion" tone="success" />网络测试</h3><span class="instance-muted">从这台服务器发起，测到目标的延迟和路线</span></header>
     <form class="net-form" autocomplete="off" novalidate @submit.prevent="toggle">
       <div class="net-line">
         <div class="sv-ranges net-modes" role="radiogroup" aria-label="测试方式">
@@ -178,7 +183,7 @@ onBeforeUnmount(() => { window.removeEventListener('pagehide', leave); media?.re
         </label>
         <el-button class="net-go" :type="busy ? 'default' : 'primary'" native-type="submit" :loading="phase === 'starting' || phase === 'stopping'" :disabled="!online && !busy">{{ busy ? '停止' : '开始' }}</el-button>
       </div>
-      <!-- The detail page on a wide screen has the room: the options stay out, nothing to unfold. -->
+      <!-- The detail page and a mesh node's page on a wide screen have the room: the options stay out, nothing to unfold. -->
       <details ref="advanced" class="net-advanced" :class="{'is-inline': inline}" :open="inline || undefined">
         <summary>高级选项</summary>
         <div class="net-adv-grid">
@@ -271,7 +276,7 @@ onBeforeUnmount(() => { window.removeEventListener('pagehide', leave); media?.re
                 <span class="net-hop-ttl" />
                 <span class="net-hop-addr">
                   <template v-if="a.geo"><span v-if="flag(a.geo.country)" class="sv-flag" aria-hidden="true">{{ flag(a.geo.country) }}</span><span class="net-hop-place">{{ geoText(a.geo) || a.geo.countryName }}</span></template>
-                  <span v-else-if="geoPending(a) && !geoDone" class="net-geo-wait" aria-label="正在查询归属地">查询中</span>
+                  <span v-else-if="geoLooking(a) && !geoDone" class="net-geo-wait" aria-label="正在查询归属地">查询中</span>
                   <span v-else class="net-hop-place">{{ a.geoSkipped ? '未查询' : geoPending(a) ? '未查到' : GEO_SCOPES[a.scope] || '' }}</span>
                 </span>
                 <span v-if="!i && lossShown(h)" class="net-hop-loss">丢包 {{ pctText(h.lossPct) }}</span>
@@ -301,7 +306,7 @@ onBeforeUnmount(() => { window.removeEventListener('pagehide', leave); media?.re
                   <template v-if="h.addrs?.length">
                     <span v-for="a in h.addrs" :key="a.ip" class="net-line-cell" :title="geoTitle(a.geo)">
                       <template v-if="a.geo"><span v-if="flag(a.geo.country)" class="sv-flag" aria-hidden="true">{{ flag(a.geo.country) }}</span><span>{{ geoText(a.geo) || a.geo.countryName }}</span></template>
-                      <span v-else-if="geoPending(a) && !geoDone" class="net-geo-wait" aria-label="正在查询归属地">查询中</span>
+                      <span v-else-if="geoLooking(a) && !geoDone" class="net-geo-wait" aria-label="正在查询归属地">查询中</span>
                       <span v-else class="instance-muted">{{ a.geoSkipped ? '未查询' : geoPending(a) ? '未查到' : GEO_SCOPES[a.scope] || '—' }}</span>
                     </span>
                   </template>

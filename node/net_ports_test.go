@@ -241,3 +241,5 @@ func TestAPortListenedOnOneAddressIsNotFree(t *testing.T) {
 		t.Fatalf("port %d reported free: %+v", port, st)
 	}
 }
+
+func atoi(s string) int { v, _ := strconv.Atoi(s); return v }

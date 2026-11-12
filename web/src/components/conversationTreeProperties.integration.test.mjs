@@ -26,7 +26,7 @@ const models = [
   {key:'slow', thinkingLevels:['low'], defaultThinkingLevel:'low', supportsFast:false},
   {key:'plain', thinkingLevels:[], defaultThinkingLevel:'', supportsFast:false},
 ];
-function harness({local = {}, inherited = {}, getProperties, failOptions = false, impact} = {}) {
+function harness({local = {}, inherited = {}, getProperties, failOptions = false, impact, extensions} = {}) {
   const calls = [], events = [], warnings = [], errors = [];
   const stored = {local:clone(local)};
   const response = id => ({name:id,path:id,workspace:{local:'/project'},prompt:{local:'original'},
@@ -38,6 +38,8 @@ function harness({local = {}, inherited = {}, getProperties, failOptions = false
     webhookEditor:ref(null), webhookVisited:ref(false), webhookFocused:ref(false),
     propertyModelOptions:ref([]), propertiesRunDefaultsBaseline:ref({}), propertiesForm:{},
     impactState:{}, impactDialog:ref(false),
+    folderExtensions:ref({inherit:true,enabled:[],autoAllow:false}), folderExtensionsBaseline:ref(''), folderExtensionCatalog:ref([]),
+    folderExtensionInherited:ref(null), folderExtensionsLoaded:ref(false), folderExtensionsCanInherit:ref(false),
     ElMessage:{warning: text => warnings.push(text), error: text => errors.push(text), success: () => {}},
     CustomEvent: class {constructor(type, options) {this.type=type; this.detail=options.detail;}},
     window:{dispatchEvent: event => events.push(clone(event.detail))}, mergeLocatedFolders:()=>{}, emitRows:()=>{}, refreshStatus:async()=>{},
@@ -47,6 +49,9 @@ function harness({local = {}, inherited = {}, getProperties, failOptions = false
       async conversationFolderPropertiesImpact(id,payload) {calls.push({kind:'impact',id,payload:clone(payload)});return impact ? impact() : {affectedCount:0};},
       async updateConversationFolderProperties(id,payload) {calls.push({kind:'update',id,payload:clone(payload)});if(Object.hasOwn(payload,'runDefaults'))stored.local=clone(payload.runDefaults);return {updatedCount:2};},
       async locateConversationFolderInTree(id) {calls.push({kind:'locate',id});return {folderItems:[]};},
+      async folderExtensions(id) {return extensions ? extensions(id) : {default:{enabled:['workitems'],autoAllow:false,from:'parent',explicit:true,own:false},canInherit:true,
+        inherited:{enabled:['workitems'],autoAllow:false,from:'parent',explicit:true},extensions:[{key:'workitems',label:'任务面板'},{key:'browser',label:'浏览器'}]};},
+      async updateFolderExtensions(id,payload) {calls.push({kind:'extensions',id,payload:clone(payload)});return {};},
     },
   };
   const context=vm.createContext(state);
@@ -135,6 +140,13 @@ for (const choice of [true,false,null]) {
     if(choice===null)assert.equal(h.lastUpdate(),undefined);
     else assert.equal(h.lastUpdate().payload.updateSnapshots,choice);
   });
+  test(`an extension default changed in the dialog follows impact choice ${choice}`,async()=>{
+    const h=harness({impact:()=>({affectedCount:2,updatableCount:2})});await h.open();
+    h.state.propertiesForm.promptMarkdown='changed';h.state.folderExtensions.value={inherit:false,enabled:['browser'],autoAllow:false};
+    const pending=h.run('saveProperties()');await flush();
+    h.run(`finishImpact(${JSON.stringify(choice)})`);await pending;
+    assert.equal(h.calls.some(call=>call.kind==='extensions'),choice!==null);
+  });
 }
 
 test('closing a dialog while impact is pending prevents a stale save',async()=>{
@@ -160,4 +172,35 @@ test('folder save keeps edits typed while impact/PUT is pending instead of closi
   const save=h.run('saveProperties()');await flush();h.state.propertiesForm.promptMarkdown='typed later';h.state.propertiesForm.promptPolicy={overrideSystemPrompt:true,toolsEnabled:false,toolNames:['removed'],userMessageTemplateEnabled:true};
   impact.resolve({affectedCount:0});await save;
   assert.equal(h.lastUpdate().payload.promptMarkdown,'submitted');assert.equal(h.state.propertiesDialog.value,true);assert.equal(h.state.propertiesForm.promptMarkdown,'typed later');assert.equal(h.state.propertiesForm.promptPolicy.userMessageTemplateEnabled,true);
+});
+
+test('a changed extension default is saved with the dialog after its impact is confirmed; an unchanged one is not sent', async () => {
+  const h=harness();await h.open();
+  assert.deepEqual(clone(h.state.folderExtensions.value),{inherit:true,enabled:['workitems'],autoAllow:false});
+  h.state.propertiesForm.promptMarkdown='changed';await h.run('saveProperties()');
+  assert.equal(h.calls.some(call=>call.kind==='extensions'),false);
+  await h.open();
+  h.state.folderExtensions.value={inherit:false,enabled:['workitems','browser'],autoAllow:true};
+  await h.run('saveProperties()');
+  const kinds=h.calls.map(call=>call.kind);
+  assert.deepEqual(h.calls.find(call=>call.kind==='extensions'),{kind:'extensions',id:'project',payload:{enabled:['workitems','browser'],autoAllow:true}});
+  assert.ok(kinds.lastIndexOf('extensions')>kinds.lastIndexOf('update'));
+  await h.open();
+  h.state.folderExtensions.value={inherit:true,enabled:[],autoAllow:false};await h.run('saveProperties()');
+  assert.deepEqual(h.calls.filter(call=>call.kind==='extensions').at(-1).payload,{inherit:true});
+  assert.deepEqual(h.errors,[]);
+});
+
+test('a top-level folder has nothing to inherit: it opens on its own setting, and an unchanged one is not sent', async () => {
+  const top={default:{enabled:[],autoAllow:false,from:'',explicit:false,own:false},inherited:{enabled:[],autoAllow:false,from:'',explicit:false},canInherit:false,extensions:[]};
+  const h=harness({extensions:()=>clone(top)});await h.open('top');
+  assert.equal(h.state.folderExtensionsCanInherit.value,false);
+  assert.deepEqual(clone(h.state.folderExtensions.value),{inherit:false,enabled:[],autoAllow:false});
+  await h.run('saveProperties()');
+  assert.equal(h.calls.some(call=>call.kind==='extensions'),false);
+  await h.open('top');h.state.folderExtensions.value={inherit:false,enabled:['browser'],autoAllow:false};await h.run('saveProperties()');
+  assert.deepEqual(h.calls.find(call=>call.kind==='extensions').payload,{enabled:['browser'],autoAllow:false});
+  // One with its own setting opens on it, whether or not it could inherit.
+  const own=harness({extensions:()=>({...clone(top),default:{enabled:['agents','workitems'],autoAllow:true,from:'top',explicit:true,own:true}})});await own.open('top');
+  assert.deepEqual(clone(own.state.folderExtensions.value),{inherit:false,enabled:['agents','workitems'],autoAllow:true});
 });

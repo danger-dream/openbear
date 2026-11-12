@@ -213,12 +213,13 @@ func (c *Collector) diskIO() (read, write uint64) {
 	return
 }
 
-// sockets counts the TCP and UDP tables of both address families.
-func sockets() (tcp, udp int) {
+// sockets counts the TCP and UDP tables of both address families, and the established connections.
+func sockets() (tcp, udp, estab int) {
 	for _, family := range []uintptr{windows.AF_INET, windows.AF_INET6} {
 		var t [15]uint32
 		if r, _, _ := procGetTcpStatisticsEx.Call(uintptr(unsafe.Pointer(&t[0])), family); r == 0 {
 			tcp += int(t[14])
+			estab += int(t[8])
 		}
 		var u [5]uint32
 		if r, _, _ := procGetUdpStatisticsEx.Call(uintptr(unsafe.Pointer(&u[0])), family); r == 0 {
@@ -242,7 +243,10 @@ func processes() int {
 	}
 }
 
-func selfRSS() int64 {
+func selfRSS() int64 { return workingSet(windows.CurrentProcess()) }
+
+// workingSet is a process's resident memory, from a handle with query access.
+func workingSet(h windows.Handle) int64 {
 	var counters struct {
 		Cb, PageFaultCount                                 uint32
 		PeakWorkingSetSize, WorkingSetSize                 uintptr
@@ -251,7 +255,7 @@ func selfRSS() int64 {
 		PagefileUsage, PeakPagefileUsage                   uintptr
 	}
 	counters.Cb = uint32(unsafe.Sizeof(counters))
-	if r, _, _ := procGetProcessMemoryInfo.Call(uintptr(windows.CurrentProcess()), uintptr(unsafe.Pointer(&counters)), uintptr(counters.Cb)); r == 0 {
+	if r, _, _ := procGetProcessMemoryInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&counters)), uintptr(counters.Cb)); r == 0 {
 		return 0
 	}
 	return int64(counters.WorkingSetSize)
@@ -276,7 +280,9 @@ func (c *Collector) Sample() Sample {
 		s.IO = DiskIO{ReadRate: perSecond(read, c.ioR, elapsed), WriteRate: perSecond(write, c.ioW, elapsed)}
 	}
 	c.ioR, c.ioW, c.ioAt = read, write, now
-	s.TCP, s.UDP = sockets()
+	var estab int
+	s.TCP, s.UDP, estab = sockets()
+	s.TCPEstab = &estab
 	s.Processes = processes()
 	if r, _, _ := procGetTickCount64.Call(); r > 0 {
 		s.Uptime = int64(r / 1000)

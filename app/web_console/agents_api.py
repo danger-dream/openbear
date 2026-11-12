@@ -398,7 +398,7 @@ class WebAdminAgentsMixin:
             return web.json_response({
                 "ok": False,
                 "error": "controller_runtime_required",
-                "message": "Plan-enabled Agent trial must be started from a conversation so AgentWait can review the Plan.",
+                "message": "Plan-enabled Agent trial must be started from a conversation so Agent(action=wait) can review the Plan.",
             }, status=409)
         session: WebSession = request[_WEB_SESSION_KEY]
         session_uuid = await self._current_session_uuid(session.chat_id)

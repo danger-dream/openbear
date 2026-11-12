@@ -70,11 +70,8 @@ class Cloudflare(Provider):
         items = await self._pages(f'/zones/{await self._zone_id(zone)}/dns_records', {'type': rtype, 'name': name})
         return [self._record(i) for i in items if i['name'].lower() == name and i['type'] == rtype]
 
-    def _ttl(self, ttl):
-        return 1 if ttl == 1 else self.ttl_for(ttl)
-
     async def create(self, zone, name, rtype, value, ttl, opts):
-        body = {'type': rtype, 'name': name, 'content': value, 'ttl': self._ttl(ttl) or 1}
+        body = {'type': rtype, 'name': name, 'content': value, 'ttl': self.ttl_for(ttl) or 1}
         if 'proxied' in (opts or {}):
             body['proxied'] = bool(opts['proxied'])
         result = (await self._api('POST', f'/zones/{await self._zone_id(zone)}/dns_records', json=body))['result']
@@ -83,8 +80,8 @@ class Cloudflare(Provider):
     async def update(self, zone, record, value, ttl, opts):
         # PATCH keeps every field not sent, including proxied, comment and tags.
         body = {'content': value}
-        if self._ttl(ttl):
-            body['ttl'] = self._ttl(ttl)
+        if self.ttl_for(ttl):
+            body['ttl'] = self.ttl_for(ttl)
         if 'proxied' in (opts or {}):
             body['proxied'] = bool(opts['proxied'])
         result = (await self._api('PATCH', f'/zones/{await self._zone_id(zone)}/dns_records/{record.id}', json=body))['result']

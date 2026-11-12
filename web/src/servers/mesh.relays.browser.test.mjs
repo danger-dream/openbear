@@ -72,16 +72,27 @@ test('mesh board layout: site relays', {skip: !chromium, timeout: 300000}, async
     await h.saved(d => memberOf(d, 'toy').relayMode === 'site', 'site relay again');
     await label(page, '打洞 · 2.6 ms').waitFor();
 
-    // Lab is behind NAT: made a relay it starts as a site relay with UDP, and needs a public relay to link to.
+    // Lab is behind NAT: made a relay its entry through SG becomes a relay link; back to a member, its entry again.
+    // Without it, made a relay, it needs a public relay to link to.
     await node(page, 'lab').click();
     await panel.getByRole('tab', {name: '配置'}).click();
     await panel.getByRole('checkbox', {name: /作为中转/}).check();
     body = await h.saved(d => memberOf(d, 'lab').role === 'relay', 'lab relay');
+    assert.deepEqual(body.relayLinks.pairs.slice(4), [{a: 'lab', b: 'sg', transport: 'udp', cost: 1, dialer: 'a'}]);
+    await page.getByText('它原来的入口改成了中转互联：SG').waitFor();
+    await panel.getByRole('checkbox', {name: /作为中转/}).uncheck();
+    body = await h.saved(d => memberOf(d, 'lab').role === 'member' && memberOf(d, 'lab').listen.udp === 51999 && d.relayLinks.pairs.length === 4, 'lab member again');
+    await panel.getByRole('tab', {name: '入口'}).click();
+    await panel.getByRole('button', {name: '删除第 1 个入口'}).click();
+    await h.saved(d => memberOf(d, 'lab').entry.candidates.length === 0, 'lab without its entry');
+    await panel.getByRole('tab', {name: '配置'}).click();
+    await panel.getByRole('checkbox', {name: /作为中转/}).check();
+    body = await h.saved(d => memberOf(d, 'lab').role === 'relay' && !memberOf(d, 'lab').entry?.candidates.length, 'lab relay, alone');
     await panel.getByText('站点中转至少要连一台公网中转，用来交换打洞地址').waitFor();
     await node(page, 'lab').locator('.pb-tag', {hasText: '需修改'}).waitFor();
     // Two site relays may be linked: by punching.
     await dragPort(page, 'lab', 'toy', 'left');
-    body = await h.saved(d => d.relayLinks.pairs.length === 5, 'site-to-site link');
+    body = await h.saved(d => d.relayLinks.pairs.length === 5 && d.relayLinks.pairs[4].b === 'toy', 'site-to-site link');
     assert.deepEqual(body.relayLinks.pairs[4], {a: 'lab', b: 'toy', transport: 'udp', cost: 1, dialer: 'a'});
     await label(page, '打洞').waitFor();
     assert.match(await panel.locator('.mesh-relay-facts').innerText(), /打洞：两台都是站点中转/);
@@ -92,12 +103,13 @@ test('mesh board layout: site relays', {skip: !chromium, timeout: 300000}, async
     assert.match(await panel.locator('.mesh-relay-facts').innerText(), /拨号：Lab 主动连接 SG/);
     await node(page, 'lab').locator('.pb-tag', {hasText: '需修改'}).waitFor({state: 'detached'});
 
-    // An entry through a site relay needs a public one too: Win without its SG entry.
+    // An entry through a site relay off the member's LAN needs a public one too, as the server's check
+    // says (the fake backend knows no LANs): Win without its SG entry.
     await node(page, 'win').click();
     await panel.getByRole('tab', {name: '入口'}).click();
     await panel.getByRole('button', {name: '删除第 2 个入口'}).click();
     await h.saved(d => memberOf(d, 'win').entry.candidates.length === 1, 'win without SG');
-    await panel.getByText('入口里有站点中转时，还要有一个公网中转入口：先经它连上，再和站点中转打洞').waitFor();
+    await panel.getByText('入口里的站点中转不在这个节点的局域网里，还要有一个公网中转入口：先经它连上，再和站点中转打洞').waitFor();
     await h.close();
   });
 });

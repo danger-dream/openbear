@@ -17,7 +17,10 @@ from app.llm.error_classify import (
     BILLING,
     CONTEXT_OVERFLOW,
     FORMAT,
+    SERVER_ERROR,
     classify_error,
+    is_gemini_sampling_failure,
+    is_retryable_reason,
     normalize_classification,
     retryable_from_contract,
 )
@@ -37,6 +40,8 @@ _SENSITIVE_KEYS = frozenset({
 })
 _STATUS_KEYS = ("status", "status_code", "statusCode", "http_status", "httpStatus")
 _MESSAGE_KEYS = ("message", "error_message", "errorMessage", "description", "title")
+# Echoed request fields: tool schema descriptions there are not error text.
+_ECHO_KEYS = frozenset({"tools", "parameters", "properties", "instructions", "input", "output"})
 
 
 def _text(value: Any) -> str:
@@ -115,7 +120,8 @@ def _json_value(text: str) -> Any | None:
     if not stripped or stripped[0] not in "{[\"":
         return None
     try:
-        return json.loads(stripped)
+        # Gateways embed raw upstream bodies (HTML, newlines) in JSON strings.
+        return json.loads(stripped, strict=False)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -159,7 +165,7 @@ def _walk(value: Any, scan: _Scan, *, depth: int = 0, field_name: str = "") -> N
         for index, (key, item) in enumerate(value.items()):
             if index >= _MAX_COLLECTION_ITEMS:
                 break
-            if _sensitive_key(key):
+            if _sensitive_key(key) or key in _ECHO_KEYS:
                 continue
             _walk(item, scan, depth=depth + 1, field_name=str(key))
         return
@@ -319,7 +325,7 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
     if not code:
         code = redact_sensitive_text(deepest_code).strip()[:200]
 
-    if not summary and root_message:
+    if not summary and root_message and root_message[:1] not in "{[<":
         summary = sanitize_user_facing_text(root_message)
     if not root_message and isinstance(original, str):
         raw = redact_sensitive_text(original).strip()
@@ -345,6 +351,17 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
         # A generic invalid_request/format envelope must not hide WS 1009.
         # Reuse bounded overflow recovery, not ordinary unchanged retries.
         reason = CONTEXT_OVERFLOW
+    elif classification in {"", FORMAT} and is_gemini_sampling_failure(message, code):
+        # Gateways report a Gemini sampling failure (malformed tool call, stream
+        # ended without finishReason) in a generic 400 invalid_request envelope.
+        # The request was valid; whether it may be repeated stays with the contract.
+        reason = SERVER_ERROR
+    elif (not structured and not classification and code_reason == FORMAT
+          and (upstream_status >= 500 or upstream_status in (408, 429))
+          and is_retryable_reason(fallback_reason)):
+        # A generic invalid_request envelope must not hide the transient status
+        # it wraps (``HTTP 502`` inside error.message). Text alone is not enough.
+        reason = fallback_reason
     else:
         reason = classification or code_reason or fallback_reason
 

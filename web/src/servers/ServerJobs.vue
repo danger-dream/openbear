@@ -1,4 +1,6 @@
 <script setup>
+import { Timer } from '@element-plus/icons-vue';
+import CardIcon from './detail/CardIcon.vue';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Api } from '../api.js';
@@ -12,7 +14,7 @@ const props = defineProps({serverId: {type: String, required: true}, active: Boo
 const CHUNK = 64 * 1024;
 const jobs = ref(null), error = ref(''), stopping = ref(''), phone = ref(false);
 const viewing = ref(''), log = ref(null), logError = ref(''), loadingEarlier = ref(false), logBox = ref(null);
-let alive = true, timer, logTimer, media;
+let alive = true, timer, logTimer, media, reads = 0;
 
 const STATES = {running: '运行中', exited: '已结束', stopped: '已停止', interrupted: '已中断'};
 const job = computed(() => jobs.value?.find(j => j.id === viewing.value) || log.value?.job || null);
@@ -40,13 +42,14 @@ async function load() {
 // The newest output, then whatever the job writes after it while the panel is open.
 async function follow() {
   clearTimeout(logTimer);
-  const id = viewing.value;
-  if (!id) return;
+  const id = viewing.value, read = ++reads;
+  if (!id || !alive) return;
   try {
     const current = log.value;
     const params = current ? {offset: current.next, limit: CHUNK * 4} : {limit: CHUNK};
     const data = ok(await Api.serverJob(props.serverId, id, params));
-    if (viewing.value !== id) return;
+    // Closed, reopened, another job opened, or the page left while this was on its way.
+    if (!alive || viewing.value !== id || read !== reads) return;
     const part = data.log, box = logBox.value;
     const atEnd = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 24;
     if (!current || part.offset > current.next) {
@@ -58,7 +61,7 @@ async function follow() {
     logError.value = '';
     const delay = followDelay(part, current?.next);
     if (data.job.state === 'running' || delay === FOLLOW_GAP) logTimer = setTimeout(follow, delay);
-  } catch (e) { if (viewing.value === id) logError.value = safeError(e); }
+  } catch (e) { if (alive && viewing.value === id && read === reads) logError.value = safeError(e); }
 }
 async function earlier() {
   const current = log.value;
@@ -98,7 +101,7 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); clearTimeout(logTime
 </script>
 <template>
   <section class="ix-card sv-jobs">
-    <header class="ix-card-head"><h3>后台任务</h3><span class="instance-muted">{{ jobs?.length ? `${jobs.length} 个` : '' }}</span><span class="ob-grow" />
+    <header class="ix-card-head"><h3><CardIcon :icon="Timer" tone="orange" />后台任务</h3><span class="instance-muted">{{ jobs?.length ? `${jobs.length} 个` : '' }}</span><span class="ob-grow" />
       <button type="button" class="ix-text-button" @click="load">刷新</button>
     </header>
     <p v-if="error" class="instance-error">{{ error }}</p>

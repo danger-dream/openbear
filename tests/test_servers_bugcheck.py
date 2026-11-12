@@ -229,9 +229,9 @@ async def test_the_ai_tool_runs_a_command_on_several_servers_at_once():
         return {'ok': True, 'exitCode': 0, 'stdout': server_id}
     servers = [{'id': f's{i}', 'name': f'n{i}', 'profile': {}, 'live': True} for i in range(12)]
 
-    async def listing(owner):
-        return {'items': servers}
-    tool = ServersTool(SimpleNamespace(exec=exec, list=listing))
+    async def brief(owner):
+        return servers
+    tool = ServersTool(SimpleNamespace(exec=exec, brief=brief))
     started = time.monotonic()
     result = await tool.exec(123, {'command': 'true', 'all': True}, None)
     assert [r['serverId'] for r in result['results']] == [s['id'] for s in servers] and result['ok']

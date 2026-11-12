@@ -4,6 +4,7 @@ import { ElMessageBox } from 'element-plus';
 import { MeshApi } from './meshApi.js';
 import { act, mesh, meshErrorText, revert, unsaved } from './meshStore.js';
 import { errorMessage, FINISHED, nameOf, PROGRESS } from './meshHelpers.js';
+import MeshNodeName from './MeshNodeName.vue';
 
 // Above the board while there is something to apply, being applied, or failed.
 // As `panel` (nothing selected): always shown, with the whole list.
@@ -52,6 +53,12 @@ function place(path) {
   if (member) return {member: members.value[Number(member[1])]?.serverId, text: members.value[Number(member[1])]?.name || '成员'};
   const rule = /^rules\[(\d+)\]/.exec(path || '');
   if (rule) return {text: `访问规则第 ${Number(rule[1]) + 1} 条`};
+  const limit = /^limits\[(\d+)\]/.exec(path || '');
+  if (limit) return {text: `连接限制第 ${Number(limit[1]) + 1} 条`};
+  const fpath = /^paths\[(\d+)\]/.exec(path || '');
+  if (fpath) return {text: `自建路线第 ${Number(fpath[1]) + 1} 条`};
+  const lrule = /^lineRules\[(\d+)\]/.exec(path || '');
+  if (lrule) return {text: `线路规则第 ${Number(lrule[1]) + 1} 条`};
   if (/^relayLinks/.test(path || '')) return {text: '中转之间的连接'};
   if (/^directLinks/.test(path || '')) return {text: '直连'};
   return {text: '组网设置'};
@@ -91,7 +98,7 @@ function apply() { expanded.value = false; emit('apply'); }
           <li v-for="(c, i) in changes" :key="i">{{ c.text }}</li>
         </template>
         <li v-for="p in kind === 'failed' ? failed : kind === 'offline' ? offline : kind === 'missing' ? missing : kind === 'running' ? progress : []" :key="p.serverId" :data-tone="p.state === 'failed' ? 'bad' : p.state === 'missing' ? 'warn' : undefined">
-          <button type="button" class="ix-text-button" @click="emit('member', p.serverId)">{{ nameOf(members, p.serverId) }}</button>：{{ p.state === 'failed' ? meshErrorText(p.error) || '原因未知' : PROGRESS[p.state]?.[1] || p.state }}
+          <button type="button" class="ix-text-button" @click="emit('member', p.serverId)"><MeshNodeName :id="p.serverId" plain /></button>：{{ p.state === 'failed' ? meshErrorText(p.error) || '原因未知' : PROGRESS[p.state]?.[1] || p.state }}
         </li>
       </ul>
     </template>

@@ -23,15 +23,26 @@ test('which servers can run tests', () => {
   assert.equal(h.eligible({id: 'mac', node: {caps: {exec: true}, info: {platform: 'darwin', arch: 'arm64'}}}), false);
 });
 
-test('the tree: servers with runs in order, categories and tests with runs, newest run first', () => {
+test('the tree: servers with runs in order, a test a row with its newest run, the earlier ones after it', () => {
   const runs = [{id: 'r1', serverId: 'sg', test: 'ipcheck', createdMs: 1, state: 'done'}, {id: 'r2', serverId: 'sg', test: 'ipcheck', createdMs: 3, state: 'running'},
     {id: 'r3', serverId: 'gone-mac', test: 'netcheck', createdMs: 2, state: 'failed'}];
   const servers = [linux('sg'), {id: 'win', node: {info: {platform: 'windows', arch: 'amd64'}}}, linux('jp'), {id: 'gone-mac', name: 'mac', node: {info: {platform: 'darwin', arch: 'arm64'}}}];
   const tree = h.buildTree(servers, runs, CATALOG);
   assert.deepEqual(tree.map(n => [n.server.id, n.eligible, n.runs, n.active]), [['sg', true, 2, 1], ['gone-mac', false, 1, 0]], 'jp can run tests but has none');
-  assert.deepEqual(tree[0].categories.map(c => c.id), ['ip']);
-  assert.deepEqual(tree[0].categories[0].tests[0].runs.map(r => r.id), ['r2', 'r1']);
+  assert.deepEqual(tree[0].tests.map(t => [t.test.id, t.latest.id, t.older.map(r => r.id)]), [['ipcheck', 'r2', ['r1']]]);
+  assert.equal(tree[0].latestMs, 3);
+  // Tests go by their categories' order, whatever the catalog's order of tests.
+  const both = h.buildTree([linux('sg')], [...runs, {id: 'r4', serverId: 'sg', test: 'netcheck', createdMs: 4, state: 'done'}],
+    {...CATALOG, tests: [...CATALOG.tests].reverse()});
+  assert.deepEqual(both[0].tests.map(t => t.test.id), ['ipcheck', 'netcheck']);
   assert.deepEqual(h.buildTree(servers, [], CATALOG), []);
+});
+
+test('a run time in the tree leaves out this year', () => {
+  const at = new Date(2026, 9, 30, 22, 5).getTime();
+  assert.equal(h.shortRunTime(at, new Date(2026, 11, 31).getTime()), '10.30 22:05');
+  assert.equal(h.shortRunTime(at, new Date(2027, 0, 1).getTime()), '2026.10.30 22:05');
+  assert.equal(h.shortRunTime(0), '');
 });
 
 test('warnings follow the options', () => {

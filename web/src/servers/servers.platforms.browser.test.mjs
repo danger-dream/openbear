@@ -4,7 +4,7 @@
 // servers.dom.test.mjs and servers.install.dom.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab} from './testing/serversBrowser.mjs';
+import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab, showTab} from './testing/serversBrowser.mjs';
 import {day, GB, server, many, uninstalledLast, TARGET, RELEASE, versions, MESH_ON, onMesh, card, orders, meshOption, off, fact} from './testing/serversBackend.mjs';
 
 test('servers page layout: Windows and macOS nodes, phone detail, file sheet and terminal keys', {skip: !chromium, timeout: 300000}, async t => {
@@ -29,7 +29,7 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
 
     await win.click();
     let detail = h.page.locator('.sv-detail:visible');
-    await detail.locator('.sv-chart svg').first().waitFor();
+    await detail.locator('[data-chart=load] svg').waitFor();
 
     // Files on Windows: the drives, then backslash paths; no permissions.
     await detail.getByRole('button', {name: '文件', exact: true}).click();
@@ -65,8 +65,13 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     await tab(h.page, '探针').click();
     await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
     detail = h.page.locator('.sv-detail:visible');
+    await showTab(detail, '系统');
     await detail.getByText('macOS 26.2').waitFor();
-    await detail.locator('.sv-chart svg').first().waitFor();
+    await detail.locator('[data-part=ssh]').getByText('连接属性').waitFor();
+    await detail.locator('[data-part=ssh]').getByText('VNC 屏幕共享').waitFor();
+    await shot(h.page, 'desktop-macos-system-conn');
+    await showTab(detail, '概览');
+    await detail.locator('[data-chart=load] svg').waitFor();
     await detail.getByRole('button', {name: '文件', exact: true}).click();
     await sheet.getByText('完全磁盘访问权限', {exact: false}).waitFor();
     await h.page.keyboard.press('Escape');
@@ -84,6 +89,19 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     await tab(h.page, '终端').click();
     const sidebar = h.page.locator('.tw-server').filter({hasText: 'Delta-JP'}).first();
     await shot(h.page, 'desktop-platform-terminal');
+    // Click Delta-JP in sidebar (opens terminal), then click 查看桌面 in the toolbar.
+    await sidebar.click();
+    await h.page.getByRole('button', {name: '查看桌面'}).click();
+    await h.page.locator('[data-desktop-pane]').first().waitFor();
+    await h.page.getByText('Delta-JP · RDP 远程桌面').waitFor();
+    await noOverflow(h.page);
+    await shot(h.page, 'desktop-windows-rdp-auth');
+    // Right-click Papa-HK.T1 in sidebar to open macOS VNC desktop via context menu.
+    await h.page.locator('.tw-server').filter({hasText: 'Papa-HK.T1'}).first().click({button: 'right'});
+    await h.page.getByRole('menuitem', {name: '打开远程桌面'}).click();
+    await h.page.getByText('Papa-HK.T1 · VNC 屏幕共享').waitFor();
+    await noOverflow(h.page);
+    await shot(h.page, 'desktop-macos-vnc-auth');
     await h.close();
   });
 
@@ -94,7 +112,7 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     }});
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
     let detail = h.page.locator('.sv-detail:visible');
-    await detail.locator('.sv-gauge').first().waitFor();
+    await detail.locator('.ov-card').first().waitFor();
     await noOverflow(h.page);
     await detail.getByRole('button', {name: '文件'}).click();
     const sheet = h.page.locator('.sv-files-drawer');
@@ -124,6 +142,15 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     await batch.getByRole('button', {name: '关闭'}).click();
     await batch.waitFor({state: 'hidden'});
 
+    await detail.getByRole('button', {name: '查看桌面'}).click();
+    await h.page.getByText('Delta-JP · RDP 远程桌面').waitFor();
+    for (const input of await h.page.locator('.dp-field > input, .dp-field > select').all()) {
+      assert.ok(await input.evaluate(el => parseFloat(getComputedStyle(el).fontSize) >= 16));
+    }
+    await h.page.locator('.tw-keys').getByRole('button', {name: 'Ctrl+Alt+Del'}).waitFor();
+    await noOverflow(h.page);
+    await shot(h.page, 'phone-windows-rdp');
+
     await tab(h.page, '探针').click();
     await h.page.locator('.pb-card').filter({hasText: 'Hotel-HK'}).click();
     detail = h.page.locator('.sv-detail:visible');
@@ -141,7 +168,8 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     const h = await setup(t, {width: 390, height: 844});
     await noOverflow(h.page);
     const heights = await h.page.locator('.pb-card').evaluateAll(cards => cards.map(c => Math.round(c.getBoundingClientRect().height)));
-    assert.ok(heights.every(height => height <= 240), JSON.stringify(heights));
+    // Six rows of pairs at most, the measured ones with latency and loss: about a third of the screen.
+    assert.ok(heights.every(height => height <= 270), JSON.stringify(heights));
     await shot(h.page, 'phone-board');
     await h.page.getByRole('button', {name: '列表视图'}).click();
     const rows = await h.page.locator('.pl-row').evaluateAll(list => list.map(r => Math.round(r.getBoundingClientRect().height)));
@@ -150,7 +178,7 @@ test('servers page layout: Windows and macOS nodes, phone detail, file sheet and
     await shot(h.page, 'phone-list');
     await h.page.locator('.pl-row').filter({hasText: 'Edge-SG.Game'}).click();
     const detail = h.page.locator('.sv-detail:visible');
-    await detail.locator('.sv-gauge').first().waitFor();
+    await detail.locator('.ov-card').first().waitFor();
     await noOverflow(h.page);
     await shot(h.page, 'phone-detail');
     await detail.locator('.ix-more').click();

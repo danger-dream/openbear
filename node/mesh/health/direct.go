@@ -221,13 +221,21 @@ type offerRate struct {
 	at     time.Time
 }
 
+// lanInterface: up, not loopback and not a tunnel. A tunnel's addresses (WireGuard, a proxy's
+// TUN, PPP) lead through another network, often by way of a far relay, so a peer behind the same
+// tunnel is no neighbour; tunnels are point-to-point or carry no hardware address.
+func lanInterface(ifc net.Interface) bool {
+	return ifc.Flags&net.FlagUp != 0 && ifc.Flags&net.FlagLoopback == 0 &&
+		ifc.Flags&net.FlagPointToPoint == 0 && len(ifc.HardwareAddr) > 0
+}
+
 // localAddrs are this machine's IPv4 addresses a peer on the same network
 // could reach, outside the mesh.
 var localAddrs = func(mesh netip.Prefix) []netip.Addr {
 	var out []netip.Addr
 	ifaces, _ := net.Interfaces()
 	for _, ifc := range ifaces {
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+		if !lanInterface(ifc) {
 			continue
 		}
 		addrs, _ := ifc.Addrs()
@@ -253,7 +261,7 @@ var localNets = func(mesh netip.Prefix) []netip.Prefix {
 	var out []netip.Prefix
 	ifaces, _ := net.Interfaces()
 	for _, ifc := range ifaces {
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+		if !lanInterface(ifc) {
 			continue
 		}
 		addrs, _ := ifc.Addrs()
@@ -314,7 +322,11 @@ func (m *Manager) configureDirects(c Config, now time.Time) {
 	}
 	for _, l := range c.Links {
 		if l.Punch {
-			add(l.Peer, kind).configured = parseEndpointAddr(l.Endpoint)
+			k := kind
+			if c.Role != "relay" && slices.ContainsFunc(c.Nodes, func(n Node) bool { return n.ID == l.Peer && n.Role == "relay" }) {
+				k = punchRelay
+			}
+			add(l.Peer, k).configured = parseEndpointAddr(l.Endpoint)
 		}
 	}
 	for _, cand := range c.Candidates {
@@ -464,6 +476,14 @@ func (m *Manager) signalPath(to string, now time.Time) (string, Path, bool) {
 			return p.config.Peer, p.path, true
 		}
 	}
+	for _, l := range m.cfg.Links {
+		if !m.owners.relays[l.Peer] {
+			continue
+		}
+		if path, ok := m.peerPath(l.Peer); ok {
+			return l.Peer, path, true
+		}
+	}
 	return "", Path{}, false
 }
 
@@ -471,6 +491,18 @@ func (m *Manager) signalPath(to string, now time.Time) (string, Path, bool) {
 // to; except is where the signal came from.
 func (m *Manager) hopToward(to, except string, now time.Time) (string, Path, bool) {
 	if m.roleOf(to) == "member" {
+		if m.linked(to) {
+			if path, ok := m.peerPath(to); ok {
+				return to, path, true
+			}
+		}
+		if m.relay.router != nil {
+			if hop, ok := m.relay.router.NextHop(to); ok && hop != "" && hop != except {
+				if path, ok := m.peerPath(hop); ok {
+					return hop, path, true
+				}
+			}
+		}
 		owner, ok := m.owners.owner(to, now)
 		if !ok {
 			return "", Path{}, false
@@ -483,6 +515,13 @@ func (m *Manager) hopToward(to, except string, now time.Time) (string, Path, boo
 	}
 	if path, ok := m.peerPath(to); ok {
 		return to, path, true
+	}
+	if m.relay.router != nil {
+		if hop, ok := m.relay.router.NextHop(to); ok && hop != "" && hop != except && hop != to {
+			if path, ok := m.peerPath(hop); ok {
+				return hop, path, true
+			}
+		}
 	}
 	if hop := m.cfg.NextHops[to]; hop != "" && hop != except && hop != to {
 		if path, ok := m.peerPath(hop); ok {

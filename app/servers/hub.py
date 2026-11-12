@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from app.servers import compat
+from app.servers.front import FEATURE as TUNNEL_FEATURE, clean_status as front_status
 from app.webhooks.repository import one
 
 CLOSE_UNAUTHORIZED = 4401
@@ -178,7 +179,33 @@ def clean_info(raw):
     for key in ('cores', 'memTotal', 'swapTotal', 'diskTotal'):
         value = raw.get(key)
         info[key] = int(value) if isinstance(value, (int, float)) and 0 <= value < 2**63 else 0
+    if raw.get('openwrt') is True:
+        info['openwrt'] = True
     return info
+
+
+CAPS = ('exec', 'terminal', 'browser')
+
+
+def clean_caps(raw):
+    caps = raw if isinstance(raw, dict) else {}
+    return {k: caps.get(k) is True for k in CAPS}
+
+
+def clean_features(raw):
+    return frozenset(str(f)[:40] for f in raw[:50]) if isinstance(raw, list) else frozenset()
+
+
+def recalled(info_json):
+    """(features, caps) a node's record keeps from its last hello. A session goes by them from its
+    connecting until its own hello, as everything does while the node is away: taken for a node
+    without features in between, it would be sent configs for one and then its own again."""
+    try:
+        stored = json.loads(info_json or '{}')
+    except (TypeError, ValueError):
+        stored = {}
+    stored = stored if isinstance(stored, dict) else {}
+    return clean_features(stored.get('features')), clean_caps(stored.get('caps'))
 
 
 def clean_sample(raw):
@@ -192,7 +219,9 @@ def clean_sample(raw):
     net = raw.get('net') if isinstance(raw.get('net'), dict) else {}
     io = raw.get('io') if isinstance(raw.get('io'), dict) else {}
     load = raw.get('load') if isinstance(raw.get('load'), list) else []
-    return {'cpu': round(float(num(raw.get('cpu'), 1000)), 2), 'steal': round(float(num(raw.get('steal'), 1000)), 2),
+    # Only where the node tells them (tcpEstab, tcpListen): absent is not none.
+    states = {k: int(num(raw[k], 1e9)) for k in ('tcpEstab', 'tcpListen') if k in raw}
+    return {**states, 'cpu': round(float(num(raw.get('cpu'), 1000)), 2), 'steal': round(float(num(raw.get('steal'), 1000)), 2),
             'iowait': round(float(num(raw.get('iowait'), 1000)), 2), 'mem': usage(raw.get('mem')), 'swap': usage(raw.get('swap')),
             'disk': usage(raw.get('disk')), 'load': [round(float(num(v, 1e6)), 2) for v in load[:3]] or [0, 0, 0],
             'io': {k: int(num(io.get(k))) for k in ('readRate', 'writeRate')},
@@ -263,6 +292,9 @@ class Session:
         self.next_sid = 1
         self.endpoint = ''
         self.on_backup = False
+        # front: the node takes itself for a front; front_access: what it serves as an exit.
+        self.front = False
+        self.front_access = {}
         self.forwarded = False
         self.inbound = Rate(INBOUND_BYTES_PER_S, INBOUND_BYTES_BURST)
         self.messages = Rate(MESSAGES_PER_S, MESSAGES_BURST)
@@ -583,6 +615,7 @@ class NodeHub:
             await ws.close()
             return ws
         session = Session(node_id, ws, channel, request.remote or '')
+        session.features, session.caps = recalled(row['info_json'])
         session.forwarded = any(h in request.headers for h in FORWARD_HEADERS)
         session.version = str(hello.get('version', ''))[:40]
         session.set_protocol(*protocol_range(hello))
@@ -664,10 +697,8 @@ class NodeHub:
             if 'mesh' in data and not session.incompatible:
                 await self.service.mesh.report(session.server_id, data['mesh'])
         elif kind == 'hello':
-            caps = data.get('caps') if isinstance(data.get('caps'), dict) else {}
-            session.caps = {k: caps.get(k) is True for k in ('exec', 'terminal', 'browser')}
-            features = data.get('features') if isinstance(data.get('features'), list) else []
-            session.features = frozenset(str(f)[:40] for f in features[:50])
+            session.caps = clean_caps(data.get('caps'))
+            session.features = clean_features(data.get('features'))
             session.version = str(data.get('version', session.version))[:40]
             session.set_protocol(*protocol_range(data, (session.protocol_min, session.protocol)))
             build = str(data.get('build') or '').lower()
@@ -675,10 +706,15 @@ class NodeHub:
             session.info = clean_info(data.get('info'))
             session.endpoint = str(data.get('endpoint') or '')[:200]
             session.on_backup = data.get('backup') is True
+            session.front = data.get('front') is True
+            session.front_access = front_status(data.get('frontAccess'))
             await self.service.node_hello(session.server_id, session.info, session.caps, session.version)
         elif kind == 'ddns':
             if not session.incompatible:
                 await self.service.ddns.observe(session.server_id, data.get('obs'))
+        elif kind == 'latency':
+            if not session.incompatible:
+                await self.service.latency.observe(session.server_id, data.get('minutes'))
         elif kind == 'reply':
             future = session.calls.pop(str(data.get('id', '')), None)
             if future and not future.done():
@@ -722,14 +758,50 @@ class NodeHub:
         session.next_sid += 1
         session.terminals[terminal.sid] = terminal
         terminal.start(self.service.spawn)
-        await session.channel.send_json({'t': 'term.open', 'sid': terminal.sid, 'cols': cols, 'rows': rows})
         try:
-            opened = await asyncio.wait_for(asyncio.shield(terminal.opened), 15)
-        except TimeoutError:
-            await terminal.close('open_timeout')
-            raise LookupError('open_timeout') from None
+            await session.channel.send_json({'t': 'term.open', 'sid': terminal.sid, 'cols': cols, 'rows': rows})
+            try:
+                opened = await asyncio.wait_for(asyncio.shield(terminal.opened), 15)
+            except TimeoutError:
+                raise LookupError('open_timeout') from None
+        except BaseException as exc:
+            # Cancelled or failed while the node opens it: a shell it opens after all is closed.
+            await asyncio.shield(terminal.close('open_timeout' if isinstance(exc, LookupError) else 'open_failed'))
+            raise
         if not opened:
             raise PermissionError(terminal.reason or 'open_failed')
+        return terminal
+
+    async def open_tunnel(self, server_id, sink, address):
+        """A terminal that is a TCP connection from the node to address (host:port); its output
+        goes to sink, which stands in for a browser socket. Only a node that knows dialing: an
+        older one would start a shell instead."""
+        session = self.sessions.get(server_id)
+        if not session:
+            raise LookupError('node_offline')
+        if session.incompatible:
+            raise PermissionError(session.incompatible)
+        if TUNNEL_FEATURE not in session.features or not session.caps.get('exec'):
+            raise PermissionError('capability_disabled')
+        terminal = Terminal(session, session.next_sid, sink)
+        session.next_sid += 1
+        session.terminals[terminal.sid] = terminal
+        # Do not start the output pump until the dial succeeds: a refused attempt must
+        # not close the SSH sink, which the caller may reuse through its next exit.
+        terminal.spawn = self.service.spawn
+        try:
+            await session.channel.send_json({'t': 'term.open', 'sid': terminal.sid, 'dial': address})
+            try:
+                opened = await asyncio.wait_for(asyncio.shield(terminal.opened), 25)
+            except TimeoutError:
+                raise LookupError('open_timeout') from None
+            if not opened:
+                raise PermissionError(terminal.reason or 'open_failed')
+        except BaseException:
+            await terminal.close('open_failed')
+            raise
+        terminal.start(self.service.spawn)
+        terminal.ready.set()
         return terminal
 
     async def disconnect(self, server_id, code=CLOSE_REVOKED):

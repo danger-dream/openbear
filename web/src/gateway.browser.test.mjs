@@ -4,7 +4,7 @@ import {startBrowserTestServer, waitForBrowserReady} from './browserTestServer.m
 import {createRequire} from 'node:module';
 const require = createRequire(import.meta.url);
 let chromium, WebSocketServer;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); ({WebSocketServer} = require('/opt/openclaw/node_modules/ws')); } catch {}
+try { ({chromium} = require('./testing/playwright.cjs')); ({WebSocketServer} = require('/opt/openclaw/node_modules/ws')); } catch {}
 const uuid = '11111111-1111-4111-8111-111111111111', fileId='22222222-2222-4222-8222-222222222222';
 const artifact = `/api/conversations/${uuid}/artifacts/${fileId}/content`;
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhS4AAAAASUVORK5CYII=', 'base64');

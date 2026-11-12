@@ -136,7 +136,7 @@ func TestInboundFrameRejectionAndUnauthenticatedLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 		c.SetDeadline(time.Now().Add(time.Second))
-		if err := exchangePreamble(c); err != nil {
+		if err := dialPreamble(c); err != nil {
 			t.Fatal(err)
 		}
 		c.Write(frame)
@@ -188,7 +188,7 @@ func TestCookieDoesNotAuthenticateAndDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err = exchangePreamble(c); err != nil {
+	if err = dialPreamble(c); err != nil {
 		t.Fatal(err)
 	}
 	if err = writeFrame(c, packet4(), maxDatagram(1400)); err != nil {
@@ -213,10 +213,10 @@ func TestCookieDoesNotAuthenticateAndDeadline(t *testing.T) {
 		t.Fatal("cookie incorrectly authenticated peer")
 	}
 	c.SetReadDeadline(time.Now().Add(12 * time.Second))
-	var one [1]byte
-	_, err = c.Read(one[:])
+	// Keepalives come until the server gives up on the connection.
+	_, err = io.Copy(io.Discard, c)
 	if err == nil {
-		t.Fatal("unconfirmed connection survived deadline")
+		err = io.EOF
 	}
 	if e, ok := err.(net.Error); ok && e.Timeout() {
 		t.Fatal("server did not enforce auth deadline")
@@ -240,7 +240,7 @@ func TestSlowReceiverHasBoundedSendMemory(t *testing.T) {
 		}
 		defer c.Close()
 		c.(*net.TCPConn).SetReadBuffer(1024)
-		if exchangePreamble(c) != nil {
+		if acceptPreamble(c) != nil {
 			return
 		}
 		<-stop

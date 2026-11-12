@@ -26,6 +26,10 @@ NODE_ROOT = '/var/tmp/openbear-bench'
 # and exits with CHECKSUM_FAILED when the copy there was changed or cut short.
 LISTING = '.openbear-files.sha256'
 CHECKSUM_FAILED = 86
+# What runs on OpenWrt: the others' scripts refuse its distribution, and their packages, kept
+# under NODE_ROOT (a RAM disk there), or their swap file would fill a router's memory.
+OPENWRT_TESTS = {'unlock'}
+OPENWRT_REASON = 'OpenWrt 上只能运行 Service Unlock：其余评测脚本不支持 OpenWrt，Geekbench 也无法在它的 musl 系统上运行。'
 
 CATEGORIES = [('ip', 'IP 质量'), ('network', '网络质量'), ('hardware', '硬件性能'), ('media', '流媒体与 AI 解锁')]
 
@@ -119,6 +123,7 @@ def view():
         'tests': [{'id': key, **{k: t[k] for k in ('name', 'category', 'duration', 'summary', 'options', 'warnings')},
                    'package': t['package'], 'version': PACKAGES[t['package']]} for key, t in TESTS.items()],
         'suite': {k: SUITE[k] for k in ('name', 'summary', 'duration', 'options', 'tests', 'warnings')},
+        'openwrt': {'tests': sorted(OPENWRT_TESTS), 'reason': OPENWRT_REASON},
     }
 
 
@@ -152,6 +157,30 @@ def label(test, opts):
         elif value != spec['default'] or spec['key'] == 'mode':
             parts.append(next(c[1] for c in spec['choices'] if c[0] == value))
     return ' · '.join(parts)
+
+
+# How long a run's job may go on from its start before it is stopped, in minutes: several times the
+# longest seen (or the duration above where none was), and never under a quarter of an hour, which a
+# package manager installing the dependencies over a slow mirror can take on its own.
+LIMITS = {'ipcheck': 30, 'unlock': 15, 'netroute': 60, 'geekbench5': 60,
+          'netcheck': {'low': 60, 'full': 120},
+          'tcpquality': {'route-v4': 30, 'route-v6': 30, 'v4': 60, 'v6': 60, 'intl': 60, 'speedtest': 90, 'all': 180}}
+
+
+def time_limit(test, opts):
+    """The run's limit in minutes; IPv4 + IPv6 runs the whole test once for each."""
+    if test == 'hwcheck':
+        # With the report it runs Geekbench and the graphics test as well.
+        minutes = 120 if opts.get('report') else 60
+    else:
+        minutes = LIMITS.get(test, 60)
+        if isinstance(minutes, dict):
+            minutes = minutes.get(opts.get('mode'), max(minutes.values()))
+    return minutes * 2 if opts.get('family') == '46' else minutes
+
+
+def limit_words(minutes):
+    return f'{minutes // 60} 小时' if minutes % 60 == 0 else f'{minutes} 分钟'
 
 
 def _family(opts):
@@ -196,6 +225,14 @@ def command(test, opts, out_dir):
     return (f'export OB_BENCH_DIR={shlex.quote(base)} OB_BENCH_OUT={shlex.quote(out_dir)} TERM=xterm-256color LANG=C.UTF-8; '
             'export PATH="$OB_BENCH_DIR/bin:$PATH"; '
             f'find {NODE_ROOT}/runs -mindepth 1 -maxdepth 1 -mtime +0 -exec rm -rf {{}} + 2>/dev/null; '
-            f'cd "$OB_BENCH_DIR" && sha256sum -c --quiet {LISTING} >/dev/null 2>&1 || '
+            f'cd "$OB_BENCH_DIR" && sha256sum -c {LISTING} >/dev/null 2>&1 || '
             f'{{ echo "评测包文件校验失败，下次运行时重新推送" >&2; exit {CHECKSUM_FAILED}; }}; '
             f'mkdir -p "$OB_BENCH_OUT" && cd "$OB_BENCH_OUT" && {run}')
+
+
+def unlock_command():
+    """The full unlock check's (unlock_full.py): Service Unlock's program with its JSON on stdout, after
+    the same check of the package's files as a job's."""
+    return (f'cd {shlex.quote(package_dir("unlock"))} && sha256sum -c {LISTING} >/dev/null 2>&1 || '
+            f'{{ echo "评测包文件校验失败，下次运行时重新推送" >&2; exit {CHECKSUM_FAILED}; }}; '
+            'exec ./bin/service-unlock --json')

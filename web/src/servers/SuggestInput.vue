@@ -7,7 +7,7 @@ import { noAutofill } from './serverHelpers.js';
 // cannot be styled to match the rest of the console. An option is a string, or
 // {value, note} where the note (say, the server an address belongs to) is shown and matched too.
 const props = defineProps({modelValue: {type: String, default: ''}, options: {type: Array, default: () => []}});
-const emit = defineEmits(['update:modelValue']);
+const emit = defineEmits(['update:modelValue', 'pick']);
 defineOptions({inheritAttrs: false});
 const input = ref(null), open = ref(false), active = ref(-1), width = ref(240);
 const listId = `ob-suggest-${useId()}`;
@@ -34,6 +34,7 @@ function show() {
 function close() { open.value = false; active.value = -1; }
 function pick(value) {
   emit('update:modelValue', value);
+  emit('pick', value);
   close();
   nextTick(() => input.value?.focus());
 }
@@ -61,9 +62,10 @@ function key(event) {
 }
 </script>
 <template>
-  <input ref="input" v-bind="{...$attrs, ...noAutofill}" class="ob-suggest-input" :value="modelValue" role="combobox" autocomplete="off"
+  <!-- key before the caller's own keydown: an Enter that picks from the list is handled before the caller sees it. -->
+  <input ref="input" @keydown="key" v-bind="{...$attrs, ...noAutofill}" class="ob-suggest-input" :value="modelValue" role="combobox" autocomplete="off"
     aria-autocomplete="list" :aria-expanded="shown" :aria-controls="listId" :aria-activedescendant="shown && active >= 0 ? `${listId}-${active}` : undefined"
-    @input="typed" @click="shown ? close() : show()" @keydown="key" @blur="close" />
+    @input="typed" @click="shown ? close() : show()" @blur="close" />
   <FloatingPanel :open="shown" :anchor="input" placement="bottom-start" :width="width" label="候选项" @close="close">
     <ul :id="listId" class="ob-suggest-list" role="listbox">
       <li v-for="(option, i) in matches" :id="`${listId}-${i}`" :key="option.value" role="option" :aria-selected="option.value === modelValue"

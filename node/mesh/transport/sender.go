@@ -47,7 +47,7 @@ func (b *Bind) acquireSend(r *bindRun, s *session, plane uint8, deadline time.Ti
 	if err == nil && !time.Now().Before(deadline) {
 		err = ErrBackpressure
 	}
-	if b.run != r || s.ep.retired || s.ep.current != s || s.closed.Load() {
+	if b.run != r || s.ep.retired || (s.ep.current != s && (s.parent == nil || s.ep.current != s.parent)) || s.closed.Load() {
 		err = net.ErrClosed
 	}
 	if err != nil {

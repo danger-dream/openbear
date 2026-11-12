@@ -165,7 +165,7 @@ def test_controller_release_is_a_normal_latest_release(publication):  # noqa: F8
     assert github.latest_id == 12
 
 
-# ---------------------------------------------------------------- after publication: next minor's dev.1
+# ---------------------------------------------------------------- after publication: next patch's dev.1
 
 def released(root, version):
     """The release commit a controller run leaves before publishing."""
@@ -184,9 +184,9 @@ def head(root, fmt="%H"):
     return subprocess.check_output(["git", "log", "-1", "--format=" + fmt], cwd=root, text=True).strip()
 
 
-@pytest.mark.parametrize("published, following", [("1.1.0", "1.2.0-dev.1"), ("1.2.0-beta.1", "1.3.0-dev.1"),
-                                                  ("1.2.0-rc.2", "1.3.0-dev.1")])
-def test_controller_moves_to_the_next_minor_dev_in_one_local_commit(git_repo, published, following):  # noqa: F811
+@pytest.mark.parametrize("published, following", [("1.1.0", "1.1.1-dev.1"), ("1.2.0-beta.1", "1.2.1-dev.1"),
+                                                  ("1.2.0-rc.2", "1.2.1-dev.1")])
+def test_controller_moves_to_the_next_patch_dev_in_one_local_commit(git_repo, published, following):  # noqa: F811
     release_commit = released(git_repo, published)
     (git_repo / "app/main.py").write_text("VALUE = 'unrelated work'\n")
     subprocess.run(["git", "add", "app/main.py"], cwd=git_repo, check=True)
@@ -213,7 +213,7 @@ def test_a_commit_whose_outcome_was_lost_is_recognised_not_repeated(git_repo):  
     done = candidate.start_development(git_repo, state, command)
     lost = load(state.directory / "state.json")
     lost.pop("development")
-    lost["developmentIntent"] = {"parent": release_commit, "version": "1.2.0-dev.1"}
+    lost["developmentIntent"] = {"parent": release_commit, "version": "1.1.1-dev.1"}
     again = candidate.start_development(git_repo, State(state.directory, lost), command)
     assert again == done and head(git_repo) == done["commit"]
     assert subprocess.check_output(["git", "rev-list", "--count", f"{release_commit}..HEAD"], cwd=git_repo, text=True).strip() == "1"
@@ -221,11 +221,11 @@ def test_a_commit_whose_outcome_was_lost_is_recognised_not_repeated(git_repo):  
 
 def test_an_interrupted_write_is_finished_from_its_intent(git_repo):  # noqa: F811
     release_commit = released(git_repo, "1.1.0")
-    subprocess.run([sys.executable, "-B", "scripts/bump_version.py", "1.2.0-dev.1"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run([sys.executable, "-B", "scripts/bump_version.py", "1.1.1-dev.1"], cwd=git_repo, check=True, capture_output=True)
     state, command = development_state(git_repo, "1.1.0", "1.1.0-0123456789ab")
-    state.value["developmentIntent"] = {"parent": release_commit, "version": "1.2.0-dev.1"}
+    state.value["developmentIntent"] = {"parent": release_commit, "version": "1.1.1-dev.1"}
     result = candidate.start_development(git_repo, state, command)
-    assert result["version"] == "1.2.0-dev.1" and head(git_repo, "%P") == release_commit
+    assert result["version"] == "1.1.1-dev.1" and head(git_repo, "%P") == release_commit
 
 
 @pytest.mark.parametrize("change, message", [
@@ -248,13 +248,13 @@ def test_development_version_is_never_forced_over_local_changes(git_repo, change
     assert error.value.code == 2 and head(git_repo) == before
 
 
-def test_node_moves_to_the_next_minor_dev_in_one_local_commit(repo):  # noqa: F811
+def test_node_moves_to_the_next_patch_dev_in_one_local_commit(repo):  # noqa: F811
     state, command = development_state(repo, "1.0.0", "node-1.0.0-0123456789ab")
     put(repo / "app/main.py", "unrelated\n")
     result = candidate.start_development(repo, state, command, node_release.VERSIONING)
-    assert result["version"] == "1.1.0-dev.1"
-    assert (repo / "node/VERSION").read_text() == "1.1.0-dev.1\n"
-    assert head(repo, "%s") == "release: start node 1.1.0-dev.1 development"
+    assert result["version"] == "1.0.1-dev.1"
+    assert (repo / "node/VERSION").read_text() == "1.0.1-dev.1\n"
+    assert head(repo, "%s") == "release: start node 1.0.1-dev.1 development"
     assert subprocess.check_output(["git", "show", "--name-only", "--format=", "HEAD"], cwd=repo, text=True).split() == ["node/VERSION"]
     assert candidate.version(repo) == "0.13.1"  # the controller line is untouched
 
@@ -320,6 +320,7 @@ def node_run(tmp_path, monkeypatch, version, developments):
         return {"ok": True, "url": "https://example.invalid/" + kwargs["tag"], "latest": False, "prerelease": kwargs["prerelease"]}
 
     monkeypatch.setattr(node_release, "publish", publisher)
+    monkeypatch.setattr("release_support.runner.push_candidate", lambda *_: {"ok": True})
     make = lambda: Run(tmp_path, directory, load(directory / "state.json") if (directory / "state.json").exists() else value,  # noqa: E731
                        github=SimpleNamespace(token=TOKEN), command=FakeGit(None, ""))
     return make, calls, directory
@@ -404,9 +405,11 @@ class ControllerHub:
 
 
 class Docker:
+    labels = {"openbear.release.keep": "1"}
+
     def __call__(self, args, label, **kwargs):
         if args[:3] == ["docker", "image", "inspect"]:
-            return json.dumps([{"Id": IMAGE}])
+            return json.dumps([{"Id": IMAGE, "Config": {"Labels": self.labels}}])
         return ""
 
     def recover_children(self):
@@ -462,6 +465,15 @@ def test_controller_beta_after_a_release_records_its_upgrade_base(tmp_path, caps
     assert runner.value["nodeCompatibility"] == {"ok": True, "node": "1.0.0", "warning": "", "checked": []}
     assert "Warning" not in capsys.readouterr().out
     assert not github.writes
+
+
+def test_release_images_without_the_keep_label_are_named_in_a_warning(tmp_path, capsys):
+    github = ControllerHub(tags=("v1.1.0",), nodes=[("node-v1.0.0", node_manifest("1.0.0"))])
+    runner = controller_runner(tmp_path, github, "1.2.0")
+    runner.command.labels = None
+    runner.preflight(approved=True)
+    out = capsys.readouterr().out
+    assert "without the openbear.release.keep label" in out and "python:3.11" in out and "systemd:fixture" in out
 
 
 def test_controller_release_changelog_starts_at_the_previous_release(tmp_path):

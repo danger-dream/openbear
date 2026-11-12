@@ -20,10 +20,14 @@ export const PROGRESS = {pending: ['off', '待下发'], applying: ['warn', '下�
 export const progressOf = (data, id) => (data?.apply?.progress || []).find(p => p.serverId === id) || null;
 export const FINISHED = new Set(['done', 'failed', 'offline', 'missing', 'outdated']);
 
-export const EDITABLE = {settings: () => ({}), members: () => [], relayLinks: () => ({mode: 'full', pairs: []}), directLinks: () => [], rules: () => []};
+export const EDITABLE = {settings: () => ({}), members: () => [], relayLinks: () => ({mode: 'full', pairs: []}), directLinks: () => [], rules: () => [],
+  lineRules: () => [], exitGroups: () => [], limits: () => [], paths: () => []};
+// Parts an older controller neither sends nor takes back.
+const NEWER = new Set(['lineRules', 'exitGroups', 'limits', 'paths']);
 // The part of GET /mesh that PUT /mesh/draft takes back.
 export function draftOf(state) {
-  return JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(EDITABLE).map(([key, empty]) => [key, state?.[key] ?? empty()]))));
+  return JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(EDITABLE).filter(([key]) => !NEWER.has(key) || Array.isArray(state?.[key]))
+    .map(([key, empty]) => [key, state?.[key] ?? empty()]))));
 }
 export const uid = prefix => prefix + Math.random().toString(36).slice(2, 8);
 export function move(list, index, delta) {
@@ -46,7 +50,7 @@ const MESH_ERRORS = {
   mesh_apply_running: '正在应用，请稍后再试', mesh_no_previous_revision: '没有可回退的版本', mesh_member_not_found: '这台服务器不在组网里',
   mesh_invalid: '有设置需要修改', invalid_draft: '草稿格式不正确', invalid_mesh_members: '选择的服务器不正确：一次 1–50 台，不能重复',
   server_not_found: '服务器不存在或已被删除', mesh_install_invalid: '节点返回的组网密钥不正确，安装没有完成',
-  mesh_key_in_use: '这台机器的组网密钥和另一台成员的相同，多半是克隆出来的：删掉它组网目录里的 keys 后再试',
+  mesh_key_in_use: '这个节点的组网密钥和另一台成员的相同，多半是克隆出来的：删掉它组网目录里的 keys 后再试',
   capability_disabled: '这台服务器没有开启执行命令', mesh_not_installed: '这台服务器上的组网组件没有安装',
   invalid_config: '节点拒绝了配置', apply_timeout: '节点在规定时间内没有完成应用', upgrade_not_ready: '组网服务升级后没有就绪，已回退',
   mesh_not_applied: '节点没有确认新配置', node_offline: '节点离线', node_connection_lost: '和节点的连接中断了',
@@ -56,20 +60,38 @@ const MESH_ERRORS = {
   executable_unknown: '节点找不到自己的程序文件，没法安装组网组件', invalid_mesh_layout: '布局数据不正确', invalid_range: '时间范围不正确', invalid_params: '节点不接受这个请求的参数', node_error: '节点返回了错误',
   udp_not_listening: '两端都要开启 UDP 监听才能直连', punch_no_reflector: '没有可用来打洞的中转（需要至少一台开启 UDP 监听的中转）',
   mesh_site_relay_needs_public_link: '站点中转至少要连一台公网中转，用来交换打洞地址',
-  mesh_entry_needs_bootstrap: '入口里有站点中转时，还要有一个公网中转入口：先经它连上，再和站点中转打洞',
+  mesh_entry_needs_bootstrap: '入口里的站点中转不在这个节点的局域网里，还要有一个公网中转入口：先经它连上，再和站点中转打洞',
   mesh_punch_impossible: '两端都是对称型 NAT，打洞基本不会成功，会一直经中转绕行',
   mesh_standby_unhealthy: '备用入口都连不上：在用的入口断开时，没有可以切换过去的入口',
-  mesh_exit_inconsistent: '出口被代理改写：各观测点看到的出口地址不一致，这台机器的公网地址不可靠',
+  mesh_exit_inconsistent: '出口被代理改写：各观测点看到的出口地址不一致，这个节点的公网地址不可靠',
   punch_needs_udp: '站点中转只能经 UDP 打洞接入或连接，传输方式请选 UDP', invalid_relay_mode: '中转类型只能是公网中转或站点中转',
   invalid_bias: '偏好须是 -10000～10000 的整数（毫秒）', invalid_stun: 'STUN 服务器须是“主机:端口”，例如 stun.example.com:3478，最多 8 个',
   invalid_mesh_path: '路径的起点和终点要是两台不同的服务器',
+  limit_without_condition: '连接限制至少要勾一项跨界条件',
+  limit_violation: '违反了连接限制',
+  invalid_paths: '自建路线数量或格式不正确',
+  invalid_path: '自建路线格式不正确',
+  invalid_path_via: '途经中转须是 1～8 台',
+  path_via_repeated: '同一台中转不能经过两次',
+  path_side_empty: '起点和终点不能为空',
+  path_same_ends: '起点和终点不能是同一台',
+  path_end_on_via: '起点和终点不能同时是途经中转',
+  path_pair_full: '同一对节点最多 3 条自建路线',
+  path_repeated: '和前面的一条自建路线相同',
+  path_via_not_relay: '途经节点只能是中转',
+  path_link_missing: '路线上有两台中转之间没有线路',
+  path_node_outdated: '节点版本不支持自建路线',
+  path_no_source: '自建路线的起点不能用',
+  path_no_destination: '自建路线的终点不能用',
+  path_end_skipped: '终点节点版本旧，回程走自动选路',
+  path_backup_outdated: '有节点版本旧，这一对只用第 1 条',
   mesh_service_missing: MISSING_TEXT,
 };
 // POST /mesh/members/:id/reinstall: the same codes, said for putting the service back.
 const REINSTALL_ERRORS = {mesh_member_not_found: '这台还不是已应用的网格成员，不能重新安装组网服务', node_offline: '节点离线，连上后才能重新安装',
   capability_disabled: '这台服务器的节点关闭了命令执行，没法远程安装组网服务', node_update_required: '节点版本过旧，先更新节点再重新安装',
   mesh_apply_running: '正在应用别的更改，等它完成后再重新安装',
-  mesh_key_in_use: '这台机器的组网密钥和另一台成员的相同，多半是克隆出来的：删掉它组网目录里的 keys 后再重新安装'};
+  mesh_key_in_use: '这个节点的组网密钥和另一台成员的相同，多半是克隆出来的：删掉它组网目录里的 keys 后再重新安装'};
 export const reinstallErrorText = code => REINSTALL_ERRORS[code] || '';
 // Draft checks and alerts whose wording is ours, whatever the server's message says.
 const OWN_WORDING = new Set(['udp_not_listening', 'punch_no_reflector', 'mesh_site_relay_needs_public_link', 'mesh_entry_needs_bootstrap', 'mesh_punch_impossible',
@@ -112,7 +134,7 @@ export function meshCodeText(raw) {
 export function errorMessage(e) {
   if (e?.error === 'udp_not_listening') { const hit = UDP_BY_PLACE.find(([re]) => re.test(e.path || '')); if (hit) return hit[1]; }
   if (e?.error === 'mesh_punch_impossible') { const hit = PUNCH_BY_PLACE.find(([re]) => re.test(e.path || '')); if (hit) return hit[1]; }
-  return (OWN_WORDING.has(e?.error) && MESH_ERRORS[e.error]) || e?.message || e?.text || e?.error || '这里的设置不正确';
+  return (OWN_WORDING.has(e?.error) && MESH_ERRORS[e.error]) || e?.message || e?.text || MESH_ERRORS[e?.error] || e?.error || '这里的设置不正确';
 }
 export const errorsAt = (errors, path) => (errors || []).filter(e => e.path === path).map(errorMessage);
 export const errorsUnder = (errors, prefix) => (errors || []).filter(e => e.path === prefix || e.path?.startsWith(prefix + '.') || e.path?.startsWith(prefix + '['));
@@ -122,6 +144,9 @@ export const errorsUnder = (errors, prefix) => (errors || []).filter(e => e.path
 export const warningItems = (data, prefix) => errorsUnder(Array.isArray(data?.warnings) ? data.warnings : [], prefix)
   .filter(w => !(w.error === 'mesh_punch_impossible' && punchMoot(data, w.path))).map(w => ({code: w.error || '', text: errorMessage(w)}));
 export const warningsUnder = (data, prefix) => warningItems(data, prefix).map(w => w.text);
+// The controller's warnings that ask for something to be done; the rest are advice (a shared UDP port) or say how the
+// mesh works around something (a route the node already has), shown where they belong but not as needing attention.
+export const WARNINGS_TO_FIX = new Set(['mesh_port_in_use', 'mesh_punch_impossible']);
 const hostOf = addr => { const s = String(addr || '').trim(); return s.startsWith('[') ? s.slice(1, s.indexOf(']')) : s.replace(/:\d+$/, ''); };
 // Both ends seen at one public address: behind the same NAT.
 export function sameExit(data, a, b) {
@@ -152,19 +177,29 @@ export const RELAY_MODES = [['public', '公网中转', '有别人能直接连到
 export const recommendedMode = reach => reach?.verdict ? (reach.verdict === 'public' ? 'public' : 'site') : '';
 export const listens = (m, transport) => Number(m?.listen?.[transport]) > 0;
 export const publicAddress = m => m?.publicEndpoint || m?.publicEndpointAuto || '';
+// What MeshView gives the pages below it: opening a node's page, and the servers (for regions).
+export const MESH_OPEN_NODE = 'meshOpenNode', MESH_ITEMS = 'meshItems';
+// A row that opens something and holds node names of its own (a <button> cannot hold buttons): the attributes that
+// make it act as one. Enter and Space count only on the row itself, not on a name inside it.
+export const rowButton = fn => ({role: 'button', tabindex: 0, onClick: fn,
+  onKeydown: e => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); fn(); } }});
+// The nodes page's order: by mesh address, then name.
+export const ipKey = address => { const p = String(address || '').split('.').map(Number); return p.length === 4 && p.every(Number.isFinite) ? ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3] : Infinity; };
+export const byAddress = (a, b) => ipKey(a.address) - ipKey(b.address) || String(a.name || '').localeCompare(String(b.name || ''), 'zh');
 export const nameOf = (members, id) => members?.find(m => m.serverId === id)?.name || id || '';
 
 // The member list's second line: where the member enters the mesh, and whether it is on a backup.
 export function entryLine(member, members, summary) {
-  const first = member.entry?.candidates?.[0];
+  const cands = member.entry?.candidates || [], first = cands[0];
   if (!first) return {text: '未设置入口', tone: 'warn'};
   const now = summary?.entry;
-  const candidate = now?.candidate && member.entry.candidates.find(c => c.id === now.candidate);
+  const candidate = now?.candidate && cands.find(c => c.id === now.candidate);
+  const upstreams = member.entry?.mode === 'upstreams';
   if (now?.candidate && now.candidate !== first.id) {
     const relay = candidate?.relay || now.relay, transport = now.transport || candidate?.transport;
-    return {text: `当前 ${nameOf(members, relay)} · ${transportLabel(transport)}（备用）`, tone: 'warn'};
+    return {text: `当前 ${nameOf(members, relay)} · ${transportLabel(transport)}${upstreams ? (cands.length > 1 ? ` +${cands.length - 1}` : '') : '（备用）'}`, tone: upstreams ? '' : 'warn'};
   }
-  return {text: `入口 ${nameOf(members, first.relay)} · ${transportLabel(first.transport)}`, tone: ''};
+  return {text: `入口 ${nameOf(members, first.relay)} · ${transportLabel(first.transport)}${upstreams && cands.length > 1 ? ` +${cands.length - 1}` : ''}`, tone: ''};
 }
 export const rtt = summary => Number.isFinite(summary?.rttMs) ? msText(summary.rttMs) : '';
 // Milliseconds with one decimal below 10 (2.5 ms), whole above.
@@ -172,7 +207,7 @@ export const msText = v => Number.isFinite(v) ? `${v < 10 ? Math.round(v * 10) /
 
 // Reachability (summary.reachability; status.reachability adds mapping and observers).
 export const VERDICTS = {public: ['ok', '公网可达'], punchable: ['info', '可打洞'], symmetric: ['warn', '对称型 NAT'], no_udp: ['bad', 'UDP 不通'], unknown: ['off', '未知']};
-export const VERDICT_NOTES = {public: '别的节点可以直接连到它', punchable: '在 NAT 后，可以和别的节点打洞直连', symmetric: '发往不同目标时出口端口不同，和外面的机器很难打洞，会经中转绕行；同一局域网里的机器不受影响',
+export const VERDICT_NOTES = {public: '别的节点可以直接连到它', punchable: '在 NAT 后，可以和别的节点打洞直连', symmetric: '发往不同目标时出口端口不同，和外面的节点很难打洞，会经中转绕行；同一局域网里的节点不受影响',
   no_udp: '没有任何观测点回应 UDP：打洞和 UDP 入口都用不了，只能用 TCP/TLS 入口', unknown: '还没有测出结论'};
 export const MAPPINGS = {stable: '端口固定', varies: '端口随目标变化', unknown: '未知'};
 export const FILTERINGS = {open: '不过滤，谁都能连进来', address: '只放行连过的地址', port: '只放行连过的地址和端口', unknown: '没法测'};
@@ -216,15 +251,28 @@ export function candParts(h, now = Date.now()) {
 // The candidates a member would switch to, when every one of them is failing: [{c, h}].
 export function deadStandbys(member, health) {
   const list = member?.entry?.candidates || [];
-  if (member?.entry?.mode !== 'failover' || list.length < 2) return [];
+  if (!['failover', 'upstreams'].includes(member?.entry?.mode) || list.length < 2) return [];
   const active = list.find(c => health[c.id]?.state === 'active') || list[0];
   const standbys = list.filter(c => c !== active);
   return standbys.every(c => health[c.id]?.state === 'failing') ? standbys.map(c => ({c, h: health[c.id]})) : [];
 }
 export const standbyText = (dead, members) => dead.map(({c, h}) => `${nameOf(members, c.relay)} 备用：${candErrorText(h.lastError) || '连不上'}`).join('；');
+// Whether a member's own public address matters to it: hole punching aims at it (a punched direct link,
+// a site relay's links, an entry punched to a site relay not reached on the member's LAN). Without any,
+// observers seeing its exit differently (a proxy, several exits) changes nothing. As the controller
+// decides for its alerts (mesh_status.needs_public_addr), from the document instead of the config.
+export function needsPublicAddr(work, data, member, status = null) {
+  if (!member) return false;
+  if (isSite(member)) return true;
+  const id = member.serverId, relays = new Map((work?.members || []).map(m => [m.serverId, m]));
+  if ((work?.directLinks || []).some(p => (p.a === id || p.b === id) && isPunched(p))) return true;
+  const health = entryHealth(data, id, status);
+  return (member.entry?.candidates || []).some(c => isSite(relays.get(c.relay)) && health[c.id]?.via !== 'lan');
+}
 // Alerts on a node: what the controller reports (nodes[id].alerts, strings or {code}) plus
-// what the board can tell itself. [{code, text}], the worst first.
-export function nodeAlerts(data, member, members, status = null) {
+// what the board can tell itself. [{code, text}], the worst first. With the document (work), an exit
+// seen differently is an alert only where the member's public address matters.
+export function nodeAlerts(data, member, members, status = null, work = null) {
   const id = member?.serverId, node = data?.nodes?.[id], out = new Map();
   for (const a of [...(Array.isArray(node?.alerts) ? node.alerts : []), ...(Array.isArray(node?.summary?.alerts) ? node.summary.alerts : [])]) {
     const code = typeof a === 'string' ? a : a?.code || a?.error || a?.kind;
@@ -233,11 +281,11 @@ export function nodeAlerts(data, member, members, status = null) {
   const dead = deadStandbys(member, entryHealth(data, id, status));
   if (dead.length) out.set('mesh_standby_unhealthy', {code: 'mesh_standby_unhealthy', text: standbyText(dead, members)});
   else if (out.has('mesh_standby_unhealthy') && !Object.keys(entryHealth(data, id, status)).length) out.get('mesh_standby_unhealthy').text = MESH_ERRORS.mesh_standby_unhealthy;
-  if (reachOf(data, id, status)?.consistent === false && !out.has('mesh_exit_inconsistent')) out.set('mesh_exit_inconsistent', {code: 'mesh_exit_inconsistent', text: MESH_ERRORS.mesh_exit_inconsistent});
+  if (reachOf(data, id, status)?.consistent === false && !out.has('mesh_exit_inconsistent') && (!work || needsPublicAddr(work, data, member, status))) out.set('mesh_exit_inconsistent', {code: 'mesh_exit_inconsistent', text: MESH_ERRORS.mesh_exit_inconsistent});
   const rank = code => ({mesh_standby_unhealthy: 0, mesh_exit_inconsistent: 1}[code] ?? 2);
   return [...out.values()].sort((a, b) => rank(a.code) - rank(b.code));
 }
-export const ALERT_BADGES = {mesh_standby_unhealthy: ['bad', '备用入口不可用'], mesh_exit_inconsistent: ['warn', '出口被代理改写']};
+export const ALERT_BADGES = {mesh_standby_unhealthy: ['bad', '备用入口不可用'], mesh_exit_inconsistent: ['warn', '出口被代理改写'], mesh_detour: ['warn', '连接绕路']};
 
 // Links between relays as each end measures them (summary.routing.links).
 export const LINK_STATES = {up: ['ok', '正常'], down: ['bad', '断开'], suppressed: ['warn', '线路不稳，暂停使用']};
@@ -317,7 +365,7 @@ export function routeRows(reply, src, members, data = null) {
       const fill = hops.slice(1).map((h, i) => h.rttMs === 0 && h.via === 'entry' ? entryOf(hops[i].node, h.node)?.rttMs ?? null : h.rttMs);
       total = fill.every(v => v !== null) ? fill.reduce((x, v) => x + v, 0) : null;
     }
-    return {...extra, hops, broken, stale, through, rttMs: total, rtt: broken ? '' : total !== null ? msText(total) : '延迟未知'};
+    return {...extra, hops, broken, stale, through, rttMs: total, rtt: broken ? '' : total !== null ? msText(total) : '延迟未知', fixed: r.fixed || null};
   };
   const routes = reply.routes.filter(r => r?.dst && r.dst !== src).map(r => row(r, r.dst, {key: `dst:${r.dst}`, dst: r.dst, title: nameOf(members, r.dst)}))
     .sort((a, b) => order(a.dst) - order(b.dst));
@@ -333,7 +381,7 @@ export function exportsOf(data, gateway, subnet) {
   const hit = data.exports.find(x => x?.gateway === gateway && x.subnet === subnet);
   return Array.isArray(hit?.nodes) ? hit.nodes.filter(id => id && id !== gateway) : [];
 }
-export const exportText = (ids, members) => ids.length ? `下发给：${ids.map(id => nameOf(members, id)).join('、')}` : '没有机器能访问（要在访问规则的目标里写上这个网段）';
+export const exportText = (ids, members) => ids.length ? `下发给：${ids.map(id => nameOf(members, id)).join('、')}` : '没有节点能访问（要在访问规则的目标里写上这个网段）';
 
 // UDP direct links: both ends send to each other at once, over the LAN, the configured and the
 // reported addresses; each end reports status.peers[].direct = {state, via, since, attempts,
@@ -443,7 +491,7 @@ const SKIPPED = '即使组网规则允许，这些连接也进不来。';
 export function firewallIssue(issue) {
   const d = issue?.detail || '';
   switch (issue?.code) {
-  case 'firewalld_zone': return {text: `组网网卡在 firewalld 的 ${d} 区域`, detail: `obmesh0 是在这台机器上手动指定到 ${d} 区域的，组网没有改动它；这个区域不放行的连接，${SKIPPED}需要时把它移到 trusted 区域，或在 ${d} 区域里放行。`};
+  case 'firewalld_zone': return {text: `组网网卡在 firewalld 的 ${d} 区域`, detail: `obmesh0 是在这个节点上手动指定到 ${d} 区域的，组网没有改动它；这个区域不放行的连接，${SKIPPED}需要时把它移到 trusted 区域，或在 ${d} 区域里放行。`};
   case 'firewalld_failed': return {text: '没能调整 firewalld', detail: `组网的连接可能被 firewalld 拦下：${d}`};
   case 'nftables_failed': return {text: '没能在 nftables 里放行组网', detail: `${d}。这条链拦截的连接，${SKIPPED}`};
   case 'docker_failed': return {text: '没能放行发往容器的组网连接', detail: `DOCKER-USER 里拦截的连接，${SKIPPED}${d}`};
@@ -453,7 +501,7 @@ export function firewallIssue(issue) {
     const [kind, tool] = d.split(':').map(x => x.trim());
     const name = FIREWALL_KINDS[kind] || kind;
     return {text: `找不到 ${tool || '防火墙程序'}，没能调整 ${name}`,
-      detail: `这台机器上的 ${name} 看起来在用，但组网服务在 PATH 和 /usr/sbin、/sbin 等目录里都找不到 ${tool}，没有为组网放行。${SKIPPED}装好 ${tool} 或确认它的位置后，重启组网服务即可。`};
+      detail: `这个节点上的 ${name} 看起来在用，但组网服务在 PATH 和 /usr/sbin、/sbin 等目录里都找不到 ${tool}，没有为组网放行。${SKIPPED}装好 ${tool} 或确认它的位置后，重启组网服务即可。`};
   }
   case 'iptables_nft': return {text: 'iptables 新旧两套规则并存', detail: `这台的 iptables 是旧版（legacy），但 nftables 里还有 iptables-nft 的规则（${d}），组网没有处理那一套；其中拦截的连接，${SKIPPED}`};
   default: return {text: `主机防火墙：${issue?.code || '未知问题'}`, detail: d};
@@ -494,12 +542,13 @@ const EVENTS = {'entry.switch': '切换入口', 'entry.return': '切回入口', 
   start: '组网服务启动', stop: '组网服务停止', 'control.error': '隧道报错', 'state.error': '状态没保存',
   'path.ready': '线路可用', 'path.failed': '线路不通', 'path.error': '线路出错', 'path.security': '证书不符',
   'direct.up': '直连打通', 'direct.down': '直连断开', 'direct.failed': '打洞失败', 'direct.chosen': '选定直连线路', 'direct.better': '发现更快的直连', 'direct.switched': '换用更快的直连',
-  'reach.changed': '可达性变化', 'route.changed': '换路', 'route.error': '系统路由出错', 'route.skipped': '网段没走组网', 'routing.error': '选路出错',
+  'reach.changed': '可达性变化', 'route.changed': '换路', 'pin.switch': '切换自建路线', 'route.error': '系统路由出错', 'route.skipped': '网段没走组网', 'routing.error': '选路出错',
   'link.suppressed': '线路暂停使用', 'link.reused': '线路恢复使用', 'link.redial': '换端口重连', 'link.redial.failed': '换端口重连失败',
-  'firewall.restored': '防火墙规则已恢复', error: '错误',
+  'firewall.restored': '防火墙规则已恢复', 'mtu.own': '本机组网包上限', error: '错误',
   'sign.rejected': '签名校验失败', 'owner.claim_expired': '旧接入记录作废', 'e2e.error': '端到端加密出错', 'e2e.exhausted': '端到端会话已满',
   'entry.suspect': '入口疑似丢包', 'reach.mismatch': '出口地址对不上', 'routing.unknown_link': '通告了不存在的链路', 'routing.clock': '中转时钟不准',
-  'mesh.missing': '组网服务不见了', 'mesh.reinstall': '重新安装组网服务', 'mesh.key_conflict': '上报了其他成员的密钥'};
+  'mesh.missing': '组网服务不见了', 'mesh.reinstall': '重新安装组网服务', 'mesh.key_conflict': '上报了其他成员的密钥',
+  'gateway.standby': '切换局域网网关'};
 // What a node says on another's behalf, by what a rejected signature was on.
 const SIGNED = {offer: '打洞地址', punch: '打洞状态', commit: '接入声明', 'owner notice': '接入通告', 'routing advertisement': '路由通告'};
 // The events about signatures, end-to-end encryption and relays misbehaving; the latest shows in a member's status.
@@ -560,7 +609,7 @@ export function eventView(e, member, members, keys = {}) {
   const kind = e?.kind || '', detail = String(e?.detail || '').trim();
   const out = (text, raw = '', extra = {}) => ({label: eventLabel(kind), text, raw, tone: eventTone(kind), ...extra});
   // A machine by its name: the controller's own machine by what the page calls it, one no longer in the mesh said so.
-  const who = id => { const m = members?.find(x => x.serverId === id); return m?.name || (id === 'local' ? '主控本机' : ID_LIKE.test(id || '') ? '已移出组网的机器' : id || '对端'); };
+  const who = id => { const m = members?.find(x => x.serverId === id); return m?.name || (id === 'local' ? '主控本机' : ID_LIKE.test(id || '') ? '已移出组网的节点' : id || '对端'); };
   const list = member?.entry?.candidates || [];
   // A path: an entry candidate, a link between relays (link:<peer>) or a punched one (direct:<peer>); /next is a faster one being prepared.
   const place = raw => {
@@ -599,6 +648,15 @@ export function eventView(e, member, members, keys = {}) {
     // "<dest>: <old next hop> -> <new next hop> (reason)"; the destination itself as next hop is a direct route, none is no route.
     if (!(r = /^([^:\s]+):\s*(\S+)\s*->\s*(\S+)(?:\s*\((\w+)\))?$/.exec(detail))) return out('换了一条路线', detail);
     return out(`到 ${who(r[1])}：${hop(r[1], r[2])} → ${hop(r[1], r[3])}${r[4] ? `（${ROUTE_REASONS[r[4]] || r[4]}）` : ''}`, '', {route: {dest: r[1], from: hop(r[1], r[2]), to: hop(r[1], r[3]), none: r[3] === 'none'}});
+  case 'pin.switch': {
+    // "<destination>: <rank before> -> <rank now>[ down <a> <b>| silent]", 0 for the automatic routes.
+    if (!(r = /^(\S+):\s*(\d+)\s*->\s*(\d+)(?:\s+down\s+(\S+)\s+(\S+)|\s+(silent))?$/.exec(detail))) return out('换了一条自建路线', detail);
+    const before = Number(r[2]), now = Number(r[3]), down = r[4] ? `（${who(r[4])} 和 ${who(r[5])} 之间断开）` : r[6] ? '（各段线路都在，但包过不去）' : '';
+    const text = !now ? `第 ${before} 条不通${down}，没有别的自建路线可用，改走自动选路`
+      : !before ? `改走自建路线第 ${now} 条`
+      : now > before ? `第 ${before} 条不通${down}，改走第 ${now} 条` : `第 ${now} 条恢复稳定，切回第 ${now} 条`;
+    return out(`到 ${who(r[1])}：${text}`);
+  }
   case 'link.suppressed': case 'link.reused': {
     const peer = detail.split(/[\s:]/)[0];
     return out(peer ? `到 ${who(peer)} 的中转链路${kind === 'link.suppressed' ? '反复断开，暂停用于选路' : '稳定下来，恢复选路'}` : '中转链路状态变了', peer ? '' : detail);
@@ -681,11 +739,25 @@ export function eventView(e, member, members, keys = {}) {
     return out('网关网段的路由有变化', detail);
   }
   case 'firewall.restored': return out('组网的防火墙规则被别的程序改动了，已经自动恢复', detail);
+  case 'mtu.own': {
+    // "<iface> <mtu>: this node's own packets up to <n> bytes, the network's <m>", or "none: … up to the network's <m> bytes".
+    if ((r = /^(\S+) (\d+): .* up to (\d+) bytes, the network's (\d+)$/.exec(detail))) {
+      return out(`本机网卡 ${r[1]} 的 MTU 是 ${r[2]}，装不下组网的满尺寸包：本机发出的组网包上限调到 ${r[3]} 字节（全网 ${r[4]}）`, '', {tone: 'warn'});
+    }
+    if ((r = /^none: .* up to the network's (\d+) bytes$/.exec(detail))) return out(`本机网卡装得下组网的满尺寸包，本机发出的组网包上限回到全网的 ${r[1]} 字节`, '', {tone: 'ok'});
+    return out('本机组网包上限变了', detail);
+  }
+  case 'gateway.standby': {
+    // "<subnet>: <gateway> -> <gateway> (unanswered|returned)": this member now reaches the LAN by another of its gateways.
+    if (!(r = /^(\S+):\s*(\S+)\s*->\s*(\S+)\s*\((unanswered|returned)\)$/.exec(detail))) return out('改经另一个网关访问局域网', detail, {tone: 'warn'});
+    return r[4] === 'returned' ? out(`${who(r[3])} 恢复回应，访问 ${r[1]} 切回经它，不再经 ${who(r[2])}`, '', {tone: 'ok'})
+      : out(`网关 ${who(r[2])} 没有回应，访问 ${r[1]} 改经备用网关 ${who(r[3])}`, '', {tone: 'warn'});
+  }
   case 'sign.rejected': {
     // "<what> in the name of <node> from <peer>: bad signature", a notice's node as <member>/<owner>, an advertisement's as "its origin".
     if (!(r = /^(.+?) in the name of (.+?) from (\S+): bad signature(?: \((\d+) more since the last one\))?$/.exec(detail))) return out('收到一条签名不对的消息，已丢弃', detail);
     const [, what, name, hop, more] = r, again = more ? `（之后 1 分钟内还有 ${more} 条）` : '';
-    const advice = '偶尔一次可能是对方刚重装、新密钥还没下发到这里；持续出现说明转发它的机器可能被篡改，检查那台机器。';
+    const advice = '偶尔一次可能是对方刚重装、新密钥还没下发到这里；持续出现说明转发它的节点可能被篡改，检查那个节点。';
     if (what === 'conflict claim') return out(`${who(hop)} 回复的接入冲突附带的声明不是本机签的，已忽略${again}。持续出现说明这台中转可疑。`);
     const owner = /^(\S+)\/(\S+)$/.exec(name);
     const said = name === 'its origin' ? '' : owner ? `${who(owner[1])} 经 ${who(owner[2])} 接入的` : name === hop ? '' : `以 ${who(name)} 名义的`;
@@ -697,7 +769,7 @@ export function eventView(e, member, members, keys = {}) {
   case 'e2e.exhausted': {
     const more = (r = /\((\d+) refused since the last report\)$/.exec(detail)) ? `，上次记录以来又拒绝了 ${r[1]} 次` : '';
     if ((r = /^all (\d+) end-to-end sessions in use .*?; packets for (\S+) dropped/.exec(detail)))
-      return out(`${r[1]} 个端到端会话都在用，发往 ${who(r[2])} 的包已丢弃，不会改用明文${more}。经常出现说明这台机器同时通信的对端太多。`);
+      return out(`${r[1]} 个端到端会话都在用，发往 ${who(r[2])} 的包已丢弃，不会改用明文${more}。经常出现说明这个节点同时通信的对端太多。`);
     if ((r = /^more than (\d+) new end-to-end sessions a second; packets for (\S+) dropped/.exec(detail)))
       return out(`每秒新建的端到端会话超过 ${r[1]} 个，发往 ${who(r[2])} 的包已丢弃，不会改用明文${more}。`);
     return out('端到端会话已满，有包被丢弃，不会改用明文', detail);
@@ -721,20 +793,20 @@ export function eventView(e, member, members, keys = {}) {
     if (!(r = /^reflected \[([^\]]*)\] not offered; relays saw (.*)$/.exec(detail))) return out('反射器报的出口地址和中转看到的对不上', detail);
     const seen = r[2].split(/;\s*/).map(s => /^(\S+) by (\S+)$/.exec(s)).filter(Boolean).map(m => `${m[2].split(',').map(who).join('、')} 看到 ${m[1]}`).join('；');
     const dropped = r[1].trim().split(/\s+/).filter(Boolean).join('、');
-    return out(`${dropped ? `反射器报的出口地址 ${dropped} 和中转在已认证线路上看到的对不上，没有用来打洞` : '各中转看到的出口地址不一致'}${seen ? `（${seen}）` : ''}。持续出现说明某个反射器谎报地址，或这台机器有多条出口。`);
+    return out(`${dropped ? `反射器报的出口地址 ${dropped} 和中转在已认证线路上看到的对不上，没有用来打洞` : '各中转看到的出口地址不一致'}${seen ? `（${seen}）` : ''}。持续出现说明某个反射器谎报地址，或这个节点有多条出口。`);
   }
   case 'routing.unknown_link': {
     // "<origin> advertises links the mesh does not have, ignored: [<peer> …]".
     if (!(r = /^(\S+) advertises links the mesh does not have, ignored: \[([^\]]*)\]$/.exec(detail))) return out('有中转通告了组网里没有的链路，已忽略', detail);
     const links = r[2].trim().split(/\s+/).filter(Boolean).map(p => `${who(r[1])}—${who(p)}`).join('、');
-    return out(`${who(r[1])} 的路由通告里有组网里没有的链路${links ? ` ${links}` : ''}，已忽略，不会经它们选路。刚改过中转链路时偶尔出现属于正常；持续出现说明这台中转的配置没更新，或被篡改，检查那台机器。`);
+    return out(`${who(r[1])} 的路由通告里有组网里没有的链路${links ? ` ${links}` : ''}，已忽略，不会经它们选路。刚改过中转链路时偶尔出现属于正常；持续出现说明这台中转的配置没更新，或被篡改，检查那个节点。`);
   }
   case 'routing.clock': {
     // "<origin>'s clock is <Go duration> off this relay's", positive when the origin's clock is ahead.
     if (!(r = /^(\S+?)'s clock is (-?)((?:\d+h)?(?:\d+m)?(?:[\d.]+s)?) off this relay's$/.exec(detail)) || !r[3]) return out('有中转的时钟和这里差得较多', detail);
     const parts = /^(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?$/.exec(r[3]);
     const span = [[parts[1], '小时'], [parts[2], '分'], [parts[3], '秒']].filter(([n]) => n && Number(n)).map(([n, u]) => `${Number(n)} ${u}`).join(' ') || '0 秒';
-    return out(`${who(r[1])} 的时钟比这里${r[2] ? '慢' : '快'} ${span}。不影响选路和签名校验，但会让两边的日志和事件时间对不上，建议检查这两台机器的时间同步（NTP）。`);
+    return out(`${who(r[1])} 的时钟比这里${r[2] ? '慢' : '快'} ${span}。不影响选路和签名校验，但会让两边的日志和事件时间对不上，建议检查这两个节点的时间同步（NTP）。`);
   }
   // Older data planes: "<peer>" or "<peer>: <reason>".
   case 'peer.reconnect': case 'peer.up': case 'peer.down': {
@@ -768,7 +840,7 @@ export function securityStats(status, events, member, members, keys = {}) {
   const rows = [], e2e = status?.e2e, sec = status?.security;
   if (e2e && e2e.limit) {
     const drops = [['会话已满', e2e.droppedExhausted], ['队列满', e2e.droppedQueue], ['来源不符', e2e.droppedSource], ['无法解密', e2e.droppedBad],
-      ['未加密', status.counters?.droppedPlain]].filter(([, n]) => n > 0);
+      ['未加密', status.counters?.droppedPlain], ['超过路径 MTU', status.counters?.droppedTooBig]].filter(([, n]) => n > 0);
     const total = drops.reduce((s, [, n]) => s + n, 0);
     rows.push({label: '端到端会话', value: `${e2e.sessions || 0} / ${e2e.limit}`, cls: e2e.sessions >= e2e.limit ? 'ob-warn' : '',
       note: total ? `丢弃 ${total} 个包：${drops.map(([k, n]) => `${k} ${n}`).join('、')}` : '', noteCls: 'ob-warn', wide: total > 0});
@@ -825,7 +897,7 @@ function routeGroup(group, members) {
     byDest.set(item.route.dest, d);
   }
   const dests = [...byDest.values()].sort((a, b) => b.last - a.last);
-  const name = id => members?.find(m => m.serverId === id)?.name || (id === 'local' ? '主控本机' : ID_LIKE.test(id) ? '已移出组网的机器' : id);
+  const name = id => members?.find(m => m.serverId === id)?.name || (id === 'local' ? '主控本机' : ID_LIKE.test(id) ? '已移出组网的节点' : id);
   const line = d => {
     const now = d.states.at(-1), seen = [...new Set(d.states)];
     if (d.count === 1) return `到 ${name(d.dest)}：${d.states[0]} → ${now}`;
@@ -850,7 +922,9 @@ export function lineEnd(end, transport) {
   const dialer = end.dialer === true ? '主动拨号' : end.dialer === false ? '等待对方连接' : '';
   // A standby entry that is not connected has no local address yet: only where it would go.
   const local = end.local || '', via = transportLabel(transport) || '未知方式', remote = end.remote || '未知地址';
-  return {route: `${local ? `从 ${local} ` : ''}经 ${via} 连到 ${remote}`, local, via, remote, public: end.public || '', dialer};
+  // mtu: the longest packet the line carries as this end reports it (9000 with large packets).
+  const mtu = Number.isInteger(end.mtu) && end.mtu > 0 ? end.mtu : null;
+  return {route: `${local ? `从 ${local} ` : ''}经 ${via} 连到 ${remote}`, local, via, remote, public: end.public || '', dialer, mtu};
 }
 // The ranges a line's record can be read for.
 export const LINE_RANGES = [['1h', '1 小时'], ['24h', '24 小时'], ['3d', '3 天'], ['7d', '7 天'], ['15d', '15 天'], ['30d', '30 天']];
@@ -977,6 +1051,13 @@ export function gatewayNetProblem(value, {settings = null, members = [], self = 
   }
   return '';
 }
+// The gateway already sharing a network (one announcing a subnet that overlaps it), other than self; backups do not count.
+export function sharedBy(value, members, self = null) {
+  const net = cidr(String(value || ''));
+  if (!net) return null;
+  return (members || []).find(m => m !== self && m.serverId !== self?.serverId && !m.removing && !m.gateway?.backup
+    && (m.gateway?.subnets || []).some(s => { const o = cidr(s); return o && overlaps(o, net); })) || null;
+}
 // GET /mesh warnings at one member's listen ports: {udp: [texts], …, '': [texts for the whole]}.
 export function listenWarnings(data, index) {
   const out = {};
@@ -988,3 +1069,64 @@ export function listenWarnings(data, index) {
   }
   return out;
 }
+
+// ----- exit proxy -----
+// A member's username as an exit, from its name: lower case, letters, digits, dot, dash and underscore;
+// one with none of those (a Chinese name) takes its mesh address's last number. Unique among the other exits.
+export function proxyName(member, members = []) {
+  const taken = new Set((members || []).filter(m => m !== member && m.proxy?.exit).map(m => m.proxy.exit.user));
+  let base = String(member.name || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[^a-z0-9]+|-+$/g, '').slice(0, 28);
+  if (!base) base = `exit${String(member.address || '').split('.').pop() || ''}` || 'exit';
+  let name = base, n = 2;
+  while (taken.has(name)) name = `${base}-${n++}`;
+  return name;
+}
+// The controller makes the password on save.
+export const newProxyExit = (member, members) => ({user: proxyName(member, members), password: '', port: 1081, subnets: false, lan: false, interface: '', source: ''});
+export const proxyPorts = member => member?.proxy?.ports || [];
+// Turning a machine's exit on gives it its own proxy; off, it leaves every group and the ports leading to it lead nowhere until
+// pointed elsewhere (the draft says which).
+export function setExit(work, member, on) {
+  if (Boolean(member.proxy?.exit) === on) return;
+  member.proxy = withProxy(member, 'exit', on ? newProxyExit(member, work.members) : null);
+  if (on) return;
+  for (const g of work.exitGroups || []) g.members = g.members.filter(x => x !== member.serverId);
+  for (const m of work.members || []) for (const p of proxyPorts(m)) {
+    if (p.exit === member.serverId) p.exit = '';
+    if (p.pinned === member.serverId) p.pinned = '';
+  }
+}
+export const SELECTS = [['order', '按顺序', '用第一台连得上的；连不上时按顺序换下一台'], ['latency', '延迟最低', '实测每台的延迟，用最低的；差得不多时不来回换'],
+  ['manual', '手动指定', '只用指定的那台，它连不上也不换']];
+// Proxy link schemes: socks5h hands names to the exit to resolve.
+export const LINK_SCHEMES = [['socks5', 'socks5://'], ['socks5h', 'socks5h://'], ['http', 'http://']];
+// A new proxy port on a member: the first free port from 1080, leading where it is given.
+export function newProxyPort(member, target = {}) {
+  const used = new Set(proxyPorts(member).map(p => p.port));
+  let port = 1080;
+  while (used.has(port) || port === member.proxy?.exit?.port) port++;
+  return {id: '', listen: 'local', address: '', port, exit: '', group: '', select: 'order', pinned: '', strict: false, user: 'proxy', password: '', ...target};
+}
+// The member's proxy with its exit or ports replaced (null or [] to turn them off); null when neither is left.
+export function withProxy(member, part, value) {
+  const next = {exit: member.proxy?.exit || null, ports: member.proxy?.ports || [], [part]: value};
+  if (part === 'ports' && !value) next.ports = [];
+  return next.exit || next.ports.length ? next : null;
+}
+// Where a proxy port leads, in words: an exit's name, or a group's with how it picks.
+export function portTarget(work, p) {
+  const members = work?.members || [];
+  if (p.exit) return nameOf(members, p.exit);
+  const g = (work?.exitGroups || []).find(x => x.id === p.group);
+  if (!g) return '';
+  const how = (SELECTS.find(([k]) => k === p.select) || SELECTS[0])[1];
+  return `${g.name} · ${p.select === 'manual' && p.pinned ? nameOf(members, p.pinned) : how}`;
+}
+// What the node runs for an exit's own proxy or a proxy port (summary.proxy): entries by name, the one entry of an older node.
+export function proxyRun(summary, name) {
+  const p = summary?.proxy;
+  if (!p) return null;
+  return (p.entries || []).find(e => e.name === name) || (name === 'exit' ? p.entry || null : null);
+}
+export const proxyUrl = (scheme, user, password, host, port, {masked = false} = {}) =>
+  `${scheme}://${encodeURIComponent(user)}:${masked ? '••••' : encodeURIComponent(password)}@${host}:${port}`;

@@ -23,7 +23,7 @@ class Hetzner(Provider):
     fields = (Field('token', 'API 令牌', 'password',
                     hint='Hetzner Console → 项目 → Security → API Tokens 生成「Read & Write」令牌。令牌作用于整个项目，建议把域名放在单独的项目里。'
                          '旧版 dns.hetzner.com 的令牌已不可用'),)
-    caps = Caps(by_id=False, ttl_min=60, ttl_max=86400)
+    caps = Caps(by_id=False, ttl_min=60, ttl_max=86400, zone_serial=True)
     docs = 'https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/'
     endpoint = 'https://api.hetzner.cloud/v1'
 

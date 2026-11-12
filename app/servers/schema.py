@@ -28,9 +28,20 @@ CREATE TABLE IF NOT EXISTS server_identity (
 CREATE TABLE IF NOT EXISTS server_exec_log (
  id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, server_id TEXT NOT NULL, source TEXT NOT NULL,
  command TEXT NOT NULL, started_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
- exit_code INTEGER, outcome TEXT NOT NULL DEFAULT ''
+ exit_code INTEGER, outcome TEXT NOT NULL DEFAULT '',
+ conversation_uuid TEXT NOT NULL DEFAULT '', conversation_title TEXT NOT NULL DEFAULT '', turn_uuid TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS server_exec_log_server ON server_exec_log(server_id, id);
+CREATE TABLE IF NOT EXISTS server_job_origins (
+ server_id TEXT NOT NULL, job_id TEXT NOT NULL, owner INTEGER NOT NULL, source TEXT NOT NULL,
+ conversation_uuid TEXT NOT NULL DEFAULT '', conversation_title TEXT NOT NULL DEFAULT '', turn_uuid TEXT NOT NULL DEFAULT '',
+ created_ms INTEGER NOT NULL, PRIMARY KEY(server_id, job_id)
+);
+CREATE TABLE IF NOT EXISTS server_transfers (
+ id TEXT PRIMARY KEY, owner INTEGER NOT NULL, server_id TEXT NOT NULL, state TEXT NOT NULL,
+ created_ms INTEGER NOT NULL, ended_ms INTEGER, receipt_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS server_transfers_created ON server_transfers(created_ms);
 CREATE TABLE IF NOT EXISTS server_registration_codes (
  id TEXT PRIMARY KEY, owner INTEGER NOT NULL, name TEXT NOT NULL, code_hash TEXT NOT NULL UNIQUE, sealed TEXT NOT NULL,
  profile_json TEXT NOT NULL DEFAULT '{}', expires_ms INTEGER NOT NULL DEFAULT 0, max_uses INTEGER NOT NULL DEFAULT 0,
@@ -77,7 +88,8 @@ CREATE TABLE IF NOT EXISTS mesh_nodes (
  status_json TEXT NOT NULL DEFAULT '', events_json TEXT NOT NULL DEFAULT '[]', updated_ms INTEGER NOT NULL DEFAULT 0,
  data_build TEXT NOT NULL DEFAULT '', upgrade_failed_build TEXT NOT NULL DEFAULT '', upgrade_error TEXT NOT NULL DEFAULT '',
  upgrade_ms INTEGER NOT NULL DEFAULT 0, addresses_json TEXT NOT NULL DEFAULT '[]', config_schemas TEXT NOT NULL DEFAULT '',
- sign_key TEXT NOT NULL DEFAULT '', e2e_key TEXT NOT NULL DEFAULT ''
+ sign_key TEXT NOT NULL DEFAULT '', e2e_key TEXT NOT NULL DEFAULT '', routes_json TEXT NOT NULL DEFAULT '',
+ data_features TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS mesh_layout (
  owner INTEGER NOT NULL, server_id TEXT NOT NULL, x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY(owner, server_id)
@@ -90,6 +102,12 @@ CREATE TABLE IF NOT EXISTS server_bench_runs (
  sections BLOB, log BLOB, links_json TEXT NOT NULL DEFAULT '[]', attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS server_bench_runs_server ON server_bench_runs(server_id, created_ms);
+CREATE TABLE IF NOT EXISTS server_unlock_full (
+ server_id TEXT PRIMARY KEY, owner INTEGER NOT NULL, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_desktop_configs (
+ server_id TEXT PRIMARY KEY, owner INTEGER NOT NULL, sealed TEXT NOT NULL, updated_ms INTEGER NOT NULL
+);
 '''
 # Columns added after a table was first created; existing databases gain them on start.
 ADDED = {'mesh_nodes': {'data_build': "TEXT NOT NULL DEFAULT ''", 'upgrade_failed_build': "TEXT NOT NULL DEFAULT ''",
@@ -98,9 +116,18 @@ ADDED = {'mesh_nodes': {'data_build': "TEXT NOT NULL DEFAULT ''", 'upgrade_faile
                         # [min, max] config schemas the data plane reads, as JSON; '' until it says.
                         'config_schemas': "TEXT NOT NULL DEFAULT ''",
                         # The signing (Ed25519) and end-to-end (X25519) public keys; '' until the node says.
-                        'sign_key': "TEXT NOT NULL DEFAULT ''", 'e2e_key': "TEXT NOT NULL DEFAULT ''"},
+                        'sign_key': "TEXT NOT NULL DEFAULT ''", 'e2e_key': "TEXT NOT NULL DEFAULT ''",
+                        # The machine's own routes ([{net, dev}]) as JSON; '' until the node says.
+                        'routes_json': "TEXT NOT NULL DEFAULT ''",
+                        # The config features data_build's data plane reads, as JSON; '' while not known.
+                        'data_features': "TEXT NOT NULL DEFAULT ''"},
+         # Line rules and exit groups as JSON; '' for a stage stored before them (exit groups are then made from the members' exits).
+         'mesh_settings': {'line_rules_json': "TEXT NOT NULL DEFAULT ''", 'exit_groups_json': "TEXT NOT NULL DEFAULT ''"},
          # Runs again after its package was found damaged on the node and pushed anew (once).
-         'server_bench_runs': {'attempts': 'INTEGER NOT NULL DEFAULT 0'}}
+         'server_bench_runs': {'attempts': 'INTEGER NOT NULL DEFAULT 0'},
+         # The conversation and turn a tool call came from; '' for the web page and older rows.
+         'server_exec_log': {'conversation_uuid': "TEXT NOT NULL DEFAULT ''", 'conversation_title': "TEXT NOT NULL DEFAULT ''",
+                             'turn_uuid': "TEXT NOT NULL DEFAULT ''"}}
 
 
 async def migrate(db):

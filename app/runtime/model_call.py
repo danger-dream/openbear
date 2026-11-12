@@ -15,7 +15,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.agent.transcript_repair import is_role_alternation_bridge_prefix
 from app.llm.base import AgentResult, Message, OpenBearLLMError, apply_provider_billing
+from app.llm.error_classify import is_malformed_tool_call
 from app.llm.events import StreamEvent, Usage
 from app.llm.retry import RetryPolicy, retry_wait_payload, wait_for_retry
 from app.runtime.lifecycle import _consume_cleanup_result, current_session
@@ -376,6 +378,16 @@ _RECOVERY_INSTRUCTION = (
     "text or completed work; preserve all prior tool results and instructions."
 )
 
+# Gemini samples the same broken call again from an unchanged context.
+_MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION = (
+    "The previous model response failed because its tool call was malformed "
+    "(MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL). Continue the same task and issue "
+    "the needed tool call with simple, strictly valid JSON arguments: avoid deeply nested "
+    "quotes or long inline scripts in one command string; split complex commands into "
+    "simpler steps or write a helper file first. Do not repeat completed text or completed "
+    "work; preserve all prior tool results and instructions."
+)
+
 
 class ModelCallDriver:
     def __init__(self, retry_policy: RetryPolicy):
@@ -511,7 +523,12 @@ class ModelCallDriver:
             logical.tool_calls = []
             if not accumulate_reasoning:
                 logical.reasoning = ""
+            # An interrupted echo of the bridge marker is not a reply to continue.
+            if is_role_alternation_bridge_prefix(logical.text):
+                logical.text = ""
             tail = []
             if logical.text.strip():
                 tail.append({"role": "assistant", "content": logical.text})
-            tail.append({"role": "user", "content": _RECOVERY_INSTRUCTION})
+            malformed = is_malformed_tool_call(error.message, str(error.root_cause.get("code") or ""))
+            tail.append({"role": "user", "content": (
+                _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION if malformed else _RECOVERY_INSTRUCTION)})

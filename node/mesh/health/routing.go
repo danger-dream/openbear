@@ -49,11 +49,11 @@ func (m *Manager) SetRouter(r *routing.Router) {
 	m.relay = relayRouting{router: r, links: map[string]*routeLink{}, errAt: map[string]time.Time{}}
 }
 
-func (m *Manager) routingOn() bool { return m.relay.router != nil && m.cfg.Role == "relay" }
+func (m *Manager) routingOn() bool { return m.relay.router != nil }
 
-// relayLink returns the configured link to peer if peer is a relay.
-func (m *Manager) relayLink(peer string) (Link, bool) {
-	if peer == m.cfg.Self || !m.owners.relays[peer] {
+// routedLink returns the configured link to peer.
+func (m *Manager) routedLink(peer string) (Link, bool) {
+	if peer == m.cfg.Self {
 		return Link{}, false
 	}
 	for _, l := range m.cfg.Links {
@@ -62,6 +62,14 @@ func (m *Manager) relayLink(peer string) (Link, bool) {
 		}
 	}
 	return Link{}, false
+}
+
+// relayLink returns the configured link to peer if peer is a relay.
+func (m *Manager) relayLink(peer string) (Link, bool) {
+	if !m.owners.relays[peer] {
+		return Link{}, false
+	}
+	return m.routedLink(peer)
 }
 
 // prober is the path this relay probes peer through itself, if it does.
@@ -79,7 +87,9 @@ func (m *Manager) prober(l Link) *candidateState {
 }
 
 // routeLive says whether the link carries traffic: the path committed on
-// the dialing end, punched and up on both, or prepared by the dialing end.
+// the dialing end, punched and up on both, or prepared by the dialing end
+// and committed on this one. Probes alone are no proof: they are answered
+// over the path they came on, committed or not.
 func (m *Manager) routeLive(l Link) bool {
 	switch {
 	case l.Punch:
@@ -89,7 +99,7 @@ func (m *Manager) routeLive(l Link) bool {
 		return p != nil && p.path.ID != "" && p.routeReady
 	}
 	for _, in := range m.inbound {
-		if in.peer == l.Peer && in.prepared {
+		if in.peer == l.Peer && in.prepared && m.backend.Committed(l.Peer, in.path) {
 			return true
 		}
 	}
@@ -118,7 +128,7 @@ func (m *Manager) routeSent(p *candidateState, id uint64, now time.Time) {
 	if !m.routingOn() {
 		return
 	}
-	l, ok := m.relayLink(p.config.Peer)
+	l, ok := m.routedLink(p.config.Peer)
 	if !ok || m.prober(l) != p {
 		return
 	}
@@ -148,7 +158,7 @@ func (m *Manager) routePinged(peer, nonce string, now time.Time) {
 	if !m.routingOn() {
 		return
 	}
-	l, ok := m.relayLink(peer)
+	l, ok := m.routedLink(peer)
 	if !ok || l.Dial || l.Punch {
 		return
 	}
@@ -193,7 +203,7 @@ func (m *Manager) routingTick(now time.Time) {
 	var live []string
 	configured := map[string]bool{}
 	for _, l := range m.cfg.Links {
-		if _, ok := m.relayLink(l.Peer); !ok {
+		if _, ok := m.routedLink(l.Peer); !ok {
 			continue
 		}
 		configured[l.Peer] = true

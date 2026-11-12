@@ -6,9 +6,8 @@ import {compileScript, parse} from "@vue/compiler-sfc";
 import {createRenderer, h, nextTick} from "vue";
 import {artifactFromUrl, artifactRecord, clearArtifactCache} from "./artifactFiles.js";
 
-const filename = "ArtifactCard.vue";
-const {descriptor} = parse(readFileSync(new URL(filename, import.meta.url), "utf8"), {filename});
-const source = compileScript(descriptor, {id: filename, inlineTemplate: true}).content;
+const compiled = filename => compileScript(parse(readFileSync(new URL(filename, import.meta.url), "utf8"), {filename}).descriptor, {id: filename, inlineTemplate: true}).content;
+const source = {card: compiled("ArtifactCard.vue"), audio: compiled("AudioPlayer.vue")};
 register(`data:text/javascript,${encodeURIComponent(`
  let component;
  export function initialize(source) { component = source; }
@@ -17,7 +16,8 @@ register(`data:text/javascript,${encodeURIComponent(`
   return next(specifier, context);
  }
  export function load(url, context, next) {
-  if (url.endsWith('/ArtifactCard.vue')) return {format:'module', source:component,shortCircuit:true};
+  if (url.endsWith('/ArtifactCard.vue')) return {format:'module', source:component.card,shortCircuit:true};
+  if (url.endsWith('/AudioPlayer.vue')) return {format:'module', source:component.audio,shortCircuit:true};
   return next(url, context);
  }
 `)}`, {parentURL: import.meta.url, data: source});
@@ -97,12 +97,38 @@ test("image card uses canonical lazy thumbnail, opens only one viewer, and remai
  click(find(root, "artifact-card-open")); assert.equal(dispatched.at(-1).detail.href, href);
 });
 
-for (const [ext, category] of [["pdf", "pdf"], ["docx", "document"], ["xlsx", "spreadsheet"], ["pptx", "presentation"], ["zip", "archive"], ["mp3", "audio"], ["mp4", "video"], ["woff2", "font"], ["bin", "file"]]) test(`${ext} renders distinct type and honest download-only capability`, t => {
+for (const [ext, category] of [["pdf", "pdf"], ["docx", "document"], ["xlsx", "spreadsheet"], ["pptx", "presentation"], ["zip", "archive"], ["wma", "audio"], ["mkv", "video"], ["woff2", "font"], ["bin", "file"]]) test(`${ext} renders distinct type and honest download-only capability`, t => {
  const {root} = mount(t, metadata({fileName: `file.${ext}`, mimeType: "application/octet-stream", workspacePath: undefined}));
  assert.ok(find(root, `artifact-card--${category}`)); assert.equal(text(find(root, "artifact-card-extension")), ext.toUpperCase());
  assert.match(text(root), /下载查看/); assert.match(find(root, "artifact-card-open").props["aria-label"], /查看附件详情/);
  assert.equal(find(root, "artifact-card-excerpt"), undefined); assert.equal(find(root, "artifact-card-copy-path"), undefined);
  assert.equal(find(root, "artifact-card-download").props.href, `${href}?download=1`);
+});
+
+test("playable audio plays in place outside the open button and falls back to download when the browser cannot decode it", async t => {
+ const {root} = mount(t, metadata({fileName: "voice.mp3", mimeType: "audio/mpeg"}));
+ assert.ok(find(root, "artifact-card--audio")); assert.ok(find(root, "has-player")); assert.match(text(root), /播放音频/);
+ const audio = walk(root).find(n => n.type === "audio");
+ assert.equal(audio.props.src, href); assert.equal(audio.props.controls, undefined); assert.equal(audio.props.preload, "metadata");
+ assert.match(find(root, "audio-player-toggle").props["aria-label"], /播放：测试附件/);
+ assert.equal(walk(find(root, "artifact-card-open")).slice(1).some(n => n.type === "audio" || n.type === "button"), false);
+ audio.props.onError(); await nextTick();
+ assert.equal(walk(root).some(n => n.type === "audio"), false); assert.match(text(root), /浏览器无法播放这个音频/);
+ assert.equal(find(root, "artifact-card-download").props.href, `${href}?download=1`);
+});
+
+test("playable video renders an inline player with controls outside the open button and still opens the preview from the card header", async t => {
+ const {root} = mount(t, metadata({fileName: "clip.mp4", mimeType: "video/mp4"}));
+ assert.ok(find(root, "artifact-card--video")); assert.ok(find(root, "has-thumbnail")); assert.ok(find(root, "has-player"));
+ const video = walk(root).find(n => n.type === "video");
+ assert.equal(video.props.src, `${href}#t=0.1`); assert.equal(video.props.preload, "metadata");
+ assert.equal(video.props.controls, ""); assert.equal(video.props.playsinline, "");
+ assert.equal(walk(find(root, "artifact-card-open")).includes(video), false, "interactive video player is not nested inside the open button");
+ const before = dispatched.length; click(find(root, "artifact-card-open"));
+ assert.equal(dispatched.length, before + 1); assert.equal(dispatched.at(-1).detail.href, href);
+ video.props.onError(); await nextTick();
+ assert.equal(walk(root).some(n => n.type === "video"), false); assert.match(text(root), /视频未能直接播放/);
+ click(find(root, "artifact-card-video-fallback")); assert.equal(dispatched.at(-1).detail.href, href);
 });
 
 test("HTML has page/source affordance but does not embed executable content in the card", t => {

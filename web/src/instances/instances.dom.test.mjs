@@ -195,14 +195,17 @@ test('create: generated password, copied models, automatic port/data dir; creden
   await h.close();
 });
 
-test('adding a server from the create form keeps the form; vault keys are grouped and the passphrase field is suggested', async t => {
+test('adding a server from the create form keeps the form; vault keys are named by their credential and the passphrase field is suggested', async t => {
   const h = await setup(t, {width: 1280}); await h.goto(); await click(h.page, '创建实例');
   await h.page.getByLabel('实例名称').fill('保留我');
   await pickServer(h.page, '添加服务器…');
   const server = h.page.getByRole('dialog', {name: '添加服务器'}); await server.waitFor();
   assert.equal(await server.locator('.ob-radios label').count(), 3);
-  const select = server.getByLabel('密钥库中的 SSH 私钥');
-  assert.deepEqual(await select.locator('optgroup').evaluateAll(groups => groups.map(g => g.label)), ['deploy', '可能不是 SSH 私钥', '无法使用']);
+  await server.getByText('凭证库中的私钥', {exact: true}).waitFor();
+  const select = server.getByLabel('凭证库中的 SSH 私钥');
+  assert.deepEqual(await select.locator('optgroup').evaluateAll(groups => groups.map(g => g.label)), ['可能不是 SSH 私钥', '无法使用']);
+  // Closed, the select still says which credential the key is in.
+  assert.match(await select.evaluate(s => s.options[s.selectedIndex].text), /^deploy · 主密钥/);
   assert.equal(await select.locator('option[disabled]').filter({hasText: 'PuTTY'}).count(), 1);
   await server.getByText('✓ 这个字段能解开私钥', {exact: true}).waitFor();
   await server.getByLabel('服务器名称').fill('新服务器'); await server.getByLabel('服务器地址').fill('192.0.2.20');

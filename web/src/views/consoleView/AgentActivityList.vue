@@ -1,5 +1,6 @@
 <script setup>
 import {computed} from "vue";
+import {groupConversationTimes, useConversationDay} from '../../conversationTime.js';
 import {ArrowRight} from "@element-plus/icons-vue";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import ToolArgumentsView from "./ToolArgumentsView.vue";
@@ -11,6 +12,8 @@ const props = defineProps({
 	emptyText: {type: String, default: "暂无过程记录。"},
 	compact: {type: Boolean, default: false},
 });
+
+const conversationDay = useConversationDay();
 
 const TOOL_STATUS_LABELS = {
 	running: "执行中",
@@ -58,7 +61,7 @@ function recordedText(value) {
 	return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
-const presentedLines = computed(() => props.lines.map((line) => {
+const presentedLines = computed(() => groupConversationTimes(props.lines.map((line) => {
 	const detail = line?.detail && typeof line.detail === "object" ? line.detail : {};
 	if (isModelProcessLine(line)) {
 		const status = declaredStatus(line, MODEL_STATUS_LABELS);
@@ -96,18 +99,18 @@ const presentedLines = computed(() => props.lines.map((line) => {
 			statusTone: STATUS_TONES[status],
 		},
 	};
-}));
+}), conversationDay.value));
 </script>
 
 <template>
 	<div v-if="props.lines.length" class="activity-list" :class="{compact}">
+		<template v-for="line in presentedLines" :key="line.key">
+		<div v-if="line.dateHeading" class="activity-date"><time :datetime="line.dateHeading">{{ line.dateHeading }}</time></div>
 		<div
-			v-for="line in presentedLines"
-			:key="line.key"
 			class="activity-row"
 			:class="[{'is-control': line.kind === 'agent_control', 'is-tool-call': Boolean(line.processTool), 'is-model-call': Boolean(line.processModel), 'is-compaction': line.kind === 'context_compaction_compact'}, line.tone ? `tone-${line.tone}` : '']"
 		>
-			<time>{{ line.timeLabel }}</time>
+			<time :title="line.timestampTitle || undefined">{{ line.displayTime }}</time>
 			<span class="activity-dot"></span>
 			<details v-if="line.kind === 'context_compaction_compact'" class="activity-compaction">
 				<summary><span>{{ line.message }}</span><ArrowRight/></summary>
@@ -167,6 +170,7 @@ const presentedLines = computed(() => props.lines.map((line) => {
 				<p v-if="line.kind === 'agent_control' && (line.detail?.text || line.detail?.message)" class="activity-control-text">{{ line.detail.text || line.detail.message }}</p>
 			</div>
 		</div>
+		</template>
 	</div>
 	<div v-else class="activity-list-empty">{{ emptyText }}</div>
 </template>
@@ -174,6 +178,7 @@ const presentedLines = computed(() => props.lines.map((line) => {
 <style scoped>
 .activity-list { position: relative; min-width: 0; padding-left: 4px; }
 .activity-list::before { content: ""; position: absolute; left: 62px; top: 6px; bottom: 6px; width: 1px; background: var(--ob-surface-soft); }
+.activity-date { margin: 8px 0 2px 67px; color: var(--ob-text-subtle); font-size: 10.5px; line-height: 1.4; font-variant-numeric: tabular-nums; }
 .activity-row { position: relative; display: grid; grid-template-columns: 48px 12px minmax(0, 1fr); gap: 7px; align-items: baseline; padding: 5px 0; }
 .activity-row time { width: 48px; color: var(--ob-text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: nowrap; }
 .activity-dot { z-index: 1; width: 7px; height: 7px; border: 2px solid var(--ob-border); border-radius: 50%; background: var(--ob-text-muted); box-shadow: 0 0 0 1px rgb(var(--ob-border-rgb) / 0.05); }
@@ -239,12 +244,14 @@ const presentedLines = computed(() => props.lines.map((line) => {
 	   to a desktop rail inside an already narrow work drawer. */
 	.activity-row { grid-template-columns: 8px minmax(0, 1fr); gap: 2px 8px; padding: 7px 0; }
 	.activity-list::before { left: 7px; }
+	.activity-date { margin-left: 16px; }
 	.activity-row time { grid-column: 2; grid-row: 1; width: auto; }
 	.activity-dot { grid-column: 1; grid-row: 1; margin-top: 4px; }
 	.activity-tool-call, .activity-model-call, .activity-compaction, .activity-message { grid-column: 2; grid-row: 2; }
 	.activity-tool-call > summary { flex-wrap: wrap; align-items: baseline; gap: 3px 6px; min-height: 36px; }
 	.activity-tool-description { flex: 1 1 100%; order: 1; white-space: normal; overflow: visible; overflow-wrap: anywhere; color: var(--el-text-color-regular); }
-	.activity-tool-call > summary .activity-tool-arrow { margin-left: auto; }
+	/* The right inset keeps the arrow's box inside the list while it rotates past 45°. */
+	.activity-tool-call > summary .activity-tool-arrow { margin-left: auto; margin-right: 3px; }
 	.activity-tool-call > summary > .activity-process-separator { display: none; }
 	.activity-compaction > summary { min-height: 36px; }
 	.activity-compaction > summary span { white-space: normal; overflow: visible; overflow-wrap: anywhere; }

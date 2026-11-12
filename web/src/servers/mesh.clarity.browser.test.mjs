@@ -5,7 +5,7 @@ import {createRequire} from 'node:module';
 import {startBrowserTestServer, waitForBrowserReady} from '../browserTestServer.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 
 // How the board keeps a real-sized mesh readable: lines in use stand out, lines not in use are
 // drawn quiet without labels until they or their ends are pointed at, links that would run under
@@ -28,14 +28,18 @@ test('mesh board clarity: lines in use stand out, idle ones stay quiet, links bo
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function open(t, {width = 1440, height = 1000, dark = false, broken = false} = {}) {
+  async function open(t, {width = 1440, height = 1000, dark = false, broken = false, look = null, place = null} = {}) {
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: 1, colorScheme: dark ? 'dark' : 'light', hasTouch: width < 760, isMobile: width < 760});
     t.after(() => context.close());
     const page = await context.newPage(), errors = [], view = clarityMesh({broken});
+    Object.assign(view.layout, place);
     const items = NODES.map(([id, name, region]) => server(id, name, region, id === 'mac' ? 'darwin' : id === 'win' ? 'windows' : 'linux'));
     page.on('pageerror', error => errors.push(error.message));
     // The panel folded away on the desktop: the board as wide as it gets.
-    await page.addInitScript(isDark => { window.__dark = isDark; sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); localStorage.setItem('openbear.mesh.folded', JSON.stringify({palette: true, panel: true})); }, dark);
+    await page.addInitScript(([isDark, look]) => {
+      window.__dark = isDark; localStorage.setItem('openbear.mesh.classic', '1'); sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs: [], active: 'mesh'})); localStorage.setItem('openbear.mesh.folded', JSON.stringify({palette: true, panel: true}));
+      if (look) localStorage.setItem('openbear.mesh.view', JSON.stringify(look));
+    }, [dark, look]);
     await page.route(/^https:\/\/(open\.er-api\.com|api\.frankfurter\.dev)\//, route => route.fulfill({status: 503, body: ''}));
     await page.route('**/api/**', async route => {
       const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
@@ -55,7 +59,7 @@ test('mesh board clarity: lines in use stand out, idle ones stay quiet, links bo
     await page.locator('.vue-flow__node').nth(NODES.length - 1).waitFor();
     // The board has fitted its view (finite animations done) and drawn every line.
     await page.evaluate(() => Promise.all(document.getAnimations().filter(a => a.effect?.getComputedTiming().endTime !== Infinity).map(a => a.finished.catch(() => {}))));
-    await page.locator(`.mesh-edge-label[data-edge="${'direct:0'}"]`).waitFor();
+    await page.locator(look ? '.mesh-edge-label' : `.mesh-edge-label[data-edge="${'direct:0'}"]`).first().waitFor();
     return {page, close: async () => { await context.close(); assert.deepEqual(errors, []); }};
   }
   const node = (page, id) => page.locator(`.vue-flow__node[data-id="${id}"]`);
@@ -136,6 +140,38 @@ test('mesh board clarity: lines in use stand out, idle ones stay quiet, links bo
     // TOY–Berlin carries nothing and is down: drawn at full strength.
     const line = await page.locator(`[data-id="${pair('toy', 'berlin')}"] .mesh-edge-line`).evaluate(el => parseFloat(getComputedStyle(el).strokeOpacity));
     assert.ok(line >= 0.8, `down line opacity ${line}`);
+    await close();
+  });
+
+  await t.test('desktop: right-angled lines, members inside their relays: no label covers a server, a relay\'s box or another label', async t => {
+    // TOY moved up to Home, a gap too narrow for the label of the line between them.
+    const {page, close} = await open(t, {look: {contain: true, lines: 'ortho'}, place: {toy: {x: 240, y: 490}}});
+    await page.locator('.mesh-cluster').first().waitFor();
+    await page.mouse.move(5, 5);
+    const rects = sel => page.locator(sel).evaluateAll(list => list.map(el => { const r = el.getBoundingClientRect(); return {id: el.dataset.edge || el.dataset.id || el.className, text: el.textContent.trim(), x: r.x, y: r.y, w: r.width, h: r.height}; }));
+    const apart = (a, b) => a.x + a.w <= b.x + 1 || b.x + b.w <= a.x + 1 || a.y + a.h <= b.y + 1 || b.y + b.h <= a.y + 1;
+    const tags = await rects('.mesh-edge-label'), blocks = [...await rects('.vue-flow__node'), ...await rects('.mesh-cluster')];
+    assert.ok(tags.length >= 5, `${tags.length} labels`);
+    for (const a of tags) for (const b of [...tags, ...blocks]) if (a !== b) assert.ok(apart(a, b), `label ${a.text} covers ${b.text || b.id}`);
+    // A line whose label had no room shows it, whole, when pointed at.
+    const shown = new Set(tags.map(x => x.id));
+    const left = (await page.locator('.mesh-edge:not([data-quiet])').evaluateAll(list => list.map(el => el.closest('[data-id]').dataset.id))).filter(id => !shown.has(id) && !id.startsWith('rule'));
+    assert.ok(left.length >= 1, 'some label had no room');
+    let pointed = false;
+    for (const id of left) {
+      const spots = await along(page, id, Array.from({length: 19}, (_, i) => 0.05 + i * 0.05));
+      const p = await page.evaluate(({spots, id}) => spots.find(({x, y}) => document.elementFromPoint(x, y)?.closest?.('[data-id]')?.dataset.id === id && document.elementFromPoint(x, y).classList.contains('mesh-edge-hit')), {spots, id});
+      if (!p) continue;
+      await page.mouse.move(p.x, p.y);
+      await labelOf(page, id).waitFor();
+      assert.match(await labelOf(page, id).innerText(), / · /);
+      await page.mouse.move(5, 5);
+      await labelOf(page, id).waitFor({state: 'detached'});
+      pointed = true;
+      break;
+    }
+    assert.ok(pointed, 'a line without its label could be pointed at');
+    await shot(page, 'desktop-ortho-contained');
     await close();
   });
 

@@ -40,6 +40,7 @@ def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
 
 
 _MAX_BATCH_EDITS = 20
+_MAX_READS = 20
 _MAX_BATCH_TEXT_BYTES = 1024 * 1024
 _BATCH_ITEM_FIELDS = {"old_string", "new_string", "replace_all"}
 
@@ -87,7 +88,9 @@ def make_read_tool(
     output_limit_bytes: int = DEFAULT_READ_LIMIT_BYTES,
     max_line_bytes: int = DEFAULT_READ_MAX_LINE_BYTES,
 ):
-    async def _read(args: dict[str, Any]) -> str | ToolOutcome:
+    budget = max(1024, int(output_limit_bytes))
+
+    async def _read_one(args: dict[str, Any], output_bytes: int, *, allow_image: bool) -> str | ToolOutcome:
         path = str(args.get("path") or "")
         if not path:
             return "error: missing path"
@@ -103,12 +106,14 @@ def make_read_tool(
         force = bool(args.get("force", False))
         limits = ReadLimits(
             limit_lines=max(1, int(default_limit_lines)),
-            output_bytes=max(1024, int(output_limit_bytes)),
+            output_bytes=output_bytes,
             max_line_bytes=max(1024, int(max_line_bytes)),
         )
         try:
             image = await asyncio.to_thread(load_image_for_tool, path)
             if image is not None:
+                if not allow_image:
+                    return f"error: {path} is an image; read images one per call with path"
                 directory = _artifact_base("images")
                 snapshot = await asyncio.to_thread(write_image_snapshot, directory, image)
                 return image_tool_outcome(image, snapshot)
@@ -125,6 +130,32 @@ def make_read_tool(
         except Exception as e:
             return f"error: read failed: {type(e).__name__}: {e}"
         return result.text
+
+    async def _read(args: dict[str, Any]) -> str | ToolOutcome:
+        reads = args.get("reads")
+        if reads is None:
+            return await _read_one(args, budget, allow_image=True)
+        if args.get("path"):
+            return "error: give either path or reads, not both"
+        if not isinstance(reads, list) or not reads or not all(isinstance(entry, dict) for entry in reads):
+            return "error: reads must be a non-empty list of {path, offset, limit}"
+        if len(reads) > _MAX_READS:
+            return f"error: at most {_MAX_READS} reads per call"
+        # One output budget shared by all entries, in order; later entries get what is left.
+        remaining = budget
+        parts = [f"<reads count=\"{len(reads)}\" budget_bytes=\"{budget}\">"]
+        for index, entry in enumerate(reads, 1):
+            if remaining < 1024:
+                parts.append(f"[reads[{index}] {entry.get('path') or ''}] skipped: shared output budget used up; "
+                             f"read it in another call")
+                continue
+            text = await _read_one({"force": args.get("force", False), **entry}, remaining, allow_image=False)
+            if text.startswith("error: "):
+                text = f"[reads[{index}] {entry.get('path') or ''}] {text}"
+            parts.append(text)
+            remaining -= len(text.encode("utf-8"))
+        parts.append("</reads>")
+        return "\n\n".join(parts)
 
     return _read
 
@@ -348,17 +379,21 @@ def register_file_tools(
     reg.file_state = store
     reg.add(
         "Read",
-        "Read local text files or images. JPEG, PNG, GIF and WebP images (up to 20 MiB) are sent to your vision input, with resizing or compression when required by supported model limits; source files remain unchanged. Images are returned on every call without text deduplication. Other binary/special files are rejected. Text supports offset/limit and force.",
+        "Read local text files or images. JPEG, PNG, GIF and WebP images (up to 20 MiB) are sent to your vision input, with resizing or compression when required by supported model limits; source files remain unchanged. Images are returned on every call without text deduplication. Other binary/special files are rejected. Text supports offset/limit and force. "
+        f"reads[] reads up to {_MAX_READS} text files or ranges in one call, in order, sharing one output budget (the single-read size); an entry that does not fit is skipped and named.",
         {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件路径"},
+                "reads": {"type": "array", "maxItems": _MAX_READS, "items": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"},
+                    "force": {"type": "boolean"},
+                }, "required": ["path"]}, "description": "代替 path：一次读多个文本文件或片段，各项参数同单文件；图片仍需单独读取"},
                 "offset": {"type": "integer", "description": "文本起始行（0 基）；图片不适用"},
                 "limit": {"type": "integer", "description": "文本最多读取行数；图片不适用"},
                 "force": {"type": "boolean", "description": "文本即使未变化也强制重新返回，默认 false；图片每次均返回"},
                 "description": {"type": "string", "description": "一句话说明这次读取做什么，便于进度展示"},
             },
-            "required": ["path"],
         },
         make_read_tool(
             store=store,

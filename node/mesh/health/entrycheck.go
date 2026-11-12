@@ -74,6 +74,11 @@ func (m *Manager) candidateOf(peer string) *candidateState {
 			return p
 		}
 	}
+	if m.owners.relays[peer] {
+		if p := m.links[peer]; p != nil {
+			return p
+		}
+	}
 	return nil
 }
 

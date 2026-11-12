@@ -27,13 +27,43 @@ const (
 	drrQuantum      = 1514
 	wireOverhead    = 60 // outer IPv4, UDP and WireGuard bytes the upload limit also pays
 	fragmentEntries = 1024
+	flowQueueKeep   = 256 // entries an emptied flow queue keeps room for
 )
 
 var errQueueClosed = errors.New("queue closed")
 
+// A transferable packet stores its complete TUN slot in b, with the
+// payload at readHeadroom. Its capacity is readSlotCapacity and its length
+// never exceeds readHeadroom+readBufSize. All ordinary packets have their
+// capacity clipped to length at enqueue; thus the two forms cannot collide.
+// This keeps the original single slice per queue entry and uses no unsafe.
 type queued struct {
-	b  []byte
-	at time.Time
+	b []byte
+	// at is when b was queued, from the scheduler's epoch: a queue holds
+	// many, and each is no larger than b and a time.Time were.
+	at time.Duration
+	// peer, when set, is the WireGuard peer b goes to in place of the one
+	// its destination routes to (fixedpath.go); it is never written.
+	peer *[32]byte
+}
+
+// peerKey is the key a packet's SendMetadata takes for peer.
+func peerKey(peer *[32]byte) [32]byte {
+	if peer == nil {
+		return [32]byte{}
+	}
+	return *peer
+}
+
+func packetIsSlot(b []byte) bool {
+	return cap(b) == readSlotCapacity && len(b) >= readHeadroom && len(b) <= readHeadroom+readBufSize
+}
+
+func packetData(b []byte) []byte {
+	if packetIsSlot(b) {
+		return b[readHeadroom:]
+	}
+	return b
 }
 
 type flowQueue struct {
@@ -58,12 +88,19 @@ func (f *flowQueue) pop() queued {
 	q := f.pkts[f.head]
 	f.pkts[f.head] = queued{}
 	f.head++
-	f.bytes -= len(q.b)
+	f.bytes -= len(packetData(q.b))
 	if f.head == len(f.pkts) {
+		// A queue a burst grew gives its array back once it drains.
+		if cap(f.pkts) > flowQueueKeep {
+			f.pkts = nil
+		}
 		f.pkts, f.head = f.pkts[:0], 0
 	} else if f.head > 64 && f.head*2 > len(f.pkts) {
-		f.pkts = append(f.pkts[:0], f.pkts[f.head:]...)
-		f.head = 0
+		// The moved packets' old places past the new length would keep
+		// their slots alive after they are sent.
+		n := copy(f.pkts, f.pkts[f.head:])
+		clear(f.pkts[n:])
+		f.pkts, f.head = f.pkts[:n], 0
 	}
 	return q
 }
@@ -88,6 +125,7 @@ type scheduler struct {
 	wake     chan struct{}
 	done     chan struct{}
 	now      func() time.Time
+	epoch    time.Time
 
 	smallCredit float64
 
@@ -111,7 +149,7 @@ type fragID struct {
 
 func newScheduler(buckets, maxBytes int) *scheduler {
 	s := &scheduler{buckets: make([]flowQueue, buckets), maxBytes: maxBytes, seed: maphash.MakeSeed(),
-		frags: map[fragID]int{}, wake: make(chan struct{}, 1), done: make(chan struct{}), now: time.Now,
+		frags: map[fragID]int{}, wake: make(chan struct{}, 1), done: make(chan struct{}), now: time.Now, epoch: time.Now(),
 		smallCredit: smallBurst, dropped: func(int) {}}
 	s.flowBytes = s.flowLimit()
 	return s
@@ -212,7 +250,14 @@ func (s *scheduler) enqueue(b []byte) { s.enqueueAt(b, -1) }
 
 // enqueueAt queues b in bucket i, or where classify puts it for an i out
 // of range.
-func (s *scheduler) enqueueAt(b []byte, i int) {
+func (s *scheduler) enqueueAt(b []byte, i int) { s.enqueueBacking(b, nil, i) }
+
+// enqueuePeer queues b, in bucket i as enqueueAt does, for peer.
+func (s *scheduler) enqueuePeer(b []byte, i int, peer *[32]byte) { s.enqueueFor(b, nil, i, peer) }
+
+func (s *scheduler) enqueueBacking(b, backing []byte, i int) { s.enqueueFor(b, backing, i, nil) }
+
+func (s *scheduler) enqueueFor(b, backing []byte, i int, peer *[32]byte) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -227,7 +272,13 @@ func (s *scheduler) enqueueAt(b []byte, i int) {
 		s.drop(i)
 		dropped++
 	}
-	f.pkts = append(f.pkts, queued{b, s.now()})
+	// Use the capacity marker only after verifying the exact provenance and
+	// headroom; cap-clip every other source, including relay/E2E traffic.
+	stored := b[:len(b):len(b)]
+	if len(b) > 0 && len(b) <= readBufSize && len(backing) == readSlotCapacity && &backing[readHeadroom] == &b[0] {
+		stored = backing[: readHeadroom+len(b) : readSlotCapacity]
+	}
+	f.pkts = append(f.pkts, queued{b: stored, at: s.now().Sub(s.epoch), peer: peer})
 	f.bytes += len(b)
 	s.bytes += len(b)
 	if f.list == 1 {
@@ -274,23 +325,29 @@ func (s *scheduler) fattest() int {
 // its list until the dequeue loop passes it.
 func (s *scheduler) drop(i int) {
 	q := s.buckets[i].pop()
-	s.bytes -= len(q.b)
+	s.bytes -= len(packetData(q.b))
 	if s.buckets[i].list == 1 {
-		s.smallB -= len(q.b)
+		s.smallB -= len(packetData(q.b))
 	}
 }
 
 // dequeue blocks until a packet may be sent, or the scheduler closes.
-func (s *scheduler) dequeue() ([]byte, error) {
+func (s *scheduler) dequeuePacket() (queued, error) {
+	q, _, err := s.dequeueFlow()
+	return q, err
+}
+
+// dequeueFlow is dequeuePacket with the bucket the packet was in.
+func (s *scheduler) dequeueFlow() (queued, int, error) {
 	t := time.NewTimer(time.Hour)
 	defer t.Stop()
 	for {
-		b, wait, dropped := s.next()
+		q, bucket, wait, dropped := s.nextPacket()
 		if dropped > 0 {
 			s.dropped(dropped)
 		}
-		if b != nil {
-			return b, nil
+		if q.b != nil {
+			return q, bucket, nil
 		}
 		if wait <= 0 {
 			wait = time.Hour
@@ -298,7 +355,7 @@ func (s *scheduler) dequeue() ([]byte, error) {
 		t.Reset(wait)
 		select {
 		case <-s.done:
-			return nil, errQueueClosed
+			return queued{}, -1, errQueueClosed
 		case <-s.wake:
 		case <-t.C:
 		}
@@ -306,30 +363,43 @@ func (s *scheduler) dequeue() ([]byte, error) {
 }
 
 // tryDequeue returns nil when nothing may be sent right now.
-func (s *scheduler) tryDequeue() []byte {
-	b, _, dropped := s.next()
+func (s *scheduler) tryDequeuePacket() queued {
+	q, _ := s.tryDequeueFlow()
+	return q
+}
+
+// tryDequeueFlow is tryDequeuePacket with the bucket the packet was in.
+func (s *scheduler) tryDequeueFlow() (queued, int) {
+	q, bucket, _, dropped := s.nextPacket()
 	if dropped > 0 {
 		s.dropped(dropped)
 	}
-	return b
+	return q, bucket
+}
+
+func (s *scheduler) tryDequeue() []byte { return packetData(s.tryDequeuePacket().b) }
+
+func (s *scheduler) next() ([]byte, time.Duration, int) {
+	q, _, wait, dropped := s.nextPacket()
+	return packetData(q.b), wait, dropped
 }
 
 // next picks the packet to send, or how long the rate limit makes it wait.
-func (s *scheduler) next() (pkt []byte, wait time.Duration, dropped int) {
+func (s *scheduler) nextPacket() (pkt queued, bucket int, wait time.Duration, dropped int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, 0, 0
+		return queued{}, -1, 0, 0
 	}
 	now := s.now()
 	for {
 		i, small, charged := s.pick()
 		if i < 0 {
-			return nil, 0, dropped
+			return queued{}, -1, 0, dropped
 		}
 		f := &s.buckets[i]
 		head := f.peek()
-		age := now.Sub(head.at)
+		age := now.Sub(s.epoch) - head.at
 		if age > queueMaxAge {
 			s.drop(i)
 			dropped++
@@ -340,12 +410,12 @@ func (s *scheduler) next() (pkt []byte, wait time.Duration, dropped int) {
 			dropped++
 			continue
 		}
-		size := len(head.b)
+		size := len(packetData(head.b))
 		if s.rate > 0 {
 			s.tokens = math.Min(s.burst(), s.tokens+now.Sub(s.filled).Seconds()*s.rate)
 			s.filled = now
 			if need := float64(size + wireOverhead); s.tokens < need {
-				return nil, time.Duration((need - s.tokens) / s.rate * float64(time.Second)), dropped
+				return queued{}, -1, time.Duration((need - s.tokens) / s.rate * float64(time.Second)), dropped
 			}
 			s.tokens -= float64(size + wireOverhead)
 		}
@@ -369,7 +439,7 @@ func (s *scheduler) next() (pkt []byte, wait time.Duration, dropped int) {
 			f.deficit -= size
 			s.smallCredit = math.Min(smallBurst, s.smallCredit+float64(size)*smallShare/(1-smallShare))
 		}
-		return q.b, 0, dropped
+		return q, i, 0, dropped
 	}
 }
 
@@ -385,7 +455,7 @@ func (s *scheduler) pick() (i int, small, charged bool) {
 		if s.bytes == s.smallB {
 			return s.small[0], true, false
 		}
-		if s.smallCredit >= float64(len(s.buckets[s.small[0]].peek().b)) {
+		if s.smallCredit >= float64(len(packetData(s.buckets[s.small[0]].peek().b))) {
 			return s.small[0], true, true
 		}
 	}
@@ -397,7 +467,7 @@ func (s *scheduler) pick() (i int, small, charged bool) {
 			s.bulk = s.bulk[1:]
 			continue
 		}
-		if f.deficit < len(f.peek().b) {
+		if f.deficit < len(packetData(f.peek().b)) {
 			f.deficit += drrQuantum
 			s.bulk = append(s.bulk[1:], i)
 			continue

@@ -4,7 +4,7 @@
 // servers.*.browser.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {setup, tab} from './testing/serversDom.mjs';
+import {setup, showTab, tab} from './testing/serversDom.mjs';
 import {server, card} from './testing/serversBackend.mjs';
 
 test('registration code join pending: card tag, notice, keep / take over / reject, phone without overflow', async t => {
@@ -75,6 +75,7 @@ test('settings: reminder rules, test reminder and recent list', async t => {
   await h.page.getByRole('button', {name: '设置'}).click();
   const dialog = h.page.getByRole('dialog', {name: '服务器设置'});
   await dialog.waitFor();
+  await dialog.getByRole('tab', {name: '提醒'}).click();
   assert.deepEqual(await dialog.locator('.sv-chip').allInnerTexts(), ['7 天', '3 天', '1 天', '当天', '80%', '90%', '100%']);
   await dialog.getByRole('button', {name: '删除 3 天'}).click();
   await dialog.getByRole('spinbutton', {name: '添加到期提醒天数'}).fill('14');
@@ -84,8 +85,24 @@ test('settings: reminder rules, test reminder and recent list', async t => {
   await dialog.getByLabel('每天提醒时间').fill('08:30');
   await dialog.getByRole('button', {name: '发一条测试提醒'}).click();
   await h.page.getByText('测试提醒已发出').waitFor();
-  await dialog.getByText('最近的提醒（1）').click();
-  await dialog.getByText('本期流量已用 100%', {exact: false}).waitFor();
+  // 最近提醒: a block of its own, the newest five first.
+  const recent = dialog.locator('.sv-recent');
+  await recent.getByText('共 7 条').waitFor();
+  assert.equal(await recent.locator('li').count(), 5);
+  await recent.getByText('本期流量已用 100%', {exact: false}).waitFor();
+  await recent.getByRole('button', {name: '显示全部 7 条'}).click();
+  assert.equal(await recent.locator('li').count(), 7);
+  await recent.getByRole('button', {name: '收起'}).waitFor();
+  await dialog.getByRole('tab', {name: '检测'}).click();
+  assert.ok(await dialog.getByLabel('解锁检测', {exact: false}).isChecked());
+  await dialog.getByLabel('三网回程', {exact: false}).uncheck();
+  // IP 质量 by itself, on by default: how often again.
+  assert.ok(await dialog.locator('[data-check=ipcheck]').isChecked());
+  await dialog.getByLabel('IP 质量重测间隔').selectOption('15');
+  // IP 情报: the http:BL key, kept in the vault; Radar waits for a Cloudflare account of 动态域名.
+  await dialog.locator('[data-intel-cloudflare]').getByText('在动态域名里添加一个 Cloudflare 账号后', {exact: false}).waitFor();
+  await dialog.getByLabel('http:BL 访问密钥').fill('abcdefghijkl');
+  await dialog.getByRole('tab', {name: '接入'}).click();
   await dialog.getByText('0.13.1（本地构建）').waitFor();
   await dialog.getByText('每天自动检查一次 GitHub 上的新版本').waitFor();
   await dialog.getByRole('button', {name: '检查新版本'}).click();
@@ -95,6 +112,9 @@ test('settings: reminder rules, test reminder and recent list', async t => {
   await dialog.waitFor({state: 'hidden'});
   const saved = h.calls.find(c => c.path === '/api/servers/settings' && c.method === 'PUT').body;
   assert.deepEqual(saved.reminders, {enabled: true, time: '08:30', expiryDays: [14, 7, 1, 0], trafficPercents: [80, 90, 95, 100], autoRenew: true});
+  assert.deepEqual(saved.checks, {unlock: true, route: false, ipcheck: true});
+  assert.equal(saved.ipcheckDays, 15);
+  assert.deepEqual(saved.ipIntel, {httpblKey: 'abcdefghijkl'});
   await h.close();
 });
 
@@ -347,6 +367,7 @@ test('settings: access points with test, default and guide', async t => {
   await h.page.getByRole('dialog', {name: '添加服务器'}).getByRole('button', {name: '取消'}).click();
   await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
   const detail = h.page.locator('.sv-detail:visible');
+  await showTab(detail, '系统');
   await detail.getByText('海外直连（首选）', {exact: false}).waitFor();
   await detail.getByRole('button', {name: '编辑'}).first().click();
   const editor = h.page.getByRole('dialog', {name: '编辑「Delta-JP」'});

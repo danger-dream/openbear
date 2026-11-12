@@ -8,8 +8,10 @@ import {compile, createSSRApp, h, ref} from "vue";
 import {renderToString} from "vue/server-renderer";
 import {parse} from "@vue/compiler-sfc";
 import {Clock, Timer, Top, Bottom, Coin} from "@element-plus/icons-vue";
-import {Undo2} from "@lucide/vue";
+import {Undo2, Play, StickyNote} from "@lucide/vue";
+import {artifactFormat, artifactFromUrl} from "../../artifacts/artifactFiles.js";
 import {projectOperationMessages, eventDisplayTimeMs, eventStartedAtMs, eventUpdatedAtMs} from "../../timelineProjection.js";
+import {conversationTimeParts} from '../../conversationTime.js';
 import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conversationTimeline.js";
 import {replyMarkdownText} from "./replyMarkdownShare.js";
 import {visibilitySelectionClasses, selectVisibilityRow} from './messageVisibility.js';
@@ -35,11 +37,14 @@ const setupNames = [...script.matchAll(/^(?:async )?function (\w+)\(/gm)].map(ma
 const slot = {inheritAttrs: false, setup: (_, {slots}) => () => slots.default?.()};
 function turnList(turns, running = false, hiddenIds = [], runState = {}) {
   const copies = [], emitted = [], webhookMessages = [], cronMessages = [];
+  const sampleDate = new Date(1789043900 * 1000);
+  const day = ref(`${sampleDate.getFullYear()}-${String(sampleDate.getMonth()+1).padStart(2,'0')}-${String(sampleDate.getDate()).padStart(2,'0')}`);
   const props = {turns, running, controllerRunning: running, activeTurnIndex: -1, ...runState,
     conversationUuid: "test-conversation", detailKey: () => "detail", isDetailOpen: () => false, activeToolResultIndex: () => 0};
   const hidden = new Set(hiddenIds);
   const visibility = {hiddenIds: ref(hidden), selecting: ref(false), selected: ref(new Set()), busy: ref(false), canTarget: () => true, isHidden: value => hidden.has(value?.operation?.opId || value?.opId || value?.eventKey || value?.id), assistantTargets: turn => (turn.events || []).filter(event => !hidden.has(event.id))};
-  const context = vm.createContext({contextResourceUrl,ref, ...display, isInlineProcess, conversationTimelineEntries, shouldRenderAssistantDivider, replyMarkdownText, visibilitySelectionClasses, selectVisibilityRow,
+  const previews = [];
+  const context = vm.createContext({contextResourceUrl,ref, artifactFormat, artifactFromUrl: url => artifactFromUrl(url, "https://openbear.test"), openArtifactPreview: (identity, label) => previews.push({identity, label}), conversationTimeParts, useConversationDay: () => day, ...display, isInlineProcess, conversationTimelineEntries, shouldRenderAssistantDivider, replyMarkdownText, visibilitySelectionClasses, selectVisibilityRow,
     useMessageVisibility: () => visibility,
     useWorkItems: () => null, formatTime, isClosed, leaves, topNumber, turnTaskNumbers,
     projectedEventDisplayTimeMs: eventDisplayTimeMs, projectedEventStartedAtMs: eventStartedAtMs, projectedEventUpdatedAtMs: eventUpdatedAtMs,
@@ -48,10 +53,12 @@ function turnList(turns, running = false, hiddenIds = [], runState = {}) {
     window: {clearTimeout() {}, setTimeout() { return 1; }},
   });
   vm.runInContext(script, context);
-  const app = createSSRApp({render, setup: () => vm.runInContext(`({props, emit, visibility, visibilitySelectionClasses, selectVisibilityRow, copiedMessageKey, fmtTokens, cachePct, ${setupNames.join(", ")}})`, context)});
+  const app = createSSRApp({render, setup: () => vm.runInContext(`({props, emit, visibility, visibilitySelectionClasses, selectVisibilityRow, copiedMessageKey, notedTurnKey, fmtTokens, cachePct, ${setupNames.join(", ")}})`, context)});
   for (const name of ["el-tooltip", "el-icon", "el-image", "Check", "CopyDocument", "Link", "Hide"]) app.component(name, slot);
-  for (const [name, icon] of Object.entries({Clock, Timer, Top, Bottom, Coin, Undo2})) app.component(name, icon);
+  for (const [name, icon] of Object.entries({Clock, Timer, Top, Bottom, Coin, Undo2, Play, StickyNote})) app.component(name, icon);
   app.component("MessageVisibilityAction", {render: () => null});
+  app.component("PromptSuggestions", {props: ['items', 'collapsed'], setup: p => () => h('section', {class: 'prompt-suggestions', 'data-items': p.items.join('|'), 'data-collapsed': String(p.collapsed)})});
+  app.component("AudioPlayer", {props: ['src', 'label'], setup: p => () => h('audio', {src: p.src, 'data-label': p.label})});
   app.component("ReplyMarkdownShare", {props: ['content'], setup: p => () => h('button', {'aria-label': '分享回复 Markdown', 'data-share-content': p.content})});
   // This suite isolates footer/copy contracts. Work grouping itself is mounted
   // with its real lifecycle in conversationWork.integration.test.mjs.
@@ -68,7 +75,7 @@ function turnList(turns, running = false, hiddenIds = [], runState = {}) {
   }});
   app.component("ConsoleMarkdown", {props: ["text"], setup: props => () => h("p", props.text)});
   app.component("TurnEvent", {props: ["event"], setup: props => () => h("div", {"data-event-id": props.event.id}, props.event.message?.content || "上下文压缩")});
-  return {props, copies, emitted, hidden, webhookMessages, cronMessages, html: () => renderToString(app), run: code => vm.runInContext(code, context)};
+  return {props, day, copies, emitted, hidden, webhookMessages, cronMessages, previews, html: () => renderToString(app), run: code => vm.runInContext(code, context)};
 }
 const answer = (id = "answer", content = "已完成") => ({kind: "answer", id, message: {content, createdAt: 1789044000, live: false}});
 const savedStats = () => ({live: false, durationMs: 128664,
@@ -105,7 +112,7 @@ for (const source of ['webhook', 'cron', 'user', undefined]) {
       assert.equal(component.cronMessages.length, 0);
       assert.match(userRow, /class="message-user"/);
       assert.match(userRow, /class="user-message-meta"/);
-      assert.match(userRow, /class="user-message-time"[^>]*>\d{2}:\d{2}:\d{2}<\/time>/);
+      assert.match(userRow, /class="user-message-time"[^>]*>(?:<!--.*?-->)?\d{2}:\d{2}:\d{2}<\/time>/);
       for (const label of ['复制消息', '引用本轮问答', '从此处重来', '隐藏消息']) {
         assert.ok(userRow.includes(`aria-label="${label}"`), `${label} remains available`);
       }
@@ -227,6 +234,17 @@ test("running, streaming, reasoning and live statistics do not expose a complete
   assert.equal((html.match(/class="assistant-message-meta"/g) || []).length, 1, "a later running turn must not hide prior completed stats");
 });
 
+test("next-message suggestions follow only the latest reply's footer", async () => {
+  const first = {id: "first", events: [answer("first-answer", "上一轮")], stats: savedStats()};
+  const last = {id: "last", events: [answer("last-answer", "最新回复")], stats: savedStats()};
+  const html = await turnList([first, last], false, [], {promptSuggestions: ["继续", "换个方案"], promptSuggestionsCollapsed: true}).html();
+  assert.equal((html.match(/class="prompt-suggestions"/g) || []).length, 1);
+  assert.ok(html.indexOf('class="prompt-suggestions"') > html.lastIndexOf('class="assistant-message-meta"'));
+  assert.ok(html.indexOf('class="prompt-suggestions"') > html.indexOf('data-event-id="last-answer"'));
+  assert.match(html, /data-items="继续\|换个方案" data-collapsed="true"/);
+  assert.doesNotMatch(await turnList([first, last]).html(), /prompt-suggestions/);
+});
+
 test("a turn whose controller ended shows its footer while only its Agents keep running", async () => {
   const failed = {id: "failed", user: {turnUuid: "root-failed"}, events: [answer("failed-answer", "本轮执行失败")], stats: savedStats()};
   // The controller failed; its Agents still run in the background.
@@ -279,6 +297,20 @@ test("share control receives only visible answer Markdown, never reasoning or hi
   assert.doesNotMatch(running, /aria-label="分享回复 Markdown"/);
 });
 
+test('message and process timestamps add their date when the local day changes', async () => {
+  const turn = {...footerTurn('user'), events: [answer('first', '进度'), answer('last', '结果')]};
+  const component = turnList([turn]);
+  const sameDay = await component.html();
+  assert.doesNotMatch(sameDay, /class="message-time-date"|class="time-float-date"/);
+  const originalDay = component.day.value;
+  component.day.value = '2030-01-01';
+  const older = await component.html();
+  assert.match(older, new RegExp(`class="user-message-time"[^>]*><span class="message-time-date">${originalDay}</span>\\d{2}:\\d{2}:\\d{2}`));
+  assert.match(footer(older), new RegExp(`class="message-time-date">${originalDay}</span>\\d{2}:\\d{2}:\\d{2}`));
+  assert.match(older, new RegExp(`class="time-float-date">${originalDay}</span><span>\\d{2}:\\d{2}:\\d{2}`));
+  assert.match(footer(older), /2m 9s/, 'duration stays distinct from the timestamp');
+});
+
 test("ordinary and legacy answers retain the same footer and intermediate hover timestamps", async () => {
   const html = await turnList([{id: "legacy", events: [answer("a1", "进度"), answer("a2", "结果")]}]).html();
   assert.equal((html.match(/class="assistant-message-meta"/g) || []).length, 1);
@@ -286,6 +318,24 @@ test("ordinary and legacy answers retain the same footer and intermediate hover 
   assert.match(footer(html), /assistant-message-time/);
   assert.match(footer(html), /aria-label="复制消息"/);
   assert.doesNotMatch(footer(html), /turn-token-usage/);
+});
+
+test('uploaded audio plays in the bubble and uploaded video opens the shared preview; other attachments keep their tiles', async () => {
+  const base = '/api/conversations/39a541d4-4d9c-4a58-87d6-1b276779954a/artifacts';
+  const attachment = (id, fileName, mimeType) => ({id, fileName, mimeType, contentUrl: `${base}/${id}/content`, previewUrl: `${base}/${id}/content?preview=1`});
+  const ids = ['adfead18-e6d1-40df-8475-391e1245aa01', 'adfead18-e6d1-40df-8475-391e1245aa02', 'adfead18-e6d1-40df-8475-391e1245aa03', 'adfead18-e6d1-40df-8475-391e1245aa04'];
+  const turn = {id: 'media', user: {opId: 'u', content: '', attachments: [attachment(ids[0], '录音.m4a', 'audio/mp4'), attachment(ids[1], 'clip.mp4', 'video/mp4'), attachment(ids[2], 'movie.mkv', 'video/x-matroska'), {fileName: 'loose.mp3', mimeType: 'audio/mpeg', contentUrl: '/elsewhere/loose.mp3'}]}, events: [answer()], stats: savedStats()};
+  const component = turnList([turn]);
+  const html = await component.html();
+  assert.match(html, new RegExp(`<div class="user-attachment audio"[^>]*>.*?<audio src="${base}/${ids[0]}/content" data-label="录音.m4a"`));
+  assert.match(html, new RegExp(`<button type="button" class="user-attachment video"[^>]*aria-label="播放视频：clip.mp4"[^>]*><video src="${base}/${ids[1]}/content#t=0.1" preload="metadata"[^>]*muted[^>]*playsinline`));
+  assert.match(html, /<a class="user-attachment" href="[^"]*aa03[^"]*"[^>]*><span class="file-tile">movie.mkv<\/span>/);
+  assert.match(html, /<a class="user-attachment" href="\/elsewhere\/loose.mp3"[^>]*><span class="file-tile">loose.mp3<\/span>/);
+  assert.equal((html.match(/<audio /g) || []).length, 1); assert.equal((html.match(/<video /g) || []).length, 1);
+  component.run('openMediaAttachment({currentTarget: null}, props.turns[0].user.attachments[1])');
+  assert.equal(component.previews.at(-1).identity.artifactUuid, ids[1]); assert.equal(component.previews.at(-1).label, 'clip.mp4');
+  component.run('openMediaAttachment({currentTarget: null}, props.turns[0].user.attachments[2])');
+  assert.equal(component.previews.length, 1);
 });
 
 test('hidden user content and attachments leave no DOM; copied answer excludes hidden segments', async () => {
@@ -301,4 +351,25 @@ test('hidden user content and attachments leave no DOM; copied answer excludes h
   assert.ok(restored.indexOf('private answer') < restored.indexOf('public answer'));
   const allHidden = await turnList([turn], false, ['u', 'a', 'b']).html();
   assert.doesNotMatch(allHidden, /class="turn-block"|assistant-message-meta|private|public answer/);
+});
+
+test('assistant footer note button sits immediately next to copy when notesEnabled is true', async () => {
+  const turn = {id: 'note-turn-1', turnUuid: 't-uuid-1', user: {opId: 'u-1', content: '你好'}, events: [answer('ans-op-9', '这是重点结论')], stats: savedStats()};
+  const disabledHtml = await turnList([turn]).html();
+  assert.doesNotMatch(disabledHtml, /aria-label="记入便签"/);
+
+  const enabled = turnList([turn], false, [], {notesEnabled: true});
+  const html = footer(await enabled.html());
+  const copyIdx = html.indexOf('aria-label="复制消息"');
+  const noteIdx = html.indexOf('aria-label="记入便签"');
+  const shareIdx = html.indexOf('aria-label="分享回复 Markdown"');
+  assert.ok(copyIdx > 0 && noteIdx > copyIdx && shareIdx > noteIdx);
+
+  enabled.run('captureTurnNote(props.turns[0], 0)');
+  assert.deepEqual(JSON.parse(JSON.stringify(enabled.emitted.at(-1))), ['note-turn', {
+    opId: 'ans-op-9',
+    turnUuid: 't-uuid-1',
+    turnNumber: 1,
+    quote: '这是重点结论',
+  }]);
 });

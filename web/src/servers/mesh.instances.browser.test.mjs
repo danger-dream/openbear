@@ -20,6 +20,7 @@ test('mesh board layout: instances on a mesh address and host firewalls', {skip:
     await h.saved(d => d.rules.length === 1, 'a rule of the user\'s');
     await h.page.keyboard.press('Escape');
     await panel.getByRole('button', {name: '编辑第 1 条规则'}).waitFor();
+    await panel.getByRole('button', {name: '展开自动放行（1 条，不能编辑）'}).click();
     // The automatic row lines up with the user's rule text.
     const [userX, autoX] = await Promise.all([panel.locator('.mesh-rule-list').first().locator('.mesh-rule-text').boundingBox(), auto.locator('.mesh-rule-text').boundingBox()]);
     assert.ok(Math.abs(userX.x - autoX.x) <= 1, `aligned: ${userX.x} ${autoX.x}`);
@@ -30,7 +31,7 @@ test('mesh board layout: instances on a mesh address and host firewalls', {skip:
     await row.waitFor();
     const hints = panel.locator('.mesh-hints summary');
     await hints.filter({hasText: 'work 区域'}).click();
-    await panel.getByText(/obmesh0 是在这台机器上手动指定到 work 区域的，组网没有改动它/).waitFor();
+    await panel.getByText(/obmesh0 是在这个节点上手动指定到 work 区域的，组网没有改动它/).waitFor();
     await shot(h.page, 'desktop-host-firewall');
     await noOverflow(h.page);
     await h.close();
@@ -52,7 +53,7 @@ test('mesh board layout: instances on a mesh address and host firewalls', {skip:
       const sheet = q.page.locator('.mesh-inspect-sheet');
       await sheet.locator('.mesh-stats dt', {hasText: '主机防火墙'}).waitFor();
       await sheet.locator('.mesh-hints summary', {hasText: 'work 区域'}).tap();
-      await sheet.getByText(/obmesh0 是在这台机器上手动指定到 work 区域的/).waitFor();
+      await sheet.getByText(/obmesh0 是在这个节点上手动指定到 work 区域的/).waitFor();
       assert.ok(await sheet.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'the hints fit the width');
       await shot(q.page, `phone-host-firewall-${dark ? 'dark' : 'light'}`);
       await noOverflow(q.page);

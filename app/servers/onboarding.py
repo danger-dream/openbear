@@ -16,6 +16,7 @@ from app.instances.contracts import InstanceError
 from app.instances.security import Scrubber
 from app.instances.servers import LOCAL
 from app.servers import compat, install
+from app.servers import front as fronts
 from app.servers.hub import (
     CLOSE_REPLACED,
     CONTROLLER_OUTDATED,
@@ -119,14 +120,31 @@ class Onboarding:
 
     async def addresses(self, owner, server_id):
         """(url, backup url) a server's node uses; the local node always uses loopback."""
+        access = await self.access(owner, server_id)
+        return access['url'], access['backup']
+
+    async def access(self, owner, server_id, profile=None, *, strict=True):
+        """{url, backup, pins, backupPins, front} a server's node is to use, with profile instead of
+        its own when given: a front's are its exits' accesses, any other's its access points.
+        Without one: an error when strict, else url ''."""
+        none = {'url': '', 'backup': '', 'pins': [], 'backupPins': [], 'front': False}
         if server_id == LOCAL:
-            return self.service.local_url(), ''
-        settings = await self.service.settings()
-        profile = (await self.service._profiles(owner)).get(server_id, {})
-        primary, backup = resolve(settings, profile, await self.service.mesh_point(owner, server_id))
+            return {**none, 'url': self.service.local_url()}
+        if profile is None:
+            profile = (await self.service._profiles(owner)).get(server_id, {})
+        if fronts.is_front(profile):
+            try:
+                return await self.service.front.access(owner, server_id, profile)
+            except InstanceError:
+                if strict:
+                    raise
+                return {**none, 'front': True}
+        primary, backup = resolve(await self.service.settings(), profile, await self.service.mesh_point(owner, server_id))
         if not primary:
-            raise InstanceError('node_url_required', 409)
-        return primary['url'], backup['url'] if backup else ''
+            if strict:
+                raise InstanceError('node_url_required', 409)
+            return none
+        return {**none, 'url': primary['url'], 'backup': backup['url'] if backup else ''}
 
     # ----- access points -----
     def fingerprint(self):
@@ -180,9 +198,11 @@ class Onboarding:
         node = (took and took['node']) or server_id
         local = install.command(self.service.local_url(), code, browser=browser, node=node, fingerprint=fingerprint) if server_id == LOCAL else ''
         try:
-            url, backup = await self.addresses(owner, server_id) if server_id != LOCAL else ('', '')
+            access = await self.access(owner, server_id) if server_id != LOCAL else {'url': '', 'backup': '', 'front': False}
         except InstanceError:
-            url = backup = ''
+            access = {'url': '', 'backup': '', 'front': False}
+        # A front reaches nothing but its exits: it is installed from here, over SSH through them.
+        url, backup = ('', '') if access['front'] else (access['url'], access['backup'])
         return {'ok': True, 'code': code, 'expiresAtMs': now_ms() + CODE_TTL_MS, 'issuedAtMs': now_ms(),
                 'command': install.command(url, code, backup=backup, browser=browser, node=node, fingerprint=fingerprint) if url else '', 'localCommand': local,
                 'windowsCommand': install.windows_command(url, code, backup=backup, browser=browser, node=node, fingerprint=fingerprint) if url else ''}
@@ -302,7 +322,8 @@ class Onboarding:
         if not pending:
             raise InstanceError('join_not_pending', 409)
         if action == 'reject':
-            await self.service.delete(owner, server_id)
+            # Its node may be the machine of the server it looks like, running that server's jobs.
+            await self.service.delete(owner, server_id, stop_work=False)
             return {'ok': True}
         if action == 'keep':
             async with self.db.write_transaction(label='server-join-keep') as conn:
@@ -329,7 +350,7 @@ class Onboarding:
         await self.service.metrics.rebase(target)
         await self.service.hub.disconnect(target, CLOSE_REPLACED)
         await self.service.hub.disconnect(server_id, CLOSE_REPLACED)
-        await self.service.delete(owner, server_id)
+        await self.service.delete(owner, server_id, stop_work=False)
         return {'ok': True, 'serverId': target, 'item': await self.service.get(owner, target)}
 
     def _code_view(self, row, urls):
@@ -406,7 +427,13 @@ class Onboarding:
         try:
             if not (await self.service.ensure_builds()).get('binaries'):
                 raise InstanceError('node_binary_missing', 503)
-            url, backup = await self.addresses(owner, server_id)
+            front = (await self.service._profiles(owner)).get(server_id, {}).get('front')
+            if front:
+                await self.service.front.ensure(owner, front)
+                access = await self.access(owner, server_id)
+            else:
+                url, backup = await self.addresses(owner, server_id)
+                access = {'url': url, 'backup': backup, 'pins': [], 'backupPins': [], 'front': False}
             target = await self.service.registry.target(owner, server_id)
             code = await self.new_code(owner, server_id)
         except BaseException:
@@ -416,7 +443,7 @@ class Onboarding:
                 else:
                     self.installs[server_id] = previous
             raise
-        self.service.spawn(self._install(state, owner, server_id, target, url, backup, code, browser, force))
+        self.service.spawn(self._install(state, owner, server_id, target, access, code, browser, force))
         return {'ok': True, 'install': state}
 
     async def _machine_check(self, owner, server_id, existing, force):
@@ -437,16 +464,23 @@ class Onboarding:
                                f'这台机器上已经装有其他节点（{existing}，可能属于别的主控），确认要替换时用强制安装')
         return False
 
-    async def _install(self, state, owner, server_id, target, url, backup, code, browser=False, force=False):
+    async def _install(self, state, owner, server_id, target, access, code, browser=False, force=False):
         scrub = Scrubber([code])
         sudo = not target.get('local') and target.get('username') != 'root' and target.get('auth') == 'password'
+        url, backup = access['url'], access['backup']
         current = None
         try:
             platform = await self.service.registry.platform(target)
+            # A front fetches nothing: its node program is sent over SSH through its exit, to this path.
+            pushed = f'/tmp/openbear-node-{secrets.token_hex(6)}' if access['front'] else ''
+            if pushed and (platform == 'windows' or sudo):
+                raise InstanceError('front_install_unsupported')
 
             async def stage(key):
                 # The check stage reads the node config already on the machine and changes nothing.
                 opts = {'browser': browser, 'node': server_id, 'force': force, 'fingerprint': install.fingerprint(self.service.identity_public)}
+                if access['front']:
+                    opts.update(pin=(access['pins'] or [''])[0], backup_pin=(access['backupPins'] or [''])[0], front=True, binary=pushed)
                 if platform == 'windows':
                     # An administrator's SSH session already runs elevated; there is no sudo.
                     return await self.service.registry.run(target, install.windows_ssh_command(url, code, backup=backup, stage=key, **opts), timeout=300)
@@ -457,6 +491,11 @@ class Onboarding:
                                                        stdin=install.script().encode(), timeout=300, root=True)
             for key, _ in STEPS[:-1]:
                 current = self._step(state, key, 'running')
+                if key == 'download' and pushed:
+                    sent = await self._push_binary(target, platform, state['output'], pushed)
+                    if not sent['ok']:
+                        current['detail'] = (sent['stderr'] or sent['stdout']).strip()[-200:]
+                        raise InstanceError('install_timeout' if sent['timedOut'] else 'install_download_failed')
                 result = await stage(key)
                 if key == 'check' and await self._machine_check(owner, server_id, install.existing_node(result['stdout']), force):
                     # This server's own node under the id it joined with: replaced, the check run again.
@@ -491,6 +530,14 @@ class Onboarding:
             if current:
                 current['state'] = 'failed'
         state['finishedAtMs'] = now_ms()
+
+    async def _push_binary(self, target, platform, checked, path):
+        """Send the node program for the machine's architecture (from the check stage) to path."""
+        arch = next((line.split('=', 1)[1].split()[0] for line in checked.splitlines() if line.startswith('arch=')), '')
+        binary = await install.fetch_binary(install.binary_name(platform, arch)) if arch else None
+        if not binary:
+            raise InstanceError('node_binary_missing', 503)
+        return await self.service.registry.run(target, f'umask 077 && cat > {path}', stdin=await asyncio.to_thread(binary.read_bytes), timeout=600, root=True)
 
     @staticmethod
     def _step(state, key, value):
@@ -562,10 +609,14 @@ class Onboarding:
         return {'ok': True, 'items': list(await asyncio.gather(*(self.push_one(owner, sid) for sid in targets)))}
 
     async def push_one(self, owner, sid, addresses=None):
-        """Move one online node to its configured addresses, or to the given ones."""
+        """Move one online node to its configured addresses, or to the given ones: (url, backup)
+        between access points, or a whole access()."""
         try:
-            url, backup = addresses or await self.addresses(owner, sid)
-            result = await self.service._node_call(owner, sid, 'config.url', {'url': url, 'backup': backup}, timeout=60)
+            if isinstance(addresses, tuple):
+                addresses = {'url': addresses[0], 'backup': addresses[1], 'pins': [], 'backupPins': [], 'front': False}
+            access = addresses or await self.access(owner, sid)
+            params = {k: access[k] for k in ('url', 'backup', 'pins', 'backupPins', 'front')}
+            result = await self.service._node_call(owner, sid, 'config.url', params, timeout=60)
         except InstanceError as exc:
             return {'serverId': sid, 'ok': False, 'error': exc.error}
         await self.service.mark_access_pending(sid, False)

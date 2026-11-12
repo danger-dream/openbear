@@ -65,8 +65,134 @@ func localPrefixes(c *Config) []netip.Prefix {
 	return out
 }
 
-func nodePrefixes(n *Node) []netip.Prefix {
-	return append([]netip.Prefix{host(n.Address)}, n.Subnets...)
+// nodePrefixes is what a relay routes to a node: its address and the
+// subnets it carries now.
+func nodePrefixes(c *Config, a Attachment, n *Node) []netip.Prefix {
+	return append([]netip.Prefix{host(n.Address)}, subnetsOf(c, a, n)...)
+}
+
+// subnetsOf is the gateway subnets a node carries now: those it announces,
+// and those it stands by for, each only while it is the node gatewayOf
+// names for it. Every node, the end-to-end table included, sees one node
+// carrying a subnet a backup stands by for.
+func subnetsOf(c *Config, a Attachment, n *Node) []netip.Prefix {
+	if len(n.StandbySubnets) == 0 && !c.hasStandby() {
+		return n.Subnets
+	}
+	var out []netip.Prefix
+	for _, s := range n.Subnets {
+		if !c.standingBy(s) || gatewayOf(c, a, s) == n.ID {
+			out = append(out, s)
+		}
+	}
+	for _, s := range n.StandbySubnets {
+		if gatewayOf(c, a, s) == n.ID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// hasStandby: a backup gateway, this node included, stands by for a subnet.
+func (c *Config) hasStandby() bool {
+	if c.Self.Gateway != nil && c.Self.Gateway.Backup {
+		return true
+	}
+	return slices.ContainsFunc(c.Nodes, func(n Node) bool { return len(n.StandbySubnets) > 0 })
+}
+
+// standingBy: a backup gateway, this node included, stands by for s.
+func (c *Config) standingBy(s netip.Prefix) bool {
+	if c.Self.Gateway != nil && c.Self.Gateway.Backup && slices.Contains(c.Self.Gateway.Subnets, s) {
+		return true
+	}
+	return slices.ContainsFunc(c.Nodes, func(n Node) bool { return slices.Contains(n.StandbySubnets, s) })
+}
+
+// gatewayCandidates are the other nodes that announce s and those that
+// stand by for it, in config order.
+func gatewayCandidates(c *Config, s netip.Prefix) (primaries, backups []string) {
+	for i := range c.Nodes {
+		if slices.Contains(c.Nodes[i].Subnets, s) {
+			primaries = append(primaries, c.Nodes[i].ID)
+		}
+		if slices.Contains(c.Nodes[i].StandbySubnets, s) {
+			backups = append(backups, c.Nodes[i].ID)
+		}
+	}
+	return primaries, backups
+}
+
+// gatewayOf is the node that carries s now, this one's ID for itself. A
+// relay sees attachments: the first node announcing s it can reach, else
+// itself when it stands by for s, else the first backup it can reach. A
+// member cannot: it goes by what its probes of the gateways found
+// (standby.go). A leaf member goes by its probes of s too while the node
+// they chose is one it routes to, else as a relay does, with only those
+// members its probes of s chose. Either way it is the first candidate while
+// nothing better is known.
+func gatewayOf(c *Config, a Attachment, s netip.Prefix) string {
+	if g := c.Self.Gateway; g != nil && !g.Backup && slices.Contains(g.Subnets, s) {
+		return c.Self.ID
+	}
+	primaries, backups := gatewayCandidates(c, s)
+	if c.isRouted() {
+		if !c.isRelay() {
+			if id := c.standby.chosen(s); id != "" && reachable(c, a, s, c.node(id)) {
+				return id
+			}
+		}
+		for _, id := range primaries {
+			if reachable(c, a, s, c.node(id)) {
+				return id
+			}
+		}
+		if g := c.Self.Gateway; g != nil && slices.Contains(g.Subnets, s) {
+			return c.Self.ID
+		}
+		for _, id := range backups {
+			if reachable(c, a, s, c.node(id)) {
+				return id
+			}
+		}
+	} else if id := c.standby.chosen(s); id != "" && (slices.Contains(primaries, id) || slices.Contains(backups, id)) {
+		return id
+	}
+	if len(primaries) > 0 {
+		return primaries[0]
+	}
+	if len(backups) > 0 {
+		return backups[0]
+	}
+	return ""
+}
+
+// reachable, for a relay or routed member, as a gateway of s: n is a node it
+// has a next hop to, or an unrouted member attached to some reachable relay;
+// for a leaf member, which sees no attachments, one its probes of s chose, or
+// any while it has none.
+func reachable(c *Config, a Attachment, s netip.Prefix, n *Node) bool {
+	if n == nil {
+		return false
+	}
+	if n.Role == roleRelay || n.Leaf {
+		if routes, dynamic := a.(relayRoutes); dynamic {
+			if _, ok, active := routes.RelayNextHop(n.ID); active {
+				return ok
+			}
+		}
+		if c.isRelay() {
+			_, ok := c.NextHops[n.ID]
+			return ok
+		}
+		return false
+	}
+	if c.isRelay() {
+		_, ok := a.Owner(n.ID)
+		return ok
+	}
+	id := c.standby.chosen(s)
+	return id == "" || id == n.ID
 }
 
 // intersect is every overlap of a prefix in a with one in b, the narrower
@@ -96,10 +222,11 @@ func gatewaySubnets(c *Config, subnets []netip.Prefix) []netip.Prefix {
 	return intersect(subnets, *c.Self.GatewayRoutes)
 }
 
-// memberPrefixes is a member's view of another node: its address and the
-// part of its subnets this member routes.
-func memberPrefixes(c *Config, n *Node) []netip.Prefix {
-	return append([]netip.Prefix{host(n.Address)}, gatewaySubnets(c, n.Subnets)...)
+// memberPrefixes is a member's view of another node, and the end-to-end
+// one: its address and the part of the subnets it carries now that this
+// node routes.
+func memberPrefixes(c *Config, a Attachment, n *Node) []netip.Prefix {
+	return append([]netip.Prefix{host(n.Address)}, gatewaySubnets(c, subnetsOf(c, a, n))...)
 }
 
 // planPeers computes every peer and its AllowedIPs (config section 3).
@@ -116,6 +243,80 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 		return nil
 	}
 	if !c.isRelay() {
+		if c.isRouted() {
+			via := map[string][]netip.Prefix{}
+			routes, dynamic := a.(relayRoutes)
+			upstreams := []string{}
+			for _, l := range c.Links {
+				if l.Kind == kindRelay {
+					upstreams = append(upstreams, l.Peer)
+				}
+			}
+			route := func(dest string, p ...netip.Prefix) {
+				if dynamic {
+					if hop, ok, active := routes.RelayNextHop(dest); active {
+						if ok {
+							via[hop] = append(via[hop], p...)
+						}
+						return
+					}
+				}
+				if len(upstreams) > 0 {
+					via[upstreams[0]] = append(via[upstreams[0]], p...)
+				}
+			}
+			direct := map[string]bool{}
+			for _, l := range c.Links {
+				if l.Kind != kindDirect {
+					continue
+				}
+				if !l.Punch {
+					direct[l.Peer] = true
+				} else if d, ok := a.(directRoutes); ok && d.Direct(l.Peer) {
+					direct[l.Peer] = true
+				}
+			}
+			for i := range c.Nodes {
+				n := &c.Nodes[i]
+				if direct[n.ID] {
+					via[n.ID] = append(via[n.ID], memberPrefixes(c, a, n)...)
+					continue
+				}
+				if n.Role == roleRelay || n.Leaf {
+					route(n.ID, memberPrefixes(c, a, n)...)
+					continue
+				}
+				// Unrouted member: route via the first reachable upstream relay.
+				placed := false
+				if dynamic {
+					for _, u := range upstreams {
+						if _, ok, active := routes.RelayNextHop(u); active && ok {
+							via[u] = append(via[u], memberPrefixes(c, a, n)...)
+							placed = true
+							break
+						}
+					}
+				}
+				if !placed && len(upstreams) > 0 {
+					via[upstreams[0]] = append(via[upstreams[0]], memberPrefixes(c, a, n)...)
+				}
+			}
+			for _, l := range c.Links {
+				n := c.node(l.Peer)
+				endpoint, allowed := l.Endpoint, via[l.Peer]
+				if l.Punch {
+					endpoint = ""
+					if d, ok := a.(directRoutes); !ok || !d.Direct(l.Peer) {
+						allowed = nil
+					}
+				}
+				if err := add(n, l.Kind, endpoint, allowed); err != nil {
+					return nil, err
+				}
+				out[len(out)-1].Pins = slices.Clone(l.TLSPins)
+			}
+			return out, nil
+		}
 		direct := map[string]bool{}
 		for _, l := range c.Links {
 			n := c.node(l.Peer)
@@ -125,7 +326,7 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 				// packets come from for WireGuard to accept them.
 				var allowed []netip.Prefix
 				if d, ok := a.(directRoutes); ok && d.Direct(n.ID) {
-					allowed = memberPrefixes(c, n)
+					allowed = memberPrefixes(c, a, n)
 					direct[n.ID] = true
 				}
 				if err := add(n, kindDirect, "", allowed); err != nil {
@@ -134,7 +335,7 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 				continue
 			}
 			direct[n.ID] = true
-			if err := add(n, kindDirect, l.Endpoint, memberPrefixes(c, n)); err != nil {
+			if err := add(n, kindDirect, l.Endpoint, memberPrefixes(c, a, n)); err != nil {
 				return nil, err
 			}
 			out[len(out)-1].Pins = slices.Clone(l.TLSPins)
@@ -160,7 +361,7 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 			var carried []netip.Prefix
 			for i := range c.Nodes {
 				if direct[c.Nodes[i].ID] {
-					carried = append(carried, c.Nodes[i].Subnets...)
+					carried = append(carried, subnetsOf(c, a, &c.Nodes[i])...)
 				}
 			}
 			if c.Self.Gateway != nil {
@@ -174,7 +375,7 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 		} else {
 			for i := range c.Nodes {
 				if !direct[c.Nodes[i].ID] {
-					allowed = append(allowed, c.Nodes[i].Subnets...)
+					allowed = append(allowed, subnetsOf(c, a, &c.Nodes[i])...)
 				}
 			}
 		}
@@ -202,17 +403,45 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 			via[hop] = append(via[hop], p...)
 		}
 	}
+	linkedMembers := map[string]bool{}
+	for _, l := range c.Links {
+		if l.Kind == kindMember {
+			linkedMembers[l.Peer] = true
+		}
+	}
 	for i := range c.Nodes {
 		n := &c.Nodes[i]
 		if n.Role == roleRelay {
-			route(n.ID, nodePrefixes(n)...)
+			route(n.ID, nodePrefixes(c, a, n)...)
+			continue
+		}
+		if n.Leaf || linkedMembers[n.ID] {
+			if dynamic {
+				if hop, ok, active := routes.RelayNextHop(n.ID); active && ok {
+					via[hop] = append(via[hop], nodePrefixes(c, a, n)...)
+					continue
+				}
+			}
+			if owner, ok := a.Owner(n.ID); ok {
+				if owner == c.Self.ID {
+					if linkedMembers[n.ID] {
+						via[n.ID] = append(via[n.ID], nodePrefixes(c, a, n)...)
+					}
+				} else {
+					route(owner, nodePrefixes(c, a, n)...)
+				}
+				continue
+			}
+			if hop, ok := c.NextHops[n.ID]; ok {
+				via[hop] = append(via[hop], nodePrefixes(c, a, n)...)
+			}
 			continue
 		}
 		owner, ok := a.Owner(n.ID)
 		if !ok || owner == c.Self.ID {
 			continue
 		}
-		route(owner, nodePrefixes(n)...)
+		route(owner, nodePrefixes(c, a, n)...)
 	}
 	for _, l := range c.Links {
 		endpoint, allowed := l.Endpoint, via[l.Peer]
@@ -224,21 +453,21 @@ func planPeers(c *Config, a Attachment) ([]peerSpec, error) {
 				allowed = nil
 			}
 		}
-		if err := add(c.node(l.Peer), kindRelay, endpoint, allowed); err != nil {
+		if err := add(c.node(l.Peer), l.Kind, endpoint, allowed); err != nil {
 			return nil, err
 		}
 		out[len(out)-1].Pins = slices.Clone(l.TLSPins)
 	}
 	for i := range c.Nodes {
 		n := &c.Nodes[i]
-		if n.Role != roleMember || !slices.Contains(n.Relays, c.Self.ID) {
+		if n.Role != roleMember || linkedMembers[n.ID] || !slices.Contains(n.Relays, c.Self.ID) {
 			continue
 		}
 		// Every member allowed to attach here keeps its peer, so its session
 		// survives moving away and back; only the owner relay routes to it.
 		var allowed []netip.Prefix
 		if owner, ok := a.Owner(n.ID); ok && owner == c.Self.ID {
-			allowed = nodePrefixes(n)
+			allowed = nodePrefixes(c, a, n)
 		}
 		if err := add(n, kindMember, "", allowed); err != nil {
 			return nil, err

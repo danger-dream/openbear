@@ -6,8 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+
+	"openbear/node/mesh"
 )
 
 // bashPath is the login shell commands use when the machine has it; tests
@@ -25,19 +29,35 @@ func execShell() string {
 }
 
 // shellCommand runs command through shell: bash as a login shell, anything
-// else as plain sh -c.
+// else as plain sh -c. OpenWrt's profile prints its banner and system summary
+// on every login, so there bash runs plainly with the PATH that profile sets.
 func shellCommand(shell, command string) *exec.Cmd {
 	if runtime.GOOS == "darwin" {
 		command = nohupFallback + command
 	}
+	openWrt := mesh.OpenWrt()
 	var cmd *exec.Cmd
-	if strings.HasSuffix(shell, "bash") {
+	if strings.HasSuffix(shell, "bash") && !openWrt {
 		cmd = exec.Command(shell, "-l", "-c", command)
 	} else {
 		cmd = exec.Command(shell, "-c", command)
 	}
 	cmd.Env = shellEnv(shell)
+	if openWrt {
+		cmd.Env = append(cmd.Env, "PATH="+withDirs(os.Getenv("PATH"), "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"))
+	}
 	return cmd
+}
+
+// withDirs is path followed by those of dirs it lacks.
+func withDirs(path string, dirs ...string) string {
+	have := filepath.SplitList(path)
+	for _, d := range dirs {
+		if !slices.Contains(have, d) {
+			have = append(have, d)
+		}
+	}
+	return strings.Join(slices.DeleteFunc(have, func(d string) bool { return d == "" }), ":")
 }
 
 // nohupFallback stands in for nohup where macOS's refuses to run: it first

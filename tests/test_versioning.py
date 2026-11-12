@@ -32,8 +32,8 @@ def test_what_may_be_published_and_who_is_offered_it():
 
 
 def test_development_numbers():
-    assert versioning.next_dev('1.1.0') == '1.2.0-dev.1'
-    assert versioning.next_dev('1.2.0-beta.1') == '1.3.0-dev.1' and versioning.next_dev('v1.2.3-rc.2') == '1.3.0-dev.1'
+    assert versioning.next_dev('1.1.0') == '1.1.1-dev.1' and versioning.next_dev('0.15.0') == '0.15.1-dev.1'
+    assert versioning.next_dev('1.2.0-beta.1') == '1.2.1-dev.1' and versioning.next_dev('v1.2.3-rc.2') == '1.2.4-dev.1'
     assert versioning.bump_dev('1.2.0-dev.1') == '1.2.0-dev.2' and versioning.bump_dev('1.2.0-dev.9') == '1.2.0-dev.10'
     # A build of a version about to be published keeps that version.
     assert versioning.bump_dev('1.2.0-beta.1') == '1.2.0-beta.1' and versioning.bump_dev('1.2.0') == '1.2.0'

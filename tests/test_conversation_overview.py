@@ -190,6 +190,54 @@ async def test_overview_uses_ledger_counts_without_loading_private_content_or_wr
     e.db.conn.commit_listeners.discard(wake.set)
 
 
+async def test_latest_message_time_uses_projection_without_confusing_activity_or_updates(web_env):
+    e = web_env
+    uuid, chat, _ = await seed(e)
+    await e.db.conn.execute(
+        "UPDATE web_conversations SET last_conversation_at=0,updated_at=9999 WHERE conversation_uuid=?",
+        (uuid,),
+    )
+    await e.db.conn.commit()
+    assert (await e.server._conversation_overview(123, uuid))["lastMessageAtMs"] is None
+    await e.db.conn.executemany(
+        "INSERT INTO messages(chat_id,role,content,created_at,task_uuid) VALUES(?,?,?,?,?)",
+        [(chat, "user", "question", 100, ""), (chat, "assistant", "answer", 200, ""),
+         (chat, "tool", "tool", 800, ""), (chat, "assistant", "agent", 900, "agent-task")],
+    )
+    await e.db.conn.commit()
+    assert (await e.server._conversation_overview(123, uuid))["lastMessageAtMs"] == 200_000
+    await e.db.conn.execute(
+        "INSERT INTO messages(chat_id,role,content,created_at,task_uuid) VALUES(?,?,?,?,?)",
+        (chat, "user", "later", 300, ""),
+    )
+    await e.db.conn.commit()
+    assert (await e.server._conversation_overview(123, uuid))["lastMessageAtMs"] == 300_000
+
+
+async def test_archived_legacy_overview_reads_last_message_without_backfill_writes(web_env):
+    e = web_env
+    uuid, chat, _ = await seed(e, archived=1)
+    await e.db.conn.executemany(
+        "INSERT INTO messages(chat_id,role,content,created_at,task_uuid) VALUES(?,?,?,?,?)",
+        [(chat, "user", "private question", 100, ""), (chat, "assistant", "private answer", 200, ""),
+         (chat, "assistant", " ", 300, ""), (chat, "tool", "private tool", 500, "")],
+    )
+    await e.db.conn.commit()
+    wake = asyncio.Event()
+    e.db.conn.commit_listeners.add(wake.set)
+    try:
+        overview = await e.server._conversation_overview(123, uuid)
+        assert overview["lastMessageAtMs"] == 200_000
+        assert "private" not in json.dumps(overview)
+        assert not wake.is_set()
+        row = await (await e.db.conn.execute(
+            "SELECT last_conversation_at FROM web_conversations WHERE conversation_uuid=?", (uuid,)
+        )).fetchone()
+        assert row[0] is None
+    finally:
+        e.db.conn.commit_listeners.discard(wake.set)
+
+
 async def test_overview_counts_full_history_not_detail_api_limits_and_scopes_session(web_env):
     e = web_env
     uuid, chat, session = await seed(e)

@@ -55,6 +55,9 @@ type Config struct {
 	// Protocol is the mesh protocol range this node speaks (package wire);
 	// zero is this build's.
 	Protocol wire.Range
+	// LargeFrames: this node says in its control messages that it takes
+	// large frames (wire.LargeFrames).
+	LargeFrames bool
 	// SignKey signs what this node says on its own behalf (signing.go).
 	SignKey ed25519.PrivateKey
 }
@@ -92,6 +95,9 @@ type Backend interface {
 	Remove(peer string) error
 	Handshake(peer string, path Path) error
 	DataReady(peer string, path Path) bool
+	// Committed says whether path is the one Commit last chose for peer and
+	// still in place.
+	Committed(peer string, path Path) bool
 	Warm(peer string, path Path)
 	// Punch sends a business handshake to every address until the deadline;
 	// with the deadline of an earlier call it adds the addresses to that one.

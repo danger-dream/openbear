@@ -213,7 +213,7 @@ func TestSchedulerSingleFlowKeepsTheRate(t *testing.T) {
 			sent += len(b) + wireOverhead
 		}
 		if f := s.buckets[s.classify(flowPacket(1000, 1400, 0))]; f.len() > 0 {
-			worst = max(worst, c.now().Sub(f.peek().at))
+			worst = max(worst, c.now().Sub(s.epoch)-f.peek().at)
 		}
 		c.advance(time.Millisecond)
 	}
@@ -284,5 +284,47 @@ func TestSchedulerSojournLimits(t *testing.T) {
 	s.tryDequeue()
 	if *drops == 0 {
 		t.Fatal("no drop after the sojourn time stayed above target")
+	}
+}
+
+// A flow queue keeps no packet it gave out: compacting and draining leave no
+// slot in its array past the packets it holds, and a drained queue a burst
+// grew gives its array back; a small one keeps its room.
+func TestFlowQueueKeepsNoSentSlots(t *testing.T) {
+	stale := func(f *flowQueue) int {
+		n := 0
+		for i, q := range f.pkts[:cap(f.pkts)] {
+			if (i < f.head || i >= len(f.pkts)) && q.b != nil {
+				n++
+			}
+		}
+		return n
+	}
+	var f flowQueue
+	for range 1000 {
+		f.pkts = append(f.pkts, queued{b: newReadSlot()[:readHeadroom+9000]})
+		f.bytes += 9000
+	}
+	for range 600 {
+		f.pop()
+	}
+	if f.head == 600 || stale(&f) != 0 {
+		t.Fatalf("after compaction: head %d, len %d, %d sent slots still held", f.head, len(f.pkts), stale(&f))
+	}
+	for f.len() > 0 {
+		f.pop()
+	}
+	if f.pkts != nil || f.bytes != 0 {
+		t.Fatalf("drained queue keeps %d entries of room, %d bytes", cap(f.pkts), f.bytes)
+	}
+	for range 100 {
+		f.pkts = append(f.pkts, queued{b: newReadSlot()[:readHeadroom+9000]})
+		f.bytes += 9000
+	}
+	for f.len() > 0 {
+		f.pop()
+	}
+	if cap(f.pkts) == 0 || stale(&f) != 0 {
+		t.Fatalf("small queue: room %d, %d sent slots still held", cap(f.pkts), stale(&f))
 	}
 }

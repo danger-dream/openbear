@@ -25,6 +25,10 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "bypass-run" {
+		fmt.Fprintln(os.Stderr, RunBypassed(os.Args[2:]))
+		os.Exit(1)
+	}
 	if len(os.Args) > 2 && os.Args[1] == "hold-ports" {
 		holdPorts(os.Args[2:])
 		os.Exit(0)

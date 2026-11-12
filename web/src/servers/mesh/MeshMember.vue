@@ -1,16 +1,22 @@
 <script setup>
 import { computed, inject, onMounted, ref, watch } from 'vue';
+import { ElMessage } from 'element-plus';
 import { relativeTime, timeLabel } from '../../instances/instanceHelpers.js';
 import { bytes, flag, noAutofill } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
 import { addressProblem, candLine, candParts, CAND_STATES, codeText, MISSING_TEXT, directLine, entryHealth, errorMessage, errorsAt, errorsUnder, eventRows, exportsOf, exportText, FILTERINGS, firewallIssue, firewallKinds, gatewayNetProblem, isRelay, isSite, listens, listenWarnings, MAPPINGS, nameOf,
-  nodeAlerts, peerKeys, portProblem, routeRows, routineEvent, nodeState, PROGRESS, progressOf, reachOf, recommendedMode, RELAY_MODES, rtt, securityStats, TRANSPORTS, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems } from './meshHelpers.js';
+  needsPublicAddr, nodeAlerts, peerKeys, portProblem, routeRows, routineEvent, nodeState, PROGRESS, progressOf, reachOf, recommendedMode, RELAY_MODES, rtt, securityStats, TRANSPORTS, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems } from './meshHelpers.js';
 import { ArrowUpRight, Cable, CircleAlert, Globe, Route, ShieldAlert, TriangleAlert, Unplug } from '@lucide/vue';
+import { changeRole } from './meshGraph.js';
+import { canPinRoute, fixedRouteInfo } from './meshAuto.js';
+import MeshAddress from './MeshAddress.vue';
+import MeshAuto from './MeshAuto.vue';
 import MeshChips from './MeshChips.vue';
 import MeshEntries from './MeshEntries.vue';
 import MeshField from './MeshField.vue';
 import MeshHelp from './MeshHelp.vue';
+import MeshNodeProxy from './MeshNodeProxy.vue';
 import MeshTrend from './MeshTrend.vue';
 import NetAddresses from '../NetAddresses.vue';
 import DdnsCard from '../../ddns/DdnsCard.vue';
@@ -22,7 +28,7 @@ import { usePoll } from './usePoll.js';
 // settings, peers, events and network tests. Settings are written to the draft as soon as a field is committed.
 const props = defineProps({member: {type: Object, required: true}, phone: Boolean, region: {type: String, default: ''}, tab: {type: String, default: ''}, shownPath: {type: String, default: ''},
   items: {type: Array, default: () => []}});
-const emit = defineEmits(['open-server', 'removed', 'connect', 'path', 'show-path', 'select']);
+const emit = defineEmits(['open-server', 'removed', 'connect', 'path', 'show-path', 'select', 'pin-path']);
 const tab = ref(props.tab || 'overview'), detail = ref(null), detailError = ref(''), busy = ref(false);
 watch(() => props.tab, value => { if (value) tab.value = value; });
 // The test tab stays mounted once opened, so a test keeps running (and its results stay) while
@@ -30,6 +36,20 @@ watch(() => props.tab, value => { if (value) tab.value = value; });
 const meshActive = inject('meshActive', computed(() => true));
 const probeSeen = ref(tab.value === 'probe');
 watch(tab, value => { if (value === 'probe') probeSeen.value = true; });
+const shows = key => tab.value === key;
+const formParts = [['settings', '']];
+const inPart = (part, ...keys) => part === 'settings' || keys.includes(part);
+const item = computed(() => props.items.find(i => i.id === props.member.serverId) || null);
+// What the mesh would set for this machine's fields it can work out (GET /mesh auto), and whether it does.
+const auto = computed(() => mesh.data?.auto || {});
+const isAuto = field => (m.value.auto || []).includes(field);
+function leaveAuto(field) { if (isAuto(field)) m.value.auto = m.value.auto.filter(f => f !== field); }
+function backToAuto(field) { m.value.auto = [...new Set([...(m.value.auto || []), field])]; void save(); }
+const listenAuto = computed(() => auto.value.listen?.[id.value] || null);
+const modeAuto = computed(() => auto.value.relayMode?.[id.value] || null);
+const openText = listen => TRANSPORTS.filter(([t]) => Number(listen?.[t]) > 0).map(([t, label]) => `${label} ${listen[t]}`).join('、') || '都不开';
+const sameOpen = (a, b) => TRANSPORTS.every(([t]) => (Number(a?.[t]) > 0) === (Number(b?.[t]) > 0));
+const MODE_TEXT = Object.fromEntries(RELAY_MODES.map(([v, l]) => [v, l]));
 const online = computed(() => { const item = props.items.find(i => i.id === props.member.serverId); return item ? Boolean(item.live) : true; });
 // Offline: what it reported last is shown as such, not as how it is now.
 
@@ -51,7 +71,7 @@ const offline = computed(() => node.value?.state === 'offline' || !online.value)
 const users = computed(() => members.value.filter(x => !isRelay(x) && x.entry?.candidates?.some(c => c.relay === id.value)));
 // Most used first: a member's entries come before its settings; a relay has no entries.
 const tabs = computed(() => [['overview', '状态'], !relay.value && ['entry', '入口', ['entry']],
-  ['settings', '配置', ['role', 'relayMode', 'address', 'publicEndpoint', 'listen', 'tags', 'uploadLimitMbps', 'gateway']], ['peers', '对端'], ['events', '事件'], ['probe', '测试']].filter(Boolean)
+  ['settings', '配置', ['role', 'relayMode', 'address', 'publicEndpoint', 'listen', 'tags', 'uploadLimitMbps', 'gateway']], ['proxy', '代理', ['proxy']], ['peers', '对端'], ['events', '事件'], ['probe', '测试']].filter(Boolean)
   .map(([key, label, fields = []]) => ({key, label, bad: fields.some(f => errorsUnder(mesh.errors, `members[${index.value}].${f}`).length)})));
 // A relay has no entry tab: a tab asked for that is not there opens the status.
 watch(tabs, list => { if (!list.some(t => t.key === tab.value)) tab.value = 'overview'; }, {immediate: true});
@@ -133,7 +153,9 @@ const riders = computed(() => relay.value ? users.value.map(u => {
   const i = u.entry.candidates.findIndex(c => c.relay === id.value), h = entryHealth(mesh.data, u.serverId)[u.entry.candidates[i].id];
   return {id: u.serverId, name: u.name, order: i + 1, state: h?.state || ''};
 }) : []);
-const alerts = computed(() => m.value.removing ? [] : nodeAlerts(mesh.data, m.value, members.value, detail.value?.status));
+const alerts = computed(() => m.value.removing ? [] : nodeAlerts(mesh.data, m.value, members.value, detail.value?.status, mesh.work));
+// An exit seen differently matters only where hole punching needs the member's own public address.
+const addrMatters = computed(() => needsPublicAddr(mesh.work, mesh.data, m.value, detail.value?.status));
 const site = computed(() => isSite(m.value));
 const recommended = computed(() => recommendedMode(reach.value));
 // The controller sends a new revision only to machines whose configuration it changes: an older
@@ -147,12 +169,31 @@ const exitDiffers = computed(() => {
   const exit = String(reach.value?.publicAddr || '').replace(/^\[|\](?=:)|:\d+$/g, '');
   return m.value.publicEndpoint || !m.value.publicEndpointAuto || !exit || exit === m.value.publicEndpointAuto ? '' : exit;
 });
-const roleText = computed(() => [relay.value ? (site.value ? '站点中转' : '中转') : '成员', m.value.gateway ? '网关' : ''].filter(Boolean).join(' · '));
+const roleText = computed(() => [m.value.front?.length ? '前置机' : '', relay.value ? (site.value ? '站点中转' : '中转') : '成员', m.value.gateway ? '网关' : '',
+  m.value.proxy?.exit ? '出口' : '', m.value.proxy?.ports?.length ? '代理端口' : ''].filter(Boolean).join(' · '));
+// A front's exits, by name: it dials them at its own addresses for them, and nothing else by itself.
+const frontExits = computed(() => (m.value.front || []).map(id => nameOf(members.value, id)).join('、'));
 // A gateway's networks and who gets each (GET /mesh exports, by the draft's rules: changes as rules are edited).
 // Empty for an older controller, which says nothing about it: the networks are listed plainly then.
 const gatewayNets = computed(() => (m.value.gateway?.subnets || []).map(net => ({net, ids: exportsOf(mesh.data, id.value, net)})).filter(x => x.ids)
   .map(x => ({...x, text: exportText(x.ids, members.value)})));
 const plainNets = computed(() => m.value.gateway && !gatewayNets.value.length ? (m.value.gateway.subnets || []) : []);
+// Gateway networks this machine already routes elsewhere (GET /mesh routeClashes; its own LAN is no clash), and ones
+// it keeps that clash with nothing now: each is taken over (the default) or kept here.
+const clashes = computed(() => {
+  const found = (mesh.data?.routeClashes?.[id.value] || []).filter(c => !c.fixed);
+  return [...found, ...(m.value.keepRoutes || []).filter(r => !found.some(c => c.route === r)).map(route => ({route, idle: true}))];
+});
+function setTakeover(route, on) {
+  const kept = (m.value.keepRoutes || []).filter(r => r !== route);
+  m.value.keepRoutes = on ? kept : [...kept, route];
+  void save();
+}
+function clashText(c) {
+  if (c.idle) return '现在没有冲突';
+  if (c.fixed) return `这个节点自己就在 ${c.held} 上，不能接管`;
+  return `本机已有 ${c.held} 的路由${c.dev ? `（经 ${c.dev}）` : ''}`;
+}
 
 // Where its traffic goes (GET /mesh/routes): a few rows, the rest behind a tap; a row shows that path on the board.
 const ROUTE_ROWS = 4, NET_ROWS = 3;
@@ -163,7 +204,13 @@ const shownRoutes = computed(() => routeList.value ? (routesOpen.value ? routeLi
 const shownNets = computed(() => routeList.value ? (routesOpen.value ? routeList.value.subnets : routeList.value.subnets.slice(0, NET_ROWS)) : []);
 const routeKey = r => `${id.value}>${r.dst || r.gateway}${r.subnet ? `>${r.subnet}` : ''}`;
 function showRoute(r) {
-  emit('show-path', {src: id.value, dst: r.dst || r.gateway, subnet: r.subnet || '', hops: r.hops, rttMs: r.rttMs, stale: r.stale, key: routeKey(r)});
+  emit('show-path', {src: id.value, dst: r.dst || r.gateway, subnet: r.subnet || '', hops: r.hops, rttMs: r.rttMs, stale: r.stale, fixed: r.fixed || null, key: routeKey(r)});
+}
+const fixedOf = r => fixedRouteInfo(r?.fixed);
+const canPinOf = r => !r.broken && !r.subnet && canPinRoute(r, sid => isRelay(members.value.find(x => x.serverId === sid)));
+function pinRoute(r) {
+  if (!canPinOf(r)) return;
+  emit('pin-path', {src: id.value, dst: r.dst, via: r.hops.slice(1, -1).map(h => h.node)});
 }
 // Every 10 seconds while the overview tab is open; an older controller without the endpoint is not asked again.
 const routePoll = usePoll(async () => {
@@ -223,7 +270,7 @@ const hints = computed(() => {
     } else if (a.code === 'mesh_exit_inconsistent') {
       const seen = observers.value.filter(o => o.ok && o.addr).map(o => `${observerName(o)} 看到 ${o.addr}`);
       list.push({key: a.code, rank: 1.5, tone: 'warn', text: '出口被代理改写',
-        detail: `各观测点看到的出口地址不一致${seen.length ? `（${seen.join('；')}）` : ''}，可能经过透明代理或有多条出口线路。这台机器的公网地址不可靠，不会用来打洞。`});
+        detail: `各观测点看到的出口地址不一致${seen.length ? `（${seen.join('；')}）` : ''}，可能经过透明代理或有多条出口线路。这个节点的公网地址不可靠，不会用来打洞。`});
     } else list.push({key: a.code, rank: 1.8, tone: 'warn', text: a.text, detail: ''});
   }
   // The controller's warnings about this member: they block nothing.
@@ -269,6 +316,8 @@ const detailPoll = usePoll(async () => {
 }, {interval: 5000});
 
 function setRelay(on) {
+  // Its links follow the role: direct links and its own entries as a relay, the other way back.
+  const moved = changeRole(mesh.work, id.value, on);
   m.value.role = on ? 'relay' : 'member';
   // Behind NAT (by the reachability check) it starts as a site relay.
   if (on && recommended.value) m.value.relayMode = recommended.value;
@@ -277,9 +326,14 @@ function setRelay(on) {
   if (!on && !m.value.entry) m.value.entry = {mode: 'fixed', candidates: [], autoReturn: true};
   if (!on && listens(m.value, 'tls')) m.value.listen = {...m.value.listen, tls: 0};
   void save();
+  const said = on
+    ? [moved.entries.length && `${moved.entries.join('、')} 和它的直连改成了入口（排在最后，它们现在用的入口不变）`, moved.links.length && `它原来的入口改成了中转互联：${moved.links.join('、')}`]
+    : [moved.links.length && `它的中转互联改成了它的入口：${moved.links.join('、')}`, moved.directs.length && `经它入网的 ${moved.directs.join('、')} 改成了和它直连`];
+  if (said.some(Boolean)) ElMessage({type: 'info', message: said.filter(Boolean).join('；'), duration: 8000, showClose: true});
 }
 // A site relay punches: it needs UDP.
 function setMode(mode) {
+  leaveAuto('relayMode');
   m.value.relayMode = mode;
   if (mode === 'site' && !listens(m.value, 'udp')) m.value.listen = {udp: 0, tcp: 0, tls: 0, ...(m.value.listen || {}), udp: ports.value.udp};
   void save();
@@ -295,6 +349,7 @@ const lonelySite = computed(() => {
 const modeErrors = computed(() => (mesh.errors || []).filter(e => e.path?.startsWith(`members[${index.value}].relayMode`)
   || (e.error === 'mesh_site_relay_needs_public_link' && (e.path === `members[${index.value}]` || e.path?.startsWith(`members[${index.value}].`)))).map(errorMessage));
 function setListen(transport, on) {
+  leaveAuto('listen');
   m.value.listen = {udp: 0, tcp: 0, tls: 0, ...(m.value.listen || {}), [transport]: on ? ports.value[transport] : 0};
   void save();
 }
@@ -336,6 +391,21 @@ function setAddress() {
 const addressErrors = computed(() => addressLocal.value ? [addressLocal.value] : at('address'));
 function setLimit(value) { m.value.uploadLimitMbps = value === '' ? null : Number(value); void save(); }
 function setGateway(on) { m.value.gateway = on ? {subnets: [], masquerade: true} : null; void save(); }
+const lanName = ref('');
+watch(() => m.value.gateway?.name, v => { lanName.value = v || ''; }, {immediate: true});
+function setLanName(value) {
+  const name = String(value).trim();
+  if (name) m.value.gateway.name = name; else delete m.value.gateway.name;
+  void save();
+}
+// A backup gateway stands by for another gateway's subnets and takes them while that one is away.
+const primaries = computed(() => members.value.filter(x => x !== m.value && !x.removing && x.gateway?.subnets?.length && !x.gateway.backup));
+function setBackup(on) {
+  if (on) m.value.gateway.backup = true; else delete m.value.gateway.backup;
+  if (on && !m.value.gateway.subnets.length && primaries.value.length === 1) m.value.gateway.subnets = [...primaries.value[0].gateway.subnets];
+  void save();
+}
+function backupOf(sid) { const other = members.value.find(x => x.serverId === sid); if (other) { m.value.gateway.subnets = [...other.gateway.subnets]; void save(); } }
 const netProblem = (value, {typing = false} = {}) => gatewayNetProblem(value, {settings: mesh.work?.settings, members: members.value, self: m.value, typing});
 // Tags others already use (the controller's list when it sends one), offered as typed.
 const knownTags = computed(() => Array.isArray(mesh.data?.tags) ? mesh.data.tags
@@ -345,8 +415,12 @@ const lanNets = computed(() => {
   const listed = (mesh.data?.members || []).find(x => x.serverId === id.value)?.subnetSuggestions ?? m.value.subnetSuggestions;
   return (Array.isArray(listed) ? listed : []).filter(net => !netProblem(net)).map(value => ({value, note: '本机所在的局域网'}));
 });
-const MASQUERADE_HELP = '开启后，组网成员访问这个局域网时，局域网里的设备看到的来源是网关这台机器的地址，所以不用在路由器上加回程路由；'
+const MASQUERADE_HELP = '开启后，组网成员访问这个局域网时，局域网里的设备看到的来源是网关这个节点的地址，所以不用在路由器上加回程路由；'
   + '关闭后能看到真实来源，但需要在局域网路由器上把组网网段指向这台网关。';
+const SNAT_HELP = '开启后，这个局域网里的设备访问组网时，对方看到的来源是网关这个节点的组网地址，对方那边不用有回到这个局域网的路由'
+  + '（比如对方局域网的路由器上不用加路由）；访问规则也把这些流量算作网关这个节点发出的。关闭后对方看到的是设备的真实地址。';
+const TAKEOVER_HELP = '这个节点上已经有去这些网关网段的路由（比如原来的 WireGuard）。默认接管，由组网替换原来的路由；'
+  + '取消勾选就保留原来的路由，退出组网或组网服务停止时，原来的路由会恢复。';
 const LISTEN_HELP = {relay: '成员按入口里选的传输方式连进来，用到哪种就开哪种；成员之间打洞直连要至少一台中转开启 UDP。',
   member: 'UDP 直连两端都要开启 UDP 监听；TCP 直连只有被主动连接的一端需要。只有中转可以开启 TLS 监听。'};
 
@@ -399,7 +473,7 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
         <span class="mesh-missing-action">
           <el-button size="small" type="primary" :loading="Boolean(reinstalling[id])" :disabled="Boolean(reinstalling[id]) || !online" @click="reinstall">{{ reinstalling[id] ? '正在重新安装…' : '重新安装组网服务' }}</el-button>
           <small v-if="!online && !reinstalling[id]" class="instance-muted">节点离线，连上后才能重新安装</small>
-          <small v-else-if="reinstalling[id]" class="instance-muted">正在机器上安装，最多约 3 分钟</small>
+          <small v-else-if="reinstalling[id]" class="instance-muted">正在节点上安装，最多约 3 分钟</small>
         </span>
         <small v-if="reinstallError" class="ob-bad mesh-missing-error" role="alert">没有重新安装：{{ reinstallError }}</small>
       </div>
@@ -455,7 +529,8 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
         <div v-if="verdict" class="mesh-reach">
           <p class="mesh-reach-line"><span class="pb-tag" :data-tone="verdict[0]">{{ verdict[1] }}</span>
             <span class="mono" title="真实出口：从组网的 UDP 端口向观测点查到的地址">出口 {{ reach.publicAddr || '没有测到' }}</span></p>
-          <small v-if="reach.consistent === false" class="ob-warn">出口被代理改写：各观测点看到的地址不一致</small>
+          <small v-if="reach.consistent === false && addrMatters" class="ob-warn">出口被代理改写：各观测点看到的地址不一致</small>
+          <small v-else-if="reach.consistent === false" class="instance-muted">各观测点看到的出口地址不一致（出口经过代理或有多条线路）。这台不靠打洞连接，不受影响</small>
           <details class="mesh-observers">
             <summary>{{ [observers.length ? `观测点 ${observers.filter(o => o.ok).length}/${observers.length} 个有回应` : '', reach.checkedAt ? `检测于 ${relativeTime(reach.checkedAt, Date.now())}` : ''].filter(Boolean).join(' · ') || '详情' }}</summary>
             <p class="instance-muted">{{ VERDICT_NOTES[reach.verdict] || VERDICT_NOTES.unknown }}{{ [reach.mapping && `映射：${MAPPINGS[reach.mapping] || reach.mapping}`, reach.filtering && `过滤：${FILTERINGS[reach.filtering] || reach.filtering}`].filter(Boolean).map(t => `。${t}`).join('') }}</p>
@@ -494,9 +569,10 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
             <li v-for="r in shownRoutes" :key="r.key">
               <button type="button" class="mesh-route" :aria-pressed="shownPath === routeKey(r)" :data-broken="r.broken || undefined" @click="showRoute(r)">
                 <span class="mesh-route-name">{{ r.title }}</span>
-                <span class="mesh-route-through">{{ r.through }}<span v-if="r.stale && !r.broken" class="ob-warn"> · 数据不完整</span></span>
+                <span class="mesh-route-through">{{ r.through }}<span v-if="fixedOf(r)" class="pb-tag" :data-tone="fixedOf(r).tone === 'off' ? undefined : fixedOf(r).tone">{{ fixedOf(r).text }}</span><span v-if="r.stale && !r.broken" class="ob-warn"> · 数据不完整</span></span>
                 <span class="mesh-route-rtt">{{ r.rtt }}</span>
               </button>
+              <button v-if="canPinOf(r)" type="button" class="ix-text-button mesh-route-pin" @click.stop="pinRoute(r)">加为自建路线</button>
             </li>
           </ul>
           <template v-if="shownNets.length">
@@ -525,10 +601,12 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
       </div>
     </section>
 
-    <MeshEntries v-else-if="tab === 'entry'" class="mesh-pane" :member="m" :index="index" :phone="phone" :health="health" />
+    <MeshEntries v-if="tab === 'entry'" class="mesh-pane" :member="m" :index="index" :phone="phone" :health="health" />
 
-    <form v-else-if="tab === 'settings'" class="instance-form mesh-pane mesh-config" autocomplete="off" aria-label="设置" @submit.prevent>
-      <section class="mesh-group" aria-label="基本">
+    <template v-if="tab === 'settings'">
+    <form v-for="[part, partTitle] in formParts" :key="part" class="instance-form mesh-pane mesh-config"
+      autocomplete="off" :aria-label="partTitle || '设置'" @submit.prevent>
+      <section v-if="inPart(part, 'network')" class="mesh-group" aria-label="基本">
         <h4 class="mesh-group-title">基本</h4>
         <MeshField label="标签" help="用于画板展示和访问规则里的分组，例如“公司”。">
           <MeshChips v-model="m.tags" label="添加标签" placeholder="添加标签" :max="20" :maxlength="40" :suggestions="knownTags" @change="save" />
@@ -543,17 +621,15 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
         </MeshField>
       </section>
 
-      <section class="mesh-group" aria-label="网络">
+      <section v-if="inPart(part, 'network')" class="mesh-group" aria-label="网络">
         <h4 class="mesh-group-title">网络</h4>
         <MeshField label="网格地址" help="它在网格里的地址，在地址段里；留空时应用后自动分配。">
           <input v-bind="noAutofill" :value="addressText" class="mono" inputmode="decimal" maxlength="15" :class="{invalid: addressErrors.length}" placeholder="留空自动分配" aria-label="网格地址"
             :aria-invalid="addressErrors.length > 0 || undefined" @input="typeAddress($event.target.value)" @change="setAddress" />
           <small v-for="e in addressErrors" :key="e" class="ob-bad">{{ e }}</small>
         </MeshField>
-        <MeshField label="对外地址" help="别的成员连它用的 IP 或域名。留空用节点上报的公网 IP；有端口映射时填写。">
-          <input v-model.trim="m.publicEndpoint" v-bind="noAutofill" class="mono" :class="{invalid: at('publicEndpoint').length}" :placeholder="m.publicEndpointAuto ? `自动：${m.publicEndpointAuto}` : '自动（还没有上报公网 IP）'" aria-label="对外地址" @change="save" />
-          <small v-for="e in at('publicEndpoint')" :key="e" class="ob-bad">{{ e }}</small>
-          <small v-if="site && !at('publicEndpoint').length" class="instance-muted">站点中转不对外宣告地址，这里填写的地址不会使用。</small>
+        <MeshField label="对外地址" help="别的节点主动连它时用的地址。默认跟着节点上报的公网 IP 走；有端口映射时选“手填”。">
+          <MeshAddress :member="m" :item="item" :online="online" :site="site" :errors="[...at('publicEndpoint'), ...at('publicPorts'), ...at('announce')]" :name="`mesh-address-${id}`" @change="save" />
           <small v-if="!site && exitDiffers" class="ob-warn">上报的 {{ m.publicEndpointAuto }} 和实测出口 {{ exitDiffers }} 不同（可能经过了代理），别的成员按自动地址会连不上它。</small>
         </MeshField>
         <MeshField label="监听" :help="relay ? LISTEN_HELP.relay : LISTEN_HELP.member">
@@ -573,12 +649,15 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
           </div>
           <small v-for="e in at('listen')" :key="e" class="ob-bad">{{ e }}</small>
           <small v-for="w in portWarnings[''] || []" :key="w.text" class="instance-muted">{{ w.text }}</small>
+          <MeshAuto v-if="listenAuto" :auto="isAuto('listen')" :reason="listenAuto.reason" :value="openText(listenAuto.value)" :same="sameOpen(listenAuto.value, m.listen)" @restore="backToAuto('listen')" />
         </MeshField>
       </section>
 
-      <section class="mesh-group" aria-label="角色">
+      <section v-if="inPart(part, 'role', 'lan', 'network')" class="mesh-group" :aria-label="partTitle || '角色'">
         <h4 class="mesh-group-title">角色</h4>
+        <p v-if="frontExits && inPart(part, 'role')" class="instance-muted mesh-front-note" data-front>前置机：只主动连出口 {{ frontExits }}，用服务器资料里填的出口地址；不用 STUN，只有开了 UDP 才向出口探测。新连线默认 TLS。</p>
         <template v-if="linux">
+          <template v-if="inPart(part, 'role')">
           <MeshField label="中转" help="接受其他成员的连接并替它们转发流量。">
             <label class="ob-check"><input type="checkbox" :checked="relay" @change="setRelay($event.target.checked)" /><span>作为中转</span></label>
             <small v-if="relay && users.length" class="ob-warn">{{ users.length }} 台成员把它当入口，关掉后它们要换入口</small>
@@ -586,15 +665,25 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
           </MeshField>
           <MeshField v-if="relay" label="中转类型" :help="RELAY_MODES.map(([, l, d]) => `${l}：${d}`).join('\n')">
             <div class="mesh-choice mesh-relay-mode" role="radiogroup" aria-label="中转类型">
-              <label v-for="[value, label] in RELAY_MODES" :key="value"><input type="radio" name="mesh-relay-mode" :value="value" :checked="(site ? 'site' : 'public') === value" @change="setMode(value)" />{{ label }}<span v-if="recommended === value" class="pb-tag" data-tone="ok">推荐</span></label>
+              <label v-for="[value, label] in RELAY_MODES" :key="value"><input type="radio" name="mesh-relay-mode" :value="value" :checked="(site ? 'site' : 'public') === value" @change="setMode(value)" />{{ label }}<span v-if="(modeAuto ? modeAuto.value : recommended) === value" class="pb-tag" data-tone="ok">推荐</span></label>
             </div>
-            <small v-if="recommended && recommended !== (site ? 'site' : 'public')" class="ob-warn">可达性检测结果是“{{ verdict[1] }}”，建议设为{{ RELAY_MODES.find(([v]) => v === recommended)[1] }}。</small>
+            <small v-if="!modeAuto && recommended && recommended !== (site ? 'site' : 'public')" class="ob-warn">可达性检测结果是“{{ verdict[1] }}”，建议设为{{ RELAY_MODES.find(([v]) => v === recommended)[1] }}。</small>
             <small v-if="lonelySite" class="ob-warn">{{ codeText('mesh_site_relay_needs_public_link') }}</small>
             <small v-for="e in modeErrors.filter(e => !lonelySite || e !== codeText('mesh_site_relay_needs_public_link'))" :key="e" class="ob-bad">{{ e }}</small>
+            <MeshAuto v-if="modeAuto" :auto="isAuto('relayMode')" :reason="modeAuto.reason" :value="MODE_TEXT[modeAuto.value] || modeAuto.value" :same="modeAuto.value === (site ? 'site' : 'public')" @restore="backToAuto('relayMode')" />
           </MeshField>
-          <MeshField label="网关" help="把它所在局域网的网段接入网格。在访问规则的目标里写明这些网段后，其他成员才能访问其中的机器。">
+          </template>
+          <MeshField v-if="inPart(part, 'lan')" label="网关" help="把它所在局域网的网段接入网格。在访问规则的目标里写明这些网段后，其他成员才能访问其中的节点。">
             <label class="ob-check"><input type="checkbox" :checked="Boolean(m.gateway)" @change="setGateway($event.target.checked)" /><span>把局域网网段接入网格</span></label>
             <template v-if="m.gateway">
+              <input v-bind="noAutofill" v-model="lanName" maxlength="40" placeholder="局域网名称，例如 家里" aria-label="局域网名称" @change="setLanName(lanName)" />
+              <label class="ob-check"><input type="checkbox" :checked="Boolean(m.gateway.backup)" @change="setBackup($event.target.checked)" /><span>当备用网关：首选网关连不上时接手</span></label>
+              <div v-if="m.gateway.backup && primaries.length" class="ob-inline">
+                <select aria-label="给哪台网关当备用" @change="backupOf($event.target.value)">
+                  <option value="">给哪台网关当备用…</option>
+                  <option v-for="p in primaries" :key="p.serverId" :value="p.serverId">{{ p.name }}（{{ p.gateway.name || p.gateway.subnets.join('、') }}）</option>
+                </select>
+              </div>
               <MeshChips v-model="m.gateway.subnets" label="添加网关网段" :placeholder="lanNets.length ? '选择或输入网段' : '192.168.1.0/24'" mono live :maxlength="18"
                 :validate="netProblem" :suggestions="lanNets" @change="save" />
               <small v-for="e in under('gateway')" :key="e" class="ob-bad">{{ e }}</small>
@@ -603,17 +692,32 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
                 <MeshHelp :text="MASQUERADE_HELP" label="地址转换" />
               </div>
               <small v-if="!m.gateway.masquerade" class="instance-muted">需要在局域网路由器上把组网网段 {{ mesh.work?.settings?.prefix || '' }} 指向这台网关</small>
+              <div class="mesh-masq">
+                <label class="ob-check"><input v-model="m.gateway.snat" type="checkbox" @change="save" /><span>局域网设备访问组网时也做地址转换</span></label>
+                <MeshHelp :text="SNAT_HELP" label="局域网设备访问组网" />
+              </div>
             </template>
           </MeshField>
+          <MeshField v-if="clashes.length && inPart(part, 'network')" label="路由冲突" :help="TAKEOVER_HELP">
+            <label v-for="c in clashes" :key="c.route" class="ob-check mesh-takeover">
+              <input type="checkbox" :checked="!(m.keepRoutes || []).includes(c.route)" @change="setTakeover(c.route, $event.target.checked)" />
+              <span><span>接管 <span class="mono">{{ c.route }}</span></span><small class="instance-muted">{{ clashText(c) }}</small></span>
+            </label>
+            <small v-for="e in at('keepRoutes')" :key="e" class="ob-bad">{{ e }}</small>
+          </MeshField>
         </template>
-        <template v-else>
+        <template v-else-if="inPart(part, 'role', 'lan')">
           <p class="instance-muted mesh-config-note">中转和网关只能由 Linux 担任，这台是 {{ PLATFORMS[m.platform] || m.platform }}，只能作为成员。</p>
           <small v-for="e in [...at('role'), ...under('gateway')]" :key="e" class="ob-bad">{{ e }}</small>
         </template>
       </section>
     </form>
+    </template>
 
-    <section v-else-if="tab === 'peers'" class="mesh-pane" aria-label="对端">
+    <div v-if="tab === 'proxy'" class="mesh-pane m3-tokens"><MeshNodeProxy :member="m" :index="index" :phone="phone" /></div>
+
+
+    <section v-if="shows('peers')" class="mesh-pane" aria-label="对端">
       <p v-if="!detail && !detailError" class="instance-muted" role="status">正在读取…</p>
       <p v-else-if="!peers.length" class="instance-muted">{{ detailError ? `读不到：${detailError}` : '还没有对端。应用后，这里实时显示它和每个对端的连接。' }}</p>
       <template v-else>
@@ -634,7 +738,7 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
       </template>
     </section>
 
-    <section v-else-if="tab === 'events'" class="mesh-pane" aria-label="事件">
+    <section v-if="shows('events')" class="mesh-pane" aria-label="事件">
       <p v-if="!detail && !detailError" class="instance-muted" role="status">正在读取…</p>
       <p v-else-if="!allEvents.length" class="instance-muted">{{ detailError ? `读不到：${detailError}` : '还没有切换、重连或错误。' }}</p>
       <template v-else>
@@ -662,7 +766,7 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
       </template>
     </section>
 
-    <section v-if="probeSeen" v-show="tab === 'probe'" class="mesh-pane" aria-label="测试">
+    <section v-if="probeSeen" v-show="shows('probe')" class="mesh-pane" aria-label="测试">
       <NetProbe :server-id="id" :servers="items" :online="online" :active="meshActive" board :shown-path="shownPath" @show-path="emit('show-path', $event)" />
     </section>
   </div>

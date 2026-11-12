@@ -20,6 +20,13 @@
 .net-exit > .net-addr { width: auto; }
 .net-exit > small { padding: 0 6px; font-size: var(--ix-xs); }
 .net-more { margin: 2px 0 0 6px; font-size: var(--ix-xs); }
+/* The detail page's card on a wide screen: the interface beside its addresses, which run on and wrap. */
+@media (min-width: 761px) {
+  .ix-card.net-addresses .net-iface { display: grid; grid-template-columns: 116px minmax(0, 1fr); align-items: start; column-gap: 8px; }
+  .ix-card.net-addresses .net-iface-head { min-height: 28px; }
+  .ix-card.net-addresses .net-addr-list { display: flex; flex-wrap: wrap; gap: 0 4px; }
+  .ix-card.net-addresses .net-addr { width: auto; }
+}
 
 /* The test form: mode, target (and port), start / stop; the rest folded away. */
 .net-probe.ix-card { grid-column: 1 / -1; }

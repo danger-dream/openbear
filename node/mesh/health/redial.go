@@ -98,6 +98,13 @@ const (
 	// over, and be retired from, the old connection (transport's
 	// redialGrace).
 	swapWait = 30 * time.Second
+	// A redialable path that answered before and then nothing for
+	// deadAfter, its probes failing, is redialed at once, and again every
+	// deadEvery while that lasts: the other end may have given up on the
+	// connection, or the network on its ports, while it stays open here.
+	// Waiting for bad periods needs answers, and a dead path gives none.
+	deadAfter = 20 * time.Second
+	deadEvery = 30 * time.Second
 )
 
 func above(b time.Duration, f float64, margin time.Duration) time.Duration {
@@ -138,6 +145,7 @@ type trend struct {
 	level, redials int
 	last           time.Time
 	inflight       bool
+	dead           bool // the redial under way is redialDead's
 	// After a redial: when it moved the path, and whether the other end has
 	// asked for it to be prepared again since.
 	swapped    time.Time
@@ -307,6 +315,17 @@ type redialDone struct {
 	err       error
 }
 
+func (m *Manager) redialDead(p *candidateState, t *trend, now time.Time) {
+	if m.redial.Period <= 0 || t.inflight || p.path.ID == "" || p.lastOK.IsZero() || p.track.stats.Failures+int(p.track.stats.LocalExpired) < m.cfg.Parameters.ConsecutiveFailures {
+		return
+	}
+	if now.Sub(p.lastOK) < deadAfter || (!t.last.IsZero() && now.Sub(t.last) < deadEvery) {
+		return
+	}
+	t.dead = true
+	m.startRedial(p, t)
+}
+
 func (m *Manager) startRedial(p *candidateState, t *trend) {
 	rb, ok := m.backend.(redialBackend)
 	if !ok {
@@ -333,7 +352,9 @@ func redialDetail(p *candidateState, t *trend, m *Manager) string {
 		b.WriteString(" relay=" + p.config.Peer)
 	}
 	reason := "slow"
-	if t.rttBad {
+	if t.dead {
+		reason = "dead"
+	} else if t.rttBad {
 		reason = "rtt"
 	}
 	fmt.Fprintf(&b, " reason=%s rtt=%sms baseline=", reason, msText(t.median))
@@ -369,11 +390,15 @@ func (m *Manager) redialed(v redialDone, now time.Time) {
 	t.level = min(t.level+1, max(len(m.redial.Backoff), 1))
 	t.bad = 0
 	detail := redialDetail(p, t, m)
+	t.dead = false
 	if v.err != nil {
 		m.emit("link.redial.failed", detail+" error="+v.err.Error())
 		return
 	}
 	m.emit("link.redial", detail+" port="+port(v.from)+"->"+port(v.to))
+	if !m.reach.last.IsZero() && now.Sub(m.reach.last) >= reachAgain && m.reach.next.After(now) {
+		m.reach.next = now
+	}
 	if p.path == v.path {
 		// What the next periods show is the new connection.
 		t.start, t.rtts, t.lost = now, t.rtts[:0], 0
@@ -421,6 +446,7 @@ func (m *Manager) redialTick(now time.Time) {
 		if t := m.trendOf(p); t != nil {
 			m.rollTrend(p, t, now)
 			p.swapping(now)
+			m.redialDead(p, t, now)
 		}
 	}
 	if m.store.path == "" || now.Sub(m.baselineSaved) < m.redial.SaveEvery {

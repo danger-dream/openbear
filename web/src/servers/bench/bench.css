@@ -3,7 +3,7 @@
 .bn-body { display: flex; flex: 1; min-height: 0; }
 
 /* Left: the tree. */
-.bn-tree { display: flex; flex: none; flex-direction: column; width: 320px; min-width: 0; min-height: 0; border-right: 1px solid var(--ob-chat-line); }
+.bn-tree { display: flex; flex: none; flex-direction: column; width: 336px; min-width: 0; min-height: 0; border-right: 1px solid var(--ob-chat-line); }
 .bn-tree-head { display: flex; flex: none; align-items: center; gap: 8px; padding: 10px 12px 8px 16px; }
 .bn-tree-head > h2 { margin: 0; color: var(--ob-chat-subtle); font-size: var(--ix-sm); font-weight: 500; }
 .bn-pickbar { display: flex; flex: none; align-items: center; gap: 8px; margin: 0 10px 6px; padding: 5px 6px 5px 12px; border-radius: 8px; background: var(--ob-chat-selected); font-size: var(--ix-sm); }
@@ -18,10 +18,15 @@
 .bn-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bn-row-server .bn-name { font-weight: 500; }
 .bn-row-server .sv-flag { flex: none; font-size: 14px; line-height: 1; }
-.bn-row-cat .bn-row-main { min-height: 26px; padding-left: 22px; color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
-.bn-row-test .bn-row-main { padding-left: 38px; }
-.bn-row-run { padding-left: 52px; }
-.bn-row-run[aria-current='true'] { background: var(--ob-chat-selected); }
+/* A test's row is its newest run; the earlier ones fold under it. */
+.bn-row-test { padding-left: 10px; }
+.bn-row-test .bn-row-main { padding-left: 2px; }
+.bn-row-test .bn-name { flex: 0 1 auto; }
+.bn-row-test .bn-time { color: var(--ob-chat-subtle); font-size: var(--ix-sm); }
+.bn-row-run { padding-left: 34px; }
+.bn-row-test[aria-current='true'], .bn-row-run[aria-current='true'] { background: var(--ob-chat-selected); }
+.bn-older { display: inline-flex; flex: none; align-items: center; gap: 1px; height: 24px; padding: 0 4px; color: var(--ob-chat-muted); font-size: var(--ix-xs); white-space: nowrap; }
+.bn-older:hover, .bn-older[aria-expanded='true'] { color: var(--ob-chat-text); }
 .bn-count { margin-left: auto; color: var(--ob-chat-muted); font-size: var(--ix-sm); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .bn-count[data-tone='busy'] { color: var(--ob-violet); }
 .bn-add { flex: none; width: 26px; height: 26px; color: var(--ob-chat-muted); }
@@ -31,7 +36,7 @@
 .bn-row-run .bn-row-main { padding-left: 2px; }
 .bn-time { flex: none; font-variant-numeric: tabular-nums; }
 .bn-label { min-width: 0; overflow: hidden; color: var(--ob-chat-subtle); font-size: var(--ix-sm); text-overflow: ellipsis; white-space: nowrap; }
-.bn-row-run .ix-pill { flex: none; margin-left: auto; }
+.bn-row-run .ix-pill, .bn-row-test .ix-pill { flex: none; margin-left: auto; }
 .bn-empty { padding: 32px 16px; }
 
 /* Right: one report, the comparison, or what the tab is for. */
@@ -106,6 +111,20 @@
 /* The form. */
 .bn-form .dd-field > select { width: 100%; }
 .bn-check > span { display: flex; flex-direction: column; gap: 2px; }
+.bn-tests > span:first-child { display: flex; align-items: baseline; gap: 6px; }
+.bn-tests-note { color: var(--ob-chat-subtle); font-size: var(--ix-xs); font-style: normal; }
+.bn-test-group { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.bn-test-group-name { color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
+.servers-ui .bn-form label.ob-check.bn-test { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 3px 8px; border-radius: 7px; }
+.servers-ui .bn-form label.ob-check.bn-test > input { margin: 0; }
+.bn-test:hover:not(.is-disabled) { background: var(--ob-hover); }
+.bn-test-suite { border: 1px solid var(--ob-chat-border); }
+.bn-test-name { display: flex; flex: 1; flex-wrap: wrap; align-items: baseline; column-gap: 6px; min-width: 0; color: var(--ob-text); font-size: var(--ix-md); }
+.bn-test-name small { font-size: var(--ix-xs); }
+.bn-test-time { flex: none; color: var(--ob-chat-subtle); font-size: var(--ix-xs); text-align: right; }
+.bn-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--ob-chat-border); border-radius: 9px; }
+.bn-item-head { display: flex; flex-direction: column; gap: 2px; font-size: var(--ix-md); }
+.bn-item-head small { font-size: var(--ix-sm); line-height: 1.5; }
 .bn-check small { font-size: var(--ix-sm); }
 .bn-radio { margin: 0; }
 .bn-warnings { margin: 0; padding: 9px 12px 9px 28px; border-radius: 9px; background: var(--ob-warning-soft); font-size: var(--ix-md); line-height: 1.55; }
@@ -118,9 +137,9 @@
   .bn-pickbar { margin: 0 8px 6px; }
   .bn-nodes { padding: 0 6px max(16px, env(safe-area-inset-bottom, 0px)); }
   .bn-row-main { min-height: 40px; }
-  .bn-row-cat .bn-row-main { min-height: 34px; padding-left: 20px; }
-  .bn-row-test .bn-row-main { padding-left: 32px; }
+  .bn-row-test { padding-left: 10px; }
   .bn-row-run { padding-left: 34px; }
+  .bn-older { height: 36px; padding: 0 8px; }
   .bn-pick { width: 36px; height: 40px; }
   .bn-pick > input { width: 18px; height: 18px; }
   .bn-add { width: 38px; height: 38px; }

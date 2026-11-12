@@ -85,15 +85,15 @@ test('actual composer paste and file chooser retain files, mixed text and focus 
   const file = new File(['image'], 'image.png', { type: 'image/png' }); let prevented = 0;
   c.event = { clipboardData: { items: [{ kind: 'file', getAsFile: () => file }], getData: () => 'pasted text' }, preventDefault() { prevented++; } };
   vm.runInContext('onPaste(event)', c); assert.equal(prevented, 1); assert.equal(emitted[0][0], 'attachment-change'); assert.equal(emitted[0][1][0], file); assert.deepEqual(inserts, ['pasted text']);
+  // A running turn takes the pasted file too: it goes with the interjection.
   props.running = true; vm.runInContext('onPaste(event)', c);
-  assert.equal(emitted.length, 1, 'running still prohibits new attachment paste');
-  assert.deepEqual(inserts, ['pasted text', 'pasted text'], 'text survives a rejected mixed file/text paste');
-  assert.deepEqual(warnings, ['运行中暂不能添加附件']);
+  assert.equal(emitted.length, 2, 'running accepts a pasted attachment for the interjection');
+  assert.deepEqual(inserts, ['pasted text', 'pasted text']);
   c.event = {clipboardData:{items:[{kind:'file',getAsFile:()=>file}],getData:()=>''},preventDefault(){this.prevented=true;}};
   vm.runInContext('onPaste(event)',c);
   assert.equal(c.event.prevented,true,'file-only paste is intercepted');
-  assert.equal(emitted.length,1);assert.equal(inserts.length,2);
-  assert.deepEqual(warnings,['运行中暂不能添加附件','运行中暂不能添加附件']);
+  assert.equal(emitted.length,3);assert.equal(inserts.length,2);
+  assert.deepEqual(warnings,[]);
   c.event = {clipboardData:{items:[],getData:()=> 'native text'},preventDefault(){this.prevented=true;}};
   vm.runInContext('onPaste(event)',c);assert.equal(c.event.prevented,undefined,'ordinary text retains native paste');
   await vm.runInContext('focus()', c); assert.equal(focuses[0].preventScroll, true);

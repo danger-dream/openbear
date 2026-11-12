@@ -38,7 +38,8 @@ func newE2ELab(t *testing.T, s spec, keys map[string]string) *e2eLab {
 				in <- append([]byte(nil), b[offset:]...)
 			}
 		}
-		e, err := newE2E(x.l.config(name), key, func(b []byte, _ uint64) { go x.relay(b) }, deliver, func(kind, detail string) { t.Logf("%s: %s %s", name, kind, detail) })
+		c := x.l.config(name)
+		e, err := newE2E(c, newStaticAttachment(c), key, func(b []byte, _ uint64) { go x.relay(b) }, deliver, func(kind, detail string) { t.Logf("%s: %s %s", name, kind, detail) })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,7 +274,8 @@ func TestOuterPacket(t *testing.T) {
 func TestE2ETableFindsEverySubnet(t *testing.T) {
 	l := newLab(t, spec{relays: []string{"R"}, members: map[string][]string{"A": {"R"}, "B": {"R"}},
 		subnets: map[string][]netip.Prefix{"B": {netip.MustParsePrefix("10.20.0.0/24"), netip.MustParsePrefix("192.0.2.0/24")}}})
-	tb, err := e2eTableFor(l.config("A"))
+	c := l.config("A")
+	tb, err := e2eTableFor(c, newStaticAttachment(c))
 	if err != nil {
 		t.Fatal(err)
 	}

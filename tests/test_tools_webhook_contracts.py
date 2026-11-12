@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.tools.base import ToolRegistry, ToolRuntimeContext
-from app.tools.webhook import register_webhook_tool
+from app.tools.webhook import ACTIONS, register_webhook_tool
 from app.webhooks.contracts import EndpointConfig, Scope, parse_config
 from app.webhooks.repository import one
 from tests.test_webhooks_backend import env
@@ -30,28 +30,48 @@ async def invoke(registry, ctx, action, params=None, **extra):
     return await registry.dispatch_outcome('Webhook', json.dumps({'action': action, 'params': params or {}, **extra}), context=ctx)
 
 
-@pytest.mark.parametrize('action', [None, 'create', 'update'])
+@pytest.mark.parametrize('action', ['create', 'update'])
 async def test_describe_exposes_live_wire_schemas_and_action_contracts(tool, action):
     registry, service, ctx = tool
     result = await invoke(registry, ctx, 'describe', {'action': action})
     data = json.loads(result.content)
-    assert data['configSchema'] == EndpointConfig.model_json_schema(by_alias=True)
-    assert data['scopeSchema'] == Scope.model_json_schema(by_alias=True)
-    assert set(data['contracts']) == ({action} if action else {'create', 'update'})
+    # The outline by default: every field by path, with its type, default and the rule its description starts with.
+    assert 'configSchema' not in data and 'scopeSchema' not in data and len(result.content) < 12000
+    assert 'target.mode: newConversation|fixedConversation = newConversation' in data['configFields']
+    assert any(line.startswith('processing.allowServerChanges: boolean = False \u2014 Default false') for line in data['configFields'])
+    assert any(line.startswith('statistics.dimensions[].name: string') for line in data['configFields'])
+    assert data['scopeFields'] == ['type: folder|conversation', 'id: string']
+    full = json.loads((await invoke(registry, ctx, 'describe', {'action': action, 'schema': True})).content)
+    assert full['configSchema'] == EndpointConfig.model_json_schema(by_alias=True)
+    assert full['scopeSchema'] == Scope.model_json_schema(by_alias=True)
+    assert 'configFields' not in full and full['contracts'] == data['contracts']
+    assert set(data['contracts']) == {action}
     for name, contract in data['contracts'].items():
         example = contract['example']
         assert example['action'] == name and set(example) == {'action', 'params'}
         assert set(contract['required']) <= example['params'].keys()
         EndpointConfig.model_validate(example['params']['config'])
-    assert 'guidance' in data and 'wait' in data['protocol'] and 'report' in data['protocol']
+    assert 'pre-execution script' in data['guidance'] and 'register a scoped wait' not in data['guidance']
     service.create.assert_not_awaited()
     service.update.assert_not_awaited()
 
 
-async def test_wait_describe_and_schema_remain_small(tool):
+async def test_describe_index_names_every_action_and_one_action_gives_only_its_part(tool):
     registry, _, ctx = tool
-    data = json.loads((await invoke(registry, ctx, 'describe', {'action': 'wait'})).content)
-    assert 'configSchema' not in data and 'wait' in data['protocol']
+    index = json.loads((await invoke(registry, ctx, 'describe')).content)
+    assert set(index['actions']) == set(ACTIONS) and 'configSchema' not in index and 'guidance' not in index
+    wait = json.loads((await invoke(registry, ctx, 'describe', {'action': 'wait'})).content)
+    assert 'configSchema' not in wait and wait['contract']['op'] == 'register | await | cancel'
+    assert 'register a scoped wait' in wait['guidance'] and 'pre-execution script' not in wait['guidance']
+    assert len((await invoke(registry, ctx, 'describe', {'action': 'wait'})).content) < 3000
+    for action in ACTIONS:
+        assert json.loads((await invoke(registry, ctx, 'describe', {'action': action})).content)['action'] == action
+    unknown = await invoke(registry, ctx, 'describe', {'action': 'nope'})
+    assert unknown.status == 'failed' and json.loads(unknown.content)['details']['actions'] == list(ACTIONS)
+
+
+async def test_schema_remains_small(tool):
+    registry, _, _ = tool
     schema = registry.schemas()[0]['parameters']
     assert set(schema['properties']) == {'action', 'params', '_openbearApprovalId'}
     assert 'beside config' in schema['properties']['params']['description']
@@ -156,7 +176,7 @@ async def test_rotation_still_uses_confirmation_without_config_revision(tool):
 async def test_describe_examples_create_and_update_through_registry_and_real_service(env):
     registry = env.server.tools
     ctx = ToolRuntimeContext(webhook_owner_id=123, conversation_uuid='fixture')
-    contracts = json.loads((await invoke(registry, ctx, 'describe')).content)['contracts']
+    contracts = {a: json.loads((await invoke(registry, ctx, 'describe', {'action': a})).content)['contracts'][a] for a in ('create', 'update')}
     params = contracts['create']['example']['params']
     params['scope']['id'] = 'folder'
     params['name'] = '中文触发器'

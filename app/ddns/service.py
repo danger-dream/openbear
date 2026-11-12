@@ -157,6 +157,7 @@ class Ddns:
         self.gates = {}     # account id -> (concurrency, times of recent calls)
         self.locks = collections.defaultdict(asyncio.Lock)
         self.detected = {}
+        self.refreshing = set()  # account ids whose zone list is being refreshed
         self.tasks = set()
         self.started_ms = 0
         self.pruned_ms = 0
@@ -276,6 +277,18 @@ class Ddns:
         values = {str(i.get('key') or ''): i.get('value') for i in items}
         return {field: values[key] for field, key in account['field_map'].items() if isinstance(values.get(key), str) and values[key] != ''}
 
+    async def cloudflare_account(self, owner):
+        """{alias, token} of the owner's first Cloudflare account with an API token, for what else reads Cloudflare
+        (IP 情报's Radar); None without one."""
+        for account in await self._accounts(owner):
+            if account['type'] != 'cloudflare':
+                continue
+            with contextlib.suppress(DdnsError):
+                token = (await self._creds(account)).get('token')
+                if token:
+                    return {'alias': account['alias'], 'token': token}
+        return None
+
     @staticmethod
     def _own_secret(row):
         return bool(row) and row['note'] == SECRET_NOTE and row['name'].startswith('ddns/')
@@ -367,8 +380,9 @@ class Ddns:
 
     def _zone_lock(self, aid, zone, p):
         """Held around the writes of a provider that rewrites the whole zone each time: two at
-        once would each write back the zone as it was before the other's change."""
-        return self.zone_locks[(aid, zone)] if p.caps.whole_zone else contextlib.nullcontext()
+        once would each write back the zone as it was before the other's change. Also for one
+        that refuses a second write to a zone while one is running."""
+        return self.zone_locks[(aid, zone)] if p.caps.whole_zone or p.caps.zone_serial else contextlib.nullcontext()
 
     def _gate(self, aid):
         if aid not in self.gates:
@@ -426,6 +440,14 @@ class Ddns:
                 return p.caps.zones
         except (DdnsError, ProviderError):
             return False
+
+    async def _refresh_zones_once(self, account):
+        """The hourly refresh: one at a time per account, however long it takes."""
+        self.refreshing.add(account['id'])
+        try:
+            await self._refresh_zones(account)
+        finally:
+            self.refreshing.discard(account['id'])
 
     async def _refresh_zones(self, account, *, strict=False):
         """Zones the account can manage, kept for an hour; with strict a failure is raised."""
@@ -531,7 +553,7 @@ class Ddns:
         issues = sum(1 for r in records if self._issue(r)) + sum(1 for a in accounts if a['state'] == 'error')
         return {'ok': True, 'accounts': [self._account_view(a, names, records) for a in accounts],
                 'records': [self._view(r, kinds.get(r['account_id'], '')) for r in records],
-                'providers': providers.catalog(), 'nodes': await self.nodes(owner), 'issues': issues}
+                'providers': providers.catalog(), 'nodes': await self.nodes(owner), 'issues': issues, 'features': {'providerOptions': True}}
 
     async def events(self, owner, rid, limit=50):
         await self._rec(owner, rid)
@@ -876,20 +898,14 @@ class Ddns:
                 wanted = ('url', 'url_intl', 'url_cn') if diag['recommend'] == 'url' else (diag['recommend'],)
                 found = next((r for r in diag['results'] if r['method'] in wanted and r['value']), {})
                 out['value'] = found.get('value', '')
+                # The diagnosis asks with the default parameters; the watch will ask with the record's
+                # own (an IPv6 selection, a network card, URLs), so what they see is asked again.
+                resolved = {**source, 'resolvedMethod': diag['recommend'] if diag['recommend'] in model.RESOLVED else ''}
+                spec = model.probe_spec(resolved, family, False)
+                if spec['key'] != model.probe_spec({**resolved, 'params': model.default_params()}, family, False)['key']:
+                    out['value'] = await self._probe_value(owner, sid, spec, out['notes'], diag['recommend'])
             else:
-                spec = model.probe_spec(source, family, False)
-                seen = self.obs.get(sid, {}).get(spec['key'])
-                if seen and seen['value'] and not seen['stale']:
-                    out['value'] = seen['value']
-                else:
-                    result = await self._probe(owner, sid, {'family': family, 'methods': [spec['method']], 'urls': spec['urls'], 'stun': spec['stun'],
-                                                            'iface': spec['iface'], 'bindIface': spec['bindIface'], 'v6Select': spec['v6Select'],
-                                                            'cmd': spec['cmd'], 'allowPrivate': spec['allowPrivate']})
-                    found = next((r for r in self._clean_results(result)[0] if r['method'] == spec['method']), {})
-                    out['value'] = found.get('value', '')
-                    if found.get('error'):
-                        out['notes'].append({'level': 'warn', 'text': f'{METHOD_TEXT.get(method, method)}方式取 IP 失败：'
-                                                                       f'{PROBE_ERRORS.get(found["error"], found["error"])}'})
+                out['value'] = await self._probe_value(owner, sid, model.probe_spec(source, family, False), out['notes'], method)
         except DdnsError as exc:
             text = {'node_offline': '节点离线，暂时检测不到地址'}.get(exc.error, exc.message or exc.error)
             out['notes'].append({'level': 'warn', 'text': text})
@@ -900,6 +916,19 @@ class Ddns:
                 out['notes'].append({'level': 'warn', 'text': f'检测到的地址 {out["value"]} 是{model.REASONS[reason]}，默认不会写入（高级选项里可以允许内网地址）'})
         self.detected[key] = (self.now(), out)
         return out
+
+    async def _probe_value(self, owner, sid, spec, notes, method):
+        """What the probe spec sees on the node now: its watch's latest report, else asked once."""
+        seen = self.obs.get(sid, {}).get(spec['key'])
+        if seen and seen['value'] and not seen['stale']:
+            return seen['value']
+        result = await self._probe(owner, sid, {'family': spec['family'], 'methods': [spec['method']], 'urls': spec['urls'], 'stun': spec['stun'],
+                                                'iface': spec['iface'], 'bindIface': spec['bindIface'], 'v6Select': spec['v6Select'],
+                                                'cmd': spec['cmd'], 'allowPrivate': spec['allowPrivate']})
+        found = next((r for r in self._clean_results(result)[0] if r['method'] == spec['method']), {})
+        if found.get('error'):
+            notes.append({'level': 'warn', 'text': f'{METHOD_TEXT.get(method, method)}方式取 IP 失败：{PROBE_ERRORS.get(found["error"], found["error"])}'})
+        return found.get('value', '')
 
     # ----- node callbacks -----
     def node_seen(self, server_id, connected):
@@ -1088,7 +1117,9 @@ class Ddns:
         rec = decode(row)
         if rec['state'] == 'failed' and reason not in FORCED:
             return
-        if not rec['desired']:
+        # A value the policy no longer allows (allowPrivate turned off) is not written again; what
+        # the provider holds stays as it is.
+        if not rec['desired'] or not model.check_address(rec['desired'], rec['family'], rec['policy']['allowPrivate'])[0]:
             await self._set(rid, next_ms=self.now() + CHECK_S * 1000)
             return
         account = await one(self.db.conn, 'SELECT * FROM ddns_accounts WHERE id=?', (rec['account_id'],))
@@ -1186,7 +1217,9 @@ class Ddns:
                 due = times[-1] + FIGHT_WAITS_S[min(len(times), len(FIGHT_WAITS_S)) - 1] * 1000
                 if now < due:
                     return {**out, 'state': 'fighting' if len(times) >= 2 else 'drift', 'next_ms': min(due, now + int(self.jitter(CHECK_S) * 1000))}
-        attrs = reason in FORCED
+        # TTL and options are compared when asked to, and until a sync after the record was last
+        # edited has read the provider (the one the edit started may have failed).
+        attrs = reason in FORCED or rec['updated_ms'] > rec['checked_ms']
         stale = [r for r in mine if r.value != desired or attrs and self._attrs_differ(r, rec, p)]
         if not mine or stale:
             due = self._throttled(rec['id'], reason, now)
@@ -1264,7 +1297,8 @@ class Ddns:
         now = self.now()
         out = {'remote': rec['remote'], 'pid': rec['provider_record_id'], 'times': [], 'wrote': '', 'synced': False, 'read': False}
         # remote_ms: when it was last written (synced_ms is the change that write brought).
-        if reason in FORCED or rec['remote'] != rec['desired'] or now - rec['remote_ms'] >= REWRITE_S * 1000:
+        # remote_ms before updated_ms: the write an edit started (TTL, options) has not been made.
+        if reason in FORCED or rec['remote'] != rec['desired'] or rec['updated_ms'] > rec['remote_ms'] or now - rec['remote_ms'] >= REWRITE_S * 1000:
             due = self._throttled(rec['id'], reason, now)
             if due:
                 return await self._hold(rec, due, out)
@@ -1348,12 +1382,17 @@ class Ddns:
                 self.kick(row['id'], 'check')
         for row in await many(self.db.conn, 'SELECT * FROM ddns_accounts WHERE zones_ms<=?', (now - ZONES_S * 1000,)):
             account = decode_account(row)
+            if account['id'] in self.refreshing:
+                continue
             if await self._listable(account):
-                self._spawn(self._refresh_zones(account))
+                self.refreshing.add(account['id'])
+                self._spawn(self._refresh_zones_once(account))
             else:
                 await self._set_account(account['id'], zones_ms=now)
         if now - self.pruned_ms >= 3600 * 1000:
             self.pruned_ms = now
+            for key in [k for k, (at, _) in self.detected.items() if now - at >= DETECT_CACHE_S * 1000]:
+                del self.detected[key]
             async with self.db.write_transaction(label='ddns-events-prune') as conn:
                 await conn.execute('DELETE FROM ddns_events WHERE at_ms<?', (now - EVENTS_KEEP_S * 1000,))
 
@@ -1375,7 +1414,7 @@ class Ddns:
             await self._own_node(owner, backup['serverId'])
 
     async def preview(self, owner, data):
-        if not isinstance(data, dict) or set(data) - {'serverId', 'names', 'types', 'source', 'accountIds', 'backup', 'policy', 'ttl', 'options'}:
+        if not isinstance(data, dict) or set(data) - {'serverId', 'names', 'types', 'source', 'accountIds', 'backup', 'policy', 'ttl', 'options', 'optionsByProvider'}:
             fail('invalid_parameters')
         names, types = data.get('names'), data.get('types') or ['A']
         if not isinstance(names, list) or not 0 < len(names) <= MAX_ROWS:
@@ -1383,6 +1422,9 @@ class Ddns:
         if not isinstance(types, list) or not types or set(types) - set(TYPES):
             fail('invalid_type')
         wanted = data.get('accountIds') or {}
+        options_by_provider = data.get('optionsByProvider', {})
+        if not isinstance(options_by_provider, dict) or not all(isinstance(v, dict) for v in options_by_provider.values()):
+            fail('invalid_parameters')
         if not isinstance(wanted, dict):
             fail('invalid_parameters')
         source = self._source_input(data)
@@ -1400,8 +1442,9 @@ class Ddns:
                 rows += [self._row(str(raw), t, '', [], None, None, error=exc.error) for t in types]
                 continue
             account, zone, candidates, error = self._choose(name, hint, accounts, wanted.get(raw) or wanted.get(name))
+            options = options_by_provider.get(account['type'], data.get('options')) if account else None
             for rtype in types:
-                rows.append(await self._preview_row(owner, name, rtype, zone, candidates, account, detected[TYPES[rtype]], error, data.get('options')))
+                rows.append(await self._preview_row(owner, name, rtype, zone, candidates, account, detected[TYPES[rtype]], error, options))
         return {'ok': True, 'detected': detected, 'rows': rows}
 
     @staticmethod
@@ -1441,7 +1484,7 @@ class Ddns:
         rows = data.get('rows')
         if not isinstance(rows, list) or not 0 < len(rows) <= MAX_ROWS or not all(isinstance(r, dict) for r in rows):
             fail('invalid_rows')
-        if any(set(r) - {'name', 'type', 'accountId', 'confirmTakeover'} for r in rows):
+        if any(set(r) - {'name', 'type', 'accountId', 'confirmTakeover', 'options'} for r in rows):
             fail('invalid_rows')
         records, skipped = await self._add(owner, source, backup, ttl, data.get('options'), policy, rows)
         return {'ok': True, 'records': records, 'skipped': skipped}

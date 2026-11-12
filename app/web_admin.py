@@ -21,6 +21,7 @@ from app.agents.control import AgentControlService
 from app.runtime.scheduler import ControllerRuns, ExecutionScheduler
 from app.user_interactions import InteractionService
 from app.web_console.artifacts_api import WebAdminArtifactsMixin
+from app.web_console.extensions_api import WebAdminExtensionsMixin
 from app.web_console.auth_api import WebAdminAuthMixin
 from app.web_console.chat_api import WebAdminChatHandlersMixin
 from app.web_console.collab_api import WebAdminCollabMixin
@@ -79,6 +80,7 @@ from app.web_console.system_mcp_api import WebAdminSystemMcpMixin
 from app.web_console.statistics_api import WebAdminStatisticsMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.work_items_api import WebAdminWorkItemsMixin
+from app.web_console.notes_api import WebAdminNotesMixin
 from app.web_console.update_api import WebAdminUpdateMixin
 from app.web_console.uploads import WebAdminUploadsMixin
 from app.web_console.webhooks_api import WebhookPropertiesMixin
@@ -98,6 +100,7 @@ class WebAdminServer(
     WebAdminReferenceMixin,
     WebAdminAuthMixin,
     WebAdminArtifactsMixin,
+    WebAdminExtensionsMixin,
     WebAdminConversationsMixin,
     WebAdminConversationTreeMixin,
     WebAdminConversationRetentionMixin,
@@ -119,6 +122,7 @@ class WebAdminServer(
     WebAdminChatHandlersMixin,
     WebAdminTaskMemoryMixin,
     WebAdminWorkItemsMixin,
+    WebAdminNotesMixin,
     WebAdminMemoryMixin,
 ):
     def __init__(
@@ -205,6 +209,7 @@ class WebAdminServer(
         # and Agent notifications wake that same root turn immediately.
         self._web_controller_wake_events: dict[str, asyncio.Event] = {}
         self._web_controller_notifications: dict[str, list[dict[str, Any]]] = {}
+        self._web_held_notification_claims: dict[object, set[str]] = {}
         self._web_stop_markers: dict[str, int] = {}
         self._web_stopped_task_uuids: dict[str, set[str]] = {}
         self.interactions = InteractionService(db)

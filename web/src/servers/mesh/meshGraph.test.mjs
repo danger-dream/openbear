@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addLink, alignTo, avoidBend, drawnRule, edgeGeometry, legendText, lineIdOf, nextSlot, phoneLayout, planLink, ruleEnds, ruleNodes } from './meshGraph.js';
+import { addLink, alignTo, avoidBend, changeRole, customRelayLinks, drawnRule, edgeGeometry, legendText, lineIdOf, nextSlot, phoneLayout, planLink, relayPairs, ruleEnds, ruleNodes } from './meshGraph.js';
 
 const m = (serverId, role, extra = {}) => ({serverId, name: serverId.toUpperCase(), role, listen: {udp: role === 'relay' ? 1 : 0, tcp: 0, tls: 0}, entry: role === 'relay' ? null : {mode: 'fixed', candidates: []}, tags: [], ...extra});
 const work = () => ({members: [m('r1', 'relay', {listen: {udp: 0, tcp: 2, tls: 0}}), m('r2', 'relay'), m('a', 'member', {tags: ['x']}), m('b', 'member', {listen: {udp: 0, tcp: 3, tls: 0}})],
@@ -167,4 +167,84 @@ test('a link that would run under another node bows round it, just enough, to th
   const others = Object.entries(P).filter(([id]) => id !== 'win' && id !== 'sg').map(([, [x, y]]) => box(x, y));
   const narrow = avoidBend(box(...P.win), box(...P.sg), others);
   assert.ok(narrow && clear(box(...P.win), box(...P.sg), narrow, others, 4), `bend ${narrow}`);
+});
+
+test('a front (前置机) dials its own exit and its new links prefer TLS', () => {
+  const w = {members: [m('exit', 'relay', {listen: {udp: 51999, tcp: 52000, tls: 52001}}), m('front', 'relay', {front: ['exit'], listen: {udp: 0, tcp: 0, tls: 52001}}),
+    m('home', 'relay', {relayMode: 'site', listen: {udp: 51999, tcp: 0, tls: 0}}), m('sg', 'relay', {listen: {udp: 51999, tcp: 52000, tls: 0}}), m('pc', 'member')],
+  relayLinks: {mode: 'custom', pairs: []}, directLinks: [], rules: []};
+  // From either end: the front dials its exit, over TLS though the exit listens on UDP first.
+  assert.deepEqual(planLink(w, 'exit', 'front'), {kind: 'relay', a: 'exit', b: 'front', transport: 'tls', dialer: 'b'});
+  assert.deepEqual(planLink(w, 'front', 'exit'), {kind: 'relay', a: 'front', b: 'exit', transport: 'tls', dialer: 'a'});
+  // A site relay dials the front, on what the front listens on.
+  assert.deepEqual(planLink(w, 'front', 'home'), {kind: 'relay', a: 'front', b: 'home', transport: 'tls', dialer: 'b'});
+  // Another relay: the user's choice, still TCP before UDP where the other end has no TLS.
+  assert.equal(planLink(w, 'front', 'sg').transport, 'tcp');
+  // A member entering through the front: TLS.
+  assert.deepEqual(planLink(w, 'pc', 'front'), {kind: 'entry', member: 'pc', relay: 'front', transport: 'tls'});
+  // Nothing changes for links without a front.
+  assert.equal(planLink(w, 'sg', 'exit').transport, 'udp');
+});
+
+test('a member turned into a relay keeps its links as a relay has them, and back', () => {
+  // Entered by two relays and a site relay, linked directly with three members.
+  const w = {members: [m('r1', 'relay'), m('r2', 'relay'), m('home', 'relay', {relayMode: 'site'}),
+    m('m0', 'member', {listen: {udp: 51999, tcp: 52000, tls: 0}, entry: {mode: 'failover', candidates: [{id: 'c1', relay: 'r1', transport: 'udp'}, {id: 'c2', relay: 'r2', transport: 'tcp'}, {id: 'c3', relay: 'home', transport: 'udp'}]}}),
+    m('m1', 'member', {listen: {udp: 51999, tcp: 0, tls: 0}, entry: {mode: 'fixed', candidates: [{id: 'c1', relay: 'r1', transport: 'udp'}]}}),
+    m('sg', 'member', {listen: {udp: 51999, tcp: 0, tls: 0}, entry: null}), m('x', 'member', {entry: {mode: 'fixed', candidates: [{id: 'c1', relay: 'r2', transport: 'udp'}]}})],
+    relayLinks: {mode: 'custom', pairs: [{a: 'r1', b: 'r2', transport: 'udp', cost: 1, dialer: 'a', bias: 0}]},
+    directLinks: [{a: 'm1', b: 'm0', transport: 'udp', dialer: 'a'}, {a: 'm0', b: 'sg', transport: 'udp', dialer: 'a'}, {a: 'm1', b: 'x', transport: 'udp', dialer: 'a'}], rules: []};
+  const moved = changeRole(w, 'm0', true);
+  w.members[3].role = 'relay';
+  assert.deepEqual(moved, {entries: ['M1', 'SG'], links: ['R1', 'R2', 'HOME'], directs: []});
+  // The direct links to it are entries now, last; other direct links stay.
+  assert.deepEqual(w.directLinks, [{a: 'm1', b: 'x', transport: 'udp', dialer: 'a'}]);
+  assert.deepEqual(w.members[4].entry.candidates.map(c => [c.relay, c.transport]), [['r1', 'udp'], ['m0', 'udp']]);
+  assert.deepEqual(w.members[5].entry.candidates.map(c => [c.relay, c.transport]), [['m0', 'udp']]);
+  // Its entries are relay links it dials; to a site relay over UDP.
+  assert.deepEqual(w.relayLinks.pairs.slice(1).map(p => [p.a, p.b, p.transport, p.dialer]), [['m0', 'r1', 'udp', 'a'], ['m0', 'r2', 'tcp', 'a'], ['m0', 'home', 'udp', 'a']]);
+  // Nothing doubles when done again.
+  assert.deepEqual(changeRole(w, 'm0', true), {entries: [], links: [], directs: []});
+  // Back to a member: its relay links are its entries again (as they were), members through it link to it directly.
+  const back = changeRole(w, 'm0', false);
+  w.members[3].role = 'member';
+  assert.deepEqual(back, {entries: [], links: [], directs: ['M1', 'SG']});
+  assert.deepEqual(w.relayLinks.pairs.map(p => [p.a, p.b]), [['r1', 'r2']]);
+  assert.deepEqual(w.members[3].entry.candidates.map(c => [c.relay, c.transport]), [['r1', 'udp'], ['r2', 'tcp'], ['home', 'udp']]);
+  assert.deepEqual(w.members[4].entry.candidates.map(c => c.relay), ['r1']);
+  assert.deepEqual(w.members[5].entry.candidates, []);
+  assert.deepEqual(w.directLinks.slice(1).map(p => [p.a, p.b, p.transport]), [['m1', 'm0', 'udp'], ['sg', 'm0', 'udp']]);
+  // In full mode every relay links to every relay: no pairs to add.
+  const full = {...w, relayLinks: {mode: 'full', pairs: []}, directLinks: []};
+  assert.deepEqual(changeRole(full, 'm0', true).links, []);
+});
+
+test('11-09 review: every-pair links turned manual keep what was set on them; automatic links are only those listed', () => {
+  const w = {members: [m('r1', 'relay', {listen: {udp: 0, tcp: 2, tls: 0}}), m('r2', 'relay'), m('r3', 'relay'), m('a', 'member')],
+    relayLinks: {mode: 'full', pairs: [{a: 'r1', b: 'r2', transport: 'tls', cost: 4, dialer: 'b', bias: 100}]}, directLinks: [], rules: []};
+  customRelayLinks(w);
+  // The link set by hand as it was; the others still worked out by the mesh (a TCP-only relay is not dialled over UDP).
+  assert.deepEqual(w.relayLinks, {mode: 'custom', pairs: [{a: 'r1', b: 'r2', transport: 'tls', cost: 4, dialer: 'b', bias: 100},
+    {a: 'r1', b: 'r3', transport: 'udp', cost: 1, dialer: 'a', auto: ['transport', 'dialer', 'bias']}, {a: 'r2', b: 'r3', transport: 'udp', cost: 1, dialer: 'a', auto: ['transport', 'dialer', 'bias']}]});
+  // Automatic mode: the links it chose, not every pair; turned manual, those links as they are.
+  const auto = {...w, relayLinks: {mode: 'auto', pairs: [{a: 'r1', b: 'r2', transport: 'tcp', cost: 1, dialer: 'a', bias: 0, auto: ['transport', 'dialer', 'bias']}]}};
+  assert.deepEqual(relayPairs(auto), []);
+  customRelayLinks(auto);
+  assert.deepEqual(auto.relayLinks.pairs.map(p => [p.a, p.b, p.transport]), [['r1', 'r2', 'tcp']]);
+  // A front links only to its exits and to site relays, as the controller has it.
+  const fronted = {members: [m('exit', 'relay'), m('front', 'relay', {front: ['exit']}), m('sg', 'relay'), m('home', 'relay', {relayMode: 'site'})], relayLinks: {mode: 'full', pairs: []}};
+  assert.deepEqual(relayPairs(fronted), [['exit', 'front'], ['exit', 'sg'], ['exit', 'home'], ['front', 'home'], ['sg', 'home']]);
+  // Deleting one pair of the every-pair links keeps the rest, the one set by hand among them.
+  const one = {members: w.members, relayLinks: {mode: 'full', pairs: [{a: 'r1', b: 'r2', transport: 'tls', cost: 4, dialer: 'b', bias: 100}]}};
+  customRelayLinks(one, ['r3', 'r1']);
+  assert.deepEqual(one.relayLinks.pairs.map(p => [p.a, p.b, p.transport]), [['r1', 'r2', 'tls'], ['r2', 'r3', 'udp']]);
+});
+
+test('11-09 review: a relay turned member in automatic or every-pair mode leaves its links set by hand behind', () => {
+  for (const mode of ['auto', 'full']) {
+    const w = {members: [m('r1', 'relay'), m('r2', 'relay'), m('r3', 'relay')], directLinks: [], rules: [],
+      relayLinks: {mode, pairs: [{a: 'r1', b: 'r2', transport: 'udp', cost: 1, dialer: 'a', bias: 100, auto: ['transport', 'dialer']}, {a: 'r1', b: 'r3', transport: 'tcp', cost: 1, dialer: 'a'}]}};
+    changeRole(w, 'r2', false);
+    assert.deepEqual(w.relayLinks.pairs.map(p => [p.a, p.b]), [['r1', 'r3']], mode);
+  }
 });

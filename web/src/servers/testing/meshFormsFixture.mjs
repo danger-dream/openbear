@@ -18,13 +18,14 @@ export const VIEW_KEYS = ['name', 'platform', 'publicEndpointAuto', 'subnetSugge
 // The controller's mesh API, as much of it as the settings forms use: a draft checked on PUT
 // (errors with paths and messages), warnings for ports another program holds, and the LAN
 // networks each member's machine is on (members[].subnetSuggestions).
-export function fakeMesh() {
+// clashes: Home already routes LAX's 10.20.0.0/16 over wg0 (GET /mesh routeClashes).
+export function fakeMesh({clashes = false} = {}) {
   const doc = {
     settings: {prefix: '100.96.0.0/16', controlPrefix: '100.96.255.0/24', mtu: 1400, ports: {udp: 51999, tcp: 52000, tls: 52001}, health: {}},
     members: [member('berlin', 'Berlin', 'relay', {address: '100.96.0.1', tags: ['公司', '欧洲'], listen: {udp: 51999, tcp: 52000, tls: 0}}),
       member('lax', 'LAX', 'relay', {address: '100.96.0.2', tags: ['美国'], gateway: {subnets: ['10.20.0.0/16'], masquerade: true}}),
-      member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], listen: {udp: 51999, tcp: 52000, tls: 0}})],
-    relayLinks: {mode: 'full', pairs: []}, directLinks: [], rules: [],
+      member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], direct: true, listen: {udp: 51999, tcp: 52000, tls: 0}})],
+    relayLinks: {mode: 'full', pairs: []}, directLinks: [], rules: [], limits: [],
   };
   const suggestions = {home: ['192.168.50.0/24', '10.20.5.0/24'], lax: ['10.20.0.0/16'], berlin: []};
   const nodes = Object.fromEntries(doc.members.map(m => [m.serverId, {state: 'ready', appliedRevision: 3, error: '', summary: {entry: {}, ready: true, peers: 2, rttMs: null}}]));
@@ -41,7 +42,9 @@ export function fakeMesh() {
   }
   const view = () => ({ok: true, ...JSON.parse(JSON.stringify(doc)), members: doc.members.map(m => ({...JSON.parse(JSON.stringify(m)), subnetSuggestions: suggestions[m.serverId] || []})),
     applied: {revision: 3, at: Date.now()}, draft: {dirty: JSON.stringify(doc) !== JSON.stringify(applied), changes: []}, nodes, eligible: [],
-    apply: {running: false, revision: 3, progress: []}, errors: [], warnings: doc.members[2].listen.udp === 51999 ? JSON.parse(JSON.stringify(warnings)) : [], layout: {berlin: {x: 0, y: 0}, lax: {x: 300, y: 0}, home: {x: 150, y: 220}}, installing: []});
+    apply: {running: false, revision: 3, progress: []}, errors: [], warnings: doc.members[2].listen.udp === 51999 ? JSON.parse(JSON.stringify(warnings)) : [], layout: {berlin: {x: 0, y: 0}, lax: {x: 300, y: 0}, home: {x: 150, y: 220}}, installing: [],
+    ...(clashes ? {routeClashes: {home: [{route: '10.20.0.0/16', held: '10.20.0.0/16', dev: 'wg0', fixed: false,
+      taken: !(doc.members[2].keepRoutes || []).includes('10.20.0.0/16')}]}} : {})});
   return {
     doc, warnings,
     handle(method, path, body) {

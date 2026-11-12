@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,10 @@ log = get_logger("work_items.tool")
 _STATUS_ACTIONS = ("start", "complete", "block", "ask", "drop", "reopen")
 _DIFF_LIMIT = 200_000
 _DIFF_TIMEOUT_S = 10
+_MAX_OPS = 30
+_REFERENCE = re.compile(r"\$(\d+)((?:\.\d+)*)")
+# While ops run, panel notifications are collected here and sent once at the end.
+_PUBLISH_SINK: ContextVar[list[tuple[list[str], str]] | None] = ContextVar("work_item_publish_sink", default=None)
 
 
 def _json(data: Any) -> str:
@@ -139,6 +145,10 @@ class WorkItemTool:
         return actor
 
     async def _publish(self, ctx: Any, conversation_uuid: str, numbers: list[str], action: str) -> None:
+        sink = _PUBLISH_SINK.get()
+        if sink is not None:
+            sink.append((list(numbers), action))
+            return
         callback = getattr(ctx, "conversation_event", None)
         if not callable(callback):
             return
@@ -153,21 +163,57 @@ class WorkItemTool:
         action = str(args.get("action") or "list").strip().lower()
         if not conversation_uuid:
             return _json({"ok": False, "error": "no_conversation", "message": "work items live in a Web conversation"})
+        if action == "ops" or ("ops" in args and not args.get("action")):
+            return _json(await self._ops(ctx, conversation_uuid, args.get("ops")))
         try:
             actor = await self._actor(ctx, conversation_uuid)
             result = await self._controller(actor, conversation_uuid, action, args, ctx)
             return _json({"ok": True, **result})
-        except WorkItemConflict as exc:
-            return _json({"ok": False, "error": exc.code, "message": exc.message, "conflict": True})
-        except WorkItemNotFound as exc:
-            return _json({"ok": False, "error": exc.code, "message": exc.message})
-        except WorkItemError as exc:
-            return _json({"ok": False, "error": exc.code, "message": exc.message})
-        except (TypeError, ValueError) as exc:
-            return _json({"ok": False, "error": "invalid_arguments", "message": str(exc)[:300]})
-        except Exception:
-            log.exception("work_items.tool_failed", action=action)
-            return _json({"ok": False, "error": "work_item_error"})
+        except Exception as exc:
+            return _json(_failure(exc, action))
+
+    async def _ops(self, ctx: Any, conversation_uuid: str, ops: Any) -> dict[str, Any]:
+        """Run steps in order with each action's own checks; stop at the first failure, no rollback."""
+        if not isinstance(ops, list) or not ops:
+            return {"ok": False, "error": "ops_required", "message": "ops must be a non-empty list of steps"}
+        if len(ops) > _MAX_OPS:
+            return {"ok": False, "error": "too_many_ops", "message": f"at most {_MAX_OPS} steps per call"}
+        completed: list[dict[str, Any]] = []
+        created: list[list[str]] = []
+        failed: dict[str, Any] | None = None
+        sink: list[tuple[list[str], str]] = []
+        token = _PUBLISH_SINK.set(sink)
+        try:
+            actor = await self._actor(ctx, conversation_uuid)
+            for index, raw in enumerate(ops, 1):
+                action = str(raw.get("action") or "").strip().lower() if isinstance(raw, dict) else ""
+                try:
+                    if not action or action == "ops":
+                        raise WorkItemError("invalid_step", "each step is an object with its own action (ops cannot nest)")
+                    result = await self._controller(actor, conversation_uuid, action, _with_references(raw, created, index), ctx)
+                except Exception as exc:
+                    failed = {"step": index, "action": action, **_failure(exc, action)}
+                    break
+                created.append(list(result.get("created") or []))
+                if result.get("errors"):
+                    failed = {"step": index, "action": action, "ok": False, "error": result["errors"][0]["error"],
+                              "message": result["errors"][0]["message"], **result}
+                    break
+                completed.append({"step": index, "action": action, **result})
+        except Exception as exc:
+            failed = {"step": 0, "action": "", **_failure(exc, "ops")}
+        finally:
+            _PUBLISH_SINK.reset(token)
+        if sink:
+            numbers = list(dict.fromkeys(number for changed, _ in sink for number in changed))
+            actions = list(dict.fromkeys(action for _, action in sink))
+            await self._publish(ctx, conversation_uuid, numbers, actions[0] if len(actions) == 1 else "ops")
+        if failed is None:
+            return {"ok": True, "completed": completed}
+        return {"ok": False, "error": failed["error"], "message": failed.get("message", ""),
+                "failedStep": {key: value for key, value in failed.items() if key != "ok"}, "completed": completed,
+                "notRun": len(ops) - failed["step"],
+                "note": "steps before failedStep were applied and stay applied; fix the failed step and send only it and the rest"}
 
     async def _controller(self, actor: Actor, conversation_uuid: str, action: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         dao = self.dao
@@ -323,25 +369,71 @@ class WorkItemTool:
     async def _remaining(self, conversation_uuid: str, turn_uuid: str) -> list[str]:
         return [f"#{item['number']} {item['title']}" for item in await self.dao.unfinished(conversation_uuid, turn_uuid)][:20]
 
+
+def _failure(exc: Exception, action: str) -> dict[str, Any]:
+    if isinstance(exc, WorkItemConflict):
+        return {"ok": False, "error": exc.code, "message": exc.message, "conflict": True}
+    if isinstance(exc, (WorkItemNotFound, WorkItemError)):
+        return {"ok": False, "error": exc.code, "message": exc.message}
+    if isinstance(exc, (TypeError, ValueError)):
+        return {"ok": False, "error": "invalid_arguments", "message": str(exc)[:300]}
+    log.exception("work_items.tool_failed", action=action)
+    return {"ok": False, "error": "work_item_error"}
+
+
+def _with_references(step: dict[str, Any], created: list[list[str]], index: int) -> dict[str, Any]:
+    """Replace $N / $N.k item references with numbers created by earlier steps."""
+    def resolve(value: Any) -> Any:
+        text = str(value or "").strip().lstrip("#")
+        if not isinstance(value, str) or not text.startswith("$"):
+            return value
+        match = _REFERENCE.fullmatch(text)
+        if not match:
+            raise WorkItemError("invalid_reference", f"{value!r}: write $N or $N.k, N being an earlier create/add step")
+        step_number = int(match.group(1))
+        if not 1 <= step_number < index:
+            raise WorkItemError("invalid_reference", f"{value!r}: step {step_number} is not an earlier step")
+        numbers = created[step_number - 1]
+        if not numbers:
+            raise WorkItemError("invalid_reference", f"{value!r}: step {step_number} created no item; only create/add steps can be referenced")
+        return numbers[0] + match.group(2)
+
+    out = dict(step)
+    if "number" in out:
+        out["number"] = resolve(out["number"])
+    if isinstance(out.get("items"), list):
+        out["items"] = [resolve(item) for item in out["items"]]
+    if isinstance(out.get("entries"), list):
+        out["entries"] = [{**entry, "number": resolve(entry.get("number"))} if isinstance(entry, dict) and "number" in entry else entry
+                          for entry in out["entries"]]
+    if isinstance(out.get("decisions"), list):
+        out["decisions"] = [{**entry, "items": [resolve(item) for item in entry["items"]]}
+                            if isinstance(entry, dict) and isinstance(entry.get("items"), list) else entry
+                            for entry in out["decisions"]]
+    return out
+
 _DESCRIPTION = (
-    "The conversation's task record, shown to the user as the task panel. A task holds what the user raised, what was "
-    "investigated and proposed, the user's decisions and corrections, and the evidence it was done. Numbers like #4 / #4.3 / "
-    "#4.3.1 (at most three levels) never change. The framework records each entry's source turn. Where an action needs the "
-    "user's decision, cite interactionId (an answered questionnaire), or the user's message (this turn's, or sourceTurnUuid) "
-    "with a quote of their exact words. drop, reopening dropped work and phase=decided require a quote from the cited "
-    "message or interaction answer. Feedback/rejection does not approve the proposed action. Statuses: task discussing→decided→"
-    "in_progress→done|abandoned; items todo(待做)/doing(进行中)/blocked(受阻)/ask(等你定)/done(已完成)/dropped(按决定不做). "
-    "Actions: create (new task, optional nested children), add (children under number), update (title/description/criteria/"
-    "scopeMethod; needs the revision from get or list; changing criteria needs reason), note (kind investigation|proposal|note, "
-    "summary, optional evidence files), decide (the user's decision about items: interactionId with decisions[{questionId, "
-    "items}], or the user's message, quote optional), correct (the user corrected something, from the user's message: "
-    "old/new/why, optional field changes and status), focus (this turn's scope, only on the user's instruction: items), phase "
-    "(discussing|decided|in_progress; decided needs the user's decision), start (only items inside this turn's focus), complete "
-    "(items inside the focus, or a task or section above it once all under it are closed; summary and concrete evidence: "
-    "file, report, test, command, commit, link or message reference), block/ask (reason; items "
-    "without children), drop (needs the user's decision; closes unfinished descendants too), reopen (reason; reopening "
-    "dropped work needs the user's decision and restores only descendants closed by that same drop, never auto-starts them), "
-    "delete (an item created by mistake, with reason), get, list. Status actions take one number or entries[]."
+    "The conversation's task record (the user's task panel): what the user raised, investigations and proposals, the "
+    "user's decisions and corrections, and evidence of completion. Numbers #4 / #4.3 / #4.3.1 (max three levels) never "
+    "change; every entry's source turn is recorded. "
+    "Cite a user's decision as interactionId (answered questionnaire) or the user's message (this turn's, or "
+    "sourceTurnUuid) with a quote of their exact words; drop, reopening dropped work and phase=decided require the quote. "
+    "Feedback/rejection approves nothing. "
+    "Statuses: task discussing→decided→in_progress→done|abandoned; item todo(待做)/doing(进行中)/blocked(受阻)/ask(等你定)/"
+    "done(已完成)/dropped(按决定不做). "
+    "Actions: create (task, optional nested children); add (children under number); update (title/description/criteria/"
+    "scopeMethod, revision from get/list; changing criteria needs reason); note (kind, summary, optional evidence files); "
+    "decide (the user's decision on items: interactionId with decisions, or their message, quote optional); correct (the "
+    "user's correction from their message: old/new/why, optional field changes and status); focus (this turn's scope, "
+    "only on the user's instruction); phase (decided needs the user's decision); start (only inside this turn's focus); "
+    "complete (inside the focus, or a task/section above it once all under it is closed; summary and concrete evidence: "
+    "file, report, test, command, commit, link or message reference); block/ask (reason; items without children); drop "
+    "(the user's decision; also closes unfinished descendants); reopen (reason; dropped work needs the user's decision and "
+    "gets back only the descendants that drop closed, never auto-started); delete (an item created by mistake, with "
+    "reason); get; list. Status actions take number or entries[]. "
+    "action=ops runs ops[] in order, each step checked exactly as alone; it stops at the first failure (earlier steps "
+    "stay) and reports completed and failed steps. In steps \"$N\" is the item step N created (create: the task; add: its "
+    "first new item), \"$N.2\" its 2nd child; e.g. create, decide [$1], focus [$1], start $1.1."
 )
 
 _EVIDENCE_SCHEMA = {
@@ -349,7 +441,7 @@ _EVIDENCE_SCHEMA = {
     "items": {"type": "object", "properties": {
         "kind": {"type": "string", "enum": ["file", "report", "test", "command", "commit", "link", "message", "note"]},
         "path": {"type": "string", "description": "File or report path"},
-        "server": {"type": "string", "description": "For a file on a managed server rather than this machine: the server's name"},
+        "server": {"type": "string", "description": "Managed server name, for a file not on this machine"},
         "text": {"type": "string", "description": "Test/command result or note"},
         "commit": {"type": "string"},
         "url": {"type": "string"},
@@ -380,13 +472,15 @@ def register_work_item_tool(registry: ToolRegistry, dao: WorkItemsDAO, *, limits
             "properties": {
                 "action": {"type": "string", "enum": [
                     "create", "add", "update", "note", "decide", "correct", "focus", "phase", "start", "complete",
-                    "block", "ask", "drop", "reopen", "delete", "get", "list"]},
+                    "block", "ask", "drop", "reopen", "delete", "get", "list", "ops"]},
+                "ops": {"type": "array", "items": {"type": "object"}, "description": "Steps: {action, ...same fields as a single call}"},
                 "number": {"type": "string", "description": "Item number, e.g. 4 or 4.3"},
                 "items": {"type": "array", "items": {"type": "string"}, "description": "Item numbers (focus, decide)"},
                 "entries": {"type": "array", "items": {"type": "object", "properties": {
                     "number": {"type": "string"}, "summary": {"type": "string"}, "reason": {"type": "string"},
-                    "evidence": _EVIDENCE_SCHEMA, "revision": {"type": "integer"}, "quote": {"type": "string"},
-                }, "required": ["number"]}, "description": "Several status changes at once, each with its own summary/evidence/reason"},
+                    "evidence": {"type": "array", "items": {"type": "object"}, "description": "As evidence"},
+                    "revision": {"type": "integer"}, "quote": {"type": "string"},
+                }, "required": ["number"]}, "description": "Several status changes, each with its own summary/evidence/reason"},
                 "title": {"type": "string"},
                 "description": {"type": "string"},
                 "criteria": {"type": "array", "items": {"type": "string"}, "description": "Acceptance criteria"},
@@ -402,7 +496,7 @@ def register_work_item_tool(registry: ToolRegistry, dao: WorkItemsDAO, *, limits
                     "questionId": {"type": "string"}, "items": {"type": "array", "items": {"type": "string"}}},
                     "required": ["items"]}, "description": "Which questionnaire answers concern which items"},
                 "sourceTurnUuid": {"type": "string", "description": "An earlier turn whose user message is the source (from History)"},
-                "quote": {"type": "string", "description": "The user's exact words in the cited message"},
+                "quote": {"type": "string", "description": "The user's exact words in the cited message or answer"},
                 "old": {"type": "string"}, "new": {"type": "string"}, "why": {"type": "string"},
                 "status": {"type": "string", "description": "correct: also apply this status action (e.g. reopen)"},
                 "revision": {"type": "integer", "minimum": 1},

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.agent.live_output import LiveOutput
 from app.llm.events import Usage
 
 
@@ -64,6 +65,8 @@ class RunResult:
     output_tokens_sum: int = 0
     peak_tps: float = 0.0           # 本轮内单次模型 API 调用最高输出速率
     min_tps: float = 0.0            # 本轮内单次模型 API 调用最低输出速率（仅统计有输出的调用）
+    # The call now streaming, for live stats only.
+    live_output: LiveOutput = field(default_factory=LiveOutput)
     # 本轮思考(reasoning)总时长(ms)：累加每次 API 调用「首个 reasoning 增量 → 首个
     # 正文 content 增量」之间的间隔。思考内容虽加密，但时间可测。多轮工具调用会有
     # 多段思考，全部累加。think=off / 模型不吐 reasoning 的调用记 0。

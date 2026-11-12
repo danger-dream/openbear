@@ -87,6 +87,15 @@ class HTTPClient:
             limits=httpx.Limits(max_connections=max_connections),
         )
 
+    def configure_timeouts(self, *, connect_timeout_s: float, first_byte_timeout_s: float,
+                           idle_timeout_s: float, total_timeout_s: float) -> None:
+        """Apply hot-reloaded model timeouts to later requests; open streams keep theirs."""
+        self._connect_timeout_s = connect_timeout_s
+        self._first_byte_timeout_s = first_byte_timeout_s
+        self._idle_timeout_s = idle_timeout_s
+        self._total_timeout_s = total_timeout_s
+        self._http.timeout = httpx.Timeout(self._default_timeout_s, connect=connect_timeout_s)
+
     async def close(self) -> None:
         await self._http.aclose()
 
@@ -153,6 +162,7 @@ class HTTPClient:
             else self._total_timeout_s
         )
         total_deadline = (req_start + total_to) if total_to > 0 else None
+        idle_to = self._idle_timeout_s
         # 流式读取的 read 超时交给下面的四段逻辑全权控制(read=None),connect 仍由 httpx 把关。
         stream_timeout = httpx.Timeout(self._default_timeout_s, connect=self._connect_timeout_s, read=None)
         # Manual SSE deadlines only start after headers. Keep the existing normal
@@ -206,7 +216,7 @@ class HTTPClient:
                                 f"上游首字节响应超时（{int(first_byte_to)}s 无响应）",
                                 retryable=True, protocol=protocol) from None
                         raise OpenBearLLMError(
-                            f"上游流式空闲超时（{int(self._idle_timeout_s)}s 无数据）",
+                            f"上游流式空闲超时（{int(idle_to)}s 无数据）",
                             retryable=True, protocol=protocol) from None
                     wait_s = seg_remaining
                     if total_remaining is not None:
@@ -235,7 +245,7 @@ class HTTPClient:
                                 f"上游首字节响应超时（{int(first_byte_to)}s 无响应）",
                                 retryable=True, protocol=protocol) from None
                         raise OpenBearLLMError(
-                            f"上游流式空闲超时（{int(self._idle_timeout_s)}s 无数据）",
+                            f"上游流式空闲超时（{int(idle_to)}s 无数据）",
                             retryable=True, protocol=protocol) from None
                     if not line:
                         name, event_name = event_name, ""
@@ -255,7 +265,7 @@ class HTTPClient:
                             continue
                         first_data = True
                         yield name, data
-                        data_deadline = time.monotonic() + self._idle_timeout_s
+                        data_deadline = time.monotonic() + idle_to
                         continue
                     if line.startswith(":"):
                         continue  # Heartbeats do not refresh data deadlines.

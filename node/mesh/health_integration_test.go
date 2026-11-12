@@ -49,6 +49,53 @@ func healthWait(t *testing.T, within time.Duration, f func() bool) {
 func (l *lab) startHealthNode(name string) *running {
 	return l.start(name, NewAttachment(l.config(name)))
 }
+
+// activeTo is the path n has committed for peer, if any.
+func activeTo(n *running, peer string) (health.Path, bool) {
+	for _, p := range n.bind.(*streamBind).Paths() {
+		if p.PeerID == peer && p.Active {
+			return health.Path(p.Ref), true
+		}
+	}
+	return health.Path{}, false
+}
+
+// The end that accepts a link, its path to the dialing end no longer
+// committed while the dialer's probes go on being answered over it (as when
+// it answered the prepare before the peer was a link here), asks for the
+// prepare again, commits the path and sends over it.
+func TestHealthAcceptedLinkRecommits(t *testing.T) {
+	l := newHealthLab(t, spec{relays: []string{"A", "Z"}, rules: map[string][]Rule{"A": allowICMP, "Z": allowICMP}})
+	nodes := map[string]*running{"A": l.startHealthNode("A"), "Z": l.startHealthNode("Z")}
+	t.Cleanup(func() {
+		if t.Failed() {
+			for id, n := range nodes {
+				t.Logf("failure %s health=%+v status=%+v events=%+v", id, n.health.Snapshot(), n.status(), n.events.snapshot())
+			}
+		}
+	})
+	healthWait(t, 15*time.Second, func() bool {
+		a, ok := activeTo(nodes["A"], "Z")
+		z, ok2 := activeTo(nodes["Z"], "A")
+		return ok && ok2 && nodes["A"].control.DataReady("Z", a) && nodes["Z"].control.DataReady("A", z)
+	})
+	path, _ := activeTo(nodes["Z"], "A")
+	if err := nodes["Z"].control.Deactivate("A", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := activeTo(nodes["Z"], "A"); ok {
+		t.Fatal("still committed")
+	}
+	healthWait(t, 5*time.Second, func() bool {
+		_, ok := activeTo(nodes["Z"], "A")
+		return ok
+	})
+	for _, pair := range [][2]string{{"Z", "A"}, {"A", "Z"}} {
+		send(nodes[pair[0]], packet(l.addr(pair[0]), l.addr(pair[1]), 1, 64, 0, 0, false, icmp(8, 52, nil)))
+		expect(t, nodes[pair[1]], pair[0]+" -> "+pair[1]+" after the accepting end recommitted")
+	}
+}
+
 func TestHealthRealDataAndRelayRecovery(t *testing.T) {
 	l := newHealthLab(t, spec{relays: []string{"A", "B", "Z"}, members: map[string][]string{"M": {"A", "B"}, "N": {"B", "A"}}, rules: map[string][]Rule{"A": allowICMP, "B": allowICMP, "Z": allowICMP, "M": allowICMP, "N": allowICMP}})
 	nodes := map[string]*running{}

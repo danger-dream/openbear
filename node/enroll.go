@@ -18,12 +18,31 @@ import (
 	"time"
 )
 
+// EnrollAccess is how a front reaches the controller through its exits: the
+// certificates its addresses present instead of CA-signed ones, and that it is one.
+type EnrollAccess struct {
+	Pins, BackupPins []string
+	Front            bool
+}
+
 // Enroll registers a freshly generated key with a one-time code. Only the
 // public key leaves this machine. fingerprint, when the install command gives
 // one, is the SHA-256 (hex) of the controller's identity key: a response with
 // another key, as from anything on a plain-http path, ends the enrollment.
-func Enroll(ctx context.Context, rawURL, backup, code, fingerprint string, caps Capabilities) (Config, error) {
+func Enroll(ctx context.Context, rawURL, backup, code, fingerprint string, caps Capabilities, access ...EnrollAccess) (Config, error) {
 	base, err := ControllerURL(rawURL)
+	if err != nil {
+		return Config{}, err
+	}
+	var how EnrollAccess
+	if len(access) > 0 {
+		how = access[0]
+	}
+	urlPins, err := cleanPins(how.Pins)
+	if err != nil {
+		return Config{}, err
+	}
+	backupPins, err := cleanPins(how.BackupPins)
 	if err != nil {
 		return Config{}, err
 	}
@@ -51,8 +70,14 @@ func Enroll(ctx context.Context, rawURL, backup, code, fingerprint string, caps 
 		"info": info, "version": Version, "protocol": ProtocolVersion, "protocolMin": ProtocolMin})
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	pinned := Config{URL: base.String()}
+	if spare != nil {
+		pinned.Backup = spare.String()
+	}
+	pinned.setPins(urlPins, backupPins)
 	post := func(target *url.URL) (*http.Response, error) {
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: pinned.tlsFor(target)},
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint(target, "/api/server-nodes/v1/enroll", false), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", "openbear-node/"+Version)
@@ -84,7 +109,7 @@ func Enroll(ctx context.Context, rawURL, backup, code, fingerprint string, caps 
 		return Config{}, fmt.Errorf("enrollment failed: %s", result.Error)
 	}
 	c := Config{URL: base.String(), NodeID: result.NodeID, PrivateKey: base64.StdEncoding.EncodeToString(priv.Seed()),
-		ControllerKey: result.ControllerKey, Capabilities: caps}
+		ControllerKey: result.ControllerKey, Capabilities: caps, Pins: pinned.Pins, Front: how.Front}
 	if spare != nil {
 		c.Backup = spare.String()
 	}

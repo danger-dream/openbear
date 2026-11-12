@@ -820,6 +820,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
             payload={
                 "role": "user",
                 "text": str(event.get("text") or ""),
+                "attachments": event.get("attachments") if isinstance(event.get("attachments"), list) else [],
                 **({"references": event["references"], "referenceBundleId": str(event.get("referenceBundleId") or "")} if event.get("references") else {}),
                 "queued": True,
                 "interruption": True,
@@ -876,6 +877,11 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
             "taskCounts": event.get("taskCounts") if isinstance(event.get("taskCounts"), dict) else {},
             "updatedAtMs": ts,
         }
+        # Start carries the controller's verdicts on the previous review; the
+        # wake carries each Agent's digest lines and alerts.
+        for key in ("assessments", "agents"):
+            if isinstance(event.get(key), list) and event.get(key):
+                payload[key] = event[key]
         specs.append(_operation_spec(
             op_id=f"agent-supervision:{wait_cycle_uuid or run_root_turn_uuid or turn_uuid or 'current'}",
             op_type="agent_supervision", action=action, turn_uuid=turn_uuid,
@@ -1212,13 +1218,74 @@ _TOOL_SUMMARY_PAYLOAD_FIELDS = frozenset({
 })
 _TOOL_SUMMARY_TEXT_CHARS = 512
 _TOOL_ERROR_STATUSES = {"failed", "cancelled", "interrupted"}
-# Keep this order aligned with the established browser-side collapsed-card
-# renderer.  The list API sends only the one source value it needs, while the
-# browser keeps ownership of the visual presentation.
+# A large argument object keeps its structure for the browser-side card renderer, every long
+# string cut to its start and end: the renderer also matches the end of a command (a docker
+# step after a long script), and names, ids, switches and list lengths stay as they are (it
+# counts lists: a shortened one would name a wrong number of servers).
+_TOOL_PREVIEW_CUTS = ((180, 60), (60, 20))
+_TOOL_PREVIEW_CHARS = 6000
+# Past that size, as before: the one value the renderer would show first, in this order.
 _TOOL_PREVIEW_ARGUMENT_KEYS = (
     "description", "command", "pattern", "query", "title", "body", "name",
     "ref", "path", "old_string", "content", "action", "text", "instruction", "task",
 )
+
+
+# A collapsed card's line also states how a call came out ("3 台服务器 · 全部完成").  For these tools the
+# summary carries a digest of the result: its shape and counts, never its content.
+_TOOL_RESULT_DIGEST_TOOLS = frozenset({"Servers", "Browser", "WorkItem", "RequestExtension"})
+_TOOL_RESULT_DIGEST_CHARS = 4000
+_TOOL_RESULT_DIGEST_TEXT = 120
+# What a list element keeps: the fields a card counts or names a failure by.
+_TOOL_RESULT_DIGEST_ITEM_KEYS = (
+    "ok", "state", "status", "outcome", "exitCode", "timedOut", "reason", "error", "verified",
+    "number", "step", "action", "message", "serverId", "remotePath",
+)
+_TOOL_RESULT_DIGEST_ITEM_KEYS_SHORT = ("ok", "state", "status", "outcome", "exitCode", "timedOut", "number")
+
+
+def _result_digest_value(value: Any, depth: int, item_keys: tuple[str, ...]) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= _TOOL_RESULT_DIGEST_TEXT else None
+    if depth >= 3:
+        return None
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            digested = _result_digest_value(item, depth + 1, item_keys)
+            if digested is not None:
+                out[key] = digested
+        return out
+    if isinstance(value, list):
+        # A list keeps its length; its objects keep only their state fields, other elements are blanked.
+        return [
+            {key: item[key] for key in item_keys if isinstance(item.get(key), (bool, int, float))
+             or isinstance(item.get(key), str) and len(item[key]) <= _TOOL_RESULT_DIGEST_TEXT}
+            if isinstance(item, dict) else None
+            for item in value[:100]
+        ]
+    return None
+
+
+def _tool_result_digest(payload: dict[str, Any]) -> str:
+    """Bounded JSON of a result's shape and counts for the collapsed card, or ""."""
+    if str(payload.get("name") or payload.get("toolName") or "") not in _TOOL_RESULT_DIGEST_TOOLS:
+        return ""
+    raw = payload.get("resultText") if "resultText" in payload else payload.get("result")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    for item_keys in (_TOOL_RESULT_DIGEST_ITEM_KEYS, _TOOL_RESULT_DIGEST_ITEM_KEYS_SHORT):
+        text = json.dumps(_result_digest_value(raw, 0, item_keys), ensure_ascii=False, separators=(",", ":"))
+        if len(text) <= _TOOL_RESULT_DIGEST_CHARS:
+            return text
+    return ""
 
 
 def _tool_summary_text(value: Any, *, limit: int = _TOOL_SUMMARY_TEXT_CHARS) -> str:
@@ -1294,14 +1361,25 @@ def _task_memory_preview_arguments(payload: dict[str, Any]) -> str:
     return json_dumps(preview)
 
 
+def _shrunk_arguments(value: Any, head: int, tail: int, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= head + tail + 1 else f"{value[:head]}…{value[-tail:]}"
+    if isinstance(value, dict):
+        return {key: _shrunk_arguments(item, head, tail, depth + 1) for key, item in value.items()} if depth < 6 else {}
+    if isinstance(value, list):
+        return [_shrunk_arguments(item, head, tail, depth + 1) for item in value] if depth < 6 else []
+    return value
+
+
 def _tool_preview_arguments(payload: dict[str, Any]) -> str:
     """Return a bounded source for the existing browser-side card preview.
 
     ``preview`` is a renderer line (for example ``💻 Bash: ...``), so returning
     it to a card that already renders the icon and tool name duplicates both.
     This field deliberately contains argument source only, never a newly
-    formatted UI label.  Small argument objects are retained verbatim; for a
-    large object, retain the same first display candidate used by the browser.
+    formatted UI label.  Small argument objects are retained verbatim; a large
+    one keeps its structure with long strings shortened (_TOOL_PREVIEW_CUTS),
+    and one still too large the first display candidate used by the browser.
     """
     tool_name = str(payload.get("name") or payload.get("toolName") or "").strip()
     if tool_name == "TaskMemory":
@@ -1324,6 +1402,10 @@ def _tool_preview_arguments(payload: dict[str, Any]) -> str:
     arguments = _summary_json_object(raw)
     if not arguments:
         return _tool_summary_text(raw_text)
+    for head, tail in _TOOL_PREVIEW_CUTS:
+        shrunk = json.dumps(_shrunk_arguments(arguments, head, tail), ensure_ascii=False, separators=(",", ":"))
+        if len(shrunk) <= _TOOL_PREVIEW_CHARS:
+            return shrunk
     for key in _TOOL_PREVIEW_ARGUMENT_KEYS:
         value = arguments.get(key)
         if isinstance(value, str) and value.strip():
@@ -1423,6 +1505,9 @@ def _tool_summary_payload(payload: dict[str, Any], status: str) -> dict[str, Any
     if "outputPreview" in summary:
         summary["outputPreview"] = _tool_summary_text(summary["outputPreview"])
     summary["resultState"] = _tool_result_state(payload, status)
+    digest = _tool_result_digest(payload)
+    if digest:
+        summary["resultDigest"] = digest
     return summary
 
 

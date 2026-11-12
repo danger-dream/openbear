@@ -384,6 +384,33 @@ test("monitor timeline turns structured task events into readable supervision ca
   assert.equal(isAgentMonitorEventKind("model_call_finished"), false);
 });
 
+test("supervision card shows only this Agent's verdict, alerts and digest lines", () => {
+  const detail = {
+    wakeReason: "supervision_alert",
+    assessments: [
+      {taskUuid: "task-1", verdict: "correct", basis: "连续三次改同一处"},
+      {taskUuid: "task-2", verdict: "continue", basis: "按计划推进"},
+    ],
+    agents: [
+      {taskUuid: "task-1", highlights: ["工具 Edit×3", "改动 a.py"], note: "再试一次", alerts: ["同一编辑重复 4 次：a.py"]},
+      {taskUuid: "task-2", highlights: ["工具 Read×5"], note: "", alerts: []},
+    ],
+  };
+  const [first] = buildAgentMonitorTimeline([
+    {key: "s1", taskUuid: "task-1", kind: "agent_supervision", summary: "Agent 出现需要关注的情况，已唤醒主控", detail},
+  ], completedSnapshot());
+  assert.equal(first.category, "主控监督");
+  assert.equal(first.description, "上次复查判断：纠正 · 连续三次改同一处");
+  assert.deepEqual(first.bullets, ["提醒：同一编辑重复 4 次：a.py", "工具 Edit×3", "改动 a.py", "Agent 说明：再试一次"]);
+  assert.deepEqual(first.badges, ["纠正", "1 条提醒"]);
+  assert.equal(first.tone, "warning");
+  const [second] = buildAgentMonitorTimeline([
+    {key: "s2", taskUuid: "task-2", kind: "agent_supervision", summary: "统一复查", detail},
+  ], completedSnapshot());
+  assert.deepEqual(second.bullets, ["工具 Read×5"]);
+  assert.equal(second.tone, "success");
+});
+
 test("terminal Plan defaults to the last completed required step", () => {
   const snapshot = completedSnapshot();
   snapshot.current.plan.steps.push({

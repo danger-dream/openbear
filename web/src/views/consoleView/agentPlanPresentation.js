@@ -430,6 +430,36 @@ function monitorStepContext(item, planView) {
   };
 }
 
+const SUPERVISION_VERDICTS = {
+  continue: {label: "继续", tone: "success"},
+  correct: {label: "纠正", tone: "warning"},
+  stop: {label: "停止", tone: "danger"},
+};
+
+// One supervision cycle is attached to every Agent card; show only this Agent's
+// digest lines, alerts and the controller's verdict on its previous review.
+function supervisionEventView(base, item, detail) {
+  const taskUuid = text(item.taskUuid);
+  const own = (row) => !taskUuid || text(object(row).taskUuid) === taskUuid;
+  const agent = object(array(detail.agents).find(own));
+  const assessment = object(array(detail.assessments).find(own));
+  const verdict = SUPERVISION_VERDICTS[text(assessment.verdict)];
+  const alerts = array(agent.alerts).map((value) => text(value)).filter(Boolean);
+  const note = text(agent.note);
+  return {
+    ...base,
+    category: "主控监督",
+    description: verdict ? `上次复查判断：${verdict.label} · ${text(assessment.basis)}` : "",
+    bullets: [
+      ...alerts.map((value) => `提醒：${value}`),
+      ...array(agent.highlights).map((value) => text(value)).filter(Boolean),
+      ...(note ? [`Agent 说明：${note}`] : []),
+    ],
+    badges: [verdict?.label, alerts.length ? `${alerts.length} 条提醒` : ""].filter(Boolean),
+    tone: alerts.length ? "warning" : (verdict?.tone || base.tone),
+  };
+}
+
 function monitorEventView(item = {}, planView = {}) {
   const kind = text(item.kind || item.type);
   const detail = object(item.detail);
@@ -588,6 +618,9 @@ function monitorEventView(item = {}, planView = {}) {
   }
   if (kind.startsWith("model_context_")) {
     return {...base, category: "上下文维护", title: summary, description: text(detail.reason || detail.message), tone: kind.endsWith("failed") ? "danger" : "warning"};
+  }
+  if (kind === "agent_supervision") {
+    return supervisionEventView(base, item, detail);
   }
   return {...base, description: text(detail.message || detail.reason)};
 }

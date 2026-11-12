@@ -47,7 +47,7 @@ def data_dir_from_config(config: Any) -> Path:
 # Instance deployment and the access gateway read these from the install root.
 # The 0.12 web updater did not replace them, so upgrading with it leaves them
 # out; it keeps the verified, extracted package until the next update starts.
-PACKAGE_EXTRAS = ("gateway/bin", "gateway/README.md", "Dockerfile", ".dockerignore", "docs/instances.md")
+PACKAGE_EXTRAS = ("gateway/bin", "gateway/README.md", "Dockerfile", ".dockerignore", "docs/instances.md", "benchmark-package")
 
 
 def restore_package_extras(install_root: Path, data_dir: Path) -> list[str]:
@@ -125,8 +125,10 @@ class UpdateService:
         self._etag = ""
         self._http: httpx.AsyncClient | None = None
 
+    def restore_extras(self) -> list[str]:
+        return restore_package_extras(self.install_root, self.data_dir)
+
     async def start(self) -> None:
-        restore_package_extras(self.install_root, self.data_dir)
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0),
             follow_redirects=True,

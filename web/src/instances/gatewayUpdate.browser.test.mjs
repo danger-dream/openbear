@@ -6,7 +6,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../browserTestServer.
 import {createGatewayUpdateBackend, NEW, OLD} from './gatewayUpdateFixture.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 
 // Screenshots go here when OPENBEAR_GATEWAY_UPDATE_SHOTS names a directory.
 const shots = process.env.OPENBEAR_GATEWAY_UPDATE_SHOTS || '';

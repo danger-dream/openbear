@@ -11,10 +11,14 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
+
+	meshproxy "openbear/node/mesh/proxy"
 )
 
 // Run blocks until ctx ends, then removes the interface, routes and firewall
@@ -44,7 +48,7 @@ func Run(ctx context.Context, dir string) error {
 			var c *Config
 			if c, err = ParseConfig(raw); err == nil {
 				if e, err = bringUp(dir, c, privateKey, events); err == nil {
-					limitMemory(c)
+					r.took(c)
 					r.revision, r.applied, r.err = c.Revision, c.Revision, ""
 					events.add("config.applied", fmt.Sprintf("revision %d", c.Revision))
 					r.saveApplied(raw)
@@ -69,6 +73,8 @@ func Run(ctx context.Context, dir string) error {
 		}
 	}
 	defer func() {
+		r.probes.Close()
+		r.proxy.Close()
 		e.close()
 		events.add("stop", "stopped")
 		st := Status{ConfigRevision: r.revision, AppliedRevision: r.applied, ConfigStamp: r.stamp(), Error: r.err, Iface: e.name}
@@ -100,6 +106,7 @@ func Run(ctx context.Context, dir string) error {
 			}
 		}
 		if n%10 == 0 {
+			r.proxy.Retry()
 			if cur := e.learnedEndpoints(); !maps.Equal(cur, learned) {
 				if err := saveEndpoints(dir, cur); err == nil {
 					learned = cur
@@ -108,6 +115,8 @@ func Run(ctx context.Context, dir string) error {
 		}
 		st := e.status()
 		st.ConfigRevision, st.AppliedRevision, st.ConfigStamp = r.revision, r.applied, r.stamp()
+		st.Proxy = r.proxy.Status()
+		st.Probes = r.probes.Status()
 		if r.err != "" {
 			st.Error = r.err
 		}
@@ -128,6 +137,8 @@ type runner struct {
 	err      string
 	tried    time.Time
 	cpu      cpuSampler
+	proxy    meshproxy.Service
+	probes   ProbeService
 }
 
 func (r *runner) read() ([]byte, os.FileInfo, error) {
@@ -199,10 +210,18 @@ func (r *runner) reload(e *engine) {
 		r.err = msg
 		return
 	}
-	limitMemory(c)
+	r.took(c)
 	r.applied, r.err = c.Revision, ""
 	r.events.add("config.applied", fmt.Sprintf("revision %d", c.Revision))
 	r.saveApplied(raw)
+}
+
+// took follows a config the engine runs now: the memory limit for its role
+// and the exit proxy's part of it.
+func (r *runner) took(c *Config) {
+	limitMemory(c)
+	r.proxy.Apply(c.Proxy, c.Self.Address, []netip.Prefix{c.Network.Prefix, c.Network.ControlPrefix})
+	r.probes.Apply(c.Probe)
 }
 
 // appliedFile keeps the config last applied. A running data plane keeps it
@@ -242,7 +261,7 @@ func (r *runner) fallback(privateKey string, failed []byte, cause error) *engine
 	if err != nil {
 		return nil
 	}
-	limitMemory(c)
+	r.took(c)
 	r.applied, r.tried = c.Revision, time.Now()
 	r.err = fmt.Sprintf("revision %d not applied: %v", r.revision, cause)
 	r.events.add("config.applied", fmt.Sprintf("revision %d, the last applied; %s", c.Revision, r.err))
@@ -250,18 +269,32 @@ func (r *runner) fallback(privateKey string, failed []byte, cause error) *engine
 	return e
 }
 
-// limitMemory makes the GC work harder before the process reaches the
-// controller's alarm level: 160 MiB for members, 256 MiB for relays.
-// GOMEMLIMIT, when set, wins.
+// memoryAlarm is the resident memory the controller alarms at, which status
+// reports: a sixth of the machine's memory for members and a quarter for
+// relays, within [160 MiB, 1 GiB] and [260 MiB, 2 GiB]; machines with less
+// memory, or of unknown memory, keep the lower end.
+func memoryAlarm(profile string, machine uint64) uint64 {
+	low, high, share := uint64(160<<20), uint64(1<<30), uint64(6)
+	if profile == roleRelay {
+		low, high, share = 260<<20, 2<<30, 4
+	}
+	return min(max(machine/share, low), high)
+}
+
+// memoryLimit is the alarm level limitMemory set, for status.
+var memoryLimit atomic.Uint64
+
+// limitMemory makes the GC work harder from four fifths of the alarm on,
+// before the process reaches it. GOMEMLIMIT, when set, wins, and the alarm
+// follows it.
 func limitMemory(c *Config) {
 	if os.Getenv("GOMEMLIMIT") != "" {
+		memoryLimit.Store(uint64(debug.SetMemoryLimit(-1)) / 4 * 5)
 		return
 	}
-	limit := int64(128 << 20)
-	if resourceProfile(c) == roleRelay {
-		limit = 208 << 20
-	}
-	debug.SetMemoryLimit(limit)
+	alarm := memoryAlarm(resourceProfile(c), machineMemory())
+	debug.SetMemoryLimit(int64(alarm / 5 * 4))
+	memoryLimit.Store(alarm)
 }
 
 func (r *runner) fail(revision int64, err error) {
@@ -280,7 +313,9 @@ func (r *runner) write(s Status) {
 	fillProcess(&s, r.started, r.events)
 	used, ok := processCPU()
 	s.Resources.CPUPercent = r.cpu.percent(time.Now(), used, ok)
-	if err := writeAtomic(filepath.Join(r.dir, "status.json"), s); err != nil {
+	path := StatusPath(r.dir)
+	os.MkdirAll(filepath.Dir(path), 0o700)
+	if err := writeAtomic(path, s); err != nil {
 		log.Printf("mesh: status: %v", err)
 	}
 }

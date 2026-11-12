@@ -6,6 +6,8 @@ import math
 import re
 
 from app.instances.contracts import InstanceError
+from app.servers import front as fronts
+from app.servers import latency as latencies
 
 TRAFFIC_TYPES = ('max', 'sum', 'up', 'down', 'min')
 # billing: monthly on the billing date's day; fixed: monthly on resetDay;
@@ -42,7 +44,7 @@ def _number(value, low, high, error, integer=False):
 def clean(data, prior=None):
     """Merge a PATCH-style update; unknown keys are rejected."""
     prior = prior or {}
-    if not isinstance(data, dict) or set(data) - {'alias', 'group', 'tags', 'provider', 'providerUrl', 'remark', 'region', 'sort', 'billing', 'traffic', 'access'}:
+    if not isinstance(data, dict) or set(data) - {'alias', 'group', 'tags', 'provider', 'providerUrl', 'remark', 'region', 'sort', 'billing', 'traffic', 'access', 'front', 'latency'}:
         raise InstanceError('invalid_server_profile')
     out = dict(prior)
     for key, limit in (('alias', 60), ('group', 40), ('provider', 60), ('remark', 2000)):
@@ -67,6 +69,19 @@ def clean(data, prior=None):
         if not isinstance(a, dict) or set(a) - {'primary', 'backup'}:
             raise InstanceError('invalid_server_access')
         out['access'] = {k: _text(a.get(k), 40, 'invalid_server_access') for k in ('primary', 'backup')}
+    if 'front' in data:
+        front = fronts.clean(data['front'])
+        if front:
+            out['front'] = front
+        else:
+            out.pop('front', None)
+    # Its own latency targets, or null to follow the settings.
+    if 'latency' in data:
+        own = latencies.clean_targets(data['latency'])
+        if own is None:
+            out.pop('latency', None)
+        else:
+            out['latency'] = own
     if 'billing' in data:
         b, old = data['billing'] or {}, prior.get('billing') or {}
         if not isinstance(b, dict) or set(b) - {'price', 'currency', 'cycle', 'startedAt', 'expiresAt', 'autoRenew', 'billingDay'}:

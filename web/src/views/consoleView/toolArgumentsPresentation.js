@@ -98,7 +98,9 @@ const FRESHNESS_LABELS = {
 };
 
 const ZONE_LABELS = {cn: "中国", intl: "国际"};
-const HISTORY_SCOPE_LABELS = {current: "当前对话", explicit: "指定对话", conversation: "指定对话"};
+const HISTORY_SCOPE_LABELS = {current: "当前对话", others: "其他对话", all: "全部对话", explicit: "指定对话", conversation: "指定对话"};
+const HISTORY_SOURCE_LABELS = {visible: "可见对话", execution: "执行记录"};
+const HISTORY_ORDER_LABELS = {newest: "新的在前", oldest: "旧的在前"};
 const HISTORY_FROM_LABELS = {start: "从开头", end: "从末尾"};
 function asText(value) {
 	if (value === undefined || value === null) return "";
@@ -340,19 +342,36 @@ function bashView(toolName, data) {
 	return view.finish(description || firstLine(command));
 }
 
+function readRange(entry) {
+	const offset = Number(entry?.offset), limit = Number(entry?.limit);
+	const from = Number.isFinite(offset) && entry?.offset !== undefined && entry?.offset !== null ? `自第 ${offset} 行` : "";
+	const size = Number.isFinite(limit) && entry?.limit !== undefined && entry?.limit !== null ? `${limit} 行` : "";
+	return [from, size].filter(Boolean).join(" ");
+}
+
 function readView(toolName, data) {
 	const view = new ViewBuilder(toolName, data);
 	const path = view.take("path");
 	const description = view.take("description");
 	view.addTag("说明", description, {wide: true, primary: true});
 	view.addRow("文件路径", path, {kind: "path", primary: true});
+	const reads = view.take("reads");
+	if (Array.isArray(reads)) {
+		view.addTag("文件数", `${reads.length} 个`, {primary: true});
+		reads.forEach((entry, index) => {
+			const range = readRange(entry);
+			view.addRow(`文件 ${index + 1}`, `${String(entry?.path || "")}${range ? `（${range}）` : ""}`, {kind: "path", primary: index === 0});
+		});
+	} else if (reads !== undefined) {
+		view.addBlock("reads", prettyJson(reads), "json");
+	}
 	for (const [key, label, suffix] of [["offset", "起始行", ""], ["limit", "读取行数", " 行"]]) {
 		const value = view.take(key);
 		if (value !== undefined && value !== null && value !== "") view.addTag(label, `${value}${suffix}`);
 	}
 	const force = view.take("force");
 	if (force !== undefined) view.addTag("强制读取", boolLabel(force));
-	return view.finish(description || path);
+	return view.finish(description || path || (Array.isArray(reads) ? `读取 ${reads.length} 个文件或片段` : ""));
 }
 
 function writeView(toolName, data) {
@@ -485,14 +504,25 @@ function historyView(toolName, data) {
 	const view = new ViewBuilder(toolName, data);
 	const action = view.take("action");
 	view.addTag("操作", actionLabel(action), {primary: true});
+	const source = view.take("source");
+	view.addTag("来源", HISTORY_SOURCE_LABELS[String(source || "")] || source);
 	const scope = view.take("scope");
-	view.addTag("范围", HISTORY_SCOPE_LABELS[String(scope || "")] || scope);
-	const conversationUuid = view.takeFirst(["conversationUuid", "conversation_uuid"]);
+	const currentTask = view.take("currentTask");
+	// Without scope, search covers all conversations and every other action the current one.
+	const named = HAS(view.data, "conversationUuid") || HAS(view.data, "conversation_uuid");
+	view.addTag("范围", currentTask === true ? "当前任务" : scope ? HISTORY_SCOPE_LABELS[String(scope)] || "指定对话"
+		: named ? "指定对话" : action === "search" ? "全部对话" : "当前对话");
+	const conversationUuid = view.takeFirst(["conversationUuid", "conversation_uuid"])
+		|| (scope && !HISTORY_SCOPE_LABELS[String(scope)] ? scope : undefined);
 	const turnUuid = view.takeFirst(["turnUuid", "turn_uuid"]);
 	view.addTag("对话 ID", conversationUuid, {mono: true, wide: true, primary: true});
 	view.addTag("轮次 ID", turnUuid, {mono: true, wide: true, primary: true});
 	const query = view.takeFirst(["query", "text"]);
 	view.addRow("查询内容", query, {copyable: true, primary: true});
+	view.addTag("起始时间", view.take("since"));
+	view.addTag("截止时间", view.take("until"));
+	const order = view.take("order");
+	view.addTag("排序", HISTORY_ORDER_LABELS[String(order || "")] || order);
 	const from = view.take("from");
 	view.addTag("读取位置", HISTORY_FROM_LABELS[String(from || "")] || from);
 	for (const [key, label, suffix] of [
@@ -719,18 +749,70 @@ function benchResultSuffix(action, result) {
 	return [what.trim(), state].filter(Boolean).join(" · ");
 }
 
-// What a Servers result adds to its card line: the id of a job just started,
-// how an exact edit went, how a mesh change came out, or which benchmark run it was.
+const JOB_WAIT_REASONS = {matched: "输出已匹配", exited: "已结束", timeout: "等待超时，仍在运行"};
+const num = value => Number.isFinite(value) ? value : 0;
+
+// How a batch of transfers stands: 3 台 · 全部完成, 全部完成 · 3 项, 已结束 2/5 · 40%, or the items refused outright.
+// A group or all names no count, so the servers and files a batch reached come from its items.
+function transferBatchSuffix(action, result) {
+	const s = result.summary, items = (Array.isArray(result.items) ? result.items : []).filter(i => i && typeof i === "object");
+	const refused = items.filter(i => i.ok === false && !i.state).length;
+	const total = num(s.count), finished = num(s.finished), succeeded = num(s.succeeded);
+	const batch = action === "upload_file" || action === "download_file";
+	const servers = batch ? new Set(items.map(i => i.serverId).filter(Boolean)).size : 0;
+	const files = batch ? new Set(items.map(i => i.remotePath).filter(Boolean)).size : 0;
+	const reach = servers > 1 && files > 1 ? `${servers} 台 × ${files} 个文件` : servers > 1 ? `${servers} 台` : files > 1 ? `${files} 个文件` : "";
+	const parts = [reach];
+	if (!total) parts.push(refused ? "" : action === "transfer_status" || action === "transfer_cancel" ? "没有未结束的传输" : "");
+	else if (finished < total) parts.push(`已结束 ${finished}/${total}${Number.isFinite(s.percent) ? ` · ${s.percent}%` : ""}`);
+	else parts.push(succeeded === total ? (reach ? "全部完成" : `全部完成 · ${total} 项`) : `完成 ${succeeded}/${total} · ${total - succeeded} 项未成功`);
+	if (action === "transfer_cancel" && Number.isFinite(result.cancelRequested)) parts.push(`已请求取消 ${result.cancelRequested} 项`);
+	if (refused) parts.push(`${refused} 项被拒绝`);
+	return parts.filter(Boolean).join(" · ");
+}
+
+// Results over several servers or jobs: how many matched, finished or stopped, and which servers could not answer.
+function serversBatchSuffix(action, result) {
+	if (["upload_file", "download_file", "transfer_status", "transfer_cancel", "transfers"].includes(action)) {
+		return result.summary && typeof result.summary === "object" ? transferBatchSuffix(action, result) : "";
+	}
+	if (action === "jobs" && Array.isArray(result.servers)) {
+		const matched = num(result.matchedJobs), unavailable = Array.isArray(result.unavailable) ? result.unavailable.length : 0;
+		return [matched ? `${matched} 个任务 · 分布在 ${result.servers.length} 台` : "没有匹配的任务", unavailable ? `${unavailable} 台离线或出错` : ""].filter(Boolean).join(" · ");
+	}
+	if (action === "job_wait" && Array.isArray(result.results) && result.mode) {
+		return `${result.reason === "timeout" ? "等待超时 · " : ""}完成 ${num(result.finished)}/${num(result.total)}`;
+	}
+	if (action === "job_stop" && Array.isArray(result.results)) return `已停止 ${num(result.stopped)}/${num(result.total)}`;
+	if (action === "exec" && Array.isArray(result.results) && result.results.length > 1) {
+		const runs = result.results.filter(r => r && typeof r === "object"), ok = runs.filter(r => r.ok === true).length;
+		const timedOut = runs.filter(r => r.ok !== true && r.timedOut === true).length, failed = runs.length - ok - timedOut;
+		return ok === runs.length ? `${runs.length} 台全部成功`
+			: [`${runs.length} 台`, `成功 ${ok}`, failed ? `失败 ${failed}` : "", timedOut ? `超时 ${timedOut}` : ""].filter(Boolean).join(" · ");
+	}
+	return "";
+}
+
+// What a Servers result adds to its card line: the id of a job just started (and what its wait saw),
+// how an exact edit went, how a mesh change came out, which benchmark run it was, or how a batch went.
 function serversResultSuffix(data, rawResult) {
 	const action = data?.action;
 	const mesh = ["mesh_save_draft", "mesh_join", "mesh_apply", "mesh_rollback"].includes(action);
 	const bench = ["bench_start", "bench_wait", "bench_get", "bench_stop"].includes(action);
-	if (!rawResult || (!["job_start", "edit_file"].includes(action) && !mesh && !bench)) return "";
+	const batch = ["upload_file", "download_file", "transfer_status", "transfer_cancel", "transfers", "jobs", "job_wait", "job_stop", "exec"].includes(action);
+	if (!rawResult || (!["job_start", "edit_file"].includes(action) && !mesh && !bench && !batch)) return "";
 	const result = parseArguments(rawResult).data;
 	if (!result || typeof result !== "object") return "";
 	if (mesh) return meshResultSuffix(action, result);
 	if (bench) return result.ok === false ? "" : benchResultSuffix(action, result);
-	if (action === "job_start") return typeof result.job?.id === "string" ? `任务 ${compact(result.job.id, 40)}` : "";
+	if (batch) return serversBatchSuffix(action, result);
+	if (action === "job_start") {
+		if (typeof result.job?.id !== "string") return "";
+		const wait = result.wait && typeof result.wait === "object" ? result.wait : null;
+		const seen = !wait ? "" : wait.ok === false ? "等待失败，任务已启动"
+			: wait.reason === "exited" && Number.isFinite(result.job.exitCode) ? `已结束（退出码 ${result.job.exitCode}）` : JOB_WAIT_REASONS[wait.reason] || "";
+		return [`任务 ${compact(result.job.id, 40)}`, seen].filter(Boolean).join(" · ");
+	}
 	if (result.ok === true) return result.changed === false ? "内容没有变化" : Number.isFinite(result.replacements) ? `${result.replacements} 处替换` : "";
 	return result.error === "edit_not_applied" ? "未修改：有替换没能匹配" : "";
 }
@@ -742,6 +824,31 @@ export function serversEditDiff(toolName, rawArguments, rawResult) {
 	return result && typeof result.diff === "string" ? result.diff : "";
 }
 
+// Whether the requested extension was turned on, and who allowed it.
+function extensionResultSuffix(rawResult) {
+	const result = rawResult ? parseArguments(rawResult).data : null;
+	if (!result || typeof result !== "object") return "";
+	if (result.status === "enabled") return result.approvedBy === "auto_allow" ? "自动允许" : "已同意";
+	return {already_enabled: "已开启", declined: "未同意"}[result.status]
+		|| ({user_confirmation_unavailable: "无人确认", unknown_extension: "没有这个扩展"}[result.error] || (result.ok === false ? "未开启" : ""));
+}
+
+// How a Browser call left things: how far steps got, what the page observation saw, a waitFor that never held.
+function browserResultSuffix(data, rawResult) {
+	const action = data?.action;
+	if (!rawResult || !["act", "navigate", "steps", "evaluate"].includes(action)) return "";
+	const result = parseArguments(rawResult).data;
+	if (!result || typeof result !== "object") return "";
+	if (action === "evaluate") return result.error === "wait_for_timeout" ? "等待超时，脚本未执行" : "";
+	const progress = action !== "steps" || !Array.isArray(result.steps) ? ""
+		: result.outcome === "completed" ? `${result.steps.length} 步全部完成`
+			: Number.isInteger(result.stoppedAt) ? `停在第 ${result.stoppedAt + 1} 步` : "";
+	const seen = result.observation && typeof result.observation === "object" ? result.observation : null;
+	const page = !seen ? "" : seen.skipped === "dialog_pending" ? "页面弹出对话框" : seen.navigated ? "页面已跳转"
+		: seen.changed === true ? "页面有变化" : seen.changed === false ? "页面无变化" : "";
+	return [progress, page].filter(Boolean).join(" · ");
+}
+
 export function toolArgumentsSummary(toolName, rawArguments, rawResult = "") {
 	if (String(toolName || "") === "TaskMemory") return taskMemoryToolPreview(rawArguments, rawResult);
 	if (String(toolName || "") === "WorkItem") return workItemToolPreview(rawArguments, rawResult);
@@ -749,6 +856,18 @@ export function toolArgumentsSummary(toolName, rawArguments, rawResult = "") {
 		const {data} = parseArguments(rawArguments);
 		const summary = toolActionSummary("Servers", data);
 		const suffix = summary ? serversResultSuffix(data, rawResult) : "";
+		if (summary) return suffix ? `${summary} · ${suffix}` : summary;
+	}
+	if (String(toolName || "") === "Browser") {
+		const {data} = parseArguments(rawArguments);
+		const summary = toolActionSummary("Browser", data);
+		const suffix = summary ? browserResultSuffix(data, rawResult) : "";
+		if (summary) return suffix ? `${summary} · ${suffix}` : summary;
+	}
+	if (String(toolName || "") === "RequestExtension") {
+		const {data} = parseArguments(rawArguments);
+		const summary = toolActionSummary("RequestExtension", {extension: data?.extension});
+		const suffix = extensionResultSuffix(rawResult);
 		if (summary) return suffix ? `${summary} · ${suffix}` : summary;
 	}
 	const {data} = parseArguments(rawArguments);

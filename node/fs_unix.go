@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 )
 
@@ -29,3 +30,11 @@ func keepOwner(temp string, prior fs.FileInfo) {
 }
 
 func platformFileError(error) string { return "" }
+
+// fileIdentity names the open file by device and inode.
+func fileIdentity(_ *os.File, info fs.FileInfo) string {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return strconv.FormatUint(uint64(st.Dev), 10) + ":" + strconv.FormatUint(uint64(st.Ino), 10)
+	}
+	return ""
+}

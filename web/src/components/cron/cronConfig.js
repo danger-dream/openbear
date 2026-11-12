@@ -1,7 +1,7 @@
 import {normalizedRunDefaults, updateRunDefault} from '../folderRunDefaults.js';
 
 export const OUTCOMES = ['completed', 'failed', 'timed_out', 'tokens_exceeded', 'cost_exceeded', 'cancelled'];
-export const STATUSES = ['starting', 'running', ...OUTCOMES, 'interrupted', 'post_failed', 'missed'];
+export const STATUSES = ['starting', 'running', ...OUTCOMES, 'interrupted', 'post_failed', 'missed', 'skipped'];
 export const TABS = [['basic', '基本配置'], ['schedule', '时间规则'], ['instructions', '处理指令'], ['scripts', '脚本']];
 export const PAGE_TABS = [['calendar', '任务日历'], ['jobs', '任务列表'], ['history', '运行历史']];
 // Keep draft text intact while typing; the API receives only an integer or null.
@@ -40,7 +40,7 @@ export function pickerDate(value) {
 export function pickerIso(value) {
   return value && Number.isFinite(value.getTime?.()) ? value.toISOString() : null;
 }
-const labels = {starting:'启动中', running:'运行中', completed:'已完成', failed:'失败', timed_out:'执行超时', tokens_exceeded:'Tokens 超限', cost_exceeded:'金额超限', cancelled:'已取消', interrupted:'已中断', post_failed:'后置失败', missed:'已错过', armed:'已就绪', disabled:'已停用', exhausted:'计划已结束', waiting_calendar:'等待日历数据', target_missing:'目录不可用', deleted:'已删除', pre:'前置脚本', model:'模型执行', post:'后置脚本', finished:'结束', scheduled:'定时', manual:'手动'};
+const labels = {starting:'启动中', running:'运行中', completed:'已完成', failed:'失败', timed_out:'执行超时', tokens_exceeded:'Tokens 超限', cost_exceeded:'金额超限', cancelled:'已取消', interrupted:'已中断', post_failed:'后置失败', missed:'已错过', skipped:'已跳过', retrying:'等待重试', retry:'失败重试', armed:'已就绪', disabled:'已停用', exhausted:'计划已结束', waiting_calendar:'等待日历数据', target_missing:'目录不可用', deleted:'已删除', pre:'前置脚本', model:'模型执行', post:'后置脚本', finished:'结束', scheduled:'定时', manual:'手动'};
 export const label = value => labels[value] || value || '—';
 export const clone = value => JSON.parse(JSON.stringify(value));
 export const message = error => error?.response?.data?.message || error?.message || '请求失败，请重试';

@@ -24,6 +24,11 @@ const CODE_EXTENSIONS = {
 const CODE_MIMES = {"application/json": "json", "application/x-jsonlines": "json", "application/yaml": "yaml", "application/x-yaml": "yaml", "application/xml": "xml", "application/javascript": "javascript", "application/typescript": "typescript", "application/sql": "sql"};
 const SAFE_IMAGES = new Set(["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"]);
 const SAFE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/x-icon", "image/vnd.microsoft.icon"]);
+// Only containers that mainstream browsers play natively; others stay download-only.
+const PLAYABLE_AUDIO = new Set(["mp3", "m4a", "aac", "wav", "ogg", "oga", "opus", "flac"]);
+const PLAYABLE_AUDIO_MIMES = new Set(["audio/mpeg", "audio/mp3", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/wav", "audio/x-wav", "audio/wave", "audio/ogg", "audio/opus", "audio/flac", "audio/x-flac", "audio/webm"]);
+const PLAYABLE_VIDEO = new Set(["mp4", "m4v", "webm", "mov", "ogv"]);
+const PLAYABLE_VIDEO_MIMES = new Set(["video/mp4", "video/x-m4v", "video/webm", "video/quicktime", "video/ogg"]);
 
 export function artifactFromUrl(value, origin = globalThis.location?.origin) {
 	if (!origin || typeof value !== "string" || !contextResourceUrl(value)) return null;
@@ -84,6 +89,9 @@ export function artifactFormat(metadata = {}) {
 	const generic = !mime || mime === "application/octet-stream";
 	const textMime = generic || mime.startsWith("text/") || Boolean(CODE_MIMES[mime]) || mime === "application/toml";
 	if ((SAFE_IMAGES.has(ext) && (generic || SAFE_IMAGE_MIMES.has(mime))) || SAFE_IMAGE_MIMES.has(mime) && !CODE_EXTENSIONS[ext] && !["md", "markdown", "txt"].includes(ext)) return {kind: "image", label: "图片", language: ""};
+	const mediaMimeOnly = !CODE_EXTENSIONS[ext] && !["md", "markdown", "txt"].includes(ext);
+	if ((PLAYABLE_AUDIO.has(ext) && (generic || mime.startsWith("audio/"))) || PLAYABLE_AUDIO_MIMES.has(mime) && mediaMimeOnly) return {kind: "audio", label: "音频", language: ""};
+	if ((PLAYABLE_VIDEO.has(ext) && (generic || mime.startsWith("video/"))) || PLAYABLE_VIDEO_MIMES.has(mime) && mediaMimeOnly) return {kind: "video", label: "视频", language: ""};
 	if ((["md", "markdown", "mdown"].includes(ext) && textMime) || ["text/markdown", "text/x-markdown"].includes(mime)) return {kind: "markdown", label: "Markdown", language: "markdown"};
 	if (CODE_EXTENSIONS[ext] && textMime) return {kind: "code", label: ext.toUpperCase(), language: CODE_EXTENSIONS[ext]};
 	if (CODE_MIMES[mime]) return {kind: "code", label: CODE_MIMES[mime].toUpperCase(), language: CODE_MIMES[mime]};

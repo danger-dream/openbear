@@ -21,6 +21,7 @@ from tests.test_agent_continuity import env as continuity_env
 from tests.test_rath_plan import sample_plan
 from tests.test_rath_web_api import web_env as rath_web_env
 from tests.test_tools_agent_orchestration import _FakeConfig
+from app.tools.agent_actions import schema_tool_names
 
 # Register the shared fixtures explicitly without shadowing imported names.
 env = continuity_env
@@ -168,7 +169,7 @@ async def test_direct_to_managed_is_new_round_with_preapproval_gate(env, monkeyp
     task = await dao.get_task(tid)
     assert task.input["planMode"] == "managed"
     assert (await dao.get_task(first["task"]["taskId"])).input["planMode"] == "direct"
-    assert {tool["name"] for tool in backend.calls[-1]["tools"]} == {"AgentPlanSubmit", "AgentControlAck"}
+    assert schema_tool_names(backend.calls[-1]["tools"]) == {"AgentPlanSubmit", "AgentControlAck"}
     assert "investigation" in str(backend.calls[-1]["messages"])
     assert task.run_root_turn_uuid == "managed-root"
     await manager.mark_cancelled(tid)

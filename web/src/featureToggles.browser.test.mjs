@@ -5,7 +5,7 @@ import {startBrowserTestServer} from './browserTestServer.mjs';
 import {featureApi, createFeatureState} from './featureTogglesFixture.mjs';
 const require=createRequire(import.meta.url);
 let chromium;
-try {({chromium}=require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core'));} catch {}
+try {({chromium}=require('./testing/playwright.cjs'));} catch {}
 const shots=process.env.OPENBEAR_SCREENSHOT_DIR || '';
 
 // Layout smoke of the settings switch and the hidden-page notice in the real App, on desktop,

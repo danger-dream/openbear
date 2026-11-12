@@ -101,7 +101,7 @@ async def test_terminal_dense_stream_delivers_control_and_next_run_does_not_repl
     await web_env.db.conn.commit()
     first, = await _run_reviews(web_env.server, row, root=root, run="dense-1", count=1)
     assert first["alreadyTerminal"] and not first["reviewPending"]
-    assert "Do not call AgentWait again" in first["message"]
+    assert "Do not call Agent(action=wait) again" in first["message"]
     assert [agent["taskUuid"] for agent in first["agents"]] == [task]
     observed = first["agents"][0]
     assert observed["taskUuid"] == task
@@ -112,9 +112,10 @@ async def test_terminal_dense_stream_delivers_control_and_next_run_does_not_repl
     assert first["notifications"] == [] and observed["result"] == {}
 
     second, = await _run_reviews(web_env.server, row, root=root, run="dense-2", count=1)
-    assert second["agents"][0]["recentEvents"] == []
-    assert second["agents"][0]["eventPage"]["nextAfter"] == last
-    assert second["agents"][0]["hasActivity"] is False
+    # Unchanged terminal Agents are only counted; their cursor still persists.
+    assert second["agents"] == []
+    assert second["unchangedAgents"]["count"] == 1
+    assert second["unchangedAgents"]["cursors"][task][:2] == [last, last]
     assert second["notifications"] == []
 
 
@@ -131,8 +132,8 @@ async def test_terminal_control_pages_drain_without_wait_or_terminal_latch(web_e
         pages = await _run_reviews(web_env.server, row, root=root, run="pages", count=4)
     for page in pages[:2]:
         assert page["reviewPending"]
-        assert "Call AgentWait again" in page["message"]
-        assert "Do not call AgentWait again" not in page["message"]
+        assert "Call Agent(action=wait) again" in page["message"]
+        assert "Do not call Agent(action=wait) again" not in page["message"]
     assert not pages[2]["reviewPending"]
     assert pages[1]["wakeReason"] == pages[2]["wakeReason"] == "event_backlog"
     assert pages[3]["alreadyTerminal"] and pages[3]["skipped"]  # terminal latch only AFTER draining

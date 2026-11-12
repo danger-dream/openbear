@@ -47,6 +47,8 @@ from app.tools.history import register_history_tools
 from app.tools.mcp import register_mcp_tools
 from app.tools.memory import register_memory_tools
 from app.tools.openbear_control import register_openbear_control_tool
+from app.tools.extensions import register_extension_tool
+from app.extensions import ExtensionService
 from app.tools.webhook import register_webhook_tool
 from app.tools.collab import register_collab_tools
 from app.collab.service import CollabService
@@ -161,6 +163,11 @@ class Services:
         self.collab = CollabService(self.db, self.web_admin)
         self.collab_groups = GroupService(self.db, self.web_admin, self.collab)
         self.web_admin.interactions.validators['group_proposal'] = self.collab_groups.validate_answer
+        self.extensions = ExtensionService(self.db, self.web_admin)
+        self.extensions.names = lambda: self.tools.names(scope="main")
+        self.extensions.schemas = lambda: self.tools.schemas(scope="main")
+        self.extensions.in_use["agents"] = self._agents_in_use
+        self.web_admin.extensions = self.extensions
         self.instances = None
         if not config.managed.enabled:
             from app.instances.service import InstanceService
@@ -199,6 +206,7 @@ class Services:
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
+        register_extension_tool(self.tools, self.extensions)
         self._register_optional_feature_tools(config)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
@@ -239,6 +247,18 @@ class Services:
         self.total_cache_read_tokens = 0
         self.total_cache_write_tokens = 0
         self.total_cost_usd = 0.0
+
+    async def _agents_in_use(self, row: dict) -> str:
+        tasks = await self.agent_dao.active_tasks_for_chat(int(row["internal_chat_id"]), controllable=True)
+        if tasks:
+            return f"还有 {len(tasks)} 个 Agent 未结束（运行中或等待主控处理）"
+        # Replies to this conversation's requests are awaited with Agent wait.
+        from app.collab.store import OPEN_STATES
+        cur = await self.db.conn.execute(
+            f"SELECT count(*) n FROM collab_requests WHERE from_conversation_uuid=? AND state IN ({','.join('?' for _ in OPEN_STATES)})",
+            (row["conversation_uuid"], *OPEN_STATES))
+        pending = int((await cur.fetchone())["n"])
+        return f"还有 {pending} 个会话请求没有结果" if pending else ""
 
     def _register_optional_feature_tools(self, config: Config) -> None:
         """InstanceControl/Servers only when their settings switch is on.
@@ -329,6 +349,9 @@ class Services:
             self._rebuild_tools_and_context(include_mcp=True)
             registered_mcp_tools = len(self.mcp.available_tools())
             log.info("MCP 工具已注册", 数量=registered_mcp_tools)
+        if self.update:
+            # Before what runs from them: the gateway binaries, a queued benchmark's package.
+            self.update.restore_extras()
         if self.instances is not None:
             await self.instances.start()
         if self.servers is not None:
@@ -785,6 +808,7 @@ class Services:
         register_agent_history_tool(self.tools, self.db)
         register_user_interaction_tools(self.tools, self.interactions)
         register_openbear_control_tool(self.tools, self)
+        register_extension_tool(self.tools, self.extensions)
         self._register_optional_feature_tools(config)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
@@ -1079,6 +1103,12 @@ class Services:
         self.mem = self._make_memory_client(config)
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(old_mem.close())
+        self.http.configure_timeouts(
+            connect_timeout_s=config.agent.llm_connect_timeout_s,
+            first_byte_timeout_s=config.agent.llm_first_byte_timeout_s,
+            idle_timeout_s=config.agent.llm_idle_timeout_s,
+            total_timeout_s=config.agent.llm_total_timeout_s,
+        )
         self.factory = BackendFactory(config.models, self.http)
         self.selection = ModelSelection(config.models, config_path())
         self.agents.configure(max_concurrent_tasks=config.agents.max_concurrent_tasks)

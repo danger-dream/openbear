@@ -671,7 +671,7 @@ class _WebStreamRenderer:
     async def on_steers_injected(self, steers: list[Any] | None = None, *, injected_texts: list[str] | None = None, cut: bool = False, restored: bool = False) -> None:
         if self.live is None:
             return
-        items = [dict(item) for item in (steers or []) if isinstance(item, dict)]
+        items = [steering.public(item) for item in (steers or []) if isinstance(item, dict)]
         injected = [str(text or "").strip() for text in (injected_texts or []) if str(text or "").strip()]
         if items:
             await self.live.publish({
@@ -682,6 +682,7 @@ class _WebStreamRenderer:
             })
         first = items[0] if items else {}
         references = [reference for item in items for reference in (item.get("references") or [])]
+        attachments = [attachment for item in items for attachment in (item.get("attachments") or [])]
         turn_uuid = str(first.get("turnUuid") or first.get("turn_uuid") or "").strip()
         message_uuid = str(first.get("messageUuid") or first.get("message_uuid") or "").strip()
         text = "\n\n".join(injected) if injected else "\n\n".join([self._steer_item_text(item) for item in (steers or []) if self._steer_item_text(item)])
@@ -693,6 +694,7 @@ class _WebStreamRenderer:
                 "text": text,
                 **({"source": "telegram"} if first.get("source") == "telegram" else {}),
                 "steeringInjected": True,
+                **({"attachments": attachments} if attachments else {}),
                 **({"steeringRestored": True} if restored else {}),
                 **({"references": references, "referenceBundleId": str(first.get("referenceBundleId") or references[0].get("bundleId") or "")} if references else {}),
             })

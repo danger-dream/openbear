@@ -158,6 +158,8 @@ export function fakeNet(mesh) {
 
 export const addresses = page => page.locator('section.net-addresses').first();
 export const probe = page => page.locator('section.net-probe').first();
+// The detail page's tab holding a card: 网络 for the addresses, 工具 for the test.
+export const showTab = (page, name) => page.locator('.sv-detail:visible .dt-tabs').getByRole('tab', {name, exact: true}).click();
 export const press = (h, locator) => h.phone ? locator.tap() : locator.click();
 export async function waitFor(check, what, ms = 8000) {
   for (let i = 0; i < ms / 100; i++) { if (await check()) return; await new Promise(r => setTimeout(r, 100)); }

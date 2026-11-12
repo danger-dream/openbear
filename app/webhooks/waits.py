@@ -121,16 +121,18 @@ async def await_wait(s,assignment_id,wait_id):
     from app.agent import steering
     assignment=await one(s.db.conn,'SELECT internal_chat_id FROM webhook_assignments WHERE assignment_id=?',(assignment_id,))
     human=False
+    wake=s.wake.listen()
     try:
         while True:
-            s.wake.clear()
+            wake.clear()
             if steering.has_pending(assignment['internal_chat_id']):
                 human=True
                 return {'waitId':wait_id,'state':'human_interruption','events':[],'registrationPreserved':True}
             value=await delivery(s,assignment_id,wait_id,reserve_execution=True)
             if value is not None: return value
             # Timer discovers deadlines only; no model polling and no new execution identity.
-            try: await asyncio.wait_for(s.wake.wait(),.25)
+            try: await asyncio.wait_for(wake.wait(),.25)
             except TimeoutError: pass
     finally:
+        s.wake.forget(wake)
         if s.bridge: await s.bridge.waiting(assignment_id,False,human=human)

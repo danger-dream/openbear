@@ -4,12 +4,13 @@ import ReferenceEditor from "../../references/ReferenceEditor.vue";
 import ReferencePlainText from "../../references/ReferencePlainText.vue";
 import InteractionMarkdown from "./InteractionMarkdown.vue";
 import WorkItemsDock from "./WorkItemsDock.vue";
+import RunStatusLine from "./RunStatusLine.vue";
 import GroupProposalCard from "./GroupProposalCard.vue";
 import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import ModelFeatureIcon from "./ModelFeatureIcon.vue";
 import ContextUsageMeter from './ContextUsageMeter.vue';
-import {Coins, Layers, Clock3, CornerDownLeft, Sparkles, X} from "@lucide/vue";
-import {ElMessage} from "element-plus";
+import ExtensionsMenu from './ExtensionsMenu.vue';
+import {Blocks, Coins, Layers, Clock3} from "@lucide/vue";
 import { userStorage } from '../../sessionBoundary.js';
 import {
 	ArrowDown,
@@ -55,6 +56,7 @@ import {
 const props = defineProps({
 	draft: {type: String, default: ""},
 	conversationUuid: {type: String, default: ""},
+	folderId: {type: String, default: ""},
 	pendingAttachments: {type: Array, default: () => []},
 	attachmentPreviews: {type: Object, default: () => ({})},
 	uploadProgress: {type: Object, default: () => ({})},
@@ -62,7 +64,6 @@ const props = defineProps({
 	confirmationSubmitting: {type: Object, default: () => ({})},
 	confirmationErrors: {type: Object, default: () => ({})},
 	pendingSteering: {type: Array, default: () => []},
-	promptSuggestions: {type: Array, default: () => []},
 	modelMenuOpen: {type: Boolean, default: false},
 	modelGroups: {type: Array, default: () => []},
 	currentModel: {type: String, default: ""},
@@ -83,6 +84,8 @@ const props = defineProps({
 	agentFastSupported: {type: Boolean, default: false},
 	agentDefaultThinkingLabel: {type: String, default: "模型默认"},
 	running: {type: Boolean, default: false},
+	runStartedAt: {type: Number, default: 0},
+	runStats: {type: Object, default: null},
 	canSend: {type: Boolean, default: false},
 	modelQuery: {type: String, default: ""},
 	contextStrategy: {type: String, default: "sliding_window"},
@@ -121,36 +124,12 @@ const emit = defineEmits([
 	"send",
 	"stop",
 	"answer-confirmation",
-	"pick-suggestion",
-	"dismiss-suggestions",
 	"close-menus",
 	"height-change",
 ]);
 
-// Once the user starts typing, the card stays away until the editor is empty and
-// unfocused again; clearing a typo must not make it bounce back mid-edit.
-const composerFocused = ref(false);
-const promptSuggestionsSuppressed = ref(false);
-watch(() => `${props.conversationUuid}\n${props.promptSuggestions.join("\n")}`, () => {
-	promptSuggestionsSuppressed.value = false;
-});
-watch(() => Boolean(String(props.draft || "").trim()), (typed) => {
-	if (typed) promptSuggestionsSuppressed.value = true;
-	else if (!composerFocused.value) promptSuggestionsSuppressed.value = false;
-});
-
-// Pending interactions and queued messages own the space above the editor.
-const showPromptSuggestions = computed(() => Boolean(
-	props.promptSuggestions.length && !props.running && !String(props.draft || "").trim()
-	&& !promptSuggestionsSuppressed.value
-	&& !props.pendingConfirmations.length && !props.pendingSteering.length
-));
-
-function onComposerFocusOut(event) {
+function onComposerFocusOut() {
 	scheduleRunConfigPosition();
-	if (event?.currentTarget?.contains?.(event.relatedTarget)) return;
-	composerFocused.value = false;
-	if (!String(props.draft || "").trim()) promptSuggestionsSuppressed.value = false;
 }
 
 const fileInput = ref(null);
@@ -306,6 +285,14 @@ function pendingImagePreviewIndex(item) {
 	return Math.max(0, pendingImagePreviewList().indexOf(src));
 }
 
+function openPendingImagePreview(item) {
+	const urlList = pendingImagePreviewList();
+	if (!urlList.length) return;
+	window.dispatchEvent?.(new CustomEvent("openbear:preview-images", {
+		detail: {urlList, initialIndex: pendingImagePreviewIndex(item)},
+	}));
+}
+
 function extensionFromMime(type = "") {
 	const subtype = String(type || "").split("/")[1] || "";
 	if (!subtype) return "bin";
@@ -356,8 +343,7 @@ function onPaste(event) {
 	const files = clipboardFiles(event);
 	if (!files.length) return;
 	event.preventDefault();
-	if (props.running) ElMessage.warning("运行中暂不能添加附件");
-	else emit("attachment-change", files);
+	emit("attachment-change", files);
 	insertPlainTextFromPaste(event);
 }
 
@@ -837,7 +823,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 				</div>
 				<div class="steering-queue-hint">当前运行到轮次边界后，后端会取走这些内容并作为一条 user message 注入模型。</div>
 				<div class="steering-queue-items">
-					<div v-for="item in props.pendingSteering" :key="item.id" class="steering-queue-item"><ReferencePlainText :text="item.text" :references="item.references || []" :bundle-id="item.referenceBundleId || ''"/></div>
+					<div v-for="item in props.pendingSteering" :key="item.id" class="steering-queue-item"><ReferencePlainText :text="item.text" :references="item.references || []" :bundle-id="item.referenceBundleId || ''"/><div v-if="item.attachments?.length" class="steering-queue-attachments">附件：{{ item.attachments.join("、") }}</div></div>
 				</div>
 			</div>
 
@@ -996,24 +982,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 				</div>
 			</div>
 
-			<Transition name="prompt-suggestions">
-				<section v-if="showPromptSuggestions" class="prompt-suggestions-card" aria-label="推荐的下一句">
-					<header class="prompt-suggestions-head">
-						<Sparkles class="prompt-suggestions-icon" aria-hidden="true"/>
-						<span>猜你想说</span>
-						<button type="button" class="prompt-suggestions-close" aria-label="关闭推荐" @click="emit('dismiss-suggestions')">
-							<X aria-hidden="true"/>
-						</button>
-					</header>
-					<div class="prompt-suggestions-list">
-						<button v-for="(text, index) in props.promptSuggestions" :key="`${index}:${text}`" type="button"
-						        class="prompt-suggestion" :aria-label="`填入：${text}`" @click="emit('pick-suggestion', text)">
-							<span class="prompt-suggestion-text">{{ text }}</span>
-							<CornerDownLeft class="prompt-suggestion-fill" aria-hidden="true"/>
-						</button>
-					</div>
-				</section>
-			</Transition>
+			<RunStatusLine v-if="props.running" :started-at="props.runStartedAt" :stats="props.runStats"/>
 
 			<div class="composer-box">
 				<input ref="fileInput" type="file" multiple class="hidden" @change="onAttachmentChange"/>
@@ -1024,10 +993,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 						          :src="attachmentPreviewUrl(item)"
 						          :alt="item.file.name"
 						          fit="cover"
-						          :preview-src-list="pendingImagePreviewList()"
-						          :initial-index="pendingImagePreviewIndex(item)"
-						          preview-teleported
-						          hide-on-click-modal/>
+						          @click="openPendingImagePreview(item)"/>
 						<div v-else class="attachment-file-tile">
 							<Document class="file-preview-icon"/>
 							<span>{{ item.file.name }}</span>
@@ -1055,7 +1021,6 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 					@update:model-value="emit('update:draft', $event)"
 					@send="props.canSend && emit('send')"
 					@keydown.capture="onComposerKeydownCapture"
-					@focusin="composerFocused = true"
 					@focusout="onComposerFocusOut"
 					@paste="onPaste"
 				/>
@@ -1068,10 +1033,17 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 						</el-tooltip>
 						<el-tooltip content="上传图片或附件" placement="top" :show-after="260">
 							<button type="button" class="tool-btn tool-btn-accent" aria-label="上传图片或附件"
-							        :disabled="props.running" @click="openFilePicker">
+							        @click="openFilePicker">
 								<Paperclip/>
 							</button>
 						</el-tooltip>
+						<ExtensionsMenu :conversation-uuid="props.conversationUuid" :folder-id="props.folderId" :running="props.running">
+							<template #trigger="{label, open}">
+								<el-tooltip :content="label" placement="top" :show-after="260" :disabled="open">
+									<button type="button" class="tool-btn" :class="{'tool-btn-active': open}" :aria-label="label" aria-haspopup="dialog" :aria-expanded="open"><Blocks :stroke-width="1.5"/></button>
+								</el-tooltip>
+							</template>
+						</ExtensionsMenu>
 
 						<el-tooltip v-if="props.contextStrategy === 'model_summary'" :content="props.compacting ? '正在压缩上下文…' : '手动压缩上下文'" placement="top" :show-after="260">
 							<button type="button" class="tool-btn" aria-label="手动压缩上下文" :disabled="!props.canCompact || props.compacting" @click="emit('compact')"><ContextCompactionIcon :class="{'context-compacting-icon': props.compacting}" /></button>
@@ -1201,7 +1173,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								</div>
 							</div>
 						</el-popover>
-						<el-tooltip v-if="props.running && !props.draft.trim()" content="停止生成（右键或长按切换按钮形状）" placement="top" :show-after="260">
+						<el-tooltip v-if="props.running && !props.draft.trim() && !props.pendingAttachments.length" content="停止生成（右键或长按切换按钮形状）" placement="top" :show-after="260">
 							<button type="button" class="send-button stop-button" :class="{'is-round': stopButtonShape === 'circle'}" aria-label="停止生成" aria-description="右键单击或长按切换方形与圆形，偏好保存在当前浏览器" @click="clickStopButton" @contextmenu.prevent="stopButtonContextMenu" @pointerdown="startStopShapePress" @pointermove="moveStopShapePress" @pointerup="endStopShapePress" @pointercancel="cancelButtonShapeInteraction" @pointerleave="cancelButtonShapeInteraction" @keydown="buttonShapeKeydown">
 								<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 									<rect v-if="stopButtonShape === 'circle'" x="5" y="5" width="14" height="14" rx="1.5"/>
@@ -1310,142 +1282,16 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	color: var(--ob-text);
 }
 
+.steering-queue-attachments {
+	margin-top: 0.25rem;
+	color: var(--ob-text-subtle);
+	font-size: 0.74rem;
+}
+
 .web-confirm-stack {
 	display: grid;
 	gap: 0.6rem;
 	margin-bottom: 0.75rem;
-}
-
-.prompt-suggestions-card {
-	display: grid;
-	gap: 0.3rem;
-	margin-bottom: 0.6rem;
-	border: 1px solid var(--ob-border);
-	border-radius: 1rem;
-	background: var(--ob-surface);
-	box-shadow: var(--ob-shadow-panel);
-	padding: 0.45rem 0.45rem 0.4rem;
-}
-
-.prompt-suggestions-head {
-	display: flex;
-	align-items: center;
-	gap: 0.38rem;
-	min-height: 1.6rem;
-	padding-left: 0.4rem;
-	font-size: 0.74rem;
-	font-weight: 600;
-	color: var(--ob-text-subtle);
-}
-
-.prompt-suggestions-icon {
-	width: 0.85rem;
-	height: 0.85rem;
-	color: var(--ob-violet);
-}
-
-.prompt-suggestions-close {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	width: 1.6rem;
-	height: 1.6rem;
-	margin-left: auto;
-	border-radius: 0.5rem;
-	color: var(--ob-text-muted);
-	transition: background-color 0.15s, color 0.15s;
-}
-
-.prompt-suggestions-close svg {
-	width: 0.9rem;
-	height: 0.9rem;
-}
-
-.prompt-suggestions-close:hover {
-	background: var(--ob-hover);
-	color: var(--ob-text);
-}
-
-.prompt-suggestions-list {
-	display: grid;
-	gap: 0.12rem;
-	min-width: 0;
-}
-
-.prompt-suggestion {
-	display: flex;
-	align-items: center;
-	gap: 0.6rem;
-	min-width: 0;
-	width: 100%;
-	border-radius: 0.7rem;
-	padding: 0.42rem 0.55rem;
-	text-align: left;
-	font-size: 0.84rem;
-	line-height: 1.45;
-	color: var(--ob-text);
-	transition: background-color 0.15s;
-}
-
-.prompt-suggestion-text {
-	flex: 1 1 auto;
-	min-width: 0;
-	overflow-wrap: anywhere;
-}
-
-.prompt-suggestion-fill {
-	flex: 0 0 auto;
-	width: 0.85rem;
-	height: 0.85rem;
-	color: var(--ob-text-muted);
-	opacity: 0;
-	transition: opacity 0.15s;
-}
-
-.prompt-suggestion:hover {
-	background: var(--ob-hover);
-}
-
-.prompt-suggestion:active {
-	background: var(--ob-selected);
-}
-
-.prompt-suggestion:hover .prompt-suggestion-fill,
-.prompt-suggestion:focus-visible .prompt-suggestion-fill {
-	opacity: 1;
-}
-
-.prompt-suggestion:focus-visible,
-.prompt-suggestions-close:focus-visible {
-	outline: 2px solid var(--ob-focus);
-	outline-offset: -2px;
-}
-
-@media (hover: none) and (pointer: coarse) {
-	.prompt-suggestion {
-		min-height: 2.5rem;
-	}
-
-	.prompt-suggestion-fill {
-		opacity: 0.7;
-	}
-
-	.prompt-suggestions-close {
-		width: 2.25rem;
-		height: 2.25rem;
-		margin-block: -0.3rem;
-	}
-}
-
-.prompt-suggestions-enter-active,
-.prompt-suggestions-leave-active {
-	transition: opacity 0.16s ease, transform 0.16s ease;
-}
-
-.prompt-suggestions-enter-from,
-.prompt-suggestions-leave-to {
-	opacity: 0;
-	transform: translateY(4px);
 }
 
 /* A single card owns its content scroll; only stacked cards need an outer rail. */

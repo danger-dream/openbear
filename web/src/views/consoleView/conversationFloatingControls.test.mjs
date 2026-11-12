@@ -91,6 +91,16 @@ test('the visible reading area excludes content under the glass, including colla
   }
 });
 
+test('scroll lock stays below the full minimap when the composer grows',()=>{
+  const page=css('./ConsoleView.vue','.console-page',1440);
+  const bottom=page['--console-float-rail-bottom'];
+  assert.match(bottom,/^min\(/);
+  for(const variable of ['--console-composer-height','--console-float-minimap-top','--console-float-minimap-max-height','--console-float-control-gap','--console-float-control-size']) assert.ok(bottom.includes(variable));
+  assert.equal(css('./ConsoleView.vue','.scroll-lock-toggle',1440).bottom,'var(--console-float-rail-bottom)');
+  assert.match(css('./TurnMinimap.vue','.turn-minimap-rail',1440)['max-height'],/var\(--console-float-minimap-max-height/);
+  assert.equal(css('./ConsoleView.vue','.console-controls',390).display,'none');
+});
+
 test('glass does not change header geometry; floating controls have distinct hit areas and avoid editor/selection overlays',()=>{
   const glass=css('./ConsoleHeader.vue','.console-header::before');
   assert.equal(glass['pointer-events'],'none');assert.match(glass['backdrop-filter'],/blur\(24px\)/);assert.match(glass['-webkit-backdrop-filter'],/blur\(24px\)/);assert.match(glass['mask-image'],/18px/);

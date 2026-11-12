@@ -631,6 +631,15 @@ class AgentsConfig(BaseModel):
     plan_review_prompt: str = Field(default="", alias="planReviewPrompt")
     plan_execution_prompt: str = Field(default="", alias="planExecutionPrompt")
     plan_context_restore_prompt: str = Field(default="", alias="planContextRestorePrompt")
+    # AgentWait oversight: review deadlines and anomaly wake thresholds.
+    supervision_first_review_s: int = Field(default=300, alias="supervisionFirstReviewS", ge=30, le=3600)
+    supervision_max_review_interval_s: int = Field(default=900, alias="supervisionMaxReviewIntervalS", ge=60, le=7200)
+    supervision_repeat_failures: int = Field(default=3, alias="supervisionRepeatFailures", ge=2, le=20)
+    supervision_loop_repeats: int = Field(default=4, alias="supervisionLoopRepeats", ge=2, le=20)
+    supervision_stall_minutes: int = Field(default=10, alias="supervisionStallMinutes", ge=1, le=240)
+    supervision_budget_alert_percent: int = Field(default=80, alias="supervisionBudgetAlertPercent", ge=10, le=100)
+    supervision_duration_budget_minutes: int = Field(default=60, alias="supervisionDurationBudgetMinutes", ge=0, le=1440)
+    supervision_cost_budget_usd: float = Field(default=5.0, alias="supervisionCostBudgetUsd", ge=0, le=1000)
     # Agent/AgentMessage foreground wait fallback.
     # Claude Code assistant/KAIROS forces subagents async so the main loop can
     # close its turn and later resume from task-notification.  Web/OpenBear
@@ -714,6 +723,8 @@ class UIConfig(BaseModel):
     # Deprecated compatibility input; the current timeline always carries reasoning.
     show_thinking: bool = Field(default=False, alias="showThinking", exclude=True)
     show_turn_stats: bool = Field(default=True, alias="showTurnStats")
+    notes_enabled: bool = Field(default=True, alias="notesEnabled")
+    notes_selection_popover: bool = Field(default=True, alias="notesSelectionPopover")
 
     model_config = {"populate_by_name": True, "extra": "ignore"}
 

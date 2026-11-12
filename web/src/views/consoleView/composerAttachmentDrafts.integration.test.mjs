@@ -5,6 +5,7 @@ import vm from "node:vm";
 import {createOutboundSendTracker, restoreOutboundDraft} from "./outboundSend.js";
 import {createAttachmentDraftStorage, planAttachmentDraftRecord} from "./attachmentDraftStorage.js";
 import {createMemoryAttachmentDraftDriver} from "./attachmentDraftMemoryDriver.mjs";
+import {forgetExtensionDraft} from "./extensionDrafts.js";
 
 // Runs the real ConsoleView draft functions: the composer's files must belong to
 // their own conversation exactly like its text draft, across switches, receipts
@@ -34,7 +35,7 @@ function harness({conversationUuid = "conv-a", records = new Map(), fail = null,
 	const warnings = [];
 	let previewSeq = 0;
 	const state = {
-		props,
+		props, forgetExtensionDraft,
 		draft: {value: ""},
 		draftByConversation: {value: {}},
 		restoringDraft: {value: false},

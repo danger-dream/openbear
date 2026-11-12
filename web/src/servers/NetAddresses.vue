@@ -1,4 +1,6 @@
 <script setup>
+import { Location } from '@element-plus/icons-vue';
+import CardIcon from './detail/CardIcon.vue';
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { NetApi } from './netApi.js';
@@ -10,7 +12,7 @@ import './net.css';
 // card: the detail page's card; otherwise a section of the mesh member's status page,
 // which shows the first `limit` addresses and the rest behind a tap.
 const props = defineProps({serverId: {type: String, required: true}, online: {type: Boolean, default: true}, card: Boolean, title: {type: String, default: '网络地址'},
-  limit: {type: Number, default: 0}});
+  limit: {type: Number, default: 0}, active: {type: Boolean, default: true}});
 const reply = ref(null), state = ref('idle'), error = ref(''), open = ref(false);
 let round = 0;
 
@@ -40,17 +42,21 @@ async function copy(ip) {
   try { await navigator.clipboard.writeText(ip); ElMessage.success(`已复制 ${ip}`); }
   catch { ElMessage.warning('浏览器不允许复制，请手动选择文字'); }
 }
-// Loaded once when shown, again when the server changes or the node comes back online.
-watch(() => [props.serverId, props.online], ([, online], old) => {
-  if (old && old[0] !== props.serverId) { reply.value = null; open.value = false; error.value = ''; }
-  if (online) void load(); else round++;
+// Loaded once when shown, again when the server changes or the node comes back online; while not
+// active (a tab or panel behind) only once it is.
+let stale = true;
+watch(() => [props.serverId, props.online, props.active], ([id, online, active], old) => {
+  if (old && old[0] !== id) { reply.value = null; open.value = false; error.value = ''; }
+  if (!old || old[0] !== id || online && !old[1]) stale = true;
+  if (!online) { round++; return; }
+  if (active && stale) { stale = false; void load(); }
 }, {immediate: true});
 onBeforeUnmount(() => { round++; });
 </script>
 <template>
   <section :class="card ? 'ix-card net-addresses' : 'net-addresses net-addresses-panel'" :aria-label="title">
     <header :class="card ? 'ix-card-head' : 'net-panel-head'">
-      <component :is="card ? 'h3' : 'h4'">{{ title }}</component>
+      <component :is="card ? 'h3' : 'h4'"><CardIcon v-if="card" :icon="Location" />{{ title }}</component>
       <span class="ob-grow" />
       <button v-if="!blocked" type="button" class="ix-text-button net-refresh" :disabled="state === 'loading' || state === 'refreshing'" @click="load">{{ state === 'refreshing' ? '正在刷新…' : '刷新' }}</button>
     </header>

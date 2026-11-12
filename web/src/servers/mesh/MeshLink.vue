@@ -131,14 +131,19 @@ function setBias(value) {
     customRelayLinks(work.value);
     const i = work.value.relayLinks.pairs.findIndex(p => (p.a === l.a && p.b === l.b) || (p.a === l.b && p.b === l.a));
     work.value.relayLinks.pairs[i].bias = n;
+    own(work.value.relayLinks.pairs[i], 'bias');
     void save();
     ElMessage.info('已改为逐对设置中转连接，并给这一对设了偏好');
     emit('select', {kind: 'edge', id: `pair:${i}`});
     return;
   }
   if (n) l.p.bias = n; else delete l.p.bias;
+  own(l.p, 'bias');
   void save();
 }
+// A field set here is the user's: the mesh no longer works it out (mesh_auto), or saving would put its value back.
+function own(x, field) { if (x.auto?.includes(field)) x.auto = x.auto.filter(f => f !== field); }
+function setDialer() { own(link.value.p, 'dialer'); void save(); }
 
 function enable(m, transport) {
   m.listen = {udp: 0, tcp: 0, tls: 0, ...(m.listen || {}), [transport]: ports.value[transport]};
@@ -156,10 +161,12 @@ const notes = computed(() => {
     const relay = entryRelay.value;
     if (relay && !isRelay(relay)) list.push({text: `${relay.name} 已经不是中转`});
     else if (isSite(relay)) {
-      // Reached by punching: UDP, and a public relay among the entries to exchange addresses through.
+      // Reached by punching: UDP, and off the member's LAN a public relay among the entries to exchange
+      // addresses through, which only the server's check can tell.
       if (l.c.transport !== 'udp') list.push({text: `${relay.name} 是站点中转，只能打洞（UDP）连接`, fix: '改成 UDP', action: () => setTransport('udp')});
       else if (!listens(relay, 'udp')) list.push({text: `${relay.name} 没有开启 UDP 监听`, fix: `为 ${relay.name} 开启 UDP 监听`, action: () => enable(relay, 'udp')});
-      if (!l.member.entry.candidates.some(c => isRelay(find(c.relay)) && !isSite(find(c.relay)))) list.push({text: codeText('mesh_entry_needs_bootstrap')});
+      const candidates = l.path.slice(0, l.path.lastIndexOf('['));
+      if ((mesh.errors || []).some(e => e.path === candidates && e.error === 'mesh_entry_needs_bootstrap')) list.push({text: codeText('mesh_entry_needs_bootstrap')});
     } else if (relay && !listens(relay, l.c.transport)) list.push({text: `${relay.name} 没有开启 ${transportLabel(l.c.transport)} 监听`, fix: `为 ${relay.name} 开启 ${transportLabel(l.c.transport)} 监听`, action: () => enable(relay, l.c.transport)});
     if (relay && isRelay(relay) && !isSite(relay) && !publicAddress(relay)) list.push({text: `${relay.name} 没有可用的对外地址，在它的设置里填写`});
   } else if (punched.value) {
@@ -183,8 +190,16 @@ const warnings = computed(() => [...new Set(link.value?.path ? warningsUnder(mes
 const transports = computed(() => link.value?.kind === 'direct' ? TRANSPORTS.filter(([t]) => t !== 'tls' || link.value.p.transport === 'tls') : TRANSPORTS);
 // Punched links and entries to a site relay are UDP: no choice to make.
 const fixedTransport = computed(() => relayPunched.value || (link.value?.kind === 'entry' && isSite(entryRelay.value) && link.value.c.transport === 'udp'));
+function toManual() {
+  const x = link.value?.kind === 'entry' ? link.value.c : link.value?.p;
+  if (!x) return;
+  delete x.origin; delete x.reason; delete x.since;
+  void save();
+}
 function setTransport(t) {
-  if (link.value.kind === 'entry') link.value.c.transport = t; else link.value.p.transport = t;
+  const x = link.value.kind === 'entry' ? link.value.c : link.value.p;
+  x.transport = t;
+  own(x, 'transport');
   void save();
 }
 function shift(delta) { if (move(link.value.member.entry.candidates, link.value.index, delta)) void save(); }
@@ -205,6 +220,11 @@ function setFull(on) {
       <button type="button" class="ix-text-button" @click="emit('select', {kind: 'node', id: link.b})">{{ nameOf(members, link.b) }}</button>
       <span v-if="link.kind === 'entry'" class="pb-tag" :data-tone="look.look === 'bad' ? 'bad' : look.look === 'active' ? 'ok' : undefined">{{ look.problem ? '不可用' : look.role }}</span>
     </p>
+
+    <div v-if="(link.c || link.p)?.origin === 'auto'" class="mesh-link-notes">
+      <p class="mesh-cand-note is-info"><span>自动建立{{ (link.c || link.p).reason ? `：${(link.c || link.p).reason}` : '' }}</span>
+        <button type="button" class="ix-text-button" @click="toManual">转成手动</button></p>
+    </div>
 
     <!-- What needs fixing first, each with its one-tap fix. -->
     <div v-if="notes.length || warnings.length || problems.length" class="mesh-link-notes">
@@ -240,11 +260,11 @@ function setFull(on) {
     <section v-if="lineId && Array.isArray(mesh.data?.lines)" class="mesh-link-group mesh-line-ends" aria-label="两端">
       <h4 class="mesh-group-title">两端<span v-if="lineState" class="ob-dot" :data-tone="lineState.tone">{{ lineState.text }}</span></h4>
       <p v-if="!line" class="instance-muted mesh-link-text">这条线路还没有上报，应用到网格并连上后显示两端的地址。</p>
-      <p v-else-if="line.state === 'unused'" class="instance-muted mesh-link-text">入口方式是"固定"，只用第一个入口，这条不会连接。要让它当备用，把入口方式改成"自动切换"。</p>
+      <p v-else-if="line.state === 'unused'" class="instance-muted mesh-link-text">入口方式是「只用第一个」，这条不会连接。要让它当备用，改成「主备」；要同时用上，改成「同时连上」。</p>
       <ul v-else class="mesh-line-end-list">
         <li v-for="e in lineEnds" :key="e.key">
           <p class="mesh-line-end-name"><strong>{{ e.name }}</strong><span v-if="e.info?.dialer" class="pb-tag is-plain">{{ e.info.dialer }}</span></p>
-          <p v-if="e.info" class="mesh-line-end-route"><template v-if="e.info.local">从 <span class="mono">{{ e.info.local }}</span> 经 </template><template v-else>经 </template>{{ e.info.via }} 连到 <span class="mono">{{ e.info.remote }}</span></p>
+          <p v-if="e.info" class="mesh-line-end-route"><template v-if="e.info.local">从 <span class="mono">{{ e.info.local }}</span> 经 </template><template v-else>经 </template>{{ e.info.via }} 连到 <span class="mono">{{ e.info.remote }}</span><template v-if="e.info.mtu">，路径 MTU <span class="mono">{{ e.info.mtu }}</span></template></p>
           <p v-if="e.info?.public && e.info.public !== e.info.local" class="mesh-line-end-route instance-muted">公网映射 <span class="mono">{{ e.info.public }}</span></p>
           <p v-if="!e.info" class="instance-muted mesh-line-end-route">这端没有上报</p>
         </li>
@@ -255,7 +275,7 @@ function setFull(on) {
     <!-- Its settings: the value first, what it does behind ⓘ. -->
     <section class="mesh-link-group mesh-link-settings" aria-label="设置">
       <template v-if="link.kind === 'entry'">
-        <MeshField label="顺序">
+        <MeshField v-if="link.member.entry.mode !== 'upstreams'" label="顺序">
           <div class="mesh-link-order">
             <span>第 {{ link.index + 1 }} 个，共 {{ link.member.entry.candidates.length }} 个</span>
             <span class="ob-grow" />
@@ -265,7 +285,7 @@ function setFull(on) {
         </MeshField>
         <MeshField label="模式">
           <div class="mesh-link-order">
-            <span>{{ link.member.entry.mode === 'failover' ? '自动切换' : '固定（只用第一个）' }}</span>
+            <span>{{ link.member.entry.mode === 'upstreams' ? '同时连上（去每个目标自动挑最快的入口）' : link.member.entry.mode === 'failover' ? '主备（先用第一个，连不上换下一个）' : '只用第一个' }}</span>
             <span class="ob-grow" />
             <button type="button" class="ix-text-button" @click="emit('select', {kind: 'node', id: link.a, tab: 'entry'})">修改</button>
           </div>
@@ -285,7 +305,7 @@ function setFull(on) {
         <p v-else-if="punched" class="instance-muted mesh-link-text mesh-punch-note">自动打洞：两边都在防火墙后也能直连，打不通时走中转</p>
         <p v-else-if="dialing?.fixed && dialing.dialer" class="instance-muted mesh-link-text">由 {{ dialing.dialer.name }} 主动拨号：站点中转不对外宣告地址。</p>
         <MeshField v-else label="主动方" help="另一端等待连接，需要开启对应的监听并有对外地址。">
-          <select v-model="link.p.dialer" aria-label="由谁主动连接" @change="save">
+          <select v-model="link.p.dialer" aria-label="由谁主动连接" @change="setDialer">
             <option value="a">{{ nameOf(members, link.p.a) }} 主动连接</option><option value="b">{{ nameOf(members, link.p.b) }} 主动连接</option>
           </select>
         </MeshField>

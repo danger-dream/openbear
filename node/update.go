@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -97,7 +96,7 @@ func (a *Agent) update(ctx context.Context, raw json.RawMessage) (map[string]any
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint(base, "/api/server-nodes/v1/download/"+p.Name, false), nil)
 	req.Header.Set("User-Agent", "openbear-node/"+Version)
-	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	transport := &http.Transport{TLSClientConfig: c.tlsFor(base)}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)

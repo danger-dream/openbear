@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 )
@@ -99,8 +100,8 @@ func (f *filter) setSites(sites []site) {
 func sitesOf(c *Config) []site {
 	var out []site
 	for _, n := range c.Nodes {
-		if len(n.Subnets) > 0 {
-			out = append(out, site{n.Address, n.Subnets})
+		if subnets := append(slices.Clone(n.Subnets), n.StandbySubnets...); len(subnets) > 0 {
+			out = append(out, site{n.Address, subnets})
 		}
 	}
 	return out

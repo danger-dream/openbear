@@ -25,7 +25,7 @@ def read_conversation_overview(db_path: str, owner: int, conversation_uuid: str)
         conn.execute("BEGIN")
         row = conn.execute(
             """SELECT conversation_uuid,internal_chat_id,title,folder_uuid,
-            status,current_status,updated_at,archived_at,model FROM web_conversations
+            status,current_status,updated_at,archived_at,model,last_conversation_at FROM web_conversations
             WHERE conversation_uuid=? AND owner_chat_id=?""",
             (conversation_uuid, owner),
         ).fetchone()
@@ -33,6 +33,15 @@ def read_conversation_overview(db_path: str, owner: int, conversation_uuid: str)
             return None
         conversation = dict(row)
         chat_id = int(row["internal_chat_id"])
+        last_message_at = row["last_conversation_at"]
+        if last_message_at is None:
+            last_message_at = conn.execute(
+                """SELECT MAX(created_at) FROM messages
+                WHERE chat_id=? AND COALESCE(task_uuid,'')=''
+                  AND (role='user' OR (role='assistant' AND TRIM(COALESCE(content,''))<>''))""",
+                (chat_id,),
+            ).fetchone()[0]
+        last_message_at = int(last_message_at or 0)
         usage = conn.execute(
             """SELECT session_uuid,usage_input_tokens AS input_tokens,
             usage_output_tokens AS output_tokens,usage_cache_read_tokens AS cache_read_tokens,
@@ -121,6 +130,7 @@ def read_conversation_overview(db_path: str, owner: int, conversation_uuid: str)
             "operationStartedAtMs": int(ops["started"] or 0),
             "backgroundStartedAtMs": int(tasks["started"] or 0) * 1000,
             "path": " / ".join(reversed(names)) or "临时会话",
+            "lastMessageAtMs": last_message_at * 1000 if last_message_at > 0 else None,
             "usage": ledger,
             "messageCount": int(message_count),
             "calls": {

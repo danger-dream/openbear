@@ -5,8 +5,37 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"testing"
+
+	"openbear/node/mesh/wire"
 )
+
+// dialPreamble opens a raw stream to a bind as this build's dialing end
+// does, and acceptPreamble answers one from a bind as its accepting end
+// does, with a token no companion is given.
+func dialPreamble(c net.Conn) error {
+	v, err := exchangeVersions(c, wire.Local())
+	if err == nil && v >= companionVersion {
+		_, err = dialHello(c)
+	}
+	return err
+}
+
+func acceptPreamble(c net.Conn) error {
+	v, err := exchangeVersions(c, wire.Local())
+	if err != nil || v < companionVersion {
+		return err
+	}
+	var hello [1]byte
+	if _, err = io.ReadFull(c, hello[:]); err != nil {
+		return err
+	}
+	if hello[0] != helloStream {
+		return ErrFrame
+	}
+	return writeAll(c, make([]byte, 32))
+}
 
 type shortReader struct{ io.Reader }
 

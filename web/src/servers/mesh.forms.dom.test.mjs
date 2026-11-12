@@ -8,11 +8,11 @@ import {mountPage} from './testing/pageDom.mjs';
 import {sleep, settle} from '../testing/domPage.mjs';
 import {GB, server, member, VIEW_KEYS, fakeMesh} from './testing/meshFormsFixture.mjs';
 
-async function setup(t, {width = 1440, height = 900, dark = false} = {}) {
-  const mesh = fakeMesh();
+async function setup(t, {width = 1440, height = 900, dark = false, clashes = false} = {}) {
+  const mesh = fakeMesh({clashes});
   const items = [server('berlin', 'Berlin'), server('lax', 'LAX', {region: 'US'}), server('home', 'Home', {region: 'CN'})];
   const h = await mountPage(t, {width, height, dark, load: n => import(`../views/ServersView.vue?fresh=${n}`),
-    session: {'openbear.servers.tabs': JSON.stringify({tabs: [], active: 'mesh'})},
+    session: {'openbear.servers.tabs': JSON.stringify({tabs: [], active: 'mesh'})}, local: {'openbear.mesh.classic': '1'},
     handle: async (method, path, body) => {
       let status = 200, data = {ok: true};
       if (path.startsWith('/api/servers/mesh')) [status, data] = mesh.handle(method, path.slice('/api/servers/mesh'.length), body);
@@ -152,10 +152,28 @@ test('desktop: tags, tooltips, address and ports checked as typed, gateway netwo
   const masq = panel.getByRole('checkbox', {name: '地址转换（IP 伪装）'});
   assert.equal(await masq.isChecked(), true);
   await panel.getByRole('button', {name: '地址转换：说明'}).hover();
-  await tip(page, '局域网里的设备看到的来源是网关这台机器的地址，所以不用在路由器上加回程路由').waitFor();
+  await tip(page, '局域网里的设备看到的来源是网关这个节点的地址，所以不用在路由器上加回程路由').waitFor();
   await masq.uncheck();
   await h.saved(d => memberOf(d, 'home').gateway.masquerade === false, 'masquerade off');
   await panel.getByText('需要在局域网路由器上把组网网段 100.96.0.0/16 指向这台网关').waitFor();
+  await h.close();
+});
+
+test('desktop: a gateway network the machine routes itself is taken over and given back', async t => {
+  const h = await setup(t, {clashes: true});
+  const {page} = h;
+  await node(page, 'home').click();
+  const panel = page.locator('.mesh-inspector-col');
+  await panel.getByRole('tab', {name: '配置'}).click();
+  const take = panel.getByRole('checkbox', {name: '接管 10.20.0.0/16'});
+  await take.waitFor();
+  assert.equal(await take.isChecked(), true);
+  await panel.getByRole('button', {name: '路由冲突：说明'}).hover();
+  await tip(page, '退出组网或组网服务停止时，原来的路由会恢复').waitFor();
+  await take.uncheck();
+  await h.saved(d => memberOf(d, 'home').keepRoutes?.join() === '10.20.0.0/16', 'kept');
+  await take.check();
+  await h.saved(d => memberOf(d, 'home').keepRoutes.length === 0, 'taken over again');
   await h.close();
 });
 
@@ -193,7 +211,7 @@ test('rules: 所有网关网段 on both sides, with the rest, in the summary; th
     await panel.getByRole('combobox', {name: '来源：添加成员或标签'}).selectOption('members:berlin');
     await panel.getByRole('combobox', {name: '目标：添加成员或标签'}).selectOption('members:lax');
     // LAX is a gateway chosen as a machine: its networks are not in.
-    const hint = panel.getByText('LAX 只包括这台机器，不包括它的网段；要开放网段请在这里添加。');
+    const hint = panel.getByText('LAX 只包括这个节点，不包括它的网段；要开放网段请在这里添加。');
     await hint.waitFor();
     const dst = panel.locator('.mesh-side').nth(1);
     assert.match(await dst.locator('.mesh-side-every').innerText(), /所有成员\s*各成员自己的组网地址，以后加入的也算；不含网关后面的局域网\s*所有网关网段\s*各网关后面的局域网，比如家里的 10\.10\.10\.0\/24；以后新加的网段也算/);
@@ -270,10 +288,10 @@ test('phone, light and dark: tooltips by tap, tag suggestions, 16px inputs, rule
     await box2.waitFor();
     const ruleSheet = p.page.locator('.mesh-sheet', {has: box2});
     await ruleSheet.getByRole('combobox', {name: '目标：添加成员或标签'}).selectOption('members:lax');
-    await ruleSheet.getByText('LAX 只包括这台机器，不包括它的网段').waitFor();
+    await ruleSheet.getByText('LAX 只包括这个节点，不包括它的网段').waitFor();
     await box2.tap();
     await p.saved(d => d.rules[0]?.dst.allSubnets, 'phone dst all gateway networks');
-    await ruleSheet.getByText('LAX 只包括这台机器，不包括它的网段').waitFor({state: 'detached'});
+    await ruleSheet.getByText('LAX 只包括这个节点，不包括它的网段').waitFor({state: 'detached'});
     await p.close();
   }
 });

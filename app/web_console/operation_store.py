@@ -1558,6 +1558,15 @@ class WebAdminOperationsMixin:
                                 frames.append(frame)
                 for entry in foreground:
                     store.drop(conv_uuid, str(entry.row.get("op_id") or ""))
+        # Resolving the ledger wakes the tool before its terminal operation is
+        # committed. Refresh again at that boundary: an active interaction op is
+        # independently a waiting fact, even after its form has been removed.
+        if any(frame.get("opType") == "user_interaction"
+               and frame.get("action") in {"end", "error", "cancel", "stop"}
+               for frame in frames):
+            hub = getattr(self, "global_realtime", None)
+            if hub is not None:
+                hub.invalidate_tree()
         if frames:
             payload["_webFrames"] = frames
             payload["frameSeq"] = frames[-1].get("frameSeq")

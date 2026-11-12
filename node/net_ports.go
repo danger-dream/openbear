@@ -51,7 +51,13 @@ func (a *Agent) netPorts(ctx context.Context, raw json.RawMessage) (any, error) 
 	if s, ok := h.readStatus(); ok {
 		meshPid = s.Pid
 	}
-	ours := func(o portOwner) bool { return ownedByUs(o, h.binary(), meshPid) }
+	// The data plane runs a copy elsewhere, and on Linux the node's own program, which other
+	// processes run too (background jobs): there it is the one whose pid status.json names. An
+	// older install's data plane keeps its copy until its next upgrade.
+	exe, _ := h.exe()
+	ours := func(o portOwner) bool {
+		return ownedByUs(o, h.binary(), meshPid) || !meshCopies && exe != "" && meshPid > 0 && o.pid == meshPid && ownedByUs(o, exe, 0)
+	}
 	ctx, cancel := context.WithTimeout(ctx, portOwnersWithin)
 	defer cancel()
 	out := checkPorts(ctx, map[string][]int{"tcp": tcp, "udp": udp}, ours)

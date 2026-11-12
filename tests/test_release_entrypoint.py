@@ -331,8 +331,11 @@ def test_matrix_collection_and_skip_contract():
     with pytest.raises(ReleaseError, match="Unexpected conditional skip"):
         runner.matrix_contract({name: unlisted for name in runner.TEST_STAGES})
     node = {"ok": True, "testCases": [{"id": "tests.test_servers::test_node", "status": "skipped", "skipReason": "Go toolchain is not available"},
+                                      {"id": "tests.test_servers_desktop::test_relay", "status": "skipped", "skipReason": "Go toolchain is not available"},
+                                      {"id": "tests.test_servers_front::test_front", "status": "skipped", "skipReason": "Go toolchain is not available"},
                                       {"id": "tests.test_node_browser::test_drive", "status": "skipped", "skipReason": "needs Chrome and Go"},
                                       {"id": "tests.test_browser_engine_parity::test_same", "status": "skipped", "skipReason": "needs google-chrome and Go"},
+                                      {"id": "tests.test_browser_observe_steps::test_steps", "status": "skipped", "skipReason": "needs google-chrome and Go"},
                                       {"id": "tests.test_gateway_update::test_reinstall", "status": "skipped", "skipReason": "needs the built gateway program"},
                                       {"id": "tests.test_servers_transfers::test_upload", "status": "skipped", "skipReason": "Go toolchain is not available"},
                                       {"id": "tests.test_instance_hardening::test_gateway", "status": "skipped", "skipReason": "gateway binary not built"},
@@ -354,6 +357,31 @@ def test_matrix_collection_and_skip_contract():
         values = {name: {"ok": True, "testCases": [{**case, "status": "skipped"}]} for name in runner.TEST_STAGES}
         with pytest.raises(ReleaseError, match="Unexpected conditional skip"):
             runner.matrix_contract(values)
+
+
+def test_every_unexpected_skip_is_reported_in_one_run():
+    cases = [{"id": "tests.test_gateway_update::test_new", "status": "skipped", "skipReason": "gateway unreachable"},
+             {"id": "tests.test_instance_hardening::test_new", "status": "skipped", "skipReason": "port busy"},
+             {"id": "tests.test_one::test_ok", "status": "passed"}]
+    values = {name: {"ok": True, "testCases": cases} for name in runner.TEST_STAGES}
+    with pytest.raises(ReleaseError) as refused:
+        runner.matrix_contract(values)
+    message = str(refused.value)
+    assert "(2)" in message
+    assert "tests.test_gateway_update::test_new: gateway unreachable" in message
+    assert "tests.test_instance_hardening::test_new: port busy" in message
+
+
+def test_a_flake_in_one_version_is_released_but_the_same_flake_in_two_blocks():
+    def results(*flaky_in):
+        return {name: {"ok": True, "testCases": [{"id": "tests.test_one::test_timing", "status": "passed", "flaky": name in flaky_in},
+                                                 {"id": "tests.test_one::test_ok", "status": "passed"}]}
+                for name in runner.TEST_STAGES}
+    assert runner.matrix_contract(results())["flaky"] == {}
+    assert runner.matrix_contract(results("py312"))["flaky"] == {"tests.test_one::test_timing": ["py312"]}
+    with pytest.raises(ReleaseError, match="several Python versions") as blocked:
+        runner.matrix_contract(results("py311", "py313"))
+    assert "tests.test_one::test_timing: py311, py313" in str(blocked.value)
 
 
 class MemoryCommands:
@@ -459,6 +487,7 @@ def test_whole_pipeline_B_failure_resumes_without_repeating_tests_build_or_A(tmp
         return {"ok": True, "url": "https://example.invalid/release"}
 
     monkeypatch.setattr(runner, "publish", publisher)
+    monkeypatch.setattr(runner, "push_candidate", lambda *_: calls.update(["candidate-push"]) or {"ok": True})
     obj = TestRunner(tmp_path, directory, value, github=SimpleNamespace(token="fixture"), command=MemoryCommands())
     with pytest.raises(ReleaseError, match="B fixture failure"):
         obj.run(approved=True)
@@ -467,7 +496,7 @@ def test_whole_pipeline_B_failure_resumes_without_repeating_tests_build_or_A(tmp
     resumed.run(approved=True)
     assert resumed.value["completed"]
     assert calls["B"] == 2 and calls["publish"] == 1
-    for stage in (*runner.TEST_STAGES, "build", "package", "smoke", "A"):
+    for stage in (*runner.TEST_STAGES, "build", "package", "smoke", "A", "candidate-push"):
         assert calls[stage] == 1, (stage, calls)
 
 

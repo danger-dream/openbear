@@ -136,21 +136,31 @@ async def test_root_done_while_agent_runs_stays_running_then_agent_terminal_is_u
     assert status["activityItems"][0]["activityVersion"] == 2
 
 
-@pytest.mark.parametrize("op_type,status,payload", [
-    ("user_interaction", "running", {"interactionStatus": "pending"}),
-    ("agent", "needs_openbear_control", {"taskUuid": "child"}),
-])
-async def test_waiting_rows_are_attention_and_do_not_mark_a_completion(web_env, op_type, status, payload):
+async def test_waiting_rows_are_attention_and_do_not_mark_a_completion(web_env):
     env = web_env
     row = await env.server._create_web_conversation(123)
     env.server._web_starting_turns[row["conversation_uuid"]] = "hold"
     try:
-        await publish(env, row, "wait:one", op_type=op_type, status=status, payload=payload)
+        await publish(env, row, "wait:one", op_type="user_interaction", status="running", payload={"interactionStatus": "pending"})
         item = (await env.server._tree_running_state(123))["activityItems"][0]
         assert item["activityState"] == "waiting" and item["running"]
         assert not item["activityUnread"]
     finally:
         env.server._web_starting_turns.pop(row["conversation_uuid"], None)
+
+
+async def test_agent_waiting_for_controller_is_running_not_user_attention(web_env):
+    env = web_env
+    row = await env.server._create_web_conversation(123)
+    await publish(env, row, "agent:child", op_type="agent", status="needs_openbear_control", payload={"taskUuid": "child"})
+    await env.db.conn.execute(
+        "INSERT INTO rath_tasks(task_uuid,chat_id,parent_session_uuid,status,started_at,updated_at) VALUES('child',?,?,'needs_openbear_control',100,200)",
+        (row["internal_chat_id"], row["conversation_uuid"]),
+    )
+    await env.db.conn.commit()
+    item = (await env.server._tree_running_state(123))["activityItems"][0]
+    assert item["running"] and item["activityState"] == "running"
+    assert item["activityPending"] == [] and not item["activityUnread"]
 
 
 @pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted", "partial"])

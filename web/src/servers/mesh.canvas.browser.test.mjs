@@ -133,9 +133,9 @@ test('mesh board layout: layout saving, alignment, folding columns', {skip: !chr
     assert.ok((await rail.boundingBox()).width <= 46);
     await rail.getByRole('radio', {name: '访问规则'}).click();
     await rail.getByRole('radio', {name: '选择'}).click();
-    // Both folded: the board has nearly the whole width.
+    // Both folded: the board has nearly the whole width (the page keeps its side margins).
     await page.locator('.mesh-toolbar').getByRole('button', {name: '收起属性面板'}).click();
-    assert.ok((await page.locator('.mesh-canvas').boundingBox()).width > 1440 - 100, 'the board has nearly the whole width');
+    assert.ok((await page.locator('.mesh-canvas').boundingBox()).width > 1440 - 150, 'the board has nearly the whole width');
     await shot(page, 'canvas-desktop-both-folded');
     await page.reload();
     await node(page, 'home').waitFor();

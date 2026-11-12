@@ -68,7 +68,7 @@ PLAN_EXECUTION_PROMPT = """
 当前步骤：
 {current_step}
 
-步骤开始、更新、完成、阻塞和 finalize 必须通过 AgentPlanProgress 持久化。普通工具活动必须属于 running step；实质变化必须 AgentPlanReplan；证据必须真实且可引用。每次追加调查工具前，先确认它能解决哪个仍未满足的 criterion 或哪项阻断冲突；否则不要调用。互相独立的文件/页面优先有边界地批量定位和读取；全部必需 criterion 已有直接证据且无阻断冲突时，立即冻结证据、完成步骤并成稿。
+步骤开始、更新、完成、阻塞和 finalize 必须通过 AgentPlan(action=progress) 持久化。普通工具活动必须属于 running step；实质变化必须 AgentPlan(action=replan)；证据必须真实且可引用。每次追加调查工具前，先确认它能解决哪个仍未满足的 criterion 或哪项阻断冲突；否则不要调用。互相独立的文件/页面优先有边界地批量定位和读取；全部必需 criterion 已有直接证据且无阻断冲突时，立即冻结证据、完成步骤并成稿。
 """.strip()
 
 PLAN_CONTEXT_RESTORE_PROMPT = """

@@ -371,6 +371,25 @@ async def test_responses_input_ignores_cross_protocol_reasoning():
     assert "signature" not in dumped
 
 
+async def test_responses_input_omits_role_alternation_bridges():
+    from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT, repair_role_alternation
+
+    messages = repair_role_alternation([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c1", name="WorkItem", arguments="{}")]},
+        {"role": "tool", "tool_call_id": "c1", "name": "WorkItem", "content": '{"ok":true}'},
+        {"role": "user", "content": "<work-items>#1</work-items>"},
+        {"role": "user", "content": "<work-item-focus>#1.1</work-item-focus>"},
+    ])
+    assert sum(m.get("content") == ROLE_ALTERNATION_BRIDGE_TEXT for m in messages) == 2
+
+    out = _to_responses_input(messages)
+
+    assert ROLE_ALTERNATION_BRIDGE_TEXT not in json.dumps(out, ensure_ascii=False)
+    assert [o.get("type") or o.get("role") for o in out] == [
+        "user", "function_call", "function_call_output", "user", "user"]
+
+
 async def test_responses_tools_preserve_separate_edit_contracts():
     registry = ToolRegistry()
     register_file_tools(registry)
@@ -497,6 +516,28 @@ async def test_responses_failed_emits_usage_before_error():
     assert events[error_index].retryable is True
     assert events[error_index].summary == "上游请求频率过高，请稍后重试"
     assert events[error_index].details["root_cause"]["status"] == 429
+
+
+@pytest.mark.parametrize(("error", "expected"), [
+    ({"code": "server_error", "message": "An error occurred while processing your request."},
+     "server_error: An error occurred while processing your request."),
+    (None, "responses failed without error details"),
+])
+async def test_responses_failed_ignores_echoed_tool_schema_descriptions(error, expected):
+    tool = {"type": "function", "name": "ConversationGroup", "description": "Create a group",
+            "parameters": {"type": "object", "properties": {"group": {"type": "object", "properties": {
+                "workspaceDir": {"type": "string",
+                                 "description": "absolute path; omit for a new isolated group directory"},
+            }}}}}
+    lines = _ev("response.failed", {
+        "type": "response.failed",
+        "response": {"status": "failed", "error": error, "instructions": "system",
+                     "tools": [tool], "output": []},
+    })
+    backend = OpenAIResponsesBackend(make_client(lambda r: sse_response(lines)), "https://x/v1", "k")
+    events = [event async for event in backend.stream([{"role": "user", "content": "hi"}], model="m")]
+    errors = [event for event in events if event.kind == "error"]
+    assert [event.error for event in errors] == [expected]
 
 
 async def test_responses_complete_nonstream():

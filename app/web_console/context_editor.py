@@ -68,6 +68,7 @@ class WebAdminContextEditorMixin:
         if settings is None:
             system = system or await self._build_system_prompt_for_chat(conversation_uuid=conv)
             system = effective_context_prompt(system, await conversation_strategy(self.db, conv, self.config.context_management.default_strategy))
+            system, live_tools = await self._conversation_request_inputs(conv, system)
         else:
             system = settings['system']
         sid = await dao.get_or_create_session_uuid(chat)
@@ -87,7 +88,7 @@ class WebAdminContextEditorMixin:
         if settings is None:
             history = await reconcile_task_memory_runtime_state(history, TaskMemoryDAO(self.db), conversation_uuid=conv, epoch=task_memory_runtime_epoch(history))
             history = await self._reference_store().overlay(history, conversation_uuid=conv)
-        tools = settings['tools'] if settings else (self.tools.schemas(scope='main') if self.tools else [])
+        tools = settings['tools'] if settings else live_tools
         doc = document(system, tools, history, origin={'protocol': provider.protocol, 'model': model.id, 'modelLabel': label}, runtime={'frozen': True, 'sourceConversationUuid': conv, 'sessionId': sid, 'thinkingLevel': await self._effective_thinking_level(chat, label), 'fastMode': await dao.get_fast_mode(chat), 'maxTokens': model.max_tokens})
         for index, entry in enumerate(doc['entries']):
             entry['entryId'] = f'entry-{index}'
@@ -276,6 +277,7 @@ class WebAdminContextEditorMixin:
                 title = body.get('title') or f"{row['title']} · 上下文分支"
                 if not isinstance(title, str):
                     raise ValueError('invalid_title')
+                extensions = await self._extensions_copy(row['conversation_uuid'])
                 async with self._web_conversation_create_lock:
                     async with self.db.conn.transaction(label='context-editor-create-branch') as conn:
                         branch = await self._create_web_conversation(row['owner_chat_id'], title=title, model=label,
@@ -284,7 +286,7 @@ class WebAdminContextEditorMixin:
                                         'agent_model': row.get('agent_model', ''), 'agent_think_level': row.get('agent_think_level', ''),
                                         'agent_fast_mode': row.get('agent_fast_mode', -1),
                                         'context_strategy': row.get('context_strategy', 'sliding_window')},
-                            folder_uuid=str(row.get('folder_uuid') or ''), create_lock_held=True)
+                            folder_uuid=str(row.get('folder_uuid') or ''), create_lock_held=True, extensions=extensions)
                         bid, chat = branch['conversation_uuid'], int(branch['internal_chat_id'])
                         dao = MessageDAO(self.db)
                         sid = await dao.get_or_create_session_uuid(chat)

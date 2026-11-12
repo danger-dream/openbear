@@ -15,13 +15,15 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"openbear/node/mesh/bypass"
 )
 
 // rawEcho pings over a raw ICMP socket, which also receives the time
 // exceeded and unreachable errors routers send back; replies are told apart
 // by the echo ID and matched to their request by sequence number.
 type rawEcho struct {
-	c   *icmp.PacketConn
+	c   net.PacketConn
 	p4  *ipv4.PacketConn
 	p6  *ipv6.PacketConn
 	dst net.Addr
@@ -35,16 +37,26 @@ type rawEcho struct {
 	once   sync.Once
 }
 
+// listenRaw opens the raw socket as icmp.ListenPacket does, past a transparent proxy (package bypass).
+func listenRaw(network, address string) (c net.PacketConn, err error) {
+	err = bypass.Socket(func() error {
+		lc := net.ListenConfig{Control: bypass.Control}
+		c, err = lc.ListenPacket(context.Background(), network, address)
+		return err
+	})
+	return c, err
+}
+
 func openEcho(dst netip.Addr, id int) (echoConn, error) {
 	e := &rawEcho{dst: &net.IPAddr{IP: dst.AsSlice(), Zone: dst.Zone()}, id: id, waits: map[int]chan echoReply{}, closed: make(chan struct{})}
 	var err error
 	if dst.Is4() {
-		if e.c, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0"); err == nil {
-			e.p4 = e.c.IPv4PacketConn()
+		if e.c, err = listenRaw("ip4:icmp", "0.0.0.0"); err == nil {
+			e.p4 = ipv4.NewPacketConn(e.c)
 			err = e.p4.SetControlMessage(ipv4.FlagTTL, true)
 		}
-	} else if e.c, err = icmp.ListenPacket("ip6:ipv6-icmp", "::"); err == nil {
-		e.p6 = e.c.IPv6PacketConn()
+	} else if e.c, err = listenRaw("ip6:ipv6-icmp", "::"); err == nil {
+		e.p6 = ipv6.NewPacketConn(e.c)
 		var f ipv6.ICMPFilter
 		f.SetAll(true)
 		for _, t := range []ipv6.ICMPType{ipv6.ICMPTypeEchoReply, ipv6.ICMPTypeTimeExceeded, ipv6.ICMPTypeDestinationUnreachable} {

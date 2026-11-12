@@ -3,7 +3,9 @@ import {Check, CopyDocument, Link, Hide, Clock, Timer, Top, Bottom, Coin} from "
 import {Undo2} from "@lucide/vue";
 import {ElMessage} from "element-plus";
 import {ref} from "vue";
+import {conversationTimeParts, useConversationDay} from '../../conversationTime.js';
 import { contextResourceUrl } from '../../sessionBoundary.js';
+import {artifactFormat, artifactFromUrl, openArtifactPreview} from "../../artifacts/artifactFiles.js";
 import {copyTextToClipboard} from "../../utils/clipboard.js";
 import {referenceDisplayText} from "../../references/codec.js";
 import {
@@ -12,6 +14,7 @@ import {
 	eventUpdatedAtMs as projectedEventUpdatedAtMs,
 } from "../../timelineProjection.js";
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
+import AudioPlayer from "../../artifacts/AudioPlayer.vue";
 import WebhookMessageCard from './WebhookMessageCard.vue';
 import CronMessageCard from './CronMessageCard.vue';
 import InstanceMessageCard from './InstanceMessageCard.vue';
@@ -22,13 +25,15 @@ import TurnEvent from "./TurnEvent.vue";
 import ConversationWorkBlock from './ConversationWorkBlock.vue';
 import ConversationProcessEvent from './ConversationProcessEvent.vue';
 import ConversationRetryEvent from './ConversationRetryEvent.vue';
+import PromptSuggestions from './PromptSuggestions.vue';
 import {isInlineProcess} from './conversationWork.js';
 import MessageVisibilityAction from './MessageVisibilityAction.vue';
 import {useMessageVisibility, visibilitySelectionClasses, selectVisibilityRow} from './messageVisibility.js';
 const visibility = useMessageVisibility();
+const conversationDay = useConversationDay();
 import {conversationTimelineEntries, shouldRenderAssistantDivider} from "./conversationTimeline.js";
 import {eventPrimaryToolName, isAgentEvent, tokenLine, tokenPartsFromStats, fmtTokens, cachePct} from "./display.js";
-import {ListChecks} from "@lucide/vue";
+import {ListChecks, Play, StickyNote} from "@lucide/vue";
 import {isClosed, leaves, topNumber, turnTaskNumbers, useWorkItems} from "./workItems.js";
 
 const props = defineProps({
@@ -47,8 +52,12 @@ const props = defineProps({
 	detailKey: {type: Function, required: true},
 	isDetailOpen: {type: Function, required: true},
 	activeToolResultIndex: {type: Function, required: true},
+	// Shown under the latest reply; empty whenever they must not be offered.
+	promptSuggestions: {type: Array, default: () => []},
+	promptSuggestionsCollapsed: {type: Boolean, default: false},
+	notesEnabled: {type: Boolean, default: false},
 });
-const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "delete-suffix", "cancel-retry", "retry-now", "locate-turn"]);
+const emit = defineEmits(["details-toggle", "reasoning-toggle", "select-tool-result", "delete-suffix", "cancel-retry", "retry-now", "locate-turn", "pick-suggestion", "dismiss-suggestions", "note-turn"]);
 
 function displayEvents(turn) {
 	return Array.isArray(turn?.events) ? turn.events : [];
@@ -99,8 +108,8 @@ function continuationRootLabel(turn) {
 	const info = turn?.user?.continuation || {};
 	const date = new Date(Number(info.rootStartedAt || 0) * 1000);
 	if (!info.rootStartedAt || Number.isNaN(date.getTime())) return "接续之前的一轮";
-	const sameDay = date.toDateString() === new Date().toDateString();
-	const time = date.toLocaleString("zh-CN", {hour12: false, ...(sameDay ? {} : {month: "2-digit", day: "2-digit"}), hour: "2-digit", minute: "2-digit"});
+	const parts = conversationTimeParts(date.getTime(), conversationDay.value);
+	const time = [parts.date, parts.time.slice(0, 5)].filter(Boolean).join(' ');
 	return info.rootPreview ? `接续 ${time}「${info.rootPreview}」` : `接续 ${time} 的一轮`;
 }
 
@@ -177,6 +186,19 @@ function attachmentUrl(item) {
 	return contextResourceUrl(item?.previewUrl || item?.contentUrl || item?.downloadUrl || "");
 }
 
+// Only a registered conversation attachment can open in the shared preview.
+function mediaAttachment(item) {
+	const kind = artifactFormat({fileName: attachmentName(item), mimeType: item?.mimeType}).kind;
+	if (!["audio", "video"].includes(kind)) return null;
+	const identity = artifactFromUrl(item?.contentUrl || item?.previewUrl || "");
+	return identity ? {kind, identity} : null;
+}
+
+function openMediaAttachment(event, item) {
+	const media = mediaAttachment(item);
+	if (media) openArtifactPreview(media.identity, attachmentName(item), event.currentTarget);
+}
+
 function imagePreviewList(turn) {
 	return userAttachments(turn)
 		.filter((item) => isImageAttachment(item) && attachmentUrl(item))
@@ -186,6 +208,14 @@ function imagePreviewList(turn) {
 function imagePreviewIndex(turn, item) {
 	const url = attachmentUrl(item);
 	return Math.max(0, imagePreviewList(turn).indexOf(url));
+}
+
+function openImageAttachment(turn, item) {
+	const urlList = imagePreviewList(turn);
+	if (!urlList.length) return;
+	window.dispatchEvent?.(new CustomEvent("openbear:preview-images", {
+		detail: {urlList, initialIndex: imagePreviewIndex(turn, item)},
+	}));
 }
 
 function emitDetailsToggle(event, key) {
@@ -252,25 +282,9 @@ function durationMsForEvent(event) {
 	return start && end > start ? end - start : 0;
 }
 
-// A stream paint visits many row labels. Cache the exact existing formatting,
-// rather than constructing thousands of locale formatters for unchanged times.
-const timeLabels = new Map();
-function formattedTimes(ms) {
-	const value = Number(ms || 0);
-	if (!value) return {short: '', full: ''};
-	let labels = timeLabels.get(value);
-	if (!labels) {
-		const date = new Date(value);
-		labels = {
-			short: date.toLocaleTimeString('zh-CN', {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'}),
-			full: date.toLocaleString('zh-CN', {hour12: false}),
-		};
-		timeLabels.set(value, labels);
-		if (timeLabels.size > 2048) timeLabels.delete(timeLabels.keys().next().value);
-	}
-	return labels;
-}
-function formatHoverTime(ms) { return formattedTimes(ms).short; }
+function formattedTimes(ms) { return conversationTimeParts(ms, conversationDay.value); }
+function formatDatePart(ms) { return formattedTimes(ms).date; }
+function formatHoverTime(ms) { return formattedTimes(ms).time; }
 function formatFullTime(ms) { return formattedTimes(ms).full; }
 
 function formatDuration(ms) {
@@ -315,6 +329,32 @@ function assistantDurationMs(turn) {
 
 const copiedMessageKey = ref("");
 let copiedMessageTimer = 0;
+const notedTurnKey = ref("");
+let notedTurnTimer = 0;
+
+function assistantNoteTarget(turn) {
+	return conversationEvents(turn)
+		.filter(({event, part}) => event?.kind === "answer" && part !== "reasoning" && String(event?.message?.content || "").trim() && !visibility.isHidden(event))
+		.at(-1)?.event || null;
+}
+
+function captureTurnNote(turn, turnIndex) {
+	const target = assistantNoteTarget(turn);
+	const quote = assistantTurnRawContent(turn);
+	if (!target || !quote) return;
+	const key = `note-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`;
+	notedTurnKey.value = key;
+	window.clearTimeout(notedTurnTimer);
+	notedTurnTimer = window.setTimeout(() => {
+		if (notedTurnKey.value === key) notedTurnKey.value = "";
+	}, 1400);
+	emit("note-turn", {
+		opId: String(target.id || ""),
+		turnUuid: String(turn.turnUuid || turn.user?.turnUuid || ""),
+		turnNumber: turnIndex + 1,
+		quote,
+	});
+}
 
 function assistantTurnRawContent(turn) {
 	return conversationEvents(turn)
@@ -393,10 +433,15 @@ async function copyMessage(content, key) {
 							          :src="attachmentUrl(item)"
 							          :alt="attachmentName(item)"
 							          fit="cover"
-							          :preview-src-list="imagePreviewList(turn)"
-							          :initial-index="imagePreviewIndex(turn, item)"
-							          preview-teleported
-							          hide-on-click-modal/>
+							          @click="openImageAttachment(turn, item)"/>
+							<div v-else-if="mediaAttachment(item)?.kind === 'audio'" class="user-attachment audio" :title="attachmentName(item)">
+								<span class="user-attachment-name">{{ attachmentName(item) }}</span>
+								<AudioPlayer :src="mediaAttachment(item).identity.contentUrl" :label="attachmentName(item)"/>
+							</div>
+							<button v-else-if="mediaAttachment(item)?.kind === 'video'" type="button" class="user-attachment video" :title="attachmentName(item)" :aria-label="`播放视频：${attachmentName(item)}`" @click="openMediaAttachment($event, item)">
+								<video :src="`${mediaAttachment(item).identity.contentUrl}#t=0.1`" preload="metadata" muted playsinline disablepictureinpicture tabindex="-1" aria-hidden="true"></video>
+								<span class="user-attachment-play" aria-hidden="true"><Play :size="18" :stroke-width="1.8"/></span>
+							</button>
 							<a v-else class="user-attachment" :href="attachmentUrl(item) || undefined" target="_blank" rel="noopener noreferrer"
 							   :title="attachmentName(item)">
 								<span class="file-tile">{{ attachmentName(item) }}</span>
@@ -426,7 +471,7 @@ async function copyMessage(content, key) {
 							<el-icon><Undo2 size="1em" :stroke-width="1.8" aria-hidden="true"/></el-icon>
 						</button>
 					</el-tooltip>
-					<time v-if="userTimeMs(turn)" class="user-message-time" :title="formatFullTime(userTimeMs(turn))">{{ timeBadge(userTimeMs(turn)) }}</time>
+					<time v-if="userTimeMs(turn)" class="user-message-time" :title="formatFullTime(userTimeMs(turn))"><span v-if="formatDatePart(userTimeMs(turn))" class="message-time-date">{{ formatDatePart(userTimeMs(turn)) }}</span>{{ timeBadge(userTimeMs(turn)) }}</time>
 				</div>
 			</div>
 		</div>
@@ -441,7 +486,7 @@ async function copyMessage(content, key) {
 				<ConversationWorkBlock :turn="turn" :entries="conversationEvents(turn)" :running="turnWorking(turn, turnIndex)" :duration-ms="assistantDurationMs(turn)">
 				<template #default="{entry, conversationIndex}">
 					<div class="timed-row timed-row-assistant visibility-hover-surface" :data-search-op-id="(entry.part !== 'reasoning' && entry.event.kind === 'answer') || entry.event.kind === 'live_status' ? entry.event.id : undefined" :class="[visibilitySelectionClasses(entry.event, visibility), {'has-inline-retry': entry.event.kind === 'model_retry'}]" @click.capture="selectVisibilityRow($event, entry.event, visibility)">
-						<span v-if="eventTimeMs(entry.event) && showEventTimeBadge(turn, turnIndex, conversationIndex)" class="time-float time-float-left" :title="formatFullTime(eventTimeMs(entry.event))">{{ timeBadge(eventTimeMs(entry.event), durationMsForEvent(entry.event)) }}</span>
+						<span v-if="eventTimeMs(entry.event) && showEventTimeBadge(turn, turnIndex, conversationIndex)" class="time-float time-float-left" :class="{'time-float-dated': formatDatePart(eventTimeMs(entry.event))}" :title="formatFullTime(eventTimeMs(entry.event))"><span v-if="formatDatePart(eventTimeMs(entry.event))" class="time-float-date">{{ formatDatePart(eventTimeMs(entry.event)) }}</span><span>{{ timeBadge(eventTimeMs(entry.event), durationMsForEvent(entry.event)) }}</span></span>
 						<ConversationRetryEvent v-if="entry.event.kind === 'model_retry'" :event="entry.event" :retry-action-pending="props.retryActionPending" @cancel-retry="emit('cancel-retry', $event)" @retry-now="emit('retry-now', $event)"/>
 						<ConversationProcessEvent v-else-if="useProcessRow(entry)" :event="entry.event" :part="entry.part || ''" :conversation-uuid="props.conversationUuid" :active-index="props.activeToolResultIndex(entry.event)" @select-tab="emitSelectToolResult(entry.event, $event)"/>
 						<TurnEvent v-else
@@ -477,7 +522,7 @@ async function copyMessage(content, key) {
 				</div>
 				<div v-if="assistantMetaVisible(turn, turnIndex)" class="assistant-message-meta">
 					<span class="assistant-meta-details">
-						<time v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-message-time" :title="formatFullTime(assistantTimeMs(turn))"><span v-if="assistantTimeMs(turn)" class="footer-metric" title="回复时间"><Clock class="footer-meta-icon" aria-hidden="true"/>{{ formatHoverTime(assistantTimeMs(turn)) }}</span><span v-if="assistantTimeMs(turn) && assistantDurationMs(turn)"> · </span><span v-if="assistantDurationMs(turn)" class="footer-metric" title="耗时"><Timer class="footer-meta-icon" aria-hidden="true"/>{{ formatDuration(assistantDurationMs(turn)) }}</span></time>
+						<time v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-message-time" :title="formatFullTime(assistantTimeMs(turn))"><span v-if="assistantTimeMs(turn)" class="footer-metric" title="回复时间"><Clock class="footer-meta-icon" aria-hidden="true"/><span v-if="formatDatePart(assistantTimeMs(turn))" class="message-time-date">{{ formatDatePart(assistantTimeMs(turn)) }}</span>{{ formatHoverTime(assistantTimeMs(turn)) }}</span><span v-if="assistantTimeMs(turn) && assistantDurationMs(turn)"> · </span><span v-if="assistantDurationMs(turn)" class="footer-metric" title="耗时"><Timer class="footer-meta-icon" aria-hidden="true"/>{{ formatDuration(assistantDurationMs(turn)) }}</span></time>
 						<span v-if="hasTurnTokens(turn)" class="turn-token-usage" :title="`本轮 Tokens：${turnTokenLine(turn)}`"><span v-if="assistantTimeMs(turn) || assistantDurationMs(turn)" class="assistant-meta-separator">· </span><span class="footer-metric" :aria-label="`输入 Tokens：${fmtTokens(turnTokenParts(turn).input)}`"><Top class="footer-meta-icon" aria-hidden="true"/><span class="footer-token-arrow">↑</span>{{ fmtTokens(turnTokenParts(turn).input) }}</span><span class="footer-metric-separator"> · </span><span class="footer-metric" :aria-label="`输出 Tokens：${fmtTokens(turnTokenParts(turn).output)}`"><Bottom class="footer-meta-icon" aria-hidden="true"/><span class="footer-token-arrow">↓</span>{{ fmtTokens(turnTokenParts(turn).output) }}</span><span class="footer-metric-separator"> · </span><span class="footer-metric" :aria-label="`缓存 Tokens：${fmtTokens(turnTokenParts(turn).cache)}，命中率 ${cachePct(turnTokenParts(turn).cache, turnTokenParts(turn).input)}`"><Coin class="footer-meta-icon" aria-hidden="true"/>缓存 {{ fmtTokens(turnTokenParts(turn).cache) }}（{{ cachePct(turnTokenParts(turn).cache, turnTokenParts(turn).input) }}）</span></span>
 					</span>
 					<span class="message-footer-actions">
@@ -487,12 +532,21 @@ async function copyMessage(content, key) {
 							<el-icon><Check v-if="copiedMessageKey === `assistant-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`"/><CopyDocument v-else/></el-icon>
 						</button>
 					</el-tooltip>
+					<el-tooltip v-if="props.notesEnabled && !visibility.selecting.value && assistantNoteTarget(turn)" content="记入便签" placement="bottom" :show-after="350">
+						<button type="button" class="message-icon-action" aria-label="记入便签"
+						        @click="captureTurnNote(turn, turnIndex)">
+							<el-icon><Check v-if="notedTurnKey === `note-turn-${turn.turnUuid || turn.user?.turnUuid || turn.id}`"/><StickyNote v-else size="1em" :stroke-width="1.8" aria-hidden="true"/></el-icon>
+						</button>
+					</el-tooltip>
 					<ReplyMarkdownShare v-if="!visibility.selecting.value && assistantTurnShareContent(turn)" :content="assistantTurnShareContent(turn)"/>
 					<button v-if="!visibility.selecting.value && assistantVisibilityTarget(turn)" type="button"
 					        class="message-icon-action message-hide-action message-visibility-action" aria-label="隐藏回复" aria-haspopup="dialog"
 					        :disabled="visibility.busy.value" @click.stop="visibility.openMobileMenu(assistantVisibilityTarget(turn), turn)"><el-icon><Hide/></el-icon></button>
 					</span>
 				</div>
+				<PromptSuggestions v-if="turnIndex === props.turns.length - 1 && props.promptSuggestions?.length"
+				                   :items="props.promptSuggestions" :collapsed="props.promptSuggestionsCollapsed"
+				                   @pick="emit('pick-suggestion', $event)" @dismiss="emit('dismiss-suggestions')"/>
 			</article>
 		</div>
 	</section>
@@ -549,6 +603,15 @@ async function copyMessage(content, key) {
 	transition: opacity .14s ease, transform .14s ease;
 }
 
+.time-float-dated {
+	height: auto;
+	flex-direction: column;
+	gap: .2rem;
+	padding: .32rem .5rem;
+}
+
+.time-float-date { color: var(--ob-text-subtle); }
+
 .time-float-left {
 	right: calc(100% + 12px);
 }
@@ -598,6 +661,8 @@ async function copyMessage(content, key) {
 .user-message-time {
 	color: var(--ob-text-muted);
 }
+
+.message-time-date { color: var(--ob-text-subtle); margin-right: .35em; }
 
 .message-icon-action {
 	display: inline-grid;
@@ -676,6 +741,65 @@ async function copyMessage(content, key) {
 
 .user-attachment.image {
 	aspect-ratio: 1 / 1;
+}
+
+.user-attachment.image {
+	cursor: zoom-in;
+}
+
+.user-attachment.audio {
+	grid-column: 1 / -1;
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 0.4rem;
+	min-height: 0;
+	padding: 0.6rem 0.7rem 0.7rem;
+}
+
+.user-attachment.audio .audio-player {
+	min-width: min(260px, 100%);
+}
+
+.user-attachment-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 1.5;
+}
+
+.user-attachment.video {
+	aspect-ratio: 1 / 1;
+	padding: 0;
+	font: inherit;
+	cursor: pointer;
+}
+
+.user-attachment.video video {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	pointer-events: none;
+}
+
+.user-attachment-play {
+	position: absolute;
+	display: grid;
+	place-items: center;
+	width: 38px;
+	height: 38px;
+	padding-left: 2px;
+	border-radius: 50%;
+	background: rgb(0 0 0 / 0.55);
+	color: #fff;
+}
+
+.user-attachment.video:focus-visible {
+	outline: 2px solid var(--ob-blue);
+	outline-offset: 2px;
 }
 
 .user-attachment.image {
@@ -819,6 +943,7 @@ button.turn-continuation-root:hover { color: var(--ob-text); }
 }
 
 @media (max-width: 760px) {
+	.user-message-meta { max-width: 100%; flex-wrap: wrap; }
 	.message-hide-action { display: inline-grid; width: 32px; height: 32px; flex-basis: 32px; }
 	.assistant-message-meta { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 2px; white-space: normal; }
 	.assistant-meta-details { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 3px 8px; line-height: 1.45; }

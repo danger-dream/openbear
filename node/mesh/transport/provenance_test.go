@@ -193,7 +193,7 @@ func TestAuthenticatedOneWayNewPathSurvivesDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err = exchangePreamble(c); err != nil {
+	if err = dialPreamble(c); err != nil {
 		t.Fatal(err)
 	}
 	captured := l.tap.arm(true)

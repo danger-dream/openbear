@@ -19,11 +19,12 @@ FLAP_QUIET_MS = 30 * 60_000
 # episode each time, and would otherwise send one each time.
 ALERT_COOLDOWN_MS = 30 * 60_000
 PEER_KINDS = ('entry', 'relay', 'direct', 'member')
-COUNTERS = ('delivered', 'forwarded', 'droppedAcl', 'droppedNotRelay', 'droppedTtl', 'droppedNoRoute', 'droppedQueue', 'droppedBad', 'droppedPlain')
+COUNTERS = ('delivered', 'forwarded', 'droppedAcl', 'droppedNotRelay', 'droppedTtl', 'droppedNoRoute', 'droppedQueue', 'droppedBad', 'droppedPlain',
+            'droppedTooBig')
 # A node's end-to-end sessions: what it counts besides the sessions in use and their limit.
 E2E_COUNTS = ('created', 'evicted', 'sent', 'received', 'droppedExhausted', 'droppedQueue', 'droppedSource', 'droppedBad')
 HOPS_KEPT = 64
-RESOURCES = ('rssBytes', 'heapBytes', 'queueBytes', 'conns', 'goroutines')
+RESOURCES = ('rssBytes', 'limitBytes', 'heapBytes', 'queueBytes', 'conns', 'goroutines')
 ROUTES_KEPT = 64
 DIRECT_STATES = ('direct', 'punching', 'relayed')
 DIRECT_VIA = ('lan', 'public', 'configured', 'routed', '')
@@ -40,6 +41,10 @@ LINK_STATES = ('up', 'down', 'suppressed')
 PATH_KEPT = 16
 ERRORS_TEXT = {'timeout': '超时', 'refused': '被拒绝', 'tls pin mismatch': 'TLS 证书不匹配', 'no handshake': '握手无响应',
                'unreachable': '不可达', 'punch timeout': '打洞超时'}
+DISAPPOINT_TTL_MS = 24 * 3600_000
+SUPPRESS_TTL_MS = 7 * 24 * 3600_000
+PROBES_KEPT = 64
+PROBE_METHODS = ('udp', 'tcp')
 # Memory near its limit from this share on.
 MEMORY_NEAR = 0.8
 
@@ -85,6 +90,80 @@ def _reachability(raw):
             'publicAddr': _text(raw.get('publicAddr'), 64), 'consistent': raw.get('consistent') is not False,
             'mapping': raw.get('mapping') if raw.get('mapping') in MAPPINGS else 'unknown',
             'filtering': raw.get('filtering') if raw.get('filtering') in FILTERINGS else 'unknown', 'observers': observers}
+
+
+def needs_public_addr(config):
+    """Whether a node's own public address matters to it: hole punching aims at it (a punched link, or
+    an entry punched to a site relay other than at its LAN address). Without either, observers seeing
+    its exit differently (a proxy, several exits) changes nothing. Unknown config: it may."""
+    if not config:
+        return True
+    if any(link.get('punch') for link in config.get('links') or []):
+        return True
+    for c in (config.get('entry') or {}).get('candidates') or []:
+        if c.get('punch') and not _lan(c.get('endpoint')):
+            return True
+    return False
+
+
+def detours(statuses, facts, relays, same_lan):
+    """Members whose connection to a relay leaves from somewhere else than the member: the relay sees it
+    come from an address of another machine, as with a proxy or tunnel on the member (a TUN-mode proxy
+    on a desktop). Sure for a member with a public address on an interface that the relay does not see;
+    for one behind NAT only when the address is on another member's interface (or is a relay's own) and
+    the two are not on one LAN. The address a node looks up for itself goes through such a proxy too, so
+    it is no proof of whose an address is. statuses {sid: status}; relays: their sids; same_lan(a, b).
+    Returns {member: {'relay', 'seen', 'via'}}, via the machine behind that address or ''."""
+    def nets(sid):
+        out = []
+        for p in (facts.get(sid) or {}).get('localPrefixes') or []:
+            with contextlib.suppress(ValueError):
+                n = ipaddress.ip_network(p, strict=False)
+                if n.version == 4 and n.is_global:
+                    out.append(n)
+        return out
+    own = {sid: nets(sid) for sid in facts}
+    seen = {}
+    for rid, status in statuses.items():
+        for p in (status or {}).get('peers') or []:
+            if p.get('kind') != 'member' or not p.get('active'):
+                continue
+            host = (p.get('remoteAddr') or p.get('endpoint') or '').rpartition(':')[0].strip('[]')
+            with contextlib.suppress(ValueError):
+                ip = ipaddress.ip_address(host)
+                if ip.version == 4 and ip.is_global:
+                    seen.setdefault(p['id'], []).append((rid, ip))
+
+    def holds(sid, ip):
+        return any(ip in n for n in own.get(sid, [])) or (sid in relays and (facts.get(sid) or {}).get('ipv4') == str(ip))
+    out = {}
+    for sid, hits in seen.items():
+        for rid, ip in hits:
+            if holds(sid, ip):
+                continue
+            holders = [y for y in facts if y != sid and holds(y, ip) and not same_lan(sid, y)]
+            if not own.get(sid) and not holders:
+                continue
+            # Behind that address: the machine it is on, else a member behind NAT seen there itself.
+            behind = holders or [y for y, h in seen.items() if y != sid and not own.get(y) and any(i == ip for _, i in h) and not same_lan(sid, y)]
+            out[sid] = {'relay': rid, 'seen': str(ip), 'via': sorted(behind)[0] if behind else ''}
+            break
+    return out
+
+
+def detour_alert(detour, name):
+    """The page's alert for a member's detour (detours); name(sid) gives a node's name. Shown, not sent."""
+    via = f'（{name(detour["via"])} 的地址）' if detour['via'] else ''
+    return {'code': 'mesh_detour', 'message': f'组网连接在绕路：{name(detour["relay"])} 看到它从 {detour["seen"]}{via}连过来，不是从它自己的网络出去的。'
+            '这个节点的出网多半经过代理或隧道（比如开着 TUN 模式的 Clash），组网流量跟着绕了一圈，延迟会变高。在代理里让 openbear-mesh 直连就好。'}
+
+
+def _lan(endpoint):
+    host = str(endpoint or '').partition('://')[2].rpartition(':')[0].strip('[]')
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
 
 
 def public_ip(status):
@@ -218,6 +297,48 @@ def _direct(raw):
             'attempts': int(_num(raw.get('attempts'))), 'lastError': error[:64] if isinstance(error, str) else ''}
 
 
+def _probes(raw):
+    out = []
+    for p in (raw if isinstance(raw, list) else [])[:PROBES_KEPT]:
+        if isinstance(p, dict) and isinstance(p.get('peer'), str) and p['peer'].strip():
+            rtt = _ms(p.get('rttMs'))
+            jitter = _ms(p.get('jitterMs'))
+            loss = _rate(p.get('loss'))
+            method = p.get('method') if p.get('method') in PROBE_METHODS else 'udp'
+            out.append({'peer': _text(p['peer'].strip(), 128), 'rttMs': rtt if rtt else None, 'loss': 0.0 if loss is None else loss,
+                        'jitterMs': jitter if jitter is not None else None, 'method': method, 'at': int(_num(p.get('at')))})
+    return out
+
+
+PATH_STATES = ('pinned', 'standby', 'fallback', 'waiting', 'starting')
+# The data plane reports at most 256 pairs, each with at most 8 relays.
+PATHS_KEPT = 256
+
+
+def _paths(raw):
+    """The own routes a node is the source of (fixedpath.go): {id, nodes, state, since, until?,
+    rank?, down?, silent?}. rank is the route's place among its pair's; down the first link not up;
+    silent that its links are up but its probes go unanswered."""
+    out = []
+    for p in (raw if isinstance(raw, list) else [])[:PATHS_KEPT]:
+        nodes = p.get('nodes') if isinstance(p, dict) else None
+        if not (isinstance(nodes, list) and 3 <= len(nodes) <= 10 and all(isinstance(n, str) and n for n in nodes)
+                and isinstance(p.get('id'), str) and p['id'] and p.get('state') in PATH_STATES):
+            continue
+        item = {'id': _text(p['id'], 40), 'nodes': [_text(n, 128) for n in nodes], 'state': p['state'], 'since': int(_num(p.get('since')))}
+        if p['state'] == 'waiting':
+            item['until'] = int(_num(p.get('until')))
+        if isinstance(p.get('rank'), int) and 1 <= p['rank'] <= 8:
+            item['rank'] = p['rank']
+        down = p.get('down')
+        if isinstance(down, list) and len(down) == 2 and all(n in nodes for n in down):
+            item['down'] = list(down)
+        elif p.get('silent') is True and p['state'] in ('fallback', 'starting'):
+            item['silent'] = True
+        out.append(item)
+    return out
+
+
 def clean_status(raw):
     """Node output is untrusted: known fields only, bounded."""
     raw = raw if isinstance(raw, dict) else {}
@@ -234,6 +355,10 @@ def clean_status(raw):
                       'handshakes': int(_num(p.get('handshakes'))), 'reconnects': int(_num(p.get('reconnects'))), 'rxBytes': int(_num(p.get('rxBytes'))), 'txBytes': int(_num(p.get('txBytes'))),
                       'rttMs': _ms(p.get('rttMs')),
                       'timeoutRate': round(float(_num(p.get('timeoutRate'), 2)), 3)})
+        # pathMtu: the longest packet the link carries, 9000 when large packets go over it.
+        mtu = int(_num(p.get('pathMtu'), 65535))
+        if mtu:
+            peers[-1]['pathMtu'] = mtu
         direct = _direct(p.get('direct'))
         if direct:
             peers[-1]['direct'] = direct
@@ -259,7 +384,47 @@ def clean_status(raw):
             'skippedRoutes': _prefixes(raw.get('skippedRoutes')), 'hostFirewall': _host_firewall(raw.get('hostFirewall')),
             'hostFirewallIssues': _firewall_issues(raw.get('hostFirewallIssues')),
             'reachability': _reachability(raw.get('reachability')), 'routing': _routing(raw.get('routing')),
-            'e2e': _e2e(raw.get('e2e')), 'security': _security(raw.get('security'))}
+            'e2e': _e2e(raw.get('e2e')), 'security': _security(raw.get('security')), 'proxy': _proxy(raw.get('proxy')),
+            'probes': _probes(raw.get('probes')), 'paths': _paths(raw.get('paths'))}
+
+
+PROXY_EXIT = ('active', 'opened', 'refused', 'failed', 'bytesIn', 'bytesOut')
+PROXY_USER = ('opened', 'failed', 'active', 'bytesUp', 'bytesDown')
+
+
+def _list(raw, limit):
+    return raw[:limit] if isinstance(raw, list) else []
+
+
+def _proxy(raw):
+    """The exit proxy as the node runs it: its exit's counts, and per entry (the exit's own proxy,
+    each proxy port, or the one entry of a node from before) its users, each user's exits with the
+    tunnels ready to them; None while it is neither."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    x = raw.get('exit')
+    if isinstance(x, dict):
+        out['exit'] = {'listen': _text(x.get('listen'), 64), 'error': _text(x.get('error'), 300), **{k: int(_num(x.get(k))) for k in PROXY_EXIT}}
+    if isinstance(raw.get('entry'), dict):
+        out['entry'] = _entry(raw['entry'])
+    entries = [_entry(e) for e in _list(raw.get('entries'), 64) if isinstance(e, dict)]
+    if entries:
+        out['entries'] = entries
+    return out or None
+
+
+def _entry(e):
+    users = []
+    for u in _list(e.get('users'), 64):
+        if isinstance(u, dict):
+            exits = [{'address': _text(v.get('address'), 64), 'ready': int(_num(v.get('ready'), 1000)), 'down': v.get('down') is True,
+                      'error': _text(v.get('error'), 300), 'rttMs': _ms(v.get('rttMs'))} for v in _list(u.get('exits'), 32) if isinstance(v, dict)]
+            # picked: a latency group's exit now (the one with the lowest round trip).
+            users.append({'name': _text(u.get('name'), 32), 'exit': _text(u.get('exit'), 64), **{k: int(_num(u.get(k))) for k in PROXY_USER},
+                          'exits': exits, 'picked': _text(u.get('picked'), 64)})
+    return {'name': _text(e.get('name'), 32), 'listen': [_text(v, 64) for v in _list(e.get('listen'), 8)],
+            'errors': [_text(v, 300) for v in _list(e.get('errors'), 8)], 'rejected': int(_num(e.get('rejected'))), 'users': users}
 
 
 def clean_events(raw):
@@ -326,9 +491,15 @@ def links_rtt(status):
     return min(rtts) if rtts else None
 
 
+def memory_limit(status, role):
+    """The resident memory a data plane alarms at: what it reports from its machine's memory, the
+    role's fixed level from a node that reports none."""
+    return ((status or {}).get('resources') or {}).get('limitBytes') or MEMORY_LIMIT['relay' if role == 'relay' else 'member']
+
+
 def memory(status, role):
-    """Resident memory against the limit for the role: level near from 80%, over at the limit."""
-    limit = MEMORY_LIMIT['relay' if role == 'relay' else 'member']
+    """Resident memory against the limit: level near from 80%, over at the limit."""
+    limit = memory_limit(status, role)
     rss = status['resources']['rssBytes'] if status else 0
     return {'rssBytes': rss, 'limitBytes': limit, 'level': 'over' if rss >= limit else 'near' if rss >= limit * MEMORY_NEAR else ''}
 
@@ -339,19 +510,20 @@ def summary(status, role='member'):
                 'reachability': None, 'entryHealth': [], 'routing': None}
     active = [p for p in status['peers'] if p['active']]
     entry = {k: v for k, v in (status['entry'] or {}).items() if k != 'candidates'}
-    # A member: its entry as it measures it; a relay: its links to other relays. 0 is not a measurement.
-    rtt = links_rtt(status) if role == 'relay' else entry_rtt(status, entry['relay']) if entry.get('relay') else None
+    routing = status.get('routing')
+    # A member: its entry as it measures it, or its routed links when it routes as a leaf; a relay: its links. 0 is not a measurement.
+    rtt = links_rtt(status) if (role == 'relay' or (routing and not entry.get('relay'))) else entry_rtt(status, entry['relay']) if entry.get('relay') else None
     # Each punched direct peer's state, so the page needs no member detail to show it.
     direct = {}
     for p in status['peers']:
         if p.get('direct') and p['id'] not in direct:
             direct[p['id']] = {'state': p['direct']['state'], 'via': p['direct']['via'], 'rttMs': p['rttMs']}
     reach = status.get('reachability')
-    routing = status.get('routing')
     return {'entry': entry, 'ready': status['ready'], 'peers': len(active), 'rttMs': rtt, 'memory': memory(status, role), 'direct': direct,
             'reachability': {k: reach[k] for k in ('verdict', 'publicAddr', 'consistent', 'filtering', 'checkedAt')} if reach else None,
             'entryHealth': list((status['entry'] or {}).get('candidates', [])) if role != 'relay' else [],
-            'routing': {k: routing[k] for k in ('mode', 'links', 'routes')} if routing and role == 'relay' else None}
+            'routing': {k: routing[k] for k in ('mode', 'links', 'routes')} if routing and (role == 'relay' or not status.get('entry')) else None,
+            **({'proxy': status['proxy']} if status.get('proxy') else {})}
 
 
 def node_state(*, cleanup, installing, online, configured, current, failed, status, missing=False):
@@ -409,10 +581,12 @@ class Watch:
         reach = status.get('reachability')
         if reach and not reach['consistent']:
             self.inconsistent_since, self.inconsistent_sent = now, True
-        if status['resources']['rssBytes'] > MEMORY_LIMIT['relay' if role == 'relay' else 'member']:
+        if status['resources']['rssBytes'] > memory_limit(status, role):
             self.over_since, self.over_sent = now, True
 
-    def observe(self, now, server_id, name, role, candidates, status, events, relay_name=None):
+    def observe(self, now, server_id, name, role, candidates, status, events, relay_name=None, punches=True):
+        """punches: whether its own public address matters to this node (needs_public_addr); an exit
+        seen differently is alerted only then."""
         alerts = []
         relay_name = relay_name or (lambda sid: sid)
         # Every standby candidate failing: the member would have nowhere to go if its entry broke.
@@ -429,7 +603,7 @@ class Watch:
         else:
             self.standby_since, self.standby_sent = 0, False
         reach = status.get('reachability')
-        if reach and not reach['consistent']:
+        if reach and not reach['consistent'] and punches:
             self.inconsistent_since = self.inconsistent_since or now
             if not self.inconsistent_sent and self._due('exit', now):
                 self.inconsistent_sent = True
@@ -438,7 +612,10 @@ class Watch:
         elif reach:
             self.inconsistent_since, self.inconsistent_sent = 0, False
         entry = status['entry'] or {}
-        connected = bool(entry.get('relay')) and any(p['active'] and p['kind'] == 'entry' for p in status['peers'])
+        routed_links = (status.get('routing') or {}).get('links') or []
+        connected = (bool(entry.get('relay')) and any(p['active'] and p['kind'] == 'entry' for p in status['peers'])) \
+            or any(link.get('state') == 'up' for link in routed_links) \
+            or (status.get('routing') is not None and any(p['active'] and p['kind'] == 'relay' for p in status['peers']))
         if role == 'member' and candidates and not connected:
             self.no_entry_since = self.no_entry_since or now
             if not self.no_entry_sent and now - self.no_entry_since >= NO_ENTRY_GRACE_MS and self._due('entry', now):
@@ -455,7 +632,7 @@ class Watch:
             self.flap_sent = now
             alerts.append((f'mesh-flap:{server_id}:{recent[-SWITCHES_ALERTED]}', 'mesh',
                            f'组网：{quoted(name)}5 分钟内切换入口 {len(recent)} 次，线路可能不稳定。'))
-        limit = MEMORY_LIMIT['relay' if role == 'relay' else 'member']
+        limit = memory_limit(status, role)
         rss = status['resources']['rssBytes']
         if rss > limit:
             self.over_since = self.over_since or now

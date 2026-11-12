@@ -44,6 +44,28 @@ test("tool rows say what changed, and only what the result confirms", () => {
 	assert.equal(workItemCallNumber({action: "add", number: "4.4"}, {ok: true, number: "4.4.5"}), "4.4.5");
 });
 
+test("an ops call reads as its steps, with $N resolved from the result", () => {
+	const args = {action: "ops", ops: [
+		{action: "create", title: "修网关", children: ["a"]}, {action: "decide", items: ["$1"]},
+		{action: "focus", items: ["$1"]}, {action: "start", number: "$1.1"}]};
+	const done = {ok: true, completed: [
+		{step: 1, action: "create", number: "7", created: ["7", "7.1"]}, {step: 2, action: "decide", recorded: ["7"]},
+		{step: 3, action: "focus", focus: ["7"]}, {step: 4, action: "start", items: [{number: "7.1", status: "进行中"}]}]};
+	assert.equal(workItemToolPreview(args, done), "建任务 “修网关” #7 → 记决策 #7 → 执行范围 #7 等 4 步");
+	assert.equal(workItemCallNumber(args, done), "7");
+	const short = {action: "ops", ops: [{action: "note", number: "4.1", summary: "x"}, {action: "complete", number: "4.1"}]};
+	assert.equal(workItemToolPreview(short, {ok: true, completed: [{step: 1, recorded: "4.1"}, {step: 2, items: [{number: "4.1", status: "已完成"}]}]}),
+		"记录 #4.1 → #4.1 → 已完成");
+	const failed = {ok: false, error: "outside_focus", message: "#4.2 is outside this turn's focus",
+		failedStep: {step: 2, action: "start"}, completed: [{step: 1, action: "complete", items: [{number: "4.1", status: "已完成"}]}]};
+	assert.equal(workItemToolPreview({action: "ops", ops: [{action: "complete", number: "4.1"}, {action: "start", number: "4.2"}]}, failed),
+		"#4.1 → 已完成 · 第 2 步「开始」未成功：#4.2 is outside this turn's focus");
+	assert.equal(workItemToolPreview(args, ""), "建任务 “修网关” → 记决策 $1 → 执行范围 $1 等 4 步");
+	const events = [{calls: [{name: "WorkItem", arguments: JSON.stringify(args)}], result: {content: JSON.stringify(done)}},
+		{calls: [{name: "WorkItem", arguments: JSON.stringify({action: "ops", ops: [{action: "note", number: "3.2"}, {action: "start", number: "8.1"}]})}]}];
+	assert.deepEqual(turnTaskNumbers(events), ["7", "3", "8"]);
+});
+
 test("a turn's task chips come from WorkItem calls, including those inside grouped tool runs", () => {
 	const events = [
 		{calls: [{name: "Read", arguments: "{}"}]},
@@ -52,6 +74,14 @@ test("a turn's task chips come from WorkItem calls, including those inside group
 		{calls: [{name: "WorkItem", arguments: JSON.stringify({action: "create", title: "x"})}], result: {content: JSON.stringify({ok: true, number: "6"})}},
 	];
 	assert.deepEqual(turnTaskNumbers(events), ["4", "6"]);
+});
+
+test("implicit ops associate every task, including nested calls and resolved references", () => {
+	const ops = [{action: "create", title: "new"}, {action: "note", number: "$1.1"}, {action: "note", number: "2.3"}];
+	const result = {content: JSON.stringify({ok: true, completed: [{step: 1, number: "7"}, {step: 2}, {step: 3}]})};
+	const event = args => ({calls: [{name: "WorkItem", arguments: JSON.stringify(args)}], result});
+	assert.deepEqual(turnTaskNumbers([{events: [event({ops})]}, event({ops})]), ["7", "2"]);
+	assert.deepEqual(turnTaskNumbers([event({ops})]), turnTaskNumbers([event({action: "ops", ops})]));
 });
 
 test("every item in progress in the running focus is marked, not only the last one started", async () => {

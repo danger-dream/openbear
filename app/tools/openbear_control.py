@@ -390,7 +390,7 @@ async def _action_stop(svc: Any, chat_id: int, args: dict[str, Any], reason: str
             "error": "use_AgentStop_for_agent_tasks",
             "action": "stop",
             "target": target,
-            "message": "Rath/Agent task 停止请使用 AgentStop；OpenBearControl 只控制 OpenBear 主控轮/控制面。",
+            "message": "Rath/Agent task 停止请使用 Agent(action=stop)；OpenBearControl 只控制 OpenBear 主控轮/控制面。",
         })
     confirm = await _confirm_if_needed(
         svc,
@@ -428,7 +428,7 @@ async def make_openbear_control_tool(svc: Any, args: dict[str, Any]) -> str:
                 "error": "use_AgentStop_for_agent_tasks",
                 "action": "stop",
                 "target": target_preview,
-                "message": "Rath/Agent task 停止请使用 AgentStop；OpenBearControl 只控制 OpenBear 主控轮/控制面。",
+                "message": "Rath/Agent task 停止请使用 Agent(action=stop)；OpenBearControl 只控制 OpenBear 主控轮/控制面。",
             })
     if ctx.source not in _INTERACTIVE_SOURCES:
         return _json({"status": "error", "error": "openbear_control_not_available_in_this_context", "source": ctx.source, "action": action})
@@ -463,8 +463,8 @@ def register_openbear_control_tool(reg: ToolRegistry, svc: Any) -> None:
         "OpenBearControl",
         (
             "OpenBear control plane: status/models/mcp_status/skills_status/skills_reload/mcp_reload/think/restart/new/foreground-run stop. "
-            "Do not use this tool for Rath/Agent task cancellation; use AgentStop. "
             "Risky actions provide their own required channel confirmation; for an already requested action, call this tool directly without a redundant UserInteraction pre-confirmation. Never bypass its gate. "
+            "A restart interrupts every running conversation: read status first, and while runningRuns counts runs besides this conversation's own, wait for them or name them in the reason. "
             "Actions run safely after the reply when needed. decision=feedback is not authorization. On amendments_required the user has approved the amended action: read all confirmation.text, apply it, then resubmit with _openbearApprovalId=approvalId without asking again within that scope. Cancellation or timeout never authorizes execution; "
             "do not restart/stop openbear.service via Bash. Receipts keep the action and target fixed; restart delay may increase, not advance execution."
         ),

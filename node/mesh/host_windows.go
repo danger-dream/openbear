@@ -160,10 +160,10 @@ func (h *windowsHost) close() {
 	}
 }
 
-// RemoveFirewallRules deletes the rules a data plane that did not stop
+// Sweep deletes the firewall rules a data plane of dir that did not stop
 // cleanly left behind.
-func RemoveFirewallRules() error {
-	return powershell(fmt.Sprintf("Remove-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue", firewallGroup))
+func Sweep(string) {
+	powershell(fmt.Sprintf("Remove-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue", firewallGroup))
 }
 
 type processMemoryCounters struct {

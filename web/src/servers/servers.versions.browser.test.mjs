@@ -4,7 +4,7 @@
 // servers.dom.test.mjs and servers.install.dom.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab} from './testing/serversBrowser.mjs';
+import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab, showTab} from './testing/serversBrowser.mjs';
 import {day, GB, server, many, uninstalledLast, TARGET, RELEASE, versions, MESH_ON, onMesh, card, orders, meshOption, off, fact} from './testing/serversBackend.mjs';
 
 test('servers page layout: node versions, dark phone, mesh access', {skip: !chromium, timeout: 300000}, async t => {
@@ -13,7 +13,7 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
     const h = await setup(t, {tweak: versions, release: RELEASE});
     const notice = h.page.locator('.pb-notice[data-node-update=summary]');
     await notice.getByText('2 台服务器的节点可以更新到 1.2.0，其中 1 台需要更新才能使用组网、网络测试').waitFor();
-    const tagOf = name => h.page.locator('.pb-card').filter({hasText: name}).locator('.pb-tag[data-node-state]');
+    const tagOf = name => h.page.locator('.pb-card').filter({hasText: name}).locator('.pb-mark[data-node-state]');
     // Current and newer-than-target nodes carry no tag in the list.
     // No build hashes on the board.
     await versionShot(h.page, 'desktop-board-light');
@@ -55,7 +55,7 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
     await notice.getByRole('button', {name: '全部更新'}).waitFor();
     const box = await notice.boundingBox();
     assert.ok(box.height <= 110, JSON.stringify(box));
-    const tag = await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).locator('.pb-tag[data-node-state]').boundingBox();
+    const tag = await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).locator('.pb-mark[data-node-state]').boundingBox();
     assert.ok(tag.height <= 24, JSON.stringify(tag));
     await noOverflow(h.page);
     await versionShot(h.page, 'phone-board-dark');
@@ -66,6 +66,7 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
     await h.page.locator('.pl-row').filter({hasText: 'Papa-HK.T1'}).click();
     const detail = h.page.locator('.sv-detail:visible');
     await detail.locator('.pb-notice[data-node-state=required]').waitFor();
+    await showTab(detail, '系统');
     await detail.locator('.ix-facts dt', {hasText: /^构建$/}).scrollIntoViewIfNeeded();
     await noOverflow(h.page);
     await versionShot(h.page, 'phone-detail-dark');
@@ -75,7 +76,7 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
   await t.test('dark phone: offline card, edit sheet with 16px inputs and sort order', {timeout: 90000}, async t => {
     const h = await setup(t, {width: 360, height: 780, dark: true});
     const offline = h.page.locator('.pb-card[data-state=offline]');
-    await offline.getByText('2 小时前离线', {exact: true}).waitFor();
+    await offline.locator('[data-cell=uptime]').getByText('2 小时前', {exact: true}).waitFor();
     await shot(h.page, 'phone-dark-board');
     await offline.click();
     await h.page.locator('.sv-detail:visible .ix-more').click();
@@ -129,6 +130,7 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
     await dialog.waitFor({state: 'hidden'});
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
     const detail = h.page.locator('.sv-detail:visible');
+    await showTab(detail, '系统');
     const current = fact(detail, '当前连接');
     assert.ok(await current.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'the address is not cut');
     await current.scrollIntoViewIfNeeded();

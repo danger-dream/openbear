@@ -65,7 +65,7 @@ _LEGACY_RUNTIME_BOUNDARY_REASON = "agent_task_budget_exceeded"
 _CONTROLLER_RUNTIME_BOUNDARY_REASON = "agent_runtime_safety_boundary"
 _RUNTIME_BOUNDARY_MESSAGE = (
     "The Agent paused at a hard runtime safety boundary. Decide whether to continue only from the approved Plan, "
-    "durable evidence, real blockers, scope, and safety. If work remains, use AgentMessage with narrow guidance; "
+    "durable evidence, real blockers, scope, and safety. If work remains, use Agent(action=message) with narrow guidance; "
     "the saved continuation state will be reused."
 )
 

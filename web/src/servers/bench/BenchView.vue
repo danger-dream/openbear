@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { ChevronRight, Columns2, Plus } from '@lucide/vue';
 import { Api } from '../../api.js';
@@ -10,21 +10,30 @@ import DdnsSheet from '../../ddns/DdnsSheet.vue';
 import BenchCompare from './BenchCompare.vue';
 import BenchReport from './BenchReport.vue';
 import BenchRunForm from './BenchRunForm.vue';
-import { buildTree, eligible, isActive, runTime, stateText, stateTone } from './benchHelpers.js';
+import { buildTree, eligible, isActive, runTime, shortRunTime, stateText, stateTone } from './benchHelpers.js';
 import '../../instances/instances.css';
 import '../servers.css';
 import '../../ddns/ddns.css';
 import './bench.css';
 
-// 评测, a tab of the servers page: on the left every server's runs as a tree (server → category →
-// test → run), on the right the chosen run's report, or the checked runs side by side. A phone shows
-// the tree alone; reports, the comparison and the form open as the bottom sheet.
+// 评测, a tab of the servers page: on the left every server's runs as a tree (server → a test's newest
+// run, its earlier ones folded under it), on the right the chosen run's report, or the checked runs side
+// by side. A phone shows the tree alone; reports, the comparison and the form open as the bottom sheet.
 // servers: the servers page's list; active: the tab is shown (it polls only then).
 const props = defineProps({servers: {type: Array, default: () => []}, active: {type: Boolean, default: true}});
 const catalog = ref(null), runs = ref([]), loading = ref(true), loadError = ref(''), now = ref(Date.now()), phone = ref(false);
-const details = reactive({}), expanded = reactive({});
+// The servers, and the tests' earlier runs, that are open (s:server, o:server:test): kept across visits.
+const EXPANDED_KEY = 'openbear.servers.bench.expanded';
+function storedExpanded() {
+  try {
+    const value = JSON.parse(localStorage.getItem(EXPANDED_KEY) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+const details = reactive({}), expanded = reactive(storedExpanded());
+watch(expanded, value => { try { localStorage.setItem(EXPANDED_KEY, JSON.stringify(value)); } catch { /* private mode: this visit only */ } }, {deep: true});
 const focused = ref(''), picked = ref([]), comparing = ref(false), sheet = ref(''), preset = ref(null), busy = ref(''), formRef = ref(null);
-let first = true, media;
+let media;
 const detailRequests = new Map(), detailFailures = new Set();
 
 const tree = computed(() => buildTree(props.servers, runs.value, catalog.value));
@@ -61,10 +70,6 @@ async function load() {
     if (!catalog.value) catalog.value = await Api.benchCatalog();
     const list = (await Api.benchRuns()).runs || [];
     runs.value = list; now.value = Date.now(); loadError.value = '';
-    if (first) {
-      first = false;
-      for (const id of new Set(list.map(r => r.serverId))) if (expanded[`s:${id}`] === undefined) expanded[`s:${id}`] = true;
-    }
     const updates = list.filter(run => (details[run.id] || focused.value === run.id || picked.value.includes(run.id)) && needsDetail(run.id));
     await Promise.all(updates.map(run => fetchDetail(run.id)));
     const ids = new Set(list.map(r => r.id));
@@ -155,50 +160,49 @@ onBeforeUnmount(() => media?.removeEventListener?.('change', syncPhone));
           <el-button size="small" :disabled="picked.length < 2" data-testid="bn-compare" @click="compare"><Columns2 :size="14" aria-hidden="true" class="dd-btn-icon" />并排对比</el-button>
         </div>
         <ul v-if="tree.length" class="bn-nodes" role="tree" aria-label="服务器">
-          <li v-for="node in tree" :key="node.server.id" role="treeitem" :aria-expanded="open(`s:${node.server.id}`, false)" :data-server="node.server.id">
+          <li v-for="node in tree" :key="node.server.id" role="treeitem" :aria-expanded="open(`s:${node.server.id}`, node.active > 0)" :data-server="node.server.id">
             <div class="bn-row bn-row-server">
-              <button type="button" class="bn-row-main" @click="toggle(`s:${node.server.id}`, false)">
-                <ChevronRight :size="14" class="bn-chev" :class="{'is-open': open(`s:${node.server.id}`, false)}" aria-hidden="true" />
+              <button type="button" class="bn-row-main" @click="toggle(`s:${node.server.id}`, node.active > 0)">
+                <ChevronRight :size="14" class="bn-chev" :class="{'is-open': open(`s:${node.server.id}`, node.active > 0)}" aria-hidden="true" />
                 <span class="sv-flag" aria-hidden="true">{{ flag(node.server.region) }}</span>
                 <span class="bn-name">{{ node.server.name }}</span>
-                <span class="bn-count" :data-tone="node.active ? 'busy' : undefined">{{ node.active ? `${node.active} 项进行中` : node.runs || '' }}</span>
+                <span class="bn-count" :data-tone="node.active ? 'busy' : undefined">{{ node.active ? `${node.active} 项进行中` : `${node.runs} 条 · 最近 ${shortRunTime(node.latestMs, now)}` }}</span>
               </button>
               <button v-if="node.eligible" type="button" class="ix-icon-button bn-add" :aria-label="`在 ${node.server.name} 上运行评测`" title="运行评测" @click="openForm({serverId: node.server.id})"><Plus :size="15" /></button>
             </div>
-            <ul v-if="open(`s:${node.server.id}`, false)" role="group">
-              <li v-for="cat in node.categories" :key="cat.id" role="treeitem" :aria-expanded="open(`c:${node.server.id}:${cat.id}`)">
-                <div class="bn-row bn-row-cat">
-                  <button type="button" class="bn-row-main" @click="toggle(`c:${node.server.id}:${cat.id}`)">
-                    <ChevronRight :size="13" class="bn-chev" :class="{'is-open': open(`c:${node.server.id}:${cat.id}`)}" aria-hidden="true" /><span class="bn-name">{{ cat.name }}</span>
-                  </button>
-                </div>
-                <ul v-if="open(`c:${node.server.id}:${cat.id}`)" role="group">
-                  <li v-for="t in cat.tests" :key="t.test.id" role="treeitem" :aria-expanded="open(`t:${node.server.id}:${t.test.id}`)">
-                    <div class="bn-row bn-row-test">
-                      <button type="button" class="bn-row-main" @click="toggle(`t:${node.server.id}:${t.test.id}`)">
-                        <ChevronRight :size="13" class="bn-chev" :class="{'is-open': open(`t:${node.server.id}:${t.test.id}`)}" aria-hidden="true" />
-                        <span class="bn-name">{{ t.test.name }}</span><span class="bn-count">{{ t.runs.length }}</span>
+            <ul v-if="open(`s:${node.server.id}`, node.active > 0)" role="group">
+              <template v-for="t in node.tests" :key="t.test.id">
+                <li role="treeitem" :data-run="t.latest.id" :data-test="t.test.id" :aria-expanded="t.older.length ? open(`o:${node.server.id}:${t.test.id}`, false) : undefined">
+                  <div class="bn-row bn-row-test" :aria-current="focused === t.latest.id && !comparing">
+                    <label class="bn-pick" :title="'选中后可以并排对比'">
+                      <input type="checkbox" :checked="picked.includes(t.latest.id)" :aria-label="`选中 ${t.test.name} ${runTime(t.latest.createdMs)} 用于对比`" @change="togglePick(t.latest)" />
+                    </label>
+                    <button type="button" class="bn-row-main" :title="`${t.test.name} · ${runTime(t.latest.createdMs)}${t.latest.label ? ` · ${t.latest.label}` : ''}`" @click="openRun(t.latest)">
+                      <span class="bn-name">{{ t.test.name }}</span>
+                      <span class="bn-time">{{ shortRunTime(t.latest.createdMs, now) }}</span>
+                      <span v-if="t.latest.state !== 'done'" class="ix-pill" :data-tone="stateTone(t.latest.state)">{{ stateText(t.latest) }}</span>
+                    </button>
+                    <button v-if="t.older.length" type="button" class="ix-text-button bn-older" :aria-expanded="open(`o:${node.server.id}:${t.test.id}`, false)"
+                      :aria-label="`${t.test.name} 更早的 ${t.older.length} 次`" @click="toggle(`o:${node.server.id}:${t.test.id}`, false)">更早 {{ t.older.length }} 次<ChevronRight :size="12" class="bn-chev" :class="{'is-open': open(`o:${node.server.id}:${t.test.id}`, false)}" aria-hidden="true" /></button>
+                    <button v-if="node.eligible" type="button" class="ix-icon-button bn-add" :aria-label="`在 ${node.server.name} 上运行 ${t.test.name}`" title="再运行一次"
+                      @click="openForm({serverId: node.server.id, test: t.test.id})"><Plus :size="15" /></button>
+                  </div>
+                </li>
+                <template v-if="t.older.length && open(`o:${node.server.id}:${t.test.id}`, false)">
+                  <li v-for="r in t.older" :key="r.id" role="treeitem" :data-run="r.id">
+                    <div class="bn-row bn-row-run" :aria-current="focused === r.id && !comparing">
+                      <label class="bn-pick" :title="'选中后可以并排对比'">
+                        <input type="checkbox" :checked="picked.includes(r.id)" :aria-label="`选中 ${t.test.name} ${runTime(r.createdMs)} 用于对比`" @change="togglePick(r)" />
+                      </label>
+                      <button type="button" class="bn-row-main" @click="openRun(r)">
+                        <span class="bn-time">{{ shortRunTime(r.createdMs, now) }}</span>
+                        <span class="bn-label">{{ r.label }}</span>
+                        <span v-if="r.state !== 'done'" class="ix-pill" :data-tone="stateTone(r.state)">{{ stateText(r) }}</span>
                       </button>
-                      <button v-if="node.eligible" type="button" class="ix-icon-button bn-add" :aria-label="`在 ${node.server.name} 上运行 ${t.test.name}`" title="再运行一次"
-                        @click="openForm({serverId: node.server.id, test: t.test.id})"><Plus :size="15" /></button>
                     </div>
-                    <ul v-if="open(`t:${node.server.id}:${t.test.id}`)" role="group">
-                      <li v-for="r in t.runs" :key="r.id" role="treeitem" :data-run="r.id">
-                        <div class="bn-row bn-row-run" :aria-current="focused === r.id && !comparing">
-                          <label class="bn-pick" :title="'选中后可以并排对比'">
-                            <input type="checkbox" :checked="picked.includes(r.id)" :aria-label="`选中 ${runTime(r.createdMs)} 用于对比`" @change="togglePick(r)" />
-                          </label>
-                          <button type="button" class="bn-row-main" @click="openRun(r)">
-                            <span class="bn-time">{{ runTime(r.createdMs) }}</span>
-                            <span class="bn-label">{{ r.label }}</span>
-                            <span v-if="r.state !== 'done'" class="ix-pill" :data-tone="stateTone(r.state)">{{ stateText(r) }}</span>
-                          </button>
-                        </div>
-                      </li>
-                    </ul>
                   </li>
-                </ul>
-              </li>
+                </template>
+              </template>
             </ul>
           </li>
         </ul>

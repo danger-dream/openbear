@@ -761,3 +761,13 @@ async def test_instance_and_gateway_changes_bring_the_mesh_rules_up_to_date(env,
     monkeypatch.setattr(e.instances.servers, 'run', no_run)
     await e.instances.gateway.disable(123)
     assert told[-1] is None and len(ran) == 1 and 'systemctl disable --now' in ran[0]
+
+
+def test_describe_gives_an_index_with_the_rules_and_one_action_contract():
+    from app.tools.instances import ACTIONS, describe
+    index = describe()
+    assert set(index['actions']) == set(ACTIONS) and 'contracts' not in index and 'allowServerChanges' in index['rules']
+    assert describe('remote')['contract']['revision'].startswith('required')
+    assert all(describe(action)['ok'] for action in ACTIONS)
+    unknown = describe('nope')
+    assert unknown['ok'] is False and unknown['error'] == 'unknown_action' and unknown['actions'] == ACTIONS

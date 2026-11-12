@@ -154,7 +154,7 @@ async def test_repeated_agent_windows_only_keep_current_runtime(agent_env, strat
         assert await window.store.restore_messages() == messages
 
 
-@pytest.mark.parametrize("phase,expected", [("drafting", "AgentPlanSubmit"), ("executing", "finalize"), ("finalizing", "")])
+@pytest.mark.parametrize("phase,expected", [("drafting", "AgentPlan(action=submit)"), ("executing", "finalize"), ("finalizing", "")])
 async def test_refresh_regenerates_only_effective_plan_completion_gate(agent_env, monkeypatch, phase, expected):
     runner = make_runner(agent_env, managed=True)
     async def runtime():

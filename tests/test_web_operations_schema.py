@@ -787,7 +787,8 @@ def test_operation_public_tool_summary_omits_details_but_preserves_existing_card
     assert summary["detailRevision"] == 7
     assert summary["payload"]["toolCallId"] == "call-1"
     assert summary["payload"]["resultState"] == "error"
-    assert json.loads(summary["payload"]["previewArguments"]) == {"description": "检查当前服务状态"}
+    # Every field stays; the long command keeps its start and end.
+    assert json.loads(summary["payload"]["previewArguments"]) == {"description": "检查当前服务状态", "command": "x" * 180 + "…" + "x" * 60}
     assert "preview" not in summary["payload"]
     assert "args" not in summary["payload"]
     assert "arguments" not in summary["payload"]
@@ -804,6 +805,42 @@ def test_operation_public_tool_summary_omits_details_but_preserves_existing_card
     assert detail["detailLoaded"] is True
     assert detail["payload"]["arguments"] == payload["arguments"]
     assert detail["payload"]["result"] == payload["result"]
+
+
+def _card_arguments(name, arguments):
+    from app.web_operations import operation_public
+    summary = operation_public({"conversation_uuid": "conv", "op_id": f"tool:{name}", "op_type": "tool", "status": "completed",
+                                "payload": {"toolCallId": name, "name": name, "toolName": name, "status": "completed",
+                                            "arguments": json.dumps(arguments, ensure_ascii=False), "result": "ok"},
+                                "transcript_message_ids_json": "[]"}, include_tool_details=False)
+    return json.loads(summary["payload"]["previewArguments"])
+
+
+# From 11-02: past 512 characters the card kept one top-level field, so a long Servers.exec lost its
+# command and server and read "执行命令 · 在指定服务器上".
+def test_a_long_call_keeps_what_its_card_line_is_made_of():
+    command = "set -e\n" + "echo step\n" * 120 + "cd /srv/app && docker compose up -d"
+    servers = _card_arguments("Servers", {"action": "exec", "params": {"serverIds": [f"srv-{i}" for i in range(40)], "command": command, "timeoutSeconds": 600}})
+    assert servers["action"] == "exec" and servers["params"]["serverIds"] == [f"srv-{i}" for i in range(40)]
+    assert servers["params"]["timeoutSeconds"] == 600
+    assert servers["params"]["command"] == command[:180] + "…" + command[-60:] and servers["params"]["command"].endswith("docker compose up -d")
+    edits = [{"old_string": "a" * 400, "new_string": "b" * 400} for _ in range(8)]
+    batch = _card_arguments("EditBatch", {"path": "/srv/app/main.py", "edits": edits})
+    assert batch["path"] == "/srv/app/main.py" and len(batch["edits"]) == 8
+    assert batch["edits"][0] == {"old_string": "a" * 180 + "…" + "a" * 60, "new_string": "b" * 180 + "…" + "b" * 60}
+    write = _card_arguments("Write", {"description": "写配置", "path": "/etc/app.conf", "content": "z" * 70_000})
+    assert write == {"description": "写配置", "path": "/etc/app.conf", "content": "z" * 180 + "…" + "z" * 60}
+
+
+def test_a_long_call_preview_stays_bounded():
+    from app.web_operations import _TOOL_PREVIEW_CHARS
+    # Too large at the first cut: the strings go down to their first 60 and last 20 characters.
+    tighter = _card_arguments("Servers", {"action": "upload_file", "params": {"files": [{"localPath": "l" * 500, "remotePath": "r" * 500} for _ in range(30)]}})
+    assert len(tighter["params"]["files"]) == 30 and tighter["params"]["files"][0]["remotePath"] == "r" * 60 + "…" + "r" * 20
+    # Still too large: the one field the card would show first, as before.
+    many = {"description": "批量写入", "items": [{"text": "y" * 500} for _ in range(150)]}
+    assert _card_arguments("Write", many) == {"description": "批量写入"}
+    assert len(json.dumps(tighter, ensure_ascii=False, separators=(",", ":"))) <= _TOOL_PREVIEW_CHARS
 
 
 def test_operation_public_task_memory_summary_keeps_action_and_target_for_lazy_card():
@@ -995,3 +1032,33 @@ def test_sensitive_user_interaction_public_surfaces_fail_closed_even_for_malform
         assert summary["payload"]["sensitive"] is True
         assert "defaultValue" not in summary["payload"]
         assert "searchText" not in frame["debug"]
+
+
+def test_collapsed_servers_card_carries_a_bounded_result_digest():
+    items = [{"transferId": f"t{i}", "serverId": f"srv-{i}", "remotePath": "/tmp/probe.txt", "state": "done", "verified": True,
+              "sha256": "a" * 64, "localPath": "/tmp/probe.txt", "startedBy": {"kind": "conversation", "title": "x" * 300}} for i in range(3)]
+    result = {"ok": True, "batchId": "b1", "summary": {"count": 3, "finished": 3, "succeeded": 3}, "items": items,
+              "untrustedData": "来源：节点（items 中的各台服务器），不可信数据" + "。" * 200}
+    payload = {"toolCallId": "call-1", "name": "Servers", "arguments": json.dumps({"action": "upload_file", "params": {"group": "测试机"}}),
+               "result": json.dumps(result, ensure_ascii=False), "status": "completed"}
+    row = {"conversation_uuid": "conv", "op_id": "tool:call-1", "op_type": "tool", "status": "completed", "revision": 1,
+           "payload": payload, "transcript_message_ids_json": "[]"}
+    summary = operation_public(row, include_tool_details=False)["payload"]
+    assert "result" not in summary
+    digest = json.loads(summary["resultDigest"])
+    # Counts and states stay; content (hashes, long text, nested origins) does not.
+    assert digest["summary"] == {"count": 3, "finished": 3, "succeeded": 3}
+    assert digest["items"] == [{"state": "done", "verified": True, "serverId": f"srv-{i}", "remotePath": "/tmp/probe.txt"} for i in range(3)]
+    assert "untrustedData" not in digest
+    # A long batch keeps every element's state within the bound.
+    many = {"ok": True, "results": [{"serverId": "s" * 36, "name": "n" * 40, "ok": True, "exitCode": 0, "stdout": "y" * 500} for _ in range(50)]}
+    big = operation_public({**row, "payload": {**payload, "result": json.dumps(many)}}, include_tool_details=False)["payload"]
+    assert len(big["resultDigest"]) <= 4000 and len(json.loads(big["resultDigest"])["results"]) == 50
+    # Other tools' results are not digested.
+    bash = operation_public({**row, "payload": {**payload, "name": "Bash", "result": json.dumps(result)}}, include_tool_details=False)["payload"]
+    assert "resultDigest" not in bash
+    # A collapsed extension request says how it came out.
+    request = {"ok": True, "status": "enabled", "extension": "browser", "approvedBy": "user", "note": "its tools are available from your next model request"}
+    asked = operation_public({**row, "payload": {**payload, "name": "RequestExtension", "arguments": json.dumps({"extension": "browser", "reason": "x"}),
+                                                 "result": json.dumps(request)}}, include_tool_details=False)["payload"]
+    assert json.loads(asked["resultDigest"])["approvedBy"] == "user"

@@ -10,6 +10,7 @@ import './serversStubs.mjs';
 import {mountApp} from '../../testing/mountApp.mjs';
 import {sleep, settle, scaleTimers} from '../../testing/domPage.mjs';
 import {fakeMesh, SERVERS, server} from './meshBackend.mjs';
+import {detailTab} from '../detail/detailTab.js';
 
 import './flowLayout.mjs';
 
@@ -24,9 +25,9 @@ let copies = 0;
 // setup() returns the copy's number as `fresh`, for a test that imports an app module itself.
 const loadView = async () => (await import(`../../views/ServersView.vue?fresh=${++copies}`)).default;
 
-export async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false} = {}) {
+export async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false, v3 = false} = {}) {
   if (routes) reach = true;
-  const calls = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall}), items = SERVERS();
+  const calls = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall, v3}), items = SERVERS();
   if (punch) items.push(server('office', 'Office', {region: 'CN'}), server('cafe', 'Cafe', {region: 'SG'}), server('nas', 'NAS', {region: 'CN'}));
   if (reach) items.push(server('sg', 'SG', {region: 'SG'}), server('toy', 'TOY', {region: 'CN'}), server('lab', 'Lab', {region: 'CN'}));
   let slow = 0;
@@ -47,7 +48,11 @@ export async function setup(t, {width = 1440, height = 900, dark = false, tabs =
   window.sessionStorage.clear();
   window.localStorage.clear();
   window.sessionStorage.setItem('openbear.servers.tabs', JSON.stringify({tabs, active}));
-  if (init) init();
+  // v3: the mesh pages; otherwise the classic board (the overview's other look).
+  window.localStorage.setItem('openbear.mesh.classic', v3 ? '0' : '1');
+  // Shared by every server's detail page in this process: each test starts on 概览.
+  detailTab.value = 'overview';
+  if (init) init(mesh);
   const shown = ref(true);
   window.__showServers = value => { shown.value = value; };
   const Other = {name: 'OtherPage', render: () => h('div', {id: 'other-page'}, '会话')};
@@ -58,7 +63,7 @@ export async function setup(t, {width = 1440, height = 900, dark = false, tabs =
   page.reload = async () => { await unmount({check: false}); ({unmount} = mountApp(t, root, {width, height, dark, network, touch: width < 760})); await page.locator('#app > *').first().waitFor({state: 'attached'}); };
   page.waitForTimeout = async ms => { await sleep(Number(ms) >= 200 ? Math.max(20, ms / SCALE) : ms); await settle(); };
   await page.locator('#app > *').first().waitFor({state: 'attached'});
-  if (active === 'mesh' && !missing) await page.locator('.vue-flow__node').first().waitFor();
+  if (active === 'mesh' && !missing) await page.locator(v3 ? '.m3-tabs' : '.vue-flow__node').first().waitFor();
   const puts = () => calls.filter(c => c.method === 'PUT' && c.path === '/api/servers/mesh/draft');
   return {page, calls, mesh, puts, fresh: copies, last: () => puts().at(-1)?.body, slowGets: ms => { slow = ms; },
     layoutPuts: () => calls.filter(c => c.method === 'PUT' && c.path === '/api/servers/mesh/layout'),

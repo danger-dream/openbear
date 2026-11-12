@@ -125,7 +125,7 @@ def verified_result(result: dict) -> bool:
     outputs = result.get("outputs", {})
     if not outputs.get("log") or not outputs.get("logSha256"):
         return False
-    for name in ("log", "junit"):
+    for name in ("log", "junit", "fastJunit", "rerunJunit", "reusedJunit"):
         if name not in outputs:
             continue
         path = Path(outputs[name])

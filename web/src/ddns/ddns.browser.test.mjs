@@ -6,7 +6,7 @@ import {startBrowserTestServer, waitForBrowserReady} from '../browserTestServer.
 import {fakeDdns, handleApi} from './ddnsFixture.mjs';
 const require = createRequire(import.meta.url);
 let chromium;
-try { ({chromium} = require(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = require('../testing/playwright.cjs')); } catch {}
 const shots = process.env.OPENBEAR_DDNS_SHOTS || '';
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:ddns-test"></script></body></html>';
 // window.__card mounts the card of a server's detail page instead of the page; the page sits as in the
@@ -32,11 +32,12 @@ test('动态域名 page: list, details, forms, node picker, phone and dark', {sk
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false, card = '', path = '/__test', focus = null} = {}) {
+  async function setup(t, {width = 1440, height = 900, dark = false, card = '', path = '/__test', focus = null, prepare = null} = {}) {
     const phone = width < 760;
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: phone ? 2 : 1, colorScheme: dark ? 'dark' : 'light', hasTouch: phone, isMobile: phone});
     t.after(() => context.close().catch(() => {}));
     const page = await context.newPage(), errors = [], ddns = fakeDdns();
+    prepare?.(ddns.state);
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(([isDark, card, focus]) => { window.__dark = isDark; window.__card = card; window.__focus = focus; }, [dark, card, focus]);
     await page.route('**/api/**', async route => {
@@ -159,6 +160,30 @@ test('动态域名 page: list, details, forms, node picker, phone and dark', {sk
     await noOverflow(page, 'provider sheet');
     await shot(page, 'phone-add-provider');
     await close();
+  });
+
+  await t.test('separate provider line controls fit desktop and narrow dark phone', async t => {
+    for (const width of [1440, 320]) {
+      const {page, close} = await setup(t, {width, height: 844, dark: width === 320, prepare: state => {
+        Object.assign(state.accounts.find(a => a.type === 'dnspod'), {zones: ['example.org'], state: 'ok'});
+      }});
+      await page.getByRole('button', {name: '添加解析'}).click();
+      const form = page.locator(width < 760 ? '.dd-sheet' : '.dd-dialog');
+      await form.getByRole('textbox', {name: /域名/}).fill('new.example.cn\nnew.example.org');
+      await form.locator('.dd-adv > summary').click();
+      const ali = form.getByRole('combobox', {name: '解析线路（阿里云）'});
+      const dp = form.getByRole('combobox', {name: '解析线路（DNSPod）'});
+      await ali.selectOption('telecom');
+      await dp.selectOption('联通');
+      assert.equal(await ali.inputValue(), 'telecom');
+      assert.equal(await dp.inputValue(), '联通');
+      await noOverflow(page, `mixed providers ${width}`);
+      for (const control of [ali, dp]) {
+        const box = await control.boundingBox();
+        assert.ok(box.x >= 0 && box.x + box.width <= width + 1);
+      }
+      await close();
+    }
   });
 
   await t.test('dark theme and the phone in dark', async t => {

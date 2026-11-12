@@ -21,6 +21,24 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def _conclusion_line(task: AgentTask) -> str:
+    output = task.output if isinstance(task.output, dict) else {}
+    text = str(output.get("summary") or output.get("result") or task.error or "")
+    for line in text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line[:200]
+    return ""
+
+
+def _task_round_brief(task: AgentTask) -> dict[str, Any]:
+    """An earlier round: enough to choose one; the full record is fetched by taskUuid."""
+    return {"taskUuid": task.task_uuid, "taskId": task.task_uuid,
+            "sessionTurn": int(task.input.get("sessionTurn") or 0),
+            "title": task.title, "status": task.status, "conclusion": _conclusion_line(task),
+            "brief": True}
+
+
 class AgentContinuationTools:
     async def _resolve_instance_target(self, ref: str):
         ctx = current_tool_context()
@@ -44,7 +62,7 @@ class AgentContinuationTools:
         return session, task
 
     async def agent_continue(self, args: dict[str, Any]) -> str:
-        from app.tools.agents import _normalize_agent_plan_mode, _task_public
+        from app.tools.agents import _normalize_agent_plan_mode, _owned_paths, _task_public
         ctx = current_tool_context()
         if ctx.source.startswith("agent:"):
             return _json({"ok": False, "error": "main_controller_only"})
@@ -110,6 +128,7 @@ class AgentContinuationTools:
                 continuation_request_id=str(args.get("requestId") or ctx.tool_call_id or ""),
                 attachment_refs=list(args.get("attachments") or []),
                 original_prompt=str(args["prompt"]).strip(),
+                owned_paths=_owned_paths(args.get("ownedPaths")),
             )
             return _json(result)
         except AgentContinuityError as exc:
@@ -157,6 +176,29 @@ class AgentContinuationTools:
                 "unavailableTools": {name: agent_tool_unavailable_reason(self.registry, name) for name in (approved if managed and state.get("active_plan_version") else granted) if name not in agent_delegation_names(self.registry)},
                 "presetToolCeiling": list(data.get("presetToolCeiling") or []), "phase": phase}
 
+    async def _agent_tool_calls(self, args: dict[str, Any]) -> str:
+        from app.agents.supervision import recent_tool_calls
+        try:
+            session, task = await self._resolve_instance_target(str(args.get("to") or ""))
+        except AgentContinuityError as exc:
+            return _json(exc.public())
+        target = str(args.get("taskUuid") or "").strip()
+        if not target and session and session.session_kind == "independent":
+            target = session.active_task_uuid or session.last_task_uuid
+        target = target or (task.task_uuid if task else "")
+        chosen = await self.dao.get_task(target) if target else None
+        independent = bool(session and session.session_kind == "independent")
+        if chosen is None or (chosen.agent_session_uuid != session.session_uuid if independent
+                              else chosen.task_uuid != (task.task_uuid if task else "")):
+            return _json({"ok": False, "error": "agent_task_not_in_instance"})
+        try:
+            limit = max(1, min(50, int(args.get("limit") or 10)))
+        except (TypeError, ValueError):
+            limit = 10
+        calls = await recent_tool_calls(self.dao.db, chosen.task_uuid, limit=limit)
+        return _json({"ok": True, "taskUuid": chosen.task_uuid, "title": chosen.title,
+                      "status": chosen.status, "toolCalls": calls})
+
     async def agent_info(self, args: dict[str, Any]) -> str:
         from app.tools.agents import _task_agent_plan_mode, _task_public
         ctx = current_tool_context()
@@ -175,6 +217,8 @@ class AgentContinuationTools:
             sessions = await self.dao.list_agent_sessions(openbear_session_uuid=ctx.session_uuid,
                                                          chat_id=ctx.chat_id if ctx.chat_id > 0 else None, limit=100)
             return _json({"ok": True, "instances": [agent_session_public(item) for item in sessions]})
+        if action == "tool_calls":
+            return await self._agent_tool_calls(args)
         if action != "get":
             return _json({"ok": False, "error": "invalid_action"})
         try:
@@ -219,8 +263,21 @@ class AgentContinuationTools:
                               "windowAvailable": bool(window and window["state"].get("messages") is not None),
                               "windowVersion": int(window["window_version"]) if window else None,
                               "historyCoverage": "incremental_originals" if window else "legacy_checkpoint_only"}
+            include_history = bool(args.get("includeHistory"))
+            wanted_task = str(args.get("taskUuid") or "").strip()
+            if wanted_task and not any(item.task_uuid == wanted_task for item in tasks):
+                return _json({"ok": False, "error": "agent_task_not_in_instance",
+                              "message": "taskUuid is not a round of this Agent instance."})
+
+            def task_view(item):
+                if current and item.task_uuid == current.task_uuid:
+                    return {**_task_round_brief(item), "current": True, "fullRecord": "task"}
+                if include_history or item.task_uuid == wanted_task:
+                    return _task_public(item, include_output=True)
+                return _task_round_brief(item)
+
             return _json({"ok": True, "agentSession": agent_session_public(session) if session else {},
-                          "legacy": not independent, "tasks": [_task_public(item, include_output=True) for item in tasks],
+                          "legacy": not independent, "tasks": [task_view(item) for item in tasks],
                           "task": _task_public(current, include_output=True),
                           "contextAvailable": bool(checkpoint),
                           "contextState": str((checkpoint or {}).get("state", {}).get("stage") or "unavailable"),
@@ -233,6 +290,7 @@ class AgentContinuationTools:
 
 
 def register_continuation_tools(reg, tools) -> None:
+    from app.tools.agents import OWNED_PATHS_SCHEMA
     reg.add("AgentContinue", "Continue the SAME independent Agent after its round has ended. Restores its actual retained context and private memory, appends a new instruction, and creates a new task record without reopening the previous result. No prior memory report or progress note is required. Pass the COMPLETE tools array for this round; permissions are not inherited or unioned. Use AgentMessage for unfinished tasks. Main controller only; new scope still requires user authorization.",
             {"type": "object", "properties": {
                 "to": {"type": "string", "description": "Exact agentId, or exact legacy task UUID to adopt only that task."},
@@ -242,10 +300,14 @@ def register_continuation_tools(reg, tools) -> None:
                 "description": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}},
                 "planMode": {"type": "string", "enum": ["direct", "managed"], "default": "direct"},
                 "requestId": {"type": "string", "description": "Optional idempotency key; reuse only for the same continuation request."},
+                "ownedPaths": OWNED_PATHS_SCHEMA,
             }, "required": ["to", "prompt", "tools"]}, tools.agent_continue,
             visibility={"main", "runtime"}, preserve_result=True)
-    reg.add("AgentInfo", "Read current-conversation Agent instances, retained-context availability, rounds/results and delegable capabilities. get returns the current task's authoritative planRuntime (phase, active/pending versions, Plan, steps and evidence), not inferred historical notifications. Use its taskUuid and pendingPlanVersion or activePlanVersion for version-checked Plan decisions; direct explicitly has no Plan, and available=false means Plan state could not be read. Read-only; use on demand, not as a polling timer. Does not expose private model messages or memory catalogs/bodies.",
+    reg.add("AgentInfo", "Read current-conversation Agent instances, retained-context availability, rounds/results and delegable capabilities. get returns the current round in full as task and earlier rounds in tasks only as title, status and first conclusion line; pass includeHistory=true for every round in full, or taskUuid for one earlier round. tool_calls returns the last limit (default 10, max 50) tool calls of the current round (or taskUuid) with arguments, result preview and error code. get also returns the current task's authoritative planRuntime (phase, active/pending versions, Plan, steps and evidence), not inferred historical notifications. Use its taskUuid and pendingPlanVersion or activePlanVersion for version-checked Plan decisions; direct explicitly has no Plan, and available=false means Plan state could not be read. Read-only; use on demand, not as a polling timer. Does not expose private model messages or memory catalogs/bodies.",
             {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["list", "get", "capabilities"]},
-                "to": {"type": "string", "description": "Exact agentId or task UUID for get."},
+                "action": {"type": "string", "enum": ["list", "get", "tool_calls", "capabilities"]},
+                "to": {"type": "string", "description": "Exact agentId or task UUID for get and tool_calls."},
+                "includeHistory": {"type": "boolean", "description": "get: return every earlier round in full."},
+                "taskUuid": {"type": "string", "description": "get: also return this earlier round in full; tool_calls: read this round."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "tool_calls: how many recent calls."},
             }, "required": ["action"]}, tools.agent_info, visibility={"main", "runtime"}, preserve_result=True)

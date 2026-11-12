@@ -1,15 +1,16 @@
 <script setup>
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { Api } from '../api.js';
 import { ok } from '../instances/instanceHelpers.js';
 import AccessPicker from './AccessPicker.vue';
+import FrontExits from './FrontExits.vue';
 import SuggestInput from './SuggestInput.vue';
 import { Close } from '@element-plus/icons-vue';
 import RegionPicker from './RegionPicker.vue';
-import { billingResetDay, cycleLabel, cycleOptions, cycleStart, noAutofill, safeError, trafficMode, trafficModes, trafficTypes } from './serverHelpers.js';
+import { addMonths, billingResetDay, cycleLabel, cycleOptions, cycleStart, noAutofill, safeError, trafficMode, trafficModes, trafficTypes } from './serverHelpers.js';
 
 const props = defineProps({server: {type: Object, default: null}, groups: {type: Array, default: () => []}, tags: {type: Array, default: () => []}, regions: {type: Array, default: () => []},
-  settings: {type: Object, default: () => ({accessPoints: []})}});
+  settings: {type: Object, default: () => ({accessPoints: []})}, servers: {type: Array, default: () => []}, part: {type: String, default: ''}});
 const emit = defineEmits(['saved', 'cancel']);
 const GB = 1024 ** 3, TB = 1024 ** 4;
 const CURRENCIES = ['$', '¥', '€', '£', 'HK$'];
@@ -22,6 +23,7 @@ const form = reactive({
   // Traffic not set up yet counts both directions; one set up before keeps what it counted (the larger one when unset).
   mode: trafficMode(t), type: t.type || (Object.keys(t).length ? 'max' : 'sum'), resetDay: t.resetDay || '', unitPrice: t.price || '',
   access: {primary: p.access?.primary || '', backup: p.access?.backup || ''},
+  front: Boolean(p.front?.exits?.length), exits: p.front?.exits?.length ? p.front.exits.map(e => ({...e})) : [{serverId: '', address: ''}],
 });
 const local = computed(() => Boolean(props.server?.local));
 const limited = computed(() => form.mode === 'billing' || form.mode === 'fixed');
@@ -34,15 +36,16 @@ const modeHint = computed(() => {
 // Refusals of a node that is online and kept its old address; the edit can still be saved for later.
 const SWITCH_REFUSALS = new Set(['new_url_unreachable', 'invalid_url', 'config_write_failed']);
 const busy = ref(false), error = ref(''), refused = ref(false);
-defineExpose({busy});
 const detected = computed(() => props.server?.node?.geo?.country || '');
 const cycles = computed(() => cycleOptions.some(([v]) => v === Number(form.cycle)) ? cycleOptions : [...cycleOptions, [Number(form.cycle), cycleLabel(Number(form.cycle))]]);
 // A start date left empty follows the expiry and the cycle (one cycle before); typing one stops that.
 const startAuto = ref(!b.startedAt);
 watch(() => [form.expiresAt, form.cycle], () => { if (startAuto.value) form.startedAt = cycleStart(form.expiresAt, Number(form.cycle)); }, {immediate: true});
 function startTyped() { startAuto.value = !form.startedAt; }
-// Tags: Enter, a comma or leaving the field adds what was typed.
-const tagDraft = ref('');
+const EXTENDS = [[1, '+1月'], [3, '+3月'], [6, '+6月'], [12, '+1年']];
+function extend(months) { form.expiresAt = addMonths(form.expiresAt, months); }
+// Tags: Enter, a comma, leaving the field or picking a suggestion adds it.
+const tagDraft = ref(''), tagBox = ref(null);
 const tagChoices = computed(() => props.tags.filter(tag => !form.tags.includes(tag)));
 function addTag() {
   for (const tag of tagDraft.value.split(/[,，]/).map(v => v.trim()).filter(Boolean)) {
@@ -52,6 +55,7 @@ function addTag() {
 }
 function tagKey(event) { if (event.key === ',' || event.key === '，') { event.preventDefault(); addTag(); } }
 function removeTag(tag) { form.tags = form.tags.filter(t => t !== tag); }
+function focusTag() { tagBox.value?.querySelector('input')?.focus(); }
 
 function payload() {
   const amount = Number(form.limit) || 0;
@@ -61,8 +65,26 @@ function payload() {
     traffic: {mode: form.mode, type: form.type, limit: limited.value ? Math.round(amount * (form.unit === 'TB' ? TB : GB)) : 0,
       resetDay: form.mode === 'fixed' ? Number(form.resetDay) || 0 : 0, price: form.mode === 'metered' ? Number(form.unitPrice) || 0 : 0},
     ...(local.value ? {} : {access: {...form.access}}),
+    // Only when it is or was a front: other servers' edits say nothing about it.
+    ...(local.value || !form.front && !p.front ? {} : {front: form.front ? {exits: form.exits.map(e => ({serverId: e.serverId, address: e.address.trim()}))} : null}),
   }};
 }
+// Changed since it opened: what would be saved differs, or a tag is half typed. Closing it then asks first.
+const opened = JSON.stringify(payload());
+const dirty = computed(() => JSON.stringify(payload()) !== opened || Boolean(tagDraft.value.trim()));
+defineExpose({busy, dirty});
+// Opened for its traffic (流量统计's 流量设置): that part at the top of what scrolls the form, from the first frame
+// the drawer is laid out. Not scrollIntoView: that also scrolls the overlay sideways to the drawer sliding in.
+const trafficPart = ref(null);
+onMounted(() => {
+  if (props.part !== 'traffic') return;
+  requestAnimationFrame(() => {
+    const part = trafficPart.value;
+    let box = part?.parentElement;
+    while (box && !(box.scrollHeight > box.clientHeight && /auto|scroll/.test(getComputedStyle(box).overflowY))) box = box.parentElement;
+    if (box) box.scrollTop += part.getBoundingClientRect().top - box.getBoundingClientRect().top;
+  });
+});
 async function save(later = false) {
   if (busy.value) return;
   addTag();
@@ -91,11 +113,10 @@ async function save(later = false) {
       </div>
       <div class="ob-field"><span>标签</span>
         <div class="ob-ctl">
-          <div class="sv-chips-edit sv-tags-edit">
+          <div ref="tagBox" class="sv-tags-edit" @click.self="focusTag">
             <span v-for="tag in form.tags" :key="tag" class="sv-chip">{{ tag }}<button type="button" :aria-label="`删除标签 ${tag}`" @click="removeTag(tag)"><el-icon><Close /></el-icon></button></span>
-            <input v-if="form.tags.length < 10" v-model="tagDraft" v-bind="noAutofill" list="sv-tag-choices" maxlength="40" :placeholder="form.tags.length ? '再加一个' : '例如：独服、建站专用'" aria-label="添加标签"
-              @keydown.enter.prevent="addTag" @keydown="tagKey" @blur="addTag" />
-            <datalist id="sv-tag-choices"><option v-for="tag in tagChoices" :key="tag" :value="tag" /></datalist>
+            <SuggestInput v-if="form.tags.length < 10" v-model="tagDraft" :options="tagChoices" :class="{'is-plain': !tagChoices.length}" maxlength="40" :placeholder="form.tags.length ? '再加一个' : '例如：独服、建站专用'" aria-label="添加标签"
+              @pick="addTag" @keydown.enter.prevent="addTag" @keydown="tagKey" @blur="addTag" />
           </div>
           <small>分组之外的标记，可以加多个；回车或逗号添加。</small>
         </div>
@@ -106,30 +127,44 @@ async function save(later = false) {
           <input v-model="form.providerUrl" v-bind="noAutofill" type="url" inputmode="url" maxlength="300" placeholder="续费网址，例如 https://…" aria-label="商家网址" />
         </div>
       </div>
-      <div v-if="!local && settings.accessPoints?.length" class="ob-field"><span>接入点</span>
+      <div v-if="!local" class="ob-field"><span>前置机</span>
+        <div class="ob-ctl">
+          <label class="ob-check"><input v-model="form.front" type="checkbox" /><span>这是前置机<small class="instance-muted">只经出口连 OpenBear，不用接入点；SSH 也只经出口</small></span></label>
+          <FrontExits v-if="form.front" v-model="form.exits" :servers="servers" :self="server?.id || ''" />
+        </div>
+      </div>
+      <div v-if="!local && !form.front && settings.accessPoints?.length" class="ob-field"><span>接入点</span>
         <div class="ob-ctl"><AccessPicker v-model="form.access" :points="settings.accessPoints" :default-id="settings.defaultAccess" :mesh="settings.meshAccess || null" :mesh-eligible="Boolean(server?.access?.meshEligible)" :server-mesh-reason="server?.access?.meshReason || ''" /><small>节点连回 OpenBear 用的地址。修改后，在线的节点会先确认能连上新地址再切换。</small></div>
+      </div>
+      <div v-if="settings.latency?.enabled" class="ob-field"><span>延迟</span>
+        <div class="ob-ctl"><small class="sv-field-note">{{ form.front ? '前置机只测到自己出口的延迟。' : '测哪些目标，在详情页「网络」→「延迟与丢包」的「编辑」里改。' }}</small></div>
       </div>
       <fieldset>
         <legend>账单</legend>
         <div class="ob-fields">
           <div class="ob-field"><span>价格</span>
-            <div class="ob-inline">
-              <SuggestInput v-model="form.currency" :options="CURRENCIES" class="sv-currency" maxlength="8" aria-label="币种" />
-              <input v-bind="noAutofill" v-model="form.price" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" aria-label="价格" />
+            <div class="sv-pair">
+              <div class="sv-amount">
+                <SuggestInput v-model="form.currency" :options="CURRENCIES" class="sv-currency" maxlength="8" aria-label="币种" />
+                <input v-bind="noAutofill" v-model="form.price" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" aria-label="价格" />
+              </div>
               <select v-model.number="form.cycle" aria-label="计费周期"><option v-for="[value, label] in cycles" :key="value" :value="value">{{ label }}</option></select>
             </div>
           </div>
           <div class="ob-field"><span>日期</span>
-            <div class="ob-inline sv-dates">
+            <div class="sv-pair sv-dates">
               <label>开始<input v-bind="noAutofill" v-model="form.startedAt" type="date" aria-label="开始日期" @input="startTyped" /></label>
               <label>到期<input v-bind="noAutofill" v-model="form.expiresAt" type="date" :disabled="form.cycle === -1" aria-label="到期日期" /></label>
+              <div class="sv-extend" role="group" aria-label="延长到期日">
+                <button v-for="[months, label] in EXTENDS" :key="months" type="button" :disabled="form.cycle === -1" :title="form.expiresAt ? `从 ${form.expiresAt} 往后加` : '从今天往后加'" @click="extend(months)">{{ label }}</button>
+              </div>
             </div>
           </div>
           <div v-if="startAuto && form.startedAt" class="ob-field"><span></span><small class="instance-muted sv-start-auto">开始日期按到期日往前推一个周期自动填写，可以改。</small></div>
           <div class="ob-field"><span></span><label class="ob-check"><input v-model="form.autoRenew" type="checkbox" :disabled="form.cycle <= 0" />自动续费：到期后把到期日顺延一个周期</label></div>
         </div>
       </fieldset>
-      <fieldset>
+      <fieldset ref="trafficPart">
         <legend>流量</legend>
         <div class="ob-fields">
           <div class="ob-field"><span>方式</span>

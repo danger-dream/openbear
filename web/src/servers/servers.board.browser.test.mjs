@@ -4,7 +4,7 @@
 // servers.dom.test.mjs and servers.install.dom.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab} from './testing/serversBrowser.mjs';
+import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab, showTab} from './testing/serversBrowser.mjs';
 import {day, GB, server, many, uninstalledLast, TARGET, RELEASE, versions, MESH_ON, onMesh, card, orders, meshOption, off, fact} from './testing/serversBackend.mjs';
 
 test('servers page layout: board, detail, background jobs, join requests, cards', {skip: !chromium, timeout: 300000}, async t => {
@@ -45,19 +45,33 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
     const h = await setup(t);
     await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
     const detail = h.page.locator('.sv-detail:visible');
-    await detail.locator('.sv-chart svg').first().waitFor();
-    // The cards in their order, each card's actions as buttons at its head's right.
-    const cards = await detail.locator('.sv-cards > section, section.net-probe').evaluateAll(list => list.map(el => el.querySelector('h3')?.textContent || el.getAttribute('aria-label')));
-    for (const head of await detail.locator('.ix-card-head:has(> .ix-text-button)').all()) {
-      const [title, button] = await Promise.all([head.locator('h3').boundingBox(), head.locator('> .ix-text-button').last().boundingBox()]);
-      const card = await head.boundingBox();
-      assert.ok(Math.abs(button.x + button.width - (card.x + card.width)) <= 1 && Math.abs(button.y + button.height / 2 - (title.y + title.height / 2)) <= 4, 'at the head\'s right');
+    await detail.locator('[data-chart=load] svg').waitFor();
+    // On every tab, each card's actions as buttons at its head's right. Measured all at once, when they
+    // have stopped changing: some buttons come with their card's data, a moment after the tab shows.
+    const heads = () => detail.locator('[role=tabpanel]:visible').evaluate(panel => [...panel.querySelectorAll('.ix-card-head')]
+      .filter(head => head.querySelector(':scope > h3') && head.querySelector(':scope > .ix-text-button')).map(head => {
+        const title = head.querySelector(':scope > h3').getBoundingClientRect(), button = [...head.querySelectorAll(':scope > .ix-text-button')].at(-1).getBoundingClientRect();
+        return {name: head.querySelector(':scope > h3').innerText, right: head.getBoundingClientRect().right - button.right, middle: button.y + button.height / 2 - (title.y + title.height / 2)};
+      }));
+    for (const name of ['概览', '网络', '系统', '工具']) {
+      await showTab(detail, name);
+      await settled(h.page);
+      let seen = await heads(), last = '';
+      await until(async () => { await new Promise(resolve => setTimeout(resolve, 100)); [last, seen] = [JSON.stringify(seen), await heads()]; return JSON.stringify(seen) === last; });
+      for (const head of seen) assert.ok(Math.abs(head.right) <= 1 && Math.abs(head.middle) <= 4, `${name}: ${head.name} at the head's right`);
     }
     const logs = detail.locator('.sv-logs');
+    // A long source conversation title is cut with an ellipsis inside its row.
+    const originRow = logs.locator('li').filter({hasText: 'systemctl status nginx'});
+    const [rowBox, originBox, cut] = await Promise.all([originRow.boundingBox(), originRow.locator('.sv-log-origin').boundingBox(),
+      originRow.locator('.sv-log-origin').evaluate(el => el.scrollWidth > el.clientWidth && getComputedStyle(el).textOverflow === 'ellipsis')]);
+    assert.ok(cut && originBox.x + originBox.width <= rowBox.x + rowBox.width + 1, JSON.stringify([rowBox, originBox]));
     await logs.getByRole('tab', {name: '终端记录'}).click();
     await logs.getByText('192.0.2.1 · 会话已结束').waitFor();
+    await showTab(detail, '概览');
     await detail.evaluate(el => el.closest('.sv-scroll').scrollTo(0, 0));
     await shot(h.page, 'desktop-detail');
+    await showTab(detail, '系统');
     await detail.locator('.ix-card').filter({hasText: '账单'}).getByRole('button', {name: '续费'}).click();
     await detail.locator('.ix-more').click();
     await h.page.getByRole('menuitem', {name: '移除节点…'}).click();
@@ -72,6 +86,7 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
     const h = await setup(t, {tweak: withJobs});
     await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
     const detail = h.page.locator('.sv-detail:visible');
+    await showTab(detail, '工具');
     const card = detail.locator('.sv-jobs');
     await card.locator('.sv-job-list > li').first().waitFor();
     assert.equal(await card.locator('.sv-job-stop').count(), 1);
@@ -93,13 +108,15 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
     // A node build without background jobs gets no such card.
     await tab(h.page, '探针').click();
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
-    await h.page.locator('.sv-detail:visible .sv-gauge').first().waitFor();
+    await h.page.locator('.sv-detail:visible [data-part=browser]').waitFor();
+    assert.equal(await h.page.locator('.sv-detail:visible .sv-jobs').count(), 0);
     await h.close();
 
     for (const dark of [false, true]) {
       const p = await setup(t, {width: 375, height: 812, dark, tweak: withJobs});
       await p.page.getByRole('button', {name: '列表视图'}).click();
       await p.page.locator('.pl-row').filter({hasText: 'Edge-SG.Game'}).click();
+      await showTab(p.page.locator('.sv-detail:visible'), '工具');
       const jobs = p.page.locator('.sv-detail:visible .sv-jobs');
       await jobs.locator('.sv-job-list > li').first().waitFor();
       await jobs.scrollIntoViewIfNeeded();
@@ -120,6 +137,12 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
       await shot(p.page, dark ? 'phone-dark-job-log' : 'phone-job-log');
       await sheet.locator('.el-drawer__close-btn').click();
       await sheet.waitFor({state: 'hidden'});
+      // The command log on a phone: the source conversation stays inside its row and is a finger-sized target.
+      const logRow = p.page.locator('.sv-detail:visible .sv-logs li').filter({hasText: 'systemctl status nginx'});
+      await logRow.scrollIntoViewIfNeeded();
+      const [logBox, originBox] = await Promise.all([logRow.boundingBox(), logRow.locator('.sv-log-origin').boundingBox()]);
+      assert.ok(originBox.x + originBox.width <= logBox.x + logBox.width + 1 && originBox.height >= 32, JSON.stringify([logBox, originBox]));
+      await noOverflow(p.page);
       await p.close();
     }
   });
@@ -134,6 +157,7 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
       }});
       await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
       const detail = h.page.locator('.sv-detail:visible');
+      await showTab(detail, '系统');
       await detail.getByText('比目标 0.13.1 新，不会自动降级').waitFor();
       await detail.locator('.ix-more').click();
       await h.page.getByRole('menuitem', {name: '降级节点到 0.13.1…'}).click();
@@ -207,15 +231,19 @@ test('servers page layout: board, detail, background jobs, join requests, cards'
     const bero = card('Bravo-FRA');
     const delta = card('Delta-JP');
     for (const stat of await h.page.locator('.pb-stat').all()) assert.equal(await stat.evaluate(el => getComputedStyle(el).alignItems), 'center');
-    // A card without tags keeps its lines level with its neighbours.
+    // A card without tags keeps its figures level with its neighbours', and its pairs in two aligned columns.
     const row = ['Edge-SG.Game', 'Papa-HK.T1', 'GoldenCloud-1212'];
-    const level = async selector => new Set(await Promise.all(row.map(name => card(name).locator(selector).evaluate(el => Math.round(el.getBoundingClientRect().top)))));
-    assert.equal((await level('.pb-spec')).size, 1);
-    assert.equal((await level('.pb-foot')).size, 1);
+    const level = async selector => new Set(await Promise.all(row.map(name => card(name).locator(selector).first().evaluate(el => Math.round(el.getBoundingClientRect().top)))));
+    assert.equal((await level('.pb-cells')).size, 1);
+    assert.equal(await card('Edge-SG.Game').locator('.pb-foot').count(), 0);
+    const columns = await card('Papa-HK.T1').locator('.pb-cell').evaluateAll(l => [...new Set(l.map(c => Math.round(c.getBoundingClientRect().left)))]);
+    assert.equal(columns.length, 2, `two columns: ${columns}`);
     await shot(h.page, 'desktop-cards');
     await h.close();
     const phone = await setup(t, {width: 390, height: 844, tweak: items => Object.assign(items.find(i => i.id === 'local').profile, {group: '', billing: {price: 0, cycle: 30, expiresAt: ''}})});
-    assert.equal(await phone.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).locator('.pb-tags').evaluate(el => getComputedStyle(el).display), 'none');
+    assert.equal(await phone.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).locator('.pb-foot').count(), 0);
+    const phoneColumns = await phone.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).locator('.pb-cell').evaluateAll(l => [...new Set(l.map(c => Math.round(c.getBoundingClientRect().left)))]);
+    assert.equal(phoneColumns.length, 2, 'two columns on a phone too');
     await phone.close();
   });
 

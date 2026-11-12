@@ -5,7 +5,7 @@ import {startBrowserTestServer} from '../browserTestServer.mjs';
 import {createSettingsBackend} from './contextToolArtifactsFixture.mjs';
 
 let chromium;
-try { ({chromium} = createRequire(import.meta.url)(process.env.OPENBEAR_PLAYWRIGHT_MODULE || '/opt/openclaw/node_modules/playwright-core')); } catch {}
+try { ({chromium} = createRequire(import.meta.url)('../testing/playwright.cjs')); } catch {}
 const html = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><script>window.__OPENBEAR_AUTH_MODE__="controller";</script></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:context-settings-test"></script></body></html>';
 const entry = `import {createApp} from 'vue'; import ElementPlus from 'element-plus'; import '/src/theme.js'; import 'element-plus/dist/index.css'; import '/src/style.css'; import '/src/admin-mobile.css'; import '/src/mobile-overlays.css'; import '/src/mobile-inputs.css'; import View from '/src/views/SettingsView.vue'; createApp(View).use(ElementPlus).mount('#app');`;
 

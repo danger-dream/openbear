@@ -558,3 +558,18 @@ async def test_frontend_deep_link_and_editor_dependencies(cron_env, monkeypatch)
     response = await e.client.get('/api/cron/environment', cookies=cookies)
     assert response.status == 200
     assert next(r for r in (await response.json())['runtimes'] if r['runtime'] == 'python')['available']
+
+
+def test_describe_gives_an_index_and_one_action_with_only_its_guide():
+    from app.cron.contracts import JobConfig
+    from app.tools.cron import ACTIONS, describe
+    index = describe()
+    assert set(index['actions']) == set(ACTIONS) and 'configSchema' not in index and 'guidance' not in index
+    create = describe('create')
+    assert create['configSchema'] == JobConfig.model_json_schema(by_alias=True) and 'Pre-execution scripts can prepare' in create['guidance']
+    runs = describe('runs')
+    assert 'configSchema' not in runs and 'does not automatically replay' in runs['guidance'] and 'Pre-execution' not in runs['guidance']
+    assert all(describe(action)['action'] == action for action in ACTIONS)
+    with pytest.raises(CronError) as caught:
+        describe('nope')
+    assert caught.value.payload['code'] == 'unknown_action' and caught.value.payload['actions'] == list(ACTIONS)

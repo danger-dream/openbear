@@ -302,16 +302,17 @@ def test_alternation_non_str_content_inserts_placeholder():
 
 def test_alternation_tool_to_user_inserts_anthropic_safe_append_only_bridge():
     msgs = [
+        {"role": "user", "content": "读一下"},
         {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c1", name="Read", arguments="{}")]},
         {"role": "tool", "tool_call_id": "c1", "name": "Read", "content": "r"},
         {"role": "user", "content": "接着说"},
     ]
-    first = repair_role_alternation(msgs[:2])
+    first = repair_role_alternation(msgs[:3])
     out = repair_role_alternation(msgs)
     assert out[:len(first)] == first
-    assert [message["role"] for message in out] == ["assistant", "tool", "assistant", "user"]
+    assert [message["role"] for message in out] == ["user", "assistant", "tool", "assistant", "user"]
     from app.agent.transcript_repair import ROLE_ALTERNATION_BRIDGE_TEXT
-    assert out[2]["content"] == ROLE_ALTERNATION_BRIDGE_TEXT
+    assert out[3]["content"] == ROLE_ALTERNATION_BRIDGE_TEXT
 
 
 def test_alternation_empty_input():
@@ -329,3 +330,25 @@ def test_is_role_alternation_bridge_matches_only_exact_marker():
     assert not is_role_alternation_bridge("")
     assert not is_role_alternation_bridge(None)
     assert not is_role_alternation_bridge([{"type": "text"}])
+
+
+def test_alternation_prepends_one_boundary_only_before_a_leading_assistant():
+    from app.agent.transcript_repair import HISTORY_BOUNDARY_TEXT
+
+    window = [
+        _asst_with_calls(ToolCall(id="c1", name="Read", arguments="{}")),
+        {"role": "tool", "tool_call_id": "c1", "name": "Read", "content": "ok"},
+        {"role": "assistant", "content": "earlier answer"},
+        _asst_with_calls(ToolCall(id="c2", name="Bash", arguments='{"command":"ls"}')),
+        {"role": "tool", "tool_call_id": "c2", "name": "Bash", "content": "done"},
+        {"role": "user", "content": "next question"},
+    ]
+    first = repair_role_alternation(window[:2])
+    full = repair_role_alternation(window)
+
+    assert full[:len(first)] == first
+    assert [m["role"] for m in full] == ["user", "assistant", "tool", "assistant", "assistant", "tool",
+                                          "assistant", "user"]
+    assert full[0] == {"role": "user", "content": HISTORY_BOUNDARY_TEXT}
+    assert sum(m.get("content") == HISTORY_BOUNDARY_TEXT for m in full) == 1
+    assert repair_role_alternation(window[-1:] + window)[0] == window[-1]

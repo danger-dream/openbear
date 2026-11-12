@@ -459,6 +459,7 @@ def normalize(run: Run):
         text = text.replace(str(run.out), "<OUT>")
         text = re.sub(r"\bs[0-9a-f]{8}\b", "S", text)
         text = re.sub(r'"loaderId": "[0-9A-F]+"', '"loaderId": "L"', text)
+        text = re.sub(r'"documentId": "[0-9a-f]{32}"', '"documentId": "D"', text)
         record = json.loads(text)
         result = record.get("result")
         if isinstance(result, dict):

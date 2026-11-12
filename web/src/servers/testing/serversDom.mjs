@@ -8,6 +8,7 @@ import './serversStubs.mjs';
 import {mountApp} from '../../testing/mountApp.mjs';
 import {scaleTimers} from '../../testing/domPage.mjs';
 import {createServersBackend} from './serversBackend.mjs';
+import {detailTab} from '../detail/detailTab.js';
 
 scaleTimers(10);
 const {h, KeepAlive, ref} = await import('vue');
@@ -29,6 +30,8 @@ export async function setup(t, {width = 1440, height = 900, dark = false, view =
   window.sessionStorage.clear();
   window.localStorage.clear();
   window.localStorage.setItem('openbear.servers.view', view);
+  // Shared by every server's detail page in this process: each test starts on 概览.
+  detailTab.value = 'overview';
   const shown = ref(true);
   window.__showServers = value => { shown.value = value; };
   const Other = {name: 'OtherPage', render: () => h('div', {id: 'other-page'}, '会话')};
@@ -41,3 +44,5 @@ export async function setup(t, {width = 1440, height = 900, dark = false, view =
 export const names = page => page.locator('.pb-card .pb-name').allInnerTexts();
 export const expectFocused = async locator => { if (!(await locator.evaluate(el => el === window.document.activeElement))) throw new Error('not focused'); };
 export const tab = (page, name) => page.locator('.sv-tabs [role=tab]').filter({hasText: name});
+// A tab of a server's detail page: 概览, 网络, 系统 or 工具.
+export const showTab = (detail, name) => detail.locator('.dt-tabs').getByRole('tab', {name, exact: true}).click();

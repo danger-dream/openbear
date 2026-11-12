@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"openbear/node/mesh/bypass"
 )
 
 // Network tests run in the background: the controller starts one, polls its
@@ -182,11 +184,19 @@ type probeManager struct {
 	route               func(dst netip.Addr) error
 }
 
+// newProbeManager measures this machine's own line: with a transparent proxy here, past it (package bypass).
 func newProbeManager() *probeManager {
-	var d net.Dialer
 	return &probeManager{probes: map[string]*probe{}, names: map[netip.Addr]string{},
 		maxRun: probeMaxRun, lease: probeLease, keep: probeKeep, openEcho: openEcho,
-		lookupIP: net.DefaultResolver.LookupNetIP, dial: d.DialContext, lookupAddr: net.DefaultResolver.LookupAddr, route: checkRoute}
+		lookupIP: bypassLookup, dial: bypassDial, lookupAddr: net.DefaultResolver.LookupAddr, route: checkRoute}
+}
+
+func bypassLookup(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return bypass.Resolver().LookupNetIP(ctx, network, host)
+}
+
+func bypassDial(ctx context.Context, network, address string) (net.Conn, error) {
+	return bypass.DialContext(ctx, bypass.Dialer(0), network, address)
 }
 
 func (a *Agent) netProbes() *probeManager {
@@ -206,6 +216,9 @@ func (a *Agent) netCall(ctx context.Context, m envelope) (any, error) {
 	}
 	if m.Method == "net.ports" {
 		return a.netPorts(ctx, m.Params)
+	}
+	if m.Method == "net.http" {
+		return a.netHTTP(ctx, m.Params)
 	}
 	pm := a.netProbes()
 	if m.Method == "net.probe.start" {
@@ -452,7 +465,7 @@ func checkRoute(dst netip.Addr) error {
 	if dst.Is6() {
 		network = "udp6"
 	}
-	c, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(dst, 9)))
+	c, err := bypass.Dialer(0).Dial(network, netip.AddrPortFrom(dst, 9).String())
 	if err != nil {
 		if noRoute(err) {
 			return err

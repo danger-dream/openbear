@@ -17,7 +17,7 @@ const ProtocolMin = 1
 
 // Features names the methods added after protocol 1, so the controller can
 // tell an older node apart before calling one.
-var Features = []string{"fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer"}
+var Features = []string{"fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "host", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe"}
 
 type Info struct {
 	Hostname string `json:"hostname"`
@@ -38,6 +38,8 @@ type Info struct {
 	IPv4Proxy string `json:"ipv4Proxy,omitempty"`
 	// MachineID lets a reusable registration code recognise a reinstall.
 	MachineID string `json:"machineId"`
+	// OpenWrt (or a derivative): procd, opkg, musl and a RAM /var, which some features cannot use.
+	OpenWrt bool `json:"openwrt,omitempty"`
 }
 
 type Usage struct {
@@ -63,20 +65,23 @@ type Sample struct {
 	CPU float64 `json:"cpu"`
 	// Steal is time the hypervisor gave to other guests: the direct sign of an
 	// oversold VPS host.
-	Steal     float64    `json:"steal"`
-	IOWait    float64    `json:"iowait"`
-	Mem       Usage      `json:"mem"`
-	Swap      Usage      `json:"swap"`
-	Load      [3]float64 `json:"load"`
-	Disk      Usage      `json:"disk"`
-	IO        DiskIO     `json:"io"`
-	Net       Traffic    `json:"net"`
-	TCP       int        `json:"tcp"`
-	UDP       int        `json:"udp"`
-	Processes int        `json:"processes"`
-	Uptime    int64      `json:"uptime"`
-	Boot      int64      `json:"boot"`
-	NodeRSS   int64      `json:"nodeRss"`
+	Steal  float64    `json:"steal"`
+	IOWait float64    `json:"iowait"`
+	Mem    Usage      `json:"mem"`
+	Swap   Usage      `json:"swap"`
+	Load   [3]float64 `json:"load"`
+	Disk   Usage      `json:"disk"`
+	IO     DiskIO     `json:"io"`
+	Net    Traffic    `json:"net"`
+	TCP    int        `json:"tcp"`
+	UDP    int        `json:"udp"`
+	// Established and listening TCP sockets, where the system tells them cheaply.
+	TCPEstab  *int  `json:"tcpEstab,omitempty"`
+	TCPListen *int  `json:"tcpListen,omitempty"`
+	Processes int   `json:"processes"`
+	Uptime    int64 `json:"uptime"`
+	Boot      int64 `json:"boot"`
+	NodeRSS   int64 `json:"nodeRss"`
 }
 
 type Capabilities struct {

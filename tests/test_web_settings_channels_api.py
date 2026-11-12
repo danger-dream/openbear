@@ -264,7 +264,7 @@ async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env
     ]
     agent_sections = next(domain for domain in specs_data["domains"] if domain["key"] == "agent")["sections"]
     assert [section["key"] for section in agent_sections] == [
-        "agent", "prompt_suggestions", "user_message_template", "retry", "timeouts", "compaction", "rath", "rath_prompts",
+        "agent", "prompt_suggestions", "user_message_template", "retry", "timeouts", "compaction", "rath", "rath_supervision", "rath_prompts",
     ]
     assert "agent.retryMaxDelayS" in next(section for section in agent_sections if section["key"] == "retry")["paths"]
     assert specs_data["specs"]["memory.accessKey"]["sensitive"] is True

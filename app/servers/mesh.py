@@ -15,21 +15,43 @@ import uuid
 
 from app.instances.contracts import InstanceError
 from app.instances.servers import LOCAL
-from app.servers import mesh_apply, mesh_change, mesh_lines, mesh_path, mesh_status
+from app.servers import front as fronts
+from app.servers import (
+    mesh_apply,
+    mesh_auto,
+    mesh_autolinks,
+    mesh_change,
+    mesh_lines,
+    mesh_path,
+    mesh_paths,
+    mesh_proxy,
+    mesh_status,
+)
 from app.servers import mesh_model as model
+from app.servers.checks import server_region
 from app.servers.mesh_config import (
     LEGACY_SCHEMAS,
+    MEMBERS_ROUTING_FEATURE,
+    PATHS_BACKUP_FEATURE,
+    PATHS_FEATURE,
+    STANDBY_FEATURE,
     _key32,
     build,
     can_dial,
     clean_schemas,
     config_hash,
+    endpoint_host,
     exports,
+    front_exits,
     gateway_routes,
     instance_access,
     is_lan,
+    is_site,
     key_bytes,
-    routes_and_conflicts,
+    public_port,
+    relay_pairs,
+    route_plan,
+    tls_pins,
 )
 from app.servers.mesh_trend import RANGES as TREND_RANGES
 from app.servers.mesh_trend import MeshTrend, rtt_basis
@@ -44,8 +66,26 @@ from app.servers.reminders import quoted
 from app.webhooks.repository import many, one
 
 REVISIONS_KEPT = 10
+# Config features read by the separate openbear-mesh service rather than openbear-node itself. While a
+# node update has reconnected on a new build before mesh.upgrade restarts the service, a node offers
+# only those the build the service still runs has (mesh_nodes.data_features, none if not known).
+DATA_PLANE_FEATURES = frozenset({
+    STANDBY_FEATURE,
+    mesh_proxy.ENTRIES_FEATURE,
+    MEMBERS_ROUTING_FEATURE,
+    PATHS_FEATURE,
+    PATHS_BACKUP_FEATURE,
+    'mesh.routing.paths',
+})
+# mesh.probe: what a server about to join measures to each relay.
+PROBE_COUNT = 4
+PROBE_TIMEOUT_MS = 2000
+PROBE_CALL_TIMEOUT = 30
+PROBE_STATES = ('ok', 'timeout', 'refused')
+# How long a route editor's measurement of a link not up yet stands for the same two machines.
+MEASURE_KEEP_MS = 60_000
 # Two machines with one mesh key: almost always a clone of a member's disk or template.
-KEY_CLONE_ADVICE = ('多半是从那台机器的系统快照或模板克隆出来的。请在这台机器上删掉组网目录里的 keys（Linux 是 '
+KEY_CLONE_ADVICE = ('多半是从那个节点的系统快照或模板克隆出来的。请在这个节点上删掉组网目录里的 keys（Linux 是 '
                     '/var/lib/openbear-node/mesh/keys，Windows 是 C:\\ProgramData\\OpenBear\\node\\mesh\\keys，macOS 是 '
                     '/etc/openbear-node/mesh/keys），重启它的 openbear-mesh 服务，再加入一次；它会生成自己的密钥')
 # Stage of the draft as it was before a member was marked for removal (MeshService.remove).
@@ -56,6 +96,8 @@ APPLY_TIMEOUT = 40
 UNINSTALL_TIMEOUT = 60
 TLS_CALL_TIMEOUT = 60
 STATUS_CALL_TIMEOUT = 30
+# Asked again before an apply and when the page opens: a node slower than this keeps what it reported last.
+FACTS_REFRESH_TIMEOUT = 5
 # The node stops the data plane, swaps the copy and waits up to 30 seconds for it to be ready.
 UPGRADE_TIMEOUT = 120
 # Reports come at most a minute apart.
@@ -104,10 +146,15 @@ REFUSALS = {'node_not_enrolled': '未安装节点', 'node_offline': '节点离�
             'node_protocol_outdated': '节点版本过旧，和主控不兼容，需要先更新节点',
             'controller_protocol_outdated': '节点比主控新，和主控不兼容，需要先更新主控'}
 KEY_COLUMNS = ('public_key', 'control_key', 'sign_key', 'e2e_key')
+# mesh_nodes as _rows reads it: every column but the last reports kept for restarts.
+NODE_COLUMNS = ('server_id,owner,public_key,control_key,sign_key,e2e_key,platform,data_version,local_json,tls_json,tls_checked_ms,'
+                'confirmed_revision,confirmed_hash,state,error,updated_ms,data_build,upgrade_failed_build,upgrade_error,upgrade_ms,'
+                'addresses_json,config_schemas,routes_json,data_features')
 SECURITY_KEYS = (('sign_key', 'signKey'), ('e2e_key', 'e2eKey'))
 INSTALL_KEY_NAMES = {'publicKey': '组网公钥', 'controlKey': '控制密钥'}
 MEMBER_FIELDS = (('role', '角色'), ('relayMode', '中转类型'), ('address', '地址'), ('publicEndpoint', '对外地址'), ('listen', '监听端口'), ('entry', '入口'),
-                 ('gateway', '网关'), ('tags', '标签'), ('uploadLimitMbps', '发送速率'), ('controlAddress', '控制地址'))
+                 ('gateway', '网关'), ('tags', '标签'), ('uploadLimitMbps', '发送速率'), ('controlAddress', '控制地址'), ('proxy', '出口代理'),
+                 ('keepRoutes', '保留原路由'))
 
 
 def now_ms():
@@ -116,6 +163,21 @@ def now_ms():
 
 def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def _data_features(row):
+    """The data plane features of the build openbear-mesh runs (row['data_build']); none while not known."""
+    try:
+        return frozenset(json.loads(row['data_features'] or '[]')) & DATA_PLANE_FEATURES
+    except (TypeError, ValueError):
+        return frozenset()
+
+
+def _own_data_features(session, build):
+    """The data plane features of build as JSON, from the node running it; '' if the node runs another."""
+    if not session or not build or session.build != build:
+        return ''
+    return dumps(sorted(frozenset(session.features) & DATA_PLANE_FEATURES))
 
 
 def _reported_schemas(result):
@@ -210,6 +272,34 @@ def host_routes(path=None):
     return list({(r['net'], r['dev']): r for r in out}.values())
 
 
+def clean_routes(raw):
+    """hostRoutes from mesh.install or mesh.status: [{net, dev}], the IPv4 routes of the node's
+    machine outside the mesh (those a takeover replaced included). None when the node did not send
+    them (an older node, or a system whose routes it does not read)."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for r in raw[:512]:
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            net, dev = ipaddress.ip_network(r['net']), r['dev']
+            if net.version == 4 and net.prefixlen and isinstance(dev, str):
+                out.append({'net': str(net), 'dev': dev[:32]})
+    return list({(r['net'], r['dev']): r for r in out}.values())
+
+
+def route_clashes(skipped, taken, facts):
+    """{serverId: [{route, held, dev, taken, fixed}]}: the gateway routes that overlap a route of the
+    member's machine, as route_plan found them. fixed: the machine is on that network itself, so
+    the route cannot be taken over."""
+    out = {}
+    for found, is_taken in ((skipped, False), (taken, True)):
+        for sid, entries in found.items():
+            local = set((facts.get(sid) or {}).get('localPrefixes') or [])
+            out.setdefault(sid, []).extend({'route': r, 'held': held, 'dev': dev, 'taken': is_taken, 'fixed': held in local}
+                                           for r, held, dev in entries)
+    return {sid: sorted(v, key=lambda c: ipaddress.ip_network(c['route'])) for sid, v in out.items()}
+
+
 def clean_tls(raw):
     """mesh.tls answer: the active certificate and, during a rotation, the pending one."""
     active = _cert((raw or {}).get('active'))
@@ -224,6 +314,40 @@ def dialed_pins(config, relay):
     for link in config.get('links', []):
         if link['peer'] == relay and 'tlsPins' in link:
             yield link['tlsPins']
+
+
+def _probe_target(m, facts, timed=False):
+    """A relay as mesh.probe dials it: where, its TLS pins, and the port of each transport it listens on.
+    timed: a relay listening on TLS alone is timed by TCP connects to its TLS port, as mesh.probe
+    gives a round trip only from UDP answers and TCP connects."""
+    out = {'id': m['serverId'], 'host': endpoint_host(m, facts), 'pins': tls_pins(facts, m['serverId']),
+           **{t: public_port(m, t) if m['listen'][t] else 0 for t in model.TRANSPORTS}}
+    if timed and not out['udp'] and not out['tcp']:
+        out['tcp'] = out['tls']
+    return out
+
+
+def _prober(live, facts, a, b):
+    """Which end of a link not up yet measures it, and which it dials: (prober, target), as the link
+    would be dialed; or why it cannot be measured. A member dials its relay; between relays, one that
+    may dial out (not a front, unless to its own exit) dials one others can reach (not a site relay)."""
+    def name(sid):
+        return (facts.get(sid) or {}).get('name') or sid
+    ma, mb = live[a], live[b]
+    relays = [x for x in (ma, mb) if x['role'] == 'relay']
+    if not relays:
+        return '两台都不是中转，路线中间只能经过中转'
+    if len(relays) == 1:
+        member, relay = (mb, ma) if ma['role'] == 'relay' else (ma, mb)
+        if is_site(relay):
+            return f'{name(relay["serverId"])} 是站点中转，靠打洞连接，应用后才有实测'
+        return (member['serverId'], relay['serverId']) if endpoint_host(relay, facts) else f'{name(relay["serverId"])} 没有公网地址，测不了'
+    for dialer, target in sorted(((ma, mb), (mb, ma)), key=lambda pair: bool(front_exits(facts, pair[0]['serverId']))):
+        exits = front_exits(facts, dialer['serverId'])
+        if (exits and target['serverId'] not in exits) or is_site(target) or not endpoint_host(target, facts):
+            continue
+        return dialer['serverId'], target['serverId']
+    return f'{name(a)} 和 {name(b)} 之间只能打洞或由前置机连，应用后才有实测'
 
 
 class Mesh:
@@ -244,6 +368,8 @@ class Mesh:
         self.port_checks = {}  # (server id, ports asked) -> (ms it holds until, net.ports answer)
         self.port_pending = {}  # (server id, ports asked) -> the check under way, shared by everyone asking
         self.upgrades = {}
+        # (prober, target) -> (at ms, rttMs, loss): what a route's link not up yet measured, for the editor.
+        self.measured = {}
         self.relay_upgrades = {}
         self.ready_waits = {}
         self.applying = set()  # owners with an apply or rollback from its start until its rollout ends
@@ -329,22 +455,39 @@ class Mesh:
 
     # ----- storage -----
     async def _load(self, owner, stage):
-        row = await one(self.db.conn, 'SELECT settings_json,relay_mode FROM mesh_settings WHERE owner=? AND stage=?', (owner, stage))
+        row = await one(self.db.conn, 'SELECT settings_json,relay_mode,line_rules_json,exit_groups_json FROM mesh_settings WHERE owner=? AND stage=?', (owner, stage))
         if not row:
             return model.empty_doc() if stage == 'applied' else await self._load(owner, 'applied')
         args = (owner, stage)
         members = [json.loads(r['member_json']) for r in await many(self.db.conn, 'SELECT member_json FROM mesh_members WHERE owner=? AND stage=? ORDER BY sort', args)]
         links = await many(self.db.conn, 'SELECT kind,link_json FROM mesh_links WHERE owner=? AND stage=? ORDER BY kind,sort', args)
         rules = [json.loads(r['rule_json']) for r in await many(self.db.conn, 'SELECT rule_json FROM mesh_rules WHERE owner=? AND stage=? ORDER BY sort', args)]
-        return model.upgrade({'settings': json.loads(row['settings_json']), 'members': members,
-                              'relayLinks': {'mode': row['relay_mode'], 'pairs': [json.loads(r['link_json']) for r in links if r['kind'] == 'relay']},
-                              'directLinks': [json.loads(r['link_json']) for r in links if r['kind'] == 'direct'], 'rules': rules})
+        doc = {'settings': json.loads(row['settings_json']), 'members': members,
+               'relayLinks': {'mode': row['relay_mode'], 'pairs': [json.loads(r['link_json']) for r in links if r['kind'] == 'relay']},
+               'directLinks': [json.loads(r['link_json']) for r in links if r['kind'] == 'direct'], 'rules': rules}
+        # Internal document semantics live in settings_json, not in the node config or editable settings.
+        doc['_fullLineRules'] = doc['settings'].pop('_fullLineRules', False)
+        doc['limits'] = doc['settings'].pop('_limits', [])
+        doc['paths'] = doc['settings'].pop('_paths', [])
+        if '_autoLinksState' in doc['settings']:
+            doc['_autoLinksState'] = doc['settings'].pop('_autoLinksState')
+        if row['line_rules_json']:
+            doc['lineRules'] = json.loads(row['line_rules_json'])
+        if row['exit_groups_json']:
+            doc['exitGroups'] = json.loads(row['exit_groups_json'])
+        return model.upgrade(doc)
 
     @staticmethod
     async def _save(conn, owner, stage, doc):
         for table in ('mesh_settings', 'mesh_members', 'mesh_links', 'mesh_rules'):
             await conn.execute(f'DELETE FROM {table} WHERE owner=? AND stage=?', (owner, stage))
-        await conn.execute('INSERT INTO mesh_settings VALUES(?,?,?,?)', (owner, stage, dumps(doc['settings']), doc['relayLinks']['mode']))
+        await conn.execute('INSERT INTO mesh_settings(owner,stage,settings_json,relay_mode,line_rules_json,exit_groups_json) VALUES(?,?,?,?,?,?)',
+                           (owner, stage, dumps({**doc['settings'], '_fullLineRules': doc.get('_fullLineRules', True),
+                                                 **({'_limits': doc['limits']} if doc.get('limits') else {}),
+                                                 **({'_paths': doc['paths']} if doc.get('paths') else {}),
+                                                 **({'_autoLinksState': doc['_autoLinksState']} if doc.get('_autoLinksState') else {})}),
+                            doc['relayLinks']['mode'], dumps(doc.get('lineRules') or []),
+                            dumps(doc['exitGroups']) if 'exitGroups' in doc else ''))
         for i, m in enumerate(doc['members']):
             await conn.execute('INSERT INTO mesh_members VALUES(?,?,?,?,?)', (owner, stage, m['serverId'], i, dumps(m)))
         for kind, items in (('relay', doc['relayLinks']['pairs']), ('direct', doc['directLinks'])):
@@ -400,22 +543,28 @@ class Mesh:
     def _applied_changed(self, owner):
         self.applied_issued[owner] = self.applied_issued.get(owner, 0) + 1
         self.applied_cache.pop(owner, None)
+        self.service.latency.mesh_moved(owner)
 
     async def _rows(self, owner):
-        return {r['server_id']: r for r in await many(self.db.conn, 'SELECT * FROM mesh_nodes WHERE owner=?', (owner,))}
+        """The owner's mesh_nodes rows by server, without the reports kept for restarts (status_json,
+        events_json): self.status has them, and they are most of each row."""
+        return {r['server_id']: r for r in await many(self.db.conn, f'SELECT {NODE_COLUMNS} FROM mesh_nodes WHERE owner=?', (owner,))}
 
-    async def _facts(self, owner):
-        """What configs and checks need from outside the document: names, platforms, keys, addresses, TLS pins."""
+    async def _facts(self, owner, rows=None):
+        """What configs and checks need from outside the document: names, platforms, keys, addresses, TLS pins.
+        rows: _rows(owner) when the caller has them already."""
         servers = await self.service.registry.all(owner)
         profiles = await self.service._profiles(owner)
         nodes = await self.service._nodes(owner)
-        rows = await self._rows(owner)
+        rows = await self._rows(owner) if rows is None else rows
         facts = {}
+        node_builds = {}
         for server in servers:
             sid = server['id']
             node = nodes.get(sid)
             stored = json.loads(node['info_json']) if node else {}
             session = self.hub.sessions.get(sid)
+            node_builds[sid] = (session.build if session else None) or stored.get('build') or ''
             known = stored.get('info') or {}
             info = (session.info if session else None) or known
             # Reconnected, the public address not looked up yet: the last known one, not none,
@@ -423,22 +572,33 @@ class Mesh:
             info = {**info, **{k: known[k] for k in PUBLIC_IPS if not info.get(k) and known.get(k)}}
             name = (profiles.get(sid, {}).get('alias') or '本机') if sid == LOCAL else server['name']
             facts[sid] = {'name': name, 'listed': True, 'enrolled': bool(node), 'online': bool(session),
-                          'caps': session.caps if session else stored.get('caps') or {}, 'features': session.features if session else frozenset(),
+                          'caps': session.caps if session else stored.get('caps') or {},
+                          # Offline, what it said last: a draft check on a node feature holds while it is away.
+                          'features': session.features if session else frozenset(stored.get('features') or ()),
                           'incompatible': session.incompatible if session else '',
-                          'platform': info.get('platform', ''),
+                          'platform': info.get('platform', ''), 'front': fronts.exits(profiles.get(sid)),
+                          'region': server_region(profiles.get(sid), stored),
                           'ipv4': self._settled(self.ipv4s, owner, sid, _ipv4(info.get('ipv4'))) if sid in rows else _ipv4(info.get('ipv4'))}
         for sid, row in rows.items():
             f = facts.setdefault(sid, {'name': sid, 'listed': False, 'enrolled': False, 'online': False, 'caps': {}, 'features': frozenset(),
                                        'incompatible': '', 'platform': '', 'ipv4': ''})
+            node_build = node_builds.get(sid, '')
+            if (row['state'] not in ('missing', 'cleanup') and node_build and row['data_build'] != node_build
+                    and (row['data_build'] or row['confirmed_revision'] > 0)):
+                # The node binary updated (or rolled back its upgrade), while openbear-mesh still runs another build.
+                f['features'] = frozenset(f['features']) - (DATA_PLANE_FEATURES - _data_features(row))
             f.update(publicKey=row['public_key'], controlKey=row['control_key'], signKey=row['sign_key'], e2eKey=row['e2e_key'],
                      platform=row['platform'] or f['platform'],
                      dataVersion=row['data_version'], localPrefixes=clean_local(json.loads(row['local_json'] or '[]')) or [],
                      configSchemas=clean_schemas(json.loads(row['config_schemas'])) if row['config_schemas'] else None,
                      localAddresses=json.loads(row['addresses_json'] or '[]'),
+                     hostRoutes=clean_routes(json.loads(row['routes_json'])) if row['routes_json'] else None,
                      tls=json.loads(row['tls_json']) if row['tls_json'] else None, keyConflict=self.key_conflicts.get(sid))
         if LOCAL in facts:
             # The controller's machine: its port, opened to the members over the mesh, and its routes.
-            facts[LOCAL].update(controllerPort=self.service.host.config.web.port, hostRoutes=host_routes())
+            facts[LOCAL].update(controllerPort=self.service.host.config.web.port)
+            if facts[LOCAL].get('hostRoutes') is None:
+                facts[LOCAL]['hostRoutes'] = host_routes()
         # Instances listening on their server's mesh address: opened to the gateway's server alone.
         for sid, entries in (await self._instance_ports(owner)).items():
             if sid in facts:
@@ -535,6 +695,10 @@ class Mesh:
     async def access(self, owner):
         return self.access_of(await self._load(owner, 'applied'), await self.mesh_capable(owner))
 
+    async def addresses(self, owner):
+        """{server id: mesh address} of the applied mesh's members that have one."""
+        return {m['serverId']: m['address'] for m in model.active(await self._load(owner, 'applied')) if m['address']}
+
     async def mesh_capable(self, owner):
         """Servers whose nodes have MESH_ACCESS_FEATURE: by the live session, else as last recorded."""
         out = set()
@@ -563,7 +727,8 @@ class Mesh:
         enrolled = {r['server_id'] for r in await many(self.db.conn, 'SELECT server_id FROM server_nodes WHERE owner=?', (owner,))}
         leaving, joining = [], []
         for sid, profile in profiles.items():
-            if sid == LOCAL or sid not in enrolled or not uses_mesh(profile):
+            # A front reaches the controller through its exits, whatever its access points say.
+            if sid == LOCAL or sid not in enrolled or not uses_mesh(profile) or fronts.is_front(profile):
                 continue
             then = [p and p['url'] for p in resolve(settings, profile, self.access_point(old, sid))]
             now = [p and p['url'] for p in resolve(settings, profile, self.access_point(new, sid))]
@@ -602,30 +767,52 @@ class Mesh:
             await self.service.onboarding.push(owner, sids)
 
     # ----- page -----
-    async def view(self, owner, *, ports='cached'):
+    async def view(self, owner, *, ports='cached', fresh=False):
         """The overview. ports: how listen ports are checked, as _ports takes it: 'cached' for reading it
-        (a check not answered yet is left to run), 'wait' after the draft changed."""
+        (a check not answered yet is left to run), 'wait' after the draft changed. fresh: the online
+        nodes are asked for their interfaces and routes first (the page opening)."""
+        if fresh:
+            await self._refresh_facts(owner)
         draft, applied = await self._load(owner, 'draft'), await self._load(owner, 'applied')
-        facts, rows, net = await self._facts(owner), await self._rows(owner), await self._network(owner)
+        rows = await self._rows(owner)
+        facts, net = await self._facts(owner, rows), await self._network(owner)
+        preview = mesh_auto.for_draft(draft)
+        if preview is not draft:
+            draft = mesh_auto.resolve(preview, facts)
         issued = await self._applied(owner)
         joined = {m['serverId'] for m in draft['members']} | {m['serverId'] for m in applied['members']}
         roles = self._roles(draft, applied)
         rollout = self.rollouts.get(owner)
         pending_change = await mesh_change.load(self, owner)
-        routes, conflicts = routes_and_conflicts(draft, facts)
+        routes, conflicts, taken = route_plan(draft, facts)
         warnings = [*model.hints(draft, facts, conflicts, applied), *await self._port_warnings(owner, draft, applied, facts, mode=ports)]
+        detours = mesh_status.detours({sid: (self.status.get(sid) or {}).get('status') for sid in rows}, facts,
+                                      {sid for sid, role in roles.items() if role == 'relay'}, lambda a, b: model.same_lan(a, b, facts))
+
+        def alerts(sid):
+            return [mesh_status.detour_alert(detours[sid], lambda x: (facts.get(x) or {}).get('name') or x)] if sid in detours else []
+        changes = self._changes(applied, draft, facts, configs=issued['configs'])
+        auto_links_view = mesh_autolinks.view_of(applied, facts, self.status, now_ms=now_ms())
         return {'ok': True, 'settings': draft['settings'], 'members': [self._member_view(m, facts, draft['settings']['prefix']) for m in draft['members']],
                 'relayLinks': draft['relayLinks'], 'directLinks': draft['directLinks'], 'rules': draft['rules'],
+                'lineRules': draft.get('lineRules', []), 'exitGroups': draft.get('exitGroups', []), 'limits': draft.get('limits', []),
+                'paths': draft.get('paths', []),
+                # Each fixed path's links, ends and where its pairs are now (mesh_paths.view).
+                'pathsView': mesh_paths.view(draft, facts, self.status, now_ms()),
+                # What the mesh would set for each field it can work out, and why (mesh_auto).
+                'auto': mesh_auto.explain(draft, facts),
+                'autoLinks': auto_links_view,
                 # Not the user's to edit: the gateway's server reaching instances on a mesh address.
                 'autoRules': [{'kind': 'instance', 'proto': 'tcp', **a} for a in instance_access(draft, facts)],
                 'applied': {'revision': net['applied_revision'], 'at': net['applied_ms']},
-                'draft': {'dirty': draft != applied, 'changes': self._changes(applied, draft, facts)},
-                'nodes': {sid: self._node_view(sid, row, issued['hashes'], roles.get(sid)) for sid, row in rows.items() if sid in joined or row['state'] == 'cleanup'},
+                'draft': {'dirty': self._doc_without_internal(draft) != self._doc_without_internal(applied) or any(c['kind'] == 'link.change' for c in changes), 'changes': changes},
+                'nodes': {sid: self._node_view(sid, row, issued['hashes'], roles.get(sid), alerts(sid)) for sid, row in rows.items() if sid in joined or row['state'] == 'cleanup'},
                 'installing': [{'serverId': sid, 'name': facts.get(sid, {}).get('name') or sid, 'platform': facts.get(sid, {}).get('platform', ''),
                                 'startedAt': started} for sid, (who, started) in self.installing.items() if who == owner],
                 'layout': await self._layout(owner),
                 # Who gets a route into each announced subnet, by the draft's rules.
                 'exports': exports(draft, routes),
+                'routeClashes': route_clashes(conflicts, taken, facts),
                 'eligible': self._eligible(draft, facts),
                 'apply': {**(rollout.view() if rollout else {'running': False, 'revision': net['applied_revision'], 'progress': []}),
                           **({'recovery': 'restoring'} if pending_change and pending_change['phase'] == 'aborting' else {})},
@@ -733,16 +920,19 @@ class Mesh:
         f = facts.get(m['serverId']) or {}
         # A site relay has no public endpoint, so the panel's IPv4 is not offered as one.
         auto = '' if m['role'] == 'relay' and m.get('relayMode') == 'site' else f.get('ipv4', '')
-        return {**m, 'name': f.get('name') or m['serverId'], 'platform': f.get('platform', ''), 'publicEndpointAuto': auto,
-                'subnetSuggestions': model.subnet_suggestions(f, prefix or model.DEFAULT_PREFIX)}
+        return {**m, 'name': f.get('name') or m['serverId'], 'platform': f.get('platform', ''), 'publicEndpointAuto': auto, 'region': f.get('region', ''),
+                'subnetSuggestions': model.subnet_suggestions(f, prefix or model.DEFAULT_PREFIX),
+                # A front's exits: the editor dials them from it, over TLS first.
+                'front': [e['serverId'] for e in f.get('front') or []]}
 
     @staticmethod
     def _roles(draft, applied):
         """Each member's role as its data plane runs it: the applied one, else the draft's."""
         return {m['serverId']: m['role'] for doc in (draft, applied) for m in doc['members']}
 
-    def _node_view(self, sid, row, hashes, role=None):
-        """hashes: config_hash of each config of the applied revision, as _applied gives them."""
+    def _node_view(self, sid, row, hashes, role=None, alerts=()):
+        """hashes: config_hash of each config of the applied revision, as _applied gives them. alerts: the
+        page's own, worked out across nodes (mesh_status.detours)."""
         status = (self.status.get(sid) or {}).get('status')
         current = sid in hashes and row['confirmed_hash'] == hashes[sid]
         failed = bool(row['error']) and not current
@@ -752,10 +942,11 @@ class Mesh:
         return {'state': state, 'appliedRevision': status['appliedRevision'] if status else row['confirmed_revision'],
                 'error': row['error'] if failed or missing else (status or {}).get('error', ''), 'summary': mesh_status.summary(status, role),
                 'dataVersion': row['data_version'],
-                'upgrade': {'state': self.upgrades.get(sid, ''), 'error': row['upgrade_error'], 'at': row['upgrade_ms']}}
+                'upgrade': {'state': self.upgrades.get(sid, ''), 'error': row['upgrade_error'], 'at': row['upgrade_ms']},
+                **({'alerts': list(alerts)} if alerts else {})}
 
     @staticmethod
-    def _changes(applied, draft, facts):
+    def _changes(applied, draft, facts, *, configs=None):
         def name(sid):
             return (facts.get(sid) or {}).get('name') or sid
         out = []
@@ -791,9 +982,41 @@ class Mesh:
         if [m['serverId'] for m in applied['members']] != [m['serverId'] for m in draft['members'] if m['serverId'] in before]:
             out.append({'kind': 'members.order', 'text': '调整成员顺序'})
         for key, kind, text in (('settings', 'settings', '修改网格设置'), ('relayLinks', 'relayLinks', '修改中转之间的连接'),
-                                ('directLinks', 'directLinks', '修改直连'), ('rules', 'rules', '修改访问规则')):
-            if applied[key] != draft[key]:
+                                ('directLinks', 'directLinks', '修改直连'), ('rules', 'rules', '修改访问规则'),
+                                ('lineRules', 'lineRules', '修改线路规则'), ('exitGroups', 'exitGroups', '修改出口组'),
+                                ('limits', 'limits', '修改连接限制'), ('paths', 'paths', '修改自建路线')):
+            if applied.get(key) != draft.get(key):
                 out.append({'kind': kind, 'text': text})
+        # A link in both that is to run another way, whatever changed it: in full mode a line rule changes
+        # links that are in neither document.
+        then = {}
+        if configs is None:
+            then = {frozenset((p['a'], p['b'])): p for p in relay_pairs(mesh_auto.resolve(applied, facts), facts)}
+        else:
+            # The issued bytes are authoritative: an older controller may have interpreted the same rules differently.
+            for line in mesh_lines.catalogue(applied, configs):
+                if line['kind'] != 'relay':
+                    continue
+                a, b = line['a'], line['b']
+                then[frozenset((a, b))] = {**line, 'dialer': 'b' if line['dial']['b'] else 'a',
+                                          'bias': (configs.get(a, {}).get('routing') or {}).get('bias', {}).get(b, 0)}
+        for p in relay_pairs(mesh_auto.resolve(draft, facts), facts):
+            old = then.get(frozenset((p['a'], p['b'])))
+            if not old:
+                continue
+            parts = []
+            if old['transport'] != p['transport']:
+                parts.append(f'协议 {model.TRANSPORT_NAMES[old["transport"]]} → {model.TRANSPORT_NAMES[p["transport"]]}')
+            dialers = [None if x.get('punch') else x[x['dialer']] for x in (old, p)]
+            if dialers[0] != dialers[1]:
+                parts.append('主动连的一端 ' + ' → '.join(name(d) if d else '两端打洞' for d in dialers))
+            reconnect = bool(parts)
+            if old['bias'] != p['bias']:
+                parts.append('偏好 ' + ' → '.join(f'{x:+d}ms' if x else '0' for x in (old['bias'], p['bias'])))
+            if parts:
+                out.append({'kind': 'link.change', 'a': p['a'], 'b': p['b'],
+                            'text': f'中转线路 {name(p["a"])} ⇄ {name(p["b"])}：{"、".join(parts)}，'
+                                    + ('应用后这条线路会重连' if reconnect else '应用后选路随之调整')})
         return out
 
     @staticmethod
@@ -825,10 +1048,11 @@ class Mesh:
     async def member(self, owner, server_id):
         draft, applied = await self._load(owner, 'draft'), await self._load(owner, 'applied')
         m = next((m for doc in (draft, applied) for m in doc['members'] if m['serverId'] == server_id), None)
-        row = (await self._rows(owner)).get(server_id)
+        rows = await self._rows(owner)
+        row = rows.get(server_id)
         if not m and not row:
             raise InstanceError('mesh_member_not_found', 404)
-        facts, net = await self._facts(owner), await self._network(owner)
+        facts, net = await self._facts(owner, rows), await self._network(owner)
         latest = await self._latest(owner, net)
         live = self.status.get(server_id) or {}
         role = self._roles(draft, applied).get(server_id)
@@ -888,7 +1112,31 @@ class Mesh:
         if src not in roles or dst not in roles:
             raise InstanceError('mesh_member_not_found', 404)
         latest = await self._latest(owner, await self._network(owner))
-        return {'ok': True, **mesh_path.find(src, dst, roles, self.status, latest, now_ms())}
+        return {'ok': True, **self._with_fixed(mesh_path.find(src, dst, roles, self.status, latest, now_ms()))}
+
+    async def path_options(self, owner, src, dst, k=10):
+        """The k best paths between two applied members by their latest reports, with the pair's own
+        routes as the draft has them (mesh_path.options)."""
+        if not src or not dst or src == dst or not isinstance(k, int) or not 1 <= k <= 20:
+            raise InstanceError('invalid_mesh_path')
+        applied = await self._load(owner, 'applied')
+        roles = {m['serverId']: m['role'] for m in model.active(applied)}
+        if src not in roles or dst not in roles:
+            raise InstanceError('mesh_member_not_found', 404)
+        draft = await self._load(owner, 'draft')
+        pair = [p for p in draft.get('paths') or [] if mesh_paths.pair_of(p) == frozenset((src, dst))]
+        own = [{'id': p['id'], 'rank': i + 1, 'on': p['on'],
+                'nodes': mesh_paths.nodes_of(p) if p['from'] == src else mesh_paths.nodes_of(p)[::-1]} for i, p in enumerate(pair)]
+        return {'ok': True, **mesh_path.options(src, dst, roles, self.status, now_ms(), k, own)}
+
+    @staticmethod
+    def _with_fixed(found):
+        """found with its own route as the applied document has it: its id, and whether it is the way back."""
+        fixed = found.get('fixed')
+        if not fixed:
+            return found
+        pid, back = (fixed['id'][:-len(mesh_paths.BACK_SUFFIX)], True) if fixed['id'].endswith(mesh_paths.BACK_SUFFIX) else (fixed['id'], False)
+        return {**found, 'fixed': {**fixed, 'pathId': pid, 'back': back}}
 
     async def routes(self, owner, src):
         """From one applied member: the path to every other one, as path() finds it, and to the
@@ -901,7 +1149,8 @@ class Mesh:
         if src not in roles:
             raise InstanceError('mesh_member_not_found', 404)
         latest, now = await self._latest(owner, await self._network(owner)), now_ms()
-        routes = [{'dst': m['serverId'], **mesh_path.find(src, m['serverId'], roles, self.status, latest, now)} for m in live if m['serverId'] != src]
+        routes = [{'dst': m['serverId'], **self._with_fixed(mesh_path.find(src, m['serverId'], roles, self.status, latest, now))}
+                  for m in live if m['serverId'] != src]
         subnets = []
         for route in gateway_routes(applied, await self._facts(owner)).get(src, []):
             net = ipaddress.ip_network(route)
@@ -946,12 +1195,16 @@ class Mesh:
     async def save_draft(self, owner, data):
         async with self._edit(owner):
             prior = await self._load(owner, 'draft')
-            doc = model.allocate(model.clean_doc(data, prior))
+            doc = mesh_auto.for_draft(model.allocate(model.clean_doc(data, prior)))
             facts, applied = await self._facts(owner), await self._load(owner, 'applied')
+            # A front or an exit that has just become a relay gets its link; one removed later stays removed.
+            was = {m['serverId'] for m in model.active(prior) if m['role'] == 'relay'}
+            self._link_fronts(doc, facts, {m['serverId'] for m in model.active(doc) if m['role'] == 'relay'} - was)
+            doc = mesh_auto.resolve(doc, facts, self._relay_rtts(), links=True)
 
             def invalid(d):
                 # A data plane that needs updating is not the draft's fault, and must not keep it from being edited.
-                return [x for x in model.validate(d, facts, applied=applied) if x['error'] not in model.SCHEMA_ERRORS]
+                return [x for x in model.validate(d, facts, applied=applied) if x['error'] not in model.APPLY_ERRORS]
             # A removal undone: its entries, links and rules come back, where they still hold.
             kept = {m['serverId'] for m in doc['members'] if not m['removing']}
             undone = [m['serverId'] for m in prior['members'] if m['removing'] and m['serverId'] in kept]
@@ -964,8 +1217,12 @@ class Mesh:
                 doc = back
             elif errors := invalid(doc):
                 raise model.MeshInvalid(errors)
+            doc['_autoLinksState'] = mesh_autolinks.record_user_deletions(prior, doc, prior.get('_autoLinksState'), now_ms())
             async with self.db.write_transaction(label='mesh-draft') as conn:
                 await self._save(conn, owner, 'draft', doc)
+                if '_autoLinksState' in applied or doc.get('_autoLinksState'):
+                    applied['_autoLinksState'] = copy.deepcopy(doc['_autoLinksState'])
+                    await self._save(conn, owner, 'applied', applied)
                 await self._drop_removed(conn, owner, undone)
         return await self.view(owner, ports='wait')
 
@@ -1013,24 +1270,60 @@ class Mesh:
                             present[sid]['removing'] = False
                             continue
                         member = model.new_member(sid, draft['settings'])
-                        # Two machines behind one NAT on one UDP port can lose all traffic on
-                        # some routers, so a newcomer takes the first port its NAT has free.
-                        member['listen']['udp'] = model.free_udp_port(member, model.nat_udp_ports(draft, member, facts), draft['settings'])
-                        member['entry']['candidates'] = self._first_entry(draft, facts)
+                        # A newcomer's listen ports and relay type follow the mesh until set (mesh_auto).
+                        member['auto'] = list(mesh_auto.MEMBER_AUTO)
+                        if (facts.get(sid) or {}).get('front'):
+                            # A front forwards for the networks behind it, over TLS unless told otherwise.
+                            member.update(role='relay', listen={'udp': 0, 'tcp': 0, 'tls': draft['settings']['ports']['tls']})
+                        else:
+                            # Two machines behind one NAT on one UDP port can lose all traffic on
+                            # some routers, so a newcomer takes the first port its NAT has free.
+                            member['listen']['udp'] = model.free_udp_port(member, model.nat_udp_ports(draft, member, facts), draft['settings'])
+                            member['entry']['candidates'] = self._first_entry(draft, facts)
                         draft['members'].append(member)
-                    await self._save_draft(owner, model.allocate(draft))
+                    self._link_fronts(draft, facts)
+                    await self._save_draft(owner, mesh_auto.resolve(model.allocate(draft), facts, self._relay_rtts(), links=True))
         finally:
             for sid in started:
                 self.installing.pop(sid, None)
         return {**await self.view(owner, ports='wait'), 'items': items}
 
     @staticmethod
+    def _link_fronts(draft, facts, fresh=None):
+        """Listed links (custom mode) from each front relay to its exits that are relays, the front
+        dialing over TLS where the exit listens on it: what full mode makes by itself. fresh: only
+        where the front or the exit is one of these."""
+        if draft['relayLinks']['mode'] != 'custom':
+            return
+        live = {m['serverId']: m for m in model.active(draft) if m['role'] == 'relay'}
+        listed = {frozenset((p['a'], p['b'])) for p in draft['relayLinks']['pairs']}
+        for sid in live:
+            for exit_id in (e['serverId'] for e in (facts.get(sid) or {}).get('front') or []):
+                exit_member = live.get(exit_id)
+                if not exit_member or frozenset((sid, exit_id)) in listed or fresh is not None and not {sid, exit_id} & fresh:
+                    continue
+                transport = next((t for t in ('tls', 'tcp') if exit_member['listen'][t]), 'tls')
+                draft['relayLinks']['pairs'].append({'a': sid, 'b': exit_id, 'transport': transport, 'cost': 1, 'dialer': 'a', 'bias': 0})
+                listed.add(frozenset((sid, exit_id)))
+
+    @staticmethod
     def _first_entry(draft, facts):
         for relay in model.active(draft):
             for transport in ('udp', 'tcp'):
                 if relay['role'] == 'relay' and can_dial(relay, transport, facts):
-                    return [{'id': 'c1', 'relay': relay['serverId'], 'transport': transport}]
+                    return [{'id': 'c1', 'relay': relay['serverId'], 'transport': transport, 'auto': list(mesh_auto.CANDIDATE_AUTO)}]
         return []
+
+    def _relay_rtts(self):
+        """{frozenset((a, b)): ms}: the round trips relays last reported to each other, the lower of two ends."""
+        out = {}
+        for sid, rec in self.status.items():
+            for link in (((rec or {}).get('status') or {}).get('routing') or {}).get('links') or []:
+                peer, ms = link.get('peer'), link.get('rttMs')
+                if isinstance(peer, str) and type(ms) in (int, float) and ms > 0:
+                    key = frozenset((sid, peer))
+                    out[key] = min(ms, out.get(key, ms))
+        return out
 
     async def _record_install(self, owner, sid, result, f):
         """Refused (mesh_key_in_use) when any key it reports is one another member has on record
@@ -1039,6 +1332,7 @@ class Mesh:
         platform = result.get('platform') if result.get('platform') in model.PLATFORMS else f['platform']
         local = clean_local(result.get('localPrefixes')) or []
         addresses = clean_addresses(result.get('localAddresses')) or []
+        routes = clean_routes(result.get('hostRoutes'))
         keys = {'publicKey': result['publicKey'], 'controlKey': result['controlKey'],
                 **{field: _security_keys(result)[column] for column, field in SECURITY_KEYS if column in _security_keys(result)}}
         taken = {}
@@ -1046,16 +1340,19 @@ class Mesh:
             held = await self._held_keys(conn, owner, sid)
             taken = {field: held[key_bytes(k)] for field, k in keys.items() if key_bytes(k) in held}
             if not taken:
-                await conn.execute('INSERT INTO mesh_nodes(server_id,owner,public_key,control_key,platform,data_version,local_json,addresses_json,updated_ms) '
-                                   'VALUES(?,?,?,?,?,?,?,?,?) '
+                await conn.execute('INSERT INTO mesh_nodes(server_id,owner,public_key,control_key,platform,data_version,local_json,addresses_json,'
+                                   'routes_json,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) '
                                    'ON CONFLICT(server_id) DO UPDATE SET owner=excluded.owner,public_key=excluded.public_key,control_key=excluded.control_key,'
                                    'platform=excluded.platform,data_version=excluded.data_version,local_json=excluded.local_json,'
-                                   'addresses_json=excluded.addresses_json,updated_ms=excluded.updated_ms,'
+                                   'addresses_json=excluded.addresses_json,routes_json=excluded.routes_json,updated_ms=excluded.updated_ms,'
                                    # Installed again: no longer missing (SQLite reads the old state in both).
                                    "error=CASE WHEN mesh_nodes.state='missing' THEN '' ELSE mesh_nodes.error END,"
                                    "state=CASE WHEN mesh_nodes.state IN ('cleanup','missing') THEN '' ELSE mesh_nodes.state END",
                                    (sid, owner, result['publicKey'], result['controlKey'], platform, str(result.get('dataVersion') or '')[:40], dumps(local),
-                                    dumps(addresses), now_ms()))
+                                    dumps(addresses), dumps(routes) if routes is not None else '', now_ms()))
+                data_build = str(result.get('dataBuild') or '').lower()
+                if _BUILD.fullmatch(data_build):
+                    await self._store_data_build(conn, sid, data_build)
                 await self._store_security_keys(conn, owner, sid, result)
         if taken:
             # Refused, nothing stored: said on the machine's events as a report of them would be.
@@ -1175,25 +1472,140 @@ class Mesh:
                 self.service.spawn(self._catch_up(owner, sid))
         return await self.view(owner)
 
-    async def rollback(self, owner):
-        """The previous applied revision becomes the draft and goes out. Members added since are removed again.
-        Previous: the latest earlier document that differs from the applied one (a reissue for changed
-        facts or a leaving server is skipped), preferring one that went out (applied, or partly when
-        some nodes were offline) over one that failed."""
+    async def probe(self, owner, data):
+        """Before a server joins: its node measures every relay of the applied mesh (mesh.probe), the round
+        trip and loss, and whether each transport the relay listens on answers. {results: [{relay, rttMs,
+        loss, udp, tcp, tls}]}, each transport ok, timeout, refused or closed (not listened on); a site
+        relay, reached by punching only, is punch."""
+        sid = data.get('serverId') if isinstance(data, dict) and set(data) <= {'serverId'} else None
+        if not isinstance(sid, str) or not sid:
+            raise InstanceError('invalid_mesh_probe')
+        facts = await self._facts(owner)
+        if sid not in facts or not facts[sid]['listed']:
+            raise InstanceError('server_not_found', 404)
+        relays = [m for m in model.active(await self._load(owner, 'applied')) if m['role'] == 'relay' and m['serverId'] != sid]
+        targets = [_probe_target(m, facts) for m in relays if not is_site(m) and endpoint_host(m, facts)]
+        result = await self._call(owner, sid, 'mesh.probe', {'targets': targets, 'timeoutMs': PROBE_TIMEOUT_MS, 'count': PROBE_COUNT},
+                                  timeout=PROBE_CALL_TIMEOUT) if targets else {'results': []}
+        got = {r['id']: r for r in result.get('results') or [] if isinstance(r, dict) and isinstance(r.get('id'), str)}
+        out = []
+        for m in relays:
+            r = got.get(m['serverId'])
+            if is_site(m) or not r:
+                state = 'punch' if is_site(m) else 'unknown'
+                out.append({'relay': m['serverId'], 'rttMs': None, 'loss': None, **{t: state if m['listen'][t] else 'closed' for t in model.TRANSPORTS}})
+                continue
+            rtt, loss = r.get('rttMs'), r.get('loss')
+            out.append({'relay': m['serverId'], 'rttMs': rtt if type(rtt) in (int, float) and rtt >= 0 else None,
+                        'loss': loss if type(loss) in (int, float) and 0 <= loss <= 1 else None,
+                        **{t: (r.get(t) if r.get(t) in PROBE_STATES else 'unknown') if m['listen'][t] else 'closed' for t in model.TRANSPORTS}})
+        return {'ok': True, 'serverId': sid, 'results': out}
+
+    async def measure(self, owner, nodes):
+        """A route as the editor lays it out, link by link: a link up by the latest reports as the best
+        paths cost it; one not linked yet measured now from one end (mesh.probe: from the member end,
+        else from a relay that may dial the other), kept MEASURE_KEEP_MS. {segments: [{a, b, exists,
+        rttMs, loss, how report|probe|none, why?}], rttMs (null while a segment has none)}."""
+        if (not isinstance(nodes, list) or not 2 <= len(nodes) <= mesh_paths.MAX_VIA + 2
+                or not all(isinstance(n, str) and n for n in nodes) or len(set(nodes)) != len(nodes)):
+            raise InstanceError('invalid_mesh_path')
+        live = {m['serverId']: m for m in model.active(await self._load(owner, 'draft'))}
+        if any(n not in live for n in nodes):
+            raise InstanceError('mesh_member_not_found', 404)
+        roles = {m['serverId']: m['role'] for m in model.active(await self._load(owner, 'applied'))}
+        now, facts = now_ms(), await self._facts(owner)
+        graph = mesh_path.links(roles, self.status, now)
+        segs, probes = [], {}
+        for a, b in zip(nodes, nodes[1:]):
+            up = graph.get(a, {}).get(b)
+            if up:
+                segs.append({'a': a, 'b': b, 'exists': True, 'rttMs': up[1], 'loss': up[2], 'how': 'report'})
+                continue
+            seg = {'a': a, 'b': b, 'exists': False, 'rttMs': None, 'loss': None, 'how': 'none'}
+            segs.append(seg)
+            pick = _prober(live, facts, a, b)
+            if isinstance(pick, str):
+                seg['why'] = pick
+            elif not self.hub.sessions.get(pick[0]):
+                seg['why'] = f'{facts.get(pick[0], {}).get("name") or pick[0]} 不在线，测不了'
+            else:
+                kept = self.measured.get(pick)
+                if kept and now - kept[0] < MEASURE_KEEP_MS:
+                    seg.update(rttMs=kept[1], loss=kept[2], how='probe')
+                else:
+                    probes.setdefault(pick[0], []).append((seg, live[pick[1]]))
+        await asyncio.gather(*(self._measure_from(owner, prober, items, facts) for prober, items in probes.items()))
+        rtts = [s['rttMs'] for s in segs]
+        return {'ok': True, 'segments': segs, 'rttMs': None if any(r is None for r in rtts) else round(sum(rtts), 1)}
+
+    async def _measure_from(self, owner, prober, items, facts):
+        """items [(segment, target member)]: each measured from prober, filled in place."""
+        name = facts.get(prober, {}).get('name') or prober
+        try:
+            result = await self._call(owner, prober, 'mesh.probe', {'targets': [_probe_target(m, facts, timed=True) for _, m in items], 'timeoutMs': PROBE_TIMEOUT_MS,
+                                                                     'count': PROBE_COUNT}, timeout=PROBE_CALL_TIMEOUT)
+        except (InstanceError, TimeoutError) as e:
+            for seg, _ in items:
+                seg['why'] = f'{name} 没能测：{getattr(e, "error", "") or "超时"}'
+            return
+        got = {r['id']: r for r in result.get('results') or [] if isinstance(r, dict) and isinstance(r.get('id'), str)}
+        for seg, m in items:
+            r = got.get(m['serverId']) or {}
+            rtt, loss = r.get('rttMs'), r.get('loss')
+            if type(rtt) not in (int, float) or rtt < 0:
+                target = facts.get(m['serverId'], {}).get('name') or m['serverId']
+                reached = any(r.get(t) == 'ok' for t in model.TRANSPORTS)
+                seg['why'] = f'从 {name} 能连上 {target}，但没测出延迟' if reached else f'从 {name} 连不上 {target}：各协议都没有回应'
+                continue
+            loss = loss if type(loss) in (int, float) and 0 <= loss <= 1 else 0
+            seg.update(rttMs=round(rtt, 1), loss=loss, how='probe')
+            self.measured[(prober, m['serverId'])] = (now_ms(), seg['rttMs'], loss)
+
+    async def revisions(self, owner):
+        """The revisions kept, newest first: number, when, why (apply, facts, rollback), how it went out, and
+        what changed from the one before it."""
+        net = await self._network(owner)
+        rows = await many(self.db.conn, 'SELECT revision,created_ms,reason,status,doc_json FROM mesh_revisions WHERE owner=? ORDER BY revision DESC', (owner,))
+        facts = await self._facts(owner)
+        docs = [model.upgrade(json.loads(r['doc_json'])) for r in rows]
+        out = []
+        for i, r in enumerate(rows):
+            before = docs[i + 1] if i + 1 < len(docs) else None
+            changes = self._changes(before, docs[i], facts) if before else []
+            out.append({'revision': r['revision'], 'at': r['created_ms'], 'reason': r['reason'], 'status': r['status'],
+                        'current': r['revision'] == net['applied_revision'], 'changes': [c['text'] for c in changes][:8]})
+        return {'ok': True, 'revisions': out}
+
+    async def rollback(self, owner, data=None):
+        """A kept revision becomes the draft and goes out as a new one. Members added since are removed again.
+        data {revision}: that one; without it the previous: the latest earlier document that differs from
+        the applied one (a reissue for changed facts or a leaving server is skipped), preferring one that
+        went out (applied, or partly when some nodes were offline) over one that failed."""
+        data = data or {}
+        if not isinstance(data, dict) or set(data) - {'revision'} or 'revision' in data and type(data['revision']) is not int:
+            raise InstanceError('invalid_mesh_revision')
         self._reserve(owner)
         try:
-            await self._rollback_draft(owner)
+            await self._rollback_draft(owner, data.get('revision'))
         except BaseException:
             self.applying.discard(owner)
             raise
-        return await self.apply(owner, reserved=True)
+        return await self.apply(owner, reserved=True, preserve_line_rules=True)
 
-    async def _rollback_draft(self, owner):
+    async def _rollback_draft(self, owner, revision=None):
         net, current = await self._network(owner), await self._load(owner, 'applied')
-        rows = await many(self.db.conn, 'SELECT doc_json,status FROM mesh_revisions WHERE owner=? AND revision<? ORDER BY revision DESC', (owner, net['applied_revision']))
-        docs = [(model.upgrade(json.loads(r['doc_json'])), r['status']) for r in rows]
-        docs = [(doc, status) for doc, status in docs if doc != current]
-        doc = next((doc for doc, status in docs if status in ('applied', 'partial')), docs[0][0] if docs else None)
+        if revision is not None:
+            row = await one(self.db.conn, 'SELECT doc_json FROM mesh_revisions WHERE owner=? AND revision=?', (owner, revision))
+            if not row:
+                raise InstanceError('mesh_revision_not_found', 404)
+            doc = model.upgrade(json.loads(row['doc_json']))
+            if revision == net['applied_revision'] or doc == current:
+                raise InstanceError('mesh_revision_current', 409)
+        else:
+            rows = await many(self.db.conn, 'SELECT doc_json,status FROM mesh_revisions WHERE owner=? AND revision<? ORDER BY revision DESC', (owner, net['applied_revision']))
+            docs = [(model.upgrade(json.loads(r['doc_json'])), r['status']) for r in rows]
+            docs = [(doc, status) for doc, status in docs if doc != current]
+            doc = next((doc for doc, status in docs if status in ('applied', 'partial')), docs[0][0] if docs else None)
         if not doc:
             raise InstanceError('mesh_no_previous_revision', 409)
         async with self._edit(owner):
@@ -1214,7 +1626,7 @@ class Mesh:
             raise InstanceError('mesh_apply_running', 409)
         self.applying.add(owner)
 
-    async def apply(self, owner, *, reserved=False):
+    async def apply(self, owner, *, reserved=False, preserve_line_rules=False):
         if not reserved:
             self._reserve(owner)
         lock = self._lock(owner)
@@ -1224,8 +1636,14 @@ class Mesh:
             self.applying.discard(owner)
             raise
         try:
+            await self._refresh_facts(owner)
             async with self._edit(owner):
                 draft, facts, applied = await self._load(owner, 'draft'), await self._facts(owner), await self._load(owner, 'applied')
+                # Only explicit apply opts in; rollback keeps the selected revision's interpretation.
+                if not preserve_line_rules:
+                    draft = mesh_auto.for_draft(draft)
+                # What follows the mesh, worked out from the facts as they are now.
+                draft = mesh_auto.resolve(draft, facts)
                 await self._refresh_tls(owner, draft, facts)
                 errors = model.validate(draft, facts, applying=True, applied=applied)
                 if not errors:
@@ -1234,6 +1652,7 @@ class Mesh:
                               if w['error'] == 'mesh_port_in_use']
                 if errors:
                     raise model.MeshInvalid(errors)
+                draft['_autoLinksState'] = mesh_autolinks.record_user_deletions(applied, draft, draft.get('_autoLinksState') or applied.get('_autoLinksState'), now_ms())
                 plan = await self._issue(owner, draft, facts, reason='apply', save_draft=True)
         except BaseException:
             lock.release()
@@ -1257,6 +1676,7 @@ class Mesh:
             raise InstanceError('mesh_change_recovering', 409)
         removed = [m['serverId'] for m in doc['members'] if m['removing']] + list(removed)
         doc = copy.deepcopy(doc)
+        doc.setdefault('_fullLineRules', True)
         doc['members'] = [m for m in doc['members'] if not m['removing']]
         net, previous, rows = await self._network(owner), await self._load(owner, 'applied'), await self._rows(owner)
         latest = await self._latest(owner, net)
@@ -1529,36 +1949,53 @@ class Mesh:
         if row and json.loads(row['info_json']).get('accessPending'):
             self.service._apply_access_soon(sid)
 
-    async def _refresh_node(self, owner, sid):
-        """mesh.status after a reconnect: the interfaces for the prefix check and the build of the data plane's copy,
-        and whether its mesh service is still there."""
+    async def _refresh_facts(self, owner):
+        """_refresh_node for every node online now. A node reports its interfaces and routes when it
+        connects, and they change under it (a WireGuard interface stopped, a container network added):
+        configs and route checks would otherwise go by what it had until it reconnects."""
+        rows = await self._rows(owner)
+        await asyncio.gather(*(self._refresh_node(owner, sid, timeout=FACTS_REFRESH_TIMEOUT)
+                               for sid, row in rows.items() if sid in self.hub.sessions and row['state'] != 'cleanup'))
+
+    async def _refresh_node(self, owner, sid, *, timeout=STATUS_CALL_TIMEOUT, live_status=False):
+        """mesh.status after a reconnect, and before an apply or when the page opens (_refresh_facts): the
+        interfaces and routes for the prefix and route checks, the build of the data plane's copy, and
+        whether its mesh service is still there."""
         try:
-            result = await self._call(owner, sid, 'mesh.status', {}, timeout=STATUS_CALL_TIMEOUT)
-        except InstanceError:
-            return
+            result = await self._call(owner, sid, 'mesh.status', {}, timeout=timeout)
+        except InstanceError as exc:
+            return False, exc.error
         if result.get('installed') is False or result.get('service') == 'absent':
             await self._mark_missing(owner, sid)
-            return
+            return False, MISSING_ERROR
         await self._found(sid, result)
+        if live_status and isinstance(result.get('status'), dict):
+            self.owners.setdefault(sid, owner)
+            await self.report(sid, result['status'])
         local, version, data_build = clean_local(result.get('localPrefixes')), result.get('dataVersion'), str(result.get('dataBuild') or '').lower()
         addresses = clean_addresses(result.get('localAddresses'))
+        routes = clean_routes(result.get('hostRoutes'))
         schemas = _reported_schemas(result)
         if schemas:
             await self._store_schemas(sid, schemas)
         fields = {'local_json': dumps(local) if local is not None else None,
                   'addresses_json': dumps(addresses) if addresses is not None else None,
+                  'routes_json': dumps(routes) if routes is not None else None,
                   'data_version': version[:40] if isinstance(version, str) and version else None,
                   'data_build': data_build if _BUILD.fullmatch(data_build) else None}
         fields = {k: v for k, v in fields.items() if v is not None}
         changed = False
         if fields or result.get('signKey') or result.get('e2eKey'):
             async with self.db.write_transaction(label='mesh-node') as conn:
+                if 'data_build' in fields:
+                    await self._store_data_build(conn, sid, fields.pop('data_build'))
                 if fields:
                     await conn.execute(f"UPDATE mesh_nodes SET {','.join(f'{k}=?' for k in fields)} WHERE server_id=?", (*fields.values(), sid))
                 changed = await self._store_security_keys(conn, owner, sid, result)
             await self._key_conflict(owner, sid)
         if changed:
             self._reconcile_soon(owner)
+        return True, ''
 
     async def _mark_missing(self, owner, sid):
         """The node says the mesh service of an applied member is gone (uninstalled, or the node
@@ -1675,6 +2112,13 @@ class Mesh:
         self.refused.pop(sid, None)
         return (stored or LEGACY_SCHEMAS) != schemas
 
+    async def _store_data_build(self, conn, sid, build):
+        """The build the node says its data plane runs, with what that build reads: known when the
+        node runs it too, kept while it stays the same, else not known."""
+        own = _own_data_features(self.hub.sessions.get(sid), build)
+        await conn.execute("UPDATE mesh_nodes SET data_features=CASE WHEN ? THEN ? WHEN data_build=? THEN data_features ELSE '' END,"
+                           'data_build=? WHERE server_id=?', (bool(own), own, build, build, sid))
+
     async def _upgrade(self, owner, sid, again=False):
         """Bring the data plane's copy to the node's own build after a node update. Relays go one at
         a time, each reporting ready before the next starts: a batch node update reconnects them all
@@ -1724,16 +2168,17 @@ class Mesh:
                 ready = self.ready_waits[sid] = asyncio.Event()
                 version = result.get('to') if isinstance(result.get('to'), str) and result['to'] else None
                 async with self.db.write_transaction(label='mesh-upgrade') as conn:
-                    await conn.execute("UPDATE mesh_nodes SET data_build=?,upgrade_failed_build='',upgrade_error='',upgrade_ms=?,"
-                                       'data_version=COALESCE(?,data_version) WHERE server_id=?', (target, now_ms(), version and version[:40], sid))
+                    await conn.execute("UPDATE mesh_nodes SET data_build=?,data_features=?,upgrade_failed_build='',upgrade_error='',upgrade_ms=?,"
+                                       'data_version=COALESCE(?,data_version) WHERE server_id=?',
+                                       (target, _own_data_features(self.hub.sessions.get(sid), target), now_ms(), version and version[:40], sid))
                     # This build signs and encrypts end to end with keys made by the upgrade.
                     keys_changed = await self._store_security_keys(conn, owner, sid, result)
                 await self._key_conflict(owner, sid)
-                if keys_changed:
-                    self._reconcile_soon(owner)
                 if relay and result.get('changed'):
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(ready.wait(), UPGRADE_READY_WAIT)
+                if keys_changed or result.get('changed'):
+                    self._reconcile_soon(owner)
         finally:
             self.upgrades.pop(sid, None)
             self.ready_waits.pop(sid, None)
@@ -1895,12 +2340,96 @@ class Mesh:
         if changed:
             await self.reconcile(owner)
 
+    @staticmethod
+    def _doc_without_internal(doc):
+        if not isinstance(doc, dict) or '_autoLinksState' not in doc:
+            return doc
+        out = dict(doc)
+        out.pop('_autoLinksState', None)
+        return out
+
+    async def check_auto_links(self, owner, *, now=None):
+        """Run one optimizer round on the applied document. If auto links are added or dropped,
+        issue an automatic revision on the applied document alone, align the draft while preserving
+        user edits, and enforce at least 10 minutes between automatic revisions."""
+        async with self._lock(owner):
+            if await mesh_change.load(self, owner) and await mesh_change.recover(self, owner):
+                return None
+            net = await self._network(owner)
+            if not net['applied_revision']:
+                return None
+            now = now_ms() if now is None else int(now)
+            async with self._edit(owner):
+                applied = await self._load(owner, 'applied')
+                if not mesh_autolinks.enabled(applied):
+                    return None
+                draft, facts = await self._load(owner, 'draft'), await self._facts(owner)
+                state = mesh_autolinks.clean_state(applied.get('_autoLinksState') or draft.get('_autoLinksState'), now)
+                res = mesh_autolinks.optimize(applied, facts, self.status, state=state, now_ms=now)
+                if not res['changed']:
+                    if applied.get('_autoLinksState') != res['state']:
+                        applied['_autoLinksState'] = copy.deepcopy(res['state'])
+                        draft['_autoLinksState'] = copy.deepcopy(res['state'])
+                        async with self.db.write_transaction(label='mesh-autolinks-state') as conn:
+                            await self._save(conn, owner, 'applied', applied)
+                            await self._save(conn, owner, 'draft', draft)
+                    return res
+                last_auto_ms = state.get('lastAutoRevisionMs', 0)
+                if last_auto_ms and now - last_auto_ms < mesh_autolinks.AUTO_REVISION_INTERVAL_MS:
+                    # Keep the streak/idle state so the change goes out once the 10-minute window passes.
+                    kept_state = copy.deepcopy(res['state'])
+                    kept_state['lastChange'] = state.get('lastChange')
+                    for item in res['dropped']:
+                        if item['why'] == '连续无改善' and item['key'] in state.get('idleSince', {}):
+                            kept_state['idleSince'][item['key']] = state['idleSince'][item['key']]
+                        elif item['why'] == '实测不划算':
+                            kept_state['disappointed'].pop(item['key'], None)
+                    applied['_autoLinksState'] = kept_state
+                    draft['_autoLinksState'] = copy.deepcopy(kept_state)
+                    async with self.db.write_transaction(label='mesh-autolinks-state') as conn:
+                        await self._save(conn, owner, 'applied', applied)
+                        await self._save(conn, owner, 'draft', draft)
+                    return {**res, 'changed': False, 'rateLimited': True}
+                next_doc = mesh_auto.resolve(res['doc'], facts)
+                await self._refresh_tls(owner, next_doc, facts, stale_only=True)
+                errors = model.validate(next_doc, facts, applying=True, applied=applied)
+                if errors:
+                    bad_state = copy.deepcopy(state)
+                    bad_state['lastChange'] = {
+                        'at': now,
+                        'skipped': True,
+                        'reason': f'自动版本校验未通过：{errors[0]["message"]}',
+                        'errors': errors,
+                    }
+                    applied['_autoLinksState'] = bad_state
+                    draft['_autoLinksState'] = copy.deepcopy(bad_state)
+                    async with self.db.write_transaction(label='mesh-autolinks-invalid') as conn:
+                        await self._save(conn, owner, 'applied', applied)
+                        await self._save(conn, owner, 'draft', draft)
+                    for sid in {m['serverId'] for m in model.active(applied)}:
+                        await self._event(sid, 'autolinks.invalid', bad_state['lastChange']['reason'])
+                        break
+                    return {**res, 'changed': False, 'errors': errors, 'lastChange': bad_state['lastChange']}
+                res['state']['lastAutoRevisionMs'] = now
+                next_doc['_autoLinksState'] = copy.deepcopy(res['state'])
+                aligned_draft = mesh_autolinks.align_draft(draft, applied, next_doc)
+                plan = await self._issue(owner, next_doc, facts, reason=res['revisionReason'], save_draft=False)
+                await self._save_draft(owner, aligned_draft)
+            await self._roll(owner, plan)
+            return {**res, 'revision': plan['revision']}
+
     async def _tls_loop(self):
+        ticks = max(1, TLS_CHECK_INTERVAL_S // mesh_autolinks.AUTO_LOOP_INTERVAL_S)
+        step = 0
         while True:
-            await asyncio.sleep(TLS_CHECK_INTERVAL_S)
+            await asyncio.sleep(mesh_autolinks.AUTO_LOOP_INTERVAL_S)
+            step += 1
             for owner in set(self.owners.values()):
                 with contextlib.suppress(Exception):
-                    await self.check_tls(owner)
+                    await self.check_auto_links(owner)
+                if step % ticks == 0:
+                    with contextlib.suppress(Exception):
+                        await self.check_tls(owner)
 
     # ----- reports -----
     async def report(self, server_id, raw):
@@ -1962,7 +2491,8 @@ class Mesh:
                 if restored and before:
                     watch.resume(before, member['role'], now)
             for alert_key, kind, text in watch.observe(now, server_id, self._name(server_id), member['role'],
-                                                       bool(member['entry']['candidates']), status, new, self._name):
+                                                       bool(member['entry']['candidates']), status, new, self._name,
+                                                       punches=mesh_status.needs_public_addr(applied['configs'].get(server_id))):
                 await self.service.reminders._enqueue(owner, alert_key, server_id, kind, text)
         except Exception:
             # A report must never break the node's session; the next one tries again.

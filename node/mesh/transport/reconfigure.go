@@ -81,7 +81,7 @@ func (b *Bind) Reconfigure(opt Options) error {
 			cost += nextUDP.buffers
 		}
 	}
-	if len(b.paths) > lim.paths || len(r.sessions) > lim.paths || r.unauth > lim.unauth || cost > lim.socketBytes || r.queuedBytes > lim.rxBytes {
+	if len(b.paths) > lim.paths || len(r.sessions)-r.overPaths > lim.paths || r.unauth > lim.unauth || cost > lim.socketBytes || r.queuedBytes > lim.rxBytes {
 		b.mu.Unlock()
 		return abort(errors.New("new resource profile cannot fit active paths"))
 	}

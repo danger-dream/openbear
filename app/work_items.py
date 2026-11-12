@@ -8,10 +8,12 @@ never from the model's description of them.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -142,8 +144,39 @@ def in_subtree(number: str, root: str) -> bool:
     return number == root or number.startswith(root + ".")
 
 
-def _squash(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
+def _fold(text: str) -> tuple[str, list[int]]:
+    """Quote comparison form: NFKC, without whitespace or punctuation, and each kept char's source index."""
+    chars: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(text or ""):
+        for folded in unicodedata.normalize("NFKC", char):
+            category = unicodedata.category(folded)
+            if folded.isspace() or category.startswith("P") or category == "Sk":
+                continue
+            chars.append(folded)
+            origin.append(index)
+    return "".join(chars), origin
+
+
+def quote_found(quote: str, text: str) -> bool:
+    folded = _fold(quote)[0]
+    return bool(folded) and folded in _fold(text)[0]
+
+
+def closest_passage(text: str, quote: str, limit: int = 200) -> str:
+    """The stretch of `text` best aligned with `quote`, in the original wording."""
+    folded_text, origin = _fold(text)
+    folded_quote = _fold(quote)[0]
+    if not folded_text or not folded_quote:
+        return ""
+    block = difflib.SequenceMatcher(None, folded_text, folded_quote, autojunk=False).find_longest_match(
+        0, len(folded_text), 0, len(folded_quote))
+    if block.size == 0:
+        return ""
+    start = min(max(0, block.a - block.b), max(0, len(folded_text) - len(folded_quote)))
+    end = min(len(folded_text), start + len(folded_quote))
+    passage = " ".join(text[origin[start]:origin[end - 1] + 1].split())
+    return passage if len(passage) <= limit else passage[:limit - 1] + "…"
 
 
 def _criteria(value: Any) -> list[str]:
@@ -463,8 +496,13 @@ class WorkItemsDAO:
         if source.type in {"message", "interaction"} and (quote or (require_quote and require_human)):
             if not quote:
                 raise WorkItemError("quote_required", "quote the user's words that make this decision")
-            if _squash(quote) not in _squash(source.text):
-                raise WorkItemError("quote_not_found", "the quote does not appear in the cited user message or answer")
+            if not quote_found(quote, source.text):
+                closest = closest_passage(source.text, quote)
+                raise WorkItemError(
+                    "quote_not_found",
+                    "the quote does not appear in the cited user message or answer (whitespace, full/half-width and "
+                    "punctuation differences are ignored)" + (f"; closest passage there: 「{closest}」" if closest else ""),
+                )
             source.extra["quote"] = quote
         return source
 

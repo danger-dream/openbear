@@ -41,6 +41,9 @@ PYTHON = ROOT / ".venv" / "bin" / "python"
 REPORTER = ROOT / "scripts" / "check_reporter.mjs"
 BUDGET = 540  # one shell command may run for ten minutes
 CPUS = os.cpu_count() or 4
+# A test phase running this long is stuck (the slowest test takes about 20 s): its process is
+# ended and xdist carries on with a new one, instead of the run waiting for the deadline.
+STALL_S = 150
 SCOPES = ("app", "prompts", "tests", "scripts", "web", "node", "gateway", "pyproject.toml", "uv.lock", "benchmark-package", ".githooks", ".gitattributes")
 GO_MODULES = ("node", "gateway")
 VERSION_FILES = {"node/VERSION", "gateway/VERSION"}  # raised by every build, never a reason to test
@@ -411,20 +414,64 @@ class Lane:
     failed_units: set[str] = field(default_factory=set)
     unit_seconds: dict[str, float] = field(default_factory=dict)
     alone: set[str] = field(default_factory=set)          # failed files that passed run by themselves
+    stuck: list[str] = field(default_factory=list)        # "test（phase）" whose process was ended
+    done: int = 0                                         # tests finished, of total, when the deadline ended the run
+    total: int = 0
 
 
-def run(cmd: list[str], cwd: Path, env: dict, log: Path, deadline: float, stdout: Path | None = None) -> int | None:
+def run(cmd: list[str], cwd: Path, env: dict, log: Path, deadline: float, stdout: Path | None = None,
+        progress: Path | None = None, stuck: list[str] | None = None) -> int | None:
+    """progress: the directory check_progress keeps each test process's place in."""
     with open(log, "ab") as err, open(stdout or log, "ab") as out:
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, start_new_session=True)
         _groups.add(proc.pid)
         try:
-            return proc.wait(timeout=max(1.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            _kill(proc.pid)
-            proc.wait()
-            return None
+            while True:
+                try:
+                    return proc.wait(timeout=max(1.0, min(5.0, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        _kill(proc.pid)
+                        proc.wait()
+                        return None
+                    if progress is not None:
+                        _end_stuck(progress, stuck, log)
         finally:
             _groups.discard(proc.pid)
+
+
+def _end_stuck(progress: Path, stuck: list[str], log: Path) -> None:
+    """Have a process stuck in one test phase write its tasks into the log, then end it."""
+    now = time.time()
+    for note in progress.iterdir():
+        if not note.name.isdigit():
+            continue
+        try:
+            text = note.read_text()
+            if not text or now - note.stat().st_mtime < STALL_S:
+                continue
+            os.kill(int(note.name), signal.SIGUSR1)
+            time.sleep(2)
+            os.kill(int(note.name), signal.SIGKILL)
+        except OSError:
+            continue
+        note.unlink(missing_ok=True)
+        stuck.append(text.replace("\t", "（") + "）")
+        stack = progress / f"{note.name}.stack"
+        if stack.exists():
+            with open(log, "a") as out:
+                out.write(stack.read_text())
+
+
+def _counted(log: Path) -> tuple[int, int]:
+    """Tests finished and selected, from pytest -q's progress lines, for a run ended before its report."""
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return 0, 0
+    total = re.search(r"\[(\d+) items?\]|collected (\d+) items?", text)
+    done = sum(len(m) for m in re.findall(r"^([.FEsxX]+)(?: +\[ *\d+%\])?$", text, re.M))
+    return done, int(next(g for g in total.groups() if g)) if total else 0
 
 
 def _kill(pgid: int) -> None:
@@ -498,7 +545,8 @@ def read_junit(path: Path, lane: Lane, root: Path = ROOT) -> bool:
 
 
 def pytest_cmd(junit: Path, workers: int, *more: str) -> list[str]:
-    cmd = [str(PYTHON), "-m", "pytest", "-q", "-rfE", "-o", f"cache_dir={STATE / 'pytest-cache'}", f"--junitxml={junit}"]
+    cmd = [str(PYTHON), "-m", "pytest", "-q", "-rfE", "-o", f"cache_dir={STATE / 'pytest-cache'}", f"--junitxml={junit}",
+           "-p", "scripts.check_progress"]
     if workers > 1:
         cmd += ["-n", str(workers), "--dist=worksteal"]
     return cmd + list(more)
@@ -506,14 +554,17 @@ def pytest_cmd(junit: Path, workers: int, *more: str) -> list[str]:
 
 def run_testmon(logs: Path, deadline: float, full: bool) -> Lane:
     lane = Lane("python")
-    env = {**base_env(), "TESTMON_DATAFILE": str(STATE / "testmondata"), "PYTHONPATH": str(ROOT)}
+    progress = logs / "progress-python"
+    progress.mkdir()
+    env = {**base_env(), "TESTMON_DATAFILE": str(STATE / "testmondata"), "PYTHONPATH": str(ROOT), "CHECK_PROGRESS_DIR": str(progress)}
     log, junit = logs / "python.log", logs / "python.xml"
     start = time.monotonic()
     code = run(pytest_cmd(junit, CPUS, "-p", "scripts.check_testmon", "--testmon-noselect" if full else "--testmon"),
-               ROOT, env, log, deadline)
+               ROOT, env, log, deadline, progress=progress, stuck=lane.stuck)
     lane.seconds = time.monotonic() - start
     lane.complete = code is not None
-    read_junit(junit, lane)
+    if not read_junit(junit, lane):
+        lane.done, lane.total = _counted(log)
     try:
         head = log.read_text(errors="replace").splitlines()[:40]
     except OSError:
@@ -528,11 +579,15 @@ def run_testmon(logs: Path, deadline: float, full: bool) -> Lane:
 def run_extra(tests: list[str], logs: Path, deadline: float) -> Lane:
     lane = Lane("python-extra")
     log, junit = logs / "python-extra.log", logs / "python-extra.xml"
+    progress = logs / "progress-python-extra"
+    progress.mkdir()
     start = time.monotonic()
-    code = run(pytest_cmd(junit, min(CPUS, len(tests) * 2), *tests), ROOT, base_env(), log, deadline)
+    code = run(pytest_cmd(junit, min(CPUS, len(tests) * 2), *tests), ROOT, {**base_env(), "CHECK_PROGRESS_DIR": str(progress)},
+               log, deadline, progress=progress, stuck=lane.stuck)
     lane.seconds = time.monotonic() - start
     lane.complete = code is not None
-    read_junit(junit, lane)
+    if not read_junit(junit, lane):
+        lane.done, lane.total = _counted(log)
     if code not in (0, 1, 5, None):
         lane.error = f"pytest 退出码 {code}\n{_tail(log)}"
     return lane
@@ -796,8 +851,10 @@ def report(plan: Plan, lanes: dict[str, Lane], notes: list[str], logs: Path, ref
         if lane.left:
             status += f"，还有 {lane.left} 个文件没跑到"
         elif not lane.complete:
-            status += "，超时被中止"
+            status = (f"完成 {lane.done} 项后" if lane.done else status + "，") + "超时被中止"
         out.append(f"  {label:<8}{what}：{status}  {short(lane.seconds)}")
+        for where in lane.stuck:
+            out.append(f"          卡住：{where}超过 {STALL_S} 秒没有进展，已结束这个测试进程，任务栈见日志")
         if lane.note:
             out.append(f"          {lane.note}")
         if lane.error:
@@ -805,7 +862,7 @@ def report(plan: Plan, lanes: dict[str, Lane], notes: list[str], logs: Path, ref
 
     py = lanes.get("python")
     if py:
-        line("Python", py, f"testmon 选中 {py.passed + len(py.failures) + py.skipped} 项")
+        line("Python", py, f"testmon 选中 {py.total or py.passed + len(py.failures) + py.skipped} 项")
     if lanes.get("python-extra"):
         reasons = "；".join(sorted(set(plan.extra.values())))
         line("Python", lanes["python-extra"], f"另跑 {len(plan.extra)} 个文件（{reasons[:120]}）")

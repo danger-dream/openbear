@@ -4,7 +4,7 @@
 // servers.dom.test.mjs and servers.install.dom.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab} from './testing/serversBrowser.mjs';
+import {chromium, startServersBrowser, noOverflow, shot, versionShot, settled, until, frames, names, expectFocused, tab, showTab} from './testing/serversBrowser.mjs';
 import {day, GB, server, many, uninstalledLast, TARGET, RELEASE, versions, MESH_ON, onMesh, card, orders, meshOption, off, fact} from './testing/serversBackend.mjs';
 
 test('servers page layout: node browser, adding servers on a phone, install clashes', {skip: !chromium, timeout: 300000}, async t => {
@@ -17,6 +17,7 @@ test('servers page layout: node browser, adding servers on a phone, install clas
       delta.browserState = {enabled: true, online: true, state: 'ready', source: 'download', product: 'Chrome/156.0.8078.47', headless: true, endpoint: '', epoch: 'e1'};
     }});
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+    await showTab(h.page.locator('.sv-detail:visible'), '工具');
     let card = browserCard(h.page.locator('.sv-detail:visible'));
     await card.getByText('运行中').waitFor();
     await card.getByRole('button', {name: '重启'}).click();
@@ -29,6 +30,7 @@ test('servers page layout: node browser, adding servers on a phone, install clas
       h = await setup(t, {width, height: width < 500 ? 844 : 900});
       await h.page.locator('.pb-card').filter({hasText: 'Papa-HK.T1'}).click();
       const detail = h.page.locator('.sv-detail:visible');
+      await showTab(detail, '工具');
       card = browserCard(detail);
       await card.getByText('未开启', {exact: false}).waitFor();
       await card.getByRole('button', {name: '开启'}).click();
@@ -55,6 +57,7 @@ test('servers page layout: node browser, adding servers on a phone, install clas
         error: 'browser_not_runnable: /opt/google/chrome/chrome'};
     }});
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
+    await showTab(h.page.locator('.sv-detail:visible'), '工具');
     card = browserCard(h.page.locator('.sv-detail:visible'));
     await card.getByText('启动失败').waitFor();
     await card.getByRole('button', {name: '设置'}).click();
@@ -69,6 +72,7 @@ test('servers page layout: node browser, adding servers on a phone, install clas
     // The local server's Browser tool already uses the configured default browser.
     h = await setup(t);
     await h.page.locator('.pb-card').filter({hasText: 'Edge-SG.Game'}).click();
+    await showTab(h.page.locator('.sv-detail:visible'), '工具');
     card = browserCard(h.page.locator('.sv-detail:visible'));
     await card.getByText('本机不需要开启', {exact: false}).waitFor();
     await h.close();
@@ -76,6 +80,7 @@ test('servers page layout: node browser, adding servers on a phone, install clas
     h = await setup(t);
     // A node that refuses commands is switched on where it runs.
     await h.page.locator('.pb-card').filter({hasText: 'Bravo-FRA'}).click();
+    await showTab(h.page.locator('.sv-detail:visible'), '工具');
     card = browserCard(h.page.locator('.sv-detail:visible'));
     await card.getByText('关闭了命令执行', {exact: false}).waitFor();
     await h.close();

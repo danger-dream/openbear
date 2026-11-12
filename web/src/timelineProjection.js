@@ -735,6 +735,7 @@ function opToolCall(op, mergedRootCall = null) {
     arguments: argumentsValue,
     previewArguments,
     preview: String(payload.preview || ""),
+    resultDigest: String(payload.resultDigest || ""),
   };
 }
 function opToolResult(op, mergedRootCall = null) {
@@ -821,6 +822,8 @@ function agentSupervisionRecentEvent(op, payload) {
       mode: payload.mode || "",
       wakeReason: payload.wakeReason || "",
       active: Boolean(payload.active),
+      assessments: Array.isArray(payload.assessments) ? payload.assessments : [],
+      agents: Array.isArray(payload.agents) ? payload.agents : [],
     },
   };
 }

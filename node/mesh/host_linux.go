@@ -120,6 +120,14 @@ type linuxHost struct {
 	// swept: chains a killed data plane left were taken out.
 	swept bool
 	fw    *hostFirewalls
+	// taken: by Takeover route, the routes it replaced, kept in TakenFile
+	// in takenDir (empty: in memory only). notes: what was taken over or
+	// put back since restored was last called.
+	taken    map[netip.Prefix][]string
+	takenDir string
+	notes    []string
+	// routeFile is /proc/net/route; tests put another.
+	routeFile string
 }
 
 type chain struct {
@@ -131,13 +139,15 @@ func newHost(name, dir string, _ tun.Device) hostNet {
 	h := newLinuxHost(name, hostExec, hostHas)
 	h.forwardState = filepath.Join(dir, "ip_forward.was")
 	h.fw.fd.stateFile = filepath.Join(dir, "firewalld-owned.json")
+	h.takenDir, h.taken = dir, loadTaken(dir)
 	return h
 }
 
 // newLinuxHost runs its commands through x; has says whether a program is
 // installed.
 func newLinuxHost(name string, x execFn, has func(string) bool) *linuxHost {
-	return &linuxHost{name: name, x: x, iptables: has("iptables"), chains: map[string]chain{}, forwardFile: ipForward, fw: newHostFirewalls(name, x, has)}
+	return &linuxHost{name: name, x: x, iptables: has("iptables"), chains: map[string]chain{}, forwardFile: ipForward, fw: newHostFirewalls(name, x, has),
+		taken: map[netip.Prefix][]string{}, routeFile: routeTable}
 }
 
 func (h *linuxHost) run(args ...string) error {
@@ -174,16 +184,47 @@ func (h *linuxHost) apply(next hostConfig) (err error) {
 		}
 		h.staleAddresses = h.staleAddresses[1:]
 	}
-	if first || next.MTU != h.cur.MTU {
-		if err := run("ip", "link", "set", "dev", h.name, "mtu", strconv.Itoa(next.MTU), "up"); err != nil {
+	setMTU := func() error {
+		if first || next.MTU != h.cur.MTU {
+			if err := run("ip", "link", "set", "dev", h.name, "mtu", strconv.Itoa(next.MTU), "up"); err != nil {
+				return err
+			}
+			h.cur.MTU = next.MTU
+		}
+		return nil
+	}
+	// A larger interface MTU comes after the routes that hold the mesh to
+	// the smaller one, a smaller one before they go.
+	if next.MTU <= h.cur.MTU || first {
+		if err := setMTU(); err != nil {
 			return err
 		}
-		h.cur.MTU = next.MTU
 	}
 	h.up = true
+	replace := func(dst string, mtu int) error {
+		args := []string{"ip", "-4", "route", "replace", dst, "dev", h.name, "src", addr}
+		if mtu > 0 {
+			args = append(args, "mtu", strconv.Itoa(mtu))
+		}
+		return run(args...)
+	}
+	del := func(dst string) error {
+		if err := run("ip", "-4", "route", "del", dst, "dev", h.name); err != nil {
+			out, queryErr := h.x("ip", "-4", "route", "show", dst, "dev", h.name)
+			if queryErr != nil || strings.TrimSpace(out) != "" {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, r := range next.Takeover {
+		if err := h.take(r); err != nil {
+			return err
+		}
+	}
 	for _, r := range next.Routes {
-		if first || addressChanged || !slices.Contains(h.cur.Routes, r) {
-			if err := run("ip", "-4", "route", "replace", r.String(), "dev", h.name, "src", addr); err != nil {
+		if first || addressChanged || next.RouteMTU != h.cur.RouteMTU || !slices.Contains(h.cur.Routes, r) {
+			if err := replace(r.String(), next.RouteMTU); err != nil {
 				return err
 			}
 			if !slices.Contains(h.cur.Routes, r) {
@@ -193,16 +234,34 @@ func (h *linuxHost) apply(next hostConfig) (err error) {
 	}
 	for _, r := range slices.Clone(h.cur.Routes) {
 		if !slices.Contains(next.Routes, r) {
-			if err := run("ip", "-4", "route", "del", r.String(), "dev", h.name); err != nil {
-				out, queryErr := h.x("ip", "-4", "route", "show", r.String(), "dev", h.name)
-				if queryErr != nil || strings.TrimSpace(out) != "" {
-					return err
-				}
+			if err := del(r.String()); err != nil {
+				return err
 			}
 			h.cur.Routes = slices.DeleteFunc(slices.Clone(h.cur.Routes), func(p netip.Prefix) bool { return p == r })
 		}
 	}
-	h.cur.Address, h.cur.MTU, h.cur.Routes = next.Address, next.MTU, next.Routes
+	h.releaseTaken(next.Takeover)
+	h.cur.RouteMTU = next.RouteMTU
+	for _, r := range next.Hosts {
+		if first || addressChanged || !slices.Contains(h.cur.Hosts, r) {
+			if err := replace(netip.PrefixFrom(r.Addr, 32).String(), r.MTU); err != nil {
+				return err
+			}
+			h.cur.Hosts = append(slices.DeleteFunc(slices.Clone(h.cur.Hosts), func(o hostRoute) bool { return o.Addr == r.Addr }), r)
+		}
+	}
+	for _, r := range slices.Clone(h.cur.Hosts) {
+		if !slices.ContainsFunc(next.Hosts, func(o hostRoute) bool { return o.Addr == r.Addr }) {
+			if err := del(netip.PrefixFrom(r.Addr, 32).String()); err != nil {
+				return err
+			}
+			h.cur.Hosts = slices.DeleteFunc(slices.Clone(h.cur.Hosts), func(o hostRoute) bool { return o.Addr == r.Addr })
+		}
+	}
+	if err := setMTU(); err != nil {
+		return err
+	}
+	h.cur.Address, h.cur.MTU, h.cur.Routes, h.cur.Hosts = next.Address, next.MTU, next.Routes, next.Hosts
 
 	if err := h.firewall(next); err != nil {
 		return err
@@ -242,14 +301,20 @@ func (h *linuxHost) firewall(next hostConfig) error {
 		nat := chain{table: "nat", parent: "POSTROUTING"}
 		for _, s := range g.Subnets {
 			fwd.rules = append(fwd.rules, []string{"-d", s.String(), "-i", h.name, "-j", "ACCEPT"}, []string{"-s", s.String(), "-o", h.name, "-j", "ACCEPT"})
-			nat.rules = append(nat.rules, []string{"-s", next.Prefix.String(), "-d", s.String(), "-j", "MASQUERADE"})
+			if g.Masquerade {
+				nat.rules = append(nat.rules, []string{"-s", next.Prefix.String(), "-d", s.String(), "-j", "MASQUERADE"})
+			}
+			// The mesh device's only address is this node's: MASQUERADE takes it.
+			if g.SNAT {
+				nat.rules = append(nat.rules, []string{"-s", s.String(), "-o", h.name, "-j", "MASQUERADE"})
+			}
 		}
 		want[chainFwd] = fwd
 		// The mesh device's MTU leaves room for the end-to-end header, so TCP
 		// a gateway forwards into the mesh is held to segments that fit it.
 		want[chainMSS] = chain{table: "mangle", parent: "FORWARD", rules: [][]string{
 			{"-o", h.name, "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}}}
-		if g.Masquerade {
+		if len(nat.rules) > 0 {
 			want[chainNat] = nat
 		}
 		if err := h.forwarding(true); err != nil {
@@ -395,21 +460,7 @@ func (h *linuxHost) removeChain(name string, c chain) {
 func (h *linuxHost) ensureJump(name string, c chain) bool {
 	out, _ := h.x("iptables", "-w", "-t", c.table, "-S", c.parent)
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	jump := "-A " + c.parent + " -j " + name
-	var others []string
-	at := -1
-	for i, l := range lines[1:] {
-		if l == jump {
-			if at >= 0 {
-				at = -2 // twice
-			} else if at == -1 {
-				at = i
-			}
-			continue
-		}
-		others = append(others, l)
-	}
-	pos := jumpAt(others)
+	at, pos := jumpPosition(lines, name, c.parent)
 	if at == pos {
 		return false
 	}
@@ -460,15 +511,7 @@ func jumpAt(rules []string) int {
 // intact reports whether the chain still holds exactly its rules.
 func (h *linuxHost) intact(name string, c chain) bool {
 	out, err := h.x("iptables", "-w", "-t", c.table, "-S", name)
-	if err != nil || len(strings.Split(strings.TrimSpace(out), "\n")) != len(c.rules)+1 {
-		return false
-	}
-	for _, r := range c.rules {
-		if h.iptablesCmd(c.table, append([]string{"-C", name}, r...)...) != nil {
-			return false
-		}
-	}
-	return true
+	return err == nil && chainIntact(strings.Split(strings.TrimSpace(out), "\n"), name, c)
 }
 
 // heal puts back what a firewall reload (ufw, firewalld, nftables, Docker)
@@ -479,19 +522,45 @@ func (h *linuxHost) heal() []string {
 	if !h.up {
 		return nil
 	}
+	// Snapshots are lazy and local to this round. A failed read falls back
+	// to individual queries; no stale table survives a repair.
+	tables := map[string]*iptablesSnapshot{}
+	snapshot := func(table string) *iptablesSnapshot {
+		if s, ok := tables[table]; ok {
+			return s
+		}
+		s := readIPTables(h.x, table)
+		tables[table] = s
+		return s
+	}
 	var fixed []string
 	if h.docker != nil {
-		if _, ok := h.chains[chainDocker]; !ok && h.exists("filter", dockerUser) {
-			if err := h.writeChain(chainDocker, *h.docker); err != nil {
-				h.fw.dockerErr = err.Error()
-			} else {
-				h.fw.dockerErr = ""
-				h.chains[chainDocker] = *h.docker
-				fixed = append(fixed, chainDocker+" jump in "+dockerUser)
+		if _, ok := h.chains[chainDocker]; !ok {
+			s := snapshot("filter")
+			if s == nil || s.chains[dockerUser] != nil {
+				if h.exists("filter", dockerUser) {
+					if err := h.writeChain(chainDocker, *h.docker); err != nil {
+						h.fw.dockerErr = err.Error()
+					} else {
+						h.fw.dockerErr = ""
+						h.chains[chainDocker] = *h.docker
+						fixed = append(fixed, chainDocker+" jump in "+dockerUser)
+					}
+					delete(tables, "filter")
+				}
 			}
 		}
 	}
 	for name, c := range h.chains {
+		s := snapshot(c.table)
+		if s != nil && chainIntact(s.chains[name], name, c) {
+			at, pos := jumpPosition(s.chains[c.parent], name, c.parent)
+			if at == pos {
+				continue
+			}
+		}
+		// An anomalous snapshot is only a hint. Recheck live state before
+		// repairing, as another firewall may have reloaded since the read.
 		if !h.intact(name, c) {
 			if h.writeChain(name, c) == nil {
 				fixed = append(fixed, name+" rules")
@@ -499,9 +568,22 @@ func (h *linuxHost) heal() []string {
 		} else if h.ensureJump(name, c) {
 			fixed = append(fixed, name+" jump in "+c.parent)
 		}
+		delete(tables, c.table)
 	}
 	fixed = append(fixed, h.fw.heal()...)
-	h.fw.report(h.iptables)
+	// firewalld/nft may also have changed the filter table.
+	if len(fixed) > 0 {
+		delete(tables, "filter")
+	}
+	if h.iptables {
+		if s := snapshot("filter"); s != nil {
+			h.fw.reportRules(s.raw, true)
+		} else {
+			h.fw.report(true)
+		}
+	} else {
+		h.fw.report(false)
+	}
 	return fixed
 }
 
@@ -521,6 +603,38 @@ func (h *linuxHost) close() {
 	h.docker = nil
 	h.fw.close()
 	h.forwarding(false)
+	// The mesh's routes go with its interface; what they replaced comes back.
+	for r := range h.taken {
+		if slices.Contains(h.cur.Routes, r) {
+			h.run("ip", "-4", "route", "del", r.String(), "dev", h.name)
+		}
+	}
+	h.releaseTaken(nil)
+}
+
+// Sweep takes out what a data plane of dir that is not running left on this
+// machine: its chains and rules, ip_forward as it found it, the routes its
+// gateway subnets replaced. One that stops does that itself; one that was
+// killed, or crashed, leaves it to the next to start, or to this when the
+// mesh goes with none to start.
+func Sweep(dir string) {
+	newHost("obmesh0", dir, nil).(*linuxHost).sweep()
+}
+
+func (h *linuxHost) sweep() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.iptables {
+		for name, c := range ownChains {
+			if h.exists(c.table, name) {
+				h.removeChain(name, c)
+			}
+		}
+	}
+	h.fw.nft.applied = true
+	h.fw.close()
+	h.forwarding(false)
+	h.releaseTaken(nil)
 }
 
 func residentBytes() uint64 {

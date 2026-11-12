@@ -387,7 +387,7 @@ class AgentControlService:
             raise ValueError(f"Agent task not found: {task_uuid}")
         if task.status not in ACTIVE_TASK_STATUSES:
             if task.status == "needs_openbear_control":
-                raise RuntimeError("Agent task is waiting for OpenBear control; use AgentMessage/continue_task instead of steer.")
+                raise RuntimeError("Agent task is waiting for OpenBear control; use Agent(action=message)/continue_task instead of steer.")
             raise RuntimeError(f"Agent task is not active: {task.status}")
         return await self.dao.add_control(
             task_uuid,

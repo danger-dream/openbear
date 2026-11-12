@@ -44,7 +44,7 @@ UV_BUILDS = {
 UV_DIR = ".tools/uv"
 UV_SYSTEM_DIRS = ("/root/.local/bin", "/root/.cargo/bin")
 
-REPLACE_DIRS = ("app", "web/dist", "prompts", "scripts", "gateway/bin")
+REPLACE_DIRS = ("app", "web/dist", "prompts", "scripts", "gateway/bin", "benchmark-package")
 REPLACE_FILES = (
     "pyproject.toml",
     "uv.lock",
@@ -510,8 +510,11 @@ def parse_sha256sums(text: str, filename: str) -> str:
     raise ValueError(f"SHA256SUMS 中没有 {want}")
 
 
-def _load_release_validation(install_root: Path | None = None):
-    candidates = [Path(__file__).resolve().with_name("release_validation.py")]
+def _load_release_validation(install_root: Path | None = None, staging: Path | None = None):
+    # A package is checked by its own validator once its SHA256 holds: an
+    # installed one may not know what a newer build contains.
+    candidates = [Path(staging).resolve() / "scripts" / "release_validation.py"] if staging is not None else []
+    candidates.append(Path(__file__).resolve().with_name("release_validation.py"))
     if install_root is not None:
         candidates.append(Path(install_root).resolve() / "scripts" / "release_validation.py")
     for path in candidates:
@@ -653,7 +656,7 @@ class Updater:
             # Before anything stops: a missing uv is installed now, not found
             # missing after the swap.
             ensure_uv(self.install_root, with_tool_path(), self.log)
-        validation = _load_release_validation(self.install_root)
+        validation = _load_release_validation(self.install_root, staging)
         retention = validation.retain_previous_assets(
             staging / "web" / "dist",
             self.install_root / "web" / "dist",
@@ -733,7 +736,7 @@ class Updater:
         safe_extract_zip(zip_path, extract_to)
         staging = unwrap_staging(extract_to)
         try:
-            validation = _load_release_validation(self.install_root)
+            validation = _load_release_validation(self.install_root, staging)
             report = validation.validate_release_tree(staging, self.to_version)
         except Exception as exc:
             if isinstance(exc, UpdateError):

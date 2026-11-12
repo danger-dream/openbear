@@ -14,15 +14,18 @@ ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / 'node/bin'
 
 SCRIPT = r'''#!/bin/sh
-# openbear-node installer.
+# openbear-node installer, for systemd Linux, macOS and OpenWrt (procd; Kwrt, ImmortalWrt...).
 # Usage: sh install.sh --url URL --code CODE [--fingerprint SHA256] [--backup URL] [--node ID] [--force] [--no-exec] [--no-terminal] [--browser] [--stage STAGE]
+#        [--pin SHA256] [--backup-pin SHA256] [--front] [--binary PATH]
 # STAGE is all (default) or one of check, download, enroll, service; the
 # controller runs them one by one over SSH to show progress.
 # A machine already running openbear-node as another node (its config names
 # a node id other than --node) is left alone unless --force is given.
 # With --fingerprint the node enrolls only with a controller of that identity key.
+# A front (--front) reaches the controller only through its exits, whose certificates --pin and
+# --backup-pin name, and fetches nothing: --binary is the node program the controller sent here.
 set -eu
-URL=""; BACKUP=""; CODE=""; FINGERPRINT=""; FLAGS=""; STAGE="all"; NODE=""; FORCE=""
+URL=""; BACKUP=""; CODE=""; FINGERPRINT=""; FLAGS=""; STAGE="all"; NODE=""; FORCE=""; BINARY=""; ACCESS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) URL="$2"; shift 2 ;;
@@ -33,6 +36,9 @@ while [ $# -gt 0 ]; do
     --node) NODE="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --no-exec|--no-terminal|--browser) FLAGS="$FLAGS $1"; shift ;;
+    --pin|--backup-pin) ACCESS="$ACCESS $1 $2"; shift 2 ;;
+    --front) ACCESS="$ACCESS --front"; shift ;;
+    --binary) BINARY="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,7 +64,25 @@ esac
 LABEL=com.openbear.node
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 CONF=/etc/openbear-node/config.json
+# OpenWrt: procd starts an init script; a firmware upgrade keeps only what keep.d lists.
+OPENWRT=""
+[ "$OS" = linux ] && [ -f /etc/openwrt_release ] && OPENWRT=1
+INIT=/etc/init.d/openbear-node
+KEEP=/lib/upgrade/keep.d/openbear-node
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+# The node's own service: stop before replacing the program, start again after a refused enroll.
+service_do() {
+  if [ "$OS" = darwin ]; then
+    if [ "$1" = stop ]; then launchctl bootout "system/$LABEL" 2>/dev/null || true; else [ -f "$PLIST" ] && launchctl bootstrap system "$PLIST" 2>/dev/null || true; fi
+  elif [ -n "$OPENWRT" ]; then
+    [ -x "$INIT" ] && "$INIT" "$1" 2>/dev/null || true
+  else
+    systemctl "$1" openbear-node 2>/dev/null || true
+  fi
+}
+if [ -n "$OPENWRT" ]; then
+  case "$FLAGS" in *--browser*) echo "no browser on OpenWrt: its musl system cannot run Chrome"; FLAGS=$(echo "$FLAGS" | sed 's/ --browser//g') ;; esac
+fi
 if stage check; then
   step check
   [ "$(id -u)" = 0 ] || { echo "openbear-node must be installed as root (use sudo)" >&2; exit 1; }
@@ -74,10 +98,19 @@ if stage check; then
     fi
   fi
   [ -n "$SUM" ] || { echo "the controller has no openbear-node build for $OS-$ARCH" >&2; exit 1; }
-  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || { echo "curl or wget is required" >&2; exit 1; }
+  [ -n "$BINARY" ] || command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || { echo "curl or wget is required" >&2; exit 1; }
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 1; }
   if [ "$OS" = darwin ]; then
     echo "arch=$ARCH macos=$(sw_vers -productVersion)"
+  elif [ -n "$OPENWRT" ]; then
+    echo "arch=$ARCH openwrt=$(. /etc/openwrt_release; echo "$DISTRIB_ID $DISTRIB_RELEASE" | tr ' ' '_')"
+    # The mesh needs these; the rest of the node runs without them.
+    MISSING=""
+    [ -c /dev/net/tun ] || grep -qw tun /proc/modules 2>/dev/null || MISSING="$MISSING kmod-tun"
+    ip -V 2>&1 | grep -q iproute2 || MISSING="$MISSING ip-full"
+    command -v nft >/dev/null 2>&1 || MISSING="$MISSING nftables"
+    command -v iptables >/dev/null 2>&1 || MISSING="$MISSING iptables-nft"
+    [ -z "$MISSING" ] || echo "the mesh needs:$MISSING (opkg update && opkg install$MISSING)"
   else
     echo "arch=$ARCH systemd=$([ -d /run/systemd/system ] && echo yes || echo no)"
   fi
@@ -92,29 +125,34 @@ fetch() {
 if stage download; then
   step download
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-  fetch "$URL" "$TMP/openbear-node" || { [ -n "$BACKUP" ] && echo "primary address failed, trying backup" && fetch "$BACKUP" "$TMP/openbear-node"; } \
-    || { echo "cannot download the node from the controller" >&2; exit 1; }
-  [ "$(sha256 "$TMP/openbear-node")" = "$SUM" ] || { echo "download checksum mismatch" >&2; exit 1; }
-  if [ "$OS" = darwin ]; then
-    launchctl bootout "system/$LABEL" 2>/dev/null || true
-    mkdir -p /usr/local/bin
+  if [ -n "$BINARY" ]; then
+    mv "$BINARY" "$TMP/openbear-node" || { echo "the node program sent by the controller is missing" >&2; exit 1; }
   else
-    systemctl stop openbear-node 2>/dev/null || true
+    fetch "$URL" "$TMP/openbear-node" || { [ -n "$BACKUP" ] && echo "primary address failed, trying backup" && fetch "$BACKUP" "$TMP/openbear-node"; } \
+      || { echo "cannot download the node from the controller" >&2; exit 1; }
   fi
-  install -m 0755 "$TMP/openbear-node" /usr/local/bin/openbear-node
+  [ "$(sha256 "$TMP/openbear-node")" = "$SUM" ] || { echo "download checksum mismatch" >&2; exit 1; }
+  mkdir -p /usr/local/bin
+  # Written in full beside the old program while that still runs: a full disk leaves the node running.
+  # OpenWrt has no install(1).
+  cp "$TMP/openbear-node" /usr/local/bin/.openbear-node.new && chmod 0755 /usr/local/bin/.openbear-node.new \
+    || { rm -f /usr/local/bin/.openbear-node.new; echo "cannot write /usr/local/bin (disk full?)" >&2; exit 1; }
+  service_do stop
+  if ! mv -f /usr/local/bin/.openbear-node.new /usr/local/bin/openbear-node; then
+    rm -f /usr/local/bin/.openbear-node.new
+    [ -f "$CONF" ] && service_do start
+    echo "cannot replace /usr/local/bin/openbear-node; the node that was installed here is started again" >&2
+    exit 1
+  fi
 fi
 if stage enroll; then
   step enroll
   [ -n "$CODE" ] || { echo "--code is required" >&2; exit 2; }
   # In the environment, which a node build from before fingerprints ignores.
-  if ! OPENBEAR_CONTROLLER_FINGERPRINT="$FINGERPRINT" /usr/local/bin/openbear-node enroll --url "$URL" ${BACKUP:+--backup "$BACKUP"} --code "$CODE" $FLAGS; then
+  if ! OPENBEAR_CONTROLLER_FINGERPRINT="$FINGERPRINT" /usr/local/bin/openbear-node enroll --url "$URL" ${BACKUP:+--backup "$BACKUP"} --code "$CODE" $FLAGS $ACCESS; then
     # Refused (an expired code, a typo): a node that ran here keeps its config and starts again.
     if [ -f "$CONF" ]; then
-      if [ "$OS" = darwin ]; then
-        [ -f "$PLIST" ] && launchctl bootstrap system "$PLIST" 2>/dev/null || true
-      else
-        systemctl start openbear-node 2>/dev/null || true
-      fi
+      service_do start
       echo "enroll failed; the node that was installed here is started again" >&2
     fi
     exit 1
@@ -145,6 +183,43 @@ PLIST
     launchctl bootout "system/$LABEL" 2>/dev/null || true
     launchctl bootstrap system "$PLIST"
     launchctl enable "system/$LABEL"
+    echo "openbear-node installed and started"
+  elif [ -n "$OPENWRT" ]; then
+    # Like the systemd unit: restarted 5 s after it exits, without limit; stopping it ends the
+    # node alone, not what was started from a web terminal. Before the mesh (START=99).
+    cat > "$INIT" <<'INIT'
+#!/bin/sh /etc/rc.common
+# OpenBear node
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/local/bin/openbear-node run --config /etc/openbear-node/config.json
+	procd_set_param env HOME=/root
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+INIT
+    chmod 0755 "$INIT"
+    mkdir -p "$(dirname "$KEEP")"
+    cat > "$KEEP" <<'KEEP'
+/usr/local/bin/openbear-node
+/etc/openbear-node/
+/etc/init.d/openbear-node
+/etc/rc.d/S95openbear-node
+/etc/rc.d/K10openbear-node
+/etc/init.d/openbear-mesh
+/etc/rc.d/S99openbear-mesh
+/etc/rc.d/K10openbear-mesh
+/lib/upgrade/keep.d/openbear-node
+KEEP
+    "$INIT" enable
+    "$INIT" stop >/dev/null 2>&1 || true
+    "$INIT" start
     echo "openbear-node installed and started"
   elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     cat > /etc/systemd/system/openbear-node.service <<'UNIT'
@@ -187,20 +262,24 @@ def local_manifest():
 
 
 def local_problem(value=None):
-    """Why the build in node/bin is passed over: 'invalid', 'protocol', 'features', or '' (used, or none there)."""
+    """Why the build in node/bin is passed over: 'invalid', 'protocol', 'features', 'older'
+    (than the GitHub release the last check picked), or '' (used, or none there)."""
     from app.servers import releases
     value = local_manifest() if value is None else value
     if not value:
         return ''
     if not releases.valid_manifest(value, local=True):
         return 'invalid'
-    return releases.problem(value, local=True)
+    if reason := releases.problem(value, local=True):
+        return reason
+    picked = releases.cached_manifest().get('version', '')
+    return 'older' if picked and releases.newer(picked, str(value.get('version') or '')) else ''
 
 
 def manifest():
     """The node build installs and updates use: a local one in node/bin (a development
-    checkout) when it speaks this controller's protocol and has what it needs, else the
-    GitHub release the last check picked."""
+    checkout) when it speaks this controller's protocol, has what it needs and is not older
+    than the GitHub release the last check picked; else that release."""
     from app.servers import releases
     value = local_manifest()
     if value and not local_problem(value):
@@ -370,12 +449,20 @@ def fingerprint(controller_key):
     return hashlib.sha256(base64.b64decode(controller_key)).hexdigest()
 
 
-def arguments(url, code, backup='', stage='all', *, browser=False, node='', force=False, fingerprint=''):
+def arguments(url, code, backup='', stage='all', *, browser=False, node='', force=False, fingerprint='', pin='', backup_pin='', front=False, binary=''):
     parts = ['--url', url.rstrip('/'), '--code', code]
     if fingerprint:
         parts += ['--fingerprint', fingerprint]
     if backup:
         parts += ['--backup', backup.rstrip('/')]
+    if pin:
+        parts += ['--pin', pin]
+    if backup and backup_pin:
+        parts += ['--backup-pin', backup_pin]
+    if front:
+        parts += ['--front']
+    if binary:
+        parts += ['--binary', binary]
     if node:
         parts += ['--node', node]
     if force:

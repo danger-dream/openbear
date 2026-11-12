@@ -63,6 +63,7 @@ type Page struct {
 	setupTasks        *omap[string, *task]
 	failedSessions    map[string]bool
 	snapshot          string
+	documentID        string
 	refs              map[string]refEntry
 	life              *omap[lifeKey, map[string]bool]
 	navigationStatus  *omap[lifeKey, any]
@@ -96,7 +97,7 @@ func newPage(e *Engine, target string) *Page {
 		navigationFailed: newEvent(), errorBinding: "__obError_" + uuidHex(),
 		downloads: newOmap[int, *download](), modifiers: map[string]bool{}, pressed: map[string]bool{},
 		scripts: map[string]any{}, observerSessions: newOmap[string, string](), bindingLocks: map[string]*aLock{},
-		bindingTasks: map[string]*task{},
+		bindingTasks: map[string]*task{}, documentID: uuidHex(),
 	}
 	p.obs = newObservations(p)
 	return p
@@ -118,6 +119,9 @@ func (p *Page) url() any {
 }
 
 func (p *Page) invalidateRefs() {
+	// Any frame epoch/context change invalidates cross-snapshot identity; a new id also tells a
+	// page recreated at the same URL apart.
+	p.documentID = uuidHex()
 	p.snapshot = ""
 	p.refs = map[string]refEntry{}
 }

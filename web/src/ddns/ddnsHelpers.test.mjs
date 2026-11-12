@@ -153,3 +153,23 @@ test('times, TTL and error texts', () => {
   assert.equal(h.eventTone('write'), 'ok');
   assert.equal(h.eventTone('check'), '');
 });
+
+test('a sync failing and retried needs attention; a machine\'s own names leave out the ones it only backs up', () => {
+  assert.equal(h.needsAttention({state: 'pending', failCount: 3, errorCode: 'network'}), true);
+  assert.equal(h.needsAttention({state: 'pending', failCount: 0}), false);
+  const list = [record(), record({id: 'r2', type: 'AAAA'}), record({id: 'r3', name: 'b.example.com', source: {kind: 'node', serverId: 'la', method: 'url'}, backup: {serverId: 'home', afterS: 300}}),
+    record({id: 'r4', name: 'fixed.example.com', source: {kind: 'fixed', serverId: '', fixed: '192.0.2.1'}})];
+  assert.deepEqual(h.serverDomains(list, 'home'), ['home.example.com']);
+  assert.deepEqual(h.serverDomains(list, 'la'), ['b.example.com']);
+});
+
+test('provider options do not leak across equal keys or account selection', () => {
+  const form = {...h.emptyForm('home'), names: 'new.example.com', providerOptions: {
+    aliyun: {line: 'telecom'}, dnspod: {line: '联通'}, cloudflare: {proxied: 'off'},
+  }};
+  assert.deepEqual(h.previewBody(form).optionsByProvider, {aliyun: {line: 'telecom'}, dnspod: {line: '联通'}, cloudflare: {proxied: false}});
+  const accounts = [{id: 'ali', type: 'aliyun'}, {id: 'dp', type: 'dnspod'}, {id: 'cf', type: 'cloudflare'}];
+  const rows = accounts.map(a => ({name: a.id + '.example.com', type: 'A', action: 'new', accountId: a.id}));
+  assert.deepEqual(h.createBody(form, rows, new Set(), {}, accounts).rows.map(r => r.options), [{line: 'telecom'}, {line: '联通'}, {proxied: false}]);
+  assert.deepEqual(h.createBody(form, rows, new Set(), {'ali.example.com': 'dp'}, accounts).rows[0].options, {line: '联通'});
+});

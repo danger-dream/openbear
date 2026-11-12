@@ -444,6 +444,8 @@ func endRecordedBrowser(dir string) bool {
 	return true
 }
 
+func chromeRunsHere() bool { return true }
+
 func checkLibraries(string) error { return nil }
 
 type closerFunc func() error

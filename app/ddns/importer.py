@@ -90,7 +90,7 @@ def parse(text):
             block = conf.get(family) if isinstance(conf.get(family), dict) else {}
             if not block.get('enable'):
                 continue
-            method, params, notes = _method(block, model.TYPES[rtype])
+            method, params, notes = _method(block, model.TYPES[rtype], str(conf.get('httpinterface') or '').strip())
             out['warnings'] += [f'{label}：{n}' for n in notes]
             for raw in block.get('domains') or []:
                 count += 1
@@ -155,7 +155,8 @@ def _callback(fields, url, body):
     return creds, notes
 
 
-def _method(block, family):
+def _method(block, family, http_iface=''):
+    """http_iface: the group's httpinterface, the network card its interface queries go out of."""
     kind = str(block.get('gettype') or 'url')
     params = model.default_params()
     notes = []
@@ -176,6 +177,13 @@ def _method(block, family):
     if len(urls) > model.MAX_URLS:
         notes.append(f'查询地址超过 {model.MAX_URLS} 个，只保留前 {model.MAX_URLS} 个')
     params['urls'] = urls[:model.MAX_URLS]
+    # ddns-go goes out of the default card when it cannot bind to this one; so does the import.
+    try:
+        params['bindIface'] = '' if '://' in http_iface else model._iface(http_iface)
+    except model.DdnsError:
+        pass
+    if http_iface and not params['bindIface']:
+        notes.append(f'httpinterface「{http_iface[:64]}」不是网卡名称，已忽略，查询从默认网卡发出')
     return 'url', params, notes
 
 

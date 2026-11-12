@@ -10,7 +10,7 @@ import pytest
 from app.servers import mesh as mesh_module
 from app.servers import mesh_model as model
 from app.servers import mesh_status
-from app.servers.mesh_config import build, config_hash, exports, gateway_routes
+from app.servers.mesh_config import build, config_hash, exports, gateway_routes, route_plan
 from app.webhooks.repository import one
 from tests.test_mesh_config import doc, facts, member, own_keys
 from tests.test_mesh_service import mesh_setup, settled
@@ -133,9 +133,14 @@ def test_gateway_routes_and_exports_with_all():
     assert exports(d)[1]['nodes'] == ['r1', 'm1', 'gw', 'r2', 'm3']
     d['members'][5]['removing'] = True
     assert exports(d)[1]['nodes'] == ['r1', 'm1', 'gw', 'r2']
-    # A machine that already routes the subnet elsewhere (local over a VPN) is still left out.
+    # A machine that already routes the subnet elsewhere (local over a VPN) still gets it, taking that route
+    # over; one keeping its own route (keepRoutes) is left out.
     held = {**facts(), 'm1': {**facts()['m1'], 'hostRoutes': [{'net': '10.20.20.0/24', 'dev': 'wg9'}]}}
+    assert gateway_routes(d, held)['m1'] == ['10.20.20.0/24']
+    assert route_plan(d, held)[2] == {'m1': [('10.20.20.0/24', '10.20.20.0/24', 'wg9')]}
+    d['members'][1]['keepRoutes'] = ['10.20.20.0/24']
     assert gateway_routes(d, held)['m1'] == []
+    assert route_plan(d, held)[1] == {'m1': [('10.20.20.0/24', '10.20.20.0/24', 'wg9')]}
 
 
 # ----- events -----

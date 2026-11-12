@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"openbear/node/mesh/bypass"
 	"openbear/node/mesh/wire"
 )
 
@@ -39,9 +41,11 @@ type session struct {
 	ready         bool
 	cost          int
 	// opened: when an inbound connection was accepted; evicted: closed to
-	// give its slot to another source's (accept).
-	opened  time.Time
-	evicted bool
+	// give its slot to another source's (accept); companionOnly: let in
+	// past the path limit, so only as a companion.
+	opened        time.Time
+	evicted       bool
+	companionOnly bool
 	// version is the mesh protocol the frames are in: the newest both
 	// ends' preambles allow.
 	version int
@@ -52,6 +56,15 @@ type session struct {
 	replaced bool
 	next     *session
 	err      error
+	// companion.go: a stream's companion and a companion's stream; token
+	// names the stream to its accepting end; keep: its dialing end keeps
+	// a companion beside it.
+	companion, parent *session
+	token             [32]byte
+	keep              bool
+	// peerLarge: the other end has said it takes large frames while this
+	// stream was open (SetPeerLarge).
+	peerLarge bool
 }
 
 func newListener(transport string, port int, dir string) (*listener, error) {
@@ -67,7 +80,8 @@ func newListener(transport string, port int, dir string) (*listener, error) {
 	if err := checkIPv4Free("tcp", port); err != nil {
 		return nil, err
 	}
-	l, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(port)))
+	lc := net.ListenConfig{Control: bypass.Control}
+	l, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort("", strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +125,7 @@ func (b *Bind) SetPins(s string, pins []string) {
 	b.pins[key] = set
 	if ep := b.paths[key]; ep != nil {
 		if ep.current != nil && (set.err != nil || !slices.Contains(set.values, ep.stats.FingerprintSHA256)) {
-			ep.current.conn.Close()
+			closeConn(ep.current.conn)
 		}
 		if set.err != nil {
 			ep.stats.LastError = set.err.Error()
@@ -172,23 +186,31 @@ func (b *Bind) accept(r *bindRun, l *listener) {
 				}
 			}
 		}
-		if b.run != r || r.listeners[l.transport] != l || len(r.sessions) >= lim.paths || (waiting >= lim.unauth && victim == nil) || from >= unauthPerSource || r.socketBytes-freed+cost > lim.socketBytes {
+		// With every path taken it may still be a companion of one, which
+		// it says only after the handshake (acceptHello).
+		if b.run != r || r.listeners[l.transport] != l || (waiting >= lim.unauth && victim == nil) || from >= unauthPerSource || r.socketBytes-freed+cost > lim.socketBytes {
 			b.mu.Unlock()
 			c.Close()
 			continue
 		}
 		if victim != nil {
 			victim.evicted = true
-			victim.conn.Close()
+			closeConn(victim.conn)
 		}
 		cert := l.cert
 		ep.stats.CertificateID = l.certificateID
 		if cert != nil {
 			c = tls.Server(c, &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13, SessionTicketsDisabled: true})
 		}
-		ss := &session{conn: c, ep: ep, listener: l, cost: cost, done: make(chan struct{}), opened: time.Now()}
+		ss := &session{conn: c, ep: ep, listener: l, cost: cost, done: make(chan struct{}), opened: time.Now(),
+			companionOnly: len(r.sessions)-r.overPaths >= lim.paths}
+		if ss.companionOnly {
+			r.overPaths++
+		}
 		ep.current = ss
-		b.newGeneration(ep)
+		// A path once it says it is a stream, not a companion (serve).
+		b.initPath(ep)
+		ep.generation++
 		r.sessions[ss] = true
 		r.unauth++
 		r.socketBytes += cost
@@ -217,7 +239,7 @@ func (b *Bind) serve(r *bindRun, s *session) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		if !s.authenticated {
-			s.conn.Close()
+			closeConn(s.conn)
 		}
 	})
 	defer timer.Stop()
@@ -236,19 +258,34 @@ func (b *Bind) serve(r *bindRun, s *session) {
 		b.pathError(s.ep, err)
 		return
 	}
+	if v < companionVersion && s.companionOnly {
+		b.pathError(s.ep, errPathsFull)
+		return
+	}
+	if v >= companionVersion {
+		joined, err := b.acceptHello(r, s)
+		if joined {
+			if err == nil {
+				b.readCompanion(r, s)
+			}
+			return
+		}
+		if err != nil {
+			b.pathError(s.ep, err)
+			return
+		}
+	}
 	b.mu.Lock()
 	s.version = v
 	s.ready = true
+	if b.run == r && !s.ep.retired {
+		b.ids[s.ep.id] = s.ep
+	}
 	b.event(PathEvent{Kind: "connected", Path: b.info(s.ep, 0, time.Time{})})
 	b.mu.Unlock()
 	if err := b.readStream(r, s); err != nil {
 		b.pathError(s.ep, err)
 	}
-}
-
-func exchangePreamble(c net.Conn) error {
-	_, err := exchangeVersions(c, wire.Local())
-	return err
 }
 
 // exchangeVersions sends the preamble naming the newest protocol of local
@@ -384,7 +421,7 @@ func (b *Bind) dial(ctx context.Context, r *bindRun, ep *endpoint) {
 // connect returns the connection it made, if any, once that has ended.
 func (b *Bind) connect(ctx context.Context, r *bindRun, ep *endpoint, pins pinSet) (*session, error) {
 	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
-	c, err := d.DialContext(ctx, "tcp", ep.remoteAddr().String())
+	c, err := bypass.DialMesh(ctx, d, ep.remoteAddr().String())
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +431,7 @@ func (b *Bind) connect(ctx context.Context, r *bindRun, ep *endpoint, pins pinSe
 		return nil, err
 	}
 	b.mu.Lock()
-	if b.run != r || ep.retired || ctx.Err() != nil || len(r.sessions) >= b.opt.limits().paths || r.socketBytes+cost > b.opt.limits().socketBytes {
+	if b.run != r || ep.retired || ctx.Err() != nil || len(r.sessions)-r.overPaths >= b.opt.limits().paths || r.socketBytes+cost > b.opt.limits().socketBytes {
 		b.mu.Unlock()
 		c.Close()
 		return nil, ErrBackpressure
@@ -436,6 +473,11 @@ func (b *Bind) connect(ctx context.Context, r *bindRun, ep *endpoint, pins pinSe
 	if err != nil {
 		return s, err
 	}
+	if v >= companionVersion {
+		if s.token, err = dialHello(c); err != nil {
+			return s, err
+		}
+	}
 	b.mu.Lock()
 	s.version = v
 	if b.run != r || ep.retired {
@@ -462,7 +504,7 @@ func (b *Bind) connect(ctx context.Context, r *bindRun, ep *endpoint, pins pinSe
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		if !s.authenticated {
-			s.conn.Close()
+			closeConn(s.conn)
 		}
 	})
 	defer timer.Stop()
@@ -470,42 +512,85 @@ func (b *Bind) connect(ctx context.Context, r *bindRun, ep *endpoint, pins pinSe
 	return s, err
 }
 
+// streamReadDeadline retains SetReadDeadline's error/close behavior even when
+// the next read is fully buffered. A zero deadline needs no clock reading and
+// is safe only when that read cannot reach the underlying connection. The
+// next potentially blocking read always installs its own deadline.
+func streamReadDeadline(c net.Conn, reader io.Reader, n int, timeout time.Duration) error {
+	if r, ok := reader.(*bufio.Reader); ok && r.Buffered() >= n {
+		return c.SetReadDeadline(time.Time{})
+	}
+	return c.SetReadDeadline(time.Now().Add(timeout))
+}
+
 func (b *Bind) readStream(r *bindRun, s *session) error {
+	reader, release := b.streamReader(r, s)
+	defer release()
+	b.keepAlive(r, s)
 	for {
 		b.mu.Lock()
-		limit := receiveLimit(b.opt.MTU)
+		limit := b.streamReceiveLimit(s)
 		b.mu.Unlock()
-		if err := s.conn.SetReadDeadline(time.Now().Add(180 * time.Second)); err != nil {
+		if err := streamReadDeadline(s.conn, reader, 3, idleLimit(s)); err != nil {
 			return err
 		}
-		n, plane, err := readFrameHeader(s.conn, limit)
+		n, plane, err := readFrameHeader(reader, limit)
 		if err != nil {
 			return err
 		}
-		if err = s.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		if err = streamReadDeadline(s.conn, reader, n, 5*time.Second); err != nil {
 			return err
 		}
 		if !knownPlane(plane) {
 			// A plane of a later protocol: skipped, the stream goes on.
-			if _, err = io.CopyN(io.Discard, s.conn, int64(n)); err != nil {
+			if _, err = io.CopyN(io.Discard, reader, int64(n)); err != nil {
 				return err
 			}
 			continue
 		}
-		buf := make([]byte, n)
-		if _, err = io.ReadFull(s.conn, buf); err != nil {
+		p := received{ep: s.ep, session: s, plane: plane, pooled: pooledFrame(r, s, plane, n)}
+		var buf []byte
+		if p.pooled {
+			buf = b.largeBuffer(r)[:n]
+		} else {
+			buf = make([]byte, n)
+		}
+		if _, err = io.ReadFull(reader, buf); err != nil {
+			b.dropFrame(r, received{pooled: p.pooled, data: buf})
 			return err
 		}
-		b.enqueue(r, received{ep: s.ep, session: s, plane: plane}, buf)
+		if plane == 1 {
+			b.enqueueOwned(r, p, buf)
+		} else if err = b.enqueueData(r, s, p, buf); err != nil {
+			// Failing, enqueueData did not queue buf.
+			b.dropFrame(r, received{pooled: p.pooled, data: buf})
+			return err
+		}
 	}
 }
 
 func (b *Bind) finish(r *bindRun, s *session) {
 	s.closed.Store(true)
 	s.conn.Close()
+	if s.parent != nil {
+		b.leaveStream(r, s)
+		close(s.done)
+		return
+	}
 	b.mu.Lock()
+	if c := s.companion; c != nil {
+		c.closed.Store(true)
+		closeConn(c.conn)
+	}
+	if r.tokens[s.token] == s {
+		delete(r.tokens, s.token)
+	}
 	delete(r.sessions, s)
 	r.socketBytes -= s.cost
+	if s.companionOnly {
+		s.companionOnly = false
+		r.overPaths--
+	}
 	if s.replaced {
 		// The path goes on over another connection.
 		b.mu.Unlock()

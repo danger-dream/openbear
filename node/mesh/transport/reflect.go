@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
+
+	"openbear/node/mesh/bypass"
 )
 
 // Reflector messages are reflectSize bytes and anything of another size is
@@ -246,11 +248,13 @@ func (b *Bind) SendTest(target netip.AddrPort, id [8]byte, sender byte) error {
 	if !target.Addr().Unmap().Is4() {
 		network = "udp6"
 	}
-	c, err := net.ListenUDP(network, nil)
+	lc := net.ListenConfig{Control: bypass.MeshControl}
+	pc, err := lc.ListenPacket(context.Background(), network, ":0")
 	if err != nil {
 		testSenders.Add(-1)
 		return err
 	}
+	c := pc.(*net.UDPConn)
 	p := make([]byte, reflectSize)
 	copy(p, reflectMagic)
 	p[4] = reflectTest

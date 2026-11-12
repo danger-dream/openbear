@@ -15,6 +15,10 @@ const KINDS = {entry: '入口', relay: '中转互联', direct: '直连', rule: '
 const find = (work, id) => (work?.members || []).find(m => m.serverId === id);
 const samePair = (p, a, b) => (p.a === a && p.b === b) || (p.a === b && p.b === a);
 const openOn = (m, allowed = TRANSPORTS.map(([t]) => t)) => allowed.filter(t => listens(m, t));
+// A front (前置机) is to reach nothing beyond its exits and its lines carry no UDP by default:
+// anything that touches one prefers TLS.
+const isFront = m => Boolean(m?.front?.length);
+const FRONT_ORDER = ['tls', 'tcp', 'udp'];
 
 // What dragging from one node to another makes, or why it makes nothing.
 export function planLink(work, fromId, toId, tool = 'select') {
@@ -34,19 +38,21 @@ export function planLink(work, fromId, toId, tool = 'select') {
     const used = new Set(cands.filter(c => c.relay === relay.serverId).map(c => c.transport));
     // A site relay is reached by punching: UDP only.
     if (isSite(relay)) return used.has('udp') ? {error: `${member.name} 已经有到 ${relay.name} 的入口（站点中转只能打洞连接）`} : {kind, member: member.serverId, relay: relay.serverId, transport: 'udp'};
-    const open = openOn(relay);
-    const transport = open.find(t => !used.has(t)) || (used.size ? '' : 'udp');
+    const open = isFront(member) || isFront(relay) ? openOn(relay, FRONT_ORDER) : openOn(relay);
+    const transport = open.find(t => !used.has(t)) || (used.size ? '' : isFront(member) || isFront(relay) ? 'tls' : 'udp');
     if (!transport) return {error: `${relay.name} 开启的传输方式都已经是 ${member.name} 的入口`};
     return {kind, member: member.serverId, relay: relay.serverId, transport};
   }
   if (kind === 'relay') {
     if (!ra || !rb) return {error: `中转互联的两端都要是中转，${(ra ? b : a).name} 不是`};
-    if (work.relayLinks?.mode !== 'custom') return {error: '所有中转已经两两相连。要单独设置，先选中一条中转连线，关掉“所有中转两两相连”'};
+    if ((work.relayLinks?.mode || 'full') === 'full') return {error: '所有中转已经两两相连。要单独设置，先选中一条中转连线，关掉“所有中转两两相连”'};
     if ((work.relayLinks.pairs || []).some(p => samePair(p, a.serverId, b.serverId))) return {error: `${a.name} 和 ${b.name} 已经连着`};
     // Two site relays punch (UDP); a site relay dials the public one.
     if (isSite(a) && isSite(b)) return {kind, a: a.serverId, b: b.serverId, transport: 'udp', punch: true};
-    const dialer = isSite(b) && !isSite(a) ? 'b' : 'a', passive = dialer === 'a' ? b : a;
-    return {kind, a: a.serverId, b: b.serverId, transport: openOn(passive)[0] || 'udp', dialer};
+    // A front dials its own exit; a site relay dials a public one.
+    const front = isFront(a) || isFront(b);
+    const dialer = b.front?.includes(a.serverId) || (isSite(b) && !isSite(a)) ? 'b' : 'a', passive = dialer === 'a' ? b : a;
+    return {kind, a: a.serverId, b: b.serverId, transport: (front ? openOn(passive, FRONT_ORDER) : openOn(passive))[0] || (front ? 'tls' : 'udp'), dialer};
   }
   if (kind === 'direct') {
     if (ra || rb) return {error: `直连只用于两台普通成员，${(ra ? a : b).name} 是中转；成员连中转用“入口”`};
@@ -79,6 +85,61 @@ export function addLink(work, plan) {
   work.rules.push(rule);
   return {kind: 'rule', id: rule.id};
 }
+// A server turned into a relay, or back into a member, keeps what it was linked with as the links its new
+// role has. As a relay: its direct links become an entry of the member at the other end (put last, so
+// that member keeps the entry it uses), its own entries relay links it dials. As a member: its relay
+// links become its entries, and the members entering through it get a direct link to it instead.
+// Call before the role changes. Returns the names of what moved: {entries, links, directs}.
+export function changeRole(work, id, relay) {
+  const m = find(work, id), out = {entries: [], links: [], directs: []};
+  if (!m) return out;
+  const blank = () => ({mode: 'fixed', candidates: [], autoReturn: true});
+  const has = (x, relayId, transport) => x.entry.candidates.some(c => c.relay === relayId && c.transport === transport);
+  if (relay) {
+    work.directLinks = (work.directLinks || []).filter(p => {
+      if (p.a !== id && p.b !== id) return true;
+      const other = find(work, p.a === id ? p.b : p.a);
+      if (!other || isRelay(other)) return false;
+      other.entry ||= blank();
+      const transport = listens(m, p.transport) ? p.transport : openOn(m)[0];
+      if (transport && other.entry.candidates.length < MAX_CANDIDATES && !has(other, id, transport)) {
+        other.entry.candidates.push({id: uid('c'), relay: id, transport});
+        out.entries.push(other.name);
+      }
+      return false;
+    });
+    // Every pair of relays is linked anyway in full mode.
+    if (work.relayLinks?.mode === 'custom') for (const c of m.entry?.candidates || []) {
+      const r = find(work, c.relay);
+      if (!r || !isRelay(r) || r === m || work.relayLinks.pairs.some(p => samePair(p, id, c.relay))) continue;
+      work.relayLinks.pairs.push({a: id, b: c.relay, transport: isSite(r) ? 'udp' : c.transport, cost: 1, dialer: 'a'});
+      out.links.push(r.name);
+    }
+    return out;
+  }
+  if (work.relayLinks?.mode === 'custom') work.relayLinks.pairs = work.relayLinks.pairs.filter(p => {
+    if (p.a !== id && p.b !== id) return true;
+    const r = find(work, p.a === id ? p.b : p.a), transport = isSite(r) ? 'udp' : p.transport;
+    m.entry ||= blank();
+    if (r && m.entry.candidates.length < MAX_CANDIDATES && !has(m, r.serverId, transport)) {
+      m.entry.candidates.push({id: uid('c'), relay: r.serverId, transport});
+      out.links.push(r.name);
+    }
+    return false;
+  });
+  // Automatic and every-pair links: what was set on its links goes with the role.
+  else if (work.relayLinks?.pairs) work.relayLinks.pairs = work.relayLinks.pairs.filter(p => p.a !== id && p.b !== id);
+  for (const x of work.members) {
+    if (x === m || isRelay(x) || !x.entry?.candidates?.some(c => c.relay === id)) continue;
+    const mine = x.entry.candidates.filter(c => c.relay === id);
+    x.entry.candidates = x.entry.candidates.filter(c => c.relay !== id);
+    if ((work.directLinks || []).some(p => samePair(p, x.serverId, id))) continue;
+    work.directLinks = [...(work.directLinks || []), {a: x.serverId, b: id, transport: mine[0].transport, dialer: 'a'}];
+    if (mine[0].transport === 'udp') openUdp(work, [x.serverId, id]);
+    out.directs.push(x.name);
+  }
+  return out;
+}
 // Punching needs UDP listening on both ends; turn it on where it is off. Returns the names.
 function openUdp(work, ids) {
   const opened = [];
@@ -103,17 +164,23 @@ export function selectionTitle(sel, work, installing = []) {
   return `访问规则 ${(work?.rules || []).findIndex(r => r.id === sel.id) + 1}`;
 }
 
-// Every pair of relays when relay links are automatic.
+// The pairs of relays linked without being listed: every pair when all relays link to each other, but a front
+// only with its exits and site relays (mesh_config._default_pair). Automatic and custom links are all listed.
+const frontLinks = (a, b) => [[a, b], [b, a]].every(([f, o]) => !isFront(f) || f.front.includes(o.serverId) || isSite(o));
 export function relayPairs(work) {
   const relays = (work?.members || []).filter(m => isRelay(m) && !m.removing);
-  if (work?.relayLinks?.mode === 'custom') return [];
-  return relays.flatMap((a, i) => relays.slice(i + 1).map(b => [a.serverId, b.serverId]));
+  if ((work?.relayLinks?.mode || 'full') !== 'full') return [];
+  return relays.flatMap((a, i) => relays.slice(i + 1).filter(b => frontLinks(a, b)).map(b => [a.serverId, b.serverId]));
 }
-// Turning automatic relay links off keeps what they meant, minus one pair when deleting it.
+// Turning automatic relay links off keeps what they meant, minus one pair when deleting it: the listed links
+// as they are, and each pair linked without being listed as a new link whose fields the mesh still works out.
 export function customRelayLinks(work, without = null) {
-  const pairs = relayPairs(work).filter(([a, b]) => !without || !samePair({a, b}, ...without));
-  // A site relay dials the public one.
-  work.relayLinks = {mode: 'custom', pairs: pairs.map(([a, b]) => ({a, b, transport: 'udp', cost: 1, dialer: isSite(find(work, b)) && !isSite(find(work, a)) ? 'b' : 'a'}))};
+  const ids = new Set((work?.members || []).filter(m => isRelay(m) && !m.removing).map(m => m.serverId));
+  const listed = (work.relayLinks?.pairs || []).filter(p => p.a !== p.b && ids.has(p.a) && ids.has(p.b));
+  const added = relayPairs(work).filter(([a, b]) => !listed.some(p => samePair(p, a, b)))
+    // A site relay dials the public one.
+    .map(([a, b]) => ({a, b, transport: 'udp', cost: 1, dialer: isSite(find(work, b)) && !isSite(find(work, a)) ? 'b' : 'a', auto: ['transport', 'dialer', 'bias']}));
+  work.relayLinks = {mode: 'custom', pairs: [...listed, ...added].filter(p => !without || !samePair(p, ...without))};
 }
 
 // Who a rule side covers on the board: every member with all, else chosen members and members

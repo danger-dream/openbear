@@ -30,6 +30,7 @@ from app.instances.contracts import InstanceError
 from app.servers import http as servers_http
 from app.servers import hub as hub_module
 from app.servers import install as installer
+from app.servers import latency as lat_module
 from app.servers.metrics import MetricsStore
 from app.servers.profile import add_cycle, clean, period_start
 from app.servers.service import ServerService, node_url
@@ -479,6 +480,333 @@ async def test_traffic_modes_reset_monthly_and_metered_traffic_costs(env, monkey
     await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'traffic': {'mode': 'fixed'}}}, status=400)
 
 
+async def test_traffic_calibration_counts_on_from_the_providers_figure(env, monkeypatch):
+    e, G = env, 1024 ** 3
+    server_id = (await api(e, 'POST', '/api/servers', {'name': 'calibrated', 'profile': {'traffic': {'mode': 'fixed', 'resetDay': 1, 'limit': 500 * G, 'type': 'sum'}}}))['item']['id']
+    path = f'/api/servers/{server_id}/traffic/calibration'
+    # Nothing is counted without a node.
+    assert (await api(e, 'PUT', path, {'used': G}, status=409))['error'] == 'node_required'
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("INSERT INTO server_nodes VALUES(?,?,?,?,?,?)", (server_id, 123, base64.b64encode(b'c' * 32).decode(), '{}', 1, 0))
+    zone = await e.servers.zone()
+    period = dt.datetime.now(zone).date().replace(day=1)
+    period_ts = int(dt.datetime.combine(period, dt.time(), zone).timestamp())
+
+    # The node had counted 20 GB down and 10 GB up this period when calibrated, then 1 GB more each way.
+    counted, since = [20 * G, 10 * G], []
+
+    async def traffic(sid, start):
+        if start != period_ts:
+            since.append(start)
+            return (G, G)
+        return tuple(counted)
+    monkeypatch.setattr(e.servers.metrics, 'traffic_since', traffic)
+    view = (await api(e, 'PUT', path, {'used': 100 * G}))['item']['traffic']
+    assert view['used'] == 100 * G and view['calibrated']['used'] == 100 * G and (view['rx'], view['tx']) == (20 * G, 10 * G)
+    assert abs(view['calibrated']['atMs'] - time.time() * 1000) < 5000
+    counted[:] = [21 * G, 11 * G]
+    view = (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['traffic']
+    assert view['used'] == 102 * G and (view['rx'], view['tx']) == (21 * G, 11 * G) and not since
+    # Remaining is what is left of the limit.
+    assert (await api(e, 'PUT', path, {'remaining': 450 * G}))['item']['traffic']['used'] == 50 * G
+    counted[:] = [22 * G, 12 * G]
+    for bad in ({'remaining': 501 * G}, {'used': -1}, {'used': 1.5}, {'used': True}, {'used': 1, 'remaining': 2}, {}):
+        assert (await api(e, 'PUT', path, bad, status=400))['error'] == 'invalid_traffic_calibration'
+    # An edit of the profile keeps it, as does the editor saving the same traffic settings.
+    view = (await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'remark': 'x', 'traffic': {'mode': 'fixed', 'resetDay': 1, 'limit': 500 * G, 'type': 'sum'}}}))['item']['traffic']
+    assert view['used'] == 52 * G
+    # One saved before the period's count was kept with it counts on from its time.
+    prof = (await e.servers._profiles(123))[server_id]
+    legacy = {k: v for k, v in prof['trafficCalibration'].items() if k not in ('start', 'counted')}
+    await e.servers._write_profile(123, server_id, {**prof, 'trafficCalibration': legacy})
+    assert (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['traffic']['used'] == 52 * G and since == [legacy['at']]
+    await e.servers._write_profile(123, server_id, prof)
+    # Counted another way, it no longer holds: the larger direction of what the node counted.
+    view = (await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'traffic': {'type': 'max'}}}))['item']['traffic']
+    assert view['calibrated'] is None and view['used'] == 22 * G
+    await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'traffic': {'type': 'sum'}}})
+    # One from an earlier period is not carried into this one.
+    prof = (await e.servers._profiles(123))[server_id]
+    await e.servers._write_profile(123, server_id, {**prof, 'trafficCalibration': {**prof['trafficCalibration'], 'period': '2000-01-01'}})
+    assert (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['traffic']['calibrated'] is None
+    await api(e, 'PUT', path, {'used': 7 * G})
+    view = (await api(e, 'DELETE', path))['item']['traffic']
+    assert view['calibrated'] is None and view['used'] == 34 * G
+    assert 'trafficCalibration' not in (await e.servers._profiles(123))[server_id]
+    # Without a limit there is nothing to be remaining of.
+    await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'traffic': {'mode': 'unlimited'}}})
+    assert (await api(e, 'PUT', path, {'remaining': G}, status=409))['error'] == 'traffic_limit_required'
+
+
+async def test_traffic_calibrated_within_a_minute_counts_the_rest_of_it(env):
+    # From the 11-09 review: calibrated at 12:00:35, what the node counted until 12:01 was left out (it is
+    # counted by the minute, 12:00 starting before the calibration); nor may what came before it count again.
+    e, G = env, 1024 ** 3
+    server_id = (await api(e, 'POST', '/api/servers', {'name': 'mid-minute', 'profile': {'traffic': {'mode': 'fixed', 'resetDay': 1, 'limit': 500 * G, 'type': 'down'}}}))['item']['id']
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("INSERT INTO server_nodes VALUES(?,?,?,?,?,?)", (server_id, 123, base64.b64encode(b'n' * 32).decode(), '{}', 1, 0))
+    metrics = e.servers.metrics
+
+    def sample(rx):
+        return {'net': {'rx': rx, 'tx': 0}, 'boot': 100}
+    metrics.observe(server_id, sample(0))
+    metrics.observe(server_id, sample(100))
+    assert (await api(e, 'PUT', f'/api/servers/{server_id}/traffic/calibration', {'used': G}))['item']['traffic']['used'] == G
+    metrics.observe(server_id, sample(600))
+    assert (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['traffic']['used'] == G + 500
+    # The same once the minute is written.
+    metrics.pending.append((server_id, metrics.buckets.pop(server_id)))
+    await metrics.flush()
+    assert (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['traffic']['used'] == G + 500
+
+
+async def test_choosing_servers_for_the_tool_reads_no_listing(env, monkeypatch):
+    # From the 11-09 review: naming one server had the whole listing built first, every server's traffic read.
+    e = env
+    call = await _tool(e, 784, 'conv-targets')
+    first = (await api(e, 'POST', '/api/servers', {'name': 'b-node', 'profile': {'group': 'G'}}))['item']['id']
+    second = (await api(e, 'POST', '/api/servers', {'name': 'a-node', 'profile': {'group': 'G'}}))['item']['id']
+    await api(e, 'POST', '/api/servers', {'name': 'bare'})
+    async with e.db.write_transaction(label='test') as conn:
+        for sid in (first, second):
+            await conn.execute("INSERT INTO server_nodes VALUES(?,?,?,?,?,?)", (sid, 123, base64.b64encode(sid.encode()[:32].ljust(32, b'k')).decode(), '{}', 1, 0))
+    # The same servers, names and order as the listing.
+    listed = (await e.servers.list(123))['items']
+    picked = await e.servers.brief(123)
+    assert [(i['id'], i['name'], bool(i['node']), i['live'], i['profile']) for i in picked] == [(i['id'], i['name'], bool(i['node']), i['live'], i['profile']) for i in listed]
+
+    async def refused(*args, **kwargs):
+        raise AssertionError('read for choosing servers')
+    monkeypatch.setattr(e.servers, 'list', refused)
+    monkeypatch.setattr(e.servers.metrics, 'traffic_since', refused)
+    assert (await call('exec', group='G', command='true'))['error'] == 'no_matching_online_servers'
+    assert (await call('exec', serverIds=[first, 'gone'], command='true'))['error'] == 'server_not_found'
+
+
+async def test_days_kept_storage_and_the_history_endpoints(env):
+    e = env
+    settings = (await api(e, 'GET', '/api/servers/settings'))['settings']
+    assert settings['retention'] == {'minuteDays': 31, 'hourDays': 400}
+    assert (await api(e, 'PUT', '/api/servers/settings', {'retention': {'minuteDays': 3}}, status=400))['error'] == 'invalid_retention'
+    assert (await api(e, 'PUT', '/api/servers/settings', {'retention': {'minuteDays': 500}}, status=400))['error'] == 'retention_hours_shorter'
+    for days in range(1, 31):
+        assert (await api(e, 'PUT', '/api/servers/settings', {'retention': {'minuteDays': 7, 'hourDays': days}}, status=400))['error'] == 'retention_hours_too_short'
+    saved = (await api(e, 'PUT', '/api/servers/settings', {'retention': {'minuteDays': 0, 'hourDays': 0}}))['settings']['retention']
+    assert saved == {'minuteDays': 0, 'hourDays': 0} and e.servers.metrics.retention == saved
+    storage = await api(e, 'GET', '/api/servers/storage')
+    assert storage['retention'] == saved and storage['bytes'] > 0 and set(storage['tables']) >= {'minute', 'hour', 'day', 'disk', 'ping_minute', 'ping_hour'}
+    assert (await api(e, 'POST', '/api/servers/storage/compact', {}))['freeBytes'] == 0
+    server_id = (await api(e, 'POST', '/api/servers', {'name': 'history'}))['item']['id']
+    days = await api(e, 'GET', f'/api/servers/{server_id}/traffic?unit=day')
+    assert days['unit'] == 'day' and len(days['points']) == 31 and days['points'][-1]['label'] == dt.datetime.now(await e.servers.zone()).date().isoformat()
+    assert (await api(e, 'GET', f'/api/servers/{server_id}/traffic?unit=week', status=400))['error'] == 'invalid_unit'
+    disks = await api(e, 'GET', f'/api/servers/{server_id}/disks?range=30d')
+    assert disks['partitions'] == [] and disks['range'] == '30d'
+    # Online with no recent sample: the partitions are read from the node there and then, and kept.
+    calls = []
+
+    async def call(sid, method, params, timeout):
+        calls.append(method)
+        return {'ok': True, 'result': {'mounts': [{'path': '/', 'fs': 'ext4', 'device': '/dev/vda1', 'total': 100, 'used': 40}]}}
+    e.servers.hub.sessions[server_id] = SimpleNamespace(features={'host'})
+    try:
+        with unittest.mock.patch.object(e.servers.hub, 'call', call):
+            first = await api(e, 'GET', f'/api/servers/{server_id}/disks?range=7d')
+            again = await api(e, 'GET', f'/api/servers/{server_id}/disks?range=7d')
+    finally:
+        del e.servers.hub.sessions[server_id]
+    assert first['partitions'] == [{'path': '/', 'fs': 'ext4', 'total': 100, 'used': 40}] and first['series']['/'] == [40.0]
+    assert calls == ['host.details'] and again['sampledAt'] == first['sampledAt']
+    assert (await api(e, 'GET', f'/api/servers/{server_id}/disks?range=2d', status=400))['error'] == 'invalid_range'
+    assert (await api(e, 'GET', f'/api/servers/{server_id}/metrics?range=90d'))['step'] == 12 * 3600
+
+
+async def test_latency_targets_go_to_the_node_and_its_minutes_come_back(env):
+    e = env
+    server_id = (await api(e, 'POST', '/api/servers', {'name': '延迟', 'profile': {'region': 'CN'}}))['item']['id']
+    await start_fake(e, server_id)
+    sent = []
+    real_call = e.servers.hub.call
+
+    async def call(sid, method, params, timeout):
+        if method == 'latency.watch':
+            sent.append(params)
+            return {'ok': True, 'result': {'accepted': len(params['targets'])}}
+        return await real_call(sid, method, params, timeout)
+
+    def last(check):
+        async def met():
+            return bool(sent) and check(sent[-1])
+        return met
+    with unittest.mock.patch.object(e.servers.hub, 'call', call):
+        await e.servers.latency.push(server_id)
+        assert [t['id'] for t in sent[-1]['targets']] == ['yn-ct', 'yn-cu', 'yn-cm', 'ali-dns', 'tencent-dns'] and sent[-1]['intervalMs'] == 10000
+        # Its own list, then the settings: each sends the node its targets again.
+        await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'latency': {'targets': ['bj-ct', 'c:home.example.com:22']}}})
+        await wait_for(last(lambda p: [t['id'] for t in p['targets']] == ['bj-ct', 'c:home.example.com:22']))
+        assert (await api(e, 'PUT', '/api/servers/settings', {'latency': {'intervalS': 2}}, status=400))['error'] == 'invalid_latency_interval'
+        await api(e, 'PUT', '/api/servers/settings', {'latency': {'intervalS': 5}})
+        await wait_for(last(lambda p: p['intervalMs'] == 5000))
+        await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'latency': None}})
+        await wait_for(last(lambda p: len(p['targets']) == 5))
+    assert (await api(e, 'PATCH', f'/api/servers/{server_id}', {'profile': {'latency': {'targets': ['c:127.0.0.1:1']}}}, status=400))['error'] == 'invalid_latency_targets'
+    # Minutes for the targets it was given are kept; anything else is not.
+    now = int(time.time())
+    minutes = [{'ts': now - 120 + i * 60, 'target': target, 'sent': 6, 'lost': lost, 'avg': avg, 'min': avg, 'max': avg}
+               for i in range(2) for target, lost, avg in (('yn-ct', 0, 40.0), ('yn-cu', 3, 80.0), ('stranger', 0, 1.0))]
+    await e.servers.latency.observe(server_id, minutes)
+    summary = (await api(e, 'GET', '/api/servers/latency'))['items'][server_id]
+    assert summary['cells'][-1] == [round((40 * 6 + 80 * 3) / 9, 1), 25.0] and summary['loss'] == 25.0
+    series = await api(e, 'GET', f'/api/servers/{server_id}/latency?range=1h')
+    assert [t['id'] for t in series['targets']] == ['yn-ct', 'yn-cu', 'yn-cm', 'ali-dns', 'tencent-dns']
+    assert series['targets'][0]['label'] == '云南电信' and series['targets'][0]['avg'][-1] == 40 and series['targets'][1]['loss'][-1] == 50
+    assert series['targets'][2]['avg'] == [None] * len(series['t']) and series['supported'] is True
+    catalog = (await api(e, 'GET', '/api/servers/settings'))['settings']['latencyCatalog']
+    assert len(catalog['provinces']) == 31 and catalog['directoryUpdatedAtMs'] == 0 and catalog['directoryCheckedAtMs'] == 0 and catalog['directoryRefreshS'] == 86400
+    assert catalog['directory']['yn']['ct'] == 'yn-ct-v4.ip.zstaticcdn.com:80' and {e['kind'] for e in catalog['extras']} == {'dns', 'ai', 'site', 'service'}
+    # A refresh that fails is kept with why; the directory stays as it was.
+    class Refused:
+        def get(self, url):
+            raise OSError('connection refused')
+    with unittest.mock.patch.object(e.servers, 'http', Refused()):
+        tried = await api(e, 'POST', '/api/servers/latency/refresh', {})
+    assert tried['refreshed'] is False and tried['directoryError'] == 'OSError: connection refused' and tried['directory']['yn']['ct'] == 'yn-ct-v4.ip.zstaticcdn.com:80'
+    catalog = (await api(e, 'GET', '/api/servers/settings'))['settings']['latencyCatalog']
+    assert catalog['directoryCheckedAtMs'] > 0 and catalog['directoryError'] == 'OSError: connection refused' and catalog['directoryUpdatedAtMs'] == 0
+    # The card's group comes with the summary; the series says which targets are the card's.
+    assert summary['group'] == '三网' and series['group'] == '三网'
+    assert [(t['id'], t['kind'], t['primary']) for t in series['targets']][2:] == [('yn-cm', 'three', True), ('ali-dns', 'cn', False), ('tencent-dns', 'cn', False)]
+    # Switched off: the node is told to measure nothing.
+    with unittest.mock.patch.object(e.servers.hub, 'call', call):
+        await api(e, 'PUT', '/api/servers/settings', {'latency': {'enabled': False}})
+        await wait_for(last(lambda p: p['targets'] == []))
+
+
+async def test_latency_to_other_servers(env):
+    """Another server as a target: its public address as its record has it, sent again when that changes or
+    the server goes; HTTP only to a node that has it; the card shows the targets picked; its mesh address
+    once both are on the mesh, sent again as the applied mesh changes."""
+    e = env
+    home = (await api(e, 'POST', '/api/servers', {'name': '家', 'profile': {'region': 'CN'}}))['item']['id']
+    ali = (await api(e, 'POST', '/api/servers', {'name': '阿里云', 'profile': {'region': 'CN'}}))['item']['id']
+    await start_fake(e, home)
+    await start_fake(e, ali)
+    session = e.servers.hub.sessions[ali]
+    await e.servers.node_hello(ali, {**session.info, 'ipv4': '47.100.1.2'}, session.caps, 'dev')
+    sent, real_call = [], e.servers.hub.call
+
+    async def call(sid, method, params, timeout):
+        if method == 'latency.watch':
+            sent.append((sid, params))
+            return {'ok': True, 'result': {'accepted': len(params['targets'])}}
+        return await real_call(sid, method, params, timeout)
+
+    def home_got(check):
+        async def met():
+            mine = [p for sid, p in sent if sid == home]
+            return bool(mine) and check({t['id']: t for t in mine[-1]['targets']})
+        return met
+    ping, web = f's:{ali}', f's:{ali}:http:80'
+    with unittest.mock.patch.object(e.servers.hub, 'call', call):
+        await api(e, 'PATCH', f'/api/servers/{home}', {'profile': {'latency': {'targets': [ping, web, 'yn-ct'], 'card': [ping]}}})
+        await wait_for(home_got(lambda t: list(t) == [ping, web, 'yn-ct']))
+        got = {t['id']: t for t in [p for sid, p in sent if sid == home][-1]['targets']}
+        assert got[ping] == {'id': ping, 'host': '47.100.1.2', 'mode': 'icmp'}
+        assert got[web] == {'id': web, 'host': '47.100.1.2', 'mode': 'http', 'port': 80, 'url': 'http://47.100.1.2:80/'}
+        # Its address changes: those measuring it are told the new one.
+        await e.servers.node_hello(ali, {**session.info, 'ipv4': '47.100.9.9'}, session.caps, 'dev')
+        await wait_for(home_got(lambda t: t[ping]['host'] == '47.100.9.9'))
+        # A node without HTTP probes is not sent them: the page says it waits for an update.
+        e.servers.hub.sessions[home].features = frozenset(e.servers.hub.sessions[home].features - {'latency.http'})
+        await e.servers.latency.push(home)
+        assert [t['id'] for t in [p for sid, p in sent if sid == home][-1]['targets']] == [ping, 'yn-ct']
+        series = await api(e, 'GET', f'/api/servers/{home}/latency?range=1h')
+        shown = {t['id']: t for t in series['targets']}
+        assert [shown[t]['label'] for t in (ping, web, 'yn-ct')] == ['阿里云', '阿里云 · HTTP 80', '云南电信']
+        assert (shown[ping]['kind'], shown[ping]['primary'], shown[ping]['host'], shown[ping]['mode']) == ('server', True, '47.100.9.9', 'icmp')
+        assert shown[web].get('update') is True and shown[web]['host'] == 'http://47.100.9.9:80/' and 'update' not in shown[ping]
+        assert series['group'] == '阿里云' and not shown['yn-ct']['primary']
+        # The card over the one picked.
+        now = int(time.time())
+        await e.servers.latency.observe(home, [{'ts': now - 60, 'target': ping, 'sent': 6, 'lost': 0, 'avg': 31.0, 'min': 30.0, 'max': 33.0},
+                                               {'ts': now - 60, 'target': 'yn-ct', 'sent': 6, 'lost': 0, 'avg': 90.0, 'min': 90.0, 'max': 90.0}])
+        summary = (await api(e, 'GET', '/api/servers/latency'))['items'][home]
+        assert summary['group'] == '阿里云' and summary['cells'][-1][0] == 31.0
+        # Over the mesh: passed over until both are members.
+        over = f's:{ali}@mesh:tcp:22'
+        await api(e, 'PATCH', f'/api/servers/{home}', {'profile': {'latency': {'targets': [ping, over, 'yn-ct']}}})
+        await wait_for(home_got(lambda t: list(t) == [ping, 'yn-ct']))
+        owner = (await one(e.servers.db.conn, 'SELECT owner FROM server_nodes WHERE server_id=?', (ali,)))['owner']
+        with unittest.mock.patch.object(e.servers.mesh, 'addresses', unittest.mock.AsyncMock(return_value={ali: '100.96.0.7', home: '100.96.0.8'})):
+            e.servers.mesh._applied_changed(owner)
+            await wait_for(home_got(lambda t: t.get(over, {}).get('host') == '100.96.0.7'))
+            items = {i['id']: i for i in (await api(e, 'GET', '/api/servers'))['items']}
+            assert (items[ali]['meshAddress'], items[home]['meshAddress']) == ('100.96.0.7', '100.96.0.8')
+            assert {t['id']: t['label'] for t in (await api(e, 'GET', f'/api/servers/{home}/latency?range=1h'))['targets']}[over] == '阿里云 · 组网 · TCP 22'
+        # Gone: no longer measured, and named so where its record stays.
+        await api(e, 'DELETE', f'/api/servers/{ali}')
+        await wait_for(home_got(lambda t: list(t) == ['yn-ct']))
+        assert {t['id']: t['label'] for t in (await api(e, 'GET', f'/api/servers/{home}/latency?range=1h'))['targets']}[ping] == '已删除的服务器'
+        # Measuring no other server, it reads no other's info; while it does, it reads them.
+        await api(e, 'PATCH', f'/api/servers/{home}', {'profile': {'latency': {'targets': ['yn-ct']}}})
+        lat = e.servers.latency
+        with unittest.mock.patch.object(lat, '_addresses', unittest.mock.AsyncMock(return_value={})) as read:
+            assert [t['id'] for t in await lat.targets(home)] == ['yn-ct'] and not read.called
+            await api(e, 'PATCH', f'/api/servers/{home}', {'profile': {'latency': {'targets': [f's:{home}', 'yn-ct']}}})
+            await lat.targets(home)
+            assert read.called
+
+
+async def test_latency_pushes_to_every_node_at_once_go_a_few_at_a_time(env, monkeypatch):
+    e = env
+    lat, running, most = e.servers.latency, set(), []
+
+    async def push(server_id):
+        running.add(server_id)
+        most.append(len(running))
+        await asyncio.sleep(0.02)
+        running.discard(server_id)
+    monkeypatch.setattr(lat, 'push', push)
+    for i in range(30):
+        lat.soon(f'srv-{i}')
+    await asyncio.gather(*lat.pushing.values())
+    assert max(most) == lat_module.PUSHES and len(most) == 30
+
+
+async def test_latency_minutes_kept_by_a_node_while_away_are_taken(env):
+    """Back after a time without a session, a node sends the minutes it kept once it has its targets,
+    possibly before its reply; a fresh controller knows nothing sent before. Too old or ahead: dropped."""
+    e = env
+    server_id = (await api(e, 'POST', '/api/servers', {'name': '断连', 'profile': {'region': 'CN'}}))['item']['id']
+    await start_fake(e, server_id)
+    e.servers.latency.sent.clear()
+    now = int(time.time())
+    now -= now % 60
+    away = [{'ts': now - 3600 * 6 + i * 60, 'target': 'yn-ct', 'sent': 6, 'lost': 6, 'avg': None, 'min': None, 'max': None} for i in range(3)]
+    stale = [{'ts': now - 3 * 86400, 'target': 'yn-ct', 'sent': 6, 'lost': 6}, {'ts': now + 3600, 'target': 'yn-ct', 'sent': 6, 'lost': 0, 'avg': 9.0}]
+    real_call = e.servers.hub.call
+
+    async def call(sid, method, params, timeout):
+        if method == 'latency.watch':
+            await e.servers.latency.observe(sid, away + stale)
+            return {'ok': True, 'result': {'accepted': len(params['targets'])}}
+        return await real_call(sid, method, params, timeout)
+    with unittest.mock.patch.object(e.servers.hub, 'call', call):
+        await e.servers.latency.push(server_id)
+    sid = await e.servers.metrics._sid(server_id)
+    async with e.servers.metrics.conn.execute('SELECT ts, sent, lost, avg FROM ping_minute WHERE sid=? ORDER BY ts', (sid,)) as cursor:
+        rows = [tuple(r) async for r in cursor]
+    assert rows == [(m['ts'], 6, 6, None) for m in away]
+    day = await api(e, 'GET', f'/api/servers/{server_id}/latency?range=24h')
+    assert 100.0 in day['targets'][0]['loss'] and day['targets'][0]['avg'][day['targets'][0]['loss'].index(100.0)] is None
+    # A node that refuses its targets leaves what was known before.
+    async def refuse(sid, method, params, timeout):
+        return {'ok': False, 'error': 'invalid_latency'} if method == 'latency.watch' else await real_call(sid, method, params, timeout)
+    with unittest.mock.patch.object(e.servers.hub, 'call', refuse):
+        await e.servers.latency.push(server_id)
+    assert set(e.servers.latency.sent[server_id]) == {'yn-ct', 'yn-cu', 'yn-cm', 'ali-dns', 'tencent-dns'}
+
+
 async def test_controller_pings_a_node_that_keeps_reporting(env, monkeypatch):
     # aiohttp's own heartbeat stays silent while the peer talks; the node
     # would then time the link out although it is fine.
@@ -808,6 +1136,31 @@ def test_install_script_is_valid_shell():
     assert "--code 'a b'" in installer.command('https://x.example/', 'a b')
 
 
+def test_install_script_on_openwrt(tmp_path):
+    """OpenWrt: a procd init script started at boot and kept by sysupgrade, no install(1), no browser."""
+    release, init, keep = tmp_path / 'openwrt_release', tmp_path / 'init.d/openbear-node', tmp_path / 'keep.d/openbear-node'
+    release.write_text("DISTRIB_ID='ImmortalWrt'\nDISTRIB_RELEASE='23.05.3'\n")
+    init.parent.mkdir()
+    script = installer.script()
+    assert 'install -m' not in script
+    script = (script.replace('/etc/openwrt_release', str(release)).replace('INIT=/etc/init.d/openbear-node', f'INIT={init}')
+              .replace('KEEP=/lib/upgrade/keep.d/openbear-node', f'KEEP={keep}')
+              .replace('    "$INIT" enable\n    "$INIT" stop >/dev/null 2>&1 || true\n    "$INIT" start\n', '    echo "init: enable restart"\n'))
+    if os.uname().sysname != 'Linux':
+        pytest.skip('the OpenWrt branch is for Linux')
+    done = subprocess.run(['sh', '-s', '--', '--url', 'http://127.0.0.1:9', '--code', 'c', '--browser', '--stage', 'service'],
+                          input=script, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert 'no browser on OpenWrt' in done.stdout and 'init: enable restart' in done.stdout
+    unit = init.read_text()
+    assert unit.startswith('#!/bin/sh /etc/rc.common\n') and 'USE_PROCD=1' in unit and 'START=95' in unit and os.access(init, os.X_OK)
+    assert 'procd_set_param command /usr/local/bin/openbear-node run --config /etc/openbear-node/config.json' in unit
+    assert 'procd_set_param respawn 3600 5 0' in unit
+    kept = keep.read_text().split()
+    assert {'/usr/local/bin/openbear-node', '/etc/openbear-node/', '/etc/init.d/openbear-node', '/etc/init.d/openbear-mesh'} <= set(kept)
+    assert not (tmp_path / 'systemd').exists()
+
+
 async def test_node_updates_itself_and_reconnects_with_the_new_version(env, newer_build, monkeypatch):
     e = env
     monkeypatch.setattr(installer, 'BIN', newer_build)
@@ -1036,7 +1389,11 @@ async def test_live_range_has_the_new_metrics(env):
     assert series['step'] == 3 and {'steal', 'iowait', 'ioRead', 'ioWrite'} <= set(series['points'])
     assert 0 < series['points']['mem'][-1] <= 100
     assert e.servers.hub.live(server_id)['m']['nodeRss'] > 0
-    await api(e, 'GET', f'/api/servers/{server_id}/metrics?range=1y', status=400)
+    # A page adding to what it has asks only for the samples after its last one.
+    t = series['points']['t']
+    newer = (await api(e, 'GET', f'/api/servers/{server_id}/metrics?range=live&after={t[-2]}'))['points']
+    assert newer['t'][0] > t[-2] and len(newer['t']) == len(newer['cpu']) < len(t) + 3
+    await api(e, 'GET', f'/api/servers/{server_id}/metrics?range=2y', status=400)
 
 
 async def test_access_point_changes_move_online_nodes(env):
@@ -1414,7 +1771,7 @@ async def test_servers_tool_for_the_main_controller(env):
     async def call(action, context=ctx, **params):
         return json.loads(await registry.dispatch('Servers', json.dumps({'action': action, 'params': params}), context=context))
 
-    assert 'exec' in (await call('describe'))['contracts']
+    assert 'exec' in (await call('describe'))['actions'] and 'exec' in (await call('describe', topic='exec'))['contracts']
     rows = {r['id']: r for r in (await call('list'))['items']}
     assert rows[server_id]['state'] == 'online' and rows[server_id]['memPct'] > 0 and rows[server_id]['node']['exec']
     assert rows[server_id]['billing']['expiresAt'] == '2026-01-31'
@@ -1438,6 +1795,9 @@ async def test_servers_tool_for_the_main_controller(env):
     summary = (await call('metrics', serverId=server_id, range='live', series=True))
     assert summary['summary']['mem']['max'] > 0 and 't' in summary['series']
     assert (await call('renew', serverId=server_id))['expiresAt'] == '2026-02-28'
+    calibrated = (await call('calibrate_traffic', serverId=server_id, used=5 * 1024 ** 3))['traffic']
+    assert calibrated['calibrated']['used'] == 5 * 1024 ** 3 and calibrated['used'] >= 5 * 1024 ** 3
+    assert (await call('calibrate_traffic', serverId=server_id, clear=True))['traffic']['calibrated'] is None
     assert (await call('edit', serverId=server_id, profile={'remark': '测试机'}))['item']['group'] == 'Tier 1'
     log = (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['execLog']
     assert [(r['source'], r['command'].split()[0]) for r in log] == [('ai', 'AI'), ('ai', 'rm'), ('ai', 'printf'), ('ai', 'echo')]
@@ -1607,6 +1967,28 @@ def test_file_commands_follow_the_node_platform():
     assert files.command('extract', {'path': 'C:/d/p.zip'}, w)[0].endswith("tar.exe -x -f 'C:/d/p.zip' -C 'C:/d'")
 
 
+def test_archives_with_busybox_tar_and_others(tmp_path):
+    """BusyBox tar (OpenWrt) gets -z, or the compression's own program, or 缺少压缩工具; GNU tar and macOS as before."""
+    from app.servers import files
+    assert files.command('extract', {'path': '/d/a.tar.gz'})[0] == (
+        'mkdir -p -- /d && if tar --help 2>&1 | grep -q BusyBox; then tar -xzf /d/a.tar.gz -C /d; else tar -xf /d/a.tar.gz -C /d; fi')
+    xz = files.command('extract', {'path': '/d/a.txz'})[0]
+    assert 'then xz -dc /d/a.txz | tar -xf - -C /d; elif command -v unxz' in xz and xz.count(f'exit {files.NO_TOOL}') == 2
+    assert files.command('extract', {'path': '/d/a.tar'})[0] == 'mkdir -p -- /d && tar -xf /d/a.tar -C /d'
+    packed = files.command('compress', {'paths': ['/d/x'], 'name': 't', 'format': 'tar.xz'})[0]
+    assert f'command -v xz >/dev/null 2>&1 || exit {files.NO_TOOL}; ' in packed and '| xz -c > /d/t.tar.xz || { rc=$?; rm -f -- /d/t.tar.xz; exit $rc; }' in packed
+    assert files.command('extract', {'path': '/d/a.tar.gz'}, 'darwin')[0] == 'mkdir -p -- /d && tar -xf /d/a.tar.gz -C /d'
+    assert files.command('compress', {'paths': ['/d/x'], 'name': 't', 'format': 'tar.xz'}, 'darwin')[0].endswith('tar -cJf /d/t.tar.xz -C /d -- x')
+    # With this machine's tar, for real.
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.txt').write_text('hi')
+    for fmt in ('tar.gz', 'tar.xz') if shutil.which('xz') else ('tar.gz',):
+        subprocess.run(['sh', '-c', files.command('compress', {'paths': [str(src)], 'name': 'p', 'format': fmt})[0]], check=True)
+        subprocess.run(['sh', '-c', files.command('extract', {'path': str(tmp_path / f'p.{fmt}'), 'dest': str(tmp_path / fmt)})[0]], check=True)
+        assert (tmp_path / fmt / 'src' / 'a.txt').read_text() == 'hi'
+
+
 async def test_servers_tool_does_what_the_page_does(env, monkeypatch, shipped):
     """Adding, installing, SSH logins, files, saved commands, settings, codes and removal."""
     from app.servers import onboarding
@@ -1637,7 +2019,7 @@ async def test_servers_tool_does_what_the_page_does(env, monkeypatch, shipped):
     monkeypatch.setattr(e.instances.servers, 'test_target', fake_test)
     monkeypatch.setattr(e.instances.servers, 'run', fake_run)
     await api(e, 'PUT', '/api/servers/settings', {'accessPoints': [{'id': 'ap-wg', 'name': 'WG', 'url': 'https://probe.example.com'}]})
-    assert {'add', 'install', 'file_op', 'save_settings', 'code_create', 'remove_node'} <= set((await call('describe'))['contracts'])
+    assert {'add', 'install', 'file_op', 'save_settings', 'code_create', 'remove_node'} <= set((await call('describe'))['actions'])
 
     win = {'host': '192.0.2.3', 'port': 22, 'username': 'admin', 'auth': 'password', 'password': 'pw'}
     added = await call('add', name='办公-Windows', ssh=win, install=True, profile={'group': '国内', 'region': 'CN', 'access': {'primary': 'ap-wg'}})
@@ -1688,6 +2070,19 @@ async def test_servers_tool_does_what_the_page_does(env, monkeypatch, shipped):
     assert (await call('command_save', commandId=saved[0]['id'], name='磁盘用量', command='df -h'))['items'][-1]['name'] == '磁盘用量'
     assert [c['name'] for c in (await call('command_delete', commandId=ids[1]))['items']] == ['磁盘用量']
     assert (await call('save_settings', timezone='Asia/Tokyo'))['settings']['timezone'] == 'Asia/Tokyo'
+    for days in range(1, 31):
+        assert (await call('save_settings', retention={'minuteDays': 7, 'hourDays': days}))['error'] == 'retention_hours_too_short'
+    assert (await e.servers.settings())['retention'] == {'minuteDays': 31, 'hourDays': 400}
+    # One stored shorter before the limit: read as 31 days, and saved so with the next change.
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("UPDATE server_settings SET settings_json=json_set(settings_json,'$.retention',json('{\"minuteDays\":7,\"hourDays\":7}')) WHERE id=1")
+    assert (await call('settings'))['settings']['retention'] == {'minuteDays': 7, 'hourDays': 31}
+    row = await one(e.db.conn, 'SELECT settings_json FROM server_settings WHERE id=1')
+    assert json.loads(row['settings_json'])['retention'] == {'minuteDays': 7, 'hourDays': 7}
+    await call('save_settings', retention={'minuteDays': 14})
+    row = await one(e.db.conn, 'SELECT settings_json FROM server_settings WHERE id=1')
+    assert json.loads(row['settings_json'])['retention'] == {'minuteDays': 14, 'hourDays': 31}
+    assert e.servers.metrics.retention == {'minuteDays': 14, 'hourDays': 31}
     assert (await call('settings'))['settings']['accessPoints'][0]['id'] == 'ap-wg'
     code = (await call('code_create', name='新机器', group='国内', maxUses=2))['item']
     assert code['active'] and code['command'] and code['windowsCommand']
@@ -1937,13 +2332,13 @@ def _clip_setup(tmp_path, outputs):
             return {'id': sid, 'name': sid}
     service = ServerService(SimpleNamespace(path=str(tmp_path / 'servers.db')), None, SimpleNamespace(servers=Registry()))
 
-    async def listing(owner):
-        return {'items': [{'id': sid, 'name': sid, 'profile': {}, 'live': {'m': {}}} for sid in outputs]}
+    async def brief(owner):
+        return [{'id': sid, 'name': sid, 'profile': {}, 'live': {'m': {}}} for sid in outputs]
 
     async def run(owner, sid, command, **kwargs):
         stdout, truncated = outputs[sid]
         return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': stdout, 'stderr': '', 'truncated': truncated, 'effectState': 'observed'}
-    service.list, service.exec = listing, run
+    service.brief, service.exec = brief, run
     return service, ServersTool(service)
 
 

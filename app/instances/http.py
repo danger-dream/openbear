@@ -92,9 +92,11 @@ def install(app, host, service):
     async def server_port(r, o): return await service.servers.port(o, r.match_info['id'], port(r))
     async def server_test(r, o):
         data = await body(r)
+        # A front's login is tested through its exits (via), as it will be used.
+        via = await service.servers.via_of(o, data.pop('via', None) if isinstance(data, dict) else None)
         item = service.servers._validate(data, {})
         secret = await service.servers.secret_for_test(data)
-        return {'ok': True, **(await service.servers.test_target({**item, **secret}))['facts']}
+        return {'ok': True, **(await service.servers.test_target({**item, **secret, **via}))['facts']}
     async def ssh_keys(r, o):
         from app.instances.keys import catalog
         return {'ok': True, 'items': await catalog(service.db)}

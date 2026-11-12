@@ -492,3 +492,16 @@ def test_scrub_masks_before_cutting_and_catches_pieces():
     assert ddns_module.scrub(long, creds) == ('x' * 495 + ' ***')[:500]
     assert 'tok-' not in ddns_module.scrub('x' * 490 + ' tok-0123456789abcdef', creds)
     assert ddns_module.scrub('nothing secret here', creds) == 'nothing secret here'
+
+
+def test_a_provider_taking_one_write_per_zone_gets_the_zone_lock():
+    """Hetzner refuses an action on a zone while one runs: an A and an AAAA changing together take turns."""
+    import asyncio
+
+    from app.ddns.providers import get
+    d = ddns_module.Ddns(None)
+    hetzner = get('hetzner')({'token': 't'}, {}, client=object())
+    cloudflare = get('cloudflare')({'token': 't'}, {}, client=object())
+    assert isinstance(d._zone_lock('a', 'example.com', hetzner), asyncio.Lock)
+    assert d._zone_lock('a', 'example.com', hetzner) is d._zone_lock('a', 'example.com', hetzner)
+    assert not isinstance(d._zone_lock('a', 'example.com', cloudflare), asyncio.Lock)

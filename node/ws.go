@@ -55,7 +55,8 @@ type Conn struct {
 	idle   time.Duration
 }
 
-func Dial(ctx context.Context, target string, header http.Header, timeout time.Duration) (*Conn, error) {
+// Dial connects to target; tlsConf (nil: the system's roots for the host) checks a wss server.
+func Dial(ctx context.Context, target string, header http.Header, timeout time.Duration, tlsConf ...*tls.Config) (*Conn, error) {
 	u, err := url.Parse(target)
 	if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
 		return nil, errors.New("invalid websocket url")
@@ -73,7 +74,11 @@ func Dial(ctx context.Context, target string, header http.Header, timeout time.D
 	defer cancel()
 	var raw net.Conn
 	if u.Scheme == "wss" {
-		raw, err = (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}}).DialContext(ctx, "tcp", host)
+		conf := &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}
+		if len(tlsConf) > 0 && tlsConf[0] != nil {
+			conf = tlsConf[0]
+		}
+		raw, err = (&tls.Dialer{NetDialer: dialer, Config: conf}).DialContext(ctx, "tcp", host)
 	} else {
 		raw, err = dialer.DialContext(ctx, "tcp", host)
 	}

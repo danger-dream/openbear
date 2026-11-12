@@ -833,6 +833,10 @@ copy_release_tree() {
         rm -rf "$INSTALL_DIR/gateway/bin"
         cp -a "$pkg/gateway/bin" "$INSTALL_DIR/gateway/bin" || return 1
     fi
+    if [[ -d "$pkg/benchmark-package" ]]; then
+        rm -rf "$INSTALL_DIR/benchmark-package"
+        cp -a "$pkg/benchmark-package" "$INSTALL_DIR/benchmark-package" || return 1
+    fi
     for f in gateway/README.md Dockerfile .dockerignore docs/instances.md; do
         if [[ -f "$pkg/$f" ]]; then
             mkdir -p "$(dirname "$INSTALL_DIR/$f")"
@@ -1006,7 +1010,7 @@ prepare_release_upgrade() {
 
     for rel in app web/dist prompts scripts pyproject.toml uv.lock openbear.service \
         openbear.json.example README.md README release-meta.json .venv \
-        gateway/bin gateway/README.md Dockerfile .dockerignore docs/instances.md; do
+        gateway/bin gateway/README.md Dockerfile .dockerignore docs/instances.md benchmark-package; do
         [[ -e "$INSTALL_DIR/$rel" ]] && existing+=("$rel")
     done
     if [[ "${#existing[@]}" -gt 0 ]]; then
@@ -1045,7 +1049,7 @@ restore_release_upgrade() {
     fi
     for rel in app web/dist prompts scripts pyproject.toml uv.lock openbear.service \
         openbear.json.example README.md README release-meta.json .venv \
-        gateway/bin gateway/README.md Dockerfile .dockerignore docs/instances.md; do
+        gateway/bin gateway/README.md Dockerfile .dockerignore docs/instances.md benchmark-package; do
         if ! rm -rf "$INSTALL_DIR/$rel"; then
             err "清理新版本 $rel 失败；备份保留在 $txn"
             return 1

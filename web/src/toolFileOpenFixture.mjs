@@ -14,13 +14,13 @@ const operations=[
   base('run:turn-files','run',10,'user',{turnId:'turn-files',runId:'turn-files',source:'user',status:'completed',internal:false,transcriptMessageIds:[]}),
   base('msg:m1','user_message',20,'user',{role:'user',text:'看看这两个文件',attachments:[],queued:false,interruption:false,status:'',transcriptMessageIds:[]}),
   tool('call-read','Read',{path:'/tmp/fileview/shot.png'},30),
-  tool('call-write','Write',{path:'/opt/src-space/openbear/scripts/benchmark_package.py',content:script},40),
+  tool('call-write','Write',{path:'/srv/openbear/scripts/benchmark_package.py',content:script},40),
   tool('call-bash','Bash',{command:'ls /tmp/fileview',description:'列出目录'},50),
   base('assistant:turn-files:1','assistant_message',60,'assistant',{text:'两个文件都看过了。',complete:true,footer:'',segmentIndex:1,runId:'turn-files',transcriptMessageIds:[]}),
 ];
 const files={
   'tool:call-read':{fileName:'shot.png',mimeType:'image/png',path:'/tmp/fileview/shot.png',fileState:'',body:picture},
-  'tool:call-write':{fileName:'benchmark_package.py',mimeType:'text/x-python',path:'/opt/src-space/openbear/scripts/benchmark_package.py',fileState:'changed',body:Buffer.from(script)},
+  'tool:call-write':{fileName:'benchmark_package.py',mimeType:'text/x-python',path:'/srv/openbear/scripts/benchmark_package.py',fileState:'changed',body:Buffer.from(script)},
 };
 
 export function createToolFileBackend() {

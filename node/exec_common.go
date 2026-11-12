@@ -20,6 +20,8 @@ type ExecParams struct {
 	Stdin   string `json:"stdin"`
 	Cwd     string `json:"cwd"`
 	Shell   string `json:"shell"`
+	// Bypass: run past a transparent proxy, as the node's own checks do (bypassedCommand).
+	Bypass bool `json:"bypass"`
 }
 
 type ExecResult struct {

@@ -47,7 +47,7 @@ REFUSED_WITHOUT_EXEC = samples.SAMPLES['refusal:capability_disabled']
 # Calls whose inner params belong to the browser engine (held to the Go one by test_browser_engine_parity).
 ENGINE_OPAQUE = {'browser.call', 'browser.cdp'}
 # What only the Go node does: refused here as unknown, and not sampled.
-GO_ONLY = ('mesh.', 'net.', 'ddns.', 'http.local')
+GO_ONLY = ('mesh.', 'net.', 'ddns.', 'http.local', 'host.', 'latency.')
 ARCH = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(os.uname().machine, os.uname().machine)
 BINARY = f'openbear-node-linux-{ARCH}'
 # As the Go node: output kept per stream, a terminal's unacknowledged bytes, a file chunk.
@@ -822,7 +822,7 @@ def read_file(path, offset, limit):
     # As ReadAt: a short read is the end; a file that claims a size reads to it.
     eof = len(data) < want or info.st_size > 0 and offset + len(data) >= info.st_size
     return {'data': b64(data), 'size': info.st_size, 'offset': offset, 'read': len(data), 'eof': eof,
-            'mode': f'{info.st_mode & 0o777:04o}', 'mtime': int(info.st_mtime)}
+            'mode': f'{info.st_mode & 0o777:04o}', 'mtime': int(info.st_mtime), 'file': f'{info.st_dev}:{info.st_ino}'}
 
 
 def _write(path, data, mode):
@@ -1356,6 +1356,9 @@ class FakeBrowserHost:
         self.dir = node.config_path.with_name(node.config_path.name + '.browser')
         self.state, self.source, self.product, self.error, self.epoch = 'stopped', '', '', '', ''
         self.worker = self.cdp = None
+        self.chrome_version = ''
+        self.chrome_latest = '131.0.6778.85'
+        self.chrome_update = None
 
     def settings(self):
         return self.node.config.get('browser') or {}
@@ -1365,6 +1368,10 @@ class FakeBrowserHost:
                'headless': False, 'epoch': self.epoch, 'endpoint': self.settings().get('endpoint', ''), 'download': bool(self.settings().get('download'))}
         if self.error:
             out['error'] = self.error
+        if self.chrome_version:
+            out['chromeVersion'] = self.chrome_version
+        if self.chrome_update:
+            out['update'] = self.chrome_update
         return out
 
     async def call(self, method, p):
@@ -1376,6 +1383,15 @@ class FakeBrowserHost:
             return self.status()
         if not self.node.caps['browser']:
             raise Refused('capability_disabled')
+        if method == 'browser.update':
+            if not self.chrome_version:
+                raise Refused('browser_not_downloaded')
+            result = {'current': self.chrome_version, 'latest': self.chrome_latest, 'upToDate': self.chrome_version == self.chrome_latest}
+            if not p.get('check') and not result['upToDate']:
+                result['started'] = True
+                self.chrome_version = self.chrome_latest
+                self.chrome_update = {'state': 'done', 'version': self.chrome_version, 'restartNeeded': self.state == 'ready' and not p.get('restart', False)}
+            return result
         if method == 'browser.start':
             return await self.ensure()
         if method == 'browser.restart':

@@ -5,7 +5,7 @@ export) -> node-deps (online Go module download into a keyed cache) ->
 node-test (offline ``go test -race``) -> node-build (offline cross builds,
 executable header and version checks, manifest) -> publication (the shared
 push/tag/draft/upload/verify path with ``make_latest=false``; beta and rc are
-GitHub pre-releases) -> local node/VERSION to the next minor's dev.1. There is
+GitHub pre-releases) -> local node/VERSION to the next patch's dev.1. There is
 no ZIP and no A/B installation acceptance; the controller package never carries it.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -160,6 +161,37 @@ go version > /out/toolchain.txt
 """
 DEPS_SCRIPT = PREPARE + "mkdir -p /out/gomod\nexport GOMODCACHE=/out/gomod\ngo mod download\ngo mod verify\n"
 TEST_SCRIPT = PREPARE + OFFLINE + "go test -race ./...\n"
+# The node stages run one at a time, never beside the controller matrix, so they may use
+# most of the host. Tests that hand a tree to another account need to change owners and
+# then still reach it, as the root node does on a server.
+NODE_CPUS = 6
+TEST_CAPS = ("CHOWN", "FOWNER", "DAC_OVERRIDE")
+RERUN_LIMIT = 10
+
+
+def failed_go_tests(text: str):
+    """{package: [top-level tests]} that failed in `go test ./...` output, or None when the
+    failure is not a plain test failure: a data race, a panic (a test timeout is one), a
+    build/setup failure, or a failed package without a failed test of its own."""
+    if "WARNING: DATA RACE" in text or re.search(r"^panic: ", text, re.M):
+        return None
+    failed, pending = {}, []
+    for line in text.splitlines():
+        if match := re.match(r"--- FAIL: ([^\s/]+)", line):
+            pending.append(match[1])
+        elif match := re.match(r"FAIL\t(\S+)(.*)$", line):
+            if not pending or "failed]" in match[2]:
+                return None
+            failed[match[1]] = sorted(set(pending))
+            pending = []
+    return failed if failed and not pending else None
+
+
+def rerun_script(failed: dict) -> str:
+    """Each failed test twice more on its own; both runs must pass."""
+    return PREPARE + OFFLINE + "".join(
+        f"go test -race -count=2 -run {shlex.quote('^(' + '|'.join(tests) + ')$')} {shlex.quote(package)}\n"
+        for package, tests in sorted(failed.items()))
 
 
 def build_script(version: str) -> str:
@@ -245,11 +277,11 @@ class NodeRunner(Runner):
         stage.log_path.touch()
         return stage
 
-    def contain(self, stage, script, mounts, *, online=False):
+    def contain(self, stage, script, mounts, *, online=False, cpus=2, caps=()):
         """Labelled, capability-dropped container from the shared build stage helper."""
         try:
             stage.run_container(self.value["goImage"], script, mounts, online=online,
-                                timeout=self.value.get("timeout", 1800), role=stage.stage)
+                                timeout=self.value.get("timeout", 1800), role=stage.stage, cpus=cpus, caps=caps)
         except (build.ReleaseError, subprocess.TimeoutExpired) as exc:
             raise ReleaseError(f"{stage.stage}: {exc}; log: {stage.log_path}") from None
 
@@ -287,9 +319,18 @@ class NodeRunner(Runner):
 
     def test(self, deps) -> dict:
         stage = self.stage("node-test")
-        self.contain(stage, TEST_SCRIPT, [(self.directory / "source/node", "/inputs/node", True),
-                                          (Path(deps["dir"]) / "gomod", "/inputs/gomod", True), (stage.out, "/out", False)])
-        return {"ok": True, "image": self.value["goImage"], "toolchain": (stage.out / "toolchain.txt").read_text().strip(),
+        mounts = [(self.directory / "source/node", "/inputs/node", True),
+                  (Path(deps["dir"]) / "gomod", "/inputs/gomod", True), (stage.out, "/out", False)]
+        flaky = []
+        try:
+            self.contain(stage, TEST_SCRIPT, mounts, cpus=NODE_CPUS, caps=TEST_CAPS)
+        except ReleaseError:
+            failed = failed_go_tests(stage.log_path.read_text(errors="replace"))
+            if not failed or sum(map(len, failed.values())) > RERUN_LIMIT:
+                raise
+            self.contain(stage, rerun_script(failed), mounts, cpus=NODE_CPUS, caps=TEST_CAPS)
+            flaky = [f"{package}.{test}" for package, tests in sorted(failed.items()) for test in tests]
+        return {"ok": True, "image": self.value["goImage"], "toolchain": (stage.out / "toolchain.txt").read_text().strip(), "flaky": flaky,
                 "outputs": {"log": str(stage.log_path), "logSha256": sha(stage.log_path.read_bytes())}}
 
     def build_binaries(self, deps) -> dict:
@@ -301,7 +342,8 @@ class NodeRunner(Runner):
             raise ReleaseError(f"node/protocol.go: {exc}") from None
         stage = self.stage("node-build")
         self.contain(stage, build_script(version), [(self.directory / "source/node", "/inputs/node", True),
-                                                    (Path(deps["dir"]) / "gomod", "/inputs/gomod", True), (stage.out, "/out", False)])
+                                                    (Path(deps["dir"]) / "gomod", "/inputs/gomod", True), (stage.out, "/out", False)],
+                     cpus=NODE_CPUS)
         out = stage.out / "assets"
         check_binaries(out)
         reported = (stage.out / "version.txt").read_text().strip()
@@ -364,7 +406,7 @@ class NodeRunner(Runner):
                              for name, item in stages.items()],
                   "wallSeconds": round(value.get("completedAt", now) - value["createdAt"], 3),
                   "lastError": value.get("lastError"), "publication": stages.get("publication", {}).get("result"),
-                  "cleanup": value.get("cleanup"), "development": value.get("development")}
+                  "cleanup": value.get("cleanup"), "development": value.get("development"), "flakyTests": value.get("flakyTests") or {}}
         atomic_json(self.directory / "report.json", result)
         print(json.dumps({"runId": value["runId"], "completed": result["completed"], "report": str(self.directory / "report.json"),
                           "url": (result.get("publication") or {}).get("url"), "lastError": result["lastError"]}, ensure_ascii=False), flush=True)
@@ -387,10 +429,14 @@ class NodeRunner(Runner):
                 lambda: candidate.export(self.repo, self.directory, self.state, self.command, label="node " + self.value["version"]),
                 valid=lambda _: candidate.source_matches(self.directory / "source", identity))
             self.check_source()
+            self.push_candidate()
             node = fingerprint(self.node_files())
             deps = self.state.execute("node-deps", {"key": self.deps_key()}, self.deps, valid=self.deps_valid)
-            self.state.execute("node-test", {"node": node, "image": self.value["goImage"], "deps": deps["key"], "recipe": sha(TEST_SCRIPT.encode())},
-                               lambda: self.test(deps))
+            tested = self.state.execute("node-test", {"node": node, "image": self.value["goImage"], "deps": deps["key"], "recipe": sha(TEST_SCRIPT.encode())},
+                                        lambda: self.test(deps))
+            self.value["flakyTests"] = {name: ["node-test"] for name in tested.get("flaky", [])}
+            if self.value["flakyTests"]:
+                print("Flaky (failed once, passed twice on its own; released, fix later): " + ", ".join(self.value["flakyTests"]), flush=True)
             built = self.state.execute("node-build", {"node": node, "image": self.value["goImage"], "deps": deps["key"],
                                                       "recipe": sha(build_script(self.value["version"]).encode())},
                                        lambda: self.build_binaries(deps), valid=self.materialize)

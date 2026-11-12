@@ -339,7 +339,7 @@ async def test_dynamic_plan_request_count_and_revoked_grant_rejected(env):
     await env.svc.mcp.refresh_server_tools("search.service")
     await env.grant("all")
     names = [row["name"] for row in agent_delegation_catalog(env.svc.tools) if row["kind"] == "mcp"]
-    schema = next(t for t in env.svc.tools.schemas() if t["name"] == "AgentPlanSubmit")
+    schema = next(t for t in env.svc.tools.schemas() if t["name"] == "AgentPlan")
     requests = schema["parameters"]["properties"]["plan"]["properties"]["toolRequests"]
     assert len(names) == 12 and requests["maxItems"] >= 12
     assert set(names) <= set(requests["items"]["properties"]["name"]["enum"])

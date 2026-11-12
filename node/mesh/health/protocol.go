@@ -56,6 +56,10 @@ type message struct {
 	// come from on this authenticated path; it checks what reflectors say
 	// (entrycheck.go).
 	Observed string `json:"obs,omitempty"`
+	// LargeFrames: the sender takes large frames on a stream of
+	// wire.LargeFrames or later. Every message that declares the range
+	// says it; older nodes ignore it.
+	LargeFrames bool `json:"lf,omitempty"`
 }
 
 // Offer carries a node's addresses to the other end of a punched link

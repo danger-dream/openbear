@@ -379,6 +379,9 @@ class AnthropicBackend(LLMBackend):
                 in_usage.input_tokens = u.get("input_tokens", 0)
                 in_usage.cache_read_tokens = u.get("cache_read_input_tokens", 0)
                 in_usage.cache_write_tokens = u.get("cache_creation_input_tokens", 0)
+                yield StreamEvent(kind="usage_preview", usage=Usage(
+                    input_tokens=in_usage.input_tokens, cache_read_tokens=in_usage.cache_read_tokens,
+                    cache_write_tokens=in_usage.cache_write_tokens))
             elif t == "content_block_start":
                 # Even opaque/empty-start blocks mean the request has begun
                 # producing output; a later error is not a preflight rejection.

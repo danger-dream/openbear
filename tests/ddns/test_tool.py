@@ -24,7 +24,7 @@ async def test_ddns_actions(env):  # noqa: F811
     assert all(a in ACTIONS for a in DDNS_ACTIONS)
     # Both describes fit the tool output cap, so neither reaches the AI cut short.
     described = await call('describe')
-    assert 'ddns_*' in described['contracts'] and set(DDNS_ACTIONS) <= set(described['actions'])
+    assert 'ddns' in described['topics'] and set(DDNS_ACTIONS) <= set(described['actions'])
     topic = await call('describe', topic='ddns')
     assert topic['actions'] == DDNS_ACTIONS and set(topic['contracts']) == set(DDNS_ACTIONS) and 'confirmTakeover' in topic['guide']
     for topic in (None, 'ddns'):
@@ -42,6 +42,9 @@ async def test_ddns_actions(env):  # noqa: F811
     assert (await call('ddns_account_check', accountId=account['id']))['zones'] == ['example.com']
     preview = await call('ddns_preview', serverId=sid, names=['ai.example.com'], source={'method': 'url'})
     assert preview['rows'][0]['action'] == 'new'
+    # The node named inside source, as everywhere else, by its name too.
+    by_name = await call('ddns_preview', names=['ai.example.com'], source={'kind': 'node', 'serverId': '家', 'method': 'url'})
+    assert by_name['rows'][0]['action'] == 'new' and by_name['detected']['v4']['value'] == '198.51.100.7'
     added = await call('ddns_add', serverId=sid, source={'method': 'url'}, rows=[{'name': 'ai.example.com', 'type': 'A', 'accountId': account['id']}])
     rid = added['records'][0]['id']
     await e.ddns.idle()
@@ -60,3 +63,55 @@ async def test_ddns_actions(env):  # noqa: F811
     assert (await call('ddns_delete', recordId=rid))['ok']
     assert (await call('ddns_account_delete', accountId=account['id']))['ok']
     assert 'tok' not in json.dumps(listing) and fakeprovider.store('tok').values('ai.example.com') == ['198.51.100.7']
+
+
+async def test_a_command_preview_runs_only_where_servers_may_be_changed(env):  # noqa: F811
+    """A Cron run not allowed to change servers previews a command source: the command would run on the node."""
+    e = env
+    registry = ToolRegistry()
+    register_server_tools(registry, e.servers)
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("INSERT INTO web_conversations(conversation_uuid,internal_chat_id,owner_chat_id,title) VALUES('conv-d',778,123,'t')")
+    person = ToolRuntimeContext(chat_id=778, conversation_uuid='conv-d')
+    cron = ToolRuntimeContext(chat_id=778, conversation_uuid='conv-d', source='cron')
+
+    async def call(ctx, action, **params):
+        return json.loads(await registry.dispatch('Servers', json.dumps({'action': action, 'params': params}), context=ctx))
+
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    e.nodes.probe[sid] = probe_result(cmd='198.51.100.7', url='198.51.100.7')
+    await call(person, 'ddns_account_add', type='fake', credentials={'token': 'tok'})
+    cmd = {'method': 'cmd', 'params': {'cmd': 'curl -s ip.sb'}}
+    probed = lambda: [c[2]['methods'] for c in e.nodes.calls if c[1] == 'ddns.probe']  # noqa: E731
+    refused = await call(cron, 'ddns_preview', serverId=sid, names=['ai.example.com'], source=cmd)
+    assert refused['error'] == 'automatic_mutation_forbidden' and probed() == []
+    assert (await call(cron, 'ddns_add', serverId=sid, source=cmd, rows=[]))['error'] == 'automatic_mutation_forbidden'
+    # Other sources only read: the preview stays open to it.
+    assert (await call(cron, 'ddns_preview', serverId=sid, names=['ai.example.com'], source={'method': 'url'}))['rows'][0]['action'] == 'new'
+    assert probed() == [['url']]
+    assert (await call(person, 'ddns_preview', serverId=sid, names=['ai.example.com'], source=cmd))['detected']['v4']['value'] == '198.51.100.7'
+    assert probed()[-1] == ['cmd']
+
+
+async def test_the_tool_preview_reads_the_line_it_is_given(env):  # noqa: F811
+    e = env
+    registry = ToolRegistry()
+    register_server_tools(registry, e.servers)
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("INSERT INTO web_conversations(conversation_uuid,internal_chat_id,owner_chat_id,title) VALUES('conv-d',778,123,'t')")
+    ctx = ToolRuntimeContext(chat_id=778, conversation_uuid='conv-d')
+
+    async def call(action, **params):
+        return json.loads(await registry.dispatch('Servers', json.dumps({'action': action, 'params': params}), context=ctx))
+
+    sid = await add_node(e)
+    e.nodes.connect(sid)
+    e.nodes.probe[sid] = probe_result(url='198.51.100.7')
+    await call('ddns_account_add', type='fake', credentials={'token': 'tok'})
+    fakeprovider.store('tok').add('ai.example.com', 'A', '192.0.2.9', line='telecom')
+    rows = {'serverId': sid, 'names': ['ai.example.com'], 'source': {'method': 'url'}}
+    assert (await call('ddns_preview', **rows))['rows'][0]['action'] == 'new', 'nothing on the default line'
+    row = (await call('ddns_preview', **rows, options={'line': 'telecom'}))['rows'][0]
+    assert (row['action'], row['remote']) == ('takeover', '192.0.2.9')
+    assert 'options' in ServersTool.describe('ddns_preview')['contracts']['ddns_preview']

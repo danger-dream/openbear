@@ -562,7 +562,8 @@ def test_missing_instance_and_gateway_files_fail_acceptance(config, monkeypatch)
 def test_package_extras_helper_compares_installed_tree_with_the_package(tmp_path, monkeypatch):
     from scripts.release_support.acceptance_helpers import verify_package_extras as helper
     archive = tmp_path / "openbear.zip"
-    files = {"gateway/bin/openbear-gateway-linux-amd64": b"ELF", "Dockerfile": b"FROM x", "docs/instances.md": b"doc", "app/main.py": b""}
+    files = {"gateway/bin/openbear-gateway-linux-amd64": b"ELF", "benchmark-package/README.md": b"bench",
+             "Dockerfile": b"FROM x", "docs/instances.md": b"doc", "app/main.py": b""}
     with zipfile.ZipFile(archive, "w") as package:
         for name, data in files.items():
             package.writestr(name, data)
@@ -574,7 +575,9 @@ def test_package_extras_helper_compares_installed_tree_with_the_package(tmp_path
     monkeypatch.setattr(sys, "argv", ["verify_package_extras.py", str(root), str(archive), str(output)])
 
     assert helper.main() == 0
-    assert json.loads(output.read_text())["checked"] == ["Dockerfile", "docs/instances.md", "gateway/bin/openbear-gateway-linux-amd64"]
+    assert json.loads(output.read_text())["checked"] == [
+        "Dockerfile", "benchmark-package/README.md", "docs/instances.md", "gateway/bin/openbear-gateway-linux-amd64",
+    ]
     (root / "Dockerfile").write_bytes(b"changed")
     (root / "gateway/bin/openbear-gateway-linux-amd64").unlink()
     assert helper.main() == 1
@@ -645,6 +648,9 @@ def test_config_preservation_allows_only_the_feature_switches_a_release_adds(con
         tables[name] = []
     conn.commit()
     conn.close()
+    features = root / "app/features.py"
+    features.parent.mkdir()
+    features.write_text('FEATURES = ("instances", "servers")\n')
     user_file = root / "openbear.json"
     old = {"testConfig": True, "web": {"port": 8080}}
     user_file.write_text(json.dumps(old))
@@ -670,6 +676,10 @@ def test_config_preservation_allows_only_the_feature_switches_a_release_adds(con
                        ({"testConfig": True, "web": {"port": 8080}, "added": 1}, 0o600)):
         code, report = verify(body, mode)
         assert code == 1 and report["errors"] == [{"file": "openbear.json", "error": "changed bytes or permissions"}], (body, report)
+    # A switch the upgraded release itself declares is accepted without editing the verifier.
+    features.write_text('FEATURES = ("instances", "servers", "other")\n')
+    code, report = verify({"testConfig": True, "web": {"port": 8080}, "features": {"servers": True, "other": True}})
+    assert code == 0 and report["configMigrated"] == ["openbear.json"], report
 
 
 def test_removed_file_probe_uses_actual_archive_difference(tmp_path):

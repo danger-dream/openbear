@@ -9,6 +9,15 @@ const cases = [
   ['History',{action:'read',conversationUuid:'other',turns:2},'读取指定对话最近 2 轮内容'],
   ['History',{action:'read',scope:'current',opId:'message-1'},'读取当前对话的指定消息'],
   ['History',{action:'search',scope:'current',query:'编译'},'搜索当前对话的历史：“编译”'],
+  ['History',{action:'search',query:'编译'},'搜索全部对话的历史：“编译”'],
+  ['History',{action:'search',scope:'others',query:'编译'},'搜索其他对话的历史：“编译”'],
+  ['History',{action:'search',scope:'all',source:'execution',query:'mvz24a3h395da9a3'},'搜索全部对话的执行记录：“mvz24a3h395da9a3”'],
+  ['History',{action:'search',source:'execution',query:'job'},'搜索全部对话的执行记录：“job”'],
+  ['History',{action:'search',scope:'71309d79-4ac2-443c-a534-9d42d5f165c1',query:'x'},'搜索指定对话的历史：“x”'],
+  ['History',{action:'read_events',source:'execution',scope:'all',eventIds:['1']},'读取全部对话 1 条执行记录'],
+  ['History',{action:'read',lastTurns:3},'读取当前对话最近 3 轮内容'],
+  ['AgentHistory',{action:'search',query:'编译'},'搜索当前对话的历史：“编译”'],
+  ['Read',{reads:[{path:'app/a.py',offset:10,limit:20},{path:'app/b.py'}]},'读取 2 个文件或片段 · a.py、b.py'],
   ['History',{action:'index',source:'execution',currentTask:true,limit:20},'查看当前任务的执行记录索引 · 最多 20 条'],
   ['History',{action:'read_events',source:'execution',eventIds:['1','2']},'读取当前对话 2 条执行记录'],
   ['History',{action:'read_turn',scope:'current',before:0,after:2},'读取当前对话的指定轮次 · 含后 2 轮'],
@@ -44,6 +53,14 @@ const cases = [
   ['Browser',{action:'files',params:{op:'cancel',id:1}},'取消文件下载'],
   ['Browser',{action:'network',params:{id:1,part:'response-body'}},'查看指定网络请求 · 响应正文'],
   ['Browser',{action:'recover',params:{op:'restart'}},'重启浏览器实例'],
+  ['Browser',{action:'act',params:{op:'click',target:'css=#save',observe:'snapshot'}},'点击 元素 #save · 并返回页面快照'],
+  ['Browser',{action:'navigate',params:{url:'https://example.com/',observe:'none'}},'打开 example.com 页面 · 不查看页面变化'],
+  ['Browser',{action:'act',params:{op:'press',key:'Enter',observe:'summary'}},'按下 Enter'],
+  ['Browser',{action:'steps',params:{steps:[{action:'act',op:'fill',fields:[{target:'r1',value:'secret'}]},{action:'act',op:'click',target:'css=#save'},{action:'wait',text:'已保存'}]}},'连续执行 3 步：填写 1 个表单字段 → 点击 元素 #save → 等待页面出现“已保存”'],
+  ['Browser',{action:'steps',params:{steps:[{action:'navigate',url:'https://example.com/a'},{action:'act',op:'press',key:'Tab'},{action:'act',op:'press',key:'Tab'},{action:'wait',timeMs:500}],observe:'snapshot'}},'连续执行 4 步：打开 example.com/a 页面 → 按下 Tab → 按下 Tab 等 · 并返回页面快照'],
+  ['Browser',{action:'steps'},'连续执行页面操作'],
+  ['Browser',{action:'evaluate',params:{expression:'x',waitFor:{text:'加载完成'}}},'等页面出现“加载完成”后执行页面脚本'],
+  ['Browser',{action:'evaluate',params:{expression:'x',waitFor:{expression:'secret()'}}},'等条件满足后执行页面脚本'],
   ['OpenBearControl',{action:'status'},'查看运行状态'],
   ['OpenBearControl',{action:'think',args:{level:'xhigh'}},'调整思考强度：极高'],
   ['OpenBearControl',{action:'restart',args:{delayS:3}},'3 秒后重启服务'],
@@ -112,10 +129,93 @@ test('Servers file transfers have Chinese summaries while raw parameters stay in
     assert.equal(JSON.stringify(args), raw);
     assert.deepEqual(JSON.parse(toolArgumentsRawPayload('Servers', args).content), args);
   }
+  // Without a transfer named, status and cancel mean this conversation's unfinished transfers.
   for (const [action, expected] of [
     ['upload_file', '上传文件到指定服务器'], ['download_file', '从指定服务器下载文件'],
-    ['transfer_status', '查询指定服务器的文件传输进度'], ['transfer_cancel', '取消指定服务器的文件传输'],
+    ['transfer_status', '查询本会话未结束的文件传输进度'], ['transfer_cancel', '取消本会话未结束的文件传输'],
   ]) assert.equal(toolArgumentsSummary('Servers', {action}), expected);
+});
+
+test('Servers calls over several servers, jobs and files say how many, and their results how they went', async () => {
+  const {rememberServerNames} = await import('./serverNames.js');
+  rememberServerNames([{id: 'w1', name: '公司-Windows'}, {id: 'm1', name: '公司-Mac mini'}]);
+  const say = (action, params, result) => toolArgumentsSummary('Servers', {action, params}, result ? JSON.stringify(result) : '');
+  const twelve = Array.from({length: 12}, (_, i) => `s${i}`);
+  assert.equal(say('jobs', {serverIds: twelve, state: 'running'}), '查询 12 台服务器正在运行的任务');
+  assert.equal(say('jobs', {all: true, startedBy: 'current', state: ['running', 'stopped']}), '查询全部在线服务器本会话启动的正在运行、已停止的任务');
+  assert.equal(say('jobs', {group: '国内', commandContains: 'rsync', since: '2h'}), '查询“国内”分组的在线服务器的后台任务 · 命令含 rsync · 自 2h');
+  assert.equal(say('jobs', {serverId: 'w1', state: 'exited'}), '查询“公司-Windows”已结束的任务');
+  assert.equal(say('jobs', {serverId: 'w1'}), '查看“公司-Windows”的后台任务');
+  assert.equal(say('jobs', {serverIds: twelve, state: 'running'}, {ok: true, matchedJobs: 5, servers: [{}, {}], serversWithoutMatches: 9, unavailable: [{}]}),
+    '查询 12 台服务器正在运行的任务 · 5 个任务 · 分布在 2 台 · 1 台离线或出错');
+  assert.equal(say('jobs', {all: true}, {ok: true, matchedJobs: 0, servers: [], serversWithoutMatches: 3}), '查询全部在线服务器的后台任务 · 没有匹配的任务');
+
+  const refs = [{serverId: 'w1', jobId: 'a1'}, {serverId: 'm1', jobId: 'b2'}, {serverId: 'm1', jobId: 'c3'}];
+  assert.equal(say('job_status', {jobs: refs}), '查看 2 台服务器上的 3 个后台任务');
+  assert.equal(say('job_status', {jobs: refs.slice(1)}), '查看“公司-Mac mini”的 2 个后台任务');
+  assert.equal(say('job_wait', {jobs: refs, mode: 'any', until: 'ready'}), '等待 2 台服务器上的 3 个后台任务 · 任一完成即返回 · 直到输出匹配 ready');
+  assert.equal(say('job_wait', {jobs: refs}, {ok: true, mode: 'all', reason: 'timeout', finished: 1, total: 3, results: []}),
+    '等待 2 台服务器上的 3 个后台任务 · 等待超时 · 完成 1/3');
+  assert.equal(say('job_stop', {jobs: refs}, {ok: true, stopped: 3, total: 3, results: []}), '停止 2 台服务器上的 3 个后台任务 · 已停止 3/3');
+  assert.equal(say('job_stop', {serverId: 'w1', jobId: 'a1'}), '停止“公司-Windows”的后台任务 · a1');
+  assert.equal(say('job_start', {serverId: 'w1', command: 'npm run dev', until: 'ready on'}, {ok: true, job: {id: 'j1', state: 'running'}, wait: {reason: 'matched'}}),
+    '在“公司-Windows”上启动后台任务 · npm run dev · 等到输出匹配 ready on · 任务 j1 · 输出已匹配');
+  assert.equal(say('job_start', {serverId: 'w1', command: 'make', waitSeconds: 60}, {ok: true, job: {id: 'j2', exitCode: 2}, wait: {reason: 'exited'}}),
+    '在“公司-Windows”上启动后台任务 · make · 等待结束（最多 60 秒） · 任务 j2 · 已结束（退出码 2）');
+
+  const files = [{localPath: '/a', remotePath: '/srv/a'}, {localPath: '/b', remotePath: '/srv/b'}, {localPath: '/c', remotePath: '/srv/c'}];
+  const five = ['s1', 's2', 's3', 's4', 's5'];
+  assert.equal(say('upload_file', {serverIds: five, files}), '批量上传 3 个文件到 5 台服务器');
+  assert.equal(say('upload_file', {serverIds: ['w1', 'm1'], localPath: '/a', remotePath: '/srv/a'}), '上传文件到“公司-Windows”、“公司-Mac mini” · /srv/a');
+  assert.equal(say('upload_file', {serverId: 'w1', files}), '批量上传 3 个文件到“公司-Windows”');
+  assert.equal(say('download_file', {group: '国内', remotePath: '/var/log/syslog', localPath: '/tmp/{server}.log'}), '从“国内”分组的在线服务器下载文件 · /var/log/syslog');
+  assert.equal(say('download_file', {serverIds: five, files: files.slice(0, 2)}), '从 5 台服务器批量下载 2 个文件');
+  const items = [{transferId: 't1', state: 'done'}, {transferId: 't2', state: 'transferring'}, {serverId: 's5', ok: false, error: 'node_offline'}];
+  assert.equal(say('upload_file', {serverIds: five, files}, {ok: false, batchId: 'b1', summary: {count: 2, finished: 1, succeeded: 1, percent: 60}, items}),
+    '批量上传 3 个文件到 5 台服务器 · 已结束 1/2 · 60% · 1 项被拒绝');
+  assert.equal(say('upload_file', {serverIds: five, files}, {ok: true, batchId: 'b1', summary: {count: 15, finished: 15, succeeded: 15}, items: []}),
+    '批量上传 3 个文件到 5 台服务器 · 全部完成 · 15 项');
+  assert.equal(say('transfer_status', {transferIds: ['t1', 't2'], waitSeconds: 120}, {ok: true, summary: {count: 2, finished: 2, succeeded: 1}, items: []}),
+    '查询 2 个文件传输的进度 · 等待全部结束（最多 120 秒） · 完成 1/2 · 1 项未成功');
+  assert.equal(say('transfer_status', {batchId: 'b1'}), '查询一批文件传输的进度 · b1');
+  assert.equal(say('transfer_status', {}, {ok: true, summary: {count: 0, finished: 0, succeeded: 0}, items: []}), '查询本会话未结束的文件传输进度 · 没有未结束的传输');
+  assert.equal(say('transfer_cancel', {batchId: 'b1'}, {ok: true, cancelRequested: 2, summary: {count: 3, finished: 1, succeeded: 1}, items: []}),
+    '取消一批文件传输 · b1 · 已结束 1/3 · 已请求取消 2 项');
+  assert.equal(say('transfers', {startedBy: 'current', state: 'active', direction: 'upload'}), '查看本会话的文件传输记录 · 上传 · 未结束');
+  assert.equal(say('transfers', {serverIds: ['w1']}), '查看文件传输记录 · “公司-Windows”');
+  // A group names no count: the items say how many servers and files the batch reached.
+  const reached = n => Array.from({length: n}, (_, i) => ({serverId: `g${i}`, remotePath: '/tmp/probe.txt', state: 'done'}));
+  const doneOf = n => ({count: n, finished: n, succeeded: n});
+  assert.equal(say('upload_file', {group: '测试机', files: [{localPath: '/a', remotePath: '/tmp/probe.txt'}]}, {ok: true, summary: doneOf(3), items: reached(3)}),
+    '上传文件到“测试机”分组的在线服务器 · /tmp/probe.txt · 3 台 · 全部完成');
+  assert.equal(say('download_file', {all: true, files}, {ok: true, summary: doneOf(6), items: [...reached(2), ...reached(2).map(i => ({...i, remotePath: '/b'})),
+    ...reached(2).map(i => ({...i, remotePath: '/c'}))]}), '从全部在线服务器批量下载 3 个文件 · 2 台 × 3 个文件 · 全部完成');
+  assert.equal(say('exec', {group: '测试机', command: 'rm -f /tmp/probe.txt'}, {ok: true, results: [{ok: true}, {ok: true}, {ok: true}]}),
+    '执行 rm -f /tmp/probe.txt · 在“测试机”分组的在线服务器上 · 3 台全部成功');
+  assert.equal(say('exec', {all: true, command: 'uptime'}, {ok: false, results: [{ok: true}, {ok: false, exitCode: 1}, {ok: false, timedOut: true}]}),
+    '执行 uptime · 在全部在线服务器上 · 3 台 · 成功 1 · 失败 1 · 超时 1');
+  assert.equal(say('exec', {serverId: 'w1', command: 'uptime'}, {ok: true, results: [{ok: true}]}), '执行 uptime · 在“公司-Windows”上');
+  // The old single forms read as before.
+  assert.equal(say('upload_file', {serverId: 'w1', localPath: '/a', remotePath: 'C:/a'}, {ok: true, transfer: {state: 'done'}}), '上传文件到“公司-Windows” · C:/a');
+  assert.equal(say('describe', {topic: 'job_wait'}), '查看服务器工具 job_wait 的用法');
+  assert.equal(say('describe', {topic: 'mesh_all'}), '查看组网用法');
+  assert.equal(say('describe', {topic: 'mesh'}), '查看服务器工具 mesh 的用法');
+  assert.equal(say('describe', {}), '查看服务器工具用法');
+});
+
+test('Browser results add how far steps got and what the page observation saw', () => {
+  const steps = {action:'steps',params:{steps:[{action:'act',op:'click',target:'css=#a'},{action:'wait',text:'OK'}]}};
+  const done = JSON.stringify({status:'ok',outcome:'completed',steps:[{},{}],completedSteps:2,observation:{changed:true}});
+  assert.equal(toolArgumentsSummary('Browser',steps,done),'连续执行 2 步：点击 元素 #a → 等待页面出现“OK” · 2 步全部完成 · 页面有变化');
+  const stopped = JSON.stringify({status:'error',outcome:'failed',steps:[{}],stoppedAt:0,observation:{dialog:{},skipped:'dialog_pending'}});
+  assert.match(toolArgumentsSummary('Browser',steps,stopped),/停在第 1 步 · 页面弹出对话框$/);
+  const click = {action:'act',params:{op:'click',target:'css=#a'}};
+  assert.equal(toolArgumentsSummary('Browser',click,JSON.stringify({status:'ok',observation:{navigated:true,changed:true}})),'点击 元素 #a · 页面已跳转');
+  assert.equal(toolArgumentsSummary('Browser',click,JSON.stringify({status:'ok',observation:{changed:false}})),'点击 元素 #a · 页面无变化');
+  assert.equal(toolArgumentsSummary('Browser',click,JSON.stringify({status:'ok'})),'点击 元素 #a');
+  const evaluate = {action:'evaluate',params:{expression:'x',waitFor:{text:'OK'}}};
+  assert.equal(toolArgumentsSummary('Browser',evaluate,JSON.stringify({error:'wait_for_timeout'})),'等页面出现“OK”后执行页面脚本 · 等待超时，脚本未执行');
+  assert.equal(toolArgumentsSummary('Browser',{action:'snapshot'},'not json'),'查看页面内容快照');
 });
 
 test('Servers calls read as what they do on which server, without passwords', async () => {

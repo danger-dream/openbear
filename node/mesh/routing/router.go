@@ -55,12 +55,14 @@ const (
 // Config is what the router needs from the applied config.
 type Config struct {
 	Self     string
+	Leaf     bool               // this node is a member: it receives advertisements and never forwards or advertises
 	Relays   []string           // every other relay in the mesh
-	Links    []string           // the relays this one has a link with
+	Leaves   []string           // every other member in the mesh that participates in routing
+	Links    []string           // the nodes this one has a link with
 	NextHops map[string]string  // configured next hops: the start and static mode
 	Mode     string             // dynamic (the default) or static
-	Bias     map[string]float64 // ms added to a link's cost, by linked relay
-	// Numbers are the host numbers of the relays' control addresses, this
+	Bias     map[string]float64 // ms added to a link's cost, by linked peer
+	// Numbers are the host numbers of the nodes' control addresses, this
 	// one's included, that name them in compact advertisements; without a
 	// distinct one for every relay, FormatJSON is used.
 	Numbers map[string]uint32
@@ -73,6 +75,10 @@ type Config struct {
 	// RelayLinks are the links between relays the mesh has, each pair once;
 	// a link an advertisement lists that is not among them is ignored.
 	RelayLinks [][2]string
+	// MemberLinks are the links between relays and members (or members and
+	// members for this node), each pair once; an advertised member link not
+	// among them is ignored when set.
+	MemberLinks [][2]string
 }
 
 type LinkStatus struct {
@@ -146,10 +152,11 @@ type Router struct {
 	now   func() time.Time
 	event func(kind, detail string)
 
-	known map[string]bool // every relay, this one included
-	order []string        // the other relays, sorted
-	// all is every relay, this one included, sorted: the routes of an
-	// advertisement this one forwards include those to itself.
+	known  map[string]bool // every relay, this one included if a relay
+	leaves map[string]bool // every member in routing, this one included if a leaf
+	order  []string        // the other nodes (relays and leaves), sorted
+	// all is every relay, this one included when not a leaf, sorted: the
+	// routes of an advertisement this one sends include those to relays.
 	all    []string
 	links  map[string]*metric
 	lsdb   map[string]*advert
@@ -166,12 +173,13 @@ type Router struct {
 
 	num map[string]uint32 // compact names, every relay's, or nil
 	ids map[uint32]string
-	// real is cfg.RelayLinks as pairs in order; unknownAt when each origin
-	// last had an event for listing another link, clockAt for a sequence
-	// far off this relay's clock.
-	real      map[[2]string]bool
-	unknownAt map[string]time.Time
-	clockAt   map[string]time.Time
+	// real is cfg.RelayLinks as pairs in order, realMembers cfg.MemberLinks;
+	// unknownAt when each origin last had an event for listing another link,
+	// clockAt for a sequence far off this relay's clock.
+	real        map[[2]string]bool
+	realMembers map[[2]string]bool
+	unknownAt   map[string]time.Time
+	clockAt     map[string]time.Time
 	// verified counts the advertisements whose signatures held.
 	verified uint64
 }
@@ -202,16 +210,32 @@ func (r *Router) configure(c Config) bool {
 	}
 	now := r.now()
 	r.cfg = c
-	r.known = map[string]bool{c.Self: true}
+	r.known = map[string]bool{}
+	r.leaves = map[string]bool{}
+	if c.Leaf {
+		r.leaves[c.Self] = true
+	} else {
+		r.known[c.Self] = true
+	}
 	r.order = nil
+	r.all = nil
+	if !c.Leaf {
+		r.all = append(r.all, c.Self)
+	}
 	for _, id := range c.Relays {
-		if id != c.Self && !r.known[id] {
+		if id != c.Self && !r.known[id] && !r.leaves[id] {
 			r.known[id] = true
+			r.order = append(r.order, id)
+			r.all = append(r.all, id)
+		}
+	}
+	for _, id := range c.Leaves {
+		if id != c.Self && !r.known[id] && !r.leaves[id] {
+			r.leaves[id] = true
 			r.order = append(r.order, id)
 		}
 	}
 	sort.Strings(r.order)
-	r.all = append([]string{c.Self}, r.order...)
 	sort.Strings(r.all)
 	r.num, r.ids = map[string]uint32{}, map[uint32]string{}
 	for id := range r.known {
@@ -222,9 +246,22 @@ func (r *Router) configure(c Config) bool {
 		}
 		r.num[id], r.ids[n] = n, id
 	}
+	if r.num != nil {
+		for id := range r.leaves {
+			if n, ok := c.Numbers[id]; ok && n != 0 {
+				if _, taken := r.ids[n]; !taken {
+					r.num[id], r.ids[n] = n, id
+				}
+			}
+		}
+	}
 	r.real = map[[2]string]bool{}
 	for _, p := range c.RelayLinks {
 		r.real[pair(p[0], p[1])] = true
+	}
+	r.realMembers = map[[2]string]bool{}
+	for _, p := range c.MemberLinks {
+		r.realMembers[pair(p[0], p[1])] = true
 	}
 	for o, a := range r.lsdb {
 		// What a stored advertisement lists is held to the new links too.
@@ -232,7 +269,7 @@ func (r *Router) configure(c Config) bool {
 	}
 	linked := map[string]bool{}
 	for _, p := range c.Links {
-		if !r.known[p] || p == c.Self {
+		if (!r.known[p] && !r.leaves[p]) || p == c.Self {
 			continue
 		}
 		linked[p] = true
@@ -263,7 +300,7 @@ func (r *Router) configure(c Config) bool {
 		}
 	}
 	for d := range r.routes {
-		if !r.known[d] || d == c.Self {
+		if (!r.known[d] && !r.leaves[d]) || d == c.Self {
 			delete(r.routes, d)
 		}
 	}
@@ -315,7 +352,7 @@ func (r *Router) settle(peer string, m *metric, now time.Time) {
 	case before == StateSuppressed:
 		r.event("link.reused", fmt.Sprintf("%s: penalty %.0f", peer, m.penalty))
 	}
-	if m.advState == StateUp && before != StateUp {
+	if !r.cfg.Leaf && m.advState == StateUp && before != StateUp && (r.known[peer] || r.leaves[peer]) {
 		// The neighbor may have restarted: it gets the whole database.
 		r.sync[peer] = true
 	}
@@ -347,17 +384,24 @@ func (r *Router) Tick() bool {
 func (r *Router) Advert(b Budget, peers []string) []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cfg.Leaf {
+		return nil
+	}
 	now := r.now()
 	since := now.Sub(r.sent)
 	if !r.sent.IsZero() && !(r.due && since >= advertGap) && since < advertEvery {
 		return nil
 	}
-	a := &advert{origin: r.cfg.Self, seq: max(r.seq+1, uint64(now.UnixMicro())), links: map[string]advLink{}, routes: map[string]string{}}
+	a := &advert{origin: r.cfg.Self, seq: max(r.seq+1, uint64(now.UnixMicro())), links: map[string]advLink{}, members: map[string]advLink{}, routes: map[string]string{}}
 	for p, m := range r.links {
-		a.links[p] = advLink{m.advCost, m.advState}
+		if r.leaves[p] {
+			a.members[p] = advLink{m.advCost, m.advState}
+		} else {
+			a.links[p] = advLink{m.advCost, m.advState}
+		}
 	}
 	for d, rt := range r.routes {
-		if rt.nextHop != "" {
+		if rt.nextHop != "" && r.known[d] {
 			a.routes[d] = rt.nextHop
 		}
 	}
@@ -371,11 +415,17 @@ func (r *Router) Advert(b Budget, peers []string) []Message {
 		r.tooLarge = false
 	}
 	r.sent, r.due = now, false
-	if !ok || len(peers) == 0 {
+	var destPeers []string
+	for _, p := range peers {
+		if r.known[p] || r.leaves[p] {
+			destPeers = append(destPeers, p)
+		}
+	}
+	if !ok || len(destPeers) == 0 {
 		return nil
 	}
 	r.seq = a.seq
-	return a.messages(peers)
+	return a.messages(destPeers)
 }
 
 // encode writes this relay's a in its format within b and signs it; false
@@ -432,7 +482,8 @@ func fit(budget int, encode func(routes bool) []byte) []byte {
 func (r *Router) Sync(b Budget) []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.sync) == 0 {
+	if r.cfg.Leaf || len(r.sync) == 0 {
+		r.sync = map[string]bool{}
 		return nil
 	}
 	var out []Message
@@ -443,6 +494,9 @@ func (r *Router) Sync(b Budget) []Message {
 			}
 		}
 	}) {
+		if !r.known[p] && !r.leaves[p] {
+			continue
+		}
 		for _, o := range r.order {
 			if a := r.lsdb[o]; a != nil {
 				out = append(out, a.messages([]string{p})...)
@@ -468,7 +522,7 @@ func (r *Router) Receive(from string, msg Message, b Budget) (forward []Message,
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	if r.links[from] == nil {
+	if r.links[from] == nil || !r.known[from] {
 		return nil, false, errUnlinked
 	}
 	s := r.senders[from]
@@ -484,11 +538,11 @@ func (r *Router) Receive(from string, msg Message, b Budget) (forward []Message,
 		if r.num == nil {
 			return nil, false, errNoNumbers
 		}
-		if a, err = decodeCompact(msg.Raw, r.ids, r.known); errors.Is(err, errNewerFormat) {
+		if a, err = decodeCompact(msg.Raw, r.ids, r.known, r.leaves); errors.Is(err, errNewerFormat) {
 			return nil, false, nil
 		}
 	} else {
-		a, err = decodeJSON(msg.Raw, r.known)
+		a, err = decodeJSON(msg.Raw, r.known, r.leaves)
 	}
 	if err != nil {
 		return nil, false, err
@@ -517,9 +571,11 @@ func (r *Router) Receive(from string, msg Message, b Budget) (forward []Message,
 	r.checkClock(a, now)
 	r.lsdb[a.origin] = a
 	var peers []string
-	for _, p := range r.cfg.Links {
-		if p != from && p != a.origin && r.links[p] != nil {
-			peers = append(peers, p)
+	if !r.cfg.Leaf {
+		for _, p := range r.cfg.Links {
+			if p != from && p != a.origin && r.links[p] != nil && (r.known[p] || r.leaves[p]) {
+				peers = append(peers, p)
+			}
 		}
 	}
 	return a.messages(peers), r.recompute(now), nil
@@ -533,6 +589,14 @@ func (r *Router) keepReal(origin string, a *advert, report bool) {
 		if !r.real[pair(origin, p)] {
 			delete(a.links, p)
 			unknown = append(unknown, p)
+		}
+	}
+	if len(r.realMembers) > 0 {
+		for p := range a.members {
+			if !r.realMembers[pair(origin, p)] {
+				delete(a.members, p)
+				unknown = append(unknown, p)
+			}
 		}
 	}
 	if len(unknown) == 0 || !report {
@@ -623,10 +687,11 @@ func (r *Router) recompute(now time.Time) bool {
 	changed := false
 	for _, d := range r.order {
 		rt := r.routes[d]
-		if !foreign {
+		df := foreign || (r.leaves[d] && r.links[d] != nil && r.links[d].advState == StateUp)
+		if !df {
 			rt.dynamic = false
 		}
-		next, reason := r.choose(d, rt, foreign, now)
+		next, reason := r.choose(d, rt, df, now)
 		if next == rt.nextHop {
 			continue
 		}
@@ -660,6 +725,26 @@ func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (strin
 	static := r.cfg.NextHops[d]
 	if r.links[static] == nil {
 		static = ""
+	}
+	if static == "" && r.cfg.Leaf && r.cfg.Mode != ModeStatic {
+		if r.links[d] != nil && r.links[d].advState == StateUp {
+			static = d
+		} else {
+			for _, l := range r.cfg.Links {
+				if r.known[l] && r.links[l] != nil && r.links[l].advState == StateUp {
+					static = l
+					break
+				}
+			}
+			if static == "" {
+				for _, l := range r.cfg.Links {
+					if r.known[l] && r.links[l] != nil {
+						static = l
+						break
+					}
+				}
+			}
+		}
 	}
 	if r.cfg.Mode == ModeStatic || !foreign {
 		return static, ""
@@ -749,15 +834,38 @@ func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (strin
 	return best, reason
 }
 
+// PathDown is the first link between consecutive nodes that is not up as this
+// node knows them, its own as it measures them and the others as their ends
+// advertise them, or nil when every one is up (fixed paths).
+func (r *Router) PathDown(nodes []string) []string {
+	if len(nodes) < 2 {
+		return []string{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g := r.graph
+	if g == nil {
+		return []string{nodes[0], nodes[1]}
+	}
+	for i := 0; i+1 < len(nodes); i++ {
+		if _, ok := g.adj[nodes[i]][nodes[i+1]]; !ok {
+			return []string{nodes[i], nodes[i+1]}
+		}
+	}
+	return nil
+}
+
 // graph is every relay and link as this relay knows them, with the
 // shortest distances between all relays.
 type graph struct {
-	self  string
-	nodes []string
-	adj   map[string]map[string]key // symmetric
-	dist  map[string]map[string]key
-	first map[string]string // this relay's shortest-path next hop by destination
-	lsdb  map[string]*advert
+	self    string
+	nodes   []string
+	leaves  map[string]bool
+	adj     map[string]map[string]key // symmetric
+	dist    map[string]map[string]key
+	first   map[string]string            // this node's shortest-path next hop by destination
+	firstBy map[string]map[string]string // src -> dest -> shortest-path next hop
+	lsdb    map[string]*advert
 }
 
 // key orders paths: by cost in tenths of a millisecond, then by a
@@ -783,7 +891,7 @@ func linkKey(a, b string, c float64) key {
 }
 
 func (r *Router) build() *graph {
-	g := &graph{self: r.cfg.Self, nodes: append([]string{r.cfg.Self}, r.order...), adj: map[string]map[string]key{}, dist: map[string]map[string]key{}, first: map[string]string{}, lsdb: r.lsdb}
+	g := &graph{self: r.cfg.Self, nodes: append([]string{r.cfg.Self}, r.order...), leaves: r.leaves, adj: map[string]map[string]key{}, dist: map[string]map[string]key{}, first: map[string]string{}, firstBy: map[string]map[string]string{}, lsdb: r.lsdb}
 	side := func(x, y string) (advLink, bool) {
 		if x == r.cfg.Self {
 			m := r.links[y]
@@ -795,6 +903,10 @@ func (r *Router) build() *graph {
 		a := r.lsdb[x]
 		if a == nil {
 			return advLink{}, false
+		}
+		if r.leaves[y] {
+			l, ok := a.members[y]
+			return l, ok
 		}
 		l, ok := a.links[y]
 		return l, ok
@@ -819,8 +931,12 @@ func (r *Router) build() *graph {
 		}
 	}
 	for _, src := range g.nodes {
+		if src != r.cfg.Self && g.leaves[src] {
+			continue
+		}
 		dist, first := g.dijkstra(src)
 		g.dist[src] = dist
+		g.firstBy[src] = first
 		if src == r.cfg.Self {
 			g.first = first
 		}
@@ -847,6 +963,9 @@ func (g *graph) dijkstra(src string) (map[string]key, map[string]string) {
 			return dist, first
 		}
 		done[u] = true
+		if u != src && g.leaves[u] {
+			continue
+		}
 		for v, k := range g.adj[u] {
 			if done[v] {
 				continue
@@ -894,19 +1013,22 @@ func (g *graph) chain(n, d string) (cost key, ok, loops bool) {
 		if seen[x] {
 			return unreachable, false, true
 		}
+		if g.leaves[x] {
+			return unreachable, false, false
+		}
 		seen[x] = true
 		a := g.lsdb[x]
 		if a == nil {
 			return unreachable, false, false
 		}
-		if a.routes == nil {
-			rest := g.dist[x][d]
-			if rest.unreachable() {
-				return unreachable, false, false
-			}
-			return cost.add(rest), true, false
+		var nh string
+		var has bool
+		if a.routes == nil || g.leaves[d] {
+			nh = g.firstBy[x][d]
+			has = nh != ""
+		} else {
+			nh, has = a.routes[d]
 		}
-		nh, has := a.routes[d]
 		if !has {
 			return unreachable, false, false
 		}
@@ -960,22 +1082,13 @@ func (g *graph) path(n, d string) ([]string, float64, bool) {
 			return out, cost.ms(), true
 		}
 		a := g.lsdb[x]
-		if a == nil || a.routes == nil {
-			// Follow the shortest path from x.
-			for x != d {
-				best := ""
-				for y, k := range g.adj[x] {
-					if g.dist[x][d] == k.add(g.dist[y][d]) && (best == "" || y < best) {
-						best = y
-					}
-				}
-				if best == "" || slices.Contains(out, best) {
-					return out, cost.ms(), true
-				}
-				out = append(out, best)
-				x = best
+		if a == nil || a.routes == nil || g.leaves[d] {
+			nh := g.firstBy[x][d]
+			if nh == "" || slices.Contains(out, nh) {
+				return out, cost.ms(), true
 			}
-			return out, cost.ms(), true
+			x = nh
+			continue
 		}
 		x = a.routes[d]
 	}

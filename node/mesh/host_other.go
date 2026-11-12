@@ -14,4 +14,6 @@ func createTUN(dir string, mtu int) (tun.Device, error) {
 
 func newHost(string, string, tun.Device) hostNet { return nil }
 
+func Sweep(string) {}
+
 func residentBytes() uint64 { return 0 }

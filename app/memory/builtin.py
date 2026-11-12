@@ -17,6 +17,8 @@ from app import installed_version
 from app.db.engine import DB, now_ts
 
 _REMOVED_STRUCTURAL_CATEGORIES = frozenset({"identity", "persona", "rule"})
+# Each render keeps its whole output (tens of KB); the memory page's log shows the last month.
+RENDER_LOG_DAYS = 30
 
 _DEFAULT_CATEGORIES = [
     ("network", "网络", "🌐", 40),
@@ -212,6 +214,8 @@ class TemplateEngine:
     def render(self, template: str, context: dict[str, Any]) -> str:
         ctx = {k: _wrap(v) for k, v in context.items()}
         ctx.setdefault("helpers", _Helpers())
+        ctx.setdefault("folderPrompt", "")
+        ctx.setdefault("extensionCatalog", AttrList())
         lines = template.splitlines()
         rendered = self._render_block(lines, ctx, 0, len(lines))
         return re.sub(r"\n{3,}", "\n\n", "\n".join(rendered))
@@ -491,6 +495,11 @@ class BuiltinMemoryClient:
                 template.name,
                 int((time.perf_counter() - start) * 1000),
             ),
+        )
+        # A bounded batch per render: an old backlog goes over a few renders, not in one long write.
+        await self._db.conn.execute(
+            "DELETE FROM memory_render_logs WHERE id IN (SELECT id FROM memory_render_logs WHERE ts<? ORDER BY ts LIMIT 200)",
+            (now_ts() - RENDER_LOG_DAYS * 86400,),
         )
         await self._db.conn.commit()
         return output
