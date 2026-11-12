@@ -1,7 +1,7 @@
 // The servers page in happy-dom, with the same fake backend as the browser tests.
 // setup(t, options) takes the options of the browser tests' setup() (width, dark, view, tweak,
 // keepAlive, fx, release, recheck, mesh, refuseMesh) and returns the same handles:
-// {page, calls, terminal, uploads, saved, items, close}.
+// {page, calls, terminal, uploads, saved, items, messages, close}.
 import {window} from '../../domTestEnv.mjs';
 import {network} from '../../testing/fakeNetwork.mjs';
 import './serversStubs.mjs';
@@ -12,6 +12,17 @@ import {detailTab} from '../detail/detailTab.js';
 
 scaleTimers(10);
 const {h, KeepAlive, ref} = await import('vue');
+// Every ElMessage the page shows, as {type, text}. With timers scaled a toast stays about 300 ms, which a
+// re-render of the whole board on a loaded machine outlasts; assert those through this list.
+const messages = [];
+const {ElMessage} = await import('element-plus');
+for (const type of ['success', 'warning', 'info', 'error']) {
+  const show = ElMessage[type];
+  ElMessage[type] = (options, ...rest) => {
+    messages.push({type, text: typeof options === 'string' ? options : options?.message});
+    return show(options, ...rest);
+  };
+}
 const ServersView = (await import('../../views/ServersView.vue')).default;
 
 export async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], wait = true} = {}) {
@@ -27,6 +38,7 @@ export async function setup(t, {width = 1440, height = 900, dark = false, view =
     for (const message of socket.sent) handle(message);
     socket.onSend = handle;
   };
+  messages.length = 0;
   window.sessionStorage.clear();
   window.localStorage.clear();
   window.localStorage.setItem('openbear.servers.view', view);
@@ -38,7 +50,7 @@ export async function setup(t, {width = 1440, height = 900, dark = false, view =
   const root = keepAlive ? {render: () => h(KeepAlive, {include: ['ServersView']}, [shown.value ? h(ServersView) : h(Other)])} : ServersView;
   const {page, unmount} = mountApp(t, root, {width, height, dark, network});
   if (wait) await page.locator(view === 'list' ? '.pl-row' : '.pb-card').first().waitFor();
-  return {page, backend, calls: backend.calls, terminal: backend.terminal, uploads: backend.uploads, saved: backend.saved, items: backend.items, close: () => unmount()};
+  return {page, backend, calls: backend.calls, terminal: backend.terminal, uploads: backend.uploads, saved: backend.saved, items: backend.items, messages, close: () => unmount()};
 }
 
 export const names = page => page.locator('.pb-card .pb-name').allInnerTexts();

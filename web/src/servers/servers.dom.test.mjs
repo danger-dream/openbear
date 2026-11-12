@@ -5,8 +5,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setup, names, showTab, tab, expectFocused} from './testing/serversDom.mjs';
-import {sleep} from '../testing/domPage.mjs';
+import {sleep, waitUntil} from '../testing/domPage.mjs';
 import {server, GB, day, many, uninstalledLast, versions, RELEASE, MESH_ON, onMesh, card, meshOption, off, fact} from './testing/serversBackend.mjs';
+
+// A node update reloads the whole board right after its toast, so the toast is checked as shown, not on screen.
+const shown = (h, type, text) => waitUntil(() => h.messages.some(m => m.type === type && m.text === text), {message: `${type} toast: ${text}`});
 
 test('desktop board: summary filters, update notice, sparklines, list view', async t => {
   const h = await setup(t);
@@ -180,7 +183,7 @@ test('detail: a node past the target is not offered an update; a downgrade is as
     await dialog.getByText('这是降级：「Delta-JP」的节点会从 0.14.0-dev.3 换成更旧的 0.13.1').waitFor();
     await Promise.all([h.page.waitForResponse(r => r.url().endsWith('/api/servers/srv-delta/node/update')), dialog.getByRole('button', {name: '降级'}).click()]);
     assert.deepEqual(h.calls.find(c => c.path === '/api/servers/srv-delta/node/update').body, {downgrade: true});
-    await h.page.getByText('已降级到 0.13.1，节点重新连上并报告运行新构建').waitFor();
+    await shown(h, 'success', '已降级到 0.13.1，节点重新连上并报告运行新构建');
     await h.close();
   }
 });
@@ -920,7 +923,7 @@ test('node versions: state tags, summary with 全部更新, build and source in 
   const fact = label => detail.locator('.ix-facts > div').filter({has: h.page.locator('dt', {hasText: new RegExp(`^${label}$`)})}).locator('dd');
   assert.equal(await fact('构建').innerText(), '0123456789ab · 正式版');
   await detail.locator('.pb-notice').getByRole('button', {name: '更新'}).click();
-  await h.page.getByText('文件已替换，未确认运行：节点没有在限定时间内用新程序重新连上').waitFor();
+  await shown(h, 'warning', '文件已替换，未确认运行：节点没有在限定时间内用新程序重新连上');
   await h.close();
 
   // A node that must update says why; one already on the target build says so in the detail only.
@@ -940,7 +943,7 @@ test('node versions: state tags, summary with 全部更新, build and source in 
   assert.equal(await d.locator('.ix-facts > div').filter({has: p.page.locator('dt', {hasText: /^构建$/})}).locator('dd').innerText(), '5a5a5a5a5a5a · 测试版 · 比目标 1.2.0 新，不会自动降级');
   await tab(p.page, '探针').click();
   await p.page.locator('.pb-notice[data-node-update=summary]').getByRole('button', {name: '全部更新'}).click();
-  await p.page.getByText('已更新 1 台，1 台文件已替换但未确认运行').waitFor();
+  await shown(p, 'warning', '已更新 1 台，1 台文件已替换但未确认运行');
   assert.ok(p.calls.some(c => c.path === '/api/servers/node-update'));
   await p.close();
 });

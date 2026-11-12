@@ -708,7 +708,10 @@ needs_node = pytest.mark.skipif(not shutil.which("node"), reason="Node.js is not
 def test_frontend_build_runs_the_bump_first():
     package = json.loads((ROOT / "web/package.json").read_text())
     assert package["scripts"]["prebuild"] == "node scripts/bump-dev-version.mjs"
-    assert package["scripts"]["build"].startswith("vite build")
+    assert package["scripts"]["build"].endswith("node_modules/vite/bin/vite.js build")
+    # The build needs about 3 GB of heap; in the 6 GB release and Docker build containers
+    # Node's default is about 2 GB.
+    assert "--max-old-space-size=4096" in package["scripts"]["build"]
 
 
 @needs_node
