@@ -188,7 +188,18 @@ class WebAdminWorkItemsMixin:
     def _work_item_path_allowed(path: Path) -> bool:
         # Any directory on this machine; only credential and database files stay closed.
         lowered = path.name.lower()
-        return lowered not in {"openbear.json", ".env"} and not lowered.endswith((".db", ".sqlite", ".sqlite3", ".pem", ".key"))
+        parts = {part.lower() for part in path.parts}
+        if ".managed" in parts:
+            return False
+        if ".ssh" in parts and not lowered.endswith(".pub"):
+            return False
+        if lowered in {"openbear.json", ".env", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "shadow", "gshadow"}:
+            return False
+        if (lowered.startswith(".env.") or lowered.startswith("openbear.json.")) and not lowered.endswith(
+            (".example", ".sample", ".template")
+        ):
+            return False
+        return not lowered.endswith((".db", ".sqlite", ".sqlite3", ".pem", ".key", ".p12", ".pfx", ".kdbx"))
 
     def _work_item_resolve(self, entry: dict[str, Any], row: dict[str, Any]) -> Path:
         if entry.get("kind") not in _FILE_KINDS or not entry.get("path"):

@@ -5,6 +5,7 @@ Memory 工具接口，并用轻量模板引擎构建 system prompt。
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import time
@@ -205,6 +206,37 @@ class _Helpers:
         return f"{fence}\n{text}\n{fence}"
 
 
+_SAFE_BUILTINS = {
+    "len": len,
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list,
+}
+_SAFE_HELPER_NAMES = frozenset({
+    "noteSuffix",
+    "has",
+    "join",
+    "ownerLine",
+    "runtimeLine",
+    "toolLines",
+    "mcpGroupLines",
+    "literalBlock",
+})
+_FORBIDDEN_AST_NODES = (
+    ast.Lambda,
+    ast.NamedExpr,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Yield,
+    ast.YieldFrom,
+    ast.Await,
+)
+
+
 class TemplateEngine:
     """兼容 prompt-memory 常用模板语法：[[ expr ]] / @if / @each / @raw。"""
 
@@ -227,9 +259,46 @@ class TemplateEngine:
         expr = re.sub(r"\s+&&\s+", " and ", expr)
         return expr
 
+    @classmethod
+    def _validate_ast(cls, expr: str) -> ast.Expression:
+        tree = ast.parse(expr, mode="eval")
+        for node in ast.walk(tree):
+            if isinstance(node, _FORBIDDEN_AST_NODES):
+                raise ValueError("unsupported template expression syntax")
+            if isinstance(node, ast.Name) and node.id.startswith("_"):
+                raise ValueError("private template identifiers are unavailable")
+            if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+                raise ValueError("private template attributes are unavailable")
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+                and node.slice.value.startswith("_")
+            ):
+                raise ValueError("private template keys are unavailable")
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in _SAFE_BUILTINS:
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "helpers"
+                    and node.func.attr in _SAFE_HELPER_NAMES
+                ):
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "join"
+                    and isinstance(node.func.value, ast.Constant)
+                    and isinstance(node.func.value.value, str)
+                ):
+                    continue
+                raise ValueError("unsupported function call in template expression")
+        return tree
+
     def _eval(self, expr: str, ctx: dict[str, Any]) -> Any:
-        safe_builtins = {"len": len, "str": str, "int": int, "float": float, "bool": bool, "list": list}
-        return eval(self._translate_expr(expr), {"__builtins__": safe_builtins}, ctx)  # noqa: S307 - 管理员模板，非用户输入
+        tree = self._validate_ast(self._translate_expr(expr))
+        return eval(compile(tree, "<template>", "eval"), {"__builtins__": _SAFE_BUILTINS}, ctx)  # noqa: S307 - AST-restricted template evaluation
 
     def _interpolate(self, line: str, ctx: dict[str, Any]) -> str:
         def repl(match: re.Match[str]) -> str:

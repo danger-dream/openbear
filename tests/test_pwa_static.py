@@ -122,6 +122,18 @@ async def test_pwa_does_not_weaken_api_auth_csrf_or_enable_static_writes(pwa_web
     cross_origin = await pwa_web.client.post("/api/conversations", headers={"Authorization": "test-session", "Origin": "https://untrusted.example"}, json={})
     assert cross_origin.status == 403
     assert (await cross_origin.json())["error"] == "csrf_origin_rejected"
+    for bad_headers in (
+        {"Authorization": "test-session", "Origin": "null"},
+        {"Authorization": "test-session", "Origin": "file://"},
+        {"Authorization": "test-session", "Origin": "http://untrusted.example:badport"},
+        {"Authorization": "test-session", "Sec-Fetch-Site": "cross-site"},
+    ):
+        rejected = await pwa_web.client.post("/api/conversations", headers=bad_headers, json={})
+        assert rejected.status == 403
+        assert (await rejected.json())["error"] == "csrf_origin_rejected"
+    login_csrf = await pwa_web.client.post("/api/auth/login/start", headers={"Origin": "https://untrusted.example"}, json={"secret": "x"})
+    assert login_csrf.status == 403
+    assert (await login_csrf.json())["error"] == "csrf_origin_rejected"
     same_origin = await pwa_web.client.post("/api/conversations", headers={"Authorization": "test-session", "Origin": str(pwa_web.client.make_url("/")).rstrip("/")}, json={})
     assert same_origin.status == 200
     for url in PWA_PUBLIC_FILES:

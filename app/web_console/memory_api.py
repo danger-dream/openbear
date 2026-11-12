@@ -320,7 +320,7 @@ class WebAdminMemoryMixin:
                 continue
             roots = self._template_expr_roots(stripped[4:].strip())
             allowed = allowed_roots | set(loop_vars)
-            missing = sorted(r for r in roots if r not in allowed and r not in reserved and not r.startswith("__"))
+            missing = sorted(r for r in roots if r not in allowed and r not in reserved)
             if missing:
                 errors.append(f"line {line_no}: unknown @if root variable(s): {', '.join(missing)}")
         return errors

@@ -13,7 +13,8 @@ class WebAdminAppMixin:
             custom = _origin_key(self.config.web.custom_url)
             if custom:
                 origins.add(custom)
-        host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or ""
+        forwarded_host = (request.headers.get("X-Forwarded-Host") or "").split(",", 1)[0].strip()
+        host = forwarded_host or (request.headers.get("Host") or "").strip()
         proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",", 1)[0].strip()
         if host:
             current = _origin_key(f"{proto}://{host}")
@@ -22,22 +23,29 @@ class WebAdminAppMixin:
         return origins
 
     def _origin_allowed(self, request: web.Request) -> bool:
-        origin = request.headers.get("Origin") or ""
-        referer = request.headers.get("Referer") or ""
+        origin = (request.headers.get("Origin") or "").strip()
+        referer = (request.headers.get("Referer") or "").strip()
+        sec_fetch_site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if (request.headers.get("Upgrade") or "").lower() == "websocket":
-            candidate = _origin_key(origin or referer)
+            if sec_fetch_site == "cross-site":
+                return False
+            raw = origin or referer
             # Non-browser clients may omit Origin/Referer. Browser cross-site
             # WebSocket CSRF carries Origin; when present it must be same-origin.
-            if not candidate:
+            if not raw:
                 return True
-            return candidate in self._allowed_origins(request)
+            candidate = _origin_key(raw)
+            return bool(candidate) and candidate in self._allowed_origins(request)
         if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
             return True
+        if sec_fetch_site == "cross-site":
+            return False
         # 同源表单/旧客户端可能不带 Origin/Referer；保留兼容，带了就必须同源。
-        candidate = _origin_key(origin or referer)
-        if not candidate:
+        raw = origin or referer
+        if not raw:
             return True
-        return candidate in self._allowed_origins(request)
+        candidate = _origin_key(raw)
+        return bool(candidate) and candidate in self._allowed_origins(request)
 
     def _request_is_https(self, request: web.Request) -> bool:
         # Keep the same reverse-proxy scheme convention used by origin checks.

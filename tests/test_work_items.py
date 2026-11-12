@@ -423,6 +423,9 @@ async def test_files_open_only_from_the_record_and_never_secrets(db, api):
     dao = await seeded(db)
     (root / "app.py").write_text("print('ok')\n")
     (root / "openbear.json").write_text("{\"secret\": 1}")
+    (root / ".env.production").write_text("TOKEN=1\n")
+    (root / ".managed").mkdir(exist_ok=True)
+    (root / ".managed" / "identity.json").write_text("{\"management_key\": \"x\"}")
     (root / "workspace" / "artifacts" / "report.md").write_text("# 报告")
     other = root.parent / f"{root.name}-other-project"
     other.mkdir()
@@ -430,12 +433,16 @@ async def test_files_open_only_from_the_record_and_never_secrets(db, api):
     await dao.transition(CONV, controller(), "1.2", "complete", summary="ok", evidence=[
         {"kind": "file", "path": str(root / "app.py")}, {"kind": "file", "path": str(root / "openbear.json")},
         {"kind": "report", "path": "workspace/artifacts/report.md"}, {"kind": "file", "path": str(other / "main.go")},
-        {"kind": "file", "path": "/etc/nginx/nginx.conf", "server": "Edge-FRA"}])
+        {"kind": "file", "path": "/etc/nginx/nginx.conf", "server": "Edge-FRA"},
+        {"kind": "file", "path": str(root / ".env.production")},
+        {"kind": "file", "path": str(root / ".managed" / "identity.json")}])
     base = f"/api/conversations/{CONV}/work-items/1.2/file"
     meta = await (await client.get(base, params={"ref": "item:0"})).json()
     assert meta["artifact"]["fileName"] == "app.py" and meta["artifact"]["projectFile"] is True
     assert await (await client.get(base + "/content", params={"ref": "item:0"})).text() == "print('ok')\n"
     assert (await client.get(base, params={"ref": "item:1"})).status == 403
+    assert (await client.get(base, params={"ref": "item:5"})).status == 403
+    assert (await client.get(base, params={"ref": "item:6"})).status == 403
     report = await (await client.get(base, params={"ref": "item:2"})).json()
     assert report["artifact"]["projectFile"] is False
     # Any directory on this machine opens; a file on another server does not.

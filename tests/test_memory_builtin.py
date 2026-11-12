@@ -150,6 +150,27 @@ def test_template_helpers_render_compact_mcp_groups_and_literal_blocks():
     assert "\n- item\n* emphasis\n```nested```\n````" in literal
 
 
+def test_template_engine_rejects_private_attributes_and_arbitrary_calls():
+    engine = TemplateEngine()
+    for expr in (
+        "[[ ().__class__.__base__ ]]",
+        "[[ helpers.__class__ ]]",
+        "[[ __import__('os') ]]",
+        "[[ item['_secret'] ]]",
+        "[[ item.pop() ]]",
+        "[[ (lambda: 1)() ]]",
+        "[[ [x for x in items] ]]",
+    ):
+        rendered = engine.render(expr, {"item": {"_secret": "no"}, "items": [1]})
+        assert rendered == "[[ERROR: ValueError]]", expr
+    for block in (
+        "@if ().__class__\nyes\n@endif",
+        "@each x in ().__class__.__mro__\n[[ x ]]\n@endeach",
+    ):
+        with pytest.raises(ValueError):
+            engine.render(block, {})
+
+
 async def test_builtin_memory_tools_dispatch(db):
     mem = BuiltinMemoryClient(db)
     reg = ToolRegistry()

@@ -461,6 +461,8 @@ class WebAdminArtifactsMixin:
             found = False
         if not found:
             raise web.HTTPNotFound(text="file not found")
+        if hasattr(self, "_work_item_path_allowed") and not self._work_item_path_allowed(path):
+            raise web.HTTPForbidden(text="this file cannot be opened from the panel")
         return conv_uuid, op_id, path, payload
 
     @staticmethod

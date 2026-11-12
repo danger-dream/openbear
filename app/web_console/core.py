@@ -239,12 +239,20 @@ def _sha256(value: str) -> str:
 
 
 def _origin_key(value: str) -> str:
-    parsed = urlparse(value if "://" in value else f"//{value}", scheme="http")
-    scheme = (parsed.scheme or "http").lower()
-    host = (parsed.hostname or "").lower()
-    if not host:
+    raw = str(value or "").strip()
+    if not raw or raw.lower() == "null":
         return ""
-    port = parsed.port
+    try:
+        parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
+        scheme = (parsed.scheme or "http").lower()
+        if scheme not in {"http", "https"}:
+            return ""
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return ""
+        port = parsed.port
+    except ValueError:
+        return ""
     default_port = 443 if scheme == "https" else 80
     rendered_port = "" if port in {None, default_port} else f":{port}"
     return f"{scheme}://{host}{rendered_port}"

@@ -129,6 +129,9 @@ class WebAdminAuthMixin:
             or path.startswith("/api/auth/login/status/")
             or path.startswith("/api/auth/login/consume/")
         ):
+            if path == "/api/auth/login/start" or path.startswith("/api/auth/login/consume/"):
+                if not self._origin_allowed(request):
+                    return web.json_response({"ok": False, "error": "csrf_origin_rejected"}, status=403)
             return await handler(request)
         session = await self.session_from_request(request)
         if session is None:
