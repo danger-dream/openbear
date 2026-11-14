@@ -103,28 +103,55 @@ def _media_path(block: dict[str, Any], artifact_dir: Path) -> Path | None:
     return target
 
 
-def reference_historical_media(
+_PRIMARY_INPUT_KINDS = frozenset({"human", "task", "cron", "webhook"})
+TOOL_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _media_encoded_bytes(block: dict[str, Any]) -> int:
+    path = block.get("path")
+    if isinstance(path, str) and path:
+        try:
+            size = Path(path).stat().st_size
+            return ((size + 2) // 3) * 4
+        except OSError:
+            return 0
+    source = block.get("source")
+    if isinstance(source, dict) and isinstance(source.get("data"), str):
+        return len(source["data"])
+    raw = block.get("image_url") or block.get("url")
+    if isinstance(raw, dict):
+        raw = raw.get("url")
+    return len(raw) if isinstance(raw, str) and raw.startswith("data:") else 0
+
+
+def _is_tool_media_message(message: Message) -> bool:
+    if message.get("role") != "user" or not isinstance(message.get("content"), list):
+        return False
+    if not any(_is_media(block) for block in message["content"]):
+        return False
+    meta = source_of(message)
+    if meta.get("tool_media"):
+        return True
+    first = message["content"][0] if message["content"] else None
+    return (
+        meta.get("kind") == "execution"
+        and isinstance(first, dict)
+        and first.get("type") == "text"
+        and str(first.get("text") or "").startswith("Tool images")
+    )
+
+
+def _retire_media_at(
     messages: list[Message],
+    indices: list[int],
     *,
     artifact_dir: Path,
 ) -> tuple[list[Message], int]:
-    """Caller archives originals first and commits the derived view atomically.
-
-    No byte threshold, resizing, summarization, or neutral_context conversion.
-    Missing files/unrecognized inline forms remain intact, not invented paths.
-    """
-    batches = [
-        index
-        for index, message in enumerate(messages)
-        if message.get("role") in {"user", "tool"}
-        and isinstance(message.get("content"), list)
-        and any(_is_media(block) for block in message["content"])
-    ]
-    if len(batches) < 2:
+    if not indices:
         return messages, 0
     outgoing = copy.deepcopy(messages)
     retired = 0
-    for index in batches[:-1]:
+    for index in indices:
         message = outgoing[index]
         changed = False
         for block_index, block in enumerate(message["content"]):
@@ -157,3 +184,69 @@ def reference_historical_media(
             reference_only=False,
         )
     return (outgoing, retired) if retired else (messages, 0)
+
+
+def reference_historical_media(
+    messages: list[Message],
+    *,
+    artifact_dir: Path,
+) -> tuple[list[Message], int]:
+    """Caller archives originals first and commits the derived view atomically.
+
+    No byte threshold, resizing, summarization, or neutral_context conversion.
+    Missing files/unrecognized inline forms remain intact, not invented paths.
+    """
+    batches = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"user", "tool"}
+        and isinstance(message.get("content"), list)
+        and any(_is_media(block) for block in message["content"])
+    ]
+    if len(batches) < 2:
+        return messages, 0
+    return _retire_media_at(messages, batches[:-1], artifact_dir=artifact_dir)
+
+
+def retire_seen_tool_media(
+    messages: list[Message],
+    *,
+    artifact_dir: Path,
+    active_task_uuid: str = "",
+    active_run_root_turn_uuid: str = "",
+    max_tool_media_bytes: int = TOOL_MEDIA_MAX_BYTES,
+) -> tuple[list[Message], int]:
+    """Retire tool-injected images once consumed and across a turn or byte cap."""
+    tool_indices = [i for i, m in enumerate(messages) if _is_tool_media_message(m)]
+    if not tool_indices:
+        return messages, 0
+    total_bytes = sum(
+        _media_encoded_bytes(b)
+        for i in tool_indices
+        for b in messages[i]["content"]
+        if _is_media(b)
+    )
+    over_byte_cap = bool(max_tool_media_bytes > 0 and total_bytes > max_tool_media_bytes)
+    active_scope = active_task_uuid or active_run_root_turn_uuid
+    scope_key = "task_uuid" if active_task_uuid else "run_root_turn_uuid"
+    indices: list[int] = []
+    for index in tool_indices:
+        seen_at = next(
+            (j for j in range(index + 1, len(messages)) if messages[j].get("role") == "assistant"),
+            None,
+        )
+        if seen_at is None:
+            continue
+        meta = source_of(messages[index])
+        msg_scope = str(meta.get(scope_key) or "") if active_scope else ""
+        if active_scope and msg_scope:
+            past_turn = msg_scope != active_scope
+        else:
+            past_turn = any(
+                messages[j].get("role") == "user"
+                and source_of(messages[j]).get("kind") in _PRIMARY_INPUT_KINDS
+                for j in range(seen_at + 1, len(messages))
+            )
+        if past_turn or over_byte_cap:
+            indices.append(index)
+    return _retire_media_at(messages, indices, artifact_dir=artifact_dir)

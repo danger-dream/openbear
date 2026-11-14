@@ -18,7 +18,7 @@ from app.agent.native_continuation import (
     validate_model_context,
 )
 from app.context.configuration import normalize_strategy
-from app.context.media_recovery import reference_historical_media
+from app.context.media_recovery import reference_historical_media, retire_seen_tool_media
 from app.context.prompts import effective_context_prompt
 from app.context.store import ArchivePlan, ControllerBoundary, RequestTicket, SavePlan, StaleWindow, WindowStore
 from app.context.strategies import (
@@ -325,10 +325,17 @@ class ContextManager:
         measured = estimator(messages)
         before_estimate = measured
         retired_media = 0
+        media_dir = Path(self.store.db._path).resolve().parent / "tool_artifacts" / "media-recovery" / hashlib.sha256(self.store.owner.key.encode()).hexdigest()
         if self.media_overflow:
-            owner_dir = hashlib.sha256(self.store.owner.key.encode()).hexdigest()
             messages, retired_media = reference_historical_media(
-                messages, artifact_dir=Path(self.store.db._path).resolve().parent / "tool_artifacts" / "media-recovery" / owner_dir,
+                messages, artifact_dir=media_dir,
+            )
+        else:
+            messages, retired_media = retire_seen_tool_media(
+                messages,
+                artifact_dir=media_dir,
+                active_task_uuid=self.store.owner.task_uuid if self.store.owner.kind == "agent" else "",
+                active_run_root_turn_uuid=self.active_run_root_turn_uuid,
             )
         if retired_media:
             calibrated = False
@@ -401,7 +408,7 @@ class ContextManager:
         rotated = bool(retired_media or compressed)
         detail = {
             "ownerKind": self.store.owner.kind, "ownerId": self.store.owner.key,
-            "source": (self._active_compression or {}).get("source", source or ("media_payload_recovery" if retired_media else "pre_model_request")),
+            "source": (self._active_compression or {}).get("source", source or (("media_payload_recovery" if self.media_overflow else "tool_media_retired") if retired_media else "pre_model_request")),
             "beforeEstimateTokens": before_estimate.tokens,
             "beforeRequestBytes": before_estimate.request_bytes,
             "afterRequestBytes": measured.request_bytes,
