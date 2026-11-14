@@ -93,6 +93,7 @@ import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
 	deriveOperationRunState,
+	isContextCompactionOperation,
 	isRootRunTerminalFrame,
 	isTerminalOperationFrame,
 	normalizeOperations,
@@ -443,10 +444,25 @@ const legacyContextTokens = computed(() => Math.max(0,
 	+ Number(usage.value.last_cache_read_tokens || 0)
 	+ Number(usage.value.last_cache_write_tokens || 0),
 ));
-const contextUsage = computed(() => resolveContextUsage(
+const baseContextUsage = computed(() => resolveContextUsage(
 	serverContextUsage.value,
 	legacyContextTokens.value,
 ));
+const loadedCompactionCount = computed(() => {
+	let count = 0;
+	for (const op of operationsById.value.values()) {
+		if (isContextCompactionOperation(op) && String(op?.status || "") === "completed") count += 1;
+	}
+	return count;
+});
+const compactionCount = computed(() => Math.max(
+	Math.floor(Number(baseContextUsage.value?.compactionCount) || 0),
+	loadedCompactionCount.value,
+));
+const contextUsage = computed(() => ({
+	...baseContextUsage.value,
+	compactionCount: compactionCount.value,
+}));
 const lastContextTokens = computed(() => contextUsage.value.known ? Number(contextUsage.value.tokens || 0) : 0);
 const modelCallRows = computed(() => Array.isArray(chatState.value?.modelCalls) ? chatState.value.modelCalls : []);
 const toolCallRows = computed(() => Array.isArray(chatState.value?.toolCalls) ? chatState.value.toolCalls : []);
@@ -2603,6 +2619,7 @@ function applyOperationFrameMessage(frame, options = {}) {
 		needsResync: false,
 		revisionGap: null,
 	};
+	const prevStatus = store.operationsById.get(frame.opId)?.status;
 	const changed = applyOperationFrame(store, frame);
 	if (store.needsResync) {
 		debugFrames("frame-revision-gap", {revisionGap: store.revisionGap, frame});
@@ -2630,11 +2647,13 @@ function applyOperationFrameMessage(frame, options = {}) {
 			&& appliedOperation?.payload?.windowVersion
 			&& chatState.value
 		) {
+			const added = appliedOperation.opType === "context_compaction" && prevStatus !== "completed" ? 1 : 0;
+			const nextCompactions = Math.max(0, Math.floor(Number(chatState.value.contextUsage?.compactionCount) || 0)) + added;
 			chatState.value = {
 				...chatState.value,
 				contextUsage: invalidateContextUsage(
 					chatState.value.contextUsage,
-					{...appliedOperation.payload, rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0)},
+					{...appliedOperation.payload, compactionCount: nextCompactions, rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0)},
 				),
 			};
 		}
@@ -4601,6 +4620,7 @@ onBeforeUnmount(() => {
 				:tokens-text="totalTokensDisplay"
 				:tokens-detail="totalTokensDetail"
 				:cache-percent-text="cachePct(totalTokenParts.cache, totalTokenParts.input)"
+				:compaction-count="compactionCount"
 				:duration-ms="totalDurationMs"
 				:cost-text="totalCostDisplay"
 			>

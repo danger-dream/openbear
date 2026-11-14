@@ -56,3 +56,25 @@ test("stats without a completed provider call cannot overwrite current context",
     current,
   );
 });
+
+
+test("compactionCount survives stats updates and increments on window rotation", () => {
+  const resolved = resolveContextUsage({
+    known: true,
+    tokens: 500,
+    rolloverTriggerTokens: 1000,
+    compactionCount: 2,
+  });
+  assert.equal(resolved.compactionCount, 2);
+
+  const afterStats = mergeStatsContextUsage(resolved, {
+    available: true,
+    known: true,
+    tokens: 720,
+  });
+  assert.equal(afterStats.compactionCount, 2);
+
+  const rotated = invalidateContextUsage(afterStats, {windowVersion: 3, compactionCount: 3});
+  assert.equal(rotated.known, false);
+  assert.equal(rotated.compactionCount, 3);
+});

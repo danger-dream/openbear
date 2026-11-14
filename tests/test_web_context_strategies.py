@@ -134,3 +134,52 @@ async def test_manual_is_summary_only_and_rejects_busy_without_calling_model(web
     assert response.status == 409
     assert (await response.json())["error"] == "manual_compaction_requires_summary_strategy"
     assert not backend.calls
+
+
+async def test_conversation_state_reports_completed_compaction_count_across_pagination_and_failures(web_env):
+    row, _, _ = await setup_manual(web_env)
+    uuid = row["conversation_uuid"]
+
+    before = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timeline_limit=1")).json()
+    assert before["contextUsage"]["compactionCount"] == 0
+
+    response = await web_env.client.post(f"/api/conversations/{uuid}/compact")
+    assert response.status == 200, await response.text()
+    after_one = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timeline_limit=1")).json()
+    assert after_one["contextUsage"]["compactionCount"] == 1
+
+    # Persisted sliding_window compaction in an older off-page turn is counted, while failed/running rows are excluded.
+    live = web_env.server._live_for(row)
+    await live.publish({
+        "type": "context_compaction_state",
+        "_webOperationSpecs": [
+            {
+                "op_id": "context-compaction:sw-old",
+                "op_type": "context_compaction",
+                "action": "end",
+                "status": "completed",
+                "source": "context_compaction",
+                "turn_uuid": "turn-old",
+                "payload": {"name": "ContextCompaction", "compactionId": "context-compaction:sw-old", "strategy": "sliding_window", "status": "completed"},
+            },
+            {
+                "op_id": "context-compaction:sw-failed",
+                "op_type": "context_compaction",
+                "action": "end",
+                "status": "failed",
+                "source": "context_compaction",
+                "turn_uuid": "turn-new",
+                "payload": {"name": "ContextCompaction", "compactionId": "context-compaction:sw-failed", "strategy": "sliding_window", "status": "failed"},
+            },
+            {
+                "op_id": "msg:latest-turn",
+                "op_type": "user_message",
+                "action": "end",
+                "status": "completed",
+                "turn_uuid": "turn-latest",
+                "payload": {"content": "latest question"},
+            },
+        ],
+    })
+    paged = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timeline_limit=1")).json()
+    assert paged["contextUsage"]["compactionCount"] == 2

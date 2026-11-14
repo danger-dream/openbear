@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import inspect
 
-from app.web_console.message_visibility import visibility_snapshot
-
 from app.agents import live_state as agent_live_state
-from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 from app.agents.controller_projection import project_history_message_for_controller
-from app.tools.base import current_tool_context
 from app.context.window import capped_trigger_tokens
+from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
+from app.tools.base import current_tool_context
 from app.web_console.core import *
 from app.web_console.live_stream import *
+from app.web_console.message_visibility import visibility_snapshot
+from app.web_operations import is_context_compaction_operation
 
 
 class WebAdminChatStateMixin:
@@ -182,6 +182,43 @@ class WebAdminChatStateMixin:
         if str(result.get("text") or "").strip():
             ctx.preserve_user_answer = True
         return result
+
+    async def _count_conversation_compactions(self, chat_id: int, conversation_uuid: str) -> int:
+        conv_uuid = str(conversation_uuid or "").strip()
+        count = 0
+        existing_summary_ids: set[int] = set()
+        if conv_uuid:
+            cur = await self.db.conn.execute(
+                "SELECT op_id, op_type, source, status, payload_json FROM web_operations "
+                "WHERE conversation_uuid=? AND (op_type='context_compaction' "
+                "OR source='context_compaction' OR op_id LIKE 'tool:context-compaction:%')",
+                (conv_uuid,),
+            )
+            prefix = "tool:context-compaction:"
+            for row in await cur.fetchall():
+                op_dict = dict(row)
+                payload = operation_json_loads_dict(str(op_dict.get("payload_json") or "{}"))
+                if not is_context_compaction_operation(op_dict, payload=payload):
+                    continue
+                op_id = str(op_dict.get("op_id") or "")
+                suffix = op_id[len(prefix):] if op_id.startswith(prefix) else ""
+                if suffix.isdigit():
+                    existing_summary_ids.add(int(suffix))
+                summary_id = int(payload.get("summaryId") or 0)
+                if summary_id > 0:
+                    existing_summary_ids.add(summary_id)
+                if str(op_dict.get("status") or "") == "completed":
+                    count += 1
+        for row in await SummaryDAO(self.db).list_with_anchors(chat_id):
+            summary_id = int(row.get("id") or 0)
+            if not summary_id or summary_id in existing_summary_ids:
+                continue
+            anchor_conversation = str(row.get("anchor_conversation_uuid") or "").strip()
+            if anchor_conversation and conv_uuid and anchor_conversation != conv_uuid:
+                continue
+            if str(row.get("anchor_turn_uuid") or "").strip():
+                count += 1
+        return count
 
     async def _project_context_compaction_operations(
         self,
@@ -536,11 +573,13 @@ class WebAdminChatStateMixin:
         pending_steering = steering.public_pending_items(chat_id)
         exact_context_tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=session_uuid, expected_model=model_label)
         context_trigger_tokens = self._model_rollover_trigger_tokens(model_label)
+        compaction_count = await self._count_conversation_compactions(chat_id, conv_uuid)
         context_usage = {
             "known": exact_context_tokens is not None,
             "tokens": int(exact_context_tokens or 0),
             "rolloverTriggerTokens": context_trigger_tokens,
             "percent": ((int(exact_context_tokens) * 100.0 / context_trigger_tokens) if exact_context_tokens is not None and context_trigger_tokens > 0 else None),
+            "compactionCount": compaction_count,
         }
         from app.context.store import ContextOwner, WindowStore
         window = await WindowStore(self.db, ContextOwner.controller(chat_id=chat_id, session_uuid=session_uuid)).load() if session_uuid else None

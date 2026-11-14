@@ -1076,7 +1076,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 										</span>
 										<span v-if="runConfigMetaParts.length" class="run-config-chip-meta"><span v-for="part in runConfigMetaParts" :key="part.key" class="run-config-meta-part" :class="part.key === 'fast' ? 'run-config-meta-fast' : ''" :title="part.key === 'fast' ? 'Fast 模式' : undefined"><ModelFeatureIcon v-if="part.key === 'fast'" name="zap"/><template v-else><svg v-if="part.key === 'context'" class="run-config-context-ring" :class="runConfigContextRingClass" viewBox="0 0 24 24" aria-hidden="true"><circle class="run-config-context-ring-track" cx="12" cy="12" r="9"/><circle class="run-config-context-ring-fill" cx="12" cy="12" r="9" pathLength="100" :stroke-dasharray="`${contextPercentNumber} 100`"/></svg>{{ part.text }}</template></span></span>
 									</span>
-									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}`">{{ props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩' }}</span>
+									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}${Number(props.contextUsage?.compactionCount) > 0 ? `，已压缩 ${Math.floor(Number(props.contextUsage.compactionCount))} 次` : ''}`">{{ (props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩') + (Number(props.contextUsage?.compactionCount) > 0 ? `·${Math.floor(Number(props.contextUsage.compactionCount))}` : '') }}</span>
 									<ArrowDown class="chip-caret"/>
 								</button>
 							</template>
@@ -2123,6 +2123,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	white-space: nowrap;
 	color: var(--ob-text-muted);
 	font-weight: 520;
+	font-variant-numeric: tabular-nums;
 }
 
 .run-config-chip-meta {

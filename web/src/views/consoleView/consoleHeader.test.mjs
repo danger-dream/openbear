@@ -37,8 +37,8 @@ async function renderHeader(overrides) {
 test('desktop header renders path before animated title, five readable values including cache percentage and no decoration icons', async () => {
   const html = await renderHeader({title:'长标题',conversationPath:'工程 / OpenBear'});
   assert.ok(html.indexOf('/工程/OpenBear') < html.indexOf('长标题'));
-  for (const label of ['运行状态','总 Tokens','缓存命中','总耗时','总花费']) assert.ok(html.includes(label));
-  assert.equal((html.match(/class="header-metric"/g)||[]).length, 5);
+  for (const label of ['运行状态','总 Tokens','缓存命中','已压缩','总耗时','总花费']) assert.ok(html.includes(label));
+  assert.equal((html.match(/class="header-metric"/g)||[]).length, 6);
   assert.match(html, /80\.0%/);
   assert.match(html, /会话累计读缓存 Tokens \/ 累计完整输入 Tokens/);
   assert.match(html,/128\.4<span class="header-unit">K/);

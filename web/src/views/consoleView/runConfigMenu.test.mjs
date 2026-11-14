@@ -535,3 +535,16 @@ for (const running of [false, true]) {
     assert.deepEqual(notices, [`Agent 思考已跟随主会话${running ? '，下一次新 Agent 生效' : ''}`]);
   });
 }
+
+
+test("collapsed strategy label appends compact count only when greater than zero", async () => {
+  const h = harness({modelMenuOpen: false, contextStrategy: "sliding_window", contextUsage: {known: true, compactionCount: 0}});
+  let html = await h.renderChip();
+  assert.match(html, /class="run-config-chip-strategy" aria-label="上下文压缩：滑动窗口">滑窗压缩</);
+  h.bindings.props.contextUsage = {known: true, compactionCount: 2};
+  html = await h.renderChip();
+  assert.match(html, /class="run-config-chip-strategy" aria-label="上下文压缩：滑动窗口，已压缩 2 次">滑窗压缩·2</);
+  h.bindings.props.contextStrategy = "model_summary";
+  html = await h.renderChip();
+  assert.match(html, /class="run-config-chip-strategy" aria-label="上下文压缩：模型摘要，已压缩 2 次">摘要压缩·2</);
+});
