@@ -100,6 +100,16 @@ func TestDetectProxyByWhatItDoes(t *testing.T) {
 	if got := detectProxy(); !slices.Equal(got, []string{"tproxy"}) {
 		t.Fatalf("TPROXY: %v", got)
 	}
+
+	// OpenBear's own fast relay table (TCP output redirect + UDP TPROXY routing rule) is ignored.
+	withFakeHost(t, map[string]string{
+		"ip -4 rule show":            "0:\tfrom all lookup local\n101:\tfrom all fwmark 0x4f420001 lookup 242\n32766:\tfrom all lookup main\n",
+		"ip -4 route show table 242": "local default dev lo scope host \n",
+		"nft list ruleset":           "table ip openbear_fast {\n\tchain nat_out {\n\t\ttype nat hook output priority -105; policy accept;\n\t\tip daddr 100.97.0.0/16 meta l4proto tcp redirect to :41001\n\t}\n}\n",
+	})
+	if got := detectProxy(); len(got) != 0 {
+		t.Fatalf("openbear_fast taken for an external proxy: %v", got)
+	}
 }
 
 func TestBypassInstallsOnceAndComesOut(t *testing.T) {

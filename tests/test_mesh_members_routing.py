@@ -5,7 +5,7 @@ import copy
 
 from app.servers import compat
 from app.servers import mesh_model as model
-from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build
+from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build, default_routing
 
 
 KEYS = {sid: (f'{sid}wg'.ljust(43, 'A') + '=', f'{sid}ctl'.ljust(43, 'B') + '=', f'{sid}sig'.ljust(43, 'C') + '=', f'{sid}e2e'.ljust(43, 'D') + '=')
@@ -58,7 +58,7 @@ def test_member_routing_enabled_when_member_and_all_upstreams_report_feature():
         {'peer': 'r1', 'kind': 'relay', 'dial': True, 'endpoint': 'tcp://203.0.113.1:52000'},
         {'peer': 'r2', 'kind': 'relay', 'dial': True, 'endpoint': 'udp://203.0.113.2:51999'},
     ]
-    assert m1['routing'] == {'mode': 'dynamic', 'bias': {'m2': 3, 'r1': 0, 'r2': 0}}
+    assert m1['routing'] == {'mode': 'dynamic', 'bias': {'m2': 3, 'r1': 0, 'r2': 0}, 'tuning': default_routing()}
     assert m1['relayLinks'] == [['r1', 'r2']]
     assert m1['memberLinks'] == [['m1', 'r1'], ['m1', 'r2']]
 

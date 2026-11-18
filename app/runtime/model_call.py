@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from app.agent.transcript_repair import is_role_alternation_bridge_prefix
 from app.llm.base import AgentResult, Message, OpenBearLLMError, apply_provider_billing
-from app.llm.error_classify import is_malformed_tool_call
+from app.llm.error_classify import is_malformed_tool_call, is_output_repetition
 from app.llm.events import StreamEvent, Usage
 from app.llm.retry import RetryPolicy, retry_wait_payload, wait_for_retry
 from app.runtime.lifecycle import _consume_cleanup_result, current_session
@@ -388,6 +388,12 @@ _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION = (
     "work; preserve all prior tool results and instructions."
 )
 
+_OUTPUT_REPETITION_RECOVERY_INSTRUCTION = (
+    "The previous model response was discarded because it degenerated into repeating "
+    "the same output. Respond to the same task again from the start, without repetition; "
+    "preserve all prior tool results and instructions."
+)
+
 
 class ModelCallDriver:
     def __init__(self, retry_policy: RetryPolicy):
@@ -523,12 +529,16 @@ class ModelCallDriver:
             logical.tool_calls = []
             if not accumulate_reasoning:
                 logical.reasoning = ""
-            # An interrupted echo of the bridge marker is not a reply to continue.
-            if is_role_alternation_bridge_prefix(logical.text):
+            root_code = str(error.root_cause.get("code") or "")
+            repeated = is_output_repetition(error.message, root_code)
+            # Neither an interrupted echo of the bridge marker nor a repetition
+            # loop is a reply to continue.
+            if repeated or is_role_alternation_bridge_prefix(logical.text):
                 logical.text = ""
             tail = []
             if logical.text.strip():
                 tail.append({"role": "assistant", "content": logical.text})
-            malformed = is_malformed_tool_call(error.message, str(error.root_cause.get("code") or ""))
+            malformed = is_malformed_tool_call(error.message, root_code)
             tail.append({"role": "user", "content": (
-                _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION if malformed else _RECOVERY_INSTRUCTION)})
+                _OUTPUT_REPETITION_RECOVERY_INSTRUCTION if repeated
+                else _MALFORMED_TOOL_CALL_RECOVERY_INSTRUCTION if malformed else _RECOVERY_INSTRUCTION)})

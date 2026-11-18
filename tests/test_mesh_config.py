@@ -81,6 +81,84 @@ def test_custom_relay_links_follow_the_cheapest_path():
     assert build(d, facts(), 'net', 1)['r1']['nextHops'] == {'r2': 'r2', 'r3': 'r3'}
 
 
+
+def test_static_next_hops_go_around_a_no_transit_relay_while_another_path_is_there():
+    pairs = [pair('r1', 'r2'), pair('r2', 'r3'), pair('r1', 'm1', cost=5), pair('m1', 'r3', cost=5)]
+    relays = ['r1', 'r2', 'r3', 'm1']
+    assert next_hops(relays, pairs)['r1']['r3'] == 'r2'
+    hops = next_hops(relays, pairs, {'r2'})
+    assert hops['r1'] == {'r2': 'r2', 'r3': 'm1', 'm1': 'm1'} and hops['r2'] == {'r1': 'r1', 'r3': 'r3', 'm1': 'r1'}
+    # With no way around, through it.
+    assert next_hops(relays, pairs[:2], {'r2'})['r1'] == {'r2': 'r2', 'r3': 'r2'}
+
+
+def test_no_transit_is_a_relay_switch_stored_only_when_on_and_sent_to_every_router():
+    d = doc(member('r1', 'relay'), member('r2', 'relay'), member('r3', 'relay'), member('m1'))
+    sent = lambda **on: {'members': [{'serverId': m['serverId'], **({'noTransit': on[m['serverId']]} if m['serverId'] in on else {})}
+                                     for m in d['members']]}
+    assert all('noTransit' not in c.get('routing', {}) for c in build(d, facts(), 'net', 1).values())
+    on = model.allocate(model.clean_doc(sent(r2=True), d))
+    assert [m.get('noTransit') for m in on['members']] == [None, True, None, None]
+    configs = build(on, facts(), 'net', 1)
+    assert {sid: c['routing']['noTransit'] for sid, c in configs.items() if 'routing' in c} == {'r1': ['r2'], 'r2': ['r2'], 'r3': ['r2']}
+    assert 'routing' not in configs['m1']
+    # Off is stored as absent, as before the switch existed.
+    assert model.allocate(model.clean_doc(sent(r2=False), on))['members'] == d['members']
+    with pytest.raises(model.MeshInvalid) as raised:
+        model.clean_doc(sent(r2='yes'), d)
+    assert [(e['path'], e['error']) for e in raised.value.errors] == [('members[1].noTransit', 'invalid_member')]
+    assert ('members[3].noTransit', 'no_transit_relay_only') in errors(model.allocate(model.clean_doc(sent(m1=True), d)))
+
+
+def test_no_transit_warns_of_relays_left_with_no_way_around_and_of_old_data_planes():
+    links = {'mode': 'custom', 'pairs': [pair('r1', 'r2'), pair('r2', 'r3')]}
+    shy = lambda sid: {**member(sid, 'relay'), 'noTransit': True}
+    d = doc(shy('r1'), shy('r2'), member('r3', 'relay'), relay_links=links)
+    f = facts()
+    for sid in f:
+        f[sid]['features'] = frozenset({mesh_config.NO_TRANSIT_FEATURE, mesh_config.TUNING_FEATURE})
+    hints = {(h['path'], h['error']): h['message'] for h in model.hints(d, f)}
+    assert set(hints) == {('members[0].noTransit', 'mesh_no_transit_only_way')}
+    assert hints[('members[0].noTransit', 'mesh_no_transit_only_way')] == 'R1 只和同样不中转的 R2 相连，它的流量也要借道它们。'
+    d = doc(member('r1', 'relay'), shy('r2'), member('r3', 'relay'), relay_links=links)
+    hints = {(h['path'], h['error']): h['message'] for h in model.hints(d, f)}
+    assert hints == {('members[2]', 'mesh_no_transit_only_way'): 'R3 和其余中转之间只能经不中转的 R2 相连，这部分流量会一直借道它们；给它们加一条到其他中转的线路就能避开。'}
+    links['pairs'].append(pair('r1', 'r3'))
+    assert not model.hints(d, f)
+    f['r3']['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE})
+    assert [(h['path'], h['error']) for h in model.hints(d, f)] == [('members[1].noTransit', 'mesh_no_transit_outdated')]
+    # Offline, what it reads is not known: nothing said.
+    f['r3']['features'] = frozenset()
+    assert not model.hints(d, f)
+
+
+def test_routing_settings_default_are_checked_and_sent_with_a_warning_for_old_data_planes():
+    d = doc(member('r1', 'relay'), member('r2', 'relay'), member('m1'))
+    assert d['settings']['routing'] == mesh_config.default_routing() == {
+        'switchMs': 5, 'switchPct': 0, 'shorterMs': 3, 'shorterPct': 0, 'advertMs': 2, 'advertPct': 0, 'holdS': 5, 'jitterWeight': 2,
+        'lossWeight': 1000, 'flapHoldS': 60, 'flapHoldMaxS': 480}
+    # A document stored before the setting takes the defaults.
+    old = copy.deepcopy(d)
+    del old['settings']['routing']
+    assert model.upgrade(old)['settings']['routing'] == mesh_config.default_routing()
+    on = model.clean_doc({'settings': {'routing': {'switchMs': 3, 'switchPct': 10, 'holdS': 2.5}}}, d)
+    assert on['settings']['routing'] == {**mesh_config.default_routing(), 'switchMs': 3, 'switchPct': 10, 'holdS': 2.5}
+    configs = build(on, facts(), 'net', 1)
+    assert configs['r1']['routing']['tuning'] == configs['r2']['routing']['tuning'] == on['settings']['routing']
+    # Partial changes keep the rest.
+    assert model.clean_doc({'settings': {'routing': {'lossWeight': 0}}}, on)['settings']['routing']['switchMs'] == 3
+    for bad, path in (({'switchMs': -1}, 'settings.routing.switchMs'), ({'switchPct': 95}, 'settings.routing.switchPct'), ({'holdS': True}, 'settings.routing.holdS'),
+                      ({'flapHoldS': 600, 'flapHoldMaxS': 300}, 'settings.routing.flapHoldMaxS'), ({'other': 1}, 'settings.routing')):
+        with pytest.raises(model.MeshInvalid) as raised:
+            model.clean_doc({'settings': {'routing': bad}}, d)
+        assert [e['path'] for e in raised.value.errors] == [path], bad
+    f = facts()
+    for sid in f:
+        f[sid]['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE})
+    assert not model.hints(d, f)
+    f['r2']['features'] = frozenset({'mesh'})
+    assert [(h['path'], h['error']) for h in model.hints(d, f)] == [('settings.routing', 'mesh_tuning_outdated')]
+
 def test_a_relay_without_a_path_is_unreachable_and_refused():
     links = {'mode': 'custom', 'pairs': [pair('r1', 'r2')]}
     d = doc(member('r1', 'relay'), member('r2', 'relay'), member('r3', 'relay'), relay_links=links)
@@ -153,7 +231,7 @@ def test_config_sample_is_exact():
                            {'src': ['100.96.0.3/32', '10.9.0.0/16'], 'dst': ['192.168.1.0/25'], 'proto': 'any', 'ports': []}]
     r1 = configs['r1']
     assert r1['entry'] is None and r1['nextHops'] == {'r2': 'r2'} and r1['self']['resources'] == 'relay'
-    assert r1['routing'] == {'mode': 'dynamic', 'bias': {'r2': 0}} and r1['reflectors'] == [] and 'routing' not in configs['m1']
+    assert r1['routing'] == {'mode': 'dynamic', 'bias': {'r2': 0}, 'tuning': mesh_config.default_routing()} and r1['reflectors'] == [] and 'routing' not in configs['m1']
     # By default relays prefer UDP: r2 has no UDP listener, so it dials r1's.
     assert r1['links'] == [{'peer': 'r2', 'kind': 'relay', 'dial': False}]
     assert configs['r2']['links'] == [{'peer': 'r1', 'kind': 'relay', 'dial': True, 'endpoint': 'udp://berlin.example.net:51999'}]
@@ -677,9 +755,9 @@ def test_site_relays_punch_each_other_dial_public_relays_and_are_entered_by_punc
     assert configs['m1']['reflectors'] == ['203.0.113.1:51999', '203.0.113.2:51999']
     assert configs['r2']['reflectors'] == ['203.0.113.1:51999'] and configs['gw']['reflectors'] == ['203.0.113.1:51999', '203.0.113.2:51999']
     # Each end of a link has its bias; nextHops are still worked out as the start and the static mode.
-    assert configs['gw']['routing'] == {'mode': 'dynamic', 'bias': {'r1': 0, 'r2': 0, 'r3': -5}}
-    assert configs['r3']['routing'] == {'mode': 'dynamic', 'bias': {'gw': -5, 'r1': 0}}
-    assert configs['r1']['routing'] == {'mode': 'dynamic', 'bias': {'gw': 0, 'r2': 20, 'r3': 0}}
+    assert configs['gw']['routing'] == {'mode': 'dynamic', 'bias': {'r1': 0, 'r2': 0, 'r3': -5}, 'tuning': mesh_config.default_routing()}
+    assert configs['r3']['routing'] == {'mode': 'dynamic', 'bias': {'gw': -5, 'r1': 0}, 'tuning': mesh_config.default_routing()}
+    assert configs['r1']['routing'] == {'mode': 'dynamic', 'bias': {'gw': 0, 'r2': 20, 'r3': 0}, 'tuning': mesh_config.default_routing()}
     assert configs['gw']['nextHops'] == {'r1': 'r1', 'r2': 'r2', 'r3': 'r3'} and 'routing' not in configs['m1']
     assert all(c['reachability'] == {'stun': []} for c in configs.values())
     # The panel's addresses of the machines behind NAT appear nowhere.
@@ -915,11 +993,12 @@ def test_reachability_entry_health_and_routing_are_cleaned_and_summarised():
              'via': 'wifi', 'rttMs': 0, 'lossRate': 2, 'role': 'hot'},
             {'id': 'c3', 'relay': 'r1', 'state': 'broken'}]},
         'routing': {'mode': 'dynamic',
-                    'links': [{'peer': 'gw', 'state': 'up', 'rttMs': 2.54, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0},
+                    'links': [{'peer': 'gw', 'state': 'up', 'rttMs': 2.54, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0, 'advertised': 3.04},
                               {'peer': 'r1', 'state': 'down', 'rttMs': None, 'jitterMs': -1, 'loss': 3, 'cost': None, 'penalty': 1000},
                               {'peer': 'r2', 'state': 'flapping'}],
-                    'routes': [{'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1},
-                               {'dest': 'r1', 'nextHop': 'gw', 'cost': 'inf', 'path': 'r3', 'since': 0, 'switches': 0}]},
+                    'routes': [{'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1,
+                                'best': 'r1', 'bestCost': 2.05, 'held': 'damped', 'until': 1793000060000},
+                               {'dest': 'r1', 'nextHop': 'gw', 'cost': 'inf', 'path': 'r3', 'since': 0, 'switches': 0, 'held': 'margin'}]},
         'peers': [{'id': 'gw', 'kind': 'relay', 'active': True, 'rttMs': 2.5,
                    'direct': {'state': 'direct', 'via': 'public', 'since': 3, 'attempts': 2, 'lastError': ''}}],
     }
@@ -936,9 +1015,10 @@ def test_reachability_entry_health_and_routing_are_cleaned_and_summarised():
         {'id': 'c2', 'relay': 'r2', 'transport': 'tcp', 'state': 'failing', 'since': 0, 'lastOkAt': 0, 'lastError': ('timeout' * 20)[:64], 'via': '',
          'rttMs': None, 'timeoutRate': None, 'role': ''}]
     assert status['routing'] == {'mode': 'dynamic', 'links': [
-        {'peer': 'gw', 'state': 'up', 'rttMs': 2.5, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0},
-        {'peer': 'r1', 'state': 'down', 'rttMs': None, 'jitterMs': 0.0, 'loss': 0.0, 'cost': None, 'penalty': 1000}], 'routes': [
-        {'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1},
+        {'peer': 'gw', 'state': 'up', 'rttMs': 2.5, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0, 'advertised': 3.0},
+        {'peer': 'r1', 'state': 'down', 'rttMs': None, 'jitterMs': 0.0, 'loss': 0.0, 'cost': None, 'penalty': 1000, 'advertised': None}], 'routes': [
+        {'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1,
+         'best': 'r1', 'bestCost': 2.0, 'held': 'damped', 'until': 1793000060000},
         {'dest': 'r1', 'nextHop': 'gw', 'cost': None, 'path': [], 'since': 0, 'switches': 0}]}
     # A punched relay link's state comes through like a direct link's.
     assert status['peers'][0]['direct'] == {'state': 'direct', 'via': 'public', 'since': 3, 'attempts': 2, 'lastError': ''}
@@ -1127,7 +1207,11 @@ def test_path_through_several_relays_follows_the_reported_route():
         mac={'entry': {'relay': 'toy'}, 'peers': [{'id': 'toy', 'kind': 'entry', 'active': True, 'rttMs': 4.0, 'direct': lan()}]})
     assert find('pc', 'mac', ROLES, statuses, {}, NOW) == {
         'hops': [hop('pc'), hop('home', 'entry', 1.0), hop('sg', 'relay', 79.0), hop('toy', 'relay', 75.0), hop('mac', 'lan', 4.0)],
-        'rttMs': 159.0, 'stale': False}
+        'rttMs': 159.0, 'stale': False, 'decision': {'node': 'home', 'dest': 'toy', 'cost': 160}}
+    # The relay that chose says what it would take instead and why it does not.
+    held = copy.deepcopy(statuses)
+    held['home']['status']['routing']['routes'][0].update(best='toy', bestCost=157.0, held='margin')
+    assert find('pc', 'mac', ROLES, held, {}, NOW)['decision'] == {'node': 'home', 'dest': 'toy', 'cost': 160, 'best': 'toy', 'bestCost': 157.0, 'held': 'margin'}
     # Without reported routes (static, or before any advertisement) the configured next hops are followed.
     static = copy.deepcopy(statuses)
     static['home']['status']['routing'] = None

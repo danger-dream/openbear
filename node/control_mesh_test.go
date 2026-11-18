@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -196,6 +197,80 @@ func TestMeshWithoutAnExitKeepsTrying(t *testing.T) {
 		p.quiet(t, 500*time.Millisecond)
 		cancel()
 		<-done
+	}
+}
+
+// stallFirst forwards TCP to target but holds its first connection without a
+// word, as a proxy that stalled does; it returns its URL and how many
+// connections it took.
+func stallFirst(t *testing.T, target string) (string, *atomic.Int32) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+	var n atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			if n.Add(1) == 1 {
+				mu.Lock()
+				held = append(held, c)
+				mu.Unlock()
+				continue
+			}
+			go func() {
+				up, err := net.Dial("tcp", target)
+				if err != nil {
+					c.Close()
+					return
+				}
+				go func() { io.Copy(up, c); up.Close() }()
+				io.Copy(c, up)
+				c.Close()
+			}()
+		}
+	}()
+	return "http://" + ln.Addr().String(), &n
+}
+
+// Before an operation takes the mesh down, a probe of the other address that
+// stalls is given up and tried again: the session moves there first.
+func TestLeaveMeshTriesAStalledProbeAgain(t *testing.T) {
+	fastMeshTimers(t)
+	keepTry, keepTotal := probeTry, probeTotal
+	probeTry, probeTotal = time.Second, 3*time.Second
+	t.Cleanup(func() { probeTry, probeTotal = keepTry, keepTotal })
+	p := newControllerPair(t)
+	backup, conns := stallFirst(t, p.backup.Listener.Addr().String())
+	link := &fakeLink{mesh: map[string]bool{p.primary.URL: true}}
+	a := p.f.agent(p.primary.URL, Capabilities{})
+	a.Config.Backup, a.link = backup, link
+	runAgent(t, a)
+	p.expect(t, "primary", 5*time.Second)
+	session, end := context.WithCancel(context.Background())
+	defer end()
+	ctx, release := a.leaveMesh(session, "a test")
+	defer release()
+	p.expect(t, "backup", 5*time.Second)
+	if n := conns.Load(); n < 3 {
+		t.Fatalf("%d connections to the other address, want the stalled probe, the next and the session", n)
+	}
+	end()
+	if ctx.Err() != nil {
+		t.Fatal("the operation's context ended with the session it left")
 	}
 }
 

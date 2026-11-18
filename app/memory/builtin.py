@@ -364,12 +364,13 @@ class BuiltinMemoryClient:
         template_content: str | None = None,
         template_name: str = "preview override",
         source: str = "preview",
+        template_id: int | None = None,
     ) -> str:
         await self._bootstrap()
-        template = (
-            _Template(id=0, name=template_name, content=template_content)
-            if template_content is not None else await self._active_template()
-        )
+        if template_content is not None:
+            template = _Template(id=0, name=template_name, content=template_content)
+        else:
+            template = (await self._template_by_id(template_id) if template_id else None) or await self._active_template()
         ctx = await self._main_template_context(params or {})
         return await self._render_template(template, ctx, source=source, params=params or {})
 
@@ -525,6 +526,13 @@ class BuiltinMemoryClient:
         if row:
             return _Template(id=int(row["id"]), name=str(row["name"]), content=str(row["content"]))
         return _Template(id=0, name="fallback", content=self._default_template())
+
+    async def _template_by_id(self, template_id: int) -> _Template | None:
+        cur = await self._db.conn.execute("SELECT id, name, content FROM memory_templates WHERE id=?", (int(template_id),))
+        row = await cur.fetchone()
+        if row:
+            return _Template(id=int(row["id"]), name=str(row["name"]), content=str(row["content"]))
+        return None
 
     async def _agent_active_template(self) -> _Template | None:
         cur = await self._db.conn.execute(

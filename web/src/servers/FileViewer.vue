@@ -14,6 +14,8 @@ const props = defineProps({serverId: {type: String, required: true}, path: {type
 const emit = defineEmits(['close', 'saved', 'download']);
 const image = computed(() => !props.asText && Boolean(imageType(props.entry.name)));
 const text = ref(''), original = ref(''), url = ref(''), loading = ref(true), error = ref(''), saving = ref(false);
+// A viewer is one opened object, not a live alias of the browser's selection.
+const target = {server: props.serverId, path: props.path, name: props.entry.name, dir: props.path.slice(0, props.path.lastIndexOf('/') + 1) || '/'};
 const opened = {mtime: props.entry.mtime, size: props.entry.size};
 const dirty = computed(() => !image.value && !error.value && text.value !== original.value);
 const lang = computed(() => language(props.entry.name));
@@ -24,7 +26,7 @@ async function load() {
   const tooLarge = `文件超过 ${bytes(limit)}，请下载后查看。`;
   if (props.entry.size > limit) { error.value = tooLarge; loading.value = false; return; }
   try {
-    const response = await fetch(Api.serverFileDownloadUrl(props.serverId, props.path), {credentials: 'same-origin'});
+    const response = await fetch(Api.serverFileDownloadUrl(target.server, target.path), {credentials: 'same-origin'});
     if (!response.ok) { error.value = safeError({response: {status: response.status, data: await response.json().catch(() => ({}))}}); return; }
     const buffer = await readLimited(response, limit);
     if (buffer === null) { error.value = tooLarge; return; }
@@ -36,7 +38,7 @@ async function load() {
   finally { loading.value = false; }
 }
 async function current() {
-  try { return ok(await Api.serverFiles(props.serverId, dir.value)).entries.find(e => e.name === props.entry.name) || null; }
+  try { return ok(await Api.serverFiles(target.server, target.dir)).entries.find(e => e.name === target.name) || null; }
   catch { return null; }
 }
 async function save() {
@@ -51,7 +53,7 @@ async function save() {
       } catch { return; }
     }
     const submitted = text.value;
-    await Api.uploadServerFile(props.serverId, props.path, new Blob([submitted], {type: 'text/plain'}), {overwrite: true});
+    await Api.uploadServerFile(target.server, target.path, new Blob([submitted], {type: 'text/plain'}), {overwrite: true});
     original.value = submitted;
     const fresh = await current();
     if (fresh) Object.assign(opened, {mtime: fresh.mtime, size: fresh.size});

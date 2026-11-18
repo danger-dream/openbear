@@ -40,7 +40,9 @@ class OpenBearLLMError(Exception):
                  structured: bool = False) -> None:
         from app.llm.error_classify import (
             BILLING,
+            CONTEXT_OVERFLOW,
             classify_error,
+            names_context_overflow,
             normalize_classification,
             retryable_from_contract,
         )
@@ -70,6 +72,8 @@ class OpenBearLLMError(Exception):
         fallback_reason = classify_error(self.summary or self.message, contract_status)
         if BILLING in {structured_reason, code_reason, fallback_reason}:
             self.reason = BILLING
+        elif not reason and names_context_overflow(structured_reason, code_reason, fallback_reason):
+            self.reason = CONTEXT_OVERFLOW
         else:
             self.reason = reason or structured_reason or code_reason or fallback_reason
         self.retry_after_s = max(0.0, float(retry_after_s or 0.0))

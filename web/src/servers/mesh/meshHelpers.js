@@ -21,13 +21,37 @@ export const progressOf = (data, id) => (data?.apply?.progress || []).find(p => 
 export const FINISHED = new Set(['done', 'failed', 'offline', 'missing', 'outdated']);
 
 export const EDITABLE = {settings: () => ({}), members: () => [], relayLinks: () => ({mode: 'full', pairs: []}), directLinks: () => [], rules: () => [],
-  lineRules: () => [], exitGroups: () => [], limits: () => [], paths: () => []};
+  lineRules: () => [], exitGroups: () => [], limits: () => [], paths: () => [], fastPorts: () => [], forwards: () => []};
 // Parts an older controller neither sends nor takes back.
-const NEWER = new Set(['lineRules', 'exitGroups', 'limits', 'paths']);
+const NEWER = new Set(['lineRules', 'exitGroups', 'limits', 'paths', 'fastPorts', 'forwards']);
+const VIEW_MEMBER_KEYS = new Set(['name', 'platform', 'publicEndpointAuto', 'subnetSuggestions', 'front', 'region']);
 // The part of GET /mesh that PUT /mesh/draft takes back.
 export function draftOf(state) {
   return JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(EDITABLE).filter(([key]) => !NEWER.has(key) || Array.isArray(state?.[key]))
     .map(([key, empty]) => [key, state?.[key] ?? empty()]))));
+}
+function cleanMember(m) {
+  if (!m || typeof m !== 'object') return m;
+  const out = {};
+  for (const [k, v] of Object.entries(m)) {
+    if (VIEW_MEMBER_KEYS.has(k) || v === undefined) continue;
+    if (k === 'noTransit' && !v) continue;
+    if (k === 'announce' && v !== false) continue;
+    if (k === 'publicPorts' && (!v || !Object.keys(v).length)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+function sortKeys(v) {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (!v || typeof v !== 'object') return v;
+  return Object.fromEntries(Object.keys(v).sort().map(k => [k, sortKeys(v[k])]));
+}
+export function draftSnapshot(state) {
+  if (!state) return '';
+  const d = draftOf(state);
+  d.members = (d.members || []).map(cleanMember);
+  return JSON.stringify(sortKeys(d));
 }
 export const uid = prefix => prefix + Math.random().toString(36).slice(2, 8);
 export function move(list, index, delta) {
@@ -85,6 +109,13 @@ const MESH_ERRORS = {
   path_no_destination: '自建路线的终点不能用',
   path_end_skipped: '终点节点版本旧，回程走自动选路',
   path_backup_outdated: '有节点版本旧，这一对只用第 1 条',
+  fast_member_needs_update: '快速端口所在节点的版本不支持快速端口，请先在服务器页更新节点',
+  fast_port_member: '快速端口所在的节点不在组网里',
+  fast_port_duplicate: '同一台节点上的快速端口重复',
+  fast_port_conflict: '端口和组网或快速中转的监听端口冲突',
+  fast_port_id_duplicate: '快速端口的编号重复',
+  invalid_fast_port: '快速端口格式不正确', invalid_fast_ports: '快速端口最多 256 个',
+  invalid_fast_settings: '快速中转设置格式不正确', invalid_fast_paths: '路径条数须在 1～8 之间', invalid_fast_keys: '快速中转密钥格式不正确',
   mesh_service_missing: MISSING_TEXT,
 };
 // POST /mesh/members/:id/reinstall: the same codes, said for putting the service back.
@@ -173,6 +204,21 @@ export const isRelay = m => m?.role === 'relay';
 export const isSite = m => isRelay(m) && m?.relayMode === 'site';
 export const RELAY_MODES = [['public', '公网中转', '有别人能直接连到的地址，成员和其他中转直接连它'],
   ['site', '站点中转', '在 NAT 后，不对外宣告地址：由它拨号连公网中转，和其他站点中转、本地成员之间打洞']];
+// settings.routing (mesh_config.ROUTING_TUNING): [key, default, lowest, highest].
+export const ROUTING_PARAMS = [['switchMs', 5, 0, 1000], ['switchPct', 0, 0, 90], ['shorterMs', 3, 0, 1000], ['shorterPct', 0, 0, 90], ['advertMs', 2, 0, 1000],
+  ['advertPct', 0, 0, 90], ['holdS', 5, 0, 60], ['jitterWeight', 2, 0, 10], ['lossWeight', 1000, 0, 10000], ['flapHoldS', 60, 0, 3600], ['flapHoldMaxS', 480, 0, 3600]];
+export const ROUTING_DEFAULTS = Object.fromEntries(ROUTING_PARAMS.map(([k, v]) => [k, v]));
+export const COST_FORMULA = '链路代价 = 延迟（最近 5 次探测的中位数）+ 抖动 × 抖动权重 + 丢包率 × 丢包权重 + 偏好，两端各算一份取较大的；路线代价是沿途各段已通告代价之和。';
+// Whether a path costing cost replaces the route in use costing cur by the switch threshold (tuning as GET /mesh/path gives it).
+export function switchesTo(cost, cur, tuning) {
+  const t = {...ROUTING_DEFAULTS, ...(tuning || {})}, saved = cur - cost;
+  return Number.isFinite(saved) && saved >= t.switchMs && (!t.switchPct || saved > cur * t.switchPct / 100);
+}
+// Why a route stays on its next hop while another is shortest (status routes[].held).
+export const HELD_TEXT = {margin: '便宜得不够，没到切换门槛', hold: '已满足条件，正在确认是否持续', damped: '最近来回切过，按防抖规则等待', loop: '等其他节点的通告跟上，确认不会绕回来',
+  penalty: '那条线路最近断过，等它稳定', transit: '要经过不中转的节点'};
+// A relay with noTransit (routing.noTransit on the nodes).
+export const NO_TRANSIT_HINT = '打开后，它只承载访问它自己、它共享的局域网和经它接入的成员的流量，不再替其他中转之间转发；只有别的路都断了才临时借道，通了马上切回。适合上传很低的家里或公司路由。';
 // What the reachability check suggests; '' before there is a verdict.
 export const recommendedMode = reach => reach?.verdict ? (reach.verdict === 'public' ? 'public' : 'site') : '';
 export const listens = (m, transport) => Number(m?.listen?.[transport]) > 0;
@@ -352,7 +398,7 @@ export function routeRows(reply, src, members, data = null) {
   const order = id => { const i = members.findIndex(m => m.serverId === id); return i < 0 ? members.length : i; };
   const entryOf = (a, b) => entrySegment(data, a, b);
   const row = (r, end, extra) => {
-    const hops = hopsOf(r.hops), broken = !hops.length || hops.at(-1).node !== end, stale = Boolean(r.stale);
+    const hops = hopsOf(r.hops), broken = !hops.length || hops[0].node !== src || hops.at(-1).node !== end, stale = Boolean(r.stale);
     // The machines passed on the way: every hop after the source, the destination itself left out.
     const passed = hops.slice(1).filter(h => h.node !== extra.dst).map(h => nameOf(members, h.node));
     const first = hops[1], entry = first?.via === 'entry' ? entryOf(hops[0].node, first.node) : null;
@@ -543,7 +589,8 @@ const EVENTS = {'entry.switch': '切换入口', 'entry.return': '切回入口', 
   'path.ready': '线路可用', 'path.failed': '线路不通', 'path.error': '线路出错', 'path.security': '证书不符',
   'direct.up': '直连打通', 'direct.down': '直连断开', 'direct.failed': '打洞失败', 'direct.chosen': '选定直连线路', 'direct.better': '发现更快的直连', 'direct.switched': '换用更快的直连',
   'reach.changed': '可达性变化', 'route.changed': '换路', 'pin.switch': '切换自建路线', 'route.error': '系统路由出错', 'route.skipped': '网段没走组网', 'routing.error': '选路出错',
-  'link.suppressed': '线路暂停使用', 'link.reused': '线路恢复使用', 'link.redial': '换端口重连', 'link.redial.failed': '换端口重连失败',
+  'link.suppressed': '线路暂停使用', 'link.reused': '线路恢复使用', 'link.kept': '保留线路', 'link.redial': '换端口重连', 'link.redial.failed': '换端口重连失败',
+  'link.mtu': '线路包长受限',
   'firewall.restored': '防火墙规则已恢复', 'mtu.own': '本机组网包上限', error: '错误',
   'sign.rejected': '签名校验失败', 'owner.claim_expired': '旧接入记录作废', 'e2e.error': '端到端加密出错', 'e2e.exhausted': '端到端会话已满',
   'entry.suspect': '入口疑似丢包', 'reach.mismatch': '出口地址对不上', 'routing.unknown_link': '通告了不存在的链路', 'routing.clock': '中转时钟不准',
@@ -657,10 +704,20 @@ export function eventView(e, member, members, keys = {}) {
       : now > before ? `第 ${before} 条不通${down}，改走第 ${now} 条` : `第 ${now} 条恢复稳定，切回第 ${now} 条`;
     return out(`到 ${who(r[1])}：${text}`);
   }
-  case 'link.suppressed': case 'link.reused': {
+  case 'link.suppressed': case 'link.reused': case 'link.kept': {
     const peer = detail.split(/[\s:]/)[0];
-    return out(peer ? `到 ${who(peer)} 的中转链路${kind === 'link.suppressed' ? '反复断开，暂停用于选路' : '稳定下来，恢复选路'}` : '中转链路状态变了', peer ? '' : detail);
+    const how = {'link.suppressed': '反复断开，暂停用于选路', 'link.reused': '稳定下来，恢复选路', 'link.kept': '还在反复断开，但其他链路都暂停了，继续用它选路'}[kind];
+    return out(peer ? `到 ${who(peer)} 的中转链路${how}` : '中转链路状态变了', peer ? '' : detail);
   }
+  case 'link.mtu':
+    // "<peer>: carries <n> bytes of the network's <mtu>", or "<peer>: carries the network's <mtu> bytes again".
+    if ((r = /^(\S+):\s*carries (\d+) bytes of the network's (\d+)$/.exec(detail)))
+      return out(`到 ${who(r[1])} 的 UDP 线路只能通过 ${r[2]} 字节的包（组网 MTU ${r[3]}），更长的包会通知发送方改小，选路也会尽量避开它`);
+    if ((r = /^(\S+):\s*carries less than (\d+) bytes of the network's (\d+)$/.exec(detail)))
+      return out(`到 ${who(r[1])} 的 UDP 线路连 ${r[2]} 字节的包都过不去（组网 MTU ${r[3]}），选路会尽量避开它`);
+    if ((r = /^(\S+):\s*carries the network's (\d+) bytes again$/.exec(detail)))
+      return out(`到 ${who(r[1])} 的 UDP 线路又能通过 ${r[2]} 字节的满长包了`, '', {label: '线路包长恢复', tone: 'ok'});
+    return out('线路能通过的包长变了', detail);
   case 'link.redial': case 'link.redial.failed': {
     // "<path>[ relay=<relay>] reason=rtt|slow rtt=<median>ms baseline=<b>ms slow=<share>% port=<old>-><new>"; a failed one ends in error=<error>.
     const id = detail.split(/\s+/)[0], f = Object.fromEntries([...detail.matchAll(/(\w+)=(\S+)/g)].map(m => [m[1], m[2]]));
@@ -832,7 +889,7 @@ export const eventDetail = (e, member, members, keys = {}) => eventView(e, membe
 export const eventTone = kind => ['owner.changed', 'owner.ack', 'config.applied', 'start', 'stop'].includes(kind) ? 'off'
   : ['direct.up', 'direct.switched', 'link.reused', 'path.ready', 'entry.committed', 'mesh.reinstall'].includes(kind) ? 'ok'
   : /error|fail|down|security|unavailable|unconfirmed|conflict|missing|rejected|exhausted/.test(kind || '') ? 'bad'
-  : /switch|reconnect|return|suppressed|flapping|redial|route\.changed|reach\.changed|restored|skipped|suspect|mismatch|unknown_link|routing\.clock/.test(kind || '') ? 'warn' : 'off';
+  : /switch|reconnect|return|suppressed|kept|flapping|redial|route\.changed|reach\.changed|restored|skipped|suspect|mismatch|unknown_link|routing\.clock|link\.mtu/.test(kind || '') ? 'warn' : 'off';
 
 // A member's end-to-end sessions, signature checks and latest security event as status rows
 // ({label, value, note, noteCls, cls, title, wide, at}); none for what its node does not report.
@@ -1130,3 +1187,99 @@ export function proxyRun(summary, name) {
 }
 export const proxyUrl = (scheme, user, password, host, port, {masked = false} = {}) =>
   `${scheme}://${encodeURIComponent(user)}:${masked ? '••••' : encodeURIComponent(password)}@${host}:${port}`;
+
+// ----- fast relay -----
+export const FAST_DEFAULT_PORT = 52003;
+export const FAST_DEFAULT_PATHS = 3;
+export const FAST_PROTOS = [['any', 'TCP 和 UDP'], ['tcp', 'TCP'], ['udp', 'UDP']];
+export const fastProtoText = proto => (FAST_PROTOS.find(([k]) => k === proto) || FAST_PROTOS[0])[1];
+export const FAST_ALL_SOURCES = () => ({all: true, allSubnets: true, members: [], tags: [], prefixes: []});
+export const fastOpen = src => !src || (src.all && src.allSubnets);
+// Who may use a fast port, in words.
+export const fastSources = (src, members) => fastOpen(src) ? '所有成员和共享局域网' : sideText(src, members, 'prefixes');
+// The machines that listen on the fast relay port while there is a fast port: the relays and the fast ports' own nodes.
+export function fastListener(work, member, effective = null) {
+  if (!member || member.removing) return false;
+  // New controllers expose the exact capability-filtered listener set. Older ones fall back
+  // to the document, including the fast ports made by enabled forwards.
+  if (effective) return Boolean(effective[member.serverId]);
+  const live = (work?.members || []).filter(m => !m.removing && m.address !== '');
+  const ids = new Set(live.map(m => m.serverId));
+  const hosts = new Set((work?.fastPorts || []).filter(p => ids.has(p.serverId)).map(p => p.serverId));
+  for (const f of work?.forwards || []) {
+    if (f.enabled && f.line === 'fast' && f.entry !== f.target && ids.has(f.entry) && ids.has(f.target)) hosts.add(f.target);
+  }
+  return ids.has(member.serverId) && hosts.size > 0 && (isRelay(member) || hosts.has(member.serverId));
+}
+// What each node reports of its way to a fast port's node: its channel there, if it opened one.
+export function fastUsers(data, dest) {
+  const out = [];
+  for (const [id, n] of Object.entries(data?.nodes || {})) {
+    const ch = (n?.summary?.fast?.channels || []).find(c => c.dest === dest);
+    if (ch) out.push({id, ...ch});
+  }
+  return out.sort((a, b) => (b.lastUse || 0) - (a.lastUse || 0));
+}
+// A channel's path: the nodes after its origin, names joined by arrows.
+export const fastPathText = (members, origin, path) => [origin, ...(path?.hops || [])].map(id => nameOf(members, id)).join(' → ');
+export const FAST_PATH_STATES = {ready: ['ok', '已打通'], down: ['bad', '不通'], untested: ['off', '测试中']};
+// One line on how a channel stands: the path new connections take, or why they go over the mesh.
+export function fastChannelText(members, ch) {
+  const using = ch?.paths?.[ch.using];
+  if (ch?.ready && using) return `走 ${fastPathText(members, ch.id, using)}${using.rttMs ? ` · ${msText(using.rttMs)}` : ''}`;
+  if (!ch?.paths?.length) return '预热中，暂走加密组网';
+  if (ch.paths.every(p => p.state === 'untested')) return '预热中，暂走加密组网';
+  const err = ch.paths.find(p => p.error)?.error;
+  return `路径都不通，走加密组网${err ? `：${err}` : ''}`;
+}
+
+// ----- port forwards -----
+export const FORWARD_DEFAULT_PORT = 51082;
+export const FORWARD_DEFAULT_FAST_PORT = 51083;
+export const FORWARD_LINES = [['mesh', '组网'], ['fast', '快速通道']];
+export const forwardLineText = line => (FORWARD_LINES.find(([k]) => k === line) || FORWARD_LINES[0])[1];
+export const FORWARD_PROXY = [[0, '不用'], [1, 'v1'], [2, 'v2']];
+export const newForward = (entry = '', target = '') => ({entry, listen: null, proto: 'any', target, host: '127.0.0.1', port: null, line: 'mesh', proxyProtocol: 0,
+  allow: {prefixes: [], provinces: []}, enabled: true, note: ''});
+export const forwardOpen = allow => !allow?.prefixes?.length && !allow?.provinces?.length;
+// Who may connect, in words: every client, or the networks and provinces it names.
+export function forwardAllowText(allow) {
+  if (forwardOpen(allow)) return '所有来源';
+  const nets = allow.prefixes.length, provinces = allow.provinces;
+  return [nets ? `${nets} 个 IP 或网段` : '', provinces.length > 3 ? `${provinces.slice(0, 3).join('、')} 等 ${provinces.length} 个省` : provinces.join('、')].filter(Boolean).join(' · ');
+}
+// Where a forward's clients end up: the target's own loopback, or an address it reaches.
+export function forwardTargetText(members, f) {
+  const host = f.host || '127.0.0.1';
+  const at = host.includes(':') ? `[${host}]:${f.port || ''}` : `${host}:${f.port || ''}`;
+  return host === '127.0.0.1' || host === 'localhost' ? `${nameOf(members, f.target)} 本机 :${f.port || ''}` : `${nameOf(members, f.target)} → ${at}`;
+}
+const FORWARD_ERRORS = {target_refused: '目标拒绝连接（服务没开或端口不对）', target_timeout: '目标连接超时', target_unreachable: '目标地址不可达或域名解析不了',
+  target_not_allowed: '目标还没放行这条转发（等配置下发）', target_failed: '目标连接失败', too_many_connections: '连接数到上限了', too_many_udp_clients: 'UDP 客户端数到上限了'};
+export function forwardErrorText(code) {
+  if (!code) return '';
+  if (code.startsWith('tunnel: ')) return `到目标的隧道打不开：${code.slice(8)}`;
+  return FORWARD_ERRORS[code] || code;
+}
+// What the entry runs for a forward (summary.forward.forwards), if it does.
+export const forwardRun = (data, f) => (data?.nodes?.[f.entry]?.summary?.forward?.forwards || []).find(x => x.id === f.id) || null;
+// [tone, text] of how a forward stands now.
+export function forwardState(data, f) {
+  const r = forwardRun(data, f);
+  if (!f.enabled) {
+    if (r) return ['warn', r.listen?.length ? '草稿停用 · 上报仍在监听' : '草稿停用 · 等待停止确认'];
+    const node = data?.nodes?.[f.entry];
+    const confirmed = !data?.draft?.dirty && !data?.apply?.running && data?.applied?.revision > 0
+      && node?.appliedRevision === data.applied.revision && ['ready', 'degraded'].includes(node?.state);
+    return confirmed ? ['off', '已停用'] : ['off', '草稿停用 · 待应用确认'];
+  }
+  if (!r) return ['off', '未应用'];
+  if (r.errors?.length) return ['bad', r.listen?.length ? '部分端口没监听上' : '没有监听上'];
+  if (!r.ready && (r.down || r.tunnelError)) return ['bad', '到目标的隧道不通'];
+  const now = r.active || r.sessions ? [r.active ? `${r.active} 个连接` : '', r.sessions ? `${r.sessions} 个 UDP 客户端` : ''].filter(Boolean).join(' · ') : '运行中';
+  if (r.lastError && r.lastErrorAt && Date.now() - r.lastErrorAt < 120000) return ['warn', `${now} · ${forwardErrorText(r.lastError)}`];
+  if (f.line === 'fast' && r.via === 'mesh') return ['warn', `${now} · 快速通道还没通，暂走组网`];
+  return ['ok', now];
+}
+// Each line of the allow box as typed: addresses and networks, separated by lines, commas or spaces.
+export const allowLines = text => [...new Set(String(text || '').split(/[\s,，;；]+/).map(s => s.trim()).filter(Boolean))];

@@ -55,7 +55,11 @@ func MkdirAllPlain(path string) error {
 func mkdirAll(path string) error { return MkdirAllPlain(path) }
 
 // RemovePlain deletes only a non-directory, non-reparse file by handle.
-func RemovePlain(path string) error {
+func RemovePlain(path string) error { return removeCheckedFile(path, nil) }
+
+func removeIdentifiedFile(path string, id fileIdentity) error { return removeCheckedFile(path, &id) }
+
+func removeCheckedFile(path string, id *fileIdentity) error {
 	err := func() error {
 		dir, err := openPlainDir(filepath.Dir(path), 0, false)
 		if err != nil {
@@ -69,6 +73,16 @@ func RemovePlain(path string) error {
 		defer windows.CloseHandle(h)
 		if err := plain(h); err != nil {
 			return err
+		}
+		if id != nil {
+			var info syscall.ByHandleFileInformation
+			if err := syscall.GetFileInformationByHandle(syscall.Handle(h), &info); err != nil {
+				return err
+			}
+			actual := fileIdentity{uint64(info.VolumeSerialNumber), uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}
+			if actual != *id || info.NumberOfLinks != 1 {
+				return errNotRegular
+			}
 		}
 		deleteFile := byte(1) // FILE_DISPOSITION_INFO
 		return windows.SetFileInformationByHandle(h, windows.FileDispositionInfo, &deleteFile, 1)

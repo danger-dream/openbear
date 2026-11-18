@@ -71,26 +71,30 @@ test('real App role routing hides only instances on managed and retains controll
       assert.equal(h.calls.filter(c => c.path === '/api/instances').length, 0);
     } else {
       await h.page.locator('.instances-page').waitFor();
-      assert.equal(await h.page.locator('.sidebar-desktop-nav').getByText('实例', {exact: true}).count(), 1);
+      assert.equal(await h.page.locator('.sidebar-desktop-nav').getByRole('button', {name: '更多入口'}).getAttribute('aria-current'), 'page');
     }
     const dock = h.page.locator('.sidebar-desktop-nav');
     if (mode === 'managed') {
-      for (const name of ['记忆', '凭证', '文档', '定时', 'Skills', 'MCP']) assert.equal(await dock.getByText(name, {exact: true}).count(), 1);
-      assert.equal(await dock.getByText('更多').count(), 0);
+      assert.deepEqual(await dock.locator('.sidebar-resource-label').allInnerTexts(), ['记忆', '凭证', '文档', '笔记', '更多']);
+      await dock.getByRole('button', {name: '更多入口'}).click();
+      const mMenu = h.page.getByRole('region', {name: '更多入口'});
+      await mMenu.locator('.sidebar-more-go').first().waitFor();
+      assert.equal(await mMenu.getByText('实例管理', {exact: true}).count(), 0);
+      await h.page.keyboard.press('Escape');
     } else {
       // More than six destinations: five pinned, the rest under More.
-      assert.deepEqual(await dock.locator('.sidebar-resource-label').allInnerTexts(), ['记忆', '凭证', '文档', '实例', '主机', '更多']);
+      assert.deepEqual(await dock.locator('.sidebar-resource-label').allInnerTexts(), ['记忆', '凭证', '文档', '笔记', '主机', '更多']);
       await dock.getByRole('button', {name: '更多入口'}).click();
       const menu = h.page.getByRole('region', {name: '更多入口'});
       await menu.locator('.sidebar-more-go').first().waitFor();
       const names = pressed => menu.locator(`.sidebar-more-row:has(.sidebar-more-pin[aria-pressed="${pressed}"]) .sidebar-more-go`).allInnerTexts();
-      assert.deepEqual(await names(false), ['定时任务', 'Skills', 'MCP 管理']);
-      assert.deepEqual(await names(true), ['记忆管理', '凭证库', '文档库', '实例管理', '服务器']);
+      assert.deepEqual(await names(false), ['定时任务', 'Skills', 'MCP 管理', '实例管理']);
+      assert.deepEqual(await names(true), ['记忆管理', '凭证库', '文档库', '笔记', '服务器']);
       assert.match(await menu.locator('.sidebar-more-caption').nth(1).innerText(), /已固定 5\/5 · 已满/);
       assert.ok(await menu.getByRole('button', {name: '固定 定时任务'}).isDisabled(), 'five pinned is the limit');
-      // What was unpinned can be pinned again from the same row.
-      await menu.getByRole('button', {name: '取消固定 实例管理'}).click();
-      assert.deepEqual(await names(false), ['定时任务', 'Skills', 'MCP 管理', '实例管理']);
+      // What was unpinned can be pinned again, or replaced with 实例管理.
+      await menu.getByRole('button', {name: '取消固定 笔记'}).click();
+      assert.deepEqual(await names(false), ['笔记', '定时任务', 'Skills', 'MCP 管理', '实例管理']);
       assert.ok(await menu.getByRole('button', {name: '固定 实例管理'}).isEnabled());
       await menu.getByRole('button', {name: '固定 实例管理'}).click();
       assert.deepEqual(await dock.locator('.sidebar-resource-label').allInnerTexts(), ['记忆', '凭证', '文档', '实例', '主机', '更多']);

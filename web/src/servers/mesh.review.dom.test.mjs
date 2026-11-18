@@ -71,22 +71,31 @@ test('a save that fails says why with the way to save again; field errors are sa
   }});
   const {page} = h;
   let mode = 'down';
-  intercept(h, (answer, method, path) => {
-    if (method !== 'PUT' || path !== '/draft' || !mode) return answer;
+  const handle = h.mesh.handle;
+  // A rejected save must not first commit the draft and advance its CAS token.
+  // Losing a successful response is a different case, correctly requiring reload.
+  h.mesh.handle = async (method, path, body, query) => {
+    if (method !== 'PUT' || path !== '/draft' || !mode) return handle(method, path, body, query);
     if (mode === 'down') return [503, {ok: false, error: 'mesh_busy_test'}];
     return [400, {ok: false, error: 'mesh_invalid', errors: [{path: 'members[2].proxy.ports', error: 'invalid_proxy_ports', message: '一台最多 16 个代理端口'},
       {path: 'members[2].address', error: 'address_outside', message: '地址须在 100.96.0.0/16 内，且不在控制地址段 100.96.255.0/24 内'}]}];
-  });
+  };
   await tab(page, '节点').click();
   await page.locator('.m3-row', {hasText: 'Home'}).click();
+  const before = structuredClone(h.mesh.doc), version = (await handle('GET', ''))[1].draftVersion;
   await page.locator('#m3-sec-net').getByRole('switch', {name: '监听 TCP'}).click();
   const alert = page.locator('.m3-failed[role=alert]');
   await alert.waitFor();
   assert.ok((await alert.innerText()).trim().length > 4);
+  assert.deepEqual(h.mesh.doc, before, 'rejected save does not commit');
+  assert.equal((await handle('GET', ''))[1].draftVersion, version, 'rejected save keeps the baseline token');
+  const attempts = h.puts().length;
   mode = '';
   await alert.getByRole('button', {name: '重新保存'}).click();
   await h.saved(d => memberOf(d, 'home').listen.tcp > 0, 'saved again');
   await until(page, async () => !(await alert.count()), 'the failure gone once saved');
+  assert.ok(h.puts().length > attempts, 'retry sends a new save request');
+  assert.ok(memberOf(h.mesh.doc, 'home').listen.tcp > 0, 'retry commits the edited draft');
   // Refused for two fields: each says its own reason where it is.
   mode = 'invalid';
   await page.locator('#m3-sec-net').getByRole('switch', {name: '监听 TCP'}).click();

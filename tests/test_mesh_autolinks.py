@@ -11,6 +11,7 @@ import pytest
 from app.servers import compat, mesh_autolinks, mesh_limits, mesh_status
 from app.servers import mesh_model as model
 from app.servers.mesh_config import build, relay_pairs
+from app.webhooks.repository import many
 from tests.test_mesh_service import (
     OWNER,
     applied_base,
@@ -418,6 +419,114 @@ def test_damping_near_threshold_disappointment_and_drop_after_hour():
     assert [c['relay'] for c in jc_cands] == ['Relay-DE']
 
 
+# ----- 4b. A link down most rounds (RFCHost-JP2, 2026-11-16): gone in ten rounds, kept out 24h, then 72h -----
+def _probe(peer, rtt, loss=0.0):
+    return {'peer': peer, 'rttMs': rtt, 'jitterMs': 0.0 if rtt is not None else None, 'loss': loss, 'method': 'udp', 'at': 1}
+
+
+def _link_state(statuses, a, b, state, rtt=60.0):
+    for x, y in ((a, b), (b, a)):
+        statuses[x]['status']['routing']['links'].append({'peer': y, 'state': state, 'rttMs': rtt, 'jitterMs': 0.0, 'loss': 0.0 if state == 'up' else 1.0})
+
+
+def test_an_auto_link_down_most_rounds_goes_and_stays_out_longer_each_time():
+    names = ['R1', 'R2', 'JP']
+    d = make_doc(*(make_member(n, 'relay') for n in names), pairs=[_link('R1', 'R2'), _link('R2', 'JP')], auto_links={'holdRounds': 1})
+    f = matrix_facts(names)
+    key = mesh_autolinks.pair_key('R1', 'JP')
+
+    def statuses(r1_jp):
+        st = {}
+        for a, b in (('R1', 'R2'), ('R2', 'JP')):
+            _up(st, a, b, 100.0)
+            _up(st, b, a, 100.0)
+        # R1 keeps measuring JP fast from its side, as JP2's outbound UDP went through.
+        st['R1']['status']['probes'].append(_probe('JP', 60.0))
+        if r1_jp:
+            _link_state(st, 'R1', 'JP', r1_jp)
+        return st
+
+    doc, state = d, None
+
+    def run(t, r1_jp):
+        nonlocal doc, state
+        res = mesh_autolinks.optimize(doc, f, statuses(r1_jp), state=state, now_ms=t)
+        doc, state = (res['doc'] if res['changed'] else doc), res['state']
+        return res
+
+    t0 = 60_000
+    assert [x['key'] for x in run(t0, None)['added']] == [key]
+    for i in range(1, 10):
+        assert not run(t0 + i * 60_000, 'down')['changed']
+    first = t0 + 10 * 60_000
+    assert [(x['key'], x['why']) for x in run(first, 'down')['dropped']] == [(key, '实测连不上')]
+    assert state['disappointed'][key] == first + mesh_autolinks.DISAPPOINT_TTL_MS
+    # The probe still says it pays: it used to be built again three rounds on, and dropped an hour later.
+    for i in range(1, 6):
+        res = run(first + i * 60_000, None)
+        assert not res['added'] and key not in [s['key'] for s in res['suggestions']]
+
+    again = first + mesh_autolinks.DISAPPOINT_TTL_MS + 60_000
+    assert [x['key'] for x in run(again, None)['added']] == [key]
+    for i in range(1, 10):
+        assert not run(again + i * 60_000, 'up' if i <= 2 else 'down')['changed']
+    second = again + 10 * 60_000
+    assert [(x['key'], x['why']) for x in run(second, 'down')['dropped']] == [(key, '实测不稳定')]
+    assert state['disappointed'][key] == second + mesh_autolinks.REPEAT_DISAPPOINT_TTL_MS
+    assert state['strikes'][key] == {'count': 2, 'at': second}
+    assert mesh_autolinks.clean_state(state, second + mesh_autolinks.STRIKE_MEMORY_MS)['strikes'] == {}
+
+
+def test_a_probe_pair_costs_what_its_worse_end_measures():
+    d = make_doc(make_member('R1', 'relay'), make_member('R2', 'relay'))
+    f = matrix_facts(['R1', 'R2'])
+    pair = frozenset(('R1', 'R2'))
+    statuses = {'R1': {'status': {'probes': [_probe('R2', 60.0)]}}, 'R2': {'status': {'probes': [_probe('R1', 60.0, 0.2)]}}}
+    assert mesh_autolinks.collect_measurements(d, f, statuses)[1] == {pair: 260.0}
+    statuses['R2']['status']['probes'] = [_probe('R1', None, 1.0)]
+    assert mesh_autolinks.collect_measurements(d, f, statuses)[1] == {}
+
+
+def test_a_relay_mostly_down_is_no_end_of_a_new_auto_link_until_it_holds_an_hour():
+    names = ['R1', 'R2', 'R3', 'R4', 'JP']
+    d = make_doc(*(make_member(n, 'relay') for n in names),
+                 pairs=[_link('R1', 'R2'), _link('R2', 'R3'), _link('R2', 'R4'), _link('R2', 'JP'), _link('R3', 'JP'), _link('R4', 'JP')],
+                 auto_links={'holdRounds': 100})
+    f = matrix_facts(names)
+    key = mesh_autolinks.pair_key('R1', 'JP')
+
+    def statuses(jp_up):
+        st = {}
+        for a, b in (('R1', 'R2'), ('R2', 'R3'), ('R2', 'R4'), ('R2', 'JP')):
+            _up(st, a, b, 100.0)
+            _up(st, b, a, 100.0)
+        for peer in ('R3', 'R4'):
+            _link_state(st, peer, 'JP', 'up' if jp_up else 'down', 100.0)
+        st['R1']['status']['probes'].append(_probe('JP', 60.0))
+        return st
+
+    t, state = 0, None
+
+    def watched(jp_up):
+        nonlocal t, state
+        t += 60_000
+        res = mesh_autolinks.optimize(d, f, statuses(jp_up), state=state, now_ms=t)
+        state = res['state']
+        return key in [s['key'] for s in res['suggestions']]
+
+    assert all([watched(False) for _ in range(9)])
+    assert not [watched(False) for _ in range(11)][-1]
+    assert state['nodeHealth']['JP']['until'] == t + mesh_autolinks.NODE_STABLE_MS
+    # Its neighbours lose a link each to it, not their place.
+    assert all('until' not in state['nodeHealth'][n] for n in ('R1', 'R2', 'R3', 'R4'))
+    while state['nodeHealth']['JP']['share'] < mesh_autolinks.UNSTABLE_SHARE:
+        assert not watched(True)
+    until = state['nodeHealth']['JP']['until']
+    while t + 60_000 < until:
+        assert not watched(True)
+    assert watched(True)
+
+
 # ----- 5. User deletion suppresses rebuilding for 7 days; enabled=False only returns suggestions -----
 def test_user_deleted_auto_link_suppressed_for_7_days_and_disabled_mode():
     nodes = ['Relay-HK', 'Relay-SG1', 'Relay-DE', 'App-SG', 'App-ES']
@@ -514,7 +623,7 @@ async def test_auto_revision_does_not_leak_draft_preserves_dirty_draft_and_rate_
             m['entry'] = {'mode': 'upstreams', 'candidates': [{'id': 'c1', 'relay': ids['r3'], 'transport': 'udp'}], 'autoReturn': True}
         elif m['serverId'] == ids['m2']:
             m['entry'] = {'mode': 'upstreams', 'candidates': [{'id': 'c1', 'relay': ids['r2'], 'transport': 'udp'}], 'autoReturn': True}
-    await api(e, 'PUT', '/api/servers/mesh/draft', doc)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**doc, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply', {})
     await settled(e)
 
@@ -522,7 +631,8 @@ async def test_auto_revision_does_not_leak_draft_preserves_dirty_draft_and_rate_
     view0 = await api(e, 'GET', '/api/servers/mesh')
     dirty_doc = {k: view0[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups', 'limits')}
     dirty_doc['settings']['mtu'] = 1360
-    await api(e, 'PUT', '/api/servers/mesh/draft', dirty_doc)
+    pre_auto = await api(e, 'PUT', '/api/servers/mesh/draft', {**dirty_doc, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    pre_auto_version = pre_auto['draftVersion']
     await settled(e)
 
     # Report high latency on r1<->r2 (260ms) and fast probe on r3<->m2 (25ms).
@@ -566,6 +676,25 @@ async def test_auto_revision_does_not_leak_draft_preserves_dirty_draft_and_rate_
     m2_draft = next(m for m in view1['members'] if m['serverId'] == ids['m2'])
     assert any(c.get('origin') == 'auto' and c['relay'] == ids['r3'] for c in m2_draft['entry']['candidates'])
     assert view1['autoLinks']['lastChange']['reason'].startswith('自动：')
+
+    # 2b. A browser tab still holding the pre-autolink draftVersion saves cleanly without a false 409 conflict,
+    # keeping both the user's edit and the background auto link; a stale token after a real user save still 409s.
+    browser_doc = copy.deepcopy(dirty_doc)
+    browser_doc['settings']['mtu'] = 1340
+    merged = await api(e, 'PUT', '/api/servers/mesh/draft', {**browser_doc, 'draftVersion': pre_auto_version})
+    assert merged['settings']['mtu'] == 1340
+    m2_merged = next(m for m in merged['members'] if m['serverId'] == ids['m2'])
+    assert any(c.get('origin') == 'auto' and c['relay'] == ids['r3'] for c in m2_merged['entry']['candidates'])
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**browser_doc, 'draftVersion': pre_auto_version}, status=409)
+    # Any other write to the draft (adding, removing or leaving members) drops the bases: an older token conflicts
+    # again instead of merging over that write.
+    stale = (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']
+    applied_now = mesh._doc_without_internal(await mesh._load(OWNER, 'applied'))
+    await mesh._save_draft(OWNER, await mesh._load(OWNER, 'draft'), auto_base=[{'version': stale, 'applied': applied_now}])
+    assert (await mesh._load(OWNER, 'draft')).get('_autoBase')
+    await mesh._save_draft(OWNER, await mesh._load(OWNER, 'draft'))
+    assert '_autoBase' not in await mesh._load(OWNER, 'draft')
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**browser_doc, 'draftVersion': stale}, status=409)
 
     # 3. Revision history records "自动：" and the reason.
     revs = (await api(e, 'GET', '/api/servers/mesh/revisions'))['revisions']
@@ -628,12 +757,38 @@ def test_a_stored_mesh_keeps_its_links_its_entries_and_its_configs():
         assert all(t['peer'] not in ('Relay-SG1',) for t in mesh_autolinks.probe_targets(d, f).get('App-ES', {}).get('targets', []))
 
 
+async def test_auto_bases_never_reach_a_revision_and_member_changes_always_name_a_field(env):  # noqa: F811
+    e = env
+    nodes, ids = await mesh_setup(e)
+    await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['m1']]})
+    await api(e, 'POST', '/api/servers/mesh/apply', {})
+    await settled(e)
+    mesh = e.servers.mesh
+    stale = (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']
+    draft = await mesh._load(OWNER, 'draft')
+    draft['settings']['mtu'] = 1360
+    await mesh._save_draft(OWNER, draft, auto_base=[{'version': stale, 'applied': mesh._doc_without_internal(await mesh._load(OWNER, 'applied'))}])
+    await api(e, 'POST', '/api/servers/mesh/apply', {})
+    await settled(e)
+    rows = await many(mesh.db.conn, 'SELECT doc_json FROM mesh_revisions WHERE owner=?', (OWNER,))
+    assert len(rows) >= 2 and not any('_autoBase' in r['doc_json'] for r in rows)
+    assert '_autoBase' not in await mesh._load(OWNER, 'draft')
+    # Fields without their own words still say what changed, never "修改 X 的" with nothing after it.
+    applied = await mesh._load(OWNER, 'applied')
+    changed = copy.deepcopy(applied)
+    member = next(m for m in changed['members'] if m['serverId'] == ids['m1'])
+    member['direct'] = False
+    member['auto'] = []
+    [change] = mesh._changes(applied, changed, await mesh._facts(OWNER))
+    assert change['kind'] == 'member.update' and change['text'].endswith('的自动加入口、跟随自动的设置')
+
+
 async def test_auto_links_off_takes_no_round_and_writes_nothing(env):  # noqa: F811
     e = env
     nodes, ids = await mesh_setup(e)
     await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['m1']]})
     state = await api(e, 'GET', '/api/servers/mesh')
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**state['settings'], 'autoLinks': {**state['settings']['autoLinks'], 'enabled': False}}})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**state['settings'], 'autoLinks': {**state['settings']['autoLinks'], 'enabled': False}}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply', {})
     await settled(e)
     mesh = e.servers.mesh

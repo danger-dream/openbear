@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,21 +28,41 @@ func protectedPID(pid int) bool { return pid <= 4 }
 
 // signalProcess asks the process to close as taskkill does, which console and
 // service processes refuse: they report back at once, for the user to force.
-func signalProcess(pid int, force bool) (bool, error) {
-	if !processAlive(pid) {
+func signalProcess(pid int, force bool, identity string) (bool, error) {
+	access := uint32(windows.PROCESS_QUERY_LIMITED_INFORMATION)
+	if force {
+		access |= windows.PROCESS_TERMINATE
+	}
+	h, err := windows.OpenProcess(access, false, uint32(pid))
+	if err != nil {
+		return false, err
+	}
+	defer windows.CloseHandle(h)
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return false, err
+	}
+	if identity == "" {
+		return false, errors.New("process_identity_required")
+	}
+	if hostProcessIdentity(pid, strconv.FormatInt(created.Nanoseconds(), 10)) != identity {
+		return false, errors.New("process_changed")
+	}
+	var code uint32
+	if windows.GetExitCodeProcess(h, &code) != nil || code != stillActive {
 		return false, errors.New("process_not_found")
 	}
 	if !force {
+		// taskkill's graceful request is PID based; validate immediately before
+		// invoking it. Forced termination below uses the verified stable handle.
+		if err := checkProcessIdentity(pid, identity); err != nil {
+			return false, err
+		}
 		if err := exec.Command("taskkill", "/PID", strconv.Itoa(pid)).Run(); err != nil {
 			return false, nil
 		}
 		return true, nil
 	}
-	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
-	if err != nil {
-		return false, err
-	}
-	defer windows.CloseHandle(h)
 	return true, windows.TerminateProcess(h, 1)
 }
 
@@ -56,6 +77,7 @@ func processAlive(pid int) bool {
 }
 
 type winSnap struct {
+	start string
 	name  string
 	times uint64 // kernel and user time, 100 ns units
 	rss   int64
@@ -75,6 +97,14 @@ func winSnapshot() map[int]winSnap {
 			var created, exited, kernel, user windows.Filetime
 			if windows.GetProcessTimes(h, &created, &exited, &kernel, &user) == nil {
 				s.times = filetime(kernel) + filetime(user)
+				// Bind the displayed name and creation time to the same handle;
+				// the Toolhelp PID may have been reused before OpenProcess.
+				image := make([]uint16, windows.MAX_LONG_PATH)
+				size := uint32(len(image))
+				if windows.QueryFullProcessImageName(h, 0, &image[0], &size) == nil {
+					s.name = filepath.Base(windows.UTF16ToString(image[:size]))
+					s.start = strconv.FormatInt(created.Nanoseconds(), 10)
+				}
 			}
 			s.rss = workingSet(h)
 			windows.CloseHandle(h)
@@ -129,8 +159,8 @@ func hostTop(ctx context.Context, sort string, limit int, withCommand bool) (Hos
 	cpus := float64(max(runtime.NumCPU(), 1))
 	list := make([]HostProcess, 0, len(after))
 	for pid, s := range after {
-		p := HostProcess{PID: pid, Name: s.name, RSS: s.rss}
-		if b, ok := before[pid]; ok && s.times >= b.times && elapsed > 0 {
+		p := HostProcess{PID: pid, Identity: hostProcessIdentity(pid, s.start), Name: s.name, RSS: s.rss}
+		if b, ok := before[pid]; ok && s.start == b.start && s.times >= b.times && elapsed > 0 {
 			p.CPU = round(float64(s.times-b.times)/elapsed/cpus*100, 2)
 		}
 		list = append(list, p)
@@ -163,7 +193,7 @@ $bios=Get-CimInstance Win32_BIOS
 
 type winHardwareReport struct {
 	CPU []struct {
-		Name, Vendor                       string
+		Name, Vendor                        string
 		Cores, Threads, MHz, MaxMHz, L2, L3 int
 	} `json:"cpu"`
 	Vendor, Product, BoardVendor, Board, BIOS, BIOSDate, TZ string

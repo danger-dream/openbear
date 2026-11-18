@@ -10,6 +10,7 @@ from app.agents.supervision import (
     review_observation, scan_alerts, task_brief,
 )
 from app.context.configuration import conversation_strategy
+from app.context.image_one_turn import conversation_image_one_turn
 from app.context.editor import branch_settings, EditedToolRegistry
 from app.context.prompts import effective_context_prompt
 from app.context.prompt_policy import PromptToolRegistry, policy_tool_names
@@ -624,7 +625,9 @@ class WebAdminChatRunMixin:
                 active_run_root_turn_uuid=root_turn_uuid,
                 restored_controller_anchor=restored_controller_anchor,
                 frozen_system=bool(edited_context),
+                rebuild_system=lambda current: self._rebuild_missing_persona_system(conversation_uuid, current),
                 strategy_resolver=lambda: conversation_strategy(self.db, conversation_uuid, self.config.context_management.default_strategy),
+                image_one_turn_resolver=lambda: conversation_image_one_turn(self.db, conversation_uuid=conversation_uuid),
                 strategies={"model_summary": ModelSummaryStrategy(self.config, self.llm_factory, model_label, on_model_call=_summary_model_call)},
             )
             persister.window_runtime = window_runtime

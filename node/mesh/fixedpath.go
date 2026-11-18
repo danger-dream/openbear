@@ -257,6 +257,29 @@ type pinSwitch struct {
 	silent   bool     // the path before did not answer its probes
 }
 
+// fromHere is a fixed path this node is the source of: its id, rank and the
+// nodes after this one.
+type fromHere struct {
+	id   string
+	rank int
+	hops []string
+}
+
+// sourcePaths are the fixed paths from this node to dest whose links are all
+// up, by rank.
+func (r *pinRuns) sourcePaths(dest string) []fromHere {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []fromHere
+	for _, run := range r.runs {
+		if run.source && len(run.nodes) > 1 && run.nodes[len(run.nodes)-1] == dest && run.up.Load() {
+			out = append(out, fromHere{id: run.path, rank: run.rank, hops: slices.Clone(run.nodes[1:])})
+		}
+	}
+	slices.SortFunc(out, func(a, b fromHere) int { return a.rank - b.rank })
+	return out
+}
+
 func newPinRuns() *pinRuns {
 	return &pinRuns{runs: map[string]*pinRun{}, use: map[[2]string]int{}, now: time.Now}
 }

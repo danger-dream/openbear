@@ -167,10 +167,13 @@ class Servers:
         return item
 
     def _validate(self, data, prior):
-        if set(data) - {'name', 'host', 'port', 'username', 'auth', 'password', 'privateKey', 'keyRef', 'saveKey'}:
+        if set(data) - {'name', 'host', 'port', 'username', 'auth', 'password', 'privateKey', 'keyRef', 'saveKey', 'relay'}:
             raise InstanceError('invalid_server')
         merged = {**prior, **{k: v for k, v in data.items() if k not in {'password', 'privateKey', 'keyRef', 'saveKey'}}}
         name, host, username = merged.get('name', ''), merged.get('host', ''), merged.get('username', '')
+        relay = merged.get('relay') or ''
+        if not isinstance(relay, str) or len(relay) > 80:
+            raise InstanceError('invalid_ssh_relay')
         port = merged.get('port', 22)
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
             raise InstanceError('server_name_required')
@@ -185,9 +188,10 @@ class Servers:
             raise InstanceError('invalid_server_user')
         if merged.get('auth') not in {'key', 'password', 'upload'}:
             raise InstanceError('invalid_server_auth')
-        return {'name': name.strip(), 'host': host, 'port': port, 'username': username, 'auth': merged['auth']}
+        return {'name': name.strip(), 'host': host, 'port': port, 'username': username, 'auth': merged['auth'], **({'relay': relay} if relay else {})}
 
-    async def save(self, owner, data, identity=None, via=None):
+    async def save(self, owner, data, identity=None, exits=None):
+        """exits: a front being added, whose login goes through them unless it names a relay."""
         self.service.require_controller()
         if identity == LOCAL:
             raise InstanceError('local_server_fixed', 409)
@@ -199,6 +203,7 @@ class Servers:
         prior = json.loads(row['public_json']) if row else {}
         secret = self.service.vault.open(row['protected']) if row else {}
         item = self._validate(data, prior)
+        await self._check_relay(owner, identity, item.get('relay'))
         auth = item['auth']
         if auth == 'none':
             if row and prior.get('auth') != 'none' and (await self.usage(owner)).get(identity):
@@ -235,8 +240,8 @@ class Servers:
             secret.setdefault('knownHosts', stored['knownHosts'])  # Keep the pinned host key.
         item['keyLabel'] = self._key_label(secret)
         item.update({k: prior[k] for k in ('publicIp', 'os', 'docker', 'status', 'checkedAtMs', 'error') if k in prior})
-        target = {**item, **secret, **({'via': via} if via else await self._via(owner, identity))}
-        if not row or any(prior.get(k) != item.get(k) for k in ('host', 'port', 'username', 'auth')) or secret != stored:
+        target = {**item, **secret, **await self._route(owner, identity, item, exits)}
+        if not row or any(prior.get(k) != item.get(k) for k in ('host', 'port', 'username', 'auth', 'relay')) or secret != stored:
             # Saving always proves the connection once, as the UI promises.
             result = await self.test_target(target, secret.get('knownHosts', ''))
             item.update(result['facts'])
@@ -315,28 +320,57 @@ class Servers:
             if channel:
                 raise InstanceError('node_exec_disabled' if channel['online'] else 'node_offline', 409)
             raise InstanceError('server_ssh_unavailable', 409)
-        return {'id': identity, 'owner': owner, 'local': False, 'channel': 'ssh', **item, **secret, **await self._via(owner, identity)}
+        return {'id': identity, 'owner': owner, 'local': False, 'channel': 'ssh', **item, **secret, **await self._route(owner, identity, item)}
 
-    async def _via(self, owner, identity):
-        """{'via': exits} for a front, whose SSH goes only through them; {} otherwise."""
+    async def _route(self, owner, identity, item, exits=None):
+        """How the login is reached: {'via': servers whose nodes open the TCP connection, first that
+        can} through its relay when it names one, else a front's exits; 'front' for a front, which
+        reaches nothing beyond its exits. {} for a direct login. exits: of a front not saved yet."""
+        if exits is None:
+            exits = await self._exits(owner, identity)
+        via = [item['relay']] if item.get('relay') else list(exits)
+        return {**({'via': via} if via else {}), **({'front': True} if exits else {})}
+
+    async def _exits(self, owner, identity):
+        """A front's exits, primary first; [] for any other server."""
         servers = getattr(self.service.host, 'servers', None)
-        via = await servers.front.via(owner, identity) if servers and identity else []
-        return {'via': via} if via else {}
+        return await servers.front.via(owner, identity) if servers and identity else []
 
-    async def via_of(self, owner, via):
-        """{'via': exits} for a login that is to go through these exits (a front being added); each
-        must be one of the owner's servers."""
-        if via in (None, []):
-            return {}
-        known = {s['id'] for s in await self.all(owner)}
-        if not isinstance(via, list) or not 1 <= len(via) <= 2 or any(not isinstance(v, str) or v not in known for v in via):
-            raise InstanceError('invalid_front_exit')
-        return {'via': list(dict.fromkeys(via))}
+    async def _check_relay(self, owner, identity, relay):
+        """A relay is another of the owner's servers, not this controller and not a front."""
+        if not relay:
+            return
+        if relay in (identity, LOCAL) or not await one(self.db.conn, 'SELECT 1 FROM instance_servers WHERE id=? AND owner=?', (relay, owner)) \
+                or await self._exits(owner, relay):
+            raise InstanceError('invalid_ssh_relay')
+
+    async def test_route(self, owner, data):
+        """The route of an unsaved login being tested: its relay (checked), else the exits of the
+        front it is for, given as via (a front being added) or by serverId (one saved, whose relay
+        stays when the form does not offer one)."""
+        exits, identity = data.pop('via', None), data.pop('serverId', None)
+        if identity is not None:
+            if not isinstance(identity, str):
+                raise InstanceError('invalid_server')
+            exits = await self._exits(owner, identity)
+            row = await one(self.db.conn, 'SELECT public_json FROM instance_servers WHERE id=? AND owner=?', (identity, owner))
+            if 'relay' not in data and row and json.loads(row['public_json']).get('relay'):
+                data['relay'] = json.loads(row['public_json'])['relay']
+        elif exits not in (None, []):
+            known = {s['id'] for s in await self.all(owner)}
+            if not isinstance(exits, list) or not 1 <= len(exits) <= 2 or any(not isinstance(v, str) or v not in known for v in exits):
+                raise InstanceError('invalid_front_exit')
+            exits = list(dict.fromkeys(exits))
+        item = self._validate(data, {})
+        await self._check_relay(owner, identity, item.get('relay'))
+        return item, await self._route(owner, identity, item, exits or [])
 
     def _tunnel(self, target):
-        """_ssh's tunnel argument for a front's target; {} for any other."""
+        """_ssh's tunnel argument for a target reached through other servers' nodes; {} for a direct one."""
         servers = getattr(self.service.host, 'servers', None)
-        return {'tunnel': servers.front.opener(target['via']) if servers else None} if target.get('via') else {}
+        if not target.get('via'):
+            return {}
+        return {'tunnel': servers.front.opener(target['via'], 'ssh_relay_offline' if target.get('relay') else 'front_exit_offline') if servers else None}
 
     async def channel(self, owner, identity):
         """How instance and gateway commands reach the server right now, and as whom."""
@@ -429,12 +463,20 @@ class Servers:
         await self.remember_host_key(target['id'], result['knownHosts'])
         return result
 
+    async def put(self, target, local, remote, *, timeout=600):
+        """Copy the file local over SSH to remote, relative to the login's home."""
+        if target.get('local') or target.get('channel') == 'node':
+            raise InstanceError('server_ssh_unavailable', 409)
+        result = await _scp(self.db, target, local, remote, timeout=timeout, **self._tunnel(target))
+        await self.remember_host_key(target['id'], result['knownHosts'])
+        return result
+
     async def test_target(self, target, known=''):
         tunnel = self._tunnel(target)
-        probe = FRONT_PROBE if target.get('via') else PROBE
+        probe = FRONT_PROBE if target.get('front') else PROBE
         result = await _ssh(self.db, {**target, 'knownHosts': known or target.get('knownHosts', '')}, probe, timeout=40, **tunnel)
         if not (result['ok'] and 'system=' in result['stdout']):
-            windows = await _ssh(self.db, {**target, 'knownHosts': result['knownHosts']}, FRONT_WINDOWS_PROBE if target.get('via') else WINDOWS_PROBE,
+            windows = await _ssh(self.db, {**target, 'knownHosts': result['knownHosts']}, FRONT_WINDOWS_PROBE if target.get('front') else WINDOWS_PROBE,
                                  timeout=60, **tunnel)
             if windows['ok'] and 'system=Windows' in windows['stdout']:
                 result = windows
@@ -467,15 +509,38 @@ class Servers:
         item, secret = json.loads(row['public_json']), self.service.vault.open(row['protected'])
         if item.get('auth') == 'none':
             raise InstanceError('server_ssh_unavailable', 409)
+        async def configuration(public, protected):
+            # References can stay identical while the vault key/passphrase changes. Snapshot
+            # their stored material too, without invoking SSH/key inspection under a write lock.
+            ref = protected.get('keyRef') or {}
+            key = await one(self.db.conn, 'SELECT kv_json FROM memory_secrets WHERE name=? AND archived=0', (ref.get('secret'),)) if ref else None
+            return ({k: public.get(k) for k in ('host', 'port', 'username', 'auth', 'relay')}, protected,
+                    await self._route(owner, identity, public), key['kv_json'] if key else None)
+
+        before = await configuration(item, secret)
+        known = None
         try:
-            result = await self.test_target({**item, **secret, **await self._via(owner, identity)})
-            item.update(result['facts'])
-            secret['knownHosts'] = result['knownHosts']
+            result = await self.test_target({**item, **secret, **before[2]})
+            facts = {k: v for k, v in result['facts'].items()
+                     if k in ('os', 'docker', 'publicIp', 'platform', 'status', 'checkedAtMs', 'error')}
+            known = result['knownHosts']
         except InstanceError as exc:
-            item.update(status='unreachable', error=exc.error, checkedAtMs=now())
+            facts = dict(status='unreachable', error=exc.error, checkedAtMs=now())
+        stale = False
         async with self.db.write_transaction(label='instance-server-check') as conn:
-            await conn.execute('UPDATE instance_servers SET public_json=?,protected=? WHERE id=?', (json.dumps(item, ensure_ascii=False), self.service.vault.seal(secret), identity))
-        return {'ok': True, 'item': await self.get(owner, identity)}
+            current = await one(conn, 'SELECT * FROM instance_servers WHERE id=? AND owner=?', (identity, owner))
+            if not current:
+                raise InstanceError('server_not_found', 404)
+            public = json.loads(current['public_json'])
+            protected = self.service.vault.open(current['protected'])
+            stale = before != await configuration(public, protected)
+            if not stale:
+                public.update(facts)
+                if known is not None:
+                    protected['knownHosts'] = known
+                await conn.execute('UPDATE instance_servers SET public_json=?,protected=? WHERE id=? AND owner=?',
+                                   (json.dumps(public, ensure_ascii=False), self.service.vault.seal(protected), identity, owner))
+        return {'ok': True, 'item': await self.get(owner, identity), 'stale': stale}
 
     async def port(self, owner, identity, port):
         """Whether a TCP port is free on the target, as the gateway/instance will need it."""
@@ -616,9 +681,11 @@ async def _tunnel_socket(root, target, tunnel):
         await server.wait_closed()
 
 
-async def _ssh(db, target, command, *, stdin=b'', timeout=120, tunnel=None):
-    """Fixed target only: no user SSH config, agent or forwarding. A front's (target['via']) goes
-    through the TCP connection its exit makes, tunnel(address, sink), and never directly."""
+@contextlib.asynccontextmanager
+async def _login(db, target, tunnel):
+    """What ssh and scp share for a fixed target: no user SSH config, agent or forwarding. A
+    front's (target['via']) goes through the TCP connection its exit makes, tunnel(address,
+    sink), and never directly. Yields (options, env, known hosts file, secrets to scrub)."""
     if target.get('via') and tunnel is None:
         raise InstanceError('front_exit_offline', 409)
     secrets_seen = [target.get('password', ''), target.get('privateKey', '')]
@@ -632,12 +699,12 @@ async def _ssh(db, target, command, *, stdin=b'', timeout=120, tunnel=None):
         askpass.chmod(0o700)
         async with (_tunnel_socket(root, target, tunnel) if target.get('via') else contextlib.nullcontext()) as socket_path:
             proxy = ' '.join(shlex.quote(p) for p in (sys.executable, '-I', str(BRIDGE), str(socket_path))) if socket_path else 'none'
-            args = ['ssh', '-F', '/dev/null', '-T', '-p', str(target['port']), '-l', target['username'],
-                    '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=' + str(known),
-                    '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=10',
-                    '-o', 'ServerAliveCountMax=2', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
-                    '-o', 'PermitLocalCommand=no', '-o', 'ProxyCommand=' + proxy, '-o', 'ClearAllForwardings=yes',
-                    '-o', 'NumberOfPasswordPrompts=1']
+            options = ['-F', '/dev/null', '-o', 'User=' + target['username'],
+                       '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=' + str(known),
+                       '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=10',
+                       '-o', 'ServerAliveCountMax=2', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+                       '-o', 'PermitLocalCommand=no', '-o', 'ProxyCommand=' + proxy, '-o', 'ClearAllForwardings=yes',
+                       '-o', 'NumberOfPasswordPrompts=1']
             secret = target.get('password', '')
             pem = target.get('privateKey', '')
             if target.get('keyRef'):
@@ -648,15 +715,32 @@ async def _ssh(db, target, command, *, stdin=b'', timeout=120, tunnel=None):
                 fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, 'w') as handle:
                     handle.write(pem)
-                args += ['-i', str(key), '-o', 'PasswordAuthentication=no']
+                options += ['-i', str(key), '-o', 'PasswordAuthentication=no']
             else:
-                args += ['-o', 'PubkeyAuthentication=no']
-            args += ['--', target['host'], command]
+                options += ['-o', 'PubkeyAuthentication=no']
             env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'DISPLAY': ':0', 'SSH_ASKPASS': str(askpass),
                    'SSH_ASKPASS_REQUIRE': 'force', 'OPENBEAR_SSH_SECRET': secret}
-            result = await _process(args, stdin=stdin, timeout=timeout, env=env)
-        result['knownHosts'] = known.read_text()
+            yield options, env, known, secrets_seen
+
+
+def _scrubbed(result, known, secrets_seen):
+    result['knownHosts'] = known.read_text()
     scrub = Scrubber([s for s in secrets_seen if s])
     for field in ('stdout', 'stderr'):
         result[field] = scrub(result[field])
     return result
+
+
+async def _ssh(db, target, command, *, stdin=b'', timeout=120, tunnel=None):
+    async with _login(db, target, tunnel) as (options, env, known, secrets_seen):
+        args = ['ssh', *options, '-T', '-p', str(target['port']), '--', target['host'], command]
+        return _scrubbed(await _process(args, stdin=stdin, timeout=timeout, env=env), known, secrets_seen)
+
+
+async def _scp(db, target, local, remote, *, timeout=600, tunnel=None):
+    """Copy the file local to remote on the target, a path relative to the login's home. Unlike a
+    command's stdin, an older Windows OpenSSH (Windows 10 1809) takes a whole program this way."""
+    host = f'[{target["host"]}]' if ':' in str(target['host']) else str(target['host'])
+    async with _login(db, target, tunnel) as (options, env, known, secrets_seen):
+        args = ['scp', *options, '-q', '-P', str(target['port']), '--', str(local), f'{host}:{remote}']
+        return _scrubbed(await _process(args, timeout=timeout, env=env), known, secrets_seen)

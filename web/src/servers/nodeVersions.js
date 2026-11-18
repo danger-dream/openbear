@@ -76,6 +76,14 @@ export function updateResultText(r) {
   return {tone: 'success', text: r.from === r.to ? `已更新到新构建 ${r.build || ''}，节点重新连上并报告运行新构建` : `已更新到 ${r.to}，节点重新连上并报告运行新构建`};
 }
 
+/** The board's notice while 全部更新 runs: how far it got and the nodes updating now. */
+export function updateRunText(run, items) {
+  const names = new Map((items || []).map(i => [i.id, i.name]));
+  const now = (run.active || []).map(id => names.get(id) || id);
+  const head = run.total ? `正在更新节点 ${run.done}/${run.total}` : '正在准备更新节点';
+  return now.length ? `${head}，当前：${now.slice(0, 3).join('、')}${now.length > 3 ? ` 等 ${now.length} 台` : ''}` : head;
+}
+
 /** The message after 全部更新. */
 export function updateAllText(items) {
   const list = (items || []).filter(i => i.error !== 'node_update_needs_exec');

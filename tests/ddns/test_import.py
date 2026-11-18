@@ -141,7 +141,8 @@ async def test_import_preview_then_apply_then_merge(env, cloudflare):  # noqa: F
     preview = await e.ddns.import_preview(OWNER, {'yaml': SAMPLE, 'serverId': sid})
     assert preview['accounts'] == [{'type': 'cloudflare', 'alias': 'Cloudflare', 'mergeInto': None}]
     assert preview['records'] == [{'name': 'hinet.example.com', 'type': 'A', 'method': 'url', 'action': 'takeover', 'remote': '192.0.2.44',
-                                   'value': '198.51.100.7'}]
+                                   'value': '198.51.100.7', 'rrset': False, 'remoteValues': ['192.0.2.44'],
+                                   'requiresRrsetTakeover': False, 'warning': ''}]
     assert preview['unsupported'] == [] and preview['warnings'] == []
     assert 'fake-cloudflare-token-0000' not in str(preview)
     # Not confirmed: the account comes in, the record waits for the takeover.

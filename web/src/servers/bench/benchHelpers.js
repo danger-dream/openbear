@@ -4,7 +4,7 @@ export const STATES = {queued: '排队中', preparing: '准备中', running: '�
 export const ACTIVE = new Set(['queued', 'preparing', 'running', 'collecting']);
 export const PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
 export const isActive = run => ACTIVE.has(run?.state);
-export const stateText = run => run.stopping ? '正在停止' : STATES[run.state] || run.state;
+export const stateText = run => run.stopping ? '正在停止' : run.stopPending ? '待确认停止' : STATES[run.state] || run.state;
 export const stateTone = state => ({done: 'ok', failed: 'bad', interrupted: 'bad', stopped: 'idle', queued: 'idle'})[state] || 'busy';
 
 const pad = n => String(n).padStart(2, '0');

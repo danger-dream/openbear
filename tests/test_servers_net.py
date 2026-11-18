@@ -69,7 +69,8 @@ async def mesh_net(e):
     entry = {'mode': 'fixed', 'autoReturn': True, 'candidates': [{'relay': ids['r1'], 'transport': 'tcp'}]}
     members = [{'serverId': ids['r1'], **relay}, {'serverId': ids['r2'], **relay}, {'serverId': ids['m1'], 'entry': entry},
                {'serverId': ids['m2'], 'entry': entry}, {'serverId': ids['home'], 'entry': entry, 'gateway': {'subnets': ['10.10.10.0/24']}}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': [
+    version = (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': version, 'members': members, 'rules': [
         {'src': {'members': [ids['r2']]}, 'dst': {'subnets': ['10.10.10.0/24']}}]})
     assert saved['errors'] == []
     await api(e, 'POST', '/api/servers/mesh/apply')

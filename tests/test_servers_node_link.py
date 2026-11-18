@@ -304,7 +304,7 @@ def test_install_commands_carry_the_controller_fingerprint():
     assert install.command('https://c.example.com', 'code', fingerprint=fingerprint, node='srv-a').endswith(
         f'--url https://c.example.com --code code --fingerprint {fingerprint} --node srv-a')
     assert f"-Code 'code' -Fingerprint '{fingerprint}'" in install.windows_command('https://c.example.com', 'code', fingerprint=fingerprint)
-    body = base64.b64decode(install.windows_ssh_command('https://c.example.com', 'code', fingerprint=fingerprint).split()[-1]).decode('utf-16-le')
+    body = base64.b64decode(install.windows_ssh_command('https://c.example.com', 'code', script='s.ps1', fingerprint=fingerprint).split()[-1]).decode('utf-16-le')
     assert f"-Fingerprint '{fingerprint}'" in body
     # Commands saved before fingerprints stay as they were.
     assert '--fingerprint' not in install.command('https://c.example.com', 'code') and 'Fingerprint' not in install.windows_command('https://c.example.com', 'code')

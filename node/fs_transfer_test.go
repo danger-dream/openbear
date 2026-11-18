@@ -123,11 +123,18 @@ func TestVerifiedTransferMismatchAndCancellationKeepOldFile(t *testing.T) {
 
 func TestTransferNoReplaceIsAtomicAndEmptyFilesWork(t *testing.T) {
 	dir := t.TempDir()
-	temp := filepath.Join(dir, "temp")
 	path := filepath.Join(dir, "target")
-	os.WriteFile(temp, []byte("new"), 0600)
+	stage, err := newFileStage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.write([]byte("new")); err != nil {
+		stage.close()
+		t.Fatal(err)
+	}
+	defer stage.close()
 	os.WriteFile(path, []byte("race"), 0600)
-	if err := commitNew(temp, path, ""); err == nil || err.Error() != "file_exists" {
+	if err := stage.commit("", nil, true); err == nil || err.Error() != "file_exists" {
 		t.Fatalf("overwrite race: %v", err)
 	}
 	b, _ := os.ReadFile(path)

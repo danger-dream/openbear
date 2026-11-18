@@ -33,10 +33,19 @@ DEFAULT_SETTINGS = {
 SETTINGS_KEYS = frozenset(DEFAULT_SETTINGS) | {'dropAfter'}
 MAX_PROBE_TARGETS = 64
 PROBE_INTERVAL_S = 300
-LOSS_CAP = 0.05
 MIN_COST = 0.1
 DISAPPOINT_TTL_MS = 24 * 3600_000
+# A pair let down again within STRIKE_MEMORY_MS of the last time waits the longer TTL.
+REPEAT_DISAPPOINT_TTL_MS = 72 * 3600_000
+STRIKE_MEMORY_MS = 7 * 24 * 3600_000
 SUPPRESS_TTL_MS = 7 * 24 * 3600_000
+# The share of rounds an auto link, or a relay's links, are up, smoothed by HEALTH_WEIGHT a round:
+# after HEALTH_ROUNDS rounds an auto link below UNSTABLE_SHARE goes, and a relay below it is no end
+# of a new one until it has stayed at or above it for NODE_STABLE_MS.
+HEALTH_WEIGHT = 0.1
+HEALTH_ROUNDS = 10
+UNSTABLE_SHARE = 0.5
+NODE_STABLE_MS = 3600_000
 AUTO_REVISION_INTERVAL_MS = 10 * 60_000
 AUTO_LOOP_INTERVAL_S = 60
 
@@ -119,6 +128,15 @@ def clean_state(raw, now_ms=0):
     for k, ts in (raw.get('idleSince') if isinstance(raw.get('idleSince'), dict) else {}).items():
         if isinstance(k, str) and '|' in k and isinstance(ts, (int, float)) and not isinstance(ts, bool) and int(ts) > 0:
             idle_since[k] = int(ts)
+    strikes = {}
+    for k, s in (raw.get('strikes') if isinstance(raw.get('strikes'), dict) else {}).items():
+        if isinstance(k, str) and '|' in k and isinstance(s, dict) and type(s.get('count')) is int and s['count'] > 0 \
+                and _ms(s.get('at')) and _ms(s['at']) + STRIKE_MEMORY_MS > now_ms:
+            strikes[k] = {'count': s['count'], 'at': _ms(s['at'])}
+    link_health = {k: _health(h) for k, h in (raw.get('linkHealth') if isinstance(raw.get('linkHealth'), dict) else {}).items()
+                   if isinstance(k, str) and '|' in k and _health(h)}
+    node_health = {sid: _health(h) for sid, h in (raw.get('nodeHealth') if isinstance(raw.get('nodeHealth'), dict) else {}).items()
+                   if isinstance(sid, str) and _health(h)}
     last_auto = raw.get('lastAutoRevisionMs')
     last_auto_ms = int(last_auto) if isinstance(last_auto, (int, float)) and not isinstance(last_auto, bool) and int(last_auto) > 0 else 0
     last_change = raw.get('lastChange') if isinstance(raw.get('lastChange'), dict) else None
@@ -133,12 +151,71 @@ def clean_state(raw, now_ms=0):
         'disappointed': disappointed,
         'streaks': streaks,
         'idleSince': idle_since,
+        'strikes': strikes,
+        'linkHealth': link_health,
+        'nodeHealth': node_health,
         'lastAutoRevisionMs': last_auto_ms,
         'lastChange': last_change,
         'benefits': benefits,
         'watching': watching,
         'measuredAt': int(measured) if isinstance(measured, (int, float)) and not isinstance(measured, bool) and measured > 0 else 0,
     }
+
+
+def _ms(value):
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _health(raw):
+    """A cleaned {share, rounds, up?, until?} health record, or None."""
+    if not isinstance(raw, dict) or not _num(raw.get('share'), 0, 1) or type(raw.get('rounds')) is not int or raw['rounds'] < 0:
+        return None
+    out = {'share': float(raw['share']), 'rounds': raw['rounds']}
+    if raw.get('up') is True:
+        out['up'] = True
+    if _ms(raw.get('until')):
+        out['until'] = _ms(raw['until'])
+    return out
+
+
+def _smoothed(prior, up):
+    """prior after one more round that found the share up (0-1) up; a first round starts from all up."""
+    prior = prior or {}
+    share = prior.get('share', 1.0)
+    out = {**prior, 'share': round(share + (up - share) * HEALTH_WEIGHT, 4), 'rounds': prior.get('rounds', 0) + 1}
+    if up > 0:
+        out['up'] = True
+    return out
+
+
+def _disappoint(st, k, now_ms):
+    """Keep pair k from being built again: DISAPPOINT_TTL_MS, or REPEAT_DISAPPOINT_TTL_MS when it
+    already let the mesh down within STRIKE_MEMORY_MS."""
+    count = (st['strikes'].get(k) or {}).get('count', 0) + 1
+    st['strikes'][k] = {'count': count, 'at': now_ms}
+    st['disappointed'][k] = now_ms + (DISAPPOINT_TTL_MS if count == 1 else REPEAT_DISAPPOINT_TTL_MS)
+
+
+def track_nodes(st, live, statuses, now_ms):
+    """Follow the share of each relay's links that are up, by its own report; returns the relays that
+    are no end of a new auto link now: below UNSTABLE_SHARE lately, or not yet NODE_STABLE_MS back at it."""
+    health = {}
+    for sid, m in live.items():
+        if m['role'] != 'relay':
+            continue
+        prior = st['nodeHealth'].get(sid)
+        links = [l for l in (((_status_of(statuses, sid) or {}).get('routing') or {}).get('links') or []) if l.get('peer') in live]
+        if not links:
+            if prior:
+                health[sid] = prior
+            continue
+        h = _smoothed(prior, sum(l.get('state') == 'up' for l in links) / len(links))
+        h.pop('up', None)
+        if h['rounds'] >= HEALTH_ROUNDS and h['share'] < UNSTABLE_SHARE:
+            h['until'] = now_ms + NODE_STABLE_MS
+        health[sid] = h
+    st['nodeHealth'] = health
+    return {sid for sid, h in health.items() if h.get('until', 0) > now_ms}
 
 
 def pair_key(a, b):
@@ -375,13 +452,11 @@ def _status_of(statuses, sid):
     return rec.get('status') if isinstance(rec.get('status'), dict) else rec
 
 
-def _cost_formula(rtt, jitter=0.0, loss=0.0, bias=0.0, cap_loss=True):
+def _cost_formula(rtt, jitter=0.0, loss=0.0, bias=0.0):
     if rtt is None or rtt <= 0:
         return None
     jitter = float(jitter or 0.0)
     loss = float(loss or 0.0)
-    if cap_loss:
-        loss = min(loss, LOSS_CAP)
     return max(MIN_COST, float(rtt) + 2.0 * jitter + 1000.0 * max(0.0, loss) + float(bias or 0.0))
 
 
@@ -393,6 +468,8 @@ def collect_measurements(doc, facts, statuses=None, probes=None):
     live = _live(doc)
     real_costs = {}
     probe_costs = {}
+    # A pair one end probes and gets nothing back from: the other end's probe does not make up for it.
+    unreachable = set()
 
     for sid in live:
         st = _status_of(statuses, sid)
@@ -404,14 +481,14 @@ def collect_measurements(doc, facts, statuses=None, probes=None):
                 continue
             k = frozenset((sid, peer))
             # From what was measured: the cost the node reports has its bias in already.
-            val = _cost_formula(l.get('rttMs'), l.get('jitterMs', 0.0), l.get('loss', 0.0), cap_loss=False)
+            val = _cost_formula(l.get('rttMs'), l.get('jitterMs', 0.0), l.get('loss', 0.0))
             if val is not None:
                 real_costs[k] = max(real_costs.get(k, 0.0), val)
         entry = st.get('entry') or {}
         for c in entry.get('candidates') or []:
             relay = c.get('relay')
             if relay in live and c.get('state') in ('active', 'ready') and c.get('rttMs'):
-                val = _cost_formula(c.get('rttMs'), 0.0, c.get('timeoutRate', c.get('lossRate', 0.0)), cap_loss=False)
+                val = _cost_formula(c.get('rttMs'), 0.0, c.get('timeoutRate', c.get('lossRate', 0.0)))
                 if val is not None:
                     k = frozenset((sid, relay))
                     real_costs[k] = min(real_costs.get(k, val), val)
@@ -421,17 +498,21 @@ def collect_measurements(doc, facts, statuses=None, probes=None):
                 continue
             k = frozenset((sid, peer))
             if k not in real_costs:
-                val = _cost_formula(p.get('rttMs'), 0.0, p.get('timeoutRate', 0.0), cap_loss=False)
+                val = _cost_formula(p.get('rttMs'), 0.0, p.get('timeoutRate', 0.0))
                 if val is not None:
                     real_costs[k] = val
         for pr in st.get('probes') or []:
             peer = pr.get('peer')
-            if peer not in live or pr.get('rttMs') is None:
+            if peer not in live:
                 continue
-            val = _cost_formula(pr.get('rttMs'), pr.get('jitterMs', 0.0), pr.get('loss', 0.0), cap_loss=True)
+            k = frozenset((sid, peer))
+            if pr.get('rttMs') is None:
+                if float(pr.get('loss') or 0.0) >= 1.0:
+                    unreachable.add(k)
+                continue
+            val = _cost_formula(pr.get('rttMs'), pr.get('jitterMs', 0.0), pr.get('loss', 0.0))
             if val is not None:
-                k = frozenset((sid, peer))
-                probe_costs[k] = min(probe_costs.get(k, val), val)
+                probe_costs[k] = max(probe_costs.get(k, val), val)
 
     if isinstance(probes, dict):
         for raw_k, raw_v in probes.items():
@@ -452,12 +533,14 @@ def collect_measurements(doc, facts, statuses=None, probes=None):
                 rtt = raw_v.get('rttMs', raw_v.get('rtt'))
                 jitter = raw_v.get('jitterMs', raw_v.get('jitter', 0.0))
                 loss = raw_v.get('loss', 0.0)
-                val = _cost_formula(rtt, jitter, loss, cap_loss=True)
+                val = _cost_formula(rtt, jitter, loss)
             else:
                 val = None
             if val is not None:
-                probe_costs[k] = min(probe_costs.get(k, val), val)
+                probe_costs[k] = max(probe_costs.get(k, val), val)
 
+    for k in unreachable:
+        probe_costs.pop(k, None)
     return real_costs, probe_costs
 
 
@@ -651,6 +734,7 @@ def optimize(doc, facts, statuses=None, probes=None, *, state=None, now_ms=0):
     live = _live(resolved)
     relays = {sid for sid, m in live.items() if m['role'] == 'relay'}
     real_costs, probe_costs = collect_measurements(resolved, facts, statuses, probes)
+    unstable = track_nodes(st, live, statuses, now_ms)
 
     # Step 1: check existing auto links (disappointment after real measurement, or idle for dropAfterS).
     current_auto = auto_keys_in_doc(resolved)
@@ -663,6 +747,8 @@ def optimize(doc, facts, statuses=None, probes=None, *, state=None, now_ms=0):
     for k, info in sorted(current_auto.items()):
         a, b = _split_key(k)
         edge = frozenset((a, b))
+        if _status_of(statuses, a) or _status_of(statuses, b):
+            st['linkHealth'][k] = _smoothed(st['linkHealth'].get(k), 1.0 if edge in real_costs else 0.0)
         if k in st['suppressed']:
             to_remove.add(k)
             dropped.append({'key': k, 'a': a, 'b': b, 'kind': info['kind'], 'why': '已手动删除'})
@@ -680,13 +766,23 @@ def optimize(doc, facts, statuses=None, probes=None, *, state=None, now_ms=0):
             st['idleSince'].pop(k, None)
             continue
 
+        health = st['linkHealth'].get(k) or {}
+        if health.get('rounds', 0) >= HEALTH_ROUNDS and health['share'] < UNSTABLE_SHARE:
+            # Down most rounds: what it gains when up is not worth waiting for, nor building again.
+            _disappoint(st, k, now_ms)
+            st['idleSince'].pop(k, None)
+            st['streaks'].pop(k, None)
+            to_remove.add(k)
+            dropped.append({'key': k, 'a': a, 'b': b, 'kind': info['kind'], 'why': '实测不稳定' if health.get('up') else '实测连不上'})
+            continue
+
         if edge in real_costs and gain_real <= 0:
             # Check if probe had predicted a gain while real measurement says it does not pay off.
             g_with_probe = build_graph(resolved, facts, {}, probe_costs, exclude=gone, use_real=False)
             t_with_probe = shortest_table(g_with_probe, relays)
             gain_probe, _ = evaluate_gains(t_without, t_with_probe, gain_ratio=gain_ratio, gain_ms=gain_ms)
             if gain_probe > 0:
-                st['disappointed'][k] = now_ms + DISAPPOINT_TTL_MS
+                _disappoint(st, k, now_ms)
                 st['idleSince'].pop(k, None)
                 st['streaks'].pop(k, None)
                 to_remove.add(k)
@@ -706,6 +802,9 @@ def optimize(doc, facts, statuses=None, probes=None, *, state=None, now_ms=0):
     for k in list(st['idleSince']):
         if k not in current_auto:
             st['idleSince'].pop(k, None)
+    for k in list(st['linkHealth']):
+        if k not in current_auto:
+            st['linkHealth'].pop(k, None)
 
     # Count how many auto links each node currently uses (after removals).
     used = {sid: 0 for sid in live}
@@ -731,7 +830,7 @@ def optimize(doc, facts, statuses=None, probes=None, *, state=None, now_ms=0):
         for a, b in itertools.combinations(nodes_sorted, 2):
             edge = frozenset((a, b))
             k = pair_key(a, b)
-            if edge in present_edges or k in st['suppressed'] or k in st['disappointed']:
+            if edge in present_edges or k in st['suppressed'] or k in st['disappointed'] or a in unstable or b in unstable:
                 continue
             if used.get(a, 0) >= per_node or used.get(b, 0) >= per_node:
                 continue
@@ -898,6 +997,7 @@ def align_draft(draft, before_applied, after_applied):
     before_auto = auto_keys_in_doc(before_applied)
     after_auto = auto_keys_in_doc(after_applied)
     removed_keys = set(before_auto) - set(after_auto)
+    added_keys = set(after_auto) - set(before_auto)
 
     out = copy.deepcopy(draft)
     if removed_keys:
@@ -926,6 +1026,8 @@ def align_draft(draft, before_applied, after_applied):
             if draft_relay_pairs[k].get('origin') == 'auto':
                 draft_relay_pairs[k].update(reason=p.get('reason', ''), since=p.get('since', 0))
             continue
+        if pair_key(p['a'], p['b']) not in added_keys:
+            continue
         out['relayLinks']['pairs'].append(copy.deepcopy(p))
         draft_relay_pairs[k] = out['relayLinks']['pairs'][-1]
 
@@ -943,7 +1045,7 @@ def align_draft(draft, before_applied, after_applied):
                 if by_relay[ac['relay']].get('origin') == 'auto':
                     by_relay[ac['relay']].update(reason=ac.get('reason', ''), since=ac.get('since', 0))
                 continue
-            if len(cands) >= 8:
+            if pair_key(sid, ac['relay']) not in added_keys or len(cands) >= 8:
                 continue
             cid = ac.get('id') or ''
             if not cid or cid in used_ids:

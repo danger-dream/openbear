@@ -53,13 +53,19 @@ def samples():
 def dump(d, f):
     """All a full mode doc gives: the configs, the doc as worked out and the draft check."""
     resolved = mesh_auto.resolve(d, f)
-    # Captured before documents had connection limits, fixed paths or autoLinks; with defaults they change nothing else.
-    for key in ('limits', 'paths'):
+    # Captured before documents had connection limits, fixed paths, fast ports, port forwards, autoLinks, routing, fast relay or forward
+    # parameters; with defaults they change nothing else.
+    for key in ('limits', 'paths', 'fastPorts', 'forwards'):
         if resolved.get(key) == []:
             del resolved[key]
-    if resolved.get('settings', {}).get('autoLinks') == model.default_settings()['autoLinks']:
-        resolved['settings'] = {k: v for k, v in resolved['settings'].items() if k != 'autoLinks'}
-    body = {'configs': build(d, f, 'net', 1), 'resolved': resolved, 'errors': model.validate(d, f), 'hints': model.hints(d, f)}
+    for key in ('autoLinks', 'routing', 'fast', 'forward'):
+        if resolved.get('settings', {}).get(key) == model.default_settings()[key]:
+            resolved['settings'] = {k: v for k, v in resolved['settings'].items() if k != key}
+    configs = build(d, f, 'net', 1)
+    for c in configs.values():
+        if (c.get('routing') or {}).get('tuning') == model.default_settings()['routing']:
+            del c['routing']['tuning']
+    body = {'configs': configs, 'resolved': resolved, 'errors': model.validate(d, f), 'hints': model.hints(d, f)}
     return json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
 
 

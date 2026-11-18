@@ -116,6 +116,10 @@ func routerConfig(c *Config) meshrouting.Config {
 	if r := c.Routing; r != nil {
 		rc.Mode = r.Mode
 		rc.Bias = maps.Clone(r.Bias)
+		rc.NoTransit = slices.Clone(r.NoTransit)
+		if r.Tuning != nil {
+			rc.Tuning = r.Tuning.router()
+		}
 	}
 	rc.Network, rc.RelayLinks, rc.MemberLinks = c.Network.ID, slices.Clone(c.RelayLinks), slices.Clone(c.MemberLinks)
 	rc.Keys = map[string]ed25519.PublicKey{}

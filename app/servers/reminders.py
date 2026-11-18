@@ -14,7 +14,11 @@ from app.servers import profile as profiles
 from app.servers import releases
 from app.webhooks.repository import many, one
 
-DEFAULTS = {'enabled': True, 'time': '10:00', 'expiryDays': [7, 3, 1, 0], 'trafficPercents': [80, 90, 100], 'autoRenew': True}
+# The mesh's alerts by type (mesh_status.ALERT_TYPES), each on or off apart from enabled: one off is
+# recorded as done ('off') and listed, not sent.
+MESH_ALERTS = ('standby', 'entry', 'flap', 'exit', 'memory', 'apply', 'upgrade', 'missing', 'keys')
+DEFAULTS = {'enabled': True, 'time': '10:00', 'expiryDays': [7, 3, 1, 0], 'trafficPercents': [80, 90, 100], 'autoRenew': True,
+            'mesh': dict.fromkeys(MESH_ALERTS, True)}
 _TIME = re.compile(r'([01]\d|2[0-3]):[0-5]\d')
 
 
@@ -24,8 +28,15 @@ def now_ms():
 
 def clean(data, prior=None):
     value = {**DEFAULTS, **(prior or {})}
+    stored = value['mesh'] if isinstance(value['mesh'], dict) else {}
+    value['mesh'] = {k: stored[k] if isinstance(stored.get(k), bool) else True for k in MESH_ALERTS}
     if not isinstance(data, dict) or set(data) - set(DEFAULTS):
         raise InstanceError('invalid_reminders')
+    if 'mesh' in data:
+        mesh = data['mesh']
+        if not isinstance(mesh, dict) or set(mesh) - set(MESH_ALERTS) or not all(isinstance(v, bool) for v in mesh.values()):
+            raise InstanceError('invalid_mesh_alerts')
+        value['mesh'].update(mesh)
     for key in ('enabled', 'autoRenew'):
         if key in data:
             if not isinstance(data[key], bool):

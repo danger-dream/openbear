@@ -8642,6 +8642,8 @@ async def test_conversation_defaults_seed_partial_patch_and_failed_request(web_e
         "agentFastMode": False,
         "revision": 1,
         "contextStrategy": "sliding_window",
+        "imageOneTurn": {"enabled": False, "includeUser": True, "agents": True},
+        "promptTemplate": "",
         "updatedAt": seeded["updatedAt"],
     }
 
@@ -8756,6 +8758,8 @@ async def test_conversation_defaults_normalize_stale_models_and_capabilities(web
         "agentFastMode": True,
         "revision": 7,
         "contextStrategy": "sliding_window",
+        "imageOneTurn": {"enabled": False, "includeUser": True, "agents": True},
+        "promptTemplate": "",
         "updatedAt": 10,
     }
 
@@ -8838,7 +8842,7 @@ async def test_real_conversation_main_config_success_syncs_defaults(web_env):
         "thinkingLevels", "defaultThinkingLevel", "supportsThinking", "fastMode",
         "fastRequested", "fastSupported", "effectiveFastMode", "agentRunConfig",
         "contextWindow", "rolloverTriggerTokens", "windowTriggerRatio",
-        "contextStrategy", "manualCompactMinPercent",
+        "contextStrategy", "imageOneTurn", "promptTemplate", "promptTemplateLocked", "promptTemplateMissing", "manualCompactMinPercent",
     }
     assert model_config["conversationUuid"] == uuid
     assert model_config["model"] == "openai/cheap"

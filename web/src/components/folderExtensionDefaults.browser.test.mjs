@@ -23,9 +23,10 @@ const catalog=[
  {key:'browser',label:'浏览器',hint:'操作远程浏览器和服务器节点的浏览器',tokens:1200,requires:[]},
  {key:'mcp:parrot',label:'parrot',hint:'MCP 服务：'+'web_search, web_fetch, image_generate, image_edit, '.repeat(3),tokens:12500,requires:[]},
 ];
-const top=new URLSearchParams(location.search).has('top');
-const inherited={enabled:['workitems','agents'],autoAllow:true,explicit:true,from:'F0'};
-const value=ref({inherit:!top,enabled:top?[]:[...inherited.enabled],autoAllow:false});
+const params=new URLSearchParams(location.search), top=params.has('top');
+const inherited=!top?{enabled:['workitems','agents'],autoAllow:true,explicit:true,from:'F0'}
+ :params.has('unset')?{enabled:[],autoAllow:false,explicit:false,from:''}:{enabled:['browser'],autoAllow:false,explicit:true,from:'__system'};
+const value=ref({inherit:true,enabled:[...inherited.enabled],autoAllow:false});
 const hide=ref(false);
 window.__value=()=>JSON.parse(JSON.stringify(value.value));
 createApp({render:()=>h(ElDialog,{modelValue:true,title:'目录属性',width:'min(820px, calc(100vw - 24px))',class:'folder-properties-dialog',appendToBody:true},()=>
@@ -33,7 +34,7 @@ createApp({render:()=>h(ElDialog,{modelValue:true,title:'目录属性',width:'mi
   h('section',{class:'property-section'},[h('label',{class:'property-switch'},[
    h('span',{class:'property-switch-text'},[h('span','不显示在最近会话'),h('small','此目录及其子目录的会话不显示在最近会话，运行和未读状态不受影响。')]),
    h(ElSwitch,{modelValue:hide.value,'onUpdate:modelValue':v=>hide.value=v,'aria-label':'不显示在最近会话'})])]),
-  h(FolderExtensionDefaults,{modelValue:value.value,'onUpdate:modelValue':v=>value.value=v,catalog,inherited,inheritedFrom:'OpenBear',canInherit:!top}),
+  h(FolderExtensionDefaults,{modelValue:value.value,'onUpdate:modelValue':v=>value.value=v,catalog,inherited,inheritedFrom:top?'':'OpenBear',canInherit:true,topLevel:top}),
  ]))}).use(ElementPlus).mount('#app');
 `;
 const html = '<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="app"></div><script type="module" src="/@id/__x00__virtual:folder-extensions"></script></body></html>';
@@ -104,7 +105,7 @@ test('the folder extensions tab spaces its switches and shows each extension wit
     }
     assert.deepEqual(errors, []);
   });
-  await t.test('a top-level folder has no inherit switch and edits its own setting', {timeout: 45000}, async t => {
+  await t.test('a top-level folder inherits the system default until it has its own setting', {timeout: 45000}, async t => {
     const context = await browser.newContext({viewport: {width: 1440, height: 900}});
     t.after(() => context.close());
     const page = await context.newPage();
@@ -112,9 +113,16 @@ test('the folder extensions tab spaces its switches and shows each extension wit
     const dialog = page.locator('.folder-properties-dialog');
     await dialog.getByText('扩展工具', {exact: true}).waitFor();
     assert.equal(await dialog.getByText('继承上级目录').count(), 0);
-    assert.deepEqual((await dialog.locator('.property-switch .property-switch-text > span').allInnerTexts()), ['不显示在最近会话', '自动允许模型开启扩展']);
-    await dialog.locator('.folder-extension-row', {hasText: '浏览器'}).locator('.el-checkbox').click();
-    assert.deepEqual(await page.evaluate(() => window.__value()), {inherit: false, enabled: ['browser'], autoAllow: false});
+    const inherit = dialog.locator('.property-switch', {hasText: '继承系统默认'});
+    assert.match(await inherit.innerText(), /沿用系统默认的设置/);
+    assert.match(await dialog.locator('.folder-extension-list-head').innerText(), /继承系统默认，不能单独修改；要单独设置，先关闭“继承系统默认”/);
+    const rows = dialog.locator('.folder-extension-row');
+    assert.deepEqual(await rows.evaluateAll(els => els.filter(el => el.querySelector('.el-checkbox.is-checked')).map(el => el.querySelector('.folder-extension-text > span').textContent)), ['浏览器']);
     if (shots) await dialog.screenshot({path: `${shots}/desktop-light-top.png`});
+    await inherit.locator('.el-switch').click();
+    await rows.filter({hasText: '任务面板'}).locator('.el-checkbox').click();
+    assert.deepEqual(await page.evaluate(() => window.__value()), {inherit: false, enabled: ['workitems', 'browser'], autoAllow: false});
+    await page.goto(`${fixture.base}/fixture?top=1&unset=1`);
+    assert.match(await dialog.locator('.property-switch', {hasText: '继承系统默认'}).innerText(), /系统默认还没有设置，新会话的扩展全部关闭/);
   });
 });

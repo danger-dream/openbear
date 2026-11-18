@@ -74,13 +74,18 @@ func (s *systemdService) install(bin, dir string) error {
 
 func (s *systemdService) state() string {
 	if _, err := os.Stat(s.unit); err != nil {
-		return "absent"
+		if errors.Is(err, os.ErrNotExist) {
+			return "absent"
+		}
+		return "unknown"
 	}
 	switch out, _ := s.systemctl("is-active", meshUnitName); out {
-	case "active", "activating", "reloading":
+	case "active", "activating", "reloading", "deactivating":
 		return "running"
+	case "inactive", "failed":
+		return "stopped"
 	}
-	return "stopped"
+	return "unknown"
 }
 
 func (s *systemdService) start() error {
@@ -94,8 +99,15 @@ func (s *systemdService) stop() error {
 }
 
 func (s *systemdService) remove() error {
-	s.systemctl("stop", meshUnitName)
-	s.systemctl("disable", meshUnitName)
+	if err := s.stop(); err != nil {
+		return err
+	}
+	if state := s.state(); state != "stopped" && state != "absent" {
+		return errors.New("service stop not confirmed")
+	}
+	if _, err := s.systemctl("disable", meshUnitName); err != nil {
+		return err
+	}
 	if err := os.Remove(s.unit); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -137,32 +149,44 @@ func (s *procdService) install(bin, dir string) error {
 
 func (s *procdService) state() string {
 	if _, err := os.Stat(s.script); err != nil {
-		return "absent"
+		if errors.Is(err, os.ErrNotExist) {
+			return "absent"
+		}
+		return "unknown"
 	}
-	if s.running() {
+	running, err := s.running()
+	if err != nil {
+		return "unknown"
+	}
+	if running {
 		return "running"
 	}
 	return "stopped"
 }
 
 // running asks procd over ubus whether an instance of the service runs.
-func (s *procdService) running() bool {
+func (s *procdService) running() (bool, error) {
 	out, err := s.run("ubus", "call", "service", "list", `{"name":"`+s.name+`"}`)
 	if err != nil {
-		return false
+		return false, err
 	}
 	var list map[string]struct {
 		Instances map[string]struct {
 			Running bool `json:"running"`
 		} `json:"instances"`
 	}
-	json.Unmarshal([]byte(out), &list)
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return false, err
+	}
+	if list == nil {
+		return false, errors.New("invalid procd service state")
+	}
 	for _, instance := range list[s.name].Instances {
 		if instance.Running {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (s *procdService) start() error {
@@ -176,18 +200,28 @@ func (s *procdService) stop() error {
 	if _, err := s.run(s.script, "stop"); err != nil {
 		return err
 	}
-	for deadline := time.Now().Add(25 * time.Second); s.running(); {
+	for deadline := time.Now().Add(25 * time.Second); ; {
+		running, err := s.running()
+		if err != nil {
+			return err
+		}
+		if !running {
+			return nil
+		}
 		if time.Now().After(deadline) {
 			return errors.New("still running")
 		}
 		time.Sleep(s.poll)
 	}
-	return nil
 }
 
 func (s *procdService) remove() error {
-	s.stop()
-	s.run(s.script, "disable")
+	if err := s.stop(); err != nil {
+		return err
+	}
+	if _, err := s.run(s.script, "disable"); err != nil {
+		return err
+	}
 	if err := os.Remove(s.script); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

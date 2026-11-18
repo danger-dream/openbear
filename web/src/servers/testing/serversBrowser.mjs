@@ -29,12 +29,12 @@ export async function startServersBrowser(t, {entries = ['/src/servers/TerminalW
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], touch = false, scale = 1, tiles = 'ok'} = {}) {
+  async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], updateRun = null, touch = false, scale = 1, tiles = 'ok'} = {}) {
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: scale, colorScheme: dark ? 'dark' : 'light', acceptDownloads: true, hasTouch: touch, isMobile: touch});
     await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: serverFixture.base});
     t.after(() => context.close());
     const page = await context.newPage(), errors = [];
-    const backend = createServersBackend({tweak, ...(fx === undefined ? {} : {fx}), release, recheck, mesh, refuseMesh});
+    const backend = createServersBackend({tweak, ...(fx === undefined ? {} : {fx}), release, recheck, mesh, refuseMesh, updateRun});
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(([isDark, mode, alive]) => { window.__dark = isDark; window.__keepAlive = alive; sessionStorage.clear(); localStorage.setItem('openbear.servers.view', mode); }, [dark, view, keepAlive]);
     await page.routeWebSocket(/\/api\/servers\/[^/]+\/terminal/, ws => {
@@ -61,8 +61,10 @@ export async function startServersBrowser(t, {entries = ['/src/servers/TerminalW
 }
 
 export const noOverflow = async page => assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'page scrolls horizontally');
-// Screenshots (only with OPENBEAR_SERVER_SHOTS) are taken once the sheets and dialogs have finished moving.
-export const settled = page => page.evaluate(() => Promise.all(document.getAnimations().map(a => a.finished.catch(() => {}))));
+// Screenshots (only with OPENBEAR_SERVER_SHOTS) are taken once the sheets and dialogs have finished moving;
+// a loading spinner turns for ever and is not waited for.
+export const settled = page => page.evaluate(() => Promise.all(document.getAnimations()
+  .filter(a => a.effect?.getTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))));
 export const shot = async (page, name) => { if (shots) { await settled(page); await page.screenshot({path: `${shots}/${name}.png`}); } };
 // Node version screenshots can go to a directory of their own.
 const versionShots = process.env.OPENBEAR_NODE_VERSION_SHOTS || shots;

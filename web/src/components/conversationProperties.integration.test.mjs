@@ -6,6 +6,7 @@ import * as Vue from 'vue';
 import {parse} from '@vue/compiler-sfc';
 import * as promptPolicy from './promptPolicy.js';
 import {updateRunDefault,runDefaultOption} from './folderRunDefaults.js';
+import {normalizeImageOneTurn} from '../views/consoleView/imageOneTurn.js';
 import {tabKey} from './webhooks/webhookConfig.js';
 import {runConfigFromResponse} from '../views/consoleView/runConfigState.js';
 const source=parse(fs.readFileSync(new URL('./ConversationPropertiesDialog.vue',import.meta.url),'utf8')).descriptor.scriptSetup.content.replace(/^import .*;\n/gm,'');
@@ -16,8 +17,8 @@ function harness(overrides={}) {
   const props=Vue.reactive({modelValue:true,conversation:{conversationUuid:'C1',title:'one'},initialTab:'context'});
   const calls=[],toasts=[];
   const ctx={...Vue,...promptPolicy,watch:()=>{},onBeforeUnmount:()=>{},defineProps:()=>props,defineEmits:()=>()=>{},defineExpose:()=>{},inject:(_key,fallback)=>async(id,request)=>{calls.push(['queue',id]);return request();},
-    modelThinkingLevels:()=>['off','high'],thinkingLabel:x=>x,tabKey,updateRunDefault,runDefaultOption,runConfigFromResponse,apiError:e=>e.message,
-    ElMessage:{success:s=>toasts.push(s)},ElMessageBox:{confirm:async()=>{throw 'close';}},
+    modelThinkingLevels:()=>['off','high'],thinkingLabel:x=>x,tabKey,updateRunDefault,runDefaultOption,runConfigFromResponse,normalizeImageOneTurn,apiError:e=>e.message,
+    ElMessage:{success:s=>toasts.push(s),error:s=>toasts.push(s)},ElMessageBox:{confirm:async()=>{throw 'close';}},
     Api:{conversationPropertiesImpact:async()=>({affectedCount:0}),conversationProperties:async id=>({properties:{contextMode:'inherit',contextText:'',inheritedContext:id},runConfig:runConfig(id,'M1')}),conversationState:async()=>{throw new Error('Property dialogs must not load conversation history');},rathOptions:async()=>({models:[{key:'M1'}]}),
       conversationSetModel:async(id,model)=>{calls.push(['model',id,model]);return {runConfig:runConfig(id,model)};},
       updateConversationProperties:async(id,data)=>{calls.push(['context',id,data]);return {properties:data};},...overrides},console};
@@ -146,4 +147,16 @@ test('late policy save keeps every subsequently changed field, not just text',as
   h.run("contextPolicy.value={text:'later',overrideSystemPrompt:true,toolsEnabled:true,toolNames:['removed'],userMessageTemplateEnabled:true}");
   pending.resolve({properties:{contextText:'submitted',overrideSystemPrompt:true,toolsEnabled:false,toolNames:[],userMessageTemplateEnabled:false}});
   assert.equal(await saving,false);assert.deepEqual(JSON.parse(JSON.stringify(h.run('contextPolicy.value'))),{text:'later',overrideSystemPrompt:true,toolsEnabled:true,toolNames:['removed'],userMessageTemplateEnabled:true});assert.equal(h.run('dirtyContext.value'),true);
+});
+
+
+test('persona save failure is visible from the context tab and preserves context edits', async () => {
+  const h=harness({conversationSetPromptTemplate:async()=>{throw Error('network failed');}});
+  await h.run('load()');
+  h.run("contextEditorText.value='unsaved context'");
+  assert.equal(h.run('tab.value'),'context');
+  await h.run("mutate('persona','7')");
+  assert.equal(h.run('modelSaving.value'),false);
+  assert.equal(h.run('contextEditorText.value'),'unsaved context');
+  assert.equal(h.toasts.at(-1),'network failed');
 });

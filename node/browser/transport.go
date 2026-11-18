@@ -398,7 +398,7 @@ type pipeTransport struct {
 	r      *bufio.Reader
 	w      io.Writer
 	closer io.Closer
-	wmu    sync.Mutex
+	wgate  chan struct{}
 	once   sync.Once
 	closed chan struct{}
 	limit  int
@@ -410,15 +410,27 @@ func (p *pipeTransport) setSizer(s sizer) { p.size = s }
 // NewPipe wraps Chrome's --remote-debugging-pipe streams: every message is
 // a JSON text terminated by a NUL byte.
 func NewPipe(r io.Reader, w io.Writer, closer io.Closer) Transport {
-	return &pipeTransport{r: bufio.NewReaderSize(r, 64<<10), w: w, closer: closer, closed: make(chan struct{}), limit: maxMessage}
+	return &pipeTransport{r: bufio.NewReaderSize(r, 64<<10), w: w, closer: closer, closed: make(chan struct{}), wgate: make(chan struct{}, 1), limit: maxMessage}
 }
 
 func (p *pipeTransport) Send(ctx context.Context, msg []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	p.wmu.Lock()
-	defer p.wmu.Unlock()
+	// Waiting for another frame is cancellable without invalidating its transport.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	select {
+	case p.wgate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closed:
+		return net.ErrClosed
+	}
+	defer func() { <-p.wgate }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-p.closed:
 		return net.ErrClosed
@@ -426,8 +438,26 @@ func (p *pipeTransport) Send(ctx context.Context, msg []byte) error {
 	}
 	buf := make([]byte, len(msg)+1)
 	copy(buf, msg)
-	_, err := p.w.Write(buf)
-	return err
+	// Allocation/copy is still pre-write work; cancellation here must not poison
+	// a healthy connection. Past this check we commit to one physical Write.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Close must unblock both streams (as os.Pipe does). Do not orphan a Write
+	// goroutine: write synchronously and join the cancellation callback instead.
+	// Once writing began we cannot tell whether Chrome saw a partial/full action.
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { p.Close(); close(closed) })
+	n, err := p.w.Write(buf)
+	if !stop() {
+		<-closed
+		return errWriteInterrupted
+	}
+	if err != nil || n != len(buf) {
+		p.Close() // a partial NUL frame must never prefix the next command
+		return errWriteInterrupted
+	}
+	return nil
 }
 
 // Receive returns the next message; one over its ceiling is discarded in

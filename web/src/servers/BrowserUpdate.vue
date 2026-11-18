@@ -44,7 +44,7 @@ async function update() {
 
 <template>
   <div class="sv-browser-update">
-    <small class="instance-muted">下载后固定使用该版本，可手动检查更新。<template v-if="browser?.chromeVersion">当前下载版本：{{ browser.chromeVersion }}</template></small>
+    <small class="instance-muted">下载后固定使用该版本，可手动检查更新。<template v-if="browser?.chromeVersion">已安装版本：{{ browser.chromeVersion }}</template></small>
     <div class="sv-browser-update-actions">
       <button type="button" class="ix-text-button" :disabled="checking || updating || !online || !supported" @click="check">检查更新</button>
       <button v-if="available" type="button" class="ix-text-button" :disabled="checking || updating || !online" @click="update">更新到 {{ available }}</button>
@@ -55,8 +55,9 @@ async function update() {
     <small v-else-if="browser?.update?.state === 'failed'" role="alert">更新失败，原版本保留：{{ browser.update.error }}</small>
     <small v-else-if="browser?.update?.error" role="alert">已下载，但重启失败：{{ browser.update.error }}</small>
     <small v-else-if="browser?.update?.restartNeeded" class="instance-muted">新版已下载，重启浏览器后生效，现有页面未关闭。</small>
-    <small v-else-if="browser?.update?.state === 'done'" class="instance-muted">已更新到 {{ browser.update.version }}</small>
+    <small v-else-if="browser?.update?.state === 'done'" class="instance-muted">已下载 {{ browser.update.version }}<template v-if="browser.update.configurationChanged">；配置已变化，未重启当前浏览器</template><template v-else-if="!browser.update.restarted">，不代表当前窗口已切换版本</template></small>
     <small v-else-if="message" class="instance-muted">{{ message }}</small>
+    <small v-if="browser?.state === 'ready' && browser?.runningVersion" class="instance-muted">实际运行：{{ browser.runningVersion }}<template v-if="browser.runningVerified === false">（运行来源未核实）</template></small>
     <small v-if="error" role="alert">{{ error }}</small>
   </div>
 </template>

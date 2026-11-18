@@ -6,6 +6,9 @@ const regionNames = typeof Intl !== 'undefined' && Intl.DisplayNames ? new Intl.
 export function regionName(code) {
   try { return code ? regionNames?.of(code.toUpperCase()) || code : ''; } catch { return code || ''; }
 }
+// A server as the server picker (ddns/NodePicker.vue) lists it: flag, name and current address.
+export const pickerNode = s => ({serverId: s.id, name: s.name, region: s.region, online: Boolean(s.live || s.node?.online),
+  v4: s.node?.info?.ipv4 || '', v6: s.node?.info?.ipv6 || ''});
 
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 export function bytes(value, digits = 1) {
@@ -157,6 +160,7 @@ const ERRORS = {
   file_op_timeout: '操作超时（30 分钟），可能仍在服务器上进行。',
   file_op_failed: '操作失败。',
   file_job_not_found: '这次操作的结果已过期，请刷新目录查看。',
+  file_jobs_busy: '正在执行的文件操作较多，请等已有操作结束后再试。',
   not_found: '文件或目录不存在。',
   permission_denied: '没有权限。',
   is_directory: '这是一个目录。',
@@ -223,6 +227,7 @@ const ERRORS = {
   invalid_server_profile: '服务器资料不正确。',
   invalid_server_settings: '设置内容不正确。',
   invalid_reminders: '提醒设置不正确。',
+  invalid_mesh_alerts: '组网提醒的开关不正确。',
   invalid_registration_code: '注册码设置不正确（有效期 0–3650 天，次数 0–10000）。',
   command_not_found: '这条命令已被删除，请刷新。',
   invalid_command: '命令内容不正确。',
@@ -231,6 +236,7 @@ const ERRORS = {
   public_key_in_use: '这个节点的密钥已被另一台服务器使用，不能重复注册。',
   upload_offset_mismatch: '上传中断了，请重新上传。',
   upload_out_of_order: '上传中断了，请重新上传。',
+  upload_changed: '上传临时文件已发生变化，本次上传已停止，请重新上传。',
   io_error: '服务器读写文件时出错，请检查磁盘后重试。',
   browser_installing: '浏览器还在下载，请等下载完成后再试。',
   unsupported_method: '这台服务器的节点版本太旧，不支持这个操作，请先更新节点。',
@@ -261,6 +267,9 @@ const ERRORS = {
   front_exit_not_ready: '出口还没有准备好前置接入服务，请确认出口节点在线、版本已更新，并检查前置接入端口后重试。',
   front_exit_offline: '出口节点不在线或不支持前置接入，请先让出口上线并更新节点，再重试。',
   front_serve_failed: '出口没能启用前置接入服务，请检查出口节点和端口是否被占用后重试。',
+  front_exit_unreachable: '前置机连不上出口的前置接入端口：请在出口机的防火墙放行这个 TCP 端口入站（地址见上方步骤）。经专线过来的来源可能是专线内网地址，不是前置机的公网 IP。',
+  invalid_ssh_relay: 'SSH 经由的服务器不可用：不能选主控本机、这台服务器自己或前置机，请重新选择。',
+  ssh_relay_offline: 'SSH 经由的服务器节点不在线、已删除或不支持转发，请让它上线并更新节点，或改为直接连接。',
   front_port_fronts_offline: '有前置机不在线，收不到新的接入地址。请先让所有前置机上线，再修改前置接入端口。',
   invalid_front_port: '前置接入端口不正确，请填写 1–65535 的整数。',
   invalid_httpbl_key: 'http:BL 密钥格式不正确，请填写 12 位小写字母的密钥；留空可清除。',
@@ -298,6 +307,9 @@ const ERRORS = {
   unsupported_sort: '这个系统暂不支持这种排序。',
   invalid_pid: '这个进程不能结束。',
   process_not_found: '进程已经不在了。',
+  process_changed: '这个进程编号已被另一个进程使用，未执行结束操作，请刷新列表。',
+  process_identity_required: '缺少进程启动身份，请刷新列表后重试。',
+  process_identity_unavailable: '无法确认这个进程的启动身份，未执行结束操作。',
   bench_platform_unsupported: '评测目前只支持 Linux（amd64、arm64）节点。',
   bench_openwrt_unsupported: 'OpenWrt 上只能运行 Service Unlock：其余评测脚本不支持 OpenWrt，Geekbench 也无法在它的 musl 系统上运行。',
   bench_exec_disabled: '这台服务器的节点关闭了命令执行，不能运行评测。',

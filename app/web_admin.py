@@ -81,6 +81,7 @@ from app.web_console.statistics_api import WebAdminStatisticsMixin
 from app.web_console.task_memory_api import WebAdminTaskMemoryMixin
 from app.web_console.work_items_api import WebAdminWorkItemsMixin
 from app.web_console.notes_api import WebAdminNotesMixin
+from app.web_console.kb_notes_api import WebAdminKBNotesMixin
 from app.web_console.update_api import WebAdminUpdateMixin
 from app.web_console.uploads import WebAdminUploadsMixin
 from app.web_console.webhooks_api import WebhookPropertiesMixin
@@ -123,6 +124,7 @@ class WebAdminServer(
     WebAdminTaskMemoryMixin,
     WebAdminWorkItemsMixin,
     WebAdminNotesMixin,
+    WebAdminKBNotesMixin,
     WebAdminMemoryMixin,
 ):
     def __init__(

@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import { mesh } from './meshStore.js';
 import { cidr, errorsUnder, ipv4, mutualRule, rowButton, ruleWords } from './meshHelpers.js';
+import { lanAccess as lanIn } from './meshNetworks.js';
 import MeshNodeSelect from './MeshNodeSelect.vue';
 import MeshSideNames from './MeshSideNames.vue';
 
@@ -22,18 +23,11 @@ const words = r => ruleWords(r, members.value);
 // Networks are matched as the controller matches them (mesh_config): a source network holding a node's mesh address
 // names that node, and a rule's network overlapping a LAN covers it, in part when it does not take in a whole LAN network.
 const within = (net, ip) => ip !== null && ip >= net.base && ip < net.base + net.size;
-const overlap = (a, b) => a.base < b.base + b.size && b.base < a.base + a.size;
 const nodeIn = (side, id, dst) => {
   const m = members.value.find(x => x.serverId === id);
   return side?.all || (side?.members || []).includes(id) || (side?.tags || []).some(t => (m?.tags || []).includes(t))
     || (!dst && (side?.prefixes || []).some(n => { const net = cidr(n); return net && within(net, ipv4(m?.address)); }));
 };
-function lanIn(side, nets, dst) {
-  if (side?.allSubnets) return {hit: true, part: []};
-  const lan = nets.map(cidr).filter(Boolean);
-  const hits = (side?.[dst ? 'subnets' : 'prefixes'] || []).map(n => [n, cidr(n)]).filter(([, c]) => c && lan.some(l => overlap(c, l)));
-  return {hit: hits.length > 0, part: hits.filter(([, c]) => !lan.some(l => c.base <= l.base && c.base + c.size >= l.base + l.size)).map(([n]) => n)};
-}
 const preview = computed(() => {
   const [kind, id] = picked.value.split(':'), lan = kind === 'lan' ? lans.value.find(l => l.id === id) : null;
   const inSide = (side, dst) => lan ? lanIn(side, lan.nets, dst) : {hit: nodeIn(side, id, dst), part: []};

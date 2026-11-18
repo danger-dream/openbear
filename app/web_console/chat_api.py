@@ -5,6 +5,7 @@ import dataclasses
 
 from app.agent.native_continuation import validate_model_context
 from app.agents import live_state as agent_live_state
+from app.context import image_one_turn, prompt_template
 from app.context.configuration import CONTEXT_STRATEGIES, normalize_strategy
 from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers
 from app.interaction_data import redact_result
@@ -50,7 +51,11 @@ class WebAdminChatHandlersMixin:
         "agentModel": "agent_model",
         "agentThinkLevel": "agent_think_level",
         "agentFastMode": "agent_fast_mode",
+        "imageOneTurn": "image_one_turn",
+        "promptTemplate": "prompt_template",
     }
+    # Conversation and folder settings that the remembered global defaults never carry.
+    _WEB_LOCAL_ONLY_FIELDS = frozenset({"contextStrategy", "imageOneTurn", "promptTemplate"})
 
     def _web_current_default_model(self) -> str:
         candidates = [
@@ -111,6 +116,8 @@ class WebAdminChatHandlersMixin:
             "agentModel": agent_model,
             "agentThinkLevel": agent_think,
             "agentFastMode": None if agent_fast_raw < 0 else bool(agent_fast_raw),
+            "imageOneTurn": image_one_turn.normalize(row.get("image_one_turn")),
+            "promptTemplate": prompt_template.normalize(row.get("prompt_template")),
             "revision": int(row.get("revision") or 0),
             "updatedAt": int(row.get("updated_at") or 0),
         }
@@ -125,6 +132,8 @@ class WebAdminChatHandlersMixin:
             "agent_model": str(defaults.get("agentModel") or ""),
             "agent_think_level": str(defaults.get("agentThinkLevel") or ""),
             "agent_fast_mode": -1 if defaults.get("agentFastMode") is None else (1 if defaults.get("agentFastMode") is True else 0),
+            "image_one_turn": image_one_turn.dumps(defaults.get("imageOneTurn")),
+            "prompt_template": prompt_template.normalize(defaults.get("promptTemplate")),
         }
 
     def _apply_folder_run_defaults(self, defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +176,7 @@ class WebAdminChatHandlersMixin:
         unknown = set(body) - set(self._WEB_DEFAULT_FIELDS)
         if unknown:
             return None, ("invalid_defaults_field", 400)
-        if require_complete and not (set(self._WEB_DEFAULT_FIELDS) - {"contextStrategy"}).issubset(body):
+        if require_complete and not (set(self._WEB_DEFAULT_FIELDS) - self._WEB_LOCAL_ONLY_FIELDS).issubset(body):
             return None, ("run_config_incomplete", 400)
         if not body:
             return None, ("nothing_to_update", 400)
@@ -178,6 +187,14 @@ class WebAdminChatHandlersMixin:
                 if not isinstance(value, str) or value not in CONTEXT_STRATEGIES:
                     return None, ("invalid_context_strategy", 400)
                 merged[key] = value
+            elif key == "imageOneTurn":
+                if image_one_turn.patch_error(value):
+                    return None, ("invalid_image_one_turn", 400)
+                merged[key] = {**image_one_turn.normalize(current.get(key)), **value}
+            elif key == "promptTemplate":
+                if prompt_template.patch_error(value):
+                    return None, ("invalid_prompt_template", 400)
+                merged[key] = prompt_template.normalize(value)
             elif key in {"mainModel", "mainThinkingLevel", "agentModel", "agentThinkLevel"}:
                 if not isinstance(value, str):
                     return None, ("invalid_defaults_type", 400)
@@ -299,6 +316,10 @@ class WebAdminChatHandlersMixin:
         body = await self._json_body(request)
         if "contextStrategy" in body:
             return web.json_response({"ok": False, "error": "use_system_context_default"}, status=400)
+        if "imageOneTurn" in body:
+            return web.json_response({"ok": False, "error": "image_one_turn_not_global"}, status=400)
+        if "promptTemplate" in body:
+            return web.json_response({"ok": False, "error": "prompt_template_not_global"}, status=400)
         # Serialize validation + partial write so dependency checks (for example
         # Fast support after a concurrent model change) observe server commit order.
         async with self._web_conversation_create_lock:
@@ -340,11 +361,16 @@ class WebAdminChatHandlersMixin:
             if not isinstance(run_config_raw, dict):
                 return web.json_response({"ok": False, "error": "invalid_run_config_type"}, status=400)
             updates, error = self._validate_web_defaults_patch(run_config_raw, current, require_complete=True)
+            if not error and "promptTemplate" in run_config_raw:
+                code = await prompt_template.selectable_error(self.db, prompt_template.normalize(run_config_raw["promptTemplate"]))
+                error = (code, 400) if code else None
             if error:
                 code, status = error
                 return web.json_response({"ok": False, "error": code}, status=status)
             selected = dict(current)
             selected.update(run_config_raw)
+            if "imageOneTurn" in run_config_raw:
+                selected["imageOneTurn"] = {**image_one_turn.normalize(current.get("imageOneTurn")), **run_config_raw["imageOneTurn"]}
             normalized = self._normalize_web_run_defaults({**self._web_defaults_storage(selected), "revision": 0, "updated_at": 0})
         else:
             selected = dict(current)
@@ -776,6 +802,50 @@ class WebAdminChatHandlersMixin:
                          detail={"conversationUuid": row["conversation_uuid"], "strategy": value})
         return web.json_response({"ok": True, "strategy": value, "effectiveAt": "next_safe_boundary", "runConfig": config})
 
+    async def handle_api_conversation_image_one_turn(self, request: web.Request) -> web.Response:
+        session: WebSession = request[_WEB_SESSION_KEY]
+        row = await self._conversation_from_request(request)
+        body = await self._json_body(request)
+        if image_one_turn.patch_error(body):
+            return web.json_response({"ok": False, "error": "invalid_image_one_turn"}, status=400)
+        async with self.db.conn.transaction(label="conversation-image-one-turn") as conn:
+            cur = await conn.execute("SELECT image_one_turn FROM web_conversations WHERE conversation_uuid=? AND owner_chat_id=?",
+                                     (row["conversation_uuid"], session.chat_id))
+            current = await cur.fetchone()
+            value = {**image_one_turn.normalize(current["image_one_turn"] if current else None), **body}
+            await conn.execute("UPDATE web_conversations SET image_one_turn=?,updated_at=? WHERE conversation_uuid=? AND owner_chat_id=?",
+                               (image_one_turn.dumps(value), now_ts(), row["conversation_uuid"], session.chat_id))
+        config = await self._conversation_run_config_public(session.chat_id, row["conversation_uuid"])
+        await self.audit("web.conversation.image_one_turn", actor="web", chat_id=session.chat_id,
+                         detail={"conversationUuid": row["conversation_uuid"], **image_one_turn.normalize(value)})
+        return web.json_response({"ok": True, "imageOneTurn": image_one_turn.normalize(value), "runConfig": config})
+
+    async def handle_api_conversation_prompt_template(self, request: web.Request) -> web.Response:
+        session: WebSession = request[_WEB_SESSION_KEY]
+        row = await self._conversation_from_request(request)
+        body = await self._json_body(request)
+        value = body.get("promptTemplate")
+        if set(body) != {"promptTemplate"} or prompt_template.patch_error(value):
+            return web.json_response({"ok": False, "error": "invalid_prompt_template"}, status=400)
+        value = prompt_template.normalize(value)
+        if code := await prompt_template.selectable_error(self.db, value):
+            return web.json_response({"ok": False, "error": code}, status=400)
+        # Serialize selection with the first render/freeze; never hold a DB writer while rendering.
+        async with self._conversation_tree_lock:
+            async with self.db.conn.transaction(label="conversation-prompt-template") as conn:
+                # The template is chosen before the first round; its snapshot then fixes it.
+                cur = await conn.execute("SELECT COALESCE(system_snapshot,'')<>'' AS frozen FROM sessions WHERE chat_id=?",
+                                         (int(row["internal_chat_id"]),))
+                frozen = await cur.fetchone()
+                if frozen is not None and frozen["frozen"]:
+                    return web.json_response({"ok": False, "error": "prompt_template_locked"}, status=409)
+                await conn.execute("UPDATE web_conversations SET prompt_template=?,updated_at=? WHERE conversation_uuid=? AND owner_chat_id=?",
+                                   (value, now_ts(), row["conversation_uuid"], session.chat_id))
+        config = await self._conversation_run_config_public(session.chat_id, row["conversation_uuid"])
+        await self.audit("web.conversation.prompt_template", actor="web", chat_id=session.chat_id,
+                         detail={"conversationUuid": row["conversation_uuid"], "promptTemplate": value})
+        return web.json_response({"ok": True, "promptTemplate": value, "runConfig": config})
+
     async def handle_api_conversation_compact(self, request: web.Request) -> web.Response:
         from app.context.builder import build_controller_history
         from app.context.editor import branch_settings
@@ -860,6 +930,7 @@ class WebAdminChatHandlersMixin:
                 tool_result_artifact_tokens=self.config.context_management.tool_result_artifact_tokens),
                 backend=backend, model=model, model_label=label, strategy_resolver=strategy, on_rotated=done,
                 frozen_system=bool(edited_context),
+                rebuild_system=lambda current: self._rebuild_missing_persona_system(conv_uuid, current),
                 strategies={"model_summary": ModelSummaryStrategy(self.config, self.llm_factory, label, on_model_call=account)})
             active_policy = await self._active_prompt_policy(conv_uuid)
 
@@ -1637,7 +1708,8 @@ class WebAdminChatHandlersMixin:
             """
             SELECT conversations.*,
                    sessions.thinking_level AS run_thinking_level,
-                   sessions.fast_mode AS run_fast_mode
+                   sessions.fast_mode AS run_fast_mode,
+                   COALESCE(sessions.system_snapshot,'')<>'' AS prompt_frozen
             FROM web_conversations AS conversations
             LEFT JOIN sessions ON sessions.chat_id=conversations.internal_chat_id
             WHERE conversations.owner_chat_id=? AND conversations.conversation_uuid=?
@@ -1677,6 +1749,10 @@ class WebAdminChatHandlersMixin:
         return {
             "conversationUuid": str(conversation.get("conversation_uuid") or ""),
             "contextStrategy": normalize_strategy(conversation.get("context_strategy")),
+            "imageOneTurn": image_one_turn.normalize(conversation.get("image_one_turn")),
+            "promptTemplate": prompt_template.normalize(conversation.get("prompt_template")),
+            "promptTemplateLocked": bool(conversation.get("prompt_frozen")),
+            "promptTemplateMissing": await prompt_template.missing(self.db, conversation.get("prompt_template")),
             "manualCompactMinPercent": self.config.agent.manual_compact_min_percent,
             "model": model,
             "thinkingLevel": thinking_level,

@@ -6,6 +6,7 @@ import { Api, apiError } from "../api";
 import { authMode } from '../authMode.js';
 import ModelOrderPicker from "../components/ModelOrderPicker.vue";
 import DeviceNotifications from "../pwa/DeviceNotifications.vue";
+import SystemExtensionDefaults from "../components/SystemExtensionDefaults.vue";
 import { settingDisplayValue, settingStorageValue, settingRangeLabel } from "./settingsDisplay.js";
 import { applyFeatureSettings } from "../featureToggles.js";
 
@@ -113,11 +114,16 @@ function matchesDeviceNotificationQuery() {
   const q = query.value.trim().toLowerCase();
   return !q || '通知 本设备系统通知 浏览器 pwa 安卓 android chrome 应用 权限 开启 关闭 测试 notification push'.includes(q);
 }
+function matchesExtensionDefaultsQuery() {
+  const q = query.value.trim().toLowerCase();
+  return !q || '新会话默认扩展 系统默认 工具 自动允许模型开启扩展 extensions token'.includes(q);
+}
 function domainSettingCount(domain, filtered = false) {
   return (domain?.sections || []).reduce((total, section) => {
     if (filtered) return total + specsForSection(section).length;
     return total + (section.paths || []).filter((path) => settingAvailable(specs.value[path])).length;
-  }, domain?.key === 'notifications' && (!filtered || matchesDeviceNotificationQuery()) ? 1 : 0);
+  }, (domain?.key === 'notifications' && (!filtered || matchesDeviceNotificationQuery()) ? 1 : 0)
+    + (domain?.key === 'tools' && (!filtered || matchesExtensionDefaultsQuery()) ? 1 : 0));
 }
 const activeDomainInfo = computed(() => {
   const domain = domains.value.find((domain) => domain.key === activeDomain.value) || domains.value[0] || {};
@@ -134,10 +140,13 @@ const visibleSections = computed(() => {
 });
 const showDeviceNotifications = computed(() => domains.value.some(domain => domain.key === 'notifications') &&
   (query.value.trim() ? matchesDeviceNotificationQuery() : activeDomain.value === 'notifications'));
-const totalSettings = computed(() => Object.values(specs.value || {}).filter(settingAvailable).length + Number(domains.value.some(domain => domain.key === 'notifications')));
+const showExtensionDefaults = computed(() => domains.value.some(domain => domain.key === 'tools') &&
+  (query.value.trim() ? matchesExtensionDefaultsQuery() : activeDomain.value === 'tools'));
+const totalSettings = computed(() => Object.values(specs.value || {}).filter(settingAvailable).length + Number(domains.value.some(domain => domain.key === 'notifications'))
+  + Number(domains.value.some(domain => domain.key === 'tools')));
 const restartCount = computed(() => Object.values(specs.value || {}).filter(settingAvailable).filter((s) => s.effect === "需要重启").length);
 const dirtyCount = computed(() => Object.values(specs.value || {}).filter(settingAvailable).filter((spec) => isDirty(spec)).length);
-const resultCount = computed(() => visibleSections.value.reduce((total, section) => total + section.specs.length, Number(showDeviceNotifications.value)));
+const resultCount = computed(() => visibleSections.value.reduce((total, section) => total + section.specs.length, Number(showDeviceNotifications.value) + Number(showExtensionDefaults.value)));
 function optionsFor(spec) {
   if (Array.isArray(spec?.choices) && spec.choices.length) return spec.choices;
   return selectOptions[spec?.path] || [];
@@ -473,8 +482,9 @@ onMounted(load);
 
         <p v-if="['managed', 'gateway'].includes(authMode)" class="text-xs text-macsub mb-3">此实例不使用 Telegram。容器重启、升级和持久化目录由主控维护；其他业务设置仍可在此管理。</p>
         <DeviceNotifications v-if="showDeviceNotifications" />
+        <SystemExtensionDefaults v-if="showExtensionDefaults" />
 
-        <div v-if="!visibleSections.length && !showDeviceNotifications" class="settings-empty">
+        <div v-if="!visibleSections.length && !showDeviceNotifications && !showExtensionDefaults" class="settings-empty">
           <svg class="settings-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>
           <strong>没有找到匹配设置</strong>
           <p>换个关键词，或者搜索配置路径。</p>

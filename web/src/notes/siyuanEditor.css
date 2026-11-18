@@ -1,0 +1,1782 @@
+/* SiYuan Protyle-inspired Markdown Editor Styles (Scoped against @tailwind base resets) */
+.sy-editor-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--ob-surface, #ffffff);
+  color: var(--ob-text, #222222);
+}
+
+.sy-editor-shell svg {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* Breadcrumb & Action Topbar (32px crisp bar like SiYuan .protyle-breadcrumb) */
+.sy-editor-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 2px 10px 2px 12px;
+  border-bottom: 1px solid var(--ob-border);
+  flex: none;
+  overflow: hidden;
+}
+
+.sy-topbar-leading {
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+
+.sy-topbar-leading:empty {
+  display: none;
+}
+
+.sy-breadcrumbs {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  color: var(--ob-text-subtle, #5f6368);
+}
+
+.sy-crumb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 150px;
+  flex: 0 1 auto;
+  height: 24px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.sy-crumb-btn > span,
+.sy-crumb-current > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sy-crumb-btn:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.1));
+  color: var(--ob-text, #222222);
+}
+
+.sy-crumb-current {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: clamp(110px, 25vw, 280px);
+  flex: 0 1 auto;
+  height: 24px;
+  padding: 0 4px;
+  font-weight: 500;
+  color: var(--ob-text, #222222);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sy-crumb-heading {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 160px;
+  flex: 0 1 auto;
+  padding: 0 4px;
+  color: var(--ob-text-muted, #8c959f);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sy-crumb-sep {
+  opacity: 0.42;
+  flex: none;
+}
+
+.sy-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+}
+
+.sy-save-badge {
+  font-size: 11px;
+  color: var(--ob-text-muted, #8c959f);
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+.sy-save-badge.is-saving {
+  color: var(--ob-blue);
+  background: var(--ob-blue-soft);
+}
+
+.sy-save-badge.is-dirty {
+  color: var(--ob-warning, #d97706);
+}
+
+.sy-save-badge.is-error {
+  color: var(--ob-danger, #dc2626);
+}
+
+.sy-mode-segmented {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  margin-right: 2px;
+  border-radius: 6px;
+  background: rgb(var(--ob-border-rgb) / 0.06);
+  gap: 1px;
+}
+
+.sy-mode-segmented button {
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  line-height: 18px;
+  background: transparent;
+  color: var(--ob-text-subtle, #5f6368);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.sy-mode-segmented button:hover:not(.is-active) {
+  color: var(--ob-text, #222222);
+}
+
+.sy-mode-segmented button.is-active {
+  background: var(--ob-surface-raised, #ffffff);
+  color: var(--ob-text, #222222);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.sy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text-subtle, #5f6368);
+  opacity: 0.78;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+.sy-icon-btn:hover {
+  opacity: 1;
+  background: var(--ob-hover, rgba(127, 127, 127, 0.12));
+  color: var(--ob-text, #222222);
+}
+
+.sy-icon-btn.is-active {
+  opacity: 1;
+  background: var(--ob-blue-soft);
+  color: var(--ob-blue);
+}
+
+.sy-icon-btn.is-locked {
+  opacity: 1;
+  background: rgba(217, 119, 6, 0.13);
+  color: var(--ob-warning, #d97706);
+}
+
+/* Main Workspace & Paper Stage */
+.sy-editor-workspace {
+  display: flex;
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+.sy-scroll-stage {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 24px 64px 200px;
+  scroll-behavior: smooth;
+}
+
+.sy-paper {
+  position: relative;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.sy-paper.is-wide {
+  max-width: 1240px;
+}
+
+/* SiYuan Protyle Left Block Gutter Handle (.protyle-gutters) */
+.sy-block-gutter {
+  position: absolute;
+  z-index: 16;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 1px;
+  padding-right: 4px;
+  transform: translateX(-100%);
+  margin-left: 26px;
+  user-select: none;
+}
+
+.sy-block-gutter-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: rgb(var(--ob-text-muted-rgb) / 0.85);
+  opacity: 0.72;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+.sy-block-gutter-btn.is-parent {
+  opacity: 0.48;
+}
+
+.sy-block-gutter-btn:hover,
+.sy-block-gutter-btn.is-selected {
+  opacity: 1;
+  background: var(--ob-hover);
+  color: var(--ob-text);
+}
+
+.sy-block-gutter-btn.is-selected {
+  background: var(--ob-selected);
+  color: var(--ob-blue);
+}
+
+.sy-block-gutter-btn[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.sy-block-drop-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ob-blue);
+  pointer-events: none;
+  z-index: 18;
+}
+
+/* SiYuan Full-Block Selection Highlight (.protyle-wysiwyg--select) */
+.sy-protyle .sy-block-selected {
+  position: relative;
+  background-color: rgb(var(--ob-blue-rgb) / 0.12) !important;
+  box-shadow: 0 0 0 3px rgb(var(--ob-blue-rgb) / 0.12);
+  border-radius: 5px;
+}
+
+.sy-protyle .sy-code-block.sy-block-selected,
+.sy-protyle .tableWrapper.sy-block-selected,
+.sy-protyle table.sy-block-selected,
+.sy-protyle .sy-image-block.sy-block-selected {
+  outline: 2px solid rgb(var(--ob-blue-rgb) / 0.55);
+  outline-offset: 1px;
+}
+
+.sy-protyle hr.sy-block-selected {
+  border-top-color: var(--ob-blue);
+  box-shadow: 0 0 0 5px rgb(var(--ob-blue-rgb) / 0.14);
+}
+
+/* SiYuan Block Context Menu */
+.sy-block-menu {
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+.sy-block-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 8px 5px;
+  font-size: 11px;
+  color: var(--ob-text-muted);
+}
+
+.sy-block-menu-head span {
+  font-weight: 600;
+  color: var(--ob-text-subtle);
+}
+
+.sy-block-menu-head small {
+  color: var(--ob-blue);
+  font-size: 10.5px;
+}
+
+.sy-block-turn-bar {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 2px;
+  padding: 2px 3px 4px;
+}
+
+.sy-block-turn-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 25px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ob-text-subtle);
+  cursor: pointer;
+}
+
+.sy-block-turn-bar button:hover {
+  background: var(--ob-hover);
+  color: var(--ob-text);
+}
+
+.sy-block-turn-bar button.is-current {
+  background: var(--ob-selected);
+  color: var(--ob-blue);
+}
+
+.sy-block-menu > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 29px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sy-block-menu > button:hover {
+  background: var(--ob-hover);
+}
+
+.sy-block-menu > button.is-danger {
+  color: var(--ob-danger);
+}
+
+.sy-block-menu > button span {
+  flex: 1 1 0%;
+  min-width: 0;
+}
+
+.sy-block-menu > button kbd {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--ob-text-muted);
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.sy-block-menu hr {
+  border: 0;
+  border-top: 1px solid var(--ob-border-soft);
+  margin: 4px 2px;
+}
+
+/* SiYuan Protyle Document Header: borderless, icon above title when set, gutter hover trigger when empty */
+.sy-doc-header {
+  position: relative;
+  margin: 6px 0 12px;
+  padding: 0 2px;
+}
+
+/* Invisible left hover bridge so moving the cursor from title to the left icon never drops hover */
+.sy-doc-header::before {
+  content: '';
+  position: absolute;
+  left: -46px;
+  top: -6px;
+  bottom: -6px;
+  width: 48px;
+}
+
+.sy-doc-icon-hero-row {
+  margin-bottom: 6px;
+}
+
+.sy-doc-icon-hero {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  height: 52px;
+  padding: 4px 6px;
+  margin-left: -4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 42px;
+  line-height: 1;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  cursor: pointer;
+  transition: background 0.14s ease, transform 0.12s ease;
+}
+
+.sy-doc-icon-hero:hover:not(:disabled) {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.1));
+}
+
+.sy-doc-icon-hero:disabled {
+  cursor: default;
+}
+
+.sy-doc-title-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+}
+
+.sy-doc-gutter-icon {
+  position: absolute;
+  left: -34px;
+  top: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ob-text-muted, #8c959f);
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: opacity 0.16s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.sy-doc-header:hover .sy-doc-gutter-icon,
+.sy-doc-header.is-gutter-visible .sy-doc-gutter-icon,
+.sy-doc-header:focus-within .sy-doc-gutter-icon {
+  opacity: 0.78;
+  pointer-events: auto;
+}
+
+.sy-doc-gutter-icon:hover {
+  opacity: 1 !important;
+  background: var(--ob-hover, rgba(127, 127, 127, 0.14));
+  color: var(--ob-text, #222222);
+}
+
+.sy-doc-title-input {
+  flex: 1 1 0%;
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  background: transparent;
+  color: var(--ob-text, #222222);
+  font-family: inherit;
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.38;
+  padding: 2px 0;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.sy-doc-title-input::placeholder {
+  color: rgb(var(--ob-text-muted-rgb) / 0.65);
+  font-weight: 700;
+}
+
+/* Emoji Picker Grid */
+.sy-emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+  padding: 8px;
+}
+
+.sy-emoji-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 19px;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  cursor: pointer;
+}
+
+.sy-emoji-cell:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.14));
+}
+
+.sy-emoji-clear {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  height: 28px;
+  border: 1px solid var(--ob-border, rgba(127, 127, 127, 0.22));
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ob-text-subtle, #6e7781);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sy-emoji-clear:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.1));
+  color: var(--ob-text, #222222);
+}
+
+/* Floating Non-Layout-Shifting Contextual Table Toolbar */
+.sy-table-bar {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 22;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100% - 20px);
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 3px 7px;
+  border: 1px solid var(--ob-border, rgba(127, 127, 127, 0.22));
+  border-radius: 8px;
+  background: rgb(var(--ob-surface-raised-rgb) / 0.94);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+.sy-table-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.sy-table-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text, #222222);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+
+.sy-table-bar button:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.13));
+}
+
+.sy-table-bar button.is-danger {
+  color: var(--ob-danger, #dc2626);
+}
+
+.sy-table-bar .sy-bar-sep {
+  width: 1px;
+  height: 13px;
+  background: var(--ob-border, rgba(127, 127, 127, 0.24));
+  margin: 0 2px;
+  flex: none;
+}
+
+/* ProseMirror WYSIWYG Typography (Exact SiYuan Protyle Rhythm: 16px / 26px) */
+.sy-protyle .ProseMirror {
+  outline: none;
+  min-height: 360px;
+  font-size: 16px;
+  line-height: 1.625;
+  color: var(--ob-text, #222222);
+  word-break: break-word;
+}
+
+.sy-protyle .ProseMirror p {
+  margin: 2px 0;
+  padding: 3px 2px;
+  border-radius: 4px;
+}
+
+.sy-protyle .ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: rgb(var(--ob-text-muted-rgb) / 0.75);
+  pointer-events: none;
+  height: 0;
+}
+
+/* Headings + Hover Gutter Level Indicator */
+.sy-protyle .ProseMirror h1,
+.sy-protyle .ProseMirror h2,
+.sy-protyle .ProseMirror h3,
+.sy-protyle .ProseMirror h4,
+.sy-protyle .ProseMirror h5,
+.sy-protyle .ProseMirror h6 {
+  position: relative;
+  font-weight: 600;
+  line-height: 1.42;
+  color: var(--ob-text, #222222);
+  padding: 3px 2px;
+  scroll-margin-top: 24px;
+}
+
+.sy-protyle .ProseMirror h1 { font-size: 1.75em; margin: 0.72em 0 0.22em; }
+.sy-protyle .ProseMirror h2 { font-size: 1.5em; margin: 0.65em 0 0.2em; }
+.sy-protyle .ProseMirror h3 { font-size: 1.25em; margin: 0.56em 0 0.16em; }
+.sy-protyle .ProseMirror h4 { font-size: 1.125em; margin: 0.5em 0 0.14em; }
+.sy-protyle .ProseMirror h5 { font-size: 1em; margin: 0.45em 0 0.12em; }
+.sy-protyle .ProseMirror h6 { font-size: 0.875em; margin: 0.42em 0 0.12em; color: var(--ob-text-subtle, #5f6368); }
+
+/* Blockquote (SiYuan .bq) */
+.sy-protyle .ProseMirror blockquote {
+  margin: 6px 0;
+  padding: 4px 12px 4px 14px;
+  border-left: 4px solid var(--ob-border-strong);
+  color: var(--ob-text-subtle);
+  background: rgb(var(--ob-surface-soft-rgb) / 0.55);
+  border-radius: 0 4px 4px 0;
+}
+
+.sy-protyle .ProseMirror blockquote > p {
+  margin: 2px 0;
+  padding: 2px 0;
+}
+
+/* Bullet, Ordered & Task Lists (overriding @tailwind base list-style:none & padding:0) */
+.sy-protyle .ProseMirror ul,
+.sy-protyle .ProseMirror ol {
+  margin: 3px 0;
+  padding-left: 1.62em;
+}
+
+.sy-protyle .ProseMirror ul { list-style-type: disc; }
+.sy-protyle .ProseMirror ul ul { list-style-type: circle; }
+.sy-protyle .ProseMirror ul ul ul { list-style-type: square; }
+.sy-protyle .ProseMirror ol { list-style-type: decimal; }
+
+.sy-protyle .ProseMirror li {
+  margin: 2px 0;
+  padding-left: 2px;
+}
+
+.sy-protyle .ProseMirror li::marker {
+  color: rgb(var(--ob-text-subtle-rgb) / 0.82);
+}
+
+.sy-protyle .ProseMirror li > p {
+  margin: 1px 0;
+  padding: 2px 0;
+}
+
+.sy-protyle .ProseMirror li > ul,
+.sy-protyle .ProseMirror li > ol {
+  margin: 2px 0;
+}
+
+.sy-protyle .ProseMirror ul.sy-task-list {
+  list-style: none;
+  padding-left: 2px;
+}
+
+.sy-task-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 2px 0;
+  padding-left: 0;
+}
+
+.sy-task-checkbox {
+  display: inline-flex;
+  align-items: center;
+  height: 1.625em;
+  padding-top: 2px;
+  flex: none;
+  cursor: pointer;
+}
+
+.sy-task-checkbox input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--ob-blue, #2563eb);
+  cursor: pointer;
+}
+
+.sy-task-content {
+  flex: 1 1 0%;
+  min-width: 0;
+}
+
+.sy-task-item[data-checked="true"] > .sy-task-content {
+  color: var(--ob-text-muted, #8c959f);
+  text-decoration: line-through;
+}
+
+/* Horizontal Rule */
+.sy-protyle .ProseMirror hr {
+  border: 0;
+  border-top: 1px solid var(--ob-border, rgba(127, 127, 127, 0.22));
+  margin: 14px 0;
+}
+
+/* Inline Code & Links */
+.sy-inline-code {
+  padding: 0.12em 0.38em;
+  margin: 0 1px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: rgb(var(--ob-border-rgb) / 0.065);
+  color: var(--ob-text, inherit);
+}
+
+.sy-link {
+  color: var(--ob-blue, #2563eb);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  cursor: pointer;
+}
+
+.sy-raw-block {
+  margin: 8px 0 12px;
+  padding: 8px 12px;
+  border: 1px dashed var(--ob-border-strong);
+  border-radius: 7px;
+  color: var(--ob-text-muted);
+  background: var(--ob-code-bg);
+}
+
+.sy-raw-block pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  line-height: 1.6;
+}
+
+.sy-raw-inline {
+  padding: 0 3px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  color: var(--ob-text-muted);
+  background: var(--ob-code-bg);
+}
+
+.sy-raw-block.ProseMirror-selectednode,
+.sy-raw-inline.ProseMirror-selectednode {
+  outline: 2px solid var(--ob-blue, #2563eb);
+  outline-offset: 1px;
+}
+
+/* SiYuan-style Code Block (macOS subtle dots + bash › + hover copy icon + line numbers gutter) */
+.sy-code-block {
+  position: relative;
+  margin: 8px 0 12px;
+  border: 1px solid var(--ob-border);
+  border-radius: 7px;
+  background: var(--ob-bg);
+  overflow: hidden;
+}
+
+html.dark .sy-code-block,
+:root[data-theme="dark"] .sy-code-block {
+  background: rgb(var(--ob-surface-raised-rgb) / 0.65);
+  border-color: var(--ob-border);
+}
+
+.sy-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 30px;
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--ob-border-soft);
+  font-size: 12px;
+  color: var(--ob-text-subtle);
+  user-select: none;
+}
+
+.sy-code-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sy-code-dots i {
+  display: inline-block;
+  width: 9.5px;
+  height: 9.5px;
+  border-radius: 50%;
+  opacity: 0.82;
+}
+
+.sy-code-dots i.is-red { background: #ff5f56; }
+.sy-code-dots i.is-amber { background: #ffbd2e; }
+.sy-code-dots i.is-green { background: #27c93f; }
+
+.sy-code-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sy-code-lang-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  padding: 0 2px;
+  color: var(--ob-text-muted, #768390);
+  transition: color 0.14s ease, background 0.12s ease;
+}
+
+.sy-code-lang-wrap:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.12));
+  color: var(--ob-text, #222222);
+}
+
+.sy-code-lang-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  padding: 2px 13px 2px 5px;
+  background: transparent;
+  color: inherit;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+  outline: none;
+  text-align: right;
+}
+
+.sy-code-lang-select option {
+  background: var(--ob-surface-raised, #ffffff);
+  color: var(--ob-text, #222222);
+}
+
+.sy-code-lang-caret {
+  position: absolute;
+  right: 2px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.sy-code-block:hover .sy-code-lang-caret,
+.sy-code-lang-wrap:focus-within .sy-code-lang-caret {
+  opacity: 0.65;
+}
+
+.sy-code-lang-readonly {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--ob-text-muted, #768390);
+}
+
+.sy-code-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ob-text-muted, #768390);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.14s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.sy-code-block:hover .sy-code-copy-btn,
+.sy-code-copy-btn:focus-visible,
+.sy-code-copy-btn.is-copied {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .sy-code-copy-btn,
+  .sy-code-lang-caret {
+    opacity: 0.78;
+  }
+}
+
+.sy-code-copy-btn:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.14));
+  color: var(--ob-text, #222222);
+}
+
+.sy-code-copy-btn.is-copied {
+  color: #16a34a;
+}
+
+.sy-code-body {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.sy-code-gutter {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  min-width: 34px;
+  padding: 10px 8px 10px 10px;
+  border-right: 1px solid var(--ob-border-soft);
+  font: 13.5px/1.62 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  color: rgb(var(--ob-text-muted-rgb) / 0.72);
+  user-select: none;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-code-pre {
+  flex: 1 1 0%;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 14px;
+  overflow-x: auto;
+  font: 13.5px/1.62 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  background: transparent !important;
+  tab-size: 2;
+}
+
+.sy-code-pre code {
+  font-family: inherit;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+/* SiYuan-clean Table styling */
+.sy-table-scroll,
+.sy-protyle .tableWrapper {
+  width: 100%;
+  overflow-x: auto;
+  margin: 8px 0 12px;
+}
+
+.sy-protyle table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14.5px;
+  line-height: 1.55;
+  border: 1px solid var(--ob-border-strong);
+}
+
+.sy-protyle th,
+.sy-protyle td {
+  position: relative;
+  min-width: 84px;
+  padding: 6px 12px;
+  border: 1px solid var(--ob-border-strong);
+  vertical-align: middle;
+  box-sizing: border-box;
+}
+
+.sy-protyle th {
+  font-weight: 600;
+  background: var(--ob-bg);
+}
+
+.sy-protyle tr:nth-child(even) td {
+  background: rgb(var(--ob-surface-soft-rgb) / 0.35);
+}
+
+.sy-protyle td > p,
+.sy-protyle th > p {
+  margin: 0;
+  padding: 0;
+}
+
+.sy-protyle .selectedCell::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ob-selected);
+  pointer-events: none;
+}
+
+.sy-protyle .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background-color: var(--ob-blue, #2563eb);
+  pointer-events: none;
+}
+
+/* Image Block & Inline Image (overriding @tailwind base img { display:block }) */
+.sy-image-block {
+  margin: 8px 0;
+}
+
+.sy-image-figure {
+  margin: 0;
+  display: inline-flex;
+  flex-direction: column;
+  max-width: 100%;
+}
+
+.sy-image-frame {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--ob-border-soft, rgba(127, 127, 127, 0.16));
+}
+
+.sy-image-block.is-selected .sy-image-frame {
+  outline: 2px solid var(--ob-blue, #2563eb);
+}
+
+.sy-image-frame img {
+  display: block;
+  max-width: 100%;
+  max-height: 560px;
+  height: auto;
+  cursor: zoom-in;
+}
+
+.sy-image-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.sy-image-frame:hover .sy-image-actions,
+.sy-image-block.is-selected .sy-image-actions {
+  opacity: 1;
+}
+
+.sy-image-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #fff;
+  cursor: pointer;
+}
+
+.sy-image-actions button.is-danger:hover {
+  background: #dc2626;
+}
+
+.sy-image-caption-input {
+  margin-top: 4px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ob-text-subtle, #6e7781);
+  font-size: 12px;
+  text-align: center;
+}
+
+.sy-image-caption {
+  margin-top: 4px;
+  color: var(--ob-text-subtle, #6e7781);
+  font-size: 12px;
+  text-align: center;
+}
+
+img.sy-inline-image {
+  display: inline-block !important;
+  max-width: 100%;
+  max-height: 280px;
+  vertical-align: middle;
+  border-radius: 4px;
+  cursor: zoom-in;
+}
+
+/* Reference capsule baseline alignment inside ProseMirror */
+.sy-protyle .reference-chip {
+  vertical-align: baseline;
+  margin: 0 2px;
+}
+
+/* Floating Selection Bubble Menu & Slash Command Menu */
+.sy-bubble-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 4px;
+}
+
+.sy-bubble-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 27px;
+  min-width: 27px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text, #222222);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.sy-bubble-toolbar button:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.14));
+}
+
+.sy-bubble-toolbar button.is-active {
+  background: var(--ob-blue-soft);
+  color: var(--ob-blue);
+}
+
+.sy-link-popover {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+}
+
+.sy-link-popover input {
+  flex: 1 1 0%;
+  min-width: 180px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--ob-border-strong, rgba(127, 127, 127, 0.3));
+  border-radius: 6px;
+  background: var(--ob-surface, #fff);
+  color: var(--ob-text, #222222);
+  font-size: 12px;
+  outline: none;
+}
+
+.sy-slash-list {
+  max-height: 310px;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.sy-slash-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ob-text, #222222);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sy-slash-item.is-selected,
+.sy-slash-item:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.12));
+}
+
+.sy-slash-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  border-radius: 5px;
+  background: var(--ob-surface-soft, rgba(127, 127, 127, 0.09));
+  color: var(--ob-text-subtle, #6e7781);
+  font-size: 11.5px;
+  font-weight: 600;
+  flex: none;
+}
+
+.sy-slash-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.sy-slash-copy strong {
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.sy-slash-copy small {
+  font-size: 11px;
+  color: var(--ob-text-muted, #8c959f);
+}
+
+.sy-slash-shortcut {
+  font-size: 11px;
+  color: var(--ob-text-muted, #8c959f);
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+/* Source Mode Host */
+.sy-source-stage {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Right Outline (TOC) Sidebar */
+.sy-outline-aside {
+  width: 224px;
+  flex: none;
+  border-left: 1px solid var(--ob-border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--ob-bg);
+}
+
+.sy-outline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ob-text-subtle);
+  border-bottom: 1px solid var(--ob-border-soft);
+}
+
+.sy-outline-list {
+  flex: 1 1 0%;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.sy-outline-item {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  padding-left: calc(8px + (var(--toc-level, 1) - 1) * 11px);
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text-subtle, #57606a);
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.sy-outline-item:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.1));
+  color: var(--ob-text, #222222);
+}
+
+.sy-outline-empty {
+  padding: 20px 12px;
+  font-size: 12px;
+  color: var(--ob-text-muted, #8c959f);
+  text-align: center;
+}
+
+/* Bottom Statusbar (SiYuan bottom-right subtle stats) */
+.sy-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 24px;
+  padding: 0 12px;
+  border-top: 1px solid var(--ob-border-soft);
+  font-size: 11px;
+  color: var(--ob-text-muted, #8c959f);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.sy-statusbar > span:first-child {
+  opacity: 0.72;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sy-statusbar-stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  flex: none;
+}
+
+@media (max-width: 960px) {
+  .sy-scroll-stage {
+    padding: 20px 28px 140px;
+  }
+}
+
+@media (max-width: 760px) {
+  .sy-editor-topbar {
+    padding: 3px 8px;
+    gap: 4px;
+  }
+  .sy-topbar-actions {
+    gap: 2px;
+  }
+  .sy-mode-segmented button {
+    padding: 2px 7px;
+    font-size: 11.5px;
+  }
+  .sy-scroll-stage {
+    padding: 14px 16px 96px;
+  }
+  .sy-doc-header {
+    margin: 2px 0 8px;
+  }
+  .sy-doc-icon-hero {
+    font-size: 34px;
+    height: 42px;
+    min-width: 42px;
+  }
+  .sy-doc-gutter-icon {
+    position: static;
+    transform: none;
+    opacity: 0.72;
+    pointer-events: auto;
+    margin-right: 4px;
+    width: 28px;
+    height: 28px;
+  }
+  .sy-doc-title-input {
+    font-size: 23px;
+  }
+  .sy-protyle .ProseMirror {
+    font-size: 16px;
+    min-height: 260px;
+  }
+  .sy-icon-btn {
+    min-height: 34px;
+    min-width: 34px;
+    padding: 0 5px;
+  }
+}
+
+@media (max-width: 420px) {
+  .sy-breadcrumbs {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * SiYuan-style Top Formatting Toolbar + Inline Memo + Marks
+ * ============================================================ */
+.sy-editor-shell.is-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 2600;
+  background: var(--ob-surface, #ffffff);
+}
+
+.sy-crumb-block-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ob-text-subtle, #768390);
+  padding: 2px 3px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.sy-format-toolbar {
+  display: flex;
+  align-items: center;
+  min-height: 33px;
+  padding: 2px 10px;
+  border-bottom: 1px solid var(--ob-border-soft, rgba(127, 127, 127, 0.12));
+  background: var(--ob-surface, transparent);
+  flex: none;
+  overflow: hidden;
+}
+
+.sy-format-scroll {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.sy-format-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.sy-fmt-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex: none;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text-muted, #57606a);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.sy-fmt-btn:hover:not(:disabled) {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.12));
+  color: var(--ob-text, #1f2328);
+}
+
+.sy-fmt-btn.is-active {
+  background: rgba(37, 99, 235, 0.12);
+  color: var(--ob-blue, #2563eb);
+}
+
+html.dark .sy-fmt-btn.is-active,
+:root[data-theme="dark"] .sy-fmt-btn.is-active {
+  background: rgba(96, 165, 250, 0.18);
+  color: #60a5fa;
+}
+
+.sy-fmt-btn:disabled {
+  opacity: 0.34;
+  cursor: default;
+}
+
+.sy-fmt-sep {
+  width: 1px;
+  height: 15px;
+  margin: 0 5px;
+  flex: none;
+  background: var(--ob-border-soft, rgba(127, 127, 127, 0.2));
+}
+
+.sy-fmt-color-btn {
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sy-fmt-letter-a {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 12px;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+.sy-fmt-color-bar {
+  width: 13px;
+  height: 2.5px;
+  border-radius: 1.5px;
+}
+
+.sy-fmt-script-btn span {
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+.sy-fmt-script-btn sup,
+.sy-fmt-script-btn sub {
+  font-size: 8.5px;
+  font-weight: 700;
+}
+
+.sy-color-palette {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sy-color-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ob-text-subtle);
+}
+
+.sy-color-swatches {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 4px;
+}
+
+.sy-color-swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 23px;
+  border: 1px solid var(--ob-border-soft);
+  border-radius: 5px;
+  background: var(--ob-surface);
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.1s ease, border-color 0.12s ease;
+}
+
+.sy-color-swatch:hover {
+  transform: scale(1.08);
+  border-color: var(--ob-blue, #2563eb);
+}
+
+.sy-swatch-a {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ob-text);
+}
+
+/* Inline marks in ProseMirror */
+.sy-protyle .ProseMirror u {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.sy-protyle .ProseMirror mark.sy-mark-highlight {
+  background: rgba(250, 204, 21, 0.34);
+  color: inherit;
+  padding: 1px 3px;
+  border-radius: 3px;
+}
+
+html.dark .sy-protyle .ProseMirror mark.sy-mark-highlight,
+:root[data-theme="dark"] .sy-protyle .ProseMirror mark.sy-mark-highlight {
+  background: rgba(234, 179, 8, 0.28);
+}
+
+.sy-protyle .ProseMirror kbd.sy-inline-kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  margin: 0 1px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  line-height: 1.35;
+  color: var(--ob-text);
+  background: var(--ob-bg);
+  border: 1px solid var(--ob-border-strong, rgba(127, 127, 127, 0.32));
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+
+/* SiYuan Inline Memo (行内备注：浅蓝底色 + 底部深蓝实线，1:1 对齐思源 Password 密钥列视觉) */
+.sy-protyle .ProseMirror span.sy-inline-memo {
+  background: rgba(37, 99, 235, 0.11);
+  border-bottom: 2px solid rgba(29, 78, 216, 0.85);
+  padding: 1px 2px;
+  border-radius: 2px 2px 0 0;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.sy-protyle .ProseMirror span.sy-inline-memo:hover {
+  background: rgba(37, 99, 235, 0.2);
+  border-bottom-color: #1d4ed8;
+}
+
+html.dark .sy-protyle .ProseMirror span.sy-inline-memo,
+:root[data-theme="dark"] .sy-protyle .ProseMirror span.sy-inline-memo {
+  background: rgba(96, 165, 250, 0.16);
+  border-bottom-color: rgba(96, 165, 250, 0.88);
+}
+
+html.dark .sy-protyle .ProseMirror span.sy-inline-memo:hover,
+:root[data-theme="dark"] .sy-protyle .ProseMirror span.sy-inline-memo:hover {
+  background: rgba(96, 165, 250, 0.26);
+  border-bottom-color: #93c5fd;
+}
+
+/* SiYuan Memo Floating Popover Card */
+.sy-memo-popover {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px 12px;
+  gap: 8px;
+}
+
+.sy-memo-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sy-memo-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ob-text);
+}
+
+.sy-memo-title small {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ob-text-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.sy-memo-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.sy-memo-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ob-text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.sy-memo-icon-btn:hover {
+  background: var(--ob-hover, rgba(127, 127, 127, 0.12));
+  color: var(--ob-text);
+}
+
+.sy-memo-icon-btn.is-active {
+  background: rgba(37, 99, 235, 0.14);
+  color: var(--ob-blue, #2563eb);
+}
+
+.sy-memo-icon-btn.is-danger:hover {
+  background: rgba(220, 38, 38, 0.12);
+  color: #dc2626;
+}
+
+.sy-memo-textarea {
+  width: 100%;
+  min-height: 152px;
+  max-height: 380px;
+  resize: vertical;
+  padding: 9px 11px;
+  border: 1px solid var(--ob-border);
+  border-radius: 6px;
+  background: var(--ob-bg);
+  color: var(--ob-text);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'PingFang SC', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+  word-break: break-all;
+}
+
+.sy-memo-textarea:focus {
+  border-color: var(--ob-blue, #2563eb);
+}
+
+@media (min-width: 761px) {
+  .sy-format-scroll {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    row-gap: 2px;
+  }
+}
+
+@media (max-width: 760px) {
+  .sy-doc-header::before {
+    display: none;
+  }
+  .sy-format-toolbar {
+    padding: 2px 6px;
+  }
+  .sy-fmt-btn {
+    width: 30px;
+    height: 30px;
+  }
+  .sy-memo-textarea {
+    font-size: 16px;
+  }
+}

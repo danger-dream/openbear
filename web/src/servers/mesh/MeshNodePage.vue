@@ -5,10 +5,10 @@ import { ArrowUp, ArrowUpRight, ChevronLeft, Map as MapIcon, X } from '@lucide/v
 import { relativeTime } from '../../instances/instanceHelpers.js';
 import { bytes, flag, noAutofill, regionName } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
-import { keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
+import { applyBlocked, keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
 import { addressProblem, codeText, errorMessage, errorsAt, errorsUnder, FILTERINGS, firewallIssue, firewallKinds, isRelay, isSite, listens, listenWarnings, MAPPINGS,
-  MISSING_TEXT, msText, nameOf, nodeAlerts, nodeState, portProblem, progressOf, PROGRESS, reachOf, recommendedMode, rowButton, ruleWords, securityStats, TRANSPORTS, transportLabel,
-  uid, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems, WARNINGS_TO_FIX } from './meshHelpers.js';
+  MISSING_TEXT, msText, nameOf, NO_TRANSIT_HINT, nodeAlerts, nodeState, portProblem, progressOf, PROGRESS, reachOf, recommendedMode, rowButton, ruleWords, securityStats, TRANSPORTS, transportLabel,
+  uid, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems, warningsUnder, WARNINGS_TO_FIX } from './meshHelpers.js';
 import { changeRole } from './meshGraph.js';
 import { directEdgeId, relayEdgeId } from './meshEdit.js';
 import { usePoll } from './usePoll.js';
@@ -16,6 +16,8 @@ import MeshAddress from './MeshAddress.vue';
 import MeshChips from './MeshChips.vue';
 import MeshFr from './MeshFr.vue';
 import MeshNodeDiag from './MeshNodeDiag.vue';
+import MeshNodeFast from './MeshNodeFast.vue';
+import MeshNodeForwards from './MeshNodeForwards.vue';
 import MeshNodeLan from './MeshNodeLan.vue';
 import MeshNodeProxy from './MeshNodeProxy.vue';
 import MeshNodeRoutes from './MeshNodeRoutes.vue';
@@ -58,16 +60,21 @@ const state = computed(() => {
 const roleText = computed(() => relay.value ? (m.value.front?.length ? '前置机' : site.value ? '站点中转' : '中转') : '成员');
 const features = computed(() => {
   const out = [];
+  if (relay.value && m.value.noTransit) out.push(['notransit', '不中转']);
+  const fast = (mesh.work?.fastPorts || []).filter(p => p.serverId === props.id);
+  if (fast.length) out.push(['fast', `快速端口 ${fast.map(p => `:${p.port}`).join(' ')}`]);
   if (m.value?.gateway?.subnets?.length) out.push(['lan', m.value.gateway.backup ? '备用网关' : '共享局域网']);
   if (m.value?.proxy?.exit) out.push(['exit', '出口']);
   if (m.value?.proxy?.ports?.length) out.push(['ap', `代理端口 ${m.value.proxy.ports.map(p => `:${p.port}`).join(' ')}`]);
+  const forwards = (mesh.work?.forwards || []).filter(f => f.entry === props.id && f.enabled);
+  if (forwards.length) out.push(['forward', `转发 ${forwards.map(f => `:${f.listen}`).join(' ')}`]);
   return out;
 });
 const auto = computed(() => data.value?.auto || {});
 const isAuto = (obj, field) => (obj?.auto || []).includes(field);
 
 // ---- sections, and which one is on screen ----
-const SECS = [['overview', '概况'], ['role', '角色'], ['connect', '怎么连进组网'], ['lan', '共享局域网'], ['proxy', '出口和代理端口'], ['access', '访问'],
+const SECS = [['overview', '概况'], ['role', '角色'], ['connect', '怎么连进组网'], ['lan', '共享局域网'], ['fast', '快速中转'], ['proxy', '出口和代理端口'], ['forward', '端口转发'], ['access', '访问'],
   ['net', '网络参数'], ['diag', '诊断'], ['danger', '移除']];
 const body = ref(null), current = ref('overview');
 function go(key) {
@@ -115,6 +122,11 @@ const nowEntry = computed(() => {
   return actual?.id || summary?.relay ? {relay: actual?.id || summary.relay, transport: actual?.transport || summary?.transport} : null;
 });
 const relayLines = computed(() => lines.value.filter(l => l.kind === 'relay' && (l.a === props.id || l.b === props.id)));
+// A member routed as a leaf (同时连上) has no one entry: its links to the relays it enters by.
+const routedLinks = computed(() => {
+  const links = (status.value.routing || node.value?.summary?.routing)?.links;
+  return !relay.value && !nowEntry.value && Array.isArray(links) ? links : [];
+});
 const connText = computed(() => {
   if (!m.value) return '';
   if (relay.value) {
@@ -122,6 +134,13 @@ const connText = computed(() => {
     return [relayLines.value.length ? `${up === relayLines.value.length ? '' : `${up}/`}${relayLines.value.length} 条线路` : '还没有线路', riders.value.length ? `${riders.value.length} 台成员经它接入` : ''].filter(Boolean).join(' · ');
   }
   const e = nowEntry.value;
+  if (!e && routedLinks.value.length) {
+    const all = routedLinks.value, up = all.filter(l => l.state === 'up');
+    if (!up.length) return offline.value ? '离线' : `${all.length} 个中转都没连上`;
+    const best = [...up].sort((a, b) => (a.rttMs ?? Infinity) - (b.rttMs ?? Infinity))[0];
+    return [`同时连上 ${up.length === all.length ? '' : `${up.length}/`}${all.length} 个中转`, `最快经 ${nm(best.peer)}`,
+      transportLabel(lineOf('entry', props.id, best.peer)?.transport), msText(best.rttMs)].filter(Boolean).join(' · ');
+  }
   if (!e) return (m.value.entry?.candidates || []).length ? (offline.value ? '离线' : '还没连上') : '还没有设置接入的中转';
   const l = lineOf('entry', props.id, e.relay);
   return [`经 ${nm(e.relay)}`, transportLabel(e.transport || l?.transport), msText(l?.rttMs)].filter(Boolean).join(' · ');
@@ -186,7 +205,16 @@ const attention = computed(() => {
   const out = [];
   for (const e of errorsUnder(mesh.errors, `members[${index.value}]`)) {
     const p = e.path || '';
-    out.push({tone: 'bad', text: errorMessage(e), sec: /entry/.test(p) ? 'connect' : /gateway|takeover/.test(p) ? 'lan' : /proxy/.test(p) ? 'proxy' : /role|relayMode/.test(p) ? 'role' : 'net'});
+    out.push({tone: 'bad', text: errorMessage(e), sec: /entry/.test(p) ? 'connect' : /gateway|takeover/.test(p) ? 'lan' : /\.fast/.test(p) ? 'fast' : /proxy/.test(p) ? 'proxy' : /role|relayMode|noTransit/.test(p) ? 'role' : 'net'});
+  }
+  for (const e of mesh.errors || []) {
+    const rm = /^relayLinks\.pairs\[(\d+)\]/.exec(e.path || ''), dm = /^directLinks\[(\d+)\]/.exec(e.path || '');
+    const pair = rm ? mesh.work?.relayLinks?.pairs?.[Number(rm[1])] : dm ? mesh.work?.directLinks?.[Number(dm[1])] : null;
+    if (!pair || (pair.a !== props.id && pair.b !== props.id)) continue;
+    const target = pair.dialer === 'b' ? pair.a : pair.b;
+    const sec = ['endpoint_missing', 'transport_not_listening'].includes(e.error) && target === props.id ? 'net' : 'connect';
+    const text = errorMessage(e);
+    if (!out.some(x => x.text === text)) out.push({tone: 'bad', text, sec});
   }
   for (const a of nodeAlerts(data.value, m.value, members.value, detail.value?.status, mesh.work)) {
     out.push({tone: 'warn', text: a.code === 'mesh_standby_unhealthy' ? `备用入口不可用：${a.text}` : a.text, detail: codeText(a.code), sec: a.code === 'mesh_standby_unhealthy' ? 'connect' : 'overview'});
@@ -196,7 +224,7 @@ const attention = computed(() => {
   for (const w of warningItems(data.value, `members[${index.value}]`)) {
     if (seen.has(w.text) || w.code === 'mesh_gateway_route_conflict') continue;
     seen.add(w.text);
-    out.push({tone: WARNINGS_TO_FIX.has(w.code) ? 'warn' : 'info', text: WARNINGS_TO_FIX.has(w.code) ? w.text : `建议：${w.text}`, sec: 'net'});
+    out.push({tone: WARNINGS_TO_FIX.has(w.code) ? 'warn' : 'info', text: WARNINGS_TO_FIX.has(w.code) ? w.text : `建议：${w.text}`, sec: /no_transit/.test(w.code) ? 'role' : 'net'});
   }
   const mem = memory.value, usage = mem ? `${bytes(mem.rssBytes)} / ${bytes(mem.limitBytes)}` : '';
   if (mem?.level === 'over') out.push({tone: 'bad', text: `内存超过告警线（${usage}），可能被系统重启，重启时组网会短暂断开`, sec: 'diag'});
@@ -204,6 +232,15 @@ const attention = computed(() => {
   const skipped = status.value.skippedRoutes || [];
   if (skipped.length) out.push({tone: 'warn', text: `${skipped.length} 条组网路由没有加上：${skipped.join('、')}，去往这些网段的流量不经过组网`, sec: 'diag'});
   if (m.value.platform === 'darwin' && status.value.hostFirewall === 'on') out.push({tone: 'warn', text: 'macOS 防火墙已开启，可能拦截从组网进来的连接', sec: 'overview'});
+  if (status.value.fast?.listenError) out.push({tone: 'bad', text: `快速中转端口监听失败：${status.value.fast.listenError}`, sec: 'fast'});
+  (mesh.work?.forwards || []).forEach((f, i) => {
+    if (f.entry !== props.id && f.target !== props.id) return;
+    for (const e of errorsUnder(mesh.errors, `forwards[${i}]`)) out.push({tone: 'bad', text: `端口转发 :${f.listen}：${errorMessage(e)}`, sec: 'forward'});
+  });
+  for (const f of status.value.forward?.forwards || []) {
+    for (const e of f.errors || []) out.push({tone: 'bad', text: `端口转发没有监听上：${e}`, sec: 'forward'});
+  }
+  if (status.value.fast?.tcpMem?.limited) out.push({tone: 'warn', text: 'TCP 内存偏小，速度和并发受限', sec: 'fast'});
   for (const issue of status.value.hostFirewallIssues || []) { const f = firewallIssue(issue); out.push({tone: 'warn', text: f.text, detail: f.detail, sec: 'overview'}); }
   return out;
 });
@@ -218,7 +255,8 @@ function setRelay(on) {
   const moved = changeRole(mesh.work, props.id, on);
   m.value.role = on ? 'relay' : 'member';
   if (on && recommended.value) m.value.relayMode = recommended.value;
-  if (!on) delete m.value.relayMode;
+  // The server keeps what a member leaves out: a setting turned off is sent as off, and the relay type it keeps stays shown.
+  if (!on) m.value.noTransit = false;
   if (on && (isSite(m.value) ? !listens(m.value, 'udp') : !TRANSPORTS.some(([t]) => listens(m.value, t)))) m.value.listen = {udp: 0, tcp: 0, tls: 0, ...(m.value.listen || {}), udp: ports.value.udp};
   if (!on && !m.value.entry) m.value.entry = {mode: 'failover', candidates: [], autoReturn: true};
   if (!on && listens(m.value, 'tls')) m.value.listen = {...m.value.listen, tls: 0};
@@ -237,6 +275,12 @@ function setMode(mode) {
   void save();
 }
 function backToAuto(field) { m.value.auto = [...new Set([...(m.value.auto || []), field])]; void save(); }
+function setNoTransit(on) {
+  m.value.noTransit = on;
+  void save();
+}
+const transitErrors = computed(() => errorsAt(mesh.errors, `members[${index.value}].noTransit`));
+const transitWarnings = computed(() => warningsUnder(data.value, `members[${index.value}].noTransit`));
 const modeErrors = computed(() => (mesh.errors || []).filter(e => e.path?.startsWith(`members[${index.value}].relayMode`)
   || (e.error === 'mesh_site_relay_needs_public_link' && (e.path === `members[${index.value}]` || e.path?.startsWith(`members[${index.value}].`)))).map(errorMessage));
 const frontExits = computed(() => (m.value?.front || []).map(nm).join('、'));
@@ -367,7 +411,7 @@ function setAddress() {
 }
 const limitText = ref('');
 watch(() => `${props.id}|${m.value?.uploadLimitMbps ?? ''}`, () => { limitText.value = m.value?.uploadLimitMbps ?? ''; }, {immediate: true});
-function addressAuto() { m.value.publicEndpoint = ''; delete m.value.announce; delete m.value.publicPorts; void save(); }
+function addressAuto() { m.value.publicEndpoint = ''; m.value.announce = true; m.value.publicPorts = {}; void save(); }
 function setLimit() { const v = String(limitText.value).trim(); m.value.uploadLimitMbps = v === '' ? null : Number(v); void save(); }
 const knownTags = computed(() => Array.isArray(data.value?.tags) ? data.value.tags
   : [...new Set(members.value.filter(x => x.serverId !== props.id).flatMap(x => x.tags || []))]);
@@ -388,7 +432,7 @@ const joined = computed(() => {
 });
 const short = name => name.length > 14 ? `${name.slice(0, 13)}…` : name;
 const mapH = computed(() => Math.max(70, joined.value.length * 24 + 10));
-const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.serverId === props.id));
+const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.serverId === props.id || c.a === props.id || c.b === props.id));
 </script>
 <template>
   <section v-if="m" class="m3-node" :class="{'is-phone': phone}" :aria-label="m.name">
@@ -405,8 +449,8 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
       <el-button v-if="!fresh" size="small" @click="emit('board', id)"><MapIcon :size="13" />在画板上看</el-button>
       <el-button size="small" @click="emit('open-server', id)"><ArrowUpRight :size="13" />打开服务器页</el-button>
     </header>
-    <p v-if="fresh && !m.removing" class="m3-banner"><span>这个节点在<b>草稿</b>里：组网服务已经装好，但还没连进组网。下面的设置都可以先改好，然后点「应用到网格」，它就会按这些设置连上。</span>
-      <el-button size="small" type="primary" :disabled="Boolean(mesh.errors.length)" @click="emit('apply')">应用到网格</el-button></p>
+    <p v-if="fresh && !m.removing" class="m3-banner"><span>这个节点在<b>草稿</b>里：组网服务已经装好，但还没连进组网。下面的设置都可以先改好，然后点「应用」，它就会按这些设置连上。</span>
+      <el-button size="small" type="primary" :disabled="applyBlocked()" @click="emit('apply')">应用</el-button></p>
     <div class="m3-node-grid">
       <nav class="m3-node-nav" aria-label="小节">
         <button v-for="[k, l] in SECS" :key="k" type="button" :aria-current="current === k ? 'true' : undefined" @click="go(k)">{{ l }}</button>
@@ -455,9 +499,14 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
             </div>
             <template #hint><b>公网中转</b>：有公网地址，别人能直接连它。<b>站点中转</b>：在家里或公司的 NAT 后面，别人连不进来，只能由它主动连公网中转，或者和别的站点中转打洞。</template>
           </MeshFr>
+          <MeshFr v-if="relay" label="不中转" :errors="transitErrors">
+            <button type="button" class="m3-sw" role="switch" :aria-checked="Boolean(m.noTransit)" @click="setNoTransit(!m.noTransit)"><i></i><span>只承载自己的流量</span></button>
+            <small v-for="w in transitWarnings" :key="w" class="ob-warn m3-fr-error">{{ w }}</small>
+            <template #hint>{{ NO_TRANSIT_HINT }}</template>
+          </MeshFr>
           <MeshFr v-if="linux" label="前置机">
-            <span v-if="frontExits">是：只主动连它的出口 {{ frontExits }}</span><span v-else class="m3-faint">不是</span>
-            <template #hint>前置机是专线的入口端（比如服务商给的国内专线机），只和它的出口（最多 2 台）连线，不接受别人连入，线路默认 TLS。在「服务器」页这台的资料里设置出口地址就成为前置机。
+            <span v-if="frontExits">是：主动连它的出口 {{ frontExits }}，国内节点可经 TLS 连它</span><span v-else class="m3-faint">不是</span>
+            <template #hint>前置机是专线的入口端（比如服务商给的国内专线机），只主动连它的出口（最多 2 台，不连其他公网中转），线路默认 TLS；要让国内站点中转或成员连入它，请在「网络参数 → 对外地址」填写它的国内入口地址。在「服务器」页这台的资料里设置出口地址就成为前置机。
               <button type="button" class="ix-text-button" @click="emit('open-server', id)">去服务器资料设置</button></template>
           </MeshFr>
         </section>
@@ -549,8 +598,11 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
           </template>
         </section>
 
-        <MeshNodeLan :member="m" :index="index" :items="items" @edit="emit('edit', $event)" @open="emit('open', $event)" @rules="emit('rules')" />
-        <MeshNodeProxy :member="m" :index="index" :phone="phone" @group="g => emit('edit', {kind: 'group', id: g})" />
+        <!-- Opening another node keeps this page: what is half typed or opened here (and in 对外地址) is one node's, so these are made again for each. -->
+        <MeshNodeLan :key="id" :member="m" :index="index" :items="items" @edit="emit('edit', $event)" @open="emit('open', $event)" @rules="emit('rules')" />
+        <MeshNodeFast :key="id" :member="m" :index="index" :detail="detail" :phone="phone" @open="emit('open', $event)" @net="go('net')" />
+        <MeshNodeProxy :key="id" :member="m" :index="index" :phone="phone" @group="g => emit('edit', {kind: 'group', id: g})" />
+        <MeshNodeForwards :key="id" :member="m" :phone="phone" :region-of="regionOf" />
 
         <!-- 访问 -->
         <section id="m3-sec-access" class="m3-dsec" aria-label="访问">
@@ -583,8 +635,8 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
             <small v-for="w in portWarnings" :key="w.text || w" class="ob-warn m3-block">{{ w.text || w }}</small>
             <template #hint>别的节点主动连它时用的协议和端口。只有被别人连的节点才需要开；成员开 UDP 是为了打洞直连。{{ relay ? '' : '只有中转可以开 TLS。' }}</template>
           </MeshFr>
-          <MeshFr label="对外地址" sub="别人连它用" :auto="{value: `公网 IPv4 ${m.publicEndpointAuto || ''}`, why: '节点上报的公网 IP，变了会跟着变'}" :changed="Boolean(m.publicEndpoint) || m.announce === false" restorable @restore="addressAuto">
-            <MeshAddress :member="m" :item="items.find(i => i.id === id)" :online="online" :site="site" :errors="at('publicEndpoint')" name="m3-node-address" @change="save" />
+          <MeshFr label="对外地址" sub="别人连它用" :auto="m.front?.length && !m.publicEndpointAuto ? {value: '未设置', why: '前置机不自动探测公网 IP；国内节点要连它时请在下方填写入口地址'} : site ? {value: '没有公网地址', why: '站点中转在 NAT 后，别人连不进来，由它主动连公网中转或和别的站点中转打洞'} : {value: `公网 IPv4 ${m.publicEndpointAuto || '（暂无）'}`, why: '节点上报的公网 IP，变了会跟着变'}" :changed="Boolean(m.publicEndpoint) || m.announce === false || Boolean(m.publicPorts && Object.keys(m.publicPorts).length)" restorable @restore="addressAuto">
+            <MeshAddress :key="id" :member="m" :item="items.find(i => i.id === id)" :online="online" :site="site" :errors="[...at('publicEndpoint'), ...at('publicPorts'), ...at('announce')]" name="m3-node-address" @change="save" />
           </MeshFr>
           <MeshFr label="组网地址" :hint="`它在组网里的 IP，要在地址段 ${mesh.work?.settings?.prefix || ''} 里。`" :errors="addressLocal ? [addressLocal] : at('address')">
             <input v-model="addressText" v-bind="noAutofill" class="m3-input m3-mid mono" placeholder="应用后自动分配" aria-label="组网地址" @change="setAddress" />
@@ -643,8 +695,8 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
             <li v-if="fresh && !changes.length">新加入，还没有应用到网格</li>
             <li v-for="(c, i) in changes" :key="i">{{ c.text }}</li>
           </ul>
-          <p v-else class="m3-faint">没有。改动会先进草稿，点顶部「应用到网格」才发到节点上。</p>
-          <div v-if="changes.length || fresh" class="m3-ctl m3-box-ctl"><el-button size="small" type="primary" :disabled="Boolean(mesh.errors.length) || mesh.saving" @click="emit('apply')">应用到网格</el-button></div>
+          <p v-else class="m3-faint">没有。改动会先进草稿，点顶部「应用」才发到节点上。</p>
+          <div v-if="changes.length || fresh" class="m3-ctl m3-box-ctl"><el-button size="small" type="primary" :disabled="applyBlocked()" @click="emit('apply')">应用</el-button></div>
         </section>
         <section v-if="needs.length || problem" class="m3-box">
           <h4>需要注意</h4>

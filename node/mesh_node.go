@@ -624,17 +624,17 @@ func (h *meshHost) uninstall() error {
 func (h *meshHost) remove() error {
 	r := h.record()
 	before, _ := h.readStatus()
-	if runtime.GOOS != "linux" {
-		if err := stopForRemoval(h.service, before.Pid, h.exitWait); err != nil {
-			return err
-		}
+	if err := stopForRemoval(h.service, before.Pid, h.exitWait); err != nil {
+		return err
 	}
 	if h.service.state() != "absent" {
 		if err := h.service.remove(); err != nil {
 			return errors.New("service_failed: " + err.Error())
 		}
 	}
-	waitExit(before.Pid, h.exitWait)
+	if !waitExit(before.Pid, h.exitWait) {
+		return errors.New("service_failed: mesh process did not exit")
+	}
 	// A data plane that was not running cleans up nothing as it goes.
 	mesh.Sweep(h.dir)
 	if r["wintun"] == true {
@@ -891,7 +891,8 @@ func stopForRemoval(service meshService, pid int, limit time.Duration) error {
 	if service.state() != "absent" {
 		stopErr = service.stop()
 	}
-	if !waitExit(pid, limit) || service.state() == "running" {
+	state := service.state()
+	if !waitExit(pid, limit) || (state != "stopped" && state != "absent") {
 		if stopErr != nil {
 			return fmt.Errorf("service_failed: still running: %w", stopErr)
 		}

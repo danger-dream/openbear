@@ -34,7 +34,9 @@ const (
 // probeLarge asks whether a path end to end carries large packets
 // (large.go), answered by a short probeLargeReply; probePath whether a fixed
 // path does, the rank of the path first in the id (fixedpath.go), answered
-// over the way back of that rank.
+// over the way back of that rank; probeLink, sent to a peer over its link,
+// whether the link carries a packet of its size (linkmtu.go), answered by a
+// short probeLinkReply.
 const (
 	probeRequest    = 1
 	probeReply      = 2
@@ -42,6 +44,8 @@ const (
 	probeLargeReply = 4
 	probePath       = 5
 	probePathReply  = 6
+	probeLink       = 7
+	probeLinkReply  = 8
 )
 
 // entryProbe is a member's probing of its entry.
@@ -78,8 +82,10 @@ func probePacket(src, dst netip.Addr, kind byte, id [8]byte, size int) []byte {
 	return b
 }
 
-// probe answers a request for this node and takes a reply to its own.
-func (t *meshTUN) probe(p ipv4, r *routing) {
+// probe answers a request for this node and takes a reply to its own; via
+// is the peer a probe sent straight over its link came from, nil for one
+// end to end.
+func (t *meshTUN) probe(p ipv4, r *routing, via *[32]byte) {
 	l4 := p.payload()
 	var id [8]byte
 	copy(id[:], l4[9:17])
@@ -105,6 +111,20 @@ func (t *meshTUN) probe(p ipv4, r *routing) {
 		}
 	case probePathReply:
 		r.pins.answer(r.nodes.self, p.src, int(id[0]), binary.BigEndian.Uint32(id[1:5]))
+	case probeLink:
+		if z := r.nodes.byAddr[p.src]; z != nil {
+			reply := probePacket(r.nodes.self, p.src, probeLinkReply, id, 0)
+			if via != nil {
+				// Back over the link it came by, whatever the routes say.
+				t.sched.enqueuePeer(reply, -1, via)
+			} else {
+				t.sendOwn(r, reply, z)
+			}
+		}
+	case probeLinkReply:
+		if z := r.nodes.byAddr[p.src]; z != nil {
+			t.paths.linkAnswered(z.id, id)
+		}
 	case probeReply:
 		if z := r.nodes.byAddr[p.src]; z != nil && r.gateways != nil {
 			r.gateways.answered(z.id, id)

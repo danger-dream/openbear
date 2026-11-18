@@ -128,6 +128,10 @@ type meshTUN struct {
 	largeLast, batch     []int
 	largeTaken           int
 	largeDone            atomic.Int64
+	// fast is the fast relay's look at each packet this node sends into the
+	// mesh (fast.Service.Outbound): true when it took the packet.
+	fast      atomic.Pointer[func([]byte) bool]
+	fastReply atomic.Pointer[func([]byte) bool]
 	// spares are the large buffers ReadLargeSwap displaced, for pump to read
 	// into in place of the slots that went into the scheduler; at most
 	// transport.LargeSpares, more go to the GC.
@@ -233,40 +237,74 @@ func (t *meshTUN) pump() {
 				t.Device.Write([][]byte{back}, readHeadroom)
 				continue
 			}
-			z := r.nodes.owner(p.dst)
-			if z == nil {
-				t.stats.DroppedNoRoute.Add(1)
+			if tap := t.fast.Load(); tap != nil && (*tap)(p.b) {
 				continue
 			}
-			if r.gateways != nil {
-				r.gateways.use(p.dst)
-			}
-			hop := r.hop(p.dst)
-			if h, ok := r.pins.local(r.nodes.self, z.addr); ok {
-				// A fixed path's first relay; end to end even when the
-				// destination is a next hop of its own.
-				hop = h.nextID
-			}
-			if t.tooBigLocal(p, z, hop) {
-				continue
-			}
-			t.filter.outbound(p)
-			if hop == z.id {
-				t.sched.enqueueBacking(p.b, backing, -1)
-				continue
-			}
-			e := t.e2e.Load()
-			if e == nil {
-				t.stats.DroppedNoRoute.Add(1)
-				continue
-			}
-			e.send(p.b, z, uint64(t.sched.bucketOf(p.b))+1)
+			t.sendLocal(p, backing, r)
 		}
 		if err != nil && !errors.Is(err, tun.ErrTooManySegments) {
 			t.sched.close()
 			return
 		}
 	}
+}
+
+// sendLocal uses the same routing, fixed paths, MTU and ACL flow tracking for
+// OS traffic and a source-preserving fast fallback. It never recaptures packets.
+func (t *meshTUN) sendLocal(p ipv4, backing []byte, r *routing) {
+	z := r.nodes.owner(p.dst)
+	if z == nil {
+		t.stats.DroppedNoRoute.Add(1)
+		return
+	}
+	if r.gateways != nil {
+		r.gateways.use(p.dst)
+	}
+	hop := r.hop(p.dst)
+	if h, ok := r.pins.local(r.nodes.self, z.addr); ok {
+		// A fixed path's first relay; end to end even when the
+		// destination is a next hop of its own.
+		hop = h.nextID
+	}
+	if t.tooBigLocal(p, z, hop) {
+		return
+	}
+	t.sendOn(p, backing, z, hop)
+}
+
+// sendOn sends p, of this node's own, for z through hop.
+func (t *meshTUN) sendOn(p ipv4, backing []byte, z *e2eNode, hop string) {
+	t.filter.outbound(p)
+	if hop == z.id {
+		t.sched.enqueueBacking(p.b, backing, -1)
+		return
+	}
+	e := t.e2e.Load()
+	if e == nil {
+		t.stats.DroppedNoRoute.Add(1)
+		return
+	}
+	e.send(p.b, z, uint64(t.sched.bucketOf(p.b))+1)
+}
+
+func (t *meshTUN) fastToMesh(b []byte) {
+	p, ok := parseIPv4(b)
+	r := t.route.Load()
+	if !ok || r.control.Contains(p.src) || r.control.Contains(p.dst) || !containsAny(r.local, p.src) || !containsAny(r.routes, p.dst) {
+		return
+	}
+	t.sendLocal(p, nil, r)
+}
+func (t *meshTUN) takeFastReply(b []byte) bool {
+	tap := t.fastReply.Load()
+	return tap != nil && (*tap)(b)
+}
+
+// toOS hands the OS a packet as if it came from the mesh.
+func (t *meshTUN) toOS(p []byte) {
+	b := make([]byte, readHeadroom+len(p))
+	copy(b[readHeadroom:], p)
+	_, _ = t.Device.Write([][]byte{b}, readHeadroom)
 }
 
 // sendOuter queues an end-to-end packet in the bucket id-1 its inner flow
@@ -314,11 +352,13 @@ func (t *meshTUN) deliverInner(bufs [][]byte, offset int) {
 			t.e2eStats(func(s *e2eStats) { s.DroppedSource.Add(1) })
 		case t.relayTooBig(p, r):
 		case isProbe(p, r.nodes.self):
-			t.probe(p, r)
+			t.probe(p, r, nil)
 		case !t.filter.inbound(p):
 			t.stats.DroppedACL.Add(1)
 		default:
-			out = append(out, b)
+			if !t.takeFastReply(p.b) {
+				out = append(out, b)
+			}
 			t.stats.Delivered.Add(1)
 		}
 	}
@@ -515,8 +555,16 @@ func (t *meshTUN) WriteWithMetadata(bufs [][]byte, offset int, metadata []conn.R
 			if t.relayTooBig(p, r) {
 				continue
 			}
+			if isProbe(p, r.nodes.self) {
+				// A link's, sent straight over it (linkmtu.go).
+				key := metadata[i].PublicKey
+				t.probe(p, r, &key)
+				continue
+			}
 			if t.filter.inbound(p) {
-				out = append(out, b)
+				if !t.takeFastReply(p.b) {
+					out = append(out, b)
+				}
 				t.stats.Delivered.Add(1)
 			} else {
 				t.stats.DroppedACL.Add(1)

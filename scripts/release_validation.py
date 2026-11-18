@@ -8,10 +8,14 @@ than trusting source-tree build results.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
+import shlex
+import subprocess
+import sys
 import sqlite3
 import struct
 import tempfile
@@ -34,6 +38,7 @@ SCHEMA = 1
 ASSET_MARKER = ".openbear-assets.json"
 USER_AGENT = "OpenBear-Release-Validation/1.0"
 DEFAULT_STORAGE_DB_PATH = "./data/openbear.db"
+PROC_ROOT = Path("/proc")
 
 REQUIRED_DIRS = ("app", "web/dist", "prompts", "scripts")
 REQUIRED_FILES = (
@@ -89,7 +94,175 @@ def uv_lock_version(value: Any) -> str:
     return f"{base}-{'beta' if label == 'b' else 'rc'}.{number}" if label else base
 
 
-def resolve_storage_db_path(install_root: Path, config_path: Path | None = None) -> Path:
+def expand_runtime_path(value: str, root: Path, home: str | None = None) -> Path:
+    if home and (value == "~" or value.startswith("~/")):
+        value = home + value[1:]
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else root / path).absolute()
+
+
+def deployment_config(root: Path, explicit: str = "", service: str = "openbear.service", *, require_running: bool = False) -> dict[str, str]:
+    """Read the service's effective configuration before stopping it; never guess a DB name.
+
+    EnvironmentFiles and specifiers need the live process to disambiguate. A stopped
+    ordinary unit can use its merged Environment; unrelated/mismatched deployments
+    are rejected before any installation files or service state change.
+    """
+    root = Path(root).resolve()
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", service):
+        raise ReleaseValidationError("升级服务名无效")
+    properties = "MainPID,WorkingDirectory,Environment,EnvironmentFiles,UnsetEnvironment,LoadState"
+    try:
+        proc = subprocess.run(["systemctl", "show", service, "--property=" + properties],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReleaseValidationError("无法及时读取升级服务配置，未停止服务或切换文件") from exc
+    if proc.returncode:
+        raise ReleaseValidationError("无法读取升级服务配置；尚未停止服务或切换文件")
+    fields = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+    pid = int(fields.get("MainPID") or "0")
+    if require_running and not pid:
+        raise ReleaseValidationError("旧版升级接管需要原服务仍在运行，以确认实际配置路径")
+    if pid:
+        process = PROC_ROOT / str(pid)
+        try:
+            before = (process / "stat").read_bytes()
+            cwd = (process / "cwd").resolve(strict=True)
+            env = dict(item.split(b"=", 1) for item in (process / "environ").read_bytes().split(b"\0") if b"=" in item)
+            command = (process / "cmdline").read_bytes().split(b"\0")
+            after = (process / "stat").read_bytes()
+        except OSError as exc:
+            raise ReleaseValidationError("无法读取原服务的运行配置；请在原服务稳定运行时重试") from exc
+        # starttime is stable; CPU time in the rest of stat is not.
+        if before.rsplit(b")", 1)[1].split()[19] != after.rsplit(b")", 1)[1].split()[19]:
+            raise ReleaseValidationError("读取配置时原服务进程已变化，请重试")
+        if cwd != root or not any(command[i:i + 2] == [b"-m", b"app.main"] for i in range(len(command) - 1)):
+            raise ReleaseValidationError("服务工作目录或启动入口与升级目标不一致，未改变原系统")
+        raw = env.get(b"OPENBEAR_CONFIG", b"./openbear.json").decode()
+        home = env.get(b"HOME", b"/root").decode()
+    else:
+        cwd_text = fields.get("WorkingDirectory") or str(root)
+        if "%" in cwd_text or Path(cwd_text).resolve() != root:
+            raise ReleaseValidationError("停止状态服务的工作目录无法安全确认")
+        if fields.get("EnvironmentFiles") or fields.get("UnsetEnvironment"):
+            raise ReleaseValidationError("服务含环境文件/取消环境覆盖，请先启动原服务以确认有效配置")
+        try:
+            env_text = dict(item.split("=", 1) for item in shlex.split(fields.get("Environment", "")) if "=" in item)
+        except ValueError as exc:
+            raise ReleaseValidationError("无法解析服务环境，未改变原系统") from exc
+        raw = env_text.get("OPENBEAR_CONFIG", explicit or str(root / "openbear.json"))
+        home = env_text.get("HOME", os.path.expanduser("~"))
+        if "%" in raw or "%" in home:
+            raise ReleaseValidationError("停止状态服务含环境路径说明符，请先启动原服务")
+    if any(c in raw + home for c in "\r\n\0"):
+        raise ReleaseValidationError("原服务配置路径含不可安全写入 unit 的控制字符，未改变原系统")
+    config = expand_runtime_path(raw, root, home)
+    if explicit and expand_runtime_path(explicit, root, home).resolve() != config.resolve():
+        raise ReleaseValidationError("指定配置与原服务实际配置不一致，拒绝改变部署意图")
+    database = resolve_storage_db_path(root, config, home=home)
+    for path in (config.resolve(), database):
+        for rel in ("app", "scripts", "prompts", "web/dist", "gateway/bin", "benchmark-package", ".venv"):
+            base = root / rel
+            if path == base or base in path.parents:
+                raise ReleaseValidationError("配置或数据库位于将被替换的程序目录，不能安全升级")
+    return {"configPath": str(config), "configHome": home, "databasePath": str(database)}
+
+
+def render_service_unit(template: str, root: Path, config: str, home: str = "") -> str:
+    def quote(value):
+        if any(c in value for c in "\r\n\0"):
+            raise ReleaseValidationError("服务路径含无效控制字符")
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+    text = template.replace("__OPENBEAR_DIR__", str(root))
+    line = "Environment=" + quote("OPENBEAR_CONFIG=" + config)
+    text, count = re.subn(r"(?m)^Environment=OPENBEAR_CONFIG=.*$", lambda _m: line, text)
+    if not count:
+        text = text.replace("[Service]\n", "[Service]\n" + line + "\n", 1)
+    if home:
+        text = text.replace("[Service]\n", "[Service]\nEnvironment=" + quote("HOME=" + home) + "\n", 1)
+    return text
+
+
+# Exact standalone script shipped with 0.16.0. Do not intercept arbitrary Python
+# callers, classify/validate CLIs, or newer updaters which speak this protocol.
+LEGACY_0160_SHA256 = "4491aeafaa4cec0af6ac094acc67c69f8fe18f34935148ab8c59d8df97e9c945"
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _handoff_0160(frame, staging: Path, version: str) -> None:
+    if frame.f_code.co_name != "_download_and_verify" or frame.f_globals.get("UPDATER_PROTOCOL", 0) >= 2:
+        return
+    worker = frame.f_locals.get("self")
+    source = Path(frame.f_code.co_filename)
+    if not worker or getattr(worker, "from_version", "") != "0.16.0" or _file_digest(source) != LEGACY_0160_SHA256:
+        return
+    try:
+        if worker.stopped or worker.did_swap:
+            raise ReleaseValidationError("旧版更新器已进入切换阶段，拒绝重复接管")
+        if len(sys.argv) != 4 or sys.argv[1:3] != ["apply", "--request"]:
+            raise ReleaseValidationError("旧版升级请求入口无法核实")
+        request_path = Path(sys.argv[3]).resolve()
+        request_bytes = request_path.read_bytes()
+        request = json.loads(request_bytes)
+        if request != worker.request:
+            raise ReleaseValidationError("旧版升级请求已变化")
+        # The Web launcher uses data/update-request.json; the supported standalone
+        # CLI (also fixed acceptance B) may use an external private request file.
+        # Both are bound byte-for-byte, not identified by their filename.
+        staging = staging.resolve()
+        if Path(__file__).resolve() != staging / "scripts/release_validation.py" or staging != Path(frame.f_locals["staging"]).resolve():
+            raise ReleaseValidationError("旧版升级候选目录不一致")
+        archive = Path(frame.f_locals["zip_path"]).resolve()
+        digest = frame.f_locals.get("expected", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or _file_digest(archive) != digest:
+            raise ReleaseValidationError("旧版升级候选摘要不一致")
+        # Recursion is a plain validation call, not an updater frame. No handoff
+        # happens until the complete candidate (including resources) validates.
+        validate_release_tree(staging, version)
+        config = deployment_config(worker.install_root, service=worker.service_name, require_running=True)
+        if Path(config["databasePath"]).parent != worker.data_dir:
+            raise ReleaseValidationError("原服务数据库目录与升级请求不一致")
+        python = worker.install_root / ".venv/bin/python"
+        check = subprocess.run([str(python), "-c", "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)"],
+                               capture_output=True, timeout=15)
+        if check.returncode:
+            raise ReleaseValidationError("已安装运行环境不满足 Python 3.11，未停止原服务")
+        base = worker.data_dir / "updater"
+        # Kept outside staging: the new updater clears staging before rechecking
+        # and extracting this exact ZIP. exec replaces, rather than forks, apply.
+        bridge = Path(tempfile.mkdtemp(prefix="compat-0160-", dir=base))
+        for name in ("updater.py", "release_validation.py"):
+            shutil.copy2(staging / "scripts" / name, bridge / name)
+        shutil.copy2(archive, bridge / "package.zip")
+        manifest = {"schema": 1, "requestPath": str(request_path), "requestSha256": hashlib.sha256(request_bytes).hexdigest(),
+                    "request": request, "zipSha256": digest, "config": config}
+        manifest_path = bridge / "handoff.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o600)
+        os.execv(str(python), [str(python), str(bridge / "updater.py"), "apply", "--request", str(request_path), "--handoff", str(manifest_path)])
+        raise ReleaseValidationError("升级接管未替换旧进程")
+    except Exception as exc:
+        # The old write_result itself breaks on Python 3.8. Exit past its
+        # Exception handlers, with a normal failure record and the service intact.
+        message = "0.16.0 升级兼容接管失败，原服务和文件未切换: " + str(exc)
+        worker.log(message)
+        payload = {"schema": 1, "status": "failed", "fromVersion": worker.from_version, "toVersion": worker.to_version,
+                   "finishedAt": int(time.time()), "message": message, "acked": False, "requiresRestart": True}
+        temp = worker.result_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp.replace(worker.result_path)
+        worker.write_state("done", lastResultStatus="failed")
+        raise SystemExit(1) from None
+
+
+def resolve_storage_db_path(install_root: Path, config_path: Path | None = None, *, home: str | None = None) -> Path:
     """Resolve storage.dbPath with the same default/cwd meaning as ``app.config``."""
     root = Path(install_root).resolve()
     config = Path(config_path) if config_path is not None else root / "openbear.json"
@@ -112,7 +285,7 @@ def resolve_storage_db_path(install_root: Path, config_path: Path | None = None)
         raw_path = DEFAULT_STORAGE_DB_PATH
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ReleaseValidationError("storage.dbPath 必须是非空路径")
-    database = Path(raw_path).expanduser()
+    database = expand_runtime_path(raw_path, root, home)
     if not database.is_absolute():
         database = root / database
     return database.resolve()
@@ -123,6 +296,8 @@ def create_sqlite_backup(
     backup_dir: Path | None = None,
     *,
     config_path: Path | None = None,
+    home: str | None = None,
+    expected_database: str | None = None,
     label: str = "upgrade",
 ) -> dict[str, Any]:
     """Create a private SQLite online backup that includes committed WAL contents.
@@ -132,7 +307,9 @@ def create_sqlite_backup(
     is handled consistently.  A missing database is a clean no-op.
     """
     root = Path(install_root).resolve()
-    database = resolve_storage_db_path(root, config_path)
+    database = resolve_storage_db_path(root, config_path, home=home)
+    if expected_database and database != Path(expected_database):
+        raise ReleaseValidationError("停服前后数据库配置已变化，未切换文件")
     if not database.exists():
         return {
             "ok": True,
@@ -497,7 +674,41 @@ def _read_versions(root: Path) -> dict[str, str]:
     return versions
 
 
+def validate_prompt_resources(root: Path, version: str) -> None:
+    # Resource format introduced in the 0.16.1 family, including its dev/beta/rc
+    # builds. The previous release must still validate during rollback.
+    core = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-|$)", normalize_version(version))
+    if not core or tuple(map(int, core.groups())) < (0, 16, 1):
+        return
+    required = ("guides/cron.md", "guides/webhook.md", "collab-member.md", "personas/manifest.json")
+    prompts = root / "prompts"
+    for name in required:
+        path = prompts / name
+        if not path.is_file() or not path.stat().st_size:
+            raise ReleaseValidationError("发行包缺少提示资源: prompts/" + name)
+    try:
+        manifest = json.loads((prompts / "personas/manifest.json").read_text(encoding="utf-8"))
+        entries = manifest["personas"]
+        if manifest.get("schema") != 1 or not isinstance(entries, list):
+            raise ValueError("schema/personas")
+        seen = set()
+        for item in entries:
+            key, digest = item["id"], item["sha256"]
+            if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", key) or key in seen or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("id/sha256")
+            seen.add(key)
+            if _file_digest(prompts / "personas" / (key + ".tpl")) != digest:
+                raise ValueError("资源摘要不符: " + key)
+        if not {"little-code", "ctf-sandbox", "da-fei-yu", "gemini-argon-4"} <= seen:
+            raise ValueError("缺少内置人设条目")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ReleaseValidationError("发行包人设资源无效: " + str(exc)) from exc
+
+
 def validate_release_tree(root: Path, expected_version: str) -> dict[str, Any]:
+    # The one legacy caller which cannot pass a new protocol is recognized by
+    # its exact source fingerprint and live apply frame, never just argv/env.
+    _handoff_0160(sys._getframe(1), Path(root), expected_version)
     root = Path(root).resolve()
     missing = [rel for rel in REQUIRED_DIRS if not (root / rel).is_dir()]
     missing.extend(rel for rel in REQUIRED_FILES if not (root / rel).is_file())
@@ -512,6 +723,7 @@ def validate_release_tree(root: Path, expected_version: str) -> dict[str, Any]:
         detail = ", ".join(f"{name}={value or '<empty>'}" for name, value in sorted(mismatched.items()))
         raise ReleaseValidationError(f"发行包版本不一致，期望 {expected}: {detail}")
     frontend = validate_frontend_resources(root / "web" / "dist")
+    validate_prompt_resources(root, expected)
     return {
         "ok": True,
         "root": str(root),
@@ -696,14 +908,30 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--root", required=True)
     backup.add_argument("--backup-dir")
     backup.add_argument("--config")
+    backup.add_argument("--home")
+    backup.add_argument("--expected-database")
     backup.add_argument("--label", default="upgrade")
+    config = sub.add_parser("resolve-config")
+    config.add_argument("--root", required=True)
+    config.add_argument("--config", default="")
+    config.add_argument("--service", default="openbear.service")
+    unit = sub.add_parser("render-unit")
+    unit.add_argument("--root", required=True)
+    unit.add_argument("--template", required=True)
+    unit.add_argument("--config", required=True)
+    unit.add_argument("--home", default="")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "validate-tree":
+        if args.command == "render-unit":
+            print(render_service_unit(Path(args.template).read_text(encoding="utf-8"), Path(args.root), args.config, args.home), end="")
+            return 0
+        if args.command == "resolve-config":
+            result = deployment_config(Path(args.root), args.config, args.service)
+        elif args.command == "validate-tree":
             result = validate_release_tree(Path(args.root), args.version)
         elif args.command == "retain-assets":
             result = retain_previous_assets(
@@ -715,6 +943,8 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.root),
                 Path(args.backup_dir) if args.backup_dir else None,
                 config_path=Path(args.config) if args.config else None,
+                home=args.home,
+                expected_database=args.expected_database,
                 label=args.label,
             )
         else:

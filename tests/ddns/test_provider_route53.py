@@ -64,12 +64,19 @@ def provider(api):
     return get('route53')(CREDS, client=api.client())
 
 
-def change(request):
+def changes(request):
     root = ET.fromstring(request.content)
-    c = root.find(f'{NS}ChangeBatch/{NS}Changes/{NS}Change')
-    s = c.find(f'{NS}ResourceRecordSet')
-    return (c.findtext(f'{NS}Action'), s.findtext(f'{NS}Name'), s.findtext(f'{NS}Type'), s.findtext(f'{NS}TTL'),
-            [v.text for v in s.iter(f'{NS}Value')])
+    out = []
+    for c in root.findall(f'{NS}ChangeBatch/{NS}Changes/{NS}Change'):
+        s = c.find(f'{NS}ResourceRecordSet')
+        out.append((c.findtext(f'{NS}Action'), s.findtext(f'{NS}Name'), s.findtext(f'{NS}Type'), s.findtext(f'{NS}TTL'),
+                    [v.text for v in s.iter(f'{NS}Value')]))
+    return out
+
+
+def change(request):
+    [only] = changes(request)
+    return only
 
 
 async def test_caps():
@@ -102,10 +109,10 @@ async def test_records_none():
     assert await provider(api).records('example.com', 'home.example.com', 'A') == []
 
 
-async def test_create_is_upsert():
+async def test_create_does_not_upsert_a_set_that_appeared_after_read():
     api = fake()
     record = await provider(api).create('example.com', 'home.example.com', 'A', '198.51.100.9', None, {})
-    assert change(api.requests[-1]) == ('UPSERT', 'home.example.com.', 'A', '300', ['198.51.100.9'])
+    assert change(api.requests[-1]) == ('CREATE', 'home.example.com.', 'A', '300', ['198.51.100.9'])
     assert api.requests[-1].headers['Content-Type'] == 'application/xml'
     assert record == Record('', 'home.example.com', 'A', '198.51.100.9', 300)
 
@@ -114,7 +121,8 @@ async def test_update_keeps_ttl_and_replaces_the_set():
     api = fake()
     current = Record('', 'home.example.com', 'AAAA', '2001:db8::1,2001:db8::2', 60)
     updated = await provider(api).update('example.com', current, '2001:db8::9', None, {})
-    assert change(api.requests[-1]) == ('UPSERT', 'home.example.com.', 'AAAA', '60', ['2001:db8::9'])
+    assert changes(api.requests[-1]) == [('DELETE', 'home.example.com.', 'AAAA', '60', ['2001:db8::1', '2001:db8::2']),
+                                         ('CREATE', 'home.example.com.', 'AAAA', '60', ['2001:db8::9'])]
     assert updated.ttl == 60 and updated.value == '2001:db8::9'
 
 
@@ -122,6 +130,43 @@ async def test_delete_repeats_the_current_set():
     api = fake()
     await provider(api).delete('example.com', Record('', 'home.example.com', 'A', '198.51.100.1,198.51.100.2', 60))
     assert change(api.requests[-1]) == ('DELETE', 'home.example.com.', 'A', '60', ['198.51.100.1', '198.51.100.2'])
+
+
+async def test_conditional_update_keeps_simple_attributes_and_old_ttl():
+    body = rrset('home.example.com.', 'A', ['198.51.100.1'], 60).replace(
+        '</ResourceRecordSet>', '<HealthCheckId>health-1</HealthCheckId><MultiValueAnswer>false</MultiValueAnswer></ResourceRecordSet>')
+    api = fake().on('GET', BASE + '/hostedzone/Z1/rrset', signed(lambda r, m: xml(
+        200, f'<ListResourceRecordSetsResponse xmlns="{XMLNS}"><ResourceRecordSets>{body}</ResourceRecordSets></ListResourceRecordSetsResponse>')))
+    p = provider(api)
+    [old] = await p.records('example.com', 'home.example.com', 'A')
+    assert old.extra == {'HealthCheckId': 'health-1', 'MultiValueAnswer': 'false'}
+    updated = await p.update('example.com', old, '198.51.100.9', 600, {})
+    assert changes(api.requests[-1]) == [('DELETE', 'home.example.com.', 'A', '60', ['198.51.100.1']),
+                                         ('CREATE', 'home.example.com.', 'A', '600', ['198.51.100.9'])]
+    sets = ET.fromstring(api.requests[-1].content).findall(f'.//{NS}ResourceRecordSet')
+    assert len(sets) == 2
+    for s in sets:
+        assert s.findtext(f'{NS}HealthCheckId') == 'health-1' and s.findtext(f'{NS}MultiValueAnswer') == 'false'
+    await p.delete('example.com', updated)
+    assert change(api.requests[-1]) == ('DELETE', 'home.example.com.', 'A', '600', ['198.51.100.9'])
+    assert ET.fromstring(api.requests[-1].content).findtext(f'.//{NS}HealthCheckId') == 'health-1'
+
+
+@pytest.mark.parametrize('message,expected', [
+    ("Tried to delete resource record set [name='home.example.com.', type='A'] but the values provided do not match the current values", 'record_conflict'),
+    ("Tried to delete resource record set [name='home.example.com.', type='A'] but it was not found", 'record_conflict'),
+    ("Tried to create resource record set [name='home.example.com.', type='A'] but it already exists", 'record_conflict'),
+    ('Invalid Resource Record: FATAL problem: ARRDATAIllegalIPv4Address', 'bad_request'),
+])
+@pytest.mark.parametrize('envelope', ['root', 'code'])
+async def test_conditional_conflicts_are_retryable_but_invalid_inputs_are_not(message, expected, envelope):
+    body = (f'<InvalidChangeBatch xmlns="{XMLNS}"><Messages><Message>{message}</Message></Messages></InvalidChangeBatch>' if envelope == 'root' else
+            f'<ErrorResponse xmlns="{XMLNS}"><Error><Code>InvalidChangeBatch</Code><Message>{message}</Message></Error></ErrorResponse>')
+    api = FakeAPI().on('POST', BASE + '/hostedzone/Z1/rrset/', lambda r, m: xml(400, body))
+    api.on('GET', BASE + '/hostedzonesbyname', lambda r, m: xml(200, BY_NAME))
+    with pytest.raises(ProviderError) as err:
+        await provider(api).update('example.com', Record('', 'home.example.com', 'A', '198.51.100.1', 60), '198.51.100.9', None, {})
+    assert err.value.code == expected and err.value.permanent == (expected == 'bad_request')
 
 
 async def test_unknown_zone():

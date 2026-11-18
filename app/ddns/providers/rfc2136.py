@@ -54,7 +54,7 @@ class Rfc2136(Provider):
         Field('protocol', '传输协议', 'select', options=('udp:UDP（响应被截断时改用 TCP）', 'tcp:TCP'), optional=True, default='udp'),
         Field('zones', '可管理的域', optional=True, hint='逗号分隔，例如 example.com,example.net；不填则不能列出域'),
     )
-    caps = Caps(zones=False, by_id=False, multi=False, ttl_min=1, ttl_max=2147483647)
+    caps = Caps(zones=False, by_id=False, multi=False, ttl_min=1, ttl_max=2147483647, rrset=True)
     docs = 'https://datatracker.ietf.org/doc/html/rfc2136'
 
     def __init__(self, creds, settings=None, *, client=None):
@@ -71,7 +71,7 @@ class Rfc2136(Provider):
         self.protocol = self.creds.get('protocol', 'udp').lower()
         self.managed = [z.strip().lower().rstrip('.') for z in self.creds.get('zones', '').split(',') if z.strip()]
         if self.managed:
-            self.caps = Caps(zones=True, by_id=False, multi=False, ttl_min=1, ttl_max=2147483647)
+            self.caps = Caps(zones=True, by_id=False, multi=False, ttl_min=1, ttl_max=2147483647, rrset=True)
 
     async def _where(self):
         try:
@@ -135,22 +135,34 @@ class Rfc2136(Provider):
     async def _update(self, zone, change):
         message = dns.update.UpdateMessage(zone, keyring=self.key)
         change(message)
-        response = await self.send(message)
-        if response.rcode() != dns.rcode.NOERROR:
-            raise ProviderError('bad_request', f'server answered {dns.rcode.to_text(response.rcode())}')
+        response = await self.send(message, any_rcode=True)
+        rcode = response.rcode()
+        if rcode != dns.rcode.NOERROR:
+            # A prerequisite failed: re-read before retrying, never send an unconditional update.
+            code = 'record_conflict' if rcode in (dns.rcode.NXRRSET, dns.rcode.YXRRSET, dns.rcode.NXDOMAIN, dns.rcode.YXDOMAIN) else RCODES.get(rcode, 'bad_request')
+            raise ProviderError(code, f'server answered {dns.rcode.to_text(rcode)}')
 
     async def create(self, zone, name, rtype, value, ttl, opts):
         self.relative(zone, name)
         ttl = self.ttl_for(ttl) or DEFAULT_TTL
-        await self._update(zone, lambda m: m.replace(dns.name.from_text(name), ttl, rtype, value))
+        def create(m):
+            m.absent(dns.name.from_text(name), rtype)
+            m.replace(dns.name.from_text(name), ttl, rtype, value)
+        await self._update(zone, create)
         return Record('', name, rtype, value, ttl)
 
     async def update(self, zone, record, value, ttl, opts):
         self.relative(zone, record.name)
         ttl = self.ttl_for(ttl) or record.ttl or DEFAULT_TTL
-        await self._update(zone, lambda m: m.replace(dns.name.from_text(record.name), ttl, record.type, value))
+        def update(m):
+            m.present(dns.name.from_text(record.name), record.type, *record.value.split(','))
+            m.replace(dns.name.from_text(record.name), ttl, record.type, value)
+        await self._update(zone, update)
         return Record('', record.name, record.type, value, ttl)
 
     async def delete(self, zone, record):
         self.relative(zone, record.name)
-        await self._update(zone, lambda m: m.delete(dns.name.from_text(record.name), record.type))
+        def delete(m):
+            m.present(dns.name.from_text(record.name), record.type, *record.value.split(','))
+            m.delete(dns.name.from_text(record.name), record.type)
+        await self._update(zone, delete)

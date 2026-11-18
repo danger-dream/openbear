@@ -19,7 +19,7 @@ export function server(id, name, {group = '', region = 'SG', cpu = 10, mem = 30,
   return {id, name, local, ssh, usedBy: [], region, install: null, live,
     profile: {group, region, sort: 0, billing: {price, currency, cycle, startedAt: '', expiresAt: day(expires), autoRenew: false}, traffic: {limit: limit * GB, type: 'max', resetDay: 0}},
     node: node ? {enrolledAtMs: Date.now() - 86400000, lastSeenAtMs: Date.now() - (online ? 0 : 7200000), online, version, latest: '0.13.1', updateAvailable: outdated && online,
-      caps: {exec, terminal}, info, geo: null} : null,
+      caps: {exec, terminal}, features: ['host', 'host.processIdentity', 'fs.write.noReplace'], info, geo: null} : null,
     traffic: node ? {periodStart: day(-10), resetDay: 1, rx: used * GB, tx: used * GB / 3, type: 'max', used: used * GB, limit: limit * GB} : null};
 }
 export function fixtures() {
@@ -174,7 +174,8 @@ export const ADDRS = {
 // query, body (parsed JSON or null), raw (Buffer or null)}; the answer is {status, json} or
 // {status, headers, body}. external(request) answers the public exchange-rate sources.
 // openTerminal(send) is one terminal WebSocket: it greets, and returns the handler of a message.
-export function createServersBackend({tweak = null, fx = FX, release = null, recheck = null, mesh = null, refuseMesh = []} = {}) {
+// updateRun: a 全部更新 already under way as the page opens, {queue: [results to come], ...run}.
+export function createServersBackend({tweak = null, fx = FX, release = null, recheck = null, mesh = null, refuseMesh = [], updateRun = null} = {}) {
   const calls = [], terminal = {sockets: 0, input: [], control: []}, uploads = [], saved = [], fileJobs = {};
     const items = fixtures();
     tweak?.(items);
@@ -182,6 +183,9 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
       retention: {minuteDays: 31, hourDays: 400}, latency: {...LATENCY}, latencyCatalog: LATENCY_CATALOG}, job = null, storage = structuredClone(STORAGE);
     let codes = [{id: 'rc1', name: '新开的 VPS', group: 'Tier 1', access: {}, active: true, uses: 2, maxUses: 0, expiresAtMs: 0, createdAtMs: Date.now() - 86400000, lastUsedAtMs: Date.now() - 7200000, revokedAtMs: 0,
       command: 'curl -fsSL https://node.example.com/api/server-nodes/v1/install.sh | sh -s -- --url https://node.example.com --code rc1secret'}], batchJob = null, batchPolls = 0;
+    // 全部更新 in the background: each read of it finds one more node done.
+    let run = null, runQueue = [];
+    if (updateRun) ({queue: runQueue, ...run} = structuredClone(updateRun));
     // An IP.Check.Place run started from the detail page: under way for two more reads, then a fresh report.
     const ipRuns = {}, unlockRuns = {};
     const bgJobs = [
@@ -191,6 +195,9 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
       {id: 'mh2k0z9y8x7w', command: 'python3 train.py', cwd: '', shell: '/bin/sh', state: 'interrupted', exitCode: null, startedAtMs: Date.now() - 90000000, endedAtMs: null, durationMs: null},
     ];
     for (const i of items) if (!i.local) i.access = {primary: ACCESS[i.profile.group === 'Tier 1' ? 1 : 0], backup: i.profile.group === 'Tier 1' ? ACCESS[0] : null};
+    // A front's (前置机) addresses are its exits' front accesses, each serving it already.
+    const exitPoint = e => ({id: `front:${e.serverId}`, serverId: e.serverId, name: items.find(x => x.id === e.serverId)?.name || e.serverId, url: `https://${e.address}:52002`, ready: true, error: ''});
+    for (const i of items) if (i.profile.front?.exits?.length) i.access = {primary: exitPoint(i.profile.front.exits[0]), backup: i.profile.front.exits[1] ? exitPoint(i.profile.front.exits[1]) : null};
     // With the built-in mesh access point: each server says whether it can pick it, and what its choice lacks.
     const pointOf = id => id === 'ap-mesh' ? settings.meshAccess : ACCESS.find(a => a.id === id);
     const meshAccessOf = (choice, eligible, reason = '') => {
@@ -301,10 +308,21 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
         items.forEach((i, index) => { i.profile.sort = index; });
         data = {ok: true, items};
       } else if (path === '/api/servers/node-url') data = {ok: true, items: items.filter(i => i.live && !i.local).map(i => ({serverId: i.id, ok: i.id !== 'srv-bravo', changed: true, backupReachable: true, ...(i.id === 'srv-bravo' ? {error: 'new_url_unreachable'} : {})}))};
-      else if (path === '/api/servers/node-update') {
-        const outdated = items.filter(i => i.node?.updateAvailable);
-        for (const i of outdated) Object.assign(i.node, {version: '0.13.1', updateAvailable: false});
-        data = {ok: true, items: outdated.map(i => ({serverId: i.id, ok: true, changed: true, from: '0.13.0', to: '0.13.1', ...(i.updateResult || {})}))};
+      else if (path === '/api/servers/node-update' && method === 'POST') {
+        if (!run?.running) {
+          runQueue = items.filter(i => i.node?.updateAvailable).map(i => ({serverId: i.id, ok: true, changed: true, from: '0.13.0', to: '0.13.1', ...(i.updateResult || {})}));
+          run = {id: 'nu' + calls.length, running: runQueue.length > 0, startedAt: Date.now(), finishedAt: runQueue.length ? 0 : Date.now(), total: runQueue.length,
+            done: 0, active: runQueue.slice(0, 1).map(r => r.serverId), items: [], error: ''};
+        }
+        data = {ok: true, run};
+      } else if (path === '/api/servers/node-update') {
+        if (run?.running) {
+          const next = runQueue.shift(), own = items.find(i => i.id === next.serverId);
+          if (own?.node) Object.assign(own.node, {version: '0.13.1', updateAvailable: false});
+          run = {...run, items: [...run.items, next], done: run.done + 1, active: runQueue.slice(0, 1).map(r => r.serverId),
+            running: runQueue.length > 0, finishedAt: runQueue.length ? 0 : Date.now()};
+        }
+        data = {ok: true, run};
       } else if (path === '/api/servers/exec' && method === 'POST') {
         job = {id: 'job1', command: body.command, timeout: body.timeout, createdAtMs: Date.now(), done: false, items: body.serverIds.map(serverId => ({serverId, state: 'running'}))};
         data = {ok: true, job};
@@ -370,10 +388,12 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
         if (item.node?.version === 'old') return {status: 409, json: {ok: false, error: 'node_update_required'}};
         const rows = (item.processes || PROCESSES).filter(p => !(item.ended || []).includes(p.pid));
         const key = {cpu: p => p.cpu, mem: p => p.rss, io: p => (p.readRate || 0) + (p.writeRate || 0), conn: p => p.conns || 0, net: p => p.conns || 0}[sort];
-        data = {ok: true, sort, sorts: ['cpu', 'mem', 'io', 'conn', 'net'], count: 214, processes: [...rows].sort((a, b) => key(b) - key(a)).slice(0, 10),
+        data = {ok: true, sort, sorts: ['cpu', 'mem', 'io', 'conn', 'net'], count: 214, processes: [...rows].sort((a, b) => key(b) - key(a)).slice(0, 10).map(p => ({...p, identity: p.identity || `instance-${p.pid}`})),
           ...(sort === 'net' ? {interfaces: [{name: 'eth0', rxRate: 2.4e6, txRate: 8.1e5}, {name: 'docker0', rxRate: 3e5, txRate: 1.2e5}, {name: 'br-71aa55b7cfe3', rxRate: 0, txRate: 0}],
             netns: [{name: 'immich_server', pids: 3, rxRate: 2.9e5, txRate: 1.1e5}]} : {})};
       } else if (path.endsWith('/processes/kill') && method === 'POST') {
+        const selected = (item.processes || PROCESSES).find(p => p.pid === body.pid);
+        if (!selected || body.identity !== (selected.identity || `instance-${body.pid}`)) return {status: 409, json: {ok: false, error: 'process_changed'}};
         // A first, gentle try at the stubborn one leaves it running; force ends it.
         const exited = body.force || body.pid !== 4242;
         if (exited) item.ended = [...item.ended || [], body.pid];
@@ -470,7 +490,11 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
       } else if (/^\/api\/servers\/[\w-]+$/.test(path) && method === 'GET') data = {ok: true, item: {...item, terminalLog: [{startedAtMs: Date.now() - 3600000, endedAtMs: Date.now() - 3000000, ip: '192.0.2.1', reason: 'exited'}],
         execLog: [{source: 'ai', command: 'systemctl status nginx --no-pager', startedAtMs: Date.now() - 600000, durationMs: 80, exitCode: 0, outcome: 'ok',
             conversationUuid: 'conv-nginx', conversationTitle: '排查 nginx 502：上游超时与反向代理配置核对（含访问日志和错误日志分析）'},
-          {source: 'batch', command: 'df -h /data', startedAtMs: Date.now() - 900000, durationMs: 40, exitCode: 1, outcome: 'failed'}]}};
+          {source: 'batch', command: 'df -h /data', startedAtMs: Date.now() - 900000, durationMs: 40, exitCode: 1, outcome: 'failed'},
+          {source: 'check', command: '解锁检测：运行 Service Unlock', startedAtMs: Date.now() - 1200000, durationMs: 7600, exitCode: 1, outcome: 'ok'},
+          {source: 'bench', command: '评测：运行 IP.Check.Place（后台任务 mvz7wgig36961940）', startedAtMs: Date.now() - 1500000, durationMs: 9000, exitCode: -1,
+            outcome: 'stopped'},
+          {source: 'auto', command: '更新节点 1.3.0', startedAtMs: Date.now() - 1800000, durationMs: 20000, exitCode: 0, outcome: 'ok'}]}};
       else if (/^\/api\/servers\/[\w-]+$/.test(path) && method === 'PATCH') {
         const moved = JSON.stringify(body.profile.access) !== JSON.stringify(item.profile.access);
         const choice = body.profile.access || {};

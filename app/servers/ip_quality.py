@@ -113,6 +113,11 @@ def summarize(report):
         'mail': {'port25': mail.get('Port25') is True, 'listed': int(blacklist.get('Blacklisted') or 0), 'marked': int(blacklist.get('Marked') or 0),
                  'checked': int(blacklist.get('Total') or 0)},
     }
+    # Older packages did not distinguish failed lookups; do not invent coverage for them.
+    if all(isinstance(blacklist.get(k), (int, float)) and not isinstance(blacklist[k], bool)
+           for k in ('Failed', 'Unknown', 'Answered')):
+        summary['mail'].update(failed=max(0, int(blacklist['Failed'])), unknown=max(0, int(blacklist['Unknown'])),
+                               answered=max(0, int(blacklist['Answered'])))
     summary['purity'] = purity(summary)
     summary['scenes'] = scenes(summary, summary['purity']['value'])
     return summary
@@ -207,10 +212,16 @@ async def latest(conn, owner, server_id, ips=None):
     going = await many(conn, f"SELECT id, state, created_ms, started_ms FROM server_bench_runs WHERE owner=? AND server_id=? AND test=? "
                              f"AND state IN ({','.join('?' * len(UNDER_WAY))}) ORDER BY created_ms DESC LIMIT 1", (owner, server_id, TEST, *UNDER_WAY))
     pending = {'runId': going[0]['id'], 'state': going[0]['state'], 'startedMs': going[0]['started_ms'] or going[0]['created_ms']} if going else None
-    rows = await many(conn, "SELECT id, ended_ms, sections FROM server_bench_runs WHERE owner=? AND server_id=? AND test=? AND state='done' "
-                            'ORDER BY ended_ms DESC LIMIT 10', (owner, server_id, TEST))
+    rows = await many(conn, "SELECT id, ended_ms, sections, error FROM server_bench_runs WHERE owner=? AND server_id=? AND test=? "
+                            "AND (state='done' OR error='bench_json_invalid') ORDER BY ended_ms DESC LIMIT 10", (owner, server_id, TEST))
+    # A new broken structured report supersedes old quality, rather than silently presenting stale success.
+    if rows and rows[0]['error'] == 'bench_json_invalid':
+        return {'ok': True, 'report': None, 'changes': [], 'previousAtMs': 0, 'pending': pending,
+                'error': 'bench_json_invalid', 'failedRunId': rows[0]['id']}
     found = []
     for row in rows:
+        if row['error'] == 'bench_json_invalid':
+            continue
         for report, family in _reports(row['sections']):
             summary = summarize(report)
             if summary:

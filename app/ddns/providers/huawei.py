@@ -19,7 +19,7 @@ class Huawei(Provider):
     tier = 'B'
     fields = (Field('access_key_id', 'Access Key ID（AK）'), Field('secret_access_key', 'Secret Access Key（SK）', 'password'))
     options = (Field('line', '解析线路', 'select', options=LINES, optional=True, default='default_view', hint='只在新建时生效'),)
-    caps = Caps(ttl_min=1, ttl_max=2147483647)
+    caps = Caps(ttl_min=1, ttl_max=2147483647, rrset=True)
     docs = 'https://support.huaweicloud.com/usermanual-dns/dns_usermanual_0027.html'
     endpoint = 'https://dns.myhuaweicloud.com'
 

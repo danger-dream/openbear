@@ -7,17 +7,17 @@ import { Api } from '../api.js';
 import { ok, relativeTime, timeLabel } from '../instances/instanceHelpers.js';
 import { MOBILE_VIEWPORT_QUERY } from '../mobileViewport.js';
 import { bytes, safeError } from './serverHelpers.js';
-import { FOLLOW_GAP, LOG_LIMIT, followDelay, keepRecent } from './jobLog.js';
+import { FOLLOW_GAP, LOG_LIMIT, followDelay, keepRecent, retryDelay, canStopJob } from './jobLog.js';
 
 const props = defineProps({serverId: {type: String, required: true}, active: Boolean, now: {type: Number, required: true}});
 // Output read per request; earlier output comes in pieces of the same size.
 const CHUNK = 64 * 1024;
 const jobs = ref(null), error = ref(''), stopping = ref(''), phone = ref(false);
 const viewing = ref(''), log = ref(null), logError = ref(''), loadingEarlier = ref(false), logBox = ref(null);
-let alive = true, timer, logTimer, media, reads = 0;
+let alive = true, timer, logTimer, media, reads = 0, failures = 0;
 
 const STATES = {running: '运行中', exited: '已结束', stopped: '已停止', interrupted: '已中断'};
-const job = computed(() => jobs.value?.find(j => j.id === viewing.value) || log.value?.job || null);
+const job = computed(() => log.value?.job || jobs.value?.find(j => j.id === viewing.value) || null);
 const running = computed(() => (jobs.value || []).some(j => j.state === 'running'));
 const stateTone = j => j.state === 'running' ? 'ok' : j.state === 'exited' && j.exitCode === 0 ? 'off' : 'bad';
 const stateText = j => j.state === 'exited' ? (j.exitCode === 0 ? '成功' : `退出码 ${j.exitCode}`) : STATES[j.state] || j.state;
@@ -59,9 +59,15 @@ async function follow() {
     } else log.value = keepRecent({...current, data: current.data + part.data, next: part.next, size: part.size, first: part.first, job: data.job});
     if (atEnd) void nextTick(() => { if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight; });
     logError.value = '';
+    failures = 0;
     const delay = followDelay(part, current?.next);
     if (data.job.state === 'running' || delay === FOLLOW_GAP) logTimer = setTimeout(follow, delay);
-  } catch (e) { if (alive && viewing.value === id && read === reads) logError.value = safeError(e); }
+  } catch (e) {
+    if (!alive || viewing.value !== id || read !== reads) return;
+    logError.value = safeError(e);
+    const delay = retryDelay(e, ++failures);
+    if (delay != null) logTimer = setTimeout(follow, delay);
+  }
 }
 async function earlier() {
   const current = log.value;
@@ -74,11 +80,12 @@ async function earlier() {
   } catch (e) { ElMessage.error(safeError(e)); }
   finally { loadingEarlier.value = false; }
 }
-function open(j) { viewing.value = j.id; log.value = null; logError.value = ''; void follow(); }
-function close() { viewing.value = ''; clearTimeout(logTimer); log.value = null; }
+function retryLog() { failures = 0; void follow(); }
+function open(j) { viewing.value = j.id; log.value = null; logError.value = ''; retryLog(); }
+function close() { ++reads; viewing.value = ''; clearTimeout(logTimer); log.value = null; failures = 0; }
 async function stop(j) {
   try {
-    await ElMessageBox.confirm(`结束这个任务和它启动的所有进程？\n${j.command.length > 200 ? j.command.slice(0, 200) + '…' : j.command}`, '停止后台任务',
+    await ElMessageBox.confirm(`${j.state === 'interrupted' ? '任务管理进程已中断，但节点确认仍有残留命令运行。停止这些残留进程？' : '结束这个任务和它启动的所有进程？'}\n${j.command.length > 200 ? j.command.slice(0, 200) + '…' : j.command}`, '停止后台任务',
       {confirmButtonText: '停止', cancelButtonText: '取消', type: 'warning'});
   } catch { return; }
   stopping.value = j.id;
@@ -90,7 +97,10 @@ async function stop(j) {
 }
 function syncPhone() { phone.value = media.matches; }
 
-watch(() => [props.serverId, props.active], () => { if (props.active) void load(); else clearTimeout(timer); });
+watch(() => [props.serverId, props.active], ([serverId], [previousId]) => {
+  if (serverId !== previousId) close();
+  if (props.active) void load(); else clearTimeout(timer);
+});
 onMounted(() => {
   media = window.matchMedia(MOBILE_VIEWPORT_QUERY);
   syncPhone();
@@ -114,7 +124,7 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); clearTimeout(logTime
           <code class="sv-job-command">{{ j.command }}</code>
           <span class="sv-job-meta"><span>{{ took(j) }}</span><time :title="timeLabel(j.startedAtMs)">{{ relativeTime(j.startedAtMs, now) }}</time></span>
         </button>
-        <button v-if="j.state === 'running'" type="button" class="ix-text-button sv-job-stop" :disabled="stopping === j.id" @click="stop(j)">停止</button>
+        <button v-if="canStopJob(j)" type="button" class="ix-text-button sv-job-stop" :disabled="stopping === j.id" @click="stop(j)">{{ j.state === 'interrupted' ? '停止残留进程' : '停止' }}</button>
       </li>
     </ol>
     <el-drawer :model-value="Boolean(viewing)" @update:model-value="v => { if (!v) close() }" :direction="phone ? 'btt' : 'rtl'" :size="phone ? '86%' : '560px'"
@@ -128,12 +138,12 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); clearTimeout(logTime
         <div class="sv-job-actions">
           <button v-if="log && log.start > log.first && !log.trimmed && log.data.length < LOG_LIMIT" type="button" class="ix-text-button" :disabled="loadingEarlier" @click="earlier">加载更早的输出</button>
           <span class="ob-grow" />
-          <el-button v-if="job.state === 'running'" size="small" :loading="stopping === job.id" @click="stop(job)">停止任务</el-button>
+          <el-button v-if="canStopJob(job)" size="small" :loading="stopping === job.id" @click="stop(job)">{{ job.state === 'interrupted' ? '停止残留进程' : '停止任务' }}</el-button>
         </div>
         <p v-if="log?.trimmed" class="instance-muted" role="status">输出较多，这里只保留最近约 {{ bytes(LOG_LIMIT) }}，更早的部分已截断。</p>
-        <p v-if="logError" class="instance-error">{{ logError }}</p>
-        <pre v-else-if="log" ref="logBox" class="sv-job-log" tabindex="0" aria-label="任务输出">{{ log.data || (job.state === 'running' ? '还没有输出' : '没有输出') }}</pre>
-        <p v-else class="instance-muted" role="status">正在读取…</p>
+        <p v-if="logError" class="instance-error">{{ logError }} <button type="button" class="ix-text-button" @click="retryLog">重试日志</button></p>
+        <pre v-if="log" ref="logBox" class="sv-job-log" tabindex="0" aria-label="任务输出">{{ log.data || (job.state === 'running' ? '还没有输出' : '没有输出') }}</pre>
+        <p v-else-if="!logError" class="instance-muted" role="status">正在读取…</p>
       </div>
     </el-drawer>
   </section>

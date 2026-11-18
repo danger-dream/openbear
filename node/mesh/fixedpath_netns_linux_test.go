@@ -147,11 +147,12 @@ func TestRoutingNetnsFixedPath(t *testing.T) {
 		t.Fatalf("not on the route within 5 s of the cut: %v", firstRoute)
 	}
 
-	// Restore it: on the routes for pinHold, then the fixed paths again.
+	// Restore it: on the routes while the link is held down (routing's
+	// probationBase) and for pinHold after, then the fixed paths again.
 	time.Sleep(5 * time.Second)
 	restored := time.Now()
 	l.netem(l.link("X", "Y"), "")
-	l.waitFor("X-Y up", 30*time.Second, func() bool { return l.pathState("A", "p1") == "waiting" })
+	l.waitFor("X-Y up", 45*time.Second, func() bool { return l.pathState("A", "p1") == "waiting" })
 	waitingAt := time.Since(restored)
 	time.Sleep(pinHold/2 - waitingAt)
 	if got, _ := l.rttNow("A", "B"); !near(got, 20) {
@@ -256,6 +257,8 @@ func TestRoutingNetnsFixedPathBackup(t *testing.T) {
 	if a, b := states("A"), states("B"); a != "pinned standby" || b != "pinned standby" {
 		t.Fatalf("all up: A %s, B %s", a, b)
 	}
+	// Which path answers first while all come up varies; what follows does not.
+	before := len(switches("A"))
 	l.netem(l.link("X", "Y"), "loss 100%")
 	both("on p2 after X-Y cut", 30, 20*time.Second)
 	if s := l.pathStates("A")["p1"]; s.State != "fallback" || !slices.Equal(s.Down, []string{"X", "Y"}) {
@@ -264,7 +267,8 @@ func TestRoutingNetnsFixedPathBackup(t *testing.T) {
 	l.netem(l.link("W", "B"), "loss 100%")
 	both("on the routes after W-B cut", 10, 20*time.Second)
 	l.netem(l.link("X", "Y"), "")
-	l.waitFor("p1 waiting", 30*time.Second, func() bool { return l.pathStates("A")["p1"].State == "waiting" })
+	// Held down for routing's probationBase once back, then waiting.
+	l.waitFor("p1 waiting", 45*time.Second, func() bool { return l.pathStates("A")["p1"].State == "waiting" })
 	restored := time.Now()
 	if got, _ := l.rttNow("A", "B"); !near(got, 10) {
 		t.Fatalf("within the hold: A>B %.1f ms", got)
@@ -274,12 +278,12 @@ func TestRoutingNetnsFixedPathBackup(t *testing.T) {
 		t.Fatalf("back on p1 %.1fs after it was seen up, before the hold", since.Seconds())
 	}
 	l.netem(l.link("W", "B"), "")
-	l.waitFor("p2 standing by", hold+30*time.Second, func() bool { return states("A") == "pinned standby" && states("B") == "pinned standby" })
+	l.waitFor("p2 standing by", hold+45*time.Second, func() bool { return states("A") == "pinned standby" && states("B") == "pinned standby" })
 	if got, _ := l.rttNow("A", "B"); !near(got, 60) {
 		t.Fatalf("p2 back took the pair: A>B %.1f ms", got)
 	}
-	want := []string{"B: 0 -> 1", "B: 1 -> 2 down X Y", "B: 2 -> 0 down W B", "B: 0 -> 1"}
-	if got := switches("A"); !slices.Equal(got, want) {
+	want := []string{"B: 1 -> 2 down X Y", "B: 2 -> 0 down W B", "B: 0 -> 1"}
+	if got := switches("A")[before:]; !slices.Equal(got, want) {
 		t.Errorf("A's switches %q, want %q", got, want)
 	}
 	for _, id := range ids {

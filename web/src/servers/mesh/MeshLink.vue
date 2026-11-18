@@ -4,7 +4,8 @@ import { ElMessage } from 'element-plus';
 import { MeshApi } from './meshApi.js';
 import { directPeers, linkLive, mesh, save } from './meshStore.js';
 import { candLine, codeText, costText, DIRECT_VIA, directErrorText, directLive, directReason, directStateText, durationText, errorMessage, errorsUnder, isPunched, isRelay, isSite,
-  LINE_STATES, lineEnd, lineOf, LINK_STATES, listens, lossText, move, msText, nameOf, needsPunch, publicAddress, reachOf, relayMetric, rtt, sameExit, TRANSPORTS, transportLabel, warningsUnder } from './meshHelpers.js';
+  LINE_STATES, lineEnd, lineOf, LINK_STATES, listens, lossText, move, msText, nameOf, needsPunch, publicAddress, reachOf, relayMetric, ROUTING_DEFAULTS, rtt, sameExit, TRANSPORTS, transportLabel,
+  warningsUnder } from './meshHelpers.js';
 import { customRelayLinks, entryLook, lineIdOf, punchedRelayLink, standbyDetail } from './meshGraph.js';
 import MeshField from './MeshField.vue';
 import MeshLineTrend from './MeshLineTrend.vue';
@@ -92,7 +93,20 @@ const metricFacts = computed(() => {
   const m = metric.value;
   if (!m) return [];
   return [['线路', LINK_STATES[m.state][1], m.state === 'up' ? '' : m.state === 'down' ? 'ob-bad' : 'ob-warn'], ['延迟', m.state === 'up' ? msText(m.rttMs) : ''], ['抖动', m.state === 'up' ? msText(m.jitterMs) : ''],
-    ['丢包', lossText(m.loss)], ['代价', costText(m)]].filter(([, v]) => v);
+    ['丢包', lossText(m.loss)], ['实测代价', costText(m)], ['选路用', m.state === 'up' && advertised.value != null ? String(advertised.value) : '']].filter(([, v]) => v);
+});
+// What routes go by: the larger of the costs the two ends last advertised.
+const advertised = computed(() => {
+  const v = (metric.value?.ends || []).map(e => e.advertised).filter(Number.isFinite);
+  return v.length ? Math.round(Math.max(...v) * 10) / 10 : null;
+});
+// The measured cost worked out with this link's figures and the settings' weights.
+const costMath = computed(() => {
+  const m = metric.value;
+  if (!m || m.state !== 'up' || !Number.isFinite(m.rttMs)) return '';
+  const t = {...ROUTING_DEFAULTS, ...(work.value?.settings?.routing || {})}, r1 = v => Math.round((Number(v) || 0) * 10) / 10;
+  return `实测代价 = 延迟 ${r1(m.rttMs)} + 抖动 ${r1(m.jitterMs)} × ${t.jitterWeight} + 丢包率 ${lossText(m.loss) || '0%'} × ${t.lossWeight}${bias.value ? ` + 偏好 ${bias.value}` : ''} ≈ ${costText(m)}。`
+    + `选路用两端已通告代价里较大的那个；实测和已通告的差超过 ${t.advertMs} ms（设置的「选路」里的通告门槛）并持续 ${t.holdS} 秒才更新。`;
 });
 const metricNote = computed(() => {
   const m = metric.value;
@@ -244,6 +258,7 @@ function setFull(on) {
         <div v-for="[label, value, cls] in metricFacts" :key="label"><dt>{{ label }}</dt><dd :class="cls">{{ value }}</dd></div>
       </dl>
       <p v-else class="instance-muted mesh-link-text">还没有实测数据。中转上报后，这里显示延迟、抖动、丢包和代价。</p>
+      <p v-if="costMath" class="instance-muted mesh-link-text mesh-cost-math">{{ costMath }}</p>
       <p v-if="metricNote" class="instance-muted mesh-link-text">{{ metricNote }}</p>
       <p v-if="metric?.state === 'suppressed'" class="mesh-link-text mesh-direct-why">这条线路最近反复断开，先不用于选路，稳定后自动恢复。</p>
     </section>

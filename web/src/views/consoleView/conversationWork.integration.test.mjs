@@ -746,15 +746,15 @@ test('group bottom close folds the whole disclosure, not just one nested tool', 
   assert.equal(find(root,'process-summary').props['aria-expanded'],false);
 });
 
-test('small phone toolbar reserves separate tracks rather than hiding controls; reduced-motion and shared theme roles remain', () => {
+test('small phone toolbar stays one row with its actions in one tools menu; reduced-motion and shared theme roles remain', () => {
   const composer=fs.readFileSync(new URL('./ConsoleComposer.vue',import.meta.url),'utf8');
-  assert.match(composer,/@media \(max-width: 360px\)[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
+  assert.doesNotMatch(composer,/@media \(max-width: 360px\)/);
+  assert.match(composer,/<ComposerToolsMenu v-if="phone"/);
   assert.match(composer,/\.composer-usage-summary \{ display: flex; flex-wrap: wrap/);
   assert.doesNotMatch(composer,/\.composer-box \{[^}]*margin-bottom: 32px/);
-  assert.match(composer,/\.composer-toolbar \.send-button \{ grid-row: 2; grid-column: 2/);
-  // At 320px the shell (24), box padding/border (16) and send column (38)
-  // leave 242px for four 44px actions. Context has its own reserved row below.
-  assert.ok(320 - 40 - 38 >= 4 * 44);
+  // At 320px the shell (24), box padding/border (16), the 38px tools button and
+  // the 38px send button leave 204px for the model and its status.
+  assert.ok(320 - 40 - 38 - 38 >= 200);
   const css=fs.readFileSync(new URL('./conversationWork.css',import.meta.url),'utf8');
   assert.match(css,/--work-text: var\(--ob-text\)/);
   assert.match(css,/--work-panel: var\(--ob-surface\)/);

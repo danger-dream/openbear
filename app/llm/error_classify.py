@@ -83,6 +83,7 @@ _CLASSIFICATION_ALIASES = {
     "upstream_stream_incomplete": SERVER_ERROR,
     "malformed_function_call": SERVER_ERROR,
     "unexpected_tool_call": SERVER_ERROR,
+    "context_length_exceeded": CONTEXT_OVERFLOW,
 }
 _CLIENT_REQUEST_RETRY_SCOPES = frozenset({
     "client", "request", "client_request", "client/request", "whole_request",
@@ -108,6 +109,19 @@ def normalize_classification(value: str | None, status: int = 0) -> str:
 
 def is_retryable_reason(reason: str) -> bool:
     return reason in _RETRYABLE_REASONS
+
+
+def names_context_overflow(classification: str, code_reason: str, fallback_reason: str) -> bool:
+    """A generic request rejection whose code or text names a context overflow.
+
+    Gateways type overflow as ``invalid_request``; it must still reach the
+    window-reduction recovery instead of ending as a final format error.
+    """
+    generic = ("", FORMAT, UNKNOWN)
+    return classification in generic and (
+        code_reason == CONTEXT_OVERFLOW
+        or (code_reason in generic and fallback_reason == CONTEXT_OVERFLOW)
+    )
 
 
 def retryable_from_contract(
@@ -257,6 +271,11 @@ def _is_gemini_sampling_failure_text(low: str) -> bool:
 def is_gemini_sampling_failure(message: str | None, code: str | None = "") -> bool:
     """Gemini ended this sample abnormally; the request itself was valid."""
     return _is_gemini_sampling_failure_text(f"{code or ''} {message or ''}".lower())
+
+
+def is_output_repetition(message: str | None, code: str | None = "") -> bool:
+    """The gateway stopped a response that degenerated into a repetition loop."""
+    return "output_repetition_detected" in f"{code or ''} {message or ''}".lower()
 
 
 def is_malformed_tool_call(message: str | None, code: str | None = "") -> bool:

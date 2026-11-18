@@ -10,12 +10,12 @@ import (
 func protectedPID(pid int) bool { return pid <= 1 }
 
 // signalProcess asks a process to end (SIGTERM), or ends it (SIGKILL).
-func signalProcess(pid int, force bool) (bool, error) {
+func signalProcess(pid int, force bool, identity string) (bool, error) {
 	sig := syscall.SIGTERM
 	if force {
 		sig = syscall.SIGKILL
 	}
-	if err := syscall.Kill(pid, sig); err != nil {
+	if err := signalProcessInstance(pid, sig, identity); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return false, errors.New("process_not_found")
 		}

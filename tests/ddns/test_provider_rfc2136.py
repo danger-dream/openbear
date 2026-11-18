@@ -47,9 +47,25 @@ class FakeDNS:
         self.seen.append((transport, request))
         response = dns.message.make_response(request)
         if request.opcode() == dns.opcode.UPDATE:
-            self.apply(request)
+            absent_conflict = any(r.deleting == dns.rdataclass.NONE and
+                                  (r.name.to_text(omit_final_dot=True), dns.rdatatype.to_text(r.rdtype)) in self.data
+                                  for r in request.prerequisite)
+            # UPDATE wire parsing may split one value-dependent prerequisite into
+            # several RRs: compare the whole set, independent of wire order.
+            expected = {}
+            for r in request.prerequisite:
+                if r.deleting is None and len(r):
+                    key = (r.name.to_text(omit_final_dot=True), dns.rdatatype.to_text(r.rdtype))
+                    expected.setdefault(key, set()).update(rd.to_text() for rd in r)
+            changed = any(set(self.data.get(key, (0, []))[1]) != values for key, values in expected.items())
             if self.rcode is not None:
                 response.set_rcode(self.rcode)
+            elif absent_conflict:
+                response.set_rcode(dns.rcode.YXRRSET)
+            elif changed:
+                response.set_rcode(dns.rcode.NXRRSET)
+            else:
+                self.apply(request)
         elif transport == 'udp' and self.truncate:
             response.flags |= dns.flags.TC
         else:
@@ -162,9 +178,14 @@ async def test_records_reads_the_rrset():
 
 
 @pytest.mark.parametrize('algorithm', ['hmac-sha256', 'hmac-sha512', 'hmac-sha1'])
-async def test_create_replaces_the_rrset(algorithm):
+async def test_create_requires_absent_rrset(algorithm):
     async with FakeDNS(algorithm) as server:
-        record = await provider(server, algorithm=algorithm).create(ZONE, 'home.example.com', 'A', '203.0.113.5', 60, {})
+        p = provider(server, algorithm=algorithm)
+        with pytest.raises(ProviderError):
+            await p.create(ZONE, 'home.example.com', 'A', '203.0.113.5', 60, {})
+        assert server.data[('home.example.com', 'A')][1] == ['198.51.100.1', '198.51.100.2']
+        del server.data[('home.example.com', 'A')]
+        record = await p.create(ZONE, 'home.example.com', 'A', '203.0.113.5', 60, {})
         assert record == Record('', 'home.example.com', 'A', '203.0.113.5', 60)
         assert server.data[('home.example.com', 'A')] == (60, ['203.0.113.5'])
         update = server.seen[-1][1]
@@ -183,8 +204,31 @@ async def test_update_keeps_ttl_and_other_types():
 
 async def test_delete_removes_the_rrset():
     async with FakeDNS() as server:
-        await provider(server).delete(ZONE, Record('', 'home.example.com', 'A', '198.51.100.1'))
+        await provider(server).delete(ZONE, Record('', 'home.example.com', 'A', '198.51.100.2,198.51.100.1'))
         assert ('home.example.com', 'A') not in server.data
+
+
+@pytest.mark.parametrize('operation', ['update', 'delete'])
+async def test_stale_rrset_rejected_atomically_without_touching_siblings(operation):
+    # No server/socket: exercise real TSIG wire encoding and the same authoritative fake.
+    server = FakeDNS()
+    p = get('rfc2136')({'server': '192.0.2.53', 'key_name': 'ddns-key', 'secret': SECRET}, client=object())
+
+    async def send(message, any_rcode=False):
+        response = server.handle(message.to_wire(), 'memory')
+        return dns.message.from_wire(response, keyring={server.key.name: server.key}, request_mac=message.mac)
+
+    p.send = send
+    stale = Record('', 'home.example.com', 'A', '198.51.100.1', 120)
+    with pytest.raises(ProviderError) as err:
+        if operation == 'update':
+            await p.update(ZONE, stale, '203.0.113.5', None, {})
+        else:
+            await p.delete(ZONE, stale)
+    assert err.value.code == 'record_conflict' and not err.value.permanent
+    assert server.data[('home.example.com', 'A')] == (120, ['198.51.100.1', '198.51.100.2'])
+    prerequisite = server.seen[-1][1].prerequisite
+    assert prerequisite and {rd.to_text() for r in prerequisite for rd in r} == {'198.51.100.1'}
 
 
 async def test_tcp_transport():
@@ -211,7 +255,8 @@ async def test_wrong_secret_is_auth_failed():
 
 
 @pytest.mark.parametrize('rcode,expected', [(dns.rcode.REFUSED, 'forbidden'), (dns.rcode.NOTAUTH, 'zone_not_found'),
-                                            (dns.rcode.SERVFAIL, 'server_error'), (dns.rcode.NXRRSET, 'bad_request')])
+                                            (dns.rcode.SERVFAIL, 'server_error'), (dns.rcode.NXRRSET, 'record_conflict'),
+                                            (dns.rcode.YXRRSET, 'record_conflict')])
 async def test_update_rcodes(rcode, expected):
     async with FakeDNS() as server:
         server.rcode = rcode

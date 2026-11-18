@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS conversation_extensions (
   updated_at_ms     INTEGER NOT NULL DEFAULT 0
 );
 
--- 目录给新会话的扩展默认值；folder_uuid='__temporary' 是不在目录里的会话。
--- 没有行的目录沿父目录向上找，都没有则全部关闭。
+-- 目录给新会话的扩展默认值；folder_uuid='__temporary' 是不在目录里的会话，'__system' 是系统默认。
+-- 没有行的目录沿父目录向上找，再看系统默认，都没有则全部关闭。
 CREATE TABLE IF NOT EXISTS folder_extension_defaults (
   folder_uuid   TEXT PRIMARY KEY,
   owner_chat_id INTEGER NOT NULL,

@@ -195,8 +195,8 @@ test('desktop: the node picker, warnings, preview with takeovers, save, edit', a
   await pr.nth(1).getByRole('checkbox').check();
   await d.getByTestId('dd-save').click();
   const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'save');
-  assert.deepEqual(saved.body.rows, [{name: 'www.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: false, options: {proxied: true}}, {name: 'take.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}},
-    {name: 'same.example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}}], 'a record already holding the value is adopted without a question');
+  assert.deepEqual(saved.body.rows, [{name: 'www.example.com', zone: 'example.com', type: 'A', accountId: 'a_cf', confirmTakeover: false, options: {proxied: true}}, {name: 'take.example.com', zone: 'example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}},
+    {name: 'same.example.com', zone: 'example.com', type: 'A', accountId: 'a_cf', confirmTakeover: true, options: {proxied: true}}], 'a record already holding the value is adopted without a question');
   assert.deepEqual({backup: saved.body.backup, ttl: saved.body.ttl, options: saved.body.options, policy: saved.body.policy},
     {backup: {serverId: 'hk', afterS: 900}, ttl: 300, options: {}, policy: {multi: 'one', allowPrivate: true, onDrift: 'alert'}});
   await d.waitFor({state: 'hidden'});
@@ -238,7 +238,7 @@ test('desktop: two accounts for one zone: the row asks which one, then saves to 
   await d.locator('.dd-pr[data-action="new"]').waitFor();
   await d.getByTestId('dd-save').click();
   const saved = await called(c => c.method === 'POST' && c.path === '/api/ddns/records', 'save');
-  assert.deepEqual(saved.body.rows, [{name: 'new.example.com', type: 'A', accountId: 'a_cf2', confirmTakeover: false, options: {}}]);
+  assert.deepEqual(saved.body.rows, [{name: 'new.example.com', zone: 'example.com', type: 'A', accountId: 'a_cf2', confirmTakeover: false, options: {}}]);
   await close();
 });
 

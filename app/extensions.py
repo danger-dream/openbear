@@ -18,6 +18,8 @@ from typing import Any, Awaitable, Callable
 from app.utils import estimate_tokens
 
 TEMPORARY = "__temporary"
+# The system default: below every folder chain, including the temporary node's.
+SYSTEM = "__system"
 
 
 @dataclass(frozen=True)
@@ -289,7 +291,7 @@ class ExtensionService:
             (conversation_uuid, json.dumps(sorted(with_required(value.get("enabled") or []))), int(bool(value.get("autoAllow"))), _now()))
 
     async def folder_default(self, owner: int, folder_uuid: str, *, inherited: bool = False) -> dict[str, Any]:
-        """The nearest folder setting up the tree (inherited: above this folder); without one every extension starts off."""
+        """The nearest setting up the tree (inherited: above this folder), then the system default; without any every extension starts off."""
         current, seen = folder_uuid or TEMPORARY, set()
         while current and current not in seen:
             seen.add(current)
@@ -298,12 +300,15 @@ class ExtensionService:
             row = None if inherited and len(seen) == 1 else await cur.fetchone()
             if row:
                 return {"enabled": json.loads(row["enabled_json"]), "autoAllow": bool(row["auto_allow"]), "from": current, "explicit": True}
-            if current == TEMPORARY:
+            if current == SYSTEM:
                 break
+            if current == TEMPORARY:
+                current = SYSTEM
+                continue
             cur = await self.db.conn.execute(
                 "SELECT parent_uuid FROM web_conversation_folders WHERE folder_uuid=? AND owner_chat_id=?", (current, owner))
             parent = await cur.fetchone()
-            current = str(parent["parent_uuid"] or "") if parent else ""
+            current = (str(parent["parent_uuid"] or "") or SYSTEM) if parent else SYSTEM
         return {"enabled": [], "autoAllow": False, "from": "", "explicit": False}
 
     async def set_folder_default(self, owner: int, folder_uuid: str, value: dict[str, Any] | None) -> dict[str, Any]:
@@ -329,7 +334,7 @@ class ExtensionService:
         return {"enabled": default["enabled"], "autoAllow": default["autoAllow"]}
 
     async def for_unattended(self, owner: int, folder_uuid: str, declared: list[str] | None) -> dict[str, Any] | None:
-        """A scheduled or event run: what its task declares, else an explicit folder setting, else everything (None)."""
+        """A scheduled or event run: what its task declares, else an explicit folder or system setting, else everything (None)."""
         default = await self.folder_default(owner, folder_uuid)
         if declared is not None:
             return {"enabled": list(declared), "autoAllow": default["autoAllow"] if default["explicit"] else False}

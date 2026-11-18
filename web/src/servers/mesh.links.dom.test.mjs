@@ -136,7 +136,9 @@ test('site relays and relay links: relay mode and its recommendation, punched li
   await label(page, '打洞 · 2.6 ms').click();
   await panel.getByText('自动打洞：两台站点中转都在 NAT 后也能直接相连，打不通时经其他中转绕行').waitFor();
   assert.match(await panel.locator('.mesh-relay-facts').innerText(), /连接方式\s*打洞：两台都是站点中转/);
-  assert.match(await panel.locator('.mesh-relay-metric').innerText(), /线路\s*正常[\s\S]*延迟\s*2\.6 ms[\s\S]*抖动\s*0\.2 ms[\s\S]*丢包\s*0%[\s\S]*代价\s*3/);
+  assert.match(await panel.locator('.mesh-relay-metric').innerText(), /线路\s*正常[\s\S]*延迟\s*2\.6 ms[\s\S]*抖动\s*0\.2 ms[\s\S]*丢包\s*0%[\s\S]*实测代价\s*3[\s\S]*选路用\s*3\.4/);
+  // Routes go by the larger of what the two ends advertised; the measured cost worked out with this link's figures.
+  assert.match(await panel.locator('.mesh-cost-math').innerText(), /^实测代价 = 延迟 2\.6 \+ 抖动 0\.2 × 2 \+ 丢包率 0% × 1000 ≈ 3。选路用两端已通告代价里较大的那个/);
   await page.waitForFunction(() => /持续/.test(document.querySelector('.mesh-direct-live .mesh-stats')?.innerText || ''));
   const live = await panel.locator('.mesh-direct-live .mesh-stats').innerText();
   for (const want of [/打洞\s*直连中/, /经由\s*公网/, /持续\s*42 分钟/, /尝试次数\s*2 次/, /最近错误\s*无/]) assert.match(live, want);
@@ -632,11 +634,18 @@ test('grid settings: extra STUN observers, checked, saved; left out for an older
   assert.deepEqual(body.settings.reachability.stun, ['stun.miwifi.com:3478']);
   await h.close();
 
+  // The tunnel port, with the default ports: an older controller without settings.proxy gets none while it stays 51080.
   const plain = await setup(t);
   const settings = inspector(plain.page);
+  assert.equal(await settings.getByRole('spinbutton', {name: '隧道端口'}).inputValue(), '51080');
   await settings.getByRole('spinbutton', {name: 'MTU'}).fill('1380');
   await settings.getByRole('button', {name: '保存到草稿'}).click();
   body = await plain.saved(d => d.settings.mtu === 1380, 'mtu');
   assert.equal('reachability' in body.settings, false);
+  assert.equal('proxy' in body.settings, false);
+  await settings.getByRole('spinbutton', {name: '隧道端口'}).fill('51081');
+  await settings.getByRole('button', {name: '保存到草稿'}).click();
+  body = await plain.saved(d => d.settings.proxy?.port === 51081, 'the tunnel port');
+  assert.deepEqual(body.settings.proxy, {password: '', port: 51081});
   await plain.close();
 });

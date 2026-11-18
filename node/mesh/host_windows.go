@@ -30,7 +30,7 @@ type windowsHost struct {
 	cur   hostConfig
 	up    bool
 	dirty bool
-	ports [3]int // the firewall rules' udp, tcp, tls
+	ports []string // the firewall rules' ports, as UDP 51820
 	rules bool
 }
 
@@ -92,8 +92,19 @@ func (h *windowsHost) apply(next hostConfig) (err error) {
 		h.cur.Routes = append(slices.Clone(h.cur.Routes), r)
 	}
 	h.cur.Routes = next.Routes
-	ports := [3]int{next.UDP, next.TCP, next.TLS}
-	if !h.rules || ports != h.ports {
+	var ports []string
+	if next.UDP != 0 {
+		ports = append(ports, fmt.Sprintf("UDP %d", next.UDP))
+	}
+	for _, p := range append([]int{next.TCP, next.TLS, next.Fast}, next.ForwardTCP...) {
+		if p != 0 {
+			ports = append(ports, fmt.Sprintf("TCP %d", p))
+		}
+	}
+	for _, p := range next.ForwardUDP {
+		ports = append(ports, fmt.Sprintf("UDP %d", p))
+	}
+	if !h.rules || !slices.Equal(ports, h.ports) {
 		if err := h.firewall(ports); err != nil {
 			return err
 		}
@@ -110,19 +121,13 @@ func powershell(script string) error {
 	return nil
 }
 
-func (h *windowsHost) firewall(ports [3]int) error {
+func (h *windowsHost) firewall(ports []string) error {
 	h.rules = false
 	script := fmt.Sprintf("Remove-NetFirewallRule -Group '%[1]s' -ErrorAction SilentlyContinue; "+
 		"New-NetFirewallRule -Group '%[1]s' -DisplayName '%[1]s interface' -Direction Inbound -InterfaceAlias '%[2]s' -Action Allow | Out-Null", firewallGroup, h.name)
-	for i, p := range ports {
-		if p == 0 {
-			continue
-		}
-		proto := "TCP"
-		if i == 0 {
-			proto = "UDP"
-		}
-		script += fmt.Sprintf("; New-NetFirewallRule -Group '%[1]s' -DisplayName '%[1]s %[2]s %[3]d' -Direction Inbound -Protocol %[2]s -LocalPort %[3]d -Action Allow | Out-Null", firewallGroup, proto, p)
+	for _, p := range ports {
+		proto, port, _ := strings.Cut(p, " ")
+		script += fmt.Sprintf("; New-NetFirewallRule -Group '%[1]s' -DisplayName '%[1]s %[2]s %[3]s' -Direction Inbound -Protocol %[2]s -LocalPort %[3]s -Action Allow | Out-Null", firewallGroup, proto, port)
 	}
 	if err := powershell(script); err != nil {
 		return fmt.Errorf("firewall: %w", err)

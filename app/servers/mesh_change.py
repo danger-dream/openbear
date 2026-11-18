@@ -160,7 +160,7 @@ async def run(mesh, owner, plan):
             if result.get('state') != 'confirmed':
                 raise InstanceError('mesh_change_unconfirmed', 409)
         await parallel(confirm, change['targets'])
-        async with mesh.db.write_transaction(label='mesh-change-commit') as conn:
+        async with mesh._edit(owner), mesh.db.write_transaction(label='mesh-change-commit') as conn:
             await conn.execute('UPDATE mesh_network SET applied_revision=?,applied_ms=? WHERE owner=?', (plan['revision'], int(time.time() * 1000), owner))
             await mesh._save(conn, owner, 'applied', plan['doc'])
             # A draft edited while the rollout was in progress remains the user's next draft.

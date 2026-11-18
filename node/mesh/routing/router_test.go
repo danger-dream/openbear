@@ -139,22 +139,34 @@ func TestLinkMetrics(t *testing.T) {
 	}
 }
 
+// legacyTuning is what the parameters were before the config set them: a
+// route moved for 20 % and more than 10 ms, a link's cost was advertised
+// again once it moved by 20 % and 10 ms. The tests of the dynamics written
+// for them, and the replay of the simulation, keep them. A route moved for
+// more than 10 ms: costs are in tenths, so at least 10.1.
+var legacyTuning = Tuning{SwitchMs: 10.1, SwitchPct: 20, ShorterMs: 3, ShorterPct: 5, AdvertMs: 10, AdvertPct: 20, Hold: 5 * time.Second,
+	JitterWeight: 2, LossWeight: 1000, FlapHold: time.Minute, FlapHoldMax: 8 * time.Minute}
+
 // TestAdvertisedCostThreshold: the cost a link is routed by changes only
-// when the measured cost has differed by more than 20 % and 10 ms for 5 s.
+// when the measured cost has differed by more than AdvertMs (2 ms by
+// default; 10 ms and 20 % with legacyTuning) for Hold.
 func TestAdvertisedCostThreshold(t *testing.T) {
 	for _, c := range []struct {
+		tune                 *Tuning
 		measured, advertised float64
 		want                 bool
 	}{
-		{100, 100, false}, {85, 100, false}, {79, 100, true}, {125.1, 100, true}, {124, 100, false},
-		{2, 10, false}, {21, 10, true}, {19.9, 10, false}, {3, 14, true},
+		{&legacyTuning, 100, 100, false}, {&legacyTuning, 85, 100, false}, {&legacyTuning, 79, 100, true}, {&legacyTuning, 125.1, 100, true},
+		{&legacyTuning, 124, 100, false}, {&legacyTuning, 2, 10, false}, {&legacyTuning, 21, 10, true}, {&legacyTuning, 19.9, 10, false},
+		{&legacyTuning, 3, 14, true},
+		{&DefaultTuning, 25, 31.4, true}, {&DefaultTuning, 30, 31.4, false}, {&DefaultTuning, 102, 100, false}, {&DefaultTuning, 102.1, 100, true},
 	} {
-		if got := differs(c.measured, c.advertised); got != c.want {
-			t.Errorf("differs(%v, %v) = %v", c.measured, c.advertised, got)
+		if got := c.tune.differs(c.measured, c.advertised); got != c.want {
+			t.Errorf("differs(%v, %v) with %+v = %v", c.measured, c.advertised, *c.tune, got)
 		}
 	}
 	now := time.Unix(0, 0)
-	m := newMetric(0)
+	m := newMetric(0, &legacyTuning)
 	for i := 0; i < warmSamples; i++ {
 		m.sample(10*time.Millisecond, false, now)
 	}
@@ -162,13 +174,13 @@ func TestAdvertisedCostThreshold(t *testing.T) {
 		t.Fatalf("warmed up: %+v", m)
 	}
 	m.rtt = 40
-	for d := time.Duration(0); d < switchHold; d += 100 * time.Millisecond {
+	for d := time.Duration(0); d < legacyTuning.Hold; d += 100 * time.Millisecond {
 		if m.settle(now.Add(d)) {
 			t.Fatalf("advertised after %v", d)
 		}
 	}
-	if !m.settle(now.Add(switchHold)) || m.advCost != 40 {
-		t.Fatalf("not advertised after %v: %+v", switchHold, m)
+	if !m.settle(now.Add(legacyTuning.Hold)) || m.advCost != 40 {
+		t.Fatalf("not advertised after %v: %+v", legacyTuning.Hold, m)
 	}
 	// An interruption starts the 5 s again.
 	m.rtt = 100
@@ -237,7 +249,7 @@ func TestBetterPathNeedsFiveSeconds(t *testing.T) {
 			}
 		})
 	}
-	if want := 2*time.Second + switchHold; moved < want || moved > want+20*time.Millisecond || back-moved > 20*time.Millisecond {
+	if want := 2*time.Second + DefaultTuning.Hold; moved < want || moved > want+20*time.Millisecond || back-moved > 20*time.Millisecond {
 		t.Fatalf("A moved after %v, B after %v; want %v", moved, back, want)
 	}
 	if e := n.eventsOf("A", "route.changed"); !slices.Contains(e, "B: B -> C (better)") {
@@ -285,8 +297,12 @@ type solo struct {
 }
 
 func newSolo(t *testing.T, relays, links []string, hops map[string]string) *solo {
+	return newSoloTuned(t, relays, links, hops, &legacyTuning)
+}
+
+func newSoloTuned(t *testing.T, relays, links []string, hops map[string]string, tune *Tuning) *solo {
 	s := &solo{t: t, now: time.Unix(1_800_000_000, 0), seq: map[string]uint64{}}
-	s.r = New(signed(Config{Self: "A", Relays: relays, Links: links, NextHops: hops}), func() time.Time { return s.now }, func(k, d string) { s.ev = append(s.ev, k+" "+d) })
+	s.r = New(signed(Config{Self: "A", Relays: relays, Links: links, NextHops: hops, Tuning: tune}), func() time.Time { return s.now }, func(k, d string) { s.ev = append(s.ev, k+" "+d) })
 	return s
 }
 
@@ -882,7 +898,7 @@ func TestLeafRouting(t *testing.T) {
 		rA.Probe("B", ms(20))
 		rB.Probe("A", ms(20))
 	}
-	now = now.Add(switchHold + time.Second)
+	now = now.Add(DefaultTuning.Hold + time.Second)
 	rA.Tick()
 	rB.Tick()
 	advA = rA.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"})

@@ -13,6 +13,14 @@ const inside = async (dialog, locator, label) => {
   }
 };
 const near = (a, b, label) => assert.ok(Math.abs(a - b) <= 1.5, `${label}: ${a} vs ${b}`);
+// The server picker (ddns/NodePicker.vue) of an exit or the SSH relay: opened by its button, a name picked from its list.
+const picker = (scope, label) => scope.getByRole('button', {name: new RegExp(`^${label}：`)});
+async function pick(page, scope, label, name) {
+  await picker(scope, label).click();
+  const panel = page.locator('.dd-node-panel');
+  await panel.locator('.ss-option').filter({has: page.locator('.ss-name', {hasText: new RegExp(`^${name}$`)})}).click();
+  await panel.waitFor({state: 'detached'});
+}
 async function pickAddress(scope, label, ip) {
   const select = scope.getByLabel(label, {exact: true});
   await select.locator(`option[value="${ip}"]`).waitFor({state: 'attached'});
@@ -26,10 +34,19 @@ test('fronts: add form and editor fit desktop and phone, light and dark', {skip:
     await h.page.getByRole('button', {name: '添加服务器'}).click();
     const dialog = h.page.getByRole('dialog', {name: '添加服务器'});
     await dialog.getByRole('tab', {name: '前置机'}).click();
-    await dialog.getByLabel('出口', {exact: true}).selectOption('srv-papa');
+    // The exit's list open: flags and addresses, inside the screen.
+    await picker(dialog, '出口').click();
+    const list = h.page.locator('.dd-node-panel');
+    await list.waitFor();
+    const listBox = await box(list), screen = h.page.viewportSize();
+    assert.ok(listBox.left >= 0 && listBox.right <= screen.width + 1 && listBox.bottom <= screen.height + 1, `the list leaves the screen: ${JSON.stringify(listBox)}`);
+    await shot(h.page, `front-exit-list-${width}${dark ? '-dark' : ''}`);
+    await picker(dialog, '出口').click();
+    await list.waitFor({state: 'detached'});
+    await pick(h.page, dialog, '出口', 'Papa-HK.T1');
     await pickAddress(dialog, '出口地址', '10.0.10.246');
     await dialog.getByRole('button', {name: '加一个备用出口'}).click();
-    await dialog.getByLabel('备用出口', {exact: true}).selectOption('srv-delta');
+    await pick(h.page, dialog, '备用出口', 'Delta-JP');
     await pickAddress(dialog, '备用出口地址', '10.77.17.46');
     // Five ways to add a server, each tab whole; every exit control inside the form.
     await inside(dialog, dialog.getByRole('tab'), 'a tab');
@@ -38,8 +55,33 @@ test('fronts: add form and editor fit desktop and phone, light and dark', {skip:
     const [primary, backup] = [await box(dialog.getByLabel('出口地址', {exact: true})), await box(dialog.getByLabel('备用出口地址', {exact: true}))];
     near(primary.left, backup.left, 'address columns'); near(primary.width, backup.width, 'address widths');
     assert.ok(primary.width >= 120, `出口地址 is ${primary.width}px wide`);
+    // Each exit picker as tall as the address beside it and on its line.
+    const exitPicker = await box(picker(dialog, '出口'));
+    near(exitPicker.height, primary.height, 'exit picker and address heights'); near(exitPicker.top, primary.top, 'exit picker and address on one line');
+    // Its name whole, not squeezed by the address the field beside it already shows.
+    for (const label of ['出口', '备用出口']) {
+      const name = picker(dialog, label).locator('.ss-name');
+      assert.ok(await name.evaluate(el => el.scrollWidth <= el.clientWidth + 1), `${label} name cut: ${await name.innerText()}`);
+    }
+    // The SSH relay in the same column as the user, and the install choice whole on one line.
+    await pick(h.page, dialog, 'SSH 经由', 'Delta-JP');
+    const [relay, user] = [await box(picker(dialog, 'SSH 经由')), await box(dialog.getByLabel('SSH 用户'))];
+    near(relay.left, user.left, 'relay and user columns'); near(relay.right, user.right, 'relay and user right edges'); near(relay.height, user.height, 'relay and user heights');
+    const choices = await dialog.getByRole('radiogroup', {name: '安装方式'}).locator('label').evaluateAll(els => els.map(el => el.getBoundingClientRect().toJSON()));
+    near(choices[0].top, choices[1].top, 'both install choices on one line');
+    await inside(dialog, dialog.locator('.ob-fields select, .ob-fields input'), 'a field');
     await noOverflow(h.page);
     await shot(h.page, `front-add-${width}${dark ? '-dark' : ''}`);
+    // With an install command: no login asked; the command in the form, nothing outside it.
+    await dialog.getByLabel('安装命令').check();
+    await dialog.getByLabel('服务器名称').fill('广州');
+    await shot(h.page, `front-add-command-form-${width}${dark ? '-dark' : ''}`);
+    await dialog.getByRole('button', {name: '生成安装命令'}).click();
+    await dialog.getByText('30 分钟内有效，只能用一次').waitFor();
+    await inside(dialog, dialog.locator('.as-result > *'), 'the command result');
+    await noOverflow(h.page);
+    await shot(h.page, `front-add-command-${width}${dark ? '-dark' : ''}`);
+    await dialog.getByRole('button', {name: '继续添加'}).click();
     await dialog.getByRole('button', {name: '取消'}).click();
 
     await h.page.locator('.pb-card').filter({hasText: 'Delta-JP'}).click();
@@ -47,10 +89,10 @@ test('fronts: add form and editor fit desktop and phone, light and dark', {skip:
     await h.page.locator('.sv-detail:visible [data-part=billing]').getByRole('button', {name: '编辑'}).click();
     const editor = h.page.getByRole('dialog', {name: '编辑「Delta-JP」'});
     await editor.getByLabel(/这是前置机/).check();
-    await editor.getByLabel('出口', {exact: true}).selectOption('srv-papa');
+    await pick(h.page, editor, '出口', 'Papa-HK.T1');
     await pickAddress(editor, '出口地址', '10.0.10.246');
     await editor.getByRole('button', {name: '加一个备用出口'}).click();
-    await editor.getByLabel('备用出口', {exact: true}).selectOption('srv-bravo');
+    await pick(h.page, editor, '备用出口', 'Bravo-FRA');
     await inside(editor, editor.locator('.sv-front-exit > *'), 'an exit control');
     near((await box(editor.getByLabel('出口地址', {exact: true}))).left, (await box(editor.getByLabel('备用出口地址', {exact: true}))).left, 'editor address columns');
     // The tag box is as tall as the name field and spans the same width as the group.

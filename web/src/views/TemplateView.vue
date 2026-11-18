@@ -9,6 +9,7 @@ import {Api, apiError} from "../api";
 import {mobileSelectOptions} from "../mobileSelect.js";
 import PromptTemplateEditor from "../components/PromptTemplateEditor.vue";
 import MobileAdminSummary from "../components/MobileAdminSummary.vue";
+import LocalPersonaSync from "../components/LocalPersonaSync.vue";
 
 const templates = ref([]);
 const activeId = ref(null);
@@ -22,6 +23,7 @@ const showHelp = ref(false);
 const mobilePane = ref("edit");
 const showParams = ref(false);
 const showBuiltinImport = ref(false);
+const showPersonaSync = ref(false);
 const builtinImportKinds = ref(["main", "agent"]);
 const builtinImportLoading = ref(false);
 
@@ -119,6 +121,13 @@ markdown.renderer.rules.link_open = (tokens, idx, options, _env, self) => {
 const renderedPreview = computed(() => markdown.render(previewResult.value || ""));
 const activeTemplateName = computed(() => templates.value.find((t) => t.is_active)?.name || "未设置");
 const agentActiveTemplateName = computed(() => templates.value.find((t) => t.is_agent_active)?.name || "未设置");
+const templateRoles = (t) => [t?.is_active && "主提示词", t?.is_agent_active && "Agent 提示词", t?.is_persona && !t?.is_agent_active && "人设"].filter(Boolean);
+const rolesText = computed(() => templateRoles(editing.value).join(" · ") || "未使用");
+const personaHint = computed(() => {
+	if (editing.value?.is_agent_active) return "Agent 提示词不能作为人设";
+	if (editing.value?.is_active) return "它是主提示词，人设列表里显示为「系统默认」";
+	return "新建会话、目录和会话属性里可以选这份";
+});
 
 async function load(keepId = activeId.value, {preserveDirty = false, selectEditor = true} = {}) {
 	const request = ++loadRequest;
@@ -212,6 +221,7 @@ async function saveTemplate(patch = {}, message = "已保存") {
 function save() { return saveTemplate(); }
 function activate() { return saveTemplate({is_active: 1}, "已设为激活模板"); }
 function activateAgent() { return saveTemplate({is_agent_active: 1}, "已设为 Agent 提示词"); }
+function setPersona(on) { return saveTemplate({is_persona: on ? 1 : 0}, on ? "已设为人设，新建会话时可以选择" : "已取消人设"); }
 
 async function newTpl() {
 	if (!alive || saving.value || changingTemplate.value) return;
@@ -232,6 +242,11 @@ async function newTpl() {
 			else ElMessage.error(`创建失败：${apiError(error)}`);
 		}
 	} finally { changingTemplate.value = false; }
+}
+
+async function personasSynced() {
+	try { await load(activeId.value, {preserveDirty: true}); }
+	catch (error) { if (alive) ElMessage.warning(`人设已同步，但列表刷新失败：${apiError(error)}`); }
 }
 
 function openBuiltinImport() {
@@ -280,7 +295,7 @@ async function importBuiltinTemplates() {
 async function removeCurrent() {
 	if (!editing.value || saving.value || changingTemplate.value) return;
 	const name = editing.value.name;
-	await ElMessageBox.confirm(`确定删除模板「${name}」？不可恢复。`, "删除确认", {
+	await ElMessageBox.confirm(`确定删除模板「${name}」？不可恢复。已有会话继续保留当前系统上下文；下次压缩或必须重新组装时，缺失的人设会使用系统默认，并在会话人设入口显示关注角标。`, "删除确认", {
 		type: "warning", confirmButtonText: "删除", cancelButtonText: "取消",
 	});
 	const r = await Api.deleteTemplate(editing.value.id);
@@ -354,12 +369,10 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 				<span class="text-xs text-macsub truncate">选择模板 · 编辑 · 自动补全 · 实时预览</span>
 			</div>
 			<div class="admin-desktop-only template-actions flex gap-2 shrink-0">
-				<el-button :icon="'QuestionFilled'" @click="showHelp = true" round>语法说明</el-button>
-				<el-button :icon="'Download'" @click="openBuiltinImport" round>导入随版本模板</el-button>
-				<el-button :icon="'Plus'" @click="newTpl" round :disabled="saving || changingTemplate">新建</el-button>
-				<el-button @click="save" round :disabled="saving || changingTemplate || !dirty()">保存</el-button>
-				<el-button type="primary" @click="activate" round :disabled="saving || changingTemplate || !editing || editing.is_active">设为激活</el-button>
-				<el-button type="success" @click="activateAgent" round :disabled="saving || changingTemplate || !editing || editing.is_agent_active">设为Agent提示词</el-button>
+				<el-button :icon="'QuestionFilled'" @click="showHelp = true" round title="语法说明" aria-label="语法说明">语法说明</el-button>
+				<el-button :icon="'User'" @click="showPersonaSync = true" round title="同步本地人设" aria-label="同步本地人设">同步本地人设</el-button>
+				<el-button :icon="'Download'" @click="openBuiltinImport" round title="导入随版本模板" aria-label="导入随版本模板">导入随版本模板</el-button>
+				<el-button :icon="'Plus'" @click="newTpl" round :disabled="saving || changingTemplate" title="新建模板" aria-label="新建模板">新建</el-button>
 			</div>
 			<div class="admin-mobile-only template-mobile-actions">
 				<button type="button" :disabled="saving || changingTemplate" @click="newTpl">新建</button>
@@ -369,6 +382,8 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					<div class="template-more-menu" @click="$event.currentTarget.closest('details').open = false">
 						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_active" @click="activate">设为主提示词</button>
 						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_agent_active" @click="activateAgent">设为 Agent 提示词</button>
+						<button type="button" :disabled="saving || changingTemplate || !editing || Boolean(editing.is_agent_active)" @click="setPersona(!editing.is_persona)">{{ editing?.is_persona ? '取消人设' : '设为人设' }}</button>
+						<button type="button" @click="showPersonaSync = true">同步本地人设</button>
 						<button type="button" @click="openBuiltinImport">导入随版本模板</button>
 						<button type="button" @click="showHelp = true">语法说明</button>
 						<button type="button" class="is-danger" :disabled="saving || changingTemplate || !editing" @click="removeCurrent">删除当前模板</button>
@@ -377,37 +392,57 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 		</header>
 		
-		<div v-if="editing" class="template-meta h-14 shrink-0 px-4 border-b border-macborder bg-ob-surface/55 flex items-center gap-3">
-			<div class="flex items-center gap-2 min-w-0">
-				<span class="text-xs text-macsub shrink-0">模板</span>
-				<el-select v-model="activeId" :disabled="changingTemplate" @change="selectById" :popper-options="mobileSelectOptions()" filterable class="!w-72" aria-label="选择模板" placeholder="选择模板">
-					<el-option v-for="t in templates" :key="t.id"
-					           :label="t.name + (t.is_active ? ' · 激活' : '') + (t.is_agent_active ? ' · Agent提示词' : '')"
-					           :value="t.id"/>
+		<div v-if="editing" class="template-meta template-bar">
+			<div class="template-identity">
+				<el-select v-model="activeId" :disabled="changingTemplate" @change="selectById" :popper-options="mobileSelectOptions()" filterable
+				           class="template-switch" popper-class="template-switch-popper" aria-label="选择模板" placeholder="搜索模板">
+					<template #label>切换模板</template>
+					<el-option v-for="t in templates" :key="t.id" :label="t.name" :value="t.id">
+						<span class="template-option"><span class="template-option-name">{{ t.name }}</span><span v-if="templateRoles(t).length" class="template-option-roles">{{ templateRoles(t).join(' · ') }}</span></span>
+					</el-option>
 				</el-select>
-				<el-input v-model="editing.name" aria-label="模板名称" placeholder="模板名" class="!w-72"/>
+				<el-input v-model="editing.name" aria-label="模板名称" placeholder="模板名" class="template-name"><template #prefix>名称</template></el-input>
 			</div>
-			
-			<div class="template-status flex items-center gap-2 text-xs shrink-0">
-				<span v-if="editing.is_active" class="text-ob-success">● 当前激活</span>
-				<span v-else class="text-macsub">激活: {{ activeTemplateName }}</span>
-				<span v-if="editing.is_agent_active" class="text-ob-success">● Agent提示词</span>
-				<span v-else class="text-macsub">Agent: {{ agentActiveTemplateName }}</span>
-				<span v-if="dirty()" class="text-ob-orange">● 未保存</span>
-			</div>
-			
-			<div class="template-counters ml-auto flex items-center gap-2 shrink-0">
-				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-ob-soft">模板 {{
-						formatNum(templateChars)
-					}} 字 / {{ formatNum(templateTokens) }} tk</span>
-				<span class="text-[11px] text-macsub px-2 py-1 rounded-full bg-ob-soft">输出 {{
-						formatNum(outputChars)
-					}} 字 / {{ formatNum(outputTokens) }} tk</span>
-				<el-button size="small" text type="danger" :icon="'Delete'" @click="removeCurrent">删除</el-button>
+			<el-popover trigger="click" placement="bottom-start" :width="340" :show-arrow="false" popper-class="settings-ui template-roles-popper">
+				<template #reference>
+					<button type="button" class="template-roles-trigger" :aria-label="`用途：${rolesText}`">
+						<span class="template-roles-key">用途</span><span class="template-roles-value" :class="{'is-empty': !templateRoles(editing).length}">{{ rolesText }}</span>
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+					</button>
+				</template>
+				<div class="template-roles" role="group" aria-label="模板用途">
+					<div class="template-roles-title">这份模板的用途</div>
+					<div class="template-role">
+						<span class="template-role-dot" :class="{'is-on': editing.is_active}" aria-hidden="true"></span>
+						<div class="template-role-text"><span>主提示词</span><small>{{ editing.is_active ? '新会话默认使用这份' : `当前是「${activeTemplateName}」` }}</small></div>
+						<span v-if="editing.is_active" class="template-role-state">使用中</span>
+						<el-button v-else size="small" :disabled="saving || changingTemplate" aria-label="设为主提示词" @click="activate">设为</el-button>
+					</div>
+					<div class="template-role">
+						<span class="template-role-dot" :class="{'is-on': editing.is_agent_active}" aria-hidden="true"></span>
+						<div class="template-role-text"><span>Agent 提示词</span><small>{{ editing.is_agent_active ? 'Agent 使用这份' : `当前是「${agentActiveTemplateName}」` }}</small></div>
+						<span v-if="editing.is_agent_active" class="template-role-state">使用中</span>
+						<el-button v-else size="small" :disabled="saving || changingTemplate" aria-label="设为 Agent 提示词" @click="activateAgent">设为</el-button>
+					</div>
+					<div class="template-role">
+						<span class="template-role-dot" :class="{'is-on': editing.is_persona && !editing.is_agent_active}" aria-hidden="true"></span>
+						<div class="template-role-text"><span>人设</span><small>{{ personaHint }}</small></div>
+						<el-switch :model-value="Boolean(editing.is_persona) && !editing.is_agent_active" size="small" aria-label="作为人设"
+						           :disabled="saving || changingTemplate || Boolean(editing.is_agent_active)" @update:model-value="setPersona"/>
+					</div>
+				</div>
+			</el-popover>
+			<div class="template-bar-end">
+				<span class="template-size" title="当前模板原文的字数和 tokens">{{ formatNum(templateChars) }} 字 · {{ formatNum(templateTokens) }} tk</span>
+				<span v-if="dirty()" class="template-dirty">未保存</span>
+				<el-button type="primary" @click="save" :disabled="saving || changingTemplate || !dirty()">保存</el-button>
+				<el-tooltip content="删除模板" placement="bottom" :show-after="260">
+					<el-button type="danger" :icon="'Delete'" circle aria-label="删除模板" :disabled="saving || changingTemplate" @click="removeCurrent"/>
+				</el-tooltip>
 			</div>
 		</div>
 		
-		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-ob-orange">· 未保存</span></MobileAdminSummary>
+		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '人设', value: editing.is_agent_active ? '不可用' : editing.is_persona ? '是' : '否' }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-ob-orange">· 未保存</span></MobileAdminSummary>
 		<div v-if="editing" class="admin-mobile-only template-pane-switch" role="group" aria-label="模板工作区">
 			<button type="button" :aria-pressed="mobilePane === 'edit'" aria-controls="template-editor-pane" @click="mobilePane = 'edit'">编辑模板</button>
 			<button type="button" :aria-pressed="mobilePane === 'preview'" aria-controls="template-preview-pane" @click="mobilePane = 'preview'">实时预览</button>
@@ -420,24 +455,21 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					</div>
 				</section>
 				
-				<aside id="template-preview-pane" class="template-preview-pane flex-[0.92] min-w-[420px] max-w-[820px] flex flex-col bg-ob-bg">
+				<aside id="template-preview-pane" class="template-preview-pane flex-[0.92] min-w-[340px] max-w-[820px] flex flex-col bg-ob-bg">
 					<div
-						class="template-preview-toolbar h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between bg-ob-surface/80 backdrop-blur">
-						<div class="flex items-center gap-2">
-							<div class="w-2 h-2 rounded-full"
+						class="template-preview-toolbar h-12 shrink-0 px-4 border-b border-macborder flex items-center justify-between gap-3 bg-ob-surface/80 backdrop-blur">
+						<div class="template-preview-title flex items-center gap-2 min-w-0">
+							<div class="w-2 h-2 rounded-full shrink-0"
 							     :class="previewError ? 'bg-ob-danger' : previewResult ? 'bg-ob-success' : 'bg-ob-soft'"></div>
-							<div>
-								<div class="text-sm font-semibold">实时预览</div>
-								<div class="text-[11px] text-macsub">未保存内容也参与渲染</div>
-							</div>
+							<div class="text-sm font-semibold whitespace-nowrap">实时预览</div>
 						</div>
-						<div class="flex items-center gap-2">
-							<el-radio-group v-model="previewMode" size="small">
+						<div class="template-preview-controls flex items-center gap-2 shrink-0 ml-auto">
+							<el-radio-group v-model="previewMode" size="small" class="template-preview-mode">
 								<el-radio-button label="raw">原文</el-radio-button>
 								<el-radio-button label="html">渲染</el-radio-button>
 							</el-radio-group>
-							<el-switch v-model="autoPreview" size="small" active-text="自动"/>
-							<el-button size="small" :icon="'Setting'" @click="showParams = true" round>参数</el-button>
+							<el-switch v-model="autoPreview" size="small" active-text="自动" class="template-preview-auto"/>
+							<el-button size="small" :icon="'Setting'" @click="showParams = true" round class="template-preview-params" title="预览参数" aria-label="预览参数">参数</el-button>
 							<el-button size="small" type="primary" :icon="'VideoPlay'" @click="runPreview()"
 							           :loading="previewLoading" round>渲染
 							</el-button>
@@ -464,8 +496,8 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 						{{ previewError }}
 					</div>
 					
-					<div class="px-4 py-2 shrink-0 flex items-center justify-between text-[11px] text-macsub">
-						<span>{{ previewAt ? `最后渲染 ${previewAt}` : '等待首次渲染' }}</span>
+					<div class="px-4 py-2 shrink-0 flex flex-wrap items-center justify-between gap-x-3 text-[11px] text-macsub">
+						<span>{{ previewAt ? `最后渲染 ${previewAt}` : '等待首次渲染' }} · 含未保存的修改</span>
 						<span>{{ formatNum(outputChars) }} chars / {{ formatNum(outputTokens) }} tokens</span>
 					</div>
 					
@@ -515,6 +547,8 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 				>导入所选模板</el-button>
 			</template>
 		</el-dialog>
+
+		<LocalPersonaSync v-model="showPersonaSync" @synced="personasSynced"/>
 
 		<el-dialog append-to-body class="settings-ui admin-dialog template-dialog" v-model="showParams" title="预览样例运行时参数" width="760px">
 			<div class="text-xs text-macsub mb-2">默认来自后端当前运行时 params；改完会自动刷新预览。</div>
@@ -572,6 +606,59 @@ memory.docNames         文档名称索引</pre>
 </template>
 
 <style>
+.template-page { container: template-page / inline-size; }
+.template-bar { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px 10px; min-height: 56px; padding: 10px 16px; border-bottom: 1px solid var(--ob-border); }
+.template-identity { display: flex; flex: 1 1 340px; align-items: center; gap: 8px; min-width: 0; max-width: 520px; }
+.template-switch { flex: none; width: 116px; }
+.template-name { flex: 1 1 auto; min-width: 0; }
+.template-name .el-input__prefix-inner { padding-right: 8px; margin-right: 8px; border-right: 1px solid var(--ob-border); font-size: 12px; line-height: 14px; color: var(--ob-text-muted); }
+.template-switch-popper .el-select-dropdown { min-width: 300px; }
+.template-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-width: 0; }
+.template-option-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.template-option-roles { flex: none; font-size: 11.5px; color: var(--ob-text-muted); }
+.template-roles-trigger { display: inline-flex; flex: none; align-items: center; gap: 6px; height: 32px; padding: 0 8px 0 10px; border: 1px solid var(--el-border-color); border-radius: 6px; background: var(--ob-surface); font-size: 12px; color: var(--ob-text); cursor: pointer; }
+.template-roles-trigger:hover { border-color: var(--el-border-color-hover); }
+.template-roles-key { color: var(--ob-text-muted); }
+.template-roles-value { font-weight: 500; white-space: nowrap; }
+.template-roles-value.is-empty { font-weight: 400; color: var(--ob-text-muted); }
+.template-roles-trigger svg { width: 14px; height: 14px; fill: none; stroke: var(--ob-text-muted); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.template-bar-end { display: flex; flex: none; align-items: center; gap: 8px; margin-left: auto; }
+.template-size { padding: 0 8px; border-radius: 5px; background: var(--ob-hover); font-size: 11.5px; line-height: 24px; color: var(--ob-text-subtle); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.template-dirty { font-size: 12px; color: var(--ob-orange); white-space: nowrap; }
+.template-dirty::before { content: "●"; margin-right: 4px; font-size: 9px; vertical-align: 1px; }
+.template-roles-popper.el-popover.el-popper { padding: 6px; }
+.template-roles-title { padding: 6px 8px 4px; font-size: 12px; font-weight: 600; color: var(--ob-text-strong); }
+.template-role { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 6px 8px; }
+.template-role + .template-role { border-top: 1px solid var(--ob-border-soft); }
+.template-role-dot { flex: none; width: 8px; height: 8px; border-radius: 999px; background: var(--ob-border-strong); }
+.template-role-dot.is-on { background: var(--ob-success); }
+.template-role-text { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+.template-role-text > span { font-size: 13px; color: var(--ob-text); }
+.template-role-text > small { overflow: hidden; font-size: 11.5px; line-height: 1.45; color: var(--ob-text-muted); text-overflow: ellipsis; white-space: nowrap; }
+.template-role-state { flex: none; font-size: 12px; color: var(--ob-success); }
+.template-roles-popper .template-role .el-button:not(.is-link) { height: 26px; min-height: 26px; padding: 0 12px; border-color: var(--el-border-color); background: var(--ob-surface); color: var(--ob-text); }
+.template-preview-pane { container: template-preview / inline-size; }
+.template-preview-mode, .template-preview-auto { flex: none; white-space: nowrap; }
+@container template-page (max-width: 620px) {
+	.template-actions .el-button > span { display: none; }
+	.template-actions .el-button { width: 30px; padding: 0; }
+}
+@container template-preview (max-width: 400px) {
+	.template-preview-title { display: none; }
+	.template-preview-params > span { display: none; }
+	.template-preview-params.el-button { width: 26px; padding: 0; }
+}
+@media (min-width: 761px) {
+	@container template-page (max-width: 760px) {
+		.template-page .template-pane-switch { display: flex; flex: none; margin: 10px 16px 0; padding: 2px; gap: 3px; border-radius: 7px; background: var(--ob-hover); }
+		.template-page .template-pane-switch button { flex: 1; min-height: 28px; border-radius: 5px; font-size: 12px; color: var(--ob-text-subtle); }
+		.template-page .template-pane-switch button[aria-pressed="true"] { background: var(--ob-surface); color: var(--ob-text); box-shadow: var(--ob-shadow-panel); }
+		.template-page .template-editor-pane { flex: 1 1 0%; border-right: 0; }
+		.template-page .template-preview-pane { flex: 1 1 0%; min-width: 0; max-width: none; }
+		.template-page .mobile-pane-edit .template-preview-pane, .template-page .mobile-pane-preview .template-editor-pane { display: none; }
+	}
+}
+
 .builtin-template-option.el-checkbox.is-bordered {
 	width: 100%;
 	height: auto;

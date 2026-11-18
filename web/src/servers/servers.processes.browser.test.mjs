@@ -53,7 +53,7 @@ test('processes behind the live cards, ending one, and the machine in detail', {
     await pop.locator('.pt-note', {hasText: '已强制结束 clickhouse-server（PID 4242）'}).waitFor();
     await h.page.waitForFunction(() => ![...document.querySelectorAll('.sv-top-popper .pt-name')].some(n => n.textContent === 'clickhouse-server'));
     const kills = h.calls.filter(c => c.path.endsWith('/processes/kill')).map(c => c.body);
-    assert.deepEqual(kills, [{pid: 4242, name: 'clickhouse-server', force: false}, {pid: 4242, name: 'clickhouse-server', force: true}]);
+    assert.deepEqual(kills, [{pid: 4242, name: 'clickhouse-server', identity: 'instance-4242', force: false}, {pid: 4242, name: 'clickhouse-server', identity: 'instance-4242', force: true}]);
 
     // Clicking elsewhere closes it, and it stops asking the node.
     await detail.locator('.ix-card-head h3', {hasText: '走势'}).click();

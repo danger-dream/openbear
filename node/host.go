@@ -16,6 +16,7 @@ import (
 // whole machine, so the rows add up to the CPU gauge.
 type HostProcess struct {
 	PID       int     `json:"pid"`
+	Identity  string  `json:"identity,omitempty"`
 	Name      string  `json:"name"`
 	User      string  `json:"user,omitempty"`
 	Command   string  `json:"command,omitempty"`
@@ -140,31 +141,43 @@ func (a *Agent) hostCall(ctx context.Context, m envelope) (any, error) {
 		return hostTop(ctx, p.Sort, min(p.Limit, 50), exec)
 	case "host.details":
 		return hostDetails(ctx, a.Collector.Info())
-	case "host.kill":
+	case "host.kill", "host.killIdentity":
 		if !exec {
 			return nil, errors.New("capability_disabled")
 		}
 		var p struct {
-			PID   int  `json:"pid"`
-			Force bool `json:"force"`
+			PID      int    `json:"pid"`
+			Force    bool   `json:"force"`
+			Identity string `json:"identity"`
 		}
 		if json.Unmarshal(m.Params, &p) != nil || protectedPID(p.PID) || p.PID == os.Getpid() {
 			return nil, errors.New("invalid_pid")
 		}
-		asked, err := signalProcess(p.PID, p.Force)
+		if p.Identity == "" && m.Method == "host.kill" {
+			// N-1 controllers selected only a PID. Preserve that legacy call,
+			// without claiming it identifies the instance shown in their UI.
+			p.Identity = currentProcessIdentity(p.PID)
+			if p.Identity == "" && !processAlive(p.PID) {
+				return nil, errors.New("process_not_found")
+			}
+		}
+		if p.Identity == "" {
+			return nil, errors.New("process_identity_required")
+		}
+		asked, err := signalProcess(p.PID, p.Force, p.Identity)
 		if err != nil {
 			return nil, err
 		}
 		// A process that can only be ended by force says so at once instead of after the wait.
-		return map[string]any{"pid": p.PID, "exited": asked && waitExited(ctx, p.PID, killWait)}, nil
+		return map[string]any{"pid": p.PID, "identity": p.Identity, "exited": asked && waitExited(ctx, p.PID, p.Identity, killWait)}, nil
 	}
 	return nil, errors.New("unsupported_method")
 }
 
-func waitExited(ctx context.Context, pid int, limit time.Duration) bool {
+func waitExited(ctx context.Context, pid int, identity string, limit time.Duration) bool {
 	deadline := time.Now().Add(limit)
 	for {
-		if !processAlive(pid) {
+		if processInstanceExited(pid, identity) {
 			return true
 		}
 		if time.Now().After(deadline) {
@@ -172,7 +185,7 @@ func waitExited(ctx context.Context, pid int, limit time.Duration) bool {
 		}
 		select {
 		case <-ctx.Done():
-			return !processAlive(pid)
+			return processInstanceExited(pid, identity)
 		case <-time.After(200 * time.Millisecond):
 		}
 	}

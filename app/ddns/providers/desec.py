@@ -66,6 +66,9 @@ class Desec(Provider):
             self._min_ttl[zone] = int(self.json(domain).get('minimum_ttl') or 3600)
         return max(ttl, self._min_ttl[zone])
 
+    async def effective_ttl(self, zone, ttl):
+        return await self._ttl(zone, ttl)
+
     async def records(self, zone, name, rtype):
         rrset = await self._rrset(zone, name, rtype)
         return [Record('', name, rtype, v, rrset.get('ttl')) for v in rrset.get('records') or []] if rrset else []

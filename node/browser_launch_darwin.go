@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,54 @@ func browserCandidates() []string {
 
 func browserCanRun(string) bool { return true }
 
+func init() { findLegacyBrowser = findDarwinBrowser }
+
+func findDarwinBrowser(ctx context.Context, _ string) (*launched, error) {
+	uid := consoleUser()
+	if uid <= 0 || os.Geteuid() != 0 {
+		return nil, nil
+	}
+	account, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return nil, err
+	}
+	profile := filepath.Join(account.HomeDir, "Library", "Application Support", "OpenBear", "Browser")
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+	address, pid, err := legacyBrowserEndpoint(profile, hostname,
+		func(pid int) error { return syscall.Kill(pid, 0) },
+		func(endpoint string) (string, error) { return devtoolsAddress(ctx, endpoint) })
+	if err != nil || address == "" {
+		return nil, err
+	}
+	l := reusedBrowser(address, profile, filepath.Join(profile, "OpenBear Downloads"))
+	// Read the surviving process, not the newly selected binary. Older nodes did
+	// not persist executable identity; inability to verify is explicitly unknown.
+	identified := false
+	if pid > 0 {
+		probe, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		owner, _ := exec.CommandContext(probe, "/bin/ps", "-ww", "-p", strconv.Itoa(pid), "-o", "uid=").Output()
+		args, _ := exec.CommandContext(probe, "/bin/ps", "-ww", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+		exe, _ := exec.CommandContext(probe, "/bin/ps", "-ww", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+		command := strings.TrimSpace(string(args))
+		profileArg := "--user-data-dir=" + profile
+		if strings.TrimSpace(string(owner)) == strconv.Itoa(uid) && (strings.Contains(command, profileArg+" ") || strings.HasSuffix(command, profileArg)) {
+			identified = true
+			path := strings.TrimSpace(string(exe))
+			if filepath.IsAbs(path) {
+				l.executable = path
+			}
+		}
+	}
+	if !identified {
+		return nil, errors.New("browser_legacy_identity_unverified")
+	}
+	return l, nil
+}
+
 // launchBrowser opens a window on the logged-in user's desktop, running as
 // that user with a profile in their home; with nobody logged in it starts
 // headless. A window left by an earlier node process is reused.
@@ -54,8 +103,10 @@ func launchBrowser(ctx context.Context, exe, dir string) (*launched, error) {
 	if err = makeUserDirs(account.HomeDir, parts, 2, uid, gid); err != nil {
 		return nil, err
 	}
-	if address := readDevToolsPort(profile); address != "" && devToolsAlive(ctx, address) {
-		return reusedBrowser(address, profile, downloads), nil
+	if legacy, err := findDarwinBrowser(ctx, dir); err != nil {
+		return nil, err
+	} else if legacy != nil {
+		return legacy, nil
 	}
 	clearDevToolsPort(profile)
 	args := append([]string{"asuser", strconv.Itoa(uid), "/usr/bin/sudo", "-u", "#" + strconv.Itoa(uid), "-H", "--", exe},

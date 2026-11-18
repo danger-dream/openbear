@@ -72,6 +72,9 @@ async function copy(text) {
 
 const report = computed(() => data.value?.report || null);
 const pending = computed(() => data.value?.pending || null);
+const structuredFailure = computed(() => data.value?.error === 'bench_json_invalid');
+const mailKnown = computed(() => report.value?.mail?.answered != null);
+const mailIncomplete = computed(() => !mailKnown.value || Boolean(report.value?.mail?.failed || report.value?.mail?.unknown));
 const net = computed(() => intel.value?.network || null);
 // The address the report is for when that is not the server's IPv4 now: an IPv6 report, or one from before the address changed
 // (moved; IP.Check.Place masks it, 203.0.*.*).
@@ -149,6 +152,7 @@ const RING = 2 * Math.PI * 15;
     <p v-else-if="!data" class="instance-muted dt-wait" role="status">正在读取…</p>
     <template v-else>
       <p v-if="!report" class="dt-empty">{{ pending ? '正在运行 IP.Check.Place，大约 1～3 分钟。'
+        : structuredFailure ? '本次结构化报告缺失或无效，未沿用旧质量结果。可到评测页查看原始报告或重新检测。'
         : auto ? (online ? '还没有检测过，已在自动检测的队列里：轮到时会在这台服务器上运行 IP.Check.Place，同时最多 2 台、每台 1～3 分钟。想马上看可以点「检测」。'
           : '还没有检测过，这台上线后会自动检测。')
         : '还没有检测过。检测会在服务器上运行 IP.Check.Place，看 IP 类型、各家数据库的风险评分和平台解锁情况。' }}</p>
@@ -241,8 +245,8 @@ const RING = 2 * Math.PI * 15;
                 <small v-if="intel.httpbl.listed" class="ipq-sub">{{ intel.httpbl.days }} 天前活动{{ intel.httpbl.kinds.length ? ` · ${intel.httpbl.kinds.map(k => HTTPBL_KINDS[k]).join('、')}` : '' }}</small></dd>
               <dd v-else class="instance-muted">{{ missing(intel?.httpbl) || '未配置（服务器设置 → 检测）' }}</dd></div>
             <div><dt>邮件黑名单</dt><dd v-if="!report.mail.checked"><b class="ipq-tag" data-tone="off">没有数据</b></dd>
-              <dd v-else><b class="ipq-tag" :data-tone="report.mail.listed ? 'bad' : 'ok'">{{ report.mail.listed ? `上榜 ${report.mail.listed} 个` : '未上榜' }}</b>
-              <small class="ipq-sub">共查 {{ report.mail.checked }} 个{{ report.mail.marked ? ` · ${report.mail.marked} 个标记` : '' }}</small></dd></div>
+              <dd v-else><b class="ipq-tag" :data-tone="report.mail.listed ? 'bad' : mailIncomplete ? 'off' : 'ok'">{{ report.mail.listed ? `上榜 ${report.mail.listed} 个` : mailIncomplete ? '覆盖不完整' : '未上榜' }}</b>
+              <small class="ipq-sub">{{ mailKnown ? `有效查询 ${report.mail.answered}/${report.mail.checked} · 失败 ${report.mail.failed} · 未知 ${report.mail.unknown}` : `共查 ${report.mail.checked} 个 · 旧报告未记录失败覆盖率` }}{{ report.mail.marked ? ` · ${report.mail.marked} 个标记` : '' }}</small></dd></div>
           </dl>
         </section>
 

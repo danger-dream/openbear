@@ -5,6 +5,7 @@ import {
   Check,
   CornerUpRight,
   ExternalLink,
+  FilePlus2,
   Globe,
   Pencil,
   Pin,
@@ -285,6 +286,24 @@ async function handleCopyToGlobal(note) {
   } catch (err) {
     ElMessage.error(apiError(err));
   }
+}
+
+function handleCaptureToKbNote(note) {
+  if (!note) return;
+  if (phone.value && store) store.mobileOpen.value = false;
+  window.dispatchEvent(
+    new CustomEvent('openbear:capture-to-kb-note', {
+      detail: {
+        quote: note.quote || '',
+        content: note.content || '',
+        conversationUuid: note.conversationUuid || store?.usableConversationUuid.value || '',
+        conversationTitle: note.conversationTitle || '',
+        opId: note.opId || '',
+        turnUuid: note.turnUuid || '',
+        turnNumber: note.turnNumber || 0,
+      },
+    }),
+  );
 }
 
 async function handleDeleteNote(note) {
@@ -751,6 +770,15 @@ onBeforeUnmount(() => {
                       <TextQuote :size="13" :stroke-width="1.75" aria-hidden="true" />
                     </button>
                     <button
+                      type="button"
+                      class="notes-act-btn"
+                      title="存入全局笔记"
+                      aria-label="存入全局笔记"
+                      @click="handleCaptureToKbNote(note)"
+                    >
+                      <FilePlus2 :size="12.5" :stroke-width="1.75" aria-hidden="true" />
+                    </button>
+                    <button
                       v-if="note.scope === 'session'"
                       type="button"
                       class="notes-act-btn"
@@ -976,6 +1004,9 @@ onBeforeUnmount(() => {
               <div class="notes-card-acts is-always">
                 <button type="button" class="notes-act-btn" aria-label="引用到输入框" @click="handleInsertNote(note)">
                   <TextQuote :size="15" :stroke-width="1.75" aria-hidden="true" />
+                </button>
+                <button type="button" class="notes-act-btn" aria-label="存入全局笔记" @click="handleCaptureToKbNote(note)">
+                  <FilePlus2 :size="14.5" :stroke-width="1.75" aria-hidden="true" />
                 </button>
                 <button
                   v-if="note.scope === 'session'"

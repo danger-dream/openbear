@@ -16,22 +16,23 @@ async def test_an_older_node_is_asked_to_update(env):
     # The fake node, like a build from before host.*, refuses the methods.
     for method, path in [('GET', '/processes?sort=cpu'), ('GET', '/details')]:
         assert (await api(e, method, f'/api/servers/{sid}{path}', status=409))['error'] == 'node_update_required'
-    e.servers.hub.sessions[sid].features = frozenset(f for f in e.servers.hub.sessions[sid].features if f != 'host')
+    e.servers.hub.sessions[sid].features = frozenset(f for f in e.servers.hub.sessions[sid].features if f not in {'host', 'host.processIdentity'})
     assert (await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 42}, status=409))['error'] == 'node_update_required'
 
 
 async def test_processes_details_and_ending_one(env, monkeypatch):
     e = env
     sid = await _server(e)
+    e.servers.hub.sessions[sid].features |= frozenset({'host', 'host.processIdentity'})
     calls = []
     replies = {
-        'host.top': {'sort': 'mem', 'sorts': ['cpu', 'mem'], 'count': 2, 'processes': [{'pid': 42, 'name': 'nginx', 'cpu': 1.5, 'rss': 1024}]},
+        'host.top': {'sort': 'mem', 'sorts': ['cpu', 'mem'], 'count': 2, 'processes': [{'pid': 42, 'identity': 'epoch:42:start', 'name': 'nginx', 'cpu': 1.5, 'rss': 1024}]},
         'host.details': {'hostname': 'box', 'cpu': {'model': 'AMD EPYC', 'threads': 4}, 'disks': [], 'mounts': [], 'interfaces': []},
     }
 
     async def call(server_id, method, params, timeout):
         calls.append((server_id, method, params))
-        if method == 'host.kill':
+        if method == 'host.killIdentity':
             return {'ok': True, 'result': {'pid': params['pid'], 'exited': not params['force']}}
         return {'ok': True, 'result': replies[method]}
 
@@ -43,9 +44,10 @@ async def test_processes_details_and_ending_one(env, monkeypatch):
 
     for body in [{'pid': '42'}, {'pid': 0}, {'pid': 42, 'force': 'yes'}, {'pid': 42, 'name': 3}]:
         assert (await api(e, 'POST', f'/api/servers/{sid}/processes/kill', body, status=400))['error'] == 'invalid_pid'
-    done = await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 42, 'name': 'nginx'})
-    assert done == {'ok': True, 'pid': 42, 'exited': True} and calls[-1][2] == {'pid': 42, 'force': False}
-    still = await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 43, 'force': True})
+    done = await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 42, 'name': 'nginx', 'identity': 'epoch:42:start'})
+    assert done == {'ok': True, 'pid': 42, 'identity': 'epoch:42:start', 'exited': True}
+    assert calls[-1] == (sid, 'host.killIdentity', {'pid': 42, 'force': False, 'identity': 'epoch:42:start'})
+    still = await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 43, 'force': True, 'identity': 'epoch:43:start'})
     assert still['exited'] is False
     logged = [r['command'] for r in await many(e.db.conn, 'SELECT command FROM server_exec_log WHERE server_id=? ORDER BY id', (sid,))]
     assert logged[-2:] == ['结束进程 nginx（PID 42）', '强制结束进程 43（PID 43），未退出']
@@ -54,4 +56,4 @@ async def test_processes_details_and_ending_one(env, monkeypatch):
         return {'ok': False, 'error': 'capability_disabled'}
 
     monkeypatch.setattr(e.servers.hub, 'call', refused)
-    assert (await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 42}, status=403))['error'] == 'capability_disabled'
+    assert (await api(e, 'POST', f'/api/servers/{sid}/processes/kill', {'pid': 42, 'identity': 'epoch:42:start'}, status=403))['error'] == 'capability_disabled'

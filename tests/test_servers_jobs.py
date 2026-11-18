@@ -1,5 +1,6 @@
 """The Servers tool across servers: jobs listed and filtered on many at once, several jobs waited for or
 stopped in one call, and the conversation behind each job and command."""
+import asyncio
 import json
 import time
 
@@ -120,6 +121,69 @@ async def test_jobs_across_servers_with_filters_origins_and_batched_wait_and_sto
     row = await one(e.db.conn, 'SELECT * FROM server_exec_log WHERE server_id=? ORDER BY id DESC LIMIT 1 OFFSET 1', (a,))
     assert row['turn_uuid'] == 'turn-1'
     assert any(r['command'].startswith(f'停止后台任务 {served}') and r.get('conversationUuid') == 'conv-batch-1' for r in log)
+
+
+async def test_a_command_record_says_how_the_script_ended(env):
+    """The record of a command or background job says how it ended: by exit code 0, or by the judge
+    its caller gives for a program whose exit code does not tell; a job's once this controller sees
+    it end, a stop as stopped, one whose caller judges it by the caller's word, and one its node
+    no longer lists as not known."""
+    e = env
+    sid = (await api(e, 'POST', '/api/servers', {'name': '记录-甲'}))['item']['id']
+    await start_fake(e, sid)
+    await wait_for(lambda: _online(e, sid))
+
+    async def record(job_id):
+        return await one(e.db.conn, 'SELECT outcome,exit_code,duration_ms,job_judge FROM server_exec_log WHERE server_id=? AND job_id=?', (sid, job_id))
+
+    async def ended(job_id):
+        row = await record(job_id)
+        return row['outcome'], row['exit_code']
+
+    async def last():
+        return await one(e.db.conn, 'SELECT outcome,exit_code FROM server_exec_log WHERE server_id=? ORDER BY id DESC LIMIT 1', (sid,))
+    await e.servers.exec(123, sid, 'exit 1')
+    assert dict(await last()) == {'outcome': 'failed', 'exit_code': 1}
+    await e.servers.exec(123, sid, 'echo report; exit 1', judge=lambda r: 'report' in r['stdout'])
+    assert dict(await last()) == {'outcome': 'ok', 'exit_code': 1}
+    await e.servers.exec(123, sid, 'exit 1', judge=lambda r: 'report' in r['stdout'])
+    assert dict(await last()) == {'outcome': 'failed', 'exit_code': 1}
+
+    done = (await e.servers.job_start(123, sid, 'sleep 0.3'))['job']['id']
+    bad = (await e.servers.job_start(123, sid, 'exit 3'))['job']['id']
+    judged = (await e.servers.job_start(123, sid, 'exit 1', judged=True))['job']['id']
+    long = (await e.servers.job_start(123, sid, 'sleep 60'))['job']['id']
+    assert (await record(done))['outcome'] == 'started' and (await record(judged))['job_judge'] == 'caller'
+    for job_id in (done, bad, judged):
+        assert (await e.servers.job_wait(123, sid, job_id, timeout=10))['reason'] == 'exited'
+    assert await ended(done) == ('ok', 0) and (await record(done))['duration_ms'] >= 250
+    assert await ended(bad) == ('failed', 3)
+    # Exited, its caller has not said yet how it went.
+    assert (await record(judged))['outcome'] == 'started'
+    await e.servers.job_ended(123, sid, judged, 'ok', 1)
+    assert await ended(judged) == ('ok', 1)
+    await e.servers.job_ended(123, sid, judged, 'failed')
+    assert (await record(judged))['outcome'] == 'ok', 'an ended record is left as it is'
+    await e.servers.job_stop(123, sid, long)
+    assert (await record(long))['outcome'] == 'stopped'
+
+    # Jobs no one looks at again: the sweep reads them on their node; one the node forgot is not known.
+    unseen = (await e.servers.job_start(123, sid, 'true'))['job']['id']
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("INSERT INTO server_exec_log(owner,server_id,source,command,started_ms,outcome,job_id) VALUES(123,?,'ai','后台任务 forgotten1：true',?,'started','forgotten1')",
+                           (sid, int(time.time() * 1000) - 3600_000))
+        await conn.execute("INSERT INTO server_exec_log(owner,server_id,source,command,started_ms,outcome,job_id) VALUES(123,?,'ai','后台任务 justnow1：true',?,'started','justnow1')",
+                           (sid, int(time.time() * 1000)))
+    for _ in range(50):
+        await e.servers.sweep_job_ends()
+        if (await record(unseen))['outcome'] != 'started':
+            break
+        await asyncio.sleep(0.05)
+    assert (await record(unseen))['outcome'] == 'ok'
+    assert (await record('forgotten1'))['outcome'] == 'unknown'
+    assert (await record('justnow1'))['outcome'] == 'started', 'just started, not yet listed: not taken as forgotten'
+    log = (await api(e, 'GET', f'/api/servers/{sid}'))['item']['execLog']
+    assert next(entry['outcome'] for entry in log if entry['command'] == f'后台任务 {long}：sleep 60') == 'stopped'
 
 
 async def test_origins_columns_join_an_older_database(tmp_path):

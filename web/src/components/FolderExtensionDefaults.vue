@@ -8,8 +8,9 @@ const props = defineProps({
 	catalog: {type: Array, default: () => []},
 	inherited: {type: Object, default: null},
 	inheritedFrom: {type: String, default: ""},
-	// A top-level folder or the temporary node has nothing above it: it only has its own setting.
 	canInherit: {type: Boolean, default: true},
+	// A top-level folder or the temporary node inherits the system default directly.
+	topLevel: {type: Boolean, default: false},
 	disabled: {type: Boolean, default: false},
 });
 const emit = defineEmits(["update:modelValue"]);
@@ -21,8 +22,11 @@ const tokensOf = keys => keys.reduce((sum, key) => sum + Number(byKey.value[key]
 const inheriting = computed(() => props.canInherit && value.value.inherit);
 const shown = computed(() => inheriting.value
 	? {enabled: props.inherited?.enabled || [], autoAllow: !!props.inherited?.autoAllow} : value.value);
-const source = computed(() => props.inherited?.explicit ? `「${props.inheritedFrom || "上级目录"}」` : "");
-const inheritedText = computed(() => source.value ? `沿用${source.value}的设置` : "上级目录都没有设置，新会话的扩展全部关闭");
+const inheritLabel = computed(() => props.topLevel ? "继承系统默认" : "继承上级目录");
+const source = computed(() => !props.inherited?.explicit ? ""
+	: props.inherited.from === "__system" ? "系统默认" : `「${props.inheritedFrom || "上级目录"}」`);
+const inheritedText = computed(() => source.value ? `沿用${source.value}的设置`
+	: props.topLevel ? "系统默认还没有设置，新会话的扩展全部关闭" : "上级目录和系统默认都没有设置，新会话的扩展全部关闭");
 const selectedTokens = computed(() => tokensOf(shown.value.enabled));
 function toggle(key, on) {
 	const enabled = new Set(value.value.enabled);
@@ -45,15 +49,15 @@ function toggle(key, on) {
 		</header>
 		<label v-if="props.canInherit" class="property-switch">
 			<span class="property-switch-text">
-				<span>继承上级目录</span>
+				<span>{{ inheritLabel }}</span>
 				<small>{{ inheritedText }}</small>
 			</span>
-			<el-switch :model-value="value.inherit" :disabled="props.disabled" aria-label="继承上级目录" @update:model-value="update({inherit: $event})"/>
+			<el-switch :model-value="value.inherit" :disabled="props.disabled" :aria-label="inheritLabel" @update:model-value="update({inherit: $event})"/>
 		</label>
 		<div class="folder-extension-list" :class="{'is-inherited': inheriting}" role="group" aria-labelledby="folder-extension-list-title">
 			<div class="folder-extension-list-head">
 				<span id="folder-extension-list-title">扩展工具</span>
-				<small v-if="inheriting">继承{{ source || '上级目录' }}，不能单独修改；要单独设置，先关闭“继承上级目录”。</small>
+				<small v-if="inheriting">继承{{ source || (props.topLevel ? '系统默认' : '上级目录') }}，不能单独修改；要单独设置，先关闭“{{ inheritLabel }}”。</small>
 				<small v-else>勾选的扩展会出现在新会话的工具列表里，右侧是开启后每次请求大约多占的 token。</small>
 			</div>
 			<label v-for="item in props.catalog" :key="item.key" class="folder-extension-row">

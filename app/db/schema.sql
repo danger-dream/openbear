@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   title                 TEXT DEFAULT '',
   model                 TEXT DEFAULT '',
   context_strategy      TEXT NOT NULL DEFAULT 'sliding_window',
+  image_one_turn        TEXT NOT NULL DEFAULT '',
+  prompt_template       TEXT NOT NULL DEFAULT '',
   -- Completed executions and the exact completion version seen by the Web user.
   activity_version      INTEGER NOT NULL DEFAULT 0,
   activity_read_version INTEGER NOT NULL DEFAULT 0,
@@ -798,12 +800,23 @@ CREATE TABLE IF NOT EXISTS memory_templates (
   content     TEXT NOT NULL DEFAULT '',
   is_active   INTEGER DEFAULT 0,
   is_agent_active INTEGER DEFAULT 0,
+  is_persona  INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_templates_active
   ON memory_templates(is_active, id DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_templates_agent_active
   ON memory_templates(is_agent_active, id DESC);
+
+CREATE TABLE IF NOT EXISTS memory_persona_imports (
+  source_key    TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  template_id   INTEGER NOT NULL REFERENCES memory_templates(id) ON DELETE CASCADE,
+  imported_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (source_key, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_persona_imports_template
+  ON memory_persona_imports(template_id);
 
 CREATE TABLE IF NOT EXISTS memory_render_logs (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,

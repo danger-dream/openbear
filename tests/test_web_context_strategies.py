@@ -134,3 +134,148 @@ async def test_manual_is_summary_only_and_rejects_busy_without_calling_model(web
     assert response.status == 409
     assert (await response.json())["error"] == "manual_compaction_requires_summary_strategy"
     assert not backend.calls
+
+
+async def test_conversation_state_reports_completed_compaction_count_across_pagination_and_failures(web_env):
+    row, _, _ = await setup_manual(web_env)
+    uuid = row["conversation_uuid"]
+
+    before = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timelineLimit=1")).json()
+    assert before["contextUsage"]["compactionCount"] == 0
+
+    response = await web_env.client.post(f"/api/conversations/{uuid}/compact")
+    assert response.status == 200, await response.text()
+    after_one = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timelineLimit=1")).json()
+    assert after_one["contextUsage"]["compactionCount"] == 1
+
+    # Persisted sliding_window compaction in an older off-page turn is counted, while failed/running rows are excluded.
+    live = web_env.server._live_for(row)
+    await live.publish({
+        "type": "context_compaction_state",
+        "_webOperationSpecs": [
+            {
+                "op_id": "context-compaction:sw-old",
+                "op_type": "context_compaction",
+                "action": "end",
+                "status": "completed",
+                "source": "context_compaction",
+                "turn_uuid": "turn-old",
+                "payload": {"name": "ContextCompaction", "compactionId": "context-compaction:sw-old", "strategy": "sliding_window", "status": "completed"},
+            },
+            {
+                "op_id": "context-compaction:sw-failed",
+                "op_type": "context_compaction",
+                "action": "end",
+                "status": "failed",
+                "source": "context_compaction",
+                "turn_uuid": "turn-new",
+                "payload": {"name": "ContextCompaction", "compactionId": "context-compaction:sw-failed", "strategy": "sliding_window", "status": "failed"},
+            },
+            {
+                "op_id": "msg:latest-turn",
+                "op_type": "user_message",
+                "action": "end",
+                "status": "completed",
+                "turn_uuid": "turn-latest",
+                "payload": {"content": "latest question"},
+            },
+        ],
+    })
+    paged = await (await web_env.client.get(f"/api/conversations/{uuid}/state?timelineLimit=1")).json()
+    assert paged["contextUsage"]["compactionCount"] == 2
+    assert paged["timelineLimit"] == 1 and paged["hasMoreBefore"] is True
+    assert all(op["opId"] != "context-compaction:sw-old" for op in paged["operations"])
+
+
+async def test_compaction_count_and_operation_cursor_share_the_lock(web_env, monkeypatch):
+    import asyncio
+
+    env = web_env
+    await _login_cookie(env)
+    row = await env.server._create_web_conversation(123)
+    uuid = row['conversation_uuid']
+    live = env.server._live_for(row)
+    op_id = 'context-compaction:race'
+    async def publish(status):
+        await live.publish({'type': 'context_compaction_state', '_webOperationSpecs': [{
+            'op_id': op_id, 'op_type': 'context_compaction', 'action': 'start' if status == 'running' else 'end',
+            'status': status, 'lifecycle': 'active' if status == 'running' else 'terminal',
+            'payload': {'name': 'ContextCompaction', 'status': status, 'windowVersion': 2},
+        }]})
+    await publish('running')
+    async def no_reconcile(*args, **kwargs):
+        pass
+    monkeypatch.setattr(env.server, '_reconcile_inactive_web_conversation_operations', no_reconcile)
+    reading, release, publishing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = env.server._count_conversation_compactions
+    async def gated_count(*args):
+        assert env.server._web_operation_lock(uuid).locked()
+        reading.set()
+        await release.wait()
+        return await original(*args)
+    monkeypatch.setattr(env.server, '_count_conversation_compactions', gated_count)
+    state_request = asyncio.ensure_future(env.client.get(f'/api/conversations/{uuid}/state?timelineLimit=1'))
+    finishing = None
+    try:
+        await asyncio.wait_for(reading.wait(), 5)
+        async def finish():
+            publishing.set()
+            await publish('completed')
+        finishing = asyncio.create_task(finish())
+        await publishing.wait()
+        await asyncio.sleep(0)
+        assert not finishing.done(), 'terminal frame cannot cross the snapshot/count boundary'
+    finally:
+        release.set()
+    before = await (await state_request).json()
+    await finishing
+    after = await (await env.client.get(f'/api/conversations/{uuid}/state?timelineLimit=1')).json()
+    assert before['timelineLimit'] == after['timelineLimit'] == 1
+    assert before['contextUsage']['compactionCount'] == 0
+    assert next(op for op in before['operations'] if op['opId'] == op_id)['status'] == 'running'
+    assert after['contextUsage']['compactionCount'] == 1
+    assert after['frameSeq'] > before['frameSeq']
+    assert next(op for op in after['operations'] if op['opId'] == op_id)['status'] == 'completed'
+
+
+async def test_window_summary_waits_for_terminal_frame_instead_of_legacy_projection(web_env):
+    import json
+
+    env = web_env
+    await _login_cookie(env)
+    row = await env.server._create_web_conversation(123)
+    chat, uuid = row['internal_chat_id'], row['conversation_uuid']
+    dao = MessageDAO(env.db)
+    anchor = await dao.add(chat, 'user', 'anchor', conversation_uuid=uuid, turn_uuid='turn', run_root_turn_uuid='turn')
+    summary = await SummaryDAO(env.db).add(chat, 'summary', anchor, 10)
+    sid = await dao.get_or_create_session_uuid(chat)
+    await env.db.conn.execute(
+        'INSERT INTO context_window_rotations(rotation_id,owner_key,window_version,reason,detail_json,created_at) VALUES(?,?,?,?,?,?)',
+        ('race-rotation', f'controller:{chat}:{sid}', 1, 'pre_model_request', json.dumps({'summaryId': summary}), 1))
+    await env.db.conn.commit()
+    # The window commit precedes the completed operation. It must not be counted
+    # as a legacy summary now and then counted a second time on frame replay.
+    assert await env.server._count_conversation_compactions(chat, uuid) == 0
+    assert await env.server._project_context_compaction_operations(chat, uuid, []) == []
+    await env.server._live_for(row).publish({'type': 'context_compaction_state', '_webOperationSpecs': [{
+        'op_id': 'context-compaction:summary', 'op_type': 'context_compaction', 'action': 'end',
+        'status': 'completed', 'payload': {'summaryId': summary, 'status': 'completed', 'windowVersion': 1},
+    }]})
+    assert await env.server._count_conversation_compactions(chat, uuid) == 1
+
+
+async def test_manual_compaction_uses_default_for_missing_persona_without_editing_snapshot(web_env):
+    from tests.test_prompt_template import template
+
+    row, _backend, store = await setup_manual(web_env)
+    await template(web_env, 'default', 'DEFAULT-AFTER-DELETION', is_active=1)
+    persona = await template(web_env, 'retired', 'PERSONA', is_persona=1)
+    await web_env.db.conn.execute('UPDATE web_conversations SET prompt_template=? WHERE conversation_uuid=?', (persona, row['conversation_uuid']))
+    await web_env.db.conn.commit()
+    assert (await web_env.client.delete(f'/api/memory/templates/{persona}')).status == 200
+    response = await web_env.client.post(f"/api/conversations/{row['conversation_uuid']}/compact")
+    assert response.status == 200, await response.text()
+    saved = await store.load(fresh=True)
+    assert saved['state']['systemReplacement']['system'] == 'DEFAULT-AFTER-DELETION'
+    assert await MessageDAO(web_env.db).get_system_snapshot(row['internal_chat_id']) == 'Original system'
+    assert (await response.json())['state']['promptTemplateMissing'] is True

@@ -45,12 +45,17 @@ type pool struct {
 	exits  map[netip.Addr]*exitPool
 	closed bool
 	stop   chan struct{}
-	// dial, when set, replaces dialing exit:port: tests.
+	// dial, when set, replaces dialing exit:port: a fast forward's tunnels, tests.
 	dial func(ctx context.Context, exit netip.Addr) (*net.TCPConn, error)
 }
 
 func newPool(port int) *pool {
-	p := &pool{port: port, exits: map[netip.Addr]*exitPool{}, stop: make(chan struct{})}
+	return newDialPool(port, nil)
+}
+
+// newDialPool's tunnels come from dial, nil for dialing exit:port.
+func newDialPool(port int, dial func(ctx context.Context, exit netip.Addr) (*net.TCPConn, error)) *pool {
+	p := &pool{port: port, exits: map[netip.Addr]*exitPool{}, stop: make(chan struct{}), dial: dial}
 	go p.maintain()
 	return p
 }

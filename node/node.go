@@ -404,7 +404,11 @@ func (a *Agent) dial(ctx context.Context, c Config, hello map[string]any) (*Conn
 		return nil, nil, none, signedUpgradeRefusal(err, controller, c.NodeID, nonce)
 	}
 	conn.SetIdleTimeout(20 * time.Second)
+	stop := context.AfterFunc(ctx, func() { conn.raw.Close() })
 	ch, first, err := secure(conn, c.NodeID, key, controller, hello)
+	if !stop() && err == nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		conn.raw.Close()
 		return nil, nil, none, err
@@ -757,7 +761,7 @@ func (a *Agent) dispatch(ctx context.Context, m envelope) (result any, next erro
 	// Updating replaces the program that runs commands, so it needs the same consent.
 	if !a.config().Capabilities.Exec {
 		switch m.Method {
-		case "exec", "update", "fs.list", "fs.stat", "fs.read", "fs.write", "fs.edit", "fs.transfer", "fs.hash", "fs.cancel",
+		case "exec", "update", "fs.list", "fs.stat", "fs.read", "fs.write", "fs.writeSafe", "fs.edit", "fs.transfer", "fs.hash", "fs.cancel",
 			"job.start", "job.list", "job.status", "job.stop", "front.serve",
 			"mesh.status", "mesh.install", "mesh.apply", "mesh.tls", "mesh.upgrade", "mesh.uninstall",
 			"mesh.prepare", "mesh.activate", "mesh.confirm", "mesh.abort":
@@ -779,7 +783,7 @@ func (a *Agent) dispatch(ctx context.Context, m envelope) (result any, next erro
 		if err == nil && result.(map[string]any)["changed"] == true {
 			next = ErrRestart
 		}
-	case "fs.list", "fs.stat", "fs.read", "fs.write", "fs.transfer", "fs.hash", "fs.cancel":
+	case "fs.list", "fs.stat", "fs.read", "fs.write", "fs.writeSafe", "fs.transfer", "fs.hash", "fs.cancel":
 		result, err = a.uploads.handle(m.Method, m.Params)
 	case "fs.edit":
 		result, err = a.uploads.edit(m.Params)
@@ -826,13 +830,10 @@ func (a *Agent) browserCall(ctx context.Context, m envelope) (any, error) {
 	case "browser.update":
 		return h.updateChrome(ctx, m.Params)
 	case "browser.restart":
-		h.stop()
-		status, err := h.ensure(ctx)
-		// Nothing was attached yet and ensure took over a leftover window: restart that one too.
-		if err == nil && h.reused() {
-			h.stop()
-			status, err = h.ensure(ctx)
-		}
+		h.mu.Lock()
+		intent := h.intentLocked()
+		h.mu.Unlock()
+		status, err := h.restartIntent(ctx, &intent)
 		if err == nil && status["state"] == "ready" {
 			h.chromeRestarted()
 			status = h.status()

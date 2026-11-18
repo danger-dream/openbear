@@ -162,12 +162,29 @@ type outboundNotice struct {
 	notice        Notice
 	peer          string
 	next, expires time.Time
-	since         time.Time // first send of an unanswered claim; kept across refreshes
+	since         time.Time     // first send of an unanswered claim; kept across refreshes
+	retry         time.Duration // the wait after the last send; kept across refreshes
 }
 
 // noticeGrace keeps the round trip of every routine refresh out of the status:
 // only claims still unanswered after a few retries count as pending.
 const noticeGrace = 3 * time.Second
+
+// An unanswered notice is sent again after a second, then twice as long
+// each time up to noticeRetryMax: a lossy neighbor gets a few sends a
+// lease, not one a second.
+const noticeRetryMax = 10 * time.Second
+
+func noticeRetry(last time.Duration) time.Duration {
+	if last <= 0 {
+		return time.Second
+	}
+	return min(2*last, noticeRetryMax)
+}
+
+// unconfirmedEvery is how often owner.unconfirmed names one neighbor, with
+// the leases that expired unanswered on it since.
+const unconfirmedEvery = time.Minute
 
 // linkRetryLimit caps how long a lost relay or direct link waits between
 // attempts; entry candidates back off up to five minutes.
@@ -202,6 +219,11 @@ type Manager struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	error       string
+
+	// unconfirmed counts, by neighbor, the leases that expired unanswered
+	// since the last owner.unconfirmed about it, at unconfirmedAt.
+	unconfirmed   map[string]int
+	unconfirmedAt map[string]time.Time
 
 	directs     map[string]*directState
 	session     string
@@ -385,9 +407,25 @@ func (m *Manager) configure(c Config) error {
 			allowed[n.ID] = n.Relays
 		}
 	}
+	oldAllowed := map[string][]string{}
+	for _, n := range m.cfg.Nodes {
+		if n.Role != "relay" {
+			oldAllowed[n.ID] = n.Relays
+		}
+	}
 	dropped, err := m.owners.configure(c.Revision, allowed, relays, c.Network, keys)
 	if err != nil {
 		return err
+	}
+	// A notice still waiting for its ACK goes on unless this revision
+	// changed what it is about: the member's relays, or a key that signs it.
+	for key, n := range m.notices {
+		signed := func(id string) bool { return keys[id].Equal(m.signKeys[id]) }
+		linked := slices.ContainsFunc(c.Links, func(l Link) bool { return l.Peer == n.peer })
+		if !linked || !relays[n.peer] || !relays[n.notice.Owner] || !slices.Equal(oldAllowed[n.notice.Member], allowed[n.notice.Member]) ||
+			!signed(n.notice.Member) || !signed(n.notice.Owner) || !signed(c.Self) {
+			delete(m.notices, key)
+		}
 	}
 	if dropped > 0 {
 		m.claimsExpired += dropped
@@ -438,6 +476,10 @@ func (m *Manager) configure(c Config) error {
 			}
 		}
 	}
+	// An entry switch under way goes on while its candidate stays as it was.
+	if q := m.proposal; q != nil && (keep[q.candidate] == nil || keep[q.candidate] != m.candidates[q.candidate]) {
+		m.proposal = nil
+	}
 	m.configureDirects(c, now)
 	oldNodes := m.cfg.Nodes
 	m.cfg = c
@@ -482,9 +524,7 @@ func (m *Manager) configure(c Config) error {
 			delete(m.lastRefresh, id)
 		}
 	}
-	m.proposal = nil
 	m.nextCold = now.Add(c.Parameters.ColdRetry)
-	m.notices = map[string]outboundNotice{}
 	m.error = ""
 	return nil
 }
@@ -963,7 +1003,10 @@ func (m *Manager) tick(now time.Time) {
 			continue
 		}
 		if !now.Before(n.expires) {
-			m.emit("owner.unconfirmed", fmt.Sprintf("%s member=%s seq=%d: lease expired without ACK", n.peer, n.notice.Member, n.notice.Seq))
+			if m.unconfirmed == nil {
+				m.unconfirmed = map[string]int{}
+			}
+			m.unconfirmed[n.peer]++
 			delete(m.notices, key)
 			continue
 		}
@@ -971,10 +1014,12 @@ func (m *Manager) tick(now time.Time) {
 			if p, ok := m.peerPath(n.peer); ok {
 				m.send(n.peer, p, message{Type: "owner", Notice: &n.notice}, 0)
 			}
-			n.next = now.Add(time.Second)
+			n.retry = noticeRetry(n.retry)
+			n.next = now.Add(n.retry)
 			m.notices[key] = n
 		}
 	}
+	m.reportUnconfirmed(now)
 	expired := false
 	for id, until := range m.owners.expires {
 		if !now.Before(until) {
@@ -1558,6 +1603,11 @@ func (m *Manager) notice(member string, seq, refresh uint64, msig string) Notice
 }
 
 func (m *Manager) noticeLinkUp(l Link) bool {
+	// Nothing comes back over a link routing finds down, though its path
+	// may stay committed while the other end's probes still arrive.
+	if m.routingOn() && m.relay.router.Down(l.Peer) {
+		return false
+	}
 	if l.Punch {
 		return m.directUp(l.Peer)
 	}
@@ -1581,13 +1631,31 @@ func (m *Manager) broadcast(n Notice, except string) {
 		}
 		key := l.Peer + ":" + n.Member
 		since, expires := now, now.Add(time.Duration(n.LeaseMs)*time.Millisecond)
+		var retry time.Duration
 		if old, ok := m.notices[key]; ok {
-			since = old.since
+			since, retry = old.since, old.retry
 			if old.notice.Owner == n.Owner && old.notice.Seq == n.Seq {
 				expires = old.expires
 			}
 		}
-		m.notices[key] = outboundNotice{notice: n, peer: l.Peer, next: now, expires: expires, since: since}
+		m.notices[key] = outboundNotice{notice: n, peer: l.Peer, next: now, expires: expires, since: since, retry: retry}
+	}
+}
+
+// reportUnconfirmed names each neighbor whose leases expired unanswered,
+// at most once every unconfirmedEvery: a neighbor that answers nothing
+// would otherwise fill the event list with one event per member.
+func (m *Manager) reportUnconfirmed(now time.Time) {
+	for peer, n := range m.unconfirmed {
+		if now.Sub(m.unconfirmedAt[peer]) < unconfirmedEvery {
+			continue
+		}
+		m.emit("owner.unconfirmed", fmt.Sprintf("%s: %d leases expired without ACK", peer, n))
+		if m.unconfirmedAt == nil {
+			m.unconfirmedAt = map[string]time.Time{}
+		}
+		m.unconfirmedAt[peer] = now
+		delete(m.unconfirmed, peer)
 	}
 }
 func (m *Manager) pendingNotices(now time.Time) int {

@@ -25,6 +25,24 @@ VALIDATOR_PATH = ROOT / "scripts" / "release_validation.py"
 INSTALL_PATH = ROOT / "scripts" / "install.sh"
 
 
+@pytest.fixture(autouse=True)
+def isolated_service_observation(tmp_path, monkeypatch):
+    # New preflight observes systemd before stop. Both in-process workers and
+    # installer child Python processes must see only this synthetic stopped unit.
+    fake = tmp_path / "service-observer-bin"
+    fake.mkdir()
+    command = fake / "systemctl"
+    command.write_text('#!/bin/sh\nif [ "$1" = show ]; then printf "MainPID=0\\nLoadState=loaded\\n"; else exit 97; fi\n')
+    command.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake) + os.pathsep + os.environ.get("PATH", ""))
+    real_run = subprocess.run
+    def run(args, **kwargs):
+        if isinstance(args, (list, tuple)) and args[:2] == ["systemctl", "show"]:
+            return subprocess.CompletedProcess(args, 0, "MainPID=0\nLoadState=loaded\n", "")
+        return real_run(args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", run)
+
+
 def validation_module():
     spec = importlib.util.spec_from_file_location("test_release_validation", VALIDATOR_PATH)
     assert spec is not None and spec.loader is not None
@@ -36,7 +54,7 @@ def validation_module():
 def make_release(root: Path, version: str = "2.0.0") -> Path:
     (root / "app").mkdir(parents=True)
     (root / "web" / "dist" / "assets").mkdir(parents=True)
-    (root / "prompts").mkdir()
+    shutil.copytree(ROOT / "prompts", root / "prompts")
     (root / "scripts").mkdir()
     (root / "app" / "__init__.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
     (root / "app" / "main.py").write_text('VALUE = "new"\n', encoding="utf-8")
@@ -977,6 +995,7 @@ RELEASE_VERSION=2.0.0
 RELEASE_SERVICE_WAS_ACTIVE=1
 RELEASE_REQUIRES_DB_BACKUP=1
 systemctl() {{ echo "$1" >> {events}; return 0; }}
+resolve_upgrade_config {package}
 if commit_release_upgrade {txn}; then
     exit 2
 fi

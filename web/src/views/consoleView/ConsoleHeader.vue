@@ -15,6 +15,7 @@ const props = defineProps({
 	tokensText: {type: String, default: "0"},
 	tokensDetail: {type: String, default: ""},
 	cachePercentText: {type: String, default: "—"},
+	compactionCount: {type: Number, default: 0},
 	durationMs: {type: Number, default: 0},
 	costText: {type: String, default: "$0.0000"},
 });
@@ -65,6 +66,10 @@ const runStatusText = computed(() => props.status && props.status !== "就绪" ?
 			<div class="header-metric" title="会话累计读缓存 Tokens / 累计完整输入 Tokens（含读缓存与写缓存）">
 				<dt>缓存命中</dt>
 				<dd><span class="header-number">{{ props.cachePercentText }}</span></dd>
+			</div>
+			<div class="header-metric" title="当前会话累计完成的上下文压缩次数">
+				<dt>已压缩</dt>
+				<dd><span class="header-number">{{ props.compactionCount }}<span class="header-unit">次</span></span></dd>
 			</div>
 			<div class="header-metric">
 				<dt>总耗时</dt>

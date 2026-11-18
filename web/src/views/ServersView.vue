@@ -273,7 +273,7 @@ watch(bgpFor, open => {
       <ServerGuide />
     </el-drawer>
     <el-dialog :model-value="dialog === 'ssh'" @update:model-value="dismiss('ssh')" :title="sshTarget?.ssh ? 'SSH 连接' : '登记 SSH 连接'" width="500px" class="admin-dialog instance-dialog instance-ui servers-ui" append-to-body destroy-on-close :close-on-click-modal="false" :before-close="closeDialog">
-      <ServerForm v-if="dialog === 'ssh' && sshServer" ref="dialogRef" :server="sshServer" @saved="sshSaved" @cancel="dialog = ''" />
+      <ServerForm v-if="dialog === 'ssh' && sshServer" ref="dialogRef" :server="sshServer" :servers="items" @saved="sshSaved" @cancel="dialog = ''" />
     </el-dialog>
     <el-popover v-if="!phone" :visible="Boolean(bgpFor)" :virtual-ref="bgpFor?.anchor" virtual-triggering placement="bottom-start" :width="bgpWidth"
       popper-class="instance-ui servers-ui sv-bgp-popper">

@@ -341,7 +341,7 @@ async def test_a_past_line_is_only_its_owners(env, monkeypatch):  # noqa: F811
     members = added['members']
     members[0]['role'] = 'relay'
     await api(e, 'PUT', '/api/servers/mesh/draft', {'members': [members[0], {'serverId': m1, 'entry': {
-        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}]})
+        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     # m1 once entered r1 over tcp: no longer a line, still on record.
@@ -369,7 +369,7 @@ async def test_reports_read_the_applied_revision_once_until_another_is_issued(en
     members = added['members']
     members[0]['role'] = 'relay'
     await api(e, 'PUT', '/api/servers/mesh/draft', {'members': [members[0], {'serverId': m1, 'entry': {
-        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}]})
+        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     mesh = e.servers.mesh
@@ -391,7 +391,7 @@ async def test_reports_read_the_applied_revision_once_until_another_is_issued(en
     view = await api(e, 'GET', '/api/servers/mesh')
     view['members'][1]['entry']['candidates'][0]['transport'] = 'tcp'
     view['members'][0]['listen']['tcp'] = 52000
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': view['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': view['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     applied = await mesh._applied(123)
@@ -408,9 +408,9 @@ async def test_the_overview_lists_lines_and_the_trend_answers_by_line(env, monke
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [r1, m1]})
     members = added['members']
     members[0]['role'] = 'relay'
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'PUT', '/api/servers/mesh/draft', {'members': [members[0], {'serverId': m1, 'entry': {
-        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}]})
+        'mode': 'fixed', 'candidates': [{'relay': r1, 'transport': 'udp'}]}}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     line_id = f'entry:{m1}|{r1}|udp'

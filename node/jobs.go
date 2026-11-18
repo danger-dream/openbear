@@ -78,7 +78,8 @@ type jobView struct {
 	Command   string `json:"command"`
 	Cwd       string `json:"cwd,omitempty"`
 	Shell     string `json:"shell"`
-	State     string `json:"state"` // running, exited, stopped, interrupted
+	State     string `json:"state"`   // running, exited, stopped, interrupted
+	CanStop   bool   `json:"canStop"` // live runner or identity-verified residual child
 	ExitCode  *int   `json:"exitCode"`
 	Signal    string `json:"signal,omitempty"`
 	StartedAt int64  `json:"startedAt"`
@@ -240,7 +241,7 @@ func (s *jobStore) cleanup() []jobView {
 			continue
 		}
 		ended := time.UnixMilli(max(v.EndedAt, v.StartedAt))
-		if v.State != "running" && now.Sub(ended) > jobKeepFor {
+		if v.State != "running" && !v.CanStop && now.Sub(ended) > jobKeepFor {
 			os.RemoveAll(dir)
 			continue
 		}
@@ -248,7 +249,7 @@ func (s *jobStore) cleanup() []jobView {
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].StartedAt < views[j].StartedAt })
 	for extra := len(views) - jobKeep; extra > 0; extra-- {
-		i := slices.IndexFunc(views, func(v jobView) bool { return v.State != "running" })
+		i := slices.IndexFunc(views, func(v jobView) bool { return v.State != "running" && !v.CanStop })
 		if i < 0 {
 			break
 		}
@@ -303,6 +304,10 @@ func (s *jobStore) stop(dir string, view jobView) (any, error) {
 // readJob derives a job's state from its directory alone.
 func readJob(dir string) (v jobView, err error) {
 	defer func() {
+		if err == nil {
+			_, child := liveProcess(dir, "child")
+			v.CanStop = v.State == "running" || (v.ExitCode == nil && child)
+		}
 		if v.EndedAt > 0 {
 			v.DurationMs = v.EndedAt - v.StartedAt
 		} else if err == nil {

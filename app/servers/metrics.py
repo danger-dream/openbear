@@ -53,6 +53,16 @@ CREATE TABLE IF NOT EXISTS counters (
 CREATE TABLE IF NOT EXISTS day (
  server_id TEXT NOT NULL, day TEXT NOT NULL, ts INTEGER NOT NULL, rx INTEGER NOT NULL, tx INTEGER NOT NULL,
  PRIMARY KEY(server_id, day)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS day_basis (
+ server_id TEXT NOT NULL, day TEXT NOT NULL, zone TEXT NOT NULL, end INTEGER NOT NULL,
+ PRIMARY KEY(server_id, day)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS day_archive (
+ id INTEGER PRIMARY KEY, server_id TEXT NOT NULL, day TEXT NOT NULL, ts INTEGER NOT NULL,
+ rx INTEGER NOT NULL, tx INTEGER NOT NULL, zone TEXT);
+CREATE INDEX IF NOT EXISTS day_archive_server ON day_archive(server_id, day);
+CREATE TABLE IF NOT EXISTS day_accounted (
+ server_id TEXT NOT NULL, ts INTEGER NOT NULL, rx INTEGER NOT NULL, tx INTEGER NOT NULL,
+ PRIMARY KEY(server_id, ts)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS disk (
  server_id TEXT NOT NULL, ts INTEGER NOT NULL, mount TEXT NOT NULL, fs TEXT NOT NULL, total INTEGER NOT NULL, used INTEGER NOT NULL,
  PRIMARY KEY(server_id, ts, mount)) WITHOUT ROWID;
@@ -190,6 +200,7 @@ class MetricsStore:
         await self.conn.commit()
         async with self.conn.execute('SELECT server_id,boot,rx,tx FROM counters') as cursor:
             self.counters = {r['server_id']: (r['boot'], r['rx'], r['tx']) async for r in cursor}
+        await self.change_timezone(self.zone)
         self.flusher = asyncio.create_task(self._flush_loop(), name='server-metrics-flush')
         self.maintaining = asyncio.create_task(self._upgrade(), name='server-metrics-upgrade')
 
@@ -378,8 +389,76 @@ class MetricsStore:
     async def _rollup_day(self, server_id, ts):
         # Only the day being written is summed again: one that has ended keeps its total.
         day, start, end = self._day(ts)
-        await self.conn.execute('INSERT OR REPLACE INTO day(server_id,day,ts,rx,tx) SELECT ?,?,?,CAST(TOTAL(rx) AS INTEGER),CAST(TOTAL(tx) AS INTEGER) '
-                                'FROM hour WHERE server_id=? AND ts>=? AND ts<?', (server_id, day, start, server_id, start, end))
+        await self.conn.execute('INSERT OR REPLACE INTO day(server_id,day,ts,rx,tx) SELECT ?,?,?, '
+                                'CAST(TOTAL(MAX(h.rx-COALESCE(a.rx,0),0)) AS INTEGER), '
+                                'CAST(TOTAL(MAX(h.tx-COALESCE(a.tx,0),0)) AS INTEGER) '
+                                'FROM hour h LEFT JOIN day_accounted a USING(server_id,ts) '
+                                'WHERE h.server_id=? AND h.ts>=? AND h.ts<?', (server_id, day, start, server_id, start, end))
+        await self.conn.execute('INSERT OR REPLACE INTO day_basis VALUES(?,?,?,?)', (server_id, day, self.zone.key, end))
+
+    async def change_timezone(self, zone):
+        """Rebuild only traffic backed by all its hourly bytes, in one metrics transaction.
+
+        A frozen daily total keeps its original label/basis. Its surviving hours are
+        checkpointed, not counted again in the new days; later increments in the same
+        hour still count. No interpolation, discarded totals or guessed historical zone.
+        """
+        zone = ZoneInfo(zone) if isinstance(zone, str) else zone
+        async with self.lock:
+            if await self.meta('day-zone') == zone.key:
+                self.zone = zone
+                return
+            old_zone, committing = self.zone, None
+            try:
+                async with self.conn.execute('SELECT d.*,b.zone,b.end FROM day d LEFT JOIN day_basis b USING(server_id,day) '
+                                             'ORDER BY d.server_id,d.ts,d.day') as cursor:
+                    days = [dict(r) async for r in cursor]
+                for index, row in enumerate(days):
+                    # Legacy rows did not record a zone/end. The next stored start bounds
+                    # their source interval (gaps have no traffic); the last spans all remaining
+                    # stored hours. Compare BOTH byte totals before claiming it is rebuildable.
+                    following = days[index + 1] if index + 1 < len(days) else None
+                    end = row['end']
+                    if end is None and following and following['server_id'] == row['server_id']:
+                        end = following['ts']
+                    sql = ('SELECT h.ts,h.rx,h.tx,MAX(h.rx-COALESCE(a.rx,0),0) AS rx_new, '
+                           'MAX(h.tx-COALESCE(a.tx,0),0) AS tx_new FROM hour h '
+                           'LEFT JOIN day_accounted a USING(server_id,ts) WHERE h.server_id=? AND h.ts>=?')
+                    args = [row['server_id'], row['ts']]
+                    if end is not None:
+                        sql += ' AND h.ts<?'
+                        args.append(end)
+                    async with self.conn.execute(sql, args) as cursor:
+                        hours = [dict(r) async for r in cursor]
+                    complete = (sum(h['rx_new'] for h in hours), sum(h['tx_new'] for h in hours)) == (row['rx'], row['tx'])
+                    if not complete:
+                        await self.conn.execute('INSERT INTO day_archive(server_id,day,ts,rx,tx,zone) VALUES(?,?,?,?,?,?)',
+                                                (row['server_id'], row['day'], row['ts'], row['rx'], row['tx'], row['zone']))
+                        await self.conn.executemany('INSERT OR REPLACE INTO day_accounted VALUES(?,?,?,?)',
+                                                    [(row['server_id'], h['ts'], h['rx'], h['tx']) for h in hours])
+                await self.conn.execute('DELETE FROM day')
+                await self.conn.execute('DELETE FROM day_basis')
+                self.zone = zone
+                async with self.conn.execute('SELECT server_id,ts FROM hour') as cursor:
+                    rebuild = {(r['server_id'], self._day(r['ts'])[1]) async for r in cursor}
+                for server_id, ts in rebuild:
+                    await self._rollup_day(server_id, ts)
+                await self.conn.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('day-zone', zone.key))
+                committing = asyncio.create_task(self.conn.commit())
+                await asyncio.shield(committing)
+            except BaseException:
+                # A queued commit may finish after cancellation: keep the in-memory zone
+                # aligned with that durable result, just as flush keeps its checkpoint.
+                if committing is not None:
+                    try:
+                        await committing
+                    except Exception:
+                        pass
+                    else:
+                        raise
+                await self.conn.rollback()
+                self.zone = old_zone
+                raise
 
     def prune_soon(self):
         """After the days kept changed: the next round of the flush loop prunes."""
@@ -410,6 +489,8 @@ class MetricsStore:
                     upto = min(cutoff, oldest + 86400)
                     async with self.lock:
                         await self.conn.execute(f'DELETE FROM {table} WHERE {column}=? AND ts<?', (key, upto))
+                        if table == 'hour':
+                            await self.conn.execute('DELETE FROM day_accounted WHERE server_id=? AND ts<?', (key, upto))
                         await self.conn.commit()
                     oldest = upto if upto < cutoff else None
                     await asyncio.sleep(0)
@@ -505,11 +586,15 @@ class MetricsStore:
         return {'range': span, 'step': step, 'sampledAt': latest, 'partitions': current, 't': t, 'series': series}
 
     async def traffic_stats(self, server_id, unit, now=None):
+        async with self.lock:
+            return await self._traffic_stats(server_id, unit, now)
+
+    async def _traffic_stats(self, server_id, unit, now=None):
         """Traffic per hour (last 48), day (last 31) or month (last 12), oldest first; the last one is the
         current one so far. Hours come from the hourly table, days and months from the daily one."""
         count = TRAFFIC_UNITS[unit]
         now = int(now or time.time())
-        points = []
+        points, history = [], []
         if unit == 'hour':
             start = now - now % 3600 - (count - 1) * 3600
             async with self.conn.execute('SELECT ts, rx, tx FROM hour WHERE server_id=? AND ts>=? ORDER BY ts', (server_id, start)) as cursor:
@@ -520,9 +605,19 @@ class MetricsStore:
                 points.append({'t': ts, 'label': '', 'rx': rx, 'tx': tx})
         else:
             today = dt.date.fromisoformat(self._day(now)[0])
+            # A retained eastern-zone label can be tomorrow (or next month) after a
+            # westward switch. Keep that transition point visible, not outside the chart.
+            async with self.conn.execute('SELECT MAX(day) FROM day_archive WHERE server_id=?', (server_id,)) as cursor:
+                last = (await cursor.fetchone())[0]
+            if last:
+                today = max(today, dt.date.fromisoformat(last))
             first = today - dt.timedelta(days=count - 1) if unit == 'day' else _month_add(today.replace(day=1), -(count - 1))
             async with self.conn.execute('SELECT day, rx, tx FROM day WHERE server_id=? AND day>=? ORDER BY day', (server_id, first.isoformat())) as cursor:
                 rows = [(r['day'], r['rx'], r['tx']) async for r in cursor]
+            async with self.conn.execute('SELECT day,rx,tx,zone FROM day_archive WHERE server_id=? AND day>=? ORDER BY day,id', (server_id, first.isoformat())) as cursor:
+                for r in await cursor.fetchall():
+                    rows.append((r['day'], r['rx'], r['tx']))
+                    history.append({'day': r['day'], 'timezone': r['zone'], 'rx': r['rx'], 'tx': r['tx']})
             keys = [(first + dt.timedelta(days=i)).isoformat() for i in range(count)] if unit == 'day' \
                 else [_month_add(first, i).isoformat()[:7] for i in range(count)]
             sums = {k: [0, 0] for k in keys}
@@ -536,12 +631,16 @@ class MetricsStore:
                 boundary = int(dt.datetime.combine(date, dt.time(), self.zone).timestamp())
                 points.append({'t': boundary - boundary % 3600, 'label': key, 'rx': sums[key][0], 'tx': sums[key][1]})
         # Still in memory: the minute being filled and minutes not yet written.
-        current = points[-1]
+        indexed = {p['t'] if unit == 'hour' else p['label']: p for p in points}
         for sid, bucket in [*self.pending, *((k, v) for k, v in self.buckets.items())]:
-            if sid == server_id and bucket.ts >= current['t']:
-                current['rx'] += bucket.rx
-                current['tx'] += bucket.tx
-        return {'unit': unit, 'points': points}
+            key = bucket.ts - bucket.ts % 3600 if unit == 'hour' else self._day(bucket.ts)[0]
+            if unit == 'month':
+                key = key[:7]
+            if sid == server_id and key in indexed:
+                indexed[key]['rx'] += bucket.rx
+                indexed[key]['tx'] += bucket.tx
+        current_label = self._day(now)[0][:7] if unit == 'month' else self._day(now)[0]
+        return {'unit': unit, 'points': points, 'timezone': self.zone.key, 'history': history, 'currentLabel': current_label}
 
     async def _sid(self, server_id, create=False):
         """The small number latency rows name a server by; None when it has none and create is off."""
@@ -661,7 +760,7 @@ class MetricsStore:
         self.counters.pop(server_id, None)
         self.pending = [p for p in self.pending if p[0] != server_id]
         async with self.lock:
-            for table in ('minute', 'hour', 'counters', 'day', 'disk'):
+            for table in ('minute', 'hour', 'counters', 'day', 'day_basis', 'day_archive', 'day_accounted', 'disk'):
                 await self.conn.execute(f'DELETE FROM {table} WHERE server_id=?', (server_id,))
             await self.conn.execute(f'DELETE FROM meta WHERE key IN ({",".join("?" * len(SERVER_META))})', [p + server_id for p in SERVER_META])
             sid = await self._sid(server_id)
@@ -698,6 +797,10 @@ class MetricsStore:
         return {'range': span, 'step': step, 'start': start, 'end': now, 'points': points}
 
     async def traffic_since(self, server_id, start):
+        async with self.lock:
+            return await self._traffic_since(server_id, start)
+
+    async def _traffic_since(self, server_id, start):
         """Bytes received/sent since a unix time: the hours from the hourly table (each one rolled up
         with every minute written, the current one too, and kept at least as long as the minutes), the
         minutes only before the first whole hour, plus what is still in memory."""

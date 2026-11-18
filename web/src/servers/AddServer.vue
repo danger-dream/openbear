@@ -10,6 +10,7 @@ import FrontExits from './FrontExits.vue';
 import InstallCommand from './InstallCommand.vue';
 import InstallConflict from './InstallConflict.vue';
 import InstallProgress from './InstallProgress.vue';
+import SshRelay from './SshRelay.vue';
 import SuggestInput from './SuggestInput.vue';
 import { dateTime, noAutofill, safeError } from './serverHelpers.js';
 
@@ -18,7 +19,7 @@ const emit = defineEmits(['open', 'changed', 'settings', 'guide', 'close']);
 const MODES = [['ssh', 'SSH 安装'], ['batch', '批量 SSH'], ['command', '安装命令'], ['code', '注册码'], ['front', '前置机']];
 const mode = ref('ssh'), busy = ref(false), error = ref('');
 const form = reactive({name: '', host: '', port: 22, username: 'root', auth: 'key', group: '', access: {primary: '', backup: ''},
-  lines: '', defaultPort: 22, codeName: '', expires: 0, uses: 0, browser: false, exits: [{serverId: '', address: ''}]});
+  lines: '', defaultPort: 22, codeName: '', expires: 0, uses: 0, browser: false, exits: [{serverId: '', address: ''}], relay: '', frontInstall: 'ssh'});
 const login = ref(null), batchLogin = ref(null), frontLogin = ref(null);
 const created = ref(null), command = ref(null), job = ref(null), codes = ref([]), fresh = ref('');
 let timer, alive = true;
@@ -29,6 +30,9 @@ const HOST = /^[A-Za-z0-9][A-Za-z0-9.:-]*$/;
 const points = computed(() => props.settings.accessPoints || []);
 const ready = computed(() => points.value.length > 0);
 const profile = () => ({...(form.group.trim() ? {group: form.group.trim()} : {}), ...(form.access.primary || form.access.backup ? {access: {...form.access}} : {})});
+const frontProfile = () => ({...(form.group.trim() ? {group: form.group.trim()} : {}), front: {exits: form.exits.map(e => ({serverId: e.serverId, address: e.address.trim()}))}});
+const relay = () => form.relay ? {relay: form.relay} : {};
+const relayName = computed(() => props.servers.find(s => s.id === form.relay)?.name || '');
 const parsed = computed(() => form.lines.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
   const words = line.split(/[\s,，]+/).filter(Boolean);
   const numeric = v => /^\d{1,5}$/.test(v || '');
@@ -58,7 +62,7 @@ async function installViaSsh() {
   error.value = ''; busy.value = true;
   try {
     const item = ok(await Api.createServer({name: form.name.trim() || form.host.trim(), profile: profile(),
-      ssh: {host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...login.value.credentials()}})).item;
+      ssh: {host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...relay(), ...login.value.credentials()}})).item;
     login.value.clear();
     emit('changed');
     // The server exists from here on: a failed start is retried, not saved again.
@@ -72,14 +76,15 @@ async function installViaSsh() {
   } catch (e) { error.value = safeError(e); }
   finally { busy.value = false; }
 }
-// A front: its login is the front as its exit reaches it, proved and used only through the exits.
+// A front: its login is the front as its exit (or the chosen relay) reaches it, proved and used only that way.
+// With an install command it is run on the front instead, which fetches everything through its exit.
 async function installFront() {
+  if (form.frontInstall === 'command') return makeCommand(true);
   if (busy.value) return;
   error.value = ''; busy.value = true;
   try {
-    const item = ok(await Api.createServer({name: form.name.trim() || form.host.trim(),
-      profile: {...(form.group.trim() ? {group: form.group.trim()} : {}), front: {exits: form.exits.map(e => ({serverId: e.serverId, address: e.address.trim()}))}},
-      ssh: {host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...frontLogin.value.credentials()}})).item;
+    const item = ok(await Api.createServer({name: form.name.trim() || form.host.trim(), profile: frontProfile(),
+      ssh: {host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...relay(), ...frontLogin.value.credentials()}})).item;
     frontLogin.value.clear();
     emit('changed');
     created.value = item;
@@ -109,7 +114,7 @@ async function installBatch() {
   error.value = ''; busy.value = true;
   try {
     job.value = ok(await Api.batchInstallServers({servers: parsed.value.map(({name, host, port}) => ({name, host, port})),
-      ssh: {username: form.username.trim(), auth: form.auth, ...batchLogin.value.credentials()}, profile: profile(), browser: form.browser})).job;
+      ssh: {username: form.username.trim(), auth: form.auth, ...relay(), ...batchLogin.value.credentials()}, profile: profile(), browser: form.browser})).job;
     poll(async () => {
       try { job.value = ok(await Api.batchInstallStatus(job.value.id)).job; } catch { return true; }
       emit('changed');
@@ -137,22 +142,23 @@ function openExisting(id) { if (id) emit('open', {id}); }
 // The server made by a try whose command never came (no node build yet, a lost request):
 // trying again asks for its command, it does not add the server once more.
 let unshown = null;
-async function makeCommand() {
+async function makeCommand(front = false) {
   if (busy.value || !form.name.trim()) return;
   error.value = ''; busy.value = true;
   try {
-    const wanted = JSON.stringify({name: form.name.trim(), profile: profile()});
-    let item = unshown?.item;
+    const wanted = JSON.stringify({name: form.name.trim(), profile: front ? frontProfile() : profile()});
+    let item = unshown?.front === front ? unshown.item : null;
     if (!item) {
-      item = ok(await Api.createServer({name: form.name.trim(), profile: profile()})).item;
-      unshown = {item, wanted};
+      item = ok(await Api.createServer({name: form.name.trim(), profile: front ? frontProfile() : profile()})).item;
+      unshown = {item, wanted, front};
       emit('changed');
     } else if (unshown.wanted !== wanted) {
-      item = ok(await Api.updateServer(item.id, {name: form.name.trim(), profile: {group: form.group.trim(), access: {...form.access}}})).item;
-      unshown = {item, wanted};
+      const patch = front ? {group: form.group.trim(), front: frontProfile().front} : {group: form.group.trim(), access: {...form.access}};
+      item = ok(await Api.updateServer(item.id, {name: form.name.trim(), profile: patch})).item;
+      unshown = {item, wanted, front};
       emit('changed');
     }
-    const enrollment = ok(await Api.serverEnrollment(item.id, {browser: form.browser}));
+    const enrollment = ok(await Api.serverEnrollment(item.id, {browser: !front && form.browser}));
     unshown = null;
     command.value = {item, ...enrollment, registered: false, online: false};
     poll(async () => {
@@ -211,9 +217,18 @@ onBeforeUnmount(() => { alive = false; stop(); });
       <div class="instance-actions"><el-button size="small" @click="emit('settings')">去设置</el-button></div>
     </div>
 
-    <!-- SSH: the controller logs in and installs, step by step; a front's SSH goes through its exit. -->
+    <!-- SSH: the controller logs in and installs, step by step; a front's SSH goes through its exit or the chosen relay. -->
     <template v-if="mode === 'ssh' || mode === 'front'">
-      <div v-if="created" class="as-result">
+      <div v-if="mode === 'front' && command" class="as-result">
+        <p class="as-title"><strong>{{ command.item.name }}</strong><span class="instance-muted">30 分钟内有效，只能用一次</span></p>
+        <InstallCommand :command="command.command" :windows-command="command.windowsCommand" note />
+        <InstallProgress :manual="command" />
+        <div class="instance-form-footer">
+          <el-button @click="again">继续添加</el-button>
+          <el-button type="primary" @click="emit('open', command.item)">打开服务器</el-button>
+        </div>
+      </div>
+      <div v-else-if="created" class="as-result">
         <p class="as-title"><strong>{{ created.name }}</strong><span class="instance-muted">{{ created.ssh?.host }}:{{ created.ssh?.port }}</span></p>
         <InstallProgress :install="created.install" :busy="busy" @open="openExisting" @force="retry(true)" />
         <p v-if="error" role="alert" class="instance-error">{{ error }}</p>
@@ -226,22 +241,37 @@ onBeforeUnmount(() => { alive = false; stop(); });
       <form v-else-if="mode === 'front'" class="instance-form" autocomplete="off" @submit.prevent="installFront">
         <div class="ob-fields" :class="{busy}">
           <div class="ob-field"><span>出口</span><FrontExits v-model="form.exits" :servers="servers" /></div>
-          <div class="ob-field"><span>地址</span>
+          <div class="ob-field"><span>安装</span>
             <div class="ob-ctl">
-              <div class="ob-inline"><input v-model="form.host" v-bind="noAutofill" required maxlength="253" :pattern="HOST_PATTERN" :title="HOST_TITLE" class="mono" placeholder="出口登录前置机用的地址" aria-label="前置机地址" /><input v-bind="noAutofill" v-model.number="form.port" class="mono ob-port" type="number" inputmode="numeric" min="1" max="65535" required aria-label="SSH 端口" /></div>
-              <small>OpenBear 经出口登录前置机安装节点，不会直接连它。填出口能连到的地址，比如前置机的专线内网地址。</small>
+              <div class="ob-radios sv-radios" role="radiogroup" aria-label="安装方式">
+                <label><input v-model="form.frontInstall" type="radio" name="as-front-install" value="ssh" />SSH 登录安装</label>
+                <label><input v-model="form.frontInstall" type="radio" name="as-front-install" value="command" />安装命令</label>
+              </div>
+              <small v-if="form.frontInstall === 'command'">在前置机上以 root 运行一条命令，它经出口下载安装脚本和节点程序并校验，适合 OpenBear 登录不到的前置机。</small>
             </div>
           </div>
-          <label class="ob-field"><span>用户</span><input v-model="form.username" v-bind="noAutofill" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
-          <SshAuth ref="frontLogin" v-model="form.auth" @error="error = $event" />
-          <label class="ob-field"><span>名称</span><input v-model="form.name" v-bind="noAutofill" maxlength="60" placeholder="留空用地址" aria-label="服务器名称" /></label>
+          <template v-if="form.frontInstall === 'ssh'">
+            <div class="ob-field"><span>经由</span>
+              <div class="ob-ctl"><SshRelay v-model="form.relay" :servers="servers" front /><small>出口登录不了前置机时（比如只允许家里、公司登录），选一台能登录它的服务器转发。</small></div>
+            </div>
+            <div class="ob-field"><span>地址</span>
+              <div class="ob-ctl">
+                <div class="ob-inline"><input v-model="form.host" v-bind="noAutofill" required maxlength="253" :pattern="HOST_PATTERN" :title="HOST_TITLE" class="mono" :placeholder="relayName ? `${relayName} 登录前置机用的地址` : '出口登录前置机用的地址'" aria-label="前置机地址" /><input v-bind="noAutofill" v-model.number="form.port" class="mono ob-port" type="number" inputmode="numeric" min="1" max="65535" required aria-label="SSH 端口" /></div>
+                <small v-if="relayName">OpenBear 经 {{ relayName }} 的节点登录前置机安装节点，不会直接连它。填 {{ relayName }} 能连到的地址。Windows 需要开启 OpenSSH 服务器，用管理员账号登录。</small>
+                <small v-else>OpenBear 经出口登录前置机安装节点，不会直接连它。填出口能连到的地址，比如前置机的专线内网地址。Windows 需要开启 OpenSSH 服务器，用管理员账号登录。</small>
+              </div>
+            </div>
+            <label class="ob-field"><span>用户</span><input v-model="form.username" v-bind="noAutofill" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
+            <SshAuth ref="frontLogin" v-model="form.auth" @error="error = $event" />
+          </template>
+          <label class="ob-field"><span>名称</span><input v-model="form.name" v-bind="noAutofill" maxlength="60" :required="form.frontInstall === 'command'" :placeholder="form.frontInstall === 'command' ? '例如：广州前置' : '留空用地址'" aria-label="服务器名称" /></label>
           <label class="ob-field"><span>分组</span><SuggestInput v-model="form.group" :options="groups" maxlength="40" placeholder="可选" aria-label="分组" /></label>
         </div>
         <p v-if="error" role="alert" class="instance-error">{{ error }}</p>
         <div class="instance-form-footer">
-          <span class="ob-hint">经出口测试 SSH，再把节点程序推送过去安装；前置机不跑解锁检测和三网回程。</span>
+          <span class="ob-hint">{{ form.frontInstall === 'command' ? '保存后出口开始等待前置机连接，再给出安装命令' : `${relayName ? `经 ${relayName} ` : '经出口'}测试 SSH，再把节点程序推送过去安装` }}；前置机不跑解锁检测和三网回程。</span>
           <el-button :disabled="busy" @click="emit('close')">取消</el-button>
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="!form.exits.every(e => e.serverId && e.address.trim())">保存并安装</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="!form.exits.every(e => e.serverId && e.address.trim()) || form.frontInstall === 'command' && !form.name.trim()">{{ form.frontInstall === 'command' ? '生成安装命令' : '保存并安装' }}</el-button>
         </div>
       </form>
       <form v-else class="instance-form" autocomplete="off" @submit.prevent="installViaSsh">
@@ -249,8 +279,11 @@ onBeforeUnmount(() => { alive = false; stop(); });
           <div class="ob-field"><span>地址</span>
             <div class="ob-ctl">
               <div class="ob-inline"><input v-model="form.host" v-bind="noAutofill" required maxlength="253" :pattern="HOST_PATTERN" :title="HOST_TITLE" class="mono" placeholder="IP 或域名" aria-label="服务器地址" /><input v-bind="noAutofill" v-model.number="form.port" class="mono ob-port" type="number" inputmode="numeric" min="1" max="65535" required aria-label="SSH 端口" /></div>
-              <small>OpenBear 用这个地址登录服务器安装节点，内网地址也可以。</small>
+              <small>{{ relayName ? `OpenBear 经 ${relayName} 的节点登录服务器安装节点，填 ${relayName} 能连到的地址。` : 'OpenBear 用这个地址登录服务器安装节点，内网地址也可以。' }}Windows 需要开启 OpenSSH 服务器，用管理员账号登录。</small>
             </div>
+          </div>
+          <div class="ob-field"><span>经由</span>
+            <div class="ob-ctl"><SshRelay v-model="form.relay" :servers="servers" /><small>只允许特定网络登录 SSH 时，选那个网络里的一台服务器转发。</small></div>
           </div>
           <label class="ob-field"><span>用户</span><input v-model="form.username" v-bind="noAutofill" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
           <SshAuth ref="login" v-model="form.auth" @error="error = $event" />
@@ -294,10 +327,13 @@ onBeforeUnmount(() => { alive = false; stop(); });
               <small v-if="lineErrors.length" class="ob-bad">第 {{ parsed.indexOf(lineErrors[0]) + 1 }} 行格式不对：{{ lineErrors[0].line }}</small>
               <small v-else-if="parsed.length > BATCH_LIMIT" class="ob-bad">一次最多安装 {{ BATCH_LIMIT }} 台，现在有 {{ parsed.length }} 台，请分批添加。</small>
               <small v-else-if="parsed.length">将安装 {{ parsed.length }} 台：{{ parsed.slice(0, 3).map(l => l.name).join('、') }}{{ parsed.length > 3 ? ' 等' : '' }}</small>
-              <small v-else>名称和端口可以省略，省略的端口用下面的默认端口。</small>
+              <small v-else>名称和端口可以省略，省略的端口用下面的默认端口。所有机器用同一个账号登录；Windows 需要开启 OpenSSH 服务器，用管理员账号。</small>
             </div>
           </div>
           <label class="ob-field"><span>默认端口</span><input v-bind="noAutofill" v-model.number="form.defaultPort" class="mono sv-day" type="number" inputmode="numeric" min="1" max="65535" aria-label="默认 SSH 端口" /></label>
+          <div class="ob-field"><span>经由</span>
+            <div class="ob-ctl"><SshRelay v-model="form.relay" :servers="servers" /><small>只允许特定网络登录 SSH 时，选那个网络里的一台服务器转发。</small></div>
+          </div>
           <label class="ob-field"><span>用户</span><input v-model="form.username" v-bind="noAutofill" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
           <SshAuth ref="batchLogin" v-model="form.auth" @error="error = $event" />
           <label class="ob-field"><span>分组</span><SuggestInput v-model="form.group" :options="groups" maxlength="40" placeholder="可选" aria-label="分组" /></label>
@@ -324,7 +360,7 @@ onBeforeUnmount(() => { alive = false; stop(); });
           <el-button type="primary" @click="emit('open', command.item)">打开服务器</el-button>
         </div>
       </div>
-      <form v-else class="instance-form" autocomplete="off" @submit.prevent="makeCommand">
+      <form v-else class="instance-form" autocomplete="off" @submit.prevent="makeCommand()">
         <div class="ob-fields" :class="{busy}">
           <label class="ob-field"><span>名称</span><input v-model="form.name" v-bind="noAutofill" required maxlength="60" placeholder="例如：家里的 NAS" aria-label="服务器名称" /></label>
           <label class="ob-field"><span>分组</span><SuggestInput v-model="form.group" :options="groups" maxlength="40" placeholder="可选" aria-label="分组" /></label>

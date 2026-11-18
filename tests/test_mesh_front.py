@@ -3,6 +3,9 @@ no other relay and no STUN server about its reachability, and full mode links it
 and to the site relays that dial it."""
 from __future__ import annotations
 
+import copy
+
+from app.servers import mesh_auto, mesh_model
 from app.servers.mesh import Mesh
 from app.servers.mesh_config import build, relay_pairs
 from tests.test_mesh_config import doc, facts, member, pair
@@ -85,3 +88,35 @@ def test_joining_links_a_front_to_its_exit_once():
     d['relayLinks']['pairs'] = []
     Mesh._link_fronts(d, f, {'r2'})
     assert d['relayLinks']['pairs'] == []
+
+
+def test_joining_front_with_auto_listen_exit_defaults_to_tls_and_opens_exit_tls():
+    f = front_facts(m2={'ipv4': ''})
+    exit_ = {**member('r1', 'relay', listen={'udp': 51999, 'tcp': 52000, 'tls': 0}), 'auto': list(mesh_auto.MEMBER_AUTO)}
+    front = {**member('m2', 'relay', listen={'udp': 0, 'tcp': 0, 'tls': 52001}), 'auto': list(mesh_auto.MEMBER_AUTO)}
+    d = doc(exit_, front, relay_links={'mode': 'custom', 'pairs': []})
+    Mesh._link_fronts(d, f)
+    resolved = mesh_auto.resolve(d, f, links=True)
+    assert resolved['relayLinks']['pairs'][0]['transport'] == 'tls'
+    assert resolved['members'][0]['listen']['tls'] == 52001
+
+    # Connecting a site relay to a front with no publicEndpoint/ipv4 explains how to fill the front's address.
+    with_site = copy.deepcopy(resolved)
+    with_site['members'].append(member('m1', 'relay', relayMode='site'))
+    with_site['relayLinks']['pairs'].append(pair('m1', 'm2', transport='tls', dialer='a'))
+    errs = mesh_model.validate(with_site, f)
+    assert any(e['error'] == 'endpoint_missing' and '是前置机，还没有填对外地址' in e['message'] for e in errs)
+
+    # Custom-mode relay link edits emit specific link changes with endpoints instead of duplicate generic relayLinks.
+    applied = copy.deepcopy(resolved)
+    applied['members'][0]['listen']['tcp'] = 52000
+    applied['relayLinks']['pairs'][0]['transport'] = 'tcp'
+    changes = Mesh._changes(applied, resolved, f)
+    assert [c['kind'] for c in changes] == ['member.update', 'link.change']
+    assert changes[1]['a'] == 'm2' and changes[1]['b'] == 'r1' and 'TCP → TLS' in changes[1]['text']
+
+    # Non-default link cost (e.g. cost=80) is read from applied pairs even when issued configs are passed.
+    cost_doc = copy.deepcopy(resolved)
+    cost_doc['relayLinks']['pairs'][0]['cost'] = 80
+    issued = build(cost_doc, f, 'net', 1)
+    assert Mesh._changes(cost_doc, copy.deepcopy(cost_doc), f, configs=issued) == []

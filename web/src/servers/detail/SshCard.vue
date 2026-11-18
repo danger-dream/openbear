@@ -8,7 +8,8 @@ import { canDesktop as checkDesktop, hasDesktop as checkHasDesktop, noAutofill, 
 import CardIcon from './CardIcon.vue';
 
 // 连接属性: SSH login and (for Windows / macOS) RDP / VNC desktop credentials and port.
-const props = defineProps({server: {type: Object, required: true}, busy: Boolean, active: {type: Boolean, default: true}});
+// via: how the SSH login is reached when not directly (经出口, or 经 <relay>).
+const props = defineProps({server: {type: Object, required: true}, busy: Boolean, active: {type: Boolean, default: true}, via: {type: String, default: ''}});
 const emit = defineEmits(['check', 'edit', 'desktop']);
 
 const platform = computed(() => platformOf(props.server));
@@ -121,6 +122,7 @@ onMounted(() => { void loadDesktopConfig(); });
       </div>
       <dl v-if="server.ssh" class="ix-facts">
         <div><dt>地址</dt><dd class="mono ix-ellipsis">{{ server.ssh.username }}@{{ server.ssh.host }}:{{ server.ssh.port }}</dd></div>
+        <div v-if="via"><dt>经由</dt><dd class="ix-ellipsis">{{ via }}</dd></div>
         <div><dt>认证</dt><dd class="ix-ellipsis">{{ server.ssh.keyLabel || '密码' }}</dd></div>
         <div><dt>状态</dt><dd><span class="ob-dot" :data-tone="server.ssh.status === 'ok' ? 'ok' : server.ssh.status === 'unreachable' ? 'bad' : 'off'">{{ {ok: '连接正常', unreachable: '无法连接'}[server.ssh.status] || '尚未验证' }}</span></dd></div>
         <div v-if="server.usedBy.length"><dt>使用中</dt><dd>{{ server.usedBy.join('、') }}</dd></div>

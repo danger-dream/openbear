@@ -2,7 +2,7 @@
 they make one dedicated line with. Each exit's node serves its fronts' access to this controller
 (node/front.go): TLS with a self-signed certificate the fronts pin, forwarding only the node API to
 the exit's own address of the controller. The controller reaches a front's SSH through a TCP
-tunnel the exit's node opens, never directly."""
+tunnel the exit's node opens (or the node of the relay its login names), never directly."""
 from __future__ import annotations
 
 import ipaddress
@@ -173,14 +173,14 @@ class Fronts:
         row = await one(self.db.conn, 'SELECT profile_json FROM server_profiles WHERE server_id=? AND owner=?', (server_id, owner))
         return [e['serverId'] for e in exits(json.loads(row['profile_json']) if row else {})]
 
-    def opener(self, via):
-        """open(address, sink) -> a terminal that is a TCP connection to address from the first exit
-        that can make one; None for a server with no exits."""
+    def opener(self, via, offline='front_exit_offline'):
+        """open(address, sink) -> a terminal that is a TCP connection to address from the first of
+        these servers (a front's exits, or a login's relay) that can make one; None for none."""
         if not via:
             return None
 
         async def open_tunnel(address, sink):
-            error = InstanceError('front_exit_offline', 409)
+            error = InstanceError(offline, 409)
             for sid in via:
                 if self.capable(sid):
                     try:

@@ -9,6 +9,7 @@ import InstallProgress from './InstallProgress.vue';
 import PlatformMark from './PlatformMark.vue';
 import ServerJobs from './ServerJobs.vue';
 import BrowserUpdate from './BrowserUpdate.vue';
+import {browserRestartFeedback} from './browserStatus.js';
 import {stopWorkConfirmation, stopWorkWarning, stopWorkFailure} from './stopWork.js';
 import MeshCard from './mesh/MeshCard.vue';
 import DdnsCard from '../ddns/DdnsCard.vue';
@@ -150,6 +151,13 @@ async function retryRelease() {
 }
 const canSsh = computed(() => s.value.local || s.value.ssh);
 const front = computed(() => Boolean(s.value.profile?.front?.exits?.length));
+// The server whose node the SSH login goes through: its relay, else a front's exits.
+const relayName = computed(() => s.value.ssh?.relay ? props.servers.find(o => o.id === s.value.ssh.relay)?.name || '已删除的服务器' : '');
+const sshVia = computed(() => relayName.value ? `经 ${relayName.value}` : front.value && s.value.ssh ? '经出口' : '');
+// A front not connected (offline, or not after its command or install) while its exit already serves it:
+// what usually keeps it out is the exit's firewall.
+const frontWaiting = computed(() => front.value && s.value.access?.primary?.ready
+  && (state.value === 'offline' || state.value === 'none' && Boolean(enrollment.value || s.value.install?.state === 'failed')) ? s.value.access.primary.url : '');
 // Which access point the node uses, and whether it fell back to the backup.
 const access = computed(() => {
   if (s.value.local) return '本机直连';
@@ -179,8 +187,8 @@ const browserLine = computed(() => BROWSER_STATES[browser.value?.state] || (stat
 const browserFacts = computed(() => {
   const b = browser.value;
   if (!b?.state) return [];
-  const source = b.endpoint ? `已有的浏览器（${b.endpoint}）` : {system: '这台机器上安装的浏览器', download: '自动下载的测试版 Chrome'}[b.source] || '';
-  return [['浏览器', b.product], ['来源', source], ['窗口', b.state === 'ready' && !b.endpoint ? (b.headless ? '无头模式' : '显示在桌面上') : ''],
+  const source = b.endpoint ? `已有的浏览器（${b.endpoint}）` : {system: '这台机器上安装的浏览器', download: '自动下载的测试版 Chrome', unknown: '遗留窗口，运行来源未核实'}[b.runningSource || b.source] || '';
+  return [['运行版本', b.runningVersion || b.product], ['来源', source], ['核实', b.state === 'ready' && b.runningVerified === undefined ? '旧节点未提供运行来源核实信息' : ''], ['提示', b.restartNeeded ? '所选版本或来源尚未生效，显式重启后应用；现有页面未关闭' : ''], ['窗口', b.state === 'ready' && !b.endpoint ? (b.headless ? '无头模式' : '显示在桌面上') : ''],
     ['进度', b.state === 'installing' && b.downloaded ? `已下载 ${bytes(b.downloaded)}` : ''],
     ['下载', b.downloadsUnavailable ? '这个浏览器在别的机器上，网页下载的文件保存在那台机器，取不回来' : ''], ['原因', browserReason(b.error)]].filter(([, v]) => v);
 });
@@ -192,10 +200,10 @@ function browserReason(error) {
   return exe ? `节点没法运行这台机器上的 ${exe}：Linux 上浏览器由专用账户 openbear-browser 运行，它进不去浏览器所在的目录。`
     + '可以在“设置”里改用下载的测试版 Chrome 或连接已有的浏览器，也可以放开该目录的访问权限后重启浏览器。' : error;
 }
-const SOURCES = {ai: 'AI', batch: '批量', web: '页面', files: '文件', instance: '实例', gateway: '网关'};
+const SOURCES = {ai: 'AI', batch: '批量', web: '页面', files: '文件', instance: '实例', gateway: '网关', check: '检测', bench: '评测', auto: '自动更新'};
 // Runs that went over SSH while the node was offline are logged as `<source>-ssh`.
 const sourceLabel = source => source?.endsWith('-ssh') ? `${SOURCES[source.slice(0, -4)] || source.slice(0, -4)} · SSH` : SOURCES[source] || source;
-const OUTCOMES = {ok: '成功', failed: '失败', timeout: '超时', refused: '被拒绝', unknown: '结果未知', started: '已启动'};
+const OUTCOMES = {ok: '成功', failed: '失败', timeout: '超时', refused: '被拒绝', unknown: '结果未知', started: '已启动', stopped: '已停止'};
 const openConversation = conversationUuid => window.dispatchEvent(new CustomEvent('openbear:open-conversation', {detail: {conversationUuid}}));
 const duration = entry => {
   if (!entry.endedAtMs) return '进行中';
@@ -287,6 +295,7 @@ async function checkSsh() {
   await run('ssh', async () => {
     const result = ok(await Api.checkInstanceServer(s.value.id));
     emit('changed');
+    if (result.stale) { ElMessage.info('连接配置已更新，已忽略旧检查结果'); return; }
     ElMessage[result.item.status === 'unreachable' ? 'warning' : 'success'](result.item.status === 'unreachable' ? '连接失败' : '连接正常');
   });
 }
@@ -300,8 +309,8 @@ async function loadBrowser() {
     if (!alive || s.value.id !== id || request !== browserRequest) return;
     browser.value = result;
   } catch { if (!alive || s.value.id !== id || request !== browserRequest) return; browser.value = null; }
-  // A download or start takes a while; follow it until it settles.
-  if (alive && props.active && (['installing', 'starting'].includes(browser.value?.state) || ['downloading', 'restarting'].includes(browser.value?.update?.state))) browserTimer = setTimeout(loadBrowser, 3000);
+  // Follow startup/update progress and detect an externally closed ready browser.
+  if (alive && props.active && (['ready', 'installing', 'starting'].includes(browser.value?.state) || ['downloading', 'restarting'].includes(browser.value?.update?.state))) browserTimer = setTimeout(loadBrowser, 3000);
 }
 function openBrowser() {
   browserForm.mode = browser.value?.endpoint ? 'endpoint' : browser.value?.download ? 'download' : 'launch';
@@ -319,7 +328,13 @@ function saveBrowser(enabled) {
 }
 async function restartBrowser() {
   if (!await confirm(`重启「${s.value.name}」的浏览器？上面打开的页面会关闭，登录状态保留。`, '重启浏览器', '重启')) return;
-  await run('browser', async () => { browser.value = ok(await Api.restartServerBrowser(s.value.id)).browser; void loadBrowser(); }, '浏览器已重启');
+  await run('browser', async () => {
+    browser.value = ok(await Api.restartServerBrowser(s.value.id)).browser;
+    const feedback = browserRestartFeedback(browser.value);
+    void loadBrowser();
+    if (feedback.type === 'error') { error.value = browserReason(feedback.message); return; }
+    ElMessage[feedback.type](feedback.message);
+  });
 }
 watch(() => [s.value.id, caps.value.browser, state.value, props.active], () => { if (props.active) void loadBrowser(); });
 async function confirm(text, title, button) {
@@ -481,16 +496,17 @@ onBeforeUnmount(() => { alive = false; stops.forEach(stop => stop()); clearTimeo
       </span>
     </div>
 
+    <p v-if="frontWaiting" class="ob-notice" role="status" data-front-waiting>出口已在 <span class="mono">{{ frontWaiting }}</span> 等待这台前置机连接。一直连不上时，在出口机的防火墙放行这个 TCP 端口入站；经专线过来的来源可能是专线内网地址，不是前置机的公网 IP。</p>
     <section v-if="installCard" class="ix-card sv-install">
       <header class="ix-card-head"><h3>{{ s.node ? '重新安装节点' : '安装节点' }}</h3><span class="instance-muted">节点主动连回主控，服务器不需要开放任何端口</span></header>
       <InstallProgress v-if="s.install" :install="s.install" :busy="Boolean(busy) || installing" @open="emit('open', $event)" @force="installViaSsh(true)" />
       <p v-if="!build.available" class="ob-notice ob-row" data-node-release="none">暂时没有可用的节点版本，稍后重试。<button type="button" class="ix-text-button" :disabled="checkingRelease" @click="retryRelease">{{ checkingRelease ? '检查中…' : '重试' }}</button></p>
-      <p v-else-if="front" class="instance-muted" data-front-install>前置机经出口安装：OpenBear 经出口登录它，把节点程序推送过去，不提供手动安装命令。首选出口要在线。</p>
+      <p v-else-if="front" class="instance-muted" data-front-install>前置机经出口接入：OpenBear {{ relayName ? `经 ${relayName}` : '经出口' }}登录它推送节点程序；也可以生成安装命令，在前置机上以 root 运行，它经出口下载并校验。首选出口要在线。</p>
       <p v-else-if="!settings.accessPoints?.length && !s.local" class="ob-notice ob-row">还没有接入点，服务器上的节点不知道该连哪里。<button type="button" class="ix-text-button" @click="emit('settings')">去设置</button></p>
       <label v-if="!s.local && !front" class="ob-check sv-install-browser"><input v-model="installBrowser" type="checkbox" /><span>同时开启浏览器<small class="instance-muted">主控可以用这台机器的浏览器和网络访问网页；没装 Chrome 时会自动下载</small></span></label>
       <div class="instance-actions">
-        <el-button v-if="canSsh" type="primary" :loading="installing" :disabled="Boolean(busy) || installing || !build.available || (!settings.accessPoints?.length && !s.local && !front)" @click="installViaSsh">{{ s.local ? '在本机安装' : front ? '经出口安装' : '通过 SSH 安装' }}</el-button>
-        <el-button v-if="!front" :disabled="Boolean(busy) || !build.available || (!settings.accessPoints?.length && !s.local)" @click="generate">{{ enrollment ? '重新生成安装命令' : '生成安装命令' }}</el-button>
+        <el-button v-if="canSsh" type="primary" :loading="installing" :disabled="Boolean(busy) || installing || !build.available || (!settings.accessPoints?.length && !s.local && !front)" @click="installViaSsh">{{ s.local ? '在本机安装' : relayName ? `经 ${relayName} 安装` : front ? '经出口安装' : '通过 SSH 安装' }}</el-button>
+        <el-button :disabled="Boolean(busy) || !build.available || (!settings.accessPoints?.length && !s.local && !front)" @click="generate">{{ enrollment ? '重新生成安装命令' : '生成安装命令' }}</el-button>
         <el-button v-if="!canSsh" :disabled="Boolean(busy)" @click="emit('ssh', s)">登记 SSH 后一键安装</el-button>
       </div>
       <InstallCommand v-if="command" :command="command" :windows-command="windowsCommand" :platform="s.node?.info?.platform || s.ssh?.platform || ''" note />
@@ -579,7 +595,7 @@ onBeforeUnmount(() => { alive = false; stops.forEach(stop => stop()); clearTimeo
           </section>
           <div class="dt-system-side">
             <BillingCard :server="s" :now="now" :busy="Boolean(busy)" @edit="emit('edit', s)" @renew="renew" />
-            <SshCard v-if="s.ssh || showDesktop" :server="s" :busy="Boolean(busy)" @check="checkSsh" @edit="emit('ssh', s)" @desktop="emit('desktop', s)" />
+            <SshCard v-if="s.ssh || showDesktop" :server="s" :via="sshVia" :busy="Boolean(busy)" @check="checkSsh" @edit="emit('ssh', s)" @desktop="emit('desktop', s)" />
           </div>
         </div>
       </div>
@@ -594,7 +610,7 @@ onBeforeUnmount(() => { alive = false; stops.forEach(stop => stop()); clearTimeo
             <p v-if="s.local && !caps.browser" class="instance-muted">本机不需要开启：浏览器工具不指定服务器时，用的就是设置里配置的默认浏览器（CDP 地址）。</p>
             <dl v-else-if="caps.browser" class="ix-facts">
               <div><dt>状态</dt><dd><span class="ob-dot" :data-tone="browserLine[0]">{{ browserLine[1] }}</span></dd></div>
-              <div v-for="[label, value] in browserFacts" :key="label"><dt>{{ label }}</dt><dd :class="label === '原因' ? 'sv-browser-error' : 'ix-ellipsis'" :title="value">{{ value }}</dd></div>
+              <div v-for="[label, value] in browserFacts" :key="label"><dt>{{ label }}</dt><dd :class="['原因', '提示'].includes(label) ? 'sv-browser-error' : 'ix-ellipsis'" :title="value">{{ value }}</dd></div>
             </dl>
             <p v-else class="instance-muted">未开启。开启后，主控可以用这台机器的浏览器、网络和 IP 访问网页，并使用在那个浏览器里登录过的账号。{{ caps.exec === false ? '这台节点关闭了命令执行，要在服务器上重新运行带 --browser 的安装命令来开启。' : '' }}</p>
             <BrowserUpdate v-if="caps.browser && (browser?.chromeVersion || browser?.download || browser?.source === 'download')" :key="s.id"
@@ -636,7 +652,7 @@ onBeforeUnmount(() => { alive = false; stops.forEach(stop => stop()); clearTimeo
     </template>
     <div v-else class="ix-grid sv-cards dt-grid">
       <BillingCard :server="s" :now="now" :busy="Boolean(busy)" @edit="emit('edit', s)" @renew="renew" />
-      <SshCard v-if="s.ssh || showDesktop" :server="s" :busy="Boolean(busy)" @check="checkSsh" @edit="emit('ssh', s)" @desktop="emit('desktop', s)" />
+      <SshCard v-if="s.ssh || showDesktop" :server="s" :via="sshVia" :busy="Boolean(busy)" @check="checkSsh" @edit="emit('ssh', s)" @desktop="emit('desktop', s)" />
       <MeshCard :server-id="s.id" :active="active" @open="emit('mesh', $event)" />
     </div>
 

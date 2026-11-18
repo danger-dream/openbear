@@ -29,7 +29,7 @@ type replayResult struct {
 // T TOY, S Singapore, L Los Angeles, starting from the configured next hops
 // of today (home to TOY through Singapore). The flow measured is H to T,
 // as in sim.py, along the next hops the relays actually use.
-func replay(t *testing.T, d simData, ht []*float64) replayResult {
+func replay(t *testing.T, d simData, ht []*float64, tune *Tuning) replayResult {
 	const warm = 15 // sim.py's WARM
 	n := newNet(t, map[string]time.Duration{
 		"H-T": 1250 * time.Microsecond, "H-S": 40 * time.Millisecond, "H-L": 101 * time.Millisecond,
@@ -40,6 +40,7 @@ func replay(t *testing.T, d simData, ht []*float64) replayResult {
 		"S>H": "H", "S>T": "T", "S>L": "L",
 		"L>H": "H", "L>S": "S", "L>T": "S",
 	})
+	n.retune(tune)
 	series := map[string][]*float64{"H-T": ht, "H-S": d.Links["H-S"], "H-L": d.Links["H-L"], "L-S": d.Links["S-L"], "S-T": d.Links["T-S"]}
 	steps := len(ht)
 	sample := func(link string, at int) *float64 { return series[link][at] }
@@ -107,7 +108,12 @@ func sortedPair(a, b string) []string {
 // Its results (result.txt) for the proposed algorithm: no switches without
 // a fault; outage 2 switches, 3 s lost, back to the direct path at 103 s;
 // flapping 2 switches, 3 s lost, back at 213 s; degradation 2 switches,
-// 4 s lost, back at 168 s.
+// 4 s lost, back at 168 s. Since links between relays are held down for a
+// while once back (probationBase), the routers go back later than sim.py:
+// the outage's link is back at 90 s and taken again 30 s later; the
+// degradation's last down ends at 143 s, taken again 30 s later; the flap's
+// four downs in 30 s hold its link for 240 s after the last, past the end
+// of the data, and the path stays on its one detour.
 func TestReplayMatchesSimulation(t *testing.T) {
 	raw, err := os.ReadFile("testdata/sim-links.json")
 	if err != nil {
@@ -124,15 +130,16 @@ func TestReplayMatchesSimulation(t *testing.T) {
 		lost     int    // at most
 		away     [2]int // the move off the direct path falls in this range of seconds
 		back     [2]int // and the move back in this one
+		ends     string // the path at the end
 	}{
-		{"none", d.Links["H-T"], 0, 0, [2]int{}, [2]int{}},
-		{"outage", d.Scenarios["outage"], 2, 3, [2]int{62, 64}, [2]int{100, 106}},
-		{"flap", d.Scenarios["flap"], 2, 3, [2]int{122, 124}, [2]int{205, 216}},
-		{"degrade", d.Scenarios["degrade"], 2, 4, [2]int{128, 134}, [2]int{165, 171}},
+		{"none", d.Links["H-T"], 0, 0, [2]int{}, [2]int{}, "H>T"},
+		{"outage", d.Scenarios["outage"], 2, 3, [2]int{62, 64}, [2]int{119, 126}, "H>T"},
+		{"flap", d.Scenarios["flap"], 1, 3, [2]int{122, 124}, [2]int{}, "H>S>T"},
+		{"degrade", d.Scenarios["degrade"], 2, 4, [2]int{128, 134}, [2]int{172, 178}, "H>T"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := replay(t, d, c.ht)
+			r := replay(t, d, c.ht, &legacyTuning)
 			t.Logf("switches %d, lost %d s, asymmetric %v (longest %v), path: %s", r.switches, r.lost, r.asymmetric, r.longest, strings.Join(r.timeline, "; "))
 			if r.longest > 100*time.Millisecond {
 				t.Fatalf("the two directions disagreed for %v at a stretch", r.longest)
@@ -140,13 +147,14 @@ func TestReplayMatchesSimulation(t *testing.T) {
 			if r.switches != c.switches || r.lost > c.lost {
 				t.Fatalf("switches %d (want %d), lost %d s (want at most %d)", r.switches, c.switches, r.lost, c.lost)
 			}
-			if c.switches == 2 {
-				if r.changes[0] < c.away[0] || r.changes[0] > c.away[1] || r.changes[1] < c.back[0] || r.changes[1] > c.back[1] {
-					t.Fatalf("moved away at %d s and back at %d s, want %v and %v", r.changes[0], r.changes[1], c.away, c.back)
-				}
+			if c.switches >= 1 && (r.changes[0] < c.away[0] || r.changes[0] > c.away[1]) {
+				t.Fatalf("moved away at %d s, want %v", r.changes[0], c.away)
 			}
-			if last := r.timeline[len(r.timeline)-1]; !strings.HasSuffix(last, " H>T") {
-				t.Fatalf("ends on %s", last)
+			if c.switches == 2 && (r.changes[1] < c.back[0] || r.changes[1] > c.back[1]) {
+				t.Fatalf("moved back at %d s, want %v", r.changes[1], c.back)
+			}
+			if last := r.timeline[len(r.timeline)-1]; !strings.HasSuffix(last, " "+c.ends) {
+				t.Fatalf("ends on %s, want %s", last, c.ends)
 			}
 		})
 	}

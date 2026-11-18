@@ -8,7 +8,7 @@ const props = defineProps({id: {type: String, required: true}, data: {type: Obje
 defineOptions({inheritAttrs: false});
 const d = computed(() => props.data);
 const nets = computed(() => d.value.subnets || []);
-const role = computed(() => [d.value.relay && (d.value.site ? '站点中转' : '中转'), d.value.gateway && '网关'].filter(Boolean));
+const role = computed(() => [d.value.relay && (d.value.site ? '站点中转' : '中转'), d.value.noTransit && '不中转', d.value.gateway && '网关'].filter(Boolean));
 // A member drawn inside its relay is one line: what is wrong with it if anything, else its round trip.
 const note = computed(() => {
   const x = d.value;

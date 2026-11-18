@@ -56,9 +56,10 @@ FORCED = ('manual', 'config')
 RETRYABLE = frozenset({'verify_failed', 'node_offline', 'timeout'})
 SOURCE_STATES = frozenset({'offline', 'no_address', 'node_outdated', 'conn_unavailable', 'probe_refused'})
 SOFT_STATES = SOURCE_STATES | {'ok', 'pending', 'syncing'}
-ISSUE_STATES = SOURCE_STATES | {'drift', 'fighting', 'failed', 'ambiguous'}
-JSON_FIELDS = ('source', 'backup', 'options', 'policy', 'drift_times')
-STATE_TEXT = {'ok': '正常', 'pending': '等待同步', 'syncing': '正在同步', 'drift': '被外部改动', 'fighting': '另一个系统也在写这条记录',
+ISSUE_STATES = SOURCE_STATES | {'drift', 'fighting', 'failed', 'ambiguous', 'rrset_review'}
+JSON_FIELDS = ('source', 'backup', 'options', 'policy', 'drift_times', 'pending_cleanup')
+RRSET_WARNING = '整体替换将移除其他地址；请明确选择“接管整个记录集”，复核前不写入 DNS'
+STATE_TEXT = {'rrset_review': RRSET_WARNING, 'ok': '正常', 'pending': '等待同步', 'syncing': '正在同步', 'drift': '被外部改动', 'fighting': '另一个系统也在写这条记录',
               'offline': '来源离线，DNS 保持不变', 'failed': '同步失败，处理后手动同步', 'paused': '已停用', 'no_address': '取不到可用地址',
               'node_outdated': '节点版本过旧，需要更新节点', 'conn_unavailable': '连接来源地址不可用',
               'probe_refused': '节点拒绝了取 IP 参数', 'ambiguous': '认不出服务商上哪条同名记录归 OpenBear 管理，没有写入'}
@@ -315,7 +316,7 @@ class Ddns:
             name = f'{base}-{n}'
         return name
 
-    async def _save_secret(self, cls, alias, values, secret_id=0):
+    async def _save_secret(self, cls, alias, values, secret_id=0, mapping=None):
         """Write credential values to the vault through the credentials page's own writer: into the
         account's own secret when it has one (blank fields keep their value), else a new one."""
         row, items = await self._secret_kv(secret_id) if secret_id else (None, [])
@@ -324,7 +325,7 @@ class Ddns:
             known = {str(i.get('key') or ''): i for i in items}
             merged = {k: i.get('value') for k, i in known.items()}
             merged.update(values)
-            model.missing_fields(cls, merged)
+            model.missing_fields(cls, {f: merged.get(k) for f, k in mapping.items()} if mapping is not None else merged)
             items = [{**i, 'value': values[i.get('key')]} if i.get('key') in values else i for i in items]
             items += [{'key': k, 'value': v} for k, v in values.items() if k not in known]
             args.update(id=secret_id)
@@ -618,17 +619,32 @@ class Ddns:
             fields['settings_json'] = dumps(model.clean_settings(data['settings'], account['settings']))
         if data.get('credentials') is not None:
             values = model.clean_credentials(cls, data['credentials'], partial=True)
-            row, _ = await self._secret_kv(account['secret_id'])
+            row, items = await self._secret_kv(account['secret_id'])
             own = self._own_secret(row)
-            # Through the agent tool not a secret another account also reads either: its values would be the AI's to choose.
-            if own and tool and await self._shared(account['secret_id'], aid):
+            # Editing one account must not rotate another account's shared credentials.
+            if own and await self._shared(account['secret_id'], aid):
                 own = False
             if not own:
                 # A secret of the user's own is never written into: the account gets one of its own.
                 with contextlib.suppress(DdnsError):
                     values = {**await self._creds(account), **values}
-            secret_id = await self._save_secret(cls, fields.get('alias', account['alias']), values, account['secret_id'] if own else 0)
-            fields.update(secret_id=secret_id, field_map_json=dumps({**{k: k for k in values}, **(account['field_map'] if secret_id == account['secret_id'] else {})}))
+            mapping = dict(account['field_map']) if own else {}
+            protected = {key for field, key in mapping.items() if field not in values}
+            occupied = {str(i.get('key') or '') for i in items} | set(mapping.values()) | set(values)
+            stored_values = {}
+            for field, value in values.items():
+                key, suffix = field, 1
+                # An identity key may itself back an unchanged field via a custom mapping.
+                if key in protected:
+                    while key in occupied:
+                        suffix += 1
+                        key = f'{field}_{suffix}'
+                mapping[field] = key
+                stored_values[key] = value
+                occupied.add(key)
+            secret_id = await self._save_secret(cls, fields.get('alias', account['alias']), stored_values, account['secret_id'] if own else 0,
+                                                mapping=mapping if own else None)
+            fields.update(secret_id=secret_id, field_map_json=dumps(mapping))
         elif data.get('secretRef') is not None:
             secret_id, mapping, _ = await self._ref_creds(cls, data['secretRef'])
             fields.update(secret_id=secret_id, field_map_json=dumps(mapping))
@@ -1143,12 +1159,52 @@ class Ddns:
         else:
             await self._done(rec, account, outcome)
 
+    @staticmethod
+    def _rrset_values(found):
+        return [v.strip() for r in found for v in r.value.split(',') if v.strip()]
+
+    @staticmethod
+    def _rrset_blocked(rec, found, p):
+        # multi=all historically meant updating all Records, not consent to discard RRset addresses.
+        return p.caps.rrset and not rec['policy'].get('rrsetTakeover', False) and any(len(r.value.split(',')) > 1 for r in found)
+
+    async def _review_rrset(self, rec, found):
+        values = self._rrset_values(found)
+        if rec['state'] != 'rrset_review':
+            await self._event(rec['owner'], rec['id'], 'rrset_review', RRSET_WARNING, {'values': values})
+        await self._set(rec['id'], state='rrset_review', remote=','.join(values), remote_ms=self.now())
+
+    async def _resume_cleanup(self, rec, account, p, found):
+        """Only the journal's exact old value may be removed; never all non-desired siblings."""
+        pending = rec.get('pending_cleanup')
+        if not pending or not p.caps.staged_update:
+            return found
+        old = Record(**pending['old'])
+        replacement = pending['replacement']
+        aid, zone = account['id'], rec['zone']
+        if any(r.value == replacement for r in found):
+            if any(r.value == old.value for r in found):
+                await self._call(aid, p.delete, zone, old)
+                self._wrote(rec['id'])
+                found = p.on_line(await self._call(aid, p.records, zone, rec['name'], rec['rtype']), rec['options'])
+                if any(r.value == old.value for r in found):
+                    raise DdnsError('verify_failed', message=f'旧地址 {old.value} 尚未删除，将继续重试')
+            rec['remote'] = replacement
+        elif any(r.value == old.value for r in found):
+            # The add never took effect (or was removed outside): converge again from the known old value.
+            rec['remote'] = old.value
+        await self._set(rec['id'], pending_cleanup=None, remote=rec['remote'])
+        rec['pending_cleanup'] = None
+        return found
+
     def _mine(self, rec, found, p, *, strict=False):
         """The records at the provider this one manages: all of the name's with multi=all, else the
         one taken over (by id). Without an id, by name and type: the one holding the value OpenBear
         wants or last saw there, else a lone record, unless the name has had several (strict, as for
         deleting: not even that). None: none is recognisably it, and none may be touched."""
-        if rec['policy']['multi'] == 'all':
+        if self._rrset_blocked(rec, found, p):
+            return None
+        if rec['policy']['multi'] == 'all' or p.caps.rrset and rec['policy'].get('rrsetTakeover'):
             return list(found)
         if rec['provider_record_id'] and p.caps.by_id:
             return [r for r in found if r.id == rec['provider_record_id']]
@@ -1183,17 +1239,34 @@ class Ddns:
         self.held.pop(rid, None)
 
     @staticmethod
-    def _attrs_differ(r, rec, p):
-        ttl = p.ttl_for(rec['ttl']) if rec['ttl'] else None
+    def _attrs_differ(r, rec, p, ttl=None):
+        ttl = p.ttl_for(rec['ttl']) if ttl is None else ttl
         if ttl and r.ttl and r.ttl != ttl:
             return True
         return any(k in r.extra and r.extra[k] != v for k, v in rec['options'].items())
 
     async def _converge(self, rec, account, p, reason):
+        # Only these adapters use atomic RRset conditions. Every retry re-reads and
+        # re-applies ownership/consent/drift checks; a new sibling is never implicit consent.
+        attempts = 3 if p.type in ('rfc2136', 'route53') else 1
+        for attempt in range(attempts):
+            try:
+                return await self._converge_once(rec, account, p, reason)
+            except ProviderError as exc:
+                if exc.code != 'record_conflict' or attempt == attempts - 1:
+                    raise  # sustained contention uses the existing automatic backoff
+
+    async def _converge_once(self, rec, account, p, reason):
         aid, zone, name, rtype, desired = account['id'], rec['zone'], rec['name'], rec['rtype'], rec['desired']
         # Records of the name on another line (电信, 联通...) are not this one's.
         found = p.on_line(await self._call(aid, p.records, zone, name, rtype), rec['options'])
+        found = await self._resume_cleanup(rec, account, p, found)
         await self._saw(rec, found)
+        if self._rrset_blocked(rec, found, p):
+            await self._review_rrset(rec, found)
+            return {'remote': ','.join(self._rrset_values(found)), 'pid': rec['provider_record_id'], 'times': rec['drift_times'],
+                    'wrote': '', 'synced': False, 'read': True, 'state': 'rrset_review',
+                    'next_ms': self.now() + int(self.jitter(CHECK_S) * 1000)}
         mine = self._mine(rec, found, p)
         now = self.now()
         times = [t for t in rec['drift_times'] if now - t < FIGHT_WINDOW_S * 1000]
@@ -1219,8 +1292,10 @@ class Ddns:
                     return {**out, 'state': 'fighting' if len(times) >= 2 else 'drift', 'next_ms': min(due, now + int(self.jitter(CHECK_S) * 1000))}
         # TTL and options are compared when asked to, and until a sync after the record was last
         # edited has read the provider (the one the edit started may have failed).
-        attrs = reason in FORCED or rec['updated_ms'] > rec['checked_ms']
-        stale = [r for r in mine if r.value != desired or attrs and self._attrs_differ(r, rec, p)]
+        attrs = (reason in FORCED or rec['updated_ms'] > rec['checked_ms'] or
+                 rec['ttl'] is None and account.get('updated_ms', 0) > rec['checked_ms'])
+        ttl = await p.effective_ttl(zone, rec['ttl']) if attrs else None
+        stale = [r for r in mine if r.value != desired or attrs and self._attrs_differ(r, rec, p, ttl)]
         if not mine or stale:
             due = self._throttled(rec['id'], reason, now)
             if due:
@@ -1231,7 +1306,13 @@ class Ddns:
             out['pid'] = created.id if isinstance(created, Record) else created if isinstance(created, str) else ''
             out['wrote'] = 'recreated' if rec['synced_ms'] and not expected else 'created'
         for r in stale:
+            # Persist BEFORE add-new: a crash or a failed delete must not lose the old value's identity.
+            staged = p.caps.staged_update and r.value != desired
+            if staged:
+                await self._set(rec['id'], pending_cleanup={'old': r.public(), 'replacement': desired})
             await self._call(aid, p.update, zone, r, desired, rec['ttl'], rec['options'])
+            if staged:
+                await self._set(rec['id'], pending_cleanup=None)
             self._wrote(rec['id'])
             out['wrote'] = 'updated' if expected else 'reverted'
         if out['wrote']:
@@ -1317,7 +1398,7 @@ class Ddns:
         problem = self.problems.get(rid)
         if problem and state == 'ok':
             state = problem[0]
-        fields = {'remote': out['remote'], 'state': state, 'error': '', 'error_code': '', 'fail_count': 0, 'first_fail_ms': 0,
+        fields = {'remote': out['remote'], 'state': state, 'error': '', 'error_code': '',
                   'next_ms': out['next_ms'], 'drift_times': out['times'], 'provider_record_id': out['pid'] or ''}
         if out['read'] or out['synced']:
             fields['remote_ms'] = now
@@ -1327,6 +1408,9 @@ class Ddns:
             # The change this sync started from: one coming while it ran is still to be written,
             # not taken for an outside change.
             fields['synced_ms'] = rec['changed_ms'] or now
+            # Review/drift/hold are not recovery. Keep the original failure identity
+            # (and count) across those states, including a restart, until truly synced.
+            fields.update(fail_count=0, first_fail_ms=0)
         await self._set(rid, **fields)
         server = rec['source'].get('serverId', '')
         if out['wrote'] == 'created':
@@ -1338,7 +1422,7 @@ class Ddns:
         elif out['wrote']:
             await self._event(owner, rid, 'write', f'已写入 {rec["desired"]}' + (f'（原来是 {rec["remote"]}）' if rec['remote'] and rec['remote'] != rec['desired'] else ''),
                               {'value': rec['desired'], 'previous': rec['remote']})
-        if rec['first_fail_ms']:
+        if rec['first_fail_ms'] and out['synced']:
             await self._event(owner, rid, 'recover', '同步恢复正常', {'failures': rec['fail_count']})
             if await one(self.db.conn, 'SELECT 1 FROM server_notifications WHERE id=?', (f'ddns-fail:{rid}:{rec["first_fail_ms"]}',)):
                 await self._alert(owner, f'ddns-recover:{rid}:{rec["first_fail_ms"]}', 'ddns_recover', f'{label} 已恢复正常，当前值 {rec["desired"]}。', server)
@@ -1472,7 +1556,11 @@ class Ddns:
             return row
         value = row['value']
         match = next((r for r in found if value and r.value == value), None)
-        return {**row, 'action': 'same' if match else 'takeover', 'remote': (match or found[0]).value, 'remoteCount': len(found)}
+        rrset = providers.get(account['type']).caps.rrset
+        needs_rrset = rrset and any(len(r.value.split(',')) > 1 for r in found)
+        return {**row, 'action': 'same' if match and not needs_rrset else 'takeover', 'remote': (match or found[0]).value,
+                'remoteCount': len(found), 'rrset': rrset, 'remoteValues': self._rrset_values(found),
+                'requiresRrsetTakeover': needs_rrset, 'warning': RRSET_WARNING if needs_rrset else ''}
 
     async def create_records(self, owner, data):
         if not isinstance(data, dict) or set(data) - {'serverId', 'source', 'backup', 'ttl', 'options', 'policy', 'rows'}:
@@ -1484,7 +1572,9 @@ class Ddns:
         rows = data.get('rows')
         if not isinstance(rows, list) or not 0 < len(rows) <= MAX_ROWS or not all(isinstance(r, dict) for r in rows):
             fail('invalid_rows')
-        if any(set(r) - {'name', 'type', 'accountId', 'confirmTakeover', 'options'} for r in rows):
+        if any(set(r) - {'name', 'zone', 'type', 'accountId', 'confirmTakeover', 'confirmRrsetTakeover', 'options'} for r in rows):
+            fail('invalid_rows')
+        if any('confirmRrsetTakeover' in r and not isinstance(r['confirmRrsetTakeover'], bool) for r in rows):
             fail('invalid_rows')
         records, skipped = await self._add(owner, source, backup, ttl, data.get('options'), policy, rows)
         return {'ok': True, 'records': records, 'skipped': skipped}
@@ -1498,7 +1588,11 @@ class Ddns:
             label = {'name': str(row.get('name') or ''), 'type': str(row.get('type') or '')}
             try:
                 name, hint = model.clean_name(row.get('name'))
-                hint = row.get('zone') or hint
+                if row.get('zone') not in (None, ''):
+                    zone_hint, nested = model.clean_name(row['zone'])
+                    if nested or '*' in zone_hint or not model.in_zone(name, zone_hint) or hint and hint != zone_hint:
+                        fail('zone_not_found')
+                    hint = zone_hint
                 label['name'] = name
                 rtype = row.get('type')
                 if rtype not in TYPES:
@@ -1508,6 +1602,8 @@ class Ddns:
                 account = accounts.get(row.get('accountId'))
                 if account is None:
                     fail('account_not_found', 404)
+                if hint and account['zones'] and hint not in account['zones']:
+                    fail('zone_not_found')
                 zone = self._zone_of(account, name, hint)
                 if not zone:
                     fail('zone_not_found')
@@ -1523,6 +1619,7 @@ class Ddns:
             if family not in detected:
                 detected[family] = await self._detect(owner, source, family)
             value = detected[family]['value']
+            row_policy = {**policy, 'rrsetTakeover': policy.get('rrsetTakeover', False) or row.get('confirmRrsetTakeover') is True}
             pid, taken = str(row.get('recordId') or ''), None
             if readable(account['type']):
                 try:
@@ -1531,10 +1628,14 @@ class Ddns:
                 except DdnsError as exc:
                     skipped.append({**label, 'reason': 'error', 'error': exc.error, 'message': exc.message})
                     continue
+                if self._rrset_blocked({'policy': row_policy}, found, providers.get(account['type'])):
+                    skipped.append({**label, 'reason': 'rrset_takeover_required', 'remoteValues': self._rrset_values(found), 'message': RRSET_WARNING})
+                    continue
                 if found:
                     taken = next((r for r in found if pid and r.id == pid), None) or next((r for r in found if value and r.value == value), None) or found[0]
                     same = bool(value) and all(r.value == value for r in (found if policy['multi'] == 'all' else [taken]))
-                    if not same and row.get('confirmTakeover') is not True:
+                    whole_confirmed = providers.get(account['type']).caps.rrset and row_policy['rrsetTakeover']
+                    if not same and row.get('confirmTakeover') is not True and not whole_confirmed:
                         skipped.append({**label, 'reason': 'takeover_not_confirmed', 'remote': taken.value})
                         continue
                     pid = taken.id
@@ -1558,7 +1659,7 @@ class Ddns:
                 await conn.execute('INSERT INTO ddns_records(id,owner,account_id,zone,name,rtype,source_json,backup_json,ttl,options_json,policy_json,'
                                    'provider_record_id,desired,desired_ms,remote,remote_ms,changed_ms,state,next_ms,several_seen,created_ms,updated_ms) '
                                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                                   (rid, owner, account['id'], zone, name, rtype, dumps(stored), dumps(backup), ttl, dumps(opts), dumps(policy), pid,
+                                   (rid, owner, account['id'], zone, name, rtype, dumps(stored), dumps(backup), ttl, dumps(opts), dumps(row_policy), pid,
                                     desired, now if desired else 0, remote, now if remote else 0, now if desired else 0, 'pending', now,
                                     int(len(found) > 1) if taken is not None else 0, now, now))
             source_text = METHOD_TEXT.get(model.method_of(stored, family) or 'fixed', '')
@@ -1634,7 +1735,7 @@ class Ddns:
         if 'options' in changes and self._line(account, changes['options']) != self._line(account, rec['options']):
             # Another line is another record at the provider: the old line's one this record managed goes,
             # and the new line's is written as a change of its settings, not taken for one deleted outside.
-            await self._leave_line(owner, rec, account)
+            await self._leave_line(owner, {**rec, 'policy': changes.get('policy', rec['policy'])}, account)
             changes.update(provider_record_id='', remote='', changed_ms=max(now, rec['changed_ms'] + 1))
         state = {'state': 'paused', 'next_ms': 0} if not enabled else {'state': 'pending', 'next_ms': now}
         if 'source' in changes and changes['source'] != rec['source']:
@@ -1667,6 +1768,9 @@ class Ddns:
                     return
                 async with self._zone_lock(account['id'], rec['zone'], p):
                     found = p.on_line(await self._call(account['id'], p.records, rec['zone'], rec['name'], rec['rtype']), rec['options'])
+                    if self._rrset_blocked(rec, found, p):
+                        await self._review_rrset(rec, found)
+                        fail('rrset_takeover_required', 409, RRSET_WARNING + '；现有 IP：' + ', '.join(self._rrset_values(found)))
                     targets = self._mine(rec, found, p, strict=True)
                     if targets is None:
                         await self._event(owner, rec['id'], 'line_left', '换了线路；原线路上的记录认不出哪条归它管理，没有删除，可以到服务商那里处理')
@@ -1676,6 +1780,8 @@ class Ddns:
                     if targets:
                         await self._event(owner, rec['id'], 'line_left', f'换了线路，已删除原线路上的记录（{"、".join(t.value for t in targets)}）')
         except (ProviderError, DdnsError) as exc:
+            if isinstance(exc, DdnsError) and exc.error == 'rrset_takeover_required':
+                raise
             await self._event(owner, rec['id'], 'line_left', f'换了线路；删除原线路上的记录失败，它还在：{scrub(getattr(exc, "message", ""), creds)}')
 
     async def delete_record(self, owner, rid, *, delete_remote=False):
@@ -1692,17 +1798,30 @@ class Ddns:
                     if not p.caps.delete:
                         fail('delete_unsupported', 409)
                     async with self._zone_lock(account['id'], rec['zone'], p):
-                        if p.caps.read:
-                            found = p.on_line(await self._call(account['id'], p.records, rec['zone'], rec['name'], rec['rtype']), rec['options'])
-                            targets = self._mine(rec, found, p, strict=True)
-                            if targets is None:
-                                fail('record_ambiguous', 409, f'服务商上 {rec["name"]} 的 {rec["rtype"]} 记录（'
-                                                              f'{"、".join(r.value for r in found[:5])}）都不是 OpenBear 写入的值，'
-                                                              '认不出哪条归它管理，没有删除；可以只停止管理，再到服务商那里删除')
-                        else:
-                            targets = [Record(rec['provider_record_id'], rec['name'], rec['rtype'], rec['remote'], rec['ttl'], dict(rec['options']))]
-                        for target in targets:
-                            await self._call(account['id'], p.delete, rec['zone'], target)
+                        attempts = 3 if p.type in ('rfc2136', 'route53') else 1
+                        for attempt in range(attempts):
+                            try:
+                                if p.caps.read:
+                                    found = p.on_line(await self._call(account['id'], p.records, rec['zone'], rec['name'], rec['rtype']), rec['options'])
+                                    if self._rrset_blocked(rec, found, p):
+                                        await self._review_rrset(rec, found)
+                                        fail('rrset_takeover_required', 409, RRSET_WARNING + '；现有 IP：' + ', '.join(self._rrset_values(found)))
+                                    found = await self._resume_cleanup(rec, account, p, found)
+                                    targets = self._mine(rec, found, p, strict=True)
+                                    if targets is None:
+                                        fail('record_ambiguous', 409, f'服务商上 {rec["name"]} 的 {rec["rtype"]} 记录（'
+                                                                      f'{"、".join(r.value for r in found[:5])}）都不是 OpenBear 写入的值，'
+                                                                      '认不出哪条归它管理，没有删除；可以只停止管理，再到服务商那里删除')
+                                else:
+                                    targets = [Record(rec['provider_record_id'], rec['name'], rec['rtype'], rec['remote'], rec['ttl'], dict(rec['options']))]
+                                for target in targets:
+                                    await self._call(account['id'], p.delete, rec['zone'], target)
+                                break
+                            except ProviderError as exc:
+                                if exc.code != 'record_conflict' or attempt == attempts - 1:
+                                    raise
+                                # Re-select from the new snapshot. In particular, an absent
+                                # set is already deleted; an unknown/new sibling is not ours.
             except ProviderError as exc:
                 raise DdnsError(exc.code, 400, model.MESSAGES.get(exc.code, '') + '：' + scrub(exc.message, creds)) from None
         async with self.db.write_transaction(label='ddns-record-delete') as conn:
@@ -1780,7 +1899,11 @@ class Ddns:
                 else:
                     if found:
                         match = next((x for x in found if item['value'] and x.value == item['value']), None)
-                        item.update(action='same' if match else 'takeover', remote=(match or found[0]).value)
+                        rrset = providers.get(account['type']).caps.rrset
+                        needs_rrset = rrset and any(len(r.value.split(',')) > 1 for r in found)
+                        item.update(action='same' if match and not needs_rrset else 'takeover', remote=(match or found[0]).value,
+                                    rrset=rrset, remoteValues=self._rrset_values(found), requiresRrsetTakeover=needs_rrset,
+                                    warning=RRSET_WARNING if needs_rrset else '')
             records.append(item)
         return {'ok': True, 'accounts': [{'type': a['type'], 'alias': a['alias'], 'mergeInto': merge[a['key']]['id'] if a['key'] in merge else None}
                                          for a in parsed['accounts']],

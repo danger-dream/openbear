@@ -4,6 +4,8 @@ import fs from "node:fs";
 import vm from "node:vm";
 import {initialConversationTitle} from "../../conversationTitle.js";
 import {extensionDraft, forgetExtensionDraft} from "./extensionDrafts.js";
+import {normalizeImageOneTurn} from "./imageOneTurn.js";
+import {normalizePromptTemplate} from "./promptTemplate.js";
 
 const source = fs.readFileSync(new URL("./ConsoleView.vue", import.meta.url), "utf8");
 const display = fs.readFileSync(new URL("./display.js", import.meta.url), "utf8");
@@ -19,8 +21,9 @@ const actual = [
   between("watch(() => props.folderId,", "watch(() => draft.value,"),
   between("export function modelThinkingLevels(", "export function thinkingLabel(", display).replaceAll("export function", "function"),
 ].join("\n");
-const cheap = {contextStrategy: "sliding_window", mainModel: "cheap", mainThinkingLevel: "low", mainFastMode: false, agentModel: "cheap", agentThinkLevel: "low", agentFastMode: false};
-const paid = {contextStrategy: "sliding_window", mainModel: "paid", mainThinkingLevel: "high", mainFastMode: true, agentModel: "paid", agentThinkLevel: "high", agentFastMode: true};
+const imageOneTurnOff = {enabled: false, includeUser: true, agents: true};
+const cheap = {contextStrategy: "sliding_window", imageOneTurn: imageOneTurnOff, promptTemplate: "", mainModel: "cheap", mainThinkingLevel: "low", mainFastMode: false, agentModel: "cheap", agentThinkLevel: "low", agentFastMode: false};
+const paid = {contextStrategy: "sliding_window", imageOneTurn: imageOneTurnOff, promptTemplate: "", mainModel: "paid", mainThinkingLevel: "high", mainFastMode: true, agentModel: "paid", agentThinkLevel: "high", agentFastMode: true};
 const flush = async () => {for (let i = 0; i < 20; i++) await Promise.resolve();};
 function deferred() {let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject};}
 
@@ -37,6 +40,8 @@ function harness({folderId = "project", getDefaults} = {}) {
       {key: "paid", thinkingLevels: ["low", "medium", "high"], defaultThinkingLevel: "high", supportsFast: true},
     ]),
     localContextStrategy: ref("sliding_window"),
+    localImageOneTurn: ref(normalizeImageOneTurn()), normalizeImageOneTurn,
+    localPromptTemplate: ref(""), normalizePromptTemplate,
     localModel: ref("cheap"), localThinking: ref("low"), localFast: ref(false),
     localAgentModel: ref(""), localAgentThinking: ref(""), localAgentFast: ref(null),
     isLocalConversation: {get value() {return props.conversationUuid.startsWith("local:");}},
@@ -146,11 +151,12 @@ test("folder property refresh preserves explicit draft choices and updates untou
   assert.deepEqual(h.config(), {...current, agentFastMode: false});
 });
 
-test("returning to the same draft from another conversation keeps its explicit choices", async () => {
-  const h = harness();
+test("returning to the same draft from another conversation keeps its explicit choices when the folder sets no model", async () => {
+  const h = harness({getDefaults: () => ({defaults: paid, folderDefaults: {mainThinkingLevel: "high"}})});
   await h.run("loadLocalRunDefaults()");
   await h.run("patchLocalRunDefaults({mainModel:'cheap'})");
   const chosen = h.config();
+  h.run("leaveLocalDraft()");
   Object.assign(h.state.props, {conversationUuid: "existing", folderId: "other"});
   h.state.folderChanged("other", "project");
   Object.assign(h.state.props, {conversationUuid: "local:new", folderId: "project"});
@@ -161,6 +167,41 @@ test("returning to the same draft from another conversation keeps its explicit c
   assert.deepEqual(h.config(), chosen);
   await h.run("ensureServerConversationForSend('hello', pending)");
   assert.deepEqual(JSON.parse(JSON.stringify(h.creates[0].runConfig)), chosen);
+});
+
+test("a folder that sets the model restores its model settings after the draft is left", async () => {
+  for (const folderId of ["project", ""]) {
+    // A temporary draft gets the same folder-style defaults from the temporary properties.
+    const h = harness({folderId, getDefaults: () => ({defaults: paid, folderDefaults: paid})});
+    await h.run("loadLocalRunDefaults()");
+    await h.run("patchLocalRunDefaults({mainModel:'cheap'})");
+    await h.run("patchLocalRunDefaults({agentThinkLevel:'low'})");
+    await h.run("patchLocalRunDefaults({contextStrategy:'model_summary'})");
+    // A choice made during this visit is what this visit shows.
+    assert.equal(h.config().mainModel, "cheap");
+    h.run("leaveLocalDraft()");
+    Object.assign(h.state.props, {conversationUuid: "existing", folderId: "other"});
+    h.state.folderChanged("other", folderId);
+    Object.assign(h.state.props, {conversationUuid: "local:new", folderId});
+    h.state.folderChanged(folderId, "other");
+    await h.run("loadLocalRunDefaults('local:new')");
+    await flush();
+    // Non-model draft choices stay; the model settings come from the folder again.
+    const expected = {...paid, contextStrategy: "model_summary"};
+    assert.deepEqual(h.config(), expected);
+    await h.run("ensureServerConversationForSend('hello', pending)");
+    assert.deepEqual(JSON.parse(JSON.stringify(h.creates[0].runConfig)), expected);
+    assert.deepEqual(h.patches, []);
+  }
+});
+
+test("an unavailable folder model keeps the draft's explicit model choice after leaving", async () => {
+  const h = harness({getDefaults: () => ({defaults: paid, folderDefaults: {...paid, mainModel: "removed"}})});
+  await h.run("loadLocalRunDefaults()");
+  await h.run("patchLocalRunDefaults({mainModel:'cheap'})");
+  h.run("leaveLocalDraft()");
+  await h.run("loadLocalRunDefaults('local:new')");
+  assert.equal(h.config().mainModel, "cheap");
 });
 
 test("sending or retargeting the draft forgets its explicit choices", async () => {
@@ -315,4 +356,56 @@ test("existing conversations ignore directory defaults refresh events", async ()
   await flush();
   assert.equal(h.requests.length, 0);
   assert.equal(h.resets.length, 0);
+});
+
+test("temporary draft defaults sync chatState immediately and never revert to a previous model on send", async () => {
+  const h = harness({
+    folderId: "",
+    getDefaults: () => ({defaults: cheap, folderDefaults: {mainModel: "cheap", mainThinkingLevel: "low"}}),
+  });
+  // Simulate residual state from a previously viewed/created conversation using `paid`.
+  h.state.localModel.value = "paid";
+  h.state.chatState.value = {
+    conversationUuid: "previous-conv",
+    model: "paid",
+    thinkingLevel: "high",
+    effectiveThinkingLevel: "high",
+    running: true,
+  };
+  await h.run("loadLocalRunDefaults()");
+  assert.equal(h.state.localModel.value, "cheap");
+  assert.equal(h.state.chatState.value.model, "cheap");
+  assert.equal(h.state.chatState.value.thinkingLevel, "low");
+
+  // Even if an earlier stale reset wrote `paid` into chatState before send,
+  // transitioning local:new -> server UUID adopts created.state / submitted runConfig.
+  h.state.chatState.value = {...h.state.chatState.value, model: "paid", running: true, optimisticMarker: "keep"};
+  h.state.Api.createConversation = async (data) => {
+    h.creates.push(data);
+    return {
+      conversation: {conversationUuid: "created-temp", title: data.title},
+      state: {
+        conversationUuid: "created-temp",
+        model: data.runConfig.mainModel,
+        thinkingLevel: data.runConfig.mainThinkingLevel,
+        effectiveThinkingLevel: data.runConfig.mainThinkingLevel,
+        thinkingLevels: ["low", "medium"],
+        defaultThinkingLevel: "low",
+        fastMode: false,
+        effectiveFastMode: false,
+        fastSupported: false,
+        contextStrategy: data.runConfig.contextStrategy,
+        messages: [],
+        operations: [],
+        running: false,
+      },
+    };
+  };
+  await h.run("ensureServerConversationForSend('hello', pending)");
+  assert.equal(h.state.isLocalConversation.value, false);
+  assert.equal(h.state.chatState.value.conversationUuid, "created-temp");
+  assert.equal(h.state.chatState.value.model, "cheap");
+  assert.equal(h.state.chatState.value.thinkingLevel, "low");
+  assert.equal(h.state.chatState.value.running, true);
+  assert.equal(h.state.chatState.value.optimisticMarker, "keep");
 });

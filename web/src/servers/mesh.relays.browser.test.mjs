@@ -71,6 +71,14 @@ test('mesh board layout: site relays', {skip: !chromium, timeout: 300000}, async
     await modes.getByRole('radio', {name: /^站点中转/}).check();
     await h.saved(d => memberOf(d, 'toy').relayMode === 'site', 'site relay again');
     await label(page, '打洞 · 2.6 ms').waitFor();
+    // Not transiting: kept while on and shown on the board; off again, said as off and staying off.
+    await panel.getByRole('checkbox', {name: '只承载自己的流量'}).check();
+    await h.saved(d => memberOf(d, 'toy').noTransit === true, 'toy carrying its own only');
+    await node(page, 'toy').getByText('不中转').waitFor();
+    await panel.getByRole('checkbox', {name: '只承载自己的流量'}).uncheck();
+    await h.saved(d => memberOf(d, 'toy').noTransit === false, 'toy transiting again');
+    await node(page, 'toy').getByText('不中转').waitFor({state: 'detached'});
+    assert.equal(await panel.getByRole('checkbox', {name: '只承载自己的流量'}).isChecked(), false, 'the box stays clear after the reply');
 
     // Lab is behind NAT: made a relay its entry through SG becomes a relay link; back to a member, its entry again.
     // Without it, made a relay, it needs a public relay to link to.

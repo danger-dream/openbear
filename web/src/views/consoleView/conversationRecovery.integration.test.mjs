@@ -6,6 +6,7 @@ import {markRaw, toRaw} from 'vue';
 import {applyLiveOperationUpdate,applyOperationFrame,deriveOperationRunState,projectOperationMessages,isRootRunTerminalFrame,isTerminalOperationFrame,normalizeOperations,preferNewerLiveOperations,shouldApplyOperationFrame} from '../../timelineProjection.js';
 import {mergeOperationSnapshots} from './timelinePagination.js';
 import {createOperationFrameBuffer} from './operationFrameBuffer.js';
+import {invalidateContextUsage} from './contextUsage.js';
 
 // Actual component recovery functions and reducer, with only transport/UI seams.
 const source=fs.readFileSync(new URL('./ConsoleView.vue',import.meta.url),'utf8');
@@ -20,7 +21,7 @@ function harness(){
   const props={conversationUuid:'A'};
   const snapshot=deferred(),stateReadStarted=deferred();
   const context=vm.createContext({
-    Map,props,markRaw,toRaw,console:{warn(){}},applyOperationFrame,normalizeOperations,mergeOperationSnapshots,shouldApplyOperationFrame,
+    Map,props,markRaw,toRaw,invalidateContextUsage,console:{warn(){}},applyOperationFrame,normalizeOperations,mergeOperationSnapshots,shouldApplyOperationFrame,
     deriveOperationRunState,projectOperationMessages,applyLiveOperationUpdate,preferNewerLiveOperations,
     WebSocket:{OPEN:1},mergeStatsUsageIntoState(){},
     stateStatsByOpId:new Map(),chatState:{value:null},searchWindowActive:{value:false},
@@ -286,4 +287,20 @@ test('unmount while frame request is in flight neither applies nor launches a st
   const h=harness();const recovery=h.run('resyncOperationFrames({afterFrameSeq:0})');
   h.run('componentMounted=false');h.requests[0].reject(new Error('offline'));await tick();
   assert.equal(h.loads.length,0);await recovery;
+});
+
+
+test('consistent HTTP compaction baseline and terminal replay count exactly once, including reconnect', () => {
+  const h=harness();
+  h.context.chatState.value={contextUsage:{compactionCount:4},rolloverTriggerTokens:8000};
+  h.run(`loadOperationsFromState({frameSeq:10,operations:[{opId:'context-compaction:c',opType:'context_compaction',revision:1,displaySeq:1,status:'running',lifecycle:'active',payload:{status:'running'}}]})`);
+  const frame={opId:'context-compaction:c',opType:'context_compaction',action:'end',revision:2,frameSeq:11,displaySeq:1,payload:{status:'completed',windowVersion:2}};
+  h.context.frame=frame;
+  h.run('applyOperationFrameMessage(frame)');
+  assert.equal(h.context.chatState.value.contextUsage.compactionCount,5);
+  h.run('applyOperationFrameMessage(frame)');
+  assert.equal(h.context.chatState.value.contextUsage.compactionCount,5);
+  h.run(`loadOperationsFromState({frameSeq:11,operations:[{opId:'context-compaction:c',opType:'context_compaction',revision:2,displaySeq:1,status:'completed',lifecycle:'terminal',payload:{status:'completed',windowVersion:2}}]})`);
+  h.run('applyOperationFrameMessage(frame)');
+  assert.equal(h.context.chatState.value.contextUsage.compactionCount,5);
 });

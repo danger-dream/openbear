@@ -1195,7 +1195,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
     ),
     "tools": (
         "工具",
-        "命令执行、文件处理与结果回灌",
+        "命令执行、文件处理、结果回灌与新会话默认扩展",
         [
             "bash",
             "files",

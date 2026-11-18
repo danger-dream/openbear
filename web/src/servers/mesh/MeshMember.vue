@@ -6,7 +6,7 @@ import { bytes, flag, noAutofill } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
 import { addressProblem, candLine, candParts, CAND_STATES, codeText, MISSING_TEXT, directLine, entryHealth, errorMessage, errorsAt, errorsUnder, eventRows, exportsOf, exportText, FILTERINGS, firewallIssue, firewallKinds, gatewayNetProblem, isRelay, isSite, listens, listenWarnings, MAPPINGS, nameOf,
-  needsPublicAddr, nodeAlerts, peerKeys, portProblem, routeRows, routineEvent, nodeState, PROGRESS, progressOf, reachOf, recommendedMode, RELAY_MODES, rtt, securityStats, TRANSPORTS, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems } from './meshHelpers.js';
+  needsPublicAddr, NO_TRANSIT_HINT, nodeAlerts, peerKeys, portProblem, routeRows, routineEvent, nodeState, PROGRESS, progressOf, reachOf, recommendedMode, RELAY_MODES, rtt, securityStats, TRANSPORTS, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems, warningsUnder } from './meshHelpers.js';
 import { ArrowUpRight, Cable, CircleAlert, Globe, Route, ShieldAlert, TriangleAlert, Unplug } from '@lucide/vue';
 import { changeRole } from './meshGraph.js';
 import { canPinRoute, fixedRouteInfo } from './meshAuto.js';
@@ -71,7 +71,7 @@ const offline = computed(() => node.value?.state === 'offline' || !online.value)
 const users = computed(() => members.value.filter(x => !isRelay(x) && x.entry?.candidates?.some(c => c.relay === id.value)));
 // Most used first: a member's entries come before its settings; a relay has no entries.
 const tabs = computed(() => [['overview', '状态'], !relay.value && ['entry', '入口', ['entry']],
-  ['settings', '配置', ['role', 'relayMode', 'address', 'publicEndpoint', 'listen', 'tags', 'uploadLimitMbps', 'gateway']], ['proxy', '代理', ['proxy']], ['peers', '对端'], ['events', '事件'], ['probe', '测试']].filter(Boolean)
+  ['settings', '配置', ['role', 'relayMode', 'noTransit', 'address', 'publicEndpoint', 'listen', 'tags', 'uploadLimitMbps', 'gateway']], ['proxy', '代理', ['proxy']], ['peers', '对端'], ['events', '事件'], ['probe', '测试']].filter(Boolean)
   .map(([key, label, fields = []]) => ({key, label, bad: fields.some(f => errorsUnder(mesh.errors, `members[${index.value}].${f}`).length)})));
 // A relay has no entry tab: a tab asked for that is not there opens the status.
 watch(tabs, list => { if (!list.some(t => t.key === tab.value)) tab.value = 'overview'; }, {immediate: true});
@@ -169,7 +169,7 @@ const exitDiffers = computed(() => {
   const exit = String(reach.value?.publicAddr || '').replace(/^\[|\](?=:)|:\d+$/g, '');
   return m.value.publicEndpoint || !m.value.publicEndpointAuto || !exit || exit === m.value.publicEndpointAuto ? '' : exit;
 });
-const roleText = computed(() => [m.value.front?.length ? '前置机' : '', relay.value ? (site.value ? '站点中转' : '中转') : '成员', m.value.gateway ? '网关' : '',
+const roleText = computed(() => [m.value.front?.length ? '前置机' : '', relay.value ? (site.value ? '站点中转' : '中转') : '成员', relay.value && m.value.noTransit ? '不中转' : '', m.value.gateway ? '网关' : '',
   m.value.proxy?.exit ? '出口' : '', m.value.proxy?.ports?.length ? '代理端口' : ''].filter(Boolean).join(' · '));
 // A front's exits, by name: it dials them at its own addresses for them, and nothing else by itself.
 const frontExits = computed(() => (m.value.front || []).map(id => nameOf(members.value, id)).join('、'));
@@ -321,7 +321,8 @@ function setRelay(on) {
   m.value.role = on ? 'relay' : 'member';
   // Behind NAT (by the reachability check) it starts as a site relay.
   if (on && recommended.value) m.value.relayMode = recommended.value;
-  if (!on) delete m.value.relayMode;
+  // The server keeps what a member leaves out: a setting turned off is sent as off, and the relay type it keeps stays shown.
+  if (!on) m.value.noTransit = false;
   if (on && (isSite(m.value) ? !listens(m.value, 'udp') : !TRANSPORTS.some(([t]) => listens(m.value, t)))) m.value.listen = {udp: 0, tcp: 0, tls: 0, ...(m.value.listen || {}), udp: ports.value.udp};
   if (!on && !m.value.entry) m.value.entry = {mode: 'fixed', candidates: [], autoReturn: true};
   if (!on && listens(m.value, 'tls')) m.value.listen = {...m.value.listen, tls: 0};
@@ -336,6 +337,10 @@ function setMode(mode) {
   leaveAuto('relayMode');
   m.value.relayMode = mode;
   if (mode === 'site' && !listens(m.value, 'udp')) m.value.listen = {udp: 0, tcp: 0, tls: 0, ...(m.value.listen || {}), udp: ports.value.udp};
+  void save();
+}
+function setNoTransit(on) {
+  m.value.noTransit = on;
   void save();
 }
 // A site relay has to reach at least one public relay to exchange addresses through.
@@ -671,6 +676,11 @@ onMounted(() => { void detailPoll.run(); void routePoll.run(); });
             <small v-if="lonelySite" class="ob-warn">{{ codeText('mesh_site_relay_needs_public_link') }}</small>
             <small v-for="e in modeErrors.filter(e => !lonelySite || e !== codeText('mesh_site_relay_needs_public_link'))" :key="e" class="ob-bad">{{ e }}</small>
             <MeshAuto v-if="modeAuto" :auto="isAuto('relayMode')" :reason="modeAuto.reason" :value="MODE_TEXT[modeAuto.value] || modeAuto.value" :same="modeAuto.value === (site ? 'site' : 'public')" @restore="backToAuto('relayMode')" />
+          </MeshField>
+          <MeshField v-if="relay" label="不中转" :help="NO_TRANSIT_HINT">
+            <label class="ob-check"><input type="checkbox" :checked="Boolean(m.noTransit)" @change="setNoTransit($event.target.checked)" /><span>只承载自己的流量</span></label>
+            <small v-for="w in warningsUnder(mesh.data, `members[${index}].noTransit`)" :key="w" class="ob-warn">{{ w }}</small>
+            <small v-for="e in at('noTransit')" :key="e" class="ob-bad">{{ e }}</small>
           </MeshField>
           </template>
           <MeshField v-if="inPart(part, 'lan')" label="网关" help="把它所在局域网的网段接入网格。在访问规则的目标里写明这些网段后，其他成员才能访问其中的节点。">

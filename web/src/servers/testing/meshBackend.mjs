@@ -23,14 +23,24 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
   if (routes) reach = true;
   const doc = {
     settings: {prefix: '100.96.0.0/16', mtu: 1400, ports: {udp: 51999, tcp: 52000, tls: 52001}, health: {},
-      ...(v3 ? {autoLinks: {enabled: true, perNode: 2, gainRatio: 0.25, gainMs: 25, holdRounds: 3, dropAfterS: 1800}} : {})},
+      ...(v3 ? {autoLinks: {enabled: true, perNode: 2, gainRatio: 0.25, gainMs: 25, holdRounds: 3, dropAfterS: 1800},
+        routing: {switchMs: 5, switchPct: 0, shorterMs: 3, shorterPct: 0, advertMs: 2, advertPct: 0, holdS: 5, jitterWeight: 2, lossWeight: 1000, flapHoldS: 60, flapHoldMaxS: 480}} : {})},
     members: [member('berlin', 'Berlin', 'relay', {address: '100.96.0.1'}), member('lax', 'LAX', 'relay', {address: '100.96.0.2', listen: {udp: 51999, tcp: 52000, tls: 0}}),
       member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], ...(v3 ? {direct: true} : {}),
         entry: {mode: v3 ? 'upstreams' : 'failover', autoReturn: true, candidates: [{id: 'c1', relay: 'berlin', transport: 'udp'},
           {id: 'c2', relay: 'lax', transport: 'tcp', ...(v3 ? {origin: 'auto', reason: '去 LAX 比经 Berlin 快 42 ms（实测 152 ms vs 194 ms）', since: Date.now() - 600000} : {})}]}})],
     relayLinks: {mode: 'full', pairs: []}, directLinks: [], rules: [],
     // v3: a controller with line rules, exit groups, connection limits and fixed paths (the new mesh pages).
-    ...(v3 ? {lineRules: [], exitGroups: [], limits: [], paths: []} : {}),
+    ...(v3 ? {lineRules: [], exitGroups: [], limits: [], paths: [], fastPorts: [], forwards: []} : {}),
+  };
+  // The provinces a forward may allow, as the controller's mesh_geo gives them.
+  const forwardGeo = {ready: true, updatedAt: Date.now() - 3600000, checkedAt: Date.now() - 600000, error: '', source: 'ip2region',
+    provinces: [['北京市', 5685, 5172], ['上海市', 2258, 364], ['广东省', 2915, 1581], ['云南省', 322, 70]].map(([name, v4, v6]) => ({name, v4, v6}))};
+  let draftSequence = 0, versionDoc = '';
+  const draftVersion = () => {
+    const next = JSON.stringify(doc);
+    if (next !== versionDoc) { versionDoc = next; draftSequence++; }
+    return String(draftSequence);
   };
   const rollbacks = [];
   // What a v3 controller works out by itself, as GET /mesh auto says it.
@@ -166,12 +176,13 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
   if (punch && !legacyDirect) for (const [id, n] of Object.entries(nodes)) n.summary.direct = Object.fromEntries((live[id] || []).map(p => [p.id, {state: p.direct.state, via: p.direct.via, rttMs: p.rttMs}]));
   if (reach) {
     for (const k of Object.keys(nodes)) delete nodes[k];
-    const link = (peer, state, rttMs, jitterMs, loss, cost) => ({peer, state, rttMs, jitterMs, loss, cost, penalty: state === 'suppressed' ? 2600 : 0});
+    const link = (peer, state, rttMs, jitterMs, loss, cost, advertised) => ({peer, state, rttMs, jitterMs, loss, cost, penalty: state === 'suppressed' ? 2600 : 0,
+      ...(advertised != null ? {advertised} : {})});
     const routing = {
       sg: [link('home', 'up', 79.4, 1.2, 0, 82), link('toy', 'up', 75.2, 0.9, 0, 77)],
       lax: [link('home', 'suppressed', 182, 46, 0.3, null)],
-      home: [link('sg', 'up', 79.4, 1.2, 0, 82), link('lax', 'up', 171, 31, 0.1, 333), link('toy', 'up', 2.5, 0.2, 0, 2.9)],
-      toy: [link('home', 'up', 2.6, 0.2, 0, 3), link('sg', 'up', 75.2, 0.9, 0, 77)]};
+      home: [link('sg', 'up', 79.4, 1.2, 0, 82), link('lax', 'up', 171, 31, 0.1, 333), link('toy', 'up', 2.5, 0.2, 0, 2.9, 3.4)],
+      toy: [link('home', 'up', 2.6, 0.2, 0, 3, 2.8), link('sg', 'up', 75.2, 0.9, 0, 77)]};
     const summaryOf = id => {
       const s = status[id], {observers, mapping, ...reachability} = s.reachability;
       return {entry: s.entry ? {candidate: s.entry.candidate, relay: s.entry.relay, transport: s.entry.transport, switches: s.entry.switches} : {}, ready: true, peers: 3,
@@ -390,17 +401,17 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
     else { p.state = 'done'; nodes[p.serverId] = {...(nodes[p.serverId] || {}), state: 'ready', appliedRevision: rollout.revision, error: '', summary: nodes[p.serverId]?.summary || {entry: {}, ready: true, peers: 1, rttMs: 80}}; }
     if (!rollout.progress.some(x => x.state === 'pending' || x.state === 'applying')) rollout.running = false;
   }
-  const view = () => ({ok: true, ...JSON.parse(JSON.stringify(doc)), applied: {revision, at: Date.now()}, draft: {dirty: JSON.stringify(doc) !== JSON.stringify(applied), changes: changes()},
+  const view = () => ({ok: true, draftVersion: draftVersion(), ...JSON.parse(JSON.stringify(doc)), applied: {revision, at: Date.now()}, draft: {dirty: JSON.stringify(doc) !== JSON.stringify(applied), changes: changes()},
     nodes, eligible: eligible(), apply: rollout ? JSON.parse(JSON.stringify(rollout)) : {running: false, revision, progress: []}, errors: [], ...(reach ? {warnings: warnings()} : {}), ...(routes && !oldRoutes ? {exports: exportsNow()} : {}), ...(lines ? {lines: LINES} : {}),
     // The gateway on Berlin reaching an instance on Home's mesh address, as the controller adds it.
     ...(firewall ? {autoRules: [{kind: 'instance', proto: 'tcp', serverId: 'home', gateway: 'berlin', instanceId: 'i-edge', name: 'Edge-Fra', port: 18970, src: '100.96.0.1/32', dst: '100.96.0.3/32'}]} : {}),
     ...(old ? {} : {layout: JSON.parse(JSON.stringify(layout)), installing: JSON.parse(JSON.stringify(installing))}),
-    ...(v3 ? {auto: autoNow(), pathsView: buildPathsView(doc), autoLinks: {suggestions: [], lastChange: {at: Date.now() - 300000, text: '为 Home 新增上游 LAX（实测快 42 ms）'}}} : {})});
+    ...(v3 ? {auto: autoNow(), pathsView: buildPathsView(doc), forwardGeo, autoLinks: {suggestions: [], lastChange: {at: Date.now() - 300000, text: '为 Home 新增上游 LAX（实测快 42 ms）'}}} : {})});
   const trend = range => Array.from({length: 30}, (_, i) => ({at: Date.now() - (30 - i) * 120000, rttMs: i === 20 ? null : 140 + (i % 7) * 6, timeoutRate: i === 20 ? 1 : 0, switches: i === 20 ? 1 : 0,
     reconnects: i === 12 ? 1 : 0, rssBytes: 200e6 + i * 1e6, cpuPercent: 2 + (i % 5) * 0.4, rxBytes: 1e6 * i, txBytes: 5e5 * i, range}));
-  const extra = {peers: [], events: []};
+  const extra = {peers: [], events: [], status: {}};
   return {
-    // extra: more peers and events for Home's detail, set by a test.
+    // extra: more peers and events for Home's detail, and fields replacing those of its status, set by a test.
     doc, nodes, layout, rollbacks, extra, failing: id => { failing = id; }, setPath: fn => { pathOf = fn; }, setPathsView: fn => { customPathsView = fn; }, setBest: fn => { bestOf = fn; }, setReinstall: outcome => { reinstallOutcome = outcome; },
     async handle(method, path, body, query = '') {
       if (method === 'GET' && path === '') { step(); return [200, view()]; }
@@ -450,10 +461,39 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
         return [200, {ok: true, ...routesOf(src)}];
       }
       if (method === 'PUT' && path === '/draft') {
-        const errors = validate(body);
+        if (!body?.draftVersion) return [428, {ok: false, error: 'mesh_draft_version_required'}];
+        if (body.draftVersion !== draftVersion()) return [409, {ok: false, error: 'mesh_draft_conflict'}];
+        // A copy: the calls the tests read keep what the page sent.
+        const {draftVersion: _version, ...draft} = JSON.parse(JSON.stringify(body));
+        // As mesh_model._member: a switch a member leaves out keeps what the draft had; only an explicit
+        // off (noTransit false, announce true, no port mapping) clears it.
+        const before = new Map((doc.members || []).map(m => [m.serverId, m]));
+        for (const m of Array.isArray(draft.members) ? draft.members : []) {
+          const prior = before.get(m.serverId) || {};
+          for (const [key, off] of [['noTransit', v => !v], ['announce', v => v !== false], ['publicPorts', v => !v || !Object.values(v).some(Boolean)], ['relayMode', () => false]]) {
+            if (!(key in m)) { if (key in prior) m[key] = JSON.parse(JSON.stringify(prior[key])); }
+            else if (off(m[key])) delete m[key];
+          }
+          // listen key by key; the fast port's 0 is back to the network's.
+          if (m.listen && prior.listen) {
+            m.listen = {...prior.listen, ...m.listen};
+            if (m.listen.fast === 0) delete m.listen.fast;
+          }
+        }
+        // As mesh_model._settings: health parameters key by key, a value left out kept.
+        if (draft.settings?.health && doc.settings?.health) draft.settings.health = {...doc.settings.health, ...draft.settings.health};
+        const errors = validate(draft);
         if (errors.length) return [400, {ok: false, error: 'mesh_invalid', errors}];
-        Object.assign(doc, JSON.parse(JSON.stringify(body)));
+        Object.assign(doc, JSON.parse(JSON.stringify(draft)));
+        draftSequence++;
         if (Array.isArray(doc.paths)) doc.paths.forEach((p, i) => { if (!p.id) p.id = `p${i + 1}`; });
+        // As mesh_fast.clean_ports: a new fast port gets the first free id.
+        if (Array.isArray(doc.fastPorts)) doc.fastPorts.forEach(p => { if (!p.id) { let n = 1; while (doc.fastPorts.some(x => x.id === `f${n}`)) n++; p.id = `f${n}`; } });
+        // As mesh_forward.clean: a new forward gets the first free id, addresses become networks.
+        for (const f of Array.isArray(doc.forwards) ? doc.forwards : []) {
+          if (!f.id) { let n = 1; while (doc.forwards.some(x => x.id === `fw${n}`)) n++; f.id = `fw${n}`; }
+          if (f.allow) f.allow.prefixes = f.allow.prefixes.map(p => p.includes('/') ? p : `${p}/${p.includes(':') ? 128 : 32}`);
+        }
         doc.members.forEach((m, i) => { if (!m.address) m.address = `100.96.0.${10 + i}`; });
         // As mesh_proxy.ensure_secrets and clean_member: an exit's password, a LAN port's, each port's id.
         for (const m of doc.members) {
@@ -527,7 +567,8 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
             ...(secure ? {counters: {droppedPlain: 1}, e2e: {sessions: 64, limit: 64, innerMtu: 1348, droppedExhausted: 4, droppedQueue: 0, droppedSource: 0, droppedBad: 2},
               security: {signing: {verified: 120, rejected: 5, byHop: {berlin: 5}}, claims: {expired: 0}}} : {}),
             peers: [{id: 'lax', kind: 'entry', active: true, transport: 'tcp', endpoint: '198.51.100.3:52000', localAddr: '10.0.0.5:40112', lastHandshakeUnixNano: String((Date.now() - 20000) * 1e6), rxBytes: 5e6, txBytes: 2e6, rttMs: 152.3, reconnects: 2},
-              {id: 'berlin', kind: 'entry', active: false, transport: 'udp', endpoint: '198.51.100.6:51999', lastHandshakeUnixNano: '0', rxBytes: 0, txBytes: 0, rttMs: null}, ...(live.home || []), ...extra.peers]} : null,
+              {id: 'berlin', kind: 'entry', active: false, transport: 'udp', endpoint: '198.51.100.6:51999', lastHandshakeUnixNano: '0', rxBytes: 0, txBytes: 0, rttMs: null}, ...(live.home || []), ...extra.peers],
+            ...extra.status} : null,
           events: id === 'home' ? [...(gone === 'home' ? goneEvents : []), {seq: 17, at: Date.now() - 120000, kind: 'peer.reconnect', detail: 'berlin'}, {seq: 18, at: Date.now() - 60000, kind: 'path.failed', detail: 'c1: probe timeout'},
             ...(upgrades ? [{seq: 18, at: Date.now() - 30000, kind: 'upgrade.failed', detail: 'data plane upgrade did not get ready; rolled back'}] : []), ...punchEvents,
             ...(secure ? [{seq: 19, at: Date.now() - 300000, kind: 'sign.rejected', detail: 'offer in the name of lax from berlin: bad signature'},

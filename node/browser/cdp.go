@@ -178,6 +178,13 @@ func (c *conn) read() {
 // call sends one command and waits up to timeout (and ctx) for its reply.
 // The command is never resent.
 func (c *conn) call(ctx context.Context, method string, params any, session string, timeout time.Duration) (*Obj, error) {
+	return c.callWithReplyStop(ctx, method, params, session, timeout, nil)
+}
+
+// replyStop ends only the reply wait after an event acknowledges the command.
+// It must not cancel Send: the peer can emit that event before Write returns.
+// The original context and timeout still bound both writing and waiting.
+func (c *conn) callWithReplyStop(ctx context.Context, method string, params any, session string, timeout time.Duration, replyStop <-chan struct{}) (*Obj, error) {
 	if !c.connected() {
 		return nil, ErrDisconnected
 	}
@@ -210,6 +217,9 @@ func (c *conn) call(ctx context.Context, method string, params any, session stri
 		return nil, err
 	}
 	if err := c.t.Send(ctx, body); err != nil {
+		if errors.Is(err, errWriteInterrupted) {
+			return nil, err
+		}
 		if ctx.Err() != nil {
 			return nil, ctxErr(ctx)
 		}
@@ -218,6 +228,8 @@ func (c *conn) call(ctx context.Context, method string, params any, session stri
 	select {
 	case r := <-ch:
 		return r.result, r.err
+	case <-replyStop:
+		return nil, errCancelled
 	case <-ctx.Done():
 		select {
 		case r := <-ch:

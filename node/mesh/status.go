@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	meshfast "openbear/node/mesh/fast"
 	"openbear/node/mesh/health"
 	meshproxy "openbear/node/mesh/proxy"
 	meshrouting "openbear/node/mesh/routing"
@@ -88,10 +89,15 @@ type Status struct {
 	Protocols [2]int `json:"protocols"`
 	// Proxy is the exit proxy's entry and exit, while the node is either.
 	Proxy *meshproxy.Status `json:"proxy,omitempty"`
+	// Forward is how the port forwards this node takes clients for, or is
+	// the target of, are doing.
+	Forward *meshproxy.ForwardStatus `json:"forward,omitempty"`
 	// Probes are the latest lightweight candidate measurements (probes.go).
 	Probes []ProbeResult `json:"probes,omitempty"`
 	// Paths are the fixed paths' pairs this node is the source of (fixedpath.go).
 	Paths []PathStatus `json:"paths,omitempty"`
+	// Fast is this node's fast relay state while fast relay is enabled on it.
+	Fast *meshfast.Status `json:"fast,omitempty"`
 }
 
 // RoutingStatus: a cost is null where it is infinite, for a link down or
@@ -110,6 +116,11 @@ type RouteLink struct {
 	Loss     float64  `json:"loss"`
 	Cost     *float64 `json:"cost"`
 	Penalty  float64  `json:"penalty"`
+	// Advertised: the cost this relay last advertised for the link, what
+	// routes go by; null unless up.
+	Advertised *float64 `json:"advertised"`
+	// HeldMs: how much longer a link back from down is held down, while it is.
+	HeldMs int64 `json:"heldMs,omitempty"`
 }
 
 type RelayRoute struct {
@@ -119,6 +130,14 @@ type RelayRoute struct {
 	Path     []string `json:"path"`
 	Since    int64    `json:"since"`
 	Switches int      `json:"switches"`
+	// Best, with Held: the shortest path's next hop while the route stays
+	// on another, its cost (null without one yet), why it stays (margin,
+	// hold, damped, loop, penalty, transit) and, for hold and damped, until
+	// when (Unix ms).
+	Best     string   `json:"best,omitempty"`
+	BestCost *float64 `json:"bestCost,omitempty"`
+	Held     string   `json:"held,omitempty"`
+	Until    int64    `json:"until,omitempty"`
 }
 
 func finite(v float64) *float64 {
@@ -132,10 +151,18 @@ func routingStatus(r *meshrouting.Router) *RoutingStatus {
 	st := r.Status()
 	out := &RoutingStatus{Mode: st.Mode, Links: []RouteLink{}, Routes: []RelayRoute{}}
 	for _, l := range st.Links {
-		out.Links = append(out.Links, RouteLink{Peer: l.Peer, State: l.State, RTTMs: l.RTTMs, JitterMs: l.JitterMs, Loss: math.Round(l.Loss*1000) / 1000, Cost: finite(l.Cost), Penalty: l.Penalty})
+		out.Links = append(out.Links, RouteLink{Peer: l.Peer, State: l.State, RTTMs: l.RTTMs, JitterMs: l.JitterMs, Loss: math.Round(l.Loss*1000) / 1000, Cost: finite(l.Cost), Penalty: l.Penalty,
+			Advertised: finite(l.Advertised), HeldMs: l.Held.Milliseconds()})
 	}
 	for _, x := range st.Routes {
-		out.Routes = append(out.Routes, RelayRoute{Dest: x.Dest, NextHop: x.NextHop, Cost: finite(x.Cost), Path: x.Path, Since: x.Since.UnixMilli(), Switches: x.Switches})
+		r := RelayRoute{Dest: x.Dest, NextHop: x.NextHop, Cost: finite(x.Cost), Path: x.Path, Since: x.Since.UnixMilli(), Switches: x.Switches, Best: x.Best, Held: x.Held}
+		if x.Best != "" {
+			r.BestCost = finite(x.BestCost)
+		}
+		if !x.Until.IsZero() {
+			r.Until = x.Until.UnixMilli()
+		}
+		out.Routes = append(out.Routes, r)
 	}
 	return out
 }
@@ -544,14 +571,14 @@ func (e *engine) status() Status {
 		TxSwapped: c.LargeSwapped.Load(), TxCopied: c.LargeCopied.Load(), TxReused: c.LargeReused.Load(), TxAllocated: c.LargeAllocated.Load(), TxDiscarded: c.LargeDiscarded.Load()}
 	view, r := e.tun.paths.view.Load(), e.tun.route.Load()
 	for i := range s.Peers {
-		s.Peers[i].PathMTU = view.linkMTU(s.Peers[i].ID)
+		s.Peers[i].PathMTU = view.linkShown(s.Peers[i].ID)
 	}
 	if e.e2e != nil {
 		s.E2E = e.e2e.status()
 		for i := range s.E2E.Peers {
 			p := &s.E2E.Peers[i]
 			if z := r.nodes.byID[p.ID]; r.nodes != nil && z != nil {
-				p.PathMTU = view.pathMTU(p.ID, r.hop(z.addr))
+				p.PathMTU = view.pathMTU(p.ID, r.firstHop(z))
 			}
 		}
 	}

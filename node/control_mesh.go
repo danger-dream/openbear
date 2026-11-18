@@ -40,6 +40,13 @@ var (
 	// handoverWait is how long an operation waits for the session on the
 	// other address before it goes ahead regardless.
 	handoverWait = 30 * time.Second
+	// Before an operation takes the mesh down the other address is tried up
+	// to probeTries times, each for probeTry, within probeTotal: through a
+	// proxy one connection can stall where the next goes through at once.
+	// probeTotal stays within what the controller waits for mesh.apply.
+	probeTries = 3
+	probeTry   = 10 * time.Second
+	probeTotal = 20 * time.Second
 )
 
 func (a *Agent) meshLink() meshLink {
@@ -62,11 +69,20 @@ func (a *Agent) overMesh(address string) bool {
 // when the mesh is down.
 func (a *Agent) meshExit(onBackup bool) bool {
 	c := a.config()
-	in, other := c.URL, c.Backup
+	other := c.Backup
 	if onBackup {
-		in, other = c.Backup, c.URL
+		other = c.URL
 	}
-	return other != "" && a.overMesh(in) && !a.overMesh(other)
+	return other != "" && a.overMesh(a.inUse(onBackup)) && !a.overMesh(other)
+}
+
+// inUse is the address the session uses, the backup when onBackup.
+func (a *Agent) inUse(onBackup bool) string {
+	c := a.config()
+	if onBackup {
+		return c.Backup
+	}
+	return c.URL
 }
 
 func (a *Agent) onBackup() bool {
@@ -187,6 +203,24 @@ func (a *Agent) returnHomeOverMesh(ctx context.Context) {
 	}
 }
 
+// answersWithin is answers tried up to probeTries times within probeTotal.
+func (a *Agent) answersWithin(ctx context.Context, c Config) bool {
+	ctx, cancel := context.WithTimeout(ctx, probeTotal)
+	defer cancel()
+	for range probeTries {
+		try, cancelTry := context.WithTimeout(ctx, probeTry)
+		ok := a.answers(try, c)
+		cancelTry()
+		if ok {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+	}
+	return false
+}
+
 // answers: a probe handshake with c.URL reaches the controller.
 func (a *Agent) answers(ctx context.Context, c Config) bool {
 	conn, _, first, err := a.dial(ctx, c, handshakeParams(true))
@@ -209,9 +243,10 @@ type callState struct {
 // leaveMesh runs before an operation of this node that takes the mesh here
 // down (what names it). If the session is on a mesh address and the other
 // address answers, the session moves there first: leaveMesh returns once the
-// new session said hello, or after handoverWait, with a context that the
-// old session's end does not cancel. Until release, a session on the other
-// address does not go back to the mesh.
+// new session said hello, or after handoverWait. A session left on the mesh
+// address ends with the operation it carries, so whenever the session is on
+// one the context returned is one its end does not cancel. Until release, a
+// session on the other address does not go back to the mesh.
 func (a *Agent) leaveMesh(ctx context.Context, what string) (context.Context, func()) {
 	a.mu.Lock()
 	a.held++
@@ -223,18 +258,18 @@ func (a *Agent) leaveMesh(ctx context.Context, what string) (context.Context, fu
 	}
 	onBackup := a.onBackup()
 	if !a.meshExit(onBackup) {
+		if a.overMesh(a.inUse(onBackup)) {
+			return context.WithoutCancel(ctx), release
+		}
 		return ctx, release
 	}
 	probe := a.config()
 	if !onBackup {
 		probe.URL = probe.Backup
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	ok := a.answers(probeCtx, probe)
-	cancel()
-	if !ok {
+	if !a.answersWithin(ctx, probe) {
 		a.Logger.Printf("%s takes the mesh down, but the other address does not answer; staying on the mesh address", what)
-		return ctx, release
+		return context.WithoutCancel(ctx), release
 	}
 	ready := make(chan struct{})
 	a.mu.Lock()

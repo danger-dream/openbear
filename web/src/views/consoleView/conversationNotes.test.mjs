@@ -53,4 +53,18 @@ test('desktop sticky note sits above work-items on the right rail and uses neutr
   assert.match(consoleSource, /<ConversationNotesSelection[^>]+:scroller="scroller"/);
   assert.match(consoleSource, /<ConversationNotes @locate="locateFromNotes"/);
   assert.match(consoleSource, /返回便签/);
+
+  // 6. Selection context menu, desktop floating bar and mobile pill put Copy & Search first.
+  assert.match(
+    selSource,
+    /class="notes-ctx-menu"[\s\S]*?复制选中内容[\s\S]*?使用 Google 搜索[\s\S]*?class="notes-ctx-sep"/,
+  );
+  assert.match(
+    selSource,
+    /class="notes-sel-toolbar"[\s\S]*?<span>复制<\/span>[\s\S]*?<span>搜索<\/span>[\s\S]*?<span>记便签<\/span>/,
+  );
+  assert.match(
+    selSource,
+    /class="notes-mobile-sel-actions"[\s\S]*?>复制<\/button>[\s\S]*?>搜索<\/button>[\s\S]*?记便签/,
+  );
 });

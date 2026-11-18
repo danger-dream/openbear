@@ -238,7 +238,10 @@ smail[occupied]="${Font_Yellow}Occupied$Font_Suffix"
 smail[blocked]="${Font_Red}Remote Port 25 unreachable​$Font_Suffix"
 smail[provider]="Conn: "
 smail[dnsbl]="DNSBL database: "
-smail[available]="$Font_Suffix${Font_Cyan}Active $Font_B"
+smail[failed]="Failed: "
+smail[unknown]="Unknown: "
+smail[coverage]="Answered: "
+smail[available]="$Font_Suffix${Font_Cyan}Queried $Font_B"
 smail[clean]="$Font_Suffix${Font_Green}Clean $Font_B"
 smail[marked]="$Font_Suffix${Font_Yellow}Marked $Font_B"
 smail[blacklisted]="$Font_Suffix${Font_Red}Blacklisted $Font_B"
@@ -363,7 +366,10 @@ smail[occupied]="$Font_Yellow占用$Font_Suffix"
 smail[blocked]="$Font_Red远端25端口不可达​$Font_Suffix"
 smail[provider]="通信："
 smail[dnsbl]="IP地址黑名单数据库："
-smail[available]="$Font_Suffix$Font_Cyan有效 $Font_B"
+smail[failed]="失败："
+smail[unknown]="未知："
+smail[coverage]="有效查询："
+smail[available]="$Font_Suffix$Font_Cyan查询 $Font_B"
 smail[clean]="$Font_Suffix$Font_Green正常 $Font_B"
 smail[marked]="$Font_Suffix$Font_Yellow已标记 $Font_B"
 smail[blacklisted]="$Font_Suffix$Font_Red黑名单 $Font_B"
@@ -1411,7 +1417,7 @@ return
 fi
 local fakecontent=$(echo "$Media_Cookie"|sed -n '8p')
 local refreshToken=$(echo $TokenContent|jq -r '.refresh_token')
-local disneycontent=$(echo $fakecontent|sed "s/ILOVEDISNEY/$refreshToken/g")
+local disneycontent=$(printf '%s' "$fakecontent"|jq --arg token "$refreshToken" 'walk(if type == "string" and . == "ILOVEDISNEY" then $token else . end)')
 local tmpresult=$(curl $CurlARG -$1 --user-agent "$UA_Browser" -X POST -sSL --max-time 10 "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql" -H "authorization: ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84" -d "$disneycontent" 2>&1)
 if ! (echo "$tmpresult"|jq . >/dev/null 2>&1);then
 disney[ustatus]="${smedia[bad]}"
@@ -1772,32 +1778,57 @@ check_email_service $service
 kill_progress_bar
 done
 }
+# A successful process, a successful DNS response and a listing are separate facts.
+dnsbl_query(){
+local result status rcode answers answer verdict=Clean
+result=$(dig +time=5 +tries=1 +noall +comments +answer "$1" A 2>/dev/null)
+status=$?
+if [[ $status -ne 0 ]];then echo Failed; return; fi
+rcode=$(printf '%s\n' "$result"|sed -n 's/.*status: \([A-Z]*\),.*/\1/p'|head -n 1)
+case "$rcode" in
+NXDOMAIN)echo Clean; return;;
+NOERROR);;
+SERVFAIL|REFUSED|FORMERR|NOTIMP)echo Failed; return;;
+*)echo Unknown; return;;
+esac
+answers=$(printf '%s\n' "$result"|awk '$4 == "A" {print $5}')
+if [[ -z $answers ]];then
+# An unresolved alias is not evidence that the blacklist has no record.
+if printf '%s\n' "$result"|awk '$4 == "CNAME" {found=1} END {exit !found}';then echo Unknown; else echo Clean; fi
+return
+fi
+while IFS= read -r answer;do
+case "$answer" in
+127.255.*)echo Failed; return;; # DNSBL provider error / blocked public resolver
+127.0.0.2)[[ $verdict != Unknown ]]&&verdict=Blacklisted;;
+127.0.0.*)[[ $verdict == Clean ]]&&verdict=Other;;
+*)verdict=Unknown;;
+esac
+done <<<"$answers"
+echo "$verdict"
+}
 check_dnsbl_parallel(){
-ip_to_check=$1
-parallel_jobs=$2
-smail[t]=0
-smail[c]=0
-smail[m]=0
-smail[b]=0
+local ip_to_check=$1 parallel_jobs=$2 reversed_ip zones
+local total=0 clean=0 blacklisted=0 other=0 failed=0 unknown=0
 reversed_ip=$(echo "$ip_to_check"|awk -F. '{print $4"."$3"."$2"."$1}')
-local total=0
-local clean=0
-local blacklisted=0
-local other=0
-curl $CurlARG -sL "${rawgithub}main/ref/dnsbl.list"|sort -u|xargs -P "$parallel_jobs" -I {} bash -c "result=\$(dig +short \"$reversed_ip.{}\" A); if [[ -z \"\$result\" ]]; then echo 'Clean'; elif [[ \"\$result\" =~ ^127\.255\.255\. ]]; then echo 'Clean'; elif [[ \"\$result\" == '127.0.0.2' ]]; then echo 'Blacklisted'; else echo 'Other'; fi"|{
+if ! zones=$(curl $CurlARG -fsSL "${rawgithub}main/ref/dnsbl.list");then
+echo 'DNSBL list unavailable' >&2
+echo '0 0 0 0 0 0'
+return
+fi
+export -f dnsbl_query
+printf '%s\n' "$zones"|sort -u|grep -E '^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$'|xargs -r -P "$parallel_jobs" -I {} bash -c 'dnsbl_query "$1.$2"' _ "$reversed_ip" {}|{
 while IFS= read -r line;do
 ((total++))
 case "$line" in
-"Clean")((clean++));;
-"Blacklisted")((blacklisted++));;
-*)((other++))
+Clean)((clean++));;
+Blacklisted)((blacklisted++));;
+Other)((other++));;
+Failed)((failed++));;
+*)((unknown++));;
 esac
 done
-smail[t]="$total"
-smail[c]="$clean"
-smail[m]="$other"
-smail[b]="$blacklisted"
-echo "${smail[t]} ${smail[c]} ${smail[m]} ${smail[b]}"
+echo "$total $clean $other $blacklisted $failed $unknown"
 }
 }
 check_dnsbl(){
@@ -1811,7 +1842,10 @@ smail[t]=${num_array[0]:-0}
 smail[c]=${num_array[1]:-0}
 smail[m]=${num_array[2]:-0}
 smail[b]=${num_array[3]:-0}
-smail[sdnsbl]="$Font_Cyan${smail[dnsbl]}  ${smail[available]}${smail[t]}   ${smail[clean]}${smail[c]}   ${smail[marked]}${smail[m]}   ${smail[blacklisted]}${smail[b]}$Font_Suffix"
+smail[f]=${num_array[4]:-0}
+smail[u]=${num_array[5]:-0}
+smail[answered]=$((smail[c]+smail[m]+smail[b]))
+smail[sdnsbl]="$Font_Cyan${smail[dnsbl]}  ${smail[available]}${smail[t]}   ${smail[clean]}${smail[c]}   ${smail[marked]}${smail[m]}   ${smail[blacklisted]}${smail[b]}   ${smail[failed]}${smail[f]}   ${smail[unknown]}${smail[u]}   ${smail[coverage]}${smail[answered]}/${smail[t]}$Font_Suffix"
 }
 show_head(){
 echo -ne "\r$(printf '%72s'|tr ' ' '#')\n"
@@ -2331,215 +2365,223 @@ input=$(echo "$input"|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 echo -n "$input"
 }
 factor_bool(){
-local tmp_txt=""
-if [[ $1 == "true" ]];then
-tmp_txt+=".Factor |= . * { $3: { $2: true } } | "
-elif [[ $1 == "false" ]];then
-tmp_txt+=".Factor |= . * { $3: { $2: false } } | "
+if [[ $1 == "true" || $1 == "false" ]];then
+json_field "Factor.$3.$2" b "$1"
 elif [ ${#1} -eq 2 ];then
-tmp_txt+=".Factor |= . * { $3: { $2: \"$1\" } } | "
+json_field "Factor.$3.$2" s "$1"
 else
-tmp_txt+=".Factor |= . * { $3: { $2: null } } | "
+json_field "Factor.$3.$2" b null
 fi
-[[ -z $tmp_txt ]]&&tmp_txt="null"
-echo "$tmp_txt"
+}
+
+# JSON values travel only as data arguments, never as jq source. # denotes an array index.
+json_field(){
+json_fields+=("$1" "$2" "$3")
+}
+json_document(){
+jq -n --argjson base "$1" --args '
+  $ARGS.positional as $v |
+  reduce range(0; $v|length; 3) as $i ($base;
+    ($v[$i] | split(".") | map(if startswith("#") then ltrimstr("#")|tonumber else . end)) as $path |
+    ($v[$i+2]) as $raw |
+    setpath($path; if $v[$i+1] == "s" then $raw
+      elif $v[$i+1] == "b" then (if $raw == "true" then true elif $raw == "false" then false else null end)
+      else (try ($raw|tonumber) catch null) end))
+' -- "${json_fields[@]}"
 }
 save_json(){
-local head_updates=""
-local basic_updates=""
-local type_updates=""
-local score_updates=""
-local factor_updates=""
-local media_updates=""
-local mail_updates=""
+local -a json_fields=()
 if [ $fullIP -eq 1 ];then
-head_updates+=".Head |= . + { IP: \"${IP:-null}\" } | "
+json_field "Head.IP" s "${IP:-null}"
 else
-head_updates+=".Head |= . + { IP: \"${IPhide:-null}\" } | "
+json_field "Head.IP" s "${IPhide:-null}"
 fi
-head_updates+=".Head |= . + { Command: \"${shead[bash]:-null}\" } | "
-head_updates+=".Head |= . + { GitHub: \"${shead[git]:-null}\" } | "
-head_updates+=".Head |= . + { Time: \"${shead[time_raw]:-null}\" } | "
-head_updates+=".Head |= . + { Version: \"${script_version:-null}\" } | "
+json_field "Head.Command" s "${shead[bash]:-null}"
+json_field "Head.GitHub" s "${shead[git]:-null}"
+json_field "Head.Time" s "${shead[time_raw]:-null}"
+json_field "Head.Version" s "${script_version:-null}"
 if [ $mode_lite -eq 0 ];then
-basic_updates+=".Info |= . + { ASN: \"${maxmind[asn]:-null}\" } | "
-basic_updates+=".Info |= . + { Organization: \"${maxmind[org]:-null}\" } | "
-basic_updates+=".Info |= . + { Latitude: \"${maxmind[lat]:-null}\" } | "
-basic_updates+=".Info |= . + { Longitude: \"${maxmind[lon]:-null}\" } | "
-basic_updates+=".Info |= . + { DMS: \"${maxmind[dms]:-null}\" } | "
-basic_updates+=".Info |= . + { Map: \"${maxmind[map]:-null}\" } | "
-basic_updates+=".Info |= . + { TimeZone: \"${maxmind[timezone]:-null}\" } | "
-basic_updates+=".Info |= . * { City: { Name: \"${maxmind[city]:-null}\" } } | "
-basic_updates+=".Info |= . * { City: { PostalCode: \"${maxmind[post]:-null}\" } } | "
-basic_updates+=".Info |= . * { City: { SubCode: \"${maxmind[subcode]:-null}\" } } | "
-basic_updates+=".Info |= . * { City: { Subdivisions: \"${maxmind[sub]:-null}\" } } | "
-basic_updates+=".Info |= . * { Region: { Code: \"${maxmind[countrycode]:-null}\" } } | "
-basic_updates+=".Info |= . * { Region: { Name: \"${maxmind[country]:-null}\" } } | "
-basic_updates+=".Info |= . * { Continent: { Code: \"${maxmind[continentcode]:-null}\" } } | "
-basic_updates+=".Info |= . * { Continent: { Name: \"${maxmind[continent]:-null}\" } } | "
-basic_updates+=".Info |= . * { RegisteredRegion: { Code: \"${maxmind[regcountrycode]:-null}\" } } | "
-basic_updates+=".Info |= . * { RegisteredRegion: { Name: \"${maxmind[regcountry]:-null}\" } } | "
+json_field "Info.ASN" s "${maxmind[asn]:-null}"
+json_field "Info.Organization" s "${maxmind[org]:-null}"
+json_field "Info.Latitude" s "${maxmind[lat]:-null}"
+json_field "Info.Longitude" s "${maxmind[lon]:-null}"
+json_field "Info.DMS" s "${maxmind[dms]:-null}"
+json_field "Info.Map" s "${maxmind[map]:-null}"
+json_field "Info.TimeZone" s "${maxmind[timezone]:-null}"
+json_field "Info.City.Name" s "${maxmind[city]:-null}"
+json_field "Info.City.PostalCode" s "${maxmind[post]:-null}"
+json_field "Info.City.SubCode" s "${maxmind[subcode]:-null}"
+json_field "Info.City.Subdivisions" s "${maxmind[sub]:-null}"
+json_field "Info.Region.Code" s "${maxmind[countrycode]:-null}"
+json_field "Info.Region.Name" s "${maxmind[country]:-null}"
+json_field "Info.Continent.Code" s "${maxmind[continentcode]:-null}"
+json_field "Info.Continent.Name" s "${maxmind[continent]:-null}"
+json_field "Info.RegisteredRegion.Code" s "${maxmind[regcountrycode]:-null}"
+json_field "Info.RegisteredRegion.Name" s "${maxmind[regcountry]:-null}"
 if [[ -n ${maxmind[countrycode]} && ${maxmind[countrycode]} != "null" ]];then
 if [ "${maxmind[countrycode]}" == "${maxmind[regcountrycode]}" ];then
-basic_updates+=".Info |= . + { Type: \"$(clean_ansi "${sbasic[type0]:-null}")\" } | "
+json_field "Info.Type" s "$(clean_ansi "${sbasic[type0]:-null}")"
 else
-basic_updates+=".Info |= . + { Type: \"$(clean_ansi "${sbasic[type1]:-null}")\" } | "
+json_field "Info.Type" s "$(clean_ansi "${sbasic[type1]:-null}")"
 fi
 else
-basic_updates+='.Info |= . + { Type: "null" } | '
+json_field "Info.Type" s "null"
 fi
 else
-basic_updates+=".Info |= . + { ASN: \"${ipinfo[asn]:-null}\" } | "
-basic_updates+=".Info |= . + { Organization: \"${ipinfo[org]:-null}\" } | "
-basic_updates+=".Info |= . + { Latitude: \"${ipinfo[lat]:-null}\" } | "
-basic_updates+=".Info |= . + { Longitude: \"${ipinfo[lon]:-null}\" } | "
-basic_updates+=".Info |= . + { DMS: \"${ipinfo[dms]:-null}\" } | "
-basic_updates+=".Info |= . + { Map: \"${ipinfo[map]:-null}\" } | "
-basic_updates+=".Info |= . + { TimeZone: \"${ipinfo[timezone]:-null}\" } | "
-basic_updates+=".Info |= . * { City: { Name: \"${ipinfo[city]:-null}\" } } | "
-basic_updates+=".Info |= . * { City: { PostalCode: \"${ipinfo[post]:-null}\" } } | "
-basic_updates+='.Info |= . * { City: { SubCode: "null" } } | '
-basic_updates+='.Info |= . * { City: { Subdivisions: "null" } } | '
-basic_updates+=".Info |= . * { Region: { Code: \"${ipinfo[countrycode]:-null}\" } } | "
-basic_updates+=".Info |= . * { Region: { Name: \"${ipinfo[country]:-null}\" } } | "
-basic_updates+='.Info |= . * { Continent: { Code: "null" } } | '
-basic_updates+=".Info |= . * { Continent: { Name: \"${ipinfo[continent]:-null}\" } } | "
-basic_updates+=".Info |= . * { RegisteredRegion: { Code: \"${ipinfo[regcountrycode]:-null}\" } } | "
-basic_updates+=".Info |= . * { RegisteredRegion: { Name: \"${ipinfo[regcountry]:-null}\" } } | "
+json_field "Info.ASN" s "${ipinfo[asn]:-null}"
+json_field "Info.Organization" s "${ipinfo[org]:-null}"
+json_field "Info.Latitude" s "${ipinfo[lat]:-null}"
+json_field "Info.Longitude" s "${ipinfo[lon]:-null}"
+json_field "Info.DMS" s "${ipinfo[dms]:-null}"
+json_field "Info.Map" s "${ipinfo[map]:-null}"
+json_field "Info.TimeZone" s "${ipinfo[timezone]:-null}"
+json_field "Info.City.Name" s "${ipinfo[city]:-null}"
+json_field "Info.City.PostalCode" s "${ipinfo[post]:-null}"
+json_field "Info.City.SubCode" s "null"
+json_field "Info.City.Subdivisions" s "null"
+json_field "Info.Region.Code" s "${ipinfo[countrycode]:-null}"
+json_field "Info.Region.Name" s "${ipinfo[country]:-null}"
+json_field "Info.Continent.Code" s "null"
+json_field "Info.Continent.Name" s "${ipinfo[continent]:-null}"
+json_field "Info.RegisteredRegion.Code" s "${ipinfo[regcountrycode]:-null}"
+json_field "Info.RegisteredRegion.Name" s "${ipinfo[regcountry]:-null}"
 if [[ -n ${ipinfo[countrycode]} && ${ipinfo[countrycode]} != "null" ]];then
 if [ "${ipinfo[countrycode]}" == "${ipinfo[regcountrycode]}" ];then
-basic_updates+=".Info |= . + { Type: \"$(clean_ansi "${sbasic[type0]:-null}")\" } | "
+json_field "Info.Type" s "$(clean_ansi "${sbasic[type0]:-null}")"
 else
-basic_updates+=".Info |= . + { Type: \"$(clean_ansi "${sbasic[type1]:-null}")\" } | "
+json_field "Info.Type" s "$(clean_ansi "${sbasic[type1]:-null}")"
 fi
 else
-basic_updates+='.Info |= . + { Type: "null" } | '
+json_field "Info.Type" s "null"
 fi
 fi
-type_updates+=".Type |= . * { Usage: { IPinfo: \"$(clean_ansi "${ipinfo[susetype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Usage: { ipregistry: \"$(clean_ansi "${ipregistry[susetype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Usage: { ipapi: \"$(clean_ansi "${ipapi[susetype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Usage: { AbuseIPDB: \"$(clean_ansi "${abuseipdb[susetype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Usage: { IP2LOCATION: \"$(clean_ansi "${ip2location[susetype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Company: { IPinfo: \"$(clean_ansi "${ipinfo[scomtype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Company: { ipregistry: \"$(clean_ansi "${ipregistry[scomtype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Company: { ipapi: \"$(clean_ansi "${ipapi[scomtype]:-null}")\" } } | "
-type_updates+=".Type |= . * { Company: { IP2LOCATION: \"$(clean_ansi "${ip2location[scomtype]:-null}")\" } } | "
-score_updates+=".Score |= . + { IP2LOCATION: \"${ip2location[score]:-null}\" } | "
-score_updates+=".Score |= . + { SCAMALYTICS: \"${scamalytics[score]:-null}\" } | "
-score_updates+=".Score |= . + { ipapi: \"${ipapi[score]:-null}\" } | "
-score_updates+=".Score |= . + { AbuseIPDB: \"${abuseipdb[score]:-null}\" } | "
-score_updates+=".Score |= . + { IPQS: \"${ipapi[ipqs]:-null}\" } | "
-score_updates+=".Score |= . + { DBIP: \"${dbip[score]:-null}\" } | "
-factor_updates+=$(factor_bool "${ip2location[countrycode]}" "IP2LOCATION" "CountryCode")
-factor_updates+=$(factor_bool "${ipapi[countrycode]}" "ipapi" "CountryCode")
-factor_updates+=$(factor_bool "${ipregistry[countrycode]}" "ipregistry" "CountryCode")
-factor_updates+=$(factor_bool "${ipqs[countrycode]}" "IPQS" "CountryCode")
-factor_updates+=$(factor_bool "${scamalytics[countrycode]}" "SCAMALYTICS" "CountryCode")
-factor_updates+=$(factor_bool "${ipdata[countrycode]}" "ipdata" "CountryCode")
-factor_updates+=$(factor_bool "${ipinfo[countrycode]}" "IPinfo" "CountryCode")
-factor_updates+=$(factor_bool "${ipwhois[countrycode]}" "IPWHOIS" "CountryCode")
-factor_updates+=$(factor_bool "${dbip[countrycode]}" "DBIP" "CountryCode")
-factor_updates+=$(factor_bool "${ip2location[proxy]}" "IP2LOCATION" "Proxy")
-factor_updates+=$(factor_bool "${ipapi[proxy]}" "ipapi" "Proxy")
-factor_updates+=$(factor_bool "${ipregistry[proxy]}" "ipregistry" "Proxy")
-factor_updates+=$(factor_bool "${ipqs[proxy]}" "IPQS" "Proxy")
-factor_updates+=$(factor_bool "${scamalytics[proxy]}" "SCAMALYTICS" "Proxy")
-factor_updates+=$(factor_bool "${ipdata[proxy]}" "ipdata" "Proxy")
-factor_updates+=$(factor_bool "${ipinfo[proxy]}" "IPinfo" "Proxy")
-factor_updates+=$(factor_bool "${ipwhois[proxy]}" "IPWHOIS" "Proxy")
-factor_updates+=$(factor_bool "${dbip[proxy]}" "DBIP" "Proxy")
-factor_updates+=$(factor_bool "${ip2location[tor]}" "IP2LOCATION" "Tor")
-factor_updates+=$(factor_bool "${ipapi[tor]}" "ipapi" "Tor")
-factor_updates+=$(factor_bool "${ipregistry[tor]}" "ipregistry" "Tor")
-factor_updates+=$(factor_bool "${ipqs[tor]}" "IPQS" "Tor")
-factor_updates+=$(factor_bool "${scamalytics[tor]}" "SCAMALYTICS" "Tor")
-factor_updates+=$(factor_bool "${ipdata[tor]}" "ipdata" "Tor")
-factor_updates+=$(factor_bool "${ipinfo[tor]}" "IPinfo" "Tor")
-factor_updates+=$(factor_bool "${ipwhois[tor]}" "IPWHOIS" "Tor")
-factor_updates+=$(factor_bool "${dbip[tor]}" "DBIP" "Tor")
-factor_updates+=$(factor_bool "${ip2location[vpn]}" "IP2LOCATION" "VPN")
-factor_updates+=$(factor_bool "${ipapi[vpn]}" "ipapi" "VPN")
-factor_updates+=$(factor_bool "${ipregistry[vpn]}" "ipregistry" "VPN")
-factor_updates+=$(factor_bool "${ipqs[vpn]}" "IPQS" "VPN")
-factor_updates+=$(factor_bool "${scamalytics[vpn]}" "SCAMALYTICS" "VPN")
-factor_updates+=$(factor_bool "${ipdata[vpn]}" "ipdata" "VPN")
-factor_updates+=$(factor_bool "${ipinfo[vpn]}" "IPinfo" "VPN")
-factor_updates+=$(factor_bool "${ipwhois[vpn]}" "IPWHOIS" "VPN")
-factor_updates+=$(factor_bool "${dbip[vpn]}" "DBIP" "VPN")
-factor_updates+=$(factor_bool "${ip2location[server]}" "IP2LOCATION" "Server")
-factor_updates+=$(factor_bool "${ipapi[server]}" "ipapi" "Server")
-factor_updates+=$(factor_bool "${ipregistry[server]}" "ipregistry" "Server")
-factor_updates+=$(factor_bool "${ipqs[server]}" "IPQS" "Server")
-factor_updates+=$(factor_bool "${scamalytics[server]}" "SCAMALYTICS" "Server")
-factor_updates+=$(factor_bool "${ipdata[server]}" "ipdata" "Server")
-factor_updates+=$(factor_bool "${ipinfo[server]}" "IPinfo" "Server")
-factor_updates+=$(factor_bool "${ipwhois[server]}" "IPWHOIS" "Server")
-factor_updates+=$(factor_bool "${dbip[server]}" "DBIP" "Server")
-factor_updates+=$(factor_bool "${ip2location[abuser]}" "IP2LOCATION" "Abuser")
-factor_updates+=$(factor_bool "${ipapi[abuser]}" "ipapi" "Abuser")
-factor_updates+=$(factor_bool "${ipregistry[abuser]}" "ipregistry" "Abuser")
-factor_updates+=$(factor_bool "${ipqs[abuser]}" "IPQS" "Abuser")
-factor_updates+=$(factor_bool "${scamalytics[abuser]}" "SCAMALYTICS" "Abuser")
-factor_updates+=$(factor_bool "${ipdata[abuser]}" "ipdata" "Abuser")
-factor_updates+=$(factor_bool "${ipinfo[abuser]}" "IPinfo" "Abuser")
-factor_updates+=$(factor_bool "${ipwhois[abuser]}" "IPWHOIS" "Abuser")
-factor_updates+=$(factor_bool "${dbip[abuser]}" "DBIP" "Abuser")
-factor_updates+=$(factor_bool "${ip2location[robot]}" "IP2LOCATION" "Robot")
-factor_updates+=$(factor_bool "${ipapi[robot]}" "ipapi" "Robot")
-factor_updates+=$(factor_bool "${ipregistry[robot]}" "ipregistry" "Robot")
-factor_updates+=$(factor_bool "${ipqs[robot]}" "IPQS" "Robot")
-factor_updates+=$(factor_bool "${scamalytics[robot]}" "SCAMALYTICS" "Robot")
-factor_updates+=$(factor_bool "${ipdata[robot]}" "ipdata" "Robot")
-factor_updates+=$(factor_bool "${ipinfo[robot]}" "IPinfo" "Robot")
-factor_updates+=$(factor_bool "${ipwhois[robot]}" "IPWHOIS" "Robot")
-factor_updates+=$(factor_bool "${dbip[robot]}" "DBIP" "Robot")
-media_updates+=".Media |= . * { TikTok: { Status: \"$(clean_ansi "${tiktok[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { DisneyPlus: { Status: \"$(clean_ansi "${disney[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { Netflix: { Status: \"$(clean_ansi "${netflix[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { Youtube: { Status: \"$(clean_ansi "${youtube[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { AmazonPrimeVideo: { Status: \"$(clean_ansi "${amazon[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { Reddit: { Status: \"$(clean_ansi "${reddit[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { ChatGPT: { Status: \"$(clean_ansi "${chatgpt[ustatus]:-null}")\" } } | "
-media_updates+=".Media |= . * { TikTok: { Region: \"$(clean_ansi "${tiktok[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { DisneyPlus: { Region: \"$(clean_ansi "${disney[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { Netflix: { Region: \"$(clean_ansi "${netflix[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { Youtube: { Region: \"$(clean_ansi "${youtube[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { AmazonPrimeVideo: { Region: \"$(clean_ansi "${amazon[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { Reddit: { Region: \"$(clean_ansi "${reddit[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { ChatGPT: { Region: \"$(clean_ansi "${chatgpt[uregion]//[][]/}")\" } } | "
-media_updates+=".Media |= . * { TikTok: { Type: \"$(clean_ansi "${tiktok[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { DisneyPlus: { Type: \"$(clean_ansi "${disney[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { Netflix: { Type: \"$(clean_ansi "${netflix[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { Youtube: { Type: \"$(clean_ansi "${youtube[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { AmazonPrimeVideo: { Type: \"$(clean_ansi "${amazon[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { Reddit: { Type: \"$(clean_ansi "${reddit[utype]:-null}")\" } } | "
-media_updates+=".Media |= . * { ChatGPT: { Type: \"$(clean_ansi "${chatgpt[utype]:-null}")\" } } | "
+json_field "Type.Usage.IPinfo" s "$(clean_ansi "${ipinfo[susetype]:-null}")"
+json_field "Type.Usage.ipregistry" s "$(clean_ansi "${ipregistry[susetype]:-null}")"
+json_field "Type.Usage.ipapi" s "$(clean_ansi "${ipapi[susetype]:-null}")"
+json_field "Type.Usage.AbuseIPDB" s "$(clean_ansi "${abuseipdb[susetype]:-null}")"
+json_field "Type.Usage.IP2LOCATION" s "$(clean_ansi "${ip2location[susetype]:-null}")"
+json_field "Type.Company.IPinfo" s "$(clean_ansi "${ipinfo[scomtype]:-null}")"
+json_field "Type.Company.ipregistry" s "$(clean_ansi "${ipregistry[scomtype]:-null}")"
+json_field "Type.Company.ipapi" s "$(clean_ansi "${ipapi[scomtype]:-null}")"
+json_field "Type.Company.IP2LOCATION" s "$(clean_ansi "${ip2location[scomtype]:-null}")"
+json_field "Score.IP2LOCATION" s "${ip2location[score]:-null}"
+json_field "Score.SCAMALYTICS" s "${scamalytics[score]:-null}"
+json_field "Score.ipapi" s "${ipapi[score]:-null}"
+json_field "Score.AbuseIPDB" s "${abuseipdb[score]:-null}"
+json_field "Score.IPQS" s "${ipqs[score]:-null}"
+json_field "Score.DBIP" s "${dbip[score]:-null}"
+factor_bool "${ip2location[countrycode]}" "IP2LOCATION" "CountryCode"
+factor_bool "${ipapi[countrycode]}" "ipapi" "CountryCode"
+factor_bool "${ipregistry[countrycode]}" "ipregistry" "CountryCode"
+factor_bool "${ipqs[countrycode]}" "IPQS" "CountryCode"
+factor_bool "${scamalytics[countrycode]}" "SCAMALYTICS" "CountryCode"
+factor_bool "${ipdata[countrycode]}" "ipdata" "CountryCode"
+factor_bool "${ipinfo[countrycode]}" "IPinfo" "CountryCode"
+factor_bool "${ipwhois[countrycode]}" "IPWHOIS" "CountryCode"
+factor_bool "${dbip[countrycode]}" "DBIP" "CountryCode"
+factor_bool "${ip2location[proxy]}" "IP2LOCATION" "Proxy"
+factor_bool "${ipapi[proxy]}" "ipapi" "Proxy"
+factor_bool "${ipregistry[proxy]}" "ipregistry" "Proxy"
+factor_bool "${ipqs[proxy]}" "IPQS" "Proxy"
+factor_bool "${scamalytics[proxy]}" "SCAMALYTICS" "Proxy"
+factor_bool "${ipdata[proxy]}" "ipdata" "Proxy"
+factor_bool "${ipinfo[proxy]}" "IPinfo" "Proxy"
+factor_bool "${ipwhois[proxy]}" "IPWHOIS" "Proxy"
+factor_bool "${dbip[proxy]}" "DBIP" "Proxy"
+factor_bool "${ip2location[tor]}" "IP2LOCATION" "Tor"
+factor_bool "${ipapi[tor]}" "ipapi" "Tor"
+factor_bool "${ipregistry[tor]}" "ipregistry" "Tor"
+factor_bool "${ipqs[tor]}" "IPQS" "Tor"
+factor_bool "${scamalytics[tor]}" "SCAMALYTICS" "Tor"
+factor_bool "${ipdata[tor]}" "ipdata" "Tor"
+factor_bool "${ipinfo[tor]}" "IPinfo" "Tor"
+factor_bool "${ipwhois[tor]}" "IPWHOIS" "Tor"
+factor_bool "${dbip[tor]}" "DBIP" "Tor"
+factor_bool "${ip2location[vpn]}" "IP2LOCATION" "VPN"
+factor_bool "${ipapi[vpn]}" "ipapi" "VPN"
+factor_bool "${ipregistry[vpn]}" "ipregistry" "VPN"
+factor_bool "${ipqs[vpn]}" "IPQS" "VPN"
+factor_bool "${scamalytics[vpn]}" "SCAMALYTICS" "VPN"
+factor_bool "${ipdata[vpn]}" "ipdata" "VPN"
+factor_bool "${ipinfo[vpn]}" "IPinfo" "VPN"
+factor_bool "${ipwhois[vpn]}" "IPWHOIS" "VPN"
+factor_bool "${dbip[vpn]}" "DBIP" "VPN"
+factor_bool "${ip2location[server]}" "IP2LOCATION" "Server"
+factor_bool "${ipapi[server]}" "ipapi" "Server"
+factor_bool "${ipregistry[server]}" "ipregistry" "Server"
+factor_bool "${ipqs[server]}" "IPQS" "Server"
+factor_bool "${scamalytics[server]}" "SCAMALYTICS" "Server"
+factor_bool "${ipdata[server]}" "ipdata" "Server"
+factor_bool "${ipinfo[server]}" "IPinfo" "Server"
+factor_bool "${ipwhois[server]}" "IPWHOIS" "Server"
+factor_bool "${dbip[server]}" "DBIP" "Server"
+factor_bool "${ip2location[abuser]}" "IP2LOCATION" "Abuser"
+factor_bool "${ipapi[abuser]}" "ipapi" "Abuser"
+factor_bool "${ipregistry[abuser]}" "ipregistry" "Abuser"
+factor_bool "${ipqs[abuser]}" "IPQS" "Abuser"
+factor_bool "${scamalytics[abuser]}" "SCAMALYTICS" "Abuser"
+factor_bool "${ipdata[abuser]}" "ipdata" "Abuser"
+factor_bool "${ipinfo[abuser]}" "IPinfo" "Abuser"
+factor_bool "${ipwhois[abuser]}" "IPWHOIS" "Abuser"
+factor_bool "${dbip[abuser]}" "DBIP" "Abuser"
+factor_bool "${ip2location[robot]}" "IP2LOCATION" "Robot"
+factor_bool "${ipapi[robot]}" "ipapi" "Robot"
+factor_bool "${ipregistry[robot]}" "ipregistry" "Robot"
+factor_bool "${ipqs[robot]}" "IPQS" "Robot"
+factor_bool "${scamalytics[robot]}" "SCAMALYTICS" "Robot"
+factor_bool "${ipdata[robot]}" "ipdata" "Robot"
+factor_bool "${ipinfo[robot]}" "IPinfo" "Robot"
+factor_bool "${ipwhois[robot]}" "IPWHOIS" "Robot"
+factor_bool "${dbip[robot]}" "DBIP" "Robot"
+json_field "Media.TikTok.Status" s "$(clean_ansi "${tiktok[ustatus]:-null}")"
+json_field "Media.DisneyPlus.Status" s "$(clean_ansi "${disney[ustatus]:-null}")"
+json_field "Media.Netflix.Status" s "$(clean_ansi "${netflix[ustatus]:-null}")"
+json_field "Media.Youtube.Status" s "$(clean_ansi "${youtube[ustatus]:-null}")"
+json_field "Media.AmazonPrimeVideo.Status" s "$(clean_ansi "${amazon[ustatus]:-null}")"
+json_field "Media.Reddit.Status" s "$(clean_ansi "${reddit[ustatus]:-null}")"
+json_field "Media.ChatGPT.Status" s "$(clean_ansi "${chatgpt[ustatus]:-null}")"
+json_field "Media.TikTok.Region" s "$(clean_ansi "${tiktok[uregion]//[][]/}")"
+json_field "Media.DisneyPlus.Region" s "$(clean_ansi "${disney[uregion]//[][]/}")"
+json_field "Media.Netflix.Region" s "$(clean_ansi "${netflix[uregion]//[][]/}")"
+json_field "Media.Youtube.Region" s "$(clean_ansi "${youtube[uregion]//[][]/}")"
+json_field "Media.AmazonPrimeVideo.Region" s "$(clean_ansi "${amazon[uregion]//[][]/}")"
+json_field "Media.Reddit.Region" s "$(clean_ansi "${reddit[uregion]//[][]/}")"
+json_field "Media.ChatGPT.Region" s "$(clean_ansi "${chatgpt[uregion]//[][]/}")"
+json_field "Media.TikTok.Type" s "$(clean_ansi "${tiktok[utype]:-null}")"
+json_field "Media.DisneyPlus.Type" s "$(clean_ansi "${disney[utype]:-null}")"
+json_field "Media.Netflix.Type" s "$(clean_ansi "${netflix[utype]:-null}")"
+json_field "Media.Youtube.Type" s "$(clean_ansi "${youtube[utype]:-null}")"
+json_field "Media.AmazonPrimeVideo.Type" s "$(clean_ansi "${amazon[utype]:-null}")"
+json_field "Media.Reddit.Type" s "$(clean_ansi "${reddit[utype]:-null}")"
+json_field "Media.ChatGPT.Type" s "$(clean_ansi "${chatgpt[utype]:-null}")"
 if [[ ${smail[local]} -eq 1 ]];then
-mail_updates+=".Mail |= . + { Port25: true } | "
+json_field "Mail.Port25" b "true"
 for service in "${services[@]}";do
 if [[ ${smailstatus[$service]} == "true" ]];then
-mail_updates+=".Mail |= . + { \"$service\": true } | "
+json_field "Mail.$service" b "true"
 else
-mail_updates+=".Mail |= . + { \"$service\": false } | "
+json_field "Mail.$service" b "false"
 fi
 done
 elif [[ ${smail[local]} -eq 2 ]];then
-mail_updates+=".Mail |= . + { Port25: null } | "
+json_field "Mail.Port25" b "null"
 for service in "${services[@]}";do
-mail_updates+=".Mail |= . + { \"$service\": null } | "
+json_field "Mail.$service" b "null"
 done
 else
-mail_updates+=".Mail |= . + { Port25: false } | "
+json_field "Mail.Port25" b "false"
 for service in "${services[@]}";do
-mail_updates+=".Mail |= . + { \"$service\": false } | "
+json_field "Mail.$service" b "false"
 done
 fi
-mail_updates+=".Mail |= . * { DNSBlacklist: { Total: ${smail[t]:-null} } } | "
-mail_updates+=".Mail |= . * { DNSBlacklist: { Clean: ${smail[c]:-null} } } | "
-mail_updates+=".Mail |= . * { DNSBlacklist: { Marked: ${smail[m]:-null} } } | "
-mail_updates+=".Mail |= . * { DNSBlacklist: { Blacklisted: ${smail[b]:-null} } } | "
-ipjson=$(echo "$ipjson"|jq "$head_updates$basic_updates$type_updates$score_updates$factor_updates$media_updates$mail_updates.")
+json_field "Mail.DNSBlacklist.Total" n "${smail[t]:-null}"
+json_field "Mail.DNSBlacklist.Clean" n "${smail[c]:-null}"
+json_field "Mail.DNSBlacklist.Marked" n "${smail[m]:-null}"
+json_field "Mail.DNSBlacklist.Blacklisted" n "${smail[b]:-null}"
+json_field "Mail.DNSBlacklist.Failed" n "${smail[f]:-null}"
+json_field "Mail.DNSBlacklist.Unknown" n "${smail[u]:-null}"
+json_field "Mail.DNSBlacklist.Answered" n "${smail[answered]:-null}"
+ipjson=$(json_document "$ipjson") || { ipjson=""; echo "Structured report generation failed" >&2; return 1; }
 }
 check_IP(){
 IP=$1
@@ -2606,7 +2648,7 @@ local report_link=""
 [[ $mode_lite -eq 0 && mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s --connect-timeout 10 --max-time 60 -X POST https://upload.check.place -d "type=ip" --data-urlencode "json=$ipjson" --data-urlencode "content=$ip_report")
 [[ mode_json -eq 0 ]]&&echo -ne "\r$ip_report\n"
 [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
-[[ mode_json -eq 1 ]]&&echo -ne "\r$ipjson\n"
+[[ mode_json -eq 1 ]]&&printf '%s\n' "$ipjson"
 echo -ne "\r\n"
 if [[ mode_output -eq 1 ]];then
 case "$outputfile" in

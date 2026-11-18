@@ -1,11 +1,11 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
-import { Copy, Globe, PenLine, StickyNote, X } from '@lucide/vue';
+import { Copy, FilePlus2, Globe, PenLine, Search, StickyNote, X } from '@lucide/vue';
 import { apiError } from '../../api.js';
 import { copyTextToClipboard } from '../../utils/clipboard.js';
 import { notesSelectionPopoverEnabled, notesSettings } from '../../notesSettings.js';
-import { clampOverlayPosition, extractTranscriptSelection } from './notesSelection.js';
+import { buildWebSearchUrl, clampOverlayPosition, extractTranscriptSelection } from './notesSelection.js';
 import { useUserNotes } from './notesStore.js';
 
 const props = defineProps({
@@ -20,6 +20,7 @@ const menuRef = ref(null);
 const barRef = ref(null);
 
 let media = null;
+let mouseUpTimer = 0;
 let selectionTimer = 0;
 
 const sessionAvailable = computed(() => Boolean(notes?.usableConversationUuid.value));
@@ -45,15 +46,22 @@ function onContextMenu(event) {
   if (!captured) return;
   event.preventDefault();
   floatingBar.value = null;
-  const pos = clampOverlayPosition(
-    event.clientX + 4,
-    event.clientY + 4,
-    188,
-    154,
-    window.innerWidth,
-    window.innerHeight,
-  );
+  const rawX = event.clientX + 4;
+  const rawY = event.clientY + 4;
+  const estW = 192;
+  const estH = sessionAvailable.value ? 182 : 150;
+  const pos = clampOverlayPosition(rawX, rawY, estW, estH, window.innerWidth, window.innerHeight);
   contextMenu.value = { ...captured, x: pos.x, y: pos.y };
+  nextTick(() => {
+    const el = menuRef.value;
+    if (!el || !contextMenu.value) return;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const refined = clampOverlayPosition(rawX, rawY, rect.width, rect.height, window.innerWidth, window.innerHeight);
+    if (refined.x !== contextMenu.value.x || refined.y !== contextMenu.value.y) {
+      contextMenu.value = { ...contextMenu.value, x: refined.x, y: refined.y };
+    }
+  });
 }
 
 function showDesktopFloatingBar() {
@@ -63,19 +71,30 @@ function showDesktopFloatingBar() {
     floatingBar.value = null;
     return;
   }
-  const barW = 216;
-  const barH = 34;
-  const rawX = captured.rect.left + captured.rect.width / 2 - barW / 2;
-  const rawY = captured.rect.top >= barH + 16 ? captured.rect.top - barH - 8 : captured.rect.bottom + 8;
-  const pos = clampOverlayPosition(rawX, rawY, barW, barH, window.innerWidth, window.innerHeight);
+  const place = (barW, barH) => {
+    const rawX = captured.rect.left + captured.rect.width / 2 - barW / 2;
+    const rawY = captured.rect.top >= barH + 16 ? captured.rect.top - barH - 8 : captured.rect.bottom + 8;
+    return clampOverlayPosition(rawX, rawY, barW, barH, window.innerWidth, window.innerHeight);
+  };
+  const pos = place(sessionAvailable.value ? 396 : 318, 34);
   floatingBar.value = { ...captured, x: pos.x, y: pos.y };
+  nextTick(() => {
+    const el = barRef.value;
+    if (!el || !floatingBar.value || phone.value) return;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const refined = place(rect.width, rect.height);
+    if (refined.x !== floatingBar.value.x || refined.y !== floatingBar.value.y) {
+      floatingBar.value = { ...floatingBar.value, x: refined.x, y: refined.y };
+    }
+  });
 }
 
 function onMouseUp(event) {
   if (phone.value || !notesSelectionPopoverEnabled()) return;
   if (menuRef.value?.contains(event.target) || barRef.value?.contains(event.target)) return;
-  window.clearTimeout(selectionTimer);
-  selectionTimer = window.setTimeout(showDesktopFloatingBar, 16);
+  window.clearTimeout(mouseUpTimer);
+  mouseUpTimer = window.setTimeout(showDesktopFloatingBar, 16);
 }
 
 function onSelectionChange() {
@@ -122,13 +141,25 @@ function clearDomSelection() {
 
 async function copySelected(item) {
   if (!item?.quote) return;
+  const text = item.quote;
+  const isPhone = phone.value;
   closeAll();
+  if (isPhone) clearDomSelection();
   try {
-    await copyTextToClipboard(item.quote);
+    await copyTextToClipboard(text);
     ElMessage.success('已复制选中内容');
   } catch {
     ElMessage.error('复制失败，请使用快捷键复制');
   }
+}
+
+function searchSelected(item) {
+  const url = buildWebSearchUrl(item?.quote);
+  if (!url) return;
+  const isPhone = phone.value;
+  closeAll();
+  if (isPhone) clearDomSelection();
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 async function saveSelection(item, scope) {
@@ -155,6 +186,24 @@ function annotateSelection(item) {
   closeAll();
   clearDomSelection();
   notes.beginAnnotatedNote(payload, { mobile: phone.value });
+}
+
+function captureSelectionToKbNote(item) {
+  if (!item?.quote) return;
+  const payload = { ...item };
+  closeAll();
+  clearDomSelection();
+  window.dispatchEvent(
+    new CustomEvent('openbear:capture-to-kb-note', {
+      detail: {
+        quote: payload.quote,
+        content: '',
+        conversationUuid: notes?.usableConversationUuid.value || '',
+        opId: payload.opId || '',
+        turnNumber: payload.turnNumber || 0,
+      },
+    }),
+  );
 }
 
 watch(
@@ -187,6 +236,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.clearTimeout(mouseUpTimer);
   window.clearTimeout(selectionTimer);
   props.scroller?.removeEventListener?.('contextmenu', onContextMenu);
   props.scroller?.removeEventListener?.('scroll', closeAll);
@@ -214,6 +264,10 @@ onBeforeUnmount(() => {
         <Copy :size="14" :stroke-width="1.75" aria-hidden="true" />
         <span>复制选中内容</span>
       </button>
+      <button type="button" class="notes-ctx-item" role="menuitem" @click="searchSelected(contextMenu)">
+        <Search :size="14" :stroke-width="1.75" aria-hidden="true" />
+        <span>使用 Google 搜索</span>
+      </button>
       <div class="notes-ctx-sep" role="separator"></div>
       <button
         v-if="sessionAvailable"
@@ -233,6 +287,10 @@ onBeforeUnmount(() => {
         <PenLine :size="14" :stroke-width="1.75" aria-hidden="true" />
         <span>加批注后记入…</span>
       </button>
+      <button type="button" class="notes-ctx-item" role="menuitem" @click="captureSelectionToKbNote(contextMenu)">
+        <FilePlus2 :size="14" :stroke-width="1.75" aria-hidden="true" />
+        <span>存入全局笔记…</span>
+      </button>
     </div>
 
     <!-- PC 端按需划词极简工具条（仅系统设置开启「启用划词功能」后显示） -->
@@ -241,10 +299,20 @@ onBeforeUnmount(() => {
       ref="barRef"
       class="notes-sel-toolbar"
       role="toolbar"
-      aria-label="划词记入便签"
+      aria-label="划词操作"
       :style="{ left: `${floatingBar.x}px`, top: `${floatingBar.y}px` }"
       @mousedown.prevent
     >
+      <button type="button" class="notes-sel-btn" title="复制选中内容" @click="copySelected(floatingBar)">
+        <Copy :size="13.5" :stroke-width="1.8" aria-hidden="true" />
+        <span>复制</span>
+      </button>
+      <span class="notes-sel-div" aria-hidden="true"></span>
+      <button type="button" class="notes-sel-btn" title="使用 Google 搜索选中内容" @click="searchSelected(floatingBar)">
+        <Search :size="13.5" :stroke-width="1.8" aria-hidden="true" />
+        <span>搜索</span>
+      </button>
+      <span class="notes-sel-div" aria-hidden="true"></span>
       <button
         v-if="sessionAvailable"
         type="button"
@@ -264,18 +332,34 @@ onBeforeUnmount(() => {
         <PenLine :size="13.5" :stroke-width="1.8" aria-hidden="true" />
         <span>批注</span>
       </button>
+      <span class="notes-sel-div" aria-hidden="true"></span>
+      <button type="button" class="notes-sel-btn" title="存入全局笔记" @click="captureSelectionToKbNote(floatingBar)">
+        <FilePlus2 :size="13.5" :stroke-width="1.8" aria-hidden="true" />
+        <span>存笔记</span>
+      </button>
     </div>
   </Teleport>
 
-  <!-- 手机端按需划词底部操作条（仅开启「启用划词功能」后显示，避开系统原生复制菜单） -->
-  <div v-if="floatingBar && phone" ref="barRef" class="notes-mobile-sel-bar" role="region" aria-label="选中文字记入便签">
+  <!-- 手机端按需划词底部操作条（仅开启「启用划词功能」后显示） -->
+  <div
+    v-if="floatingBar && phone"
+    ref="barRef"
+    class="notes-mobile-sel-bar"
+    role="region"
+    aria-label="选中文字操作"
+    @mousedown.prevent
+  >
     <span class="notes-mobile-sel-count">已选 <strong>{{ floatingBar.quote.length }}</strong> 字</span>
     <div class="notes-mobile-sel-actions">
+      <button type="button" @click="copySelected(floatingBar)">复制</button>
+      <button type="button" @click="searchSelected(floatingBar)">搜索</button>
+      <span class="notes-mobile-sel-div" aria-hidden="true"></span>
       <button v-if="sessionAvailable" type="button" class="is-primary" @click="saveSelection(floatingBar, 'session')">
         记便签
       </button>
       <button type="button" @click="saveSelection(floatingBar, 'global')">全局</button>
       <button type="button" @click="annotateSelection(floatingBar)">批注</button>
+      <button type="button" @click="captureSelectionToKbNote(floatingBar)">存笔记</button>
       <button type="button" class="is-close" aria-label="关闭选词条" @click="floatingBar = null">
         <X :size="15" :stroke-width="1.8" aria-hidden="true" />
       </button>
@@ -406,10 +490,11 @@ html.dark .notes-sel-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   width: max-content;
-  max-width: calc(100% - 24px);
-  padding: 5px 6px 5px 14px;
+  max-width: calc(100% - 16px);
+  box-sizing: border-box;
+  padding: 4px 5px 4px 12px;
   border: 1px solid var(--ob-chat-border);
   border-radius: 18px;
   background: rgb(var(--ob-surface-rgb) / .96);
@@ -434,14 +519,21 @@ html.dark .notes-mobile-sel-bar {
 .notes-mobile-sel-actions {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 2px;
+}
+.notes-mobile-sel-div {
+  width: 1px;
+  height: 15px;
+  margin: 0 2px;
+  background: var(--ob-border);
+  flex: none;
 }
 .notes-mobile-sel-actions button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: 36px;
-  padding: 0 10px;
+  padding: 0 8px;
   border: 0;
   border-radius: 11px;
   background: transparent;
@@ -457,9 +549,29 @@ html.dark .notes-mobile-sel-bar {
   color: var(--ob-text-inverse);
 }
 .notes-mobile-sel-actions button.is-close {
-  width: 34px;
+  width: 32px;
   padding: 0;
   color: var(--ob-text-subtle);
+}
+
+@media (max-width: 380px) {
+  .notes-mobile-sel-bar {
+    padding: 4px 4px;
+    gap: 2px;
+  }
+  .notes-mobile-sel-count {
+    display: none;
+  }
+  .notes-mobile-sel-actions {
+    gap: 1px;
+  }
+  .notes-mobile-sel-actions button {
+    padding: 0 5px;
+    font-size: 11.5px;
+  }
+  .notes-mobile-sel-actions button.is-close {
+    width: 26px;
+  }
 }
 
 @keyframes notes-pop-in {

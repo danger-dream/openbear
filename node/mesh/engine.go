@@ -39,7 +39,11 @@ type hostConfig struct {
 	UDP      int // actual WireGuard port
 	TCP      int
 	TLS      int
-	Gateway  *Gateway
+	Fast     int
+	// ForwardTCP and ForwardUDP: the ports port forwards take clients on.
+	ForwardTCP []int
+	ForwardUDP []int
+	Gateway    *Gateway
 	// Takeover: Routes installed over a route of this machine's own.
 	Takeover []netip.Prefix
 }
@@ -52,8 +56,8 @@ func (h hostConfig) equal(o hostConfig) bool {
 		return fmt.Sprint(g.Subnets, g.Masquerade, g.SNAT)
 	}
 	return h.Address == o.Address && h.Prefix == o.Prefix && h.MTU == o.MTU && slices.Equal(h.Routes, o.Routes) &&
-		h.RouteMTU == o.RouteMTU && slices.Equal(h.Hosts, o.Hosts) && h.UDP == o.UDP && h.TCP == o.TCP && h.TLS == o.TLS && gw(h.Gateway) == gw(o.Gateway) &&
-		slices.Equal(h.Takeover, o.Takeover)
+		h.RouteMTU == o.RouteMTU && slices.Equal(h.Hosts, o.Hosts) && h.UDP == o.UDP && h.TCP == o.TCP && h.TLS == o.TLS && h.Fast == o.Fast && gw(h.Gateway) == gw(o.Gateway) &&
+		slices.Equal(h.Takeover, o.Takeover) && slices.Equal(h.ForwardTCP, o.ForwardTCP) && slices.Equal(h.ForwardUDP, o.ForwardUDP)
 }
 
 // engine is one running data plane: the WireGuard device, meshTUN and
@@ -238,6 +242,7 @@ func startEngine(dir string, c *Config, privateKey string, dev tun.Device, host 
 	if largePool {
 		go e.watchLarge()
 	}
+	go e.watchLinks()
 	if e.health != nil && !c.isRelay() {
 		go e.probeEntry()
 	}
@@ -506,11 +511,17 @@ func (e *engine) applyLocked(next *Config, reconfigure bool) error {
 	e.e2e.rerouted(old, r)
 
 	listen, _ := deviceState(e.dev)
-	h := hostConfig{Address: next.Self.Address, Prefix: next.Network.Prefix, MTU: next.ownMTU() - e2eOverhead, Routes: hostRoutes(next, peers),
-		UDP: listen, TCP: next.Self.Listen.TCP, TLS: next.Self.Listen.TLS, Gateway: next.Self.Gateway}
-	if large {
-		h.MTU, h.RouteMTU, h.Hosts = largeInner, next.ownMTU()-e2eOverhead, largeRoutes(e.tun.paths.view.Load(), r)
+	fastPort := 0
+	if next.Fast != nil {
+		fastPort = next.Fast.Port
 	}
+	h := hostConfig{Address: next.Self.Address, Prefix: next.Network.Prefix, MTU: next.ownMTU() - e2eOverhead, Routes: hostRoutes(next, peers),
+		UDP: listen, TCP: next.Self.Listen.TCP, TLS: next.Self.Listen.TLS, Fast: fastPort, Gateway: next.Self.Gateway}
+	h.ForwardTCP, h.ForwardUDP = next.Forward.ListenPorts()
+	if large {
+		h.MTU, h.RouteMTU = largeInner, next.ownMTU()-e2eOverhead
+	}
+	h.Hosts = mtuRoutes(e.tun.paths.view.Load(), r)
 	var skipped []netip.Prefix
 	h.Routes, skipped = withoutLocal(h.Routes, next.Network.Prefix, e.name, e.heldRoutes(), next.Self.Takeover)
 	h.Takeover = slices.DeleteFunc(slices.Clone(h.Routes), func(r netip.Prefix) bool { return !slices.Contains(next.Self.Takeover, r) })

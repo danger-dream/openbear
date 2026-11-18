@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import draggable from 'vuedraggable';
 import { Grid, List } from '@element-plus/icons-vue';
@@ -8,7 +8,7 @@ import { ok } from '../instances/instanceHelpers.js';
 import PlatformMark from './PlatformMark.vue';
 import ServerCard from './ServerCard.vue';
 import { dragEdgeScroll } from './dragEdgeScroll.js';
-import { nodeStateTag, updateAllText, updateSummary } from './nodeVersions.js';
+import { nodeStateTag, updateAllText, updateRunText, updateSummary } from './nodeVersions.js';
 import { bytes, daysLeft, expiryTone, flag, monthly, percent, rate, regionName, safeError, spendInCny, tone, noAutofill } from './serverHelpers.js';
 import { latencyTone, lossText, lossTone, ms, pingTitle } from './detail/detailHelpers.js';
 import PingStrip from './PingStrip.vue';
@@ -96,16 +96,47 @@ const spendTitle = computed(() => !cny.value ? '' : [
   props.fx.date ? `汇率日期 ${props.fx.date}` : '',
 ].filter(Boolean).join('\n'));
 function toggleQuick(value) { quick.value = quick.value === value ? '' : value; }
+// 全部更新 runs on the controller: the board follows it until it ends, and after a reload
+// picks up one still running. However long the relays take, no request waits on them.
+const run = ref(null), RUN_POLL_MS = 2000;
+let runTimer = 0, unmounted = false;
+const runText = computed(() => run.value ? updateRunText(run.value, props.items) : '');
+function finished(r) {
+  const {tone, text, failed} = updateAllText(r.items);
+  if (r.error) ElMessage.error(`全部更新中断：${safeError({response: {data: {error: r.error}}})}`);
+  else ElMessage[tone](failed?.length ? `${text}：${safeError({response: {data: {error: failed[0].error}}})}` : text);
+  emit('changed');
+}
+function follow(r) {
+  clearTimeout(runTimer);
+  if (unmounted) return;
+  if (!r?.running) {
+    if (run.value && r) finished(r);
+    run.value = null; updating.value = false;
+    return;
+  }
+  run.value = r; updating.value = true;
+  runTimer = setTimeout(async () => {
+    // A request that fails (the network, a restart) is tried again: the run goes on regardless.
+    try { follow(ok(await Api.serverNodeUpdateRun()).run); } catch { follow(run.value); }
+  }, RUN_POLL_MS);
+}
 async function updateAll() {
   if (updating.value) return;
   updating.value = true;
   try {
-    const {tone, text, failed} = updateAllText(ok(await Api.updateServerNodes()).items);
-    ElMessage[tone](failed?.length ? `${text}：${safeError({response: {data: {error: failed[0].error}}})}` : text);
-    emit('changed');
-  } catch (e) { ElMessage.error(safeError(e)); }
-  finally { updating.value = false; }
+    const r = ok(await Api.updateServerNodes()).run;
+    if (r.running) follow(r);
+    else { updating.value = false; finished(r); }
+  } catch (e) { updating.value = false; ElMessage.error(safeError(e)); }
 }
+onMounted(async () => {
+  try {
+    const r = ok(await Api.serverNodeUpdateRun()).run;
+    if (r?.running && !run.value) follow(r);
+  } catch { /* the summary stays as it is */ }
+});
+onBeforeUnmount(() => { unmounted = true; clearTimeout(runTimer); });
 // While a card is dragged the list holds still: a poll replacing the items must not move it underneath.
 const shown = computed(() => frozen.value || visible.value);
 const sameSection = e => !e.relatedContext?.element || Boolean(e.draggedContext.element.node) === Boolean(e.relatedContext.element.node);
@@ -153,6 +184,11 @@ const trafficPct = i => i.traffic?.limit ? Math.round(percent(i.traffic.used, i.
       <span>暂时没有可用的节点版本，稍后重试</span>
       <span class="ob-grow" />
       <el-button size="small" :loading="checking" @click="retryRelease">重试</el-button>
+    </div>
+    <div v-else-if="run" class="pb-notice" role="status" data-node-update="running">
+      <span>{{ runText }}</span>
+      <span class="ob-grow" />
+      <el-button size="small" loading disabled>正在更新</el-button>
     </div>
     <div v-else-if="summary.due" class="pb-notice" role="status" data-node-update="summary">
       <span v-if="summary.direct">{{ summary.direct }} 台服务器的节点可以更新到{{ target }}<template v-if="summary.required">，其中 {{ summary.required }} 台{{ summary.features ? `需要更新才能使用${summary.features}` : '必须更新' }}</template><template v-if="summary.blocked">；另有 {{ summary.blocked }} 台关闭了命令执行，需要在服务器上重新运行安装命令</template></span>

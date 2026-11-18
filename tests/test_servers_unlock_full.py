@@ -91,7 +91,9 @@ async def test_a_run_kept_shown_and_replaced(env, monkeypatch):  # noqa: F811
 
     async def run(owner, server_id, command, **kw):
         ran.append((command, kw['source'], kw['log']))
+        judges.append(kw.get('judge'))
         return {'ok': reply['exitCode'] == 0, 'timedOut': False, **reply}
+    judges = []
     monkeypatch.setattr(env.servers.bench, '_push', push)
     monkeypatch.setattr(env.servers, 'exec', run)
     sid = await server(env, 'Mad', ipv4='45.32.100.1', online=False)
@@ -107,6 +109,10 @@ async def test_a_run_kept_shown_and_replaced(env, monkeypatch):  # noqa: F811
     await env.servers.unlock_full.check(sid)
     assert pushed == [(sid, 'unlock', 'linux/amd64')]
     assert ran[0][0].endswith('exec ./bin/service-unlock --json') and ran[0][1:] == ('check', '解锁检测：运行 Service Unlock')
+    # Its command record says it went well by the report, not by exit 0, which a whole run seldom ends in.
+    judge = judges[0]
+    assert judge({'exitCode': 1, 'stdout': json.dumps(SPAIN)}) and judge({'exitCode': 0, 'stdout': json.dumps(SPAIN)})
+    assert not judge({'exitCode': 1, 'stdout': ''}) and not judge({'exitCode': 2, 'stdout': json.dumps(SPAIN)})
     shown = await api(env, 'GET', path)
     assert shown['full']['source'] == 'auto' and shown['full']['country'] == 'ES' and len(shown['full']['items']) == 58
     marker = (await stored())[full.KEY]
@@ -245,6 +251,33 @@ async def test_full_unlock_and_benchmark_share_slot_through_cleanup(env, monkeyp
         finish_clean.set()
         finish_bench.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_full_unlock_waits_for_pending_benchmark_stop(env, monkeypatch):
+    sid = await server(env, 'test', online=False)
+    await connect(env, sid, LINUX)
+    full, bench = env.servers.unlock_full, env.servers.bench
+    events, confirmed = [], False
+
+    async def stop_leftovers(server_id):
+        assert server_id == sid and bench.measurement_lock(sid).locked()
+        events.append('stop')
+        if not confirmed:
+            raise InstanceError('node_offline', 503)
+
+    async def program(*args):
+        events.append('measure')
+        return {'exitCode': 0, 'stdout': json.dumps(SPAIN)}
+
+    monkeypatch.setattr(bench, '_stop_leftovers', stop_leftovers)
+    monkeypatch.setattr(full, '_program', program)
+    with pytest.raises(InstanceError, match='node_offline'):
+        await full.check(sid)
+    assert events == ['stop'] and sid in full.deferred
+    assert full.due(sid, await full._stored(sid), LINUX)
+    confirmed = True
+    await full.check(sid)
+    assert events == ['stop', 'stop', 'measure'] and sid not in full.deferred
 
 
 def test_full_unlock_trims_untrusted_fields_and_collections():

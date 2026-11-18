@@ -62,12 +62,35 @@ type pathView struct {
 	own   int             // the longest packet of this node's own its links carry (underlay.go)
 	links map[string]bool // large links, by peer
 	far   map[string]bool // nodes end to end a probe showed large paths to
+	// failing are the UDP links seen not to carry the network MTU, by peer,
+	// narrow those of them with what they were seen to carry (linkmtu.go);
+	// short the nodes end to end a relay said its next hop takes less to,
+	// with what it takes.
+	failing map[string]bool
+	narrow  map[string]int
+	short   map[string]int
 }
+
+// linkShown is the MTU status shows for the link to peer: what it carries,
+// for one failing the network MTU with no size of the ladder answered the
+// short probe's, which it does carry.
+func (v *pathView) linkShown(peer string) int {
+	if v.failing[peer] && v.narrow[peer] == 0 {
+		return linkBase
+	}
+	return v.linkMTU(peer)
+}
+
+// held: some link or path takes less than the network MTU.
+func (v *pathView) held() bool { return len(v.narrow) > 0 || len(v.short) > 0 }
 
 // linkMTU is the longest packet the link to peer carries.
 func (v *pathView) linkMTU(peer string) int {
 	if v.on && v.links[peer] {
 		return wire.LargeMTU
+	}
+	if l := v.narrow[peer]; l > 0 {
+		return l
 	}
 	return v.small
 }
@@ -82,7 +105,33 @@ func (v *pathView) innerMTU(z *e2eNode, hop string) int {
 	case v.far[z.id]:
 		return largeFar
 	}
-	return v.own - e2eOverhead
+	inner := v.own - e2eOverhead
+	if hop == z.id {
+		// Not sealed end to end: the link's limit is the packet's.
+		if l := v.narrow[hop]; l > 0 {
+			inner = min(inner, l)
+		}
+		return inner
+	}
+	if mtu := v.heldMTU(z.id, hop); mtu < v.own {
+		// The inner device pads to 16 bytes: what it seals of a packet
+		// this long still fits.
+		inner = (mtu - e2eOverhead) &^ 15
+	}
+	return inner
+}
+
+// heldMTU is this node's own MTU, held to what the link to hop carries
+// and what a relay said the path to node id takes.
+func (v *pathView) heldMTU(id, hop string) int {
+	mtu := v.own
+	if l := v.narrow[hop]; l > 0 {
+		mtu = min(mtu, l)
+	}
+	if l := v.short[id]; l > 0 {
+		mtu = min(mtu, l)
+	}
+	return mtu
 }
 
 // pathMTU is the MTU status shows for the path to node id through hop.
@@ -90,7 +139,7 @@ func (v *pathView) pathMTU(id, hop string) int {
 	if v.on && v.links[hop] && (hop == id || v.far[id]) {
 		return wire.LargeMTU
 	}
-	return v.own
+	return v.heldMTU(id, hop)
 }
 
 // paths keeps the view: the engine sets the links, probes answered and
@@ -108,6 +157,10 @@ type paths struct {
 	far    map[string]*farPath
 	tokens float64
 	filled time.Time
+	// udp is what probing found of each UDP link, short what relays said
+	// of paths end to end (linkmtu.go).
+	udp   map[string]*linkSizes
+	short map[string]shortPath
 }
 
 type farPath struct {
@@ -121,18 +174,31 @@ type farPath struct {
 }
 
 func newPaths(small int) *paths {
-	p := &paths{changed: make(chan struct{}, 1), now: time.Now, small: small, own: small, links: map[string]bool{}, far: map[string]*farPath{}, tokens: tooBigRate}
+	p := &paths{changed: make(chan struct{}, 1), now: time.Now, small: small, own: small, links: map[string]bool{}, far: map[string]*farPath{}, tokens: tooBigRate,
+		udp: map[string]*linkSizes{}, short: map[string]shortPath{}}
 	p.publish()
 	return p
 }
 
 // publish swaps in a view of what p holds. Called with p.mu.
 func (p *paths) publish() {
-	v := &pathView{on: p.on, small: p.small, own: p.own, links: maps.Clone(p.links), far: map[string]bool{}}
+	v := &pathView{on: p.on, small: p.small, own: p.own, links: maps.Clone(p.links), far: map[string]bool{},
+		failing: map[string]bool{}, narrow: map[string]int{}, short: map[string]int{}}
 	for id, f := range p.far {
 		if f.large {
 			v.far[id] = true
 		}
+	}
+	for id, s := range p.udp {
+		if s.failing() {
+			v.failing[id] = true
+		}
+		if s.limit > 0 {
+			v.narrow[id] = s.limit
+		}
+	}
+	for id, s := range p.short {
+		v.short[id] = s.mtu
 	}
 	p.view.Store(v)
 }
@@ -150,6 +216,10 @@ func (p *paths) configure(on bool, small, own int) {
 	defer p.mu.Unlock()
 	if on == p.on && small == p.small && own == p.own {
 		return
+	}
+	if small != p.small || own != p.own {
+		// Measured against the MTUs before.
+		p.udp, p.short = map[string]*linkSizes{}, map[string]shortPath{}
 	}
 	p.on, p.small, p.own = on, small, own
 	if !on {
@@ -234,17 +304,27 @@ func (p *paths) answered(id string, probe [8]byte) {
 	}
 }
 
-// tooBig: a relay could not carry this node's packet to node id.
-func (p *paths) tooBig(id string) {
+// tooBig: a relay could not carry this node's packet to node id, its next
+// hop taking mtu.
+func (p *paths) tooBig(id string, mtu int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	f := p.far[id]
-	if f == nil {
-		return
+	changed := false
+	if f := p.far[id]; f != nil {
+		f.sent, f.hold = time.Time{}, p.now().Add(farHoldOff)
+		if f.large {
+			f.large, changed = false, true
+		}
 	}
-	f.sent, f.hold = time.Time{}, p.now().Add(farHoldOff)
-	if f.large {
-		f.large = false
+	if mtu >= minOwnMTU && mtu < p.own {
+		if s, ok := p.short[id]; !ok || mtu < s.mtu {
+			changed = true
+		} else {
+			mtu = s.mtu
+		}
+		p.short[id] = shortPath{mtu, p.now().Add(shortHold)}
+	}
+	if changed {
 		p.publish()
 		p.due()
 	}
@@ -270,9 +350,10 @@ type hostRoute struct {
 	MTU  int
 }
 
-// largeRoutes are the host routes the view gives the nodes of r.
-func largeRoutes(v *pathView, r *routing) []hostRoute {
-	if !v.on || r == nil || r.nodes == nil {
+// mtuRoutes are the host routes the view gives the nodes of r: those whose
+// paths take other than the mesh's routes do.
+func mtuRoutes(v *pathView, r *routing) []hostRoute {
+	if (!v.on && !v.held()) || r == nil || r.nodes == nil {
 		return nil
 	}
 	var out []hostRoute
@@ -280,7 +361,7 @@ func largeRoutes(v *pathView, r *routing) []hostRoute {
 		if z.addr == r.nodes.self {
 			continue
 		}
-		if mtu := v.innerMTU(z, r.hop(z.addr)); mtu > v.own-e2eOverhead {
+		if mtu := v.innerMTU(z, r.firstHop(z)); mtu != v.own-e2eOverhead {
 			out = append(out, hostRoute{z.addr, mtu})
 		}
 	}
@@ -318,33 +399,46 @@ func checksum(b []byte) uint16 {
 }
 
 // e2eTooBig: p is an ICMP "fragmentation needed" about an end-to-end
-// packet self sent; dst is the node it was for.
-func e2eTooBig(p ipv4, self netip.Addr) (dst netip.Addr, ok bool) {
+// packet self sent; dst is the node it was for, mtu what the next hop takes.
+func e2eTooBig(p ipv4, self netip.Addr) (dst netip.Addr, mtu int, ok bool) {
 	l4 := p.payload()
 	if p.proto != protoICMP || len(l4) < 28 || l4[0] != 3 || l4[1] != 4 {
-		return dst, false
+		return dst, 0, false
 	}
 	q := l4[8:]
 	if q[0]>>4 != 4 || q[9] != protoE2E || netip.AddrFrom4([4]byte(q[12:16])) != self {
-		return dst, false
+		return dst, 0, false
 	}
-	return netip.AddrFrom4([4]byte(q[16:20])), true
+	return netip.AddrFrom4([4]byte(q[16:20])), int(binary.BigEndian.Uint16(l4[6:8])), true
 }
 
-// tooBigLocal drops p, from the OS for node z, when it is longer than its
-// path takes, answering with DF to the OS as z.
+// tooBigLocal takes p, from the OS for node z, when it is longer than its
+// path takes: with DF it is dropped and answered to the OS as z, without it
+// goes on in fragments that fit.
 func (t *meshTUN) tooBigLocal(p ipv4, z *e2eNode, hop string) bool {
 	v := t.paths.view.Load()
-	if !v.on {
+	if !v.on && !v.held() {
 		return false
 	}
 	mtu := v.innerMTU(z, hop)
 	if len(p.b) <= mtu {
 		return false
 	}
+	if !p.dontFragment() {
+		if parts := fragments(p, mtu); parts != nil {
+			for _, b := range parts {
+				q, _ := parseIPv4(b)
+				t.sendOn(q, nil, z, hop)
+			}
+			return true
+		}
+	}
 	t.stats.DroppedTooBig.Add(1)
 	if p.dontFragment() && t.paths.allowICMP() {
 		icmp := tooBigICMP(z.addr, p, mtu)
+		if t.takeFastReply(icmp) {
+			return true
+		}
 		back := make([]byte, readHeadroom+len(icmp))
 		copy(back[readHeadroom:], icmp)
 		t.Device.Write([][]byte{back}, readHeadroom)
@@ -356,7 +450,7 @@ func (t *meshTUN) tooBigLocal(p ipv4, z *e2eNode, hop string) bool {
 // longer than the link to hop takes, answering the node it is from.
 func (t *meshTUN) tooBigForward(r *routing, p ipv4, hop string) bool {
 	v := t.paths.view.Load()
-	if !v.on {
+	if !v.on && v.narrow[hop] == 0 {
 		return false
 	}
 	mtu := v.linkMTU(hop)
@@ -382,16 +476,31 @@ func (t *meshTUN) sendOwn(r *routing, b []byte, z *e2eNode) {
 }
 
 // relayTooBig takes p when it is a relay's ICMP about this node's
-// end-to-end packet: the path to the node it was for is no longer large.
+// end-to-end packet: the path to the node it was for is no longer large,
+// or takes less than the network MTU.
 func (t *meshTUN) relayTooBig(p ipv4, r *routing) bool {
-	dst, ok := e2eTooBig(p, r.nodes.self)
+	dst, mtu, ok := e2eTooBig(p, r.nodes.self)
 	if !ok {
 		return false
 	}
-	if z := r.nodes.byAddr[dst]; z != nil {
-		t.paths.tooBig(z.id)
+	// Only relays forward what this node sends end to end: from any other
+	// node it is no word on a path. Every relay is trusted with it, as with
+	// forwarding; which of them the path passes is not known here.
+	if from := r.nodes.byAddr[p.src]; from != nil && from.relay {
+		if z := r.nodes.byAddr[dst]; z != nil {
+			t.paths.tooBig(z.id, mtu)
+		}
 	}
 	return true
+}
+
+// firstHop is the peer this node's own packets for z leave through: the
+// first relay of a fixed path in use, else the route's next hop.
+func (r *routing) firstHop(z *e2eNode) string {
+	if h, ok := r.pins.local(r.nodes.self, z.addr); ok {
+		return h.nextID
+	}
+	return r.hop(z.addr)
 }
 
 // watchLarge keeps the large links, the paths end to end and their host
@@ -425,7 +534,7 @@ func (e *engine) checkLarge() {
 	targets := map[string]string{}
 	for _, id := range e.e2e.inUse(farProbeEvery) {
 		if z := r.nodes.byID[id]; z != nil {
-			if hop := r.hop(z.addr); hop != "" && hop != id {
+			if hop := r.firstHop(z); hop != "" && hop != id {
 				targets[id] = hop
 			}
 		}
@@ -452,7 +561,7 @@ func (e *engine) refreshHost() {
 		return
 	}
 	h := e.hostCfg
-	h.Hosts = largeRoutes(e.tun.paths.view.Load(), e.tun.route.Load())
+	h.Hosts = mtuRoutes(e.tun.paths.view.Load(), e.tun.route.Load())
 	if !e.hostDirty && h.equal(e.hostCfg) {
 		return
 	}

@@ -60,6 +60,7 @@ type Page struct {
 	mainID            string
 	frames            map[string]*Frame
 	sessionRoots      map[string]string
+	sessionTargets    map[string]string // includes sessions whose setup has not returned a tree yet
 	setupTasks        *omap[string, *task]
 	failedSessions    map[string]bool
 	snapshot          string
@@ -91,7 +92,7 @@ type Page struct {
 
 func newPage(e *Engine, target string) *Page {
 	p := &Page{
-		e: e, target: target, frames: map[string]*Frame{}, sessionRoots: map[string]string{},
+		e: e, target: target, frames: map[string]*Frame{}, sessionRoots: map[string]string{}, sessionTargets: map[string]string{},
 		setupTasks: newOmap[string, *task](), failedSessions: map[string]bool{}, refs: map[string]refEntry{},
 		life: newOmap[lifeKey, map[string]bool](), navigationStatus: newOmap[lifeKey, any](),
 		navigationFailed: newEvent(), errorBinding: "__obError_" + uuidHex(),
@@ -183,10 +184,12 @@ func (p *Page) setupSession(ctx context.Context, sid, target string, main bool) 
 	e := p.e
 	defer func() {
 		if r := recover(); r != nil {
-			p.failedSessions[sid] = true
+			if e.sessions[sid] == p {
+				p.failedSessions[sid] = true
+			}
 			panic(r)
 		}
-		if err != nil {
+		if err != nil && e.sessions[sid] == p {
 			p.failedSessions[sid] = true
 		}
 	}()
@@ -196,6 +199,9 @@ func (p *Page) setupSession(ctx context.Context, sid, target string, main bool) 
 	treeResult, err := e.call(ctx, "Page.getFrameTree", nil, sid)
 	if err != nil {
 		return err
+	}
+	if ctx.Err() != nil || e.sessions[sid] != p {
+		return errCancelled
 	}
 	tree := asObj(treeResult.Must("frameTree"))
 	root := asStr(asObj(tree.Must("frame")).Must("id"))
@@ -223,10 +229,17 @@ func (p *Page) setupSession(ctx context.Context, sid, target string, main bool) 
 		return err
 	}
 	observer := asStr(attached.Must("sessionId"))
+	if ctx.Err() != nil || e.sessions[sid] != p {
+		e.callTimeout(ctx, "Target.detachFromTarget", O("sessionId", observer), "", 200*time.Millisecond)
+		return errCancelled
+	}
 	p.observerSessions.Set(sid, observer)
 	e.sessions[observer] = p
 	if _, err = e.call(ctx, "Console.enable", nil, observer); err != nil {
 		return err
+	}
+	if ctx.Err() != nil || e.sessions[sid] != p {
+		return errCancelled
 	}
 	p.obs.consoleReady[observer] = true
 	if _, err = e.call(ctx, "Runtime.addBinding", O("name", p.errorBinding), observer); err != nil {
@@ -243,6 +256,9 @@ func (p *Page) setupSession(ctx context.Context, sid, target string, main bool) 
 	script, err := e.call(ctx, "Page.addScriptToEvaluateOnNewDocument", O("source", source, "runImmediately", true), sid)
 	if err != nil {
 		return err
+	}
+	if ctx.Err() != nil || e.sessions[sid] != p {
+		return errCancelled
 	}
 	p.scripts[sid] = script.Must("identifier")
 	// Only descendants of this owned page/session; never browser-root auto attach.
@@ -277,6 +293,12 @@ func (p *Page) refreshBinding(ctx context.Context, sid string) error {
 		return err
 	}
 	defer lock.release()
+	if ctx.Err() != nil {
+		return errCancelled
+	}
+	if current, ok := p.observerSessions.Get(sid); !ok || current != observer {
+		return nil
+	}
 	// Cloak can drop the injected binding function at navigation while retaining
 	// the new-document listeners. Reinstall and flush their bounded early errors.
 	if _, err := p.e.call(ctx, "Runtime.addBinding", O("name", p.errorBinding), observer); err != nil {
@@ -286,6 +308,35 @@ func (p *Page) refreshBinding(ctx context.Context, sid string) error {
 	expression := "(()=>{const visit=w=>{try{w[" + key + "]?.flush();for(const f of w.frames)visit(f)}catch{}};visit(globalThis)})()"
 	_, err := p.e.call(ctx, "Runtime.evaluate", O("expression", expression), observer)
 	return err
+}
+
+// forgetSession retires only this session, never a frame's newer owner after swap.
+// Cancel before removing indices: in-flight setup checks ownership after awaits.
+func (p *Page) forgetSession(sid string) {
+	if t, ok := p.setupTasks.Get(sid); ok {
+		t.cancel()
+		p.setupTasks.Del(sid)
+	}
+	if t := p.bindingTasks[sid]; t != nil {
+		t.cancel()
+		delete(p.bindingTasks, sid)
+	}
+	if observer, ok := p.observerSessions.Get(sid); ok {
+		delete(p.e.sessions, observer)
+		delete(p.obs.consoleReady, observer)
+		p.observerSessions.Del(sid)
+		p.e.spawn(func(ctx context.Context) error {
+			_, err := p.e.callTimeout(ctx, "Target.detachFromTarget", O("sessionId", observer), "", 200*time.Millisecond)
+			return err
+		})
+	}
+	delete(p.e.sessions, sid)
+	delete(p.sessionRoots, sid)
+	delete(p.sessionTargets, sid)
+	delete(p.scripts, sid)
+	delete(p.bindingLocks, sid)
+	delete(p.failedSessions, sid)
+	delete(p.obs.consoleReady, sid)
 }
 
 // event applies one CDP event (handlers only update state and spawn work).
@@ -302,14 +353,19 @@ func (p *Page) event(method string, data *Obj, sid string) {
 		}
 		child := asStr(data.Must("sessionId"))
 		target := asStr(info.Must("targetId"))
+		for old, oldTarget := range p.sessionTargets {
+			if oldTarget == target && old != child {
+				p.forgetSession(old)
+			}
+		}
 		p.e.sessions[child] = p
+		p.sessionTargets[child] = target
 		p.setupTasks.Set(child, p.e.spawn(func(ctx context.Context) error {
 			return p.setupSession(ctx, child, target, false)
 		}))
 	case "Target.detachedFromTarget":
 		child := asStr(data.Must("sessionId"))
-		delete(p.e.sessions, child)
-		delete(p.sessionRoots, child)
+		p.forgetSession(child)
 		for _, frame := range p.frames {
 			if frame.session == child {
 				frame.invalidate()
@@ -345,7 +401,21 @@ func (p *Page) event(method string, data *Obj, sid string) {
 			}
 		}
 	case "Page.frameDetached":
-		if frame := p.frames[pyStr(data.Must("frameId"))]; frame != nil {
+		fid := pyStr(data.Must("frameId"))
+		if p.frames[fid] == nil && p.e.sessions[sid] == p && !pyEqual(data.Def("reason", nil), "swap") {
+			// Removal can beat the first frame tree reply. Retire that pending
+			// target too, otherwise setup would recreate it after removal.
+			for session, target := range p.sessionTargets {
+				if target == fid && session != p.session {
+					p.forgetSession(session)
+				}
+			}
+		}
+		if frame := p.frames[fid]; frame != nil {
+			parent := p.frames[frame.parent]
+			if sid != frame.session && sid != p.session && (parent == nil || parent.session != sid) {
+				return
+			}
 			frame.invalidate()
 			if !pyEqual(data.Def("reason", nil), "swap") {
 				removed := map[string]bool{frame.id: true}
@@ -369,6 +439,27 @@ func (p *Page) event(method string, data *Obj, sid string) {
 						descendant.invalidate()
 					}
 					descendant.detached = true
+					delete(p.frames, fid)
+				}
+				for session, root := range p.sessionRoots {
+					if removed[root] && session != p.session {
+						p.forgetSession(session)
+					}
+				}
+				for session, target := range p.sessionTargets {
+					if removed[target] && session != p.session {
+						p.forgetSession(session)
+					}
+				}
+				for _, key := range p.life.Keys() {
+					if removed[key.frame] {
+						p.life.Del(key)
+					}
+				}
+				for _, key := range p.navigationStatus.Keys() {
+					if removed[key.frame] {
+						p.navigationStatus.Del(key)
+					}
 				}
 			}
 		}
@@ -386,7 +477,7 @@ func (p *Page) event(method string, data *Obj, sid string) {
 		}
 	case "Page.lifecycleEvent":
 		name := data.Must("name")
-		if pyEqual(name, "DOMContentLoaded") && p.observerSessions.Has(sid) {
+		if pyEqual(name, "DOMContentLoaded") && p.observerSessions.Has(sid) && (p.bindingTasks[sid] == nil || p.bindingTasks[sid].finished()) {
 			p.bindingTasks[sid] = p.e.spawn(func(ctx context.Context) error { return p.refreshBinding(ctx, sid) })
 		}
 		key := lifeKey{pyStr(data.Must("frameId")), loaderOf(data.Must("loaderId"))}

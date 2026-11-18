@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from app import installed_version, versioning
+from app.config import config_path
 from app.logging import get_logger
 from app.telegram_ui import send_rich
 from app.update.loader import load_updater, updater_script_path
@@ -249,6 +250,9 @@ class UpdateService:
                 "sha256Url": str(available.get("sha256Url") or ""),
                 "installRoot": str(self.install_root),
                 "dataDir": str(self.data_dir),
+                "configPath": str(config_path().absolute()),
+                "configHome": str(Path.home()),
+                "databasePath": str(Path(self.config.storage.db_path).expanduser().resolve()),
                 "serviceName": "openbear.service",
                 "healthUrl": self._health_url(),
                 "force": bool(force),
@@ -293,7 +297,9 @@ class UpdateService:
         return f"http://{host}:{port}/health"
 
     async def _launch_updater(self, script: Path) -> None:
-        python = shutil.which("python3") or sys_executable()
+        # The running application already satisfies the Python baseline. System
+        # python3 may be 3.8 even when uv installed our 3.12 runtime.
+        python = sys_executable()
         updater = load_updater()
         env = updater.with_tool_path()
         proc = await asyncio.create_subprocess_exec(

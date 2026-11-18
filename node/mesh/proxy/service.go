@@ -85,6 +85,14 @@ func (s *Service) apply(c *Config, self netip.Addr, mesh []netip.Prefix) {
 			s.exit = nil
 		}
 		s.exitKey, s.exitErr = k, ""
+		// Publish policy before accepting the new generation. Old prewarmed
+		// TCP tunnels and UDP associations read this same policy on each target.
+		var p *policy
+		var clients []netip.Addr
+		if exit != nil {
+			p, clients = &policy{lan: exit.LAN, mesh: mesh, self: &s.local}, exit.Clients
+		}
+		s.exitConns.updateExit(p, clients)
 		if exit != nil {
 			x, err := startExit(netip.AddrPortFrom(self, uint16(port)), exit, mesh, &s.exitStats, &s.local, &s.exitConns)
 			if err != nil {
@@ -92,14 +100,6 @@ func (s *Service) apply(c *Config, self netip.Addr, mesh []netip.Prefix) {
 			}
 			s.exit = x
 		}
-		// Tunnels open run on, but for an entry or a target the exit no longer allows.
-		var p *policy
-		if exit != nil {
-			p = &policy{lan: exit.LAN, mesh: mesh, self: &s.local}
-		}
-		s.exitConns.cut(func(from, to netip.Addr) bool {
-			return p == nil || !slices.Contains(exit.Clients, from) || to.IsValid() && !p.allowed(to)
-		})
 	}
 	keys := map[string]string{}
 	for _, e := range list {

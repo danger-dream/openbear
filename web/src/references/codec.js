@@ -1,10 +1,11 @@
 import MarkdownIt from 'markdown-it';
 
 export const REFERENCE_MIME = 'application/x-openbear-reference+json';
-export const REFERENCE_KINDS = ['mem', 'doc', 'secret', 'chat', 'turn', 'message', 'server'];
-export const KIND_LABELS = {mem: '记忆', doc: '文档', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息', server: '服务器'};
+export const REFERENCE_KINDS = ['mem', 'doc', 'note', 'secret', 'chat', 'turn', 'message', 'server'];
+export const KIND_LABELS = {mem: '记忆', doc: '文档', note: '笔记', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息', server: '服务器'};
 // Same allow-list as app/reference_servers.py SERVER_ID ('local' or a registry UUID).
 export const SERVER_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+export const NOTE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const referencePattern = /\[((?:\\.|[^\[\]\\\n])*)\]\((openbear:\/\/ref\/[^\s)]+)\)/g;
 // Keep this syntax-only preset aligned with app/references.py.
 const referenceMarkdown = new MarkdownIt('default', {html:false,linkify:false});
@@ -16,8 +17,10 @@ export function normalizeReference(input) {
   if (!id || id.length > 160 || /[\r\n\0]/.test(id)) return null;
   if (['mem','doc','secret'].includes(input.kind) && (!/^[1-9]\d*$/.test(id) || BigInt(id) > 9223372036854775807n)) return null;
   if (input.kind === 'server' && !SERVER_ID_PATTERN.test(id)) return null;
+  if (input.kind === 'note' && !NOTE_ID_PATTERN.test(id)) return null;
   const ref = {kind: input.kind, id, label: String(input.label || input.title || input.name || id).slice(0,300), scope: input.scope === 'recent' ? 'recent' : 'full'};
-  if (input.mode === 'mention') {
+  // Notes have no model-side reader, so a note is always referenced with its content.
+  if (input.mode === 'mention' && ref.kind !== 'note') {
     ref.mode = 'mention';
     if (['chat','turn','message'].includes(ref.kind) && ['conversation_too_long','conversation_total_limit'].includes(input.modeReason)) ref.modeReason=input.modeReason;
   }

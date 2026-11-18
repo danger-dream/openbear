@@ -17,7 +17,7 @@ const ProtocolMin = 1
 
 // Features names the methods added after protocol 1, so the controller can
 // tell an older node apart before calling one.
-var Features = []string{"fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "host", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe"}
+var Features = []string{"fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "fs.write.noReplace", "host", "host.processIdentity", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe", "mesh.routing.noTransit", "mesh.routing.tuning", "mesh.fastPorts", "mesh.forwards"}
 
 type Info struct {
 	Hostname string `json:"hostname"`

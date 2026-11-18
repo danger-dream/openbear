@@ -1,13 +1,15 @@
 <script setup>
 import { computed, reactive, watch } from 'vue';
+import NodePicker from '../ddns/NodePicker.vue';
 import { NetApi } from './netApi.js';
 import { SCOPES } from './netHelpers.js';
+import { pickerNode } from './serverHelpers.js';
 
 // A front's (前置机) exits: the primary and an optional backup, each with the address of the exit the front reaches it at.
 const props = defineProps({modelValue: {type: Array, required: true}, servers: {type: Array, default: () => []}, self: {type: String, default: ''}});
 const emit = defineEmits(['update:modelValue']);
 // Exits are other servers with a node, not the controller's machine and not fronts themselves.
-const choices = computed(() => props.servers.filter(s => !s.local && s.id !== props.self && !s.profile?.front && s.node));
+const choices = computed(() => props.servers.filter(s => !s.local && s.id !== props.self && !s.profile?.front && s.node).map(pickerNode));
 function set(i, patch) {
   emit('update:modelValue', props.modelValue.map((e, j) => j === i ? {...e, ...patch} : {...e}));
 }
@@ -15,7 +17,6 @@ function pickExit(i, serverId) { set(i, {serverId, address: ''}); void load(serv
 function addBackup() { emit('update:modelValue', [...props.modelValue, {serverId: '', address: ''}]); }
 // Either one goes when there are two; the one left is the primary.
 function remove(i) { emit('update:modelValue', props.modelValue.filter((_, j) => j !== i)); }
-const label = s => `${s.name}${s.live ? '' : '（离线）'}`;
 
 // The addresses on each exit's interfaces, then a public one behind NAT; mesh and link-local ones cannot be the line.
 const known = reactive({});
@@ -56,10 +57,9 @@ function prompt(e) {
 <template>
   <div class="ob-ctl sv-front-exits">
     <div v-for="(e, i) in modelValue" :key="i" class="sv-front-exit" :class="{'has-remove': modelValue.length > 1}">
-      <select :value="e.serverId" required :aria-label="i ? '备用出口' : '出口'" @change="pickExit(i, $event.target.value)">
-        <option value="" disabled>{{ i ? '选择备用出口' : '选择出口' }}</option>
-        <option v-for="s in choices" :key="s.id" :value="s.id" :disabled="modelValue.some((x, j) => j !== i && x.serverId === s.id)">{{ label(s) }}</option>
-      </select>
+      <!-- The other exit is not offered again. -->
+      <NodePicker :model-value="e.serverId" :nodes="choices" :label="i ? '备用出口' : '出口'" :placeholder="i ? '选择备用出口' : '选择出口'"
+        :exclude="modelValue.find((x, j) => j !== i)?.serverId || ''" :outdated="() => false" @update:model-value="pickExit(i, $event)" />
       <select :value="e.address" required :disabled="!e.serverId" :aria-label="i ? '备用出口地址' : '出口地址'" @change="set(i, {address: $event.target.value})">
         <option value="" disabled>{{ prompt(e) }}</option>
         <option v-for="o in options(e)" :key="o.ip" :value="o.ip">{{ o.note ? `${o.ip}（${o.note}）` : o.ip }}</option>

@@ -20,14 +20,16 @@ type udpHub struct {
 	pc     *net.UDPConn
 	mu     sync.Mutex
 	assocs map[*udpAssoc]bool
+	closed bool
 }
 
 type udpAssoc struct {
-	peer   netip.Addr
-	client netip.AddrPort // set by the first datagram, under the hub's mu
-	mu     sync.Mutex
-	w      *bufio.Writer
-	st     *userStats
+	peer            netip.Addr
+	client          netip.AddrPort // set by the first datagram, under the hub's mu
+	mu              sync.Mutex
+	w               *bufio.Writer
+	st              *userStats
+	control, tunnel net.Conn
 }
 
 func startHub(at net.Addr) *udpHub {
@@ -44,7 +46,30 @@ func startHub(at net.Addr) *udpHub {
 	return h
 }
 
-func (h *udpHub) close() { h.pc.Close() }
+func (h *udpHub) close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	if h.pc != nil {
+		h.pc.Close()
+	}
+	// A replaced hub cannot keep the association alive. Close its TCP
+	// control and tunnel explicitly, so clients rebuild instead of blackholing.
+	for a := range h.assocs {
+		a.control.Close()
+		a.tunnel.Close()
+	}
+}
+
+func (h *udpHub) add(a *udpAssoc) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return false
+	}
+	h.assocs[a] = true
+	return true
+}
 
 func (h *udpHub) find(from netip.AddrPort) *udpAssoc {
 	h.mu.Lock()
@@ -202,10 +227,10 @@ func (s *entryServer) sharedUDP(c *net.TCPConn, u *User, h *udpHub, peer netip.A
 		socksReply(c, status, netip.AddrPort{})
 		return
 	}
-	a := &udpAssoc{peer: peer, w: bufio.NewWriterSize(t, 0x10000), st: st}
-	h.mu.Lock()
-	h.assocs[a] = true
-	h.mu.Unlock()
+	a := &udpAssoc{peer: peer, w: bufio.NewWriterSize(t, 0x10000), st: st, control: c, tunnel: t}
+	if !h.add(a) {
+		return
+	}
 	defer func() {
 		h.mu.Lock()
 		delete(h.assocs, a)

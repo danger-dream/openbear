@@ -45,7 +45,7 @@ _STUN = re.compile(r'(stun:)?([\w.\-]{1,253}|\[([0-9a-fA-F:.]{2,45})\])(:\d{1,5}
 # The longest v6Select value a node takes, in UTF-8 bytes.
 MAX_SELECT = 256
 PROXY_SCHEMES = ('http', 'https')
-DEFAULT_POLICY = {'multi': 'one', 'allowPrivate': False, 'onDrift': 'revert'}
+DEFAULT_POLICY = {'multi': 'one', 'allowPrivate': False, 'onDrift': 'revert', 'rrsetTakeover': False}
 DEFAULT_V6_SELECT = {'mode': 'first', 'value': '', 'allowTemporary': False}
 BACKUP_AFTER_S = 300
 
@@ -388,7 +388,7 @@ def clean_policy(data, prior=None):
     if not isinstance(data, dict) or set(data) - set(DEFAULT_POLICY):
         fail('invalid_policy')
     value.update(data)
-    if value['multi'] not in ('one', 'all') or value['onDrift'] not in ('revert', 'alert') or not isinstance(value['allowPrivate'], bool):
+    if value['multi'] not in ('one', 'all') or value['onDrift'] not in ('revert', 'alert') or not isinstance(value['allowPrivate'], bool) or not isinstance(value['rrsetTakeover'], bool):
         fail('invalid_policy')
     return value
 

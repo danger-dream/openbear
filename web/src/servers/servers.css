@@ -30,6 +30,11 @@
 .sv-front-exit { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; gap: 8px; }
 .sv-front-exit.has-remove { grid-template-columns: repeat(2, minmax(0, 1fr)) auto; }
 .sv-front-add { align-self: flex-start; }
+/* The server pickers of an exit and of the SSH relay as tall as the fields around them. */
+.sv-front-exit > .ss-trigger, .sv-ssh-relay > .ss-trigger { padding-top: 7px; padding-bottom: 7px; }
+@media (max-width: 760px) { .sv-front-exit > .ss-trigger, .sv-ssh-relay > .ss-trigger { font-size: 16px; } }
+/* Its address is in the field beside it: the exit's half keeps its name, saying only when it is offline. */
+.sv-front-exit > .ss-trigger .ss-via:not(.dd-off) { display: none; }
 /* A field that only says something: level with its label. */
 .sv-field-note { padding-top: 7px; }
 /* Tags: the chips and the input in one box drawn like the other fields. */

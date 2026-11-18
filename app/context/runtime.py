@@ -18,7 +18,8 @@ from app.agent.native_continuation import (
     validate_model_context,
 )
 from app.context.configuration import normalize_strategy
-from app.context.media_recovery import reference_historical_media
+from app.context import image_one_turn
+from app.context.media_recovery import reference_earlier_round_media, reference_historical_media
 from app.context.prompts import effective_context_prompt
 from app.context.store import ArchivePlan, ControllerBoundary, RequestTicket, SavePlan, StaleWindow, WindowStore
 from app.context.strategies import (
@@ -66,6 +67,8 @@ class ContextManager:
         model_label: str = "",
         restored_controller_anchor: dict[str, Any] | None = None,
         frozen_system: bool = False,
+        image_one_turn_resolver: Callable[[], Awaitable[dict[str, bool]]] | None = None,
+        rebuild_system: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self.store = store
         self.policy = policy
@@ -82,6 +85,9 @@ class ContextManager:
         self.state_revision = 0
         self.last_estimate: InputEstimate | None = None
         self.strategy_resolver = strategy_resolver
+        self.image_one_turn_resolver = image_one_turn_resolver
+        self.rebuild_system = rebuild_system
+        self.image_one_turn = image_one_turn.normalize(None)
         self.strategies = {"sliding_window": SlidingWindowStrategy(), **(strategies or {})}
         self.active_strategy = "sliding_window"
         self.system = ""
@@ -99,6 +105,8 @@ class ContextManager:
             # because the user switches the next compression's strategy.
             if self.strategy_resolver:
                 self.active_strategy = normalize_strategy(await self.strategy_resolver())
+            if self.image_one_turn_resolver:
+                self.image_one_turn = image_one_turn.normalize(await self.image_one_turn_resolver())
             self._active_compression = None
             try:
                 return await self._prepare(messages, **kwargs)
@@ -230,7 +238,7 @@ class ContextManager:
             saved_state = (loaded or {}).get("state") or {}
         # Checkpoints do not change the request identity; keep it even when a
         # compatibility caller has not supplied the full label/options yet.
-        identity = {key: saved_state[key] for key in ("requestModelLabel", "replayIdentity") if key in saved_state}
+        identity = {key: saved_state[key] for key in ("requestModelLabel", "replayIdentity", "systemReplacement") if key in saved_state}
         if self.model_label:
             identity["requestModelLabel"] = self.model_label
         if self.replay_identity:
@@ -269,6 +277,15 @@ class ContextManager:
         saved = await self.store.load(fresh=True)
         if not self.frozen_system:
             system = effective_context_prompt(system, self.active_strategy)
+        # A deleted persona is retired only at a rebuild boundary. Its replacement
+        # belongs to the committed window, not sessions.system_snapshot. An explicit
+        # prompt refresh/editor change has a different source and supersedes it.
+        system_source = hashlib.sha256(system.encode()).hexdigest()
+        replacement = ((saved or {}).get("state") or {}).get("systemReplacement")
+        if self.frozen_system or not replacement or replacement.get("source") != system_source:
+            replacement = None
+        if replacement:
+            system = replacement["system"]
         self.system = system
         self.request_options = copy.deepcopy(request_options or {})
         route = self.request_route(system, tools)
@@ -325,11 +342,19 @@ class ContextManager:
         measured = estimator(messages)
         before_estimate = measured
         retired_media = 0
+        retire_source = "media_payload_recovery"
+        media_dir = (Path(self.store.db._path).resolve().parent / "tool_artifacts" / "media-recovery"
+                     / hashlib.sha256(self.store.owner.key.encode()).hexdigest())
+        agent = self.store.owner.kind == "agent"
         if self.media_overflow:
-            owner_dir = hashlib.sha256(self.store.owner.key.encode()).hexdigest()
-            messages, retired_media = reference_historical_media(
-                messages, artifact_dir=Path(self.store.db._path).resolve().parent / "tool_artifacts" / "media-recovery" / owner_dir,
+            messages, retired_media = reference_historical_media(messages, artifact_dir=media_dir)
+        elif self.image_one_turn["enabled"] and (self.image_one_turn["agents"] or not agent):
+            messages, retired_media = reference_earlier_round_media(
+                messages, artifact_dir=media_dir, scope_key="task_uuid" if agent else "run_root_turn_uuid",
+                active_scope=self.store.owner.task_uuid if agent else self.active_run_root_turn_uuid,
+                include_input=self.image_one_turn["includeUser"],
             )
+            retire_source = "image_one_turn"
         if retired_media:
             calibrated = False
             measured = estimator(messages)
@@ -349,6 +374,15 @@ class ContextManager:
         # request. There is no second, output-derived compression allowance.
         ceiling = max(1, threshold - 1) if threshold else 0
         if needed:
+            if self.rebuild_system and not self.frozen_system:
+                rebuilt = await self.rebuild_system(system)
+                if rebuilt != system:
+                    system = self.system = rebuilt
+                    replacement = {"source": system_source, "system": system}
+                    route = self.route = self.request_route(system, tools)
+                    calibrated, neutral_ratio = False, 0.0
+                    messages = neutral_context(messages)
+                    measured = estimator(messages)
             self._active_compression = {
                 "strategy": self.active_strategy, "scope": "agent" if self.store.owner.kind == "agent" else "root",
                 "ownerKind": self.store.owner.kind, "ownerId": self.store.owner.key,
@@ -401,7 +435,7 @@ class ContextManager:
         rotated = bool(retired_media or compressed)
         detail = {
             "ownerKind": self.store.owner.kind, "ownerId": self.store.owner.key,
-            "source": (self._active_compression or {}).get("source", source or ("media_payload_recovery" if retired_media else "pre_model_request")),
+            "source": (self._active_compression or {}).get("source", source or (retire_source if retired_media else "pre_model_request")),
             "beforeEstimateTokens": before_estimate.tokens,
             "beforeRequestBytes": before_estimate.request_bytes,
             "afterRequestBytes": measured.request_bytes,
@@ -439,7 +473,7 @@ class ContextManager:
             expected_message_high_water=expected_message_high_water, controller_boundary=controller_boundary,
             source_message_high_water=controller_boundary.high_water if controller_boundary else None,
             extra_state={"strategy": self.active_strategy, "compressionPending": False,
-                         "replayIdentity": self.replay_identity, **carried,
+                         "replayIdentity": self.replay_identity, "systemReplacement": replacement, **carried,
                          **({"requestModelLabel": self.model_label or saved["state"]["requestModelLabel"]}
                             if self.model_label or ((saved or {}).get("state") or {}).get("requestModelLabel") else {}),
                          "estimatedNextInputTokens": measured.tokens, "rawEstimatedInputTokens": outgoing_raw.tokens,

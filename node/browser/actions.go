@@ -207,6 +207,8 @@ func (a *actions) guards(ctx context.Context, node *Node, p point, action string
 }
 
 func (a *actions) stopGuards(ctx context.Context, guards []*Node, check bool) error {
+	ctx, cancel := cleanupContext()
+	defer cancel()
 	intercepted := false
 	for _, guard := range guards {
 		result, err := guard.call(ctx, "function(){return this.stop()}")
@@ -259,6 +261,12 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (a *actions) restoreModifiers(desired map[string]bool) error {
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	return a.setModifiers(ctx, desired)
 }
 
 func (a *actions) setModifiers(ctx context.Context, desired map[string]bool) error {
@@ -370,6 +378,8 @@ func (a *actions) key(ctx context.Context, key string, down bool) error {
 		}
 		key = m
 	}
+	previousModifiers := copySet(a.page.modifiers)
+	wasPressed := a.page.pressed[key]
 	d, err := a.describeKey(ctx, key)
 	if err != nil {
 		return err
@@ -409,6 +419,14 @@ func (a *actions) key(ctx context.Context, key string, down bool) error {
 	}
 	markEffect(ctx)
 	_, err = a.page.input(ctx, "Input.dispatchKeyEvent", payload)
+	if !down && err != nil && !errors.Is(err, errDialogOpened) {
+		// Keep uncertain releases tracked so the independent cleanup can release
+		// them; never replay a keyDown or text insertion.
+		a.page.modifiers = previousModifiers
+		if wasPressed {
+			a.page.pressed[key] = true
+		}
+	}
 	return err
 }
 
@@ -429,10 +447,12 @@ func (a *actions) press(ctx context.Context, chord string) (err error) {
 	modifiers, key := parts[:len(parts)-1], parts[len(parts)-1]
 	previous := copySet(a.page.modifiers)
 	defer func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		if a.page.pressed[key] {
 			a.key(ctx, key, false)
 		}
-		if rerr := a.setModifiers(ctx, previous); rerr != nil {
+		if rerr := a.restoreModifiers(previous); rerr != nil && err == nil {
 			err = rerr
 		}
 	}()
@@ -465,6 +485,8 @@ func (a *actions) click(ctx context.Context, params *Obj) (err error) {
 	bits := map[string]int{"left": 1, "right": 2, "middle": 4}
 	down := false
 	defer func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		if down {
 			a.mouse(ctx, "mouseReleased", *p, button, 0, 0)
 		}
@@ -475,10 +497,10 @@ func (a *actions) click(ctx context.Context, params *Obj) (err error) {
 			cleanup = a.stopGuards(ctx, guards, false)
 		}
 		node.release(ctx)
-		if cleanup == nil {
-			cleanup = a.setModifiers(ctx, previous)
+		if restore := a.restoreModifiers(previous); cleanup == nil {
+			cleanup = restore
 		}
-		if cleanup != nil {
+		if cleanup != nil && err == nil {
 			err = cleanup
 		}
 	}()
@@ -513,10 +535,11 @@ func (a *actions) click(ctx context.Context, params *Obj) (err error) {
 			if err := a.mouse(ctx, "mousePressed", *p, button, bit, count); err != nil {
 				return err
 			}
-			down = false
 			if err := a.mouse(ctx, "mouseReleased", *p, button, 0, count); err != nil {
+				down = !errors.Is(err, errDialogOpened)
 				return err
 			}
+			down = false
 		}
 	}
 	if a.page.obs.dialog != nil {
@@ -617,6 +640,8 @@ func (a *actions) drag(ctx context.Context, params *Obj) (err error) {
 	released := true
 	e := a.e()
 	defer func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		if !released {
 			a.mouse(ctx, "mouseReleased", a.page.mouse, "left", 0, 0)
 		}

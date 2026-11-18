@@ -18,9 +18,11 @@ from app.llm.error_classify import (
     CONTEXT_OVERFLOW,
     FORMAT,
     SERVER_ERROR,
+    UNKNOWN,
     classify_error,
     is_gemini_sampling_failure,
     is_retryable_reason,
+    names_context_overflow,
     normalize_classification,
     retryable_from_contract,
 )
@@ -146,6 +148,16 @@ def _details_candidate(node: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _node_code(node: dict[str, Any]) -> str:
+    classification = _text(node.get("classification"))
+    code = _text(node.get("code"))
+    # A recognized specific code (``upstream_stream_incomplete``) beats a
+    # generic type (``api_error``); otherwise keep the historical order.
+    if not classification and code and normalize_classification(code) not in ("", UNKNOWN):
+        return code
+    return _text(node.get("classification") or node.get("error_type") or node.get("type") or node.get("code"))
+
+
 def _walk(value: Any, scan: _Scan, *, depth: int = 0, field_name: str = "") -> None:
     if depth > _MAX_PARSE_DEPTH:
         return
@@ -156,7 +168,7 @@ def _walk(value: Any, scan: _Scan, *, depth: int = 0, field_name: str = "") -> N
         status = _dict_status(value)
         if status:
             scan.statuses.append((depth, status))
-        code = _text(value.get("classification") or value.get("error_type") or value.get("type") or value.get("code"))
+        code = _node_code(value)
         for key in _MESSAGE_KEYS:
             message = _text(value.get(key)).strip()
             if message:
@@ -350,6 +362,8 @@ def normalize_error_payload(value: Any, *, transport_status: int = 0) -> Normali
     elif is_request_size_error(message) and classification in {"", FORMAT}:
         # A generic invalid_request/format envelope must not hide WS 1009.
         # Reuse bounded overflow recovery, not ordinary unchanged retries.
+        reason = CONTEXT_OVERFLOW
+    elif names_context_overflow(classification, code_reason, fallback_reason):
         reason = CONTEXT_OVERFLOW
     elif classification in {"", FORMAT} and is_gemini_sampling_failure(message, code):
         # Gateways report a Gemini sampling failure (malformed tool call, stream

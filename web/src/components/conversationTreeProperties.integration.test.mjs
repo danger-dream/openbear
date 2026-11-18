@@ -191,16 +191,21 @@ test('a changed extension default is saved with the dialog after its impact is c
   assert.deepEqual(h.errors,[]);
 });
 
-test('a top-level folder has nothing to inherit: it opens on its own setting, and an unchanged one is not sent', async () => {
-  const top={default:{enabled:[],autoAllow:false,from:'',explicit:false,own:false},inherited:{enabled:[],autoAllow:false,from:'',explicit:false},canInherit:false,extensions:[]};
+test('a top-level folder opens inheriting the system default, and an unchanged one is not sent', async () => {
+  const system={enabled:['workitems'],autoAllow:true,from:'__system',explicit:true};
+  const top={default:{...system,own:false},inherited:system,canInherit:true,extensions:[]};
   const h=harness({extensions:()=>clone(top)});await h.open('top');
-  assert.equal(h.state.folderExtensionsCanInherit.value,false);
-  assert.deepEqual(clone(h.state.folderExtensions.value),{inherit:false,enabled:[],autoAllow:false});
+  assert.equal(h.state.folderExtensionsCanInherit.value,true);
+  assert.deepEqual(clone(h.state.folderExtensions.value),{inherit:true,enabled:['workitems'],autoAllow:true});
   await h.run('saveProperties()');
   assert.equal(h.calls.some(call=>call.kind==='extensions'),false);
   await h.open('top');h.state.folderExtensions.value={inherit:false,enabled:['browser'],autoAllow:false};await h.run('saveProperties()');
   assert.deepEqual(h.calls.find(call=>call.kind==='extensions').payload,{enabled:['browser'],autoAllow:false});
-  // One with its own setting opens on it, whether or not it could inherit.
+  // One with its own setting opens on it.
   const own=harness({extensions:()=>({...clone(top),default:{enabled:['agents','workitems'],autoAllow:true,from:'top',explicit:true,own:true}})});await own.open('top');
   assert.deepEqual(clone(own.state.folderExtensions.value),{inherit:false,enabled:['agents','workitems'],autoAllow:true});
+  // The system default itself has nothing above it and edits its own setting.
+  const root=harness({extensions:()=>({default:{enabled:[],autoAllow:false,from:'',explicit:false,own:false},inherited:{enabled:[],autoAllow:false,from:'',explicit:false},canInherit:false,extensions:[]})});
+  await root.open('top');
+  assert.deepEqual(clone(root.state.folderExtensions.value),{inherit:false,enabled:[],autoAllow:false});
 });

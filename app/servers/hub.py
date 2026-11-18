@@ -620,13 +620,14 @@ class NodeHub:
         session.version = str(hello.get('version', ''))[:40]
         session.set_protocol(*protocol_range(hello))
         previous = self.sessions.get(node_id)
+        keepalive = None
         self.sessions[node_id] = session
-        if previous:
-            await previous.ws.close(code=CLOSE_REPLACED, message=b'replaced')
-        await channel.send_json({'t': 'config', 'interval': REPORT_INTERVAL, **self._terms(hello)})
-        await self.service.node_seen(node_id, connected=True)
-        keepalive = asyncio.create_task(self._keepalive(ws))
         try:
+            if previous:
+                await previous.ws.close(code=CLOSE_REPLACED, message=b'replaced')
+            await channel.send_json({'t': 'config', 'interval': REPORT_INTERVAL, **self._terms(hello)})
+            await self.service.node_seen(node_id, connected=True)
+            keepalive = asyncio.create_task(self._keepalive(ws))
             async for message in ws:
                 if message.type != WSMsgType.BINARY:
                     continue
@@ -658,7 +659,8 @@ class NodeHub:
                     await asyncio.sleep(wait)
                 await self._message(session, data)
         finally:
-            keepalive.cancel()
+            if keepalive is not None:
+                keepalive.cancel()
             for future in session.calls.values():
                 if not future.done():
                     future.set_exception(ConnectionError('node_disconnected'))
@@ -672,9 +674,12 @@ class NodeHub:
                 for terminal in list(session.terminals.values()):
                     terminal.finish('node_disconnected')
                 session.terminals.clear()
-                if current:
+                # A replacement may have arrived while this cleanup was scheduled.
+                if current and node_id not in self.sessions:
                     with contextlib.suppress(Exception):
                         await self.service.node_seen(node_id, connected=False)
+                with contextlib.suppress(Exception):
+                    await ws.close()
             await asyncio.shield(self.service.spawn(end()))
         return ws
 

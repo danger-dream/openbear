@@ -9,7 +9,42 @@ diff --git a/net.sh b/net.sh
  local RunTimes=$(curl $CurlARG -s --max-time 10 "https://hits.xykt.de/net?action=hit" 2>&1)
  stail[today]=$(echo "$RunTimes"|jq '.daily')
  stail[total]=$(echo "$RunTimes"|jq '.total')
-@@ -595,9 +596,11 @@
+@@ -384,6 +385,12 @@
+ kill_progress_bar(){
+ kill "$bar_pid" 2>/dev/null&&echo -ne "\r"
+ }
++net_dependencies_ready(){
++jq --version >/dev/null 2>&1 && curl --version >/dev/null 2>&1 && bc --version >/dev/null 2>&1 &&
++command -v convert >/dev/null 2>&1 && command -v mtr >/dev/null 2>&1 && command -v iperf3 >/dev/null 2>&1 &&
++(command -v stun >/dev/null 2>&1 || ! command -v apt >/dev/null 2>&1) &&
++(command -v free >/dev/null 2>&1 || [[ "$(uname)" == Darwin ]])
++}
+ install_dependencies(){
+ local is_dep=1
+ local is_nexttrace=1
+@@ -392,7 +399,7 @@
+ if [ "$(uname)" == "Darwin" ]||[ $(id -u) -eq 0 ];then
+ usesudo=""
+ fi
+-if ! jq --version >/dev/null 2>&1||! curl --version >/dev/null 2>&1||! command -v convert >/dev/null 2>&1||! command -v mtr >/dev/null 2>&1||! command -v iperf3 >/dev/null 2>&1||(! command -v stun >/dev/null 2>&1&&command -v apt >/dev/null 2>&1)||(! command -v free >/dev/null 2>&1&&[[ "$(uname)" != "Darwin" ]]);then
++if ! net_dependencies_ready;then
+ is_dep=0
+ fi
+ if ! command -v nexttrace >/dev/null 2>&1;then
+@@ -477,6 +484,12 @@
+ install_stun
+ fi
+ fi
++# Package managers may succeed without providing a usable tool. Never measure with missing core dependencies.
++if ! net_dependencies_ready || ! command -v nexttrace >/dev/null 2>&1 || ! command -v speedtest >/dev/null 2>&1 || ! command -v stun >/dev/null 2>&1;then
++echo 'Required dependencies unavailable after installation (jq curl bc convert mtr iperf3 stun nexttrace speedtest free).' >&2
++return 1
++fi
++return 0
+ }
+ install_packages(){
+ local package_manager=$1
+@@ -595,9 +608,11 @@
  http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" "$url" 2>/dev/null)
  if [[ $http_code == "204" ]];then
  rawgithub="https://github.com/xykt/NetQuality/raw/"
@@ -21,7 +56,7 @@ diff --git a/net.sh b/net.sh
  return 1
  fi
  }
-@@ -1043,7 +1046,7 @@
+@@ -1043,7 +1058,7 @@
  bar_pid="$!"&&disown "$bar_pid"
  trap "kill_progress_bar" RETURN
  getnat=()
@@ -30,7 +65,171 @@ diff --git a/net.sh b/net.sh
  local result=$(stun "stun.l.google.com" 2>/dev/null)
  else
  local result=$(stun "stun.miwifi.com" 2>/dev/null)
-@@ -2733,6 +2736,7 @@
+@@ -1405,7 +1420,7 @@
+ declare -A asns
+ local max_hop=0
+ local cn_hop=0
+-local all_asn=""
++local -A seen_asn=()
+ local tresucn="NoData"
+ local tresuww="NoData"
+ local max_retries=10
+@@ -1422,10 +1437,11 @@
+ IFS=',' read -r -a elements <<<"$line"
+ local hop="${elements[4]}"
+ local ip="${elements[5]}"
+-[[ ${elements[6]} != *"?"* ]]&&local asn="${elements[6]#AS}"
++local asn=""
++[[ ${elements[6]} =~ ^(AS)?([0-9]+)$ ]]&&asn="${BASH_REMATCH[2]}"
+ ips["$hop"]="$ip"
+ asns["$hop"]="$asn"
+-[[ -n $asn && $asn != *"?"* ]]&&all_asn="$all_asn$asn "
++[[ -n $asn ]]&&seen_asn["$asn"]=1
+ ((hop>max_hop))&&max_hop="$hop"
+ [[ $cn_hop -eq 0 ]]&&[[ $asn =~ ^("58453"|"58807"|"4837"|"10099"|"9929"|"4134"|"4809"|"23764"|"4538"|"7497")$ ]]&&cn_hop="$hop"
+ done <<<"$response"
+@@ -1433,83 +1449,83 @@
+ [[ ${asns[$cn_hop]} == "17676" ]]&&cn_hop=$((cn_hop+1))
+ case "${asns[$cn_hop]}" in
+ "4134")tresucn="163"
+-if [[ $all_asn == *AS9929* ]];then
++if [[ -n ${seen_asn[9929]} ]];then
+ tresucn="9929"
+-elif [[ $all_asn == *AS10099* ]];then
++elif [[ -n ${seen_asn[10099]} ]];then
+ tresucn="10099"
+-elif [[ $all_asn == *AS23764* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[23764]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS4809* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[4809]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS23764* ]];then
++elif [[ -n ${seen_asn[23764]} ]];then
+ tresucn="CTGGIA"
+-elif [[ $all_asn == *AS4809* ]];then
++elif [[ -n ${seen_asn[4809]} ]];then
+ tresucn="CN2GIA"
+-elif [[ $all_asn == *AS58807* ]];then
++elif [[ -n ${seen_asn[58807]} ]];then
+ tresucn="CMIN2"
+ fi
+ ;;
+ "4837")tresucn="4837"
+-if [[ $all_asn == *AS9929* ]];then
++if [[ -n ${seen_asn[9929]} ]];then
+ tresucn="9929"
+-elif [[ $all_asn == *AS10099* ]];then
++elif [[ -n ${seen_asn[10099]} ]];then
+ tresucn="10099"
+-elif [[ $all_asn == *AS23764* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[23764]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS4809* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[4809]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS23764* ]];then
++elif [[ -n ${seen_asn[23764]} ]];then
+ tresucn="CTGGIA"
+-elif [[ $all_asn == *AS4809* ]];then
++elif [[ -n ${seen_asn[4809]} ]];then
+ tresucn="CN2GIA"
+-elif [[ $all_asn == *AS58807* ]];then
++elif [[ -n ${seen_asn[58807]} ]];then
+ tresucn="CMIN2"
+ fi
+ ;;
+ "58453")tresucn="CMI"
+-if [[ $all_asn == *AS9929* ]];then
++if [[ -n ${seen_asn[9929]} ]];then
+ tresucn="9929"
+-elif [[ $all_asn == *AS10099* ]];then
++elif [[ -n ${seen_asn[10099]} ]];then
+ tresucn="10099"
+-elif [[ $all_asn == *AS23764* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[23764]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS4809* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[4809]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS23764* ]];then
++elif [[ -n ${seen_asn[23764]} ]];then
+ tresucn="CTGGIA"
+-elif [[ $all_asn == *AS4809* ]];then
++elif [[ -n ${seen_asn[4809]} ]];then
+ tresucn="CN2GIA"
+-elif [[ $all_asn == *AS58807* ]];then
++elif [[ -n ${seen_asn[58807]} ]];then
+ tresucn="CMIN2"
+ fi
+ ;;
+ "58807")tresucn="CMIN2"
+ ;;
+ "9808")tresucn="CMI"
+-if [[ $all_asn == *AS9929* ]];then
++if [[ -n ${seen_asn[9929]} ]];then
+ tresucn="9929"
+-elif [[ $all_asn == *AS10099* ]];then
++elif [[ -n ${seen_asn[10099]} ]];then
+ tresucn="10099"
+-elif [[ $all_asn == *AS23764* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[23764]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS4809* && $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[4809]} && -n ${seen_asn[4134]} ]];then
+ tresucn="CN2GT"
+-elif [[ $all_asn == *AS23764* ]];then
++elif [[ -n ${seen_asn[23764]} ]];then
+ tresucn="CTGGIA"
+-elif [[ $all_asn == *AS4809* ]];then
++elif [[ -n ${seen_asn[4809]} ]];then
+ tresucn="CN2GIA"
+-elif [[ $all_asn == *AS58807* ]];then
++elif [[ -n ${seen_asn[58807]} ]];then
+ tresucn="CMIN2"
+ fi
+ ;;
+ "9929")tresucn="9929"
+ ;;
+ "10099")tresucn="10099"
+-[[ $all_asn == *AS9929* ]]&&tresucn="9929"
++[[ -n ${seen_asn[9929]} ]]&&tresucn="9929"
+ ;;
+ "4809")tresucn="CN2GIA"
+ if ((cn_hop>1));then
+-[[ $all_asn == *AS23764* ]]&&tresucn="CTGGIA"
++[[ -n ${seen_asn[23764]} ]]&&tresucn="CTGGIA"
+ else
+ for ((hop=cn_hop; hop<=max_hop; hop++));do
+ [[ ${asns[$hop]} == "4809" || ${asns[$hop]} == "23764" ]]&&continue
+@@ -1527,19 +1543,19 @@
+ "7497")tresucn="CSTNET"
+ ;;
+ *)tresucn="NoData"
+-if [[ $all_asn == *AS58807* ]];then
++if [[ -n ${seen_asn[58807]} ]];then
+ tresucn="CMIN2"
+-elif [[ $all_asn == *AS9929* ]];then
++elif [[ -n ${seen_asn[9929]} ]];then
+ tresucn="9929"
+-elif [[ $all_asn == *AS10099* ]];then
++elif [[ -n ${seen_asn[10099]} ]];then
+ tresucn="10099"
+-elif [[ $all_asn == *AS4809* ]];then
++elif [[ -n ${seen_asn[4809]} ]];then
+ tresucn="CN2"
+-elif [[ $all_asn == *AS9808* ]];then
++elif [[ -n ${seen_asn[9808]} ]];then
+ tresucn="CMI"
+-elif [[ $all_asn == *AS4134* ]];then
++elif [[ -n ${seen_asn[4134]} ]];then
+ tresucn="163"
+-elif [[ $all_asn == *AS4837* ]];then
++elif [[ -n ${seen_asn[4837]} ]];then
+ tresucn="4837"
+ fi
+ esac
+@@ -2733,6 +2749,7 @@
  exit 0
  }
  show_ad(){
@@ -38,7 +237,247 @@ diff --git a/net.sh b/net.sh
  RANDOM=$(date +%s)
  local -a ads=()
  local i=1
-@@ -2999,8 +3003,8 @@
+@@ -2830,132 +2847,131 @@
+ AS_MAPPING["$as"]="$name"
+ done < <(curl -sL "${rawgithub}main/ref/AS_Mapping.txt")
+ }
++# JSON values travel only as data arguments, never as jq source. # denotes an array index.
++json_field(){
++json_fields+=("$1" "$2" "$3")
++}
++json_document(){
++jq -n --argjson base "$1" --args '
++  $ARGS.positional as $v |
++  reduce range(0; $v|length; 3) as $i ($base;
++    ($v[$i] | split(".") | map(if startswith("#") then ltrimstr("#")|tonumber else . end)) as $path |
++    ($v[$i+2]) as $raw |
++    setpath($path; if $v[$i+1] == "s" then $raw
++      elif $v[$i+1] == "b" then (if $raw == "true" then true elif $raw == "false" then false else null end)
++      else (try ($raw|tonumber) catch null) end))
++' -- "${json_fields[@]}"
++}
+ save_json(){
+-local head_updates=""
+-local bgp_updates=""
+-local local_updates=""
+-local connectivity_updates=""
++local -a json_fields=()
+ if [ $fullIP -eq 1 ];then
+-head_updates+=".Head |= . + { IP: \"${IP:-null}\" } | "
+-else
+-head_updates+=".Head |= . + { IP: \"${IPhide:-null}\" } | "
+-fi
+-head_updates+=".Head |= . + { Command: \"${shead[bash]:-null}\" } | "
+-head_updates+=".Head |= . + { GitHub: \"${shead[git]:-null}\" } | "
+-head_updates+=".Head |= . + { Time: \"${shead[time_raw]:-null}\" } | "
+-head_updates+=".Head |= . + { Version: \"${script_version:-null}\" } | "
++json_field "Head.IP" s "${IP:-null}"
++else
++json_field "Head.IP" s "${IPhide:-null}"
++fi
++json_field "Head.Command" s "${shead[bash]:-null}"
++json_field "Head.GitHub" s "${shead[git]:-null}"
++json_field "Head.Time" s "${shead[time_raw]:-null}"
++json_field "Head.Version" s "${script_version:-null}"
+ local first_asn
+ first_asn=$(echo "${bgp[asn]}"|awk -F',' '{print $1}'|sed 's/^AS//')
+ first_asn=${first_asn:-null}
+-bgp_updates+=".BGP |= . + { ASN: \"$first_asn\" } | "
+-bgp_updates+=".BGP |= . + { Organization: \"${bgp[org]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { Prefix: ${bgp[prefixnum]:-null} } | "
+-bgp_updates+=".BGP |= . + { RIR: \"${bgp[rir]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { RegDate: \"${bgp[regdate]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { ModDate: \"${bgp[moddate]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { Country: \"${bgp[country]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { IntermediateRegion: \"${bgp[intermediateregion]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { SubRegion: \"${bgp[subregion]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { Region: \"${bgp[region]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { Address: \"${bgp[address]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { GeoFeed: \"${bgp[geofeed]:-null}\" } | "
++json_field "BGP.ASN" s "$first_asn"
++json_field "BGP.Organization" s "${bgp[org]:-null}"
++json_field "BGP.Prefix" n "${bgp[prefixnum]:-null}"
++json_field "BGP.RIR" s "${bgp[rir]:-null}"
++json_field "BGP.RegDate" s "${bgp[regdate]:-null}"
++json_field "BGP.ModDate" s "${bgp[moddate]:-null}"
++json_field "BGP.Country" s "${bgp[country]:-null}"
++json_field "BGP.IntermediateRegion" s "${bgp[intermediateregion]:-null}"
++json_field "BGP.SubRegion" s "${bgp[subregion]:-null}"
++json_field "BGP.Region" s "${bgp[region]:-null}"
++json_field "BGP.Address" s "${bgp[address]:-null}"
++json_field "BGP.GeoFeed" s "${bgp[geofeed]:-null}"
+ if [[ -n ${bgp[iptotal]} && -n ${bgp[ipactive]} ]];then
+-bgp_updates+=".BGP |= . + { IPinTotal: ${bgp[iptotal]:-null} } | "
+-bgp_updates+=".BGP |= . + { IPActive: ${bgp[ipactive]:-null} } | "
+-bgp_updates+=".BGP |= . + { NeighborinTotal: ${bgp[neighbortotal]:-null} } | "
+-bgp_updates+=".BGP |= . + { NeighborActive: ${bgp[neighboractive]:-null} } | "
++json_field "BGP.IPinTotal" n "${bgp[iptotal]:-null}"
++json_field "BGP.IPActive" n "${bgp[ipactive]:-null}"
++json_field "BGP.NeighborinTotal" n "${bgp[neighbortotal]:-null}"
++json_field "BGP.NeighborActive" n "${bgp[neighboractive]:-null}"
+ elif [[ -n ${bgp[neighbortotal]} && -n ${bgp[neighboractive]} ]];then
+-bgp_updates+=".BGP |= . + { IPinTotal: ${bgp[neighbortotal]:-null} } | "
+-bgp_updates+=".BGP |= . + { IPActive: ${bgp[neighboractive]:-null} } | "
+-bgp_updates+=".BGP |= . + { NeighborinTotal: ${bgp[neighbortotal]:-null} } | "
+-bgp_updates+=".BGP |= . + { NeighborActive: ${bgp[neighboractive]:-null} } | "
+-else
+-bgp_updates+=".BGP |= . + { IPinTotal: null } | "
+-bgp_updates+=".BGP |= . + { IPActive: null } | "
+-bgp_updates+=".BGP |= . + { NeighborinTotal: null } | "
+-bgp_updates+=".BGP |= . + { NeighborActive: null } | "
+-fi
+-local_updates+=".Local |= . + { NAT: \"${getnat[nat]:-null}\" } | "
+-local_updates+=".Local |= . + { NATDescribe: \"$(echo -e "${slocal[${getnat[type]:-0}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|xargs)\" } | "
+-local_updates+=".Local |= . + { Mapping: \"$(echo -e "${slocal[m${getnat[m]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|xargs)\" } | "
+-local_updates+=".Local |= . + { Filter: \"$(echo -e "${slocal[f${getnat[f]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|xargs)\" } | "
+-local_updates+=".Local |= . + { Port: \"$(echo -e "${slocal[p${getnat[p]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|xargs)\" } | "
+-local_updates+=".Local |= . + { Hairpin: \"$(echo -e "${slocal[h${getnat[h]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|xargs)\" } | "
+-local_updates+=".Local |= . + { TCPCongestionControl: \"${gettcp[tcpcc]:-null}\" } | "
+-local_updates+=".Local |= . + { QueueDiscipline: \"${gettcp[qdisc]:-null}\" } | "
+-local_updates+=".Local |= . + { TCPReceiveBuffer: \"${gettcp[rmem]:-null}\" } | "
+-local_updates+=".Local |= . + { TCPSendBuffer: \"${gettcp[wmem]:-null}\" } | "
+-bgp_updates+=".BGP |= . + { IXCount: ${conn[ix]:-null} } | "
+-bgp_updates+=".BGP |= . + { UpstreamsCount: ${conn[upstreams]:-null} } | "
+-bgp_updates+=".BGP |= . + { PeersCount: ${conn[peers]:-null} } | "
++json_field "BGP.IPinTotal" n "${bgp[neighbortotal]:-null}"
++json_field "BGP.IPActive" n "${bgp[neighboractive]:-null}"
++json_field "BGP.NeighborinTotal" n "${bgp[neighbortotal]:-null}"
++json_field "BGP.NeighborActive" n "${bgp[neighboractive]:-null}"
++else
++json_field "BGP.IPinTotal" b "null"
++json_field "BGP.IPActive" b "null"
++json_field "BGP.NeighborinTotal" b "null"
++json_field "BGP.NeighborActive" b "null"
++fi
++json_field "Local.NAT" s "${getnat[nat]:-null}"
++json_field "Local.NATDescribe" s "$(printf '%s\n' "${slocal[${getnat[type]:-0}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
++json_field "Local.Mapping" s "$(printf '%s\n' "${slocal[m${getnat[m]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
++json_field "Local.Filter" s "$(printf '%s\n' "${slocal[f${getnat[f]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
++json_field "Local.Port" s "$(printf '%s\n' "${slocal[p${getnat[p]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
++json_field "Local.Hairpin" s "$(printf '%s\n' "${slocal[h${getnat[h]}]:-null}"|sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g'|sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
++json_field "Local.TCPCongestionControl" s "${gettcp[tcpcc]:-null}"
++json_field "Local.QueueDiscipline" s "${gettcp[qdisc]:-null}"
++json_field "Local.TCPReceiveBuffer" s "${gettcp[rmem]:-null}"
++json_field "Local.TCPSendBuffer" s "${gettcp[wmem]:-null}"
++json_field "BGP.IXCount" n "${conn[ix]:-null}"
++json_field "BGP.UpstreamsCount" n "${conn[upstreams]:-null}"
++json_field "BGP.PeersCount" n "${conn[peers]:-null}"
++local ci=0
+ for id in $(echo "${!casn[@]}"|tr ' ' '\n'|sort -n);do
+ if [[ -z ${casn[$id]} ]];then
+ continue
+ fi
+-connectivity_updates+=".Connectivity += [{\"ID\": $id, \"ASN\": ${casn[$id]:-null}, \"Org\": \"${corg[$id]:-null}\", \"IsTarget\": $([[ ${ctarget[$id]} == "true" ]]&&echo true||echo false), \"IsTier1\": $([[ ${ctier1[$id]} == "true" ]]&&echo true||echo false), \"IsUpstream\": $([[ ${cupstream[$id]} == "true" ]]&&echo true||echo false)}] | "
+-done
+-netdata=$(echo "$netdata"|jq "$head_updates$bgp_updates$local_updates$connectivity_updates.")
+-local delay_objects=()
++json_field "Connectivity.#$ci.ID" n "$id"
++json_field "Connectivity.#$ci.ASN" n "${casn[$id]:-null}"
++json_field "Connectivity.#$ci.Org" s "${corg[$id]:-null}"
++json_field "Connectivity.#$ci.IsTarget" b "$([[ ${ctarget[$id]} == "true" ]]&&echo true||echo false)"
++json_field "Connectivity.#$ci.IsTier1" b "$([[ ${ctier1[$id]} == "true" ]]&&echo true||echo false)"
++json_field "Connectivity.#$ci.IsUpstream" b "$([[ ${cupstream[$id]} == "true" ]]&&echo true||echo false)"
++((ci+=1))
++done
++local di=0 ti=0 si=0 key provider resu
+ local keys=($(echo "${!pcode[@]}"|tr ' ' '\n'|sort -n))
+ for key in "${keys[@]}";do
+-delay_object="{
+-            \"Code\": \"${pcode[$key]:-null}\",
+-            \"Name\": \"${pshort[$key]:-null}\",
+-            \"CT\": {
+-                \"Average\": \"${pavg[${key}1$1]:-null}\""
++json_field "Delay.#$di.Code" s "${pcode[$key]:-null}"
++json_field "Delay.#$di.Name" s "${pshort[$key]:-null}"
++for provider in 1 2 3;do
++local carrier
++case $provider in 1)carrier=CT;; 2)carrier=CU;; 3)carrier=CM;; esac
++json_field "Delay.#$di.$carrier.Average" s "${pavg[${key}${provider}$1]:-null}"
+ for ((resu=1; resu<=ping_test_count; resu++));do
+-delay_object+=", \"$resu\": \"${pout[${key}1$1$resu]:-null}\""
+-done
+-delay_object+="},
+-            \"CU\": {
+-                \"Average\": \"${pavg[${key}2$1]:-null}\""
+-for ((resu=1; resu<=ping_test_count; resu++));do
+-delay_object+=", \"$resu\": \"${pout[${key}2$1$resu]:-null}\""
+-done
+-delay_object+="},
+-            \"CM\": {
+-                \"Average\": \"${pavg[${key}3$1]:-null}\""
+-for ((resu=1; resu<=ping_test_count; resu++));do
+-delay_object+=", \"$resu\": \"${pout[${key}3$1$resu]:-null}\""
+-done
+-delay_object+="}}"
+-delay_objects+=("$delay_object")
+-done
+-delay_array=$(printf '%s\n' "${delay_objects[@]}"|jq -s .)
+-netdata=$(echo "$netdata"|jq --argjson delay_array "$delay_array" '.Delay = $delay_array')
+-local transfer_object=()
+-local keys=($(echo "${!icity[@]}"|tr ' ' '\n'|sort -n))
++json_field "Delay.#$di.$carrier.$resu" s "${pout[${key}${provider}$1$resu]:-null}"
++done
++done
++((di+=1))
++done
++keys=($(echo "${!icity[@]}"|tr ' ' '\n'|sort -n))
+ for key in "${keys[@]}";do
+-transfer_object="{
+-            \"City\": \"${icity[$key]:-null}\",
+-            \"SendSpeed\": \"${isout[$key$11]:-null}\",
+-            \"SendRetransmits\": \"${isout[$key$12]:-null}\",
+-            \"ReceiveSpeed\": \"${isout[$key$13]:-null}\",
+-            \"ReceiveRetransmits\": \"${isout[$key$14]:-null}\",
+-            \"Delay\": {
+-                \"Average\": \"${iavg[$key]:-null}\""
++json_field "Transfer.#$ti.City" s "${icity[$key]:-null}"
++json_field "Transfer.#$ti.SendSpeed" s "${isout[$key$11]:-null}"
++json_field "Transfer.#$ti.SendRetransmits" s "${isout[$key$12]:-null}"
++json_field "Transfer.#$ti.ReceiveSpeed" s "${isout[$key$13]:-null}"
++json_field "Transfer.#$ti.ReceiveRetransmits" s "${isout[$key$14]:-null}"
++json_field "Transfer.#$ti.Delay.Average" s "${iavg[$key]:-null}"
+ for ((resu=1; resu<=10; resu++));do
+-transfer_object+=", \"$resu\": \"${ipout[$key$1$resu]:-null}\""
+-done
+-transfer_object+="}}"
+-netdata=$(echo "$netdata"|jq --argjson transfer_object "$transfer_object" '.Transfer += [$transfer_object]')
+-done
+-local speedtest_object=()
+-local keys=($(echo "${!scity[@]}"|tr ' ' '\n'|sort -n))
++json_field "Transfer.#$ti.Delay.$resu" s "${ipout[$key$1$resu]:-null}"
++done
++((ti+=1))
++done
++keys=($(echo "${!scity[@]}"|tr ' ' '\n'|sort -n))
+ for key in "${keys[@]}";do
+ if [[ ${sout[${key}1]} -gt 0 || ${sout[${key}2]} -gt 0 || ${sout[${key}3]} -gt 0 || ${sout[${key}4]} -gt 0 ]];then
+-speedtest_object="{
+-                \"City\": \"${scity[$key]:-null}\",
+-                \"Provider\": \"${spv[$key]:-null}\",
+-                \"ID\": \"${sid[$key]:-null}\",
+-                \"SendSpeed\": \"${sout[${key}1]:-null}\",
+-                \"SendDelay\": \"${sout[${key}2]:-null}\",
+-                \"ReceiveSpeed\": \"${sout[${key}3]:-null}\",
+-                \"ReceiveDelay\": \"${sout[${key}4]:-null}\"
+-            }"
+-netdata=$(echo "$netdata"|jq --argjson speedtest_object "$speedtest_object" '.Speedtest += [$speedtest_object]')
+-fi
+-done
++json_field "Speedtest.#$si.City" s "${scity[$key]:-null}"
++json_field "Speedtest.#$si.Provider" s "${spv[$key]:-null}"
++json_field "Speedtest.#$si.ID" s "${sid[$key]:-null}"
++json_field "Speedtest.#$si.SendSpeed" s "${sout[${key}1]:-null}"
++json_field "Speedtest.#$si.SendDelay" s "${sout[${key}2]:-null}"
++json_field "Speedtest.#$si.ReceiveSpeed" s "${sout[${key}3]:-null}"
++json_field "Speedtest.#$si.ReceiveDelay" s "${sout[${key}4]:-null}"
++((si+=1))
++fi
++done
++netdata=$(json_document "$netdata") || { netdata=""; echo "Structured report generation failed" >&2; return 1; }
+ }
+ check_Net(){
+ IP=$1
+@@ -2999,8 +3015,8 @@
  [[ $mode_skip != *"6"* && $2 -eq 4 ]]&&show_speedtest
  [[ $mode_skip != *"7"* ]]&&show_iperf
  show_tail)
@@ -48,8 +487,9 @@ diff --git a/net.sh b/net.sh
 +[[ mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s --connect-timeout 10 --max-time 60 -X POST https://upload.check.place -d "type=net" --data-urlencode "json=$netdata" --data-urlencode "content=$net_report")
  [[ mode_json -eq 0 ]]&&echo -ne "\r$net_report\n"
  [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
- [[ mode_json -eq 1 ]]&&echo -ne "\r$netdata\n"
-@@ -3013,6 +3017,11 @@
+-[[ mode_json -eq 1 ]]&&echo -ne "\r$netdata\n"
++[[ mode_json -eq 1 ]]&&printf '%s\n' "$netdata"
+@@ -3013,6 +3029,11 @@
  ;;
  *)echo -e "$net_report"|sed 's/\x1b\[[0-9;]*[mGKHF]//g' >>"$outputfile" 2>/dev/null
  esac
@@ -61,3 +501,12 @@ diff --git a/net.sh b/net.sh
  fi
  }
  generate_random_user_agent
+@@ -3023,7 +3044,7 @@
+ is_valid_ipv4 $IPV4
+ is_valid_ipv6 $IPV6
+ get_opts "$@"
+-[[ mode_no -eq 0 ]]&&install_dependencies 1>&2
++if [[ mode_no -eq 0 ]];then install_dependencies 1>&2 || exit 3;fi
+ set_language
+ read_ref
+ if [[ $ERRORcode -ne 0 ]];then

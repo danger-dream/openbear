@@ -13,8 +13,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	meshfast "openbear/node/mesh/fast"
 	meshproxy "openbear/node/mesh/proxy"
+	meshrouting "openbear/node/mesh/routing"
 	"openbear/node/mesh/sign"
 	"openbear/node/mesh/wire"
 )
@@ -82,6 +85,13 @@ type Config struct {
 	// Paths are the fixed paths this node is on (fixedpath.go). Older nodes
 	// ignore it; the controller sends it to nodes that report the feature.
 	Paths []FixedPath `json:"paths,omitempty"`
+	// Fast is this node's fast relay configuration; nil when disabled. Older
+	// nodes ignore it.
+	Fast *meshfast.Config `json:"fast,omitempty"`
+	// Forward is this node's part of the port forwards: the ports it takes
+	// clients on and what it dials for others' as their target. Older nodes
+	// ignore it; the controller sends it to nodes that report the feature.
+	Forward *meshproxy.ForwardConfig `json:"forward,omitempty"`
 
 	// keys are this node's signing and end-to-end keys, which the engine
 	// running the config gives it (keys.go); not in config.json.
@@ -96,10 +106,53 @@ type Config struct {
 
 // Routing: mode dynamic (the default) follows measured link costs, static
 // keeps nextHops; bias adds milliseconds to the cost of the link to a
-// relay, either way.
+// relay, either way. NoTransit are the relays, this one included, that
+// forward between two other relays only when no other path is left; they
+// still carry what goes to or comes from themselves, their subnets and the
+// members entering by them. Older nodes ignore it.
 type Routing struct {
-	Mode string             `json:"mode,omitempty"`
-	Bias map[string]float64 `json:"bias,omitempty"`
+	Mode      string             `json:"mode,omitempty"`
+	Bias      map[string]float64 `json:"bias,omitempty"`
+	NoTransit []string           `json:"noTransit,omitempty"`
+	// Tuning: the parameters of link costs and of moving routes
+	// (meshrouting.Tuning); absent, its defaults. Older nodes ignore it.
+	Tuning *RoutingTuning `json:"tuning,omitempty"`
+}
+
+// RoutingTuning is meshrouting.Tuning in ms, percent and seconds.
+type RoutingTuning struct {
+	SwitchMs     float64 `json:"switchMs"`
+	SwitchPct    float64 `json:"switchPct"`
+	ShorterMs    float64 `json:"shorterMs"`
+	ShorterPct   float64 `json:"shorterPct"`
+	AdvertMs     float64 `json:"advertMs"`
+	AdvertPct    float64 `json:"advertPct"`
+	HoldS        float64 `json:"holdS"`
+	JitterWeight float64 `json:"jitterWeight"`
+	LossWeight   float64 `json:"lossWeight"`
+	FlapHoldS    float64 `json:"flapHoldS"`
+	FlapHoldMaxS float64 `json:"flapHoldMaxS"`
+}
+
+func (t *RoutingTuning) check() error {
+	for _, f := range []struct {
+		name      string
+		v, lo, hi float64
+	}{{"switchMs", t.SwitchMs, 0, 1000}, {"switchPct", t.SwitchPct, 0, 90}, {"shorterMs", t.ShorterMs, 0, 1000}, {"shorterPct", t.ShorterPct, 0, 90},
+		{"advertMs", t.AdvertMs, 0, 1000}, {"advertPct", t.AdvertPct, 0, 90}, {"holdS", t.HoldS, 0, 60}, {"jitterWeight", t.JitterWeight, 0, 10},
+		{"lossWeight", t.LossWeight, 0, 10000}, {"flapHoldS", t.FlapHoldS, 0, 3600}, {"flapHoldMaxS", t.FlapHoldMaxS, t.FlapHoldS, 3600}} {
+		if math.IsNaN(f.v) || f.v < f.lo || f.v > f.hi {
+			return fmt.Errorf("routing.tuning.%s must be between %g and %g", f.name, f.lo, f.hi)
+		}
+	}
+	return nil
+}
+
+func (t *RoutingTuning) router() *meshrouting.Tuning {
+	sec := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+	return &meshrouting.Tuning{SwitchMs: t.SwitchMs, SwitchPct: t.SwitchPct, ShorterMs: t.ShorterMs, ShorterPct: t.ShorterPct, AdvertMs: t.AdvertMs,
+		AdvertPct: t.AdvertPct, Hold: sec(t.HoldS), JitterWeight: t.JitterWeight, LossWeight: t.LossWeight, FlapHold: sec(t.FlapHoldS),
+		FlapHoldMax: sec(t.FlapHoldMaxS)}
 }
 
 // Reachability lists STUN servers, host:port, asked besides the reflectors.
@@ -144,9 +197,10 @@ type Self struct {
 }
 
 type Listen struct {
-	UDP int `json:"udp"`
-	TCP int `json:"tcp"`
-	TLS int `json:"tls"`
+	UDP  int `json:"udp"`
+	TCP  int `json:"tcp"`
+	TLS  int `json:"tls"`
+	Fast int `json:"fast,omitempty"`
 }
 
 type Gateway struct {
@@ -310,6 +364,16 @@ func (c *Config) check() error {
 			return err
 		}
 	}
+	if c.Forward != nil {
+		if err := c.Forward.Check(); err != nil {
+			return err
+		}
+	}
+	if c.Fast != nil {
+		if err := c.Fast.Check(); err != nil {
+			return err
+		}
+	}
 	n := c.Network
 	if err := checkSubnet("network.prefix", n.Prefix); err != nil {
 		return err
@@ -341,13 +405,16 @@ func (c *Config) check() error {
 	if err := c.checkAddresses("self", s.Address, s.ControlAddress, used); err != nil {
 		return err
 	}
-	for name, p := range map[string]int{"udp": s.Listen.UDP, "tcp": s.Listen.TCP, "tls": s.Listen.TLS} {
+	for name, p := range map[string]int{"udp": s.Listen.UDP, "tcp": s.Listen.TCP, "tls": s.Listen.TLS, "fast": s.Listen.Fast} {
 		if p < 0 || p > 65535 {
 			return fmt.Errorf("self.listen.%s is not a port", name)
 		}
 	}
 	if s.Listen.TCP != 0 && s.Listen.TCP == s.Listen.TLS {
 		return errors.New("self.listen.tcp and self.listen.tls are the same port")
+	}
+	if s.Listen.Fast != 0 && (s.Listen.Fast == s.Listen.TCP || s.Listen.Fast == s.Listen.TLS) {
+		return errors.New("self.listen.fast conflicts with self.listen.tcp or self.listen.tls")
 	}
 	if s.Listen.TLS != 0 && s.Role != roleRelay {
 		return errors.New("self.listen.tls is for relays; this node is a member")
@@ -545,6 +612,16 @@ func (c *Config) check() error {
 			}
 			if math.IsNaN(b) || b < -10000 || b > 10000 {
 				return fmt.Errorf("routing.bias[%s] must be between -10000 and 10000 ms", peer)
+			}
+		}
+		for _, id := range r.NoTransit {
+			if role := c.roleOf(id); role != "" && role != roleRelay {
+				return fmt.Errorf("routing.noTransit: %q is not a relay", id)
+			}
+		}
+		if r.Tuning != nil {
+			if err := r.Tuning.check(); err != nil {
+				return err
 			}
 		}
 	}

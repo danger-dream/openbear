@@ -1,8 +1,8 @@
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { ElMessageBox } from 'element-plus';
 import { MeshApi } from './meshApi.js';
-import { act, mesh, meshErrorText, revert, unsaved } from './meshStore.js';
+import { act, applyBlocked, mesh, meshErrorText, revert, unsaved } from './meshStore.js';
 import { errorMessage, FINISHED, nameOf, PROGRESS } from './meshHelpers.js';
 import MeshNodeName from './MeshNodeName.vue';
 
@@ -25,14 +25,14 @@ const local = computed(() => mesh.rejected || unsaved());
 const recovery = computed(() => data.value?.apply?.recovery || '');
 const recoveryText = computed(() => recovery.value === 'restoring' ? '正在恢复旧网络，等待节点重连确认；草稿已保留。' : recovery.value === 'restored' ? '这次变更未提交，已恢复旧网络；草稿已保留，可调整后重试。' : '');
 const kind = computed(() => running.value ? 'running' : failed.value.length && !dirty.value && !local.value && !recovery.value ? 'failed'
-  : dirty.value || local.value || recovery.value === 'restoring' ? 'dirty' : missing.value.length ? 'missing' : offline.value.length ? 'offline' : '');
+  : dirty.value || (local.value && (!mesh.conflict || props.panel)) || recovery.value === 'restoring' ? 'dirty' : missing.value.length ? 'missing' : offline.value.length ? 'offline' : '');
 const done = computed(() => progress.value.filter(p => FINISHED.has(p.state)).length);
 const applying = computed(() => progress.value.find(p => p.state === 'applying'));
 const list = (items, n = 2) => items.slice(0, n).join('；') + (items.length > n ? ` 等 ${items.length} 项` : '');
 const title = computed(() => ({
   running: `正在应用 ${done.value}/${progress.value.length}`,
   failed: `${failed.value.length} 台失败`,
-  dirty: changes.value.length ? `有 ${changes.value.length} 项更改未应用` : '有更改未应用',
+  dirty: changes.value.length ? `有 ${changes.value.length} 项更改未应用` : local.value ? '有修改还没保存' : '有更改未应用',
   offline: `${offline.value.length} 台离线，连上后自动补发`,
   missing: `${missing.value.length} 台的组网服务不见了`,
 })[kind.value]);
@@ -48,23 +48,40 @@ const summary = computed(() => {
   return '';
 });
 // Where an error points, for the expanded list: members[2].entry… → that member.
-function place(path) {
-  const member = /^members\[(\d+)\]/.exec(path || '');
+function place(e) {
+  const path = e?.path || '';
+  const member = /^members\[(\d+)\]/.exec(path);
   if (member) return {member: members.value[Number(member[1])]?.serverId, text: members.value[Number(member[1])]?.name || '成员'};
-  const rule = /^rules\[(\d+)\]/.exec(path || '');
+  const rpair = /^relayLinks\.pairs\[(\d+)\]/.exec(path);
+  if (rpair) {
+    const p = mesh.work?.relayLinks?.pairs?.[Number(rpair[1])];
+    if (p) {
+      const target = ['endpoint_missing', 'transport_not_listening', 'tls_fingerprint_missing'].includes(e?.error)
+        ? (p.dialer === 'b' ? p.a : p.b) : p.a;
+      return {member: target, text: `中转线路 ${nameOf(members.value, p.a)} ⇄ ${nameOf(members.value, p.b)}`};
+    }
+  }
+  const dpair = /^directLinks\[(\d+)\]/.exec(path);
+  if (dpair) {
+    const p = mesh.work?.directLinks?.[Number(dpair[1])];
+    if (p) return {member: p.a, text: `直连 ${nameOf(members.value, p.a)} ⇄ ${nameOf(members.value, p.b)}`};
+  }
+  const rule = /^rules\[(\d+)\]/.exec(path);
   if (rule) return {text: `访问规则第 ${Number(rule[1]) + 1} 条`};
-  const limit = /^limits\[(\d+)\]/.exec(path || '');
+  const limit = /^limits\[(\d+)\]/.exec(path);
   if (limit) return {text: `连接限制第 ${Number(limit[1]) + 1} 条`};
-  const fpath = /^paths\[(\d+)\]/.exec(path || '');
+  const fpath = /^paths\[(\d+)\]/.exec(path);
   if (fpath) return {text: `自建路线第 ${Number(fpath[1]) + 1} 条`};
-  const lrule = /^lineRules\[(\d+)\]/.exec(path || '');
+  const lrule = /^lineRules\[(\d+)\]/.exec(path);
   if (lrule) return {text: `线路规则第 ${Number(lrule[1]) + 1} 条`};
-  if (/^relayLinks/.test(path || '')) return {text: '中转之间的连接'};
-  if (/^directLinks/.test(path || '')) return {text: '直连'};
+  if (/^relayLinks/.test(path)) return {text: '中转之间的连接'};
+  if (/^directLinks/.test(path)) return {text: '直连'};
   return {text: '组网设置'};
 }
-const problems = computed(() => mesh.errors.map(e => ({...place(e.path), message: errorMessage(e)})));
-const canApply = computed(() => dirty.value && !local.value && !mesh.saving && !mesh.errors.length && !busy.value && recovery.value !== 'restoring');
+const problems = computed(() => mesh.errors.map(e => ({...place(e), message: errorMessage(e)})));
+const hasDetails = computed(() => Boolean(problems.value.length || changes.value.length));
+watch(hasDetails, ok => { if (!ok) expanded.value = false; });
+const canApply = computed(() => dirty.value && !applyBlocked() && !busy.value && recovery.value !== 'restoring');
 const pct = computed(() => progress.value.length ? Math.round(done.value / progress.value.length * 100) : 0);
 
 async function confirm(text, heading, button) {
@@ -107,7 +124,7 @@ function apply() { expanded.value = false; emit('apply'); }
     <div class="mesh-bar-main">
       <div class="mesh-bar-text" :class="{'has-note': mesh.errors.length || mesh.saving}">
         <strong :title="title">{{ title }}</strong>
-        <span v-if="summary" class="mesh-bar-summary" :title="summary">{{ summary }}</span>
+        <span v-if="summary && !(expanded && kind === 'dirty')" class="mesh-bar-summary" :title="summary">{{ summary }}</span>
         <span v-if="mesh.errors.length" class="mesh-bar-problem mesh-bar-note">{{ mesh.errors.length }} 处设置需要修改，{{ mesh.rejected ? '改好之前不会保存' : '改好之前不能应用' }}</span>
         <span v-else-if="mesh.saving" class="mesh-bar-summary mesh-bar-note">正在保存…</span>
       </div>
@@ -120,12 +137,12 @@ function apply() { expanded.value = false; emit('apply'); }
         <el-button @click="emit('member', missing[0].serverId)">查看{{ missing.length > 1 ? `「${nameOf(members, missing[0].serverId)}」` : '' }}</el-button>
       </div>
       <div v-else-if="kind === 'dirty'" class="mesh-bar-actions">
-        <el-button :aria-expanded="expanded" @click="expanded = !expanded">{{ expanded ? '收起' : '查看全部' }}</el-button>
+        <el-button v-if="hasDetails" :aria-expanded="expanded" @click="expanded = !expanded">{{ expanded ? '收起' : '查看全部' }}</el-button>
         <el-button :loading="busy === 'discard'" :disabled="Boolean(busy)" @click="discard">放弃</el-button>
         <el-button type="primary" :disabled="!canApply" @click="apply">应用</el-button>
       </div>
     </div>
-    <ul v-if="expanded && kind === 'dirty'" class="mesh-bar-list">
+    <ul v-if="expanded && kind === 'dirty' && hasDetails" class="mesh-bar-list">
       <li v-for="(p, i) in problems" :key="'e' + i" data-tone="bad">
         <button v-if="p.member" type="button" class="ix-text-button" @click="emit('member', p.member)">{{ p.text }}</button><span v-else>{{ p.text }}</span>：{{ p.message }}
       </li>

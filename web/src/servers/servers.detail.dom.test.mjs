@@ -313,7 +313,7 @@ test('IP 质量: the address and its 纯净分, each panel of facts and verdicts
   assert.deepEqual(await rows(card, 'ASN / 运营商'), ['ASN AS2914', 'ASN 归属 NTT America, Inc.', 'ASN 自报类型 NSP 网络服务商', 'ASN IPv4 总量 7,340,032 1205 个前缀',
     '预估带宽 100+Tbps PeeringDB 自报', 'ASN 注册日期 1994-07-01', '企业信息 NTT America, Inc.']);
   assert.deepEqual(await rows(card, 'IP 情报（威胁指标）'), ['风险标记 代理', '滥用等级 极度纯净 AbuseIPDB', '综合风险 75 · 高 5 家中最高', 'HTTP 蜜罐黑名单 纯净',
-    '邮件黑名单 未上榜 共查 423 个 · 12 个标记']);
+    '邮件黑名单 覆盖不完整 共查 423 个 · 旧报告未记录失败覆盖率 · 12 个标记']);
   assert.deepEqual(await rows(card, '风险深度检测'), ['代理（Proxy） 1/7 家判定', 'VPN 未检测到 6 家', 'Tor 未检测到 7 家', '机房（Hosting） 5/6 家判定', '滥用者 未检测到 6 家', '机器人 未检测到 4 家']);
   assert.deepEqual(await card.locator('[aria-label="风险深度检测"] .ipq-tag').evaluateAll(l => l.map(b => b.dataset.tone)), ['warn', 'ok', 'ok', 'bad', 'ok', 'ok']);
   // Open ports: probed from the controller when asked; the ones better closed marked.

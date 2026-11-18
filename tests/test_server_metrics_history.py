@@ -155,7 +155,8 @@ async def test_meta_goes_with_its_server_and_lookups_a_month_old(tmp_path):
     await store.forget('s')
     async with store.conn.execute('SELECT key FROM meta') as cursor:
         left = {r[0] async for r in cursor}
-    assert left == set(kept)
+    assert left == set(kept) | {'day-zone'}
+    assert await store.meta('day-zone') == ZONE.key
     await store.close()
 
 

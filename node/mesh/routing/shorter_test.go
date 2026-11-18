@@ -122,9 +122,12 @@ func TestShorterPathIsLoopFree(t *testing.T) {
 
 // TestShorterPathWaitsForPenalty: a first link that went down lately does
 // not take the shorter rule until its penalty is below 750; the 0.8 rule
-// and loop-freedom are as ever.
+// and loop-freedom are as ever. A link between relays is held down longer
+// than that once back (TestALinkBackFromDownIsHeldLongerEachTime); D's has
+// no probation here, as a link to a member has none.
 func TestShorterPathWaitsForPenalty(t *testing.T) {
 	s := twoWays(t, 73.2, 77.5)
+	s.r.links["D"].probation = false
 	if s.switchAfter("D", "D", 6*time.Second) != 5*time.Second {
 		t.Fatal("no switch to D")
 	}

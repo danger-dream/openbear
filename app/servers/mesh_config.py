@@ -11,9 +11,10 @@ import heapq
 import ipaddress
 import itertools
 import json
+import math
 import re
 
-from app.servers import compat, mesh_auto, mesh_limits, mesh_proxy
+from app.servers import compat, mesh_auto, mesh_fast, mesh_forward, mesh_limits, mesh_proxy
 
 # The config.json schemas this controller writes, (min, max).
 SCHEMA = compat.CONFIG_SCHEMA
@@ -25,6 +26,20 @@ STANDBY_FEATURE = 'mesh.standby'
 PATHS_FEATURE = 'mesh.routing.paths.probe'
 # The data plane takes a pair's routes in order, the next when one goes down; without it, the first alone.
 PATHS_BACKUP_FEATURE = 'mesh.routing.paths.backup'
+# The data plane routes around routing.noTransit; one without it may still forward through those relays.
+NO_TRANSIT_FEATURE = 'mesh.routing.noTransit'
+# The data plane takes routing.tuning; one without it keeps its fixed thresholds (20 % and 10 ms).
+TUNING_FEATURE = 'mesh.routing.tuning'
+# settings.routing, sent as routing.tuning (node/mesh/routing README, "Parameters"): default, lowest, highest.
+ROUTING_TUNING = {'switchMs': (5, 0, 1000), 'switchPct': (0, 0, 90), 'shorterMs': (3, 0, 1000), 'shorterPct': (0, 0, 90),
+                  'advertMs': (2, 0, 1000), 'advertPct': (0, 0, 90), 'holdS': (5, 0, 60), 'jitterWeight': (2, 0, 10),
+                  'lossWeight': (1000, 0, 10000), 'flapHoldS': (60, 0, 3600), 'flapHoldMaxS': (480, 0, 3600)}
+
+
+def default_routing():
+    return {k: v[0] for k, v in ROUTING_TUNING.items()}
+
+
 TRANSPORTS = ('udp', 'tcp', 'tls')
 HEALTH = {'activeIntervalMs': 1000, 'standbyIntervalMs': 2000, 'coldRetryMs': 30000, 'initialTimeoutMs': 3000, 'minTimeoutMs': 2000,
           'maxTimeoutMs': 10000, 'consecutiveFailures': 3, 'readySuccesses': 3, 'handshakeGraceMs': 6000, 'returnHealthyMs': 60000,
@@ -297,10 +312,12 @@ def plain_pair(a, b, facts):
     return {'a': a['serverId'], 'b': b['serverId'], 'transport': 'udp', 'cost': 1, 'dialer': 'a'}
 
 
-def next_hops(relays, pairs):
+def next_hops(relays, pairs, no_transit=()):
     """For each relay, the neighbour relay to send to for every other relay it can reach.
     Every hop picks a neighbour on a shortest path, so the remaining distance shrinks at
-    each hop and forwarding never loops; ties go to the smaller id."""
+    each hop and forwarding never loops; ties go to the smaller id. A path is first the
+    fewer times it goes on through a relay of no_transit, then the cheaper, as the data
+    plane routes (routing.noTransit)."""
     adjacent = {r: {} for r in relays}
     for pair in pairs:
         a, b = pair['a'], pair['b']
@@ -309,20 +326,23 @@ def next_hops(relays, pairs):
             adjacent[a][b] = adjacent[b][a] = cost
     hops = {r: {} for r in relays}
     for target in sorted(relays):
-        distance = {target: 0}
-        queue = [(0, target)]
+        distance = {target: (0, 0)}
+        queue = [((0, 0), target)]
         while queue:
             d, node = heapq.heappop(queue)
             if d > distance[node]:
                 continue
+            toll = int(node != target and node in no_transit)
             for neighbour, cost in adjacent[node].items():
-                if d + cost < distance.get(neighbour, float('inf')):
-                    distance[neighbour] = d + cost
-                    heapq.heappush(queue, (d + cost, neighbour))
+                nd = (d[0] + toll, d[1] + cost)
+                if nd < distance.get(neighbour, (math.inf, math.inf)):
+                    distance[neighbour] = nd
+                    heapq.heappush(queue, (nd, neighbour))
         for source in relays:
             if source == target or source not in distance:
                 continue
-            hops[source][target] = min((cost + distance[n], n) for n, cost in adjacent[source].items() if n in distance)[1]
+            hops[source][target] = min(((distance[n][0] + int(n != target and n in no_transit), cost + distance[n][1]), n)
+                                       for n, cost in adjacent[source].items() if n in distance)[1]
     return hops
 
 
@@ -394,6 +414,8 @@ def node_rules(doc, server_id, facts=None):
         out.append({'src': [src], 'dst': [f"{me['address']}/32"], 'proto': 'tcp', 'ports': [[p, p] for p in sorted(instances[src])]})
     # An exit's proxy for every member, its tunnel port for the ports leading to it, also whatever the user's rules say.
     out += mesh_proxy.rules_for(doc, server_id, live)
+    out += mesh_fast.rules_for(doc, server_id, live, facts)
+    out += mesh_forward.rules_for(doc, server_id, live, facts)
     for rule in doc['rules']:
         dst = rule['dst']
         targets = [f"{me['address']}/32"] if named(dst, me) else []
@@ -650,9 +672,11 @@ def build(doc, facts, network_id, revision):
 def _build(doc, facts, network_id, revision):
     s = doc['settings']
     live = {m['serverId']: m for m in _live(doc)}
+    fast_listening = mesh_fast.listeners(doc, live, facts)
     relays = sorted(sid for sid, m in live.items() if m['role'] == 'relay')
+    no_transit = [sid for sid in relays if live[sid].get('noTransit')]
     pairs = relay_pairs(doc, facts)
-    hops = next_hops(relays, pairs)
+    hops = next_hops(relays, pairs, set(no_transit))
     network = {'id': network_id, 'prefix': s['prefix'], 'controlPrefix': s['controlPrefix'], 'mtu': s['mtu']}
     if s.get('tcpJumbo'):
         network['tcpJumbo'] = True
@@ -784,10 +808,15 @@ def _build(doc, facts, network_id, revision):
                 candidates.append(candidate)
             mode, auto_return = node_entry_mode(m)
             entry = {'mode': mode, 'candidates': candidates, 'autoReturn': auto_return}
+        self_listen = dict(m['listen'])
+        if sid in fast_listening:
+            self_listen['fast'] = mesh_fast.listen_port(m, s, doc, facts)
+        else:
+            self_listen.pop('fast', None)
         configs[sid] = {
             'schema': schema, 'revision': revision, 'network': network,
             'self': {'id': sid, 'name': name(sid), 'role': m['role'], 'address': m['address'], 'controlAddress': m['controlAddress'],
-                     'listen': dict(m['listen']), 'gateway': self_gateway(sid, m),
+                     'listen': self_listen, 'gateway': self_gateway(sid, m),
                      'uploadLimitMbps': m['uploadLimitMbps'], 'resources': m['role'],
                      # Gateway subnets this node routes to: only those the rules let it reach or answer.
                      'gatewayRoutes': routes[sid],
@@ -808,11 +837,18 @@ def _build(doc, facts, network_id, revision):
         proxy = mesh_proxy.config(doc, sid, live, facts)
         if proxy:
             configs[sid]['proxy'] = proxy
+        fast_cfg = mesh_fast.config(doc, sid, live, facts)
+        if fast_cfg:
+            configs[sid]['fast'] = fast_cfg
+        forward = mesh_forward.config(doc, sid, live, facts)
+        if forward:
+            configs[sid]['forward'] = forward
         if has_members_routing(sid) and probes_by_node.get(sid, {}).get('targets'):
             configs[sid]['probe'] = probes_by_node[sid]
         if relay or leaf:
             # nextHops stay the start and the static mode; bias shifts the measured cost of each link.
-            configs[sid]['routing'] = {'mode': 'dynamic', 'bias': dict(sorted(bias.items()))}
+            configs[sid]['routing'] = {'mode': 'dynamic', 'bias': dict(sorted(bias.items())), **({'noTransit': no_transit} if no_transit else {}),
+                                       'tuning': {**default_routing(), **(s.get('routing') or {})}}
             configs[sid]['relayLinks'] = [list(p) for p in relay_links]
             if member_links:
                 configs[sid]['memberLinks'] = [list(p) for p in member_links]

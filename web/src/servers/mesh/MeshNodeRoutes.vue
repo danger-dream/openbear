@@ -3,7 +3,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { MeshApi } from './meshApi.js';
 import { mesh, meshError, revert, save } from './meshStore.js';
-import { errorMessage, isRelay, msText, nameOf, transportLabel } from './meshHelpers.js';
+import { errorMessage, HELD_TEXT, isRelay, msText, nameOf, ROUTING_DEFAULTS, switchesTo, transportLabel } from './meshHelpers.js';
 import { fixedRouteInfo } from './meshAuto.js';
 import { addRoute, changeRoute, gapsOf, MAX_PER_PAIR, MAX_VIA, moveInPair, nodesFrom, pairRoutes, pairsOf, routeRtt, routeState, sameRoute } from './meshRoutes.js';
 import { usePoll } from './usePoll.js';
@@ -11,6 +11,7 @@ import MeshDialog from './MeshDialog.vue';
 import MeshFr from './MeshFr.vue';
 import MeshNodeName from './MeshNodeName.vue';
 import MeshNodeSelect from './MeshNodeSelect.vue';
+import MeshRoutePair from './MeshRoutePair.vue';
 
 // A node's routes: its own routes (自建路线) by the other end, each pair's in their order; the route to or
 // from another node as the nodes take it now and, on demand, the best ten by the latest reports, any of
@@ -77,6 +78,21 @@ const hops = computed(() => (path.value?.hops || []).map((h, i, all) => {
   return {node: h.node, transport: l ? transportLabel(l.transport) : h.via === 'lan' ? '局域网' : '', rtt: i ? h.rttMs : null};
 }));
 const pathFixed = computed(() => fixedRouteInfo(path.value?.fixed));
+const costText = v => Number.isFinite(v) ? `${Math.round(v * 10) / 10}` : '—';
+const thresholdText = t => `至少便宜 ${t.switchMs} ms${t.switchPct ? ` 且超过 ${t.switchPct}%` : ''}`;
+// What the relay that chose the route says: its cost, and the cheaper next hop it does not take and why.
+const decision = computed(() => {
+  const d = path.value?.decision;
+  if (!d || pathFixed.value) return null;
+  const t = {...ROUTING_DEFAULTS, ...(path.value.tuning || {})};
+  const who = `${nm(d.node)} 选的路线，代价 ${costText(d.cost)}`;
+  if (!d.best) return {text: `${who}；它看来这已是最便宜的。`, tone: ''};
+  const saved = Number.isFinite(d.cost) && Number.isFinite(d.bestCost) ? Math.round((d.cost - d.bestCost) * 10) / 10 : null;
+  const left = d.until ? Math.max(0, Math.ceil((d.until - Date.now()) / 1000)) : 0;
+  const why = HELD_TEXT[d.held] || '';
+  return {tone: 'warn', text: `${who}；改走 ${nm(d.best)} 代价 ${costText(d.bestCost)}${saved != null ? `，便宜 ${saved} ms` : ''}，没换：${why}`
+    + (d.held === 'margin' ? `（门槛：${thresholdText(t)}）` : '') + (left ? `，约 ${left} 秒后再看` : '') + '。'};
+});
 const nowNodes = computed(() => hops.value.at(-1)?.node === ends.value[1] ? hops.value.map(h => h.node) : []);
 function showPathOnBoard() {
   if (!path.value?.hops?.length) return;
@@ -89,6 +105,14 @@ async function loadBest() {
   try { best.value = {ends: [...ends.value], ...(await MeshApi.pathOptions(...ends.value))}; } catch (e) { bestError.value = meshError(e); best.value = null; } finally { bestBusy.value = false; }
 }
 watch(() => [other.value, props.id, outward.value], () => { best.value = null; bestError.value = ''; void loadPath(); }, {immediate: true});
+// A route of the best ten against the one in use: how much cheaper, and whether that is enough to move.
+function versus(r) {
+  const cur = best.value?.current?.cost;
+  if (!Number.isFinite(cur) || !Number.isFinite(r.cost) || r.nodes.join('>') === (best.value.current.nodes || []).join('>')) return '';
+  const saved = Math.round((cur - r.cost) * 10) / 10;
+  if (saved <= 0) return `比现在贵 ${Math.round(-saved * 10) / 10}`;
+  return r.noTransit ? `便宜 ${saved}，但要借道` : `便宜 ${saved}，${switchesTo(r.cost, cur, best.value.tuning) ? '够门槛' : '不到门槛'}`;
+}
 const segText = s => [Number.isFinite(s.rttMs) ? msText(s.rttMs) : s.exists === false ? '应用后实测' : '', s.loss ? `丢包 ${Math.round(s.loss * 1000) / 10}%` : ''].filter(Boolean).join(' · ');
 const pairFull = (a, b) => pairRoutes(paths.value, a, b).length >= MAX_PER_PAIR;
 // Whether a path can become an own route: relays between, at most MAX_VIA of them, not one already.
@@ -205,30 +229,22 @@ defineExpose({openBuilder});
         <button type="button" class="ix-text-button" @click="openBuilder()">＋ 自己搭一条</button>
       </div>
       <p v-if="!pairs.length" class="m3-hint">还没有。在下面计算路线后点「加为自建」，或自己搭一条。</p>
-      <section v-for="g in pairs" :key="g.other" class="m3-rt-pair">
-        <div class="m3-rt-pair-h">
-          <span><MeshNodeName :id="id" plain /> ⇄ <MeshNodeName :id="g.other" /></span>
-          <span class="ob-grow" />
+      <MeshRoutePair v-for="g in pairs" :key="g.other" :a="id" :b="g.other" :self="id" :routes="g.routes.map(ownRow)">
+        <template #actions>
           <button type="button" class="ix-text-button" :aria-expanded="editing.has(g.other)" @click="toggleEdit(g.other)">{{ editing.has(g.other) ? '完成' : '编辑' }}</button>
-        </div>
-        <ol class="m3-rt-list">
-          <li v-for="(r, i) in g.routes.map(ownRow)" :key="r.p.id" :data-off="r.p.on === false || undefined">
-            <span class="m3-no">{{ i + 1 }}</span>
-            <span class="m3-rt-chain"><template v-for="(n, k) in r.nodes" :key="n"><span v-if="k" class="m3-faint"> → </span><MeshNodeName :id="n" :plain="n === id" /></template></span>
-            <span class="m3-rt-state" :data-tone="r.state.tone">{{ r.state.text }}<template v-if="r.rtt != null && r.state.tone !== 'bad'"> · {{ msText(r.rtt) }}</template></span>
-            <div v-if="editing.has(g.other)" class="m3-rt-acts">
-              <template v-if="g.routes.length > 1">
-                <button type="button" class="ix-icon-button" :disabled="!i" title="往前" :aria-label="`第 ${i + 1} 条往前`" @click="move(r.p, -1)">↑</button>
-                <button type="button" class="ix-icon-button" :disabled="i >= g.routes.length - 1" title="往后" :aria-label="`第 ${i + 1} 条往后`" @click="move(r.p, 1)">↓</button>
-              </template>
-              <button type="button" class="ix-text-button" @click="openBuilder({routeId: r.p.id})">修改</button>
-              <button type="button" class="ix-text-button" @click="toggleOn(r.p)">{{ r.p.on === false ? '启用' : '停用' }}</button>
-              <button type="button" class="ix-text-button m3-danger-text" @click="remove(r.p)">删除</button>
-            </div>
-          </li>
-        </ol>
-        <p class="m3-hint">{{ g.routes.length > 1 ? `按顺序用第一条通的；这 ${g.routes.length} 条都不通时` : '不通时' }}走自动选路，回程原路返回。</p>
-      </section>
+        </template>
+        <template #route="{route: r, index: i}">
+          <div v-if="editing.has(g.other)" class="m3-rt-acts">
+            <template v-if="g.routes.length > 1">
+              <button type="button" class="ix-icon-button" :disabled="!i" title="往前" :aria-label="`第 ${i + 1} 条往前`" @click="move(r.p, -1)">↑</button>
+              <button type="button" class="ix-icon-button" :disabled="i >= g.routes.length - 1" title="往后" :aria-label="`第 ${i + 1} 条往后`" @click="move(r.p, 1)">↓</button>
+            </template>
+            <button type="button" class="ix-text-button" @click="openBuilder({routeId: r.p.id})">修改</button>
+            <button type="button" class="ix-text-button" @click="toggleOn(r.p)">{{ r.p.on === false ? '启用' : '停用' }}</button>
+            <button type="button" class="ix-text-button m3-danger-text" @click="remove(r.p)">删除</button>
+          </div>
+        </template>
+      </MeshRoutePair>
     </div>
 
     <div class="m3-rt-calc">
@@ -252,6 +268,7 @@ defineExpose({openBuilder});
         <span class="ob-grow" /><b>{{ Number.isFinite(path?.rttMs) ? msText(path.rttMs) : '延迟未知' }}</b>
       </div>
       <p v-else-if="path" class="m3-hint ob-warn">现在没有路线：中间缺少接入或线路。</p>
+      <p v-if="!pathError && hops.length && decision" class="m3-hint m3-rt-why" :class="{'ob-warn': decision.tone === 'warn'}">{{ decision.text }}</p>
       <div class="m3-rt-calc-acts">
         <el-button size="small" :loading="bestBusy" :disabled="fresh || !other" @click="loadBest">计算前 10 条</el-button>
         <button v-if="hops.length" type="button" class="ix-text-button" @click="showPathOnBoard">在图上显示现在的路线</button>
@@ -264,9 +281,11 @@ defineExpose({openBuilder});
             <span class="m3-no">{{ i + 1 }}</span>
             <span class="m3-rt-chain"><template v-for="(n, k) in r.nodes" :key="n"><template v-if="k"><span class="m3-hop-ms" :data-loss="r.segments[k - 1].loss ? '' : undefined"> {{ segText(r.segments[k - 1]) }} → </span></template><MeshNodeName :id="n" :plain="n === id" /></template></span>
             <span class="m3-rt-state"><b>{{ Number.isFinite(r.rttMs) ? msText(r.rttMs) : '延迟未知' }}</b>
+              <span class="m3-rt-cost" :title="`选路代价 ${costText(r.cost)}`">代价 {{ costText(r.cost) }}<template v-if="versus(r)"> · {{ versus(r) }}</template></span>
               <span v-if="r.own" class="pb-tag" data-tone="ok">自建第 {{ r.own }} 条</span>
               <span v-else-if="nowNodes.join('>') === r.nodes.join('>')" class="pb-tag">现在走的</span>
-              <button v-if="!r.own && canAdd(r.nodes)" type="button" class="ix-text-button" @click="addFrom(r.nodes)">加为自建</button></span>
+              <span v-if="r.noTransit" class="pb-tag" data-tone="warn" title="经过设为不中转的中转：只有别的路都断了才会这样走">借道不中转</span>
+              <button v-else-if="!r.own && canAdd(r.nodes)" type="button" class="ix-text-button" @click="addFrom(r.nodes)">加为自建</button></span>
           </li>
           <li v-for="o in best.own.filter(x => !x.place)" :key="o.id" data-outside>
             <span class="m3-no">·</span>
@@ -274,7 +293,7 @@ defineExpose({openBuilder});
             <span class="m3-rt-state"><b>{{ Number.isFinite(o.rttMs) ? msText(o.rttMs) : '' }}</b><span class="pb-tag">自建第 {{ o.rank }} 条{{ o.on ? '' : '（停用）' }} · 不在前 10</span></span>
           </li>
         </ol>
-        <p class="m3-hint">按实测排序：延迟加上抖动和丢包，和自动选路的算法一样，所以有丢包的路线会排在后面。</p>
+        <p class="m3-hint">按选路代价排序：各段已通告的代价之和（延迟加上抖动、丢包和偏好），节点自动选路比较的就是它。<template v-if="best.current?.cost != null">现在走的代价 {{ costText(best.current.cost) }}，另一条要{{ thresholdText({...ROUTING_DEFAULTS, ...(best.tuning || {})}) }}才会换过去（在设置的「选路」里可以改）。</template><template v-if="best.routes.some(r => r.noTransit)">经过不中转节点的路线只在别的路都断了时才用，排在最后。</template></p>
       </template>
     </div>
   </MeshFr>

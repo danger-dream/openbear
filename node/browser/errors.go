@@ -23,6 +23,11 @@ type operation struct {
 	phase    string
 }
 
+// Cleanup must not inherit an exhausted operation budget or replay its effects.
+func cleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 500*time.Millisecond)
+}
+
 type opKey struct{}
 
 func withOp(ctx context.Context, op *operation) context.Context {
@@ -102,7 +107,8 @@ func (timeoutError) Is(target error) bool { return target == context.DeadlineExc
 
 var (
 	// ErrDisconnected: the CDP connection is closed (Python ConnectionError("cdp_disconnected")).
-	ErrDisconnected = errors.New("cdp_disconnected")
+	ErrDisconnected     = errors.New("cdp_disconnected")
+	errWriteInterrupted = errors.Join(ErrDisconnected, errors.New("cdp_write_interrupted"))
 	// ErrTimeout: a CDP call or operation ran out of time (Python TimeoutError).
 	ErrTimeout error = timeoutError{}
 

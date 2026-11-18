@@ -9,6 +9,13 @@ export function clampOverlayPosition(x, y, boxWidth, boxHeight, viewportWidth, v
   };
 }
 
+export function buildWebSearchUrl(text) {
+  const normalized = Array.from(String(text ?? '').replace(/\s+/g, ' ').trim()).slice(0, 1000)
+    .map(char => /^[\uD800-\uDFFF]$/.test(char) ? '\uFFFD' : char).join('');
+  if (!normalized) return '';
+  return `https://www.google.com/search?q=${encodeURIComponent(normalized)}`;
+}
+
 function elementOf(node) {
   if (!node) return null;
   return node.nodeType === 1 ? node : node.parentElement || null;

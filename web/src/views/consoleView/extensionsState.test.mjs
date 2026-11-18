@@ -13,8 +13,8 @@ const folder = () => ({default:{enabled:[],autoAllow:false},extensions:state().e
 function panel(t, api = {}, initial = {}) {
  const props = reactive({conversationUuid:'A',folderId:'F1',running:false,...initial});
  const scope = effectScope(), cleanup = [];
- const make = new Function('defineProps','ref','computed','watch','onMounted','onBeforeUnmount','Api','extensionDraft','setExtensionDraft','onExtensionDraftForgotten','fmtTokens', script + '\nreturn {load,change,changeDraft,state,loading,saving,error,canChange};');
- const p = scope.run(() => make(() => props,ref,computed,watch,()=>{},fn=>cleanup.push(fn),{conversationExtensions:async()=>state(),folderExtensions:async()=>folder(),...api},extensionDraft,setExtensionDraft,onExtensionDraftForgotten,String));
+ const make = new Function('defineProps','defineExpose','ref','computed','watch','onMounted','onBeforeUnmount','Api','extensionDraft','setExtensionDraft','onExtensionDraftForgotten','fmtTokens', script + '\nreturn {load,change,changeDraft,state,loading,saving,error,canChange};');
+ const p = scope.run(() => make(() => props,()=>{},ref,computed,watch,()=>{},fn=>cleanup.push(fn),{conversationExtensions:async()=>state(),folderExtensions:async()=>folder(),...api},extensionDraft,setExtensionDraft,onExtensionDraftForgotten,String));
  const stop = () => {cleanup.splice(0).forEach(fn=>fn()); scope.stop();};
  t.after(() => {stop(); forgetExtensionDraft('local:new');});
  return {...p,props,stop};

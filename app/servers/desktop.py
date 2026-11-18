@@ -168,61 +168,67 @@ def build_rdcleanpath_error(error_code: int = 1, http_status: int | None = None,
 
 
 class _StreamSink:
-    """Collects bytes from a node tunnel into an asyncio queue for protocol handshakes and relay."""
+    """Byte-bounded tunnel sink. Waiting here stalls only Terminal._pump, not
+    the node receive loop; its ACK stays pending until capacity is available.
+    Handshake leftovers share the same budget as relay data.
+    """
 
-    def __init__(self):
-        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    def __init__(self, capacity: int = 256 * 1024):
+        if capacity < 1:
+            raise ValueError('invalid_sink_capacity')
+        self.capacity = capacity
         self.reason = ''
         self.closed = False
         self._buf = bytearray()
+        self._changed = asyncio.Condition()
+        self._writer = asyncio.Lock()
 
     async def send_bytes(self, data: bytes):
-        if not self.closed and data:
-            self.queue.put_nowait(bytes(data))
+        # Serialize producers so splitting an oversized chunk cannot reorder bytes.
+        async with self._writer:
+            view = memoryview(data)
+            offset = 0
+            while offset < len(view):
+                async with self._changed:
+                    await self._changed.wait_for(lambda: self.closed or len(self._buf) < self.capacity)
+                    if self.closed:
+                        raise ConnectionError(self.reason or 'tunnel_closed')
+                    take = min(len(view) - offset, self.capacity - len(self._buf))
+                    self._buf.extend(view[offset:offset + take])
+                    offset += take
+                    self._changed.notify_all()
 
     async def send_json(self, value: dict):
         if isinstance(value, dict) and value.get('state') == 'closed':
             self.reason = str(value.get('reason') or 'closed')
 
     async def close(self):
-        if not self.closed:
+        async with self._changed:
             self.closed = True
-            self.queue.put_nowait(None)
+            self._changed.notify_all()
+
+    async def _read(self, n: int | None) -> bytes:
+        async with self._changed:
+            await self._changed.wait_for(lambda: self.closed or len(self._buf) >= (n or 1))
+            take = min(len(self._buf), 262144) if n is None else n
+            if not take or len(self._buf) < take:
+                raise ConnectionError(self.reason or 'tunnel_closed')
+            out = bytes(self._buf[:take])
+            del self._buf[:take]
+            self._changed.notify_all()
+            return out
 
     async def read_chunk(self, timeout: float | None = None) -> bytes:
-        if self._buf:
-            out = bytes(self._buf)
-            self._buf.clear()
-            return out
-        chunk = await (asyncio.wait_for(self.queue.get(), timeout) if timeout else self.queue.get())
-        if chunk is None:
-            raise ConnectionError(self.reason or 'tunnel_closed')
-        if self.queue.empty():
-            return chunk
-        # Coalesce multiple queued chunks that arrived together (e.g. a large RDP/VNC frame)
-        # to minimize lock acquisitions, TLS read calls, and WebSocket frames.
-        buf = bytearray(chunk)
-        while not self.queue.empty() and len(buf) < 262144:
-            nxt = self.queue.get_nowait()
-            if nxt is None:
-                self.queue.put_nowait(None)
-                break
-            buf.extend(nxt)
-        return bytes(buf)
+        return await asyncio.wait_for(self._read(None), timeout) if timeout is not None else await self._read(None)
 
     async def read_exact(self, n: int, timeout: float = HANDSHAKE_TIMEOUT_S) -> bytes:
-        deadline = time.monotonic() + timeout
-        while len(self._buf) < n:
-            rem = deadline - time.monotonic()
-            if rem <= 0:
-                raise TimeoutError('tunnel_read_timeout')
-            chunk = await asyncio.wait_for(self.queue.get(), rem)
-            if chunk is None:
-                raise ConnectionError(self.reason or 'tunnel_closed')
-            self._buf.extend(chunk)
-        out = bytes(self._buf[:n])
-        del self._buf[:n]
-        return out
+        # Protocol handshakes read TPKTs (at most 65535 bytes). Refuse requests
+        # larger than the budget rather than deadlocking a producer at capacity.
+        if n < 0 or n > self.capacity:
+            raise ValueError('invalid_tunnel_read_size')
+        if n == 0:
+            return b''
+        return await asyncio.wait_for(self._read(n), timeout)
 
     async def read_tpkt(self, timeout: float = HANDSHAKE_TIMEOUT_S) -> bytes:
         header = await self.read_exact(4, timeout)
@@ -257,9 +263,6 @@ async def perform_rdp_tls_handshake(terminal, sink: _StreamSink, x224_request: b
     incoming = ssl.MemoryBIO()
     outgoing = ssl.MemoryBIO()
     ssl_obj = ctx.wrap_bio(incoming, outgoing, server_side=False, server_hostname=host)
-    if sink._buf:
-        incoming.write(bytes(sink._buf))
-        sink._buf.clear()
 
     deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
     while True:
@@ -542,6 +545,8 @@ class DesktopManager:
         except (ConnectionError, RuntimeError):
             pass
         finally:
+            # Wake a terminal pump blocked in send_bytes before closing its tunnel.
+            await sink.close()
             if pump_task:
                 pump_task.cancel()
 
@@ -709,6 +714,8 @@ class DesktopManager:
         except (ConnectionError, RuntimeError):
             pass
         finally:
+            # Wake a terminal pump blocked in send_bytes before closing its tunnel.
+            await sink.close()
             if pump_task:
                 pump_task.cancel()
 

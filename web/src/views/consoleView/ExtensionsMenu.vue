@@ -22,6 +22,9 @@ const canChange = computed(() => usable.value && state.value && !saving.value);
 const items = computed(() => state.value?.extensions || []);
 const enabledCount = computed(() => items.value.filter(item => item.enabled).length);
 const label = computed(() => state.value ? `扩展（已开启 ${enabledCount.value} 个）` : "扩展");
+const summary = computed(() => state.value ? `已开启 ${enabledCount.value} 个` : "");
+// The phone composer lists this menu in its tools sheet and opens it from there.
+defineExpose({show: () => { open.value = true; }, summary});
 const note = computed(() => draft.value ? "发送第一条消息时生效" : "开关从下一次请求起生效");
 let generation = 0, media = null;
 

@@ -69,7 +69,6 @@
 .settings-ui.template-page .template-actions { flex-wrap: wrap; gap: 6px; }
 .settings-ui.template-page .template-meta { background: var(--ob-surface); }
 .settings-ui.template-page .template-preview-toolbar { background: var(--ob-surface); backdrop-filter: none; }
-.settings-ui.template-page .template-counters > span { border-radius: 5px; background: var(--ob-hover); }
 .settings-ui.template-page .template-mobile-actions button,
 .settings-ui.template-page .template-more > summary { border-radius: 6px; background: transparent; color: var(--ob-chat-subtle); }
 .settings-ui.template-page .template-mobile-actions button.is-primary { color: var(--ob-chat-text); background: var(--ob-chat-selected); }

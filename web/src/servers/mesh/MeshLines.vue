@@ -15,6 +15,7 @@ import MeshLimit from './MeshLimit.vue';
 import MeshLineRule from './MeshLineRule.vue';
 import MeshNodeName from './MeshNodeName.vue';
 import MeshNodeSelect from './MeshNodeSelect.vue';
+import MeshRoutePair from './MeshRoutePair.vue';
 
 // The lines: the user's line rules first, how relay links come about, the round trips between relays,
 // every relay link with what of it differs from the automatic values, direct links and members' entries.
@@ -250,20 +251,11 @@ const entries = computed(() => (work.value?.members || []).map((m, idx) => ({m, 
       <section class="m3-rulebox-sec" aria-label="自建路线">
         <div class="m3-rulebox-h"><b>自建路线</b><small>两台之间按顺序经过指定的中转，每对最多 3 条；在节点页「路线」里新建和调整</small>
           <span class="m3-faint">{{ routePairs.length ? `${routePairs.length} 对 · ${paths.length} 条` : '还没有' }}</span></div>
-        <ol v-if="routePairs.length" class="m3-paths-list">
-          <li v-for="g in routePairs" :key="g.a + g.b">
-            <button type="button" class="m3-list-main" @click="emit('open', g.a)">
-              <b><MeshNodeName :id="g.a" plain /> ⇄ <MeshNodeName :id="g.b" plain /></b>
-              <ol class="m3-rt-list">
-                <li v-for="(r, i) in g.routes" :key="r.p.id" :data-off="r.p.on === false || undefined">
-                  <span class="m3-no">{{ i + 1 }}</span>
-                  <span class="m3-rt-chain">{{ r.nodes.map(nm).join(' → ') }}</span>
-                  <span class="m3-rt-state" :data-tone="r.state.tone">{{ r.state.text }}<template v-if="r.rtt != null && r.state.tone !== 'bad'"> · {{ msText(r.rtt) }}</template></span>
-                </li>
-              </ol>
-            </button>
-          </li>
-        </ol>
+        <div v-if="routePairs.length" class="m3-rt-own">
+          <MeshRoutePair v-for="g in routePairs" :key="g.a + g.b" :a="g.a" :b="g.b" :routes="g.routes">
+            <template #actions><button type="button" class="ix-text-button" @click="emit('open', g.a)">编辑</button></template>
+          </MeshRoutePair>
+        </div>
       </section>
       <section class="m3-rulebox-sec" aria-label="线路规则">
         <div class="m3-rulebox-h"><b>线路规则</b><small>对某些节点之间的线路指定协议、谁主动连或偏好；没有规则时按对方开着的最快协议和实测延迟自动定，排在上面的优先</small>

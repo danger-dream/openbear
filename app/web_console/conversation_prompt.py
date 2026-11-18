@@ -75,7 +75,8 @@ class WebAdminConversationPromptMixin:
                 existing = await cur.fetchone()
                 if existing is None:
                     return _prompt_response({"ok": False, "error": "session_not_found"}, status=409)
-                before = str(existing["system_snapshot"] or "")
+                stored_before = str(existing["system_snapshot"] or "")
+                before = await self._effective_window_system(chat_id, stored_before)
                 before_hash = system_prompt_sha256(before)
                 try:
                     candidate = await self._build_system_prompt_for_chat(conv_uuid, strict=True)
@@ -135,7 +136,7 @@ class WebAdminConversationPromptMixin:
                 async with self.db.conn.transaction(label="conversation-prompt-refresh") as conn:
                     cur = await conn.execute(
                         "UPDATE sessions SET system_snapshot=?,updated_at=? WHERE chat_id=? AND COALESCE(system_snapshot,'')=?",
-                        (candidate, now_ts(), chat_id, before),
+                        (candidate, now_ts(), chat_id, stored_before),
                     )
                     if cur.rowcount != 1:
                         return _prompt_response({"ok": False, "error": "prompt_preview_changed"}, status=409)

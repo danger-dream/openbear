@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { flag } from '../serverHelpers.js';
 import { mesh, save } from './meshStore.js';
 import { exportsOf, gatewayNetProblem, nameOf, nodeState, rowButton, ruleWords, sharedBy } from './meshHelpers.js';
+import { lanAccess } from './meshNetworks.js';
 import MeshDialog from './MeshDialog.vue';
 import MeshNodeName from './MeshNodeName.vue';
 import MeshSideNames from './MeshSideNames.vue';
@@ -18,11 +19,11 @@ const nm = id => nameOf(members.value, id);
 const same = (a, b) => a.length === b.length && a.every(x => b.includes(x));
 const changed = computed(() => new Set((mesh.data?.draft?.changes || []).map(c => c.serverId).filter(Boolean)));
 const lans = computed(() => members.value.filter(m => m.gateway?.subnets?.length && !m.gateway.backup).map(g => {
-  const nets = g.gateway.subnets, rules = (mesh.work?.rules || []).filter(r => r.dst?.allSubnets || (r.dst?.subnets || []).some(n => nets.includes(n)));
+  const nets = g.gateway.subnets, rules = (mesh.work?.rules || []).map(r => ({r, access: lanAccess(r.dst, nets)})).filter(x => x.access.hit);
   const reach = new Set(nets.flatMap(n => exportsOf(mesh.data, g.serverId, n) || []));
   return {g, name: g.gateway.name || `${g.name} 的局域网`, subnets: nets,
     backups: members.value.filter(b => b.gateway?.backup && same(b.gateway.subnets || [], nets)),
-    who: rules.map(r => ({src: r.src, what: ruleWords(r, members.value)[4]})), reach: reach.size,
+    who: rules.map(({r, access}) => ({src: r.src, what: [access.part.length ? `仅 ${access.part.join('、')}` : '', ruleWords(r, members.value)[4]].filter(Boolean).join(' · ')})), reach: reach.size,
     pending: changed.value.has(g.serverId) || !mesh.data?.nodes?.[g.serverId]?.appliedRevision};
 }));
 // LAN networks found on nodes that share none yet: the ones another gateway shares already are shown greyed, and a node

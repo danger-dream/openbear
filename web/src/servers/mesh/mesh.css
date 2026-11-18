@@ -649,6 +649,11 @@
 .mesh-settings-fields { display: flex; flex-direction: column; }
 .mesh-settings-fields.busy { opacity: .7; pointer-events: none; }
 .mesh-settings-fields > .mesh-fold { margin-top: 4px; }
+.mesh-routing-fields { display: flex; flex-direction: column; }
+.mesh-routing-fields > p { margin: 6px 0 2px; font-size: var(--ix-xs); }
+.mesh-routing-fields > .ix-text-button { align-self: flex-start; margin: 2px 0 6px; font-size: var(--ix-xs); }
+.mesh-routing-row { flex-wrap: wrap; gap: 6px; }
+.servers-ui .mesh-routing-row input { flex: 0 1 90px; width: 90px !important; }
 .mesh-ports { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .mesh-ports > label { display: flex; flex-direction: column; gap: 2px; min-width: 0; color: var(--ob-chat-subtle); font-size: var(--ix-xs); }
 .servers-ui .mesh-ports input { width: 100% !important; min-width: 0; }

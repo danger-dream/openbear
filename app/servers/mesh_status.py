@@ -18,6 +18,9 @@ FLAP_QUIET_MS = 30 * 60_000
 # One kind of alert for one node at most this often: a condition that comes and goes starts a new
 # episode each time, and would otherwise send one each time.
 ALERT_COOLDOWN_MS = 30 * 60_000
+# The type of a mesh alert by its key's first part: what the reminder settings turn on or off (reminders.MESH_ALERTS).
+ALERT_TYPES = {'mesh_standby_unhealthy': 'standby', 'mesh-entry': 'entry', 'mesh-flap': 'flap', 'mesh_exit_inconsistent': 'exit',
+               'mesh-memory': 'memory', 'mesh-apply': 'apply', 'mesh-upgrade': 'upgrade', 'mesh-missing': 'missing', 'mesh-key-in-use': 'keys'}
 PEER_KINDS = ('entry', 'relay', 'direct', 'member')
 COUNTERS = ('delivered', 'forwarded', 'droppedAcl', 'droppedNotRelay', 'droppedTtl', 'droppedNoRoute', 'droppedQueue', 'droppedBad', 'droppedPlain',
             'droppedTooBig')
@@ -38,6 +41,8 @@ CANDIDATES_KEPT = 16
 LINE_ROLES = ('active', 'standby', 'cold')
 ROUTING_MODES = ('dynamic', 'static')
 LINK_STATES = ('up', 'down', 'suppressed')
+# Why a route stays while the shortest path's next hop is another (node/mesh/routing README, "Status and events").
+ROUTE_HELD = ('margin', 'hold', 'damped', 'loop', 'penalty', 'transit')
 PATH_KEPT = 16
 ERRORS_TEXT = {'timeout': '超时', 'refused': '被拒绝', 'tls pin mismatch': 'TLS 证书不匹配', 'no handshake': '握手无响应',
                'unreachable': '不可达', 'punch timeout': '打洞超时'}
@@ -234,13 +239,20 @@ def _routing(raw):
         if isinstance(link, dict) and link.get('state') in LINK_STATES:
             links.append({'peer': _text(link.get('peer'), 128), 'state': link['state'], 'rttMs': _ms(link.get('rttMs')),
                           'jitterMs': round(float(_num(link.get('jitterMs'), 1e7)), 1), 'loss': round(float(_num(link.get('loss'), 1.000001)), 3),
-                          'cost': _signed(link.get('cost')), 'penalty': int(_num(link.get('penalty'), 1e6))})
+                          'cost': _signed(link.get('cost')), 'penalty': int(_num(link.get('penalty'), 1e6)),
+                          'advertised': _signed(link.get('advertised'))})
+            if held := int(_num(link.get('heldMs'), 1e7)):
+                links[-1]['heldMs'] = held
     for route in (raw.get('routes') if isinstance(raw.get('routes'), list) else [])[:300]:
         if isinstance(route, dict):
             path = route.get('path') if isinstance(route.get('path'), list) else []
             routes.append({'dest': _text(route.get('dest'), 128), 'nextHop': _text(route.get('nextHop'), 128), 'cost': _signed(route.get('cost')),
                            'path': [_text(n, 128) for n in path[:PATH_KEPT]], 'since': int(_num(route.get('since'))),
                            'switches': int(_num(route.get('switches')))})
+            best = _text(route.get('best'), 128)
+            if best:
+                routes[-1].update(best=best, bestCost=_signed(route.get('bestCost')), held=route.get('held') if route.get('held') in ROUTE_HELD else '',
+                                  until=int(_num(route.get('until'))))
     return {'mode': raw.get('mode') if raw.get('mode') in ROUTING_MODES else '', 'links': links, 'routes': routes}
 
 
@@ -385,11 +397,93 @@ def clean_status(raw):
             'hostFirewallIssues': _firewall_issues(raw.get('hostFirewallIssues')),
             'reachability': _reachability(raw.get('reachability')), 'routing': _routing(raw.get('routing')),
             'e2e': _e2e(raw.get('e2e')), 'security': _security(raw.get('security')), 'proxy': _proxy(raw.get('proxy')),
-            'probes': _probes(raw.get('probes')), 'paths': _paths(raw.get('paths'))}
+            'fast': _fast(raw.get('fast')), 'probes': _probes(raw.get('probes')), 'paths': _paths(raw.get('paths')),
+            'forward': _forward(raw.get('forward'))}
 
 
 PROXY_EXIT = ('active', 'opened', 'refused', 'failed', 'bytesIn', 'bytesOut')
 PROXY_USER = ('opened', 'failed', 'active', 'bytesUp', 'bytesDown')
+FAST_ROLE = ('active', 'opened', 'failed', 'bytesIn', 'bytesOut')
+
+
+def _fast_role(raw):
+    d = raw if isinstance(raw, dict) else {}
+    return {k: int(_num(d.get(k))) for k in FAST_ROLE}
+
+
+def _three_u64(raw):
+    if not isinstance(raw, list) or len(raw) != 3:
+        return [0, 0, 0]
+    return [int(_num(v)) for v in raw]
+
+
+def _fast(raw):
+    """Fast relay state reported by the node under status.fast; None when disabled."""
+    if not isinstance(raw, dict):
+        return None
+    out = {
+        'port': int(_num(raw.get('port'), 65535)),
+        'listenError': _text(raw.get('listenError'), 300),
+        'entry': _fast_role(raw.get('entry')),
+        'transit': _fast_role(raw.get('transit')),
+        'exit': _fast_role(raw.get('exit')),
+        'headerErrors': int(_num(raw.get('headerErrors'))),
+        'refusedEntry': int(_num(raw.get('refusedEntry'))),
+        'refusedExit': int(_num(raw.get('refusedExit'))),
+    }
+    cap = raw.get('capture')
+    if isinstance(cap, dict):
+        out['capture'] = {'mode': _text(cap.get('mode'), 8), 'active': cap.get('active') is True, 'udp': cap.get('udp') is True,
+                          'error': _text(cap.get('error'), 300), 'missing': _text(cap.get('missing'), 32)}
+    channels = []
+    for ch in _list(raw.get('channels'), 64):
+        if not isinstance(ch, dict) or not isinstance(ch.get('dest'), str) or not ch['dest']:
+            continue
+        paths = []
+        for p in _list(ch.get('paths'), 8):
+            if isinstance(p, dict):
+                rtt = _ms(p.get('rttMs'))
+                paths.append({'hops': [_text(h, 128) for h in _list(p.get('hops'), 8) if isinstance(h, str)],
+                              'fixed': _text(p.get('fixed'), 64), 'state': _text(p.get('state'), 16),
+                              'since': int(_num(p.get('since'))), 'rttMs': rtt if rtt else None, 'error': _text(p.get('error'), 300)})
+        using = ch.get('using')
+        channels.append({'dest': _text(ch['dest'], 128), 'ready': ch.get('ready') is True,
+                         'using': using if type(using) is int and 0 <= using < len(paths) else -1,
+                         'opened': int(_num(ch.get('opened'))), 'lastUse': int(_num(ch.get('lastUse'))),
+                         'streams': int(_num(ch.get('streams'))), 'fallbacks': int(_num(ch.get('fallbacks'))), 'paths': paths})
+    if channels:
+        out['channels'] = channels
+    peers = []
+    for p in _list(raw.get('peers'), 128):
+        if isinstance(p, dict) and isinstance(p.get('peer'), str) and p['peer']:
+            rtt = _ms(p.get('rttMs'))
+            peers.append({
+                'peer': _text(p['peer'], 128),
+                'target': _text(p.get('target'), 120),
+                'viaMesh': p.get('viaMesh') is True,
+                'ready': int(_num(p.get('ready'), 1000)),
+                'rttMs': rtt if rtt else None,
+                'down': p.get('down') is True,
+                'error': _text(p.get('error'), 300),
+            })
+    if peers:
+        out['peers'] = peers
+    tm = raw.get('tcpMem')
+    if isinstance(tm, dict):
+        out['tcpMem'] = {
+            'pageBytes': int(_num(tm.get('pageBytes'), 1 << 20)),
+            'original': _three_u64(tm.get('original')),
+            'current': _three_u64(tm.get('current')),
+            'originalBytes': _three_u64(tm.get('originalBytes')),
+            'currentBytes': _three_u64(tm.get('currentBytes')),
+            'changed': tm.get('changed') is True,
+            'limited': tm.get('limited') is True,
+            'readOnly': tm.get('readOnly') is True,
+            'container': tm.get('container') is True,
+            'pressures': int(_num(tm.get('pressures'))),
+            'error': _text(tm.get('error'), 300),
+        }
+    return out
 
 
 def _list(raw, limit):
@@ -425,6 +519,37 @@ def _entry(e):
                           'exits': exits, 'picked': _text(u.get('picked'), 64)})
     return {'name': _text(e.get('name'), 32), 'listen': [_text(v, 64) for v in _list(e.get('listen'), 8)],
             'errors': [_text(v, 300) for v in _list(e.get('errors'), 8)], 'rejected': int(_num(e.get('rejected'))), 'users': users}
+
+
+FORWARD_COUNTS = ('active', 'opened', 'refused', 'failed', 'bytesIn', 'bytesOut')
+
+
+def _forward(raw):
+    """The port forwards as the node runs them: each it takes clients for (what listens, what could
+    not, its counts, its last error and the tunnels to its target), and its part as a target; None
+    while it is neither."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    forwards = []
+    for f in _list(raw.get('forwards'), 256):
+        if not isinstance(f, dict):
+            continue
+        forwards.append({'id': _text(f.get('id'), 32), 'listen': [_text(v, 64) for v in _list(f.get('listen'), 4)],
+                         'errors': [_text(v, 300) for v in _list(f.get('errors'), 4)], 'sessions': int(_num(f.get('sessions'))),
+                         **{k: int(_num(f.get(k))) for k in FORWARD_COUNTS}, 'lastError': _text(f.get('lastError'), 300),
+                         'lastErrorAt': int(_num(f.get('lastErrorAt'))), 'ready': int(_num(f.get('ready'), 1000)), 'down': f.get('down') is True,
+                         'tunnelError': _text(f.get('tunnelError'), 300), 'rttMs': _ms(f.get('rttMs')),
+                         # A fast forward's line for new connections: fast, or mesh while no fast path answers.
+                         **({'via': f['via']} if f.get('via') in ('fast', 'mesh') else {})})
+    if forwards:
+        out['forwards'] = forwards
+    t = raw.get('target')
+    if isinstance(t, dict):
+        out['target'] = {'listen': [_text(v, 64) for v in _list(t.get('listen'), 4)], 'errors': [_text(v, 300) for v in _list(t.get('errors'), 4)],
+                         **{k: int(_num(t.get(k))) for k in FORWARD_COUNTS}, 'lastError': _text(t.get('lastError'), 300),
+                         'lastErrorAt': int(_num(t.get('lastErrorAt')))}
+    return out or None
 
 
 def clean_events(raw):
@@ -523,7 +648,9 @@ def summary(status, role='member'):
             'reachability': {k: reach[k] for k in ('verdict', 'publicAddr', 'consistent', 'filtering', 'checkedAt')} if reach else None,
             'entryHealth': list((status['entry'] or {}).get('candidates', [])) if role != 'relay' else [],
             'routing': {k: routing[k] for k in ('mode', 'links', 'routes')} if routing and (role == 'relay' or not status.get('entry')) else None,
-            **({'proxy': status['proxy']} if status.get('proxy') else {})}
+            **({'proxy': status['proxy']} if status.get('proxy') else {}),
+            **({'fast': status['fast']} if status.get('fast') else {}),
+            **({'forward': status['forward']} if status.get('forward') else {})}
 
 
 def node_state(*, cleanup, installing, online, configured, current, failed, status, missing=False):
@@ -547,6 +674,10 @@ def node_state(*, cleanup, installing, online, configured, current, failed, stat
     if not configured:
         return 'installed'
     return 'ready' if current and status and status['ready'] else 'degraded'
+
+
+def alert_type(key):
+    return ALERT_TYPES[key.split(':', 1)[0]]
 
 
 class Watch:

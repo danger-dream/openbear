@@ -71,10 +71,12 @@ class Caps:
     multi: bool = True       # several records may share one name and type
     whole_zone: bool = False  # every write rewrites the whole zone: writes to one zone must not overlap
     zone_serial: bool = False  # refuses a write to a zone while another one to it is running
+    rrset: bool = False      # one Record is the whole RRset, update replaces all its addresses
+    staged_update: bool = False  # add-new/delete-old needs a durable service journal
 
     def public(self):
         return {'zones': self.zones, 'read': self.read, 'byId': self.by_id, 'ttlMin': self.ttl_min, 'ttlMax': self.ttl_max,
-                'ttlAuto': self.ttl_auto, 'types': list(self.types), 'delete': self.delete, 'multi': self.multi}
+                'ttlAuto': self.ttl_auto, 'types': list(self.types), 'delete': self.delete, 'multi': self.multi, 'rrset': self.rrset}
 
 
 @dataclasses.dataclass
@@ -179,6 +181,10 @@ class Provider:
         if self.caps.ttl_auto and int(value) == 1:
             return 1
         return max(self.caps.ttl_min, min(self.caps.ttl_max, int(value)))
+
+    async def effective_ttl(self, zone, ttl):
+        """Same normalization used by writes, including provider-specific constraints."""
+        return self.ttl_for(ttl)
 
     async def request(self, method, url, *, ok=(200, 201, 202, 204), **kwargs):
         """Send one API request; transport and HTTP failures become ProviderError."""

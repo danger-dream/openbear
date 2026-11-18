@@ -31,6 +31,7 @@ from app.servers import http as servers_http
 from app.servers import hub as hub_module
 from app.servers import install as installer
 from app.servers import latency as lat_module
+from app.servers import reminders as reminders_module
 from app.servers.metrics import MetricsStore
 from app.servers.profile import add_cycle, clean, period_start
 from app.servers.service import ServerService, node_url
@@ -375,7 +376,8 @@ async def test_local_refusal_of_exec_is_respected(env):
     # and updating every node leaves this one alone instead of failing on it.
     await api(e, 'POST', f'/api/servers/{server_id}/node/update', status=409)
     assert (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['node']['updateAvailable']
-    assert (await api(e, 'POST', '/api/servers/node-update'))['items'] == []
+    run = (await api(e, 'POST', '/api/servers/node-update'))['run']
+    assert run['items'] == [] and not run['running'] and run['total'] == 0
 
 
 async def test_node_endpoints_authenticate_themselves(env):
@@ -966,9 +968,10 @@ async def test_access_points_settings_and_install_commands(env):
         {'name': '海外直连', 'url': 'https://probe.example.com/'}, {'name': '国内中转', 'url': 'https://cn.example.com:20443'}]}))['settings']
     direct, relay = saved['accessPoints']
     assert (direct['url'], relay['url'], saved['defaultAccess']) == ('https://probe.example.com', 'https://cn.example.com:20443', direct['id'])
-    assert saved['reminders'] == {'enabled': True, 'time': '10:00', 'expiryDays': [7, 3, 1, 0], 'trafficPercents': [80, 90, 100], 'autoRenew': True}
+    mesh_on = dict.fromkeys(reminders_module.MESH_ALERTS, True)
+    assert saved['reminders'] == {'enabled': True, 'time': '10:00', 'expiryDays': [7, 3, 1, 0], 'trafficPercents': [80, 90, 100], 'autoRenew': True, 'mesh': mesh_on}
     rules = await api(e, 'PUT', '/api/servers/settings', {'reminders': {'time': '08:30', 'expiryDays': [1, 14], 'trafficPercents': [95]}})
-    assert rules['settings']['reminders'] == {'enabled': True, 'time': '08:30', 'expiryDays': [14, 1], 'trafficPercents': [95], 'autoRenew': True}
+    assert rules['settings']['reminders'] == {'enabled': True, 'time': '08:30', 'expiryDays': [14, 1], 'trafficPercents': [95], 'autoRenew': True, 'mesh': mesh_on}
     assert rules['settings']['accessPoints'] == saved['accessPoints']
     await api(e, 'PUT', '/api/servers/settings', {'reminders': {'time': '25:00'}}, status=400)
     plain = (await api(e, 'POST', '/api/servers', {'name': 'plain'}))['item']
@@ -1187,7 +1190,8 @@ async def test_node_updates_itself_and_reconnects_with_the_new_version(env, newe
     assert not node['updateAvailable'] and node['update']['state'] == 'current' and node['build'] == result['build']
     log = (await api(e, 'GET', f'/api/servers/{server_id}'))['item']['execLog']
     assert log[0]['command'] == '更新节点 dev → 9.9.9'
-    assert (await api(e, 'POST', '/api/servers/node-update'))['items'] == []
+    run = (await api(e, 'POST', '/api/servers/node-update'))['run']
+    assert run['items'] == [] and not run['running'] and run['total'] == 0
 
 
 async def test_a_local_rebuild_of_the_same_version_reaches_the_node(env, tmp_path, monkeypatch):
@@ -1838,11 +1842,15 @@ def test_install_scripts_cover_macos_and_windows(monkeypatch, tmp_path):
     assert installer.windows_command('https://x.example/', "a'b") == (
         "[Net.ServicePointManager]::SecurityProtocol=3072; & ([scriptblock]::Create((irm 'https://x.example/api/server-nodes/v1/install.ps1'))) "
         "-Url 'https://x.example' -Code 'a''b'")
-    line = installer.windows_ssh_command('http://198.51.100.10:1', 'c0de', backup='https://b.example', stage='enroll')
+    line = installer.windows_ssh_command('http://198.51.100.10:1', 'c0de', script='openbear-install-1.ps1', backup='https://b.example', stage='enroll')
     assert line.startswith('powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ') and len(line) < 8000
     body = base64.b64decode(line.split()[-1]).decode('utf-16-le')
-    assert "@('http://198.51.100.10:1/api/server-nodes/v1/install.ps1','https://b.example/api/server-nodes/v1/install.ps1')" in body
+    # The script is the file scp put into the login's home, read and removed: nothing is fetched and
+    # nothing comes on stdin, which an older Windows OpenSSH at times never ends.
+    assert "Join-Path $HOME 'openbear-install-1.ps1'" in body and 'Remove-Item -Force -LiteralPath $p' in body
+    assert '[Console]::In' not in body and 'Invoke-WebRequest' not in body and 'install.ps1' not in body
     assert "-Url 'http://198.51.100.10:1' -Code 'c0de' -Backup 'https://b.example' -Stage 'enroll'" in body
+    assert "'--config', $config" in windows
     # PowerShell also closes a single-quoted string at typographic quotes.
     assert installer.ps('a\u2019; calc; \u2018b') == "'a\u2019\u2019; calc; \u2018\u2018b'"
 
@@ -1884,8 +1892,14 @@ async def test_ssh_install_on_windows_runs_powershell_stages(env, monkeypatch, s
     async def fake_run(target, command, *, stdin=b'', timeout=120, sudo=False, root=False):
         calls.append((command, stdin, sudo, root))
         return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': '@@step x\r\nfine', 'stderr': '', 'knownHosts': 'k'}
+    puts = []
+
+    async def fake_put(target, local, remote, *, timeout=600):
+        puts.append((local.read_text(), remote))
+        return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': '', 'stderr': '', 'knownHosts': 'k'}
     monkeypatch.setattr(e.instances.servers, 'test_target', fake_test)
     monkeypatch.setattr(e.instances.servers, 'run', fake_run)
+    monkeypatch.setattr(e.instances.servers, 'put', fake_put)
     await api(e, 'PUT', '/api/servers/settings', {'accessPoints': [{'name': '直连', 'url': 'https://probe.example.com'}]})
     created = await api(e, 'POST', '/api/servers', {'name': 'win', 'ssh': {'host': '192.0.2.3', 'port': 22, 'username': 'admin', 'auth': 'password', 'password': 'pw'}})
     server_id = created['item']['id']
@@ -1898,6 +1912,9 @@ async def test_ssh_install_on_windows_runs_powershell_stages(env, monkeypatch, s
     assert [s['state'] for s in state['steps']] == ['done', 'done', 'done', 'done', 'failed'] and state['error'] == 'node_not_connected'
     assert len(calls) == 4 and all(c[0].startswith('powershell -NoLogo') and c[1:] == (b'', False, False) for c in calls)
     stages = [base64.b64decode(c[0].split()[-1]).decode('utf-16-le') for c in calls]
+    # Each stage runs a fresh copy of the script, sent by scp just before.
+    assert len(puts) == 4 and all(text == installer.windows_script() for text, _ in puts)
+    assert len({name for _, name in puts}) == 4 and all(f"Join-Path $HOME '{name}'" in s for (_, name), s in zip(puts, stages))
     assert [f"-Stage '{k}'" in s for k, s in zip(('check', 'download', 'enroll', 'service'), stages)] == [True] * 4
     assert "-Url 'https://probe.example.com' -Code '" in stages[0] and 'fine' in state['output']
     enrollment = await api(e, 'POST', f'/api/servers/{server_id}/enrollment')
@@ -2016,8 +2033,14 @@ async def test_servers_tool_does_what_the_page_does(env, monkeypatch, shipped):
     async def fake_run(target, command, *, stdin=b'', timeout=120, sudo=False, root=False):
         runs.append(command)
         return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': 'fine', 'stderr': '', 'knownHosts': 'k'}
+    sent = []
+
+    async def fake_put(target, local, remote, *, timeout=600):
+        sent.append(remote)
+        return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': '', 'stderr': '', 'knownHosts': 'k'}
     monkeypatch.setattr(e.instances.servers, 'test_target', fake_test)
     monkeypatch.setattr(e.instances.servers, 'run', fake_run)
+    monkeypatch.setattr(e.instances.servers, 'put', fake_put)
     await api(e, 'PUT', '/api/servers/settings', {'accessPoints': [{'id': 'ap-wg', 'name': 'WG', 'url': 'https://probe.example.com'}]})
     assert {'add', 'install', 'file_op', 'save_settings', 'code_create', 'remove_node'} <= set((await call('describe'))['actions'])
 
@@ -2027,6 +2050,7 @@ async def test_servers_tool_does_what_the_page_does(env, monkeypatch, shipped):
     assert added['sshFacts']['platform'] == 'windows' and added['item']['platform'] == 'windows' and added['item']['group'] == '国内'
     assert added['install']['state'] == 'failed' and added['install']['error'] == 'node_not_connected'
     assert [s['state'] for s in added['install']['steps']] == ['done'] * 4 + ['failed'] and all(r.startswith('powershell -NoLogo') for r in runs)
+    assert len(sent) == 4 and all(name.endswith('.ps1') for name in sent)
     got = (await call('get', serverId=win_id))['item']
     assert got['install']['error'] == 'node_not_connected' and got['region'] == 'CN' and got['sshTarget']['platform'] == 'windows'
     commands = await call('install_command', serverId=win_id)

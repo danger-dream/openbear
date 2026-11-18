@@ -33,6 +33,7 @@ function connection(m) {
 }
 function features(m) {
   const out = [];
+  if (isRelay(m) && m.noTransit) out.push(['notransit', '不中转']);
   if (m.gateway?.subnets?.length) out.push(['lan', m.gateway.backup ? '备用网关' : '共享局域网']);
   if (m.proxy?.exit) out.push(['exit', '出口']);
   if (m.proxy?.ports?.length) out.push(['ap', `代理端口 ${m.proxy.ports.map(p => `:${p.port}`).join(' ')}`]);

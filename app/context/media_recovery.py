@@ -1,8 +1,10 @@
-"""One-shot media replay recovery after an explicit message_too_big rejection.
+"""Media replay becomes file references in two cases only.
 
-Normal requests never retire media. Recovery keeps the newest media-bearing
-message (the complete attachment batch), replaces older local/inline media with
-file references, and preserves text, tool batches and opaque assistant state.
+Recovery after an explicit message_too_big rejection keeps the newest
+media-bearing message (the complete attachment batch) and replaces older
+local/inline media. A conversation that turned on "图片只看一轮" replaces media
+from earlier rounds. Otherwise normal requests never retire media. Text, tool
+batches and opaque assistant state are preserved.
 """
 
 from __future__ import annotations
@@ -32,8 +34,11 @@ _MEDIA_TYPES = frozenset(
 )
 
 
-def _is_media(block: Any) -> bool:
-    return isinstance(block, dict) and block.get("type") in _MEDIA_TYPES
+_IMAGE_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def _is_media(block: Any, types: frozenset[str] = _MEDIA_TYPES) -> bool:
+    return isinstance(block, dict) and block.get("type") in types
 
 
 def _inline_media(block: dict[str, Any]) -> tuple[bytes, str] | None:
@@ -103,6 +108,19 @@ def _media_path(block: dict[str, Any], artifact_dir: Path) -> Path | None:
     return target
 
 
+_INPUT_KINDS = frozenset({"human", "task", "cron", "webhook"})
+
+
+def _media_batches(messages: list[Message], types: frozenset[str] = _MEDIA_TYPES) -> list[int]:
+    return [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"user", "tool"}
+        and isinstance(message.get("content"), list)
+        and any(_is_media(block, types) for block in message["content"])
+    ]
+
+
 def reference_historical_media(
     messages: list[Message],
     *,
@@ -113,22 +131,52 @@ def reference_historical_media(
     No byte threshold, resizing, summarization, or neutral_context conversion.
     Missing files/unrecognized inline forms remain intact, not invented paths.
     """
-    batches = [
-        index
-        for index, message in enumerate(messages)
-        if message.get("role") in {"user", "tool"}
-        and isinstance(message.get("content"), list)
-        and any(_is_media(block) for block in message["content"])
-    ]
+    batches = _media_batches(messages)
     if len(batches) < 2:
+        return messages, 0
+    return _reference_media_at(messages, batches[:-1], artifact_dir=artifact_dir)
+
+
+def reference_earlier_round_media(
+    messages: list[Message],
+    *,
+    artifact_dir: Path,
+    scope_key: str,
+    active_scope: str,
+    include_input: bool,
+) -> tuple[list[Message], int]:
+    """图片只看一轮: images from rounds other than active_scope (a run root turn,
+    or an Agent's task) become file references; the active round's stay, and
+    so do documents and audio.
+
+    include_input also covers images the user or the task sent, not only tool
+    images. A batch without a known round is left alone rather than guessed.
+    """
+    if not active_scope:
+        return messages, 0
+    batches = []
+    for index in _media_batches(messages, _IMAGE_TYPES):
+        meta = source_of(messages[index])
+        scope = str(meta.get(scope_key) or "")
+        if not scope or scope == active_scope:
+            continue
+        if meta.get("kind") in _INPUT_KINDS and not include_input:
+            continue
+        batches.append(index)
+    return _reference_media_at(messages, batches, artifact_dir=artifact_dir, types=_IMAGE_TYPES)
+
+
+def _reference_media_at(messages: list[Message], batches: list[int], *, artifact_dir: Path,
+                        types: frozenset[str] = _MEDIA_TYPES) -> tuple[list[Message], int]:
+    if not batches:
         return messages, 0
     outgoing = copy.deepcopy(messages)
     retired = 0
-    for index in batches[:-1]:
+    for index in batches:
         message = outgoing[index]
         changed = False
         for block_index, block in enumerate(message["content"]):
-            if not _is_media(block):
+            if not _is_media(block, types):
                 continue
             path = _media_path(block, artifact_dir)
             if path is None:

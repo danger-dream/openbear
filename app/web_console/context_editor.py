@@ -72,6 +72,8 @@ class WebAdminContextEditorMixin:
         else:
             system = settings['system']
         sid = await dao.get_or_create_session_uuid(chat)
+        if settings is None:
+            system = await self._effective_window_system(chat, system)
         anchor = await dao._controller_context_anchor(chat)
         # Read only: unlike runtime loading, opening an editor must not delete a
         # mismatched checkpoint or mutate a window selection.
@@ -285,7 +287,9 @@ class WebAdminContextEditorMixin:
                                         'main_fast_mode': await MessageDAO(self.db).get_fast_mode(int(row['internal_chat_id'])),
                                         'agent_model': row.get('agent_model', ''), 'agent_think_level': row.get('agent_think_level', ''),
                                         'agent_fast_mode': row.get('agent_fast_mode', -1),
-                                        'context_strategy': row.get('context_strategy', 'sliding_window')},
+                                        'context_strategy': row.get('context_strategy', 'sliding_window'),
+                                        'image_one_turn': row.get('image_one_turn', ''),
+                                        'prompt_template': row.get('prompt_template', '')},
                             folder_uuid=str(row.get('folder_uuid') or ''), create_lock_held=True, extensions=extensions)
                         bid, chat = branch['conversation_uuid'], int(branch['internal_chat_id'])
                         dao = MessageDAO(self.db)

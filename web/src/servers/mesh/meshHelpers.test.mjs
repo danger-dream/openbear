@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { meshCodeText, relayInUse, routedLinks } from './meshHelpers.js';
+import { meshCodeText, relayInUse, routedLinks, switchesTo } from './meshHelpers.js';
 
 test('mesh error codes read in Chinese, with the node reason after a colon', () => {
   assert.equal(meshCodeText('mesh_apply_running'), '正在应用，请稍后再试');
@@ -295,6 +295,11 @@ test('every event kind the data plane and the controller record reads in Chinese
     ['start', 'obmesh0 up, revision 65, 5 peers, 2 learned addresses restored', ['组网服务启动', '第 65 版配置，5 个对端，恢复了 2 个记下的对端地址', '']],
     ['upgrade.failed', 'data plane upgrade to build c4ec3ff88e29 did not get ready; rolled back', ['组网服务升级失败，已回退', '新版本启动后没有就绪，已回到原来的版本', 'raw']],
     ['link.suppressed', `${id(1)}: penalty 1200`, ['线路暂停使用', '到 Berlin 的中转链路反复断开，暂停用于选路', '']],
+    ['link.kept', `${id(1)}: penalty 2600`, ['保留线路', '到 Berlin 的中转链路还在反复断开，但其他链路都暂停了，继续用它选路', '']],
+    ['link.mtu', `${id(1)}: carries 1392 bytes of the network's 1400`,
+      ['线路包长受限', '到 Berlin 的 UDP 线路只能通过 1392 字节的包（组网 MTU 1400），更长的包会通知发送方改小，选路也会尽量避开它', '']],
+    ['link.mtu', `${id(1)}: carries less than 576 bytes of the network's 1400`, ['线路包长受限', '到 Berlin 的 UDP 线路连 576 字节的包都过不去（组网 MTU 1400），选路会尽量避开它', '']],
+    ['link.mtu', `${id(1)}: carries the network's 1400 bytes again`, ['线路包长恢复', '到 Berlin 的 UDP 线路又能通过 1400 字节的满长包了', '']],
     ['route.changed', `${id(9)}: ${id(1)} -> none (down)`, ['换路', '到 已移出组网的节点：经 Berlin → 无路可走（原线路断开）', '']],
     ['something.new', 'raw words', ['其他事件', '', 'raw']],
   ];
@@ -587,4 +592,39 @@ test('a member moving between the gateways of a LAN reads in Chinese', async () 
   assert.deepEqual(v('192.168.1.0/24: b -> p (returned)'), ['切换局域网网关', 'Home-GW 恢复回应，访问 192.168.1.0/24 切回经它，不再经 Home-NAS', '', 'ok']);
   // A detail of another shape is kept as it was.
   assert.deepEqual(v('192.168.1.0/24 moved'), ['切换局域网网关', '改经另一个网关访问局域网', '192.168.1.0/24 moved', 'warn']);
+});
+
+test('switchesTo: at least switchMs cheaper, and with switchPct more than that share', () => {
+  assert.equal(switchesTo(176, 190.4), true);
+  assert.equal(switchesTo(186, 190.4), false);
+  assert.equal(switchesTo(185.4, 190.4), true);
+  assert.equal(switchesTo(176, 190.4, {switchMs: 20}), false);
+  assert.equal(switchesTo(176, 190.4, {switchMs: 10, switchPct: 20}), false);
+  assert.equal(switchesTo(150, 190.4, {switchMs: 10, switchPct: 20}), true);
+  assert.equal(switchesTo(NaN, 190.4), false);
+});
+
+test('fast ports: who may use one, which nodes listen, and how each user\'s channel stands', async () => {
+  const {draftOf, fastChannelText, fastListener, fastPathText, fastSources, fastUsers} = await import('./meshHelpers.js');
+  const members = [{serverId: 'lax', name: 'LAX', role: 'relay'}, {serverId: 'jp', name: 'JP', role: 'relay'}, {serverId: 'home', name: 'Home', role: 'member'}, {serverId: 'mac', name: 'Mac', role: 'member'}];
+  const work = {members, fastPorts: [{id: 'f1', serverId: 'mac', port: 48888, proto: 'any', src: {all: true, allSubnets: true}}]};
+  assert.deepEqual(draftOf({members: [], fastPorts: work.fastPorts}).fastPorts, work.fastPorts);
+  assert.equal('fastPorts' in draftOf({members: []}), false, 'an older controller is not sent fast ports');
+  assert.equal(fastSources(undefined, members), '所有成员和共享局域网');
+  assert.equal(fastSources({all: false, allSubnets: false, members: ['home'], tags: [], prefixes: []}, members), 'Home');
+  // Relays and the fast ports' own nodes listen; nobody while there is no fast port.
+  assert.deepEqual(members.map(m => fastListener(work, m)), [true, true, false, true]);
+  assert.equal(fastListener({members, fastPorts: []}, members[0]), false);
+  const data = {nodes: {
+    home: {summary: {fast: {channels: [{dest: 'mac', ready: true, using: 1, lastUse: 2, streams: 4, fallbacks: 1,
+      paths: [{hops: ['jp', 'mac'], state: 'down', error: 'dial tcp: timeout'}, {hops: ['lax', 'mac'], state: 'ready', rttMs: 142.4}]}]}}},
+    jp: {summary: {fast: {channels: [{dest: 'mac', ready: false, using: -1, lastUse: 1, paths: [{hops: ['mac'], state: 'untested'}]}]}}},
+    lax: {summary: {}},
+  }};
+  const users = fastUsers(data, 'mac');
+  assert.deepEqual(users.map(u => u.id), ['home', 'jp'], 'the one used last first');
+  assert.equal(fastPathText(members, 'home', users[0].paths[1]), 'Home → LAX → Mac');
+  assert.equal(fastChannelText(members, users[0]), '走 Home → LAX → Mac · 142 ms');
+  assert.equal(fastChannelText(members, users[1]), '预热中，暂走加密组网');
+  assert.equal(fastChannelText(members, {id: 'home', ready: false, using: -1, paths: [{hops: ['mac'], state: 'down', error: 'refused'}]}), '路径都不通，走加密组网：refused');
 });

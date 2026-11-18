@@ -97,7 +97,7 @@ test('search finds servers by name, pinyin, group, region and IP, and only where
 test('real picker: 服务器 tab multi-selects by tap, shows state, and inserts all checked as capsules',async t=>{
  await directory();
  const p=picker(t);await settled();
- assert.deepEqual(plain(p.run('tabs.value')).map(tab=>tab[1]),['全部','记忆','文档','凭证','会话','服务器','历史']);
+ assert.deepEqual(plain(p.run('tabs.value')).map(tab=>tab[1]),['全部','记忆','文档','笔记','凭证','会话','服务器','历史']);
  p.run("changeTab('server')");await settled();
  assert.equal(p.run('serverMode.value'),true);assert.equal(p.run('results.value.length'),3);
  let html=await p.render();

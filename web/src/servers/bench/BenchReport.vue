@@ -22,7 +22,7 @@ const running = computed(() => isActive(props.run));
 const meta = computed(() => [runTime(props.run.createdMs), props.run.label, props.run.package, took(props.run, props.now)].filter(Boolean).join(' · '));
 const failure = computed(() => props.run.state !== 'failed' && props.run.state !== 'interrupted' ? ''
   // Stopped at its time limit: the reason names the limit.
-  : props.run.error === 'bench_timeout' && props.run.detail ? props.run.detail : errorText(props.run.error || 'bench_internal'));
+  : ['bench_timeout', 'bench_json_invalid'].includes(props.run.error) && props.run.detail ? props.run.detail : errorText(props.run.error || 'bench_internal'));
 const links = computed(() => sections.value.filter(s => s.link).map(s => ({label: s.label ? `${s.label} 在线报告` : '在线报告', href: s.link})));
 
 // The job's last lines as a terminal would show them: each line from its last carriage return.
@@ -56,10 +56,11 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); });
       <div v-if="!compact" class="bn-rep-actions">
         <a v-for="l in links" :key="l.href" class="ix-text-button bn-link" :href="l.href" target="_blank" rel="noopener noreferrer">{{ l.label }}<ExternalLink :size="13" aria-hidden="true" /></a>
         <el-button v-if="running" size="small" :loading="busy" :disabled="run.stopping" @click="emit('stop', run)">{{ run.stopping ? '正在停止' : run.state === 'queued' ? '取消' : '停止' }}</el-button>
-        <el-button v-else size="small" :loading="busy" class="dd-danger" @click="emit('delete', run)">删除</el-button>
+        <el-button v-else size="small" :loading="busy" :disabled="run.stopPending" class="dd-danger" @click="emit('delete', run)">删除</el-button>
       </div>
     </header>
     <p v-if="failure" class="dd-note bn-note" data-tone="bad">{{ failure }}<template v-if="run.detail && run.detail !== failure">（{{ run.detail }}）</template></p>
+    <p v-if="run.stopPending && !running" class="instance-muted bn-wait" role="status">停止尚未确认，节点上线后会继续停止作业；确认前不能删除记录或启动下一项评测。</p>
     <template v-if="running">
       <p class="instance-muted bn-wait" role="status">{{ run.state === 'queued' ? '排队中：这台服务器上前面还有评测，结束后自动开始。' : run.state === 'running' ? '正在运行，下面是节点上的最新输出。'
         : run.state === 'collecting' ? (run.stopping ? '评测已结束：节点在线就照常收完报告，断线了就不再等它回来。' : '评测已结束，正在收集报告。') : '正在准备，稍等。' }}</p>

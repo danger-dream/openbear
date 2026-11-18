@@ -2,12 +2,14 @@
 import { computed, nextTick, ref, useId } from 'vue';
 import FloatingPanel from '../references/FloatingPanel.vue';
 import { flag, noAutofill, regionName } from '../servers/serverHelpers.js';
+import './ddns.css';
 
 // Flag, name and current IPv4 of each node (offline ones say so); searchable, and driven by the keyboard
 // from the search box: ↑ ↓ move, Enter picks, Esc closes only the list, not the dialog around it.
 // outdated: whether a node is marked 需升级 (by default, one whose node cannot do dynamic DNS).
 const props = defineProps({modelValue: {type: String, default: ''}, nodes: {type: Array, required: true}, label: {type: String, default: '节点'},
-  none: {type: String, default: ''}, exclude: {type: String, default: ''}, outdated: {type: Function, default: node => !node.ddns}});
+  none: {type: String, default: ''}, exclude: {type: String, default: ''}, outdated: {type: Function, default: node => !node.ddns},
+  placeholder: {type: String, default: '选择节点'}});
 const emit = defineEmits(['update:modelValue']);
 const button = ref(null), search = ref(null), floating = ref(null);
 const open = ref(false), query = ref(''), active = ref(0);
@@ -71,7 +73,7 @@ function key(event) {
       <span v-if="outdated(current)" class="ss-tag dd-tag-warn">需升级</span>
       <span class="ss-via mono" :class="{'dd-off': !current.online}">{{ note(current) }}</span>
     </template>
-    <span v-else class="ss-name is-empty">{{ none || '选择节点' }}</span>
+    <span v-else class="ss-name is-empty">{{ none || placeholder }}</span>
   </button>
   <FloatingPanel ref="floating" :open="open" :anchor="button" placement="bottom-start" :width="400" :label="`选择${label}`" @close="close()">
     <div class="ss-panel dd-node-panel">

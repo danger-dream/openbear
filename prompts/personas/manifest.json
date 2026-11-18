@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "personas": [
+    {
+      "id": "little-code",
+      "name": "小码酱",
+      "sha256": "121b087b1384ec89b60565dcf45a7323ce4e91f15c6df37503ccf849ca3c0235"
+    },
+    {
+      "id": "ctf-sandbox",
+      "name": "CTF 沙箱",
+      "sha256": "c1bb0df5326b43fbbae004940af028c03575f104368432a640fabcfe31e652a4"
+    },
+    {
+      "id": "da-fei-yu",
+      "name": "大肥鱼",
+      "sha256": "137a7b6e9dd355294621f20b0c1aab71aa9169ed74797a08a6a70ae825f816b5"
+    },
+    {
+      "id": "gemini-argon-4",
+      "name": "gemini-argon-4",
+      "sha256": "293454332636eace623f8e2c413803f4a324acbaec5a15d9ede93f50a54f53b0"
+    }
+  ]
+}

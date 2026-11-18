@@ -76,16 +76,27 @@ function pinRoute(r) {
   if (!canPinOf(r)) return;
   emit('pin-path', {src: id.value, dst: r.dst, via: r.hops.slice(1, -1).map(h => h.node)});
 }
-const routePoll = usePoll(async () => {
+const routePoll = usePoll(async current => {
   if (tab.value !== 'routes') return;
-  try { routes.value = await MeshApi.routes(id.value); routesState.value = 'ok'; routesError.value = ''; }
+  const sid = id.value;
+  try {
+    const reply = await MeshApi.routes(sid);
+    if (!current() || sid !== id.value) return;
+    routes.value = reply; routesState.value = 'ok'; routesError.value = '';
+  }
   catch (e) {
+    if (!current() || sid !== id.value) return;
     const code = e?.response?.data?.error;
     if (e?.response?.status === 404 && code !== 'mesh_member_not_found') { routesState.value = 'unsupported'; return; }
     if (code === 'mesh_member_not_found') { routes.value = null; routesState.value = 'draft'; }
     else { routesError.value = meshError(e); if (!routes.value) routesState.value = 'error'; }
   }
 }, {interval: () => routesState.value === 'unsupported' ? 0 : 10000});
+watch(id, () => {
+  routePoll.stop();
+  routes.value = null; routesError.value = ''; routesState.value = 'loading'; routePage.value = 1;
+  if (tab.value === 'routes') void routePoll.run();
+}, {flush: 'sync'});
 </script>
 <template>
   <section id="m3-sec-diag" class="m3-dsec" aria-label="诊断">

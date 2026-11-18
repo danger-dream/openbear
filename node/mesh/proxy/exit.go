@@ -91,7 +91,7 @@ func (s *exitServer) allowed(a netip.Addr) bool {
 	if s.allow != nil {
 		return s.allow(a)
 	}
-	return s.policy.allowed(a)
+	return s.conns.allowed(a, s.policy)
 }
 
 func (s *exitServer) serve(c *net.TCPConn) {
@@ -109,6 +109,13 @@ func (s *exitServer) serve(c *net.TCPConn) {
 	switch cmd {
 	case cmdConnect:
 		out, status := s.dialTCP(target)
+		if out != nil {
+			to, err := netip.ParseAddrPort(out.RemoteAddr().String())
+			if err != nil || !s.conns.reached(c, to.Addr().Unmap()) {
+				out.Close()
+				return
+			}
+		}
 		if _, err := c.Write([]byte{status}); err != nil || status != statusOK {
 			if out != nil {
 				out.Close()
@@ -116,9 +123,6 @@ func (s *exitServer) serve(c *net.TCPConn) {
 			return
 		}
 		defer out.Close()
-		if to, err := netip.ParseAddrPort(out.RemoteAddr().String()); err == nil {
-			s.conns.reached(c, to.Addr().Unmap())
-		}
 		in, outBytes := relay(c, out)
 		s.stats.BytesIn.Add(in)
 		s.stats.BytesOut.Add(outBytes)
@@ -191,6 +195,10 @@ func (s *exitServer) dialTCP(a Addr) (*net.TCPConn, byte) {
 	}
 	d := s.dialer()
 	for i, ip := range ips {
+		if !s.allowed(ip) {
+			status = statusNotAllowed
+			continue
+		}
 		// One silent address must not take the whole budget from the rest.
 		actx, acancel := ctx, context.CancelFunc(func() {})
 		if deadline, ok := ctx.Deadline(); ok && i < len(ips)-1 {
@@ -229,16 +237,60 @@ func dialStatus(err error) byte {
 // relay copies both ways until both are done, half-closing each side as
 // its source ends; between two TCP connections Linux splices. It returns
 // the bytes from a to b and from b to a.
-func relay(a, b *net.TCPConn) (int64, int64) {
+func relay(a, b *net.TCPConn) (int64, int64) { return relayObserved(a, b, nil) }
+
+func relayObserved(a, b *net.TCPConn, attempt *forwardAttempt) (int64, int64) {
 	done := make(chan int64, 1)
 	go func() {
-		n, _ := io.Copy(b, a)
-		b.CloseWrite()
+		n, err := io.Copy(b, a)
+		if err != nil {
+			if attempt != nil {
+				attempt.streamError("tunnel_to_backend", err)
+			}
+			abortForwardConn(a)
+			abortForwardConn(b)
+		} else {
+			b.CloseWrite()
+		}
 		done <- n
 	}()
-	n, _ := io.Copy(a, b)
-	a.CloseWrite()
+	n, err := io.Copy(a, b)
+	if err != nil {
+		if attempt != nil {
+			attempt.streamError("backend_to_tunnel", err)
+		}
+		abortForwardConn(a)
+		abortForwardConn(b)
+	} else {
+		a.CloseWrite()
+	}
 	return <-done, n
+}
+
+// udpTarget resolves one datagram's destination. Cached DNS answers retain
+// addresses only, never permission from an earlier policy generation.
+func (s *exitServer) udpTarget(a Addr, resolved map[string]netip.Addr) (netip.Addr, bool) {
+	ip := a.IP
+	if a.Host != "" {
+		if ip = resolved[a.Host]; !ip.IsValid() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ips, status := s.resolve(ctx, a)
+			cancel()
+			if status != statusOK {
+				return netip.Addr{}, false
+			}
+			ip = ips[0]
+			if len(resolved) > 256 {
+				clear(resolved)
+			}
+			resolved[a.Host] = ip
+		}
+	}
+	if !s.allowed(ip.Unmap()) {
+		s.stats.Refused.Add(1)
+		return netip.Addr{}, false
+	}
+	return ip, true
 }
 
 // udp relays a UDP association: frames from the tunnel go out from one
@@ -270,23 +322,8 @@ func (s *exitServer) udp(c *net.TCPConn) {
 			if err != nil {
 				return
 			}
-			ip := a.IP
-			if a.Host != "" {
-				if ip = resolved[a.Host]; !ip.IsValid() {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					ips, status := s.resolve(ctx, a)
-					cancel()
-					if status != statusOK {
-						continue
-					}
-					ip = ips[0]
-					if len(resolved) > 256 {
-						clear(resolved)
-					}
-					resolved[a.Host] = ip
-				}
-			} else if !s.allowed(ip.Unmap()) {
-				s.stats.Refused.Add(1)
+			ip, allowed := s.udpTarget(a, resolved)
+			if !allowed {
 				continue
 			}
 			last.Store(time.Now().UnixNano())
@@ -306,6 +343,9 @@ func (s *exitServer) udp(c *net.TCPConn) {
 			}
 			c.Close()
 			return
+		}
+		if !s.allowed(from.Addr().Unmap()) {
+			continue
 		}
 		last.Store(time.Now().UnixNano())
 		s.stats.BytesIn.Add(int64(n))

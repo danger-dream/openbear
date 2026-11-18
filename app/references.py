@@ -45,7 +45,7 @@ REFERENCE_LINK = re.compile(r"\[((?:\\.|[^\[\]\\\n])*)\]\((openbear://ref/[^\s)]
 # linkify bare URLs, or recursively parse image alt text as explicit references.
 REFERENCE_MARKDOWN = MarkdownIt("default", {"html": False, "linkify": False})
 BUNDLE_FIELD = "openbear_reference_bundle"
-KINDS = {"mem", "doc", "secret", "chat", "turn", "message", "server"}
+KINDS = {"mem", "doc", "note", "secret", "chat", "turn", "message", "server"}
 MAX_REFERENCES = 30
 MENTION_NOTICE = "仅提及：仅提供名称和定位，未提供正文；不表示要求读取。"
 
@@ -85,6 +85,8 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
         ):
             return None
         if kind == "server" and not SERVER_ID.fullmatch(identity):
+            return None
+        if kind == "note" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity):
             return None
         if kind in {"turn", "message"} and (len(parts) != 3 or not parts[2]):
             return None
@@ -179,6 +181,9 @@ def reference_occurrences(text: str) -> list[dict]:
                 invalid_mode = False
             if invalid_mode:
                 raise ReferenceError("invalid_reference_mode", label)
+        # No tool reads knowledge-base notes, so a locator-only note would be unusable.
+        if ref and ref["kind"] == "note" and ref.get("mode") == "mention":
+            raise ReferenceError("invalid_reference_mode", label)
         if ref:
             found.append(ref)
             if len(found) > 1000:
@@ -484,6 +489,16 @@ class ReferenceMaterials:
                         )
                 else:
                     content = json.dumps(item.get("kv") or [], ensure_ascii=False)
+            elif ref["kind"] == "note":
+                cursor = await self.db.conn.execute(
+                    "SELECT title, content FROM kb_notes WHERE note_uuid=? AND owner_chat_id=? LIMIT 1",
+                    (ref["id"], owner),
+                )
+                note_row = await cursor.fetchone()
+                if not note_row:
+                    raise ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
+                label = str(note_row["title"] or ref["label"])
+                content = str(note_row["content"] or "")
             else:
                 label, content = history["sourceLabel"], history["content"]
             tokens = estimate_tokens(content)

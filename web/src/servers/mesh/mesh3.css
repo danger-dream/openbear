@@ -143,6 +143,10 @@ html.dark .mesh3, html.dark .m3-tokens { --m-teal: 94 210 196; --m-violet: 167 1
 .m3-sec-h small { color: var(--m-muted); font-size: var(--ix-xs); font-weight: 400; }
 .m3-input { height: 32px; min-width: 0; padding: 0 10px; border: 1px solid var(--m-border); border-radius: 8px; background: var(--m-panel); color: var(--m-text); font-size: var(--ix-sm); }
 .m3-input.m3-short { width: 90px; }
+/* A label and its box wrap together; the labels share a width so the boxes line up when each pair takes a line. */
+.m3-ports { align-items: center; gap: 6px 14px; }
+.m3-pair { display: inline-flex; align-items: center; gap: 6px; }
+.m3-ports .m3-pair > span { min-width: 2.2em; }
 .m3-list-head .m3-input, .mesh3 .m3-list-head input.m3-input { flex: 0 1 320px; width: 320px; max-width: 100%; }
 .m3-empty-line { padding: 24px 4px; }
 .m3-note { margin-top: 6px; font-size: var(--ix-xs); }
@@ -205,13 +209,12 @@ button.m3-row:hover:not(:disabled), .m3-row-link:hover { background: var(--m-hov
 .mesh3.is-phone .m3-row > :nth-child(n+3) { flex: 0 1 auto; min-width: 0; font-size: var(--ix-xs); }
 .mesh3.is-phone .m3-row-addr:empty, .mesh3.is-phone .m3-row-tags:empty { display: none; }
 
-/* Numbered lists: line rules, revisions, limits, fixed paths. */
-.m3-list, .m3-limits-list, .m3-paths-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+/* Numbered lists: line rules, revisions, limits. */
+.m3-list, .m3-limits-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .m3-list > li, .m3-limits-list > li { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--m-line); border-radius: 10px; background: var(--m-panel); font-size: var(--ix-sm); }
-.m3-list > li[data-off], .m3-limits-list > li[data-off], .m3-paths-list > li[data-off] { opacity: .6; }
+.m3-list > li[data-off], .m3-limits-list > li[data-off] { opacity: .6; }
 .m3-list > li[data-current] { border-color: rgb(var(--m-ok) / .4); }
-.m3-list > li.instance-muted, .m3-limits-list > li.instance-muted, .m3-paths-list > li.instance-muted { display: block; padding: 10px 12px; border: 1px solid var(--m-line); border-radius: 10px; background: var(--m-panel); font-size: var(--ix-sm); }
-.m3-paths-list > li:not(.instance-muted) { border: 1px solid var(--m-line); border-radius: 10px; background: var(--m-panel); font-size: var(--ix-sm); }
+.m3-list > li.instance-muted, .m3-limits-list > li.instance-muted { display: block; padding: 10px 12px; border: 1px solid var(--m-line); border-radius: 10px; background: var(--m-panel); font-size: var(--ix-sm); }
 .m3-path-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
 .m3-path-sum { flex: none; color: var(--m-subtle); font-size: var(--ix-xs); white-space: nowrap; }
 .m3-path-sum[data-tone='ok'] { color: rgb(var(--m-ok)); }
@@ -474,6 +477,18 @@ button.m3-row:hover:not(:disabled), .m3-row-link:hover { background: var(--m-hov
 .mesh-settings.is-page .m3-dsec { padding-bottom: 10px; }
 .mesh-settings.is-page .instance-form-footer { justify-content: flex-start; }
 .m3-health > summary { padding: 10px 0; }
+.mesh-alerts { max-width: 900px; margin-top: 18px; }
+.mesh-alerts > h3 .ix-text-button { margin-left: auto; font-size: var(--ix-xs); font-weight: 400; }
+/* The hint goes under the switch on a desktop, as every settings row; on a phone under the label, the switch at the right. */
+.mesh-alerts .m3-fl small { display: none; }
+.mesh3.is-phone .mesh-alerts .m3-fr { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 12px; padding: 10px 0; }
+.mesh3.is-phone .mesh-alerts .m3-fl { padding-top: 0; }
+.mesh3.is-phone .mesh-alerts .m3-fl small { display: block; margin-top: 2px; line-height: 1.5; }
+.mesh3.is-phone .mesh-alerts .m3-fc .m3-hint { display: none; }
+.m3-routing { margin-top: 6px; }
+.m3-routing-title { display: flex; align-items: center; gap: 8px; margin: 14px 0 0; color: var(--m-text); font-size: var(--ix-sm); font-weight: 600; }
+.m3-routing-title .ix-text-button { margin-left: auto; font-weight: 400; font-size: var(--ix-xs); }
+.m3-routing .m3-ctl { align-items: center; }
 .mesh3 .m3-settings .m3-fc :is(input.m3-input, select.m3-sel) { display: inline-block; width: auto; }
 .mesh3 .m3-settings .m3-fc input.m3-input.m3-mid { width: 220px; }
 .mesh3 .m3-settings .m3-fc input.m3-input.m3-short { width: 96px; }
@@ -521,6 +536,8 @@ button.m3-row:hover:not(:disabled), .m3-row-link:hover { background: var(--m-hov
 .m3-rt-state[data-tone='ok'] { color: rgb(var(--m-ok)); }
 .m3-rt-state[data-tone='warn'] { color: rgb(var(--m-warn)); }
 .m3-rt-state[data-tone='bad'] { color: rgb(var(--m-bad)); }
+.m3-rt-cost { color: var(--m-subtle); white-space: nowrap; }
+.m3-rt-why { margin: 2px 0 0; }
 .m3-rt-acts { display: flex; flex: 1 1 100%; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding-left: 28px; }
 .m3-danger-text.ix-text-button { color: rgb(var(--m-bad)); }
 .m3-rt-calc { display: grid; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--m-line); }
@@ -616,3 +633,47 @@ button.m3-node-name:focus-visible { outline: 2px solid rgb(var(--m-blue) / .5); 
 .mesh3.is-phone .m3-path-acts > .ix-icon-button { width: 32px; height: 32px; }
 .mesh3.is-phone .m3-path-acts > .ix-text-button { min-height: 32px; padding: 0 8px; }
 .m3-entry-auto { margin-top: 6px; }
+.m3-tag[data-kind='fast'] { background: rgb(var(--m-blue) / .1); color: rgb(var(--m-blue)); }
+.m3-rows-fast .m3-row { grid-template-columns: minmax(150px, 1fr) minmax(170px, 1.1fr) minmax(130px, 1fr) minmax(160px, 1.4fr) 64px; }
+.m3-fast-run { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh3.is-phone .m3-fast-run { white-space: normal; }
+.m3-fast-lead { margin: 0; line-height: 1.6; }
+.m3-fast-users { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.m3-fast-users > li { border: 1px solid var(--m-line); border-radius: 8px; background: var(--m-cluster); }
+.m3-fast-user { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 6px 10px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.m3-fast-user > b { flex: none; color: var(--m-strong); font-weight: 600; }
+.m3-fast-user-now { flex: 1; min-width: 0; color: var(--m-subtle); font-size: var(--ix-xs); }
+.m3-fast-paths { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px; }
+.m3-fast-path { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: baseline; gap: 2px 8px; font-size: var(--ix-xs); }
+.m3-fast-path > small { grid-column: 2 / -1; }
+.m3-fast-path-hops { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .m3-fast-path { grid-template-columns: 22px minmax(0, 1fr); }
+  .m3-fast-path > .m3-faint { grid-column: 2; }
+}
+.m3-fast-kvs { margin-top: 8px; }
+.m3-fast-roles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.m3-fast-role { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 8px 10px; border: 1px solid var(--m-line); border-radius: 8px; background: var(--m-cluster); font-size: var(--ix-xs); }
+.m3-fast-role > b { color: var(--m-strong); font-size: var(--ix-sm); font-weight: 600; }
+.m3-fast-peers { margin-top: 10px; }
+.mesh3.is-phone .m3-fast-roles { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+/* Port forwards: the list, and the editor's paired fields (one column on phones). */
+.m3-rows-forwards .m3-row { grid-template-columns: minmax(150px, 1fr) minmax(110px, .7fr) minmax(190px, 1.6fr) minmax(80px, .6fr) minmax(120px, 1fr) minmax(140px, 1.1fr); }
+.m3-rows > li[data-off] { opacity: .6; }
+.m3-fwd-run, .m3-fwd-allow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh3.is-phone .m3-fwd-run, .mesh3.is-phone .m3-fwd-allow { white-space: normal; }
+.m3-fwd-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 14px; }
+.m3-fwd-pair > .m3-field { align-content: start; }
+.m3-fwd.is-phone .m3-fwd-pair { grid-template-columns: minmax(0, 1fr); }
+.m3-ctl.m3-fwd-dest { flex-wrap: nowrap; align-items: center; }
+.instance-ui .m3-fwd-dest > input:not([type='checkbox']):not([type='radio']):not([type='file']) { flex: 1 1 auto; width: auto; min-width: 0; }
+.instance-ui .m3-fwd-dest > input.m3-short:not([type='checkbox']):not([type='radio']):not([type='file']) { flex: 0 0 90px; width: 90px; }
+.m3-fwd-sub { display: grid; gap: 4px; margin-top: 8px; }
+.m3-input.m3-fwd-nets { width: 100%; height: auto; min-height: 64px; padding: 6px 10px; line-height: 1.5; resize: vertical; }
+/* Phones: the entry and its port on the first line, where it goes on the next, its state last. */
+.mesh3.is-phone .m3-rows-forwards .m3-row::before { content: ''; order: 1; flex-basis: 100%; height: 0; }
+.mesh3.is-phone .m3-rows-forwards .m3-row > .m3-row-name { flex: 0 1 auto; }
+.mesh3.is-phone .m3-rows-forwards .m3-row > :nth-child(2) { margin-left: 0; }
+.mesh3.is-phone .m3-rows-forwards .m3-row > :nth-child(n+3) { order: 2; }
+.mesh3.is-phone .m3-rows-forwards .m3-row > .m3-row-conn { flex: 0 1 auto; margin-left: 0; }
+.mesh3.is-phone .m3-rows-forwards .m3-row > .m3-fwd-run { flex-basis: 100%; }

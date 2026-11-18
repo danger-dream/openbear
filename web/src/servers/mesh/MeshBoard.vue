@@ -6,7 +6,7 @@ import { ElMessage } from 'element-plus';
 import { ArrowUpRight, Boxes, Cable, CornerDownRight, LayoutGrid, Link2, Maximize, Minus, MousePointer2, Network, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, ShieldCheck, Undo2, X } from '@lucide/vue';
 import { flag, regionName } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
-import { directPeers, install, layout, loadPeers, mesh, meshError, meshErrorText, place, removeFromMesh, ruleHover, save, saveLayout, summaryPeers } from './meshStore.js';
+import { directPeers, install, layout, loadPeers, mesh, meshError, meshErrorText, place, reloadDraft, removeFromMesh, ruleHover, save, saveLayout, summaryPeers } from './meshStore.js';
 import { ALERT_BADGES, codeText, directLabel, directLive, directReason, errorMessage, errorsUnder, HOP_VIA, isPunched, isRelay, isSite, LINK_STATES, msText, nameOf, needsPunch, nodeAlerts, nodeState,
   LINE_STATES, lineOf, lossText, MISSING_TEXT, PROGRESS, progressOf, protoText, reachOf, relayInUse, relayMetric, routedLinks, rtt, ruleSentence, sameExit, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningsUnder } from './meshHelpers.js';
 import { addLink, alignTo, avoidBend, customRelayLinks, DRAG_TYPE, drawnRule, edgeGeometry, entryHow, entryLook, legendText, lineIdOf, linkKindLabel, nextSlot, pathEdges, phoneLayout, planLink, punchedRelayLink, relayPairs, ruleEnds, ruleNodes, SNAP_PX,
@@ -148,7 +148,7 @@ const nodeLooks = computed(() => {
     const [tone, label] = nodeState(data.value, m.serverId);
     const reach = reachOf(data.value, m.serverId), verdict = verdictBadge(reach), alerts = m.removing ? [] : nodeAlerts(data.value, m, members.value, null, work.value);
     const alert = alerts[0] ? (ALERT_BADGES[alerts[0].code] || ['bad', codeText(alerts[0].code) || alerts[0].code]) : null;
-    out.set(m.serverId, reuse(lookCache, next, m.serverId, {name: m.name, flag: flag(regionOf(m.serverId)), address: m.address, relay: isRelay(m), site: isSite(m), gateway: Boolean(m.gateway), subnets: m.gateway?.subnets || [],
+    out.set(m.serverId, reuse(lookCache, next, m.serverId, {name: m.name, flag: flag(regionOf(m.serverId)), address: m.address, relay: isRelay(m), site: isSite(m), noTransit: isRelay(m) && Boolean(m.noTransit), gateway: Boolean(m.gateway), subnets: m.gateway?.subnets || [],
         tone, title: `${m.name} · ${label}`, rtt: isRelay(m) ? '' : rtt(data.value?.nodes?.[m.serverId]?.summary), badge: badgeOf(m), removing: m.removing,
         reach: verdict && !m.removing ? [...verdict, `可达性：${verdict[1]}。${VERDICT_NOTES[reach.verdict] || VERDICT_NOTES.unknown}`] : null,
         alert: alert ? [alert[0], alert[1], alerts.map(a => a.text).join('\n')] : null,
@@ -1257,7 +1257,8 @@ defineExpose({select, join, fit});
       </div>
       <!-- Under the canvas: it grows and shrinks from the bottom, so the nodes never jump. -->
       <MeshChanges @apply="emit('apply')" @member="id => select({kind: 'node', id})" />
-      <p v-if="mesh.error" role="alert" class="instance-error mesh-error">{{ mesh.error }}</p>
+      <p v-if="mesh.error" role="alert" class="instance-error mesh-error">{{ mesh.error }}
+        <button v-if="mesh.conflict" type="button" class="ix-text-button" @click="reloadDraft">载入最新草稿</button></p>
       <p v-if="mesh.loadError" role="status" class="instance-muted mesh-error">暂时读不到最新状态（{{ mesh.loadError }}），稍后自动重试。</p>
     </section>
 

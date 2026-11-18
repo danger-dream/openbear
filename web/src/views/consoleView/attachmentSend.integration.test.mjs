@@ -52,7 +52,7 @@ function harness() {
     scrollBottom:async()=>{}, ensureLocalRunDefaults:async()=>{throw Error('persisted conversation must not create new one');}, forgetLocalDraftChoices:noop, extensionDraft, forgetExtensionDraft, updatePromptSuggestions:noop,
     Api:{uploadConversationFiles:(uuid, files, options)=>{uploads.push({uuid,files,options}); return upload.promise;}},
     attachmentDrafts:{removeItems:async()=>true}, emit:noop,
-    closeWs:noop, clearUiCaches:noop, resetOperationStore:noop, resetAgentAutoOpenBoundary:noop, resetTransientThinking:noop,
+    closeWs:noop, clearUiCaches:noop, resetOperationStore:noop, resetAgentAutoOpenBoundary:noop, leaveLocalDraft:noop, resetTransientThinking:noop,
     stashAttachmentsForConversation:null, releaseSentAttachments:noop, restoreReleasedAttachments:noop, queueSentAttachmentPreviewRevokes:noop,
     clearDraftForConversation:noop, migrateAttachmentDraft:noop, releaseStashedAttachments:noop,
     restoreAttachmentsForConversation:async uuid=>{

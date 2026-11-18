@@ -15,7 +15,7 @@ class Spaceship(Provider):
     tier = 'A'
     fields = (Field('key', 'API Key', hint='在 API Manager 创建，权限勾选 dnsrecords:read 和 dnsrecords:write（列域名需 domains:read）'),
               Field('secret', 'API Secret', 'password'))
-    caps = Caps(by_id=False, ttl_min=60, ttl_max=3600)
+    caps = Caps(by_id=False, ttl_min=60, ttl_max=3600, staged_update=True)
     docs = 'https://www.spaceship.com/application/api-manager/'
     endpoint = 'https://spaceship.dev/api'
 

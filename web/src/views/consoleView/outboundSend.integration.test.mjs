@@ -91,7 +91,7 @@ function harness({local = false, halfOpenFirst = false, createConversation} = {}
     isLocalConversation: {get value() {return props.conversationUuid.startsWith("local:");}},
     localToServerTransitionUuid: {value: ""}, terminalStateRefreshScheduler: {invalidate: noop}, cancelScheduledUiWork: noop,
     runConfigOverride: {value:null}, activeTurnIndex: {value:0},
-    resetAgentAutoOpenBoundary: noop, clearUiCaches: noop, resetOperationStore: noop,
+    resetAgentAutoOpenBoundary: noop, leaveLocalDraft: noop, clearUiCaches: noop, resetOperationStore: noop,
     restoreDraftForConversation: (uuid) => {context.draft.value = context.draftByConversation.value[uuid] || '';},
     focusComposer: async () => {},
     conversationWsUrl: (uuid) => `ws://test.invalid/${uuid}`,
@@ -662,4 +662,70 @@ test('C03: both send entry points wait for hydration instead of sending a partia
   assert.equal(h.run('canSend.value'), false);
   await h.run('send()'); assert.equal(h.sends().length, 0);
   assert.equal(h.context.draft.value, 'original message');
+});
+
+function personaControls(h, {saving, local = false} = {}) {
+  const c = h.context;
+  Object.assign(c, {
+    propertyPersistence: null, promptTemplateSaving: {value: false}, promptTemplateLocked: {value: false},
+    modelMutationCounts: {value: new Map()}, modelMutationKey: () => c.props.conversationUuid,
+    normalizePromptTemplate: value => String(value), isRunConfigInteractionCurrent: () => true,
+    patchLocalRunDefaults: async patch => {await saving; c.savedPersona = patch.promptTemplate;},
+    runConfigSaves: {enqueue: async (_uuid, request) => {await request(); c.savedPersona = '7';}},
+  });
+  c.Api.conversationSetPromptTemplate = () => saving;
+  c.modelMutating = {get value() {return Boolean(c.modelMutationCounts.value.get(c.props.conversationUuid));}};
+  vm.runInContext(between('function beginModelMutation(', 'async function selectContextStrategy(')
+    + between('async function selectPromptTemplate(', 'async function compactContext('), c);
+}
+
+for (const local of [false, true]) test(`persona save gates actual first send (local=${local})`, async () => {
+  let release;
+  const saving = new Promise(resolve => {release = resolve;});
+  const h = harness({local});
+  personaControls(h, {saving, local});
+  const selecting = h.run("selectPromptTemplate('7')");
+  await flush();
+  assert.equal(h.run('canSend.value'), false);
+  assert.equal(await h.run('send()'), false);
+  assert.equal(h.sends().length, 0);
+  assert.equal(h.context.draft.value, 'original message');
+  release(); await selecting;
+  assert.equal(h.context.savedPersona, '7');
+  assert.equal(h.run('canSend.value'), true);
+  assert.equal(await h.run('send()'), true);
+  assert.equal(h.sends().length, 1);
+});
+
+test('a draft persona cannot change after first send has captured its creation config', async () => {
+  let release;
+  const creating = new Promise(resolve => {release = resolve;});
+  const h = harness({local: true, createConversation: () => creating});
+  personaControls(h, {saving: Promise.resolve()});
+  const sending = h.run('send()');
+  await flush();
+  await h.run("selectPromptTemplate('7')");
+  assert.equal(h.context.savedPersona, undefined);
+  release({conversation: {conversationUuid: 'conv-created'}});
+  await sending;
+  assert.equal(h.sends().length, 1);
+});
+
+test('persona save failure releases the send gate without clearing the draft', async () => {
+  const h = harness();
+  personaControls(h, {saving: Promise.reject(new Error('offline'))});
+  await h.run("selectPromptTemplate('7')");
+  assert.equal(h.run('modelMutating.value'), false);
+  assert.equal(h.context.draft.value, 'original message');
+  assert.equal(h.sends().length, 0);
+  assert.match(h.warnings.at(-1), /offline/);
+});
+
+test('saving a draft as a real conversation also closes the persona selection boundary', async () => {
+  const h = harness({local: true});
+  personaControls(h, {saving: Promise.resolve()});
+  h.context.propertyPersistence = new Promise(() => {});
+  await h.run("selectPromptTemplate('7')");
+  assert.equal(h.context.savedPersona, undefined);
+  assert.equal(h.context.promptTemplateSaving.value, false);
 });

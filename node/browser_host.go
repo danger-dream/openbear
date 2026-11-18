@@ -12,8 +12,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"openbear/node/browser"
@@ -39,14 +41,15 @@ var (
 
 // launched is a browser this node started.
 type launched struct {
-	transport browser.Transport // pipe mode
-	endpoint  string            // port mode: the browser's ws:// address
-	downloads string            // where the browser saves files, readable by the node
-	headless  bool
-	reused    bool // left running by an earlier node process
-	stop      func()
-	done      <-chan struct{} // closed when the process exits
-	output    func() string   // the end of the browser's stderr, when captured
+	transport  browser.Transport // pipe mode
+	endpoint   string            // port mode: the browser's ws:// address
+	downloads  string            // where the browser saves files, readable by the node
+	headless   bool
+	reused     bool   // left running by an earlier node process
+	executable string // actual executable, if the surviving instance was identified
+	stop       func()
+	done       <-chan struct{} // closed when the process exits
+	output     func() string   // the end of the browser's stderr, when captured
 }
 
 // reusedBrowser is a window an earlier node process left on a desktop. This
@@ -67,6 +70,11 @@ func reusedBrowser(address, profile, downloads string) *launched {
 	}}
 }
 
+// Only macOS desktop windows can survive without a host/pipe attachment.
+// Probing never launches or closes a browser.
+var findLegacyBrowser = func(context.Context, string) (*launched, error) { return nil, nil }
+var launchLocalBrowser = launchBrowser
+
 // profileLocked tells whether a browser still holds the profile: Windows
 // keeps a delete-on-close lockfile, macOS and Linux a SingletonLock link.
 func profileLocked(profile string) bool {
@@ -78,6 +86,53 @@ func profileLocked(profile string) bool {
 	return false
 }
 
+// legacyBrowserEndpoint probes a macOS desktop profile without changing it. A
+// local SingletonLock whose PID is definitely gone is crash debris, not a live
+// browser. Chrome's normal startup owns recovery of that stale singleton; never
+// kill a process or clear a profile merely because its DevTools endpoint failed.
+// The probes are parameters so recovery can be tested without a desktop/process.
+func legacyBrowserEndpoint(profile, hostname string, processProbe func(int) error, endpointProbe func(string) (string, error)) (string, int, error) {
+	pid := 0
+	lock, err := os.Readlink(filepath.Join(profile, "SingletonLock"))
+	if err == nil {
+		i := strings.LastIndexByte(lock, '-')
+		if i <= 0 || hostname == "" || lock[:i] != hostname {
+			return "", 0, errors.New("browser_legacy_identity_unverified")
+		}
+		pid, err = strconv.Atoi(lock[i+1:])
+		if err != nil || pid <= 1 {
+			return "", 0, errors.New("browser_legacy_identity_unverified")
+		}
+		if err = processProbe(pid); errors.Is(err, syscall.ESRCH) {
+			// No mutation here: even an update-only discovery remains read-only.
+			return "", 0, nil
+		} else if err != nil && !errors.Is(err, syscall.EPERM) {
+			return "", 0, errors.New("browser_legacy_identity_unverified")
+		}
+	} else if !os.IsNotExist(err) {
+		return "", 0, errors.New("browser_legacy_identity_unverified")
+	}
+	address := readDevToolsPort(profile)
+	if address == "" {
+		if pid != 0 || profileLocked(profile) {
+			return "", 0, errors.New("browser_legacy_unreachable")
+		}
+		return "", 0, nil
+	}
+	actual, err := endpointProbe("http://" + strings.TrimPrefix(strings.Split(address, "/devtools/")[0], "ws://"))
+	if err != nil {
+		if pid != 0 || profileLocked(profile) {
+			return "", 0, errors.New("browser_legacy_unreachable")
+		}
+		return "", 0, nil
+	}
+	// A recycled port, or a window without a verified local lock, is not ours.
+	if actual != address || pid == 0 {
+		return "", 0, errors.New("browser_legacy_identity_unverified")
+	}
+	return address, pid, nil
+}
+
 // browserHost owns the engine and the browser behind Capabilities.Browser. It
 // outlives controller sessions so pages and logins survive reconnects.
 type browserHost struct {
@@ -85,26 +140,29 @@ type browserHost struct {
 	dir   string
 	slots chan struct{}
 
-	mu             sync.Mutex
-	engine         *browser.Engine
-	launch         *launched
-	epoch          string
-	state          string // stopped, installing, starting, ready, failed
-	source         string // system, download, endpoint
-	product        string
-	headless       bool
-	err            string
-	progress       int64
-	starting       chan struct{}
-	stopping       chan struct{}
-	generation     uint64
-	startCancel    context.CancelFunc
-	downloadCancel context.CancelFunc
-	downloading    chan struct{}
-	update         map[string]any // the last update of the downloaded Chrome, as browser.status shows it
-	updating       bool
-	updateCancel   context.CancelFunc
-	updateDone     chan struct{}
+	mu                sync.Mutex
+	engine            *browser.Engine
+	launch            *launched
+	epoch             string
+	state             string // stopped, installing, starting, ready, failed
+	source            string // actual running source: system, download, endpoint, unknown
+	product           string
+	runningExecutable string
+	selectedSource    string
+	restartNeeded     bool
+	headless          bool
+	err               string
+	progress          int64
+	starting          chan struct{}
+	stopping          chan struct{}
+	generation        uint64
+	startCancel       context.CancelFunc
+	downloadCancel    context.CancelFunc
+	downloading       chan struct{}
+	update            map[string]any // the last update of the downloaded Chrome, as browser.status shows it
+	updating          bool
+	updateCancel      context.CancelFunc
+	updateDone        chan struct{}
 }
 
 func (a *Agent) browserHost() *browserHost {
@@ -122,6 +180,11 @@ func (h *browserHost) statusLocked() map[string]any {
 	c := h.agent.config()
 	out := map[string]any{"enabled": c.Capabilities.Browser, "state": h.state, "source": h.source, "product": h.product,
 		"headless": h.headless, "epoch": h.epoch, "endpoint": c.Browser.Endpoint, "download": c.Browser.Download}
+	out["runningVersion"], out["runningSource"] = h.product, h.source
+	out["runningExecutable"], out["selectedSource"] = h.runningExecutable, h.selectedSource
+	out["runningVerified"] = h.engine != nil && h.engine.Connected() && h.source != "unknown"
+	installed := installedChrome(h.dir)
+	out["restartNeeded"] = h.needsRestartLocked(installed)
 	if c.Browser.Endpoint != "" && !loopbackEndpoint(c.Browser.Endpoint) {
 		// Files it saves are on its own machine; the node cannot hand them over.
 		out["downloadsUnavailable"] = true
@@ -132,8 +195,9 @@ func (h *browserHost) statusLocked() map[string]any {
 	if h.state == "installing" {
 		out["downloaded"] = h.progress
 	}
-	if version := installedChrome(h.dir); version != "" {
-		out["chromeVersion"] = version
+	if installed != "" {
+		out["chromeVersion"] = installed
+		out["installedVersion"] = installed
 	}
 	if h.update != nil {
 		update := map[string]any{}
@@ -145,18 +209,57 @@ func (h *browserHost) statusLocked() map[string]any {
 	return out
 }
 
+// Installation can finish while the old engine stays attached. Derive the
+// version part on every status read rather than freezing it at browser startup.
+func (h *browserHost) needsRestartLocked(installed string) bool {
+	if h.restartNeeded {
+		return true // selected source differs, or an unattached legacy window
+	}
+	if h.engine == nil || h.source != "download" || installed == "" {
+		return false
+	}
+	version := strings.TrimPrefix(strings.TrimPrefix(h.product, "HeadlessChrome/"), "Chrome/")
+	return version != installed
+}
+
 func (h *browserHost) status() map[string]any {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.state == "ready" && h.engine != nil && !h.engine.Connected() {
+		// Read only the existing transport. No ensure/discovery/launch on status.
+		h.state, h.err = "stopped", "connection to the browser was lost"
+		h.product, h.source, h.runningExecutable = "", "", ""
+		h.restartNeeded = false
+	}
 	return h.statusLocked()
 }
 
 // ensure starts or attaches the browser when needed. A browser still being
 // downloaded is reported, not waited for: the download can take minutes.
+type browserIntent struct {
+	generation uint64
+	config     BrowserConfig
+	enabled    bool
+}
+
+func (h *browserHost) intentLocked() browserIntent {
+	c := h.agent.config()
+	return browserIntent{h.generation, c.Browser, c.Capabilities.Browser}
+}
+func (h *browserHost) matchesLocked(intent *browserIntent) bool {
+	return intent == nil || *intent == h.intentLocked()
+}
 func (h *browserHost) ensure(ctx context.Context) (map[string]any, error) {
+	return h.ensureIntent(ctx, nil)
+}
+func (h *browserHost) ensureIntent(ctx context.Context, intent *browserIntent) (map[string]any, error) {
 	for {
 		h.mu.Lock()
 		c := h.agent.config()
+		if !h.matchesLocked(intent) {
+			h.mu.Unlock()
+			return nil, errors.New("browser_configuration_changed")
+		}
 		if !c.Capabilities.Browser {
 			defer h.mu.Unlock()
 			return h.statusLocked(), nil
@@ -170,7 +273,7 @@ func (h *browserHost) ensure(ctx context.Context) (map[string]any, error) {
 				return nil, ctx.Err()
 			}
 		}
-		if h.state == "ready" && h.engine != nil && !h.engine.Connected() {
+		if h.engine != nil && !h.engine.Connected() {
 			// An attached browser that went away (closed window, restarted
 			// endpoint) is attached again rather than reported ready.
 			engine := h.engine
@@ -232,7 +335,7 @@ func (h *browserHost) start(ctx context.Context, c Config, generation uint64) er
 	var l *launched
 	init := map[string]any{"connectTimeoutS": 15, "snapshotMaxChars": 12000, "maxEventEntries": 200,
 		"maxBodyBytes": 2 << 20, "maxArtifactBytes": 32 << 20}
-	source := "endpoint"
+	source, selectedExe := "endpoint", ""
 	if c.Browser.Endpoint != "" {
 		address, err := devtoolsAddress(ctx, c.Browser.Endpoint)
 		if err != nil {
@@ -252,8 +355,8 @@ func (h *browserHost) start(ctx context.Context, c Config, generation uint64) er
 			h.download(generation)
 			return errors.New("browser_installing")
 		}
-		source = found
-		if l, err = launchBrowser(ctx, exe, h.dir); err != nil {
+		source, selectedExe = found, exe
+		if l, err = launchLocalBrowser(ctx, exe, h.dir); err != nil {
 			return err
 		}
 		if l.transport != nil {
@@ -269,7 +372,7 @@ func (h *browserHost) start(ctx context.Context, c Config, generation uint64) er
 		defer stop()
 	}
 	if _, err := engine.Execute(ctx, "initialize", raw); err != nil {
-		closeBrowserEngine(engine, l)
+		abandonBrowserStart(engine, l)
 		if l != nil {
 			// What the browser printed, such as a sandbox or library failure.
 			if l.output != nil {
@@ -289,8 +392,14 @@ func (h *browserHost) start(ctx context.Context, c Config, generation uint64) er
 	h.mu.Lock()
 	if generation != h.generation || ctx.Err() != nil {
 		h.mu.Unlock()
-		closeBrowserEngine(engine, l)
+		abandonBrowserStart(engine, l)
 		return context.Canceled
+	}
+	h.selectedSource, h.runningExecutable, h.restartNeeded = source, selectedExe, false
+	if l != nil && l.reused {
+		h.runningExecutable = l.executable
+		source = h.executableSource(l.executable)
+		h.restartNeeded = l.executable == "" || filepath.Clean(l.executable) != filepath.Clean(selectedExe)
 	}
 	h.engine, h.launch, h.epoch = engine, l, randomHex(8)
 	h.state, h.source, h.product, h.headless, h.err = "ready", source, product, l != nil && l.headless, ""
@@ -305,6 +414,17 @@ func (h *browserHost) start(ctx context.Context, c Config, generation uint64) er
 	return nil
 }
 
+func (h *browserHost) executableSource(exe string) string {
+	if exe == "" {
+		return "unknown"
+	}
+	rel, err := filepath.Rel(h.dir, exe)
+	if err == nil && h.within(h.dir, exe) && strings.HasPrefix(strings.SplitN(rel, string(os.PathSeparator), 2)[0], "chrome-") {
+		return "download"
+	}
+	return "system"
+}
+
 // drop forgets an engine whose browser went away; the next call starts again.
 func (h *browserHost) drop(engine *browser.Engine, why string) {
 	h.mu.Lock()
@@ -314,6 +434,8 @@ func (h *browserHost) drop(engine *browser.Engine, why string) {
 	}
 	l := h.launch
 	h.engine, h.launch, h.state, h.err = nil, nil, "stopped", why
+	h.product, h.source, h.runningExecutable = "", "", ""
+	h.restartNeeded = false
 	h.stopping = make(chan struct{})
 	h.mu.Unlock()
 	h.finishStop(engine, l)
@@ -325,6 +447,14 @@ func (h *browserHost) finishStop(engine *browser.Engine, l *launched) {
 	close(h.stopping)
 	h.stopping = nil
 	h.mu.Unlock()
+}
+
+func abandonBrowserStart(engine *browser.Engine, l *launched) {
+	if l != nil && l.reused {
+		engine.Close()
+		return
+	}
+	closeBrowserEngine(engine, l)
 }
 
 func closeBrowserEngine(engine *browser.Engine, l *launched) {
@@ -358,9 +488,18 @@ func (h *browserHost) reused() bool {
 	return h.launch != nil && h.launch.reused
 }
 
-func (h *browserHost) stop() {
+func (h *browserHost) stop() { h.stopIntent(nil) }
+
+func (h *browserHost) stopIntent(intent *browserIntent) bool {
 	h.mu.Lock()
+	if !h.matchesLocked(intent) {
+		h.mu.Unlock()
+		return false
+	}
 	h.generation++
+	if intent != nil {
+		intent.generation = h.generation
+	}
 	if h.startCancel != nil {
 		h.startCancel()
 	}
@@ -368,10 +507,12 @@ func (h *browserHost) stop() {
 		h.downloadCancel()
 	}
 	h.state, h.err = "stopped", ""
+	h.product, h.source, h.runningExecutable = "", "", ""
+	h.restartNeeded = false
 	if wait := h.stopping; wait != nil {
 		h.mu.Unlock()
 		<-wait
-		return
+		return true
 	}
 	engine, l := h.engine, h.launch
 	h.engine, h.launch = nil, nil
@@ -382,6 +523,7 @@ func (h *browserHost) stop() {
 	if engine != nil {
 		h.finishStop(engine, l)
 	}
+	return true
 }
 
 func (h *browserHost) current() (*browser.Engine, string) {
@@ -488,6 +630,7 @@ func (h *browserHost) updateChrome(ctx context.Context, raw json.RawMessage) (an
 	}
 	h.mu.Lock()
 	busy := h.downloading != nil || h.updating
+	intent := h.intentLocked() // authorization belongs to the request's configuration
 	h.mu.Unlock()
 	if busy {
 		return nil, errors.New("browser_installing")
@@ -516,12 +659,12 @@ func (h *browserHost) updateChrome(ctx context.Context, raw json.RawMessage) (an
 	h.updateCancel, h.updateDone = cancel, make(chan struct{})
 	h.update = map[string]any{"state": "downloading", "version": version, "from": current, "downloaded": int64(0)}
 	h.mu.Unlock()
-	go h.installUpdate(updateCtx, version, link, p.Restart)
+	go h.installUpdate(updateCtx, version, link, p.Restart, intent)
 	out["started"] = true
 	return out, nil
 }
 
-func (h *browserHost) installUpdate(ctx context.Context, version, link string, restart bool) {
+func (h *browserHost) installUpdate(ctx context.Context, version, link string, restart bool, intent browserIntent) {
 	h.mu.Lock()
 	cancel, done := h.updateCancel, h.updateDone
 	h.mu.Unlock()
@@ -541,7 +684,23 @@ func (h *browserHost) installUpdate(ctx context.Context, version, link string, r
 		h.agent.Logger.Printf("browser update to %s failed: %v", version, err)
 		return
 	}
-	running := h.engine != nil && h.source == "download" || h.starting != nil
+	// Probe a surviving desktop window even when no engine has attached yet.
+	// This discovers only; it must not launch or close anything without restart.
+	probe := h.engine == nil && intent.config.Endpoint == "" && h.matchesLocked(&intent)
+	h.mu.Unlock()
+	var legacy *launched
+	var probeErr error
+	if probe {
+		legacy, probeErr = findLegacyBrowser(ctx, h.dir)
+	}
+	h.mu.Lock()
+	running := h.engine != nil && (h.source == "download" || h.source == "unknown") || h.starting != nil || legacy != nil || probeErr != nil
+	if !h.matchesLocked(&intent) {
+		h.update = map[string]any{"state": "done", "version": version, "restartNeeded": false, "configurationChanged": true}
+		h.updating = false
+		h.mu.Unlock()
+		return
+	}
 	if !running {
 		// A desktop browser can survive the node process. Only an explicit restart
 		// lets us discard old versions without breaking that browser's resources.
@@ -550,20 +709,24 @@ func (h *browserHost) installUpdate(ctx context.Context, version, link string, r
 		h.mu.Unlock()
 		return
 	}
-	h.update = map[string]any{"state": "done", "version": version, "restartNeeded": true}
-	if !restart {
+	// A discovered but unattached window (or an unresolved probe) still needs an
+	// explicit restart. Attached downloads are compared to the installed version.
+	if h.engine == nil && (legacy != nil || probeErr != nil) {
+		h.restartNeeded = true
+	}
+	needed := h.needsRestartLocked(version) || h.starting != nil
+	h.update = map[string]any{"state": "done", "version": version, "restartNeeded": needed}
+	if probeErr != nil {
+		h.update["error"] = probeErr.Error()
+	}
+	if !restart || !needed || probeErr != nil {
 		h.updating = false
 		h.mu.Unlock()
 		return
 	}
 	h.update["state"] = "restarting"
 	h.mu.Unlock()
-	h.stop()
-	status, startErr := h.ensure(ctx)
-	if startErr == nil && h.reused() {
-		h.stop()
-		status, startErr = h.ensure(ctx)
-	}
+	status, startErr := h.restartIntent(ctx, &intent)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.updating = false
@@ -572,10 +735,34 @@ func (h *browserHost) installUpdate(ctx context.Context, version, link string, r
 		h.update["error"] = startErr.Error()
 	} else if status["state"] != "ready" {
 		h.update["error"] = status["error"]
-	} else {
+	} else if h.matchesLocked(&intent) {
 		h.update["restartNeeded"] = false
-		pruneChrome(h.dir)
+		h.restartNeeded = false
+		if h.source == "download" {
+			pruneChrome(h.dir)
+		}
 	}
+}
+
+// Each destructive step and start reservation must still belong to this intent.
+func (h *browserHost) restartIntent(ctx context.Context, intent *browserIntent) (map[string]any, error) {
+	if !h.stopIntent(intent) {
+		return nil, errors.New("browser_configuration_changed")
+	}
+	status, err := h.ensureIntent(ctx, intent)
+	if err == nil && h.reused() {
+		if !h.stopIntent(intent) {
+			return nil, errors.New("browser_configuration_changed")
+		}
+		status, err = h.ensureIntent(ctx, intent)
+		if err == nil && h.reused() {
+			return status, errors.New("browser_restart_not_applied")
+		}
+	}
+	if err == nil && status["state"] == "ready" && status["restartNeeded"] == true {
+		return status, errors.New("browser_restart_not_applied")
+	}
+	return status, err
 }
 
 func (h *browserHost) cancelUpdate() {
@@ -593,7 +780,7 @@ func (h *browserHost) cancelUpdate() {
 func (h *browserHost) chromeRestarted() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.updating || h.downloading != nil || h.source != "download" {
+	if h.updating || h.downloading != nil || h.source != "download" || h.needsRestartLocked(installedChrome(h.dir)) || h.launch != nil && h.launch.reused {
 		return
 	}
 	if h.update != nil && h.update["state"] == "done" {

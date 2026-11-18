@@ -455,7 +455,7 @@ func TestRoutingNetnsFaults(t *testing.T) {
 			time.Sleep(time.Until(start.Add(30 * time.Second)))
 			l.netem(k, "")
 			return time.Now()
-		}, 45 * time.Second},
+		}, 55 * time.Second},
 		{"flap", func(l *rtLab, k *rtLink, start time.Time) time.Time {
 			for i := 0; i < 30; i += 4 {
 				if (i/4)%2 == 0 {
@@ -474,7 +474,7 @@ func TestRoutingNetnsFaults(t *testing.T) {
 			time.Sleep(time.Until(start.Add(40 * time.Second)))
 			l.netem(k, "")
 			return time.Now()
-		}, 60 * time.Second},
+		}, 120 * time.Second},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			l := newRTLab(t, []string{"H", "T", "S", "L"},
@@ -535,24 +535,29 @@ func TestRoutingNetnsFaults(t *testing.T) {
 					t.Errorf("%s dropped %d packets for their TTL", id, n)
 				}
 			}
-			if !slices.Equal(after.Path, []string{"H", "T"}) || r.back < 0 {
-				t.Fatalf("not back on the direct path: %v", after.Path)
-			}
+			back := slices.Equal(after.Path, []string{"H", "T"}) && r.back >= 0
+			detour := slices.Equal(after.Path, []string{"H", "S", "T"})
+			// The link is held down for a while once back (routing's
+			// probationBase, 30 s, doubled for each further down in 10
+			// minutes): later back than sim.py's result.txt.
 			switch c.name {
 			case "outage":
-				// result.txt: 2 switches, 3 s lost, away at +3 s, back at +13 s.
-				if switches != 2 || r.detour < 0 || r.detour > 5*time.Second || r.lost > 5*time.Second || r.back > 30*time.Second {
-					t.Fatalf("outage: %d switches, %s", switches, r)
+				// result.txt: 2 switches, 3 s lost, away at +3 s, back at +13 s;
+				// here back at about +35 s, its hold and the 5 s rule.
+				if !back || switches != 2 || r.detour < 0 || r.detour > 5*time.Second || r.lost > 5*time.Second || r.back > 45*time.Second {
+					t.Fatalf("outage: on %v, %d switches, %s", after.Path, switches, r)
 				}
 			case "flap":
-				// result.txt: 2 switches, 3 s lost, back at +63 s.
-				if switches > 2 {
-					t.Fatalf("flap: %d switches, %s", switches, r)
+				// result.txt: 2 switches, 3 s lost, back at +63 s; here four downs
+				// in 30 s hold the link 240 s after the last: one detour, kept.
+				if back || !detour || switches != 1 || r.lost > 5*time.Second {
+					t.Fatalf("flap: on %v, %d switches, %s", after.Path, switches, r)
 				}
 			case "degrade":
-				// result.txt: 2 switches, 4 s lost, away at +11 s, back at +8 s.
-				if switches > 2 || r.detour < 0 || r.detour > 40*time.Second {
-					t.Fatalf("degrade: %d switches, %s", switches, r)
+				// result.txt: 2 switches, 4 s lost, away at +11 s, back at +8 s;
+				// here back once the link is no longer held, if it went down.
+				if !back && !detour || switches > 2 || r.detour < 0 || r.detour > 40*time.Second {
+					t.Fatalf("degrade: on %v, %d switches, %s", after.Path, switches, r)
 				}
 			}
 		})
@@ -622,7 +627,9 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 	l.netem(l.link("C", "D"), "")
 	phase("C-D back", 0)
 	// The flapping suppressed C-D; until it is reused (penalty below 750,
-	// about a minute) A would have no path through D.
+	// about a minute) A would have no path through D. Then it is still held
+	// down for minutes after its downs (probationBase), but let up at once
+	// when D is reachable no other way, as once A-B and A-C are cut.
 	linkUp := func(a, b string) bool {
 		s := l.status(a)
 		if s.Routing == nil {
@@ -630,7 +637,7 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 		}
 		for _, k := range s.Routing.Links {
 			if k.Peer == b {
-				return k.State == "up"
+				return k.State == "up" || k.HeldMs > 0 && k.State == "down"
 			}
 		}
 		return false

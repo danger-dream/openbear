@@ -7,8 +7,15 @@
 !README.md
 !app/
 !app/**
-!prompts/
+# File exceptions, not directory exceptions (which also include descendants).
 !prompts/*.tpl
+!prompts/guides/*.md
+!prompts/collab-member.md
+!prompts/personas/manifest.json
+!prompts/personas/*.tpl
+prompts/*.tpl/*
+prompts/guides/*/*
+prompts/personas/*/*
 !web/
 !web/src/
 !web/src/**

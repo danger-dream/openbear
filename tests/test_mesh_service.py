@@ -35,11 +35,13 @@ class Nodes:
     def __init__(self, e):
         self.e, self.calls, self.configs, self.fail, self.refuse, self.tls, self.local = e, [], {}, {}, {}, {}, {}
         self.builds, self.upgrade_errors, self.upgrades, self.gate = {}, {}, [], None
+        self.versions = {}  # dataVersion per node; a node left out says 1.0.0
         self.install_gates, self.install_errors = {}, {}
         self.addresses = {}  # localAddresses per node; a node left out sends none, as an older one would
         self.routes = {}  # hostRoutes per node, the same way
         self.schemas = {}  # configSchemas per node in mesh.status; a node left out says this controller's, as a current one would
         self.status_gates = {}  # mesh.status waits on these, failing as the hub does once its timeout passes
+        self.applied_errors = {}  # the error a node's status shows as it applies a revision, running it
 
     async def call(self, server_id, method, params, timeout):
         if server_id not in self.e.servers.hub.sessions:
@@ -52,13 +54,14 @@ class Nodes:
                 return {'ok': False, 'error': self.install_errors[server_id]}
             platform = self.e.servers.hub.sessions[server_id].info['platform']
             return {'ok': True, 'result': {'publicKey': (server_id[:8] + 'wg').ljust(43, 'A') + '=', 'controlKey': (server_id[:8] + 'c').ljust(43, 'B') + '=',
-                                           **self._security_keys(server_id), 'platform': platform, 'dataVersion': '1.0.0', 'localPrefixes': self.local.get(server_id, []),
+                                           **self._security_keys(server_id), 'platform': platform, 'dataVersion': self.versions.get(server_id, '1.0.0'),
+                                           'localPrefixes': self.local.get(server_id, []),
                                            **self._addresses(server_id)}}
         if method == 'mesh.status':
             if server_id in self.status_gates:
                 await asyncio.wait_for(self.status_gates[server_id].wait(), timeout)
             return {'ok': True, 'result': {'installed': True, 'service': 'running', 'localPrefixes': self.local.get(server_id, []),
-                                           'dataVersion': '1.0.0', 'dataBuild': self.builds.get(server_id, ''), **self._addresses(server_id),
+                                           'dataVersion': self.versions.get(server_id, '1.0.0'), 'dataBuild': self.builds.get(server_id, ''), **self._addresses(server_id),
                                            **self._security_keys(server_id), 'configSchemas': self.schemas.get(server_id, list(compat.CONFIG_SCHEMA))}}
         if method == 'mesh.upgrade':
             self.upgrades.append(('start', server_id))
@@ -78,7 +81,7 @@ class Nodes:
             if server_id in self.fail:
                 return {'ok': True, 'result': {'appliedRevision': revision - 1, 'ready': False, 'error': self.fail[server_id]}}
             self.configs[server_id] = params['config']
-            return {'ok': True, 'result': {'appliedRevision': revision, 'ready': True, 'error': ''}}
+            return {'ok': True, 'result': {'appliedRevision': revision, 'ready': True, 'error': self.applied_errors.get(server_id, '')}}
         if method == 'mesh.tls':
             state = self.tls[server_id]
             if params.get('activate'):
@@ -101,7 +104,7 @@ class Nodes:
         return [sid for sid, m, _ in self.calls if m == method]
 
 
-async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('mesh',), online=True):
+async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('mesh', config_module.TUNING_FEATURE), online=True):
     sid = (await api(e, 'POST', '/api/servers', {'name': name}))['item']['id']
     info = {'platform': platform, 'ipv4': ipv4}
     async with e.db.write_transaction(label='test') as conn:
@@ -112,7 +115,7 @@ async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('m
     return sid
 
 
-async def connect(e, sid, info=None, *, exec_=True, features=('mesh',), build=''):
+async def connect(e, sid, info=None, *, exec_=True, features=('mesh', config_module.TUNING_FEATURE), build=''):
     row = await one(e.db.conn, 'SELECT info_json FROM server_nodes WHERE server_id=?', (sid,))
     info = info or json.loads(row['info_json'])['info']
     session = hub_module.Session(sid, FakeWS(), None, '127.0.0.1')
@@ -168,7 +171,7 @@ async def test_join_edit_apply_in_order_and_report_status(env, monkeypatch):  # 
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][1]['role'] = 'relay'
     draft['members'][2]['role'] = 'relay'  # Windows
-    bad = await api(e, 'PUT', '/api/servers/mesh/draft', draft, status=400)
+    bad = await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']}, status=400)
     assert bad['error'] == 'mesh_invalid' and {'path': 'members[2].role', 'error': 'relay_requires_linux'}.items() <= bad['errors'][0].items()
     draft['members'][2]['role'] = 'member'
     for i in (0, 1):
@@ -177,7 +180,7 @@ async def test_join_edit_apply_in_order_and_report_status(env, monkeypatch):  # 
                                     'autoReturn': True}
     draft['members'][3]['entry'] = {'mode': 'fixed', 'candidates': [{'relay': ids['r2'], 'transport': 'udp'}], 'autoReturn': True}
     draft['rules'] = [{'src': {'prefixes': ['100.96.0.0/16']}, 'dst': {'members': [ids['m2']]}, 'proto': 'icmp'}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['members'][2]['entry']['candidates'][0]['id'] == 'c1' and saved['errors'] == []
 
     # Relays first, then the members; an offline one is marked and the rest go on.
@@ -237,7 +240,7 @@ async def test_join_edit_apply_in_order_and_report_status(env, monkeypatch):  # 
     # The path from the latest reports: m1 is on r1, which it reports a round trip to.
     path = await api(e, 'GET', f'/api/servers/mesh/path?src={ids["m1"]}&dst={ids["r1"]}')
     assert path == {'ok': True, 'hops': [{'node': ids['m1'], 'via': '', 'rttMs': None}, {'node': ids['r1'], 'via': 'entry', 'rttMs': 151.2}],
-                    'rttMs': 151.2, 'stale': False}
+                    'rttMs': 151.2, 'stale': False, 'tuning': config_module.default_routing()}
     # r1 reports no routes, so its configured next hop is taken; nobody reports the r1-r2 round trip.
     path = await api(e, 'GET', f'/api/servers/mesh/path?src={ids["m1"]}&dst={ids["r2"]}')
     assert [h['node'] for h in path['hops']] == [ids['m1'], ids['r1'], ids['r2']] and path['stale'] and path['rttMs'] is None
@@ -245,8 +248,8 @@ async def test_join_edit_apply_in_order_and_report_status(env, monkeypatch):  # 
     assert (await api(e, 'GET', f'/api/servers/mesh/path?src={ids["m1"]}&dst={ids["m1"]}', status=400))['error'] == 'invalid_mesh_path'
     # The best paths: m1 enters r1 alone, and nothing reports a link beyond it.
     best = await api(e, 'GET', f'/api/servers/mesh/path/options?src={ids["m1"]}&dst={ids["r1"]}')
-    assert best == {'ok': True, 'routes': [{'nodes': [ids['m1'], ids['r1']], 'segments': [{'a': ids['m1'], 'b': ids['r1'], 'exists': True, 'rttMs': 151.2}],
-                                            'rttMs': 151.2, 'own': None}], 'own': []}
+    route = {'nodes': [ids['m1'], ids['r1']], 'segments': [{'a': ids['m1'], 'b': ids['r1'], 'exists': True, 'rttMs': 151.2}], 'rttMs': 151.2, 'cost': 151.2}
+    assert best == {'ok': True, 'routes': [{**route, 'own': None}], 'own': [], 'current': route, 'tuning': config_module.default_routing()}
     assert (await api(e, 'GET', f'/api/servers/mesh/path/options?src={ids["m1"]}&dst={ids["r2"]}'))['routes'] == []
     assert (await api(e, 'GET', f'/api/servers/mesh/path/options?src={ids["m1"]}&dst={ids["r1"]}&k=99', status=400))['error'] == 'invalid_mesh_path'
 
@@ -284,7 +287,7 @@ async def test_failure_stops_the_rollout_and_retry_and_rollback(env):  # noqa: F
     draft['members'][0]['role'] = 'relay'
     draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert nodes.sent('mesh.apply') == [ids['r1'], ids['m1'], ids['m2']]
@@ -292,7 +295,7 @@ async def test_failure_stops_the_rollout_and_retry_and_rollback(env):  # noqa: F
     # Revision 2 moves the relay's UDP port; the relay refuses it, nobody else gets it.
     nodes.calls.clear()
     draft['members'][0]['listen'] = {'udp': 51000}
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.fail[ids['r1']] = 'listen udp :51000: address already in use'
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
@@ -329,7 +332,7 @@ async def test_failure_stops_the_rollout_and_retry_and_rollback(env):  # noqa: F
     draft = {k: state[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][1].update(tags=['公司'], uploadLimitMbps=10)
     draft['rules'] = [{'src': {'tags': ['公司']}, 'dst': {'members': [ids['m2']]}, 'proto': 'tcp', 'ports': [[22, 22]]}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['apply']['progress'][0] == {'serverId': ids['m1'], 'state': 'failed', 'error': reason}
@@ -339,6 +342,20 @@ async def test_failure_stops_the_rollout_and_retry_and_rollback(env):  # noqa: F
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['apply']['progress'][0]['error'] == 'apply_timeout' and state['apply']['progress'][1]['error'] == 'stopped'
+    # Owners not yet acknowledged: with the revision not running it is a failure; running it, it is delivered.
+    pending = 'ownership propagation pending: 4 acknowledgements'
+    nodes.fail[ids['m1']] = f'apply_timeout: {pending}'
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    state = await settled(e)
+    assert state['apply']['progress'][0] == {'serverId': ids['m1'], 'state': 'failed', 'error': f'apply_timeout: {pending}'}
+    del nodes.fail[ids['m1']]
+    nodes.applied_errors[ids['m1']] = pending
+    alerts = (await e.db.conn.execute_fetchall("SELECT COUNT(*) FROM server_notifications WHERE id LIKE 'mesh-apply:%'"))[0][0]
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    state = await settled(e)
+    assert {p['state'] for p in state['apply']['progress']} == {'done'} and state['nodes'][ids['m1']]['error'] == ''
+    assert nodes.configs[ids['m1']]['revision'] == state['applied']['revision']
+    assert (await e.db.conn.execute_fetchall("SELECT COUNT(*) FROM server_notifications WHERE id LIKE 'mesh-apply:%'"))[0][0] == alerts
 
 
 async def test_removal_revokes_first_then_uninstalls_and_delete_leaves(env):  # noqa: F811
@@ -350,7 +367,7 @@ async def test_removal_revokes_first_then_uninstalls_and_delete_leaves(env):  # 
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r2'], 'transport': 'udp'}, {'relay': ids['r1'], 'transport': 'udp'}]
     draft['members'][3]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['rules'] = [{'src': {'members': [ids['m1']]}, 'dst': {'members': [ids['m2']]}, 'proto': 'any'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert nodes.configs[ids['m2']]['nodes'][0]['id'] in ids.values()
@@ -399,7 +416,7 @@ async def test_automatic_address_changes_and_tls_rotation_reissue(env, monkeypat
     draft['members'][0].update(role='relay', listen={'udp': 51999, 'tcp': 0, 'tls': 52001})
     draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'tls'}]
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
 
     # The relay must be online to give its certificate when the change is applied.
     del e.servers.hub.sessions[ids['r1']]
@@ -451,7 +468,7 @@ async def test_a_punched_link_follows_the_public_ip_a_node_verified(env, monkeyp
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['directLinks'] = [{'a': ids['m1'], 'b': ids['m2'], 'transport': 'udp', 'dialer': 'a'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     # The panel's IPv4 of either end (45.32.100.3/4) is not an endpoint.
@@ -488,7 +505,7 @@ async def test_a_public_address_that_keeps_changing_is_reissued_once_it_holds(en
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['directLinks'] = [{'a': ids['m1'], 'b': ids['m2'], 'transport': 'udp', 'dialer': 'a'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
 
@@ -505,6 +522,37 @@ async def test_a_public_address_that_keeps_changing_is_reissued_once_it_holds(en
     assert nodes.configs[ids['m2']]['links'][0]['endpoint'] == 'udp://45.32.100.32:51999'
 
 
+async def test_a_data_plane_restarting_keeps_what_its_last_reachability_check_found(env, monkeypatch):  # noqa: F811
+    """A relay left to the mesh as site or public, public by its check: its data plane restarts (an
+    upgrade) and reports before checking again. The mesh keeps it public rather than reissuing
+    every config with it as a site relay and back once it has checked."""
+    e = env
+    monkeypatch.setattr(mesh_module, 'PUBLIC_ADDR_SETTLE_S', 0.3)
+    nodes, ids = await mesh_setup(e)
+    added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
+    members = added['members']
+    members[0]['role'] = members[1]['role'] = 'relay'
+    members[1]['relayMode'] = 'site'
+    members[2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    await settled(e)
+    assert '45.32.100.2:51999' not in nodes.configs[ids['m1']]['reflectors']
+
+    def report(reach):
+        return {'startedAt': 1, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA), 'reachability': reach}
+    await e.servers.mesh.report(ids['r2'], report({'verdict': 'public', 'publicAddr': '45.32.100.2:51999', 'consistent': True, 'checkedAt': 1}))
+    state = await settled(e)
+    assert '45.32.100.2:51999' in nodes.configs[ids['m1']]['reflectors']
+    revision = state['applied']['revision']
+    await e.servers.mesh.report(ids['r2'], report({'verdict': 'unknown', 'consistent': True, 'checkedAt': 0}))
+    await connect(e, ids['r2'])
+    await asyncio.sleep(0.5)
+    state = await settled(e)
+    assert state['applied']['revision'] == revision
+    assert '45.32.100.2:51999' in nodes.configs[ids['m1']]['reflectors']
+
+
 async def test_a_public_address_flipping_between_hellos_reissues_nothing_until_one_holds(env, monkeypatch):  # noqa: F811
     """A hello reissues with the facts it reads: the public address read there must have held too,
     or one switched back and forth between hellos reissues to those punching towards it each time."""
@@ -517,7 +565,7 @@ async def test_a_public_address_flipping_between_hellos_reissues_nothing_until_o
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['directLinks'] = [{'a': ids['m1'], 'b': ids['m2'], 'transport': 'udp', 'dialer': 'a'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
 
@@ -552,7 +600,7 @@ async def test_discard_uninstalls_members_never_applied_and_tracks_local_prefixe
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][0]['role'] = 'relay'
     draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     row = await one(e.db.conn, 'SELECT local_json FROM mesh_nodes WHERE server_id=?', (ids['m1'],))
@@ -593,8 +641,8 @@ async def test_discard_uninstalls_members_never_applied_and_tracks_local_prefixe
     assert (await e.servers.mesh._facts(OWNER))[ids['m1']]['hostRoutes'] == [{'net': '10.0.0.0/24', 'dev': 'wg0'}]
     # What an applied member says of its own machine warns; it does not hold up edits that change neither it nor the prefix.
     assert state['errors'] == [] and [(x['path'], x['error']) for x in state['warnings'] if x['error'] == 'mesh_prefix_overlap'] == [('members[1]', 'mesh_prefix_overlap')]
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {'mtu': 1300}})
-    err = await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {'prefix': '100.96.0.0/20'}}, status=400)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {'mtu': 1300}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    err = await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {'prefix': '100.96.0.0/20'}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']}, status=400)
     assert [(x['path'], x['error']) for x in err['errors']] == [('settings.prefix', 'prefix_conflict')]
 
 
@@ -605,7 +653,7 @@ async def test_a_failed_delivery_shows_until_the_node_runs_the_latest_config(env
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][0]['role'] = 'relay'
     draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     report = {'schema': 1, 'startedAt': 5, 'appliedRevision': 1, 'ready': True, 'iface': 'obmesh0', 'error': '', 'peers': [], 'entry': None,
@@ -616,7 +664,7 @@ async def test_a_failed_delivery_shows_until_the_node_runs_the_latest_config(env
     # Only m1's config changes and it is refused; its own report still says ready on the old config.
     original = json.loads(json.dumps(draft))
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.fail[ids['m1']] = 'shaper: tc not found'
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
@@ -631,7 +679,7 @@ async def test_a_failed_delivery_shows_until_the_node_runs_the_latest_config(env
     # Reverting makes the latest config the one it already runs: nothing is sent and it is ready again.
     await connect(e, ids['m1'])
     await settled(e)
-    await api(e, 'PUT', '/api/servers/mesh/draft', original)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**original, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.calls.clear()
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
@@ -639,7 +687,7 @@ async def test_a_failed_delivery_shows_until_the_node_runs_the_latest_config(env
     assert state['nodes'][ids['m1']] == {**state['nodes'][ids['m1']], 'state': 'ready', 'error': ''}
 
     # A failure, then a successful delivery.
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     assert (await settled(e))['nodes'][ids['m1']]['state'] == 'failed'
     del nodes.fail[ids['m1']]
@@ -674,7 +722,7 @@ async def upgrade_setup(e):
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][0]['role'] = draft['members'][1]['role'] = 'relay'
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     nodes.builds = {ids[k]: OLD for k in ('r1', 'r2', 'm1')}
@@ -781,6 +829,40 @@ async def test_a_later_node_update_keeps_what_the_running_data_planes_read(env, 
     assert {nodes.builds[ids[k]] for k in ('r1', 'r2', 'm1')} == {NEWER}
 
 
+async def test_a_node_update_after_the_controller_forgot_what_the_data_planes_read(env, monkeypatch):  # noqa: F811
+    """What the running data planes read is not recorded (the controller upgraded to one that keeps
+    it, and no report since came from the node running that build), then a batch node update: the
+    relays' data planes upgrade one at a time, and until they do the members stay leaves."""
+    e = env
+    monkeypatch.setattr(mesh_module, 'UPGRADE_READY_WAIT', 10)
+    monkeypatch.setattr(mesh_module, 'MEMBER_UPGRADE_SETTLE', 0.05)
+    nodes, ids, _ = await upgrade_setup(e)
+    relays = {ids['r1'], ids['r2']}
+    features = ('mesh', mesh_module.MEMBERS_ROUTING_FEATURE)
+    nodes.builds = {ids[k]: NEW for k in ('r1', 'r2', 'm1')}
+    nodes.versions = {ids[k]: '1.2.1-dev.48' for k in ('r1', 'r2', 'm1')}
+    for key in ('r1', 'r2', 'm1'):
+        await connect(e, ids[key], features=features, build=NEW)
+    await settled(e)
+    assert nodes.configs[ids['m1']]['self'].get('leaf') is True
+    async with e.db.write_transaction(label='test') as conn:
+        await conn.execute("UPDATE mesh_nodes SET data_features=''")
+    nodes.calls.clear()
+    nodes.upgrades.clear()
+    for key in ('r1', 'r2', 'm1'):
+        await connect(e, ids[key], features=features, build=NEWER)
+    await until(lambda: any(s == 'end' and sid in relays for s, sid in nodes.upgrades))
+    await asyncio.sleep(0.15)
+    # The second relay still runs NEW: nothing takes the members out of the routes meanwhile.
+    assert nodes.sent('mesh.apply') == []
+    first = next(sid for s, sid in nodes.upgrades if s == 'start' and sid in relays)
+    await ready_after_upgrade(e, first)
+    await ready_after_upgrade(e, (relays - {first}).pop())
+    await until(lambda: ('end', ids['m1']) in nodes.upgrades)
+    await settled(e)
+    assert nodes.sent('mesh.apply') == [] and nodes.configs[ids['m1']]['self'].get('leaf') is True
+
+
 async def test_a_data_plane_build_not_known_reads_nothing_new(env, monkeypatch):  # noqa: F811
     """What another build than the node's reads is known only once the node ran it: a data plane
     left on a build of before (1.2.0) is given none of the new features."""
@@ -811,7 +893,7 @@ async def test_upgrade_waits_for_a_rollout_and_skips_the_same_build(env):  # noq
 
     nodes.gate = asyncio.Event()
     draft['members'][2]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await until(lambda: ids['m1'] in nodes.sent('mesh.apply'))
     await connect(e, ids['r2'], build=NEW)
@@ -1027,7 +1109,7 @@ async def test_servers_tool_runs_the_mesh_tab_in_process(env):  # noqa: F811
     assert list(overview['contracts']) == ['mesh'] and overview['guide'] and 'mesh_all' in overview['group']
     assert len(json.dumps(overview, ensure_ascii=False)) < 4000
     draft_contract = json.dumps(described['contracts']['mesh_save_draft'])
-    assert all(word in draft_contract for word in ('relayMode', 'bias', 'stun', 'candidates', 'directLinks', 'rules', 'No revision or lock'))
+    assert all(word in draft_contract for word in ('relayMode', 'bias', 'stun', 'candidates', 'directLinks', 'rules', 'draftVersion', 'mesh_draft_conflict'))
     assert tool_module.MESH_MUTATING <= tool_module.MUTATING and not {'mesh', 'mesh_draft', 'mesh_member', 'mesh_trend', 'mesh_path'} & tool_module.MUTATING
 
     # Joining installs the mesh service at once: no confirmation, no confirm parameter.
@@ -1043,7 +1125,7 @@ async def test_servers_tool_runs_the_mesh_tab_in_process(env):  # noqa: F811
     members = [{'serverId': m['serverId']} for m in draft['members']]
     # Checks fail: nothing is saved and every problem comes back as the page gets it.
     members[2]['role'] = 'relay'  # Windows
-    bad = await call('mesh_save_draft', members=members)
+    bad = await call('mesh_save_draft', draftVersion=draft['draftVersion'], members=members)
     assert bad['ok'] is False and bad['error'] == 'mesh_invalid'
     assert {'path': 'members[2].role', 'error': 'relay_requires_linux', 'message': '中转只能是 Linux'} in bad['errors']
     refused = await call('mesh_save_draft', member=members)
@@ -1053,13 +1135,13 @@ async def test_servers_tool_runs_the_mesh_tab_in_process(env):  # noqa: F811
     members[3] = {'serverId': ids['m2'], 'entry': {'mode': 'fixed', 'candidates': [{'relay': ids['r2'], 'transport': 'udp'}], 'autoReturn': True}}
     for i in (0, 1):
         members[i].update(role='relay', listen={'udp': 51999, 'tcp': 52000, 'tls': 0})
-    saved = await call('mesh_save_draft', members=members, relayLinks={'mode': 'custom', 'pairs': [{'a': ids['r1'], 'b': ids['r2'], 'bias': -5}]},
+    saved = await call('mesh_save_draft', draftVersion=draft['draftVersion'], members=members, relayLinks={'mode': 'custom', 'pairs': [{'a': ids['r1'], 'b': ids['r2'], 'bias': -5}]},
                        settings={'reachability': {'stun': ['stun.example.com:3478']}})
     assert saved['ok'] and saved['errors'] == [] and saved['relayLinks']['pairs'][0]['bias'] == -5
     assert saved['settings']['reachability'] == {'stun': ['stun.example.com:3478']}
     # Connection limits are saved through it too, and read back with the draft.
     assert 'manualOnly' in draft_contract
-    limited = await call('mesh_save_draft', limits=[{'name': '两台成员之间只能手动建', 'a': {'kind': 'machines', 'ids': [ids['m1']]},
+    limited = await call('mesh_save_draft', draftVersion=saved['draftVersion'], limits=[{'name': '两台成员之间只能手动建', 'a': {'kind': 'machines', 'ids': [ids['m1']]},
                                                      'b': {'kind': 'machines', 'ids': [ids['m2']]}, 'manualOnly': True}])
     assert limited['ok'] and [(k['id'], k['name'], k['manualOnly']) for k in limited['limits']] == [('k1', '两台成员之间只能手动建', True)]
     assert (await call('mesh_draft'))['limits'] == limited['limits']
@@ -1097,7 +1179,7 @@ async def test_servers_tool_runs_the_mesh_tab_in_process(env):  # noqa: F811
     assert (await call('mesh_path', src=ids['m1'], dst='nope'))['error'] == 'mesh_member_not_found'
 
     # Discard drops an unapplied edit.
-    await call('mesh_save_draft', settings={'mtu': 1380})
+    await call('mesh_save_draft', draftVersion=(await call('mesh_draft'))['draftVersion'], settings={'mtu': 1380})
     assert (await call('mesh_discard'))['draft']['dirty'] is False
 
     # Leaving, then applying, uninstalls the mesh service without asking; rollback brings back the previous revision.
@@ -1105,7 +1187,7 @@ async def test_servers_tool_runs_the_mesh_tab_in_process(env):  # noqa: F811
     assert next(m for m in left['members'] if m['serverId'] == ids['m2'])['removing'] is True
     applied = await call('mesh_apply')
     assert applied['applied']['revision'] == 2 and nodes.sent('mesh.uninstall') == [ids['m2']]
-    await call('mesh_save_draft', settings={'mtu': 1380})
+    await call('mesh_save_draft', draftVersion=(await call('mesh_draft'))['draftVersion'], settings={'mtu': 1380})
     assert (await call('mesh_apply'))['applied']['revision'] == 3 and nodes.configs[ids['m1']]['network']['mtu'] == 1380
     rolled = await call('mesh_rollback')
     assert rolled['applied']['revision'] == 4 and rolled['apply']['running'] is False and rolled['settings']['mtu'] == 1400
@@ -1184,7 +1266,7 @@ async def test_join_picks_a_udp_port_free_behind_the_same_nat_and_warns_on_share
     members = [{'serverId': sid} for sid in ports(added)]
     for i in (0, 1):
         members[i].update(role='relay', listen={'udp': 51999, 'tcp': 52000, 'tls': 0})
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['errors'] == [] and shared(saved) == []
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [lan]})
     assert ports(added)[lan] == 51999 and shared(added) == []
@@ -1194,7 +1276,7 @@ async def test_join_picks_a_udp_port_free_behind_the_same_nat_and_warns_on_share
     members[3]['listen'] = {'udp': 51999}
     async with e.db.write_transaction(label='test') as conn:
         await conn.execute("UPDATE mesh_nodes SET local_json='[]' WHERE server_id IN (?,?)", (ids['m1'], ids['m2']))
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert ports(saved)[ids['m2']] == 51999 and shared(saved) == []
     for sid, port, verdict in ((ids['m1'], 51999, 'punchable'), (ids['m2'], 1026, 'no_udp')):
         reach = {'checkedAt': 1, 'verdict': verdict, 'publicAddr': f'192.0.2.117:{port}', 'consistent': True, 'filtering': 'unknown', 'observers': []}
@@ -1228,7 +1310,7 @@ async def test_gateway_routes_lan_entry_and_the_route_table(env):  # noqa: F811
                {'serverId': home, 'gateway': {'subnets': ['10.10.10.0/24']},
                 'entry': {'mode': 'fixed', 'autoReturn': True, 'candidates': [{'relay': ids['r1'], 'transport': 'tcp'}]}}]
     rules = [{'src': {'members': [ids['r2']]}, 'dst': {'subnets': ['10.10.10.0/24']}}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['errors'] == []
     # By the draft: only LAX gets the home subnet.
     assert saved['exports'] == [{'gateway': home, 'subnet': '10.10.10.0/24', 'nodes': [ids['r2']]}]
@@ -1297,7 +1379,7 @@ async def test_an_apply_and_the_page_opening_ask_the_nodes_for_their_routes_firs
                {'serverId': home, 'gateway': {'subnets': ['10.10.10.0/24']}, 'entry': entry}]
     rules = [{'src': {'members': [ids['m1']]}, 'dst': {'subnets': ['10.10.10.0/24']}}]
     clash = {ids['m1']: [{'route': '10.10.10.0/24', 'held': '10.10.10.0/24', 'dev': 'wg0', 'taken': False, 'fixed': False}]}
-    assert (await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules}))['routeClashes'] == clash
+    assert (await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']}))['routeClashes'] == clash
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert nodes.configs[ids['m1']]['self']['gatewayRoutes'] == []
@@ -1336,7 +1418,7 @@ async def applied_base(e, members=('r1', 'm1', 'm2')):
     draft['members'][0]['role'] = 'relay'
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     return nodes, ids, draft
@@ -1346,7 +1428,7 @@ async def test_a_second_apply_or_a_rollback_during_a_rollout_is_refused_and_keep
     e = env
     nodes, ids, draft = await applied_base(e)
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.gate = asyncio.Event()
     # Two applies sent together (a double click): one runs, the other is refused at once.
     async def apply():
@@ -1356,7 +1438,7 @@ async def test_a_second_apply_or_a_rollback_during_a_rollout_is_refused_and_keep
     assert sorted([first.get('error', 'ok'), second.get('error', 'ok')]) == ['mesh_apply_running', 'ok']
     # A rollback while it runs is refused before it touches the draft.
     draft['members'][2]['uploadLimitMbps'] = 7
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert (await api(e, 'POST', '/api/servers/mesh/rollback', status=409))['error'] == 'mesh_apply_running'
     nodes.gate.set()
     state = await settled(e)
@@ -1370,14 +1452,14 @@ async def test_rollback_skips_reissues_and_takes_revisions_some_nodes_missed(env
     # Revision 2 changes m1 while m2 is offline: partly delivered, still the one in effect.
     del e.servers.hub.sessions[ids['m2']]
     draft['members'][1]['uploadLimitMbps'] = draft['members'][2]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     await connect(e, ids['m2'])
     await settled(e)
     # Revision 3 changes m1 again; revision 4 only follows a fact (r1's public address).
     draft['members'][1]['uploadLimitMbps'] = 9
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     async with e.db.write_transaction(label='test') as conn:
@@ -1437,7 +1519,7 @@ async def test_alerts_for_lasting_conditions_are_not_sent_again_after_a_controll
     nodes, ids, draft = await applied_base(e)
     # A punched direct link: m1's own public address matters, so its exit seen differently is alerted.
     draft['directLinks'] = [{'a': ids['m1'], 'b': ids['m2'], 'transport': 'udp', 'dialer': 'a'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     over = {**READY, 'resources': {'rssBytes': 200 * 1024 ** 2},
@@ -1469,7 +1551,7 @@ async def test_reissues_for_a_changing_address_do_not_push_out_what_rollback_nee
     monkeypatch.setattr(mesh_module, 'PUBLIC_ADDR_SETTLE_S', 0)
     nodes, ids, draft = await applied_base(e)
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     # r1's address changes a dozen times: a reissue each.
@@ -1496,7 +1578,7 @@ async def test_a_node_that_applies_a_failed_revision_itself_is_ready_and_later_c
     # Revision 2 opens TCP 52020 on the Windows member (set by hand: out of auto); the port is taken and it keeps revision 1.
     draft['members'][1]['listen']['tcp'] = 52020
     draft['members'][1]['auto'] = []
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.fail[win] = 'revision 2 not applied: listen tcp :52020: bind: address in use'
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
@@ -1519,7 +1601,7 @@ async def test_a_node_that_applies_a_failed_revision_itself_is_ready_and_later_c
 
     # Revision 3 closes the port again: the same config as revision 1, but not what it runs, so it is sent.
     draft['members'][1]['listen']['tcp'] = 0
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert config_hash(await revision_config(e, 3, win)) == config_hash(await revision_config(e, 1, win))
@@ -1532,7 +1614,7 @@ async def test_a_node_back_on_an_older_revision_gets_the_latest_once(env):  # no
     nodes, ids, draft = await applied_base(e)
     win = ids['m1']
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     await e.servers.mesh.report(win, {**READY, 'appliedRevision': 2})
@@ -1579,7 +1661,7 @@ async def test_reports_during_a_rollout_leave_the_record_to_the_delivery(env):  
     nodes, ids, draft = await applied_base(e)
     win = ids['m1']
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.gate = asyncio.Event()
     await api(e, 'POST', '/api/servers/mesh/apply')
     # A report sent before the new config took: still revision 1, while revision 2 goes out.
@@ -1606,7 +1688,7 @@ async def test_a_relay_reconnecting_before_its_address_is_known_keeps_its_last_o
     draft['members'][0]['role'] = draft['members'][1]['role'] = 'relay'
     draft['members'][1]['relayMode'] = 'site'
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert dialed(nodes)[(ids['r2'], ids['r1'])].startswith('udp://45.32.100.1:')
@@ -1621,7 +1703,7 @@ async def test_a_relay_reconnecting_before_its_address_is_known_keeps_its_last_o
     assert json.loads(row['info_json'])['info']['ipv4'] == '45.32.100.1'
     # A change applied in that window still aims at the address last known.
     draft['members'][2]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['applied']['revision'] == 2 and not state['errors']
@@ -1644,7 +1726,7 @@ async def test_new_signing_or_end_to_end_keys_go_to_every_node(env):  # noqa: F8
     draft['members'][0]['role'] = 'relay'
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     keys_of = lambda sid: {n['id']: (n['signKey'], n['e2eKey']) for n in nodes.configs[sid]['nodes']}  # noqa: E731
@@ -1669,7 +1751,7 @@ async def keys_mesh(e):
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['directLinks'] = [{'a': ids['m1'], 'b': ids['m2'], 'transport': 'udp', 'dialer': 'a'}]
     draft['rules'] = [{'src': {'members': [ids['m1'], ids['m2']]}, 'dst': {'members': [ids['m1'], ids['m2']]}, 'proto': 'icmp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['applied']['revision'] == 1
@@ -1746,7 +1828,7 @@ async def schema_mesh(e):
     draft['members'][0]['role'] = 'relay'
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     return nodes, ids, draft
 
 
@@ -1799,7 +1881,7 @@ async def test_a_config_a_member_cannot_read_is_not_sent(env, monkeypatch):  # n
     # The draft check names it, and apply is refused.
     assert [(x['path'], x['error']) for x in state['errors']] == [('members[2]', 'config_schema_mismatch')]
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.calls.clear()
     await api(e, 'POST', '/api/servers/mesh/apply', status=400)
     assert nodes.sent('mesh.apply') == []
@@ -1934,7 +2016,7 @@ async def test_a_failed_delivery_quotes_the_nodes_error_like_a_name(env):  # noq
     nodes, ids, draft = await applied_base(e)
     nodes.refuse[ids['m1']] = 'invalid_config: see https://evil.example/x'
     draft['members'][1]['uploadLimitMbps'] = 5
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     texts = [r['text'] for r in await many(e.db.conn, "SELECT text FROM server_notifications WHERE id LIKE 'mesh-apply:%'")]
@@ -1952,7 +2034,7 @@ async def instance_mesh(e):
     draft['members'][0]['role'] = 'relay'
     for m in draft['members'][1:]:
         m['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['applied']['revision'] == 1
@@ -2059,7 +2141,7 @@ async def test_a_stopped_rollout_is_not_finished_by_the_nodes_next_reports(env):
     nodes, ids, draft = await applied_base(e)
     nodes.calls.clear()
     draft['members'][0]['listen'] = {'udp': 51000}
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     nodes.fail[ids['r1']] = 'listen udp :51000: address already in use'
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
@@ -2085,14 +2167,14 @@ async def test_undoing_a_removal_brings_back_its_entries_links_and_rules(env):  
     e = env
     nodes, ids, draft = await applied_base(e)
     draft['rules'] = [{'src': {'members': [ids['m1']]}, 'dst': {'members': [ids['r1']]}, 'proto': 'tcp', 'ports': [[22, 22]]}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     before = await settled(e)
     removed = await api(e, 'DELETE', f'/api/servers/mesh/members/{ids["r1"]}')
     assert [m['entry']['candidates'] for m in removed['members'][1:]] == [[], []] and removed['rules'] == []
     back = {k: removed[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     back['members'][0]['removing'] = False
-    restored = await api(e, 'PUT', '/api/servers/mesh/draft', back)
+    restored = await api(e, 'PUT', '/api/servers/mesh/draft', {**back, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert [m['entry']['candidates'] for m in restored['members'][1:]] == [m['entry']['candidates'] for m in before['members'][1:]]
     assert [(r['src'], r['dst']) for r in restored['rules']] == [(r['src'], r['dst']) for r in before['rules']]
     assert restored['draft'] == {'dirty': False, 'changes': []}
@@ -2100,7 +2182,7 @@ async def test_undoing_a_removal_brings_back_its_entries_links_and_rules(env):  
     removed = await api(e, 'DELETE', f'/api/servers/mesh/members/{ids["r1"]}')
     back = {k: removed[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     back['members'][0]['removing'] = False
-    assert (await api(e, 'PUT', '/api/servers/mesh/draft', back))['draft']['changes'] == []
+    assert (await api(e, 'PUT', '/api/servers/mesh/draft', {**back, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']}))['draft']['changes'] == []
 
 
 async def test_removing_an_exit_leaves_a_draft_that_applies_and_undoing_it_brings_its_groups_back(env):  # noqa: F811
@@ -2117,7 +2199,7 @@ async def test_removing_an_exit_leaves_a_draft_that_applies_and_undoing_it_bring
     draft['members'][0]['proxy'] = {'exit': None, 'ports': [{'id': 'p1', 'exit': ids['m1']}, {'id': 'p2', 'port': 1082, 'group': 'home', 'select': 'manual', 'pinned': ids['m1']}]}
     draft['exitGroups'] = [{'id': 'home', 'name': 'home', 'members': [ids['m1'], ids['m2']]},
                            {'id': 'solo', 'name': 'solo', 'members': [ids['m1']]}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     before = await settled(e)
     removed = await api(e, 'DELETE', f'/api/servers/mesh/members/{ids["m1"]}')
@@ -2126,7 +2208,7 @@ async def test_removing_an_exit_leaves_a_draft_that_applies_and_undoing_it_bring
     assert {x['error'] for x in removed['errors']} == {'proxy_port_target', 'proxy_group_pinned'}
     back = {k: removed[k] for k in keys}
     back['members'][1]['removing'] = False
-    restored = await api(e, 'PUT', '/api/servers/mesh/draft', back)
+    restored = await api(e, 'PUT', '/api/servers/mesh/draft', {**back, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert restored['exitGroups'] == before['exitGroups'] and restored['members'][0]['proxy'] == before['members'][0]['proxy']
     assert restored['draft'] == {'dirty': False, 'changes': []}
 
@@ -2141,12 +2223,12 @@ async def test_auto_links_save_when_a_relay_with_a_set_link_becomes_a_member(env
     draft['members'][2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
     draft['relayLinks'] = {'mode': 'auto', 'pairs': [{'a': ids['r1'], 'b': ids['r2'], 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 100,
                                                       'auto': ['transport', 'dialer']}]}
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert [p['bias'] for p in saved['relayLinks']['pairs']] == [100]
     draft = {k: saved[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][1]['role'] = 'member'
     draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['relayLinks']['pairs'] == [] and saved['errors'] == []
 
 
@@ -2189,7 +2271,7 @@ async def test_a_new_member_overlapping_the_prefix_holds_only_the_apply(env):  #
     assert [(x['path'], x['error']) for x in added['warnings'] if x['error'] == 'mesh_prefix_overlap'] == [(f'members[{index}]', 'mesh_prefix_overlap')]
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['rules'] = [{'src': {'all': True}, 'dst': {'all': True}, 'proto': 'icmp', 'ports': [], 'note': 'ping'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     refused = await api(e, 'POST', '/api/servers/mesh/apply', status=400)
     assert [(x['path'], x['error']) for x in refused['errors']] == [(f'members[{index}]', 'prefix_conflict')]
 
@@ -2225,7 +2307,7 @@ async def test_legacy_full_line_rules_wait_for_explicit_apply_not_reconcile(env)
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2']]})
     for m in added['members']:
         m['role'] = 'relay'
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     mesh = e.servers.mesh
@@ -2276,21 +2358,21 @@ async def test_connection_limits_are_kept_with_the_draft_checked_and_applied_but
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2']]})
     for m in added['members']:
         m['role'] = 'relay'
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     both = {'name': '两台之间', 'a': {'kind': 'machines', 'ids': [ids['r1']]}, 'b': {'kind': 'machines', 'ids': [ids['r2']]}}
-    view = await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'relayEnd': True}]})
+    view = await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'relayEnd': True}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert view['limits'][0]['id'] == 'k1' and view['limits'][0]['relayEnd'] is True
     assert {'kind': 'limits', 'text': '修改连接限制'} in view['draft']['changes'] and not view['errors']
     e.servers.mesh.applied_cache.clear()
     assert (await api(e, 'GET', '/api/servers/mesh'))['limits'] == view['limits']
     # A limit the listed link breaks is named on it, and the draft is kept as it was.
     pair = {'a': ids['r1'], 'b': ids['r2'], 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}
-    bad = await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'transports': ['tls']}], 'relayLinks': {'mode': 'custom', 'pairs': [pair]}}, status=400)
+    bad = await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'transports': ['tls']}], 'relayLinks': {'mode': 'custom', 'pairs': [pair]}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']}, status=400)
     assert bad['errors'] == [{'path': 'relayLinks.pairs[0]', 'error': 'limit_violation', 'message': 'Berlin 和 LAX 违反连接限制「两台之间」：跨界只允许 TLS'}]
     assert (await api(e, 'GET', '/api/servers/mesh'))['limits'] == view['limits']
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'relayEnd': True}], 'relayLinks': {'mode': 'full', 'pairs': []}})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'limits': [{**both, 'relayEnd': True}], 'relayLinks': {'mode': 'full', 'pairs': []}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert not state['draft']['dirty'] and state['limits'][0]['relayEnd'] is True and '_limits' not in state['settings']
@@ -2306,7 +2388,7 @@ async def test_a_fixed_entry_stored_before_upstreams_runs_as_it_was_until_the_us
     for m in added['members'][:2]:
         m['role'] = 'relay'
     added['members'][2]['entry'] = {'candidates': [{'relay': ids['r1'], 'transport': 'udp'}, {'relay': ids['r2'], 'transport': 'udp'}]}
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert nodes.configs[ids['m1']]['entry']['mode'] == 'failover'
@@ -2334,7 +2416,7 @@ async def test_a_fixed_entry_stored_before_upstreams_runs_as_it_was_until_the_us
     # Nothing to apply: the draft keeps the entry as stored, and applying anything else leaves it too.
     preview = await api(e, 'GET', '/api/servers/mesh')
     assert not preview['draft']['dirty'] and preview['members'][2]['entry']['mode'] == 'fixed' and preview['members'][2]['direct'] is True
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**preview['settings'], 'mtu': preview['settings']['mtu'] - 20}})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**preview['settings'], 'mtu': preview['settings']['mtu'] - 20}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     assert (await mesh._load(OWNER, 'applied'))['members'][2]['entry']['mode'] == 'fixed'
@@ -2342,7 +2424,7 @@ async def test_a_fixed_entry_stored_before_upstreams_runs_as_it_was_until_the_us
     # The user moves it to upstreams.
     members = (await api(e, 'GET', '/api/servers/mesh'))['members']
     members[2]['entry'] = {**members[2]['entry'], 'mode': 'upstreams'}
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert not state['draft']['dirty'] and (await mesh._load(OWNER, 'applied'))['members'][2]['entry']['mode'] == 'upstreams'

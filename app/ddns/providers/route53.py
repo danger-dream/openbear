@@ -1,6 +1,6 @@
 """Amazon Route 53 REST API (2013-04-01, XML) with SigV4.
 
-A record set is identified by name and type; writes UPSERT the whole set."""
+A record set is identified by name and type; updates atomically DELETE the exact old set and CREATE its replacement."""
 from __future__ import annotations
 
 import time
@@ -39,7 +39,7 @@ class Route53(Provider):
     name = 'AWS Route 53'
     tier = 'B'
     fields = (Field('access_key_id', 'Access Key ID'), Field('secret_access_key', 'Secret Access Key', 'password'))
-    caps = Caps(by_id=False, multi=False, ttl_min=1, ttl_max=2147483647)
+    caps = Caps(by_id=False, multi=False, ttl_min=1, ttl_max=2147483647, rrset=True)
     docs = 'https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/r53-api-permissions-ref.html'
     endpoint = 'https://route53.amazonaws.com'
 
@@ -65,8 +65,15 @@ class Route53(Provider):
         if response.status_code >= 300:
             # Errors raised before the service (signature, credentials) may come without the namespace.
             fields = {el.tag.rpartition('}')[2]: el.text for el in root.iter()} if root is not None else {}
-            code = fields.get('Code')
-            message = f'{code}: {fields.get("Message") or ""}' if code else ''
+            code = fields.get('Code') or (root.tag.rpartition('}')[2] if root is not None else '')
+            messages = [el.text or '' for el in root.iter() if el.tag.rpartition('}')[2] == 'Message'] if root is not None else []
+            message = f'{code}: {"; ".join(messages)}' if code else ''
+            # InvalidChangeBatch also includes malformed input: retry only conditional-write conflicts.
+            if code == 'InvalidChangeBatch' and any(
+                    ('tried to delete resource record set' in m.lower() and
+                     ('do not match' in m.lower() or 'not found' in m.lower())) or
+                    ('tried to create resource record set' in m.lower() and 'already exists' in m.lower()) for m in messages):
+                raise ProviderError('record_conflict', message, status=response.status_code)
             if code in ERRORS:
                 raise ProviderError(ERRORS[code], message, status=response.status_code)
             raise self.http_error(response, message)
@@ -113,32 +120,46 @@ class Route53(Provider):
                 raise ProviderError('unsupported', 'Route 53 目前只支持 simple 记录，不支持路由策略或 Alias 记录')
             values = [v.text for v in rrset.iter(f'{NS}Value')]
             ttl = rrset.findtext(f'{NS}TTL')
-            extra = {}
+            extra = {key: rrset.findtext(f'{NS}{key}') for key in ('HealthCheckId', 'MultiValueAnswer')
+                     if rrset.find(f'{NS}{key}') is not None}
             out.append(Record('', name, rtype, ','.join(values), int(ttl) if ttl else None, extra))
         return out
 
-    async def change(self, zone, action, name, rtype, values, ttl):
+    async def change(self, zone, changes):
         zid = await self.zone_id(zone)
-        records = ''.join(f'<ResourceRecord><Value>{escape(v)}</Value></ResourceRecord>' for v in values)
+        parts = []
+        for action, record in changes:
+            records = ''.join(f'<ResourceRecord><Value>{escape(v)}</Value></ResourceRecord>' for v in record.value.split(','))
+            # Repeat supported simple-record attributes on both DELETE and CREATE, not just the values.
+            multi = record.extra.get('MultiValueAnswer')
+            health = record.extra.get('HealthCheckId')
+            parts.append(f'<Change><Action>{action}</Action><ResourceRecordSet><Name>{escape(record.name)}.</Name><Type>{record.type}</Type>'
+                         + (f'<MultiValueAnswer>{escape(multi)}</MultiValueAnswer>' if multi is not None else '')
+                         + f'<TTL>{record.ttl or DEFAULT_TTL}</TTL><ResourceRecords>{records}</ResourceRecords>'
+                         + (f'<HealthCheckId>{escape(health)}</HealthCheckId>' if health is not None else '')
+                         + '</ResourceRecordSet></Change>')
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><ChangeBatch><Changes>'
-                f'<Change><Action>{action}</Action><ResourceRecordSet><Name>{escape(name)}.</Name><Type>{rtype}</Type>'
-                f'<TTL>{ttl}</TTL><ResourceRecords>{records}</ResourceRecords></ResourceRecordSet></Change>'
-                '</Changes></ChangeBatch></ChangeResourceRecordSetsRequest>').encode()
+                + ''.join(parts) + '</Changes></ChangeBatch></ChangeResourceRecordSetsRequest>').encode()
         root = await self.call('POST', f'/2013-04-01/hostedzone/{zid}/rrset/', body=body)
         if root.find(f'{NS}ChangeInfo') is None:
             raise ProviderError('invalid_response', 'ChangeResourceRecordSets returned no ChangeInfo')
 
     async def create(self, zone, name, rtype, value, ttl, opts):
         ttl = self.ttl_for(ttl) or DEFAULT_TTL
-        await self.change(zone, 'UPSERT', name, rtype, [value], ttl)
-        return Record('', name, rtype, value, ttl)
+        # A create must not take over a set that appeared after the service's read.
+        record = Record('', name, rtype, value, ttl)
+        await self.change(zone, [('CREATE', record)])
+        return record
 
     async def update(self, zone, record, value, ttl, opts):
         ttl = self.ttl_for(ttl) or record.ttl or DEFAULT_TTL
-        await self.change(zone, 'UPSERT', record.name, record.type, [value], ttl)
-        return Record('', record.name, record.type, value, ttl, dict(record.extra))
+        updated = Record('', record.name, record.type, value, ttl, dict(record.extra))
+        # Route 53 validates the entire batch before applying any change. A stale DELETE
+        # rejects both operations, so another writer's new addresses cannot be discarded.
+        await self.change(zone, [('DELETE', record), ('CREATE', updated)])
+        return updated
 
     async def delete(self, zone, record):
         # DELETE must repeat the record set exactly as it is now.
-        await self.change(zone, 'DELETE', record.name, record.type, record.value.split(','), record.ttl or DEFAULT_TTL)
+        await self.change(zone, [('DELETE', record)])

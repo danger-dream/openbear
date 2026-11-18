@@ -1,9 +1,9 @@
-"""Extension switches of a conversation and the defaults a folder gives new conversations."""
+"""Extension switches of a conversation and the defaults a folder or the system gives new conversations."""
 from __future__ import annotations
 
 from aiohttp import web
 
-from app.extensions import TEMPORARY, ExtensionError
+from app.extensions import SYSTEM, TEMPORARY, ExtensionError
 from app.web_console.core import _WEB_SESSION_KEY
 
 
@@ -32,19 +32,16 @@ class WebAdminExtensionsMixin:
     async def _extension_folder(self, request: web.Request) -> tuple[int, str] | web.Response:
         owner = int(request[_WEB_SESSION_KEY].chat_id)
         folder = str(request.match_info.get("folder_uuid") or "").strip()
-        if folder != TEMPORARY and folder not in await self._tree_context_folders(owner):
+        if folder not in (TEMPORARY, SYSTEM) and folder not in await self._tree_context_folders(owner):
             return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
         return owner, folder
 
     async def _folder_extensions_payload(self, owner: int, folder: str) -> dict:
         default = await self.extensions.folder_default(owner, folder)
         inherited = await self.extensions.folder_default(owner, folder, inherited=True)
-        cur = await self.db.conn.execute(
-            "SELECT parent_uuid FROM web_conversation_folders WHERE folder_uuid=? AND owner_chat_id=?", (folder, owner))
-        parent = await cur.fetchone()
-        # A top-level folder or the temporary node has no folder above it to inherit from.
+        # Every folder and the temporary node inherit, at the latest from the system default; it has nothing above it.
         return {"ok": True, "default": {**default, "own": default["from"] == folder}, "inherited": inherited,
-                "canInherit": bool(parent and parent["parent_uuid"]),
+                "canInherit": folder != SYSTEM,
                 "extensions": self.extensions.panel(set(default["enabled"]))}
 
     async def handle_api_folder_extensions(self, request: web.Request) -> web.Response:

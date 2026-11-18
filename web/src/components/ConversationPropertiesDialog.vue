@@ -6,7 +6,9 @@ import PromptPolicyEditor from './PromptPolicyEditor.vue';
 import PromptImpactDialog from './PromptImpactDialog.vue';
 import {normalizePromptPolicy, promptPolicyFlags, conversationPromptPolicy, conversationPolicyPayload} from './promptPolicy.js';
 import ModelSettings from './ModelSettings.vue';
+import PersonaSelect from './PersonaSelect.vue';
 import {updateRunDefault} from './folderRunDefaults.js';
+import {normalizeImageOneTurn} from '../views/consoleView/imageOneTurn.js';
 import WebhookEditor from './webhooks/WebhookEditor.vue';
 import {tabKey} from './webhooks/webhookConfig.js';
 import {runConfigFromResponse} from '../views/consoleView/runConfigState.js';
@@ -34,6 +36,8 @@ const contextPolicy = computed({
   set: value => { if (contextReady.value) Object.assign(context.value, {contextText: value.text, ...promptPolicyFlags(value)}); },
 });
 const inheritedPolicy = computed(() => normalizePromptPolicy(context.value.promptPolicy?.inherited || {text: context.value.inheritedContext}));
+const promptOverridden = computed(() => (contextPolicy.value.text.trim() ? contextPolicy.value : inheritedPolicy.value).overrideSystemPrompt);
+const personaLocked = computed(() => Boolean(model.value.promptTemplateLocked));
 function adoptContext(properties) {
   const policy = conversationPromptPolicy(properties);
   return {...properties, contextText: policy.text, ...promptPolicyFlags(policy)};
@@ -47,10 +51,10 @@ function chooseImpact(value) {
   return new Promise(resolve => { resolveImpact = resolve; });
 }
 const modelSettings = computed(() => ({mainModel:model.value.model,mainThinkingLevel:model.value.thinkingLevel || model.value.effectiveThinkingLevel || model.value.defaultThinkingLevel || 'off',mainFastMode:model.value.fastRequested ?? model.value.fastMode,
-  agentModel:model.value.agentRunConfig?.model || '',agentThinkLevel:model.value.agentRunConfig?.thinkLevel || '',agentFastMode:model.value.agentRunConfig?.fastMode ?? null,contextStrategy:model.value.contextStrategy || 'sliding_window'}));
+  agentModel:model.value.agentRunConfig?.model || '',agentThinkLevel:model.value.agentRunConfig?.thinkLevel || '',agentFastMode:model.value.agentRunConfig?.fastMode ?? null,contextStrategy:model.value.contextStrategy || 'sliding_window',imageOneTurn:normalizeImageOneTurn(model.value.imageOneTurn)}));
 function changeModelSetting(field,selection) {
   const value = updateRunDefault({},field,selection)[field];
-  const main = {mainModel:'model',mainThinkingLevel:'thinking',mainFastMode:'fast',contextStrategy:'strategy'};
+  const main = {mainModel:'model',mainThinkingLevel:'thinking',mainFastMode:'fast',contextStrategy:'strategy',imageOneTurn:'image'};
   return main[field] ? mutate(main[field],value) : mutate('agent',{[({agentModel:'model',agentThinkLevel:'thinkLevel',agentFastMode:'fastMode'})[field]]:value});
 }
 const tabs = [['context','上下文配置'],['model','模型配置'],['trigger','触发器']];
@@ -137,14 +141,14 @@ async function saveContext() {
 async function mutate(field,value) {
   if (!canEditModel.value) return;
   const id = uuid.value, run = generation;
-  const requests = {model:()=>Api.conversationSetModel(id,value),thinking:()=>Api.conversationSetThinking(id,value),fast:()=>Api.conversationSetFast(id,value),agent:()=>Api.conversationSetAgentRunConfig(id,value),strategy:()=>Api.conversationSetContextStrategy(id,value)};
+  const requests = {model:()=>Api.conversationSetModel(id,value),thinking:()=>Api.conversationSetThinking(id,value),fast:()=>Api.conversationSetFast(id,value),agent:()=>Api.conversationSetAgentRunConfig(id,value),strategy:()=>Api.conversationSetContextStrategy(id,value),image:()=>Api.conversationSetImageOneTurn(id,value),persona:()=>Api.conversationSetPromptTemplate(id,value)};
   modelSaving.value = true; modelError.value = '';
   try {
     const response = await saveRunConfig(id,requests[field]);
     if (run !== generation) return;
     const snapshot = runConfigFromResponse(response,id); if (!snapshot) throw new Error('未取得完整模型配置，未更新界面');
-    model.value = snapshot; ElMessage.success(field === 'strategy' ? '压缩策略已保存，在下一安全边界生效' : '已保存，下一次运行生效；当前运行不切换');
-  } catch (exception) { if (run === generation) modelError.value = apiError(exception); }
+    model.value = snapshot; ElMessage.success(field === 'strategy' ? '压缩策略已保存，在下一安全边界生效' : field === 'image' ? '图片只看一轮已保存，下一次请求生效' : field === 'persona' ? '人设已保存，第一轮开始时使用' : '已保存，下一次运行生效；当前运行不切换');
+  } catch (exception) { if (run === generation) { modelError.value = apiError(exception); if (field === 'persona') ElMessage.error(modelError.value); } }
   finally { if (run === generation) modelSaving.value = false; }
 }
 async function canLeave() {
@@ -166,7 +170,8 @@ defineExpose({canLeave});
     <div v-if="local" class="property-section"><h3>这是尚未持久保存的草稿</h3><p>没有有效触发地址。创建为真实会话后才能配置入口，不会自动运行模型、启用入口或发送消息。</p><el-button type="primary" @click="emit('persist')">保存为真实会话后继续</el-button></div>
     <div v-else class="property-form"><div class="property-panels" style="width:100%">
       <section v-show="tab === 'context'" v-loading="loading && !contextReady" id="conversation-property-panel-context" role="tabpanel" aria-labelledby="conversation-property-tab-context" class="property-tab-panel" style="width:100%">
-        <p v-if="error" class="wh-alert" role="alert">{{ error }}<el-button :disabled="busy || loading || dirtyContext" @click="loadProperties()">重新读取</el-button><span v-if="dirtyContext">未保存的上下文仍保留，请先保存或放弃更改。</span></p><div class="property-section"><PromptPolicyEditor v-model="contextPolicy" :disabled="!contextReady" :conversation-id="uuid" :inherited-policy="inheritedPolicy" :inherited-source-path="context.promptPolicy?.inheritedSourcePath || ''" /></div>
+        <p v-if="error" class="wh-alert" role="alert">{{ error }}<el-button :disabled="busy || loading || dirtyContext" @click="loadProperties()">重新读取</el-button><span v-if="dirtyContext">未保存的上下文仍保留，请先保存或放弃更改。</span></p><div class="property-section"><PersonaSelect :value="model.promptTemplate || ''" :disabled="!canEditModel || personaLocked" :overridden="promptOverridden"
+          :hint="personaLocked ? '会话已经开始，人设不能更改。' : '第一轮开始前可以更改，选择后立即保存。'" @change="mutate('persona', $event)" /></div><div class="property-section"><PromptPolicyEditor v-model="contextPolicy" :disabled="!contextReady" :conversation-id="uuid" :inherited-policy="inheritedPolicy" :inherited-source-path="context.promptPolicy?.inheritedSourcePath || ''" /></div>
       </section>
       <section v-show="tab === 'model'" v-loading="loading || modelsLoading" id="conversation-property-panel-model" role="tabpanel" aria-labelledby="conversation-property-tab-model" class="property-tab-panel" style="width:100%"><p v-if="modelError || modelsError" class="wh-alert" role="alert">{{ [modelError,modelsError].filter(Boolean).join('；') }}<el-button :disabled="busy || loading || modelsLoading" @click="retryModel">重新读取模型配置</el-button></p><ModelSettings :model-value="modelSettings" :models="models" :disabled="!canEditModel" @change="changeModelSetting" /><p class="property-note">逐项保存，下一次运行生效；不会改变当前运行。</p></section>
       <section v-if="triggerVisited && modelValue" v-show="tab === 'trigger'" id="conversation-property-panel-trigger" role="tabpanel" aria-labelledby="conversation-property-tab-trigger" class="wh-fill"><WebhookEditor ref="trigger" :scope="{type:'conversation',id:uuid}" :title="conversation?.title" :active="tab === 'trigger'" @cancel="close" /></section>

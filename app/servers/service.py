@@ -9,6 +9,7 @@ import copy
 import datetime as dt
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -61,6 +62,8 @@ from app.servers.schema import migrate
 from app.servers.transfers import Transfers
 from app.webhooks.repository import many, one
 
+log = logging.getLogger(__name__)
+
 DEFAULT_TIMEZONE = 'Asia/Shanghai'
 TERMINAL_IDLE_S = 30 * 60
 TERMINAL_POLL_S = 60  # how often an idle terminal is looked at
@@ -77,6 +80,10 @@ JOB_WAIT_MAX = 300
 JOB_COMMAND_MAX = 8000
 JOB_STDIN_MAX = 1024 * 1024
 JOB_ORIGIN_KEEP = 500
+# How often records of background jobs still saying started are looked up on their nodes, and how
+# long after its start a job its node does not list is taken as forgotten rather than just started.
+JOB_END_SWEEP_S = 60
+JOB_GONE_MS = 10 * 60_000
 # Stopping a node's jobs and the server's benchmarks before it is deleted or uninstalled takes at most this long altogether.
 WORK_STOP_TIMEOUT = 30
 # Output kept in memory while job_wait looks for a pattern; a match must fit in it.
@@ -116,6 +123,25 @@ def stale_location(stored, info):
 def short_build(build):
     """The first 12 hex digits of a build's sha256, as shown to people and the model."""
     return str(build or '')[:12]
+
+
+def _judged(result, judge):
+    """The outcome of a command that ran to its end, by judge when the caller gave one."""
+    if judge and result.get('outcome') in ('ok', 'failed'):
+        result['outcome'] = 'ok' if judge(result) else 'failed'
+
+
+def _job_outcome(job):
+    """A background job's end for its record by its exit code, '' while it runs. Stopped is a stop
+    asked for; interrupted, its machine restarted under it, says nothing of how it would have gone."""
+    state = job.get('state')
+    if state == 'running' or not state:
+        return ''
+    if state == 'stopped':
+        return 'stopped'
+    if state == 'exited':
+        return 'ok' if job.get('exitCode') == 0 else 'failed'
+    return 'unknown'
 
 
 def node_facts(session=None, stored=None):
@@ -202,6 +228,11 @@ def _listed_order(item):
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+def _run_view(run):
+    """A 全部更新 run as the page reads it: done counts the results in."""
+    return {**run, 'active': list(run['active']), 'items': list(run['items']), 'done': len(run['items'])}
 
 
 def dumps(value):
@@ -296,6 +327,8 @@ class ServerService:
         # go onto a node automatically: (server id, sha256) -> when it last failed.
         self.node_updates = set()
         self.relay_updates = asyncio.Lock()
+        # owner -> the last 全部更新 from the page (start_node_updates).
+        self.update_runs = {}
         self.auto_failed = {}
         self.auto_pending = set()
 
@@ -309,7 +342,7 @@ class ServerService:
         await migrate(self.db)
         await self.transfers.load()
         await self._load_identity()
-        self._metrics_settings(await self.settings())
+        await self._metrics_settings(await self.settings())
         await self.metrics.start()
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), cookie_jar=aiohttp.DummyCookieJar(), trust_env=False)
         await self.latency.start()
@@ -328,6 +361,7 @@ class ServerService:
             self.spawn(self.route.loop())
             self.spawn(self.ipchecks.loop())
             self.spawn(self._disk_loop())
+            self.spawn(self._job_ends_loop())
 
     # ----- switches (system settings) -----
     def _config(self, section):
@@ -425,8 +459,11 @@ class ServerService:
                 'latency': latencies.clean_settings({}, value.get('latency')),
                 'ipcheckDays': value['ipcheckDays'] if value.get('ipcheckDays') in ip_quality.EVERY_DAYS else 7}
 
-    def _metrics_settings(self, settings):
-        self.metrics.zone = ZoneInfo(settings['timezone'])
+    async def _metrics_settings(self, settings):
+        if self.metrics.conn is None:
+            self.metrics.zone = ZoneInfo(settings['timezone'])
+        else:
+            await self.metrics.change_timezone(settings['timezone'])
         self.metrics.retention = dict(settings['retention'])
 
     async def settings_view(self, owner, value=None):
@@ -450,6 +487,20 @@ class ServerService:
                 raise InstanceError('mesh_access_requires_member', 409)
 
     async def save_settings(self, data, owner=None):
+        # Settings and the metrics migration must follow the same order across callers.
+        if not hasattr(self, '_settings_lock'):
+            self._settings_lock = asyncio.Lock()
+        async with self._settings_lock:
+            saving = asyncio.create_task(self._save_settings(data, owner))
+            try:
+                return await asyncio.shield(saving)
+            except asyncio.CancelledError:
+                # Once either database is written, finish aligning them before another
+                # caller can save settings (or shutdown can cancel the metrics writer).
+                await saving
+                raise
+
+    async def _save_settings(self, data, owner=None):
         if not isinstance(data, dict) or set(data) - {'accessPoints', 'defaultAccess', 'timezone', 'reminders', 'checks', 'frontPort', 'retention', 'latency', 'ipIntel', 'ipcheckDays'}:
             raise InstanceError('invalid_server_settings')
         intel = data.get('ipIntel')
@@ -492,7 +543,12 @@ class ServerService:
             await self.intel.save_httpbl_key(intel['httpblKey'])
         async with self.db.write_transaction(label='server-settings') as conn:
             await conn.execute('INSERT OR REPLACE INTO server_settings VALUES(1,?)', (dumps(value),))
-        self._metrics_settings(value)
+        try:
+            await self._metrics_settings(value)
+        except Exception:
+            async with self.db.write_transaction(label='server-settings-restore') as conn:
+                await conn.execute('INSERT OR REPLACE INTO server_settings VALUES(1,?)', (dumps(before),))
+            raise
         if before['retention'] != value['retention']:
             self.metrics.prune_soon()
         # A front measures its exits on the front port.
@@ -569,7 +625,7 @@ class ServerService:
         ssh = None
         if not local and server.get('auth') != 'none':
             ssh = {k: server.get(k) for k in ('host', 'port', 'username', 'auth', 'keyLabel', 'status', 'checkedAtMs', 'error', 'os', 'docker', 'publicIp',
-                                              'platform')}
+                                              'platform', 'relay')}
         stored = json.loads(node['info_json']) if node else {}
         live = self.hub.live(sid)
         view = None
@@ -761,9 +817,9 @@ class ServerService:
             await self._check_mesh_access(owner, None, cleaned)
             front = cleaned.get('front')
             await self.front.check(owner, None, front)
-        # A front's login is proved through its exits, as it is always used.
-        via = [e['serverId'] for e in front['exits']] if front else None
-        result = await self.registry.save(owner, {**(ssh or {'auth': 'none'}), 'name': data.get('name')}, via=via)
+        # A front's login is proved through its exits (or its relay), as it is always used.
+        exits = [e['serverId'] for e in front['exits']] if front else None
+        result = await self.registry.save(owner, {**(ssh or {'auth': 'none'}), 'name': data.get('name')}, exits=exits)
         server_id = result['item']['id']
         if data.get('profile'):
             await self._save_profile(owner, server_id, data['profile'])
@@ -986,12 +1042,21 @@ class ServerService:
 
         async def stop_job(job):
             result = await self.job_stop(owner, server_id, job['id'], log=f'强制停止后台任务 {job["id"]}（移除节点前）：{job["command"]}')
-            if result.get('job', {}).get('state') not in {'exited', 'stopped', 'interrupted'}:
+            stopped = result.get('job', {})
+            # A terminal state alone says the runner ended, not that its children did.
+            # Once a node has explicitly reported this capability, require it to clear;
+            # allow an already-sent kill to finish within the existing removal deadline.
+            has_stop_capability = type(job.get('canStop')) is bool or type(stopped.get('canStop')) is bool
+            while stopped.get('canStop') is True:
+                await asyncio.sleep(0.1)
+                stopped = (await self.job_status(owner, server_id, job['id'], limit=1))['job']
+            if (stopped.get('state') not in {'exited', 'stopped', 'interrupted'}
+                    or has_stop_capability and stopped.get('canStop') is not False):
                 raise InstanceError('job_stop_unconfirmed', 409)
             report['stopped'].append({'kind': 'job', 'id': job['id'], 'label': job['command'][:200]})
 
         for job in jobs:
-            if job['state'] == 'running':
+            if job['state'] == 'running' or job.get('canStop') is True:
                 await attempt('job', job['id'], job['command'][:200], lambda: stop_job(job))
         if report['failed']:
             error = InstanceError('server_work_stop_failed', 409)
@@ -1114,6 +1179,11 @@ class ServerService:
         a few at a time, then mesh relays one after another, each back on its new build before
         the next goes, so the mesh never loses more than one relay at once. downgrade=True also
         takes the nodes the target is older than (only ever asked for explicitly)."""
+        plan = await self._update_plan(owner, server_ids, auto=auto, downgrade=downgrade)
+        return {'ok': True, 'items': await self._run_updates(owner, plan, source=source, auto=auto, downgrade=downgrade)}
+
+    async def _update_plan(self, owner, server_ids, *, auto, downgrade):
+        """(build, the nodes update_nodes takes, the relays among all) for update_nodes."""
         owned = {r['server_id'] for r in await many(self.db.conn, 'SELECT server_id FROM server_nodes WHERE owner=?', (owner,))}
         built = await self.ensure_builds()
         gone = releases.withdrawn()
@@ -1121,17 +1191,31 @@ class ServerService:
         targets = [sid for sid, s in list(self.hub.sessions.items())
                    if sid in owned and (server_ids is None or sid in server_ids) and s.caps.get('exec') and sid not in self.node_updates
                    and self._wanted(update_state(built, node_facts(s), gone), downgrade and not auto) and (not auto or self._auto_due(sid, s, built))]
-        relays = await self._relays(owner)
+        return built, targets, await self._relays(owner)
+
+    async def _run_updates(self, owner, plan, *, source, auto, downgrade, run=None):
+        """The items of update_nodes. run, a 全部更新 the page follows: the nodes updating now
+        (active) and each result as it comes (items)."""
+        built, targets, relays = plan
         gate = asyncio.Semaphore(4)
 
-        async def one_node(sid):
+        async def one_node(sid, relay=False):
             session = self.hub.sessions.get(sid)
+            if run is not None:
+                run['active'].append(sid)
             try:
                 result = {'serverId': sid, **await self.update_node(owner, sid, source=source, downgrade=downgrade and not auto)}
             except InstanceError as exc:
                 result = {'serverId': sid, 'ok': False, 'error': exc.error}
+            finally:
+                if run is not None:
+                    run['active'].remove(sid)
             if auto:
                 self._auto_record(sid, session, built, result)
+            if relay:
+                result['relay'] = True
+            if run is not None:
+                run['items'].append(result)
             return result
 
         async def ordinary(sid):
@@ -1140,8 +1224,43 @@ class ServerService:
         items = list(await asyncio.gather(*(ordinary(sid) for sid in targets if sid not in relays)))
         for sid in (sid for sid in targets if sid in relays):
             async with self.relay_updates:
-                items.append({**await one_node(sid), 'relay': True})
-        return {'ok': True, 'items': items}
+                items.append(await one_node(sid, relay=True))
+        return items
+
+    # ----- 全部更新 from the page, in the background -----
+    async def start_node_updates(self, owner):
+        """Start 全部更新, or join the one running: the request returns at once and the page
+        follows node_update_run, however long the relays take one after another."""
+        run = self.update_runs.get(owner)
+        if run and run['running']:
+            return {'ok': True, 'run': _run_view(run)}
+        run = self.update_runs[owner] = {'id': secrets.token_hex(6), 'running': True, 'startedAt': now_ms(), 'finishedAt': 0,
+                                         'total': 0, 'active': [], 'items': [], 'error': ''}
+        try:
+            plan = await self._update_plan(owner, None, auto=False, downgrade=False)
+        except BaseException as exc:
+            run.update(running=False, finishedAt=now_ms(), error=getattr(exc, 'error', '') or 'node_update_failed')
+            raise
+        run['total'] = len(plan[1])
+
+        async def go():
+            try:
+                await self._run_updates(owner, plan, source='web', auto=False, downgrade=False, run=run)
+            except Exception as exc:  # noqa: BLE001 - the page says it failed; each node keeps what it reached
+                log.exception('node updates stopped')
+                run['error'] = getattr(exc, 'error', '') or 'node_update_failed'
+            finally:
+                run.update(running=False, finishedAt=now_ms())
+        if plan[1]:
+            self.spawn(go())
+        else:
+            run.update(running=False, finishedAt=now_ms())
+        return {'ok': True, 'run': _run_view(run)}
+
+    def node_update_run(self, owner):
+        """The last 全部更新 started from the page, running or how it ended; None before any."""
+        run = self.update_runs.get(owner)
+        return {'ok': True, 'run': _run_view(run) if run else None}
 
     @staticmethod
     def _wanted(status, downgrade):
@@ -1435,30 +1554,35 @@ class ServerService:
             raise InstanceError(error, {'not_found': 404, 'permission_denied': 403, 'capability_disabled': 403}.get(error, 409))
         return reply.get('result') if isinstance(reply.get('result'), dict) else {}
 
-    async def _log(self, owner, server_id, source, command, started, result, origin=None):
-        """origin: {conversationUuid, title, turnUuid} of the tool call that did it."""
+    async def _log(self, owner, server_id, source, command, started, result, origin=None, *, job_id='', job_judge=''):
+        """origin: {conversationUuid, title, turnUuid} of the tool call that did it. job_id: a background
+        job's, whose end is written into this record (_jobs_ended); job_judge 'caller' when the code that
+        started it says how it ended (job_ended)."""
         origin = origin or {}
         async with self.db.write_transaction(label='server-exec-log') as conn:
             await conn.execute('INSERT INTO server_exec_log(owner,server_id,source,command,started_ms,duration_ms,exit_code,outcome,'
-                               'conversation_uuid,conversation_title,turn_uuid) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                               'conversation_uuid,conversation_title,turn_uuid,job_id,job_judge) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                (owner, server_id, source, command[:2000], started, int(result.get('durationMs') or now_ms() - started),
                                 result.get('exitCode'), result.get('outcome', ''), origin.get('conversationUuid') or '',
-                                (origin.get('title') or '')[:200], origin.get('turnUuid') or ''))
+                                (origin.get('title') or '')[:200], origin.get('turnUuid') or '', job_id, job_judge))
             await conn.execute('DELETE FROM server_exec_log WHERE server_id=? AND id NOT IN (SELECT id FROM server_exec_log WHERE server_id=? ORDER BY id DESC LIMIT ?)',
                                (server_id, server_id, EXEC_LOG_KEEP))
 
-    async def exec(self, owner, server_id, command, *, timeout=120, cwd='', stdin='', source='web', log=None, shell='', ssh_fallback=False, origin=None,
+    async def exec(self, owner, server_id, command, *, timeout=120, cwd='', stdin='', source='web', log=None, shell='', ssh_fallback=False, origin=None, judge=None,
                    bypass=False):
         """Run one command; every attempt is logged (command text, never output). shell='sh'
         keeps the controller's own machine-read commands on plain /bin/sh. With ssh_fallback a
-        server whose node is not connected runs it over its saved SSH login instead."""
+        server whose node is not connected runs it over its saved SSH login instead. judge: for a
+        program whose exit code does not say how it went, result -> whether it ended as it should
+        (its report read), which the record shows; else exit code 0 is success."""
         node = await one(self.db.conn, 'SELECT server_id FROM server_nodes WHERE server_id=? AND owner=?', (server_id, owner))
 
         async def over_ssh(error, status):
             target = await self._ssh_target(owner, server_id) if ssh_fallback else None
             if not target:
                 raise InstanceError(error, status)
-            return await self._exec_ssh(owner, server_id, target, command, timeout=timeout, cwd=cwd, stdin=stdin, source=source, log=log, origin=origin)
+            return await self._exec_ssh(owner, server_id, target, command, timeout=timeout, cwd=cwd, stdin=stdin, source=source, log=log, origin=origin,
+                                        judge=judge)
         if not node:
             return await over_ssh('node_not_enrolled', 404)
         if server_id not in self.hub.sessions:
@@ -1483,6 +1607,7 @@ class ServerService:
                           'outcome': 'timeout' if timed_out else 'ok' if value.get('exitCode') == 0 else 'failed',
                           **{k: value.get(k) for k in ('exitCode', 'stdout', 'stderr', 'truncated', 'timedOut', 'durationMs')},
                           **({'shell': value['shell']} if isinstance(value.get('shell'), str) and value['shell'] else {})}
+        _judged(result, judge)
         await self._log(owner, server_id, source, log or command, started, result, origin)
         return result
 
@@ -1497,7 +1622,7 @@ class ServerService:
                 return None
             raise
 
-    async def _exec_ssh(self, owner, server_id, target, command, *, timeout, cwd, stdin, source, log, origin=None):
+    async def _exec_ssh(self, owner, server_id, target, command, *, timeout, cwd, stdin, source, log, origin=None, judge=None):
         """One run over SSH, never retried: after a drop or a timeout the result is unknown."""
         if stdin:
             # The script itself travels on the remote shell's stdin.
@@ -1505,9 +1630,10 @@ class ServerService:
         platform = await self.registry.platform(target)
         line, body = remote.script(command, platform, cwd)
         started = now_ms()
-        raw = await _ssh(self.db, target, line, stdin=body, timeout=timeout, **({'tunnel': self.front.opener(target['via'])} if target.get('via') else {}))
+        raw = await _ssh(self.db, target, line, stdin=body, timeout=timeout, **self.registry._tunnel(target))
         await self.registry.remember_host_key(server_id, raw.get('knownHosts', ''))
         result = {**remote.result(raw, platform), 'durationMs': now_ms() - started}
+        _judged(result, judge)
         await self._log(owner, server_id, f'{source}-ssh', log or command, started, result, origin)
         return result
 
@@ -1651,10 +1777,13 @@ class ServerService:
         session = self.hub.sessions.get(server_id)
         command, timeout = file_ops.command(data['op'], data, install.platform_of(session.info if session else {}))
         cutoff = now_ms() - 3600000
-        for job_id in [k for k, j in self.file_jobs.items() if j['createdAtMs'] < cutoff]:
+        for job_id in [k for k, j in self.file_jobs.items() if j['state'] in ('done', 'failed') and j['createdAtMs'] < cutoff]:
             self.file_jobs.pop(job_id, None)
         while len(self.file_jobs) >= 50:
-            self.file_jobs.pop(next(iter(self.file_jobs)))
+            terminal = next((k for k, j in self.file_jobs.items() if j['state'] in ('done', 'failed')), None)
+            if terminal is None:
+                raise InstanceError('file_jobs_busy', 409)
+            self.file_jobs.pop(terminal)
         job = {'id': secrets.token_hex(8), 'owner': owner, 'serverId': server_id, 'op': data['op'], 'createdAtMs': now_ms(), 'state': 'running'}
         self.file_jobs[job['id']] = job
 
@@ -1687,16 +1816,18 @@ class ServerService:
         result['data'] = base64.b64decode(result.get('data') or '')
         return result
 
-    async def write_file(self, owner, server_id, path, chunks, *, mode='', mkdirs=False, source='web', label='写入文件'):
+    async def write_file(self, owner, server_id, path, chunks, *, mode='', mkdirs=False, no_replace=False, source='web', label='写入文件'):
         """Write an async iterable of byte chunks; the target changes only after the last one."""
+        if no_replace:
+            self._require_file_process_feature(server_id, 'fs.write.noReplace')
         started, upload, offset = now_ms(), secrets.token_hex(12), 0
         pending = None
         async for chunk in chunks:
             if pending is not None:
-                await self._write_chunk(owner, server_id, path, pending, upload, offset, False, mode, mkdirs)
+                await self._write_chunk(owner, server_id, path, pending, upload, offset, False, mode, mkdirs, no_replace)
                 offset += len(pending)
             pending = chunk
-        await self._write_chunk(owner, server_id, path, pending or b'', upload, offset, True, mode, mkdirs)
+        await self._write_chunk(owner, server_id, path, pending or b'', upload, offset, True, mode, mkdirs, no_replace)
         size = offset + len(pending or b'')
         await self._log(owner, server_id, source, f'{label} {path}（{size} 字节）', started, {'exitCode': 0, 'outcome': 'ok'})
         return {'ok': True, 'path': path, 'size': size}
@@ -1736,16 +1867,22 @@ class ServerService:
 
     async def kill_process(self, owner, server_id, data, *, source='web'):
         """End a process; the node waits for it to go and refuses pid 1 and itself. name only labels the log line."""
+        if not isinstance(data, dict):
+            raise InstanceError('invalid_pid')
         pid, force, name = data.get('pid'), data.get('force', False), data.get('name', '')
+        identity = data.get('identity')
         if type(pid) is not int or pid < 1 or type(force) is not bool or not isinstance(name, str):
             raise InstanceError('invalid_pid')
         await self.registry.get(owner, server_id)
         started = now_ms()
-        result = await self._host_call(owner, server_id, 'host.kill', {'pid': pid, 'force': force}, timeout=30)
+        self._require_file_process_feature(server_id, 'host.processIdentity')
+        if not isinstance(identity, str) or not identity or len(identity) > 256:
+            raise InstanceError('process_identity_required', 409)
+        result = await self._host_call(owner, server_id, 'host.killIdentity', {'pid': pid, 'force': force, 'identity': identity}, timeout=30)
         exited = bool(result.get('exited'))
         await self._log(owner, server_id, source, f"{'强制结束' if force else '结束'}进程 {name[:80] or pid}（PID {pid}）" + ('' if exited else '，未退出'),
                         started, {'exitCode': 0 if exited else None, 'outcome': 'ok' if exited else 'failed'})
-        return {'ok': True, 'pid': pid, 'exited': exited}
+        return {'ok': True, 'pid': pid, 'identity': identity, 'exited': exited}
 
     async def _call_newer(self, owner, server_id, feature, method, params, *, timeout=60):
         """A node call that an older node build lacks: refused up front, never emulated."""
@@ -1796,6 +1933,8 @@ class ServerService:
         job = job if isinstance(job, dict) else {}
         return {'id': str(job.get('id') or ''), 'command': str(job.get('command') or ''), 'cwd': str(job.get('cwd') or ''),
                 'shell': str(job.get('shell') or ''), 'state': str(job.get('state') or ''), 'exitCode': job.get('exitCode'),
+                # None explicitly means an N-1 node did not report residual-process capability.
+                'canStop': job.get('canStop') if type(job.get('canStop')) is bool else None,
                 **({'signal': str(job['signal'])} if job.get('signal') else {}),
                 'startedAtMs': job.get('startedAt') or 0, 'endedAtMs': job.get('endedAt') or None, 'durationMs': job.get('durationMs')}
 
@@ -1804,9 +1943,12 @@ class ServerService:
         log = log if isinstance(log, dict) else {}
         return {'data': str(log.get('data') or ''), **{k: int(log.get(k) or 0) for k in ('offset', 'next', 'size', 'first')}}
 
-    async def job_start(self, owner, server_id, command, *, cwd='', stdin='', source='web', log=None, origin=None, bypass=False):
+    async def job_start(self, owner, server_id, command, *, cwd='', stdin='', source='web', log=None, origin=None, bypass=False, judged=False):
         """Start a command that runs on apart from this connection; returns at once. log: what the
-        command record says instead of the command itself; origin as in _log, kept with the job."""
+        command record says instead of the command itself; origin as in _log, kept with the job.
+        The record says how the job ended once this controller sees it end (_jobs_ended): by its exit
+        code, or with judged by what the caller says (job_ended), for a script whose exit code does
+        not tell."""
         if not isinstance(command, str) or not command.strip() or len(command) > JOB_COMMAND_MAX:
             raise InstanceError('command_required')
         if not isinstance(cwd, str) or len(cwd) > 4096 or not isinstance(stdin, str) or len(stdin.encode()) > JOB_STDIN_MAX:
@@ -1822,10 +1964,64 @@ class ServerService:
             raise
         job = self._job_view(result)
         await self._log(owner, server_id, source, f'{log}（后台任务 {job["id"]}）' if log else f'后台任务 {job["id"]}：{command}', started,
-                        {'outcome': 'started'}, origin)
+                        {'outcome': 'started'}, origin, job_id=job['id'], job_judge='caller' if judged else '')
         if job['id']:
             await self._job_origin(owner, server_id, job['id'], source, origin or {})
         return {'ok': True, 'job': job}
+
+    async def _jobs_ended(self, owner, server_id, jobs):
+        """Write the end of each of jobs that has ended into its record still saying started. One whose
+        caller judges it (job_start judged) is left to the caller once it exited; a stop, or a restart
+        under it, is how it ended whoever judges."""
+        ended = {j['id']: j for j in jobs if j.get('id') and _job_outcome(j)}
+        if not ended:
+            return
+        rows = await many(self.db.conn, "SELECT id,job_id,job_judge,started_ms FROM server_exec_log WHERE server_id=? AND owner=? "
+                                        f"AND outcome='started' AND job_id IN ({','.join('?' * len(ended))})", (server_id, owner, *ended))
+        for row in rows:
+            job = ended[row['job_id']]
+            outcome = _job_outcome(job)
+            if row['job_judge'] == 'caller' and outcome in ('ok', 'failed'):
+                continue
+            await self._end_record(row, outcome, job.get('exitCode'), job.get('endedAtMs'))
+
+    async def job_ended(self, owner, server_id, job_id, outcome, exit_code=None, ended_ms=None):
+        """How a job started with judged went, as its caller found (outcome ok, failed, stopped or
+        unknown), into its record; a record that already says how it ended is left as it is."""
+        row = await one(self.db.conn, "SELECT id,started_ms FROM server_exec_log WHERE server_id=? AND owner=? AND job_id=? AND outcome='started' "
+                                      'ORDER BY id DESC LIMIT 1', (server_id, owner, job_id))
+        if row:
+            await self._end_record(row, outcome, exit_code, ended_ms)
+
+    async def _end_record(self, row, outcome, exit_code, ended_ms):
+        async with self.db.write_transaction(label='server-exec-log-end') as conn:
+            await conn.execute("UPDATE server_exec_log SET outcome=?,exit_code=?,duration_ms=CASE WHEN ? THEN ? ELSE duration_ms END "
+                               "WHERE id=? AND outcome='started'", (outcome, exit_code, bool(ended_ms), max(0, (ended_ms or 0) - row['started_ms']), row['id']))
+
+    async def _job_ends_loop(self):
+        while True:
+            await asyncio.sleep(JOB_END_SWEEP_S)
+            with contextlib.suppress(Exception):
+                await self.sweep_job_ends()
+
+    async def sweep_job_ends(self):
+        """The records of background jobs still saying started that no one has looked at since: what
+        each online node says of them now. One its node no longer lists ended long enough ago that
+        the node forgot it (it keeps its last 50): how it went is not known."""
+        servers = await many(self.db.conn, "SELECT DISTINCT owner,server_id FROM server_exec_log WHERE outcome='started' AND job_id!=''")
+        for server in servers:
+            owner, server_id = server['owner'], server['server_id']
+            if server_id not in self.hub.sessions:
+                continue
+            try:
+                listed = {j['id'] for j in (await self.jobs_list(owner, server_id))['jobs']}
+            except InstanceError:
+                continue
+            rows = await many(self.db.conn, "SELECT id,job_id,started_ms FROM server_exec_log WHERE server_id=? AND owner=? AND outcome='started' "
+                                            "AND job_id!='' AND started_ms<?", (server_id, owner, now_ms() - JOB_GONE_MS))
+            for row in rows:
+                if row['job_id'] not in listed:
+                    await self._end_record(row, 'unknown', None, None)
 
     async def _job_origin(self, owner, server_id, job_id, source, origin):
         async with self.db.write_transaction(label='server-job-origin') as conn:
@@ -1848,7 +2044,9 @@ class ServerService:
     async def jobs_list(self, owner, server_id):
         await self.registry.get(owner, server_id)
         result = await self._call_newer(owner, server_id, 'jobs', 'job.list', {}, timeout=30)
-        return {'ok': True, 'jobs': [self._job_view(j) for j in result.get('jobs') or []]}
+        jobs = [self._job_view(j) for j in result.get('jobs') or []]
+        await self._jobs_ended(owner, server_id, jobs)
+        return {'ok': True, 'jobs': jobs}
 
     async def job_status(self, owner, server_id, job_id, *, offset=None, limit=None):
         """The job and part of its output: the tail, or from offset (bytes the job ever wrote)."""
@@ -1858,7 +2056,9 @@ class ServerService:
             raise InstanceError('invalid_offset')
         params = {'id': job_id, **({'offset': offset} if offset is not None else {}), **({'limit': limit} if limit else {})}
         result = await self._call_newer(owner, server_id, 'jobs', 'job.status', params, timeout=30)
-        return {'ok': True, 'job': self._job_view(result.get('job')), 'log': self._job_log(result.get('log'))}
+        job = self._job_view(result.get('job'))
+        await self._jobs_ended(owner, server_id, [job])
+        return {'ok': True, 'job': job, 'log': self._job_log(result.get('log'))}
 
     async def job_stop(self, owner, server_id, job_id, *, source='web', log=None, origin=None):
         """End the job's whole process group (Windows: process tree)."""
@@ -1867,6 +2067,7 @@ class ServerService:
         started = now_ms()
         result = await self._call_newer(owner, server_id, 'jobs', 'job.stop', {'id': job_id}, timeout=45)
         job = self._job_view(result.get('job'))
+        await self._jobs_ended(owner, server_id, [job])
         if result.get('stopped'):
             await self._log(owner, server_id, source, log or f'停止后台任务 {job_id}：{job["command"]}', started, {'exitCode': job['exitCode'], 'outcome': 'ok'},
                             origin)
@@ -1936,6 +2137,21 @@ class ServerService:
         found = json.loads(out or b'null') if proc.returncode == 0 else None
         return tuple(found) if found else None
 
-    async def _write_chunk(self, owner, server_id, path, data, upload, offset, done, mode, mkdirs):
-        await self._node_call(owner, server_id, 'fs.write', {'path': path, 'data': base64.b64encode(data).decode(), 'upload': upload,
-                                                            'offset': offset, 'done': done, 'mode': mode, 'mkdirs': mkdirs}, timeout=120)
+    def _require_file_process_feature(self, server_id, feature):
+        session = self.hub.sessions.get(server_id)
+        if session and feature not in session.features:
+            raise InstanceError('node_update_required', 409)
+
+    async def _write_chunk(self, owner, server_id, path, data, upload, offset, done, mode, mkdirs, no_replace=False):
+        if no_replace:
+            self._require_file_process_feature(server_id, 'fs.write.noReplace')
+        params = {'path': path, 'data': base64.b64encode(data).decode(), 'upload': upload,
+                  'offset': offset, 'done': done, 'mode': mode, 'mkdirs': mkdirs}
+        if no_replace:
+            params['noReplace'] = True
+        try:
+            await self._node_call(owner, server_id, 'fs.writeSafe' if no_replace else 'fs.write', params, timeout=120)
+        except InstanceError as exc:
+            if no_replace and exc.error == 'unsupported_method':
+                raise InstanceError('node_update_required', 409) from None
+            raise

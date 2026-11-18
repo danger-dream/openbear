@@ -1,3 +1,6 @@
+import {normalizeImageOneTurn} from "../views/consoleView/imageOneTurn.js";
+import {normalizePromptTemplate} from "../views/consoleView/promptTemplate.js";
+
 export const RUN_DEFAULT_FIELDS = Object.freeze([
   "mainModel",
   "mainThinkingLevel",
@@ -6,6 +9,8 @@ export const RUN_DEFAULT_FIELDS = Object.freeze([
   "agentThinkLevel",
   "agentFastMode",
   "contextStrategy",
+  "imageOneTurn",
+  "promptTemplate",
 ]);
 
 export const RUN_DEFAULT_INHERIT = "inherit";
@@ -73,7 +78,9 @@ export function normalizedRunDefaults({local, inherited, fallback, resolved} = {
     : selected.agentFastMode === true && agent?.supportsFast ? true : null;
 
   const contextStrategy = selected.contextStrategy === "model_summary" ? "model_summary" : "sliding_window";
-  return {mainModel, mainThinkingLevel: mainThinkingLevel || "off", mainFastMode, agentModel, agentThinkLevel, agentFastMode, contextStrategy};
+  const imageOneTurn = normalizeImageOneTurn(selected.imageOneTurn);
+  const promptTemplate = normalizePromptTemplate(selected.promptTemplate);
+  return {mainModel, mainThinkingLevel: mainThinkingLevel || "off", mainFastMode, agentModel, agentThinkLevel, agentFastMode, contextStrategy, imageOneTurn, promptTemplate};
 }
 
 export function runDefaultSelection(value, field) {

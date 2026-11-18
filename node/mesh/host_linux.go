@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"golang.zx2c4.com/wireguard/tun"
+	meshfast "openbear/node/mesh/fast"
 )
 
 const (
@@ -276,10 +277,13 @@ func (h *linuxHost) firewall(next hostConfig) error {
 	if next.UDP != 0 {
 		in.rules = append(in.rules, []string{"-p", "udp", "-m", "udp", "--dport", strconv.Itoa(next.UDP), "-j", "ACCEPT"})
 	}
-	for _, p := range []int{next.TCP, next.TLS} {
+	for _, p := range append([]int{next.TCP, next.TLS, next.Fast}, next.ForwardTCP...) {
 		if p != 0 {
 			in.rules = append(in.rules, []string{"-p", "tcp", "-m", "tcp", "--dport", strconv.Itoa(p), "-j", "ACCEPT"})
 		}
+	}
+	for _, p := range next.ForwardUDP {
+		in.rules = append(in.rules, []string{"-p", "udp", "-m", "udp", "--dport", strconv.Itoa(p), "-j", "ACCEPT"})
 	}
 	want[chainIn] = in
 	if h.iptables {
@@ -322,7 +326,7 @@ func (h *linuxHost) firewall(next hostConfig) error {
 		}
 	}
 	// firewalld and nftables: never fatal, what does not go through is reported.
-	w := firewallWant{addr: next.Address, udp: next.UDP, tcp: next.TCP, tls: next.TLS}
+	w := firewallWant{addr: next.Address, udp: next.UDP, tcp: next.TCP, tls: next.TLS, fast: next.Fast, fwdTCP: next.ForwardTCP, fwdUDP: next.ForwardUDP}
 	if next.Gateway != nil {
 		w.subnets = slices.Clone(next.Gateway.Subnets)
 	}
@@ -619,6 +623,8 @@ func (h *linuxHost) close() {
 // mesh goes with none to start.
 func Sweep(dir string) {
 	newHost("obmesh0", dir, nil).(*linuxHost).sweep()
+	meshfast.SweepTransparent()
+	meshfast.SweepTCPMem(dir)
 }
 
 func (h *linuxHost) sweep() {

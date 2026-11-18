@@ -111,7 +111,9 @@ type pendingCall struct {
 
 func (e *Engine) start(ctx context.Context, method string, params any, session string) *pendingCall {
 	pc := &pendingCall{ch: make(chan reply, 1), done: make(chan struct{})}
-	cctx, cancel := context.WithCancel(ctx)
+	// Modal/navigation events stop the local reply wait, not the physical send.
+	// The operation context remains the authority for actual I/O cancellation.
+	replyCtx, cancel := context.WithCancel(context.Background())
 	pc.cancel = cancel
 	c := e.cdp
 	var d time.Duration
@@ -131,17 +133,19 @@ func (e *Engine) start(ctx context.Context, method string, params any, session s
 	}
 	go func() {
 		defer close(pc.done)
+		defer cancel()
 		if early != nil {
 			pc.ch <- reply{err: early}
 			return
 		}
-		res, err := c.call(cctx, method, params, session, d)
+		res, err := c.callWithReplyStop(ctx, method, params, session, d, replyCtx.Done())
 		pc.ch <- reply{result: res, err: err}
 	}()
 	return pc
 }
 
-// stop cancels local waiting for the command and waits for its task.
+// stop ends only local reply waiting and joins the task. A send still in progress
+// finishes once, bounded by the original operation context/timeout, never replayed.
 func (pc *pendingCall) stop(e *Engine) {
 	pc.cancel()
 	e.block(func() { <-pc.done })
@@ -655,6 +659,8 @@ func (e *Engine) execute(ctx context.Context, action string, params *Obj) (any, 
 			code = "navigation_timeout"
 		}
 		return nil, browserError(ctx, code, "", details)
+	case errors.Is(err, errWriteInterrupted):
+		return nil, browserError(ctx, "browser_connection_lost", "unknown", map[string]any{"effectsPossible": true})
 	case errors.Is(err, ErrDisconnected):
 		return nil, browserError(ctx, "browser_connection_lost", "", nil)
 	}

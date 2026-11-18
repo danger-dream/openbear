@@ -22,7 +22,7 @@ const floating = ref(null), menuBox = ref(null);
 const viewing = ref(null);
 const chmod = reactive({open: false, targets: [], bits: [], octal: '', special: 0, recursive: false});
 const pack = reactive({open: false, targets: [], name: '', format: 'tar.gz'});
-let alive = true;
+let alive = true, navigation = 0;
 
 const shown = computed(() => entries.value.filter(e => hidden.value || !e.name.startsWith('.')));
 const crumbs = computed(() => P.value.crumbs(path.value));
@@ -32,26 +32,29 @@ const drives = computed(() => P.value.windows && path.value === '/');
 const picked = computed(() => shown.value.filter(e => selected.value.includes(e.name)));
 const allPicked = computed(() => shown.value.length > 0 && picked.value.length === shown.value.length);
 const join = (dir, name) => P.value.join(dir, name);
-const full = entry => join(path.value, entry.name);
-const where = () => P.value.show(path.value) || '此电脑';
+const full = entry => entry.location?.path || join(path.value, entry.name);
+const place = entry => entry?.location || {server: props.serverId, dir: path.value, platform: props.platform};
 
 async function go(target = draft.value) {
-  const next = P.value.normalize(target);
+  const next = P.value.normalize(target), mine = ++navigation, server = props.serverId, platform = props.platform;
   loading.value = true; error.value = '';
   try {
-    const data = ok(await Api.serverFiles(props.serverId, next));
+    const data = ok(await Api.serverFiles(server, next));
+    if (!alive || mine !== navigation || props.serverId !== server) return;
     if (data.path !== path.value) selected.value = [];
     path.value = data.path;
     draft.value = P.value.show(data.path);
-    entries.value = data.entries;
+    entries.value = data.entries.map(entry => ({...entry, location: {server, dir: data.path, path: pathsFor(platform).join(data.path, entry.name), platform}}));
     truncated.value = data.truncated;
     selected.value = selected.value.filter(n => data.entries.some(e => e.name === n));
+    return {navigation: mine, server, path: data.path, entries: entries.value};
   } catch (e) {
+    if (!alive || mine !== navigation || props.serverId !== server) return;
     error.value = props.platform === 'darwin' && e?.response?.data?.error === 'permission_denied'
       ? '没有权限。macOS 的隐私保护不让读取这个目录：在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”里加入 /usr/local/bin/openbear-node 后重试。'
       : safeError(e);
     draft.value = P.value.show(path.value);
-  } finally { loading.value = false; }
+  } finally { if (alive && mine === navigation) loading.value = false; }
 }
 function up() { if (path.value !== '/') go(P.value.parent(path.value)); }
 // Folders open, text and images open in the viewer; anything else shows its menu.
@@ -61,14 +64,21 @@ function choose(entry, event) {
   else if (k === 'text' || k === 'image') view(entry);
   else openMenu(event, entry);
 }
-function view(entry, asText = false) { viewing.value = {entry, path: full(entry), asText}; }
+function view(entry, asText = false) {
+  const context = place(entry);
+  viewing.value = {entry, path: full(entry), server: context.server, where: pathsFor(context.platform).show(context.dir) || '此电脑', asText};
+}
+function refreshViewed() {
+  const context = viewing.value && place(viewing.value.entry);
+  if (context && alive && !loading.value && props.serverId === context.server && path.value === context.dir) void go(path.value);
+}
 function toggle(entry) {
   selected.value = selected.value.includes(entry.name) ? selected.value.filter(n => n !== entry.name) : [...selected.value, entry.name];
 }
 function toggleAll() { selected.value = allPicked.value ? [] : shown.value.map(e => e.name); }
 function download(entry) {
   const a = document.createElement('a');
-  a.href = Api.serverFileDownloadUrl(props.serverId, full(entry));
+  a.href = Api.serverFileDownloadUrl(place(entry).server, full(entry));
   a.download = entry.name;
   document.body.appendChild(a);
   a.click();
@@ -83,6 +93,7 @@ function openMenu(event, entry) {
   event?.preventDefault?.();
   event?.stopPropagation?.();
   if (busy.value) return;
+  menu.context = place(entry);
   menu.targets = entry ? (picked.value.length > 1 && selected.value.includes(entry.name) ? picked.value : [entry]) : [];
   menu.anchor = event?.type === 'contextmenu' ? new DOMRect(event.clientX, event.clientY, 0, 0) : event?.currentTarget || null;
   menu.from = event?.currentTarget instanceof HTMLElement ? event.currentTarget : document.activeElement;
@@ -121,7 +132,7 @@ const actions = computed(() => {
   ].filter(Boolean);
 });
 async function act(key) {
-  const targets = menu.targets, one = targets[0];
+  const targets = menu.targets, one = targets[0], context = menu.context;
   closeMenu();
   if (key === 'open') go(full(one));
   else if (key === 'edit' || key === 'view') view(one);
@@ -130,7 +141,7 @@ async function act(key) {
   else if (key === 'copy') copy(P.value.show(full(one)));
   else if (key === 'upload') picker.value.click();
   else if (key === 'refresh') go(path.value);
-  else if (key === 'mkdir' || key === 'touch') create(key);
+  else if (key === 'mkdir' || key === 'touch') create(key, context);
   else if (key === 'rename') rename(one);
   else if (key === 'delete') remove(targets);
   else if (key === 'chmod') openChmod(targets);
@@ -143,53 +154,58 @@ async function copy(text) {
 }
 
 // Every change runs on the server as a background job; long ones are polled.
-async function run(op, data, label) {
+async function run(op, data, label, context = place()) {
   busy.value = label;
   try {
-    let job = ok(await Api.serverFileOp(props.serverId, {op, ...data})).job, wait = 250;
+    let job = ok(await Api.serverFileOp(context.server, {op, ...data})).job, wait = 250;
     while (job.state === 'running' && alive) {
       await new Promise(resolve => setTimeout(resolve, wait));
       wait = Math.min(1500, wait * 1.6);
-      job = ok(await Api.serverFileOpJob(props.serverId, job.id)).job;
+      job = ok(await Api.serverFileOpJob(context.server, job.id)).job;
     }
     if (job.state === 'failed') { ElMessage.error(errorText(job.error) + (job.detail ? `（${job.detail}）` : '')); return false; }
     return true;
   } catch (e) { ElMessage.error(safeError(e)); return false; }
-  finally { busy.value = ''; if (alive) void go(path.value); }
+  finally { busy.value = ''; if (op !== 'touch' && alive && !loading.value && props.serverId === context.server && path.value === context.dir) void go(path.value); }
 }
-const valid = value => P.value.validName(value);
-async function ask(title, label, value = '') {
+async function ask(title, label, value = '', platform = props.platform) {
+  const valid = pathsFor(platform).validName;
   try {
     const {value: answer} = await ElMessageBox.prompt(label, title, {inputValue: value, inputValidator: valid, confirmButtonText: '确定', cancelButtonText: '取消',
       customClass: 'fb-prompt'});
     return answer.trim();
   } catch { return null; }
 }
-async function create(kindOf) {
-  const name = await ask(kindOf === 'mkdir' ? '新建文件夹' : '新建文件', `在 ${where()} 中创建`);
-  if (!name || !await run(kindOf, {path: path.value, name}, '正在创建…') || kindOf !== 'touch') return;
-  await go(path.value);
-  const made = entries.value.find(e => e.name === name);
+async function create(kindOf, context = place()) {
+  const name = await ask(kindOf === 'mkdir' ? '新建文件夹' : '新建文件', `在 ${pathsFor(context.platform).show(context.dir) || '此电脑'} 中创建`, '', context.platform);
+  if (!name || !await run(kindOf, {path: context.dir, name}, '正在创建…', context) || kindOf !== 'touch') return;
+  if (props.serverId !== context.server || path.value !== context.dir || loading.value) return;
+  const refreshed = await go(context.dir);
+  if (!refreshed || !alive || refreshed.navigation !== navigation || props.serverId !== context.server
+      || refreshed.server !== context.server || path.value !== context.dir || refreshed.path !== context.dir) return;
+  const made = refreshed.entries.find(e => e.name === name);
   if (made) view(made);
 }
 async function rename(entry) {
-  const name = await ask('重命名', `「${entry.name}」的新名称`, entry.name);
-  if (name && name !== entry.name) await run('rename', {path: full(entry), name}, '正在重命名…');
+  const context = place(entry), target = full(entry);
+  const name = await ask('重命名', `「${entry.name}」的新名称`, entry.name, context.platform);
+  if (name && name !== entry.name) await run('rename', {path: target, name}, '正在重命名…', context);
 }
 async function remove(targets) {
+  const context = place(targets[0]), paths = targets.map(full);
   const list = targets.slice(0, 5).map(e => `「${e.name}」`).join('、') + (targets.length > 5 ? ` 等 ${targets.length} 项` : '');
   const folders = targets.some(e => e.dir);
   try {
     await ElMessageBox.confirm(`删除 ${list}？${folders ? '文件夹里的内容会一起删除。' : ''}删除后无法恢复。`, '删除', {confirmButtonText: '删除', cancelButtonText: '取消',
       type: 'warning', confirmButtonClass: 'el-button--danger'});
   } catch { return; }
-  if (await run('delete', {paths: targets.map(full)}, '正在删除…')) selected.value = [];
+  if (await run('delete', {paths}, '正在删除…', context) && props.serverId === context.server && path.value === context.dir) selected.value = [];
 }
 function openChmod(targets) {
   const mode = targets.length === 1 ? targets[0].mode : '0644';
   // setuid, setgid and sticky bits have no checkbox; keep them as they were.
   const special = (parseInt(mode || '0', 8) >> 9) & 7;
-  Object.assign(chmod, {open: true, targets, bits: modeBits(mode), octal: modeFrom(modeBits(mode), special), special, recursive: false});
+  Object.assign(chmod, {open: true, targets: [...targets], context: place(targets[0]), paths: targets.map(full), bits: modeBits(mode), octal: modeFrom(modeBits(mode), special), special, recursive: false});
 }
 function syncOctal() { chmod.octal = modeFrom(chmod.bits, chmod.special); }
 function syncBits() {
@@ -200,31 +216,34 @@ function syncBits() {
 async function applyChmod() {
   if (!/^[0-7]{3,4}$/.test(chmod.octal)) { ElMessage.error(errorText('invalid_file_mode')); return; }
   chmod.open = false;
-  await run('chmod', {paths: chmod.targets.map(full), mode: chmod.octal, recursive: chmod.recursive}, '正在修改权限…');
+  await run('chmod', {paths: chmod.paths, mode: chmod.octal, recursive: chmod.recursive}, '正在修改权限…', chmod.context);
 }
 function openPack(targets) {
-  const base = targets.length === 1 ? targets[0].name : (P.value.leaf(path.value) || 'archive');
-  Object.assign(pack, {open: true, targets, name: base, format: P.value.windows ? 'zip' : 'tar.gz'});
+  const context = place(targets[0]), paths = pathsFor(context.platform);
+  const base = targets.length === 1 ? targets[0].name : (paths.leaf(context.dir) || 'archive');
+  Object.assign(pack, {open: true, targets: [...targets], context, paths: targets.map(full), where: paths.show(context.dir) || '此电脑', name: base, format: paths.windows ? 'zip' : 'tar.gz'});
 }
 async function applyPack() {
   const name = pack.name.trim();
-  if (valid(name) !== true) { ElMessage.error(errorText('invalid_file_name')); return; }
+  if (pathsFor(pack.context.platform).validName(name) !== true) { ElMessage.error(errorText('invalid_file_name')); return; }
   pack.open = false;
-  if (await run('compress', {paths: pack.targets.map(full), name, format: pack.format}, '正在压缩…')) selected.value = [];
+  const context = pack.context;
+  if (await run('compress', {paths: pack.paths, name, format: pack.format}, '正在压缩…', context) && props.serverId === context.server && path.value === context.dir) selected.value = [];
 }
 async function extract(entry) {
+  const context = place(entry), target = full(entry), paths = pathsFor(context.platform);
   try {
     const {value} = await ElMessageBox.prompt(`「${entry.name}」解压到（不存在会自动创建，同名文件会被覆盖）`, '解压', {
-      inputValue: P.value.show(join(path.value, archiveBase(entry.name))), confirmButtonText: '解压', cancelButtonText: '取消', customClass: 'fb-prompt',
-      inputValidator: v => (v && P.value.absolute(v)) || (P.value.windows ? '请填写带盘符的完整路径，例如 D:\\backup' : '请填写以 / 开头的完整路径')});
-    await run('extract', {path: full(entry), dest: P.value.normalize(value)}, '正在解压…');
+      inputValue: paths.show(paths.join(context.dir, archiveBase(entry.name))), confirmButtonText: '解压', cancelButtonText: '取消', customClass: 'fb-prompt',
+      inputValidator: v => (v && paths.absolute(v)) || (paths.windows ? '请填写带盘符的完整路径，例如 D:\\backup' : '请填写以 / 开头的完整路径')});
+    await run('extract', {path: target, dest: paths.normalize(value)}, '正在解压…', context);
   } catch { /* cancelled */ }
 }
 
 const UPLOAD_LIMIT = 4 * 1024 ** 3;
 // dir and server are where the files were chosen: browsing on during the upload does not move the rest.
-async function send(file, dir, server, overwrite = false) {
-  const target = join(dir, file.name);
+async function send(file, dir, server, overwrite = false, platform = props.platform) {
+  const target = pathsFor(platform).join(dir, file.name);
   const task = reactive({name: file.name, size: file.size, done: 0, state: 'running', error: ''});
   uploads.value = [task, ...uploads.value.filter(u => u.state === 'running')].slice(0, 6);
   // The controller refuses larger uploads from Content-Length before any data is sent.
@@ -237,20 +256,20 @@ async function send(file, dir, server, overwrite = false) {
       uploads.value = uploads.value.filter(u => u !== task);
       try { await ElMessageBox.confirm(`「${file.name}」已存在，要覆盖吗？`, '覆盖文件', {confirmButtonText: '覆盖', cancelButtonText: '取消', type: 'warning'}); }
       catch { return; }
-      return send(file, dir, server, true);
+      return send(file, dir, server, true, platform);
     }
     task.state = 'failed'; task.error = safeError(e);
   }
-  if (alive && props.serverId === server && path.value === dir) void go(path.value);
+  if (alive && !loading.value && props.serverId === server && path.value === dir) void go(path.value);
 }
 async function upload(files) {
-  const dir = path.value, server = props.serverId;
-  for (const file of files) await send(file, dir, server);
+  const dir = path.value, server = props.serverId, platform = props.platform;
+  for (const file of files) await send(file, dir, server, false, platform);
 }
 function chosen(event) { upload([...event.target.files]); event.target.value = ''; }
 function dropped(event) { dragging.value = false; if (event.dataTransfer?.files?.length) upload([...event.dataTransfer.files]); }
 const icon = entry => entry.dir ? Folder : entry.type === 'link' ? Link : Document;
-watch(() => props.serverId, () => { selected.value = []; go(home()); });
+watch(() => props.serverId, () => { selected.value = []; entries.value = []; closeMenu(); path.value = home(); go(home()); });
 onMounted(() => go(home()));
 onBeforeUnmount(() => { alive = false; });
 </script>
@@ -332,11 +351,11 @@ onBeforeUnmount(() => { alive = false; });
       </template>
     </el-dialog>
     <el-dialog v-model="pack.open" title="压缩" width="420px" append-to-body class="admin-dialog instance-dialog instance-ui servers-ui fb-dialog">
-      <p class="instance-muted fb-dialog-note">{{ pack.targets.length === 1 ? pack.targets[0].name : `${pack.targets.length} 项` }} → {{ where() }}</p>
+      <p class="instance-muted fb-dialog-note">{{ pack.targets.length === 1 ? pack.targets[0].name : `${pack.targets.length} 项` }} → {{ pack.where }}</p>
       <div class="ob-fields">
         <label class="ob-field"><span>文件名</span><input v-model="pack.name" v-bind="noAutofill" aria-label="压缩包名称" @keydown.enter="applyPack" /></label>
         <label class="ob-field"><span>格式</span>
-          <select v-if="P.windows" v-model="pack.format" aria-label="压缩格式"><option value="zip">zip</option><option value="tar.gz">tar.gz</option></select>
+          <select v-if="pack.context?.platform === 'windows'" v-model="pack.format" aria-label="压缩格式"><option value="zip">zip</option><option value="tar.gz">tar.gz</option></select>
           <select v-else v-model="pack.format" aria-label="压缩格式"><option value="tar.gz">tar.gz（通用）</option><option value="zip">zip（Windows 友好）</option><option value="tar.xz">tar.xz（更小，更慢）</option></select>
         </label>
       </div>
@@ -344,7 +363,7 @@ onBeforeUnmount(() => { alive = false; });
         <div class="instance-form-footer"><el-button @click="pack.open = false">取消</el-button><el-button type="primary" @click="applyPack">压缩</el-button></div>
       </template>
     </el-dialog>
-    <FileViewer v-if="viewing" :server-id="serverId" :path="viewing.path" :where="P.show(P.parent(viewing.path)) || '此电脑'" :entry="viewing.entry" :as-text="viewing.asText" :phone="phone"
-      @close="viewing = null" @saved="go(path)" @download="download(viewing.entry)" />
+    <FileViewer v-if="viewing" :key="viewing.server + ':' + viewing.path" :server-id="viewing.server" :path="viewing.path" :where="viewing.where" :entry="viewing.entry" :as-text="viewing.asText" :phone="phone"
+      @close="viewing = null" @saved="refreshViewed" @download="download(viewing.entry)" />
   </div>
 </template>

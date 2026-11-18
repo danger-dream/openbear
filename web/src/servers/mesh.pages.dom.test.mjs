@@ -58,7 +58,7 @@ test('a node\'s page: sections, what it is joined to, auto values with the way b
   assert.deepEqual((await texts(page.locator('.m3-row-name strong'))), ['Berlin', 'LAX', 'Home']);
   await page.locator('.m3-row', {hasText: 'Home'}).click();
   const nav = await texts(page.locator('.m3-node-nav button'));
-  assert.deepEqual(nav, ['概况', '角色', '怎么连进组网', '共享局域网', '出口和代理端口', '访问', '网络参数', '诊断', '移除']);
+  assert.deepEqual(nav, ['概况', '角色', '怎么连进组网', '共享局域网', '快速中转', '出口和代理端口', '端口转发', '访问', '网络参数', '诊断', '移除']);
   // The relays it enters by, in order, each with its protocol.
   assert.deepEqual(plain(await texts(page.locator('#m3-sec-connect .m3-nitems-main b'))), ['Berlin', 'LAX']);
   // Listen ports set by hand: what the mesh would set and why, and the way back.
@@ -75,7 +75,9 @@ test('a node\'s page: sections, what it is joined to, auto values with the way b
   await network.getByRole('radio', {name: /^手填/}).click();
   await network.getByRole('textbox', {name: '手填对外地址'}).fill('home.example.net');
   await network.getByRole('textbox', {name: '手填对外地址'}).dispatchEvent('change');
-  await h.saved(d => memberOf(d, 'home').publicEndpoint === 'home.example.net' && !('announce' in memberOf(d, 'home')), 'typed address');
+  // Announced again said as such: the controller keeps what a member leaves out.
+  await h.saved(d => memberOf(d, 'home').publicEndpoint === 'home.example.net' && memberOf(d, 'home').announce === true, 'typed address');
+  await until(page, () => !('announce' in h.mesh.doc.members.find(m => m.serverId === 'home')), 'announced again in the draft');
   // Only TCP is listened on now: its mapping.
   await network.getByRole('textbox', {name: 'TCP 对外端口'}).fill('41999');
   await network.getByRole('textbox', {name: 'TCP 对外端口'}).dispatchEvent('change');
@@ -108,7 +110,41 @@ test('a node\'s page: sections, what it is joined to, auto values with the way b
   await page.getByRole('button', {name: '返回节点列表'}).click();
   await page.locator('.m3-row', {hasText: 'Berlin'}).click();
   assert.deepEqual(plain(await texts(page.locator('#m3-sec-lan .m3-backup > button:first-child'))), ['LAX']);
+  // Berlin carries only its own: kept while on and tagged in the list; off again, said as off and staying off.
+  await page.locator('#m3-sec-role').getByRole('switch', {name: '只承载自己的流量'}).click();
+  await h.saved(d => memberOf(d, 'berlin').noTransit === true, 'Berlin carrying its own only');
+  await page.getByRole('button', {name: '返回节点列表'}).click();
+  await until(page, async () => (await texts(page.locator('.m3-row', {hasText: 'Berlin'}).locator('.m3-row-tags .m3-tag'))).includes('不中转'), 'Berlin tagged');
+  await page.locator('.m3-row', {hasText: 'Berlin'}).click();
+  const transit = page.locator('#m3-sec-role').getByRole('switch', {name: '只承载自己的流量'});
+  await transit.click();
+  await h.saved(d => memberOf(d, 'berlin').noTransit === false, 'Berlin transiting again');
+  await until(page, () => !('noTransit' in h.mesh.doc.members.find(m => m.serverId === 'berlin')), 'off in the draft');
+  await page.waitForTimeout(300);
+  assert.equal(await transit.getAttribute('aria-checked'), 'false', 'the switch stays off after the reply');
   await h.close();
+});
+
+test('a node\'s page: how a member is joined now, by its one entry or by every relay it is joined to at once (desktop and phone)', async t => {
+  for (const [width, height] of [[1440, 900], [390, 844]]) {
+    const h = await setup(t, {v3: true, width, height});
+    const {page} = h;
+    await tab(page, '节点').click();
+    await page.locator('.m3-row', {hasText: 'Home'}).click();
+    const now = page.locator('.m3-kvs > div', {has: page.locator('dt', {hasText: /^现在怎么连着$/})}).locator('dd');
+    await until(page, async () => (await now.innerText()).startsWith('经 LAX'), 'one entry');
+    // Joined to Berlin and LAX at once, routing as a leaf: no entry, a link to each.
+    const links = [{peer: 'berlin', state: 'up', rttMs: 188.4}, {peer: 'lax', state: 'up', rttMs: 151.2}];
+    const relayPeer = id => ({id, kind: 'relay', active: true, transport: 'udp', endpoint: '', lastHandshakeUnixNano: String((Date.now() - 5000) * 1e6), rxBytes: 1, txBytes: 1, rttMs: 150});
+    Object.assign(h.mesh.nodes.home.summary, {entry: {}, routing: {mode: 'dynamic', links, routes: []}});
+    Object.assign(h.mesh.extra.status, {entry: null, peers: [relayPeer('berlin'), relayPeer('lax')], routing: {mode: 'dynamic', links, routes: []}});
+    await until(page, async () => /^同时连上 2 个中转 · 最快经 .*LAX.* · 151 ms$/.test(await now.innerText()), 'joined at once');
+    links[1].state = 'down';
+    await until(page, async () => /^同时连上 1\/2 个中转 · 最快经 .*Berlin.* · 188 ms$/.test(await now.innerText()), 'one link down');
+    links[0].state = 'down';
+    await until(page, async () => (await now.innerText()) === '2 个中转都没连上', 'both down');
+    await h.close();
+  }
 });
 
 test('joining: the node measures every relay, the role and the relays recommended with reasons, then the draft gets them', async t => {
@@ -138,6 +174,9 @@ test('joining: the node measures every relay, the role and the relays recommende
   const draft = await h.saved(d => memberOf(d, 'mac')?.entry?.candidates?.length === 2, 'the newcomer\'s entries');
   assert.deepEqual(memberOf(draft, 'mac').entry.candidates.map(c => [c.relay, c.transport, c.auto || []]), [['berlin', 'udp', ['transport']], ['lax', 'tcp', []]]);
   await page.locator('.m3-joined', {hasText: '公司-Mac 已加入草稿'}).waitFor();
+  // Applied from the changes bar instead of the note: once the newcomer has the applied revision, the note goes too.
+  await page.locator('.mesh-bar').getByRole('button', {name: '应用'}).click();
+  await until(page, async () => (await page.locator('.m3-joined', {hasText: '已加入草稿'}).count()) === 0, 'the note gone once Mac is applied');
   await h.close();
 });
 
@@ -566,5 +605,152 @@ test('a member on one entry keeps it until moved: on its page any way and back, 
   await tab(page, '线路').click();
   await page.locator('.m3-autolinks-bar').first().waitFor();
   assert.equal(await page.locator('.m3-autolinks-bar', {hasText: '一次只用一个入口'}).count(), 0);
+  await h.close();
+});
+
+test('routing: why a route stays, the best ten against the route in use, the thresholds in the settings', async t => {
+  const h = await setup(t, {v3: true});
+  const {page} = h;
+  const tuning = {switchMs: 20, switchPct: 0};
+  h.mesh.setPath((src, dst) => ({hops: [{node: src, via: ''}, {node: 'berlin', via: 'entry', rttMs: 12}, {node: dst, via: 'relay', rttMs: 140}], rttMs: 152, stale: false,
+    decision: {node: 'berlin', dest: dst, cost: 190.4, best: 'lax', bestCost: 176, held: 'margin'}, tuning}));
+  await tab(page, '节点').click();
+  await page.locator('.m3-row', {hasText: 'Home'}).click();
+  const why = page.locator('.m3-rt-why');
+  await why.waitFor();
+  assert.equal(await why.innerText(), 'Berlin 选的路线，代价 190.4；改走 LAX 代价 176，便宜 14.4 ms，没换：便宜得不够，没到切换门槛（门槛：至少便宜 20 ms）。');
+  // The best ten, each against the route in use.
+  const seg = (a, b, rttMs) => ({a, b, exists: true, rttMs});
+  h.mesh.setBest(() => ({routes: [{nodes: ['home', 'lax'], segments: [seg('home', 'lax', 150)], rttMs: 150, cost: 176, own: null},
+    {nodes: ['home', 'berlin', 'lax'], segments: [seg('home', 'berlin', 12), seg('berlin', 'lax', 140)], rttMs: 152, cost: 190.4, own: null},
+    {nodes: ['home', 'mac', 'lax'], segments: [seg('home', 'mac', 20), seg('mac', 'lax', 140)], rttMs: 160, cost: 200, own: null}],
+  own: [], current: {nodes: ['home', 'berlin', 'lax'], cost: 190.4}, tuning}));
+  await page.getByRole('button', {name: '计算前 10 条'}).click();
+  const costs = page.locator('.m3-rt-best .m3-rt-cost');
+  await until(page, async () => await costs.count() === 3, 'the best routes listed');
+  assert.deepEqual(await texts(costs), ['代价 176 · 便宜 14.4，不到门槛', '代价 190.4', '代价 200 · 比现在贵 9.6']);
+  assert.match(await page.locator('.m3-rt-best + .m3-hint').innerText(), /现在走的代价 190\.4，另一条要至少便宜 20 ms才会换过去/);
+  // The thresholds: in the settings, checked, saved, back to their defaults.
+  await tab(page, '设置').click();
+  const routing = page.getByRole('region', {name: '选路'});
+  await routing.waitFor();
+  assert.match(await routing.innerText(), /链路代价 = 延迟/);
+  await routing.getByRole('spinbutton', {name: '切换门槛 且超过 %'}).fill('95');
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  await routing.getByText('在 0～90 之间').waitFor();
+  await routing.getByRole('spinbutton', {name: '切换门槛 且超过 %'}).fill('0');
+  await routing.getByRole('spinbutton', {name: '切换门槛 至少便宜 ms'}).fill('3');
+  await routing.getByRole('spinbutton', {name: '丢包权重 ms（全丢时）'}).fill('500');
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  const saved = await h.saved(d => d.settings.routing?.switchMs === 3, 'the thresholds saved');
+  assert.deepEqual(saved.settings.routing, {switchMs: 3, switchPct: 0, shorterMs: 3, shorterPct: 0, advertMs: 2, advertPct: 0, holdS: 5, jitterWeight: 2, lossWeight: 500,
+    flapHoldS: 60, flapHoldMaxS: 480});
+  await routing.getByRole('button', {name: '全部恢复默认'}).click();
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  await h.saved(d => d.settings.routing?.switchMs === 5 && d.settings.routing.lossWeight === 1000, 'back to the defaults');
+  await h.close();
+});
+
+// 2026-11-16: a backup entry on a broken relay alerted again and again, with nowhere to stop it.
+test('settings: the mesh notifications switched by type, saved at once into the server settings, not the draft', async t => {
+  const h = await setup(t, {v3: true});
+  const {page} = h;
+  await tab(page, '设置').click();
+  const alerts = page.getByRole('region', {name: '通知'});
+  await alerts.waitFor();
+  const standby = alerts.getByRole('switch', {name: '备用入口都连不上提醒'});
+  await until(page, async () => await standby.isEnabled(), 'the switches loaded');
+  assert.equal(await standby.getAttribute('aria-checked'), 'true');
+  assert.equal(await alerts.getByRole('switch').count(), 9);
+  await standby.click();
+  await until(page, async () => await standby.getAttribute('aria-checked') === 'false' && await standby.isEnabled(), 'switched off');
+  assert.equal(await standby.innerText(), '不推送');
+  const saves = () => h.calls.filter(c => c.method === 'PUT' && c.path === '/api/servers/settings').map(c => c.body);
+  assert.deepEqual(saves(), [{reminders: {mesh: {standby: false}}}]);
+  assert.equal(h.puts().length, 0, 'nothing into the draft');
+  await alerts.getByRole('button', {name: '全部打开'}).click();
+  await until(page, async () => await standby.getAttribute('aria-checked') === 'true' && await standby.isEnabled(), 'all on again');
+  assert.equal(saves().length, 2);
+  assert.equal(await alerts.getByRole('button', {name: '全部打开'}).isDisabled(), true);
+  await h.close();
+});
+
+test('settings: the tunnel port with the default ports, saved into settings.proxy; gone from the exits page', async t => {
+  const h = await setup(t, {v3: true, init: mesh => { mesh.doc.settings.proxy = {port: 51080, password: 'tunnel-pw'}; }});
+  const {page} = h;
+  await tab(page, '出口和代理').click();
+  await page.getByRole('region', {name: '出口和代理'}).waitFor();
+  assert.equal(await page.getByRole('spinbutton', {name: '隧道端口'}).count(), 0);
+  await tab(page, '设置').click();
+  const tunnel = page.getByRole('spinbutton', {name: '隧道端口'});
+  await tunnel.waitFor();
+  assert.equal(await tunnel.inputValue(), '51080');
+  await tunnel.fill('0');
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  await page.getByText('隧道端口在 1–65535 之间').waitFor();
+  await tunnel.fill('51090');
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  const saved = await h.saved(d => d.settings.proxy?.port === 51090, 'the tunnel port saved');
+  assert.deepEqual(saved.settings.proxy, {port: 51090, password: 'tunnel-pw'});
+  assert.deepEqual(saved.settings.ports, {udp: 51999, tcp: 52000, tls: 52001});
+  await h.close();
+});
+
+// 2026-11-17: the controller keeps what a draft leaves out, so going back to a default has to be said, or it comes back.
+test('back to a default stays there: a node\'s fast port and relay type, the network\'s MTU and health parameters', async t => {
+  const h = await setup(t, {v3: true, init: mesh => {
+    Object.assign(mesh.doc.settings, {mtu: 1360, health: {activeIntervalMs: 1500}});
+    mesh.doc.fastPorts = [{id: 'f1', serverId: 'lax', port: 48888, proto: 'any', src: {all: true, allSubnets: true, members: [], tags: [], prefixes: []}, note: ''}];
+    Object.assign(mesh.doc.members.find(m => m.serverId === 'berlin'), {relayMode: 'site', listen: {udp: 51999, tcp: 0, tls: 0, fast: 52013}});
+  }});
+  const {page} = h;
+  const berlin = () => h.mesh.doc.members.find(m => m.serverId === 'berlin');
+  await tab(page, '节点').click();
+  await page.locator('.m3-row', {hasText: 'Berlin'}).click();
+  // Its own fast port back to the network's: sent as 0, gone from the draft, the field empty after the reply.
+  const fast = page.getByRole('textbox', {name: '快速中转监听端口'});
+  assert.equal(await fast.inputValue(), '52013');
+  await fast.fill('');
+  await fast.dispatchEvent('change');
+  await h.saved(d => memberOf(d, 'berlin').listen.fast === 0, 'the fast port back to the default');
+  await until(page, () => !('fast' in berlin().listen), 'no fast port of its own in the draft');
+  await page.waitForTimeout(300);
+  assert.equal(await fast.inputValue(), '');
+  // A member, then a relay again: the type it keeps (site) is what is sent and shown, not 公网中转 for a moment.
+  const role = page.locator('#m3-sec-role').getByRole('radiogroup', {name: '角色'});
+  await role.getByRole('radio', {name: '成员'}).click();
+  await h.saved(d => memberOf(d, 'berlin').role === 'member', 'a member');
+  await role.getByRole('radio', {name: '中转'}).click();
+  await h.saved(d => memberOf(d, 'berlin').role === 'relay' && memberOf(d, 'berlin').relayMode === 'site', 'a relay again, still a site relay');
+  assert.equal(await page.getByRole('radiogroup', {name: '中转类型'}).getByRole('radio', {name: '站点中转'}).getAttribute('aria-checked'), 'true');
+  // Left empty, the MTU and a health parameter are their defaults, as the fields say: sent, and shown after the reply.
+  await tab(page, '设置').click();
+  const mtu = page.getByRole('spinbutton', {name: 'MTU'});
+  assert.equal(await mtu.inputValue(), '1360');
+  await mtu.fill('');
+  await page.locator('details.m3-health > summary').click();
+  const interval = page.getByRole('spinbutton', {name: '在用入口的探测间隔'});
+  assert.equal(await interval.inputValue(), '1500');
+  await interval.fill('');
+  await page.getByRole('button', {name: '保存到草稿'}).click();
+  await h.saved(d => d.settings.mtu === 1400 && d.settings.health.activeIntervalMs === 1000, 'MTU and the interval back to their defaults');
+  await until(page, async () => await mtu.inputValue() === '1400' && await interval.inputValue() === '1000', 'the defaults shown after the reply');
+  await h.close();
+});
+
+// 2026-11-17: the node's page is kept when another node is opened from it; what was opened for one node stays with that node.
+test('a node opened from another\'s page starts clean: no 手填 address carried over from the last one', async t => {
+  const h = await setup(t, {v3: true});
+  const {page} = h;
+  await tab(page, '节点').click();
+  await page.locator('.m3-row', {hasText: 'Berlin'}).click();
+  await page.locator('.m3-node h2', {hasText: 'Berlin'}).waitFor();
+  await page.getByRole('radio', {name: /^手填/}).click();
+  await page.getByRole('textbox', {name: '手填对外地址'}).waitFor();
+  // Home, joined through Berlin, opened from Berlin's page.
+  await page.locator('button.m3-node-name[title="打开 Home"]').click();
+  await page.locator('.m3-node h2', {hasText: 'Home'}).waitFor();
+  assert.equal(await page.getByRole('textbox', {name: '手填对外地址'}).count(), 0, 'Home shows its own address choice');
+  assert.equal(await page.getByRole('radio', {name: /^手填/}).isChecked(), false);
   await h.close();
 });

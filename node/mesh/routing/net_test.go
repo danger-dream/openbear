@@ -20,6 +20,9 @@ type testNet struct {
 	budget Budget
 	onSend func(from string, m Message)
 	hops   map[string]map[string]string
+	// tune is every router's tuning: legacyTuning, which the tests on this
+	// net were written for, unless a test sets another.
+	tune *Tuning
 }
 
 type testLink struct {
@@ -36,7 +39,8 @@ type delivery struct {
 // newNet builds relays joined by links "A-B" with their one-way delays;
 // nextHops are each relay's configured next hops, "A>C": "B".
 func newNet(t *testing.T, links map[string]time.Duration, nextHops map[string]string) *testNet {
-	n := &testNet{t: t, now: time.Unix(1_800_000_000, 0), r: map[string]*Router{}, links: map[[2]string]*testLink{}, events: map[string][]string{}, budget: Budget{JSON: 1000, Compact: 1000}}
+	n := &testNet{t: t, now: time.Unix(1_800_000_000, 0), r: map[string]*Router{}, links: map[[2]string]*testLink{}, events: map[string][]string{}, budget: Budget{JSON: 1000, Compact: 1000},
+		tune: &legacyTuning}
 	neighbors := map[string][]string{}
 	for l, d := range links {
 		a, b, _ := strings.Cut(l, "-")
@@ -66,7 +70,7 @@ func newNet(t *testing.T, links map[string]time.Duration, nextHops map[string]st
 }
 
 func (n *testNet) config(name string, edit func(*Config)) Config {
-	c := Config{Self: name, NextHops: n.hops[name], Numbers: map[string]uint32{}}
+	c := Config{Self: name, NextHops: n.hops[name], Numbers: map[string]uint32{}, Tuning: n.tune}
 	for i, o := range n.names {
 		c.Numbers[o] = uint32(i + 1)
 	}
@@ -82,6 +86,14 @@ func (n *testNet) config(name string, edit func(*Config)) Config {
 		edit(&c)
 	}
 	return signed(c)
+}
+
+// retune gives every router t.
+func (n *testNet) retune(t *Tuning) {
+	n.tune = t
+	for _, name := range n.names {
+		n.r[name].Configure(n.config(name, nil))
+	}
 }
 
 // probe gives both ends of a link the same probe result; rtt < 0 is lost.

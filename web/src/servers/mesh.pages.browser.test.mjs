@@ -179,7 +179,61 @@ test('mesh pages: the lines page at work, its scrollbar at the window\'s edge', 
       await page.locator('.m3-rows-lines').scrollIntoViewIfNeeded();
       await shot(page, `${name}-lines`);
       await noOverflow(page);
+
+      // Own routes, the node page's cards: each pair as wide as the section, every route's state at its
+      // right edge, beside its chain where there is room, a short pair's as a long one's.
+      h.mesh.doc.paths = [
+        {id: 'p1', on: true, from: 'home', to: 'lax', via: ['berlin', 'r1', 'r2'], _states: {to: 'pinned', back: 'pinned'}},
+        {id: 'p2', on: true, from: 'home', to: 'lax', via: ['berlin'], _states: {to: 'standby', back: 'standby'}},
+        {id: 'p3', on: true, from: 'home', to: 'berlin', via: ['lax'], _states: {to: 'pinned', back: 'pinned'}}];
+      await page.evaluate(async () => { const {refresh} = await import('/src/servers/mesh/meshStore.js'); await refresh(true); });
+      const own = page.getByRole('region', {name: '自建路线'});
+      await own.locator('.m3-rt-state').nth(2).waitFor();
+      await own.scrollIntoViewIfNeeded();
+      const list = await own.locator('.m3-rt-own').boundingBox();
+      for (const card of await own.locator('.m3-rt-pair').all()) {
+        const box = await card.boundingBox();
+        assert.ok(Math.abs(box.width - list.width) <= 1, `a pair's card is ${box.width}px of ${list.width}px`);
+      }
+      const rights = [];
+      for (const row of await own.locator('.m3-rt-list > li').all()) {
+        const [chain, state] = await Promise.all([row.locator('.m3-rt-chain').boundingBox(), row.locator('.m3-rt-state').boundingBox()]);
+        rights.push(state.x + state.width);
+        if (width > 760) assert.ok(Math.abs(state.y + state.height / 2 - (chain.y + chain.height / 2)) < 6, 'a state beside its chain');
+      }
+      assert.ok(Math.max(...rights) - Math.min(...rights) <= 1, `states end at ${rights.map(Math.round)}`);
+      // Every hop with its flag, the pair's names too.
+      assert.equal(await own.locator('.m3-rt-pair').first().locator('.m3-rt-pair-h .m3-node-name .sv-flag').count(), 2);
+      const chain = own.locator('.m3-rt-list > li').first().locator('.m3-rt-chain');
+      assert.equal(await chain.locator('.m3-node-name').count(), 5);
+      assert.equal(await chain.locator('.m3-node-name .sv-flag').count(), 5);
+      await shot(page, `${name}-own`);
+      await noOverflow(page);
       await h.close();
     });
+  }
+});
+
+test('mesh settings: the notifications laid out on a desktop and a phone', {skip: !chromium, timeout: 300000}, async t => {
+  const {setup} = await startMeshBrowser(t);
+  for (const [name, width, height] of [['desktop', 1440, 900], ['phone', 390, 844]]) {
+    for (const dark of [false, true]) {
+      await t.test(`${name}${dark ? ', dark' : ''}: every switch in reach beside its label, no overflow`, {timeout: 120000}, async t => {
+        const h = await setup(t, {v3: true, width, height, dark});
+        const {page} = h;
+        await page.locator('.m3-tabs').getByRole('tab', {name: /^设置/}).click();
+        const alerts = page.getByRole('region', {name: '通知'});
+        await alerts.scrollIntoViewIfNeeded();
+        const switches = alerts.getByRole('switch');
+        assert.equal(await switches.count(), 9);
+        for (let i = 0; i < 9; i++) {
+          const box = await switches.nth(i).boundingBox();
+          assert.ok(box.x >= 0 && box.x + box.width <= width && box.height >= 28, `switch ${i}: ${JSON.stringify(box)}`);
+        }
+        await shot(page, `${name}-${dark ? 'dark' : 'light'}-settings-alerts`);
+        await noOverflow(page);
+        await h.close();
+      });
+    }
   }
 });

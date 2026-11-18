@@ -50,6 +50,12 @@ func processAlive(pid int) bool {
 // hostTop reads ps once: its %cpu is the kernel's recent average for each
 // process, of one core, so it is divided by the cores for the machine's share.
 func hostTop(ctx context.Context, sort string, limit int, withCommand bool) (HostTop, error) {
+	starts := map[int]string{}
+	if processes, err := unix.SysctlKinfoProcSlice("kern.proc.all"); err == nil {
+		for _, p := range processes {
+			starts[int(p.Proc.P_pid)] = strconv.FormatInt(p.Proc.P_starttime.Sec, 10) + "." + strconv.FormatInt(int64(p.Proc.P_starttime.Usec), 10)
+		}
+	}
 	out, err := exec.CommandContext(ctx, "/bin/ps", "-axo", "pid=,user=,%cpu=,rss=,comm=").Output()
 	if err != nil {
 		return HostTop{}, err
@@ -65,9 +71,14 @@ func hostTop(ctx context.Context, sort string, limit int, withCommand bool) (Hos
 		if err != nil {
 			continue
 		}
+		start, running := processStart(pid)
+		identity := ""
+		if running && starts[pid] == start {
+			identity = hostProcessIdentity(pid, start)
+		}
 		pcpu, _ := strconv.ParseFloat(f[2], 64)
 		kb, _ := strconv.ParseInt(f[3], 10, 64)
-		list = append(list, HostProcess{PID: pid, User: f[1], CPU: round(pcpu/cpus, 2), RSS: kb * 1024,
+		list = append(list, HostProcess{PID: pid, Identity: identity, User: f[1], CPU: round(pcpu/cpus, 2), RSS: kb * 1024,
 			Name: filepath.Base(strings.Join(f[4:], " "))})
 	}
 	top := HostTop{Sort: sort, Sorts: topSorts, Count: len(list), Processes: rank(list, sort, limit)}

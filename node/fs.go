@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,7 +54,7 @@ type fileEntry struct {
 }
 
 func describe(path, name string, info fs.FileInfo) fileEntry {
-	e := fileEntry{Name: name, Size: info.Size(), Mode: fmt.Sprintf("%04o", info.Mode().Perm()), MTime: info.ModTime().Unix()}
+	e := fileEntry{Name: name, Size: info.Size(), Mode: fmt.Sprintf("%04o", posixMode(info.Mode())), MTime: info.ModTime().Unix()}
 	switch m := info.Mode(); {
 	case m.IsDir():
 		e.Type, e.Dir = "dir", true
@@ -101,6 +100,10 @@ func fileError(err error) error {
 }
 
 type upload struct {
+	stage        *fileStage
+	request      string
+	noReplace    bool
+	prior        fs.FileInfo
 	temp, target string
 	size         int64
 	touched      time.Time
@@ -133,6 +136,9 @@ func (u *uploads) handle(method string, raw json.RawMessage) (any, error) {
 	if json.Unmarshal(raw, &p) != nil || strings.ContainsRune(p.Path, 0) || p.Offset < 0 {
 		return nil, errors.New("invalid_params")
 	}
+	if method == "fs.writeSafe" {
+		p.NoReplace = true
+	}
 	if method == "fs.list" && hasDrives && p.Path == "/" {
 		return drives()
 	}
@@ -153,13 +159,7 @@ func (u *uploads) handle(method string, raw json.RawMessage) (any, error) {
 		up := u.open[p.Upload]
 		u.mu.Unlock()
 		if up != nil {
-			if err := os.Remove(up.temp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return nil, fileError(err)
-			}
-			u.mu.Lock()
-			delete(u.open, p.Upload)
-			u.mu.Unlock()
-			u.forget(p.Upload)
+			u.dropLocked(p.Upload)
 		}
 		return map[string]any{"cancelled": true}, nil
 	case "fs.stat":
@@ -222,7 +222,7 @@ func list(path string) (any, error) {
 }
 
 func read(path string, offset, limit int64) (any, error) {
-	f, err := os.Open(path)
+	f, err := openReadFile(path)
 	if err != nil {
 		return nil, fileError(err)
 	}
@@ -248,7 +248,7 @@ func read(path string, offset, limit int64) (any, error) {
 	}
 	eof := err == io.EOF || info.Size() > 0 && offset+int64(n) >= info.Size()
 	result := map[string]any{"data": base64.StdEncoding.EncodeToString(buf[:n]), "size": info.Size(), "offset": offset,
-		"read": n, "eof": eof, "mode": fmt.Sprintf("%04o", info.Mode().Perm()), "mtime": info.ModTime().Unix()}
+		"read": n, "eof": eof, "mode": fmt.Sprintf("%04o", posixMode(info.Mode())), "mtime": info.ModTime().Unix()}
 	// Which file this chunk came from: a reader in chunks tells a file replaced
 	// under the same name (an atomic save, a log rotation) from one that grew.
 	if id := fileIdentity(f, info); id != "" {
@@ -281,39 +281,8 @@ func target(path string) (string, fs.FileInfo, error) {
 	return path, info, nil
 }
 
-// commit gives the finished temp file the existing file's owner (or the
-// requested mode) and renames it into place atomically.
-func commit(temp, path, mode string, prior fs.FileInfo) error {
-	perm := fs.FileMode(0o644)
-	if prior != nil {
-		perm = prior.Mode().Perm()
-	}
-	if mode != "" {
-		v, err := strconv.ParseUint(mode, 8, 32)
-		if err != nil || v > 0o7777 {
-			os.Remove(temp)
-			return errors.New("invalid_mode")
-		}
-		perm = fs.FileMode(v)
-	}
-	if err := os.Chmod(temp, perm); err != nil {
-		os.Remove(temp)
-		return fileError(err)
-	}
-	if prior != nil {
-		keepOwner(temp, prior)
-	}
-	if err := os.Rename(temp, path); err != nil {
-		os.Remove(temp)
-		return fileError(err)
-	}
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
-}
-
+// write keeps the source object and destination directory pinned throughout an
+// upload. A continuation cannot change its target or no-replace contract.
 func (u *uploads) write(path string, p fileParams) (any, error) {
 	data, err := base64.StdEncoding.DecodeString(p.Data)
 	if err != nil || len(data) > fileChunkMax {
@@ -326,71 +295,75 @@ func (u *uploads) write(path string, p fileParams) (any, error) {
 		unlock := u.lock(p.Upload)
 		defer unlock()
 	}
-	if p.Mkdirs {
-		if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, fileError(err)
+	var up *upload
+	if p.Upload != "" {
+		u.mu.Lock()
+		up = u.open[p.Upload]
+		u.mu.Unlock()
+	}
+	if p.Offset != 0 {
+		if up == nil || up.request != path || up.size != p.Offset || up.noReplace != p.NoReplace {
+			return nil, errors.New("upload_out_of_order")
+		}
+	} else {
+		if up != nil {
+			u.dropLocked(p.Upload)
+		}
+		if p.Mkdirs {
+			if err = os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return nil, fileError(err)
+			}
+		}
+		requested := path
+		var prior fs.FileInfo
+		// Do not resolve a no-replace target symlink: the existing directory entry
+		// itself counts as occupied, even when its referent does not exist.
+		if !p.NoReplace {
+			path, prior, err = target(path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		stage, err := newFileStage(path)
+		if err != nil {
+			return nil, err
+		}
+		up = &upload{stage: stage, temp: stage.temp, target: path, request: requested, noReplace: p.NoReplace, prior: prior}
+		if p.Upload != "" {
+			u.mu.Lock()
+			u.open[p.Upload] = up
+			if !u.janitor {
+				u.janitor = true
+				go u.sweep()
+			}
+			u.mu.Unlock()
+			u.remember(p.Upload, up)
 		}
 	}
-	path, prior, err := target(path)
-	if err != nil {
-		return nil, err
-	}
-	dir, base := filepath.Dir(path), filepath.Base(path)
 	if p.Upload == "" {
-		temp := filepath.Join(dir, "."+base+".obtmp-"+randomHex(6))
-		if err = writeFile(temp, data, os.O_WRONLY|os.O_CREATE|os.O_EXCL, true); err != nil {
-			os.Remove(temp)
-			return nil, err
-		}
-		if err = commit(temp, path, p.Mode, prior); err != nil {
-			return nil, err
-		}
-		return map[string]any{"path": shownPath(path), "size": len(data), "done": true}, nil
+		defer up.stage.close()
 	}
 	u.mu.Lock()
-	up := u.open[p.Upload]
-	if p.Offset == 0 {
-		if up != nil {
-			os.Remove(up.temp)
-		}
-		up = &upload{temp: filepath.Join(dir, "."+base+".obupload-"+p.Upload), target: path}
-		u.open[p.Upload] = up
-		if !u.janitor {
-			u.janitor = true
-			go u.sweep()
-		}
-	} else if up == nil || up.target != path || up.size != p.Offset {
-		u.mu.Unlock()
-		return nil, errors.New("upload_out_of_order")
-	}
 	up.touched = time.Now()
 	u.mu.Unlock()
-	if p.Offset == 0 {
-		u.remember(p.Upload, up.temp)
-	}
-	flags := os.O_WRONLY | os.O_APPEND
-	if p.Offset == 0 {
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-	}
-	if err = writeFile(up.temp, data, flags, p.Done); err != nil {
-		u.dropLocked(p.Upload)
+	if err = up.stage.write(data); err != nil {
+		if p.Upload != "" {
+			u.dropLocked(p.Upload)
+		}
 		return nil, err
 	}
 	u.mu.Lock()
 	up.size += int64(len(data))
 	size := up.size
 	u.mu.Unlock()
-	if !p.Done {
-		return map[string]any{"path": shownPath(path), "size": size, "done": false}, nil
+	if p.Upload != "" && !p.Done {
+		return map[string]any{"path": shownPath(up.target), "size": size, "done": false}, nil
 	}
-	u.mu.Lock()
-	delete(u.open, p.Upload)
-	u.mu.Unlock()
-	// From here the temp file is published or removed before this returns.
-	u.forget(p.Upload)
+	if p.Upload != "" {
+		defer u.dropLocked(p.Upload)
+	}
 	if p.SHA256 != "" {
-		defer os.Remove(up.temp)
-		result, err := hashFile(up.temp)
+		result, err := hashOpenFile(up.stage.file)
 		if err != nil {
 			return nil, err
 		}
@@ -398,37 +371,14 @@ func (u *uploads) write(path string, p fileParams) (any, error) {
 			return nil, errors.New("checksum_mismatch")
 		}
 	}
-	if p.NoReplace {
-		err = commitNew(up.temp, path, p.Mode)
-	} else {
-		err = commit(up.temp, path, p.Mode, prior)
-	}
-	if err != nil {
+	if err = up.stage.commit(p.Mode, up.prior, up.noReplace); err != nil {
 		return nil, err
 	}
-	result := map[string]any{"path": shownPath(path), "size": size, "done": true}
+	result := map[string]any{"path": shownPath(up.target), "size": size, "done": true}
 	if p.SHA256 != "" {
 		result["sha256"] = p.SHA256
 	}
 	return result, nil
-}
-
-func writeFile(path string, data []byte, flags int, sync bool) error {
-	f, err := os.OpenFile(path, flags, 0o600)
-	if err != nil {
-		return fileError(err)
-	}
-	_, err = f.Write(data)
-	if err == nil && sync {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fileError(err)
-	}
-	return nil
 }
 
 func (u *uploads) lock(id string) func() {
@@ -465,7 +415,7 @@ func (u *uploads) dropLocked(id string) {
 	delete(u.open, id)
 	u.mu.Unlock()
 	if up != nil {
-		os.Remove(up.temp)
+		up.stage.close()
 		u.forget(id)
 	}
 }
@@ -491,7 +441,11 @@ func (u *uploads) recover(dir string) {
 		if !open {
 			data, err := os.ReadFile(filepath.Join(dir, id))
 			temp := string(data)
-			if name := filepath.Base(temp); err == nil && filepath.IsAbs(temp) && strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".obupload-"+id) {
+			var record uploadRecord
+			if err == nil && json.Unmarshal(data, &record) == nil && record.Identity != "" {
+				recoverFileStage(record)
+			} else if name := filepath.Base(temp); err == nil && filepath.IsAbs(temp) && strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".obupload-"+id) {
+				// N-1 records name a single legacy temporary entry; unlink only.
 				os.Remove(temp)
 			}
 			os.Remove(filepath.Join(dir, id))
@@ -502,14 +456,24 @@ func (u *uploads) recover(dir string) {
 
 // remember and forget keep the record of an unfinished upload; losing one
 // only costs the cleanup after a restart.
-func (u *uploads) remember(id, temp string) {
+type uploadRecord struct {
+	Temp     string `json:"temp"`
+	Identity string `json:"identity"`
+}
+
+func (u *uploads) remember(id string, up *upload) {
 	u.mu.Lock()
 	dir := u.pending
 	u.mu.Unlock()
 	if dir == "" || os.MkdirAll(dir, 0o700) != nil {
 		return
 	}
-	os.WriteFile(filepath.Join(dir, id), []byte(temp), 0o600)
+	info, err := up.stage.file.Stat()
+	if err != nil {
+		return
+	}
+	data, _ := json.Marshal(uploadRecord{Temp: up.temp, Identity: fileIdentity(up.stage.file, info)})
+	os.WriteFile(filepath.Join(dir, id), data, 0o600)
 }
 
 func (u *uploads) forget(id string) {

@@ -11,6 +11,7 @@ from app.llm.error_classify import (
     AUTH,
     AUTH_PERMANENT,
     BILLING,
+    CONTEXT_OVERFLOW,
     FORMAT,
     MODEL_NOT_FOUND,
     RATE_LIMIT,
@@ -421,6 +422,91 @@ def test_ordinary_invalid_request_envelope_stays_a_final_format_error():
     assert normalized.reason == FORMAT and normalized.retryable is False
 
 
+def test_recognized_code_beats_generic_type():
+    # Parrot's sanitized Antigravity terminal, as received 2026-11-16.
+    payload = {"type": "response.failed", "response": {"status": "failed", "error": {
+        "type": "api_error", "code": "upstream_stream_incomplete",
+        "message": "Antigravity stream ended without a completion reason",
+    }}}
+
+    event = error_event(payload, event_name="response.failed")
+
+    assert event.reason == SERVER_ERROR and event.retryable is True
+    assert event.error.startswith("upstream_stream_incomplete: ")
+
+
+@pytest.mark.parametrize("error", [
+    {"type": "invalid_request_error", "message": "Invalid JSON payload"},
+    {"type": "invalid_request_error", "code": "invalid_api_key", "message": "bad key"},
+])
+def test_generic_type_with_unrecognized_code_is_unchanged(error):
+    normalized = normalize_error_payload({"type": "error", "error": error})
+
+    assert normalized.reason == FORMAT and normalized.retryable is False
+    assert normalized.message.startswith("invalid_request_error: ")
+
+
+_PARROT_OVERFLOW = "prompt is too long: 200001 tokens > 200000 maximum"
+_PARROT_OVERFLOW_DETAILS = {
+    "summary": f"Upstream 400 invalid_request: {_PARROT_OVERFLOW}",
+    "root_cause": {"status": 400, "classification": "invalid_request", "code": "context_length_exceeded",
+                   "message": _PARROT_OVERFLOW, "retryable": False, "retry_scope": "none"},
+    "attempts": [{"attempt": 1, "status": 400, "classification": "invalid_request",
+                  "code": "context_length_exceeded", "message": _PARROT_OVERFLOW,
+                  "retryable": False, "retry_scope": "none"}],
+}
+
+
+@pytest.mark.parametrize("details", [_PARROT_OVERFLOW_DETAILS, None], ids=["details", "bare"])
+@pytest.mark.parametrize(("event_name", "frame"), [
+    ("error", lambda d: {"type": "error", "error": {
+        "type": "invalid_request_error", "message": _PARROT_OVERFLOW,
+        "code": "context_length_exceeded", **({"details": d} if d else {})}}),
+    ("", lambda d: {"error": {
+        "message": _PARROT_OVERFLOW, "type": "invalid_request_error",
+        "code": "context_length_exceeded", "param": None, **({"details": d} if d else {})}}),
+    ("error", lambda d: {
+        "type": "error", "code": "context_length_exceeded", "message": _PARROT_OVERFLOW, "param": None,
+        "sequence_number": 0, "error_type": "invalid_request_error", **({"details": d} if d else {})}),
+], ids=["anthropic", "chat", "responses"])
+def test_parrot_stream_context_overflow_reaches_window_recovery(event_name, frame, details):
+    event = error_event(frame(details), event_name=event_name)
+    exc = OpenBearLLMError.from_stream_event(event)
+
+    assert event.reason == CONTEXT_OVERFLOW and event.retryable is False
+    assert exc.reason == CONTEXT_OVERFLOW
+
+
+@pytest.mark.parametrize("code", ["context_length_exceeded", None])
+def test_parrot_json_context_overflow_reaches_window_recovery(code):
+    payload = {"error": {
+        "message": _PARROT_OVERFLOW_DETAILS["summary"], "type": "invalid_request_error",
+        "code": code, "param": None, "details": json.loads(json.dumps(_PARROT_OVERFLOW_DETAILS)),
+    }}
+    payload["error"]["details"]["root_cause"]["code"] = code
+
+    normalized = normalize_error_payload(payload, transport_status=400)
+    exc = OpenBearLLMError(normalized.message, **normalized.exception_kwargs(protocol="anthropic"))
+
+    assert normalized.reason == CONTEXT_OVERFLOW and normalized.retryable is False
+    assert exc.reason == CONTEXT_OVERFLOW
+
+
+def test_error_without_reason_derives_context_overflow_from_root_code():
+    exc = OpenBearLLMError(_PARROT_OVERFLOW, status=400, root_cause=_PARROT_OVERFLOW_DETAILS["root_cause"])
+
+    assert exc.reason == CONTEXT_OVERFLOW and exc.retryable is False
+
+
+def test_non_overflow_contract_is_not_overridden_by_overflow_text():
+    payload = _structured_payload(
+        status=429, classification="rate_limit_error", summary="limited",
+        message="context length exceeded", retryable=True, retry_scope="request",
+    )
+
+    assert normalize_error_payload(payload, transport_status=429).reason == RATE_LIMIT
+
+
 async def _client_with_handler(handler) -> HTTPClient:
     client = HTTPClient()
     await client.raw.aclose()
@@ -469,6 +555,22 @@ async def test_http_sse_non_2xx_propagates_transport_and_structured_root():
         assert exc.reason == RATE_LIMIT
         assert exc.retryable is True
         assert exc.summary == "触发上游限流，请稍后重试"
+    finally:
+        await client.close()
+
+
+async def test_http_parrot_context_overflow_raises_context_overflow():
+    payload = {"type": "error", "error": {
+        "type": "invalid_request_error", "message": _PARROT_OVERFLOW_DETAILS["summary"],
+        "code": "context_length_exceeded", "details": _PARROT_OVERFLOW_DETAILS,
+    }}
+    client = await _client_with_handler(lambda request: httpx.Response(400, json=payload))
+    try:
+        with pytest.raises(OpenBearLLMError) as raised:
+            async for _ in client.post_sse("https://example.test/v1", {}, {}, protocol="anthropic"):
+                pass
+        assert raised.value.reason == CONTEXT_OVERFLOW
+        assert raised.value.retryable is False
     finally:
         await client.close()
 

@@ -4,7 +4,7 @@ import { ElMessage } from 'element-plus';
 import { Api } from '../api.js';
 import { ok } from '../instances/instanceHelpers.js';
 import { desktopReason, noAutofill, safeError } from './serverHelpers.js';
-import { charToKeyCode, formatIronError, RDP_COMBOS, RDP_SCANCODES, VNC_COMBOS, vncCharKey } from './desktopInput.js';
+import { pointerButtonMask, charToKeyCode, formatIronError, RDP_COMBOS, RDP_SCANCODES, VNC_COMBOS, vncCharKey } from './desktopInput.js';
 
 // Lazy module loaders: neither @novnc/novnc nor ironrdp-wasm is fetched until
 // the user actually opens a macOS or Windows desktop session. A load that
@@ -75,6 +75,9 @@ const protocolLabel = computed(() => isMac.value ? 'VNC 屏幕共享' : 'RDP 远
 let rfb = null, rfbClass = null, rdpMod = null, rdpSession = null, pendingVncCreds = false;
 let observer = null, disposed = false, connectGen = 0, inputRaf = 0, pendingMove = null, pendingWheelV = 0, pendingWheelH = 0;
 let isComposing = false, lastTapTime = 0, tapDragActive = false;
+const pressedButtons = new Set();
+let capturedPointer = null;
+const inputAllowed = () => props.active && state.value === 'open' && !authVisible.value && !settingsVisible.value && !clipboardVisible.value;
 
 function emitMeta() {
   emit('meta', {
@@ -236,6 +239,7 @@ async function fetchConfig() {
 }
 
 function cleanupSession() {
+  releaseInputs();
   pendingVncCreds = false;
   if (inputRaf) {
     cancelAnimationFrame(inputRaf);
@@ -575,7 +579,7 @@ function scheduleRdpInputFlush() {
   if (inputRaf) return;
   inputRaf = requestAnimationFrame(() => {
     inputRaf = 0;
-    if (state.value !== 'open' || !rdpSession || !rdpMod) {
+    if (!inputAllowed() || !rdpSession || !rdpMod) {
       pendingMove = null;
       pendingWheelV = 0;
       pendingWheelH = 0;
@@ -621,15 +625,17 @@ function dispatchPointerMove(x, y) {
   pointer.y = Math.max(0, Math.min((remoteSize.height || 720) - 1, Math.round(y)));
   updateVirtualCursorPosition();
   if (isMac.value) {
-    sendVncPointer(pointer.x, pointer.y, tapDragActive ? 1 : 0);
+    sendVncPointer(pointer.x, pointer.y, pointerButtonMask(pressedButtons));
   } else if (rdpSession && rdpMod) {
     queueRdpMove(pointer.x, pointer.y);
   }
 }
 
 function dispatchPointerButton(button, down) {
+  if (down) pressedButtons.add(button);
+  else pressedButtons.delete(button);
   if (isMac.value) {
-    const mask = down ? (button === 2 ? 4 : button === 1 ? 2 : 1) : 0;
+    const mask = pointerButtonMask(pressedButtons);
     sendVncPointer(pointer.x, pointer.y, mask);
   } else if (rdpSession && rdpMod) {
     const ev = down ? rdpMod.DeviceEvent.mouseButtonPressed(button) : rdpMod.DeviceEvent.mouseButtonReleased(button);
@@ -645,8 +651,9 @@ function dispatchPointerClick(button = 0) {
 function dispatchWheel(vertical, step) {
   if (isMac.value) {
     const bit = vertical ? (step > 0 ? 8 : 16) : (step > 0 ? 32 : 64);
-    sendVncPointer(pointer.x, pointer.y, bit);
-    sendVncPointer(pointer.x, pointer.y, 0);
+    const mask = pointerButtonMask(pressedButtons);
+    sendVncPointer(pointer.x, pointer.y, mask | bit);
+    sendVncPointer(pointer.x, pointer.y, mask);
   } else if (rdpSession && rdpMod) {
     queueRdpWheel(vertical, step);
   }
@@ -655,7 +662,7 @@ function dispatchWheel(vertical, step) {
 // ----- Desktop Mouse & Keyboard Input (RDP) -----
 function onRdpKeyDown(e) {
   if (state.value !== 'open' || !rdpSession || !rdpMod) return;
-  if (authVisible.value || settingsVisible.value || clipboardVisible.value) return;
+  if (!inputAllowed()) return;
   const sc = RDP_SCANCODES[e.code];
   if (sc != null) {
     e.preventDefault();
@@ -666,7 +673,7 @@ function onRdpKeyDown(e) {
 
 function onRdpKeyUp(e) {
   if (state.value !== 'open' || !rdpSession || !rdpMod) return;
-  if (authVisible.value || settingsVisible.value || clipboardVisible.value) return;
+  if (!inputAllowed()) return;
   const sc = RDP_SCANCODES[e.code];
   if (sc != null) {
     e.preventDefault();
@@ -690,37 +697,45 @@ function surfaceCoords(clientX, clientY) {
   return {x, y};
 }
 
+function syncRdpButtons(e) {
+  // Pointer Events report intermediate mouse chords on pointermove, not pointerdown/up.
+  // DOM buttons bits differ from button indices (right=2, middle=4).
+  const bits = [1, 4, 2, 8, 16];
+  const mask = e.type === 'pointerdown' && !e.buttons ? (bits[e.button] || 0) : e.buttons;
+  if (!Number.isInteger(mask)) return;
+  for (let button = 0; button < bits.length; button++) {
+    const down = Boolean(mask & bits[button]);
+    if (pressedButtons.has(button) !== down) dispatchPointerButton(button, down);
+  }
+}
+
 function onRdpMouseMove(e) {
-  if (state.value !== 'open' || !rdpSession || !rdpMod) return;
+  if (e.pointerType === 'touch' || !inputAllowed() || !rdpSession || !rdpMod) return;
   const {x, y} = surfaceCoords(e.clientX, e.clientY);
+  syncRdpButtons(e);
   queueRdpMove(x, y);
 }
 
 function onRdpMouseDown(e) {
-  if (state.value !== 'open' || !rdpSession || !rdpMod) return;
+  if (e.pointerType === 'touch' || !inputAllowed() || !rdpSession || !rdpMod) return;
   e.preventDefault();
   rdpCanvas.value?.focus();
-  const {x, y} = surfaceCoords(e.clientX, e.clientY);
-  pendingMove = null;
-  applyRdpEvents([
-    rdpMod.DeviceEvent.mouseMove(x, y),
-    rdpMod.DeviceEvent.mouseButtonPressed(e.button),
-  ]);
+  surfaceCoords(e.clientX, e.clientY);
+  capturedPointer = e.pointerId;
+  try { rdpCanvas.value?.setPointerCapture(e.pointerId); } catch { /* global pointerup is a fallback */ }
+  syncRdpButtons(e);
 }
 
 function onRdpMouseUp(e) {
-  if (state.value !== 'open' || !rdpSession || !rdpMod) return;
+  if (isMac.value || e.pointerType === 'touch' || !pressedButtons.size) return;
   e.preventDefault();
-  const {x, y} = surfaceCoords(e.clientX, e.clientY);
-  pendingMove = null;
-  applyRdpEvents([
-    rdpMod.DeviceEvent.mouseMove(x, y),
-    rdpMod.DeviceEvent.mouseButtonReleased(e.button),
-  ]);
+  surfaceCoords(e.clientX, e.clientY);
+  syncRdpButtons(e);
+  if (!pressedButtons.size) releasePointerCapture();
 }
 
 function onRdpWheel(e) {
-  if (state.value !== 'open' || !rdpSession || !rdpMod) return;
+  if (!inputAllowed() || !rdpSession || !rdpMod) return;
   e.preventDefault();
   if (e.deltaY !== 0) queueRdpWheel(true, e.deltaY > 0 ? -1 : 1);
   if (e.deltaX !== 0) queueRdpWheel(false, e.deltaX > 0 ? -1 : 1);
@@ -746,8 +761,10 @@ function autoPanViewportNearEdge() {
 }
 
 function onStageTouchStart(e) {
+  if (touchState?.completed) return;
+  if (e.touches.length > 2) { releaseInputs(); return; }
   if (state.value !== 'open') return;
-  if (authVisible.value || settingsVisible.value || clipboardVisible.value) return;
+  if (!inputAllowed()) return;
 
   if (e.touches.length === 1) {
     const t = e.touches[0];
@@ -779,10 +796,8 @@ function onStageTouchStart(e) {
     };
   } else if (e.touches.length === 2) {
     if (touchState?.timer) clearTimeout(touchState.timer);
-    if (tapDragActive) {
-      tapDragActive = false;
-      dispatchPointerButton(0, false);
-    }
+    if (pressedButtons.has(0)) dispatchPointerButton(0, false);
+    tapDragActive = false;
     touchState = {
       count: 2,
       lastX: (e.touches[0].clientX + e.touches[1].clientX) / 2,
@@ -793,8 +808,8 @@ function onStageTouchStart(e) {
 }
 
 function onStageTouchMove(e) {
-  if (!touchState || state.value !== 'open') return;
-  if (authVisible.value || settingsVisible.value || clipboardVisible.value) return;
+  if (!touchState || touchState.completed || state.value !== 'open') return;
+  if (!inputAllowed()) return;
 
   if (e.touches.length === 1 && touchState.count === 1) {
     const t = e.touches[0];
@@ -854,13 +869,16 @@ function onStageTouchMove(e) {
 function onStageTouchEnd(e) {
   if (!touchState || state.value !== 'open') return;
   clearTimeout(touchState.timer);
-  if (touchState.count === 1 && !touchState.longPressed) {
-    if (tapDragActive) {
+  if (touchState.completed) {
+    if (!e.touches.length) touchState = null;
+    return;
+  }
+  touchState.completed = true;
+  if (touchState.count === 1) {
+    if (pressedButtons.has(0)) {
       tapDragActive = false;
       dispatchPointerButton(0, false);
-    } else if (touchState.dragging) {
-      dispatchPointerButton(0, false);
-    } else if (!touchState.moved) {
+    } else if (!touchState.moved && !touchState.longPressed) {
       lastTapTime = Date.now();
       dispatchPointerClick(0);
     }
@@ -1060,7 +1078,7 @@ function triggerRightClick() {
 
 function onStageMouseMove(e) {
   if (props.phone || state.value !== 'open' || scaleMode.value === 'fit') return;
-  if (authVisible.value || settingsVisible.value || clipboardVisible.value) return;
+  if (!inputAllowed()) return;
   const scroller = scrollContainer();
   const stageEl = stage.value;
   if (!scroller || !stageEl) return;
@@ -1132,6 +1150,7 @@ function zoomBy(delta) {
 }
 
 function toggleTouchMode() {
+  releaseInputs();
   touchMode.value = touchMode.value === 'direct' ? 'trackpad' : 'direct';
   updateVirtualCursorPosition();
   ElMessage.info(touchMode.value === 'trackpad' ? '触控板模式：单指滑动移动光标，轻点左键，双指轻点右键，双指滑动滚轮' : '直点模式：点按位置即左键，长按右键，单指滑动平移画面');
@@ -1208,19 +1227,49 @@ function focus() {
   }
 }
 
-function onWindowBlur() {
-  if (rdpSession) {
-    try { rdpSession.releaseAllInputs(); } catch { /* ignore */ }
+function releasePointerCapture() {
+  const id = capturedPointer;
+  capturedPointer = null;
+  if (id != null) {
+    try { rdpCanvas.value?.releasePointerCapture(id); } catch { /* already lost */ }
   }
 }
 
+function releaseInputs() {
+  // Drop queued movement/wheel *before* releasing: old input must not replay afterward.
+  if (inputRaf) cancelAnimationFrame(inputRaf);
+  inputRaf = 0;
+  pendingMove = null;
+  pendingWheelV = pendingWheelH = 0;
+  clearTimeout(touchState?.timer);
+  touchState = null;
+  tapDragActive = false;
+  lastTapTime = 0;
+  if (isMac.value && pressedButtons.size) sendVncPointer(pointer.x, pointer.y, 0);
+  pressedButtons.clear();
+  if (rdpSession) {
+    try { rdpSession.releaseAllInputs(); } catch { /* ignore */ }
+  }
+  releasePointerCapture();
+}
+
+function onLostPointerCapture() {
+  if (capturedPointer != null) releaseInputs();
+}
+const onWindowBlur = releaseInputs;
+watch([authVisible, settingsVisible, clipboardVisible], values => {
+  if (values.some(Boolean)) releaseInputs();
+}, {flush: 'sync'});
+
 watch(() => props.phone, isPhone => {
+  releaseInputs();
   touchMode.value = isPhone ? 'trackpad' : 'direct';
   updateVirtualCursorPosition();
   emitMeta();
 });
 
 watch(() => props.active, v => {
+  if (!v) releaseInputs();
   if (v) nextTick(() => { requestAnimationFrame(() => { updateCanvasScale(); focus(); }); });
 });
 
@@ -1240,6 +1289,7 @@ onMounted(() => {
   observer = new ResizeObserver(() => updateCanvasScale());
   if (stage.value) observer.observe(stage.value);
   window.addEventListener('blur', onWindowBlur);
+  window.addEventListener('pointerup', onRdpMouseUp);
   document.addEventListener('fullscreenchange', onFullscreenChange);
   void connect(true);
 });
@@ -1248,6 +1298,7 @@ onBeforeUnmount(() => {
   disposed = true;
   observer?.disconnect();
   window.removeEventListener('blur', onWindowBlur);
+  window.removeEventListener('pointerup', onRdpMouseUp);
   document.removeEventListener('fullscreenchange', onFullscreenChange);
   cleanupSession();
 });
@@ -1279,7 +1330,7 @@ defineExpose({
     @touchstart="onStageTouchStart"
     @touchmove="onStageTouchMove"
     @touchend="onStageTouchEnd"
-    @touchcancel="onStageTouchEnd"
+    @touchcancel="releaseInputs"
     @mousemove="onStageMouseMove"
     @wheel.capture="onStageWheelCapture"
     @scroll="updateVirtualCursorPosition"
@@ -1298,9 +1349,12 @@ defineExpose({
       aria-label="Windows 远程桌面画布"
       @keydown="onRdpKeyDown"
       @keyup="onRdpKeyUp"
-      @mousemove="onRdpMouseMove"
-      @mousedown="onRdpMouseDown"
-      @mouseup="onRdpMouseUp"
+      @blur="releaseInputs"
+      @pointermove="onRdpMouseMove"
+      @pointerdown="onRdpMouseDown"
+      @pointerup="onRdpMouseUp"
+      @pointercancel="releaseInputs"
+      @lostpointercapture="onLostPointerCapture"
       @wheel="onRdpWheel"
       @contextmenu.prevent
     />

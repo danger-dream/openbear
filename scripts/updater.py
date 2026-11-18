@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = 1
+UPDATER_PROTOCOL = 2  # verified 0.16.0 handoff, effective config and runtime interpreter
+SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 BACKUP_KEEP = 3
 HEALTH_WAIT_S = 90
 HEALTH_INTERVAL_S = 1.0
@@ -541,7 +544,7 @@ class UpdateError(RuntimeError):
 
 
 class Updater:
-    def __init__(self, request: dict[str, Any]) -> None:
+    def __init__(self, request: dict[str, Any], *, handoff: Path | None = None, request_path: Path | None = None) -> None:
         self.request = request
         self.install_root = Path(request["installRoot"]).resolve()
         self.data_dir = Path(request.get("dataDir") or (self.install_root / "data")).resolve()
@@ -558,6 +561,11 @@ class Updater:
         self.database_backup_path: Path | None = None
         self.did_swap = False
         self.classification: dict[str, Any] = {}
+        self.handoff_path = handoff
+        self.request_path = request_path
+        self.handoff: dict[str, Any] = {}
+        self.config: dict[str, str] = {}
+        self.validation = None
 
     def log(self, message: str) -> None:
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
@@ -584,30 +592,43 @@ class Updater:
         atomic_write_json(self.state_path, current)
 
     def write_result(self, status: str, message: str, **extra: Any) -> None:
+        def display(path):
+            try:
+                return str(path.relative_to(self.install_root))
+            except ValueError:
+                return str(path)
         payload = {
             "schema": SCHEMA,
             "status": status,
+            "requestId": self.request.get("requestId", ""),
             "fromVersion": self.from_version,
             "toVersion": self.to_version,
             "requiresRestart": bool((self.classification or {}).get("requiresRestart")),
             "effect": str((self.classification or {}).get("effect") or ""),
             "finishedAt": int(time.time()),
             "message": message,
-            "logPath": str(self.log_path.relative_to(self.install_root)) if self.log_path.is_relative_to(self.install_root) else str(self.log_path),
+            "logPath": display(self.log_path),
             "acked": False,
         }
         if self.database_backup_path is not None:
             db_backup = self.database_backup_path
-            payload["databaseBackupPath"] = (
-                str(db_backup.relative_to(self.install_root))
-                if db_backup.is_relative_to(self.install_root)
-                else str(db_backup)
-            )
+            payload["databaseBackupPath"] = display(db_backup)
         payload.update(extra)
         atomic_write_json(self.result_path, payload)
         self.write_state("done", lastResultStatus=status)
 
     def run(self) -> int:
+        lock_dir = self.data_dir / "updater"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with (lock_dir / "apply.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.log("另一个更新进程仍在执行，未开始重复 apply")
+                return 1
+            return self._run_locked()
+
+    def _run_locked(self) -> int:
         try:
             self._run()
             return 0
@@ -633,9 +654,64 @@ class Updater:
                 self.write_result("failed", f"{type(exc).__name__}: {exc}；回滚失败: {rollback_exc}")
             return 1
 
+    def _read_handoff(self) -> None:
+        if self.handoff_path is None:
+            return
+        directory = self.handoff_path.parent
+        if (directory.parent != self.data_dir / "updater" or not directory.name.startswith("compat-0160-")
+                or Path(__file__).resolve() != directory / "updater.py" or sys.version_info < (3, 11)):
+            raise UpdateError("升级接管位置或解释器无效")
+        manifest = read_json(self.handoff_path)
+        if (manifest.get("schema") != 1 or manifest.get("request") != self.request
+                or str(self.request_path) != manifest.get("requestPath")
+                or sha256_file(self.request_path) != manifest.get("requestSha256")):
+            raise UpdateError("升级接管请求已变化，未停止原服务")
+        digest = manifest.get("zipSha256", "")
+        if (not re.fullmatch(r"[0-9a-f]{64}", digest) or sha256_file(directory / "package.zip") != digest
+                or (self.request.get("sha256") and self.request["sha256"].lower() != digest)):
+            raise UpdateError("升级接管发行包摘要不一致")
+        # Bind the executing helper files to that same authenticated archive.
+        with zipfile.ZipFile(directory / "package.zip") as archive:
+            for name in ("updater.py", "release_validation.py"):
+                entries = [n for n in archive.namelist() if n == "scripts/" + name or n.endswith("/scripts/" + name)]
+                if len(entries) != 1 or archive.read(entries[0]) != (directory / name).read_bytes():
+                    raise UpdateError("升级接管程序与发行包不一致")
+        try:
+            with (directory / "consumed").open("x") as handle:
+                handle.write(str(os.getpid()))
+        except FileExistsError as exc:
+            raise UpdateError("此升级接管已使用；请重新发起更新，不要重复执行 apply") from exc
+        self.handoff = manifest
+
+    def _claim_request(self) -> None:
+        request_id = str(self.request.get("requestId") or self.handoff.get("requestSha256") or "")
+        if not request_id:
+            return  # historical direct/acceptance requests without an ID
+        receipts = self.data_dir / "updater" / "requests"
+        receipts.mkdir(parents=True, exist_ok=True)
+        receipt = receipts / hashlib.sha256(request_id.encode()).hexdigest()
+        try:
+            with receipt.open("x") as handle:
+                handle.write(str(os.getpid()))
+        except FileExistsError as exc:
+            raise UpdateError("此升级请求已执行；请从页面重新发起更新，不要重放原请求") from exc
+
+    def _prepare_config(self) -> None:
+        config = self.validation.deployment_config(
+            self.install_root, str(self.request.get("configPath") or ""), self.service_name,
+            require_running=bool(self.handoff))
+        original = self.handoff.get("config") or {key: self.request[key] for key in
+                                                 ("configPath", "configHome", "databasePath") if key in self.request}
+        if any(config.get(key) != value for key, value in original.items()):
+            raise UpdateError("升级期间有效配置已变化，未停止原服务；请重新发起更新")
+        if Path(config["databasePath"]).parent != self.data_dir:
+            raise UpdateError("实际数据库目录与升级请求不一致，未停止原服务")
+        self.config = config
+
     def _run(self) -> None:
         self.log(f"开始更新 {self.from_version or '?'} -> {self.to_version or '?'}")
         self.write_state("checking")
+        self._read_handoff()
         if not self.allow_dirty and _git_dirty(self.install_root):
             raise UpdateError("安装目录有未提交改动，已拒绝覆盖。如需继续请确认覆盖工作区。")
         staging = self._download_and_verify()
@@ -657,6 +733,8 @@ class Updater:
             # missing after the swap.
             ensure_uv(self.install_root, with_tool_path(), self.log)
         validation = _load_release_validation(self.install_root, staging)
+        self.validation = validation
+        self._prepare_config()
         retention = validation.retain_previous_assets(
             staging / "web" / "dist",
             self.install_root / "web" / "dist",
@@ -665,6 +743,7 @@ class Updater:
             f"前端资源代际: active={retention.get('active', 0)} retained={retention.get('retained', 0)}"
         )
         self.write_state("applying", requiresRestart=requires_restart, effect=self.classification.get("effect"))
+        self._claim_request()
         self.backup_path = self._backup()
         if requires_restart:
             self._stop_service()
@@ -708,7 +787,9 @@ class Updater:
         zip_url = str(self.request.get("zipUrl") or "")
         zip_name = f"openbear-{self.to_version}.zip"
         zip_path = work / zip_name
-        if zip_url:
+        if self.handoff:
+            shutil.copy2(self.handoff_path.parent / "package.zip", zip_path)
+        elif zip_url:
             self.log(f"下载 {zip_url}")
             _download(zip_url, zip_path)
         else:
@@ -716,7 +797,7 @@ class Updater:
             if not local.is_file():
                 raise UpdateError("更新请求缺少 zipUrl / zipPath")
             shutil.copy2(local, zip_path)
-        expected = str(self.request.get("sha256") or "").strip().lower()
+        expected = str(self.handoff.get("zipSha256") or self.request.get("sha256") or "").strip().lower()
         sums_url = str(self.request.get("sha256Url") or "")
         if not expected and sums_url:
             sums_path = work / "SHA256SUMS"
@@ -768,11 +849,16 @@ class Updater:
 
     def _backup_database(self) -> None:
         self.write_state("backing_up_database")
-        validation = _load_release_validation(self.install_root)
+        validation = self.validation or _load_release_validation(self.install_root)
         try:
+            # The source follows the effective config; recovery snapshots keep
+            # the established install-root location shared with install.sh.
             result = validation.create_sqlite_backup(
                 self.install_root,
                 self.install_root / "data" / "backups",
+                config_path=Path(self.config["configPath"]) if self.config else None,
+                home=self.config.get("configHome"),
+                expected_database=self.config.get("databasePath"),
                 label=f"v{self.from_version or 'unknown'}-to-v{self.to_version or 'unknown'}",
             )
         except Exception as exc:
@@ -838,11 +924,14 @@ class Updater:
         src = self.install_root / "openbear.service"
         if not src.is_file():
             return
-        dest = Path("/etc/systemd/system") / self.service_name
+        dest = SYSTEMD_UNIT_DIR / self.service_name
         if not dest.parent.is_dir():
             self.log("没有 /etc/systemd/system，跳过 unit 安装")
             return
-        text = src.read_text(encoding="utf-8").replace("__OPENBEAR_DIR__", str(self.install_root))
+        validation = self.validation or _load_release_validation(self.install_root)
+        text = validation.render_service_unit(src.read_text(encoding="utf-8"), self.install_root,
+                                              self.config.get("configPath", str(self.install_root / "openbear.json")),
+                                              self.config.get("configHome", ""))
         dest.write_text(text, encoding="utf-8")
         self._systemctl("daemon-reload")
 
@@ -1073,7 +1162,8 @@ def _cmd_classify_names(args: argparse.Namespace) -> int:
 
 def _cmd_apply(args: argparse.Namespace) -> int:
     request = read_json(Path(args.request))
-    return Updater(request).run()
+    return Updater(request, handoff=Path(args.handoff).resolve() if args.handoff else None,
+                   request_path=Path(args.request).resolve()).run()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1097,6 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     apply_cmd = sub.add_parser("apply", help="apply an update request")
     apply_cmd.add_argument("--request", required=True)
+    apply_cmd.add_argument("--handoff", help=argparse.SUPPRESS)
     apply_cmd.set_defaults(func=_cmd_apply)
     return parser
 

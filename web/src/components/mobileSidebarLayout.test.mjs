@@ -135,11 +135,11 @@ async function renderDesktop(items,active){
 }
 test('desktop dock keeps five pinned destinations plus More once there are more than six, routing and reference gestures intact',async()=>{
   const r=runtime();
-  assert.deepEqual(Array.from(r.props.items,item=>item.key),['memory','secrets','docs','cron','skills','mcp','instances','servers','settings']);
+  assert.deepEqual(Array.from(r.props.items,item=>item.key),['memory','secrets','docs','notes','cron','skills','mcp','instances','servers','settings']);
   const desktopItems=r.props.items.filter(item=>item.key!=='settings');
   const view=await renderDesktop(desktopItems,'docs');
-  assert.deepEqual(view.buttons.map(b=>b.props['aria-label']||b.children?.at?.(-1)?.children),['记忆','凭证','文档','实例','主机','更多入口']);
-  const pinned=['memory','secrets','docs','instances','servers'].map(key=>desktopItems.find(item=>item.key===key));
+  assert.deepEqual(view.buttons.map(b=>b.props['aria-label']||b.children?.at?.(-1)?.children),['记忆','凭证','文档','笔记','主机','更多入口']);
+  const pinned=['memory','secrets','docs','notes','servers'].map(key=>desktopItems.find(item=>item.key===key));
   for(const [index,item] of pinned.entries()){
     const button=view.buttons[index];
     assert.equal(button.props.class,'sidebar-resource-tile');
@@ -152,9 +152,9 @@ test('desktop dock keeps five pinned destinations plus More once there are more 
     button.props.onKeydown(event);assert.deepEqual(view.calls.at(-1),['shelf-key',event,item.key]);
   }
   assert.match(view.html,/--sidebar-resource-columns:6/);
-  for(const name of ['定时','Skills','MCP'])assert.doesNotMatch(view.html,new RegExp(`>${name}<`));
+  for(const name of ['定时','Skills','MCP','实例'])assert.doesNotMatch(view.html,new RegExp(`>${name}<`));
   // Six or fewer destinations all stay in the row, with no More.
-  const few=await renderDesktop(desktopItems.filter(item=>!['instances','servers'].includes(item.key)),'docs');
+  const few=await renderDesktop(desktopItems.filter(item=>!['instances','servers','mcp'].includes(item.key)),'docs');
   assert.equal(few.buttons.length,6);assert.doesNotMatch(few.html,/更多/);
   const footerButton=appNodes.find(n=>hasClass(n,'sidebar-footer-settings'));
   assert.ok(footerButton,'footer contains dedicated desktop settings action');
@@ -171,7 +171,7 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
   }});
   const source=app.slice(app.indexOf('function showReferenceShelf('),app.indexOf('function insertShelfReference('));
   vm.runInContext(source,context);
-  for(const [index,[key,kind]] of [['memory','mem'],['secrets','secret'],['docs','doc']].entries()){
+  for(const [index,[key,kind]] of [['memory','mem'],['secrets','secret'],['docs','doc'],['notes','note']].entries()){
     context.showReferenceShelf({currentTarget:target},key);
     assert.equal(timers.at(-1).delay,index===0?220:500);timers.at(-1).fn();
     assert.equal(shelf.value.kind,kind);assert.equal(shelf.value.anchor,grid);
@@ -188,7 +188,7 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
 });
 
 function runtime(){
-  const nav=vm.runInNewContext(app.slice(app.indexOf('const allNav = ['),app.indexOf('const nav = computed')).replace('const allNav =','result ='),{InstancesView:null,ServersView:null,MemoryView:null,SecretsView:null,DocsView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null});
+  const nav=vm.runInNewContext(app.slice(app.indexOf('const allNav = ['),app.indexOf('const nav = computed')).replace('const allNav =','result ='),{InstancesView:null,ServersView:null,MemoryView:null,SecretsView:null,DocsView:null,NotesView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null});
   const props={items:nav.filter(item=>!item.headerOnly),active:'docs',sidebarOpen:true},calls=[],mount=[],unmount=[],watchers=[];
   const media={matches:true,addEventListener(){},removeEventListener(){}};
   const context=vm.createContext({defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),ref,onMounted:fn=>mount.push(fn),onBeforeUnmount:fn=>unmount.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media}});
@@ -208,7 +208,7 @@ test('collapsed resource footer is one entry; expanded controller grid keeps all
   const r=runtime();let view=await render(r);
   assert.match(view.html,/资源与设置/);assert.doesNotMatch(view.html,/记忆管理|凭证库|MCP 管理/);
   vm.runInContext('menuOpen.value=true',r.context);view=await render(r);
-  const buttons=view.nodes.filter(n=>n.type==='button');assert.equal(buttons.length,10);
+  const buttons=view.nodes.filter(n=>n.type==='button');assert.equal(buttons.length,11);
   for(const [index,item] of r.props.items.entries()){
     assert.ok(view.html.includes(item.label));
     assert.equal(buttons[index+1].props['aria-current'],item.key==='docs'?'page':undefined);

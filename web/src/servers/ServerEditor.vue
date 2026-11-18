@@ -129,7 +129,7 @@ async function save(later = false) {
       </div>
       <div v-if="!local" class="ob-field"><span>前置机</span>
         <div class="ob-ctl">
-          <label class="ob-check"><input v-model="form.front" type="checkbox" /><span>这是前置机<small class="instance-muted">只经出口连 OpenBear，不用接入点；SSH 也只经出口</small></span></label>
+          <label class="ob-check"><input v-model="form.front" type="checkbox" /><span>这是前置机<small class="instance-muted">只经出口连 OpenBear，不用接入点；SSH 经出口，或经 SSH 连接里选的服务器</small></span></label>
           <FrontExits v-if="form.front" v-model="form.exits" :servers="servers" :self="server?.id || ''" />
         </div>
       </div>

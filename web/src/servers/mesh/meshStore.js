@@ -2,7 +2,7 @@ import { reactive, shallowRef } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { errorText, safeError } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
-import { draftOf, meshCodeText, reinstallErrorText } from './meshHelpers.js';
+import { draftOf, draftSnapshot, meshCodeText, reinstallErrorText } from './meshHelpers.js';
 
 // Mesh codes first; other codes go to the servers page wording, free text (a
 // data plane message) is shown as it is.
@@ -15,29 +15,34 @@ export const meshError = e => meshCodeText(e?.response?.data?.error) || safeErro
 // One copy of the mesh for the page and the server cards. `work` is what the
 // user edits; every edit is written to the draft with PUT. A poll never
 // replaces edits that are not saved yet (in flight, or rejected with errors).
-export const mesh = reactive({data: null, work: null, errors: [], rejected: false, saving: false, installing: false, loadError: '', error: '', unavailable: false});
+export const mesh = reactive({data: null, work: null, errors: [], rejected: false, conflict: false, saving: false, installing: false, loadError: '', error: '', unavailable: false});
 let saving = null, again = false, loading = null;
-// The draft as the server last had it (JSON). Reactive: the draft being edited is not swapped for an
+// The draft as the server last had it (canonical JSON). Reactive: the draft being edited is not swapped for an
 // equal copy, so whatever asks unsaved() must still see a save come back.
 const synced = shallowRef('');
+let syncedWork = '';
+let draftVersion = ''; // The baseline of work, never advanced by a poll while local edits remain.
+const conflictMessage = '草稿已被其他页面或工具修改。本地编辑已保留；请载入最新草稿后重新修改，避免覆盖他人的更改。';
 // Bumped when a change to the mesh (a draft save, an action, a layout save) starts and when it ends:
 // a poll that was out meanwhile may have been answered before the change and is dropped whole.
 let revision = 0;
 
-const snapshot = () => JSON.stringify(mesh.work);
+const snapshot = () => draftSnapshot(mesh.work);
 // The rule under the pointer, in the board's legend or the panel's list: the board highlights its members.
 export const ruleHover = reactive({id: ''});
 // What the overview panel has open: kept while the panel comes and goes with the selection.
 export const folds = reactive({rules: false, autoRules: false, proxies: false});
 export const unsaved = () => Boolean(mesh.work) && snapshot() !== synced.value;
+export const applyBlocked = () => unsaved() || mesh.rejected || mesh.conflict || mesh.saving || Boolean(mesh.errors.length);
 
-function adopt(data, force = false) {
+function adopt(data, force = false, saved = false) {
   const state = data?.mesh || data;
   if (!state || !Array.isArray(state.members)) return;
-  const next = draftOf(state), text = JSON.stringify(next);
+  const next = draftOf(state), text = draftSnapshot(next), raw = JSON.stringify(next);
   // The same draft as the one being edited is not swapped in: nothing that reads it is worked out again.
-  if ((force || !unsaved()) && text !== snapshot()) mesh.work = next;
-  synced.value = text;
+  const replace = force || !unsaved();
+  if (replace && raw !== JSON.stringify(mesh.work)) mesh.work = next;
+  if (replace || saved) { synced.value = text; syncedWork = raw; draftVersion = state.draftVersion || ''; }
   mesh.data = state;
   adoptLayout(state.layout);
   mesh.unavailable = false;
@@ -60,23 +65,36 @@ export function refresh(fresh = false) {
 
 export function save() {
   if (!mesh.work) return Promise.resolve();
+  if (!unsaved() && !saving) {
+    const wasConflict = mesh.conflict;
+    mesh.rejected = false; mesh.conflict = false; mesh.error = '';
+    mesh.errors = mesh.data?.errors || [];
+    if (mesh.data) adopt(mesh.data, true);
+    if (wasConflict) void refresh();
+    return Promise.resolve();
+  }
+  if (mesh.conflict) { mesh.error = conflictMessage; return Promise.resolve(); }
   if (saving) { again = true; return saving; }
-  const body = snapshot();
+  const body = snapshot(), payload = draftOf(mesh.work);
   mesh.saving = true; revision++;
   saving = (async () => {
     try {
-      const data = await MeshApi.saveDraft(JSON.parse(body));
+      const data = await MeshApi.saveDraft({...payload, draftVersion});
       mesh.rejected = false; mesh.errors = []; mesh.error = '';
       const state = Array.isArray((data?.mesh || data)?.members) ? data : await MeshApi.state();
       // The server may fill in ids or addresses; take them unless the user typed on meanwhile.
-      adopt(state, snapshot() === body);
+      adopt(state, snapshot() === body, true);
     } catch (e) {
       const errors = e?.response?.data?.errors;
-      if (e?.response?.status === 400 && Array.isArray(errors) && errors.length) { mesh.errors = errors; mesh.rejected = true; }
+      if (['mesh_draft_conflict', 'mesh_draft_version_required'].includes(e?.response?.data?.error)) {
+        mesh.conflict = true; mesh.rejected = false;
+        mesh.errors = mesh.data?.errors || [];
+        mesh.error = conflictMessage;
+      } else if (e?.response?.status === 400 && Array.isArray(errors) && errors.length) { mesh.errors = errors; mesh.rejected = true; mesh.error = ''; }
       else mesh.error = meshError(e);
     } finally {
       saving = null; mesh.saving = false; revision++;
-      if (again) { again = false; if (unsaved()) void save(); }
+      if (again) { again = false; void save(); }
     }
   })();
   return saving;
@@ -84,9 +102,22 @@ export function save() {
 
 // Back to the draft as the server has it, dropping edits it rejected.
 export function revert() {
-  mesh.rejected = false;
-  mesh.work = JSON.parse(synced.value || 'null');
+  mesh.rejected = false; mesh.conflict = false; mesh.error = '';
+  if (mesh.data) adopt(mesh.data, true);
+  else mesh.work = JSON.parse(syncedWork || 'null');
   mesh.errors = mesh.data?.errors || [];
+}
+
+export async function reloadDraft() {
+  try { await ElMessageBox.confirm('放弃本地未保存的编辑，载入服务器上的最新草稿？', '草稿冲突', {confirmButtonText: '载入最新草稿', cancelButtonText: '继续保留'}); }
+  catch { return; }
+  const before = snapshot(), mine = ++revision;
+  try {
+    const data = await MeshApi.state();
+    if (mine !== revision || before !== snapshot() || saving) { mesh.error = '载入期间又有编辑，本地内容已保留。请确认后重新载入。'; return; }
+    mesh.rejected = false; adopt(data, true); mesh.conflict = false; mesh.error = '';
+  } catch (e) { mesh.error = meshError(e); }
+  finally { revision++; }
 }
 
 // Board positions: {serverId: {x, y}}. Not part of the draft. Moves are kept
@@ -174,13 +205,20 @@ export async function reinstallMesh(m) {
   const id = m.serverId;
   reinstalling[id] = true; installs++; mesh.installing = true;
   try {
-    adopt(await MeshApi.reinstall(id));
+    const before = snapshot(), mine = ++revision;
+    const data = await MeshApi.reinstall(id);
+    if (mine === revision && before === snapshot() && !saving) adopt(data);
+    else {
+      const current = revision, latest = await MeshApi.state();
+      if (current === revision && !saving) adopt(latest);
+    }
     ElMessage.success(`已在「${m.name}」上重新安装组网服务，正在把新密钥下发给其他成员`);
     return '';
   } catch (e) {
     void refresh();
     return reinstallErrorText(e?.response?.data?.error) || meshError(e);
   } finally {
+    revision++;
     delete reinstalling[id]; installs--; mesh.installing = installs > 0;
   }
 }
@@ -205,9 +243,17 @@ export async function act(call) {
   revision++;
   try {
     if (saving) await saving;
+    const before = snapshot(), mine = revision;
     const data = await call();
-    mesh.rejected = false;
-    adopt(Array.isArray((data?.mesh || data)?.members) ? data : await MeshApi.state(), true);
+    const state = Array.isArray((data?.mesh || data)?.members) ? data : await MeshApi.state();
+    if (mine === revision && before === snapshot() && !saving) {
+      mesh.rejected = false; mesh.conflict = false;
+      adopt(state, true);
+    } else {
+      // An edit/save overtook this action's response. Never roll its baseline back.
+      const current = revision, latest = await MeshApi.state();
+      if (current === revision && !saving) adopt(latest);
+    }
     return data || {};
   } catch (e) {
     const errors = e?.response?.data?.errors;

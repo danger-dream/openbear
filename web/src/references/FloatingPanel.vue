@@ -9,15 +9,16 @@ async function position(){
  if(!props.open||!panel.value||!props.anchor||typeof window==='undefined')return;
  const generation=++positionGeneration;
  const viewport=window.visualViewport;
- const width=Math.min(props.width,(viewport?.width||window.innerWidth)-24);
+ const maxViewportW=(viewport?.width||window.innerWidth)-24;
+ const widthStyle=props.width>0?`${Math.min(props.width,maxViewportW)}px`:'max-content';
  const availableHeight=Math.max(120,(viewport?.height||window.innerHeight)-32);
  const height=props.height?`${Math.min(props.height,430,availableHeight)}px`:'';
- panel.value.style.width=`${width}px`;panel.value.style.maxHeight=`${Math.min(430,availableHeight)}px`;panel.value.style.height=height;
+ panel.value.style.width=widthStyle;panel.value.style.maxWidth=`${maxViewportW}px`;panel.value.style.maxHeight=`${Math.min(430,availableHeight)}px`;panel.value.style.height=height;
  const anchor=typeof props.anchor.getBoundingClientRect==='function'?props.anchor:{getBoundingClientRect:()=>props.anchor};
  const pos=await computePosition(anchor,panel.value,{strategy:'fixed',placement:props.placement,middleware:[offset(8),flip(),shift({padding:12})]});
  if(!props.open||generation!==positionGeneration||!panel.value)return;
  const top=Math.min(Math.max((viewport?.offsetTop||0)+8,pos.y),(viewport?.offsetTop||0)+(viewport?.height||innerHeight)-panel.value.offsetHeight-8);
- style.value={position:'fixed',left:`${pos.x}px`,top:`${Math.max(8,top)}px`,width:`${width}px`,height,maxHeight:`${Math.min(430,availableHeight)}px`,visibility:'visible'};
+ style.value={position:'fixed',left:`${pos.x}px`,top:`${Math.max(8,top)}px`,width:widthStyle,maxWidth:`${maxViewportW}px`,height,maxHeight:`${Math.min(430,availableHeight)}px`,visibility:'visible'};
 }
 function schedule(){cancelAnimationFrame(frame);frame=requestAnimationFrame(position);}
 function outside(event){if(!panel.value?.contains(event.target)&&!props.anchor?.contains?.(event.target))emit('close');}

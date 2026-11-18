@@ -53,14 +53,14 @@ func TestTooBigICMP(t *testing.T) {
 	outer := dfPacket(a, z, protoE2E, 1500, true)
 	q, _ := parseIPv4(outer)
 	icmp, _ := parseIPv4(tooBigICMP(netip.MustParseAddr("100.96.0.1"), q, 1420))
-	if dst, ok := e2eTooBig(icmp, a); !ok || dst != z {
+	if dst, mtu, ok := e2eTooBig(icmp, a); !ok || dst != z || mtu != 1420 {
 		t.Fatal("end-to-end ICMP not recognised")
 	}
-	if _, ok := e2eTooBig(icmp, z); ok {
+	if _, _, ok := e2eTooBig(icmp, z); ok {
 		t.Fatal("taken for another node's packet")
 	}
 	plain, _ := parseIPv4(tooBigICMP(z, p, 1420))
-	if _, ok := e2eTooBig(plain, a); ok {
+	if _, _, ok := e2eTooBig(plain, a); ok {
 		t.Fatal("taken for an end-to-end packet")
 	}
 }
@@ -102,7 +102,7 @@ func TestPathMTUs(t *testing.T) {
 	if v := p.view.Load(); v.innerMTU(far, "S") != 1368 {
 		t.Fatal("large through a small first hop")
 	}
-	p.tooBig("Z")
+	p.tooBig("Z", 1420)
 	if p.view.Load().far["Z"] {
 		t.Fatal("ICMP from a relay kept the path large")
 	}
@@ -151,7 +151,7 @@ func TestLargeRoutes(t *testing.T) {
 	r := &routing{nodes: nodes, hops: []hopPrefix{
 		{host(netip.MustParseAddr("100.96.0.12")), "100.96.0.12"}, {host(netip.MustParseAddr("100.96.0.15")), "100.96.0.15"}, {meshPrefix, "100.96.0.12"}}}
 	p := newPaths(1420)
-	if largeRoutes(p.view.Load(), r) != nil {
+	if mtuRoutes(p.view.Load(), r) != nil {
 		t.Fatal("routes while off")
 	}
 	p.configure(true, 1420, 1420)
@@ -162,7 +162,7 @@ func TestLargeRoutes(t *testing.T) {
 		}
 	}
 	want := []hostRoute{{netip.MustParseAddr("100.96.0.12"), largeInner}, {netip.MustParseAddr("100.96.0.13"), largeFar}}
-	if got := largeRoutes(p.view.Load(), r); !slices.Equal(got, want) {
+	if got := mtuRoutes(p.view.Load(), r); !slices.Equal(got, want) {
 		t.Fatalf("routes %v, want %v", got, want)
 	}
 	if largeInner != 8948 || largeFar+15+e2eOverhead > wire.LargeMTU {
@@ -189,7 +189,8 @@ func largeTUN(t *testing.T, relay bool, links map[string]bool) (*meshTUN, *tunte
 }
 
 // A packet from the OS longer than its path takes is dropped, and with DF
-// answered to the OS as from its destination with the path's MTU.
+// answered to the OS as from its destination with the path's MTU; without
+// DF it goes on in fragments.
 func TestTooBigFromTheOS(t *testing.T) {
 	mt, ct, s, self := largeTUN(t, false, map[string]bool{"100.96.0.12": true})
 	big, small := netip.MustParseAddr("100.96.0.12"), netip.MustParseAddr("100.96.0.13")
@@ -213,8 +214,12 @@ func TestTooBigFromTheOS(t *testing.T) {
 			}
 		}
 	}
-	if mt.stats.DroppedTooBig.Load() != 3 || s.queuedBytes() != 0 {
-		t.Fatalf("dropped %d, queued %d", mt.stats.DroppedTooBig.Load(), s.queuedBytes())
+	// largeInner+1 bytes: one fragment of largeInner, one of a byte.
+	waitLarge(t, func() bool { return s.queuedBytes() == largeInner+1+20 })
+	if mt.stats.DroppedTooBig.Load() != 2 {
+		t.Fatalf("dropped %d", mt.stats.DroppedTooBig.Load())
+	}
+	for s.tryDequeue() != nil {
 	}
 	ct.Outbound <- dfPacket(self, big, protoTCP, largeInner, true)
 	waitLarge(t, func() bool { return s.queuedBytes() == largeInner })
@@ -283,7 +288,7 @@ func TestLargeLostAndRegained(t *testing.T) {
 	if _, changed := mt.paths.update(map[string]bool{}, nil); !changed {
 		t.Fatal("no change")
 	}
-	if got := largeRoutes(mt.paths.view.Load(), r); len(got) != 0 {
+	if got := mtuRoutes(mt.paths.view.Load(), r); len(got) != 0 {
 		t.Fatalf("host routes %v after the loss", got)
 	}
 	pkt := send()
@@ -301,7 +306,7 @@ func TestLargeLostAndRegained(t *testing.T) {
 	if v.linkMTU("100.96.0.12") != wire.LargeMTU {
 		t.Fatal("path MTU not back at 9000")
 	}
-	if got := largeRoutes(v, r); !slices.Equal(got, []hostRoute{{z, largeInner}}) {
+	if got := mtuRoutes(v, r); !slices.Equal(got, []hostRoute{{z, largeInner}}) {
 		t.Fatalf("host routes %v", got)
 	}
 	send()

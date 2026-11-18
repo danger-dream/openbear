@@ -55,6 +55,9 @@ class ClouDNS(Provider):
         ttl = self.ttl_for(ttl)
         return TTLS[min(bisect.bisect_left(TTLS, ttl), len(TTLS) - 1)] if ttl else None
 
+    async def effective_ttl(self, zone, ttl):
+        return self._ttl(ttl)
+
     async def records(self, zone, name, rtype):
         host = self.relative(zone, name, '')
         out, page = [], 1

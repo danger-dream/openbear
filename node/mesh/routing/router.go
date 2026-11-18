@@ -29,27 +29,57 @@ const (
 	ReasonShorter = "shorter"
 )
 
-// A path through fewer relays is taken while the route in use works when
-// it costs below shorterRatio of it and at least shorterMargin less, for
-// switchHold (README, "Choosing a next hop").
+// Why a route stays on its next hop while the shortest path's is another
+// (RouteStatus.Held).
 const (
-	shorterRatio  = 0.95
-	shorterMargin = 3.0 // ms
+	HeldMargin  = "margin"  // cheaper by less than the switch (or shorter) threshold
+	HeldHold    = "hold"    // the rule is met and has to hold until Until
+	HeldDamped  = "damped"  // flap damping: the route went back and forth lately; until Until
+	HeldLoop    = "loop"    // its advertised path is not loop-free yet; advertisements are catching up
+	HeldPenalty = "penalty" // a path through fewer relays, over a first link that went down lately
+	HeldTransit = "transit" // it goes on through more no-transit relays
 )
 
-// Route flap damping (README, "Choosing a next hop"): a route that went
-// back, by better or shorter, to the next hop it had left by better or
-// shorter less than flapWindow before has flapped. While it has flapped
-// within flapWindow, a move by better or shorter waits until its rule has
-// held for flapHold, doubled for each further flap, up to flapHoldMax.
-// Moves because the route in use broke never wait, nor does the move back
-// to the next hop they left; moves within flapSettle of the route's first
-// advertisements, while it converges, are no flaps.
+// Tuning are the parameters of link costs and of moving routes (README,
+// "Link metrics" and "Choosing a next hop"); DefaultTuning without one.
+type Tuning struct {
+	// A working route moves to one costing at least SwitchMs less and, with
+	// SwitchPct, more than that share of its cost less.
+	SwitchMs, SwitchPct float64
+	// One through fewer relays: at least ShorterMs less and, with
+	// ShorterPct, more than that share less, for Hold on end.
+	ShorterMs, ShorterPct float64
+	// A link's advertised cost follows the measured one once they differ by
+	// more than AdvertMs and, with AdvertPct, more than that share of the
+	// larger, for Hold.
+	AdvertMs, AdvertPct float64
+	Hold                time.Duration
+	// A link costs its round trip, JitterWeight times its jitter,
+	// LossWeight times its loss rate (0-1) and its bias, in ms.
+	JitterWeight, LossWeight float64
+	// Flap damping: a route that went back, by better or shorter, to the
+	// next hop it had left by better or shorter less than flapWindow before
+	// has flapped. While it has flapped within flapWindow, a move by better
+	// or shorter waits until its rule has held for FlapHold, doubled for
+	// each further flap, up to FlapHoldMax. Moves because the route in use
+	// broke never wait, nor does the move back to the next hop they left;
+	// moves within flapSettle of the route's first advertisements, while it
+	// converges, are no flaps.
+	FlapHold, FlapHoldMax time.Duration
+}
+
+var DefaultTuning = Tuning{SwitchMs: 5, ShorterMs: 3, AdvertMs: 2, Hold: 5 * time.Second, JitterWeight: 2, LossWeight: 1000,
+	FlapHold: time.Minute, FlapHoldMax: 8 * time.Minute}
+
+// cheaper says whether saving saved ms on a route costing cur ms meets ms
+// and pct.
+func cheaper(saved, cur, ms, pct float64) bool {
+	return saved >= ms && (pct == 0 || saved > cur*pct/100)
+}
+
 const (
-	flapWindow  = 10 * time.Minute
-	flapHold    = time.Minute
-	flapHoldMax = 8 * time.Minute
-	flapSettle  = advertExpiry
+	flapWindow = 10 * time.Minute
+	flapSettle = advertExpiry
 )
 
 // Config is what the router needs from the applied config.
@@ -62,6 +92,11 @@ type Config struct {
 	NextHops map[string]string  // configured next hops: the start and static mode
 	Mode     string             // dynamic (the default) or static
 	Bias     map[string]float64 // ms added to a link's cost, by linked peer
+	// NoTransit are the relays, this one included, that forward between two
+	// other relays only when no other path is left: going on through one
+	// from a relay to a relay costs lastResort.
+	NoTransit []string
+	Tuning    *Tuning
 	// Numbers are the host numbers of the nodes' control addresses, this
 	// one's included, that name them in compact advertisements; without a
 	// distinct one for every relay, FormatJSON is used.
@@ -90,6 +125,9 @@ type LinkStatus struct {
 	// Advertised is the cost this relay gives the link in its
 	// advertisements; routes use the larger of the two ends'. +Inf unless up.
 	Advertised float64
+	// Held is how much longer a link back from down is held down
+	// (probationBase), 0 unless it is.
+	Held time.Duration
 }
 
 type RouteStatus struct {
@@ -98,6 +136,13 @@ type RouteStatus struct {
 	Path          []string
 	Since         time.Time
 	Switches      int
+	// Best is the shortest path's next hop when the route stays on another,
+	// BestCost its cost along the next hops advertised (+Inf when it has
+	// none yet), Held why (Held*), until Until for HeldHold and HeldDamped.
+	Best     string
+	BestCost float64
+	Held     string
+	Until    time.Time
 }
 
 type Status struct {
@@ -125,16 +170,21 @@ type route struct {
 	leftAt time.Time
 	broken bool
 	flaps  []time.Time
+	// What the last choice found: RouteStatus.Best, BestCost, Held, Until.
+	best     string
+	bestCost key
+	held     string
+	until    time.Time
 }
 
 // damping is how long a move by better or shorter to next must wait, 0
 // without flaps within flapWindow.
-func (rt *route) damping(next string, now time.Time) time.Duration {
+func (rt *route) damping(next string, now time.Time, t *Tuning) time.Duration {
 	rt.flaps = slices.DeleteFunc(rt.flaps, func(t time.Time) bool { return now.Sub(t) >= flapWindow })
 	if len(rt.flaps) == 0 || (rt.broken && next == rt.left) {
 		return 0
 	}
-	return min(flapHoldMax, flapHold<<min(len(rt.flaps)-1, 8))
+	return min(t.FlapHoldMax, t.FlapHold<<min(len(rt.flaps)-1, 8))
 }
 
 // moved records a move from old to next for reason.
@@ -154,7 +204,11 @@ type Router struct {
 
 	known  map[string]bool // every relay, this one included if a relay
 	leaves map[string]bool // every member in routing, this one included if a leaf
-	order  []string        // the other nodes (relays and leaves), sorted
+	// noTransit is cfg.NoTransit of the relays known.
+	noTransit map[string]bool
+	// tuning is cfg.Tuning, or DefaultTuning; every metric points to it.
+	tuning Tuning
+	order  []string // the other nodes (relays and leaves), sorted
 	// all is every relay, this one included when not a leaf, sorted: the
 	// routes of an advertisement this one sends include those to relays.
 	all    []string
@@ -208,8 +262,13 @@ func (r *Router) configure(c Config) bool {
 	if c.Mode == "" {
 		c.Mode = ModeDynamic
 	}
+	tuning := DefaultTuning
+	if c.Tuning != nil {
+		tuning = *c.Tuning
+	}
 	now := r.now()
-	r.cfg = c
+	retune := r.tuning != tuning
+	r.cfg, r.tuning = c, tuning
 	r.known = map[string]bool{}
 	r.leaves = map[string]bool{}
 	if c.Leaf {
@@ -237,6 +296,12 @@ func (r *Router) configure(c Config) bool {
 	}
 	sort.Strings(r.order)
 	sort.Strings(r.all)
+	r.noTransit = map[string]bool{}
+	for _, id := range c.NoTransit {
+		if r.known[id] {
+			r.noTransit[id] = true
+		}
+	}
 	r.num, r.ids = map[string]uint32{}, map[uint32]string{}
 	for id := range r.known {
 		n, ok := c.Numbers[id]
@@ -275,10 +340,13 @@ func (r *Router) configure(c Config) bool {
 		linked[p] = true
 		m := r.links[p]
 		if m == nil {
-			m = newMetric(c.Bias[p])
+			m = newMetric(c.Bias[p], &r.tuning)
 			r.links[p] = m
 		}
-		if b := c.Bias[p]; b != m.bias {
+		// A member has its links and the way back to it kept (keep): no
+		// probation that would cut it off longer than its link was down.
+		m.probation = !c.Leaf && r.known[p]
+		if b := c.Bias[p]; b != m.bias || retune {
 			m.bias = b
 			if m.state() == StateUp {
 				m.advCost = round1(m.cost())
@@ -327,6 +395,43 @@ func (r *Router) Gone(peer string) bool {
 	return r.measure(peer, func(m *metric, now time.Time) { m.gone(now) })
 }
 
+// Down says whether the link to peer lost its last probes in a row: a
+// suppressed link that answers is not down.
+func (r *Router) Down(peer string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.links[peer]
+	return m != nil && m.down
+}
+
+// narrowCost is what a link that carries less than the network MTU from
+// this end adds to its cost, in ms: packets over it are held to less, so
+// routes take it only where nothing else comes within that.
+const narrowCost = 50.0
+
+// SetNarrow says which linked peers' links carry less than the network MTU
+// from this end. The cost a link advertises follows at once; next hops move
+// at the next Tick.
+func (r *Router) SetNarrow(peers map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for p, m := range r.links {
+		n := 0.0
+		if peers[p] {
+			n = narrowCost
+		}
+		if n == m.narrow {
+			continue
+		}
+		m.narrow = n
+		if m.state() == StateUp {
+			m.advCost = round1(m.cost())
+			m.pending = time.Time{}
+			r.due = true
+		}
+	}
+}
+
 func (r *Router) measure(peer string, f func(*metric, time.Time)) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -336,8 +441,107 @@ func (r *Router) measure(peer string, f func(*metric, time.Time)) bool {
 	}
 	now := r.now()
 	f(m, now)
+	if m.heldFor > 0 {
+		r.event("link.held", fmt.Sprintf("%s: back after %d downs in %v, held for %v", peer, len(m.downs), flapWindow, m.heldFor))
+		m.heldFor = 0
+	}
+	for _, p := range r.release() {
+		if p != peer {
+			r.settle(p, r.links[p], now)
+		}
+	}
+	for _, p := range r.keep() {
+		if p != peer {
+			r.settle(p, r.links[p], now)
+		}
+	}
 	r.settle(peer, m, now)
 	return r.recompute(now)
+}
+
+// keep leaves a member a link while every one it has that answers is
+// suppressed: damping is to steer around a flapping link, not to cut the
+// member off the mesh. A member keeps its best; for the way back, one relay
+// keeps its link to it (lastToLeaf). Links between relays are left to
+// damping: a relay has other relays to route through. It says whose kept
+// changed.
+func (r *Router) keep() []string {
+	want := map[string]bool{}
+	if r.cfg.Leaf {
+		pick, best := "", math.Inf(1)
+		bestRank := 2
+		for p, m := range r.links {
+			if !m.working() {
+				continue
+			}
+			// Leaves do not advertise. Follow the relay's usable return edge
+			// before local cost, otherwise the two ends can keep different links.
+			rank := 1 // unknown peer advertisement: retain N-1/static fallback
+			if a := r.lsdb[p]; a != nil {
+				if l, ok := a.members[r.cfg.Self]; ok {
+					if l.state != StateUp {
+						continue
+					}
+					rank = 0
+				}
+			}
+			if !m.suppressed {
+				pick = ""
+				break
+			}
+			if c := m.measured(); rank < bestRank || rank == bestRank && (c < best || c == best && p < pick) {
+				pick, best, bestRank = p, c, rank
+			}
+		}
+		if pick != "" {
+			want[pick] = true
+		}
+	} else {
+		for p, m := range r.links {
+			want[p] = r.leaves[p] && m.suppressed && m.working() && r.lastToLeaf(p)
+		}
+	}
+	var changed []string
+	for p, m := range r.links {
+		if want[p] != m.kept {
+			m.kept = want[p]
+			changed = append(changed, p)
+		}
+	}
+	return changed
+}
+
+// release lets a held link up at once when its peer is not reachable another
+// way: the hold steers routes around a link that keeps going down, it cuts
+// off neither end (a relay that restarted comes back on every link at once,
+// and each neighbor has others).
+func (r *Router) release() (released []string) {
+	for _, p := range r.order {
+		m := r.links[p]
+		if m == nil || !m.held || r.graph != nil && !r.graph.dist[r.cfg.Self][p].unreachable() {
+			continue
+		}
+		m.held, m.heldUntil = false, time.Time{}
+		r.event("link.released", p+": not reachable another way")
+		released = append(released, p)
+	}
+	return released
+}
+
+// lastToLeaf says whether this relay is the one to keep its suppressed link
+// to leaf: no other relay advertises one that is up, and none named before
+// it one that is suppressed. Kept, the link is advertised up, so the others
+// leave theirs suppressed.
+func (r *Router) lastToLeaf(leaf string) bool {
+	for o, a := range r.lsdb {
+		if o == r.cfg.Self {
+			continue
+		}
+		if l, ok := a.members[leaf]; ok && (l.state == StateUp || l.state == StateSuppressed && o < r.cfg.Self) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Router) settle(peer string, m *metric, now time.Time) {
@@ -349,6 +553,8 @@ func (r *Router) settle(peer string, m *metric, now time.Time) {
 	switch {
 	case m.advState == StateSuppressed:
 		r.event("link.suppressed", fmt.Sprintf("%s: penalty %.0f", peer, m.penalty))
+	case m.kept && before == StateSuppressed:
+		r.event("link.kept", fmt.Sprintf("%s: penalty %.0f", peer, m.penalty))
 	case before == StateSuppressed:
 		r.event("link.reused", fmt.Sprintf("%s: penalty %.0f", peer, m.penalty))
 	}
@@ -364,8 +570,12 @@ func (r *Router) Tick() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	for p, m := range r.links {
+	for _, m := range r.links {
 		m.decay(now)
+	}
+	r.release()
+	r.keep()
+	for p, m := range r.links {
 		r.settle(p, m, now)
 	}
 	for o, a := range r.lsdb {
@@ -663,17 +873,25 @@ func (r *Router) Status() Status {
 		if m.advState == StateUp {
 			adv = m.advCost
 		}
+		var held time.Duration
+		if m.held {
+			held = max(0, m.heldUntil.Sub(r.now()))
+		}
 		s.Links = append(s.Links, LinkStatus{Peer: p, State: m.state(), RTTMs: round1(m.rtt), JitterMs: round1(m.jitter), Loss: m.loss(),
-			Cost: round1(m.cost()), Penalty: math.Round(m.penalty), Advertised: adv})
+			Cost: round1(m.cost()), Penalty: math.Round(m.penalty), Advertised: adv, Held: held})
 	}
 	g := r.graph
 	for _, d := range r.order {
 		rt := r.routes[d]
-		st := RouteStatus{Dest: d, NextHop: rt.nextHop, Cost: math.Inf(1), Path: []string{}, Since: rt.since, Switches: rt.switches}
+		st := RouteStatus{Dest: d, NextHop: rt.nextHop, Cost: math.Inf(1), Path: []string{}, Since: rt.since, Switches: rt.switches,
+			Best: rt.best, BestCost: math.Inf(1), Held: rt.held, Until: rt.until}
 		if rt.nextHop != "" && g != nil {
 			if path, cost, ok := g.path(rt.nextHop, d); ok {
 				st.Path, st.Cost = path, cost
 			}
+		}
+		if rt.best != "" && !rt.bestCost.unreachable() {
+			st.BestCost = rt.bestCost.ms()
 		}
 		s.Routes = append(s.Routes, st)
 	}
@@ -692,6 +910,9 @@ func (r *Router) recompute(now time.Time) bool {
 			rt.dynamic = false
 		}
 		next, reason := r.choose(d, rt, df, now)
+		if next == rt.best {
+			rt.best, rt.bestCost, rt.held, rt.until = "", unreachable, "", time.Time{}
+		}
 		if next == rt.nextHop {
 			continue
 		}
@@ -722,6 +943,7 @@ func orNone(s string) string {
 func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (string, string) {
 	pending := rt.pending
 	rt.pending = ""
+	rt.best, rt.bestCost, rt.held, rt.until = "", unreachable, "", time.Time{}
 	static := r.cfg.NextHops[d]
 	if r.links[static] == nil {
 		static = ""
@@ -773,10 +995,12 @@ func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (strin
 	}
 	// The shortest path's next hop, once the path it advertises is
 	// loop-free and cheaper than the route in use; while that route works,
-	// only when it is below switchRatio of its cost and more than
-	// switchMargin cheaper. The costs compared are advertised ones, which
-	// follow a link only after a change lasted switchHold.
-	if pref := g.first[d]; pref != "" && g.feasible(pref, d, curCost) {
+	// only when it is cheaper by Tuning.SwitchMs (and SwitchPct). The costs
+	// compared are advertised ones, which follow a link only after a change
+	// lasted Tuning.Hold.
+	t := &r.tuning
+	pref := g.first[d]
+	if pref != "" && g.feasible(pref, d, curCost) {
 		if pref == cur {
 			return cur, ""
 		}
@@ -784,9 +1008,11 @@ func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (strin
 			return pref, reason
 		}
 		// While the route in use works, a move waits for its rule to hold
-		// as long as flap damping says, and the shorter rule for switchHold
-		// at least.
-		damping := rt.damping(pref, now)
+		// as long as flap damping says, and the shorter rule for Hold at
+		// least.
+		damping := rt.damping(pref, now, t)
+		prefCost, _, _ := g.via(pref, d)
+		rt.best, rt.bestCost = pref, prefCost
 		wait := func(hold time.Duration, why string) (string, string) {
 			if pending != pref {
 				rt.pendingAt = now
@@ -796,24 +1022,43 @@ func (r *Router) choose(d string, rt *route, foreign bool, now time.Time) (strin
 				rt.pending = ""
 				return pref, why
 			}
+			rt.held, rt.until = HeldHold, rt.pendingAt.Add(hold)
+			if damping >= hold {
+				rt.held = HeldDamped
+			}
 			return cur, ""
 		}
-		prefCost, _, _ := g.via(pref, d)
-		if prefCost.ms() < switchRatio*curCost.ms() && curCost.ms()-prefCost.ms() > switchMargin {
-			if damping == 0 {
+		// Through fewer no-transit relays wins whatever it costs, without
+		// waiting for flap damping; the thresholds hold between paths
+		// through as many.
+		same, fewer := prefCost.tolls == curCost.tolls, prefCost.tolls < curCost.tolls
+		saved := curCost.ms() - prefCost.ms()
+		if fewer || same && cheaper(saved, curCost.ms(), t.SwitchMs, t.SwitchPct) {
+			if damping == 0 || fewer {
 				return pref, ReasonBetter
 			}
 			return wait(damping, ReasonBetter)
 		}
-		// A path through fewer relays needs less: below shorterRatio and
-		// at least shorterMargin cheaper, but for switchHold on end, as
-		// nothing else delays it, and not over a first link that went down
-		// lately (penalty not yet below reuseBelow): a flapping link comes
-		// back up cheaper than the detour every time.
-		if m := r.links[pref]; m != nil && m.penalty < reuseBelow && g.relays(pref, d) < g.relays(cur, d) &&
-			prefCost.ms() < shorterRatio*curCost.ms() && curCost.ms()-prefCost.ms() >= shorterMargin {
-			return wait(max(switchHold, damping), ReasonShorter)
+		// A path through fewer relays needs less: ShorterMs (and
+		// ShorterPct), but for Hold on end, as nothing else delays it, and
+		// not over a first link that went down lately (penalty not yet below
+		// reuseBelow): a flapping link comes back up cheaper than the detour
+		// every time.
+		if m := r.links[pref]; same && m != nil && g.relays(pref, d) < g.relays(cur, d) && cheaper(saved, curCost.ms(), t.ShorterMs, t.ShorterPct) {
+			if m.penalty < reuseBelow {
+				return wait(max(t.Hold, damping), ReasonShorter)
+			}
+			rt.held = HeldPenalty
 		}
+		if rt.held == "" {
+			rt.held = HeldMargin
+			if !same {
+				rt.held = HeldTransit
+			}
+		}
+	} else if pref != "" && pref != cur && curUsable {
+		rt.best, rt.held = pref, HeldLoop
+		rt.bestCost, _, _ = g.via(pref, d)
 	}
 	if curUsable {
 		return cur, ""
@@ -858,25 +1103,36 @@ func (r *Router) PathDown(nodes []string) []string {
 // graph is every relay and link as this relay knows them, with the
 // shortest distances between all relays.
 type graph struct {
-	self    string
-	nodes   []string
-	leaves  map[string]bool
-	adj     map[string]map[string]key // symmetric
-	dist    map[string]map[string]key
-	first   map[string]string            // this node's shortest-path next hop by destination
-	firstBy map[string]map[string]string // src -> dest -> shortest-path next hop
-	lsdb    map[string]*advert
+	self      string
+	nodes     []string
+	leaves    map[string]bool
+	noTransit map[string]bool
+	adj       map[string]map[string]key // symmetric
+	dist      map[string]map[string]key
+	first     map[string]string            // this node's shortest-path next hop by destination
+	firstBy   map[string]map[string]string // src -> dest -> shortest-path next hop
+	lsdb      map[string]*advert
 }
 
-// key orders paths: by cost in tenths of a millisecond, then by a
-// tie-breaker every relay derives the same from the link's two ends, so
-// all relays agree on one shortest path between any two.
-type key struct{ w, tie int64 }
+// key orders paths: by how many times they go on through a no-transit
+// relay from a relay to a relay (tolls), then by cost in tenths of a
+// millisecond, then by a tie-breaker every relay derives the same from the
+// link's two ends, so all relays agree on one shortest path between any two.
+type key struct{ tolls, w, tie int64 }
 
-var unreachable = key{math.MaxInt64 / 4, 0}
+var unreachable = key{tolls: math.MaxInt32, w: math.MaxInt64 / 4}
 
-func (k key) less(o key) bool   { return k.w < o.w || (k.w == o.w && k.tie < o.tie) }
-func (k key) add(o key) key     { return key{k.w + o.w, k.tie + o.tie} }
+// lastResort is what going on through a no-transit relay adds: such a path
+// is taken only when no other is up, and left by better once one is.
+var lastResort = key{tolls: 1}
+
+func (k key) less(o key) bool {
+	if k.tolls != o.tolls {
+		return k.tolls < o.tolls
+	}
+	return k.w < o.w || (k.w == o.w && k.tie < o.tie)
+}
+func (k key) add(o key) key     { return key{k.tolls + o.tolls, k.w + o.w, k.tie + o.tie} }
 func (k key) unreachable() bool { return k.w >= unreachable.w }
 func (k key) ms() float64       { return float64(k.w) / 10 }
 func linkKey(a, b string, c float64) key {
@@ -887,11 +1143,11 @@ func linkKey(a, b string, c float64) key {
 	h.Write([]byte(a))
 	h.Write([]byte{0})
 	h.Write([]byte(b))
-	return key{max(1, int64(math.Round(c*10))), int64(h.Sum32()&0xffff) + 1}
+	return key{w: max(1, int64(math.Round(c*10))), tie: int64(h.Sum32()&0xffff) + 1}
 }
 
 func (r *Router) build() *graph {
-	g := &graph{self: r.cfg.Self, nodes: append([]string{r.cfg.Self}, r.order...), leaves: r.leaves, adj: map[string]map[string]key{}, dist: map[string]map[string]key{}, first: map[string]string{}, firstBy: map[string]map[string]string{}, lsdb: r.lsdb}
+	g := &graph{self: r.cfg.Self, nodes: append([]string{r.cfg.Self}, r.order...), leaves: r.leaves, noTransit: r.noTransit, adj: map[string]map[string]key{}, dist: map[string]map[string]key{}, first: map[string]string{}, firstBy: map[string]map[string]string{}, lsdb: r.lsdb}
 	side := func(x, y string) (advLink, bool) {
 		if x == r.cfg.Self {
 			m := r.links[y]
@@ -974,12 +1230,25 @@ func (g *graph) dijkstra(src string) (map[string]key, map[string]string) {
 			hop := first[u]
 			if u == src {
 				hop = v
+			} else {
+				nd = nd.add(g.toll(u, v, g.leaves[src] && first[u] == u))
 			}
 			if nd.less(dist[v]) || (nd == dist[v] && hop < first[v]) {
 				dist[v], first[v] = nd, hop
 			}
 		}
 	}
+}
+
+// toll is what going on from relay u to v adds to a path: lastResort when
+// u does not forward between two other relays, it was not entered from the
+// member that uses it as an entry (fromMember), and v is a relay. A path
+// to a member ends at the relays it enters by, which carry it as their own.
+func (g *graph) toll(u, v string, fromMember bool) key {
+	if g.noTransit[u] && !fromMember && !g.leaves[v] {
+		return lastResort
+	}
+	return key{}
 }
 
 // via is the cost from this relay through neighbor n to d along the next
@@ -1036,7 +1305,7 @@ func (g *graph) chain(n, d string) (cost key, ok, loops bool) {
 		if !linked {
 			return unreachable, false, false
 		}
-		cost, x = cost.add(k), nh
+		cost, x = cost.add(k).add(g.toll(x, nh, x == n && g.leaves[g.self])), nh
 	}
 	return unreachable, false, true
 }

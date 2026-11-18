@@ -4,14 +4,17 @@ import { ElMessage } from 'element-plus';
 import { copyTextToClipboard } from '../../utils/clipboard.js';
 import { flag } from '../serverHelpers.js';
 import { mesh, save } from './meshStore.js';
-import { byAddress, errorMessage, errorsUnder, LINK_SCHEMES, nodeState, portTarget, proxyPorts, proxyRun, proxyUrl, rowButton, setExit, uid } from './meshHelpers.js';
+import { byAddress, errorMessage, errorsUnder, fastChannelText, fastProtoText, fastSources, fastUsers, LINK_SCHEMES, nodeState, portTarget, proxyPorts, proxyRun, proxyUrl, rowButton, setExit, uid } from './meshHelpers.js';
 import MeshDialog from './MeshDialog.vue';
+import MeshFastPortEdit from './MeshFastPortEdit.vue';
 import MeshNodeName from './MeshNodeName.vue';
 import MeshPortEdit from './MeshPortEdit.vue';
 
 // Exits and proxy ports: the machines that are exits, each a SOCKS5 / HTTP proxy on its mesh address to copy; exit groups,
-// sets of exits by region or kind; and proxy ports, a port on one machine leading to an exit or a group through the tunnel.
-const props = defineProps({phone: Boolean, items: {type: Array, default: () => []}, group: {type: String, default: ''}, create: {type: Object, default: null}});
+// sets of exits by region or kind; proxy ports, a port on one machine leading to an exit or a group through the tunnel;
+// and fast ports, a node's port whose connections to its mesh address go by the fast relay.
+const props = defineProps({phone: Boolean, items: {type: Array, default: () => []}, group: {type: String, default: ''}, fastPort: {type: String, default: ''},
+  create: {type: Object, default: null}});
 const emit = defineEmits(['open']);
 const work = computed(() => mesh.work);
 const members = computed(() => (work.value?.members || []).filter(m => !m.removing).sort(byAddress));
@@ -107,15 +110,23 @@ function portRun({m, p}) {
 const portLink = p => p.listen === 'lan' && p.address ? proxyUrl(scheme.value, p.user, p.password, p.address, p.port) : `${scheme.value}://127.0.0.1:${p.port}`;
 const copyPort = ({m, p}) => p.listen === 'lan' && !p.password ? ElMessage.info('保存后生成密码，再复制') : copy(portLink(p), ` ${m.name} :${p.port} 的链接`);
 
-const tunnelPort = computed(() => work.value?.settings?.proxy?.port || 51080);
-function setTunnelPort(value) {
-  const n = Number(value);
-  if (!Number.isInteger(n)) return;
-  work.value.settings.proxy = {...(work.value.settings.proxy || {password: ''}), port: n};
-  commit();
+// ---- fast ports ----
+const fastPorts = computed(() => work.value?.fastPorts || []);
+const fast = ref(null);
+watch(() => props.fastPort, id => { if (id) fast.value = {id}; }, {immediate: true});
+const fastErrors = i => errorsUnder(mesh.errors, `fastPorts[${i}]`).length;
+const fastAddr = x => { const m = members.value.find(y => y.serverId === x.serverId); return m?.address ? `${m.address}:${x.port}` : ''; };
+// How it is used now: by how many nodes, and the way the one used last goes.
+function fastRun(x) {
+  const users = fastUsers(mesh.data, x.serverId);
+  if (!users.length) return '还没人用';
+  const last = fastChannelText(members.value, users[0]);
+  return users.length > 1 ? `${users.length} 台在用 · ${members.value.find(m => m.serverId === users[0].id)?.name || users[0].id} ${last}` : `${members.value.find(m => m.serverId === users[0].id)?.name || users[0].id} ${last}`;
 }
-const tunnelErrors = computed(() => errorsUnder(mesh.errors, 'settings.proxy').map(errorMessage));
-watch(() => props.create, c => { if (c?.kind === 'exit') openAdd(); else if (c?.kind === 'group') newGroup(); else if (c?.kind === 'port') port.value = {create: true}; }, {immediate: true});
+const copyFast = x => fastAddr(x) ? copy(fastAddr(x), ` ${fastAddr(x)}`) : ElMessage.info('应用后分配组网地址，再复制');
+
+watch(() => props.create, c => { if (c?.kind === 'exit') openAdd(); else if (c?.kind === 'group') newGroup(); else if (c?.kind === 'port') port.value = {create: true};
+  else if (c?.kind === 'fast') fast.value = {create: true}; }, {immediate: true});
 </script>
 <template>
   <section class="m3-pane" aria-label="出口和代理">
@@ -123,7 +134,8 @@ watch(() => props.create, c => { if (c?.kind === 'exit') openAdd(); else if (c?.
       <div class="sv-ranges" role="radiogroup" aria-label="链接格式"><button v-for="[k, l] in LINK_SCHEMES" :key="k" type="button" role="radio" :aria-checked="scheme === k" @click="scheme = k">{{ l }}</button></div>
     </header>
     <p class="m3-lead"><b>出口</b>是组网里一台对外的代理：复制它的链接，组网里的程序直接用，流量从那台机器出去。<b>出口组</b>按地区或用途（家宽、解锁）把出口编在一起。
-      <b>代理端口</b>开在你程序所在的那台机器上，经提前建好的隧道走某个出口或出口组，新连接不用跨组网握手，延迟更低。</p>
+      <b>代理端口</b>开在你程序所在的那台机器上，经提前建好的隧道走某个出口或出口组，新连接不用跨组网握手，延迟更低。
+      <b>快速端口</b>是某台节点上的一个端口：访问它的组网地址加这个端口时，自动沿组网选出的最快路径直连接力，比加密组网更快。</p>
 
     <h3 class="m3-sec-h">出口<small>每个出口在自己的组网地址上提供 SOCKS5 / HTTP，组网成员凭用户名和密码直接用</small><span class="ob-grow" />
       <el-button v-if="exits.length > 1" size="small" @click="copyExits">复制全部</el-button>
@@ -180,12 +192,22 @@ watch(() => props.create, c => { if (c?.kind === 'exit') openAdd(); else if (c?.
       <li v-if="!ports.length" class="instance-muted">还没有代理端口。不开也能直接用出口；在意延迟时，在程序所在的机器上开一个。</li>
     </ul>
 
-    <details class="m3-more">
-      <summary>隧道端口 <span class="mono m3-faint">{{ tunnelPort }}</span></summary>
-      <p class="instance-muted">代理端口和出口之间的隧道用这个端口，只在组网内可达，自动放行，一般不用改。</p>
-      <input class="m3-input mono" type="number" min="1" max="65535" :value="tunnelPort" aria-label="隧道端口" style="max-width: 140px" @change="setTunnelPort($event.target.value)" />
-      <small v-for="e in tunnelErrors" :key="e" class="ob-bad">{{ e }}</small>
-    </details>
+    <h3 class="m3-sec-h">快速端口<small>只适合 ss2022、HTTPS、SSH 这类本身已加密的流量；路径、放行和回落都由组网自动完成</small><span class="ob-grow" />
+      <el-button size="small" :disabled="!members.length" @click="fast = {create: true}">＋ 新建快速端口</el-button></h3>
+    <ul class="m3-rows m3-rows-fast" :class="{'is-phone': phone}">
+      <li v-if="!phone && fastPorts.length" aria-hidden="true"><div class="m3-row m3-row-head"><span>节点</span><span>地址</span><span>谁能用</span><span>状态</span><span></span></div></li>
+      <li v-for="(x, i) in fastPorts" :key="x.id || i">
+        <div class="m3-row m3-row-click" :aria-label="`打开 ${members.find(m => m.serverId === x.serverId)?.name || x.serverId} :${x.port} 的快速端口`" v-bind="rowButton(() => { fast = {id: x.id}; })">
+          <span class="m3-row-name"><span class="ob-dot" :data-tone="stateOf(x.serverId)[0]" aria-hidden="true"></span><strong><MeshNodeName :id="x.serverId" plain /></strong>
+            <span v-if="fastErrors(i)" class="m3-tag" data-kind="bad">需修改</span></span>
+          <span class="m3-faint"><span class="mono">{{ fastAddr(x) || `:${x.port}` }}</span> · {{ fastProtoText(x.proto) }}<template v-if="x.note"> · {{ x.note }}</template></span>
+          <span class="m3-row-conn">{{ fastSources(x.src, members) }}</span>
+          <span class="m3-faint m3-fast-run">{{ fastRun(x) }}</span>
+          <span><el-button size="small" :aria-label="`复制 ${fastAddr(x) || x.port}`" @click.stop="copyFast(x)">复制</el-button></span>
+        </div>
+      </li>
+      <li v-if="!fastPorts.length" class="instance-muted">还没有快速端口。比如选 LAX02、填 48888，之后从组网里任何地方访问 LAX02 的组网地址:48888 都会自动加速。</li>
+    </ul>
 
     <MeshDialog v-model="adding" title="添加出口" :phone="phone" width="560px">
       <div class="m3-form">
@@ -228,5 +250,6 @@ watch(() => props.create, c => { if (c?.kind === 'exit') openAdd(); else if (c?.
     </MeshDialog>
 
     <MeshPortEdit :at="port" :phone="phone" :region-of="regionOf" @close="port = null" />
+    <MeshFastPortEdit :at="fast" :phone="phone" :region-of="regionOf" @close="fast = null" @open="id => { fast = null; emit('open', id, 'fast'); }" />
   </section>
 </template>

@@ -6,6 +6,7 @@ const PAGE_TITLES = Object.freeze({
   memory: "记忆管理",
   secrets: "凭证库",
   docs: "文档库",
+  notes: "笔记",
   skills: "Skills",
   mcp: "MCP 管理",
   statistics: "数据统计",

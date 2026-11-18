@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS server_exec_log (
  id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, server_id TEXT NOT NULL, source TEXT NOT NULL,
  command TEXT NOT NULL, started_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
  exit_code INTEGER, outcome TEXT NOT NULL DEFAULT '',
- conversation_uuid TEXT NOT NULL DEFAULT '', conversation_title TEXT NOT NULL DEFAULT '', turn_uuid TEXT NOT NULL DEFAULT ''
+ conversation_uuid TEXT NOT NULL DEFAULT '', conversation_title TEXT NOT NULL DEFAULT '', turn_uuid TEXT NOT NULL DEFAULT '',
+ job_id TEXT NOT NULL DEFAULT '', job_judge TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS server_exec_log_server ON server_exec_log(server_id, id);
 CREATE TABLE IF NOT EXISTS server_job_origins (
@@ -127,7 +128,10 @@ ADDED = {'mesh_nodes': {'data_build': "TEXT NOT NULL DEFAULT ''", 'upgrade_faile
          'server_bench_runs': {'attempts': 'INTEGER NOT NULL DEFAULT 0'},
          # The conversation and turn a tool call came from; '' for the web page and older rows.
          'server_exec_log': {'conversation_uuid': "TEXT NOT NULL DEFAULT ''", 'conversation_title': "TEXT NOT NULL DEFAULT ''",
-                             'turn_uuid': "TEXT NOT NULL DEFAULT ''"}}
+                             'turn_uuid': "TEXT NOT NULL DEFAULT ''",
+                             # A background job's record: its id, so its end is written into it, and who judges that
+                             # end ('' its exit code, 'caller' the code that started it, as a benchmark its report).
+                             'job_id': "TEXT NOT NULL DEFAULT ''", 'job_judge': "TEXT NOT NULL DEFAULT ''"}}
 
 
 async def migrate(db):

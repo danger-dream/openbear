@@ -260,14 +260,18 @@ async def check(*, api=None, prerelease=None, only_if_switched=False):
             return {'ok': True, **state()}  # a check that ran meanwhile already follows the setting
         previous = state()
         result = {'checkedAtMs': int(time.time() * 1000), 'prerelease': prerelease, 'latest': '', 'incompatible': '', 'lacking': '',
-                  'withdrawn': [], 'error': ''}
+                  'withdrawn': list(previous.get('withdrawn') or []), 'error': ''}
         base = api or _api()
         try:
             async with _client(30) as http:
                 offered = sorted((v for v in await _tags(http, base) if versioning.offered(v, prerelease)), key=version_key, reverse=True)
+                visited = set()
                 for version in offered[:MAX_CANDIDATES]:
+                    visited.add(version)
                     found = await _usable(http, base, version, prerelease, result)
                     if found:
+                        if version in result['withdrawn']:
+                            result['withdrawn'].remove(version)
                         manifest, assets = found
                         result['latest'] = version
                         target = cache_dir(version)
@@ -278,13 +282,28 @@ async def check(*, api=None, prerelease=None, only_if_switched=False):
                         break
                 else:
                     result['error'] = 'no_compatible_node_release'
+                # Selecting a newer version says nothing about an older withdrawal. Recheck
+                # only known withdrawals; absence from tags or a failed check cannot clear one.
+                for version in list(result['withdrawn']):
+                    if version in visited:
+                        continue
+                    status = {'withdrawn': [version], 'incompatible': '', 'lacking': ''}
+                    try:
+                        restored = await _usable(http, base, version, True, status)
+                    except (httpx.HTTPError, ValueError, RuntimeError):
+                        continue
+                    if restored or version not in status['withdrawn']:
+                        result['withdrawn'].remove(version)
         except (httpx.HTTPError, ValueError):
             result['error'] = 'github_unreachable'
         except RuntimeError as exc:
             result['error'] = str(exc)[:120]
         if result['error'] not in ('', 'no_compatible_node_release'):
             for key in _KEPT_ON_FAILURE:
-                result[key] = previous.get(key, result[key])
+                if key == 'withdrawn':
+                    result[key] = list(dict.fromkeys([*(previous.get(key) or []), *result[key]]))
+                else:
+                    result[key] = previous.get(key, result[key])
         _write(_cache / 'state.json', result)
         _prune(result)
         return {'ok': not result['error'], **result}
@@ -295,13 +314,15 @@ async def _usable(http, base, version, prerelease, result):
     response = await http.get(f'{base}/releases/tags/{TAG_PREFIX}{version}')
     if response.status_code == 404:
         # The tag is there but its release is gone (or still a draft): withdrawn.
-        result['withdrawn'].append(version)
+        if version not in result['withdrawn']:
+            result['withdrawn'].append(version)
         return None
     if response.status_code != 200:
         raise RuntimeError(f'github_http_{response.status_code}')
     row = response.json()
     if not isinstance(row, dict) or row.get('draft'):
-        result['withdrawn'].append(version)
+        if version not in result['withdrawn']:
+            result['withdrawn'].append(version)
         return None
     if row.get('prerelease') and not prerelease:
         # Marked pre-release on GitHub: only for those who take test versions.
@@ -312,8 +333,12 @@ async def _usable(http, base, version, prerelease, result):
         return None
     manifest = await http.get(links['manifest.json'])
     value = manifest.json() if manifest.status_code == 200 else {}
-    if not valid_manifest(value, version):
+    if not valid_manifest(value, version) or not all(_link(links.get(n)) for n in value['binaries']):
         return None
+    # A published, complete release is restored even if this controller cannot
+    # use its protocol/features. Compatibility and withdrawal are separate facts.
+    if version in result['withdrawn']:
+        result['withdrawn'].remove(version)
     reason = problem(value)
     if reason == 'protocol':
         if protocol_range(value)[0] > PROTOCOL[1]:
@@ -321,8 +346,6 @@ async def _usable(http, base, version, prerelease, result):
         return None
     if reason == 'features':
         result['lacking'] = result['lacking'] or version
-        return None
-    if not all(_link(links.get(n)) for n in value['binaries']):
         return None
     return value, links
 

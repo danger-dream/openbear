@@ -25,6 +25,7 @@ const v6Known = computed(() => node.value?.v6 || preview.value?.detected?.v6?.va
 const rows = computed(() => preview.value?.rows || []);
 const counts = computed(() => previewCounts(rows.value, confirmed.value));
 const recordAccount = computed(() => props.accounts.find(a => a.id === props.record?.accountId) || null);
+const rrsetAccount = computed(() => Boolean(providerOf(props.providers, recordAccount.value?.type).caps?.rrset));
 const previewAccountIds = ref([]);
 // Accounts the rows will be written to: their provider options and TTL ranges apply.
 const targetAccounts = computed(() => {
@@ -158,7 +159,7 @@ async function save() {
   finally { saving.value = false; }
 }
 // Why a row was not saved (POST /ddns/records skipped[].reason); error rows carry their message.
-const SKIP_REASONS = {exists: '已经有这条解析', takeover_not_confirmed: '服务商上已有不同的记录，需要先在预览里确认接管'};
+const SKIP_REASONS = {rrset_takeover_required: '记录集有多个 IP，整体替换将移除其他地址，需明确确认整组接管', exists: '已经有这条解析', takeover_not_confirmed: '服务商上已有不同的记录，需要先在预览里确认接管'};
 defineExpose({busy: saving});
 </script>
 <template>
@@ -208,6 +209,10 @@ defineExpose({busy: saving});
         <div v-if="edit" class="dd-pr">
           <span class="dd-pr-name">{{ record.name }} · {{ record.type }}</span><span class="ix-pill" data-tone="ok">更新设置</span>
           <span class="dd-pr-meta">{{ accountLabel(recordAccount, providers) }}　→　<span class="mono">{{ preview?.rows?.[0]?.value || record.desired || '—' }}</span></span>
+          <template v-if="rrsetAccount">
+            <span class="dd-pr-meta">现有 IP：<span class="mono">{{ record.remote || '—' }}</span>。整体替换将移除其他地址；未明确接管时，多值记录集不写入 DNS。</span>
+            <label class="dd-take"><input v-model="form.rrsetTakeover" type="checkbox" /><span>接管整个记录集（更新将移除其他地址，删除将移除整个记录集）</span></label>
+          </template>
         </div>
         <template v-else-if="rows.length">
           <div v-for="row in rows" :key="rowKey(row)" class="dd-pr" :data-action="row.action">
@@ -225,7 +230,8 @@ defineExpose({busy: saving});
             <span v-if="row.action === 'exists'" class="dd-pr-meta">已有这条解析，保存时会跳过</span>
             <label v-if="row.action === 'takeover'" class="dd-take">
               <input type="checkbox" :checked="confirmed.has(rowKey(row))" @change="confirm(row, $event.target.checked)" />
-              <span>服务商上已有这条记录，当前值 <span class="mono">{{ row.remote || '—' }}</span>{{ row.remoteCount > 1 ? `（同名共 ${row.remoteCount} 条）` : '' }}。确认由 OpenBear 接管，并改为 <span class="mono">{{ row.value || '—' }}</span></span>
+              <span v-if="row.requiresRrsetTakeover">现有 IP：<span class="mono">{{ (row.remoteValues || []).join('、') || row.remote }}</span>。整体替换将移除其他地址。确认接管整个记录集，并改为 <span class="mono">{{ row.value || '—' }}</span>（删除将移除整个记录集）</span>
+              <span v-else>服务商上已有这条记录，当前值 <span class="mono">{{ row.remote || '—' }}</span>{{ row.remoteCount > 1 ? `（同名共 ${row.remoteCount} 条）` : '' }}。确认由 OpenBear 接管，并改为 <span class="mono">{{ row.value || '—' }}</span></span>
             </label>
           </div>
         </template>
@@ -266,7 +272,7 @@ defineExpose({busy: saving});
           <select v-model="form.ttl"><option v-for="[v, l] in TTLS" :key="String(v)" :value="v">{{ l }}</option></select>
           <small v-if="ttlHint" class="instance-muted">{{ ttlHint }}</small></label>
         <label class="dd-field"><span>同名多条记录时</span>
-          <select v-model="form.multi"><option value="one">只管理接管的那一条</option><option value="all">全部改成同一个值</option></select></label>
+          <select v-model="form.multi"><option value="one">只管理选定记录（多值记录集须另行确认）</option><option value="all">同名记录全部改成同一个值（不授权整组接管）</option></select></label>
         <label v-for="f in optionFields" :key="f.id" class="dd-field"><span>{{ f.label }}<template v-if="targetAccounts.length > 1">（{{ f.provider }}）</template></span>
           <select v-if="f.kind === 'bool' || f.kind === 'select'" v-model="f.values[f.key]">
             <option value="">{{ f.kind === 'bool' ? '保持记录原样' : '不设置' }}</option>

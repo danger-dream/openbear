@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"openbear/node/mesh/bypass"
+	"openbear/node/mesh/fast"
 )
 
 // The node keeps package bypass's rules in place while a transparent proxy
@@ -121,7 +122,7 @@ func detectProxy() []string {
 func ruleTables(rules string) []string {
 	var out []string
 	for _, line := range strings.Split(rules, "\n") {
-		if strings.HasPrefix(line, strconv.Itoa(bypass.RulePref)+":") {
+		if strings.HasPrefix(line, strconv.Itoa(bypass.RulePref)+":") || strings.HasPrefix(line, strconv.Itoa(fast.RulePref)+":") {
 			continue
 		}
 		f := strings.Fields(line)
@@ -129,7 +130,7 @@ func ruleTables(rules string) []string {
 		if t == "" {
 			t = fieldAfter(f, "table")
 		}
-		if t != "" && !slices.Contains([]string{"local", "main", "default", "253", "254", "255"}, t) && !slices.Contains(out, t) {
+		if t != "" && !slices.Contains([]string{"local", "main", "default", "253", "254", "255", strconv.Itoa(fast.RouteTable)}, t) && !slices.Contains(out, t) {
 			out = append(out, t)
 		}
 	}
@@ -181,6 +182,10 @@ func nftRedirectsOutput(ruleset string) bool {
 		case strings.HasPrefix(line, "table "):
 			table, cur = strings.TrimSuffix(strings.TrimSpace(line), " {"), nil
 		case strings.HasPrefix(line, "\tchain "):
+			if table == "table ip "+fast.Table || table == "table inet "+fast.Table || table == "table inet "+bypass.Table {
+				cur = nil
+				continue
+			}
 			k := chainKey{table, strings.Fields(line)[1]}
 			cur = &k
 		case line == "\t}":

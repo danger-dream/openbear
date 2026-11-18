@@ -6,6 +6,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	meshrouting "openbear/node/mesh/routing"
 )
 
 func TestValidate(t *testing.T) {
@@ -269,6 +272,55 @@ func TestValidateControllerForms(t *testing.T) {
 	for name, raw := range bad {
 		if Validate(raw) == nil {
 			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+func TestRouterConfigNoTransit(t *testing.T) {
+	l := newLab(t, spec{relays: []string{"R1", "R2", "R3"}, members: map[string][]string{"A": {"R1"}}})
+	c := l.config("R1")
+	c.Routing = &Routing{NoTransit: []string{"R1", "R3"}}
+	if got := routerConfig(c).NoTransit; !slices.Equal(got, []string{"R1", "R3"}) {
+		t.Fatalf("no-transit relays %v, want R1 and R3", got)
+	}
+	raw, _ := json.Marshal(c)
+	if err := Validate(raw); err != nil {
+		t.Fatal(err)
+	}
+	c.Routing.NoTransit = []string{"R3", "A"}
+	raw, _ = json.Marshal(c)
+	if err := Validate(raw); err == nil || !strings.Contains(err.Error(), `"A" is not a relay`) {
+		t.Fatalf("member A as no-transit: %v", err)
+	}
+}
+
+func TestRouterConfigTuning(t *testing.T) {
+	l := newLab(t, spec{relays: []string{"R1", "R2"}})
+	c := l.config("R1")
+	if routerConfig(c).Tuning != nil {
+		t.Fatal("tuning without one in the config")
+	}
+	c.Routing = &Routing{Tuning: &RoutingTuning{SwitchMs: 5, ShorterMs: 3, AdvertMs: 2, HoldS: 2.5, JitterWeight: 1, LossWeight: 500, FlapHoldS: 30, FlapHoldMaxS: 240}}
+	want := meshrouting.Tuning{SwitchMs: 5, ShorterMs: 3, AdvertMs: 2, Hold: 2500 * time.Millisecond, JitterWeight: 1, LossWeight: 500, FlapHold: 30 * time.Second,
+		FlapHoldMax: 4 * time.Minute}
+	if got := routerConfig(c).Tuning; got == nil || *got != want {
+		t.Fatalf("tuning %+v, want %+v", got, want)
+	}
+	raw, _ := json.Marshal(c)
+	if err := Validate(raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []func(*RoutingTuning){
+		func(x *RoutingTuning) { x.SwitchPct = 95 }, func(x *RoutingTuning) { x.SwitchMs = -1 }, func(x *RoutingTuning) { x.FlapHoldMaxS = 10 },
+		func(x *RoutingTuning) { x.HoldS = 61 },
+	} {
+		tune := *c.Routing.Tuning
+		bad(&tune)
+		c2 := *c
+		c2.Routing = &Routing{Tuning: &tune}
+		raw, _ := json.Marshal(&c2)
+		if err := Validate(raw); err == nil || !strings.Contains(err.Error(), "routing.tuning.") {
+			t.Fatalf("%+v accepted: %v", tune, err)
 		}
 	}
 }

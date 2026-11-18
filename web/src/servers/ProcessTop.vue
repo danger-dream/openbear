@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref } from 'vue';
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
 import { Api } from '../api.js';
 import { bytes, rate, safeError } from './serverHelpers.js';
 
@@ -14,7 +14,9 @@ const LINUX_ONLY = new Set(['io', 'conn', 'net']);
 const linux = computed(() => (props.server.node?.info?.platform || 'linux') === 'linux');
 const current = ref(linux.value || !LINUX_ONLY.has(props.sort) ? props.sort : 'cpu');
 const data = ref(null), error = ref(''), stale = ref(false);
-const confirming = ref(0), ending = ref(0), stuck = ref(0), note = ref('');
+const confirming = ref(null), ending = ref(''), stuck = ref(null), note = ref('');
+const processKey = p => `${props.server.id}:${p.pid}:${p.identity || ''}`;
+const selection = p => ({server: props.server.id, key: processKey(p), pid: p.pid, identity: p.identity, name: p.name});
 const sorts = computed(() => SORTS.filter(([key]) => linux.value || !LINUX_ONLY.has(key)));
 const canEnd = computed(() => props.server.node?.caps?.exec !== false);
 const rows = computed(() => data.value?.sort === current.value ? data.value.processes || [] : []);
@@ -24,16 +26,19 @@ const busyNetns = computed(() => (data.value?.netns || []).filter(n => n.rxRate 
 let timer = 0, generation = 0, alive = true, away = false;
 
 async function load() {
-  const mine = ++generation;
+  const mine = ++generation, server = props.server.id;
   clearTimeout(timer);
   try {
-    const result = await Api.serverProcesses(props.server.id, current.value);
-    if (mine !== generation || !alive) return;
+    const result = await Api.serverProcesses(server, current.value);
+    if (mine !== generation || !alive || props.server.id !== server) return;
     data.value = result;
+    for (const state of [confirming, stuck]) {
+      if (state.value && !(result.processes || []).some(p => processKey(p) === state.value.key)) state.value = null;
+    }
     error.value = '';
     stale.value = false;
   } catch (e) {
-    if (mine !== generation || !alive) return;
+    if (mine !== generation || !alive || props.server.id !== server) return;
     error.value = safeError(e);
     stale.value = true;
     // An older node will not answer on the next try either.
@@ -46,28 +51,35 @@ function shown() { if (document.hidden) clearTimeout(timer); else resume(); }
 function pick(key) {
   if (key === current.value) return;
   current.value = key;
-  confirming.value = stuck.value = 0;
+  confirming.value = stuck.value = null;
   load();
 }
 async function end(p, force) {
-  ending.value = p.pid;
+  if (!p?.identity || ending.value) return;
+  ending.value = p.key;
   note.value = '';
   try {
-    const result = await Api.killServerProcess(props.server.id, {pid: p.pid, name: p.name, force});
+    const result = await Api.killServerProcess(p.server, {pid: p.pid, name: p.name, identity: p.identity, force});
+    if (!alive || props.server.id !== p.server) return;
     if (result.exited) {
-      stuck.value = 0;
+      stuck.value = null;
       note.value = `已${force ? '强制' : ''}结束 ${p.name}（PID ${p.pid}）。`;
       load();
     } else {
-      stuck.value = p.pid;
+      stuck.value = rows.value.some(row => processKey(row) === p.key) ? p : null;
       note.value = force ? `${p.name}（PID ${p.pid}）仍未退出。` : `${p.name}（PID ${p.pid}）没有在 10 秒内退出，可以强制结束。`;
     }
   } catch (e) {
+    if (!alive || props.server.id !== p.server) return;
+    stuck.value = null;
     note.value = safeError(e);
+    if (['process_changed', 'process_not_found'].includes(e?.response?.data?.error)) load();
   } finally {
-    ending.value = confirming.value = 0;
+    if (ending.value === p.key) ending.value = '';
+    if (confirming.value?.key === p.key) confirming.value = null;
   }
 }
+watch(() => props.server.id, () => { confirming.value = stuck.value = null; data.value = null; note.value = ''; load(); });
 onMounted(() => { document.addEventListener('visibilitychange', shown); load(); });
 onDeactivated(() => { away = true; clearTimeout(timer); });
 onActivated(() => { if (away) { away = false; resume(); } });
@@ -97,7 +109,7 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); document.removeEvent
         <div class="pt-section">进程 <small class="instance-muted">按 TCP 连接数，系统不按进程统计流量</small></div>
       </template>
       <ul v-if="rows.length" class="pt-rows">
-        <li v-for="p in rows" :key="p.pid" class="pt-row" :data-pid="p.pid">
+        <li v-for="p in rows" :key="processKey(p)" class="pt-row" :data-pid="p.pid">
           <div class="pt-who">
             <span class="pt-name" :title="p.command || p.name">{{ p.name }}</span>
             <small class="instance-muted">PID {{ p.pid }}{{ p.user ? ` · ${p.user}` : '' }}</small>
@@ -109,19 +121,20 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); document.removeEvent
             <template v-else><span :class="{'is-key': current === 'cpu'}"><small>CPU</small>{{ p.cpu.toFixed(1) }}%</span><span :class="{'is-key': current === 'mem'}"><small>内存</small>{{ bytes(p.rss) }}</span></template>
           </div>
           <div v-if="canEnd" class="pt-action">
-            <span v-if="ending === p.pid" class="instance-muted">正在结束…</span>
-            <template v-else-if="confirming === p.pid">
-              <button type="button" class="ix-text-button is-danger" @click="end(p, false)">确认结束</button>
-              <button type="button" class="ix-text-button" @click="confirming = 0">取消</button>
+            <span v-if="ending === processKey(p)" class="instance-muted">正在结束…</span>
+            <template v-else-if="confirming?.key === processKey(p)">
+              <button type="button" class="ix-text-button is-danger" @click="end(confirming, false)">确认结束</button>
+              <button type="button" class="ix-text-button" @click="confirming = null">取消</button>
             </template>
-            <button v-else-if="stuck === p.pid" type="button" class="ix-text-button is-danger" @click="end(p, true)">强制结束</button>
-            <button v-else type="button" class="ix-text-button" :aria-label="`结束 ${p.name}（PID ${p.pid}）`" :disabled="Boolean(ending)" @click="confirming = p.pid; stuck = 0">结束</button>
+            <button v-else-if="stuck?.key === processKey(p)" type="button" class="ix-text-button is-danger" @click="end(stuck, true)">强制结束</button>
+            <button v-else type="button" class="ix-text-button" :aria-label="`结束 ${p.name}（PID ${p.pid}）`" :disabled="Boolean(ending) || !p.identity" :title="!p.identity ? '节点未提供进程启动身份，不能安全结束；请更新节点后重试' : ''" @click="confirming = selection(p); stuck = null">结束</button>
           </div>
         </li>
       </ul>
       <p v-else class="instance-muted pt-empty">{{ current === 'io' ? '现在没有进程在读写。' : current === 'conn' || current === 'net' ? '现在没有进程有 TCP 连接。' : '没有进程。' }}</p>
       <p v-if="note" class="pt-note" role="status">{{ note }}</p>
       <p v-if="current === 'cpu'" class="instance-muted pt-more">CPU 按整机算：各行加起来就是上面的 CPU 占用。</p>
+      <p v-if="canEnd && rows.some(p => !p.identity)" class="instance-muted pt-more">节点未提供部分进程的启动身份，已禁用结束操作；旧节点请先更新。</p>
       <p v-if="stale" class="instance-muted pt-more">数据可能不是最新的。</p>
     </template>
   </div>

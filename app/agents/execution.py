@@ -23,6 +23,7 @@ from app.agent.native_continuation import (
 )
 from app.agent.transcript_repair import repair_role_alternation
 from app.context.configuration import conversation_strategy
+from app.context.image_one_turn import conversation_image_one_turn
 from app.context.prompts import effective_context_prompt
 from app.context.runtime import ContextManager as WindowRuntime
 from app.context.store import ContextOwner, WindowStore
@@ -1719,6 +1720,8 @@ class AgentExecutor(AgentTaskContext):
                 active_run_root_turn_uuid=self.run_root_turn_uuid,
                 strategy_resolver=(lambda: conversation_strategy(self.dao._db, self.conversation_uuid,
                     self.context_config.context_management.default_strategy, chat_id=self.chat_id)) if self.context_config else None,
+                image_one_turn_resolver=lambda: conversation_image_one_turn(self.dao._db, conversation_uuid=self.conversation_uuid,
+                    chat_id=self.chat_id or None),
                 strategies={"model_summary": ModelSummaryStrategy(self.context_config, self.context_llm_factory,
                     self.model_label, on_model_call=self._on_summary_model_call)} if self.context_config else None,
             )

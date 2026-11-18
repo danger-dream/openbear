@@ -101,6 +101,13 @@ END;
             "owner_chat_id",
             ["name", "parent_uuid", "pinned_at", "display_order"],
         ),
+        (
+            "kb_notes",
+            "note",
+            "note_uuid",
+            "owner_chat_id",
+            ["title", "parent_uuid", "summary", "content", "pinned_at", "sort_order"],
+        ),
     ]
     for table, kind, key, owner, columns in sources:
         for action, row in [("INSERT", "NEW"), ("DELETE", "OLD"), ("UPDATE", "NEW")]:

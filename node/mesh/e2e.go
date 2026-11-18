@@ -44,10 +44,11 @@ type e2eNode struct {
 	key      string // hex X25519
 	addr     netip.Addr
 	prefixes []netip.Prefix // its address and the gateway subnets this node routes to it
+	relay    bool
 }
 
 func (n *e2eNode) equal(o *e2eNode) bool {
-	return n.id == o.id && n.key == o.key && n.addr == o.addr && slices.Equal(n.prefixes, o.prefixes)
+	return n.id == o.id && n.key == o.key && n.addr == o.addr && slices.Equal(n.prefixes, o.prefixes) && n.relay == o.relay
 }
 
 // e2eTable maps addresses to nodes for one applied config.
@@ -71,7 +72,7 @@ func e2eTableFor(c *Config, a Attachment) (*e2eTable, error) {
 		if err != nil {
 			return nil, fmt.Errorf("node %s: e2eKey: %w", n.ID, err)
 		}
-		e := &e2eNode{id: n.ID, key: k, addr: n.Address, prefixes: sortPrefixes(memberPrefixes(c, a, n))}
+		e := &e2eNode{id: n.ID, key: k, addr: n.Address, prefixes: sortPrefixes(memberPrefixes(c, a, n)), relay: n.Role == roleRelay}
 		t.byAddr[n.Address], t.byID[n.ID] = e, e
 		for _, p := range e.prefixes {
 			if p != host(n.Address) {

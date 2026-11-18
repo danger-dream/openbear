@@ -290,7 +290,7 @@ func decodeStrictly(t *testing.T, label string, v any, target any) {
 // paramTypes are the node's own types for call parameters, where it has one.
 var paramTypes = map[string]func() any{
 	"exec": func() any { return &ExecParams{} }, "fs.list": func() any { return &fileParams{} }, "fs.stat": func() any { return &fileParams{} },
-	"fs.read": func() any { return &fileParams{} }, "fs.write": func() any { return &fileParams{} }, "fs.edit": func() any { return &editParams{} },
+	"fs.read": func() any { return &fileParams{} }, "fs.write": func() any { return &fileParams{} }, "fs.writeSafe": func() any { return &fileParams{} }, "fs.edit": func() any { return &editParams{} },
 	"update": func() any { return &updateParams{} },
 }
 
@@ -339,7 +339,7 @@ func TestProtocolSamplesCoverEveryOneOnce(t *testing.T) {
 		"call:browser.cdp", "call:browser.cdp/not_forwarded", "call:browser.config", "call:browser.restart", "call:browser.start", "call:browser.update",
 		"call:browser.status", "call:browser.upload", "enroll:fingerprint", "call:config.url", "call:config.url/unchanged", "call:exec", "call:exec/timeout", "call:fs.edit", "call:fs.edit/crlf",
 		"call:fs.edit/failures", "call:fs.edit/not_text", "call:fs.list", "call:fs.read", "call:fs.read/missing", "call:fs.stat", "call:fs.write",
-		"call:fs.write/partial", "call:job.list", "call:job.start", "call:job.status", "call:job.stop", "call:no.such.method", "call:ping",
+		"call:fs.write/partial", "call:fs.writeSafe", "call:fs.writeSafe/exists", "call:job.list", "call:job.start", "call:job.status", "call:job.stop", "call:no.such.method", "call:ping",
 		"call:uninstall", "call:update", "enroll:error", "enroll:request", "enroll:response", "entry", "info", "job", "msg:auth", "msg:auth.params",
 		"msg:call", "msg:challenge", "msg:close", "msg:config", "msg:hello", "msg:reply", "msg:reply/error", "msg:report", "msg:term.ack",
 		"msg:term.close", "msg:term.closed", "msg:term.open", "msg:term.opened", "msg:term.resize", "msg:welcome", "refusal:capability_disabled",
@@ -425,6 +425,11 @@ func TestProtocolSamplesCalls(t *testing.T) {
 		if entries := results["call:fs.list"]["entries"].([]any); len(entries) != 2 || entries[0].(map[string]any)["name"] != "sub" ||
 			entries[1].(map[string]any)["name"] != "upload.txt" {
 			t.Errorf("fs.list: %v", entries)
+		}
+		callSample(t, ch, "call:fs.writeSafe", subs)
+		callSample(t, ch, "call:fs.writeSafe/exists", subs)
+		if got, _ := os.ReadFile(filepath.Join(subs["<dir>"], "safe.txt")); string(got) != "hello" {
+			t.Errorf("fs.writeSafe overwrote destination: %q", got)
 		}
 		for _, name := range []string{"call:fs.edit", "call:fs.edit/failures", "call:fs.edit/crlf", "call:fs.edit/not_text"} {
 			edit := sample(t, name, subs).(map[string]any)

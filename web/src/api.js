@@ -97,8 +97,10 @@ export const Api = {
   // Outlasts the controller: a first GitHub download (up to 600 s), the node's own update
   // (330 s) and waiting for it to come back on the new build (120 s), with room to spare.
   updateServerNode: (id, {downgrade = false} = {}) => api.post(`/servers/${encodeURIComponent(id)}/node/update`, downgrade ? {downgrade: true} : {}, {timeout: 1200000}).then(unwrap),
-  // Relays update one at a time after the rest, each confirmed back on its new build.
-  updateServerNodes: () => api.post('/servers/node-update', {}, {timeout: 3600000}).then(unwrap),
+  // 全部更新 runs in the background: this starts it (or joins the one running) and returns
+  // at once; serverNodeUpdateRun follows it, relays one at a time after the rest.
+  updateServerNodes: () => api.post('/servers/node-update', {}, {timeout: 120000}).then(unwrap),
+  serverNodeUpdateRun: () => api.get('/servers/node-update').then(unwrap),
   checkNodeRelease: () => api.post('/servers/node-release/check', {}, {timeout: 60000}).then(unwrap),
   pushServerNodeUrl: () => api.post('/servers/node-url', {}, {timeout: 120000}).then(unwrap),
   renewServer: (id) => api.post(`/servers/${encodeURIComponent(id)}/renew`, {}).then(unwrap),
@@ -222,6 +224,8 @@ export const Api = {
   conversationRetryNow: (uuid, waitId, taskUuid = "") => api.post(`/conversations/${encodeURIComponent(uuid)}/retry/now`, { waitId, ...(taskUuid ? {taskUuid} : {}) }).then(unwrap),
   answerConversationConfirmation: (uuid, confirmationId, answer = {}) => api.post(`/conversations/${encodeURIComponent(uuid)}/confirmations/${encodeURIComponent(confirmationId)}/answer`, answer).then(unwrap),
   conversationSetContextStrategy: (uuid, strategy) => api.post(`/conversations/${encodeURIComponent(uuid)}/context-strategy`, { strategy }).then(unwrap),
+  conversationSetImageOneTurn: (uuid, patch) => api.post(`/conversations/${encodeURIComponent(uuid)}/image-one-turn`, patch).then(unwrap),
+  conversationSetPromptTemplate: (uuid, promptTemplate) => api.post(`/conversations/${encodeURIComponent(uuid)}/prompt-template`, { promptTemplate }).then(unwrap),
   conversationCompact: (uuid) => api.post(`/conversations/${encodeURIComponent(uuid)}/compact`, {}, {timeout: 0}).then(unwrap),
   conversationSetModel: (uuid, model) => api.post(`/conversations/${encodeURIComponent(uuid)}/model`, { model }).then(unwrap),
   conversationSetThinking: (uuid, level) => api.post(`/conversations/${encodeURIComponent(uuid)}/thinking`, { level }).then(unwrap),
@@ -253,6 +257,28 @@ export const Api = {
   updateNoteSheet: (sheetUuid, data = {}) => api.patch(`/notes/sheets/${encodeURIComponent(sheetUuid)}`, data).then(unwrap),
   deleteNoteSheet: (sheetUuid) => api.delete(`/notes/sheets/${encodeURIComponent(sheetUuid)}`).then(unwrap),
 
+  kbNotesTree: () => api.get("/kb-notes/tree").then(unwrap),
+  kbNotesSearch: (q, limit = 40) => api.get("/kb-notes/search", { params: { q, limit } }).then(unwrap),
+  kbNote: (noteUuid) => api.get(`/kb-notes/items/${encodeURIComponent(noteUuid)}`).then(unwrap),
+  createKbNote: (data = {}) => api.post("/kb-notes/items", data).then(unwrap),
+  updateKbNote: (noteUuid, data = {}) => api.patch(`/kb-notes/items/${encodeURIComponent(noteUuid)}`, data).then(unwrap),
+  appendKbNote: (noteUuid, data = {}) => api.post(`/kb-notes/items/${encodeURIComponent(noteUuid)}/append`, data).then(unwrap),
+  captureKbNote: (data = {}) => api.post("/kb-notes/capture", data).then(unwrap),
+  moveKbNote: (noteUuid, data = {}) => api.post(`/kb-notes/items/${encodeURIComponent(noteUuid)}/move`, data).then(unwrap),
+  deleteKbNote: (noteUuid, mode = "cascade") => api.delete(`/kb-notes/items/${encodeURIComponent(noteUuid)}`, { params: { mode } }).then(unwrap),
+  uploadKbNoteAsset: (file, noteUuid = "") => {
+    const form = new FormData();
+    if (noteUuid) form.append("noteUuid", noteUuid);
+    form.append("file", file);
+    return api.post("/kb-notes/assets", form, { timeout: 60000 }).then(unwrap);
+  },
+  importKbNoteFiles: (files = [], targetParentUuid = "") => {
+    const form = new FormData();
+    if (targetParentUuid) form.append("targetParentUuid", targetParentUuid);
+    for (const f of files) form.append("files", f);
+    return api.post("/kb-notes/import/files", form, { timeout: 120000 }).then(unwrap);
+  },
+
   entries: (category = "", includeArchived = false, scope = "") => api.get("/memory/entries", { params: { ...(category ? { category } : {}), ...(scope ? { scope } : {}), ...(includeArchived ? { archived: 1 } : {}) } }).then(unwrap),
   entry: (id) => api.get(`/memory/entries/${id}`).then(unwrap),
   createEntry: (data) => api.post("/memory/entries", data).then(unwrap),
@@ -274,8 +300,11 @@ export const Api = {
   templates: () => api.get("/memory/templates").then(unwrap),
   createTemplate: (data) => api.post("/memory/templates", data).then(unwrap),
   importBuiltinTemplates: (kinds) => api.post("/memory/templates/import-builtin", { kinds }).then(unwrap),
+  localPersonas: () => api.get("/memory/templates/personas").then(unwrap),
+  syncLocalPersonas: (ids) => api.post("/memory/templates/sync-personas", { ids }).then(unwrap),
   updateTemplate: (id, data) => api.put(`/memory/templates/${id}`, data).then(unwrap),
   deleteTemplate: (id) => api.delete(`/memory/templates/${id}`).then(unwrap),
+  promptTemplateChoices: () => api.get("/prompt-templates/choices").then(unwrap),
   reorder: (kind, items) => api.post("/memory/reorder", { kind, items }).then(unwrap),
   previewTemplate: (params, templateContent, templateName = "web-preview") => api.post("/memory/preview", { params, templateContent, templateName }, { timeout: 60000 }).then(unwrap),
   renderLogs: (params = {}) => api.get("/memory/render-logs", { params }).then(unwrap),

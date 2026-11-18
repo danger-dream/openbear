@@ -7,10 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"io/fs"
 	"os"
 	"regexp"
-	"strconv"
 )
 
 var fileDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -21,24 +19,24 @@ type fileChecksum struct {
 }
 
 func hashFile(path string) (fileChecksum, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return fileChecksum{}, fileError(err)
-	}
-	if !info.Mode().IsRegular() {
-		return fileChecksum{}, errors.New("not_regular_file")
-	}
-	f, err := os.Open(path)
+	f, err := openReadFile(path)
 	if err != nil {
 		return fileChecksum{}, fileError(err)
 	}
 	defer f.Close()
+	return hashOpenFile(f)
+}
+
+func hashOpenFile(f *os.File) (fileChecksum, error) {
 	before, err := f.Stat()
 	if err != nil {
 		return fileChecksum{}, fileError(err)
 	}
 	if !before.Mode().IsRegular() {
 		return fileChecksum{}, errors.New("not_regular_file")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fileChecksum{}, fileError(err)
 	}
 	h := sha256.New()
 	n, err := io.Copy(h, f)
@@ -53,27 +51,4 @@ func hashFile(path string) (fileChecksum, error) {
 		return fileChecksum{}, errors.New("file_changed")
 	}
 	return fileChecksum{Size: n, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
-}
-
-// A hard link publishes a complete file without replacing a racing destination.
-func commitNew(temp, path, mode string) error {
-	defer os.Remove(temp)
-	perm := fs.FileMode(0o644)
-	if mode != "" {
-		n, err := strconv.ParseUint(mode, 8, 32)
-		if err != nil || n > 0o7777 {
-			return errors.New("invalid_mode")
-		}
-		perm = fs.FileMode(n)
-	}
-	if err := os.Chmod(temp, perm); err != nil {
-		return fileError(err)
-	}
-	if err := os.Link(temp, path); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return errors.New("file_exists")
-		}
-		return fileError(err)
-	}
-	return nil
 }

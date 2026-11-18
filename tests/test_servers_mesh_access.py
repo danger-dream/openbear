@@ -124,7 +124,8 @@ async def mesh_access_setup(e, monkeypatch, tmp_path, *, with_local=True):
                {'serverId': ids['m2'], 'entry': entry}, {'serverId': ids['home'], 'entry': entry, 'gateway': {'subnets': ['10.10.10.0/24']}}]
     if with_local:
         members.append({'serverId': LOCAL, 'entry': entry})
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': [
+    version = (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': version, 'members': members, 'rules': [
         {'src': {'members': [LOCAL, ids['m1']] if with_local else [ids['m1']]}, 'dst': {'subnets': ['10.10.10.0/24']}}]})
     assert saved['errors'] == []
     await api(e, 'POST', '/api/servers/mesh/apply')
@@ -158,7 +159,7 @@ async def test_mesh_access_point_follows_the_controller_in_the_mesh(env, monkeyp
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][-1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'tcp'}]
     draft['rules'][0]['src']['members'].append(LOCAL)
-    await api(e, 'PUT', '/api/servers/mesh/draft', {k: draft[k] for k in ('members', 'rules')})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {k: draft[k] for k in ('members', 'rules', 'draftVersion')})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     address = next(m['address'] for m in state['members'] if m['serverId'] == LOCAL)
@@ -256,12 +257,12 @@ async def test_controller_port_open_and_its_own_routes_taken_over_or_kept(env, m
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][[m['serverId'] for m in draft['members']].index(ids['home'])]['gateway'] = {'subnets': ['10.10.10.0/24', '172.17.5.0/24']}
     draft['rules'][0]['dst']['subnets'] = ['10.10.10.0/24', '172.17.5.0/24']
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {k: draft[k] for k in ('members', 'rules')})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {k: draft[k] for k in ('members', 'rules', 'draftVersion')})
     assert LOCAL in next(x for x in saved['exports'] if x['subnet'] == '172.17.5.0/24')['nodes']
     # Kept, wg9's route stays: the mesh does not route 10.10.10.0/24 on the controller's machine, and says how to take it.
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][index]['keepRoutes'] = ['10.10.10.0/24']
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': draft['draftVersion'], 'members': draft['members']})
     warning = next(w for w in saved['warnings'] if w['error'] == 'mesh_gateway_route_conflict')
     assert warning == {'path': f'members[{index}]', 'error': 'mesh_gateway_route_conflict',
                        'message': '本机 保留了本机原有的 10.10.10.0/24 路由（经 wg9），没有接管家里 的网关网段 10.10.10.0/24：它访问这个网段仍走原来的路由，'
@@ -275,8 +276,9 @@ async def test_controller_port_open_and_its_own_routes_taken_over_or_kept(env, m
     assert 'takeover' not in nodes.configs[LOCAL]['self']
     assert nodes.configs[LOCAL]['self']['gatewayRoutes'] == ['172.17.5.0/24']
     # A route of the controller's machine into the mesh's own range blocks it, as an interface would.
+    draft = await api(e, 'GET', '/api/servers/mesh')
     monkeypatch.setattr(mesh_module, 'ROUTE_TABLE', route_table(tmp_path, [*ROUTES, ('tailscale0', '100.96.8.0/24')]))
-    err = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']}, status=400)
+    err = await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': draft['draftVersion'], 'members': draft['members']}, status=400)
     assert any(x['error'] == 'prefix_conflict' and '100.96.8.0/24' in x['message'] for x in err['errors'])
 
 
@@ -292,7 +294,7 @@ async def test_a_delivery_that_cuts_its_connection_waits_for_the_node(env, monke
         for m in draft['members']:
             if m['serverId'] in (m1, m2):
                 m['uploadLimitMbps'] = (m['uploadLimitMbps'] or 0) + 10
-        await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+        await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': draft['draftVersion'], 'members': draft['members']})
         await api(e, 'POST', '/api/servers/mesh/apply')
         return await settled(e)
 
@@ -429,7 +431,7 @@ async def test_an_older_node_never_gets_the_mesh_address(env, monkeypatch, tmp_p
     for m in draft['members']:
         if m['serverId'] == ids['m2']:
             m['uploadLimitMbps'] = 50
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'draftVersion': draft['draftVersion'], 'members': draft['members']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     await api(e, 'POST', '/api/servers/node-url', {})

@@ -1,7 +1,9 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.context import prompt_template
 from app.memory.builtin import bundled_prompt_template
+from app.memory import personas
 from app.agents.prompting import available_agent_prompt_items
 from app.web_console.core import *
 from app.web_console.live_stream import *
@@ -510,7 +512,7 @@ class WebAdminMemoryMixin:
 
     async def handle_api_memory_templates(self, request: web.Request) -> web.Response:
         await BuiltinMemoryClient(self.db, identity=self.config.memory.identity)._bootstrap()
-        cur = await self.db.conn.execute("SELECT id, name, content, is_active, is_agent_active, updated_at FROM memory_templates ORDER BY id")
+        cur = await self.db.conn.execute("SELECT id, name, content, is_active, is_agent_active, is_persona, updated_at FROM memory_templates ORDER BY id")
         return web.json_response({
             "ok": True,
             "items": [{k: r[k] for k in r.keys()} for r in await cur.fetchall()],
@@ -524,6 +526,7 @@ class WebAdminMemoryMixin:
         content = str(data.get("content") or "")
         is_active = 1 if data.get("is_active") or data.get("isActive") else 0
         is_agent_active = 1 if data.get("is_agent_active") or data.get("isAgentActive") else 0
+        is_persona = 1 if data.get("is_persona") or data.get("isPersona") else 0
         validation_error = await self._validate_memory_template(content, name or "new template", agent_active=bool(is_agent_active and not is_active))
         if validation_error:
             return web.json_response({"ok": False, "error": validation_error}, status=400)
@@ -531,10 +534,10 @@ class WebAdminMemoryMixin:
             await self.db.conn.execute("UPDATE memory_templates SET is_active=0")
         if is_agent_active:
             await self.db.conn.execute("UPDATE memory_templates SET is_agent_active=0")
-        cur = await self.db.conn.execute("INSERT INTO memory_templates (name, content, is_active, is_agent_active, updated_at) VALUES (?,?,?,?,?)", (name, content, is_active, is_agent_active, now_ts()))
+        cur = await self.db.conn.execute("INSERT INTO memory_templates (name, content, is_active, is_agent_active, is_persona, updated_at) VALUES (?,?,?,?,?,?)", (name, content, is_active, is_agent_active, is_persona, now_ts()))
         await self.db.conn.commit()
         item_id = int(cur.lastrowid or 0)
-        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "contentLength": len(content)})
+        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "contentLength": len(content)})
         return web.json_response({"ok": True, "id": item_id})
 
     async def handle_api_memory_template_import_builtin(self, request: web.Request) -> web.Response:
@@ -654,11 +657,49 @@ class WebAdminMemoryMixin:
                 "reused": len(items) - len(created_items),
             })
 
+    async def handle_api_memory_personas(self, request: web.Request) -> web.Response:
+        try:
+            bundled = personas.bundled_personas()
+        except (OSError, UnicodeError, ValueError) as exc:
+            log.error("读取本地人设失败", 错误=type(exc).__name__)
+            return web.json_response({"ok": False, "error": "bundled_personas_unavailable"}, status=500)
+        return web.json_response({"ok": True, "items": await personas.catalog(self.db, bundled)},
+                                 headers={"Cache-Control": "no-store"})
+
+    async def handle_api_memory_personas_sync(self, request: web.Request) -> web.Response:
+        async with self._memory_operation_lock:
+            await self._require_memory_write_allowed()
+            data = await self._json_body(request)
+            if set(data) - {"ids"}:
+                return web.json_response({"ok": False, "error": "unexpected_fields"}, status=400)
+            ids = data.get("ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 100 or any(not isinstance(key, str) for key in ids):
+                return web.json_response({"ok": False, "error": "persona_ids_required"}, status=400)
+            try:
+                bundled = {item.key: item for item in personas.bundled_personas()}
+            except (OSError, UnicodeError, ValueError) as exc:
+                log.error("读取本地人设失败", 错误=type(exc).__name__)
+                return web.json_response({"ok": False, "error": "bundled_personas_unavailable"}, status=500)
+            if any(key not in bundled for key in ids):
+                return web.json_response({"ok": False, "error": "unknown_persona"}, status=400)
+            selected = [bundled[key] for key in dict.fromkeys(ids)]
+            for item in selected:
+                error = await self._validate_memory_template(item.content, item.name)
+                if error:
+                    return web.json_response({"ok": False, "error": "bundled_persona_validation_failed",
+                                              "id": item.key, "detail": error}, status=400)
+            await BuiltinMemoryClient(self.db, identity=self.config.memory.identity)._bootstrap()
+            result = await personas.sync(self.db, selected)
+            await self._audit_memory(request, "memory_template.sync_personas", {
+                "created": result["created"], "reused": result["reused"], "items": result["items"],
+            })
+            return web.json_response(result)
+
     async def handle_api_memory_template_update(self, request: web.Request) -> web.Response:
         await self._require_memory_write_allowed()
         data = await self._json_body(request)
         item_id = int(request.match_info["item_id"])
-        cur = await self.db.conn.execute("SELECT name, content, is_active, is_agent_active FROM memory_templates WHERE id=?", (item_id,))
+        cur = await self.db.conn.execute("SELECT name, content, is_active, is_agent_active, is_persona FROM memory_templates WHERE id=?", (item_id,))
         existing = await cur.fetchone()
         if not existing:
             return web.json_response({"ok": False, "error": "template_not_found"}, status=404)
@@ -666,6 +707,7 @@ class WebAdminMemoryMixin:
         content = str(data.get("content") if "content" in data else existing["content"] or "")
         is_active = 1 if (data.get("is_active") if "is_active" in data else data.get("isActive") if "isActive" in data else existing["is_active"]) else 0
         is_agent_active = 1 if (data.get("is_agent_active") if "is_agent_active" in data else data.get("isAgentActive") if "isAgentActive" in data else existing["is_agent_active"]) else 0
+        is_persona = 1 if (data.get("is_persona") if "is_persona" in data else data.get("isPersona") if "isPersona" in data else existing["is_persona"]) else 0
         validation_error = await self._validate_memory_template(content, name or f"template {item_id}", agent_active=bool(is_agent_active and not is_active))
         if validation_error:
             return web.json_response({"ok": False, "error": validation_error}, status=400)
@@ -673,10 +715,14 @@ class WebAdminMemoryMixin:
             await self.db.conn.execute("UPDATE memory_templates SET is_active=0")
         if is_agent_active:
             await self.db.conn.execute("UPDATE memory_templates SET is_agent_active=0")
-        await self.db.conn.execute("UPDATE memory_templates SET name=?, content=?, is_active=?, is_agent_active=?, updated_at=? WHERE id=?", (name, content, is_active, is_agent_active, now_ts(), item_id))
+        await self.db.conn.execute("UPDATE memory_templates SET name=?, content=?, is_active=?, is_agent_active=?, is_persona=?, updated_at=? WHERE id=?", (name, content, is_active, is_agent_active, is_persona, now_ts(), item_id))
         await self.db.conn.commit()
-        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "contentLength": len(content)})
+        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "contentLength": len(content)})
         return web.json_response({"ok": True, "id": item_id})
+
+    async def handle_api_prompt_template_choices(self, request: web.Request) -> web.Response:
+        await BuiltinMemoryClient(self.db, identity=self.config.memory.identity)._bootstrap()
+        return web.json_response({"ok": True, **await prompt_template.choices(self.db)})
 
     async def handle_api_memory_template_delete(self, request: web.Request) -> web.Response:
         await self._require_memory_write_allowed()

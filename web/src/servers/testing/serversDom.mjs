@@ -25,8 +25,8 @@ for (const type of ['success', 'warning', 'info', 'error']) {
 }
 const ServersView = (await import('../../views/ServersView.vue')).default;
 
-export async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], wait = true} = {}) {
-  const backend = createServersBackend({tweak, ...(fx === undefined ? {} : {fx}), release, recheck, mesh, refuseMesh});
+export async function setup(t, {width = 1440, height = 900, dark = false, view = 'cards', tweak = null, keepAlive = false, fx, release = null, recheck = null, mesh = null, refuseMesh = [], updateRun = null, wait = true} = {}) {
+  const backend = createServersBackend({tweak, ...(fx === undefined ? {} : {fx}), release, recheck, mesh, refuseMesh, updateRun});
   network.reset();
   network.handler = backend.handle;
   network.external = backend.external;

@@ -530,7 +530,7 @@ class FakeNode:
             return await run_command(p, self.environ)
         if method == 'update':
             return await self.update(p)
-        if method in {'fs.list', 'fs.stat', 'fs.read', 'fs.write'}:
+        if method in {'fs.list', 'fs.stat', 'fs.read', 'fs.write', 'fs.writeSafe'}:
             return await asyncio.to_thread(self.files, method, p)
         if method == 'fs.edit':
             return await asyncio.to_thread(edit_file, p)
@@ -605,7 +605,7 @@ class FakeNode:
             return {'path': path, 'entries': entries, 'truncated': len(names) > 5000}
         if method == 'fs.read':
             return read_file(path, int(p.get('offset') or 0), int(p.get('limit') or 0))
-        return self.write(path, p)
+        return self.write(path, {**p, 'noReplace': True} if method == 'fs.writeSafe' else p)
 
     def write(self, path, p):
         try:
@@ -617,6 +617,8 @@ class FakeNode:
         try:
             if p.get('mkdirs'):
                 os.makedirs(os.path.dirname(path), 0o755, exist_ok=True)
+            if p.get('noReplace') and os.path.lexists(path):
+                raise Refused('file_exists')
             if os.path.islink(path):
                 path = os.path.realpath(path)
             prior = os.stat(path) if os.path.exists(path) else None
@@ -628,7 +630,7 @@ class FakeNode:
         if not upload:
             temp = os.path.join(os.path.dirname(path), f'.{os.path.basename(path)}.obtmp-{secrets.token_hex(6)}')
             _write(temp, data, 'xb')
-            commit(temp, path, p.get('mode') or '', prior)
+            commit(temp, path, p.get('mode') or '', prior, no_replace=p.get('noReplace', False))
             return {'path': path, 'size': len(data), 'done': True}
         if not UPLOAD_ID.match(upload):
             raise Refused('invalid_params')
@@ -647,7 +649,7 @@ class FakeNode:
         if not p.get('done'):
             return {'path': path, 'size': state['size'], 'done': False}
         del self.uploads[upload]
-        commit(state['temp'], path, p.get('mode') or '', prior)
+        commit(state['temp'], path, p.get('mode') or '', prior, no_replace=p.get('noReplace', False))
         return {'path': path, 'size': state['size'], 'done': True}
 
     # -- terminals --
@@ -839,7 +841,7 @@ def _write(path, data, mode):
         raise Refused(file_error(exc)) from None
 
 
-def commit(temp, path, mode, prior):
+def commit(temp, path, mode, prior, *, no_replace=False):
     perm = (prior.st_mode & 0o7777) if prior else 0o644
     if mode:
         try:
@@ -850,11 +852,15 @@ def commit(temp, path, mode, prior):
             os.remove(temp)
             raise Refused('invalid_mode')
     try:
-        os.chmod(temp, perm)
         if prior:
             with contextlib.suppress(OSError):
                 os.chown(temp, prior.st_uid, prior.st_gid)
-        os.replace(temp, path)
+        os.chmod(temp, perm)
+        if no_replace:
+            os.link(temp, path)
+            os.unlink(temp)
+        else:
+            os.replace(temp, path)
     except OSError as exc:
         with contextlib.suppress(OSError):
             os.remove(temp)

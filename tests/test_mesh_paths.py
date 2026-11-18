@@ -313,6 +313,27 @@ def test_the_best_routes_go_by_cost_through_relays_alone():
     assert [r['nodes'] for r in mesh_path.options('m1', 'm2', ROLES, statuses, NOW, 10)['routes']] == [['m1', 'r1', 'r3', 'r2', 'm2'], ['m1', 'r3', 'r2', 'm2']]
 
 
+
+def test_the_best_routes_go_around_a_no_transit_relay_but_not_a_members_own_entry():
+    statuses = _links(('m1', 'r1', 2), ('m1', 'r3', 5), ('r1', 'r2', 10), ('r1', 'r3', 1), ('r3', 'r2', 20), ('r2', 'm2', 3),
+                      ('m3', 'r3', 1), ('m3', 'r2', 1), ('m1', 'm3', 1))
+    # m1 enters by r3: r3 carries m1's routes as its own, and only m1 -> r1 -> r3 -> r2 goes on through it between relays.
+    out = mesh_path.options('m1', 'm2', ROLES, statuses, NOW, 10, no_transit={'r3'})
+    assert [r['nodes'] for r in out['routes']] == [['m1', 'r1', 'r2', 'm2'], ['m1', 'r3', 'r1', 'r2', 'm2'], ['m1', 'r3', 'r2', 'm2'],
+                                                 ['m1', 'r1', 'r3', 'r2', 'm2']]
+    assert [r.get('noTransit') for r in out['routes']] == [None, None, None, ['r3']]
+    assert mesh_path.tolled(['r1', 'r3', 'm3'], ROLES, {'r3'}) == [] and mesh_path.tolled(['r1', 'r3', 'r2'], ROLES, {'r3'}) == ['r3']
+
+
+def test_an_own_route_passes_a_no_transit_relay_only_as_an_end_members_entry():
+    doc = _doc([_path('m1', 'm2', ['r1', 'r2']), _path('m3', 'm2', ['r3', 'r1', 'r2']), _path('r3', 'm2', ['r1', 'r2'])])
+    doc['members'][0]['noTransit'] = True
+    found = [e for e in model.validate(doc, _facts()) if e['error'] == 'path_via_no_transit']
+    assert [e['path'] for e in found] == ['paths[1]', 'paths[2]']
+    assert 'R1 设为不中转' in found[0]['message'] and 'path_via_no_transit' in model.APPLY_ERRORS
+    configs = build(doc, _facts(), 'net', 1)
+    assert _ids(configs, 'm1') == [doc['paths'][0]['id']] and _ids(configs, 'm3') == []
+
 def test_the_best_routes_show_the_pairs_own_routes():
     statuses = _links(('m1', 'r1', 2), ('r1', 'r2', 10), ('r2', 'm2', 3), ('r1', 'r3', 1), ('r3', 'r2', 1))
     own = [{'id': 'p1', 'rank': 1, 'on': True, 'nodes': ['m1', 'r1', 'r2', 'm2']},

@@ -1,17 +1,19 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+import hashlib
 import inspect
 
-from app.web_console.message_visibility import visibility_snapshot
-
 from app.agents import live_state as agent_live_state
-from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
 from app.agents.controller_projection import project_history_message_for_controller
-from app.tools.base import current_tool_context
+from app.context import image_one_turn, prompt_template
 from app.context.window import capped_trigger_tokens
+from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
+from app.tools.base import current_tool_context
 from app.web_console.core import *
 from app.web_console.live_stream import *
+from app.web_console.message_visibility import visibility_snapshot
+from app.web_operations import is_context_compaction_operation
 
 
 class WebAdminChatStateMixin:
@@ -183,6 +185,51 @@ class WebAdminChatStateMixin:
             ctx.preserve_user_answer = True
         return result
 
+    async def _window_summary_ids(self, chat_id: int) -> set[int]:
+        # Window summaries commit before their terminal operation frame. They are
+        # not legacy summaries: projecting/counting them early races that frame.
+        cur = await self.db.conn.execute(
+            "SELECT json_extract(detail_json, '$.summaryId') FROM context_window_rotations "
+            "WHERE owner_key LIKE ? AND json_valid(detail_json)", (f"controller:{int(chat_id)}:%",))
+        return {int(row[0]) for row in await cur.fetchall() if row[0]}
+
+    async def _count_conversation_compactions(self, chat_id: int, conversation_uuid: str) -> int:
+        conv_uuid = str(conversation_uuid or "").strip()
+        count = 0
+        existing_summary_ids = await self._window_summary_ids(chat_id)
+        if conv_uuid:
+            cur = await self.db.conn.execute(
+                "SELECT op_id, op_type, source, status, payload_json FROM web_operations "
+                "WHERE conversation_uuid=? AND (op_type='context_compaction' "
+                "OR source='context_compaction' OR op_id LIKE 'tool:context-compaction:%')",
+                (conv_uuid,),
+            )
+            prefix = "tool:context-compaction:"
+            for row in await cur.fetchall():
+                op_dict = dict(row)
+                payload = operation_json_loads_dict(str(op_dict.get("payload_json") or "{}"))
+                if not is_context_compaction_operation(op_dict, payload=payload):
+                    continue
+                op_id = str(op_dict.get("op_id") or "")
+                suffix = op_id[len(prefix):] if op_id.startswith(prefix) else ""
+                if suffix.isdigit():
+                    existing_summary_ids.add(int(suffix))
+                summary_id = int(payload.get("summaryId") or 0)
+                if summary_id > 0:
+                    existing_summary_ids.add(summary_id)
+                if str(op_dict.get("status") or "") == "completed":
+                    count += 1
+        for row in await SummaryDAO(self.db).list_with_anchors(chat_id):
+            summary_id = int(row.get("id") or 0)
+            if not summary_id or summary_id in existing_summary_ids:
+                continue
+            anchor_conversation = str(row.get("anchor_conversation_uuid") or "").strip()
+            if anchor_conversation and conv_uuid and anchor_conversation != conv_uuid:
+                continue
+            if str(row.get("anchor_turn_uuid") or "").strip():
+                count += 1
+        return count
+
     async def _project_context_compaction_operations(
         self,
         chat_id: int,
@@ -207,6 +254,7 @@ class WebAdminChatStateMixin:
             for item in projected
             if isinstance(item.get("payload"), dict)
         }
+        existing_ids.update(await self._window_summary_ids(chat_id))
         summaries = await SummaryDAO(self.db).list_with_anchors(chat_id)
         paged = timeline_page is not None
         if paged:
@@ -410,6 +458,7 @@ class WebAdminChatStateMixin:
         operations: list[dict[str, Any]] = []
         frame_seq = 0
         timeline_total_duration_ms = 0
+        compaction_count = 0
         if conv_uuid:
             async with self._web_operation_lock(conv_uuid):
                 if timeline_limit is None:
@@ -455,15 +504,16 @@ class WebAdminChatStateMixin:
                 )
                 frame_row = await cur.fetchone()
                 frame_seq = int(frame_row["frame_seq"] or 0) if frame_row else 0
-            operations = await self._project_context_compaction_operations(
-                chat_id,
-                conv_uuid,
-                operations,
-                include_tool_details=False,
-                timeline_page=operation_page if timeline_limit is not None else None,
-            )
-            if operations:
-                operation_page["hasAnyOperations"] = True
+                compaction_count = await self._count_conversation_compactions(chat_id, conv_uuid)
+                operations = await self._project_context_compaction_operations(
+                    chat_id,
+                    conv_uuid,
+                    operations,
+                    include_tool_details=False,
+                    timeline_page=operation_page if timeline_limit is not None else None,
+                )
+                if operations:
+                    operation_page["hasAnyOperations"] = True
         operation_source = "web_operations"
         active_ops = [op for op in operations if str(op.get("lifecycle") or "") in {"active", "paused", "waiting_control"}]
         active_agent_ops = [op for op in active_ops if str(op.get("opType") or "") == "agent"]
@@ -536,11 +586,14 @@ class WebAdminChatStateMixin:
         pending_steering = steering.public_pending_items(chat_id)
         exact_context_tokens = await messages.latest_controller_context_usage(chat_id, session_uuid=session_uuid, expected_model=model_label)
         context_trigger_tokens = self._model_rollover_trigger_tokens(model_label)
+        if not conv_uuid:
+            compaction_count = await self._count_conversation_compactions(chat_id, conv_uuid)
         context_usage = {
             "known": exact_context_tokens is not None,
             "tokens": int(exact_context_tokens or 0),
             "rolloverTriggerTokens": context_trigger_tokens,
             "percent": ((int(exact_context_tokens) * 100.0 / context_trigger_tokens) if exact_context_tokens is not None and context_trigger_tokens > 0 else None),
+            "compactionCount": compaction_count,
         }
         from app.context.store import ContextOwner, WindowStore
         window = await WindowStore(self.db, ContextOwner.controller(chat_id=chat_id, session_uuid=session_uuid)).load() if session_uuid else None
@@ -601,6 +654,10 @@ class WebAdminChatStateMixin:
             "fastSupported": bool(fast_supported),
             "effectiveFastMode": bool(fast_requested and fast_supported),
             "contextStrategy": str((conversation or {}).get("context_strategy") or "sliding_window"),
+            "imageOneTurn": image_one_turn.normalize((conversation or {}).get("image_one_turn")),
+            "promptTemplate": prompt_template.normalize((conversation or {}).get("prompt_template")),
+            "promptTemplateLocked": bool(session_config.get("system_snapshot")),
+            "promptTemplateMissing": await prompt_template.missing(self.db, (conversation or {}).get("prompt_template")),
             "manualCompactMinPercent": self.config.agent.manual_compact_min_percent,
             "agentRunConfig": agent_run_config,
             "rolloverTriggerTokens": self._model_rollover_trigger_tokens(model_label),
@@ -618,6 +675,43 @@ class WebAdminChatStateMixin:
     async def _build_history(self, chat_id: int) -> list[Message]:
         from app.context.builder import build_controller_history
         return await build_controller_history(MessageDAO(self.db), chat_id, reference_store=self._reference_store())
+
+    async def _effective_window_system(self, chat_id: int, current: str) -> str:
+        """Read the same committed replacement used by ContextManager, without rebuilding."""
+        from app.context.store import ContextOwner, WindowStore
+        cur = await self.db.conn.execute("SELECT session_uuid FROM sessions WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        if not row or not row['session_uuid']:
+            return current
+        window = await WindowStore(self.db, ContextOwner.controller(chat_id=chat_id, session_uuid=row['session_uuid'])).load()
+        replacement = ((window or {}).get('state') or {}).get('systemReplacement')
+        if not replacement:
+            return current
+        candidate = current
+        if getattr(self, "extensions", None) is not None:
+            from app.extensions import split_usage
+            candidate, _usage = split_usage(candidate)
+        if replacement.get('source') == hashlib.sha256(candidate.encode()).hexdigest():
+            return replacement['system']
+        return current
+
+    async def _rebuild_missing_persona_system(self, conversation_uuid: str, current: str) -> str:
+        """Only a required rebuild may retire a deleted persona's frozen text.
+
+        Do not re-resolve permissions or overwrite the conversation snapshot.
+        ContextManager commits the replacement with the new window instead.
+        """
+        value = await prompt_template.conversation_prompt_template(self.db, conversation_uuid)
+        if not await prompt_template.missing(self.db, value):
+            return current
+        active = await self._active_prompt_policy(conversation_uuid)
+        if active['overrideSystemPrompt']:
+            return current
+        rebuilt = await self._build_system_prompt_for_chat(conversation_uuid, prompt_policy=active)
+        if getattr(self, "extensions", None) is not None:
+            from app.extensions import split_usage
+            rebuilt, _usage = split_usage(rebuilt)
+        return rebuilt
 
     async def _build_system_prompt_for_chat(
         self,
@@ -644,6 +738,13 @@ class WebAdminChatStateMixin:
                     params, template_content=selected['text'], template_name='Conversation custom system', source='conversation')
                 if not prompt.strip() or '[[ERROR:' in prompt:
                     raise ValueError('invalid custom system template')
+                return prompt
+            template_id = await prompt_template.conversation_prompt_template(self.db, conversation_uuid)
+            if self.config.memory.provider == "builtin" and template_id:
+                prompt = await BuiltinMemoryClient(self.db, identity=self.config.memory.identity).render_system_prompt(
+                    params, template_id=int(template_id), source="runtime")
+                if not str(prompt or "").strip():
+                    raise ValueError("empty system prompt")
                 return prompt
             if self.config.memory.provider == "builtin":
                 mem = BuiltinMemoryClient(self.db, identity=self.config.memory.identity)

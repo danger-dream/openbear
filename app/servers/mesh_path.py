@@ -22,8 +22,16 @@ def find(src, dst, roles, statuses, configs, now):
     stale is true when a report needed is missing or old, or a segment has no round trip;
     rttMs is then null. A path that cannot be followed to the end stops where it breaks.
     fixed, when the source reports a fixed path for this pair: its id, nodes and state; while
-    it is pinned the hops are its nodes."""
+    it is pinned the hops are its nodes. decision: the relay (or routed member) that chose the
+    route for its next hops, as it reports it: {node, dest, cost, best?, bestCost?, held?, until?}."""
     stale = False
+    decision = {}
+
+    def decide(node, target):
+        routing = (fresh(node) or {}).get('routing') or {}
+        route = next((r for r in routing.get('routes') or [] if r.get('dest') == target), None)
+        if route:
+            decision.update(node=node, dest=target, cost=route.get('cost'), **{k: route[k] for k in ('best', 'bestCost', 'held', 'until') if k in route})
 
     def fresh(sid):
         return fresh_status(statuses, sid, now, FRESH_MS)
@@ -55,7 +63,8 @@ def find(src, dst, roles, statuses, configs, now):
     def done(complete):
         rtts = [h['rttMs'] for h in hops[1:]]
         broken = stale or not complete or any(r is None for r in rtts)
-        return {'hops': hops, 'rttMs': None if broken else round(sum(rtts), 1), 'stale': broken, **({'fixed': fixed} if fixed else {})}
+        return {'hops': hops, 'rttMs': None if broken else round(sum(rtts), 1), 'stale': broken, **({'fixed': fixed} if fixed else {}),
+                **({'decision': decision} if decision else {})}
 
     def add(node, kind):
         if any(h['node'] == node for h in hops) or len(hops) >= MAX_HOPS:
@@ -93,6 +102,7 @@ def find(src, dst, roles, statuses, configs, now):
 
     direct_route = routed_to(src, dst)
     if direct_route is not None:
+        decide(src, dst)
         for step in direct_route:
             if not add(step, hop_kind(hops[-1]['node'], step)):
                 stale = True
@@ -109,6 +119,7 @@ def find(src, dst, roles, statuses, configs, now):
             return done(False)
         tail = routed_to(start, dst)
         if tail is not None:
+            decide(start, dst)
             for step in tail:
                 if not add(step, hop_kind(hops[-1]['node'], step)):
                     stale = True
@@ -125,6 +136,7 @@ def find(src, dst, roles, statuses, configs, now):
             return done(False)
 
     if home != start:
+        decide(start, home)
         relays = _relay_path(start, home, fresh(start), configs)
         if relays is None:
             stale = True
@@ -158,8 +170,9 @@ def _relay_path(start, home, status, configs):
 
 def links(roles, statuses, now):
     """{a: {b: (cost, rttMs, loss)}}, both ways: the links up between nodes as their latest reports
-    show them, costed as the routes cost them (rtt, jitter, loss and bias, the larger of the two
-    ends' figures); a member on a single entry is linked to the relay it enters by, at its round trip."""
+    show them, costed as the routes cost them (the cost each end advertises, from rtt, jitter, loss and
+    bias, the larger of the two; the measured one from a node that does not report it); a member on a
+    single entry is linked to the relay it enters by, at its round trip."""
     sides = {}
     for sid in roles:
         status = fresh_status(statuses, sid, now, FRESH_MS) or {}
@@ -174,7 +187,7 @@ def links(roles, statuses, now):
     for pair, reports in sides.items():
         if any(r['state'] != 'up' for r in reports):
             continue
-        costs = [r['cost'] if r.get('cost') is not None else r.get('rttMs') for r in reports]
+        costs = [r['advertised'] if r.get('advertised') is not None else r['cost'] if r.get('cost') is not None else r.get('rttMs') for r in reports]
         rtt = next((r['rttMs'] for r in reports if r.get('rttMs')), None)
         cost = max((c for c in costs if c is not None), default=None)
         loss = max(r.get('loss') or 0 for r in reports)
@@ -184,36 +197,57 @@ def links(roles, statuses, now):
     return out
 
 
-def _shortest(graph, roles, src, dst, banned_nodes, banned_links):
-    """The cheapest path from src to dst through relays alone, or None."""
-    dist, prev, heap = {src: 0.0}, {}, [(0.0, src)]
+def tolled(path, roles, no_transit):
+    """The relays of no_transit a path goes on through from a relay to a relay, as the data plane
+    counts them (routing.noTransit): not where it starts or ends, toward a member, or at the relay
+    the member it starts from enters by."""
+    return [x for i, x in enumerate(path[1:-1], 1)
+            if x in no_transit and roles.get(path[i + 1]) == 'relay' and not (i == 1 and roles.get(path[0]) == 'member')]
+
+
+def _shortest(graph, roles, src, dst, banned_nodes, banned_links, no_transit=frozenset(), *, root=None):
+    """Fewest tolled relays, then cost. State includes the first-entry exemption: a cheaper
+    arrival through another relay must not replace the source member's own entry. A Yen spur
+    inherits the original root; it is not a new, toll-exempt origin."""
+    root = root or [src]
+    exempt = len(root) == 1 or len(root) == 2 and roles.get(root[0]) == 'member'
+    start = (src, exempt)
+    dist, prev, heap = {start: (0, 0.0)}, {}, [((0, 0.0), start)]
+    end = None
     while heap:
-        d, u = heapq.heappop(heap)
-        if d > dist[u]:
+        d, state = heapq.heappop(heap)
+        u, exempt = state
+        if d > dist[state]:
             continue
         if u == dst:
+            end = state
             break
         if u != src and roles.get(u) != 'relay':
             continue
         for v, (c, *_) in sorted(graph.get(u, {}).items()):
-            if v in banned_nodes or frozenset((u, v)) in banned_links:
+            if v == src or v in banned_nodes or frozenset((u, v)) in banned_links:
                 continue
-            if d + c < dist.get(v, math.inf):
-                dist[v], prev[v] = d + c, u
-                heapq.heappush(heap, (d + c, v))
-    if dst not in dist:
+            toll = int(not exempt and u in no_transit and roles.get(v) == 'relay')
+            next_state = (v, len(root) == 1 and state == start and roles.get(src) == 'member')
+            nd = (d[0] + toll, d[1] + c)
+            if nd < dist.get(next_state, (math.inf, math.inf)):
+                dist[next_state], prev[next_state] = nd, state
+                heapq.heappush(heap, (nd, next_state))
+    if end is None:
         return None
-    path = [dst]
-    while path[-1] != src:
-        path.append(prev[path[-1]])
+    path = [end[0]]
+    while end != start:
+        end = prev[end]
+        path.append(end[0])
     return path[::-1]
 
 
-def best_paths(graph, roles, src, dst, k):
-    """The k cheapest loopless paths from src to dst that only relays forward on (Yen's algorithm)."""
+def best_paths(graph, roles, src, dst, k, no_transit=frozenset()):
+    """The k cheapest loopless paths from src to dst that only relays forward on (Yen's algorithm),
+    those through fewer relays of no_transit first."""
     def cost(p):
-        return sum(graph[a][b][0] for a, b in zip(p, p[1:]))
-    first = _shortest(graph, roles, src, dst, set(), set())
+        return len(tolled(p, roles, no_transit)), sum(graph[a][b][0] for a, b in zip(p, p[1:]))
+    first = _shortest(graph, roles, src, dst, set(), set(), no_transit)
     if not first:
         return []
     found, candidates, seen = [first], [], {tuple(first)}
@@ -222,7 +256,7 @@ def best_paths(graph, roles, src, dst, k):
         for i in range(len(last) - 1):
             root = last[:i + 1]
             banned = {frozenset((p[i], p[i + 1])) for p in found if p[:i + 1] == root}
-            tail = _shortest(graph, roles, last[i], dst, set(root[:-1]), banned)
+            tail = _shortest(graph, roles, last[i], dst, set(root[:-1]), banned, no_transit, root=root)
             if tail and tuple(root[:-1] + tail) not in seen:
                 path = root[:-1] + tail
                 seen.add(tuple(path))
@@ -239,13 +273,16 @@ def _measured(graph, nodes):
         _, rtt, loss = graph.get(a, {}).get(b, (None, None, 0))
         segs.append({'a': a, 'b': b, 'exists': b in graph.get(a, {}), 'rttMs': rtt, **({'loss': loss} if loss else {})})
     rtts = [s['rttMs'] for s in segs]
-    return {'nodes': list(nodes), 'segments': segs, 'rttMs': None if any(r is None for r in rtts) else round(sum(rtts), 1)}
+    costs = [graph[a][b][0] for a, b in zip(nodes, nodes[1:]) if b in graph.get(a, {})]
+    return {'nodes': list(nodes), 'segments': segs, 'rttMs': None if any(r is None for r in rtts) else round(sum(rtts), 1),
+            'cost': round(sum(costs), 1) if len(costs) == len(segs) else None}
 
 
-def options(src, dst, roles, statuses, now, k, own=()):
+def options(src, dst, roles, statuses, now, k, own=(), no_transit=frozenset(), current=None):
     """The k best paths from src to dst by the latest reports, and the pair's own routes:
-    {routes: [{nodes, segments [{a, b, exists, rttMs, loss?}], rttMs, own (its rank, or None)}],
-    own: [{id, rank, on, nodes, segments, rttMs, place (its place in routes from 1, or None)}]}.
+    {routes: [{nodes, segments [{a, b, exists, rttMs, loss?}], rttMs, cost, own (its rank, or None), noTransit?}],
+    own: [{id, rank, on, nodes, segments, rttMs, cost, place (its place in routes from 1, or None)}],
+    current: the path in use, current (its nodes), measured the same way, or None}.
     own: [{id, rank, on, nodes}] the own routes of the pair, nodes from src to dst. A link of an
     own route that is not up yet has no rttMs and leaves the route out of the ranking."""
     graph = links(roles, statuses, now)
@@ -254,9 +291,14 @@ def options(src, dst, roles, statuses, now, k, own=()):
         if ups:
             rtt = next((p['rttMs'] for p in ups if p['rttMs']), None)
             graph.setdefault(src, {})[dst] = graph.setdefault(dst, {})[src] = (max(rtt or 1000.0, 0.1), rtt, 0)
-    found = best_paths(graph, roles, src, dst, k)
+    found = best_paths(graph, roles, src, dst, k, no_transit)
     places = {tuple(p): i + 1 for i, p in enumerate(found)}
     ranks = {tuple(o['nodes']): o['rank'] for o in own}
-    return {'routes': [{**_measured(graph, p), 'own': ranks.get(tuple(p))} for p in found],
+
+    def through(p):
+        t = tolled(p, roles, no_transit)
+        return {'noTransit': t} if t else {}
+    return {'routes': [{**_measured(graph, p), 'own': ranks.get(tuple(p)), **through(p)} for p in found],
             'own': [{'id': o['id'], 'rank': o['rank'], 'on': o['on'], **_measured(graph, o['nodes']), 'place': places.get(tuple(o['nodes']))}
-                    for o in own]}
+                    for o in own],
+            'current': {**_measured(graph, current), **through(current)} if current else None}

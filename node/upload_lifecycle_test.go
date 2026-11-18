@@ -234,7 +234,8 @@ func TestUploadLeftByAnEarlierRunIsRemovedOnTheNextOne(t *testing.T) {
 	if err := uploadChunk(first, path, "upload0001", 0, "partial", false); err != nil {
 		t.Fatal(err)
 	}
-	temp := filepath.Join(dir, ".big.iso.obupload-upload0001")
+	temp := first.open["upload0001"].temp
+	t.Cleanup(func() { first.drop("upload0001") })
 	if _, err := os.Stat(temp); err != nil {
 		t.Fatal(err)
 	}
@@ -262,8 +263,12 @@ func TestUploadLeftByAnEarlierRunIsRemovedOnTheNextOne(t *testing.T) {
 		t.Fatalf("records: %v", got)
 	}
 
+	// A real crash closes the file handle (Windows correctly refuses deletion
+	// while the old process still holds it without delete sharing).
+	first.open["upload0001"].stage.file.Close()
 	next := newUploads() // the node's next run
 	next.recover(records)
+	t.Cleanup(func() { next.drop("upload0004") })
 	if _, err := os.Stat(temp); !os.IsNotExist(err) {
 		t.Fatalf("the earlier run's temp file is still there: %v", err)
 	}

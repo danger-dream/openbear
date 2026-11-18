@@ -30,7 +30,8 @@ KEYS = {'id', 'on', 'from', 'to', 'via'}
 _ID = re.compile(r'[A-Za-z0-9_-]{1,32}')
 BACK_SUFFIX = '~back'
 # Errors about the mesh rather than the route: kept in the draft, refused at apply.
-APPLY_ERRORS = frozenset({'path_via_not_relay', 'path_link_missing', 'path_node_outdated', 'path_no_source', 'path_no_destination'})
+APPLY_ERRORS = frozenset({'path_via_not_relay', 'path_link_missing', 'path_node_outdated', 'path_no_source', 'path_no_destination',
+                          'path_via_no_transit'})
 FRESH_MS = 150_000
 
 
@@ -130,6 +131,10 @@ class _Mesh:
     def linked(self, a, b):
         return frozenset((a, b)) in self.edges
 
+    def enters(self, member, relay):
+        """Whether member is a member entering the mesh by relay."""
+        return member in self.live and not self.relay(member) and relay in mesh_config.member_relays(self.live[member], self.live)
+
     def new(self, sid, feature=FEATURE):
         return mesh_config.has_feature(self.facts, sid, feature)
 
@@ -182,11 +187,13 @@ def plan(doc, facts):
         if not path['on'] or not path['via']:
             continue
         via, s, d, problems = path['via'], path['from'], path['to'], e['problems']
-        for v in via:
+        for k, v in enumerate(via):
             if not mesh.relay(v):
                 problems.append(('path_via_not_relay', f'{mesh.name(v)} 不是中转，途经节点只能是中转'))
             elif not mesh.new(v):
                 problems.append(('path_node_outdated', f'{mesh.name(v)} 的节点版本不支持自建路线：先在服务器页更新节点'))
+            elif mesh.live[v].get('noTransit') and not (k == 0 and mesh.enters(s, v) or k == len(via) - 1 and mesh.enters(d, v)):
+                problems.append(('path_via_no_transit', f'{mesh.name(v)} 设为不中转，只能作为起点或终点成员自己的入口中转，不能替别人中转'))
         for a, b in zip(via, via[1:]):
             if not mesh.linked(a, b):
                 problems.append(('path_link_missing', f'{mesh.name(a)} 和 {mesh.name(b)} 之间没有线路'))

@@ -37,6 +37,7 @@ import ReferencePicker from "./references/ReferencePicker.vue";
 import SidebarDesktopNav from "./components/SidebarDesktopNav.vue";
 import ReferenceInspector from "./references/ReferenceInspector.vue";
 import ArtifactPreview from "./artifacts/ArtifactPreview.vue";
+import NoteCaptureDialog from "./notes/NoteCaptureDialog.vue";
 import { referenceCatalog, referenceItem, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
 
 const THEME_OPTIONS = [
@@ -56,6 +57,7 @@ function chooseThemeMode(mode) {
 const MemoryView = defineLazyView(() => import("./views/MemoryView.vue"), "记忆管理");
 const SecretsView = defineLazyView(() => import("./views/SecretsView.vue"), "凭证库");
 const DocsView = defineLazyView(() => import("./views/DocsView.vue"), "文档库");
+const NotesView = defineLazyView(() => import("./views/NotesView.vue"), "笔记");
 const CronView = defineLazyView(() => import('./views/CronView.vue'), '定时任务');
 const SkillsView = defineLazyView(() => import("./views/SkillsView.vue"), "Skills");
 const McpView = defineLazyView(() => import("./views/McpView.vue"), "MCP 管理");
@@ -71,6 +73,7 @@ const allNav = [
   { key: "memory", label: "记忆管理", shortLabel: "记忆", icon: "Collection", component: MemoryView },
   { key: "secrets", label: "凭证库", shortLabel: "凭证", icon: "Key", component: SecretsView },
   { key: "docs", label: "文档库", shortLabel: "文档", icon: "Files", component: DocsView },
+  { key: "notes", label: "笔记", shortLabel: "笔记", icon: "Notebook", component: NotesView },
   { key: 'cron', label: '定时任务', shortLabel: '定时', icon: 'Clock', component: CronView },
   { key: "skills", label: "Skills", shortLabel: "Skills", icon: "MagicStick", component: SkillsView },
   { key: "mcp", label: "MCP 管理", shortLabel: "MCP", icon: "Connection", component: McpView },
@@ -88,6 +91,7 @@ const pageToPath = {
   memory: "/memory",
   secrets: "/secrets",
   docs: "/docs",
+  notes: "/notes",
   cron: '/cron',
   skills: "/skills",
   mcp: "/mcp",
@@ -105,6 +109,7 @@ const pathToPage = {
   "/memory": "memory",
   "/secrets": "secrets",
   "/docs": "docs",
+  "/notes": "notes",
   '/cron': 'cron',
   "/skills": "skills",
   "/mcp": "mcp",
@@ -129,14 +134,14 @@ function closeReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenc
 function keepReferenceShelf(){window.clearTimeout(referenceShelfTimer);}
 function leaveReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenceShelfTimer=window.setTimeout(closeReferenceShelf,200);}
 function showReferenceShelf(event,key,keyboard=false){
-  const kind={memory:'mem',secrets:'secret',docs:'doc'}[key];
+  const kind={memory:'mem',secrets:'secret',docs:'doc',notes:'note'}[key];
   if(!kind||active.value!=='console'||(!keyboard&&!window.matchMedia('(hover: hover) and (pointer: fine)').matches))return;
   // Keep the shelf outside the entire launcher, not over the next grid column.
   const anchor=event.currentTarget.closest('.sidebar-desktop-nav')||event.currentTarget;window.clearTimeout(referenceShelfTimer);
   const delay = keyboard ? 0 : (referenceShelf.value.open && referenceShelf.value.kind !== kind ? 500 : 220);
   referenceShelfTimer=window.setTimeout(()=>{referenceShelf.value={open:true,kind,anchor};}, delay);
 }
-function referenceNavKey(event,key){if(event.key==='ArrowRight'&&['memory','secrets','docs'].includes(key)){event.preventDefault();showReferenceShelf(event,key,true);}}
+function referenceNavKey(event,key){if(event.key==='ArrowRight'&&['memory','secrets','docs','notes'].includes(key)){event.preventDefault();showReferenceShelf(event,key,true);}}
 function insertShelfReference(reference){window.dispatchEvent(new CustomEvent('openbear:insert-reference',{detail:{reference}}));closeReferenceShelf();}
 watch(active,closeReferenceShelf);
 watch(active, (value) => {
@@ -182,6 +187,22 @@ async function openConversationFolder(folderId) {
 function handleOpenConversation(event) {
   const conversationUuid = String(event?.detail?.conversationUuid || '');
   if (conversationUuid) openConversation({conversationUuid});
+}
+function handleOpenKbNote(event) {
+  const noteUuid = String(event?.detail?.noteUuid || event?.detail?.id || '');
+  if (noteUuid) window.__openbearPendingKbNoteUuid = noteUuid;
+  selectNav('notes');
+}
+function handleLocateConversation(event) {
+  const detail = event?.detail || {};
+  const conversationUuid = String(detail.conversationUuid || '');
+  if (!conversationUuid) return;
+  if (active.value === 'console' && activeConversationUuid.value === conversationUuid) {
+    if (detail.opId) window.dispatchEvent(new CustomEvent('openbear:locate-conversation-ready', { detail }));
+    return;
+  }
+  if (detail.opId) window.__openbearPendingConversationLocate = { ...detail, conversationUuid };
+  openConversation({ conversationUuid });
 }
 const pageHeaderReady = ref(false);
 // Keep fallback navigation available while a newly selected lazy page loads.
@@ -632,6 +653,7 @@ async function refreshConsoleAfterPropSync() {
   refreshConsole();
 }
 function focusLocalConversation(folderId = draftFolderId.value, { revealInFolders = true } = {}) {
+  const alreadyMountedLocal = active.value === "console" && activeConversationUuid.value === LOCAL_CONVERSATION_UUID;
   active.value = "console";
   const existing = conversations.value.find(isLocalConversation);
   const target = existing ? String(existing.folderId || "") : String(folderId || "");
@@ -640,7 +662,7 @@ function focusLocalConversation(folderId = draftFolderId.value, { revealInFolder
   activeConversationUuid.value = LOCAL_CONVERSATION_UUID;
   closeSidebar();
   syncRoute();
-  void refreshConsoleAfterPropSync();
+  if (alreadyMountedLocal) void refreshConsoleAfterPropSync();
   if (revealInFolders) void nextTick().then(() => conversationTreeRef.value?.revealDraft(target));
 }
 async function startConsoleNewSession() {
@@ -1156,6 +1178,8 @@ onMounted(() => {
   window.addEventListener('openbear:open-cron', handleOpenCron);
   window.addEventListener('openbear:open-ddns', handleOpenDdns);
   window.addEventListener('openbear:open-conversation', handleOpenConversation);
+  window.addEventListener('openbear:open-kb-note', handleOpenKbNote);
+  window.addEventListener('openbear:locate-conversation', handleLocateConversation);
   window.addEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.addEventListener("click", closeConversationMenu);
   window.addEventListener("scroll", closeConversationMenu, true);
@@ -1183,6 +1207,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('openbear:open-cron', handleOpenCron);
   window.removeEventListener('openbear:open-ddns', handleOpenDdns);
   window.removeEventListener('openbear:open-conversation', handleOpenConversation);
+  window.removeEventListener('openbear:open-kb-note', handleOpenKbNote);
+  window.removeEventListener('openbear:locate-conversation', handleLocateConversation);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.removeEventListener("click", closeConversationMenu);
   window.removeEventListener("scroll", closeConversationMenu, true);
@@ -1199,7 +1225,7 @@ onBeforeUnmount(() => {
 
 <template>
   <LoginView v-if="isLoginPath" />
-  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active) && pageHeaderReady}">
+  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'notes', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active) && pageHeaderReady}">
     <NotificationOnboarding />
     <div class="mobile-app-bar">
       <button
@@ -1306,7 +1332,7 @@ onBeforeUnmount(() => {
           ref="conversationTreeRef"
           :active-conversation-uuid="activeConversationUuid"
           :draft-conversation="currentDraftConversation()"
-          :auto-open-selected="active !== 'instances' && active !== 'skills'"
+          :auto-open-selected="active !== 'instances' && active !== 'skills' && active !== 'notes'"
           @open="handleTreeOpen"
           @activity-status="treeActivityStatus = $event"
           @show-pending="pendingConversationsOpen = true"
@@ -1623,7 +1649,7 @@ onBeforeUnmount(() => {
       >
         <template #mobile-navigation>
           <button
-            v-if="['settings', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active)"
+            v-if="['settings', 'secrets', 'docs', 'notes', 'cron', 'skills', 'mcp', 'instances', 'servers'].includes(active)"
             type="button"
             class="mobile-sidebar-toggle"
             :aria-expanded="sidebarOpen"
@@ -1637,6 +1663,7 @@ onBeforeUnmount(() => {
     </main>
 
     <ConversationPropertiesDialog ref="conversationPropertiesRef" v-model="conversationPropertiesOpen" :conversation="conversationPropertiesRow" :initial-tab="conversationPropertiesTab" @persist="persistPropertyConversation" />
+    <NoteCaptureDialog />
 
     <el-dialog
       v-model="versionDialogOpen"

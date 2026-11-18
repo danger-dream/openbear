@@ -49,7 +49,7 @@ func instanceAsset(p string) (string, string, bool) {
 
 // Keep these in sync with app/managed/http.py:GATEWAY_APP_PAGES and
 // app/web_console/auth_api.py:PWA_PUBLIC_FILES. No generic root/static fallback.
-var pagePaths = map[string]bool{"/": true, "/chat": true, "/memory": true, "/secrets": true, "/docs": true, "/mcp": true, "/skills": true, "/settings": true, "/statistics": true, "/webhooks": true, "/cron": true}
+var pagePaths = map[string]bool{"/": true, "/chat": true, "/memory": true, "/secrets": true, "/docs": true, "/notes": true, "/mcp": true, "/skills": true, "/settings": true, "/statistics": true, "/webhooks": true, "/cron": true}
 var pwaPaths = map[string]bool{"/openbear-push-sw.js": true, "/manifest.webmanifest": true, "/icons/openbear-192.png": true, "/icons/openbear-512.png": true, "/icons/apple-touch-icon.png": true}
 
 func bootstrapPath(r *http.Request) bool {

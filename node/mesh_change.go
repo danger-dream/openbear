@@ -129,14 +129,22 @@ func (a *Agent) restoreMeshChangeLocked(h *meshHost, c *meshChange) error {
 	if err := h.saveChange(c); err != nil {
 		return err
 	}
+	if !c.WasRunning || len(c.Previous) == 0 {
+		before, _ := h.readStatus()
+		if err := stopForRemoval(h.service, before.Pid, h.exitWait); err != nil {
+			return err
+		}
+	}
 	if len(c.Previous) > 0 {
+		if !c.WasRunning {
+			if err := replaceFile(h.path("applied.json"), bytes.NewReader(c.Previous), 0o600); err != nil {
+				return err
+			}
+		}
 		if err := replaceFile(h.path("config.json"), bytes.NewReader(c.Previous), 0o600); err != nil {
 			return err
 		}
 	} else {
-		if err := h.service.stop(); err != nil {
-			return err
-		}
 		for _, name := range []string{"config.json", "applied.json"} {
 			if err := os.Remove(h.path(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -159,6 +167,12 @@ func (a *Agent) restoreMeshChangeLocked(h *meshHost, c *meshChange) error {
 }
 
 func (h *meshHost) finishMeshRestore(c *meshChange) error {
+	if !c.WasRunning {
+		before, _ := h.readStatus()
+		if err := stopForRemoval(h.service, before.Pid, h.exitWait); err != nil {
+			return err
+		}
+	}
 	if len(c.Previous) > 0 && c.WasRunning {
 		var head struct {
 			Revision int64 `json:"revision"`

@@ -27,6 +27,8 @@ def put(path, text):
 def fixture_source(root, version="1.2.4"):
     put(root / "app/__init__.py", f'__version__ = "{version}"\n')
     put(root / "prompts/main.tpl", "hello")
+    # Keep the actual prompt files and manifest digests together in candidates.
+    shutil.copytree(ROOT / "prompts", root / "prompts", dirs_exist_ok=True)
     shutil.copytree(ROOT / "benchmark-package", root / "benchmark-package", dirs_exist_ok=True)
     put(root / "pyproject.toml", f'[project]\nname="openbear"\nversion="{version}"\n')
     put(root / "uv.lock", f'version=1\n[[package]]\nname="openbear"\nversion="{version}"\nsource={{virtual="."}}\n')

@@ -246,6 +246,46 @@ async def test_update_all_does_relays_last_one_at_a_time(env, node_file, monkeyp
     assert all(together == {sid} for sid, together in starts[first_relay:])
 
 
+async def test_update_all_from_the_page_runs_in_the_background(env, node_file, monkeypatch):  # noqa: F811
+    e = env
+    plain = await add_node(e, 'plain')
+    relay = await add_node(e, 'relay')
+    gate = asyncio.Event()
+
+    async def update_node(owner, sid, *, source='web', downgrade=False):
+        if sid == relay:
+            await gate.wait()
+        return {'ok': True, 'changed': True, 'confirmed': True}
+
+    async def relay_ids(owner):
+        return {relay}
+    monkeypatch.setattr(e.servers, 'update_node', update_node)
+    monkeypatch.setattr(e.servers, '_relays', relay_ids)
+    assert (await api(e, 'GET', '/api/servers/node-update'))['run'] is None
+    # The request returns while the relay is still updating: no proxy timeout cuts it off.
+    run = (await asyncio.wait_for(api(e, 'POST', '/api/servers/node-update'), 5))['run']
+    assert run['running'] and run['total'] == 2
+
+    async def progress(check):
+        for _ in range(100):
+            now = (await api(e, 'GET', '/api/servers/node-update'))['run']
+            if check(now):
+                return now
+            await asyncio.sleep(0.02)
+        raise AssertionError(now)
+    now = await progress(lambda r: r['done'] == 1 and r['active'] == [relay])
+    assert now['running'] and now['items'][0]['serverId'] == plain and now['id'] == run['id']
+    # Asked again meanwhile, it joins the run instead of starting another.
+    again = (await api(e, 'POST', '/api/servers/node-update'))['run']
+    assert again['id'] == run['id'] and again['running']
+    gate.set()
+    done = await progress(lambda r: not r['running'])
+    assert done['done'] == done['total'] == 2 and done['active'] == [] and done['finishedAt'] >= done['startedAt']
+    assert [(i['serverId'], i.get('relay', False)) for i in done['items']] == [(plain, False), (relay, True)]
+    # Once over, the next one is a new run.
+    assert (await api(e, 'POST', '/api/servers/node-update'))['run']['id'] != run['id']
+
+
 async def test_automatic_updates_follow_the_switches(env, node_file, monkeypatch):  # noqa: F811
     e = env
     sid = await add_node(e, 'auto')
@@ -396,7 +436,8 @@ async def test_an_older_target_goes_on_a_node_only_when_asked_and_is_named_a_dow
     # Automatic updates and 全部更新 take the development node behind the target, not the one past it.
     settings(e, auto=True)
     assert [i['serverId'] for i in await e.servers.auto_update()] == [behind] and sent == [behind]
-    assert (await api(e, 'POST', '/api/servers/node-update'))['items'] == [] and sent == [behind]
+    run = (await api(e, 'POST', '/api/servers/node-update'))['run']
+    assert run['items'] == [] and not run['running'] and sent == [behind]
     # Updating it without asking for a downgrade changes nothing and says why.
     result = await api(e, 'POST', f'/api/servers/{ahead}/node/update')
     assert result['changed'] is False and result['state'] == 'ahead' and result['downgrade'] is True and sent == [behind]

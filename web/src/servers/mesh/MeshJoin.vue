@@ -260,7 +260,7 @@ function reset() { step.value = 0; Object.assign(d, {serverId: '', probe: null, 
         <li v-if="d.tags.trim()">标签：{{ d.tags.trim() }}</li>
       </ul>
       <p class="m3-callout" data-tone="info"><b>接下来会发生什么：</b>点“加入草稿”后，组网服务就开始往 {{ chosen?.name }} 上装（不影响它现有的网络，最多约 3 分钟）。装好后它排在节点列表第一行，画板上标着“待应用”；
-        这时它还没连进组网，设置都可以再改。确认无误后点顶部的“应用到网格”，它才按这些设置连上。</p>
+        这时它还没连进组网，设置都可以再改。确认无误后点顶部的“应用”，它才按这些设置连上。</p>
     </template>
 
     <template #footer>

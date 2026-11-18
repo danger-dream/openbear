@@ -76,10 +76,12 @@ func (f *files) event(method string, params *Obj) {
 				file.Close()
 			}
 		}
-		if !pyEqual(record.state, "inProgress") {
+		if !pyEqual(record.state, "inProgress") && !pyEqual(record.state, "completed") {
 			return
 		}
 		switch {
+		case record.tooLarge || record.overQuota:
+			// A queued cancellation may have raced this completed event.
 		case mustNum(record.received) > e.cfgNum("maxArtifactBytes"):
 			record.tooLarge = true
 		case f.used() > downloadQuota:
@@ -148,6 +150,21 @@ func (f *files) cancel(ctx context.Context, record *download) error {
 		if _, err := f.e.call(ctx, "Browser.cancelDownload", O("guid", record.guid), ""); err != nil {
 			return err
 		}
+		if pyEqual(record.state, "inProgress") {
+			record.state = "canceled"
+		}
+	}
+	if pyEqual(record.state, "completed") && (record.tooLarge || record.overQuota) {
+		// Never remove an arbitrary GUID path: capture/check the exact completed
+		// file, then delete that identity only. Other pages' downloads are untouched.
+		file, err := f.openDownload(record)
+		if err != nil {
+			return err
+		}
+		defer file.Close() // keep the checked inode alive through removal
+		if err := removeIdentifiedFile(filepath.Join(asStr(f.e.config.Must("downloadHostPath")), record.guid), *record.file); err != nil {
+			return err
+		}
 		record.state = "canceled"
 	}
 	return nil
@@ -210,6 +227,8 @@ func (f *files) upload(ctx context.Context, page *Page, params *Obj) (result any
 	}
 	limit := e.cfgNum("maxArtifactBytes")
 	defer func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		node.frame.run(ctx, "function(id){this.__fileTransfers.delete(id)}", transfer)
 		node.release(ctx)
 	}()

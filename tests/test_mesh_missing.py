@@ -41,7 +41,7 @@ async def meshed(e):
     members = added['members']
     members[0].update(role='relay', listen={'udp': 51999, 'tcp': 52000, 'tls': 0})
     rules = [{'src': {'all': True}, 'dst': {'all': True}, 'proto': 'icmp', 'note': 'ping'}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': rules, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     assert state['applied']['revision'] == 1 and all(p['state'] == 'done' for p in state['apply']['progress'])
@@ -73,7 +73,7 @@ async def test_a_lost_mesh_service_is_found_on_reconnect_said_once_and_skipped(e
     nodes.calls.clear()
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['rules'].append({'src': {'all': True}, 'dst': {'all': True}, 'proto': 'udp'})
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': draft['rules']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': draft['rules'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     progress = {p['serverId']: (p['state'], p['error']) for p in state['apply']['progress']}
@@ -134,7 +134,7 @@ async def test_a_delivery_refused_for_a_missing_service_marks_it_once(env):  # n
     # Gone while it stayed connected: the next delivery is the first to hear of it.
     gone.add(m2)
     draft = await api(e, 'GET', '/api/servers/mesh')
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': [*draft['rules'], {'src': {'all': True}, 'dst': {'all': True}, 'proto': 'udp'}]})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': [*draft['rules'], {'src': {'all': True}, 'dst': {'all': True}, 'proto': 'udp'}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
     progress = {p['serverId']: p['state'] for p in state['apply']['progress']}
@@ -157,7 +157,7 @@ async def test_reinstall_puts_the_service_back_and_issues_a_revision_keeping_the
     # An unapplied change waits in the draft.
     draft = await api(e, 'GET', '/api/servers/mesh')
     rules = [*draft['rules'], {'src': {'members': [ids['m2']]}, 'dst': {'members': [r1]}, 'proto': 'tcp', 'ports': [[22, 22]]}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': rules})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'rules': rules, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['draft']['dirty']
 
     # Refused: not an applied member, or offline.

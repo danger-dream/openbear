@@ -86,6 +86,7 @@ const band = ms => !Number.isFinite(ms) ? 'unk' : ms < 50 ? 'good' : ms < 130 ? 
 // ---- cards ----
 function funcs(m) {
   const out = [];
+  if (isRelay(m) && m.noTransit) out.push(['notransit', '不中转']);
   const nets = m.gateway?.subnets || [];
   if (nets.length) out.push(['lan', `${m.gateway.backup ? '备用 ' : '共享 '}${nets[0]}${nets.length > 1 ? ` +${nets.length - 1}` : ''}`]);
   if (m.proxy?.exit) out.push(['exit', '出口']);

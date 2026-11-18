@@ -124,7 +124,8 @@ def install(app, host, service):
     async def test_reminder(r, o): return await service.reminders.test(o)
     async def batch(r, o): return await service.exec_batch(o, await body(r))
     async def job(r, o): return await service.exec_job(o, r.match_info['job'])
-    async def update_all(r, o): return await service.update_nodes(o)
+    async def update_all(r, o): return await service.start_node_updates(o)
+    async def update_run(r, o): return service.node_update_run(o)
     async def push_url(r, o): return await service.push_node_url(o)
     async def update_one(r, o): return await service.update_node(o, r.match_info['id'], downgrade=(await body(r)).get('downgrade') is True)
     async def renew(r, o): return await service.renew(o, r.match_info['id'])
@@ -201,7 +202,7 @@ def install(app, host, service):
         ('PUT', '/settings', save_settings), ('GET', '/reminders', reminders), ('POST', '/reminders/test', test_reminder),
         ('GET', '/storage', storage), ('POST', '/storage/compact', compact_storage),
         ('GET', '/latency', latency_summary), ('POST', '/latency/refresh', latency_refresh),
-        ('POST', '/exec', batch), ('GET', '/exec/{job}', job), ('POST', '/node-update', update_all), ('POST', '/node-url', push_url),
+        ('POST', '/exec', batch), ('GET', '/exec/{job}', job), ('POST', '/node-update', update_all), ('GET', '/node-update', update_run), ('POST', '/node-url', push_url),
         ('POST', '/access-points/test', test_access), ('GET', '/registration-codes', codes), ('POST', '/registration-codes', add_code),
         ('DELETE', '/registration-codes/{code}', revoke_code), ('POST', '/batch-install', batch_install), ('GET', '/batch-install/{job}', batch_status),
         ('GET', '/node-release', node_release), ('POST', '/node-release/check', check_node_release),
@@ -343,7 +344,8 @@ def install(app, host, service):
                         buffer.clear()
                     if not piece:
                         return
-            result = await service.write_file(owner, server_id, path, chunks(), mode=mode, mkdirs=request.query.get('mkdirs') == '1', label='上传文件')
+            result = await service.write_file(owner, server_id, path, chunks(), mode=mode, mkdirs=request.query.get('mkdirs') == '1',
+                                              no_replace=request.query.get('overwrite') != '1', label='上传文件')
         except InstanceError as exc:
             return failure(exc)
         return web.json_response(result, headers={'Cache-Control': 'no-store'})

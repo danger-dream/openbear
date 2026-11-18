@@ -135,7 +135,7 @@ async def test_all_subnets_in_changes_and_the_network_test(env):  # noqa: F811
     members[0]['role'] = 'relay'
     members[1]['gateway'] = {'subnets': ['192.168.1.0/24']}
     saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'rules': [
-        {'src': {'all': True}, 'dst': {'allSubnets': True}, 'note': 'lan'}]})
+        {'src': {'all': True}, 'dst': {'allSubnets': True}, 'note': 'lan'}], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert [c['text'] for c in saved['draft']['changes'] if c['kind'] == 'subnet.add'] == ['GW 新增网关网段 192.168.1.0/24，规则 lan 会自动包含它']
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
@@ -145,7 +145,7 @@ async def test_all_subnets_in_changes_and_the_network_test(env):  # noqa: F811
     assert target == {'kind': 'gateway', 'dst': gw, 'subnet': '192.168.1.0/24'}
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][1]['gateway'] = {'subnets': ['192.168.2.0/24']}
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert [c['text'] for c in saved['draft']['changes'] if c['kind'].startswith('subnet.')] == [
         'GW 新增网关网段 192.168.2.0/24，规则 lan 会自动包含它', 'GW 移除网关网段 192.168.1.0/24，规则 lan 不再包含它']
     assert saved['exports'] == [{'gateway': gw, 'subnet': '192.168.2.0/24', 'nodes': [r1, m1]}]
@@ -239,14 +239,14 @@ async def test_listen_ports_in_use_warn_on_save_and_refuse_apply(env):  # noqa: 
     # Adding them already asked about their default ports (the overview it returned); r1's answer is kept.
     assert sorted(calls, key=str) == sorted([(r1, {'tcp': [], 'udp': [51999]}), (win, {'tcp': [], 'udp': [51999]})], key=str)
     calls.clear()
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     ports = [w for w in saved['warnings'] if w['error'].startswith('mesh_port')]
     assert ports == [{'path': 'members[1].listen.udp', 'error': 'mesh_port_in_use',
                       'message': '公司-Windows 的 UDP 端口 52020 已被 svchost.exe（PID 4242） 占用，组网服务无法监听它。请换一个端口，或先停掉占用它的程序'}]
     # Berlin, now a public relay with its ports left to the mesh, opens TCP for newcomers too.
     assert sorted(calls, key=str) == sorted([(r1, {'tcp': [52000], 'udp': [51999]}), (win, {'tcp': [], 'udp': [52020]})], key=str)
     # Kept for a while: saving again or reading the overview asks nothing.
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'GET', '/api/servers/mesh')
     assert len(calls) == 2
     # Applying checks again, now: still held, so refused as an error and nothing goes out.
@@ -264,7 +264,7 @@ async def test_listen_ports_in_use_warn_on_save_and_refuse_apply(env):  # noqa: 
     assert not [w for w in draft['warnings'] if w['error'].startswith('mesh_port')] and calls == []
     draft['members'][0]['listen'] = {'udp': 51999, 'tcp': 443}
     held[(r1, 'tcp', 443)] = ('nginx', 0, False)
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert calls == [(r1, {'tcp': [443], 'udp': []})]
     assert [w['message'] for w in saved['warnings'] if w['error'] == 'mesh_port_in_use'] == [
         'Berlin 的 TCP 端口 443 已被 nginx 占用，组网服务无法监听它。请换一个端口，或先停掉占用它的程序']
@@ -328,7 +328,7 @@ async def test_a_silent_node_never_holds_up_the_overview(env, monkeypatch):  # n
     members = views[0]['members']
     # Its ports set by hand as they are, so the check under way covers them (left to the mesh, a relay also opens TCP).
     members[0].update(role='relay', auto=[])
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert unchecked(saved) == [silence] and calls == [a, a]
     view, took = await overview()
     assert unchecked(view) == [silence] and took < 0.3 and calls == [a, a]
@@ -348,7 +348,7 @@ async def test_the_overview_suggests_gateway_subnets(env):  # noqa: F811
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [gw]})
     assert added['members'][0]['subnetSuggestions'] == ['192.168.50.0/24']
     # Sent back with the draft, it is accepted and not stored.
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members']})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': added['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['members'][0]['subnetSuggestions'] == ['192.168.50.0/24']
     assert 'subnetSuggestions' not in (await e.servers.mesh._load(123, 'draft'))['members'][0]
     assert (await api(e, 'GET', f'/api/servers/mesh/members/{gw}'))['member']['subnetSuggestions'] == ['192.168.50.0/24']

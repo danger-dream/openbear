@@ -150,3 +150,13 @@ test('removal invalidates old branch/search responses and releases search loadin
 test('local draft submitted while removal confirmation is open is not deleted as a server conversation',async()=>{
  const pending=defer();const h=harness({confirm:()=>pending.promise});const job=h.remove(local());h.ctx.conversations.value=[conv('persisted')];h.ctx.activeConversationUuid.value='persisted';pending.resolve();await job;assert.deepEqual(h.calls.deletes,[]);assert.deepEqual(h.calls.clears,[]);assert.equal(h.ctx.activeConversationUuid.value,'persisted');
 });
+test('focusLocalConversation skips redundant console-refresh when switching from a saved conversation',async()=>{
+ let consoleRefreshes=0;
+ const h=harness({rows:[conv('saved')],active:'saved'});
+ h.ctx.refreshConsoleAfterPropSync=async()=>{consoleRefreshes+=1;};
+ await h.run("handleTreeNewConversation('')");
+ assert.equal(h.ctx.activeConversationUuid.value,'local:new');
+ assert.equal(consoleRefreshes,0);
+ await h.run("handleTreeNewConversation('')");
+ assert.equal(consoleRefreshes,1);
+});

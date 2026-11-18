@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 import socket
 import threading
 
@@ -50,6 +51,28 @@ async def test_ssh_to_a_front_never_goes_direct():
         assert 'https://' not in probe and 'ip=' in probe
 
 
+async def test_scp_shares_the_ssh_login(monkeypatch, tmp_path):
+    with pytest.raises(InstanceError) as raised:
+        await instance_servers._scp(None, {'host': '192.0.2.1', 'port': 22, 'username': 'root', 'via': ['exit']}, tmp_path / 'f', 'f')
+    assert raised.value.error == 'front_exit_offline'
+    seen = []
+
+    async def fake_process(args, *, stdin=b'', timeout=120, env=None):
+        seen.append((args, env))
+        return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': '', 'stderr': 'hunter2-long in a message'}
+    monkeypatch.setattr(instance_servers, '_process', fake_process)
+    target = {'host': 'fd00::5', 'port': 2222, 'username': 'zy', 'auth': 'password', 'password': 'hunter2-long'}
+    result = await instance_servers._scp(None, target, tmp_path / 'node.exe', 'openbear-node-1.exe')
+    await instance_servers._ssh(None, target, 'whoami')
+    (scp, env), (ssh, _) = seen
+    assert scp[0] == 'scp' and scp[-2:] == [str(tmp_path / 'node.exe'), '[fd00::5]:openbear-node-1.exe'] and scp[scp.index('-P') + 1] == '2222'
+    assert ssh[0] == 'ssh' and ssh[-2:] == ['fd00::5', 'whoami'] and ssh[ssh.index('-p') + 1] == '2222'
+    def options(args, end):
+        return [re.sub(r'/openbear-ssh-[^/]+/', '/run/', a) for a in args[1:args.index(end)]]
+    assert options(scp, '-q') == options(ssh, '-T') and 'User=zy' in scp and 'PubkeyAuthentication=no' in scp
+    assert env['OPENBEAR_SSH_SECRET'] == 'hunter2-long' and 'hunter2-long' not in result['stderr']
+
+
 def test_front_install_arguments():
     args = install.arguments('https://10.0.10.246:52002', 'c0de', '', 'enroll', pin='a' * 64, backup_pin='b' * 64, front=True, binary='/tmp/n')
     assert '--pin ' + 'a' * 64 in args and '--front' in args and '--binary /tmp/n' in args
@@ -78,9 +101,10 @@ async def test_front_enrolls_and_runs_through_its_exit(env, node_binary):
     assert point['url'] == f'https://127.0.0.1:{port}' and point['serverId'] == exit_id
     access = await e.servers.onboarding.access(OWNER, front_id)
     assert access['front'] and access['url'] == point['url'] and len(access['pins'][0]) == 64
-    # No install command to paste: a front is installed from the panel, over SSH through its exit.
+    # Its install command fetches through the exit and enrolls by the exit's certificate.
     enrollment = await api(e, 'POST', f'/api/servers/{front_id}/enrollment')
-    assert enrollment['command'] == '' and enrollment['windowsCommand'] == ''
+    assert f"{access['url']}/api/server-nodes/v1/install.sh" in enrollment['command'] and '--front' in enrollment['command'].split()
+    assert access['pins'][0] in enrollment['command'] and access['pins'][0] in enrollment['windowsCommand']
 
     config = e.tmp / 'front.json'
     enrolled = await asyncio.create_subprocess_exec(str(node_binary), 'enroll', '--url', access['url'], '--pin', access['pins'][0], '--front',
@@ -178,6 +202,84 @@ async def test_front_install_sends_the_node_over_ssh_and_enrolls_by_the_exits_ce
         assert _arg(command, '--url') == f'https://10.0.10.246:{port}' and _arg(command, '--pin') == 'ab' * 32
     # The front is never told to fetch anything: the script it runs is the controller's, sent over SSH.
     assert all('curl' not in c[1] and 'wget' not in c[1] for c in calls)
+
+
+def _ps_body(command):
+    return base64.b64decode(command.split()[-1]).decode('utf-16-le')
+
+
+def _ps_arg(body, name):
+    found = re.search(rf"-{name} '([^']*)'", body)
+    return found.group(1) if found else ''
+
+
+async def test_windows_front_gets_the_node_and_the_script_by_scp(env, monkeypatch, shipped):
+    """A Windows front: an administrator logging in with a password needs no sudo, and the node
+    program and, before every stage, the controller's script go by scp into the login's home."""
+    from app.servers import onboarding
+    from tests import fake_node
+    from tests.test_servers import run_fake
+    e = env
+    monkeypatch.setattr(onboarding, 'ONLINE_WAIT', 15)
+    exit_id = (await api(e, 'POST', '/api/servers', {'name': '家-Kwrt'}))['item']['id']
+    front_id = (await api(e, 'POST', '/api/servers', {'name': '家-Windows', 'profile': {'front': {'exits': [{'serverId': exit_id, 'address': '10.10.10.254'}]}}}))['item']['id']
+    port = (await e.servers.settings())['frontPort']
+    (shipped / 'openbear-node-windows-amd64.exe').write_bytes(b'a windows node build')
+
+    async def ready(owner, front):
+        return None
+
+    async def status(server_id):
+        return {'port': port, 'fingerprint': 'ab' * 32, 'listening': True, 'error': ''} if server_id == exit_id else {}
+
+    async def target(owner, identity, **kw):
+        return {'id': identity, 'owner': owner, 'local': False, 'channel': 'ssh', 'host': '10.10.10.20', 'port': 22,
+                'username': 'zy', 'auth': 'password', 'password': 'pw', 'via': [exit_id]}
+
+    async def platform(target):
+        return 'windows'
+    calls, puts, config = [], [], e.tmp / 'front-windows-node.json'
+
+    async def fake_run(target, command, *, stdin=b'', timeout=120, sudo=False, root=False):
+        body = _ps_body(command)
+        stage = _ps_arg(body, 'Stage')
+        calls.append((stage, body, stdin, sudo, root, target.get('via')))
+        if stage == 'enroll':
+            await fake_node.enroll(e.url, _ps_arg(body, 'Code'), config)
+        if stage == 'service':
+            await run_fake(e, config)
+        out = 'arch=amd64 build=17763' if stage == 'check' else ''
+        return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': f'@@step {stage}\r\n{out}', 'stderr': '', 'knownHosts': ''}
+
+    async def fake_put(target, local, remote, *, timeout=600):
+        puts.append((local.read_bytes(), remote, target.get('via')))
+        return {'ok': True, 'exitCode': 0, 'timedOut': False, 'stdout': '', 'stderr': '', 'knownHosts': ''}
+    monkeypatch.setattr(e.servers.front, 'ensure', ready)
+    monkeypatch.setattr(e.servers.front, '_status', status)
+    monkeypatch.setattr(e.instances.servers, 'target', target)
+    monkeypatch.setattr(e.instances.servers, 'platform', platform)
+    monkeypatch.setattr(e.instances.servers, 'run', fake_run)
+    monkeypatch.setattr(e.instances.servers, 'put', fake_put, raising=False)
+    await api(e, 'POST', f'/api/servers/{front_id}/install')
+
+    async def finished():
+        state = (await api(e, 'GET', f'/api/servers/{front_id}'))['item']['install']
+        return state if state['state'] != 'running' else None
+    state = await wait_for(finished, 30)
+    assert state['state'] == 'done', (state.get('error'), [s.get('detail') for s in state['steps']])
+    assert [c[0] for c in calls] == ['check', 'download', 'enroll', 'service']
+    assert all(via == [exit_id] for _, _, via in puts)
+    programs = [p for p in puts if p[1].endswith('.exe')]
+    scripts = [p for p in puts if p[1].endswith('.ps1')]
+    assert len(programs) == 1 and programs[0][0] == b'a windows node build'
+    pushed = programs[0][1]
+    assert re.fullmatch(r'openbear-node-[0-9a-f]{12}\.exe', pushed)
+    assert len(scripts) == 4 and all(text == install.windows_script().encode() for text, _, _ in scripts)
+    for (stage, body, stdin, sudo, root, via), (_, script, _) in zip(calls, scripts):
+        assert stdin == b'' and not sudo and not root and via == [exit_id] and f"Join-Path $HOME '{script}'" in body
+        assert _ps_arg(body, 'Binary') == pushed and ' -Front' in body and _ps_arg(body, 'Pin') == 'ab' * 32
+        assert _ps_arg(body, 'Url') == f'https://10.10.10.254:{port}'
+        assert 'Invoke-WebRequest' not in body
 
 
 async def test_front_port_rejects_offline_front_and_keeps_the_access_a_failed_move_leaves(env, monkeypatch):

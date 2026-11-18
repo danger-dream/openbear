@@ -11,6 +11,8 @@ import {
 	Unlock,
 } from "@element-plus/icons-vue";
 import ConsoleComposer from "./ConsoleComposer.vue";
+import {normalizeImageOneTurn} from "./imageOneTurn.js";
+import {normalizePromptTemplate} from "./promptTemplate.js";
 import {referenceErrorText, referenceDisplayText, referencesInText} from "../../references/codec.js";
 import {referenceCatalog, acceptActivityReadReceipt} from "../../references/catalog.js";
 import {createActivityReadTracker, withActivityReadVersion} from "../../conversationActivity.js";
@@ -93,6 +95,7 @@ import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
 	deriveOperationRunState,
+	isContextCompactionOperation,
 	isRootRunTerminalFrame,
 	isTerminalOperationFrame,
 	normalizeOperations,
@@ -346,7 +349,10 @@ const outboundSends = createOutboundSendTracker({
 });
 const handleExternalRefresh = async () => {
 	const shouldFocus = isLocalConversation.value;
-	await load({scrollMode: "preserve"});
+	await load({
+		scrollMode: "preserve",
+		refreshDefaults: shouldFocus && localDefaultsFolderId !== String(props.folderId || ""),
+	});
 	if (shouldFocus) await focusComposer();
 };
 
@@ -443,10 +449,25 @@ const legacyContextTokens = computed(() => Math.max(0,
 	+ Number(usage.value.last_cache_read_tokens || 0)
 	+ Number(usage.value.last_cache_write_tokens || 0),
 ));
-const contextUsage = computed(() => resolveContextUsage(
+const baseContextUsage = computed(() => resolveContextUsage(
 	serverContextUsage.value,
 	legacyContextTokens.value,
 ));
+const loadedCompactionCount = computed(() => {
+	let count = 0;
+	for (const op of operationsById.value.values()) {
+		if (isContextCompactionOperation(op) && String(op?.status || "") === "completed") count += 1;
+	}
+	return count;
+});
+const compactionCount = computed(() => Math.max(
+	Math.floor(Number(baseContextUsage.value?.compactionCount) || 0),
+	loadedCompactionCount.value,
+));
+const contextUsage = computed(() => ({
+	...baseContextUsage.value,
+	compactionCount: compactionCount.value,
+}));
 const lastContextTokens = computed(() => contextUsage.value.known ? Number(contextUsage.value.tokens || 0) : 0);
 const modelCallRows = computed(() => Array.isArray(chatState.value?.modelCalls) ? chatState.value.modelCalls : []);
 const toolCallRows = computed(() => Array.isArray(chatState.value?.toolCalls) ? chatState.value.toolCalls : []);
@@ -510,6 +531,14 @@ const localAgentFast = ref(null);
 const localContextStrategy = ref("sliding_window");
 const contextStrategy = computed(() => isLocalConversation.value ? localContextStrategy.value : (displayedRunConfig.value?.contextStrategy || "sliding_window"));
 const strategySaving = ref(false);
+const localImageOneTurn = ref(normalizeImageOneTurn());
+const imageOneTurn = computed(() => isLocalConversation.value ? localImageOneTurn.value : normalizeImageOneTurn(displayedRunConfig.value?.imageOneTurn));
+const imageOneTurnSaving = ref(false);
+const localPromptTemplate = ref("");
+const promptTemplate = computed(() => isLocalConversation.value ? localPromptTemplate.value : normalizePromptTemplate(displayedRunConfig.value?.promptTemplate));
+const promptTemplateLocked = computed(() => sendPending.value || propertyPersisting.value || (!isLocalConversation.value && Boolean(displayedRunConfig.value?.promptTemplateLocked)));
+const promptTemplateMissing = computed(() => !isLocalConversation.value && Boolean(displayedRunConfig.value?.promptTemplateMissing));
+const promptTemplateSaving = ref(false), propertyPersisting = ref(false);
 const compactingUuid = ref("");
 const compacting = computed(() => compactingUuid.value === activeConversationUuid.value);
 const currentModel = computed(() => (isLocalConversation.value && localModel.value) ? localModel.value : (displayedRunConfig.value?.model || ""));
@@ -731,12 +760,16 @@ let propertyPersistence = null;
 async function persistForProperties() {
 	if (!isLocalConversation.value) return activeConversationUuid.value;
 	if (propertyPersistence) return propertyPersistence;
+	if (modelMutating.value || outboundSends.current) return;
+	const finishMutation = beginModelMutation();
+	propertyPersisting.value = true;
 	propertyPersistence = (async () => {
 		const sourceUuid = String(props.conversationUuid || '');
 		await ensureLocalRunDefaults();
 		if (props.conversationUuid !== sourceUuid || outboundSends.current) throw new Error('草稿状态已变化，请重试');
 		const extensions = extensionDraft(sourceUuid);
-		const created = await Api.createConversation({title:'新会话',runConfig:completeLocalRunConfig(),folderId:props.folderId || '',...(extensions ? {extensions} : {})});
+		const submittedRunConfig = completeLocalRunConfig();
+		const created = await Api.createConversation({title:'新会话',runConfig:submittedRunConfig,folderId:props.folderId || '',...(extensions ? {extensions} : {})});
 		const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid;
 		if (!uuid) throw new Error('conversation_create_failed');
 		forgetLocalDraftChoices();
@@ -744,11 +777,11 @@ async function persistForProperties() {
 		migrateAttachmentDraft(sourceUuid, uuid);
 		if (props.conversationUuid === sourceUuid) {
 			localToServerTransitionUuid.value = uuid;
-			chatState.value = {...(chatState.value || {}), conversationUuid:uuid};
+			chatState.value = mergeCreatedConversationState(chatState.value, created, uuid, submittedRunConfig);
 			emit('conversation-created',uuid);
 		} else emit('conversations-refresh');
 		await nextTick(); return uuid;
-	})().finally(() => { propertyPersistence = null; });
+	})().finally(() => { propertyPersistence = null; propertyPersisting.value = false; finishMutation(); });
 	return propertyPersistence;
 }
 defineExpose({discardConversationDraft, focusPendingInteraction, captureMobileViewportAnchor, restoreMobileViewportAnchor, savePropertyRunConfig, persistForProperties});
@@ -783,6 +816,8 @@ function applyDefaultLocalModel() {
 
 function applyLocalRunDefaults(defaults = {}) {
 	localContextStrategy.value = defaults.contextStrategy === "model_summary" ? "model_summary" : "sliding_window";
+	localImageOneTurn.value = normalizeImageOneTurn(defaults.imageOneTurn);
+	localPromptTemplate.value = normalizePromptTemplate(defaults.promptTemplate);
 	const main = modelOptions.value.find((item) => item.key === String(defaults.mainModel || "")) || primaryModelInfo();
 	if (!main) return applyDefaultLocalModel();
 	const mainLevels = modelThinkingLevels(main);
@@ -807,6 +842,8 @@ function applyLocalRunDefaults(defaults = {}) {
 function completeLocalRunConfig() {
 	return {
 		contextStrategy: localContextStrategy.value,
+		imageOneTurn: {...localImageOneTurn.value},
+		promptTemplate: localPromptTemplate.value,
 		mainModel: localModel.value,
 		mainThinkingLevel: localThinking.value || "off",
 		mainFastMode: Boolean(localFast.value),
@@ -817,10 +854,14 @@ function completeLocalRunConfig() {
 }
 
 // Explicit draft choices last until the draft is sent, deleted or retargeted;
-// navigating away and back to the same draft must not reset them.
+// navigating away and back to the same draft must not reset them, except that
+// a folder which sets the main model owns the model settings on every visit.
+const LOCAL_MODEL_CHOICE_FIELDS = ["mainModel", "mainThinkingLevel", "mainFastMode", "agentModel", "agentThinkLevel", "agentFastMode"];
 function forgetLocalDraftChoices() {
 	localDefaultsOverrides = {};
 	localDefaultsOverridesFolderId = null;
+	localDefaultsFolderId = null;
+	localFolderDefaults = {};
 }
 
 function rememberLocalDraftChoices(patch, folderId) {
@@ -828,11 +869,80 @@ function rememberLocalDraftChoices(patch, folderId) {
 	localDefaultsOverridesFolderId = folderId;
 }
 
+function leaveLocalDraft() {
+	const folderModel = String(localFolderDefaults.mainModel || "");
+	// An unavailable folder model falls back to the remembered defaults on the server.
+	if (!folderModel || !modelOptions.value.some((m) => m.key === folderModel)) return;
+	localDefaultsOverrides = Object.fromEntries(Object.entries(localDefaultsOverrides)
+		.filter(([key]) => !LOCAL_MODEL_CHOICE_FIELDS.includes(key)));
+}
+
+function localAgentRunConfigSnapshot(mainModelKey, mainThinkingLevel) {
+	const model = localAgentModel.value || "";
+	const thinkLevel = localAgentThinking.value || "";
+	const fastMode = localAgentFast.value === true || localAgentFast.value === false ? localAgentFast.value : null;
+	const effectiveModel = model || mainModelKey || "";
+	const info = modelOptions.value.find((m) => m.key === effectiveModel) || null;
+	const levels = modelThinkingLevels(info);
+	const defaultThinking = modelDefaultThinking(info) || "";
+	const requestedThink = thinkLevel || mainThinkingLevel || "off";
+	const supportedThink = levels.includes(requestedThink);
+	const effectiveThink = supportedThink ? requestedThink : (defaultThinking || "off");
+	const mainFast = Boolean(localFast.value);
+	const effectiveFast = Boolean(info?.supportsFast) && (fastMode === null ? mainFast : fastMode === true);
+	return {
+		model,
+		thinkLevel,
+		fastMode,
+		effective: {
+			model: effectiveModel,
+			thinkLevel: effectiveThink,
+			thinkingLevels: levels,
+			defaultThinkingLevel: defaultThinking,
+			supportsThinking: levels.length > 0,
+			fastMode: effectiveFast,
+			fastSupported: Boolean(info?.supportsFast),
+		},
+	};
+}
+
+function syncLocalChatStateRunConfig(uuid = props.conversationUuid || "local:new") {
+	if (!chatState.value || typeof chatState.value !== "object") return;
+	const model = modelOptions.value.find((m) => m.key === localModel.value) || primaryModelInfo();
+	const modelKey = localModel.value || model?.key || "";
+	const thinking = localThinking.value || modelDefaultThinking(model) || "";
+	const effectiveThinkingLevel = thinking || "off";
+	const fast = Boolean(localFast.value && model?.supportsFast);
+	chatState.value = {
+		...chatState.value,
+		conversationUuid: String(uuid || chatState.value.conversationUuid || "local:new"),
+		contextStrategy: localContextStrategy.value || "sliding_window",
+		model: modelKey,
+		thinkingLevel: thinking,
+		effectiveThinkingLevel,
+		thinkingLevels: modelThinkingLevels(model),
+		defaultThinkingLevel: modelDefaultThinking(model),
+		fastMode: fast,
+		effectiveFastMode: fast,
+		fastSupported: Boolean(model?.supportsFast),
+		agentRunConfig: localAgentRunConfigSnapshot(modelKey, effectiveThinkingLevel),
+		imageOneTurn: {...localImageOneTurn.value},
+		promptTemplate: localPromptTemplate.value,
+		promptTemplateLocked: false,
+		contextWindow: Number(model?.contextWindow || 0),
+		rolloverTriggerTokens: Number(model?.rolloverTriggerTokens || 0),
+		windowTriggerRatio: Number(model?.windowTriggerRatio || 0.7),
+	};
+}
+
 async function loadLocalRunDefaults(uuid = props.conversationUuid) {
 	const requestSeq = ++defaultsRequestSeq;
 	const expectedUuid = String(uuid || "");
 	const folderId = String(props.folderId || "");
-	if (localDefaultsOverridesFolderId !== folderId) forgetLocalDraftChoices();
+	if (localDefaultsOverridesFolderId !== folderId) {
+		forgetLocalDraftChoices();
+		applyDefaultLocalModel();
+	}
 	localDefaultsFolderId = null;
 	const pending = {uuid: expectedUuid, folderId, promise: null};
 	localDefaultsLoading = pending;
@@ -845,6 +955,7 @@ async function loadLocalRunDefaults(uuid = props.conversationUuid) {
 			localFolderDefaults = data?.folderDefaults || {};
 			localDefaultsFolderId = folderId;
 			applyLocalRunDefaults({...defaults, ...localDefaultsOverrides});
+			if (!outboundSends.current) syncLocalChatStateRunConfig(expectedUuid);
 			return true;
 		} catch {
 			// Both temporary and project drafts must load their scoped defaults
@@ -883,7 +994,7 @@ async function saveLocalRunDefaults(patch, expectedUuid, folderId) {
 	await ensureLocalRunDefaults();
 	if (props.conversationUuid !== expectedUuid || String(props.folderId || "") !== folderId || !isLocalConversation.value) return null;
 	const requestSeq = ++defaultsRequestSeq;
-	if (Object.keys(localFolderDefaults).length || Object.hasOwn(patch, "contextStrategy")) {
+	if (Object.keys(localFolderDefaults).length || Object.hasOwn(patch, "contextStrategy") || Object.hasOwn(patch, "imageOneTurn") || Object.hasOwn(patch, "promptTemplate")) {
 		rememberLocalDraftChoices(patch, folderId);
 		// A one-off choice in a project draft is not a global preference update
 		// and must not reset the other fields inherited from that project.
@@ -899,7 +1010,8 @@ async function saveLocalRunDefaults(patch, expectedUuid, folderId) {
 	}
 	appliedDefaultsRevision = revision;
 	rememberLocalDraftChoices(patch, folderId);
-	applyLocalRunDefaults({...defaults, ...(Object.hasOwn(localDefaultsOverrides, "contextStrategy") ? {contextStrategy: localDefaultsOverrides.contextStrategy} : {})});
+	const localOnly = Object.fromEntries(["contextStrategy", "imageOneTurn", "promptTemplate"].filter(key => Object.hasOwn(localDefaultsOverrides, key)).map(key => [key, localDefaultsOverrides[key]]));
+	applyLocalRunDefaults({...defaults, ...localOnly});
 	resetLocalConversationState(expectedUuid || "local:new");
 	return defaults || null;
 }
@@ -1063,6 +1175,7 @@ function resetLocalConversationState(uuid = props.conversationUuid || "local:new
 	chatState.value = {
 		conversationUuid: uuid,
 		sessionUuid: "",
+		contextStrategy: localContextStrategy.value || "sliding_window",
 		model: localModel.value || model?.key || "",
 		thinkingLevel: localThinking.value || modelDefaultThinking(model) || "",
 		effectiveThinkingLevel: localThinking.value || modelDefaultThinking(model) || "off",
@@ -1072,7 +1185,9 @@ function resetLocalConversationState(uuid = props.conversationUuid || "local:new
 		effectiveFastMode: localFast.value && Boolean(model?.supportsFast),
 		fastSupported: Boolean(model?.supportsFast),
 		agentRunConfig: buildLocalAgentRunConfig(),
+		contextWindow: Number(model?.contextWindow || 0),
 		rolloverTriggerTokens: Number(model?.rolloverTriggerTokens || 0),
+		windowTriggerRatio: Number(model?.windowTriggerRatio || 0.7),
 		usage: normalizeLedgerUsageBaseline({}),
 		modelCalls: [],
 		toolCalls: [],
@@ -1694,6 +1809,34 @@ async function selectContextStrategy(strategy) {
 	} catch (error) {
 		if (isRunConfigInteractionCurrent(uuid, local)) ElMessage.error(apiError(error));
 	} finally { strategySaving.value = false; }
+}
+
+async function selectImageOneTurn(patch) {
+	if (imageOneTurnSaving.value || !patch || typeof patch !== "object") return;
+	const uuid = String(activeConversationUuid.value || "");
+	const local = isLocalConversation.value;
+	imageOneTurnSaving.value = true;
+	try {
+		if (local) await patchLocalRunDefaults({imageOneTurn: {...imageOneTurn.value, ...patch}});
+		else await runConfigSaves.enqueue(uuid, () => Api.conversationSetImageOneTurn(uuid, patch));
+	} catch (error) {
+		if (isRunConfigInteractionCurrent(uuid, local)) ElMessage.error(apiError(error));
+	} finally { imageOneTurnSaving.value = false; }
+}
+
+async function selectPromptTemplate(value) {
+	if (promptTemplateSaving.value || promptTemplateLocked.value || propertyPersistence || outboundSends.current) return;
+	const uuid = String(activeConversationUuid.value || "");
+	const local = isLocalConversation.value;
+	const id = normalizePromptTemplate(value);
+	const finishMutation = beginModelMutation();
+	promptTemplateSaving.value = true;
+	try {
+		if (local) await patchLocalRunDefaults({promptTemplate: id});
+		else await runConfigSaves.enqueue(uuid, () => Api.conversationSetPromptTemplate(uuid, id));
+	} catch (error) {
+		if (isRunConfigInteractionCurrent(uuid, local)) ElMessage.error(apiError(error));
+	} finally { promptTemplateSaving.value = false; finishMutation(); }
 }
 
 async function compactContext() {
@@ -2603,6 +2746,7 @@ function applyOperationFrameMessage(frame, options = {}) {
 		needsResync: false,
 		revisionGap: null,
 	};
+	const prevStatus = store.operationsById.get(frame.opId)?.status;
 	const changed = applyOperationFrame(store, frame);
 	if (store.needsResync) {
 		debugFrames("frame-revision-gap", {revisionGap: store.revisionGap, frame});
@@ -2630,11 +2774,13 @@ function applyOperationFrameMessage(frame, options = {}) {
 			&& appliedOperation?.payload?.windowVersion
 			&& chatState.value
 		) {
+			const added = appliedOperation.opType === "context_compaction" && prevStatus !== "completed" ? 1 : 0;
+			const nextCompactions = Math.max(0, Math.floor(Number(chatState.value.contextUsage?.compactionCount) || 0)) + added;
 			chatState.value = {
 				...chatState.value,
 				contextUsage: invalidateContextUsage(
 					chatState.value.contextUsage,
-					{...appliedOperation.payload, rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0)},
+					{...appliedOperation.payload, compactionCount: nextCompactions, rolloverTriggerTokens: Number(chatState.value.rolloverTriggerTokens || 0)},
 				),
 			};
 		}
@@ -3953,7 +4099,8 @@ async function ensureServerConversationForSend(firstText, pending) {
 		throw new Error("本地会话默认配置尚未读取完成，草稿和附件已保留");
 	const title = initialConversationTitle(referenceDisplayText(firstText || "新会话"));
 	const extensions = extensionDraft(pending.conversationUuid);
-	const created = await Api.createConversation({title, runConfig: pending.localRunConfig || completeLocalRunConfig(), folderId: pending.localFolderId, ...(extensions ? {extensions} : {})});
+	const submittedRunConfig = pending.localRunConfig || completeLocalRunConfig();
+	const created = await Api.createConversation({title, runConfig: submittedRunConfig, folderId: pending.localFolderId, ...(extensions ? {extensions} : {})});
 	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
 	if (!uuid) throw new Error("conversation_create_failed");
@@ -3967,7 +4114,7 @@ async function ensureServerConversationForSend(firstText, pending) {
 	// follow the conversation to its server id before any receipt can arrive.
 	migrateAttachmentDraft(sourceUuid, uuid);
 	if (stillViewingSource) {
-		chatState.value = {...(chatState.value || {}), conversationUuid: uuid};
+		chatState.value = mergeCreatedConversationState(chatState.value, created, uuid, submittedRunConfig);
 		emit("conversation-created", uuid);
 	} else {
 		clearDraftForConversation(sourceUuid);
@@ -3975,6 +4122,68 @@ async function ensureServerConversationForSend(firstText, pending) {
 	}
 	await nextTick();
 	return uuid;
+}
+
+function mergeCreatedConversationState(previousState, created, uuid, submittedRunConfig = null) {
+	const prev = previousState && typeof previousState === "object" ? previousState : {};
+	const serverState = created?.state && typeof created.state === "object" ? created.state : null;
+	if (serverState) {
+		const {
+			messages: _messages,
+			operations: _operations,
+			running: _running,
+			backgroundRunning: _backgroundRunning,
+			live: _live,
+			...authoritative
+		} = serverState;
+		return {
+			...prev,
+			...authoritative,
+			conversationUuid: uuid,
+			conversation: created?.conversation && typeof created.conversation === "object"
+				? {...(serverState.conversation || {}), ...created.conversation, conversationUuid: uuid}
+				: {...(serverState.conversation || prev.conversation || {}), conversationUuid: uuid},
+		};
+	}
+	const fallback = {...prev, conversationUuid: uuid};
+	if (created?.conversation && typeof created.conversation === "object") {
+		fallback.conversation = {...(prev.conversation || {}), ...created.conversation, conversationUuid: uuid};
+	}
+	if (submittedRunConfig && typeof submittedRunConfig === "object") {
+		if (submittedRunConfig.contextStrategy) fallback.contextStrategy = submittedRunConfig.contextStrategy;
+		if (submittedRunConfig.imageOneTurn) fallback.imageOneTurn = normalizeImageOneTurn(submittedRunConfig.imageOneTurn);
+		if (Object.hasOwn(submittedRunConfig, "promptTemplate")) fallback.promptTemplate = normalizePromptTemplate(submittedRunConfig.promptTemplate);
+		if (submittedRunConfig.mainModel) fallback.model = submittedRunConfig.mainModel;
+		if (submittedRunConfig.mainThinkingLevel) {
+			fallback.thinkingLevel = submittedRunConfig.mainThinkingLevel;
+			fallback.effectiveThinkingLevel = submittedRunConfig.mainThinkingLevel;
+		}
+		if (typeof submittedRunConfig.mainFastMode === "boolean") {
+			fallback.fastMode = submittedRunConfig.mainFastMode;
+			fallback.effectiveFastMode = submittedRunConfig.mainFastMode;
+		}
+		if (
+			Object.hasOwn(submittedRunConfig, "agentModel")
+			|| Object.hasOwn(submittedRunConfig, "agentThinkLevel")
+			|| Object.hasOwn(submittedRunConfig, "agentFastMode")
+		) {
+			const prevAgent = prev.agentRunConfig && typeof prev.agentRunConfig === "object" ? prev.agentRunConfig : {};
+			const agentModel = String(submittedRunConfig.agentModel || "");
+			const effectiveAgentModel = agentModel || String(fallback.model || "");
+			fallback.agentRunConfig = {
+				...prevAgent,
+				model: agentModel,
+				thinkLevel: String(submittedRunConfig.agentThinkLevel || ""),
+				fastMode: submittedRunConfig.agentFastMode === true || submittedRunConfig.agentFastMode === false
+					? submittedRunConfig.agentFastMode : null,
+				effective: {
+					...(prevAgent.effective || {}),
+					model: effectiveAgentModel,
+				},
+			};
+		}
+	}
+	return fallback;
 }
 
 function applyLoadedConversationState(data, conversationUuid, {replaceOperations = false, runConfigVersionAtRequest = null} = {}) {
@@ -4409,6 +4618,7 @@ async function switchConversation(next, prev) {
 			setDraftForConversation(prev, restoreOutboundDraft(pending.draftText, draft.value));
 		} else setDraftForConversation(prev, draft.value);
 	}
+	if (String(prev || "").startsWith("local:")) leaveLocalDraft();
 	resetAgentAutoOpenBoundary();
 	const isLocalToServerSend = String(prev || "").startsWith("local:")
 		&& next
@@ -4463,12 +4673,24 @@ watch(activeConversationUuid, next => workItems.setConversation(next), {immediat
 watch(running, () => workItems.schedule(300));
 watch(searchReturnPosition, value => { if (!value) { workItemReturn.value = null; noteReturn.value = null; } });
 watch([activeConversationUuid, loading], ([uuid, busy]) => {
+	if (!busy && window.__openbearPendingConversationLocate && window.__openbearPendingConversationLocate.conversationUuid === uuid) {
+		const extTarget = window.__openbearPendingConversationLocate;
+		window.__openbearPendingConversationLocate = null;
+		if (extTarget.opId) void locateFromNotes(extTarget);
+		return;
+	}
 	if (!busy && pendingCrossConversationNoteLocate && pendingCrossConversationNoteLocate.conversationUuid === uuid) {
 		const pendingTarget = pendingCrossConversationNoteLocate;
 		pendingCrossConversationNoteLocate = null;
 		void locateFromNotes(pendingTarget);
 	}
 });
+
+function handleExternalLocateConversation(event) {
+	const detail = event?.detail || {};
+	if (!detail.conversationUuid) return;
+	if (detail.opId) void locateFromNotes(detail);
+}
 
 
 watch(() => props.folderId, (next, prev) => {
@@ -4537,6 +4759,7 @@ onMounted(async () => {
 	document.addEventListener("visibilitychange", scheduleActivityRead);
 	window.addEventListener("openbear:console-refresh", handleExternalRefresh);
 	window.addEventListener("openbear:folder-properties-changed", handleFolderPropertiesChanged);
+	window.addEventListener("openbear:locate-conversation-ready", handleExternalLocateConversation);
 	window.addEventListener("focus", checkConnectionOnResume);
 	window.addEventListener("pageshow", checkConnectionOnResume);
 	window.addEventListener("online", checkConnectionOnResume);
@@ -4575,6 +4798,7 @@ onBeforeUnmount(() => {
 	terminalStateRefreshScheduler.dispose();
 	window.removeEventListener("openbear:console-refresh", handleExternalRefresh);
 	window.removeEventListener("openbear:folder-properties-changed", handleFolderPropertiesChanged);
+	window.removeEventListener("openbear:locate-conversation-ready", handleExternalLocateConversation);
 	defaultsRequestSeq += 1;
 	window.removeEventListener("focus", checkConnectionOnResume);
 	window.removeEventListener("pageshow", checkConnectionOnResume);
@@ -4601,6 +4825,7 @@ onBeforeUnmount(() => {
 				:tokens-text="totalTokensDisplay"
 				:tokens-detail="totalTokensDetail"
 				:cache-percent-text="cachePct(totalTokenParts.cache, totalTokenParts.input)"
+				:compaction-count="compactionCount"
 				:duration-ms="totalDurationMs"
 				:cost-text="totalCostDisplay"
 			>
@@ -4803,6 +5028,12 @@ onBeforeUnmount(() => {
 				:can-send="canSend"
 				:context-strategy="contextStrategy"
 				:strategy-saving="strategySaving"
+				:image-one-turn="imageOneTurn"
+				:image-one-turn-saving="imageOneTurnSaving"
+				:prompt-template="promptTemplate"
+				:prompt-template-locked="promptTemplateLocked"
+				:prompt-template-missing="promptTemplateMissing"
+				:prompt-template-saving="promptTemplateSaving"
 				:can-compact="canCompact"
 				:compacting="compacting"
 				:context-display="contextDisplay"
@@ -4824,6 +5055,8 @@ onBeforeUnmount(() => {
 				@toggle-model-menu="toggleModelMenu"
 				@select-model="selectModel"
 				@select-context-strategy="selectContextStrategy"
+				@update-image-one-turn="selectImageOneTurn"
+				@update-prompt-template="selectPromptTemplate"
 				@compact="compactContext"
 				@select-thinking="selectThinking"
 				@toggle-fast-mode="toggleFastMode"

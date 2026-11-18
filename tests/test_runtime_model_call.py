@@ -219,6 +219,40 @@ async def test_malformed_tool_call_retry_asks_for_simpler_arguments():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repetition", [
+    fault("output_repetition_detected: 检测到模型输出连续重复，已中止生成", status=200, retryable=True,
+          reason="unknown", root_cause={"classification": "stream_upstream_error",
+                                         "code": "output_repetition_detected", "retryable": True}),
+    fault("api_error: 检测到模型输出连续重复", status=200, retryable=True, reason="unknown",
+          root_cause={"code": "output_repetition_detected"}),
+], ids=["message", "root-code"])
+async def test_output_repetition_retry_discards_the_repeated_partial(repetition):
+    from app.runtime.model_call import _OUTPUT_REPETITION_RECOVERY_INSTRUCTION, _RECOVERY_INSTRUCTION
+
+    backend = FakeStream([
+        [StreamEvent("content", text="loop loop loop loop"), repetition],
+        [StreamEvent("content", text="partial"), fault()],
+        [StreamEvent("content", text=" answer"), StreamEvent("finish", finish_reason="stop")],
+    ])
+    tails, shown = [], []
+
+    def prepare(tail):
+        tails.append(copy.deepcopy(tail))
+        return req(backend, [{"role": "user", "content": "origin"}, *tail])
+
+    async def on_event(ev, logical, attempt):
+        if ev.kind == "content":
+            shown.append(logical.text)
+
+    result = await driver().call(prepare, lambda outcome: None, on_event=on_event)
+    assert result.response.text == "partial answer"
+    assert shown == ["loop loop loop loop", "partial", "partial answer"]
+    assert tails[1] == [{"role": "user", "content": _OUTPUT_REPETITION_RECOVERY_INSTRUCTION}]
+    assert tails[2] == [{"role": "assistant", "content": "partial"},
+                        {"role": "user", "content": _RECOVERY_INSTRUCTION}]
+
+
+@pytest.mark.asyncio
 async def test_reasoning_accumulation_switch_and_no_unsigned_tail():
     backend = FakeStream([
         [StreamEvent("reasoning", text="old", signature="old-sig"), fault()],

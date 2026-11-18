@@ -11,6 +11,7 @@ import { userStorage } from '../sessionBoundary.js';
 import { MOBILE_VIEWPORT_QUERY } from "../mobileViewport.js";
 import ModelSettings from "./ModelSettings.vue";
 import PromptPolicyEditor from "./PromptPolicyEditor.vue";
+import PersonaSelect from "./PersonaSelect.vue";
 import FolderExtensionDefaults from "./FolderExtensionDefaults.vue";
 import PromptImpactDialog from "./PromptImpactDialog.vue";
 import {normalizePromptPolicy, promptPolicyFlags} from "./promptPolicy.js";
@@ -30,7 +31,7 @@ import ConversationSelectionBar from "./ConversationSelectionBar.vue";
 import { automaticRow, batchMessage, rangeSelection, selectableRow } from "./conversationTreeSelection.js";
 import { modelDefaultThinking, modelThinkingLevels } from "../views/consoleView/display.js";
 import {
-  RUN_DEFAULT_FIELDS, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
+  RUN_DEFAULT_FIELDS, RUN_DEFAULT_INHERIT, hasRunDefault, normalizedRunDefaults, resolvedRunDefaults,
   runDefaultOption, sparseRunDefaults, updateRunDefault,
 } from "./folderRunDefaults.js";
 
@@ -1326,8 +1327,8 @@ async function showProperties(row, initialTab = 'context') {
     const data = extensionsResult.value;
     folderExtensionCatalog.value = data.extensions || [];
     folderExtensionInherited.value = data.inherited || null;
-    // A top-level folder or the temporary node has nothing above it to inherit from: it edits its own setting.
-    folderExtensionsCanInherit.value = typeof data.canInherit === "boolean" ? data.canInherit : !propertiesForm.temporary && !!propertiesForm.parentId;
+    // Every folder and the temporary node inherit, a top-level one and the temporary node from the system default.
+    folderExtensionsCanInherit.value = typeof data.canInherit === "boolean" ? data.canInherit : true;
     const own = data.default?.own ? data.default : null;
     folderExtensions.value = {inherit: !own && folderExtensionsCanInherit.value,
       enabled: [...((own || data.inherited)?.enabled || [])], autoAllow: !!(own || data.inherited)?.autoAllow};
@@ -1439,6 +1440,13 @@ function setRunDefault(field, selection) {
   propertiesForm.runDefaults = updateRunDefault(propertiesForm.runDefaults, field, selection);
   if (field === "mainModel") cleanMainDefaultsForModel();
   else if (field === "agentModel") cleanAgentDefaultsForModel();
+}
+const folderPromptOverridden = computed(() => {
+  const local = folderPromptPolicy.value;
+  return (local.text.trim() ? local : normalizePromptPolicy(propertiesForm.inheritedPromptPolicy)).overrideSystemPrompt;
+});
+function setPersonaDefault(value) {
+  setRunDefault("promptTemplate", value === null ? RUN_DEFAULT_INHERIT : runDefaultOption(value));
 }
 function clearRunDefaults() {
   propertiesForm.runDefaults = {};
@@ -2055,6 +2063,12 @@ onBeforeUnmount(() => {
                 </label>
 
               </section>
+              <section class="property-section" aria-label="人设">
+                <PersonaSelect :value="hasRunDefault(propertiesForm.runDefaults, 'promptTemplate') ? propertiesForm.runDefaults.promptTemplate : null"
+                               :inherited="inheritedRunDefaults.promptTemplate" inheritable :inherit-label="propertiesForm.temporary ? '使用系统默认' : '继承上级目录'"
+                               :disabled="propertiesLoading || propertiesSaving || !propertyModelsLoaded" :overridden="folderPromptOverridden"
+                               hint="只影响之后新建的会话；已经开始的会话保持原来的人设。" @change="setPersonaDefault" />
+              </section>
               <section class="property-section" aria-label="提示词配置">
                 <PromptPolicyEditor v-model="folderPromptPolicy" :disabled="propertiesLoading" :folder-id="propertiesForm.folderId" :inherited-policy="propertiesForm.inheritedPromptPolicy" :inherited-source-path="propertiesForm.inheritedPromptSourcePath" />
               </section>
@@ -2078,7 +2092,7 @@ onBeforeUnmount(() => {
                   <el-switch v-model="propertiesForm.hideFromRecent" aria-label="不显示在最近会话" :disabled="propertiesSaving" />
                 </label>
               </section>
-              <FolderExtensionDefaults v-if="folderExtensionsLoaded" v-model="folderExtensions" :catalog="folderExtensionCatalog" :inherited="folderExtensionInherited" :inherited-from="folderPath(folderExtensionInherited?.from)" :can-inherit="folderExtensionsCanInherit" :disabled="propertiesLoading || propertiesSaving" />
+              <FolderExtensionDefaults v-if="folderExtensionsLoaded" v-model="folderExtensions" :catalog="folderExtensionCatalog" :inherited="folderExtensionInherited" :inherited-from="folderPath(folderExtensionInherited?.from)" :can-inherit="folderExtensionsCanInherit" :top-level="propertiesForm.temporary || !propertiesForm.parentId" :disabled="propertiesLoading || propertiesSaving" />
               <el-alert v-else-if="!propertiesLoading" title="扩展设置暂时无法读取，重新打开属性再试" type="warning" :closable="false" show-icon />
             </div>
           </section>

@@ -73,6 +73,14 @@ export const VNC_COMBOS = {
   backspace: [[0xFF08, 'Backspace']],
 };
 
+// Browser button numbers and VNC masks differ for middle/right. One held-button
+// set supplies moves, wheel pulses and releases, including direct touch dragging.
+export function pointerButtonMask(buttons) {
+  let mask = 0;
+  for (const button of buttons) mask |= button === 0 ? 1 : button === 1 ? 2 : button === 2 ? 4 : 0;
+  return mask;
+}
+
 const SHIFTED_SYMBOLS = new Set('~!@#$%^&*()_+{}|:"<>?');
 
 export function vncCharKey(ch) {

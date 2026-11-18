@@ -13,7 +13,7 @@ async def test_revisions_are_listed_and_any_one_comes_back_as_a_new_revision(env
     nodes, ids, draft = await applied_base(e)
     for limit in (5, 7):
         draft['members'][1]['uploadLimitMbps'] = limit
-        await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+        await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
         await api(e, 'POST', '/api/servers/mesh/apply')
         await settled(e)
     listed = (await api(e, 'GET', '/api/servers/mesh/revisions'))['revisions']
@@ -102,13 +102,13 @@ async def test_a_newcomer_leaves_its_ports_and_relay_type_to_the_mesh(env):  # n
     assert added['members'][1]['entry']['candidates'] == []
     members = added['members']
     members[0]['role'] = 'relay'
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['members'][0]['listen'] == {'udp': 51999, 'tcp': 52000, 'tls': 0}
     assert saved['auto']['listen'][ids['r1']]['reason'] == '公网中转常开 UDP 和 TCP，新节点接入时用'
     # Set by hand: out of auto, kept as sent.
     members = saved['members']
     members[0].update(listen={'udp': 51999, 'tcp': 0, 'tls': 0}, auto=['relayMode'])
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['members'][0]['listen'] == {'udp': 51999, 'tcp': 0, 'tls': 0} and saved['members'][0]['auto'] == ['relayMode']
 
 
@@ -122,7 +122,7 @@ async def test_line_rules_and_exit_groups_are_kept_and_a_discard_brings_them_bac
     draft['members'][0]['proxy'] = {'exit': {'user': 'us'}, 'ports': []}
     draft['exitGroups'] = [{'name': 'US', 'members': [exit_id]}]
     draft['lineRules'] = [{'name': 'tls', 'on': True, 'applies': 'lines', 'a': {'kind': 'any'}, 'b': {'kind': 'any'}, 'order': ['tls'], 'bias': None, 'dialer': None}]
-    await api(e, 'PUT', '/api/servers/mesh/draft', draft)
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     # Read back from the database, not from what was sent.
     saved = await api(e, 'GET', '/api/servers/mesh')
     assert [(g['id'], g['name']) for g in saved['exitGroups']] == [('g1', 'US')] and [r['name'] for r in saved['lineRules']] == ['tls']
@@ -132,7 +132,7 @@ async def test_line_rules_and_exit_groups_are_kept_and_a_discard_brings_them_bac
     # A change to them, then discarded: back to the applied ones, nothing left over.
     state['exitGroups'][0]['name'] = 'USA'
     state['lineRules'] = []
-    await api(e, 'PUT', '/api/servers/mesh/draft', {k: state[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups')})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**{k: state[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups')}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert (await api(e, 'GET', '/api/servers/mesh'))['draft']['dirty']
     await api(e, 'POST', '/api/servers/mesh/discard')
     back = await api(e, 'GET', '/api/servers/mesh')

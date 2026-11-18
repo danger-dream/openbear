@@ -17,6 +17,7 @@ from typing import Any
 from aiohttp import web
 
 from app.db.engine import now_ts
+from app.context import prompt_template
 from app.context.prompt_policy import folder_policy, policy, read_json, snapshot_key, write_json
 from app.web_console.prompt_policy import folder_policy_key
 from app.tools import processes
@@ -28,7 +29,7 @@ _TREE_ORDER_STEP = 1024.0
 _TEMPORARY_PROPERTIES_ID = "__temporary"
 _FOLDER_RUN_FIELDS = frozenset({
     "mainModel", "mainThinkingLevel", "mainFastMode",
-    "agentModel", "agentThinkLevel", "agentFastMode", "contextStrategy",
+    "agentModel", "agentThinkLevel", "agentFastMode", "contextStrategy", "imageOneTurn", "promptTemplate",
 })
 
 
@@ -210,6 +211,9 @@ class WebAdminConversationTreeMixin:
         _stored, fallback = await self._web_run_defaults_candidate(owner)
         base = self._apply_folder_run_defaults(fallback, inherited)
         updates, error = self._validate_web_defaults_patch(raw, base)
+        if not error and "promptTemplate" in raw:
+            code = await prompt_template.selectable_error(self.db, prompt_template.normalize(raw["promptTemplate"]))
+            error = (code, 400) if code else None
         if error:
             code, status = error
             raise (web.HTTPNotFound if status == 404 else web.HTTPBadRequest)(

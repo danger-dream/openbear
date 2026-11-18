@@ -67,9 +67,10 @@ func hostFirewallIssues() []FirewallIssue {
 }
 
 type firewallWant struct {
-	addr          netip.Addr
-	udp, tcp, tls int
-	subnets       []netip.Prefix
+	addr                netip.Addr
+	udp, tcp, tls, fast int
+	fwdTCP, fwdUDP      []int // port forwards'
+	subnets             []netip.Prefix
 }
 
 // ports as firewalld names them: 51820/udp.
@@ -78,10 +79,13 @@ func (w firewallWant) ports() []string {
 	if w.udp != 0 {
 		out = append(out, strconv.Itoa(w.udp)+"/udp")
 	}
-	for _, p := range []int{w.tcp, w.tls} {
+	for _, p := range append([]int{w.tcp, w.tls, w.fast}, w.fwdTCP...) {
 		if p != 0 {
 			out = append(out, strconv.Itoa(p)+"/tcp")
 		}
+	}
+	for _, p := range w.fwdUDP {
+		out = append(out, strconv.Itoa(p)+"/udp")
 	}
 	return out
 }
@@ -803,10 +807,13 @@ func nftRules(hook, iface string, w firewallWant) [][]string {
 	if w.udp != 0 {
 		rules = append(rules, []string{"udp", "dport", strconv.Itoa(w.udp), "accept"})
 	}
-	for _, p := range []int{w.tcp, w.tls} {
+	for _, p := range append([]int{w.tcp, w.tls, w.fast}, w.fwdTCP...) {
 		if p != 0 {
 			rules = append(rules, []string{"tcp", "dport", strconv.Itoa(p), "accept"})
 		}
+	}
+	for _, p := range w.fwdUDP {
+		rules = append(rules, []string{"udp", "dport", strconv.Itoa(p), "accept"})
 	}
 	return rules
 }

@@ -10,7 +10,10 @@ import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import ModelFeatureIcon from "./ModelFeatureIcon.vue";
 import ContextUsageMeter from './ContextUsageMeter.vue';
 import ExtensionsMenu from './ExtensionsMenu.vue';
-import {Blocks, Coins, Layers, Clock3} from "@lucide/vue";
+import ImageOneTurnMenu from './ImageOneTurnMenu.vue';
+import PersonaMenu from './PersonaMenu.vue';
+import ComposerToolsMenu from './ComposerToolsMenu.vue';
+import {Blocks, Coins, Eraser, ImageIcon, Layers, LayoutGrid, Clock3, Paperclip as PaperclipIcon, Plus as PlusIcon, UserRound} from "@lucide/vue";
 import { userStorage } from '../../sessionBoundary.js';
 import {
 	ArrowDown,
@@ -90,6 +93,12 @@ const props = defineProps({
 	modelQuery: {type: String, default: ""},
 	contextStrategy: {type: String, default: "sliding_window"},
 	strategySaving: {type: Boolean, default: false},
+	imageOneTurn: {type: Object, default: () => ({})},
+	imageOneTurnSaving: {type: Boolean, default: false},
+	promptTemplate: {type: String, default: ""},
+	promptTemplateLocked: {type: Boolean, default: false},
+	promptTemplateMissing: {type: Boolean, default: false},
+	promptTemplateSaving: {type: Boolean, default: false},
 	canCompact: {type: Boolean, default: false},
 	compacting: {type: Boolean, default: false},
 	contextDisplay: {type: String, default: "—"},
@@ -115,6 +124,8 @@ const emit = defineEmits([
 	"toggle-model-menu",
 	"select-model",
 	"select-context-strategy",
+	"update-image-one-turn",
+	"update-prompt-template",
 	"compact",
 	"select-thinking",
 	"toggle-fast-mode",
@@ -151,6 +162,7 @@ const questionnaireErrors = ref({});
 const interactionNowMs = ref(Date.now());
 let interactionClockTimer = null;
 const runConfigTab = ref("main"); // main | agent
+watch(() => props.modelMenuOpen, (open) => { if (open) runConfigTab.value = "main"; });
 const DEFAULT_WINDOW_TRIGGER_RATIO = 0.7;
 const runConfigPopoverVisible = computed({
 	get: () => props.modelMenuOpen,
@@ -588,6 +600,36 @@ function answerInteraction(item, intent) {
 	emit("answer-confirmation", item, buildInteractionAnswer(item, draft, intent));
 }
 
+// A phone gets one tools button instead of the row of actions, so the model keeps its room.
+const phone = ref(false);
+let phoneMedia = null;
+function updatePhone() { phone.value = Boolean(phoneMedia?.matches); }
+const imageMenu = ref(null), extensionsMenu = ref(null), personaMenu = ref(null);
+const toolItems = computed(() => {
+	const draftEmpty = !props.draft && !props.pendingAttachments.length;
+	return [
+		{key: "new", label: "新话题", icon: PlusIcon},
+		{key: "attach", label: "上传图片或附件", icon: PaperclipIcon},
+		{key: "image", label: "图片只看一轮", hint: imageMenu.value?.summary || "", icon: ImageIcon, on: Boolean(props.imageOneTurn?.enabled), more: true},
+		{key: "extensions", label: "扩展", hint: extensionsMenu.value?.summary || "", icon: Blocks, more: true},
+		{key: "persona", label: "人设", hint: personaMenu.value?.summary || "", icon: UserRound, on: Boolean(props.promptTemplate), attention: Boolean(props.promptTemplateMissing || personaMenu.value?.attention), more: true},
+		...(props.contextStrategy === "model_summary"
+			? [{key: "compact", label: props.compacting ? "正在压缩上下文…" : "手动压缩上下文", icon: ContextCompactionIcon, disabled: !props.canCompact || props.compacting}] : []),
+		...(props.running || draftEmpty ? [] : [{key: "clear", label: "清空草稿", icon: Eraser}]),
+	];
+});
+const toolsMarked = computed(() => Boolean(props.imageOneTurn?.enabled || props.promptTemplate));
+function onToolSelect(key) {
+	if (key === "new") emit("new-session");
+	else if (key === "attach") openFilePicker();
+	else if (key === "compact") emit("compact");
+	else if (key === "clear") clearDraft();
+	else {
+		const menu = {image: imageMenu, extensions: extensionsMenu, persona: personaMenu}[key];
+		nextTick(() => menu?.value?.show());
+	}
+}
+
 function handleKeydown(event) {
 	if (event.key !== "Enter") return;
 	if (event.shiftKey) return;
@@ -692,6 +734,9 @@ watch(() => props.modelMenuOpen, (open, _, onCleanup) => {
 }, {flush: "post", immediate: true});
 
 onMounted(() => {
+	phoneMedia = window.matchMedia?.("(max-width: 760px)") || null;
+	updatePhone();
+	phoneMedia?.addEventListener?.("change", updatePhone);
 	interactionNowMs.value = Date.now();
 	interactionClockTimer = window.setInterval(() => {
 		interactionNowMs.value = Date.now();
@@ -711,6 +756,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
 	cancelStopShapePress();
+	phoneMedia?.removeEventListener?.("change", updatePhone);
 	if (interactionClockTimer) window.clearInterval(interactionClockTimer);
 	interactionClockTimer = null;
 	composerResizeObserver?.disconnect();
@@ -1026,29 +1072,62 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 				/>
 				<div class="composer-toolbar">
 					<div class="composer-actions relative flex min-w-0 flex-1 items-center gap-1.5">
-						<el-tooltip content="新话题（Ctrl+N）" placement="top" :show-after="260">
-							<button type="button" class="tool-btn" aria-label="新话题（Ctrl+N）" @click="emit('new-session')">
-								<Plus/>
-							</button>
-						</el-tooltip>
-						<el-tooltip content="上传图片或附件" placement="top" :show-after="260">
-							<button type="button" class="tool-btn tool-btn-accent" aria-label="上传图片或附件"
-							        @click="openFilePicker">
-								<Paperclip/>
-							</button>
-						</el-tooltip>
-						<ExtensionsMenu :conversation-uuid="props.conversationUuid" :folder-id="props.folderId" :running="props.running">
+						<ComposerToolsMenu v-if="phone" :items="toolItems" :conversation-uuid="props.conversationUuid" @select="onToolSelect">
+							<template #trigger="{open}">
+								<button type="button" class="tool-btn composer-tools-trigger" :class="{'tool-btn-active': open}" aria-label="功能" aria-haspopup="dialog" :aria-expanded="open">
+									<LayoutGrid :stroke-width="1.5"/>
+									<span v-if="toolsMarked" class="persona-menu-mark composer-tools-mark" aria-hidden="true"></span>
+								</button>
+							</template>
+						</ComposerToolsMenu>
+						<template v-else>
+							<el-tooltip content="新话题（Ctrl+N）" placement="top" :show-after="260">
+								<button type="button" class="tool-btn" aria-label="新话题（Ctrl+N）" @click="emit('new-session')">
+									<Plus/>
+								</button>
+							</el-tooltip>
+							<el-tooltip content="上传图片或附件" placement="top" :show-after="260">
+								<button type="button" class="tool-btn tool-btn-accent" aria-label="上传图片或附件"
+								        @click="openFilePicker">
+									<Paperclip/>
+								</button>
+							</el-tooltip>
+						</template>
+						<ImageOneTurnMenu ref="imageMenu" :value="props.imageOneTurn" :saving="props.imageOneTurnSaving" :draft="String(props.conversationUuid || '').startsWith('local:')"
+						                  :conversation-uuid="props.conversationUuid" @change="emit('update-image-one-turn', $event)">
+							<template #trigger="{label, open, on}">
+								<el-tooltip v-if="!phone" :content="label" placement="top" :show-after="260" :disabled="open">
+									<button type="button" class="tool-btn image-one-turn-trigger" :class="{'tool-btn-active': open, 'is-on': on}" :aria-label="label" aria-haspopup="dialog" :aria-expanded="open">
+										<ImageIcon :stroke-width="2"/>
+										<span v-if="on" class="image-one-turn-mark" aria-hidden="true">1</span>
+									</button>
+								</el-tooltip>
+							</template>
+						</ImageOneTurnMenu>
+						<ExtensionsMenu ref="extensionsMenu" :conversation-uuid="props.conversationUuid" :folder-id="props.folderId" :running="props.running">
 							<template #trigger="{label, open}">
-								<el-tooltip :content="label" placement="top" :show-after="260" :disabled="open">
+								<el-tooltip v-if="!phone" :content="label" placement="top" :show-after="260" :disabled="open">
 									<button type="button" class="tool-btn" :class="{'tool-btn-active': open}" :aria-label="label" aria-haspopup="dialog" :aria-expanded="open"><Blocks :stroke-width="1.5"/></button>
 								</el-tooltip>
 							</template>
 						</ExtensionsMenu>
+						<PersonaMenu ref="personaMenu" :value="props.promptTemplate" :locked="props.promptTemplateLocked" :missing="props.promptTemplateMissing" :saving="props.promptTemplateSaving"
+						             :draft="String(props.conversationUuid || '').startsWith('local:')" :conversation-uuid="props.conversationUuid"
+						             @change="emit('update-prompt-template', $event)">
+							<template #trigger="{label, open, on, attention}">
+								<el-tooltip v-if="!phone" :content="label" placement="top" :show-after="260" :disabled="open">
+									<button type="button" class="tool-btn persona-menu-trigger" :class="{'tool-btn-active': open, 'is-on': on}" :aria-label="label" aria-haspopup="dialog" :aria-expanded="open">
+										<UserRound :stroke-width="1.5"/>
+										<span v-if="on || attention" class="persona-menu-mark" :class="{'is-attention': attention}" aria-hidden="true">{{ attention ? "!" : "" }}</span>
+									</button>
+								</el-tooltip>
+							</template>
+						</PersonaMenu>
 
-						<el-tooltip v-if="props.contextStrategy === 'model_summary'" :content="props.compacting ? '正在压缩上下文…' : '手动压缩上下文'" placement="top" :show-after="260">
+						<el-tooltip v-if="!phone && props.contextStrategy === 'model_summary'" :content="props.compacting ? '正在压缩上下文…' : '手动压缩上下文'" placement="top" :show-after="260">
 							<button type="button" class="tool-btn" aria-label="手动压缩上下文" :disabled="!props.canCompact || props.compacting" @click="emit('compact')"><ContextCompactionIcon :class="{'context-compacting-icon': props.compacting}" /></button>
 						</el-tooltip>
-						<el-tooltip content="清空草稿" placement="top" :show-after="260">
+						<el-tooltip v-if="!phone" content="清空草稿" placement="top" :show-after="260">
 							<button type="button" class="tool-btn composer-clear" aria-label="清空草稿"
 							        :disabled="props.running || (!props.draft && !props.pendingAttachments.length)"
 							        @click="clearDraft">
@@ -1076,7 +1155,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 										</span>
 										<span v-if="runConfigMetaParts.length" class="run-config-chip-meta"><span v-for="part in runConfigMetaParts" :key="part.key" class="run-config-meta-part" :class="part.key === 'fast' ? 'run-config-meta-fast' : ''" :title="part.key === 'fast' ? 'Fast 模式' : undefined"><ModelFeatureIcon v-if="part.key === 'fast'" name="zap"/><template v-else><svg v-if="part.key === 'context'" class="run-config-context-ring" :class="runConfigContextRingClass" viewBox="0 0 24 24" aria-hidden="true"><circle class="run-config-context-ring-track" cx="12" cy="12" r="9"/><circle class="run-config-context-ring-fill" cx="12" cy="12" r="9" pathLength="100" :stroke-dasharray="`${contextPercentNumber} 100`"/></svg>{{ part.text }}</template></span></span>
 									</span>
-									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}`">{{ props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩' }}</span>
+									<span class="run-config-chip-strategy" :aria-label="`上下文压缩：${runConfigStrategyText}${Number(props.contextUsage?.compactionCount) > 0 ? `，已压缩 ${Math.floor(Number(props.contextUsage.compactionCount))} 次` : ''}`">{{ (props.contextStrategy === 'model_summary' ? '摘要压缩' : '滑窗压缩') + (Number(props.contextUsage?.compactionCount) > 0 ? `·${Math.floor(Number(props.contextUsage.compactionCount))}` : '') }}</span>
 									<ArrowDown class="chip-caret"/>
 								</button>
 							</template>
@@ -2025,6 +2104,58 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	cursor: not-allowed;
 }
 
+.image-one-turn-trigger {
+	position: relative;
+}
+
+.image-one-turn-trigger.is-on {
+	color: var(--ob-text-strong);
+}
+
+.persona-menu-trigger {
+	position: relative;
+}
+
+.persona-menu-trigger.is-on {
+	color: var(--ob-text-strong);
+}
+
+/* The dot says this conversation renders a persona, not the default template. */
+.persona-menu-mark {
+	position: absolute;
+	top: 5px;
+	right: 5px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--ob-text-strong);
+	box-shadow: 0 0 0 1.5px var(--ob-chat-panel);
+	pointer-events: none;
+}
+
+.persona-menu-mark.is-attention { display: grid; place-items: center; width: 11px; height: 11px; top: 2px; right: 2px; background: var(--ob-warning); color: var(--ob-surface); font-size: 9px; font-weight: 700; line-height: 1; }
+
+/* The "1" says this conversation shows each image for one round only. */
+.image-one-turn-mark {
+	position: absolute;
+	top: 3px;
+	right: 2px;
+	display: grid;
+	min-width: 12px;
+	height: 12px;
+	place-items: center;
+	padding: 0 2px;
+	border-radius: 6px;
+	background: var(--ob-text-strong);
+	color: var(--ob-text-inverse);
+	font-size: 8.5px;
+	font-weight: 700;
+	line-height: 1;
+	font-variant-numeric: tabular-nums;
+	box-shadow: 0 0 0 1.5px var(--ob-chat-panel);
+	pointer-events: none;
+}
+
 .composer-status {
 	display: flex;
 	min-width: 0;
@@ -2123,6 +2254,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	white-space: nowrap;
 	color: var(--ob-text-muted);
 	font-weight: 520;
+	font-variant-numeric: tabular-nums;
 }
 
 .run-config-chip-meta {
@@ -2556,6 +2688,9 @@ button.status-chip:hover, .status-chip-active {
 	/* Tighten the icon pitch without shrinking the 44px touch height. The 3px
 	   group offset difference keeps the first icon at its current position. */
 	.composer-actions .tool-btn { width: 38px; }
+	.image-one-turn-mark { top: 8px; right: 6px; }
+	.persona-menu-mark { top: 10px; right: 10px; }
+	.composer-tools-trigger { position: relative; }
 	.composer-actions .tool-btn:hover, .composer-actions .tool-btn-active {
 		background: radial-gradient(circle at center, var(--ob-hover) 0 16px, transparent 16.5px);
 	}
@@ -2592,15 +2727,6 @@ button.status-chip:hover, .status-chip-active {
 	:deep(.reference-editor-placeholder) { padding: .65rem .5rem; }
 }
 
-/* The extra usage control must not squeeze the model name away on small
-   phones. Only the narrowest toolbar uses two tracks; all actions stay visible. */
-@media (max-width: 360px) {
-	.composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 38px; }
-	.composer-status { display: contents; }
-	.composer-actions { grid-row: 2; grid-column: 1; }
-	.composer-toolbar button.run-config-chip { grid-row: 1; grid-column: 1; justify-self: start; max-width: 100%; }
-	.composer-toolbar .send-button { grid-row: 2; grid-column: 2; }
-}
 @media (min-width: 761px) and (max-width: 1120px) {
 	.composer-toolbar { grid-template-columns: minmax(0, 1fr); gap: 2px; }
 	.composer-status { justify-content: flex-end; }

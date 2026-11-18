@@ -79,7 +79,7 @@ async function load() {
   } catch (e) { loadError.value = safeError(e); }
   finally { loading.value = false; }
 }
-const poll = usePoll(load, {interval: () => (runs.value.some(isActive) || detailFailures.size ? 4000 : 30000), active: () => props.active});
+const poll = usePoll(load, {interval: () => (runs.value.some(r => isActive(r) || r.stopPending) || detailFailures.size ? 4000 : 30000), active: () => props.active});
 const refresh = () => poll.run();
 
 function openRun(run) {
@@ -119,6 +119,7 @@ async function stopRun(run) {
   finally { busy.value = ''; void refresh(); }
 }
 async function deleteRun(run) {
+  if (run.stopPending) return;
   try {
     await ElMessageBox.confirm(`删除这条评测记录？\n${serverOf(run)?.name || ''} · ${run.name} · ${runTime(run.createdMs)}`, '删除评测记录',
       {confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning'});

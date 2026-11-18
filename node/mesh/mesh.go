@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	meshfast "openbear/node/mesh/fast"
 	meshproxy "openbear/node/mesh/proxy"
 )
 
@@ -27,6 +28,8 @@ func Run(ctx context.Context, dir string) error {
 	started := time.Now()
 	events := &eventLog{}
 	r := &runner{dir: dir, started: started, events: events}
+	r.forward.SetFailureLog(dir)
+	r.forward.FastDial, r.forward.FastRTT = r.fast.Dial, r.fast.PathRTT
 	keyRaw, err := os.ReadFile(filepath.Join(dir, "keys", "wg.key"))
 	if err != nil {
 		r.fail(0, err)
@@ -48,6 +51,7 @@ func Run(ctx context.Context, dir string) error {
 			var c *Config
 			if c, err = ParseConfig(raw); err == nil {
 				if e, err = bringUp(dir, c, privateKey, events); err == nil {
+					r.attachFast(e)
 					r.took(c)
 					r.revision, r.applied, r.err = c.Revision, c.Revision, ""
 					events.add("config.applied", fmt.Sprintf("revision %d", c.Revision))
@@ -74,6 +78,8 @@ func Run(ctx context.Context, dir string) error {
 	}
 	defer func() {
 		r.probes.Close()
+		r.fast.Close()
+		r.forward.Close()
 		r.proxy.Close()
 		e.close()
 		events.add("stop", "stopped")
@@ -101,12 +107,15 @@ func Run(ctx context.Context, dir string) error {
 			for _, fixed := range e.host.heal() {
 				events.add("firewall.restored", fixed)
 			}
+			r.fast.Heal()
 			if err := e.recheckLocal(); err != nil {
 				events.add("route.error", err.Error())
 			}
 		}
 		if n%10 == 0 {
 			r.proxy.Retry()
+			r.forward.Retry()
+			r.fast.Retry()
 			if cur := e.learnedEndpoints(); !maps.Equal(cur, learned) {
 				if err := saveEndpoints(dir, cur); err == nil {
 					learned = cur
@@ -116,6 +125,8 @@ func Run(ctx context.Context, dir string) error {
 		st := e.status()
 		st.ConfigRevision, st.AppliedRevision, st.ConfigStamp = r.revision, r.applied, r.stamp()
 		st.Proxy = r.proxy.Status()
+		st.Forward = r.forward.Status()
+		st.Fast = r.fast.Status()
 		st.Probes = r.probes.Status()
 		if r.err != "" {
 			st.Error = r.err
@@ -138,6 +149,8 @@ type runner struct {
 	tried    time.Time
 	cpu      cpuSampler
 	proxy    meshproxy.Service
+	forward  meshproxy.Forwarder
+	fast     meshfast.Service
 	probes   ProbeService
 }
 
@@ -221,6 +234,9 @@ func (r *runner) reload(e *engine) {
 func (r *runner) took(c *Config) {
 	limitMemory(c)
 	r.proxy.Apply(c.Proxy, c.Self.Address, []netip.Prefix{c.Network.Prefix, c.Network.ControlPrefix})
+	// The fast ports first: a fast forward's tunnels open on them at once.
+	r.fast.Apply(c.Fast, c.Self.ID, c.Self.Address, c.Network.Prefix, fastRules(c.Rules))
+	r.forward.Apply(c.Forward, c.Self.Address)
 	r.probes.Apply(c.Probe)
 }
 
@@ -261,6 +277,7 @@ func (r *runner) fallback(privateKey string, failed []byte, cause error) *engine
 	if err != nil {
 		return nil
 	}
+	r.attachFast(e)
 	r.took(c)
 	r.applied, r.tried = c.Revision, time.Now()
 	r.err = fmt.Sprintf("revision %d not applied: %v", r.revision, cause)

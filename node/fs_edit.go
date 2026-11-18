@@ -6,8 +6,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,9 +83,25 @@ func (u *uploads) edit(raw json.RawMessage) (any, error) {
 	if prior.Size() > fileChunkMax {
 		return nil, errors.New("file_too_large")
 	}
-	data, err := os.ReadFile(path)
+	f, err := openReadFile(path)
 	if err != nil {
 		return nil, fileError(err)
+	}
+	defer f.Close()
+	prior, err = f.Stat()
+	if err != nil {
+		return nil, fileError(err)
+	}
+	if !prior.Mode().IsRegular() && !reparseFile(prior) {
+		return nil, errors.New("not_regular_file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, fileChunkMax+1))
+	closeErr := f.Close()
+	if err != nil {
+		return nil, fileError(err)
+	}
+	if closeErr != nil {
+		return nil, fileError(closeErr)
 	}
 	if len(data) > fileChunkMax {
 		return nil, errors.New("file_too_large")
@@ -164,16 +180,18 @@ func (u *uploads) edit(raw json.RawMessage) (any, error) {
 		result["changed"], result["diff"] = false, ""
 		return result, nil
 	}
-	temp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".obtmp-"+randomHex(6))
-	if err = writeFile(temp, []byte(next), os.O_WRONLY|os.O_CREATE|os.O_EXCL, true); err != nil {
-		os.Remove(temp)
+	stage, err := newFileStage(path)
+	if err != nil {
+		return nil, err
+	}
+	defer stage.close()
+	if err = stage.write([]byte(next)); err != nil {
 		return nil, err
 	}
 	if now, err := os.Stat(path); err != nil || now.Size() != prior.Size() || !now.ModTime().Equal(prior.ModTime()) {
-		os.Remove(temp)
 		return nil, errors.New("file_changed")
 	}
-	if err = commit(temp, path, "", prior); err != nil {
+	if err = stage.commit("", prior, false); err != nil {
 		return nil, err
 	}
 	diff, cut := unifiedDiff(shown, text, next, found)

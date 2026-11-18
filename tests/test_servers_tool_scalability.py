@@ -233,6 +233,7 @@ async def test_name_resolution_filters_patch_revisions_and_live_member(env):  # 
 
     patched = await call(
         'mesh_save_draft',
+        draftVersion=joined['draftVersion'],
         patch={
             'members': [
                 {'serverId': 'JP-Relay-2', 'role': 'relay', 'listen': {'tcp': 52010}},
@@ -256,7 +257,7 @@ async def test_name_resolution_filters_patch_revisions_and_live_member(env):  # 
     assert len(gz_draft['paths']) == 1 and gz_draft['paths'][0]['via'] == [r2_id] and gz_draft['paths'][0]['from'] == lnx_id
 
     # Reject overlapping top-level and patch keys
-    conflict = await call('mesh_save_draft', settings={'mtu': 1380}, patch={'settings': {'mtu': 1360}})
+    conflict = await call('mesh_save_draft', draftVersion=gz_draft['draftVersion'], settings={'mtu': 1380}, patch={'settings': {'mtu': 1360}})
     assert conflict['ok'] is False and conflict['error'] == 'invalid_mesh_draft'
 
     # Apply and inspect mesh_revisions + per-node config diff by server name

@@ -108,7 +108,7 @@ def test_probe_parameters_the_node_would_refuse_are_refused():
 
 def test_policy_backup_settings_options():
     assert model.clean_policy(None) == model.DEFAULT_POLICY
-    assert model.clean_policy({'onDrift': 'alert'}, {'multi': 'all'}) == {'multi': 'all', 'allowPrivate': False, 'onDrift': 'alert'}
+    assert model.clean_policy({'onDrift': 'alert'}, {'multi': 'all'}) == {'multi': 'all', 'allowPrivate': False, 'onDrift': 'alert', 'rrsetTakeover': False}
     assert error_of(model.clean_policy, {'multi': 'many'}) == 'invalid_policy'
     assert model.clean_backup({'serverId': 'b'}, 'a') == {'serverId': 'b', 'afterS': 300}
     assert error_of(model.clean_backup, {'serverId': 'a'}, 'a') == 'invalid_backup'

@@ -5,7 +5,7 @@
 const STATE_TONES = {
   ok: 'ok',
   syncing: 'busy', pending: 'busy',
-  drift: 'warn', fighting: 'warn', ambiguous: 'warn',
+  drift: 'warn', fighting: 'warn', ambiguous: 'warn', rrset_review: 'warn',
   failed: 'bad', node_outdated: 'bad', conn_unavailable: 'bad', probe_refused: 'bad',
   offline: 'idle', paused: 'idle', no_address: 'idle',
 };
@@ -114,7 +114,7 @@ export function filterRecords(records, {account = 'all', filter = 'all', query =
     && recordMatches(r, query, context));
 }
 export function eventTone(kind) {
-  if (['drift', 'recreated', 'offline', 'failover', 'ambiguous', 'hold'].includes(kind)) return 'warn';
+  if (['drift', 'recreated', 'offline', 'failover', 'ambiguous', 'rrset_review', 'hold'].includes(kind)) return 'warn';
   if (kind === 'fail') return 'bad';
   if (['create', 'write', 'takeover', 'recover', 'online', 'failback'].includes(kind)) return 'ok';
   return '';
@@ -141,14 +141,14 @@ export function recordToForm(record) {
   return {serverId: s.serverId || '', names: record.name, types: [record.type], method: s.kind === 'fixed' ? 'fixed' : (s.methodAuto ? 'auto' : s.method || 'auto'), fixed: s.fixed || '',
     urls: (p.urls || []).join('\n'), bindIface: p.bindIface || '', iface: p.iface || '', stun: (p.stun || []).join('\n'), cmd: p.cmd || '',
     v6Mode: v6.mode || 'first', v6Value: v6.value || '', v6Temporary: Boolean(v6.allowTemporary), intervalS: p.intervalS ?? null,
-    ttl: record.ttl ?? null, options, multi: record.policy?.multi || 'one', allowPrivate: Boolean(record.policy?.allowPrivate), onDrift: record.policy?.onDrift || 'revert',
+    ttl: record.ttl ?? null, options, rrsetTakeover: record.policy?.rrsetTakeover, multi: record.policy?.multi || 'one', allowPrivate: Boolean(record.policy?.allowPrivate), onDrift: record.policy?.onDrift || 'revert',
     backupId: record.backup?.serverId || '', backupAfterS: record.backup?.afterS || 300};
 }
-// Only the chosen method's parameters carry values; the rest go as empty so the shape stays whole.
+// Auto may use any supported probe; keep its custom parameters during unrelated edits.
 export function formParams(form) {
   const m = form.method;
-  return {urls: m === 'url' ? lines(form.urls) : [], iface: m === 'nic' ? form.iface.trim() : '', bindIface: ['url', 'stun'].includes(m) ? form.bindIface.trim() : '',
-    stun: m === 'stun' ? lines(form.stun) : [], cmd: m === 'cmd' ? form.cmd.trim() : '',
+  return {urls: ['auto', 'url'].includes(m) ? lines(form.urls) : [], iface: ['auto', 'nic'].includes(m) ? form.iface.trim() : '', bindIface: ['auto', 'url', 'stun'].includes(m) ? form.bindIface.trim() : '',
+    stun: ['auto', 'stun'].includes(m) ? lines(form.stun) : [], cmd: ['auto', 'cmd'].includes(m) ? form.cmd.trim() : '',
     v6Select: {mode: form.v6Mode, value: form.v6Mode === 'first' ? '' : String(form.v6Value || '').trim(), allowTemporary: Boolean(form.v6Temporary)},
     intervalS: form.intervalS ? Number(form.intervalS) : null};
 }
@@ -169,7 +169,8 @@ export function formOptions(form) {
 export function formSettings(form) {
   return {source: formSource(form), backup: form.backupId && form.method !== 'fixed' ? {serverId: form.backupId, afterS: Number(form.backupAfterS) || 300} : null,
     ttl: form.ttl ? Number(form.ttl) : null, options: formOptions(form),
-    policy: {multi: form.multi, allowPrivate: Boolean(form.allowPrivate), onDrift: form.onDrift}};
+    policy: {multi: form.multi, allowPrivate: Boolean(form.allowPrivate), onDrift: form.onDrift,
+      ...(form.rrsetTakeover !== undefined ? {rrsetTakeover: Boolean(form.rrsetTakeover)} : {})}};
 }
 export function previewBody(form, accountIds = {}) {
   const source = formSource(form);
@@ -199,7 +200,8 @@ export function createBody(form, rows, confirmed = new Set(), accountIds = {}, a
     rows: chosen.map(r => {
       const accountId = accountIds[r.name] || r.accountId;
       const provider = accounts.find(a => a.id === accountId)?.type;
-      return {name: r.name, type: r.type, accountId, confirmTakeover: r.action !== 'new',
+      return {name: r.name, ...(r.zone ? {zone: r.zone} : {}), type: r.type, accountId, confirmTakeover: r.action !== 'new',
+        ...(r.requiresRrsetTakeover ? {confirmRrsetTakeover: confirmed.has(rowKey(r))} : {}),
         ...(form.providerOptions ? {options: formOptions({options: form.providerOptions[provider] || {}})} : {})};
     })};
 }

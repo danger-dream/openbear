@@ -128,7 +128,7 @@ func TestLeavesNeverTransit(t *testing.T) {
 		rA.Probe("B", 10*time.Millisecond)
 		rB.Probe("A", 10*time.Millisecond)
 	}
-	now = now.Add(switchHold + time.Second)
+	now = now.Add(DefaultTuning.Hold + time.Second)
 	rA.Tick()
 	rB.Tick()
 	for _, m := range rA.Advert(budget, []string{"B"}) {
@@ -146,7 +146,7 @@ func TestLeavesNeverTransit(t *testing.T) {
 	for _, m := range rA.Advert(budget, []string{"B"}) {
 		rM1.Receive("A", m, budget)
 	}
-	now = now.Add(switchHold + time.Second)
+	now = now.Add(DefaultTuning.Hold + time.Second)
 	for _, m := range rA.Advert(budget, []string{"B"}) {
 		rM1.Receive("A", m, budget)
 	}

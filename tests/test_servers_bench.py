@@ -15,6 +15,7 @@ from app.servers import bench as bench_module
 from app.servers import bench_catalog as catalog
 from app.servers import bench_packages as packages
 from app.servers.bench_terminal import after_last_clear, screen
+from app.webhooks.repository import one
 from tests.test_mesh_service import server
 from tests.test_servers import api, env, shipped  # noqa: F401
 from tests.test_webhooks_backend import env as base_env  # noqa: F401
@@ -148,6 +149,12 @@ async def run_state(e, run_id, *states):
         run = (await api(e, 'GET', f'/api/servers/bench/runs/{run_id}'))['run']
         return run if run['state'] in states else None
     return await until(check)
+
+
+async def job_record(e, job):
+    """(outcome, exit code) of the command record of a run's job."""
+    row = await one(e.db.conn, 'SELECT outcome,exit_code FROM server_exec_log WHERE server_id=? AND job_id=?', (job['server'], job['id']))
+    return row['outcome'], row['exit_code']
 
 
 async def a_job(node, count=1):
@@ -304,6 +311,8 @@ async def test_a_run_pushes_runs_collects_and_cleans_up(env, monkeypatch):  # no
                             'report-6.ansi': 'v6 report\n', 'result-6.json': '{"a": 1}\n{"b": 2}\n'}, log='installing…\r\x1b[Kdone\n', code=1)
     done = await run_state(env, run['id'], 'done', 'failed')
     assert done['state'] == 'done' and done['exitCode'] == 1  # the script's last test fails; the report decides
+    # Its command record goes by the report too, not by the exit code.
+    assert await job_record(env, job) == ('ok', 1)
     assert [s['label'] for s in done['sections']] == ['IPv4', 'IPv6']
     assert done['sections'][0]['ansi'] == '\x1b[1mIP质量体检报告\x1b[0m\n风险：低\n'
     assert done['sections'][0]['json'] == {'Head': {'IP': '1.2.*.*'}} and done['sections'][1]['json'] == {'a': 1}
@@ -326,7 +335,8 @@ async def test_a_run_pushes_runs_collects_and_cleans_up(env, monkeypatch):  # no
     second = await a_job(node, 2)
     assert sum(1 for _, m, _ in node.calls if m == 'fs.write') == writes
     node.finish(second, files={'report-4.ansi': REPORT})
-    finished = await run_state(env, again['id'], 'done')
+    finished = await run_state(env, again['id'], 'failed')
+    assert finished['error'] == 'bench_json_invalid'
     assert [s['label'] for s in finished['sections']] == ['IPv4'] and 'json' not in finished['sections'][0]
 
     listed = (await api(env, 'GET', '/api/servers/bench/runs'))['runs']
@@ -391,6 +401,7 @@ async def test_stopping_queued_and_running_runs(env, monkeypatch):  # noqa: F811
     assert job['state'] == 'stopped'
     ended = await run_state(env, first['id'], 'stopped', 'failed', 'done')
     assert ended['state'] == 'stopped'
+    assert (await job_record(env, job))[0] == 'stopped'
     await asyncio.sleep(0.1)
     assert len(node.started()) == 1
 
@@ -418,6 +429,7 @@ async def test_failures_no_report_and_a_damaged_package(env, monkeypatch):  # no
     node.finish(job, log='curl: (6) Could not resolve host\n', code=7)
     failed = await run_state(env, run['id'], 'failed')
     assert (failed['error'], failed['exitCode'], failed['log']) == ('bench_no_report', 7, 'curl: (6) Could not resolve host\n')
+    assert await job_record(env, job) == ('failed', 7)
 
     listing = '/var/tmp/openbear-bench/hardware.check.place-v0.1.0/.openbear-files.sha256'
     assert listing in node.files[sid]
@@ -432,6 +444,8 @@ async def test_failures_no_report_and_a_damaged_package(env, monkeypatch):  # no
     node.finish(again, log='评测包文件校验失败\n', code=catalog.CHECKSUM_FAILED)
     failed = await run_state(env, run['id'], 'failed')
     assert failed['error'] == 'bench_package_corrupt'
+    # Both attempts' records: the first ran again, the second ended the run.
+    assert await job_record(env, job) == ('failed', catalog.CHECKSUM_FAILED) and await job_record(env, again) == ('failed', catalog.CHECKSUM_FAILED)
     await until(lambda: asyncio.sleep(0, result=listing not in node.files[sid]))
     await asyncio.sleep(0.1)
     assert len(node.started()) == 3, 'once more only'
@@ -495,7 +509,7 @@ async def test_a_restart_follows_the_job_it_left_running(env, monkeypatch):  # n
         task.cancel()
     await asyncio.sleep(0.05)
     assert not bench.workers
-    node.finish(job, files={'report-4.ansi': REPORT})
+    node.finish(job, files={'report-4.ansi': REPORT, 'result-4.json': '{}'})
     await bench.start()
     assert (await run_state(env, run['id'], 'done'))['sections'][0]['label'] == 'IPv4'
 
@@ -533,7 +547,7 @@ async def test_the_servers_tool_runs_reads_and_removes_benchmarks(env, monkeypat
     waited = await call('bench_wait', runId=run['id'], timeoutSeconds=1)
     assert waited['reason'] == 'timeout' and waited['run']['state'] == 'running'
     long_text = ('\x1b[32m' + 'x' * 100 + '\x1b[0m\n') * 150
-    node.finish(job, files={'report-4.ansi': long_text, 'result-4.json': '{"Head": {"IP": "1.2.*.*"}}', 'report-6.ansi': REPORT}, log='\x1b[1mlog\x1b[0m\n')
+    node.finish(job, files={'report-4.ansi': long_text, 'result-4.json': '{"Head": {"IP": "1.2.*.*"}}', 'report-6.ansi': REPORT, 'result-6.json': '{}'}, log='\x1b[1mlog\x1b[0m\n')
     waited = await call('bench_wait', runId=run['id'], timeoutSeconds=60)
     assert waited['reason'] == 'ended' and waited['run']['state'] == 'done'
 

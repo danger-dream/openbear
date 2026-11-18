@@ -141,6 +141,39 @@ def read_catalog(
                 "updatedAt": row["updated_at"] or 0,
                 "revision": revisions.get(key, 0),
             }
+
+        kb_rows = {
+            str(r["note_uuid"]): dict(r)
+            for r in conn.execute(
+                """SELECT note_uuid, parent_uuid, title, substr(COALESCE(NULLIF(summary,''), content, ''), 1, 256) AS preview_source, updated_at_ms
+                   FROM kb_notes WHERE owner_chat_id=? ORDER BY id DESC""",
+                (owner,),
+            ).fetchall()
+        }
+
+        def kb_parent_path(parent_uuid: str) -> str:
+            names, seen = [], set()
+            cur = parent_uuid
+            while cur and cur in kb_rows and cur not in seen:
+                seen.add(cur)
+                names.append(str(kb_rows[cur]["title"] or "未命名笔记"))
+                cur = str(kb_rows[cur]["parent_uuid"] or "")
+            return " / ".join(reversed(names))
+
+        for nuuid, r in kb_rows.items():
+            key = "note:" + nuuid
+            items[key] = {
+                "key": key,
+                "kind": "note",
+                "id": nuuid,
+                "name": nuuid,
+                "label": str(r["title"] or "未命名笔记"),
+                "group": kb_parent_path(str(r["parent_uuid"] or "")) or "顶层笔记",
+                "archived": False,
+                "updatedAt": int((r["updated_at_ms"] or 0) // 1000),
+                "revision": revisions.get(key, 0),
+                "preview": catalog_preview(str(r["preview_source"] or "")),
+            }
         return seq, items
 
 

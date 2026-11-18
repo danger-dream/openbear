@@ -34,6 +34,7 @@ var dmiPlaceholders = []string{"", "not specified", "none", "to be filled by o.e
 	"system manufacturer", "o.e.m.", "not applicable", "0123456789", "123456789", "x.x"}
 
 type procSnap struct {
+	start       string
 	name        string
 	uid         string
 	ticks       uint64
@@ -79,7 +80,7 @@ func (h linuxHost) snapshot() map[int]procSnap {
 		utime, _ := strconv.ParseUint(f[11], 10, 64)
 		stime, _ := strconv.ParseUint(f[12], 10, 64)
 		rss, _ := strconv.ParseInt(f[21], 10, 64)
-		s := procSnap{name: string(stat[open+1 : end]), ticks: utime + stime, rss: rss * page}
+		s := procSnap{name: string(stat[open+1 : end]), start: f[19], ticks: utime + stime, rss: rss * page}
 		for _, line := range strings.Split(string(h.read(dir+"/status")), "\n") {
 			if v, ok := strings.CutPrefix(line, "Uid:"); ok {
 				if fields := strings.Fields(v); len(fields) > 0 {
@@ -251,8 +252,8 @@ func (h linuxHost) top(ctx context.Context, sort string, limit int, withCommand 
 	users := h.users()
 	list := make([]HostProcess, 0, len(after))
 	for pid, s := range after {
-		p := HostProcess{PID: pid, Name: s.name, User: cmp.Or(users[s.uid], s.uid), RSS: s.rss}
-		if b, ok := before[pid]; ok && elapsed > 0 {
+		p := HostProcess{PID: pid, Identity: hostProcessIdentity(pid, s.start), Name: s.name, User: cmp.Or(users[s.uid], s.uid), RSS: s.rss}
+		if b, ok := before[pid]; ok && b.start == s.start && elapsed > 0 {
 			if s.ticks >= b.ticks {
 				p.CPU = round(float64(s.ticks-b.ticks)/clockTicks/elapsed/float64(max(cpus, 1))*100, 2)
 			}
@@ -389,7 +390,10 @@ func (h linuxHost) caches() string {
 	slices.Sort(dirs)
 	parts := []string{}
 	for _, dir := range dirs {
-		read := func(name string) string { b, _ := os.ReadFile(filepath.Join(dir, name)); return strings.TrimSpace(string(b)) }
+		read := func(name string) string {
+			b, _ := os.ReadFile(filepath.Join(dir, name))
+			return strings.TrimSpace(string(b))
+		}
 		level, kind, size := read("level"), read("type"), read("size")
 		if level == "" || size == "" || kind == "Unified" && level == "1" {
 			continue

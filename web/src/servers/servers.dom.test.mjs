@@ -92,6 +92,11 @@ test('desktop detail: summary cards, live charts, renew, logs and removing with 
   await showTab(detail, '工具');
   const logs = detail.locator('.sv-logs');
   assert.match(await logs.innerText(), /AI\s+systemctl status nginx --no-pager\s+成功/);
+  // The controller's own runs say which part of it ran them, and a job's record how it ended.
+  assert.match(await logs.innerText(), /检测\s+解锁检测：运行 Service Unlock\s+成功/);
+  assert.match(await logs.innerText(), /评测\s+评测：运行 IP\.Check\.Place（后台任务 mvz7wgig36961940）\s+已停止/);
+  assert.match(await logs.innerText(), /自动更新\s+更新节点 1\.3\.0\s+成功/);
+  assert.doesNotMatch(await logs.innerText(), /\b(check|bench|auto)\b/);
   // A command a conversation ran names it and opens it; the rest show no source.
   const origin = logs.locator('li').filter({hasText: 'systemctl status nginx'}).locator('.sv-log-origin');
   assert.match(await origin.innerText(), /^排查 nginx 502/);
@@ -943,9 +948,28 @@ test('node versions: state tags, summary with 全部更新, build and source in 
   assert.equal(await d.locator('.ix-facts > div').filter({has: p.page.locator('dt', {hasText: /^构建$/})}).locator('dd').innerText(), '5a5a5a5a5a5a · 测试版 · 比目标 1.2.0 新，不会自动降级');
   await tab(p.page, '探针').click();
   await p.page.locator('.pb-notice[data-node-update=summary]').getByRole('button', {name: '全部更新'}).click();
+  // It runs on the controller: the board follows it node by node instead of waiting on one request.
+  const running = p.page.locator('.pb-notice[data-node-update=running]');
+  await running.getByText(/^正在更新节点 [01]\/2，当前：/).waitFor();
+  assert.equal(await p.page.locator('.pb-notice[data-node-update=summary]').count(), 0);
   await shown(p, 'warning', '已更新 1 台，1 台文件已替换但未确认运行');
-  assert.ok(p.calls.some(c => c.path === '/api/servers/node-update'));
+  await running.waitFor({state: 'detached'});
+  assert.equal(p.calls.filter(c => c.path === '/api/servers/node-update' && c.method === 'POST').length, 1);
   await p.close();
+});
+
+test('node versions: a 全部更新 under way is followed after a reload', async t => {
+  const result = id => ({serverId: id, ok: true, changed: true, from: '0.13.0', to: '0.13.1'});
+  const h = await setup(t, {tweak: versions, release: RELEASE, updateRun: {id: 'nu-old', running: true, startedAt: Date.now() - 60000, finishedAt: 0, total: 3, done: 1,
+    active: ['srv-papa'], items: [result('srv-golden')], error: '', queue: [result('srv-papa'), result('srv-delta')]}});
+  const running = h.page.locator('.pb-notice[data-node-update=running]');
+  await running.getByText(/^正在更新节点 2\/3，当前：Delta-JP$/).waitFor();
+  assert.equal(await running.getByRole('button', {name: '正在更新'}).isDisabled(), true);
+  await shown(h, 'success', '已更新 3 台');
+  await running.waitFor({state: 'detached'});
+  // Followed, not started again.
+  assert.equal(h.calls.filter(c => c.path === '/api/servers/node-update' && c.method === 'POST').length, 0);
+  await h.close();
 });
 
 test('node versions: no release available, retry, and the update switches', async t => {

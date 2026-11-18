@@ -171,7 +171,7 @@ async def test_rules_on_all_say_so_in_changes(env):  # noqa: F811
     draft['members'][0]['role'] = 'relay'
     rules = [{'src': {'all': True, 'members': [ids['m1']]}, 'dst': {'all': True}, 'proto': 'icmp', 'note': 'ping'},
              {'src': {'members': [ids['m1']]}, 'dst': {'members': [ids['r1']]}}]
-    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'rules': rules})
+    saved = await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'rules': rules, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     assert saved['errors'] == [] and saved['rules'][0]['src'] == {'all': True, 'allSubnets': False, 'members': [], 'tags': [], 'prefixes': []}
     assert [c['text'] for c in saved['draft']['changes'] if c['kind'] == 'member.add'] == [
         '新增成员 Berlin，规则 ping 会自动包含它', '新增成员 公司-Win，规则 ping 会自动包含它']
@@ -204,7 +204,7 @@ async def test_repeated_node_events_are_folded_stored_and_returned(env, monkeypa
     await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], sid]})
     draft = await api(e, 'GET', '/api/servers/mesh')
     draft['members'][0]['role'] = 'relay'
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     await settled(e)
     report = {'schema': 1, 'startedAt': 5, 'appliedRevision': 1, 'ready': True, 'iface': 'obmesh0', 'error': '', 'peers': [], 'entry': None,

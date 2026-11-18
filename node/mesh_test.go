@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -540,6 +541,66 @@ func TestMeshRunsTheNodesOwnProgramOnLinux(t *testing.T) {
 		t.Fatalf("dataBuild: %v", status["dataBuild"])
 	}
 }
+
+// A session on the mesh address with no other address to move to, as when the other does not
+// answer or there is none, ends as the upgrade takes the mesh down: the upgrade goes on, waits for
+// the new data plane and records its build, which the controller finds once the node is back.
+func TestMeshUpgradeOutlivesTheSessionItEnds(t *testing.T) {
+	meshCopying(t, false)
+	refused, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedURL := "http://" + refused.Addr().String()
+	refused.Close()
+	for i, backup := range []string{closedURL, ""} {
+		h, f, exe := testMesh(t)
+		a := meshAgent(h, Capabilities{Exec: true})
+		if _, err := meshDispatch(t, a, "mesh.install", ""); err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(h.path("config.json"), []byte(`{"revision":1}`), 0o600)
+		f.active = true
+		writeStatus(t, h, map[string]any{"pid": 999990, "ready": true})
+		os.WriteFile(exe, []byte(fmt.Sprintf("build %d", i+2)), 0o755)
+
+		var logged strings.Builder
+		var logMu sync.Mutex
+		a.Logger = log.New(writerFunc(func(p []byte) (int, error) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			return logged.Write(p)
+		}), "", 0)
+		a.Config.URL, a.Config.Backup = "http://100.96.0.1:18961", backup
+		a.link = &fakeLink{mesh: map[string]bool{a.Config.URL: true}}
+		session, end := context.WithCancel(context.Background())
+		f.onStart = func() {
+			end()
+			time.Sleep(100 * time.Millisecond)
+			writeStatus(t, h, map[string]any{"pid": 999991, "ready": true})
+		}
+		r, err := a.meshCall(session, "mesh.upgrade", nil)
+		if err != nil {
+			t.Fatalf("backup %q: the upgrade stopped with its session: %v", backup, err)
+		}
+		if m, _ := r.(map[string]any); m["changed"] != true {
+			t.Fatalf("backup %q: upgrade: %v", backup, r)
+		}
+		if status, _ := meshDispatch(t, a, "mesh.status", ""); status["dataBuild"] != h.build() {
+			t.Fatalf("backup %q: dataBuild after the upgrade: %v", backup, status["dataBuild"])
+		}
+		logMu.Lock()
+		said := logged.String()
+		logMu.Unlock()
+		if backup != "" && !strings.Contains(said, "the other address does not answer; staying on the mesh address") {
+			t.Fatalf("backup %q: the agent did not try the other address: %q", backup, said)
+		}
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
 
 // An install from before, whose service runs a copy, moves onto the node's own file with its
 // next upgrade, even of the same build, and the copy goes.

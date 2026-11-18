@@ -474,13 +474,13 @@ async def test_the_tool_cannot_carry_another_accounts_secret_to_a_callback(env):
     await e.ddns.idle()
     assert sent and not any(token in s for s in sent)
     assert (await e.ddns.check_account(OWNER, victim['id']))['ok'] is True
-    # A secret only the account reads is still written in place through the tool, and the page keeps writing a shared one.
+    # A secret only the account reads is still written in place; the page also isolates a shared one.
     result = await call('ddns_account_update', accountId=hook['id'], credentials={'url': 'https://hook.example/u?ip={ip}'})
     assert result['ok'] is True and result['account']['secret']['id'] == own
     assert [i['value'] for i in (await e.ddns._secret_kv(own))[1] if i['key'] == 'url'] == ['https://hook.example/u?ip={ip}']
     shared = (await e.ddns.create_account(OWNER, {'type': 'fake', 'alias': '同一凭据', 'secretRef': {'secretId': secret_id}}))['account']
     await e.ddns.update_account(OWNER, shared['id'], {'credentials': {'token': token}})
-    assert (await e.ddns._account(OWNER, shared['id']))['secret_id'] == secret_id
+    assert (await e.ddns._account(OWNER, shared['id']))['secret_id'] != secret_id
 
 
 def test_scrub_masks_before_cutting_and_catches_pieces():

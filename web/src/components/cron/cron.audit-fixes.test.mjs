@@ -8,6 +8,7 @@ import {parse,compileScript} from '@vue/compiler-sfc';
 import * as config from './cronConfig.js';
 import * as cron from './useCron.js';
 import * as defaults from '../folderRunDefaults.js';
+import * as imageOneTurn from '../../views/consoleView/imageOneTurn.js';
 
 const read=path=>fs.readFileSync(new URL(path,import.meta.url),'utf8');
 const clone=config.clone;
@@ -24,7 +25,7 @@ function fixture(overrides={}){
 }
 function harness(path,{props={},...extra}={}){
   const descriptor=parse(read(path)).descriptor,scope=Vue.effectScope(),cleanups=[],events=[];
-  const ctx={...Vue,...config,...cron,...defaults,defineProps:()=>props,defineEmits:()=> (...args)=>events.push(args),defineExpose:()=>{},onBeforeUnmount:fn=>cleanups.push(fn),
+  const ctx={...Vue,...config,...cron,...defaults,...imageOneTurn,defineProps:()=>props,defineEmits:()=> (...args)=>events.push(args),defineExpose:()=>{},onBeforeUnmount:fn=>cleanups.push(fn),
     ElMessage:{success(){}},ElMessageBox:{confirm:async()=>{}},window:{addEventListener(){},removeEventListener(){}},crypto:{randomUUID:()=> 'test-request'},...extra};
   vm.createContext(ctx);scope.run(()=>vm.runInContext(descriptor.scriptSetup.content.replace(/^import .*;\n/gm,''),ctx));
   return {run:code=>vm.runInContext(code,ctx),ctx,descriptor,events,close(){cleanups.forEach(fn=>fn());scope.stop();}};

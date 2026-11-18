@@ -104,6 +104,21 @@ func (b *Bind) LargeLinks() map[string]bool {
 	return out
 }
 
+// UDPLinks are the peers whose active path is a UDP one now, with that path.
+func (b *Bind) UDPLinks() map[string]PathRef {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]PathRef{}
+	for id, p := range b.peers {
+		ep, err := b.path(p.active)
+		if err != nil || ep.transport != "udp" || !b.info(ep, 0, time.Time{}).Connected {
+			continue
+		}
+		out[id] = p.active
+	}
+	return out
+}
+
 // LargeChanges is signalled when LargeLinks may have changed: a path
 // connected, closed, was committed or deactivated, or a peer said
 // otherwise.

@@ -3,16 +3,18 @@ import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMoun
 import { ElMessage } from 'element-plus';
 import { MOBILE_VIEWPORT_QUERY } from '../../mobileViewport.js';
 import { MeshApi } from './meshApi.js';
-import { act, folds, install, mesh, refresh, save, unsaved } from './meshStore.js';
+import { act, applyBlocked, folds, install, mesh, refresh, reloadDraft, save, unsaved } from './meshStore.js';
 import { isRelay, MESH_ITEMS, MESH_OPEN_NODE, nameOf, uid } from './meshHelpers.js';
 import { addLink, planLink } from './meshGraph.js';
 import { removeEdge } from './meshEdit.js';
 import { MESH_VISIBLE, usePoll } from './usePoll.js';
 import MeshBoard from './MeshBoard.vue';
 import MeshAccess from './MeshAccess.vue';
+import MeshAlerts from './MeshAlerts.vue';
 import MeshChanges from './MeshChanges.vue';
 import MeshDialog from './MeshDialog.vue';
 import MeshExits from './MeshExits.vue';
+import MeshForwards from './MeshForwards.vue';
 import MeshJoin from './MeshJoin.vue';
 import MeshLans from './MeshLans.vue';
 import MeshLines from './MeshLines.vue';
@@ -26,7 +28,7 @@ import MeshSettings from './MeshSettings.vue';
 import './mesh.css';
 import './mesh3.css';
 
-// The mesh tab: loading and polling, the pages (overview board, machines, LANs, exits, access rules,
+// The mesh tab: loading and polling, the pages (overview board, machines, LANs, exits, port forwards, access rules,
 // lines, settings, revisions), the draft bar above them and the editors every page opens.
 const props = defineProps({active: Boolean, items: {type: Array, default: () => []}, focus: {type: Object, default: null}});
 const emit = defineEmits(['open-server']);
@@ -80,10 +82,11 @@ watch(() => data.value?.apply?.running, (now, before) => {
 
 // ---- pages ----
 const TAB_KEY = 'openbear.mesh.tab';
-const TABS = [['overview', '概览'], ['machines', '节点'], ['lans', '共享局域网'], ['exits', '出口和代理'], ['rules', '访问规则'], ['lines', '线路'], ['settings', '设置'], ['revisions', '版本记录']];
+const TABS = [['overview', '概览'], ['machines', '节点'], ['lans', '共享局域网'], ['exits', '出口和代理'], ['forwards', '端口转发'], ['rules', '访问规则'], ['lines', '线路'],
+  ['settings', '设置'], ['revisions', '版本记录']];
 const tab = ref((() => { try { const t = localStorage.getItem(TAB_KEY); return TABS.some(([k]) => k === t) ? t : 'overview'; } catch { return 'overview'; } })());
 watch(tab, t => { try { localStorage.setItem(TAB_KEY, t); } catch { /* private mode */ } });
-const machine = ref(''), machineSec = ref(''), exitGroup = ref(''), shownPath = ref('');
+const machine = ref(''), machineSec = ref(''), exitGroup = ref(''), fastPort = ref(''), forward = ref(''), shownPath = ref('');
 // The overview, or the board from before it (dragging links, rule arrows), remembered on this browser.
 const CLASSIC_KEY = 'openbear.mesh.classic';
 const classic = ref((() => { try { return localStorage.getItem(CLASSIC_KEY) === '1'; } catch { return false; } })());
@@ -91,7 +94,8 @@ watch(classic, on => { try { localStorage.setItem(CLASSIC_KEY, on ? '1' : '0'); 
 const board = computed(() => tab.value === 'overview' && classic.value);
 const members = computed(() => (work.value?.members || []).filter(m => !m.removing));
 const counts = computed(() => ({machines: members.value.length, lans: members.value.filter(m => m.gateway?.subnets?.length && !m.gateway.backup).length,
-  exits: (work.value?.members || []).filter(m => !m.removing && m.proxy?.exit).length, rules: (work.value?.rules || []).length, lines: lineCount.value}));
+  exits: (work.value?.members || []).filter(m => !m.removing && m.proxy?.exit).length, forwards: (work.value?.forwards || []).length, rules: (work.value?.rules || []).length,
+  lines: lineCount.value}));
 // Relay links (every pair of relays when they are all linked) and direct links.
 const lineCount = computed(() => {
   const links = work.value?.relayLinks, relays = members.value.filter(m => m.role === 'relay').length;
@@ -102,6 +106,8 @@ const summary = computed(() => [`${members.value.length} 个节点`, `${members.
 // 我想…: each task opens the page and form that does it.
 const TASKS = [['join', '加入服务器', '选服务器、角色、接入哪台中转、用什么协议和端口'], ['lan', '共享一个局域网', '选网关、勾网段、决定谁能访问'],
   ['exit', '添加出口', '让程序从某台节点出去，拿到可以直接复制的 SOCKS5 链接'], ['group', '新建出口组', '按地区或用途（家宽、解锁）把出口编在一起'],
+  ['fast', '声明快速端口', '选一台节点和一个端口，访问它的组网地址就自动走快速通道'],
+  ['forward', '新建端口转发', '在入口机上开一个端口，转到另一台的服务，代替 realm'],
   ['rule', '让 A 访问 B', '写一条访问规则'],
   ['relay', '新建中转线路', '把两台中转连起来'], ['direct', '新建直连', '让两台成员不经中转直接通']];
 const create = ref(null);
@@ -115,7 +121,7 @@ function want(kind) {
     edit({kind: 'rule', id: rule.id});
     return;
   }
-  go(kind === 'lan' ? 'lans' : kind === 'group' || kind === 'exit' ? 'exits' : 'lines');
+  go(kind === 'lan' ? 'lans' : kind === 'group' || kind === 'exit' || kind === 'fast' ? 'exits' : kind === 'forward' ? 'forwards' : 'lines');
   create.value = {kind};
   void nextTick(() => nextTick(() => { create.value = null; }));
 }
@@ -148,6 +154,8 @@ function edit(sel) {
   if (!sel) return;
   if (sel.kind === 'node') openMachine(sel.id);
   else if (sel.kind === 'group') { go('exits'); exitGroup.value = ''; void nextTick(() => { exitGroup.value = sel.id; }); }
+  else if (sel.kind === 'fastPort') { go('exits'); fastPort.value = ''; void nextTick(() => { fastPort.value = sel.id; }); }
+  else if (sel.kind === 'forward') { go('forwards'); forward.value = ''; void nextTick(() => { forward.value = sel.id; }); }
   else editor.value = {kind: sel.kind, id: sel.id};
 }
 function connect(c) {
@@ -198,11 +206,13 @@ async function join(choice) {
   go('machines');
 }
 const joinedMember = computed(() => members.value.find(m => m.serverId === joined.value) || null);
+// Applied from anywhere (the bar, another page, a tool): the note about it waiting goes, as its 待应用 tag does.
+watch(() => Boolean(joined.value && data.value?.nodes?.[joined.value]?.appliedRevision), done => { if (done) joined.value = ''; });
 const joinedText = computed(() => {
   const m = joinedMember.value;
   if (!m) return '';
   const relay = isRelay(m) ? '' : m.entry?.candidates?.[0]?.relay;
-  return `${m.name} 已加入草稿，排在下面列表第一行；画板上${relay ? `在 ${nameOf(members.value, relay)} 的成员里` : '在它那个地区的组里'}，标着“待应用”。它还没连进组网，确认设置后点“应用到网格”。`;
+  return `${m.name} 已加入草稿，排在下面列表第一行；画板上${relay ? `在 ${nameOf(members.value, relay)} 的成员里` : '在它那个地区的组里'}，标着“待应用”。它还没连进组网，确认设置后点“应用”。`;
 });
 
 function syncPhone() { phone.value = media.matches; }
@@ -226,7 +236,7 @@ onBeforeUnmount(() => { media?.removeEventListener?.('change', syncPhone); docum
       <div class="m3-top">
         <h2>组网</h2><span class="m3-faint m3-top-sum">{{ summary }}</span><span class="ob-grow" />
         <span class="m3-faint m3-live" :title="`每 ${fast ? 1 : 5} 秒读一次组网状态；延迟和在线状态以节点最近一次上报为准`"><i aria-hidden="true"></i>{{ nextIn > 0 ? `${nextIn} 秒后更新` : '正在更新…' }}</span>
-        <span v-if="!data.draft?.dirty" class="m3-faint">没有未应用的改动</span>
+        <span v-if="!data.draft?.dirty && !unsaved() && !mesh.rejected && !mesh.conflict" class="m3-faint">没有未应用的改动</span>
         <el-dropdown trigger="click" popper-class="m3-tokens" @command="want">
           <el-button size="small">我想…</el-button>
           <template #dropdown><el-dropdown-menu class="m3-tasks">
@@ -244,14 +254,15 @@ onBeforeUnmount(() => { media?.removeEventListener?.('change', syncPhone); docum
         </div>
       </header>
       <MeshChanges v-if="!board" @apply="applyNow" @member="openMachine" />
-      <p v-if="!board && actionError" role="alert" class="m3-joined m3-failed"><span>{{ actionError }}</span>
-        <el-button v-if="unsaved() && !mesh.saving" size="small" @click="save">重新保存</el-button>
-        <button type="button" class="ix-icon-button" aria-label="关闭提示" @click="mesh.error = ''">✕</button></p>
+      <p v-if="!board && (actionError || mesh.conflict)" role="alert" class="m3-joined m3-failed"><span>{{ actionError || '草稿已被其他页面或工具修改。本地编辑已保留；请载入最新草稿后重新修改，避免覆盖他人的更改。' }}</span>
+        <el-button v-if="mesh.conflict" size="small" @click="reloadDraft">载入最新草稿</el-button>
+        <el-button v-else-if="unsaved() && !mesh.saving" size="small" @click="save">重新保存</el-button>
+        <button v-if="!mesh.conflict" type="button" class="ix-icon-button" aria-label="关闭提示" @click="mesh.error = ''">✕</button></p>
       <p v-if="joining" class="m3-joined" role="status"><span>正在往 <b>{{ joining.name }}</b> 上安装组网服务（不影响它现有的网络，最多约 3 分钟），装好后加入草稿…</span></p>
       <p v-else-if="joinedMember" class="m3-joined" role="status"><span>{{ joinedText }}</span>
         <el-button size="small" @click="openMachine(joined)">查看和修改它的设置</el-button>
         <el-button size="small" @click="showOnBoard(joined)">在画板上看</el-button>
-        <el-button size="small" type="primary" :disabled="Boolean(mesh.errors.length)" @click="applyNow(); joined = ''">应用到网格</el-button>
+        <el-button size="small" type="primary" :disabled="applyBlocked()" @click="applyNow(); joined = ''">应用</el-button>
         <button type="button" class="ix-icon-button" aria-label="关闭提示" @click="joined = ''">✕</button></p>
 
       <main class="m3-page" :class="board ? 'is-classic' : tab === 'overview' ? 'is-board' : tab === 'machines' && machine ? 'is-detail' : 'is-scroll'">
@@ -263,13 +274,15 @@ onBeforeUnmount(() => { media?.removeEventListener?.('change', syncPhone); docum
           <MeshMachines v-else :phone="phone" :items="items" :joined="joined" @open="openMachine" @join="joinOpen = true" />
         </template>
         <MeshLans v-else-if="tab === 'lans'" :phone="phone" :items="items" :create="create" @open="openMachine" @rules="go('rules')" />
-        <MeshExits v-else-if="tab === 'exits'" :phone="phone" :items="items" :group="exitGroup" :create="create" @open="openMachine" />
+        <MeshExits v-else-if="tab === 'exits'" :phone="phone" :items="items" :group="exitGroup" :fast-port="fastPort" :create="create" @open="openMachine" />
+        <MeshForwards v-else-if="tab === 'forwards'" :phone="phone" :items="items" :forward="forward" :create="create" />
         <MeshAccess v-else-if="tab === 'rules'" :phone="phone" :items="items" @edit="id => edit({kind: 'rule', id})" @new="want('rule')" />
         <MeshLines v-else-if="tab === 'lines'" :phone="phone" :items="items" :create="create" @edit="edit" @open="openMachine" />
         <section v-else-if="tab === 'settings'" class="m3-pane" aria-label="设置">
           <header class="m3-pane-head"><h2>设置</h2></header>
           <p class="m3-lead">全网参数。一般只在第一次建网时看一眼；每一项都写着默认值，改完点「保存到草稿」。</p>
           <MeshSettings page :items="items" />
+          <MeshAlerts />
         </section>
         <MeshRevisions v-else-if="tab === 'revisions'" :phone="phone" @applied="poll.schedule()" />
       </main>

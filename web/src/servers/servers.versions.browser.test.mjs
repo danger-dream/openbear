@@ -49,6 +49,19 @@ test('servers page layout: node versions, dark phone, mesh access', {skip: !chro
     await p.close();
   });
 
+  await t.test('全部更新 under way on a phone, dark: the progress notice wraps, the board stays put', {timeout: 60000}, async t => {
+    const result = id => ({serverId: id, ok: true, changed: true, from: '0.13.0', to: '0.13.1'});
+    const h = await setup(t, {width: 390, height: 844, dark: true, tweak: versions, release: RELEASE, updateRun: {id: 'nu-old', running: true, startedAt: Date.now(), finishedAt: 0,
+      total: 27, done: 3, active: ['srv-papa', 'srv-delta', 'srv-golden', 'srv-edge'], items: [], error: '', queue: [result('srv-papa'), ...Array.from({length: 23}, (_, n) => result(`srv-x${n}`))]}});
+    const running = h.page.locator('.pb-notice[data-node-update=running]');
+    await running.getByText(/^正在更新节点 4\/27/).waitFor();
+    const box = await running.boundingBox();
+    assert.ok(box.height <= 110, JSON.stringify(box));
+    await noOverflow(h.page);
+    await versionShot(h.page, 'phone-update-running-dark');
+    await h.close();
+  });
+
   await t.test('node versions on a phone, dark: tags, summary and detail stay compact', {timeout: 60000}, async t => {
     const h = await setup(t, {width: 390, height: 844, dark: true, tweak: versions, release: {...RELEASE, prerelease: true, autoUpdate: true}});
     const notice = h.page.locator('.pb-notice[data-node-update=summary]');

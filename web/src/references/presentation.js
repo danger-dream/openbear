@@ -7,6 +7,7 @@ let serverFlag = () => '';
 export function setServerFlagProbe(probe) { serverFlag = typeof probe === 'function' ? probe : () => ''; }
 export const ICON_PATHS = {
   doc:'M7 3h7l4 4v14H7z M14 3v5h5 M10 12h5 M10 16h5',
+  note:'M6 3h11a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z M8 3v18 M11 8h5 M11 12h5 M11 16h3',
   mem:'M9 5a3 3 0 0 0-5 3 4 4 0 0 0 0 8 3 3 0 0 0 5 3V5z M15 5a3 3 0 0 1 5 3 4 4 0 0 1 0 8 3 3 0 0 1-5 3V5z M7 10h2 M15 14h2',
   secret:'M14 6a5 5 0 1 1-2 8l-7 7H2v-3l7-7a5 5 0 0 1 5-5z M17 9h.01',
   chat:'M4 4h16v12H9l-5 4V4z M8 8h8 M8 12h5',
@@ -20,8 +21,8 @@ export function referenceIconHtml(kind) {return `<svg class="reference-chip__ico
 export function referenceLeadHtml(ref) {const mark=ref?.kind==='server'?serverFlag(ref.id):'';return mark?`<span class="reference-chip__flag" aria-hidden="true">${escapeReferenceHtml(mark)}</span>`:referenceIconHtml(ref?.kind);}
 export function referenceCandidateDetail(item) {
   let detail = KIND_LABELS[item.kind] || '';
-  if (item.kind === 'mem' || item.kind === 'doc') detail = item.preview ?? '摘要待同步';
-  if (item.kind === 'mem' || item.kind === 'doc') detail ||= '暂无正文';
+  if (item.kind === 'mem' || item.kind === 'doc' || item.kind === 'note') detail = item.preview ?? '摘要待同步';
+  if (item.kind === 'mem' || item.kind === 'doc' || item.kind === 'note') detail ||= '暂无正文';
   if (item.kind === 'secret') {
     const keys = Array.isArray(item.fieldKeys) ? item.fieldKeys.filter(key => typeof key === 'string' && key.trim()) : null;
     detail = keys ? (keys.length ? `字段：${keys.join(' · ')}` : '暂无字段') : '字段名待同步';

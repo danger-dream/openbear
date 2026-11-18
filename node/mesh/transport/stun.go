@@ -26,12 +26,15 @@ type stunWaiter struct {
 }
 
 func isSTUN(p []byte) bool {
-	return len(p) >= 20 && p[0]&0xc0 == 0 && binary.BigEndian.Uint32(p[4:8]) == stunCookie && int(binary.BigEndian.Uint16(p[2:4]))+20 == len(p)
+	return len(p) >= 20 && len(p)%4 == 0 && p[0]&0xc0 == 0 && binary.BigEndian.Uint32(p[4:8]) == stunCookie && int(binary.BigEndian.Uint16(p[2:4]))+20 == len(p)
 }
 
 // stunReply takes a response to one of this node's requests and reports
 // whether p was one.
 func (b *Bind) stunReply(p []byte, from netip.AddrPort) bool {
+	if !isSTUN(p) {
+		return false
+	}
 	var tx [12]byte
 	copy(tx[:], p[8:20])
 	b.mu.Lock()
@@ -40,23 +43,31 @@ func (b *Bind) stunReply(p []byte, from netip.AddrPort) bool {
 		b.mu.Unlock()
 		return false
 	}
+	addr, err := parseSTUN(p)
+	if err != nil {
+		b.mu.Unlock()
+		return true // Invalid replies do not consume the pending transaction.
+	}
 	delete(b.stunWait, tx)
 	b.mu.Unlock()
-	addr, _ := parseSTUN(p)
 	w.reply <- addr
 	return true
 }
 
 // parseSTUN reads the mapped address of a binding success response.
 func parseSTUN(p []byte) (netip.AddrPort, error) {
-	if binary.BigEndian.Uint16(p[0:2]) != stunResponse {
+	if !isSTUN(p) || binary.BigEndian.Uint16(p[0:2]) != stunResponse {
 		return netip.AddrPort{}, errors.New("not a binding success response")
 	}
-	var mapped netip.AddrPort
-	for a := p[20:]; len(a) >= 4; {
+	var mapped, xorMapped netip.AddrPort
+	for a := p[20:]; len(a) > 0; {
+		if len(a) < 4 {
+			return netip.AddrPort{}, errors.New("truncated STUN attribute")
+		}
 		t, n := binary.BigEndian.Uint16(a[0:2]), int(binary.BigEndian.Uint16(a[2:4]))
-		if 4+n > len(a) {
-			break
+		span := 4 + ((n + 3) &^ 3)
+		if span > len(a) {
+			return netip.AddrPort{}, errors.New("truncated STUN attribute padding")
 		}
 		v := a[4 : 4+n]
 		if (t == stunXOR || t == stunMapped) && n == 8 && v[1] == 1 {
@@ -68,11 +79,15 @@ func parseSTUN(p []byte) (netip.AddrPort, error) {
 			}
 			got := netip.AddrPortFrom(netip.AddrFrom4(ip), port)
 			if t == stunXOR {
-				return got, nil
+				xorMapped = got
+			} else {
+				mapped = got
 			}
-			mapped = got
 		}
-		a = a[4+(n+3)&^3:]
+		a = a[span:]
+	}
+	if xorMapped.IsValid() {
+		return xorMapped, nil
 	}
 	if mapped.IsValid() {
 		return mapped, nil

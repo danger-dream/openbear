@@ -119,7 +119,7 @@ test('editor has primary vertical space and model is an unboxed secondary text e
   assert.equal(css(f,'.composer-toolbar button.run-config-chip .chip-caret',desktop).display,undefined,'desktop menu caret stays visible');
   assert.equal(css(f,'.composer-actions .tool-btn',desktop).width,undefined);
   assert.deepEqual([css(f,'.send-button',desktop).width,css(f,'.send-button',desktop).height],['2rem','2rem'],'desktop send button stays unchanged');
-  assert.equal(css(f,'.composer-toolbar',{...phone,width:360})['grid-template-columns'],'minmax(0, 1fr) 38px','narrow phone reserves the resized send column');
+  assert.equal(css(f,'.composer-toolbar',{...phone,width:360}).display,'flex','narrow phone keeps one toolbar row; its actions are in the tools menu');
   assert.equal(css(f,'.tool-btn:hover',desktop).background,'var(--ob-hover)','desktop feedback stays unchanged');
   assert.equal(css(f,'.composer-actions .tool-btn:hover',desktop).background,undefined);
   // The theme leakage that produced the outlined model pill has lower specificity

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS ddns_records (
  state TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '',
  fail_count INTEGER NOT NULL DEFAULT 0, first_fail_ms INTEGER NOT NULL DEFAULT 0, changed_ms INTEGER NOT NULL DEFAULT 0,
  synced_ms INTEGER NOT NULL DEFAULT 0, checked_ms INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL DEFAULT 0,
+ pending_cleanup_json TEXT NOT NULL DEFAULT 'null',
  drift_times_json TEXT NOT NULL DEFAULT '[]', active_source TEXT NOT NULL DEFAULT 'primary', several_seen INTEGER NOT NULL DEFAULT 0,
  created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL
 );
@@ -28,7 +29,7 @@ CREATE INDEX IF NOT EXISTS ddns_events_record ON ddns_events(record_id, id);
 CREATE INDEX IF NOT EXISTS ddns_events_at ON ddns_events(at_ms);
 '''
 # Columns added after the first release; a record from before several_seen has not been seen with several.
-ADDED = {'ddns_records': {'several_seen': 'INTEGER NOT NULL DEFAULT 0'}}
+ADDED = {'ddns_records': {'several_seen': 'INTEGER NOT NULL DEFAULT 0', 'pending_cleanup_json': "TEXT NOT NULL DEFAULT 'null'"}}
 
 
 async def migrate(db):

@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from app.servers import hub as hub_module
 from app.servers.desktop import (
     VERSION_1,
     _der_ctx,
@@ -134,7 +135,7 @@ async def test_desktop_config_gives_no_ssh_password_where_there_is_no_desktop(en
     assert (cfg['protocol'], cfg['username'], cfg['password'], cfg['source']) == ('', '', '', 'none')
 
 
-async def test_desktop_vnc_and_rdp_relay_over_node_tunnel(env, node_binary):
+async def test_desktop_vnc_and_rdp_relay_over_node_tunnel(env, node_binary, monkeypatch):
     e = env
     created = await api(e, 'POST', '/api/servers', {'name': 'DesktopNode'})
     sid = created['item']['id']
@@ -151,8 +152,18 @@ async def test_desktop_vnc_and_rdp_relay_over_node_tunnel(env, node_binary):
         msg = await ws.receive()
         assert (msg.type, ws.close_code, msg.extra) == (aiohttp.WSMsgType.CLOSE, 4400, 'unsupported_platform')
 
-    # The tunnel is the same on every platform: this Linux node stands in for each.
-    session.info = {**session.info, 'platform': 'darwin'}
+    # The tunnel is the same on every platform: this Linux fixture stands in
+    # for each. A background IP refresh may send another hello after ready(),
+    # replacing session.info with Linux again. Preserve the fixture platform
+    # through that real hello path rather than bypassing desktop's node checks.
+    simulated_platform = 'darwin'
+    clean_info = hub_module.clean_info
+
+    def desktop_info(raw):
+        return {**clean_info(raw), 'platform': simulated_platform}
+
+    monkeypatch.setattr(hub_module, 'clean_info', desktop_info)
+    session.info = desktop_info(session.info)
 
     # 1. Start a mock local VNC server
     async def handle_vnc(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -254,7 +265,8 @@ async def test_desktop_vnc_and_rdp_relay_over_node_tunnel(env, node_binary):
 
         rdp_srv = await asyncio.start_server(handle_rdp, '127.0.0.1', 0)
         rdp_port = rdp_srv.sockets[0].getsockname()[1]
-        session.info = {**session.info, 'platform': 'windows'}
+        simulated_platform = 'windows'
+        session.info = desktop_info(session.info)
 
         try:
             async with e.app.ws_connect(
@@ -267,6 +279,16 @@ async def test_desktop_vnc_and_rdp_relay_over_node_tunnel(env, node_binary):
                 tag, body, _ = _der_read_tlv(rdcp_resp, 0)
                 assert tag == TAG_SEQUENCE
                 children = dict(_der_read_children(body))
+                if 0xA1 in children:
+                    # Error PDU is a valid DER sequence too. Surface its reason
+                    # instead of hiding all failures behind KeyError(0xA6).
+                    close = await ws.receive(timeout=3)
+                    raise AssertionError({
+                        'rdcleanpathError': children[0xA1].hex(),
+                        'closeType': close.type, 'closeCode': ws.close_code,
+                        'closeReason': close.extra, 'platform': session.info.get('platform'),
+                    })
+                assert {0xA6, 0xA7, 0xA9} <= children.keys(), rdcp_resp.hex()
                 _, got_x224, _ = _der_read_tlv(children[0xA6], 0)
                 assert got_x224 == x224_confirm
                 _, certs_seq, _ = _der_read_tlv(children[0xA7], 0)

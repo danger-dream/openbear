@@ -38,6 +38,7 @@ const note = computed(() => {
   switch (rec.state) {
     case 'drift': return ['warn', `服务商上的值被改成了 ${rec.remote || '其他值'}`, rec.policy?.onDrift === 'alert'
       ? `已告警；这条解析设置为只告警，不会改回 ${rec.desired}。` : `已告警并改回 ${rec.desired}。如果反复出现，多半是还有别的程序（比如 ddns-go）在写这条记录。`];
+    case 'rrset_review': return ['warn', '多值记录集待复核，尚未写入 DNS', `现有 IP：${rec.remote || '—'}。整体替换将移除其他地址；如需整组管理，请在“编辑”中明确选择“接管整个记录集”。仅停止管理不会删除 DNS。`];
     case 'ambiguous': return ['warn', '认不出服务商上哪条同名记录归 OpenBear 管理', `服务商上的同名记录都不是 OpenBear 写入的值，所以没有写入。有多条时，删掉多余的，或把其中一条改成 ${rec.desired || '期望值'}，也可以在“编辑 → 高级选项”里改成“全部改成同一个值”；只剩一条时，OpenBear 管理的那条可能已被删除，剩下这条确实归 OpenBear 管就改成 ${rec.desired || '期望值'}，不是就停止管理或换个名字。`];
     case 'fighting': return ['warn', '另一个系统也在写这条记录', '1 小时内被反复改动。OpenBear 仍会改回，但改回的间隔逐步拉长（最长 1 小时）。停用另一个 DDNS 程序后会恢复正常。'];
     case 'offline': return ['', `来源节点 ${node.value?.name || ''} 离线`, rec.backup?.serverId
@@ -143,6 +144,7 @@ defineExpose({busy});
 
     <div v-if="removing" class="dd-note" data-tone="bad">
       <p>删除后 OpenBear 不再管理这条解析。</p>
+      <p v-if="provider?.caps?.rrset">服务商按整个记录集删除，所有现有 IP 都将移除。未授权整组接管的多值记录集不会删除；可仅停止管理。</p>
       <label class="ob-check"><input v-model="deleteRemote" type="checkbox" :disabled="provider?.caps?.delete === false" /><span>同时删除服务商上的记录<small class="instance-muted">{{ provider?.caps?.delete === false ? '这家服务商不支持删除记录' : '默认不删除，记录保持现在的值' }}</small></span></label>
     </div>
     <p v-if="error" role="alert" class="instance-error">{{ error }}</p>

@@ -69,7 +69,7 @@ async def setup(e, monkeypatch, tmp_path):
 
 async def readdress(e):
     state = await api(e, 'GET', '/api/servers/mesh')
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**state['settings'], 'prefix': '100.97.0.0/16'}})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'settings': {**state['settings'], 'prefix': '100.97.0.0/16'}, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
 
 
 async def test_refused_or_offline_exit_keeps_applied_and_cleanup(env, monkeypatch, tmp_path):
@@ -151,7 +151,7 @@ async def test_old_nodes_keep_ordinary_apply_but_unsafe_change_requires_update(e
     await api(e, 'POST', '/api/servers/mesh/discard')
     draft = await api(e, 'GET', '/api/servers/mesh')
     next(m for m in draft['members'] if m['serverId'] == ids['r1'])['uploadLimitMbps'] = 30
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await api(e, 'POST', '/api/servers/mesh/apply')
     assert all(p['state'] == 'done' for p in (await settled(e))['apply']['progress'])
 
@@ -196,7 +196,7 @@ async def test_pending_change_does_not_overwrite_later_draft_and_blocks_catchup(
         await asyncio.sleep(.01)
     draft = await api(e, 'GET', '/api/servers/mesh')
     next(m for m in draft['members'] if m['serverId'] == ids['r1'])['uploadLimitMbps'] = 30
-    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members']})
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': draft['members'], 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
     await e.servers.mesh._catch_up(OWNER, ids['m1'])
     assert not any(method == 'mesh.apply' for _, method, _ in rpc.log)
     rpc.status_gate.set()

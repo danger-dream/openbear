@@ -48,6 +48,10 @@ RELEASE_SERVICE_WAS_ACTIVE=0
 RELEASE_SERVICE_WAS_ENABLED=0
 RELEASE_REQUIRES_DB_BACKUP=1
 RELEASE_DB_BACKUP_PATH=""
+CONFIG_PATH=""
+CONFIG_HOME="${HOME:-/root}"
+CONFIG_CONTEXT=""
+CONFIG_DATABASE=""
 APT_UPDATED=0
 
 if [[ -t 1 ]]; then
@@ -457,7 +461,12 @@ detect_urls() {
 }
 
 read_web_secret() {
-    local db="$INSTALL_DIR/data/openbear.db" i
+    local db="${CONFIG_DATABASE:-}" i
+    if [[ -z "$db" ]]; then
+        db="$(PYTHONPATH="$INSTALL_DIR/scripts" "$INSTALL_DIR/.venv/bin/python" -c \
+            'import sys; from pathlib import Path; from release_validation import resolve_storage_db_path; print(resolve_storage_db_path(Path(sys.argv[1]), Path(sys.argv[2]), home=sys.argv[3]))' \
+            "$INSTALL_DIR" "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" "$CONFIG_HOME")" || return 1
+    fi
     WEB_SECRET=""
     [[ -x "$INSTALL_DIR/.venv/bin/python" ]] || return 1
     for i in $(seq 1 15); do
@@ -664,7 +673,7 @@ collect_config() {
     MODE="${OPENBEAR_MODE:-}"
     if [[ -z "$MODE" ]]; then
         # 发行包安装没有 .git；有 openbear.json 就视为已有实例，默认升级。
-        if [[ -f "$INSTALL_DIR/openbear.json" ]]; then
+        if [[ -f "$INSTALL_DIR/openbear.json" || -d "$INSTALL_DIR/app" ]]; then
             MODE="upgrade"
         elif [[ -e "$INSTALL_DIR" ]] && [[ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null || true)" ]]; then
             MODE=""
@@ -700,10 +709,12 @@ collect_config() {
 
     if [[ "$MODE" == "upgrade" ]]; then
         info "升级模式：保留 openbear.json / data / workspace / skills"
-        [[ -f "$INSTALL_DIR/openbear.json" ]] || die "升级失败：未找到 $INSTALL_DIR/openbear.json"
+        # The authenticated package resolves the running service's config before
+        # staging/switching. A non-default config need not exist at the root.
         return 0
     fi
 
+    CONFIG_PATH="$(OPENBEAR_INSTALL_ROOT="$INSTALL_DIR" python3 -c 'import os; from pathlib import Path; p=Path(os.environ.get("OPENBEAR_CONFIG") or (os.environ["OPENBEAR_INSTALL_ROOT"]+"/openbear.json")).expanduser(); print(p.absolute())')"
     section "Telegram"
     echo "  Bot Token：用 Telegram 打开 @BotFather，创建机器人后复制 token"
     echo "  Admin Telegram 用户 ID：你自己的 Telegram 数字账号 ID"
@@ -876,7 +887,7 @@ prepare_release_dependencies() {
             'import aiogram, aiohttp, aiosqlite, httpx, pydantic, yaml'
     ) || return 1
     if [[ -f "$stage/scripts/install_browser_worker.py" ]]; then
-        python3 "$stage/scripts/install_browser_worker.py" --if-enabled --root "$stage" --config "$INSTALL_DIR/openbear.json" || return 1
+        HOME="$CONFIG_HOME" python3 "$stage/scripts/install_browser_worker.py" --if-enabled --root "$stage" --config "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" || return 1
     fi
     # venv 会整体搬到正式 .venv；修正 console script/activate 中的绝对 staging 路径。
     _OB_STAGE_VENV="$stage/.venv" _OB_FINAL_VENV="$INSTALL_DIR/.venv" python3 - <<'PY' || return 1
@@ -896,8 +907,29 @@ PY
     ok "新版本依赖已在 staging 准备完成"
 }
 
+resolve_upgrade_config() {
+    local pkg="$1" context
+    context="$(python3 "$pkg/scripts/release_validation.py" resolve-config \
+        --root "$INSTALL_DIR" --service "$SERVICE_NAME" --config "${OPENBEAR_CONFIG:-}")" || {
+        err "${context:-无法读取有效升级配置}"; return 1;
+    }
+    CONFIG_PATH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["configPath"])' "$context")" || return 1
+    CONFIG_HOME="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["configHome"])' "$context")" || return 1
+    CONFIG_DATABASE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["databasePath"])' "$context")" || return 1
+    CONFIG_CONTEXT="$context"
+}
+
+check_upgrade_config() {
+    local pkg="$1" current
+    current="$(python3 "$pkg/scripts/release_validation.py" resolve-config \
+        --root "$INSTALL_DIR" --service "$SERVICE_NAME" --config "$CONFIG_PATH")" || {
+        err "${current:-无法重新确认升级配置}"; return 1;
+    }
+    [[ "$current" == "$CONFIG_CONTEXT" ]] || { err "准备期间有效配置已变化，未停止服务；请重试"; return 1; }
+}
+
 read_upgrade_web_port() {
-    local app_root="$1" py="$2" config="$INSTALL_DIR/openbear.json"
+    local app_root="$1" py="$2" config="${CONFIG_PATH:-$INSTALL_DIR/openbear.json}"
     [[ -x "$py" ]] || { err "无法读取 Web 端口：Python 不存在: $py"; return 1; }
     PYTHONPATH="$app_root" "$py" - "$config" "$app_root" <<'PY'
 import json, sys
@@ -990,6 +1022,7 @@ prepare_release_upgrade() {
         err "检测到未完成的升级事务，拒绝覆盖恢复材料: $txn"
         return 1
     fi
+    [[ -n "$CONFIG_CONTEXT" ]] || resolve_upgrade_config "$pkg" || return 1
     classify_release_database_backup_need "$pkg"
     if [[ "$RELEASE_REQUIRES_DB_BACKUP" -eq 1 ]]; then
         info "检测到后端重启升级；停服后、切换前将创建 SQLite 一致性备份"
@@ -1111,6 +1144,8 @@ backup_release_database() {
     if ! output="$("$py" "$stage/scripts/release_validation.py" backup-database \
         --root "$INSTALL_DIR" \
         --backup-dir "$INSTALL_DIR/data/backups" \
+        --config "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" --home "$CONFIG_HOME" \
+        --expected-database "$CONFIG_DATABASE" \
         --label "v${RELEASE_VERSION:-unknown}")"; then
         err "升级前数据库一致性备份失败: ${output:-无详情}"
         return 1
@@ -1127,6 +1162,7 @@ backup_release_database() {
 
 commit_release_upgrade() {
     local txn="$1" reason=""
+    check_upgrade_config "$txn/new" || return 1
     if [[ -n "$RELEASE_TXN_OWNER" ]] && ! mark_release_upgrade_switching "$txn"; then
         err "无法标记升级事务进入切换阶段；尚未停止服务或切换文件"
         return 1
@@ -1244,6 +1280,7 @@ PY
     fi
     validate_release_package "$pkg" || die "发行包不完整，未切换任何文件"
     if [[ "$MODE" == "upgrade" ]]; then
+        resolve_upgrade_config "$pkg" || die "无法确认原服务配置，未切换任何文件"
         prepare_release_upgrade "$pkg" || die "新版本 staging 或依赖准备失败，旧服务和文件未改变"
         RELEASE_UPGRADE_PENDING=1
         rm -rf "$tmp"
@@ -1298,6 +1335,13 @@ sync_code_git() {
 
 sync_code() {
     if [[ "${OPENBEAR_SOURCE:-release}" == "git" ]]; then
+        if [[ "$MODE" == "upgrade" ]]; then
+            # An old source tree has no config resolver. Do not git-switch it
+            # before finding which instance/config would actually be restarted.
+            grep -q 'sub.add_parser("resolve-config")' "$INSTALL_DIR/scripts/release_validation.py" \
+                || die "旧版 git/source 升级尚无有效配置解析器；请使用默认发行包 upgrade，原文件未改变"
+            resolve_upgrade_config "$INSTALL_DIR" || die "无法确认原服务配置，未同步源码"
+        fi
         sync_code_git
         return
     fi
@@ -1368,10 +1412,10 @@ write_runtime() {
         return 0
     fi
 
-    if [[ "$MODE" == "overwrite" && -f openbear.json ]]; then
+    if [[ "$MODE" == "overwrite" && -f "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" ]]; then
         local ts
         ts="$(date +%Y%m%d-%H%M%S)"
-        cp -a openbear.json "openbear.json.bak.${ts}"
+        cp -a "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}.bak.${ts}"
         ok "已备份 openbear.json.bak.${ts}"
     fi
 
@@ -1388,6 +1432,7 @@ write_runtime() {
     export _OB_MNAME="$MODEL_NAME"
     export _OB_PORT="$WEB_PORT"
     export _OB_NAME="$DISPLAY_NAME"
+    export _OB_CONFIG="${CONFIG_PATH:-$INSTALL_DIR/openbear.json}"
     PYTHONPATH="$INSTALL_DIR" "$INSTALL_DIR/.venv/bin/python" - <<'PY'
 import json, os
 from pathlib import Path
@@ -1413,7 +1458,9 @@ provider["models"] = models
 example["models"]["providers"] = {pname: provider}
 example["models"]["primary"] = f"{pname}/{mid}"
 example["models"]["compressionModels"] = []
-(root / "openbear.json").write_text(json.dumps(example, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+config_path = Path(os.environ["_OB_CONFIG"])
+config_path.parent.mkdir(parents=True, exist_ok=True)
+config_path.write_text(json.dumps(example, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 meta = {"displayName": os.environ.get("_OB_NAME") or "老大"}
 (root / "data" / "install-meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 from app.config import Config
@@ -1424,7 +1471,8 @@ if errors:
 print("config-ok")
 PY
     unset _OB_TOKEN _OB_ADMIN _OB_PNAME _OB_BASE _OB_KEY _OB_PROTO _OB_MID _OB_MNAME _OB_PORT _OB_NAME
-    chmod 600 "$INSTALL_DIR/openbear.json"
+    unset _OB_CONFIG
+    chmod 600 "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}"
     ok "已写入 openbear.json（600）与 data/install-meta.json"
 }
 
@@ -1432,7 +1480,11 @@ write_service() {
     section "安装 systemd 服务"
     local unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}"
     mkdir -p "$SYSTEMD_UNIT_DIR" || return 1
-    sed "s|__OPENBEAR_DIR__|${INSTALL_DIR}|g" "$INSTALL_DIR/openbear.service" > "$unit" || return 1
+    local rendered
+    rendered="$(python3 "$INSTALL_DIR/scripts/release_validation.py" render-unit \
+        --root "$INSTALL_DIR" --template "$INSTALL_DIR/openbear.service" \
+        --config "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" --home "$CONFIG_HOME")" || return 1
+    printf '%s\n' "$rendered" > "$unit" || return 1
     chmod 644 "$unit" || return 1
     systemctl daemon-reload || return 1
     systemctl enable "$SERVICE_NAME" || return 1
@@ -1508,8 +1560,8 @@ start_and_verify() {
 
 print_done() {
     local port="${WEB_PORT:-}"
-    if [[ -z "$port" && -f "$INSTALL_DIR/openbear.json" ]]; then
-        port="$("$INSTALL_DIR/.venv/bin/python" -c 'import json; print(json.load(open("openbear.json"))["web"]["port"])' 2>/dev/null || true)"
+    if [[ -z "$port" && -f "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" ]]; then
+        port="$(read_upgrade_web_port "$INSTALL_DIR" "$INSTALL_DIR/.venv/bin/python" 2>/dev/null || true)"
     fi
     port="${port:-$DEFAULT_PORT}"
     detect_urls "$port"
@@ -1571,7 +1623,7 @@ main() {
         # 事务升级的依赖已在 staging 中准备；先完成所有无需停服的本机工作。
         if [[ -z "${WEB_PORT:-}" ]]; then
             WEB_PORT="$(read_upgrade_web_port "$RELEASE_TXN/new" "$RELEASE_TXN/new/.venv/bin/python")" \
-                || die "无法从 $INSTALL_DIR/openbear.json 读取 Web 端口"
+                || die "无法从 ${CONFIG_PATH:-$INSTALL_DIR/openbear.json} 读取 Web 端口"
         fi
         ensure_firewall
         commit_release_upgrade "$RELEASE_TXN" || die "发行版升级失败，已尝试恢复旧版本"
@@ -1583,7 +1635,7 @@ main() {
     fi
     sync_python
     if [[ -n "${INSTALL_DIR:-}" && -f "${INSTALL_DIR:-}/scripts/install_browser_worker.py" ]]; then
-        python3 "$INSTALL_DIR/scripts/install_browser_worker.py" --if-enabled --root "$INSTALL_DIR" || die "浏览器 Python worker 资源校验失败"
+        HOME="$CONFIG_HOME" python3 "$INSTALL_DIR/scripts/install_browser_worker.py" --if-enabled --root "$INSTALL_DIR" --config "${CONFIG_PATH:-$INSTALL_DIR/openbear.json}" || die "浏览器 Python worker 资源校验失败"
     fi
     build_web
     write_runtime
@@ -1591,7 +1643,7 @@ main() {
     # git/source 升级没有 release staging；依赖同步后从新代码的配置模型读取端口。
     if [[ "$MODE" == "upgrade" && -z "${WEB_PORT:-}" ]]; then
         WEB_PORT="$(read_upgrade_web_port "$INSTALL_DIR" "$INSTALL_DIR/.venv/bin/python")" \
-            || die "无法从 $INSTALL_DIR/openbear.json 读取 Web 端口"
+            || die "无法从 ${CONFIG_PATH:-$INSTALL_DIR/openbear.json} 读取 Web 端口"
     fi
     ensure_firewall
     start_and_verify "${RELEASE_VERSION:-}"

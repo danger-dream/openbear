@@ -66,7 +66,7 @@ func TestLossNoiseDoesNotFlap(t *testing.T) {
 // TestLossRate: the lower of the shares lost in the last 10 and 30 probes.
 func TestLossRate(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	m := newMetric(0)
+	m := newMetric(0, &DefaultTuning)
 	exact := func(what string, want float64) {
 		t.Helper()
 		if got := m.loss(); math.Abs(got-want) > 1e-9 {
@@ -236,7 +236,7 @@ func TestFlapDamping(t *testing.T) {
 // and show.
 func TestLateAnswerBarelyMoves(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	m := newMetric(0)
+	m := newMetric(0, &DefaultTuning)
 	feed := func(ms float64, k int) {
 		for i := 0; i < k; i++ {
 			now = now.Add(time.Second)

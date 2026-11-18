@@ -27,6 +27,8 @@ VERSION = 1
 TEST = 'unlock'
 RUN_S = 300
 NODE_AWAY = {'node_offline', 'node_connection_lost'}
+# 1: a full report with at least one service it could not tell, which is most runs.
+OK_EXITS = (0, 1)
 BENCH_ACTIVE = ('queued', 'preparing', 'running', 'collecting')
 
 # The program's own rows folded into one line per service: (id, name, group, the rows its verdict
@@ -94,6 +96,16 @@ def trim(report):
     return {'results': rows('results', ('id', 'status', 'region', 'detail')), 'services': rows('services', ('id', 'type', 'status', 'value')),
             'ai': rows('ai_endpoints', ('id', 'status')), 'extra': rows('extra_checks', ('id', 'name', 'status', 'region', 'detail')),
             'selection': {k: selection.get(k) for k in ('region', 'detected_country', 'extra_family')}}
+
+
+def report_of(result):
+    """The kept report a run's output carries, or None: what says the program ended as it should."""
+    text = str(result.get('stdout') or '')
+    try:
+        report = json.JSONDecoder().raw_decode(text[text.find('{'):])[0] if '{' in text else None
+    except ValueError:
+        report = None
+    return trim(report)
 
 
 def _verdict(kind, row):
@@ -196,6 +208,11 @@ class FullUnlock(ServerChecks):
         if await one(self.db.conn, f'SELECT 1 FROM server_bench_runs WHERE server_id=? AND state IN {BENCH_ACTIVE}', (server_id,)):
             self.deferred.add(server_id)
             return None
+        try:
+            await self.service.bench._stop_leftovers(server_id)
+        except InstanceError:
+            self.deferred.add(server_id)
+            raise
         ips = addresses(json.loads(row['info_json'] or '{}').get('info') or session.info or {})
         try:
             report = await self._measure(row['owner'], server_id, f'linux/{(session.info or {}).get("arch") or ""}')
@@ -229,15 +246,9 @@ class FullUnlock(ServerChecks):
             raise InstanceError(result['error'], 409)
         if result.get('timedOut'):
             raise InstanceError('unlock_full_timeout', 504)
-        # 1: a full report with at least one service it could not tell.
-        if result.get('exitCode') not in (0, 1):
+        if result.get('exitCode') not in OK_EXITS:
             raise InstanceError('unlock_full_failed', 502)
-        text = str(result.get('stdout') or '')
-        try:
-            report = json.JSONDecoder().raw_decode(text[text.find('{'):])[0] if '{' in text else None
-        except ValueError:
-            report = None
-        kept = trim(report)
+        kept = report_of(result)
         if not kept:
             raise InstanceError('unlock_full_bad_report', 502)
         return kept
@@ -247,7 +258,8 @@ class FullUnlock(ServerChecks):
         for attempt in (0, 1):
             await self.service.bench._push(stub, platform)
             result = await self.service.exec(owner, server_id, catalog.unlock_command(), timeout=RUN_S, shell='sh', source='check',
-                                             log='解锁检测：运行 Service Unlock', bypass=True)
+                                             log='解锁检测：运行 Service Unlock', bypass=True,
+                                             judge=lambda r: r.get('exitCode') in OK_EXITS and bool(report_of(r)))
             if result.get('exitCode') == catalog.CHECKSUM_FAILED and not attempt:
                 # The node's copy was changed or cleaned away: its file list goes, so the push sends it again.
                 await self.service.exec(owner, server_id, f'rm -f {shlex.quote(catalog.package_dir(TEST) + "/" + catalog.LISTING)}', timeout=30, shell='sh',

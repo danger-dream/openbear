@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import re
 import secrets
+import tempfile
 import time
+from pathlib import Path
 
 import aiohttp
 
@@ -190,6 +193,10 @@ class Onboarding:
         # A command for a controller with no node build would only fail on the machine it is run on.
         if not (await self.service.ensure_builds()).get('binaries'):
             raise InstanceError('node_binary_missing', 503)
+        profile = {} if server_id == LOCAL else (await self.service._profiles(owner)).get(server_id, {})
+        if fronts.is_front(profile):
+            # A front reaches nothing but its exits: they serve it before it is given a command.
+            await self.service.front.ensure(owner, profile['front'])
         code = await self.new_code(owner, server_id)
         fingerprint = install.fingerprint(self.service.identity_public)
         # The node id lets the script refuse a machine already running another node; one that took
@@ -198,14 +205,19 @@ class Onboarding:
         node = (took and took['node']) or server_id
         local = install.command(self.service.local_url(), code, browser=browser, node=node, fingerprint=fingerprint) if server_id == LOCAL else ''
         try:
-            access = await self.access(owner, server_id) if server_id != LOCAL else {'url': '', 'backup': '', 'front': False}
+            access = await self.access(owner, server_id, profile) if server_id != LOCAL else {'url': '', 'backup': '', 'front': False}
         except InstanceError:
             access = {'url': '', 'backup': '', 'front': False}
-        # A front reaches nothing but its exits: it is installed from here, over SSH through them.
-        url, backup = ('', '') if access['front'] else (access['url'], access['backup'])
+        url, opts = access['url'], {'backup': access['backup'], 'browser': browser, 'node': node, 'fingerprint': fingerprint}
+        if access['front']:
+            # It fetches the script and the node program through its exit, checking their checksums.
+            opts.update(pin=(access['pins'] or [''])[0], backup_pin=(access['backupPins'] or [''])[0])
+            command, windows = install.front_command, install.windows_front_command
+        else:
+            command, windows = install.command, install.windows_command
         return {'ok': True, 'code': code, 'expiresAtMs': now_ms() + CODE_TTL_MS, 'issuedAtMs': now_ms(),
-                'command': install.command(url, code, backup=backup, browser=browser, node=node, fingerprint=fingerprint) if url else '', 'localCommand': local,
-                'windowsCommand': install.windows_command(url, code, backup=backup, browser=browser, node=node, fingerprint=fingerprint) if url else ''}
+                'command': command(url, code, **opts) if url else '', 'localCommand': local,
+                'windowsCommand': windows(url, code, **opts) if url else ''}
 
     async def enroll(self, data):
         """Public endpoint: a one-time code or a registration code binds a node's public key."""
@@ -466,15 +478,20 @@ class Onboarding:
 
     async def _install(self, state, owner, server_id, target, access, code, browser=False, force=False):
         scrub = Scrubber([code])
-        sudo = not target.get('local') and target.get('username') != 'root' and target.get('auth') == 'password'
         url, backup = access['url'], access['backup']
-        current = None
+        current, sent_script = None, ''
         try:
             platform = await self.service.registry.platform(target)
-            # A front fetches nothing: its node program is sent over SSH through its exit, to this path.
-            pushed = f'/tmp/openbear-node-{secrets.token_hex(6)}' if access['front'] else ''
-            if pushed and (platform == 'windows' or sudo):
-                raise InstanceError('front_install_unsupported')
+            # An administrator's SSH session on Windows already runs elevated; there is no sudo.
+            sudo = platform != 'windows' and not target.get('local') and target.get('username') != 'root' and target.get('auth') == 'password'
+            # A front fetches nothing: its node program is sent over SSH through its exit, to this
+            # path; on Windows by scp into the login's home, where the script looks for a relative one.
+            pushed = ''
+            if access['front']:
+                pushed = f'openbear-node-{secrets.token_hex(6)}.exe' if platform == 'windows' else f'/tmp/openbear-node-{secrets.token_hex(6)}'
+            if pushed and sudo:
+                # The sudo password occupies stdin and a front fetches no script: it is sent first, as the login.
+                sent_script = f'/tmp/openbear-install-{secrets.token_hex(6)}.sh'
 
             async def stage(key):
                 # The check stage reads the node config already on the machine and changes nothing.
@@ -482,8 +499,14 @@ class Onboarding:
                 if access['front']:
                     opts.update(pin=(access['pins'] or [''])[0], backup_pin=(access['backupPins'] or [''])[0], front=True, binary=pushed)
                 if platform == 'windows':
-                    # An administrator's SSH session already runs elevated; there is no sudo.
-                    return await self.service.registry.run(target, install.windows_ssh_command(url, code, backup=backup, stage=key, **opts), timeout=300)
+                    script = f'openbear-install-{secrets.token_hex(6)}.ps1'
+                    sent = await self._send_windows_script(target, script)
+                    if not sent['ok']:
+                        return sent
+                    return await self.service.registry.run(target, install.windows_ssh_command(url, code, script=script, backup=backup, stage=key, **opts),
+                                                           timeout=300)
+                if sent_script:
+                    return await self.service.registry.run(target, f'sh {sent_script} ' + install.arguments(url, code, backup, key, **opts), timeout=300, sudo=True)
                 if sudo:
                     # The sudo password occupies stdin, so the script is fetched instead.
                     return await self.service.registry.run(target, install.command(url, code, backup=backup, stage=key, **opts), timeout=300, sudo=True)
@@ -491,8 +514,13 @@ class Onboarding:
                                                        stdin=install.script().encode(), timeout=300, root=True)
             for key, _ in STEPS[:-1]:
                 current = self._step(state, key, 'running')
+                if key == 'check' and sent_script:
+                    sent = await self.service.registry.run(target, f'umask 077 && cat > {sent_script}', stdin=install.script().encode(), timeout=120)
+                    if not sent['ok']:
+                        current['detail'] = (sent['stderr'] or sent['stdout']).strip()[-200:]
+                        raise InstanceError('install_timeout' if sent['timedOut'] else 'install_check_failed')
                 if key == 'download' and pushed:
-                    sent = await self._push_binary(target, platform, state['output'], pushed)
+                    sent = await self._push_binary(target, platform, state['output'], pushed, root=not sudo)
                     if not sent['ok']:
                         current['detail'] = (sent['stderr'] or sent['stdout']).strip()[-200:]
                         raise InstanceError('install_timeout' if sent['timedOut'] else 'install_download_failed')
@@ -507,6 +535,9 @@ class Onboarding:
                 state['output'] = (state['output'] + ('\n' if state['output'] and text else '') + text)[-3000:]
                 if not result['ok']:
                     current['detail'] = text.strip().splitlines()[-1][:200] if text.strip() else ''
+                    if key == 'check' and '@@unreachable' in result['stdout']:
+                        current['detail'] = (url + (' / ' + backup if backup else ''))[:200]
+                        raise InstanceError('front_exit_unreachable')
                     raise InstanceError('install_timeout' if result['timedOut'] else f'install_{key}_failed')
                 self._step(state, key, 'done')
             current = self._step(state, 'online', 'running')
@@ -529,15 +560,29 @@ class Onboarding:
             state.update(state='failed', error='install_failed')
             if current:
                 current['state'] = 'failed'
+        if sent_script:
+            with contextlib.suppress(Exception):
+                await self.service.registry.run(target, f'rm -f {sent_script}', timeout=30)
         state['finishedAtMs'] = now_ms()
 
-    async def _push_binary(self, target, platform, checked, path):
-        """Send the node program for the machine's architecture (from the check stage) to path."""
+    async def _push_binary(self, target, platform, checked, path, root=True):
+        """Send the node program for the machine's architecture (from the check stage) to path, as
+        root, or as the login (root=False) when only sudo with its password makes root."""
         arch = next((line.split('=', 1)[1].split()[0] for line in checked.splitlines() if line.startswith('arch=')), '')
         binary = await install.fetch_binary(install.binary_name(platform, arch)) if arch else None
         if not binary:
             raise InstanceError('node_binary_missing', 503)
-        return await self.service.registry.run(target, f'umask 077 && cat > {path}', stdin=await asyncio.to_thread(binary.read_bytes), timeout=600, root=True)
+        if platform == 'windows':
+            # An older Windows OpenSSH stalls on a command's stdin after its first 64 KiB.
+            return await self.service.registry.put(target, binary, path, timeout=600)
+        return await self.service.registry.run(target, f'umask 077 && cat > {path}', stdin=await asyncio.to_thread(binary.read_bytes), timeout=600, root=root)
+
+    async def _send_windows_script(self, target, name):
+        """scp install.ps1 into the login's home as name, for one stage to run and remove."""
+        with tempfile.TemporaryDirectory(prefix='openbear-install-') as directory:
+            local = Path(directory) / name
+            local.write_text(install.windows_script())
+            return await self.service.registry.put(target, local, name, timeout=120)
 
     @staticmethod
     def _step(state, key, value):

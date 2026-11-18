@@ -1,7 +1,7 @@
 {
   "name": "openbear-web",
   "private": true,
-  "version": "0.16.0",
+  "version": "0.16.1-dev.58",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -23,9 +23,10 @@ SCRIPT = r'''#!/bin/sh
 # a node id other than --node) is left alone unless --force is given.
 # With --fingerprint the node enrolls only with a controller of that identity key.
 # A front (--front) reaches the controller only through its exits, whose certificates --pin and
-# --backup-pin name, and fetches nothing: --binary is the node program the controller sent here.
+# --backup-pin name. --binary is the node program the controller sent here; without it the program
+# is fetched through the exit, whose self-signed certificate is not checked: its checksum is.
 set -eu
-URL=""; BACKUP=""; CODE=""; FINGERPRINT=""; FLAGS=""; STAGE="all"; NODE=""; FORCE=""; BINARY=""; ACCESS=""
+URL=""; BACKUP=""; CODE=""; FINGERPRINT=""; FLAGS=""; STAGE="all"; NODE=""; FORCE=""; BINARY=""; ACCESS=""; FRONT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) URL="$2"; shift 2 ;;
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --no-exec|--no-terminal|--browser) FLAGS="$FLAGS $1"; shift ;;
     --pin|--backup-pin) ACCESS="$ACCESS $1 $2"; shift 2 ;;
-    --front) ACCESS="$ACCESS --front"; shift ;;
+    --front) ACCESS="$ACCESS --front"; FRONT=1; shift ;;
     --binary) BINARY="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -83,6 +84,14 @@ service_do() {
 if [ -n "$OPENWRT" ]; then
   case "$FLAGS" in *--browser*) echo "no browser on OpenWrt: its musl system cannot run Chrome"; FLAGS=$(echo "$FLAGS" | sed 's/ --browser//g') ;; esac
 fi
+# Whether a front's exit answers on its front port; without curl or wget it is taken to.
+reach() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -sk -o /dev/null --connect-timeout 8 --max-time 20 "$1/api/server-nodes/v1/install.sh"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --no-check-certificate -T 8 -O /dev/null "$1/api/server-nodes/v1/install.sh"
+  fi
+}
 if stage check; then
   step check
   [ "$(id -u)" = 0 ] || { echo "openbear-node must be installed as root (use sudo)" >&2; exit 1; }
@@ -114,12 +123,18 @@ if stage check; then
   else
     echo "arch=$ARCH systemd=$([ -d /run/systemd/system ] && echo yes || echo no)"
   fi
+  if [ -n "$FRONT" ] && ! reach "$URL" && { [ -z "$BACKUP" ] || ! reach "$BACKUP"; }; then
+    echo "@@unreachable $URL"
+    echo "cannot reach the exit's front access $URL${BACKUP:+ or $BACKUP} from this machine." >&2
+    echo "Allow this machine in on the exit's firewall for that TCP port; over a dedicated line it may come from a private address, not its public IP." >&2
+    exit 1
+  fi
 fi
 fetch() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 15 "$1/api/server-nodes/v1/download/openbear-node-$OS-$ARCH" -o "$2"
+    curl -fsSL ${FRONT:+-k} --connect-timeout 15 "$1/api/server-nodes/v1/download/openbear-node-$OS-$ARCH" -o "$2"
   else
-    wget -q -T 15 -O "$2" "$1/api/server-nodes/v1/download/openbear-node-$OS-$ARCH"
+    wget -q ${FRONT:+--no-check-certificate} -T 15 -O "$2" "$1/api/server-nodes/v1/download/openbear-node-$OS-$ARCH"
   fi
 }
 if stage download; then
@@ -290,11 +305,17 @@ def manifest():
 WINDOWS_SCRIPT = r'''# openbear-node installer for Windows 10 / Server 2016 and newer.
 # Run from an elevated PowerShell:
 #   & ([scriptblock]::Create((irm URL/api/server-nodes/v1/install.ps1))) -Url URL -Code CODE [-Fingerprint SHA256] [-Backup URL] [-Node ID] [-Force] [-NoExec] [-NoTerminal] [-Browser] [-Stage STAGE]
+#     [-Pin SHA256] [-BackupPin SHA256] [-Front] [-Binary PATH]
 # Failures throw rather than exit, so a pasted command leaves the window open.
 # A machine already running openbear-node as another node (its config names
 # a node id other than -Node) is left alone unless -Force is given.
 # With -Fingerprint the node enrolls only with a controller of that identity key.
-param([string]$Url = '', [string]$Code = '', [string]$Fingerprint = '', [string]$Backup = '', [string]$Stage = 'all', [string]$Node = '', [switch]$Force, [switch]$NoExec, [switch]$NoTerminal, [switch]$Browser)
+# A front (-Front) reaches the controller only through its exits, whose certificates -Pin and
+# -BackupPin name. -Binary is the node program the controller sent here, a path relative to the
+# login's home as scp puts it; without it the program is fetched through the exit, whose
+# self-signed certificate is not checked: its checksum is.
+param([string]$Url = '', [string]$Code = '', [string]$Fingerprint = '', [string]$Backup = '', [string]$Stage = 'all', [string]$Node = '', [switch]$Force, [switch]$NoExec, [switch]$NoTerminal, [switch]$Browser,
+  [string]$Pin = '', [string]$BackupPin = '', [switch]$Front, [string]$Binary = '')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -326,20 +347,43 @@ if (Test-Stage 'check') {
   if (-not $sum) { throw "the controller has no openbear-node build for windows-$arch" }
   "arch=$arch build=$build"
   if ($build -lt 17763) { 'note: the web terminal needs Windows 10 1809 / Server 2019 or newer' }
+  if ($Front) {
+    # Whether a front's exit answers on its front port.
+    $reached = $false
+    foreach ($base in @($Url, $Backup) | Where-Object { $_ }) {
+      $client = New-Object Net.Sockets.TcpClient
+      try { $reached = $client.ConnectAsync(([Uri]$base).DnsSafeHost, ([Uri]$base).Port).Wait(8000) } catch { $reached = $false } finally { $client.Dispose() }
+      if ($reached) { break }
+    }
+    if (-not $reached) {
+      "@@unreachable $Url"
+      throw "cannot reach the exit's front access $Url from this machine. Allow this machine in on the exit's firewall for that TCP port; over a dedicated line it may come from a private address, not its public IP."
+    }
+  }
 }
 function Get-Node($base, $to) {
-  Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri "$base/api/server-nodes/v1/download/openbear-node-windows-$arch.exe" -OutFile $to
+  $uri = "$base/api/server-nodes/v1/download/openbear-node-windows-$arch.exe"
+  if (-not $Front) { Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $uri -OutFile $to; return }
+  if ($PSVersionTable.PSVersion.Major -ge 6) { Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -TimeoutSec 120 -Uri $uri -OutFile $to; return }
+  [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+  try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $uri -OutFile $to } finally { [Net.ServicePointManager]::ServerCertificateValidationCallback = $null }
 }
 if (Test-Stage 'download') {
   '@@step download'
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ('openbear-node-' + [guid]::NewGuid().ToString('N') + '.exe')
-  try {
-    try { Get-Node $Url $tmp } catch {
-      if (-not $Backup) { throw }
-      'primary address failed, trying backup'
-      Get-Node $Backup $tmp
-    }
-  } catch { throw 'cannot download the node from the controller' }
+  if ($Binary) {
+    if (-not [IO.Path]::IsPathRooted($Binary)) { $Binary = Join-Path $HOME $Binary }
+    if (-not (Test-Path -LiteralPath $Binary)) { throw 'the node program sent by the controller is missing' }
+    Move-Item -Force -LiteralPath $Binary $tmp
+  } else {
+    try {
+      try { Get-Node $Url $tmp } catch {
+        if (-not $Backup) { throw }
+        'primary address failed, trying backup'
+        Get-Node $Backup $tmp
+      }
+    } catch { throw 'cannot download the node from the controller' }
+  }
   if ((Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower() -ne $sum) { Remove-Item -Force $tmp; throw 'download checksum mismatch' }
   $service = Get-Service $name -ErrorAction SilentlyContinue
   if ($service -and $service.Status -ne 'Stopped') { Stop-Service $name -Force; $service.WaitForStatus('Stopped', '00:00:30') }
@@ -349,8 +393,11 @@ if (Test-Stage 'download') {
 if (Test-Stage 'enroll') {
   '@@step enroll'
   if (-not $Code) { throw '-Code is required' }
-  $arguments = @('enroll', '--url', $Url, '--code', $Code)
+  $arguments = @('enroll', '--url', $Url, '--code', $Code, '--config', $config)
   if ($Backup) { $arguments += @('--backup', $Backup) }
+  if ($Pin) { $arguments += @('--pin', $Pin) }
+  if ($Backup -and $BackupPin) { $arguments += @('--backup-pin', $BackupPin) }
+  if ($Front) { $arguments += '--front' }
   if ($NoExec) { $arguments += '--no-exec' }
   if ($NoTerminal) { $arguments += '--no-terminal' }
   if ($Browser) { $arguments += '--browser' }
@@ -487,12 +534,20 @@ def ps(value):
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r'\1\1', value) + "'"
 
 
-def windows_arguments(url, code, backup='', stage='all', *, browser=False, node='', force=False, fingerprint=''):
+def windows_arguments(url, code, backup='', stage='all', *, browser=False, node='', force=False, fingerprint='', pin='', backup_pin='', front=False, binary=''):
     parts = f'-Url {ps(url.rstrip("/"))} -Code {ps(code)}'
     if fingerprint:
         parts += f' -Fingerprint {ps(fingerprint)}'
     if backup:
         parts += f' -Backup {ps(backup.rstrip("/"))}'
+    if pin:
+        parts += f' -Pin {ps(pin)}'
+    if backup and backup_pin:
+        parts += f' -BackupPin {ps(backup_pin)}'
+    if front:
+        parts += ' -Front'
+    if binary:
+        parts += f' -Binary {ps(binary)}'
     if node:
         parts += f' -Node {ps(node)}'
     if force:
@@ -511,19 +566,48 @@ def windows_command(url, code, *, backup='', browser=False, node='', fingerprint
             + windows_arguments(base, code, backup, browser=browser, node=node, fingerprint=fingerprint))
 
 
-def windows_ssh_command(url, code, *, backup='', stage='all', browser=False, node='', force=False, fingerprint=''):
-    """One line that works whether the SSH server's shell is cmd or PowerShell.
-    The script is fetched (from the backup address if needed) because cmd caps
-    a command line at 8191 characters."""
-    sources = ','.join(ps(u.rstrip('/') + '/api/server-nodes/v1/install.ps1') for u in (url, backup) if u)
+def front_command(url, code, *, backup='', browser=False, node='', fingerprint='', pin='', backup_pin=''):
+    """A front's command: install.sh comes through its exit, whose self-signed certificate is not
+    checked, so the script's checksum is before it runs."""
+    base = url.rstrip('/')
+    digest = hashlib.sha256(script().encode()).hexdigest()
+    # A subshell keeps a pasted command's exit/trap out of the login shell. Cleanup
+    # must preserve failures from mktemp, curl, checksum verification and the installer.
+    return ('( f=$(mktemp) || exit $?; trap \'r=$?; rm -f "$f" || :; exit "$r"\' 0; '
+            'curl -fsSk --connect-timeout 15 ' + shlex.quote(base + '/api/server-nodes/v1/install.sh') + ' -o "$f" || { r=$?; echo '
+            + shlex.quote(f'cannot fetch install.sh through the exit at {base}; if it does not answer, allow this machine in on the exit\'s firewall '
+                          'for that TCP port (over a dedicated line it may come from a private address)') + ' >&2; exit "$r"; }; '
+            '[ "$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d" " -f1)" = ' + digest + ' ] '
+            '|| { echo "install.sh checksum mismatch" >&2; exit 1; }; sh "$f" '
+            + arguments(base, code, backup, browser=browser, node=node, fingerprint=fingerprint, pin=pin, backup_pin=backup_pin, front=True) + ' )')
+
+
+def windows_front_command(url, code, *, backup='', browser=False, node='', fingerprint='', pin='', backup_pin=''):
+    """front_command for an elevated PowerShell, 5.1 or 7."""
+    base = url.rstrip('/')
+    digest = hashlib.sha256(windows_script().encode()).hexdigest()
+    source = ps(base + '/api/server-nodes/v1/install.ps1')
+    return ('[Net.ServicePointManager]::SecurityProtocol=3072; '
+            f'if ($PSVersionTable.PSVersion.Major -ge 6) {{ $s = irm -SkipCertificateCheck {source} }} '
+            'else { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }; '
+            f'try {{ $s = irm {source} }} finally {{ [Net.ServicePointManager]::ServerCertificateValidationCallback = $null }} }}; '
+            "if ((-join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString('x2') })) "
+            f"-ne '{digest}') {{ throw 'install.ps1 checksum mismatch' }}; & ([scriptblock]::Create($s)) "
+            + windows_arguments(base, code, backup, browser=browser, node=node, fingerprint=fingerprint, pin=pin, backup_pin=backup_pin, front=True))
+
+
+def windows_ssh_command(url, code, *, script, backup='', stage='all', browser=False, node='', force=False, fingerprint='', pin='', backup_pin='', front=False, binary=''):
+    """One line that works whether the SSH server's shell is cmd or PowerShell. It runs
+    windows_script(), which scp put into the login's home as script, and removes it. cmd caps a
+    command line at 8191 characters, a front could not fetch the script, and an older Windows
+    OpenSSH (Windows 10 1809) at times never ends a command's stdin."""
+    arguments = windows_arguments(url, code, backup, stage, browser=browser, node=node, force=force, fingerprint=fingerprint,
+                                  pin=pin, backup_pin=backup_pin, front=front, binary=binary)
     body = ("$ProgressPreference='SilentlyContinue'\n"
-            '[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072\n'
             'try {\n'
-            "  $s = $null; $why = ''\n"
-            f'  foreach ($u in @({sources})) {{ try {{ $s = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 30 -Uri $u).Content; break }} catch {{ $why = $_.Exception.Message }} }}\n'
-            "  if ($s -is [byte[]]) { $s = [Text.Encoding]::UTF8.GetString($s) }\n"
-            '  if (-not $s) { throw "cannot reach the controller: $why" }\n'
-            f'  & ([scriptblock]::Create($s)) {windows_arguments(url, code, backup, stage, browser=browser, node=node, force=force, fingerprint=fingerprint)}\n'
+            f'  $p = Join-Path $HOME {ps(script)}\n'
+            '  $s = [IO.File]::ReadAllText($p); Remove-Item -Force -LiteralPath $p\n'
+            f'  & ([scriptblock]::Create($s)) {arguments}\n'
             '} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }\n')
     encoded = base64.b64encode(body.encode('utf-16-le')).decode()
     return f'powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}'

@@ -84,7 +84,7 @@ The node's first sealed message, and again when its addresses or browser change.
 ```json
 {"t": "hello", "info": "<ref:info>", "caps": {"exec": "<bool>", "terminal": "<bool>", "browser": "<bool>"},
  "version": "<string>", "build": "<hex64>", "endpoint": "<string>", "backup": "<bool>",
- "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "host", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe"],
+ "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "fs.write.noReplace", "host", "host.processIdentity", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe", "mesh.routing.noTransit", "mesh.routing.tuning", "mesh.fastPorts", "mesh.forwards"],
  "protocol": 1, "protocolMin": 1, "front?": "<bool>", "frontAccess?": "<ref:frontAccess>"}
 ```
 
@@ -216,6 +216,24 @@ One chunk of an upload (the controller always sends uploads); the file appears w
  "result": {"path": "<dir>/sub/part.txt", "size": 3, "done": false}}
 ```
 
+### call:fs.writeSafe
+The `fs.write.noReplace` feature adds a distinct RPC so a reconnected older node cannot ignore
+`noReplace` and overwrite the destination. The final publish is conditional, not a prior stat.
+```json
+{"params": {"path": "<dir>/safe.txt", "data": "aGVsbG8=", "upload": "abcdef987654", "offset": 0, "done": true, "mode": "", "mkdirs": false, "noReplace": true},
+ "result": {"path": "<dir>/safe.txt", "size": 5, "done": true}}
+```
+
+### call:fs.writeSafe/exists
+```json
+{"params": {"path": "<dir>/safe.txt", "data": "bm8=", "upload": "abcdef987655", "offset": 0, "done": true, "mode": "", "mkdirs": false, "noReplace": true},
+ "error": "file_exists"}
+```
+
+The optional `host.processIdentity` feature adds `identity` to process rows. `host.killIdentity`
+requires that same startup identity and rejects a changed or unavailable process identity.
+The older `host.kill` RPC remains for N-1 controllers and does not promise identity protection.
+
 ### entry
 ```json
 {"name": "<string>", "type": "<string>", "dir?": "<bool>", "size": "<int>", "mode": "<string>", "mtime": "<int>", "target?": "<string>"}
@@ -289,7 +307,7 @@ Text with \n matches a file written with \r\n, and the new text gets \r\n too.
 ### job
 ```json
 {"id": "<string>", "command": "<string>", "cwd?": "<string>", "shell": "<string>", "state": "<string>", "exitCode": "<int?>",
- "signal?": "<string>", "startedAt": "<int>", "endedAt?": "<int>", "durationMs": "<int>", "pid?": "<int>"}
+ "signal?": "<string>", "startedAt": "<int>", "endedAt?": "<int>", "durationMs": "<int>", "pid?": "<int>", "canStop?": "<bool>"}
 ```
 
 ### call:job.start
@@ -356,7 +374,8 @@ refused with capability_disabled.
 ```json
 {"enabled": "<bool>", "state": "<string>", "source": "<string>", "product": "<string>", "headless": "<bool>", "epoch": "<string>",
  "endpoint": "<string>", "download": "<bool>", "downloadsUnavailable?": true, "error?": "<string>", "downloaded?": "<int>",
- "chromeVersion?": "<string>", "update?": "<any>"}
+ "chromeVersion?": "<string>", "installedVersion?": "<string>", "update?": "<any>", "selectedSource?": "<string>", "runningSource?": "<string>",
+ "runningExecutable?": "<string>", "runningVersion?": "<string>", "runningVerified?": "<bool>", "restartNeeded?": "<bool>"}
 ```
 
 ### call:browser.config
@@ -454,5 +473,5 @@ The list below is the shared executable fixture, not an exhaustive list of metho
 requires command execution for http.local, browser.config and the implemented mesh methods
 (status, install, apply, tls, upgrade, uninstall, prepare, activate, confirm, abort).
 ```json
-["exec", "update", "fs.list", "fs.stat", "fs.read", "fs.write", "fs.edit", "job.start", "job.list", "job.status", "job.stop"]
+["exec", "update", "fs.list", "fs.stat", "fs.read", "fs.write", "fs.writeSafe", "fs.edit", "job.start", "job.list", "job.status", "job.stop"]
 ```

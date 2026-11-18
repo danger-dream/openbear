@@ -18,7 +18,8 @@ const capacityLabel = computed(() => meter.value.capacity ? fmtTokens(meter.valu
 const triggerLabel = computed(() => meter.value.trigger ? fmtTokens(meter.value.trigger) : '未设置');
 const triggerPercentLabel = computed(() => meter.value.triggerPercent === null ? '—' : `${meter.value.triggerPercent.toFixed(1)}%`);
 const triggerFill = computed(() => meter.value.triggerPercent === null ? 0 : Math.min(100, meter.value.triggerPercent));
-const triggerSummary = computed(() => `上下文：已用 ${usedLabel.value} / 压缩阈值 ${triggerLabel.value}，${triggerPercentLabel.value}`);
+const compactionCount = computed(() => Math.max(0, Math.floor(Number(props.usage?.compactionCount) || 0)));
+const triggerSummary = computed(() => `上下文：已用 ${usedLabel.value} / 压缩阈值 ${triggerLabel.value}，${triggerPercentLabel.value}${compactionCount.value > 0 ? `，已压缩 ${compactionCount.value} 次` : ''}`);
 function touchOpen(event) {
 	if (event.pointerType === 'touch') open.value = !open.value;
 }
@@ -40,6 +41,7 @@ function touchOpen(event) {
 				<div><dt>模型窗口</dt><dd>{{ capacityLabel }}</dd></div>
 				<div><dt>{{ props.strategy === 'model_summary' ? '摘要压缩阈值' : '滑动窗口阈值' }}</dt><dd>{{ triggerLabel }}</dd></div>
 				<div v-if="meter.triggerPercent !== null"><dt>阈值占用</dt><dd :class="`is-${meter.tone}`">{{ meter.triggerPercent.toFixed(1) }}%</dd></div>
+				<div><dt>已压缩</dt><dd>{{ compactionCount }} 次</dd></div>
 			</dl>
 			<p>{{ props.usage.known ? '最近一次模型调用的上下文用量，非累计 Tokens。' : '当前用量尚无有效实测值，不以 0% 代替。' }}</p>
 		</section>

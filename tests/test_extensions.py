@@ -90,9 +90,10 @@ async def test_new_conversations_take_the_nearest_folder_default_and_old_ones_ke
     assert saved['default']['own'] and saved['default']['enabled'] == ['browser']
     inherited = await request(e, 'get', f'/api/conversation-folders/{child}/extensions')
     assert inherited['default']['from'] == parent and not inherited['default']['own']
-    # Only a folder with a folder above it can inherit; a top-level one and the temporary node have their own setting only.
-    assert inherited['canInherit'] is True and saved['canInherit'] is False
-    assert (await request(e, 'get', '/api/conversation-folders/__temporary/extensions'))['canInherit'] is False
+    # Every folder and the temporary node can inherit, a top-level one from the system default; the system default cannot.
+    assert inherited['canInherit'] is True and saved['canInherit'] is True
+    assert (await request(e, 'get', '/api/conversation-folders/__temporary/extensions'))['canInherit'] is True
+    assert (await request(e, 'get', '/api/conversation-folders/__system/extensions'))['canInherit'] is False
     row = await created(e, 'in child', child)
     state = await e.server.extensions.state(row['conversation_uuid'])
     assert state.enabled == {'browser'} and state.auto_allow
@@ -217,12 +218,40 @@ async def test_an_extension_in_use_cannot_be_turned_off(env):
     assert 'browser' in (await e.server.extensions.state(row['conversation_uuid'])).enabled
 
 
-async def test_unattended_runs_use_the_declared_set_then_an_explicit_folder_default_then_everything(env):
+async def test_without_a_folder_setting_new_conversations_take_the_system_default(env):
+    e = env
+    top = await folder(e, 'top')
+    child = await folder(e, 'child', top)
+    owned = await folder(e, 'owned')
+    await request(e, 'put', f'/api/conversation-folders/{owned}/extensions', {'enabled': ['browser'], 'autoAllow': False})
+    saved = await request(e, 'put', '/api/conversation-folders/__system/extensions', {'enabled': ['conversations'], 'autoAllow': True})
+    assert saved['default'] == {'enabled': ['agents', 'conversations'], 'autoAllow': True, 'from': '__system', 'explicit': True, 'own': True}
+    for fid in (top, child, '__temporary'):
+        view = await request(e, 'get', f'/api/conversation-folders/{fid}/extensions')
+        assert view['default']['from'] == '__system' and not view['default']['own'], fid
+    assert (await request(e, 'get', f'/api/conversation-folders/{top}/extensions'))['inherited']['from'] == '__system'
+    for title, fid, enabled in (('temporary', '', {'agents', 'conversations'}), ('nested', child, {'agents', 'conversations'}),
+                                ('owned', owned, {'browser'})):
+        state = await e.server.extensions.state((await created(e, title, fid))['conversation_uuid'])
+        assert state.enabled == enabled, title
+    # Changing the default afterwards leaves the conversations already made as they are.
+    earlier = await created(e, 'earlier')
+    await request(e, 'put', '/api/conversation-folders/__system/extensions', {'enabled': ['browser'], 'autoAllow': False})
+    assert (await e.server.extensions.state(earlier['conversation_uuid'])).enabled == {'agents', 'conversations'}
+    await request(e, 'put', '/api/conversation-folders/__system/extensions', {'enabled': ['nope']}, status=400)
+    await request(e, 'put', '/api/conversation-folders/__system/extensions', {'inherit': True})
+    assert not (await request(e, 'get', f'/api/conversation-folders/{top}/extensions'))['default']['explicit']
+
+
+async def test_unattended_runs_use_the_declared_set_then_an_explicit_folder_or_system_default_then_everything(env):
     e = env
     service = e.server.extensions
     fid = await folder(e, 'events')
     assert await service.for_unattended(123, fid, None) is None
     assert await service.for_unattended(123, fid, ['browser']) == {'enabled': ['browser'], 'autoAllow': False}
+    await service.set_folder_default(123, '__system', {'enabled': ['browser'], 'autoAllow': True})
+    assert await service.for_unattended(123, fid, None) == {'enabled': ['browser'], 'autoAllow': True}
+    assert await service.for_unattended(123, '', ['automation']) == {'enabled': ['automation'], 'autoAllow': True}
     await service.set_folder_default(123, fid, {'enabled': ['automation'], 'autoAllow': True})
     assert await service.for_unattended(123, fid, None) == {'enabled': ['automation'], 'autoAllow': True}
     row = await created(e, 'source', fid)

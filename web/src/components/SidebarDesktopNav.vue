@@ -6,7 +6,7 @@ import FloatingPanel from '../references/FloatingPanel.vue';
 // pinned and the rest wait under "More".
 const PINNED_STORAGE = 'openbear.sidebar.pinned';
 const LIMIT = 5;
-const DEFAULT_PINNED = ['memory', 'secrets', 'docs', 'instances', 'servers'];
+const DEFAULT_PINNED = ['memory', 'secrets', 'docs', 'notes', 'servers'];
 
 const props = defineProps({items: {type: Array, default: () => []}, active: {type: String, default: ''}});
 const emit = defineEmits(['select', 'shelf-enter', 'shelf-leave', 'shelf-key']);

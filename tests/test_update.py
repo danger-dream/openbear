@@ -18,6 +18,21 @@ def updater():
     return load_updater()
 
 
+def isolated_deployment_config(install, data, monkeypatch):
+    # These tests inject stop/swap failures; the new read-only preflight must
+    # observe their synthetic deployment rather than the developer's systemd.
+    path = install / "openbear.json"
+    config = json.loads(path.read_text()) if path.exists() else {}
+    config["storage"] = {"dbPath": str(data / "openbear.db")}
+    path.write_text(json.dumps(config))
+    real_run = subprocess.run
+    def run(args, **kwargs):
+        if args[:2] == ["systemctl", "show"]:
+            return subprocess.CompletedProcess(args, 0, "MainPID=0\nLoadState=loaded\n", "")
+        return real_run(args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", run)
+
+
 def test_version_files_are_in_sync():
     root = Path(__file__).resolve().parents[1]
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
@@ -311,6 +326,7 @@ def test_run_stop_failure_does_not_switch_or_enter_destructive_rollback(tmp_path
 
     monkeypatch.setattr(worker, "_download_and_verify", lambda: staging)
     monkeypatch.setattr(worker, "_systemctl", failed_stop)
+    isolated_deployment_config(install, data, monkeypatch)
     monkeypatch.setattr(worker, "_swap", forbidden_swap)
 
     assert worker.run() == 1
@@ -413,6 +429,7 @@ def test_run_recovers_when_swap_fails_before_or_between_directories(
 
     monkeypatch.setattr(worker, "_download_and_verify", lambda: staging)
     monkeypatch.setattr(worker, "_systemctl", fake_systemctl)
+    isolated_deployment_config(install, data, monkeypatch)
     monkeypatch.setattr(worker, "_swap", failing_swap)
     monkeypatch.setattr(worker, "_sync_deps", lambda: None)
     monkeypatch.setattr(worker, "_install_unit", lambda: None)

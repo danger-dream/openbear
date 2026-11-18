@@ -1,26 +1,33 @@
 <script setup>
-import { onBeforeUnmount, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, reactive, ref } from 'vue';
 import { Api } from '../api.js';
 import { HOST_PATTERN, HOST_TITLE, USER_PATTERN, USER_TITLE, ok, safeError } from './instanceHelpers.js';
 import SshAuth from './SshAuth.vue';
+import SshRelay from '../servers/SshRelay.vue';
 
-const props = defineProps({server: {type: Object, default: null}});
+// servers: the servers page's list, which offers a relay; elsewhere the login keeps the relay it has.
+const props = defineProps({server: {type: Object, default: null}, servers: {type: Array, default: () => []}});
 const emit = defineEmits(['saved', 'cancel']);
 const editing = props.server;
 const form = reactive({name: editing?.name || '', host: editing?.host || '', port: editing?.port || 22, username: editing?.username || 'root',
-  auth: editing ? (editing.auth === 'upload' ? 'upload' : editing.auth) : 'key'});
+  auth: editing ? (editing.auth === 'upload' ? 'upload' : editing.auth) : 'key', relay: editing?.relay || ''});
+const front = computed(() => Boolean(editing && props.servers.find(s => s.id === editing.id)?.profile?.front));
+const relayName = computed(() => props.servers.find(s => s.id === form.relay)?.name || '');
 const login = ref(null);
 const busy = ref(false), testing = ref(false), error = ref(''), testResult = ref(null);
 defineExpose({busy});
 
 const credentials = () => login.value?.credentials() || {};
 function payload() {
-  return {name: form.name.trim(), host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth, ...credentials()};
+  // relay only when there is one to keep, set or clear: a login without one is saved as before.
+  return {name: form.name.trim(), host: form.host.trim(), port: Number(form.port), username: form.username.trim(), auth: form.auth,
+    ...(props.servers.length && (form.relay || editing?.relay) ? {relay: form.relay} : {}), ...credentials()};
 }
 async function test() {
   if (testing.value) return;
   error.value = ''; testResult.value = null; testing.value = true;
-  try { testResult.value = ok(await Api.testInstanceServer(payload())); }
+  // A saved front is tested the way it is reached: through its exits unless it has a relay.
+  try { testResult.value = ok(await Api.testInstanceServer({...payload(), ...(front.value ? {serverId: editing.id} : {})})); }
   catch (e) { testResult.value = {failed: safeError(e)}; }
   finally { testing.value = false; }
 }
@@ -48,8 +55,11 @@ onBeforeUnmount(() => login.value?.clear());
       <div class="ob-field"><span>地址</span>
         <div class="ob-ctl">
           <div class="ob-inline"><input v-model="form.host" required maxlength="253" :pattern="HOST_PATTERN" :title="HOST_TITLE" class="mono" placeholder="IP 或域名" aria-label="服务器地址" /><input v-model.number="form.port" class="mono ob-port" type="number" inputmode="numeric" min="1" max="65535" required aria-label="SSH 端口" /></div>
-          <small>主控通过这个地址连接服务器，可以是公网 IP，也可以是 WG 等内网地址。</small>
+          <small>{{ relayName ? `主控经 ${relayName} 的节点连接服务器，填 ${relayName} 能连到的地址。` : front ? '前置机经出口连接，填出口能连到的地址。' : '主控通过这个地址连接服务器，可以是公网 IP，也可以是 WG 等内网地址。' }}</small>
         </div>
+      </div>
+      <div v-if="servers.length" class="ob-field"><span>经由</span>
+        <div class="ob-ctl"><SshRelay v-model="form.relay" :servers="servers" :self="editing?.id || ''" :front="front" /><small>只允许特定网络登录 SSH 时，选那个网络里的一台服务器转发。</small></div>
       </div>
       <label class="ob-field"><span>用户</span><input v-model="form.username" required maxlength="64" :pattern="USER_PATTERN" :title="USER_TITLE" class="mono" aria-label="SSH 用户" /></label>
       <SshAuth ref="login" v-model="form.auth" :editing="editing" @error="error = $event" />

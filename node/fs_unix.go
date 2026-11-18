@@ -23,12 +23,6 @@ func shownPath(p string) string { return p }
 
 func drives() (any, error) { return nil, nil }
 
-func keepOwner(temp string, prior fs.FileInfo) {
-	if st, ok := prior.Sys().(*syscall.Stat_t); ok {
-		os.Lchown(temp, int(st.Uid), int(st.Gid))
-	}
-}
-
 func platformFileError(error) string { return "" }
 
 // fileIdentity names the open file by device and inode.

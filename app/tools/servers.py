@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import codecs
 import copy
 import datetime as dt
 import json
@@ -119,7 +120,7 @@ BENCH_RUNS_MAX = 80
 SGR = re.compile(r'\x1b\[[0-9;]*m')
 # The draft is read to be sent back changed, so it gets more room than other reads while staying well under the 32000-char tool cap.
 DRAFT_BUDGET = 29500
-DRAFT_KEYS = ('settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups', 'limits', 'paths')
+DRAFT_KEYS = ('settings', 'members', 'relayLinks', 'directLinks', 'rules', 'lineRules', 'exitGroups', 'limits', 'paths', 'fastPorts', 'forwards')
 MESH_VIEW_KEYS = frozenset({'name', 'platform', 'publicEndpointAuto', 'subnetSuggestions', 'front', 'region'})
 APPLY_WAIT = 120
 
@@ -230,6 +231,64 @@ def _summary(values):
 
 def _size(value):
     return len(json.dumps(value, ensure_ascii=False))
+
+
+def _byte_page(data, render, *, budget=OUTPUT_BUDGET - 1024, text=True, eof=True):
+    def page(n):
+        raw = data[:n]
+        if text:
+            decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            value = decoder.decode(raw, final=eof and n == len(data))
+            n -= len(decoder.getstate()[0])
+        else:
+            value = base64.b64encode(raw).decode()
+        return render(value, n)
+
+    result = page(len(data))
+    if _size(result) <= budget:
+        return result
+    low, high = 0, len(data)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _size(page(mid)) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    result = page(low)
+    if _size(result) > budget:
+        raise InstanceError('output_metadata_too_large')
+    return result
+
+
+def _log_metadata(result, budget):
+    """Summarize metadata, never the log: only the node knows its original byte boundaries.
+    In a large batch, serverId/jobId still identify every row; one-job reads give more detail.
+    The budget is a target, not a per-row rejection limit: required fields take priority.
+    """
+    result = copy.deepcopy(result)
+    result['hasMore'] = result['next'] < result['outputSize']
+    job = result.get('job') or {}
+
+    def large():
+        return _size({**result, 'output': ''}) > budget
+
+    if large():
+        for key in ('command', 'cwd', 'shell'):
+            if len(str(job.get(key) or '')) > 80:
+                job[key] = str(job[key])[:80] + '…'
+                result['jobSummary'] = True
+    if large():
+        for key in ('command', 'cwd', 'shell'):
+            job.pop(key, None)
+        result['jobSummary'] = True
+    if large() and 'jobId' in result:
+        # Repeated id and optional details can otherwise consume all 50 jobs' log space.
+        for key in ('id', 'startedAtMs', 'endedAtMs', 'durationMs', 'signal'):
+            job.pop(key, None)
+        result['jobSummary'] = True
+        if large():
+            result.pop('name', None)
+    return result
 
 
 def _fit(result, steps, budget=OUTPUT_BUDGET, note='cut to fit the tool output; mesh_member gives one member in full'):
@@ -424,7 +483,7 @@ def _mesh_summary(summary):
 
 def _mesh_overview(view, offset=0, limit=None, explicit_page=False, fields=None):
     """GET /mesh for the AI: key outcome/health fields first, scalable pagination by offset/limit when members grow large."""
-    priority = ('ok', 'applied', 'apply', 'draft', 'errors', 'warnings', 'installing', 'routeClashes',
+    priority = ('ok', 'applied', 'apply', 'draft', 'draftVersion', 'errors', 'warnings', 'installing', 'routeClashes',
                 'settings', 'limits', 'paths', 'pathsView', 'lineRules', 'exitGroups', 'directLinks', 'relayLinks',
                 'rules', 'autoRules', 'exports', 'eligible', 'members', 'nodes', 'lines', 'autoLinks', 'auto')
     raw = {k: copy.deepcopy(v) for k, v in view.items() if k != 'layout'}
@@ -445,7 +504,7 @@ def _mesh_overview(view, offset=0, limit=None, explicit_page=False, fields=None)
         has_more = (offset + len(sliced)) < total_members
         result['page'] = {'target': 'members', 'offset': offset, 'returned': len(sliced), 'total': total_members,
                           'hasMore': has_more, 'nextOffset': (offset + len(sliced)) if has_more else None}
-    member_keys = ('serverId', 'name', 'platform', 'role', 'relayMode', 'address', 'publicEndpoint', 'publicEndpointAuto', 'listen', 'entry', 'direct', 'removing')
+    member_keys = ('serverId', 'name', 'platform', 'role', 'relayMode', 'address', 'publicEndpoint', 'publicEndpointAuto', 'listen', 'entry', 'direct', 'removing', 'noTransit')
 
     def compact_auto(r):
         if isinstance(r.get('auto'), dict) and any(r['auto'].values()):
@@ -487,6 +546,8 @@ def _mesh_overview(view, offset=0, limit=None, explicit_page=False, fields=None)
             r['pathsView'] = [{k: v for k, v in p.items() if k != 'segments'} for p in r['pathsView']]
         if isinstance(r.get('exports'), list):
             r['exports'] = [{**{k: v for k, v in e.items() if k != 'nodes'}, 'nodeCount': len(e.get('nodes') or [])} for e in r['exports']]
+        if isinstance(r.get('forwardGeo'), dict):
+            r['forwardGeo'] = {k: r['forwardGeo'].get(k) for k in ('ready', 'updatedAt', 'error')}
 
     def compact_members(r):
         if isinstance(r.get('members'), list):
@@ -567,7 +628,7 @@ def _mesh_overview(view, offset=0, limit=None, explicit_page=False, fields=None)
         ('lines endpoint addresses (see mesh section="lines")', compact_lines_ends),
         ('lines non-down entry details (see mesh section="lines")', compact_lines_up),
         ('nodes.summary routing and entryHealth detail', compact_nodes),
-        ('settings.health, pathsView segments and exports node lists (see mesh section="exports")', drop_settings),
+        ('settings.health, pathsView segments, exports node lists and forwardGeo provinces (see mesh section="exports" or "forwards")', drop_settings),
         ('members gateway, tags, uploadLimitMbps and controlAddress if unfiltered; rules (see mesh_draft) and autoRules; ineligible servers',
          compact_members if fields is None else (lambda r: None)),
         ('relayLinks pairs, lines list, autoLinks lists and member entry candidates (see mesh section=... or mesh_draft)', compact_links_and_lines),
@@ -591,7 +652,7 @@ def _strip_default_member_fields(m, drop_inherited=False):
 
 
 def _mesh_draft(view, offset=0, limit=None, explicit_page=False, fields=None):
-    result = {'ok': True, 'dirty': view['draft']['dirty'], 'changes': view['draft']['changes'],
+    result = {'ok': True, 'draftVersion': view.get('draftVersion'), 'dirty': view['draft']['dirty'], 'changes': view['draft']['changes'],
               'errors': view['errors'], 'warnings': view['warnings'], **{k: copy.deepcopy(view.get(k, [])) for k in DRAFT_KEYS}}
     total_members = len(result.get('members') or [])
     if fields is not None:
@@ -664,6 +725,12 @@ def _mesh_member(detail, budget=OUTPUT_BUDGET - 200):
                 config['peers'] = {'count': len(config['peers']), 'note': 'pass include=["config"] (with offset/limit) for full WireGuard peer configs'}
             if isinstance(config.get('routes'), list) and len(config['routes']) > 16:
                 config['routes'] = {'count': len(config['routes'])}
+            if isinstance(config.get('fast'), dict):
+                fc = config['fast']
+                if isinstance(fc.get('dial'), list) and len(fc['dial']) > 20:
+                    fc['dial'] = {'count': len(fc['dial'])}
+                if isinstance(fc.get('targets'), list) and len(fc['targets']) > 20:
+                    fc['targets'] = {'count': len(fc['targets'])}
 
     def routing(r):
         if status and isinstance(status.get('routing'), dict) and isinstance(status['routing'].get('routes'), list):
@@ -766,13 +833,18 @@ _MEMBER_FIELDS = (
     'role member|relay (relay: Linux only, at least one listen port); relayMode public|site (relays only; public: reachable at publicEndpoint or the '
     'panel IPv4; site: a relay behind NAT that is never dialed at an address, reached only by UDP punching, and must link to at least one public relay); '
     'address, controlAddress: IPv4 inside settings.prefix / settings.controlPrefix, "" = allocate; publicEndpoint: IP or host name without port, "" = auto; '
-    'publicPorts {udp?, tcp?, tls?}: a port mapping, the port others dial when it is not the one listened on (0 or left out = the same); '
+    'publicPorts {udp?, tcp?, tls?, fast?}: a port mapping, the port others dial when it is not the one listened on (0 or left out = the same); '
     'announce: false = others never dial it at any address (it dials them or punches), left out = announced; '
     'auto: [listen, relayMode] the fields that follow the mesh (newcomers have both; for listen only which transports are open, the numbers stay); '
-    'listen {udp, tcp, tls}: port, 0 = off (tls on relays only; a punched link or site relay needs udp); tags [<=20 strings, used by rules]; '
+    'listen {udp, tcp, tls, fast?}: port, 0 = off (tls on relays only; a punched link or site relay needs udp; fast: the fast relay port it listens on '
+    'while it takes part, left out = settings.fast.port); tags [<=20 strings, used by rules]; '
     'gateway: null | {subnets [IPv4 CIDR announced to the mesh], masquerade bool, default true, name (the LAN\'s name, <=40 chars), backup bool (true: '
     'stands by for exactly the subnets another gateway announces and takes them while that one is unreachable)} (Linux); '
     'uploadLimitMbps: null = unlimited | number; '
+    'noTransit (relays only): true = it forwards between two other relays only when no other path is up (taken back as soon as one is), '
+    'still carrying what goes to or from itself, its gateway subnets and the members entering by it (a home or office router with little upload); '
+    'own routes may not pass it unless it is an end member\'s entry relay; warnings mesh_no_transit_only_way (relays left reaching the rest only '
+    'through such relays) and mesh_no_transit_outdated (nodes to update before they route around it); '
     'entry (role member): {mode fixed|failover, autoReturn bool, candidates [{id? (c1.. assigned), relay: relay serverId, transport udp|tcp|tls, '
     'auto? [transport]}] <=8 in priority order; a candidate on a site relay must be udp and needs a public-relay candidate beside it}; '
     'proxy: null | {exit: null | {user (its SOCKS5/HTTP username, [a-z0-9][a-z0-9._-]{0,31}, unique; made from the serverId when empty), password '
@@ -786,7 +858,7 @@ _MEMBER_FIELDS = (
     'the rules for both are added whatever the user\'s rules say; '
     'removing: set by mesh_leave, false keeps the member')
 MESH_CONTRACTS = {
-    'mesh': {'section': 'optional: summary|members|nodes|lines|autoLinks|auto|rules|links|paths|exports|eligible|draft|apply (or list)',
+    'mesh': {'section': 'optional: summary|members|nodes|lines|autoLinks|auto|rules|links|paths|exports|eligible|draft|apply|forwards (or list)',
              'fields|offset|limit': 'optional field projection (supports dot paths) and pagination (returns page.nextOffset)',
              'serverId|serverIds|problemsOnly|waitUpgradeSeconds': 'optional server filter, non-ready/non-up filter, or wait 0..120 s for rollout/upgrades',
              'note': 'overview (GET /mesh without layout): applied {revision, at}, apply {running, revision, progress [{serverId, state, error}]}, '
@@ -805,6 +877,7 @@ MESH_CONTRACTS = {
                    'note': 'the draft to edit: dirty, changes, errors, warnings, plus settings, members, relayLinks, directLinks, rules, lineRules, exitGroups, limits, paths. '
                            'Default empty member fields are omitted to fit tool limits and preserved automatically when sent back to mesh_save_draft'},
     'mesh_save_draft': {
+        'draftVersion': 'required opaque token from mesh or mesh_draft; stale: mesh_draft_conflict, missing: mesh_draft_version_required. Re-read and reconcile edits after a conflict; never blindly retry an old full draft with a new token',
         'patch': 'incremental edit without resending all members/items: {settings?, members?: [{serverId (or unique name), listen? (merged), '
                  'entry?: {mode?, autoReturn?, candidates?, addCandidates?: [{relay, transport?, auto?}], removeCandidates?: [relay | {relay, transport?}]}, '
                  'gateway? (merged when dict), proxy? (merged when dict, with upsertPorts/removePorts by id or port), ...other member fields}], '
@@ -814,7 +887,7 @@ MESH_CONTRACTS = {
                  'Server names are resolved anywhere a serverId is expected',
         'settings|members|relayLinks|directLinks|rules': 'top-level params, the full parts to replace; a part left out stays as it is. '
                                                          'Prefer patch when changing a few members, links or rules; read mesh_draft for full replacement. '
-                                                         'No revision or lock to send: one draft per owner, the last save wins',
+                                                         'Send draftVersion from the read that your edit is based on; a conflicting save changes nothing',
         'members': f'[{{serverId, ...fields to change}}]: every member of the draft, in the order wanted (a missing one: member_missing; members are '
                    f'added only by mesh_join and removed by mesh_leave); a field not given keeps its value. Fields: {_MEMBER_FIELDS}',
         'relayLinks': '{mode full|custom|auto, pairs [{a, b: relay serverIds, transport udp|tcp|tls, cost 1..1000 (static routing), dialer a|b (the end that '
@@ -833,6 +906,27 @@ MESH_CONTRACTS = {
                   '(the only ones allowed), via? [serverIds] (one end among them), manualOnly bool (no automatic link or upstream)}] <=50, replaced '
                   'as a whole: hard rules on connections with one end on each side, at least one condition each. Saving refuses what you list '
                   'against them (limit_violation); automatic transports, links and the auto-links optimizer keep to them',
+        'fastPorts': '[{id? (f1.. assigned), serverId, port, proto tcp|udp|any (default any), src? (a rule side, default {all: true, allSubnets: true}: '
+                     'every member and shared subnet), note?}] <=256, replaced as a whole (patch: upsert/remove by id): connections to that member\'s '
+                     'mesh address and port go by fast relay, hop by hop over plain TCP, along the mesh\'s own paths (its fixed paths, then its route '
+                     'and the next best; settings.fast.paths of them probed and kept warm). A node\'s first connection goes over the mesh while its '
+                     'channel warms up; with no path answering, connections go over the mesh. src may use it, whatever the rules say. Every node '
+                     'of a release with it takes part (older ones are passed over: fast_member_needs_update for the port\'s own); Linux takes the '
+                     'connections with nftables, other systems in the data plane. Unencrypted between nodes: for traffic encrypted itself (ss2022, '
+                     'HTTPS, SSH). mesh_member status fast.channels shows each destination\'s paths and which one new connections take',
+        'forwards': '[{id? (fw1.. assigned), entry, target: serverIds, listen (port on every address of entry), proto any|tcp|udp (default any), '
+                    'host (what target dials, default 127.0.0.1: its loopback; any IP or name it reaches), port, line mesh|fast (default mesh), '
+                    'proxyProtocol 0|1|2 (TCP: a PROXY protocol header with the client\'s address ahead of its data), allow? {prefixes [IPs or '
+                    'CIDRs <=1000], provinces [Chinese province names as the view\'s forwardGeo lists them, e.g. 广东省]} (neither: every client), '
+                    'enabled (default true), note?}] <=256, replaced as a whole (patch: upsert/remove by id): port forwarding like realm without '
+                    'running it. Clients of entry:listen are handed to target, which connects to host:port. line mesh: through the mesh\'s '
+                    'encrypted tunnel to target\'s settings.forward.port on its mesh address, along the mesh\'s routes; fast: through the fast relay '
+                    '(unencrypted between nodes) to settings.forward.fastPort, which the controller makes a fast port only those entries use. The '
+                    'entry\'s firewall opens listen by itself; a port another program holds (a realm still running) is refused at apply '
+                    '(mesh_port_in_use). Province networks come from ip2region, kept by the controller (forwardGeo: ready, updatedAt, counts); '
+                    'apply waits for them (forward_geo_missing). Both ends need a release with it (forward_member_needs_update). mesh_member '
+                    'status forward.forwards[] shows each one\'s listen, errors, active, sessions (UDP), refused (by allow), failed, lastError, '
+                    'bytes and its tunnels (ready, rttMs); forward.target the target side',
         'paths': 'own routes (自建路线), [{id? (p1.. assigned), on bool, from, to: serverIds, via [1..8 relay serverIds in order]}] <=100, '
                  'replaced as a whole: traffic from one to the other goes through via, and back through via reversed. The routes of the same '
                  'two machines, whichever way written, are that pair\'s in list order, at most 3 (path_pair_full): the first whose links are '
@@ -856,12 +950,20 @@ MESH_CONTRACTS = {
                  'gets a route to a gateway subnet only when a rule lets it reach it (src names it, dst.subnets there) or answer sources '
                  'there; mesh exports shows who gets each subnet',
         'settings': 'merged into the current ones: proxy {port (tunnel port between proxy ports and exits on every exit\'s mesh address, default 51080), password '
-                    '(from before exits had their own; unused)}, prefix (IPv4 CIDR /8../22; changing it re-addresses every member), mtu 1280..1420 (every path\'s but '
+                    '(from before exits had their own; unused)}, fast {port (default 52003: the fast relay port relays and the fast ports\' members listen on), paths (1..8, default 3: how many paths a fast port\'s channel keeps warm), rotateKey true}, '
+                    'forward {port (default 51082), fastPort (default 51083): the tunnel ports on a forward target\'s mesh address}, prefix (IPv4 CIDR /8../22; changing it re-addresses every member), mtu 1280..1420 (every path\'s but '
                     'the large ones), tcpJumbo bool (default false: packets of up to 9000 bytes where every hop is TCP or TLS between Linux '
                     'nodes of protocol 4 or later; others stay at mtu; status peers[].pathMtu shows each link\'s), ports {udp, tcp, tls} '
                     '(defaults for new members), health {activeIntervalMs, standbyIntervalMs, coldRetryMs, initialTimeoutMs, '
                     'minTimeoutMs, maxTimeoutMs, consecutiveFailures, readySuccesses, handshakeGraceMs, returnHealthyMs, minResidenceMs, leaseMs, '
-                    'leaseRefreshMs}, reachability {stun ["host:port", <=8]: extra STUN servers every node checks its NAT with}',
+                    'leaseRefreshMs}, reachability {stun ["host:port", <=8]: extra STUN servers every node checks its NAT with}, '
+                    'routing {switchMs (default 5: a working route moves to a path costing at least this much less), switchPct (0: and more '
+                    'than this % less), shorterMs 3, shorterPct 0 (the same for a path through fewer relays, held holdS), advertMs 2, advertPct 0 '
+                    '(a link\'s routed cost follows the measured one once they differ by more), holdS 5, jitterWeight 2, lossWeight 1000 (link '
+                    'cost = rtt + jitterWeight*jitter + lossWeight*loss(0-1) + bias ms, plus 50 while a UDP link carries less than the network MTU '
+                    '(event link.mtu, peers[].pathMtu), the larger of the two ends\'), flapHoldS 60, flapHoldMaxS '
+                    '480 (after a route went back and forth within 10 minutes a move waits flapHoldS, doubled per further flap, up to flapHoldMaxS)}; '
+                    'warning mesh_tuning_outdated names routing nodes that keep the former fixed thresholds (20 % and 10 ms) until updated',
         'returns': 'the overview as in mesh. A draft that fails its checks is not saved: ok false, error mesh_invalid, errors [{path (e.g. '
                    'members[2].entry.candidates[0], relayLinks.pairs[1]), error (code), message (Chinese)}]; fix those and save again. '
                    'Saving changes no machine: mesh_apply does. Warning mesh_udp_port_shared (path members[i].listen.udp): two members '
@@ -928,7 +1030,8 @@ MESH_CONTRACTS = {
                     'fields|statusFields|configFields': 'optional field projections on member, status (e.g. ["entry","peers","routing"]) or config (e.g. ["peers","routes","proxy"])',
                     'offset|limit': 'optional pagination for sub-collections (or peersOffset/peersLimit, eventsOffset/eventsLimit, routesOffset/routesLimit); returns pages.{peers,events,routes,configPeers}.nextOffset',
                     'returns': 'member (draft view), node (as in mesh.nodes), status (the node\'s latest full report: peers, '
-                               'entry with candidates, owners, routing links and routes, reachability with observers, '
+                               'entry with candidates, owners, routing links (cost measured, advertised what routes go by) and routes (best, bestCost, '
+                               'held, until while one stays though another next hop is shortest), reachability with observers, '
                                'resources, counters), events (newest first; {seq, at, kind, detail}, a run of the same kind and detail folded into one '
                                'with firstAt = its first time, at = its latest, repeat = how many times), config (the config delivered to it); cut to fit '
                                'when large, named in truncated'},
@@ -948,15 +1051,20 @@ MESH_CONTRACTS = {
                                    'hours 30 days'},
     'mesh_path': {'src': 'serverId (or unique name)', 'dst': 'serverId (both applied members); leave it out for every route from src (supports offset/limit pagination via page.nextOffset)',
                   'best': 'optional with dst, 1-20: instead of the path in use, the best that many loopless paths from src to dst by the '
-                          'latest reports, ranked by the routes\' cost (rtt + 2 jitter + 1000 loss + bias), only relays forwarding: routes '
-                          '[{nodes, segments [{a, b, exists, rttMs}], rttMs, own (its rank among the pair\'s own routes, or null)}], and '
-                          'own [{id, rank, on, nodes from src, segments, rttMs, place (in routes, or null)}]: the pair\'s own routes in the draft',
+                          'latest reports, ranked by the routes\' cost (the link costs the ends advertise, as routing compares them), only relays '
+                          'forwarding, those through fewer noTransit relays first: routes [{nodes, segments [{a, b, exists, rttMs}], rttMs, cost, own '
+                          '(its rank among the pair\'s own routes, or null), noTransit? (the noTransit relays it goes on through)}], '
+                          'own [{id, rank, on, nodes from src, segments, rttMs, cost, place (in routes, or null)}]: the pair\'s own routes in the draft, '
+                          'current (the path in use measured the same way, or null) and tuning (settings.routing applied)',
                   'nodes': 'instead of src/dst, 2-10 serverIds of the draft in order: that route measured link by link, as the route editor does: '
                            'a link up by the latest reports (how report), one not linked yet measured now from one end with mesh.probe (how probe, '
                            'kept a minute), or why not (how none, why); segments [{a, b, exists, rttMs, loss, how, why?}], rttMs (null while one has none)',
                   'returns': 'with dst: the path traffic takes now from the latest reports: hops [{node, via (from the hop before: "" for src, '
                              'direct, lan, entry, relay), rttMs}], rttMs total, stale (a report is missing or old, or a segment has no rtt; rttMs '
-                             'is then null and hops may stop where the path is unknown). Without dst (as GET /mesh/routes): routes [{dst, hops, '
+                             'is then null and hops may stop where the path is unknown), decision {node, dest, cost, best?, bestCost?, held? '
+                             '(margin: cheaper by less than the threshold, hold or damped until until, loop, penalty, transit)}: the relay that chose '
+                             'the route and, while it stays though another next hop is shortest, that one and why, tuning (settings.routing applied). '
+                             'Without dst (as GET /mesh/routes): routes [{dst, hops, '
                              'rttMs, stale}] to every other applied member, and subnets [{subnet, gateway, hops, rttMs, stale}] for each gateway '
                              'subnet src has a route to (its gatewayRoutes), the path going to the gateway announcing it'},
 }
@@ -1005,7 +1113,10 @@ DDNS_GUIDE = (
     'disagree, believes a mesh peer on a direct link, else the ones in China unless the server\'s profile region is elsewhere), or a fixed value. The controller reads the provider, writes only when it differs and '
     'reads it back; it checks every 10 minutes, puts back values changed from outside (policy.onDrift revert) and alerts. Errors answer '
     '{ok false, error, message (Chinese)}. Add records with ddns_preview first, then ddns_add with the same names; one already at the provider '
-    'is taken over only with confirmTakeover true, so show the user its current value (preview remote) before confirming.')
+    'is taken over only with confirmTakeover true, so show the user its current value (preview remote) before confirming. For a provider that '
+    'replaces the whole RRset, several existing addresses additionally require explicit whole-set takeover: show remoteValues and explain '
+    'that replacement removes the other addresses before setting confirmRrsetTakeover or policy.rrsetTakeover. Neither confirmTakeover nor '
+    'the legacy multi=all is that authorization; without it, the record stays blocked and DNS is not written.')
 _DDNS_SOURCE = ('{kind node|fixed, serverId (node), method auto|url|nic|stun|cmd|conn (default auto), params {urls [<=8 http(s)], iface (nic; "" = the '
                 'default-route one), bindIface (url/stun), stun ["host:port", <=4], cmd (<=1000 chars; needs command execution on the node), '
                 'v6Select {mode first|index|prefix|regex, value, allowTemporary}, intervalS (nic >=10, others >=30, <=3600; null = 15 nic / 60 others)}, '
@@ -1042,16 +1153,22 @@ DDNS_CONTRACTS = {
                      'accountIds': 'optional {name: accountId} when several accounts manage a name (row error account_ambiguous)',
                      'options': 'optional, as in ddns_add (line: the provider records are read on that line)',
                      'returns': 'detected {v4, v6: {value, method, auto, notes [{level, text}]} | null}, rows [{name, type, zone, accounts '
-                                '(candidates), accountId, action new|same|takeover|exists|error, remote, remoteCount, value, error, errorCode}]'},
+                                '(candidates), accountId, action new|same|takeover|exists|error, remote, remoteCount, remoteValues, '
+                                'rrset, requiresRrsetTakeover, value, error, errorCode}]'},
     'ddns_add': {'serverId|source|backup|ttl|options|policy': f'shared by every row: source {_DDNS_SOURCE}; backup null | {{serverId, afterS '
                                                               f'60..86400, default 300}}: used while the source node is offline that long; ttl null = '
                                                               f'account default; options {{proxied bool, line code}} as the provider declares; policy '
-                                                              f'{{multi one|all, allowPrivate (write private/CGNAT addresses), onDrift revert|alert}}',
-                 'rows': '[{name, type A|AAAA, accountId (from preview), confirmTakeover (true to take over a record already there)}]',
+                                                              f'{{multi one|all, allowPrivate (write private/CGNAT addresses), onDrift revert|alert, '
+                                                              f'rrsetTakeover bool (default false; explicit whole-set replacement permission)}}',
+                 'rows': '[{name, type A|AAAA, zone (exact zone from preview, including an explicitly chosen zone), accountId (from preview), '
+                         'confirmTakeover (true to take over a record already there), confirmRrsetTakeover (true only after explicit choice '
+                         'to manage the whole RRset and remove its other addresses on replacement)}]',
                  'returns': 'records [Record], skipped [{name, type, reason takeover_not_confirmed|exists|error, remote?, error?, message?}]'},
     'ddns_update': {'recordId': 'required', 'source|backup|ttl|options|policy|enabled': 'only what changes (source fields merge into the current '
-                    'source); enabled false pauses it', 'returns': 'record'},
-    'ddns_delete': {'recordId': 'required', 'deleteRemote': 'true also deletes the record at the provider (default: only stop managing it)'},
+                    'source); enabled false pauses it. policy.rrsetTakeover true explicitly permits whole-set replacement; show all current '
+                    'remoteValues and removal consequences before requesting that choice. Omitted fields keep their current values', 'returns': 'record'},
+    'ddns_delete': {'recordId': 'required', 'deleteRemote': 'true also deletes the record at the provider (default: only stop managing it); '
+                          'ambiguous multi-value RRsets without explicit whole-set permission cannot be deleted remotely'},
     'ddns_sync': {'recordId': 'required; read and write now, a failed record included; waits up to 20 s', 'returns': 'record'},
     'ddns_events': {'recordId': 'required', 'limit': '1..200, default 50',
                     'returns': 'events [{id, at, kind create|write|takeover|drift|recreated|fail|recover|offline|online|failover|failback|address|'
@@ -1063,7 +1180,8 @@ DDNS_CONTRACTS = {
                     'apply': 'false (default): preview only {accounts [{type, alias, mergeInto}], records [{name, type, method, action, remote, '
                              'value}], unsupported [{item, reason}], warnings}; true: create the accounts (credentials into the vault; same '
                              'credentials as an existing account merge into it) and records, returning {accounts, records, skipped}',
-                    'confirmTakeover': 'with apply: take over records already at the provider'},
+                    'confirmTakeover': 'with apply: take over records already at the provider; not permission to replace a multi-value RRset. '
+                                       'Those require a separate explicit whole-set choice through ddns_add or ddns_update'},
 }
 
 
@@ -1383,18 +1501,23 @@ class ServersTool:
             return {'ok': True, 'path': listing['path'], 'count': len(entries), 'truncated': listing['truncated'] or len(entries) > 300,
                     'entries': [{k: e.get(k) for k in ('name', 'type', 'dir', 'size', 'mode', 'mtime', 'target') if e.get(k) not in (None, '')} for e in entries[:300]]}
         if action == 'read_file':
-            offset, limit = params.get('offset', 0), min(int(params.get('limit') or READ_LIMIT), READ_LIMIT)
+            offset, limit = params.get('offset', 0), params.get('limit', READ_LIMIT)
             if type(offset) is not int or offset < 0:
                 raise InstanceError('invalid_offset')
-            result = await self.service.read_file(owner, server_id, str(params.get('path', '')), offset, limit)
-            data = result.pop('data')
-            if params.get('encoding') == 'base64':
-                return {'ok': True, 'path': params.get('path'), 'size': result['size'], 'offset': offset, 'read': result['read'], 'eof': result['eof'],
-                        'mode': result['mode'], 'contentBase64': base64.b64encode(data).decode()}
-            if b'\x00' in data[:8192]:
-                return {'ok': True, 'binary': True, 'size': result['size'], 'note': 'binary file; read it again with encoding=base64'}
-            return {'ok': True, 'path': params.get('path'), 'size': result['size'], 'offset': offset, 'read': result['read'], 'eof': result['eof'],
-                    'mode': result['mode'], 'content': data.decode('utf-8', errors='replace')}
+            if type(limit) is not int or limit < 1:
+                raise InstanceError('invalid_limit')
+            text = params.get('encoding') != 'base64'
+            result = await self.service.read_file(owner, server_id, str(params.get('path', '')), offset,
+                                                  min(max(4 if text else 1, limit), READ_LIMIT))
+            data = result['data']
+            if text and b'\x00' in data[:8192]:
+                return {'ok': True, 'binary': True, 'size': result['size'], 'offset': offset, 'next': offset,
+                        'note': 'binary file; read it again with encoding=base64'}
+
+            def render(value, n):
+                return {'ok': True, 'path': params.get('path'), 'size': result['size'], 'offset': offset, 'read': n, 'next': offset + n,
+                        'eof': result['eof'] and n == len(data), 'mode': result['mode'], 'content' if text else 'contentBase64': value}
+            return _byte_page(data, render, text=text, eof=result['eof'])
         if action == 'write_file':
             path, content = params.get('path'), params.get('content')
             if isinstance(params.get('contentBase64'), str) and content is None:
@@ -1713,17 +1836,29 @@ class ServersTool:
     # ----- adding servers and installing nodes -----
     async def do_add(self, owner, server_id, params, ctx):
         data = {k: params[k] for k in ('name', 'ssh', 'profile') if k in params}
-        install = params.get('install') is True
-        if install:
-            if not isinstance(data.get('ssh'), dict):
-                raise InstanceError('ssh_required_for_install')
-        browser = self.browser_flag(params)
+        install = params.get('install', False)
+        if type(install) is not bool:
+            raise InstanceError('invalid_install')
+        if install and not isinstance(data.get('ssh'), dict):
+            raise InstanceError('ssh_required_for_install')
+        browser, force = self.browser_flag(params), self.force_flag(params)
+        today = await self.today()
         item = (await self.service.create(owner, data))['item']
-        result = {'ok': True, 'item': _row(item, await self.today()),
+        result = {'ok': True, 'created': True, 'serverId': item['id'], 'item': _row(item, today),
                   **({'sshFacts': {k: item['ssh'].get(k) for k in ('platform', 'os', 'status', 'publicIp') if item['ssh'].get(k)}} if item.get('ssh') else {})}
         if install:
-            await self.service.install(owner, item['id'], browser=browser, force=self.force_flag(params))
-            result['install'] = await self.install_state(owner, item['id'])
+            accepted = False
+            try:
+                await self.service.install(owner, item['id'], browser=browser, force=force)
+                accepted = True
+                result['install'] = await self.install_state(owner, item['id'])
+            except InstanceError as exc:
+                unknown = accepted or getattr(exc, 'effect_state', '') == 'unknown'
+                result.update(ok=False, error=exc.error,
+                              install={'state': 'unknown' if unknown else 'not_started', 'error': exc.error},
+                              note='服务器已创建，不要重复添加；请用 serverId 查询安装状态，确认后继续安装。')
+            if (result.get('install') or {}).get('state') == 'failed':
+                result.update(ok=False, note='服务器已创建，但节点安装失败；保留此 serverId，排除原因后继续安装，不要重复添加。')
         return result
 
     async def do_install(self, owner, server_id, params, ctx):
@@ -1864,8 +1999,10 @@ class ServersTool:
         return {'ok': True, 'ssh': (await self.service.get(owner, server_id)).get('ssh')}
 
     async def do_check_ssh(self, owner, server_id, params, ctx):
-        await self.service.registry.check(owner, server_id)
-        return {'ok': True, 'ssh': (await self.service.get(owner, server_id)).get('ssh')}
+        result = await self.service.registry.check(owner, server_id)
+        return {'ok': True, 'ssh': (await self.service.get(owner, server_id)).get('ssh'),
+                **({'stale': True, 'note': '连接配置已更新，已忽略旧检查结果；当前配置未由本次检查验证'}
+                   if result.get('stale') else {})}
 
     async def do_remove_ssh(self, owner, server_id, params, ctx):
         item = await self.service.get(owner, server_id)
@@ -1883,7 +2020,8 @@ class ServersTool:
     # ----- removing -----
     async def do_remove_node(self, owner, server_id, params, ctx):
         result = await self.service.revoke(owner, server_id, uninstall=params.get('uninstall') is True)
-        return {'ok': True, 'uninstalled': result.get('uninstalled', False)}
+        return {'ok': result.get('ok', True), 'uninstalled': result.get('uninstalled', False),
+                **{k: result[k] for k in ('work', 'note') if k in result}}
 
     async def do_delete(self, owner, server_id, params, ctx):
         return await self.service.delete(owner, server_id)
@@ -2046,14 +2184,39 @@ class ServersTool:
             raise InstanceError('invalid_limit')
         result = await self.service.job_status(owner, server_id, job_id, offset=offset, limit=limit)
         log = result['log']
+        # The node never splits a UTF-8 character. If a tiny limit cannot fit even
+        # one, retry at the returned boundary; keep tiny ASCII pages unchanged.
+        if limit < 4 and not log['data'] and log['next'] < log['size']:
+            result = await self.service.job_status(owner, server_id, job_id, offset=log['offset'], limit=4)
+            log = result['log']
         return {'ok': True, 'job': result['job'], 'output': log['data'], 'outputOffset': log['offset'], 'next': log['next'], 'outputSize': log['size'],
                 **({'droppedBefore': log['first']} if log['first'] else {})}
+
+    async def job_status_page(self, owner, server_id, job_id, result, *, budget=OUTPUT_BUDGET - 1024, metadata_budget=None):
+        metadata_budget = min(metadata_budget if metadata_budget is not None else budget // 2, budget - 64)
+        where = {k: result[k] for k in ('serverId', 'name', 'jobId') if k in result}
+        while True:
+            result = _log_metadata(result, metadata_budget)
+            if _size(result) <= budget:
+                return result
+            # JSON text may contain replacement characters for arbitrary source bytes (also
+            # on N-1 nodes). Do not re-encode/slice it and invent a byte cursor. Ask the same
+            # old job.status API for a smaller *raw-byte* page, anchored at the returned start
+            # even for a tail request. The observed JSON/source size ratio is only a
+            # request-size hint, never a cursor. Recheck each reply (escaping/density can
+            # change); halve at least, but allow one complete four-byte UTF-8 character.
+            overhead = _size({**result, 'output': ''})
+            span = result['next'] - result['outputOffset']
+            limit = max(4, min(span // 2, span * max(1, budget - overhead) // max(1, _size(result) - overhead)))
+            fresh = await self.job_status_view(owner, server_id, job_id, result['outputOffset'], limit)
+            result = {**where, **fresh}
 
     async def do_job_status(self, owner, server_id, params, ctx):
         if 'jobs' not in params:
             offset = params.get('offset')
-            return await self.job_status_view(owner, self.need_server(server_id), self.job_id(params), offset,
-                                              params.get('limit', JOB_TAIL if offset is None else JOB_READ_LIMIT))
+            sid, jid = self.need_server(server_id), self.job_id(params)
+            result = await self.job_status_view(owner, sid, jid, offset, params.get('limit', JOB_TAIL if offset is None else JOB_READ_LIMIT))
+            return await self.job_status_page(owner, sid, jid, result)
         refs, names = self.job_refs(params), await self.server_names()
         # Each job's share of the tool output, unless a limit was asked for.
         limit = params.get('limit', min(JOB_TAIL, max(1000, OUTPUT_BUDGET // len(refs))))
@@ -2062,6 +2225,23 @@ class ServersTool:
         values = await self.each(refs, lambda r: self.job_status_view(owner, r['serverId'], r['jobId'], r.get('offset', params.get('offset')), limit))
         results = [self.refused(v, serverId=r['serverId'], name=names.get(r['serverId'], r['serverId']), jobId=r['jobId']) if isinstance(v, InstanceError)
                    else {'serverId': r['serverId'], 'name': names.get(r['serverId'], r['serverId']), 'jobId': r['jobId'], **v} for r, v in zip(refs, values)]
+        budget = OUTPUT_BUDGET - 1024  # batch envelope, separators and untrusted-data label
+        metadata_budget = budget // len(results) - 96
+        results = [_log_metadata(r, metadata_budget) if r['ok'] else r for r in results]
+        # Reserve the actual required metadata first; give each successful job a share of
+        # what remains. A longer name/rotated log must not make the entire batch fail.
+        sizes = [_size({**r, 'output': ''}) if r['ok'] else _size(r) for r in results]
+        share = (budget - sum(sizes)) // max(1, sum(r['ok'] for r in results))
+
+        async def page(item):
+            ref, row, size = item
+            if not row['ok']:
+                return row
+            try:
+                return await self.job_status_page(owner, ref['serverId'], ref['jobId'], row, budget=size + share, metadata_budget=metadata_budget)
+            except InstanceError as exc:
+                return self.refused(exc, **{k: row[k] for k in ('serverId', 'name', 'jobId') if k in row})
+        results = await self.each(list(zip(refs, results, sizes)), page)
         return _untrusted({'ok': all(r['ok'] for r in results), 'count': len(results),
                            'states': dict(Counter(r['job']['state'] for r in results if r['ok'])), 'results': results}, '（results 中的各台服务器）')
 
@@ -2236,12 +2416,12 @@ class ServersTool:
                 'members': ('members',), 'nodes': ('nodes',), 'lines': ('lines',), 'autoLinks': ('autoLinks',),
                 'auto': ('auto',), 'rules': ('rules', 'autoRules'), 'links': ('relayLinks', 'directLinks', 'lineRules', 'limits'),
                 'paths': ('paths', 'pathsView', 'exitGroups'), 'exports': ('exports',), 'eligible': ('eligible',),
-                'draft': ('draft', 'errors', 'warnings'), 'apply': ('applied', 'apply', 'installing'),
+                'draft': ('draft', 'errors', 'warnings'), 'apply': ('applied', 'apply', 'installing'), 'forwards': ('forwards', 'forwardGeo'),
             }
             if not isinstance(sections, list) or not sections or not all(isinstance(s, str) and s in section_map for s in sections):
                 raise InstanceError('invalid_parameters')
             names = {m.get('serverId'): m.get('name') for m in view.get('members') or [] if isinstance(m, dict)}
-            keep_keys = {'ok', 'applied'} | {k for s in sections for k in section_map[s]}
+            keep_keys = {'ok', 'applied', 'draftVersion'} | {k for s in sections for k in section_map[s]}
             picked = {'ok': True, **{k: copy.deepcopy(view[k]) for k in keep_keys if k in view}}
             if 'nodes' in picked and isinstance(picked['nodes'], dict):
                 picked['nodes'] = {sid: _untrusted(n, names.get(sid) or sid) if isinstance(n, dict) else n for sid, n in picked['nodes'].items()}
@@ -2300,7 +2480,7 @@ class ServersTool:
             if isinstance(view.get('paths'), list):
                 view['paths'] = [p for p in view['paths'] if p.get('from') in wanted or p.get('to') in wanted or any(v in wanted for v in p.get('via') or [])]
         if parts is not None:
-            sub = {'ok': True, 'dirty': view['draft']['dirty'], 'changes': view['draft']['changes'],
+            sub = {'ok': True, 'draftVersion': view.get('draftVersion'), 'dirty': view['draft']['dirty'], 'changes': view['draft']['changes'],
                    'errors': view['errors'], 'warnings': view['warnings'], **{k: copy.deepcopy(view.get(k, [])) for k in parts}}
             if 'members' in sub:
                 sub['members'] = [{k: v for k, v in m.items() if k not in MESH_VIEW_KEYS} for m in sub['members']]
@@ -2395,7 +2575,7 @@ class ServersTool:
             if not isinstance(p, dict):
                 return p
             out = dict(p)
-            for k in ('a', 'b', 'from', 'to'):
+            for k in ('a', 'b', 'from', 'to', 'serverId', 'entry', 'target'):
                 if isinstance(out.get(k), str):
                     out[k] = resolve(out[k])
             if isinstance(out.get('via'), list):
@@ -2412,7 +2592,7 @@ class ServersTool:
             out['members'] = [r_member(m) for m in out['members']]
         if isinstance(out.get('relayLinks'), dict) and isinstance(out['relayLinks'].get('pairs'), list):
             out['relayLinks']['pairs'] = [r_pair(p) for p in out['relayLinks']['pairs']]
-        for k in ('directLinks', 'paths', 'limits', 'lineRules', 'exitGroups', 'rules'):
+        for k in ('directLinks', 'paths', 'limits', 'lineRules', 'exitGroups', 'rules', 'fastPorts', 'forwards'):
             if isinstance(out.get(k), list):
                 out[k] = [r_pair(x) for x in out[k]]
         if isinstance(out.get('patch'), dict):
@@ -2424,7 +2604,7 @@ class ServersTool:
                     for pk in ('upsert', 'pairs', 'remove'):
                         if isinstance(patch[lk].get(pk), list):
                             patch[lk][pk] = [r_pair(p) for p in patch[lk][pk]]
-            for ik in ('paths', 'limits', 'lineRules', 'exitGroups', 'rules'):
+            for ik in ('paths', 'limits', 'lineRules', 'exitGroups', 'rules', 'fastPorts', 'forwards'):
                 if isinstance(patch.get(ik), dict) and isinstance(patch[ik].get('upsert'), list):
                     patch[ik]['upsert'] = [r_pair(x) for x in patch[ik]['upsert']]
         return out
@@ -2455,6 +2635,11 @@ class ServersTool:
                         continue
                     if k == 'listen' and isinstance(v, dict) and isinstance(cur.get('listen'), dict):
                         cur['listen'] = {**cur['listen'], **v}
+                    elif k == 'publicPorts' and isinstance(v, dict):
+                        merged_pp = {**(cur.get('publicPorts') or {}), **v}
+                        cur['publicPorts'] = {pk: pv for pk, pv in merged_pp.items() if pv} or {}
+                        if not cur['publicPorts']:
+                            cur.pop('publicPorts', None)
                     elif k == 'entry' and isinstance(v, dict):
                         ent = copy.deepcopy(cur.get('entry') or {})
                         for ek in ('mode', 'autoReturn'):
@@ -2560,7 +2745,7 @@ class ServersTool:
                     links[idx] = {**old, **up} if (old.get('a'), old.get('b')) == (up.get('a'), up.get('b')) else up
             out['directLinks'] = links
 
-        for part in ('paths', 'limits', 'lineRules', 'exitGroups', 'rules'):
+        for part in ('paths', 'limits', 'lineRules', 'exitGroups', 'rules', 'fastPorts', 'forwards'):
             if part not in patch:
                 continue
             spec = patch[part]
@@ -2586,15 +2771,18 @@ class ServersTool:
         return out
 
     async def do_mesh_save_draft(self, owner, server_id, params, ctx):
-        allowed = set(DRAFT_KEYS) | {'patch'}
-        if not set(params) <= allowed or not params:
+        allowed = set(DRAFT_KEYS) | {'patch', 'draftVersion'}
+        if not set(params) <= allowed or not (set(params) - {'draftVersion'}):
             exc = InstanceError('invalid_mesh_draft')
             exc.errors = [{'path': '', 'error': 'invalid_mesh_draft',
-                           'message': f'params takes only {", ".join((*DRAFT_KEYS, "patch"))} (at least one)'
+                           'message': f'params takes draftVersion and at least one of {", ".join((*DRAFT_KEYS, "patch"))}'
                                       + (f'; not: {", ".join(sorted(map(str, set(params) - allowed)))}' if set(params) - allowed else '')}]
             raise exc
         _, resolve = await self.server_lookup(owner)
         resolved = self._resolve_draft_refs(params, resolve)
+        version = params.get('draftVersion')
+        if not isinstance(version, str) or not version:
+            raise InstanceError('mesh_draft_version_required', 428)
         payload = {k: resolved[k] for k in DRAFT_KEYS if k in resolved}
         if 'patch' in resolved:
             overlap = set(payload) & (set(resolved['patch']) if isinstance(resolved['patch'], dict) else set())
@@ -2604,8 +2792,10 @@ class ServersTool:
                                'message': f'cannot pass both top-level and patch for: {", ".join(sorted(overlap))}'}]
                 raise exc
             view = await self.service.mesh.view(owner, fresh=False)
+            if view.get('draftVersion') != version:
+                raise InstanceError('mesh_draft_conflict', 409)
             payload.update(self._apply_mesh_patch(view, resolved['patch']))
-        return _mesh_overview(await self.service.mesh.save_draft(owner, payload))
+        return _mesh_overview(await self.service.mesh.save_draft(owner, {**payload, 'draftVersion': version}))
 
     async def do_mesh_join(self, owner, server_id, params, ctx):
         ids = params.get('serverIds') or ([server_id] if isinstance(server_id, str) else None)
@@ -3032,7 +3222,9 @@ class ServersTool:
         return describe(topic)
 
 
-SSH_FIELDS = ('{host, port (default 22), username, auth: password|key, password (auth=password) | keyRef {secret, field} from ssh_keys (auth=key)}; '
+SSH_FIELDS = ('{host, port (default 22), username, auth: password|key, password (auth=password) | keyRef {secret, field} from ssh_keys (auth=key), '
+              'relay (optional serverId, \'\' to clear): SSH goes through a TCP tunnel that server\'s node opens (host as it reaches it), for a login only '
+              'some networks may reach; another server with a node, not local and not a front (invalid_ssh_relay; offline: ssh_relay_offline)}; '
               'saving proves the login once and detects platform linux|darwin|windows')
 READ_GUIDE = ('Read-only detail-page reports; no process killing, port scan or route/unlock recheck is started. '
               'IP intelligence and BGP may fetch public information on a cache miss; disk history may collect a current host.details sample, '
@@ -3050,7 +3242,10 @@ READ_CONTRACTS = {
     'bgp': {'serverId': 'required', 'family': 'integer 4 (default)|6', 'returns': 'BGP prefix, origin AS and upstream graph as on the page; cached where available'},
     'traffic_history': {'serverId': 'required', 'unit': 'hour: last 48 hours | day (default): last 31 days | month: last 12 months, as on the page',
                         'start|end': 'optional inclusive Unix seconds filtering bucket start times within that unit window (not arbitrary older history)',
-                        'limit': '1..200, default 48; keep the newest buckets', 'returns': 'unit, points [{t,label,rx,tx}] in bytes, totalPoints, truncated; current bucket is partial'},
+                        'limit': '1..200, default 48; keep the newest buckets', 'returns': 'unit, timezone, currentLabel, points [{t,label,rx,tx}] in bytes, '
+                        'history [{day, timezone string|null, rx, tx}], totalPoints, truncated. history preserves older totals whose full hourly detail '
+                        'is missing; null timezone means the old basis was not recorded. These bytes are already in points: do not add them again. '
+                        'Only the bucket matching currentLabel is current/partial, not a later preserved old-zone label'},
     'disk_history': {'serverId': 'required', 'range': '7d (default)|30d|90d|all', 'limit': '1..200 points, default 48; up to 20 partitions',
                      'returns': 'partitions, t (Unix seconds), series (used percent by mount), original step, sampledAt, totalPoints, totalPartitions, sampled/truncated; '
                                 'evenly spaced original samples, reduced further together if needed for output size; limit=1 keeps the latest'},
@@ -3084,8 +3279,9 @@ CONTRACTS = {
              'output': 'long stdout/stderr keep their start and end with "…（省略 N 字节）…" in between and truncated true; '
                        'outputNote says when the node had already cut it'},
     'list_dir': {'serverId': 'required', 'path': 'absolute directory; on Windows "/" lists the drives, then C:/dir'},
-    'read_file': {'serverId': 'required', 'path': 'absolute', 'offset': 'bytes, default 0', 'limit': f'bytes, max {READ_LIMIT}',
-                  'encoding': 'optional base64 for binary content (download)'},
+    'read_file': {'serverId': 'required', 'path': 'absolute', 'offset': 'bytes, default 0', 'limit': f'bytes, max {READ_LIMIT}; text reads allow at least one complete UTF-8 character',
+                  'encoding': 'optional base64 for binary content (download)',
+                  'note': 'continuous pages within the final JSON budget; read counts delivered bytes, next is the resume offset, eof is false while more remain. Use download_file for a local copy'},
     'write_file': {'serverId': 'required', 'path': 'absolute (/etc/x or C:/x)', 'content': 'full new text', 'contentBase64': 'or binary content (upload)',
                    'note': 'max 4 MB of inline content; for a local file use upload_file instead. Replaces the file atomically, keeping owner and mode', 'mode': 'optional octal like 0644',
                    'mkdirs': 'optional true: create missing parent folders; without it a missing folder answers not_found'},
@@ -3123,10 +3319,10 @@ CONTRACTS = {
                     'conversationUuid, title, turnUuid, current (true: this conversation) | bench: a benchmark run | web: started on the web page | unrecorded: no record, '
                     'started by hand outside this tool or before origins were recorded}'},
     'job_status': {'serverId': 'with jobId: one job, answered as {job, output, outputOffset, next, outputSize, droppedBefore?}', 'jobId': 'with serverId',
-                   'jobs': f'or [{{serverId, jobId, offset?}}] (<= {MAX_TARGETS}): count, states {{state: n}}, results [{{serverId, name, jobId, '
-                           f'ok, ...as for one job}} | {{serverId, name, jobId, ok false, error}}]; output shares the tool output between them',
+                   'jobs': f'or [{{serverId, jobId, offset?}}] (<= {MAX_TARGETS}): count, states {{state: n}}, results [{{serverId, name?, jobId, '
+                           f'ok, ...as for one job}} | {{serverId, name?, jobId, ok false, error}}]; output shares the tool output between them',
                    'offset': f'optional byte offset into the output; default: the last {JOB_TAIL} bytes',
-                   'limit': f'bytes, max {JOB_READ_LIMIT}', 'note': 'next is the offset after the returned output; droppedBefore: older output is gone'},
+                   'limit': f'bytes, max {JOB_READ_LIMIT}', 'note': 'output is a continuous page within the final JSON budget; next is the node-provided original-byte cursor, including for non-UTF-8 text; hasMore means keep reading. jobSummary marks shortened metadata (in large batches, name and repeated job.id/timing may be omitted; serverId/jobId always identify the row); read one job for more detail. droppedBefore: older output is gone'},
     'job_wait': {'serverId': 'with jobId: one job', 'jobId': 'with serverId', 'until': 'optional regex (Python syntax, multiline) on the output',
                  'jobs': f'or [{{serverId, jobId, until?, offset?}}] (<= {MAX_TARGETS}), each waited for at once; until and offset given '
                          f'beside jobs apply to every item without its own',
@@ -3150,7 +3346,7 @@ CONTRACTS = {
                                      'confirmed false = file replaced, not confirmed running',
                     'downgrade': 'optional true, with serverIds/serverId only (not all or group): also put the older target on those nodes; '
                                  'only when the user asked for that downgrade. Results of a downgrade carry downgrade true'},
-    'edit': {'serverId': 'required', 'name': 'optional', 'profile': 'partial: group, tags (up to 10 labels besides the group, <=20 chars each, e.g. 独服), provider, providerUrl (http(s) page to renew at), remark, region, sort, billing{price,currency,cycle,startedAt (left empty with expiresAt and a cycle: one cycle before the expiry),expiresAt,autoRenew}, traffic{mode billing|fixed|metered|unlimited (all reset monthly: billing on the day of month of the billing date, fixed on resetDay), limit bytes (billing/fixed), type sum (both directions, the default)|up|down|max (the larger direction)|min (the smaller), resetDay 1-31 (fixed), price per GB in the billing currency (metered)}, access{primary,backup: access point ids from settings, or ap-mesh (the built-in access point over the mesh, settings.meshAccess) as primary or backup: only for a member of the applied mesh other than the controller\'s own machine (local), else mesh_access_requires_member, and whose node is recent enough to take a mesh address (node feature access.mesh), else mesh_access_node_outdated (update the node first); while unavailable (controller not in the mesh, the server left it, or its node lacks access.mesh) a primary on it falls back to defaultAccess and a backup on it counts as none, and the mesh address is never sent to the node. get shows access.meshEligible, access.meshReason (\'\' = can choose it | not_member | node_outdated | local) and access.warnings (mesh_no_backup: primary over the mesh without a backup, a hint only); a node updated to one with access.mesh gets its addresses again by itself}, front{exits: [{serverId, address}] (1-2, primary first) or null: makes the server a 前置机 (front), which is to reach nothing beyond these exits (the provider\'s servers it makes one dedicated line with): each exit\'s node serves the front\'s access on settings.frontPort over TLS with a self-signed certificate the front pins, and the front\'s addresses become https://<address>:<frontPort> of its exits (access points are then ignored); address is how the front reaches that exit (an IP or host name without a port, e.g. a provider\'s private line address). Its SSH (check, install, fallback exec) goes only through a TCP tunnel its exit\'s node opens (an exit needs node feature front and command execution), never directly; it looks up no public address (no echo service, so get shows no IPv4: set its mesh publicEndpoint for links others dial to it), and unlock and route checks never run for it. An exit is another of the owner\'s servers, not the controller\'s machine and not a front (invalid_front_exit, front_exit_is_front). get shows access.primary/backup as {id: front:<exit>, serverId, url, ready, error}: ready once the exit serves}, latency{targets: [ids]} or null: its own latency targets (ids as in save_settings.latency; [] measures nothing), null to follow the settings', 'accessApply': 'now (default): an online node switches first and a refusal (e.g. new_url_unreachable) saves nothing | later: save only; the node switches when it next connects. Offline nodes always switch on their next connection; accessPending tells it has not happened yet'},
+    'edit': {'serverId': 'required', 'name': 'optional', 'profile': 'partial: group, tags (up to 10 labels besides the group, <=20 chars each, e.g. 独服), provider, providerUrl (http(s) page to renew at), remark, region, sort, billing{price,currency,cycle,startedAt (left empty with expiresAt and a cycle: one cycle before the expiry),expiresAt,autoRenew}, traffic{mode billing|fixed|metered|unlimited (all reset monthly: billing on the day of month of the billing date, fixed on resetDay), limit bytes (billing/fixed), type sum (both directions, the default)|up|down|max (the larger direction)|min (the smaller), resetDay 1-31 (fixed), price per GB in the billing currency (metered)}, access{primary,backup: access point ids from settings, or ap-mesh (the built-in access point over the mesh, settings.meshAccess) as primary or backup: only for a member of the applied mesh other than the controller\'s own machine (local), else mesh_access_requires_member, and whose node is recent enough to take a mesh address (node feature access.mesh), else mesh_access_node_outdated (update the node first); while unavailable (controller not in the mesh, the server left it, or its node lacks access.mesh) a primary on it falls back to defaultAccess and a backup on it counts as none, and the mesh address is never sent to the node. get shows access.meshEligible, access.meshReason (\'\' = can choose it | not_member | node_outdated | local) and access.warnings (mesh_no_backup: primary over the mesh without a backup, a hint only); a node updated to one with access.mesh gets its addresses again by itself}, front{exits: [{serverId, address}] (1-2, primary first) or null: makes the server a 前置机 (front), which is to reach nothing beyond these exits (the provider\'s servers it makes one dedicated line with): each exit\'s node serves the front\'s access on settings.frontPort over TLS with a self-signed certificate the front pins, and the front\'s addresses become https://<address>:<frontPort> of its exits (access points are then ignored); address is how the front reaches that exit (an IP or host name without a port, e.g. a provider\'s private line address). Its SSH (check, install, fallback exec) goes only through a TCP tunnel its exit\'s node opens (an exit needs node feature front and command execution), or its SSH relay\'s when set, never directly; it looks up no public address (no echo service, so get shows no IPv4: set its mesh publicEndpoint for links others dial to it), and unlock and route checks never run for it. An exit is another of the owner\'s servers, not the controller\'s machine and not a front (invalid_front_exit, front_exit_is_front). get shows access.primary/backup as {id: front:<exit>, serverId, url, ready, error}: ready once the exit serves}, latency{targets: [ids]} or null: its own latency targets (ids as in save_settings.latency; [] measures nothing), null to follow the settings', 'accessApply': 'now (default): an online node switches first and a refusal (e.g. new_url_unreachable) saves nothing | later: save only; the node switches when it next connects. Offline nodes always switch on their next connection; accessPending tells it has not happened yet'},
     'renew': {'serverId': 'required; advance expiresAt by one billing cycle after the user renewed'},
     'latency': {'serverId': 'optional; with it that server\'s targets over range, without it every server\'s last 30 minutes (one cell a minute: [avg ms, loss %]) and its last ten minutes\' avg and loss',
                 'range': '1h|24h|7d|30d|90d|1y (default 24h): per target label, avg ms and loss % per bucket; supported false when the node lacks the latency feature'},
@@ -3171,28 +3367,35 @@ CONTRACTS = {
                         'machine_has_other_node (a node this controller does not know, e.g. another controller\'s; force replaces it); '
                         'install.message says it in Chinese. Reinstalling the same server goes ahead. The one-time commands of '
                         'install_command stop the same way unless run with --force (Windows -Force)'},
-    'install_command': {'serverId': 'required; one-time install commands (Linux/macOS and Windows) for a machine without SSH', 'browser': 'optional true'},
+    'install_command': {'serverId': 'required; one-time install commands (Linux/macOS and Windows) for a machine without SSH; a front\'s fetch the script and '
+                                    'node program through its exit (checksums checked) and its exit is made to serve it first (front_exit_offline when '
+                                    'the primary is offline)', 'browser': 'optional true'},
     'batch_install': {'servers': '[{name, host, port}] up to the page limit', 'ssh': 'shared login as in add', 'profile': 'optional shared profile',
                       'note': 'then poll batch_install_status'},
-    'browser': {'serverId': 'required; the node browser: enabled, state (ready|installing|starting|stopped|failed), source (system|download|endpoint), '
-                            'product, headless, error. Use it with the Browser tool: page {op:new, node:<server name>}'},
+    'browser': {'serverId': 'required; the node browser: enabled, state (ready|installing|starting|stopped|failed), source (system|download|endpoint|unknown), '
+                            'product, headless, error. Optional installedVersion and runningVersion distinguish downloaded from running Chrome; '
+                            'runningVerified, runningSource, runningExecutable, selectedSource and restartNeeded describe the actual process. '
+                            'Missing fields on older nodes mean unknown, not verified. Use it with the Browser tool: page {op:new, node:<server name>}'},
     'set_browser': {'serverId': 'required', 'enabled': 'true|false', 'endpoint': 'optional existing CDP address on that machine (ws://, http://); '
                     'empty = the node starts Chrome/Edge/Chromium itself, downloading Chrome for Testing when none is installed',
                     'download': 'optional true = use downloaded Chrome for Testing even when a browser is installed '
                                 '(e.g. error browser_not_runnable: the installed one cannot be run by the node)',
                     'note': 'nodes without command execution must be set on the machine itself; '
                             'not for the local server, whose Browser tool uses its configured default browser'},
-    'restart_browser': {'serverId': 'required; restart the node\'s browser; open pages on it close'},
+    'restart_browser': {'serverId': 'required; restart the node\'s browser; open pages on it close',
+                        'returns': 'browser state: only ready confirms the browser is ready; starting/installing are progress and failed is failure, even when the status query succeeded'},
     'update_browser': {'serverId': 'required; needs node feature browser.update, otherwise node_update_required',
                        'check': 'bool, default false. true only checks the downloaded Chrome for Testing against latest Stable (read-only)',
                        'restart': 'bool, default false; only true permits closing/restarting the running browser on the new version',
                        'returns': 'update {current, latest, upToDate, started}. started only means background work started; use browser to read browser.update progress. '
+                                  'configurationChanged means the old update did not restart the newly configured browser; installedVersion alone does not prove runningVersion. '
                                   'outputLimit marks clipping: 24000 JSON characters before the untrusted-data label, 2000 per text',
                        'note': 'Explicit only; no automatic updates. check=false is a mutation and obeys allowServerChanges, even when restart=false. '
                                'The service may return browser_not_downloaded, node_offline or node_update_required; never silently install or use exec.'},
     'batch_install_status': {'jobId': 'from batch_install'},
     'set_ssh': {'serverId': 'required', 'ssh': SSH_FIELDS},
-    'check_ssh': {'serverId': 'required; test the saved SSH login again and refresh its facts'},
+    'check_ssh': {'serverId': 'required; test the saved SSH login again and refresh its facts',
+                  'returns': 'ssh; stale true means connection settings changed during the check: its result was ignored and does not verify the current login'},
     'remove_ssh': {'serverId': 'required; forget the SSH login; the node stays'},
     'ssh_keys': {'note': 'private keys stored in the vault, usable as keyRef'},
     'remove_node': {'serverId': 'required', 'uninstall': 'true: the node uninstalls itself'},
@@ -3206,7 +3409,11 @@ CONTRACTS = {
                          'worked out by the controller (available while local is in the applied mesh with an address), not saved, '
                          'chosen per server in edit profile.access'},
     'save_settings': {'accessPoints': '[{id?, name, url}]; id ap-mesh is reserved (invalid_access_points); meshAccess cannot be saved', 'frontPort': 'TCP port exits serve their fronts\' access on (default 52002); a change moves every front', 'defaultAccess': 'access point id', 'timezone': 'IANA name',
-                      'reminders': '{enabled, time HH:MM, expiryDays [..], trafficPercents [..], autoRenew}',
+                      'reminders': '{enabled, time HH:MM, expiryDays [..], trafficPercents [..], autoRenew, mesh: {standby, entry, flap, exit, memory, apply, '
+                                   'upgrade, missing, keys: bool}}; mesh: the mesh\'s alerts by type, each on by default and apart from enabled '
+                                   '(backup entries all failing, no entry, entry switching, exit seen differently, data plane memory, config delivery, '
+                                   'mesh service upgrade, mesh service gone, keys in use); one off is listed with status off, not sent; merged, '
+                                   'no mesh revision',
                       'retention': '{minuteDays, hourDays}: days the metrics file keeps minute rows (metrics and latency; default 31, at least 7) and hour rows '
                                    '(metrics, latency, partitions; default 400, never shorter than minutes); hourDays must be 0 (forever) or at least 31 days; '
                                    '1..30 returns retention_hours_too_short. 0 = for ever; daily traffic is never dropped. A shorter one prunes within a minute',
@@ -3326,6 +3533,8 @@ def register_server_tools(registry, service):
         try:
             result = await tool.dispatch(args.get('action'), args.get('params', {}), current_tool_context())
             encoded = json.dumps(result, ensure_ascii=False)
+            if args.get('action') == 'add' and result.get('created') and result.get('ok') is False:
+                return ToolOutcome(encoded, 'failed', 'reported', business_success=False)
             # A transfer that may have committed leaves the whole call's effect unknown.
             if args.get('action') in TRANSFER_ACTIONS and isinstance(result, dict) and 'unknown' in (
                     [result.get('transfer', {}).get('state')] + [i.get('state') for i in result.get('items') or [] if isinstance(i, dict)]):

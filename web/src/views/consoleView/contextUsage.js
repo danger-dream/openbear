@@ -7,6 +7,16 @@ function nonNegative(value) {
   return Number.isFinite(number) && number > 0 ? number : 0;
 }
 
+function pickCompactionCount(...sources) {
+  for (const src of sources) {
+    const rec = record(src);
+    if (rec && Object.prototype.hasOwnProperty.call(rec, "compactionCount") && Number.isFinite(Number(rec.compactionCount))) {
+      return Math.max(0, Math.floor(Number(rec.compactionCount)));
+    }
+  }
+  return 0;
+}
+
 function metadata(currentUsage, defaults = {}) {
   const current = record(currentUsage) || {};
   return {
@@ -28,11 +38,12 @@ export function resolveContextUsage(serverUsage, legacyTokens = 0) {
     const meta = metadata(server);
     const tokens = server.known ? nonNegative(server.tokens) : 0;
     return {...server, ...meta, tokens,
+      compactionCount: pickCompactionCount(server),
       percent: server.known && meta.rolloverTriggerTokens > 0 ? tokens * 100 / meta.rolloverTriggerTokens : null,
       authoritative: true};
   }
   const tokens = nonNegative(legacyTokens);
-  return {known: tokens > 0, tokens, rolloverTriggerTokens: 0, percent: null, authoritative: false};
+  return {known: tokens > 0, tokens, rolloverTriggerTokens: 0, compactionCount: 0, percent: null, authoritative: false};
 }
 
 export function mergeStatsContextUsage(currentUsage, statsUsage, defaults = {}) {
@@ -42,12 +53,16 @@ export function mergeStatsContextUsage(currentUsage, statsUsage, defaults = {}) 
   const meta = metadata(stats, {...current, ...defaults});
   const tokens = stats.known ? nonNegative(stats.tokens) : 0;
   return {...current, ...stats, ...meta, tokens,
+    compactionCount: pickCompactionCount(stats, current, defaults),
     percent: stats.known && meta.rolloverTriggerTokens > 0 ? tokens * 100 / meta.rolloverTriggerTokens : null};
 }
 
 export function invalidateContextUsage(currentUsage, defaults = {}) {
   const current = record(currentUsage) || {};
+  const compactionCount = pickCompactionCount(defaults, current);
   // New window telemetry cannot invalidate a newer completed request.
-  if (defaults.windowVersion != null && older(current, defaults)) return currentUsage;
-  return {...current, ...defaults, ...metadata(current, defaults), known: false, tokens: 0, percent: null};
+  if (defaults.windowVersion != null && older(current, defaults)) {
+    return compactionCount > pickCompactionCount(current) ? {...current, compactionCount} : currentUsage;
+  }
+  return {...current, ...defaults, ...metadata(current, defaults), compactionCount, known: false, tokens: 0, percent: null};
 }

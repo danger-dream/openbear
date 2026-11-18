@@ -8,6 +8,7 @@ import * as Vue from 'vue';
 import {renderToString} from 'vue/server-renderer';
 import * as cfg from './webhookConfig.js';
 import * as runDefaults from '../folderRunDefaults.js';
+import * as imageOneTurn from '../../views/consoleView/imageOneTurn.js';
 const displaySource=fs.readFileSync(new URL('../../views/consoleView/display.js',import.meta.url),'utf8');
 const displayScope={};vm.createContext(displayScope);vm.runInContext(displaySource.slice(displaySource.indexOf('export function modelThinkingLevels('),displaySource.indexOf('export function thinkingDesc(')).replaceAll('export function','function'),displayScope);
 const {modelThinkingLevels,thinkingLabel}=displayScope;
@@ -17,12 +18,12 @@ const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {
 const clone=value=>JSON.parse(JSON.stringify(value));
 const message={success(){},warning(){},error(){}};
 const shell={inheritAttrs:false,setup(_,{slots}){return ()=>h('div',[slots.default?.(),slots.footer?.()]);}};
-const components={PromptPolicyEditor:shell,PromptImpactDialog:shell,AdaptiveMdEditor:shell,WebhookKey:shell,WebhookField:shell,WebhookScriptEditor:shell,WebhookCollectionSettings:shell,WebhookStatistics:shell,WebhookEventDialog:shell,WebhookStatisticsConfig:shell,ModelSettings:shell,WebhookAdvancedSettings:shell,WebhookEditor:shell};
+const components={PromptPolicyEditor:shell,PromptImpactDialog:shell,AdaptiveMdEditor:shell,WebhookKey:shell,WebhookField:shell,WebhookScriptEditor:shell,WebhookCollectionSettings:shell,WebhookStatistics:shell,WebhookEventDialog:shell,WebhookStatisticsConfig:shell,ModelSettings:shell,PersonaSelect:shell,WebhookAdvancedSettings:shell,WebhookEditor:shell};
 let seq=0;
 function harness(name,{props={},api={},live=false,extra={},confirm=async()=>{}}={}) {
  const descriptor=parse(fs.readFileSync(new URL(name,import.meta.url),'utf8')).descriptor;
  const cleanup=[],inputs=reactive(props),scope=effectScope();
- const ctx={...Vue,...promptPolicy,...cfg,...runDefaults,modelThinkingLevels,thinkingLabel,...components,watch:live?watch:()=>{},AbortController,crypto:{randomUUID:()=>`ui-intent-${++seq}`},
+ const ctx={...Vue,...promptPolicy,...cfg,...runDefaults,...imageOneTurn,modelThinkingLevels,thinkingLabel,...components,watch:live?watch:()=>{},AbortController,crypto:{randomUUID:()=>`ui-intent-${++seq}`},
  window:{addEventListener(){},removeEventListener(){}},navigator:{},console,onBeforeUnmount:fn=>cleanup.push(fn),
  inject:(_key,fallback)=>fallback,defineProps:()=>inputs,defineEmits:()=>extra.onEmit || (()=>{}),defineExpose(){},
  ElMessage:message,ElMessageBox:{confirm},Api:api,apiError:e=>e.message,createWebhookEditor,...extra};

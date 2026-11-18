@@ -235,15 +235,38 @@ func TestFilesListReadWriteAndChunkedUpload(t *testing.T) {
 	if st, _ := os.Stat(big); st.Mode().Perm() != 0o750 {
 		t.Fatalf("requested mode not applied: %v", st.Mode())
 	}
-	fileCall(t, u, "fs.write", map[string]any{"path": big, "upload": "upload0002", "offset": 0, "data": enc([]byte("x"))})
+	if _, err := fileCall(t, u, "fs.write", map[string]any{"path": big, "upload": "upload0002", "offset": 0, "data": enc([]byte("x"))}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fileCall(t, u, "fs.write", map[string]any{"path": big, "upload": "upload0002", "offset": 5, "data": enc([]byte("y"))}); err == nil || err.Error() != "upload_out_of_order" {
 		t.Fatalf("a gap must be refused: %v", err)
+	}
+	if b, _ := os.ReadFile(big); string(b) != "aaabbbcc" {
+		t.Fatalf("rejected chunk changed the target: %q", b)
+	}
+	// A rejected offset keeps this upload available for a valid continuation.
+	// Its private staging directory is live, not a leaked completed upload.
+	// Cancel it before checking the final directory contents and ordering.
+	if u.open["upload0002"] == nil || u.open["upload0002"].size != 1 {
+		t.Fatal("rejected offset lost or changed the active upload")
+	}
+	if _, err := fileCall(t, u, "fs.cancel", map[string]any{"path": big, "upload": "upload0002"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(u.open) != 0 {
+		t.Fatal("cancel left an active upload")
+	}
+	if b, _ := os.ReadFile(big); string(b) != "aaabbbcc" {
+		t.Fatalf("cancel changed the committed target: %q", b)
 	}
 	listing, err := fileCall(t, u, "fs.list", map[string]any{"path": dir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	entries := listing["entries"].([]any)
+	if len(entries) != 3 {
+		t.Fatalf("unexpected final directory contents: %v", entries)
+	}
 	first := entries[0].(map[string]any)
 	if first["name"] != "conf" || first["type"] != "dir" {
 		t.Fatalf("directories come first: %v", entries)
@@ -254,7 +277,7 @@ func TestFilesListReadWriteAndChunkedUpload(t *testing.T) {
 		if e["name"] == "link.conf" {
 			sawLink = e["type"] == "link" && e["target"] == path
 		}
-		if strings.Contains(e["name"].(string), ".obtmp-") {
+		if name := e["name"].(string); strings.Contains(name, ".obtmp-") || strings.HasPrefix(name, ".obstage-") {
 			t.Fatalf("temp file left behind: %v", e)
 		}
 	}

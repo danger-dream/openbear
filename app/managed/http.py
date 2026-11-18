@@ -16,7 +16,7 @@ BUSINESS_ROOTS = frozenset({
     "conversations", "conversation-tree", "conversation-folders", "prompt-tools",
     "prompt-template", "events", "reference-catalog", "references", "reference-history",
     "audit-logs", "statistics", "mcp", "settings", "models-dev", "channels", "memory",
-    "rath", "skills", "webhooks", "cron", "push",
+    "rath", "skills", "webhooks", "cron", "push", "notes", "kb-notes",
 })
 
 
@@ -36,7 +36,7 @@ def business_route_allowed(method: str, path: str) -> bool:
 # Exact application documents, including routes installed by feature modules.
 # Login belongs to the gateway; instance administration is controller-only.
 GATEWAY_APP_PAGES = frozenset({
-    "/", "/chat", "/memory", "/secrets", "/docs", "/mcp", "/skills", "/settings",
+    "/", "/chat", "/memory", "/secrets", "/docs", "/notes", "/mcp", "/skills", "/settings",
     "/statistics", "/webhooks", "/cron",
 })
 

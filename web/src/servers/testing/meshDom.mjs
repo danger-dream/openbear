@@ -31,6 +31,8 @@ export async function setup(t, {width = 1440, height = 900, dark = false, tabs =
   if (punch) items.push(server('office', 'Office', {region: 'CN'}), server('cafe', 'Cafe', {region: 'SG'}), server('nas', 'NAS', {region: 'CN'}));
   if (reach) items.push(server('sg', 'SG', {region: 'SG'}), server('toy', 'TOY', {region: 'CN'}), server('lab', 'Lab', {region: 'CN'}));
   let slow = 0;
+  // The server settings' mesh alerts (reminders.mesh), merged on save as the controller does.
+  let alerts = Object.fromEntries(['standby', 'entry', 'flap', 'exit', 'memory', 'apply', 'upgrade', 'missing', 'keys'].map(k => [k, true]));
   network.reset();
   network.external = async () => ({status: 503, body: ''});
   network.handler = async ({path, method, body, url}) => {
@@ -39,6 +41,10 @@ export async function setup(t, {width = 1440, height = 900, dark = false, tabs =
     if (path.startsWith('/api/servers/mesh')) [status, data] = missing ? [404, {ok: false, error: 'not_found'}] : await mesh.handle(method, path.slice('/api/servers/mesh'.length), body, url.search);
     else if (path === '/api/servers' && method === 'GET') data = {ok: true, items, settings: {accessPoints: [], defaultAccess: '', timezone: 'Asia/Shanghai'}, node: {available: true, version: '0.13.1'}};
     else if (path === '/api/servers/live') data = {ok: true, at: Date.now(), items: Object.fromEntries(items.filter(i => i.live).map(i => [i.id, i.live]))};
+    else if (path === '/api/servers/settings') {
+      if (method === 'PUT') alerts = {...alerts, ...body.reminders?.mesh};
+      data = {ok: true, settings: {reminders: {mesh: alerts}}};
+    }
     else if (path.endsWith('/metrics')) data = {ok: true, step: 3, points: {t: [], cpu: [], steal: [], mem: [], rxRate: [], txRate: [], ioRead: [], ioWrite: [], load: [], tcp: [], udp: []}};
     else if (/^\/api\/servers\/[\w-]+$/.test(path)) data = {ok: true, item: {...items.find(i => i.id === path.split('/')[3]), terminalLog: [], execLog: []}};
     const json = JSON.parse(JSON.stringify(data));

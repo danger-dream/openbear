@@ -44,6 +44,9 @@ def release(tmp_path):
         (root / directory).mkdir(parents=True, exist_ok=True)
     for filename in validator.REQUIRED_FILES:
         (root / filename).write_text("test fixture\n")
+    # This candidate's version also requires the real runtime prompt closure;
+    # PWA cases vary frontend resources, not the unrelated prompt contract.
+    shutil.copytree(ROOT / "prompts", root / "prompts", dirs_exist_ok=True)
     (root / "app/__init__.py").write_text('__version__ = "1.2.3"\n')
     (root / "pyproject.toml").write_text('[project]\nname = "openbear"\nversion = "1.2.3"\n')
     (root / "uv.lock").write_text('[[package]]\nname = "openbear"\nversion = "1.2.3"\n')

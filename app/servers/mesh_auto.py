@@ -251,9 +251,10 @@ def listen_default(m, doc, live, facts, rules):
     keep = {t: m['listen'].get(t) or ports[t] for t in TRANSPORTS}
 
     def of(protos):
-        return {t: keep[t] if t in protos else 0 for t in TRANSPORTS}
+        return {**{t: keep[t] if t in protos else 0 for t in TRANSPORTS},
+                **({'fast': m['listen']['fast']} if 'fast' in m['listen'] else {})}
     if _front(m, facts):
-        return of({'tls'}), '前置机只开 TLS，只主动连它的出口'
+        return of({'tls'}), '前置机只开 TLS：主动连它的出口，国内节点经 TLS 连它'
     if m['role'] != 'relay':
         return of({'udp'}), '成员只开 UDP：别人一般不主动连成员，UDP 用来打洞直连'
     if _site(m):
@@ -270,7 +271,7 @@ def listen_default(m, doc, live, facts, rules):
             dialer = other['serverId']
         if dialer == m['serverId']:
             continue
-        first = _order_for(other, m, 'lines', facts, rules)[0][0] if 'transport' in (pair.get('auto') or []) else pair['transport']
+        first = ('tls' if _front(other, facts) else _order_for(other, m, 'lines', facts, rules)[0][0]) if 'transport' in (pair.get('auto') or []) else pair['transport']
         need[first] = need.get(first, 0) + 1
     if rules and doc.get('_fullLineRules', True) and doc['relayLinks']['mode'] == 'full':
         # The links no one listed dial by the rules' order too (full_pair); a front's take what its exit has.
@@ -287,7 +288,7 @@ def listen_default(m, doc, live, facts, rules):
     for x in live.values():
         for c in (x.get('entry') or {}).get('candidates', []):
             if x['role'] == 'member' and c['relay'] == m['serverId']:
-                first = _order_for(x, m, 'entries', facts, rules)[0][0] if 'transport' in (c.get('auto') or []) else c['transport']
+                first = ('tls' if _front(x, facts) else _order_for(x, m, 'entries', facts, rules)[0][0]) if 'transport' in (c.get('auto') or []) else c['transport']
                 need[first] = need.get(first, 0) + 1
     extra = [t for t in TRANSPORTS if t not in ('udp', 'tcp') and need.get(t)]
     reason = '公网中转常开 UDP 和 TCP，新节点接入时用'
@@ -398,6 +399,15 @@ def resolve(doc, facts, rtts=None, links=False):
             if relay and 'transport' in (c.get('auto') or []):
                 c['transport'] = within_limits(candidate_default(m, relay, facts, rules)[0], m, relay, doc, facts, c.get('origin') == 'auto')
     return doc
+
+
+def member_defaults(doc, facts):
+    """Refresh only cached member defaults, preserving draft edits and link interpretation."""
+    resolved = resolve(doc, facts)
+    return {**doc, 'members': [
+        {**m, **{k: current[k] for k in MEMBER_AUTO if k in (m.get('auto') or [])}}
+        for m, current in zip(doc['members'], resolved['members'])
+    ]}
 
 
 def automatic_pair(pair, doc):

@@ -24,7 +24,7 @@ log = get_logger("db.engine")
 
 _SCHEMA = "\n".join(
     (Path(__file__).parent / name).read_text(encoding="utf-8")
-    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql", "collab.sql", "work_items.sql", "extensions.sql", "notes.sql")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql", "collab.sql", "work_items.sql", "extensions.sql", "notes.sql", "kb_notes.sql")
 )
 
 
@@ -263,6 +263,8 @@ class DB:
         if has_web_conversations and not had_display_order:
             await self._backfill_web_conversation_display_order()
         await self._add_column_if_missing("web_conversations", "context_strategy", "context_strategy TEXT NOT NULL DEFAULT 'sliding_window'")
+        await self._add_column_if_missing("web_conversations", "image_one_turn", "image_one_turn TEXT NOT NULL DEFAULT ''")
+        await self._add_column_if_missing("web_conversations", "prompt_template", "prompt_template TEXT NOT NULL DEFAULT ''")
         # Zero watermarks intentionally leave historical completed conversations read.
         for name, ddl in (
             ("activity_version", "activity_version INTEGER NOT NULL DEFAULT 0"),
@@ -283,6 +285,7 @@ class DB:
         await self._add_column_if_missing("web_controller_context_snapshots", "known", "known INTEGER NOT NULL DEFAULT 1")
         await self._add_column_if_missing("web_memory_reminders", "session_uuid", "session_uuid TEXT NOT NULL DEFAULT ''")
         await self._add_column_if_missing("memory_templates", "is_agent_active", "is_agent_active INTEGER DEFAULT 0")
+        await self._add_column_if_missing("memory_templates", "is_persona", "is_persona INTEGER NOT NULL DEFAULT 0")
         await self._migrate_agent_prompt_template_flag()
         await self._pre_migrate_existing_messages_schema()
         await self._pre_migrate_existing_web_artifact_schema()

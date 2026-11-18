@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus';
 import { Api } from '../../api.js';
 import { ok } from '../../instances/instanceHelpers.js';
 import TrendChart from './TrendChart.vue';
+import TrafficHistoryNote from './TrafficHistoryNote.vue';
 import { COLORS } from './detailHelpers.js';
 import { every, useVisible } from './useVisible.js';
 import { bytes, dateTime, projectedTraffic, safeError, trafficTypeText } from '../serverHelpers.js';
@@ -43,7 +44,8 @@ const step = computed(() => ({hour: 3600, day: 86400, month: 86400 * 30})[unit.v
 const hourFormat = computed(() => new Intl.DateTimeFormat('en-US', {timeZone: props.timezone || undefined,
   month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}));
 function when(ts, i) {
-  const last = i === points.value.length - 1;
+  const last = unit.value === 'hour' || !data.value?.currentLabel ? i === points.value.length - 1
+    : points.value[i]?.label === data.value.currentLabel;
   let name = points.value[i]?.label || '';
   if (unit.value === 'hour') {
     const parts = Object.fromEntries(hourFormat.value.formatToParts(new Date(ts * 1000)).map(p => [p.type, p.value]));
@@ -107,7 +109,8 @@ async function clearCalibration() {
     <p v-if="error" class="instance-error">{{ error }}</p>
     <p v-else-if="!data" class="instance-muted dt-wait" role="status">正在读取…</p>
     <template v-else>
-      <TrendChart :key="`${unit}-${kind}`" title="下行与上行" label="流量统计" :t="t" :step="step" :series="series" :format="bytes" unit="bytes" :kind="kind" partial :when="when" :height="phone ? 150 : 180" empty="还没有流量记录。" />
+      <TrafficHistoryNote :history="data.history || []" :timezone="data.timezone || timezone" />
+      <TrendChart :key="`${unit}-${kind}`" title="下行与上行" label="流量统计" :t="t" :step="step" :series="series" :format="bytes" unit="bytes" :kind="kind" :partial="unit === 'hour' || !data.currentLabel || points.at(-1)?.label === data.currentLabel" :when="when" :height="phone ? 150 : 180" empty="还没有流量记录。" />
       <p class="dt-total"><span><i class="is-rx" aria-hidden="true" />下行合计 {{ bytes(totals.rx) }}</span><span><i class="is-tx" aria-hidden="true" />上行合计 {{ bytes(totals.tx) }}</span>
         <span class="instance-muted">共 {{ bytes(totals.rx + totals.tx) }}</span></p>
     </template>

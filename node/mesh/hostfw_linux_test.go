@@ -1075,3 +1075,50 @@ func TestHostFirewallKilledGatewayLeavesNothing(t *testing.T) {
 		t.Fatal("state file left:", err)
 	}
 }
+
+// A port forward's listen ports open in every firewall the machine runs.
+func TestHostFirewallForwardPorts(t *testing.T) {
+	c := fwConfig
+	c.ForwardTCP, c.ForwardUDP = []int{8443, 9000}, []int{9000}
+
+	f := newFakeHost(t)
+	h := newLinuxHost("obmesh0", f.exec, f.has)
+	if err := h.apply(c); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-i obmesh0 -j ACCEPT", "-p udp -m udp --dport 51820 -j ACCEPT", "-p tcp -m tcp --dport 443 -j ACCEPT",
+		"-p tcp -m tcp --dport 8443 -j ACCEPT", "-p tcp -m tcp --dport 9000 -j ACCEPT", "-p udp -m udp --dport 9000 -j ACCEPT"}
+	if got := f.ipt["filter"][chainIn]; !slices.Equal(got, want) {
+		t.Fatalf("iptables %q", got)
+	}
+
+	f = newFakeHost(t)
+	f.fdOn = true
+	h = newLinuxHost("obmesh0", f.exec, f.has)
+	if err := h.apply(c); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"8443/tcp", "9000/tcp", "9000/udp"} {
+		if !f.ports["public"][p] {
+			t.Fatalf("firewalld %s closed: %v", p, f.ports)
+		}
+	}
+	c.ForwardTCP, c.ForwardUDP = nil, nil
+	if err := h.apply(c); err != nil {
+		t.Fatal(err)
+	}
+	if f.ports["public"]["8443/tcp"] || f.ports["public"]["9000/udp"] {
+		t.Fatalf("firewalld kept a removed forward's port: %v", f.ports)
+	}
+
+	f = newFakeHost(t)
+	in := f.addNFT("inet", "filter", "input", "input", "drop")
+	h = newLinuxHost("obmesh0", f.exec, f.has)
+	c.ForwardTCP, c.ForwardUDP = []int{8443}, []int{9000}
+	if err := h.apply(c); err != nil {
+		t.Fatal(err)
+	}
+	if got := texts(in); !slices.Contains(got, "tcp dport 8443 accept") || !slices.Contains(got, "udp dport 9000 accept") {
+		t.Fatalf("nftables %q", got)
+	}
+}

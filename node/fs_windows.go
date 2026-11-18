@@ -70,8 +70,6 @@ func driveRoots() ([]string, error) {
 	return roots, nil
 }
 
-func keepOwner(string, fs.FileInfo) {}
-
 // fileIdentity names the open file by volume and file index.
 func fileIdentity(f *os.File, _ fs.FileInfo) string {
 	var d windows.ByHandleFileInformation

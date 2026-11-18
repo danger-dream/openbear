@@ -9,6 +9,7 @@ from app.conversation_titles import (
     render_naming_transcript,
     select_naming_turns,
 )
+from app.context import image_one_turn, prompt_template
 from app.extensions import split_usage
 from app.lifecycle import wait_for_startup
 from app.llm.events import Usage
@@ -95,6 +96,8 @@ class WebAdminConversationsMixin:
             **activity_fields(data),
             "agentModel": str(data.get("agent_model") or ""),
             "contextStrategy": str(data.get("context_strategy") or "sliding_window"),
+            "imageOneTurn": image_one_turn.normalize(data.get("image_one_turn")),
+            "promptTemplate": prompt_template.normalize(data.get("prompt_template")),
             "agentThinkLevel": str(data.get("agent_think_level") or ""),
             "agentFastMode": (
                 None
@@ -252,6 +255,8 @@ class WebAdminConversationsMixin:
         config = run_config if isinstance(run_config, dict) else {}
         model_label = str(config.get("main_model") or model or getattr(self.model_selection, "current", "") or self.config.models.primary)
         context_strategy = str(config.get("context_strategy") or self.config.context_management.default_strategy)
+        image_setting = image_one_turn.dumps(config.get("image_one_turn"))
+        template_setting = prompt_template.normalize(config.get("prompt_template"))
         main_thinking = str(config.get("main_thinking_level") or "")
         main_fast = 1 if bool(config.get("main_fast_mode")) else 0
         agent_model = str(config.get("agent_model") or "")
@@ -286,14 +291,14 @@ class WebAdminConversationsMixin:
                               conversation_uuid, owner_chat_id, internal_chat_id, title, model,
                               agent_model, agent_think_level, agent_fast_mode,
                               status, current_status, created_at, updated_at, display_order, folder_uuid, context_strategy,
-                              last_interaction_at_ms, last_conversation_at, origin_kind, origin_ref
-                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              image_one_turn, prompt_template, last_interaction_at_ms, last_conversation_at, origin_kind, origin_ref
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 conv_uuid, owner_chat_id, internal, title or "新对话", model_label,
                                 agent_model, agent_thinking, agent_fast,
                                 "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""), context_strategy,
-                                0, 0, str(origin_kind or "user"), str(origin_ref or ""),
+                                image_setting, template_setting, 0, 0, str(origin_kind or "user"), str(origin_ref or ""),
                             ),
                         )
                         await conn.execute(
@@ -639,7 +644,9 @@ class WebAdminConversationsMixin:
             owner_chat_id,
             title=new_title,
             model=str(source.get("model") or ""),
-            run_config={"context_strategy": str(source.get("context_strategy") or "sliding_window")},
+            run_config={"context_strategy": str(source.get("context_strategy") or "sliding_window"),
+                        "image_one_turn": source.get("image_one_turn") or "",
+                        "prompt_template": source.get("prompt_template") or ""},
             folder_uuid=str(source.get("folder_uuid") or ""),
             extensions=await self._extensions_copy(old_uuid),
         )

@@ -203,13 +203,13 @@ func (s *entryServer) serve(c *net.TCPConn) {
 	defer c.Close()
 	c.SetNoDelay(true)
 	c.SetDeadline(time.Now().Add(handshakeWait))
-	br := bufio.NewReaderSize(c, 4096)
+	br := newProxyReader(c)
 	first, err := br.Peek(1)
 	if err != nil {
 		return
 	}
 	if first[0] == 5 {
-		s.socks(c, br)
+		s.socks(c, br.Reader)
 	} else {
 		s.http(c, br)
 	}
@@ -452,9 +452,13 @@ func socksReply(c net.Conn, status byte, bound netip.AddrPort) error {
 
 // ----- HTTP -----
 
-func (s *entryServer) http(c *net.TCPConn, br *bufio.Reader) {
-	req, err := http.ReadRequest(br)
+func (s *entryServer) http(c *net.TCPConn, br *proxyReader) {
+	req, err := br.readRequest()
 	if err != nil {
+		if errors.Is(err, errHTTPHeadersLarge) {
+			s.rejected.Add(1)
+			io.WriteString(c, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		}
 		return
 	}
 	name, password, given := proxyAuth(req.Header.Get("Proxy-Authorization"))
