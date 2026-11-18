@@ -947,11 +947,13 @@ test('node versions: state tags, summary with 全部更新, build and source in 
   d = p.page.locator('.sv-detail:visible');
   assert.equal(await d.locator('.ix-facts > div').filter({has: p.page.locator('dt', {hasText: /^构建$/})}).locator('dd').innerText(), '5a5a5a5a5a5a · 测试版 · 比目标 1.2.0 新，不会自动降级');
   await tab(p.page, '探针').click();
+  p.backend.holdUpdateRun = true;
   await p.page.locator('.pb-notice[data-node-update=summary]').getByRole('button', {name: '全部更新'}).click();
   // It runs on the controller: the board follows it node by node instead of waiting on one request.
   const running = p.page.locator('.pb-notice[data-node-update=running]');
-  await running.getByText(/^正在更新节点 [01]\/2，当前：/).waitFor();
+  await running.getByText(/^正在更新节点 0\/2，当前：/).waitFor();
   assert.equal(await p.page.locator('.pb-notice[data-node-update=summary]').count(), 0);
+  p.backend.holdUpdateRun = false;
   await shown(p, 'warning', '已更新 1 台，1 台文件已替换但未确认运行');
   await running.waitFor({state: 'detached'});
   assert.equal(p.calls.filter(c => c.path === '/api/servers/node-update' && c.method === 'POST').length, 1);

@@ -65,7 +65,10 @@ NODE_TOOLCHAIN_SKIPS = (("tests.test_servers::", "Go toolchain is not available"
                         ("tests.test_browser_observe_steps::", "needs google-chrome and Go"),
                         ("tests.test_gateway_update::", "needs the built gateway program"),
                         ("tests.test_instance_hardening::", "gateway binary not built"),
-                        ("tests.test_servers_hardening::", "ssh-keygen is not available"))
+                        ("tests.test_servers_hardening::", "ssh-keygen is not available"),
+                        # The benchmark scripts' JSON contracts run through a real jq, which
+                        # development checks have and the matrix images do not.
+                        ("tests.test_bench_b1_b6::", "offline serialization contracts require local jq"))
 
 
 def matrix_contract(results):

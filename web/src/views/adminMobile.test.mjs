@@ -207,17 +207,19 @@ test('compact search rows, template identity and editor occupy bounded tracks ra
 });
 
 test('mobile template toolbar retains all operations with existing handlers and disabled states', async () => {
-  const called = [], scope = {editing:{is_active:false,is_agent_active:false}, dirty:()=>true, showHelp:false, saving:false, changingTemplate:false};
+  const called = [], scope = {editing:{is_active:false,is_agent_active:false}, dirty:()=>true, showHelp:false, showPersonaSync:false, saving:false, changingTemplate:false};
   for (const name of ['newTpl','save','activate','activateAgent','setPersona','openBuiltinImport','removeCurrent']) scope[name]=()=>called.push(name);
   const view = await render(findClass('Template', 'template-mobile-actions').loc.source, scope);
   for (const button of view.nodes.filter(n => n.type === 'button')) button.props.onClick();
   assert.deepEqual(called, ['newTpl','save','activate','activateAgent','setPersona','openBuiltinImport','removeCurrent']);
   assert.equal(scope.showHelp,true);
+  assert.equal(scope.showPersonaSync,true);
   for (const busy of ['saving', 'changingTemplate']) {
     scope[busy] = true;
     const pending = await render(findClass('Template', 'template-mobile-actions').loc.source, scope);
     const pendingButtons = pending.nodes.filter(n => n.type === 'button');
-    for (const index of [0, 1, 2, 3, 4, 7]) assert.equal(pendingButtons[index].props.disabled, true, `${busy}:${index}`);
+    // 新建, 保存, 设为主/Agent 提示词, 设为人设 and 删除当前模板; the sync, import and help entries stay usable.
+    for (const index of [0, 1, 2, 3, 4, 8]) assert.equal(pendingButtons[index].props.disabled, true, `${busy}:${index}`);
     scope[busy] = false;
   }
   scope.editing=null; scope.dirty=()=>false;

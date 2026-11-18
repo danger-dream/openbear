@@ -108,8 +108,9 @@ def test_joining_front_with_auto_listen_exit_defaults_to_tls_and_opens_exit_tls(
     assert any(e['error'] == 'endpoint_missing' and '是前置机，还没有填对外地址' in e['message'] for e in errs)
 
     # Custom-mode relay link edits emit specific link changes with endpoints instead of duplicate generic relayLinks.
+    # Applied before the front joined: the exit had no TLS port and the link dialed TCP.
     applied = copy.deepcopy(resolved)
-    applied['members'][0]['listen']['tcp'] = 52000
+    applied['members'][0]['listen']['tls'] = 0
     applied['relayLinks']['pairs'][0]['transport'] = 'tcp'
     changes = Mesh._changes(applied, resolved, f)
     assert [c['kind'] for c in changes] == ['member.update', 'link.change']

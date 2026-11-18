@@ -183,8 +183,9 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
       retention: {minuteDays: 31, hourDays: 400}, latency: {...LATENCY}, latencyCatalog: LATENCY_CATALOG}, job = null, storage = structuredClone(STORAGE);
     let codes = [{id: 'rc1', name: '新开的 VPS', group: 'Tier 1', access: {}, active: true, uses: 2, maxUses: 0, expiresAtMs: 0, createdAtMs: Date.now() - 86400000, lastUsedAtMs: Date.now() - 7200000, revokedAtMs: 0,
       command: 'curl -fsSL https://node.example.com/api/server-nodes/v1/install.sh | sh -s -- --url https://node.example.com --code rc1secret'}], batchJob = null, batchPolls = 0;
-    // 全部更新 in the background: each read of it finds one more node done.
-    let run = null, runQueue = [];
+    // 全部更新 in the background: each read of it finds one more node done, unless a test
+    // holds it (holdUpdateRun) to look at the running state on a slow machine.
+    let run = null, runQueue = [], holdRun = false;
     if (updateRun) ({queue: runQueue, ...run} = structuredClone(updateRun));
     // An IP.Check.Place run started from the detail page: under way for two more reads, then a fresh report.
     const ipRuns = {}, unlockRuns = {};
@@ -316,7 +317,7 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
         }
         data = {ok: true, run};
       } else if (path === '/api/servers/node-update') {
-        if (run?.running) {
+        if (run?.running && !holdRun) {
           const next = runQueue.shift(), own = items.find(i => i.id === next.serverId);
           if (own?.node) Object.assign(own.node, {version: '0.13.1', updateAvailable: false});
           run = {...run, items: [...run.items, next], done: run.done + 1, active: runQueue.slice(0, 1).map(r => r.serverId),
@@ -521,7 +522,8 @@ export function createServersBackend({tweak = null, fx = FX, release = null, rec
       }
     return {status: 200, json: data};
   }
-  return {calls, terminal, uploads, saved, items, handle, external, openTerminal, get settings() { return settings; }};
+  return {calls, terminal, uploads, saved, items, handle, external, openTerminal, get settings() { return settings; },
+    set holdUpdateRun(value) { holdRun = Boolean(value); }};
 }
 
 // The busiest processes and the machine in detail, as host.top and host.details return them.
