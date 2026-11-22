@@ -47,7 +47,8 @@ const work = computed(() => mesh.work);
 // A save or an action that failed for something other than the settings (act's "N 处设置需要修改": MeshChanges lists those).
 // The classic board shows mesh.error itself.
 const actionError = computed(() => mesh.error && !/^\d+ 处设置需要修改$/.test(mesh.error) ? mesh.error : '');
-const fast = computed(() => Boolean(data.value?.apply?.running) || mesh.installing || Boolean(data.value?.installing?.length));
+const fast = computed(() => Boolean(data.value?.apply?.running || data.value?.apply?.preparing) || mesh.applying || mesh.installing
+  || Boolean(data.value?.installing?.length));
 // The first reading once the mesh is on screen again (opened, or its browser tab back) asks the nodes
 // for their interfaces and routes; the polls in between go by what they reported last.
 let fresh = true;
@@ -66,8 +67,16 @@ watch(visible, now => { if (!now) fresh = true; });
 const tick = () => poll.run();
 
 async function applyNow() {
-  const result = await act(() => MeshApi.apply());
-  if (result) poll.schedule();
+  if (mesh.applying || data.value?.apply?.running || data.value?.apply?.preparing) return;
+  mesh.applying = true;
+  mesh.applyStartedAt = Date.now();
+  try {
+    const result = await act(() => MeshApi.apply());
+    if (result) poll.schedule();
+  } finally {
+    mesh.applying = false;
+    if (!data.value?.apply?.running) mesh.applyStartedAt = 0;
+  }
 }
 function visibility() { if (document.hidden) fresh = true; else void tick(); }
 watch(fast, () => poll.schedule());
@@ -75,9 +84,11 @@ watch(() => data.value?.apply?.running, (now, before) => {
   if (!before || now) return;
   const progress = data.value?.apply?.progress || [], failed = progress.filter(p => p.state === 'failed').length;
   const missing = progress.filter(p => p.state === 'missing').length;
+  const took = mesh.applyStartedAt ? `，用时 ${Math.max(1, Math.round((Date.now() - mesh.applyStartedAt) / 1000))} 秒` : '';
+  mesh.applyStartedAt = 0;
   if (failed) ElMessage.warning(`${failed} 台没有应用成功，原因显示在节点列表和详情里`);
-  else if (missing) ElMessage.warning(`已应用到 ${progress.filter(p => p.state === 'done').length} 台；${missing} 台的组网服务不见了，已跳过`);
-  else ElMessage.success(`已应用到 ${progress.filter(p => p.state === 'done').length} 台`);
+  else if (missing) ElMessage.warning(`已应用到 ${progress.filter(p => p.state === 'done').length} 台；${missing} 台的组网服务不见了，已跳过${took}`);
+  else ElMessage.success(`已应用到 ${progress.filter(p => p.state === 'done').length} 台${took}`);
 });
 
 // ---- pages ----

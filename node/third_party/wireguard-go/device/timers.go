@@ -77,8 +77,10 @@ func (peer *Peer) timersActive() bool {
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
-	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+	// Retries span RekeyAttemptTime whatever their interval.
+	maxAttempts := uint32(RekeyAttemptTime / peer.device.handshakeRetry())
+	if peer.timers.handshakeAttempts.Load() > maxAttempts {
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, maxAttempts+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -98,7 +100,8 @@ func expiredRetransmitHandshake(peer *Peer) {
 		}
 	} else {
 		peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
+		peer.device.handshakes.retries.Add(1)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %v, retrying (try %d)", peer, peer.device.handshakeRetry(), peer.timers.handshakeAttempts.Load()+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
@@ -170,7 +173,7 @@ func (peer *Peer) timersAnyAuthenticatedPacketReceived() {
 /* Should be called after a handshake initiation message is sent. */
 func (peer *Peer) timersHandshakeInitiated() {
 	if peer.timersActive() {
-		peer.timers.retransmitHandshake.Mod(RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.retransmitHandshake.Mod(peer.device.handshakeRetry() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 

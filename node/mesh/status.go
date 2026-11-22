@@ -65,6 +65,7 @@ type Status struct {
 	HostFirewallIssues []FirewallIssue   `json:"hostFirewallIssues,omitempty"`
 	Counters           CounterStatus     `json:"counters"`
 	ReceiveDrops       ReceiveDropStatus `json:"receiveDrops"`
+	Handshakes         HandshakeStatus   `json:"handshakes"`
 	LargeBuffers       LargeBufferStatus `json:"largeBuffers"`
 	Resources          ResourceStatus    `json:"resources"`
 	Events             []Event           `json:"events"`
@@ -106,6 +107,17 @@ type RoutingStatus struct {
 	Mode   string       `json:"mode"`
 	Links  []RouteLink  `json:"links"`
 	Routes []RelayRoute `json:"routes"`
+	// AdvertDrops: the advertisements turned away since the data plane
+	// started, by why.
+	AdvertDrops AdvertDrops `json:"advertDrops"`
+}
+
+type AdvertDrops struct {
+	OriginRate uint64 `json:"originRate"`
+	Throttled  uint64 `json:"throttled"`
+	Signature  uint64 `json:"signature"`
+	Malformed  uint64 `json:"malformed"`
+	Unlinked   uint64 `json:"unlinked"`
 }
 
 type RouteLink struct {
@@ -119,25 +131,24 @@ type RouteLink struct {
 	// Advertised: the cost this relay last advertised for the link, what
 	// routes go by; null unless up.
 	Advertised *float64 `json:"advertised"`
-	// HeldMs: how much longer a link back from down is held down, while it is.
-	HeldMs int64 `json:"heldMs,omitempty"`
 }
 
 type RelayRoute struct {
 	Dest     string   `json:"dest"`
 	NextHop  string   `json:"nextHop"`
 	Cost     *float64 `json:"cost"`
+	Smoothed *float64 `json:"smoothed,omitempty"`
 	Path     []string `json:"path"`
 	Since    int64    `json:"since"`
 	Switches int      `json:"switches"`
-	// Best, with Held: the shortest path's next hop while the route stays
-	// on another, its cost (null without one yet), why it stays (margin,
-	// hold, damped, loop, penalty, transit) and, for hold and damped, until
-	// when (Unix ms).
-	Best     string   `json:"best,omitempty"`
-	BestCost *float64 `json:"bestCost,omitempty"`
-	Held     string   `json:"held,omitempty"`
-	Until    int64    `json:"until,omitempty"`
+	Flips    int      `json:"flips,omitempty"`
+	// Best, with Held: the cheaper next hop while the route stays on another,
+	// its real cost and smoothed cost (null without one yet), and why it stays
+	// (margin, settling, loop, transit).
+	Best         string   `json:"best,omitempty"`
+	BestCost     *float64 `json:"bestCost,omitempty"`
+	BestSmoothed *float64 `json:"bestSmoothed,omitempty"`
+	Held         string   `json:"held,omitempty"`
 }
 
 func finite(v float64) *float64 {
@@ -149,18 +160,19 @@ func finite(v float64) *float64 {
 
 func routingStatus(r *meshrouting.Router) *RoutingStatus {
 	st := r.Status()
-	out := &RoutingStatus{Mode: st.Mode, Links: []RouteLink{}, Routes: []RelayRoute{}}
+	d := st.Drops
+	out := &RoutingStatus{Mode: st.Mode, Links: []RouteLink{}, Routes: []RelayRoute{},
+		AdvertDrops: AdvertDrops{OriginRate: d.OriginRate, Throttled: d.Throttled, Signature: d.Signature, Malformed: d.Malformed, Unlinked: d.Unlinked}}
 	for _, l := range st.Links {
 		out.Links = append(out.Links, RouteLink{Peer: l.Peer, State: l.State, RTTMs: l.RTTMs, JitterMs: l.JitterMs, Loss: math.Round(l.Loss*1000) / 1000, Cost: finite(l.Cost), Penalty: l.Penalty,
-			Advertised: finite(l.Advertised), HeldMs: l.Held.Milliseconds()})
+			Advertised: finite(l.Advertised)})
 	}
 	for _, x := range st.Routes {
-		r := RelayRoute{Dest: x.Dest, NextHop: x.NextHop, Cost: finite(x.Cost), Path: x.Path, Since: x.Since.UnixMilli(), Switches: x.Switches, Best: x.Best, Held: x.Held}
+		r := RelayRoute{Dest: x.Dest, NextHop: x.NextHop, Cost: finite(x.Cost), Smoothed: finite(x.Smoothed), Path: x.Path, Since: x.Since.UnixMilli(),
+			Switches: x.Switches, Flips: x.Flips, Best: x.Best, Held: x.Held}
 		if x.Best != "" {
 			r.BestCost = finite(x.BestCost)
-		}
-		if !x.Until.IsZero() {
-			r.Until = x.Until.UnixMilli()
+			r.BestSmoothed = finite(x.BestSmoothed)
 		}
 		out.Routes = append(out.Routes, r)
 	}
@@ -353,6 +365,21 @@ type ReceiveDropStatus struct {
 	Decrypt       uint64 `json:"decrypt"`
 	Replay        uint64 `json:"replay"`
 	StaleKey      uint64 `json:"staleKey"`
+}
+
+// HandshakeStatus is device.HandshakeStats: what slowed a WireGuard
+// handshake down, each of them once costing its packets 5 s.
+type HandshakeStatus struct {
+	CookiesSent     uint64 `json:"cookiesSent"`
+	CookiesReceived uint64 `json:"cookiesReceived"`
+	QueueFull       uint64 `json:"queueFull"`
+	RateLimited     uint64 `json:"rateLimited"`
+	Retries         uint64 `json:"retries"`
+}
+
+func handshakeStatus(h device.HandshakeStats) HandshakeStatus {
+	return HandshakeStatus{CookiesSent: h.CookiesSent, CookiesReceived: h.CookiesReceived, QueueFull: h.QueueFull,
+		RateLimited: h.RateLimited, Retries: h.Retries}
 }
 
 // LargeBufferStatus: what became of large packet buffers, received
@@ -566,6 +593,7 @@ func (e *engine) status() Status {
 	td, dd := e.bind.ReceiveDrops(), e.dev.ReceiveDrops()
 	s.ReceiveDrops = ReceiveDropStatus{Queue: td.Queue, TooLong: td.TooLong, StalePath: td.Stale,
 		NoBuffer: dd.NoBuffer, NoLargeBuffer: dd.NoLargeBuffer, Decrypt: dd.Decrypt, Replay: dd.Replay, StaleKey: dd.StaleKey}
+	s.Handshakes = handshakeStatus(e.dev.HandshakeStats())
 	lr := e.bind.LargeReceive()
 	s.LargeBuffers = LargeBufferStatus{RxSwapped: lr.Swapped, RxCopied: lr.Copied, RxReused: lr.Reused, RxAllocated: lr.Allocated, RxDiscarded: lr.Discarded,
 		TxSwapped: c.LargeSwapped.Load(), TxCopied: c.LargeCopied.Load(), TxReused: c.LargeReused.Load(), TxAllocated: c.LargeAllocated.Load(), TxDiscarded: c.LargeDiscarded.Load()}
@@ -787,7 +815,7 @@ func goMappedBytes() uint64 {
 
 // writeAtomic replaces path so a reader never sees half a file.
 func writeAtomic(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", " ")
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}

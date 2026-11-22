@@ -53,20 +53,33 @@ test("pending form navigation waits for matching conversation and authenticated 
   await nextTick(); assert.deepEqual(focused, ["form-b"]);
 });
 
-test("composer focuses the exact live card, never a form input or confirmation button; expired requests cannot be focused", () => {
-  const source = read("./views/consoleView/ConsoleComposer.vue");
-  const code = source.slice(source.indexOf("function focusInteraction(interactionId)"), source.indexOf("defineExpose("));
+test("composer delegates focusInteraction to PendingInteractionSheet, focusing the exact live card without focusing inputs or expired requests", () => {
+  const composerSource = read("./views/consoleView/ConsoleComposer.vue");
+  const sheetSource = read("./views/consoleView/PendingInteractionSheet.vue");
+  assert.match(composerSource, /function focusInteraction\(interactionId\)\s*\{\s*return Boolean\(interactionSheet\.value\?\.focusInteraction\?\.\(interactionId\)\);\s*\}/);
+  const code = sheetSource.slice(sheetSource.indexOf("function focusInteraction(interactionId)"), sheetSource.indexOf("defineExpose("));
   const calls = [];
+  let expanded = 0;
+  const activeId = ref("");
   const card = id => ({dataset: {interactionId: id}, scrollIntoView: options => calls.push([id, "scroll", options.block]), focus: options => calls.push([id, "focus", options.preventScroll])});
-  const props = {pendingConfirmations: [{confirmationId: "target"}, {confirmationId: "expired", expired: true}]};
-  const ctx = vm.createContext({props, interactionExpired: item => Boolean(item.expired),
-    composerShell: ref({querySelectorAll: selector => {assert.equal(selector, "[data-interaction-id]"); return [card("other"), card("target")];}}),
+  const props = {items: [{confirmationId: "target"}, {confirmationId: "expired", expired: true}]};
+  const ctx = vm.createContext({
+    props,
+    activeId,
+    nextTick,
+    isExpired: item => Boolean(item.expired),
+    expandPanel: () => { expanded++; },
+    sheetEl: ref({querySelectorAll: selector => {assert.equal(selector, "[data-interaction-id]"); return [card("other"), card("target")];}}),
+    rootEl: ref(null),
+    document: undefined,
   });
   vm.runInContext(code, ctx);
   assert.equal(vm.runInContext("focusInteraction('target')", ctx), true);
+  assert.equal(activeId.value, "target");
+  assert.equal(expanded, 1);
   assert.deepEqual(calls, [["target", "scroll", "nearest"], ["target", "focus", true]]);
   assert.equal(vm.runInContext("focusInteraction('expired')", ctx), false);
   assert.equal(vm.runInContext("focusInteraction('gone')", ctx), false);
   assert.equal(calls.length, 2);
-  assert.match(source, /:data-interaction-id="item.confirmationId" tabindex="-1"/);
+  assert.match(sheetSource, /:data-interaction-id="activeItem\.confirmationId"[\s\S]*?tabindex="-1"/);
 });

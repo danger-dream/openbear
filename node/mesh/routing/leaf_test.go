@@ -122,36 +122,37 @@ func TestLeavesNeverTransit(t *testing.T) {
 		t.Fatalf("M1 -> B nextHop = %q, want B", nh)
 	}
 
-	// Now B-M1 becomes very slow or A-B becomes very fast (10ms): B->M1 should go via A (10+5=15ms < 50ms).
-	now = now.Add(10 * time.Second)
-	for range 6 {
+	// Now A-B becomes very fast (10ms): B->M1 should move to via A and M1->B via A
+	// once smoothed costs converge.
+	for range 360 {
+		now = now.Add(time.Second)
 		rA.Probe("B", 10*time.Millisecond)
 		rB.Probe("A", 10*time.Millisecond)
-	}
-	now = now.Add(DefaultTuning.Hold + time.Second)
-	rA.Tick()
-	rB.Tick()
-	for _, m := range rA.Advert(budget, []string{"B"}) {
-		rB.Receive("A", m, budget)
-	}
-	for _, m := range rB.Advert(budget, []string{"A"}) {
-		rA.Receive("B", m, budget)
+		rA.Probe("M1", 5*time.Millisecond)
+		rB.Probe("M1", 50*time.Millisecond)
+		rB.Probe("M2", 10*time.Millisecond)
+		rM1.Probe("A", 5*time.Millisecond)
+		rM1.Probe("B", 50*time.Millisecond)
+		rA.Tick()
+		rB.Tick()
+		rM1.Tick()
+		for _, m := range rA.Advert(budget, []string{"B", "M1"}) {
+			if m.Peer == "B" {
+				rB.Receive("A", m, budget)
+			} else {
+				rM1.Receive("A", m, budget)
+			}
+		}
+		for _, m := range rB.Advert(budget, []string{"A", "M1"}) {
+			if m.Peer == "A" {
+				rA.Receive("B", m, budget)
+			} else {
+				rM1.Receive("B", m, budget)
+			}
+		}
 	}
 	if nh, ok := rB.NextHop("M1"); !ok || nh != "A" {
 		t.Fatalf("B -> M1 after A-B fast: nextHop = %q, want A", nh)
-	}
-	if nh, ok := rM1.NextHop("B"); ok && nh != "B" {
-		// M1 has not received the new adverts yet.
-	}
-	for _, m := range rA.Advert(budget, []string{"B"}) {
-		rM1.Receive("A", m, budget)
-	}
-	now = now.Add(DefaultTuning.Hold + time.Second)
-	for _, m := range rA.Advert(budget, []string{"B"}) {
-		rM1.Receive("A", m, budget)
-	}
-	for _, m := range rB.Advert(budget, []string{"A"}) {
-		rM1.Receive("B", m, budget)
 	}
 	if nh, ok := rM1.NextHop("B"); !ok || nh != "A" {
 		t.Fatalf("M1 -> B after A-B fast: nextHop = %q, want A", nh)
@@ -257,13 +258,20 @@ func TestScale200Nodes1000Links(t *testing.T) {
 	if len(dec.links) != 20 || len(dec.members) != 24 {
 		t.Fatalf("decoded %d relay links, %d member links", len(dec.links), len(dec.members))
 	}
-	// Members never appear in routes ("r").
-	for d := range dec.routes {
+	// The routes to the members it links go in too, each through the member.
+	memberRoutes := 0
+	for d, nh := range dec.routes {
 		if slices.Contains(members, d) {
-			t.Fatalf("member %s appeared in advertised routes", d)
+			memberRoutes++
+			if nh != d {
+				t.Fatalf("route to %s through %s", d, nh)
+			}
 		}
 	}
-	t.Logf("200 nodes / 1000 links per-relay compact advert (20 relay links + 24 member links + 29 relay routes): %d / %d bytes", len(msgs[0].Raw), compactBudget)
+	if memberRoutes != 24 {
+		t.Fatalf("%d routes to members, want 24: %v", memberRoutes, dec.routes)
+	}
+	t.Logf("200 nodes / 1000 links per-relay compact advert (20 relay links + 24 member links + %d routes): %d / %d bytes", len(dec.routes), len(msgs[0].Raw), compactBudget)
 }
 
 // TestLeafNewDirectLinkBreaksNeighborLoop reproduces a multi-region scenario

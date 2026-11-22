@@ -29,14 +29,14 @@ test('desktop retains normal placement and rotation switches the complete mobile
   h.win.mobile=true;h.win.dispatchEvent(new Event('resize'));h.flush();assert.equal(h.nextOptions.strategy,'fixed');assert.equal(h.nextOptions.modifiers[0].options.tether,false);h.cleanup();
   const fallback=harness({height:180,viewport:false});assert.equal(fallback.values.get('--mobile-select-height'),'180px');fallback.cleanup();
 });
-test('all nine filterable select entry points use the common viewport options without replacing their filters',()=>{
+test('all eleven filterable select entry points use the common viewport options without replacing their filters',()=>{
   const paths=['ChannelsView','MemoryView','DocsView','SecretsView','RathAgentsView','TemplateView','consoleView/TaskMemoryDrawer'];let count=0;
   for(const path of paths){
     const s=fs.readFileSync(new URL(`./views/${path}.vue`,import.meta.url),'utf8');const ast=baseParse(parse(s).descriptor.template.content);
     const visit=n=>{if(n.type===1&&n.tag==='el-select'&&n.props.some(p=>p.name==='filterable')){count++;assert.ok(n.props.some(p=>p.name==='bind'&&p.arg?.content==='popper-options'&&p.exp?.content==='mobileSelectOptions()'),path);}
       for(const c of n.children||[])visit(c);};visit(ast);
   }
-  assert.equal(count,9);
+  assert.equal(count,11);
 });
 test('dropdown scroller never exceeds the shorter viewport, retains normal 274px cap and safe areas',()=>{
   const root=postcss.parse(fs.readFileSync(new URL('./mobile-overlays.css',import.meta.url),'utf8'));let limit;

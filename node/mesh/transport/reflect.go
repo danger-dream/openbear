@@ -38,7 +38,7 @@ const (
 	reflectPerSource = 8
 	reflectTotal     = 1024
 	// How long an answered request is remembered for a test, and its
-	// source for RecentlyFrom; both maps are bounded.
+	// source address and port for RecentlyFrom; both maps are bounded.
 	reflectKeep     = 10 * time.Second
 	reflectFromKeep = 5 * time.Minute
 	reflectMaxIDs   = 1024
@@ -143,8 +143,9 @@ func (b *Bind) remember(id [8]byte, from netip.AddrPort, now time.Time) {
 			}
 		}
 	}
-	if _, ok := b.reflectFrom[from.Addr()]; ok || len(b.reflectFrom) < reflectMaxFrom {
-		b.reflectFrom[from.Addr()] = now
+	from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+	if _, ok := b.reflectFrom[from]; ok || len(b.reflectFrom) < reflectMaxFrom {
+		b.reflectFrom[from] = now
 	}
 }
 
@@ -213,18 +214,22 @@ func (b *Bind) ReflectSeen(id [8]byte) (netip.AddrPort, bool) {
 	return s.addr, true
 }
 
-// RecentlyFrom says whether ip may hold NAT or firewall state toward this
-// node: it asked this reflector, or has a UDP path that this node dials or
-// that authenticated, within the last while.
-func (b *Bind) RecentlyFrom(ip netip.Addr, within time.Duration) bool {
-	ip = ip.Unmap()
+// RecentlyFrom says whether target, an address and port, may hold NAT or
+// firewall state toward this node: from that port it asked this reflector,
+// or it is the far end of a UDP path that this node dials or that
+// authenticated, within the last while. Another port of the same address
+// holds its own state: the probes a node sends a relay from a socket of
+// their own (ProbeUDP), as every relay's measures of the others are, open
+// nothing to its listener.
+func (b *Bind) RecentlyFrom(target netip.AddrPort, within time.Duration) bool {
+	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if at, ok := b.reflectFrom[ip]; ok && time.Since(at) < within {
+	if at, ok := b.reflectFrom[target]; ok && time.Since(at) < within {
 		return true
 	}
 	for _, ep := range b.ids {
-		if ep.transport != "udp" || ep.retired || ep.remote.Addr().Unmap() != ip {
+		if ep.transport != "udp" || ep.retired || netip.AddrPortFrom(ep.remote.Addr().Unmap(), ep.remote.Port()) != target {
 			continue
 		}
 		if ep.outbound || time.Since(ep.lastAuthenticated[0]) < within || time.Since(ep.lastAuthenticated[1]) < within {

@@ -45,7 +45,7 @@ func (r *Router) Linked(peer string) bool {
 	if r.graph == nil {
 		return false
 	}
-	_, ok := r.graph.adj[r.graph.self][peer]
+	_, ok := r.graph.link(r.graph.self, peer)
 	return ok
 }
 
@@ -113,32 +113,37 @@ func (g *graph) kShortest(dest string, k int, ok func(string) bool) [][]string {
 // shortest is the cheapest path from src to dst, both included, crossing
 // none of nodes and taking none of edges; members only at its ends.
 func (g *graph) shortest(src, dst string, nodes map[string]bool, edges map[[2]string]bool, ok func(string) bool) ([]string, bool) {
-	dist := map[string]key{src: {}}
-	prev := map[string]string{}
-	done := map[string]bool{}
+	s, t := g.id(src), g.id(dst)
+	if s < 0 || t < 0 {
+		return nil, false
+	}
+	dist := map[int32]key{s: {}}
+	prev := map[int32]int32{}
+	done := map[int32]bool{}
 	for {
-		u := ""
+		u := int32(-1)
 		for n, d := range dist {
-			if !done[n] && (u == "" || d.less(dist[u]) || (d == dist[u] && n < u)) {
+			if !done[n] && (u < 0 || d.less(dist[u]) || (d == dist[u] && n < u)) {
 				u = n
 			}
 		}
-		if u == "" {
+		if u < 0 {
 			return nil, false
 		}
-		if u == dst {
+		if u == t {
 			break
 		}
 		done[u] = true
-		if u != src && g.leaves[u] {
+		if u != s && g.leaf[u] {
 			continue
 		}
-		for v, k := range g.adj[u] {
-			if done[v] || nodes[v] || edges[[2]string{u, v}] || (v != dst && !ok(v)) {
+		for _, e := range g.adj[u] {
+			v, name := e.to, g.nodes[e.to]
+			if done[v] || nodes[name] || edges[[2]string{g.nodes[u], name}] || (v != t && !ok(name)) {
 				continue
 			}
-			nd := dist[u].add(k)
-			if u != g.self {
+			nd := dist[u].add(e.k)
+			if u != g.selfAt {
 				nd = nd.add(g.toll(u, v, false))
 			}
 			if d, seen := dist[v]; !seen || nd.less(d) {
@@ -147,12 +152,13 @@ func (g *graph) shortest(src, dst string, nodes map[string]bool, edges map[[2]st
 		}
 	}
 	path := []string{dst}
-	for cur := dst; cur != src; {
-		cur = prev[cur]
-		if cur == "" || len(path) > len(g.nodes) {
+	for cur := t; cur != s; {
+		p, found := prev[cur]
+		if !found || len(path) > len(g.nodes) {
 			return nil, false
 		}
-		path = append(path, cur)
+		cur = p
+		path = append(path, g.nodes[cur])
 	}
 	slices.Reverse(path)
 	return path, true
@@ -162,13 +168,13 @@ func (g *graph) shortest(src, dst string, nodes map[string]bool, edges map[[2]st
 func (g *graph) cost(path []string) key {
 	var c key
 	for i := 0; i+1 < len(path); i++ {
-		k, linked := g.adj[path[i]][path[i+1]]
+		k, linked := g.link(path[i], path[i+1])
 		if !linked {
 			return unreachable
 		}
 		c = c.add(k)
 		if path[i] != g.self {
-			c = c.add(g.toll(path[i], path[i+1], false))
+			c = c.add(g.toll(g.index[path[i]], g.index[path[i+1]], false))
 		}
 	}
 	return c

@@ -15,6 +15,7 @@ test("SettingsHub keeps section order/default/events and loads only the selected
   const context = vm.createContext({
     ...Vue,
     onBeforeUnmount() {},
+    usePageSubject() {},
     LazyViewState: { name: "loading-state" },
     defineProps: () => props,
     defineEmits: () => (...args) => emitted.push(args),

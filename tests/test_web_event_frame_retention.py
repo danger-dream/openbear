@@ -144,6 +144,41 @@ async def test_large_protected_prefix_advances_and_equal_revision_seek_is_bounde
     assert rows[-1]["id"] == 30300
 
 
+async def test_a_batch_whose_commit_outlasts_the_write_bound_is_still_committed_and_counted(retention_env):
+    owner = retention_env
+    await _seed(owner, (("a", "op", seq, seq, _OLD) for seq in range(1, 201)))
+    original_transaction = owner.db.write_transaction
+
+    # SQLite finishes a commit on its own thread even when the awaiting task is cancelled;
+    # this commit takes longer than the 0.1 s bound on the retention write.
+    @asynccontextmanager
+    async def transaction(**kwargs):
+        if kwargs.get("label") != "web-event-frame-retention":
+            async with original_transaction(**kwargs) as conn:
+                yield conn
+            return
+        conn = None
+        try:
+            async with original_transaction(**kwargs) as conn:
+                real_commit = conn.commit
+
+                async def commit():
+                    done = asyncio.ensure_future(real_commit())
+                    await asyncio.sleep(0.25)
+                    await done
+                conn.commit = commit
+                yield conn
+        finally:
+            if conn is not None:
+                vars(conn).pop("commit", None)
+    owner.db.write_transaction = transaction
+
+    deleted = await _finish(owner, batch_size=32, max_scan_rows=4096)
+    remaining = [row["frame_seq"] for row in await _frames(owner)]
+    assert remaining == [200]
+    assert deleted == 199
+
+
 async def test_normal_reads_and_writes_interleave_between_committed_batches(retention_env):
     owner = retention_env
     await _seed(owner, (("a", "op", seq, seq, _OLD) for seq in range(1, 5001)))

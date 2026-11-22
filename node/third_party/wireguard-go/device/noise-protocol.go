@@ -223,6 +223,7 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+	cookieRetried             bool // the initiation in flight went again on a cookie
 }
 
 var (

@@ -619,7 +619,7 @@ class ServerService:
                 'limit': (t.get('limit') or 0) if mode in ('billing', 'fixed') else 0,
                 **({'price': price, 'cost': round(used / 1024 ** 3 * price, 2)} if mode == 'metered' else {})}
 
-    async def _item(self, server, prof, node, zone, settings, access, built=None, withdrawn=None, meshes=None):
+    async def _item(self, server, prof, node, zone, settings, access, built=None, withdrawn=None, meshes=None, *, include_checks=True):
         sid = server['id']
         local = sid == LOCAL
         ssh = None
@@ -645,7 +645,7 @@ class ServerService:
                     'info': stored.get('info', {}), 'geo': stored.get('geo'), 'network': stored.get('network'),
                     # A check switched off, a server in mainland China or a front: its results are kept, not shown.
                     **{key: ({k: v for k, v in ((retier(stored.get(key)) if key == 'route' else stored.get(key)) or {}).items() if k != 'v'} or None)
-                       if settings['checks'][key] and server_region(prof, stored) != DOMESTIC and not fronts.is_front(prof) else None
+                       if include_checks and settings['checks'][key] and server_region(prof, stored) != DOMESTIC and not fronts.is_front(prof) else None
                        for key in ('unlock', 'route')},
                     'endpoint': session.endpoint if session else '', 'onBackup': bool(session and session.on_backup),
                     'joinPending': await self._join_view(node['owner'], stored.get('joinPending'))}
@@ -675,15 +675,20 @@ class ServerService:
             name = ''
         return {'serverId': pending['serverId'], 'name': name, 'code': pending.get('code', ''), 'atMs': pending.get('atMs', 0)}
 
-    async def list(self, owner):
+    async def list(self, owner, *, include_checks=True):
         servers = await self.registry.all(owner)
         await self.follow_prerelease()
         prof, nodes, zone, settings = await self._profiles(owner), await self._nodes(owner), await self.zone(), await self.settings()
         built, withdrawn = install.manifest(), releases.withdrawn()
         access, meshes = await self.mesh.access(owner), await self.mesh.addresses(owner)
-        items = [await self._item(s, prof.get(s['id'], {}), nodes.get(s['id']), zone, settings, access, built, withdrawn, meshes) for s in servers]
+        items = [await self._item(s, prof.get(s['id'], {}), nodes.get(s['id']), zone, settings, access, built, withdrawn, meshes,
+                                  include_checks=include_checks) for s in servers]
         items.sort(key=_listed_order)
-        return {'ok': True, 'items': items, 'settings': {**settings, 'meshAccess': access[0], 'latencyCatalog': self.latency.view(), 'ipIntel': await self.intel.view(owner)},
+        view_settings = {**settings, 'meshAccess': access[0]}
+        if include_checks:
+            view_settings['latencyCatalog'] = self.latency.view()
+            view_settings['ipIntel'] = await self.intel.view(owner)
+        return {'ok': True, 'items': items, 'settings': view_settings,
                 'node': (await self.node_release(follow=False))['release']}
 
     async def brief(self, owner):

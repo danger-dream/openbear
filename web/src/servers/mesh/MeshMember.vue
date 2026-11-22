@@ -5,7 +5,7 @@ import { relativeTime, timeLabel } from '../../instances/instanceHelpers.js';
 import { bytes, flag, noAutofill } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
-import { addressProblem, candLine, candParts, CAND_STATES, codeText, MISSING_TEXT, directLine, entryHealth, errorMessage, errorsAt, errorsUnder, eventRows, exportsOf, exportText, FILTERINGS, firewallIssue, firewallKinds, gatewayNetProblem, isRelay, isSite, listens, listenWarnings, MAPPINGS, nameOf,
+import { addressProblem, candLine, candParts, CAND_STATES, codeText, MISSING_TEXT, directLine, entryHealth, entryLan, entryVia, errorMessage, errorsAt, errorsUnder, eventRows, exportsOf, exportText, FILTERINGS, firewallIssue, firewallKinds, gatewayNetProblem, isRelay, isSite, listens, listenWarnings, MAPPINGS, nameOf,
   needsPublicAddr, NO_TRANSIT_HINT, nodeAlerts, peerKeys, portProblem, routeRows, routineEvent, nodeState, PROGRESS, progressOf, reachOf, recommendedMode, RELAY_MODES, rtt, securityStats, TRANSPORTS, transportLabel, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems, warningsUnder } from './meshHelpers.js';
 import { ArrowUpRight, Cable, CircleAlert, Globe, Route, ShieldAlert, TriangleAlert, Unplug } from '@lucide/vue';
 import { changeRole } from './meshGraph.js';
@@ -125,10 +125,11 @@ const connection = computed(() => {
   const expected = candidates.find(c => c.id === summary?.candidate) || candidates[0];
   if (!actual && !summary?.relay) return null;
   const peer = actual?.id || summary.relay, transport = actual?.transport || summary.transport;
-  const text = [nameOf(members.value, peer), transportLabel(transport), actual?.endpoint].filter(Boolean).join(' · ');
+  const via = entryVia(entryLan(mesh.data, id.value, peer, transport, health.value[summary?.candidate]), transport);
+  const text = [nameOf(members.value, peer), via, actual?.endpoint].filter(Boolean).join(' · ');
   const differ = expected && (peer !== expected.relay ? `配置的是 ${nameOf(members.value, expected.relay)}` : transport && transport !== expected.transport ? `配置的是 ${transportLabel(expected.transport)}` : '');
   const backup = expected && candidates[0] && expected.id !== candidates[0].id ? '正在用备用入口' : '';
-  return {text, short: `经 ${[nameOf(members.value, peer), transportLabel(transport)].filter(Boolean).join(' · ')}`,
+  return {text, short: `经 ${[nameOf(members.value, peer), via].filter(Boolean).join(' · ')}`,
     note: [backup, differ ? `与配置不一致：${differ}` : ''].filter(Boolean).join('；'), tone: differ || backup ? 'warn' : ''};
 });
 const lastHandshake = computed(() => Math.max(0, ...peers.value.map(handshakeMs)));
@@ -147,7 +148,8 @@ const health = computed(() => entryHealth(mesh.data, id.value, detail.value?.sta
 const reported = computed(() => Object.keys(health.value).length > 0);
 // Its entries as configured, with what the member reports of each (nothing yet before it does).
 const candidates = computed(() => relay.value ? [] : (m.value.entry?.candidates || []).map((c, i) => ({c, i, h: health.value[c.id] || null,
-  how: isSite(members.value.find(r => r.serverId === c.relay)) && c.transport === 'udp' ? '打洞' : transportLabel(c.transport), parts: candParts(health.value[c.id] || null)})));
+  how: entryLan(mesh.data, id.value, c.relay, c.transport, health.value[c.id]) ? entryVia(true, c.transport)
+    : isSite(members.value.find(r => r.serverId === c.relay)) && c.transport === 'udp' ? '打洞' : transportLabel(c.transport), parts: candParts(health.value[c.id] || null)})));
 // The members that enter through this relay, and whether it is the entry they use now.
 const riders = computed(() => relay.value ? users.value.map(u => {
   const i = u.entry.candidates.findIndex(c => c.relay === id.value), h = entryHealth(mesh.data, u.serverId)[u.entry.candidates[i].id];

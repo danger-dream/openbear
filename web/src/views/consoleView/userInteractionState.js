@@ -83,7 +83,10 @@ export function interactionRejectActionLabel(draft) {
  * Validate only what the Web client can establish. Whitespace is used only to
  * determine emptiness; the draft itself is never normalized.
  */
-export function validateInteractionDraft(item, draft) {
+export function validateInteractionDraft(item, draft, intent = "submit") {
+	if (intent === "feedback") {
+		return hasMeaningfulInteractionText(draft?.text) ? "" : "请填写你的意见。";
+	}
 	if (actionOf(item) !== "select") return "";
 	const hasSelection = Array.isArray(draft?.selectedIndexes) && draft.selectedIndexes.length > 0;
 	return hasSelection || hasMeaningfulInteractionText(draft?.text)
@@ -98,6 +101,15 @@ export function buildInteractionAnswer(item, draft = {}, intent = "submit") {
 		const options = Array.isArray(item?.options) ? item.options : [];
 		const indexes = (Array.isArray(draft.selectedIndexes) ? draft.selectedIndexes : [])
 			.filter((index) => Number.isInteger(index) && index >= 0 && index < options.length);
+		if (intent === "feedback" && !item?.requiresAuthorization) {
+			return {
+				cancelled: false,
+				selectedIndexes: [],
+				selectedValues: [],
+				text: String(draft.text ?? ""),
+				decision: "feedback",
+			};
+		}
 		return {
 			cancelled: false,
 			selectedIndexes: [...indexes],

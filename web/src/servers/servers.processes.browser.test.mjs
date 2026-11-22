@@ -92,7 +92,11 @@ test('processes behind the live cards, ending one, and the machine in detail', {
     await sheet.locator('.pt-row').first().waitFor();
     assert.equal(await h.page.locator('.sv-top-popper:visible').count(), 0, 'no popover on a phone');
     const end = sheet.locator('.pt-row').first().getByRole('button', {name: /^结束 /});
-    assert.ok((await end.boundingBox()).height >= 32, 'a touch-sized button');
+    await settled(h.page);
+    // This once measured under 32 px in a loaded full run and could not be reproduced: report what was seen.
+    const measured = await end.evaluate(el => ({box: el.getBoundingClientRect().toJSON(), minHeight: getComputedStyle(el).minHeight,
+      height: getComputedStyle(el).height, phone: matchMedia('(max-width: 760px)').matches, width: innerWidth}));
+    assert.ok(measured.box.height >= 32, `a touch-sized button: ${JSON.stringify(measured)}`);
     assert.deepEqual(await fits(sheet), []);
     await noOverflow(h.page);
     await shot(h.page, 'phone-processes-dark');

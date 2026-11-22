@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from aiohttp import web
 
+from app.assistant import conversations as assistant_conversations
 from app.extensions import SYSTEM, TEMPORARY, ExtensionError
 from app.web_console.core import _WEB_SESSION_KEY
 
@@ -45,6 +46,12 @@ class WebAdminExtensionsMixin:
                 "extensions": self.extensions.panel(set(default["enabled"]))}
 
     async def handle_api_folder_extensions(self, request: web.Request) -> web.Response:
+        if str(request.match_info.get("folder_uuid") or "") == assistant_conversations.FOLDER:
+            # New page assistant conversations start from the 页面助手 settings, which own this default.
+            default = assistant_conversations.extensions(self.config, {e.key for e in self.extensions.catalog()})
+            return web.json_response({"ok": True, "default": {**default, "from": SYSTEM, "explicit": True, "own": False},
+                                      "inherited": {**default, "from": SYSTEM, "explicit": True}, "canInherit": False,
+                                      "extensions": self.extensions.panel(set(default["enabled"]))})
         found = await self._extension_folder(request)
         if isinstance(found, web.Response):
             return found

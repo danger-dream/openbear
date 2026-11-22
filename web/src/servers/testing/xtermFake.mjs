@@ -4,6 +4,7 @@
 // character) after the custom key handler, and search finds text in the output. OSC 8 links are
 // spans (.xterm-link): pointing at one calls options.linkHandler.hover / .leave, a click .activate,
 // with the link's range in the buffer as xterm gives it (1-based columns and lines, end included).
+// A test selects text by setting .selection on an instance (globalThis.__xtermFakes lists them).
 // The real terminal (rendering, fonts, fitting) is covered by the browser tests.
 const decoder = new TextDecoder();
 // eslint-disable-next-line no-control-regex
@@ -22,10 +23,12 @@ const emitter = () => {
 export class Terminal {
   constructor(options = {}) {
     const term = this;
-    this.cols = 80; this.rows = 24; this.element = null; this.text = '';
+    this.cols = 80; this.rows = 24; this.element = null; this.text = ''; this.selection = '';
+    (globalThis.__xtermFakes ||= []).push(this);
     this.onData = emitter(); this.onScroll = emitter(); this.onResize = emitter();
     this.options = new Proxy({...options}, {set(target, key, value) { target[key] = value; term._render(); return true; }});
-    this.buffer = {active: {getLine: y => {
+    // No scrollback: the cursor sits on the last written line.
+    this.buffer = {active: {baseY: 0, get cursorY() { return term.lines().length - 1; }, getLine: y => {
       const line = term.lines()[y];
       return line === undefined ? undefined : {translateToString: (trim, start = 0, end) => line.slice(start, end)};
     }}};
@@ -99,7 +102,7 @@ export class Terminal {
   }
   focus() { this.textarea?.focus(); }
   blur() { this.textarea?.blur(); }
-  getSelection() { return ''; }
+  getSelection() { return this.selection; }
   clearSelection() {}
   clear() { this.text = ''; this._render(); }
   resize(cols, rows) { this.cols = cols; this.rows = rows; this.onResize.fire({cols, rows}); }

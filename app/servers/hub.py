@@ -696,7 +696,7 @@ class NodeHub:
         kind = data.get('t')
         if kind == 'report':
             session.sample, session.sample_ms = clean_sample(data.get('m')), now_ms()
-            session.recent.append((session.sample_ms // 1000, session.sample))
+            session.recent.append(((session.sample_ms + 500) // 1000, session.sample))
             self.service.metrics.observe(session.server_id, session.sample)
             # A node this controller cannot work with may report the mesh in a form it does not know.
             if 'mesh' in data and not session.incompatible:

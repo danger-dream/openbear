@@ -2,10 +2,9 @@
 import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import ReferenceEditor from "../../references/ReferenceEditor.vue";
 import ReferencePlainText from "../../references/ReferencePlainText.vue";
-import InteractionMarkdown from "./InteractionMarkdown.vue";
+import PendingInteractionSheet from "./PendingInteractionSheet.vue";
 import WorkItemsDock from "./WorkItemsDock.vue";
 import RunStatusLine from "./RunStatusLine.vue";
-import GroupProposalCard from "./GroupProposalCard.vue";
 import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import ModelFeatureIcon from "./ModelFeatureIcon.vue";
 import ContextUsageMeter from './ContextUsageMeter.vue';
@@ -25,7 +24,6 @@ import {
 	Promotion,
 	Search,
 	Timer,
-	Warning,
 } from "@element-plus/icons-vue";
 import {
 	fmtBytes,
@@ -35,31 +33,15 @@ import {
 	modelShortLabel,
 	thinkingLabel,
 } from "./display.js";
-import {
-	buildQuestionnaireAnswer,
-	clearQuestionChoice,
-	createQuestionnaireDraft,
-	ensureQuestionAnswer,
-	isQuestionChoiceSelected,
-	toggleQuestionChoice,
-	validateQuestionnaire,
-} from "./questionnaireState.js";
-import {
-	buildInteractionAnswer,
-	clearInteractionSelection,
-	createInteractionDraft,
-	interactionExpiryLabel,
-	interactionPrimaryActionLabel,
-	interactionRejectActionLabel,
-	isInteractionExpired,
-	toggleInteractionOption,
-	validateInteractionDraft,
-} from "./userInteractionState.js";
 
 const props = defineProps({
 	draft: {type: String, default: ""},
 	conversationUuid: {type: String, default: ""},
 	folderId: {type: String, default: ""},
+	// The page assistant has its own system prompt, so a persona does not apply.
+	personaAvailable: {type: Boolean, default: true},
+	// A narrow panel: the actions keep their room and the run chip shortens.
+	compact: {type: Boolean, default: false},
 	pendingAttachments: {type: Array, default: () => []},
 	attachmentPreviews: {type: Object, default: () => ({})},
 	uploadProgress: {type: Object, default: () => ({})},
@@ -155,12 +137,7 @@ const runConfigSettingsOpen = ref(false);
 let runConfigFullChromeHeight = 0;
 let composerResizeObserver = null;
 let runConfigPositionFrame = 0;
-const interactionDrafts = ref({});
-const interactionErrors = ref({});
-const questionnaireDrafts = ref({});
-const questionnaireErrors = ref({});
-const interactionNowMs = ref(Date.now());
-let interactionClockTimer = null;
+const interactionSheet = ref(null);
 const runConfigTab = ref("main"); // main | agent
 watch(() => props.modelMenuOpen, (open) => { if (open) runConfigTab.value = "main"; });
 const DEFAULT_WINDOW_TRIGGER_RATIO = 0.7;
@@ -396,208 +373,8 @@ function clearDraft() {
 	adjustHeight();
 }
 
-function interactionAction(item) {
-	return String(item?.action || "confirm").trim().toLowerCase();
-}
-
-function optionLabel(option) {
-	if (option && typeof option === "object") return String(option.label || option.text || option.value || "");
-	return String(option || "");
-}
-
-function ensureInteractionDraft(item) {
-	const id = item?.confirmationId;
-	if (!id) return createInteractionDraft(item);
-	if (!interactionDrafts.value[id]) interactionDrafts.value[id] = createInteractionDraft(item);
-	return interactionDrafts.value[id];
-}
-
-function optionChecked(item, idx) {
-	return ensureInteractionDraft(item).selectedIndexes.includes(idx);
-}
-
-function clearInteractionError(item) {
-	const id = item?.confirmationId;
-	if (id && interactionErrors.value[id]) delete interactionErrors.value[id];
-}
-
-function toggleOption(item, idx) {
-	toggleInteractionOption(item, ensureInteractionDraft(item), idx);
-	clearInteractionError(item);
-}
-
-function clearSelectChoice(item) {
-	clearInteractionSelection(ensureInteractionDraft(item));
-	clearInteractionError(item);
-}
-
-function setPromptValue(item, value) {
-	ensureInteractionDraft(item).value = value;
-	clearInteractionError(item);
-}
-
-function setInteractionText(item, value) {
-	ensureInteractionDraft(item).text = value;
-	if (String(value || "").trim() || ensureInteractionDraft(item).selectedIndexes.length) clearInteractionError(item);
-}
-
-function interactionExpired(item) {
-	return isInteractionExpired(item, interactionNowMs.value);
-}
-
-function interactionDisabled(item) {
-	return Boolean(props.confirmationSubmitting[item?.confirmationId] || interactionExpired(item));
-}
-
-function interactionExpiry(item) {
-	return interactionExpiryLabel(item, interactionNowMs.value);
-}
-
-function interactionError(item) {
-	return interactionErrors.value[item?.confirmationId] || props.confirmationErrors[item?.confirmationId] || "";
-}
-
-function interactionActionName(item) {
-	return {confirm: "确认", select: "选择", prompt: "输入", questionnaire: "问卷", group_proposal: "小组方案"}[interactionAction(item)] || "确认";
-}
-
-function answerGroupProposal(item, answer) {
-	if (interactionDisabled(item)) return;
-	emit("answer-confirmation", item, answer);
-}
-
-function interactionRiskLabel(item) {
-	const type = String(item?.type || item?.tone || "").toLowerCase();
-	if (type === "danger") return "高风险操作";
-	if (type === "warning") return "请谨慎确认";
-	return "";
-}
-
-function primaryActionLabel(item) {
-	return interactionPrimaryActionLabel(
-		item,
-		ensureInteractionDraft(item),
-		Boolean(props.confirmationSubmitting[item?.confirmationId]),
-	);
-}
-
-function confirmRejectLabel(item) {
-	return interactionRejectActionLabel(ensureInteractionDraft(item));
-}
-
-function questionnaireQuestions(item) {
-	return Array.isArray(item?.questions) ? item.questions : [];
-}
-
-function questionnaireQuestionId(question) {
-	return String(question?.questionId ?? question?.id ?? "").trim();
-}
-
-function questionnaireQuestionText(question, index) {
-	return String(question?.prompt || question?.question || question?.title || question?.label || `问题 ${index + 1}`);
-}
-
-function questionnaireOptionValue(option) {
-	if (option && typeof option === "object") return option.value ?? option.label ?? "";
-	return option ?? "";
-}
-
-function questionnaireOptionDescription(option) {
-	return option && typeof option === "object" ? String(option.description || "") : "";
-}
-
-function ensureQuestionnaireDraft(item) {
-	const id = String(item?.confirmationId || "");
-	if (!questionnaireDrafts.value[id]) questionnaireDrafts.value[id] = createQuestionnaireDraft(questionnaireQuestions(item));
-	return questionnaireDrafts.value[id];
-}
-
-function questionnaireAnswer(item, question) {
-	return ensureQuestionAnswer(ensureQuestionnaireDraft(item), question);
-}
-
-function questionnaireChoiceSelected(item, question, option) {
-	return isQuestionChoiceSelected(ensureQuestionnaireDraft(item), question, option);
-}
-
-function toggleQuestionnaireChoice(item, question, option) {
-	toggleQuestionChoice(ensureQuestionnaireDraft(item), question, questionnaireOptionValue(option));
-	clearQuestionnaireError(item, question);
-}
-
-function clearQuestionnaireSelection(item, question) {
-	clearQuestionChoice(ensureQuestionnaireDraft(item), question);
-}
-
-function setQuestionnaireText(item, question, value) {
-	questionnaireAnswer(item, question).text = value;
-	if (String(value || "").trim()) clearQuestionnaireError(item, question);
-}
-
-function questionnaireRecommendationValues(question) {
-	return Array.isArray(question?.recommendation?.values) ? question.recommendation.values : [];
-}
-
-function isRecommendedOption(question, option) {
-	const value = questionnaireOptionValue(option);
-	return questionnaireRecommendationValues(question).some((item) => Object.is(item, value));
-}
-
-function questionnaireFieldId(item, question, index) {
-	const safeConfirmation = String(item?.confirmationId || "questionnaire").replace(/[^a-zA-Z0-9_-]/g, "-");
-	const safeQuestion = (questionnaireQuestionId(question) || String(index)).replace(/[^a-zA-Z0-9_-]/g, "-");
-	return `questionnaire-${safeConfirmation}-${safeQuestion}`;
-}
-
-function questionnaireError(item, question) {
-	return questionnaireErrors.value[item?.confirmationId]?.[questionnaireQuestionId(question)] || "";
-}
-
-function clearQuestionnaireError(item, question) {
-	const errors = questionnaireErrors.value[item?.confirmationId];
-	if (errors) delete errors[questionnaireQuestionId(question)];
-}
-
-function focusFirstQuestionnaireError(item) {
-	nextTick(() => {
-		const confirmationId = String(item?.confirmationId || "");
-		const cards = Array.from(composerShell.value?.querySelectorAll?.("[data-questionnaire-id]") || []);
-		const card = cards.find((element) => element.dataset.questionnaireId === confirmationId);
-		const field = card?.querySelector?.("[data-question-error='true'] textarea, [data-question-error='true'] input");
-		field?.focus?.();
-	});
-}
-
-function submitQuestionnaire(item) {
-	if (interactionDisabled(item)) return;
-	const questions = questionnaireQuestions(item);
-	const draft = ensureQuestionnaireDraft(item);
-	const errors = validateQuestionnaire(questions, draft);
-	questionnaireErrors.value[item.confirmationId] = errors;
-	if (Object.keys(errors).length) {
-		focusFirstQuestionnaireError(item);
-		return;
-	}
-	emit("answer-confirmation", item, buildQuestionnaireAnswer(questions, draft));
-}
-
-function cancelQuestionnaire(item) {
-	if (interactionDisabled(item)) return;
-	emit("answer-confirmation", item, buildQuestionnaireAnswer(questionnaireQuestions(item), ensureQuestionnaireDraft(item), true));
-}
-
-function answerInteraction(item, intent) {
-	if (interactionDisabled(item)) return;
-	const draft = ensureInteractionDraft(item);
-	if (intent !== "cancel") {
-		const error = validateInteractionDraft(item, draft);
-		if (error) {
-			interactionErrors.value[item.confirmationId] = error;
-			return;
-		}
-	}
-	clearInteractionError(item);
-	emit("answer-confirmation", item, buildInteractionAnswer(item, draft, intent));
+function onAnswerConfirmation(item, payload) {
+	emit("answer-confirmation", item, payload);
 }
 
 // A phone gets one tools button instead of the row of actions, so the model keeps its room.
@@ -612,10 +389,10 @@ const toolItems = computed(() => {
 		{key: "attach", label: "上传图片或附件", icon: PaperclipIcon},
 		{key: "image", label: "图片只看一轮", hint: imageMenu.value?.summary || "", icon: ImageIcon, on: Boolean(props.imageOneTurn?.enabled), more: true},
 		{key: "extensions", label: "扩展", hint: extensionsMenu.value?.summary || "", icon: Blocks, more: true},
-		{key: "persona", label: "人设", hint: personaMenu.value?.summary || "", icon: UserRound, on: Boolean(props.promptTemplate), attention: Boolean(props.promptTemplateMissing || personaMenu.value?.attention), more: true},
+		...(props.personaAvailable ? [{key: "persona", label: "人设", hint: personaMenu.value?.summary || "", icon: UserRound, on: Boolean(props.promptTemplate), attention: Boolean(props.promptTemplateMissing || personaMenu.value?.attention), more: true}] : []),
 		...(props.contextStrategy === "model_summary"
 			? [{key: "compact", label: props.compacting ? "正在压缩上下文…" : "手动压缩上下文", icon: ContextCompactionIcon, disabled: !props.canCompact || props.compacting}] : []),
-		...(props.running || draftEmpty ? [] : [{key: "clear", label: "清空草稿", icon: Eraser}]),
+		...(props.running || draftEmpty || props.compact ? [] : [{key: "clear", label: "清空草稿", icon: Eraser}]),
 	];
 });
 const toolsMarked = computed(() => Boolean(props.imageOneTurn?.enabled || props.promptTemplate));
@@ -737,10 +514,6 @@ onMounted(() => {
 	phoneMedia = window.matchMedia?.("(max-width: 760px)") || null;
 	updatePhone();
 	phoneMedia?.addEventListener?.("change", updatePhone);
-	interactionNowMs.value = Date.now();
-	interactionClockTimer = window.setInterval(() => {
-		interactionNowMs.value = Date.now();
-	}, 1000);
 	const el = composerShell.value;
 	if (!el) return;
 	const notifyHeight = () => {
@@ -757,8 +530,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
 	cancelStopShapePress();
 	phoneMedia?.removeEventListener?.("change", updatePhone);
-	if (interactionClockTimer) window.clearInterval(interactionClockTimer);
-	interactionClockTimer = null;
 	composerResizeObserver?.disconnect();
 	composerResizeObserver = null;
 });
@@ -843,16 +614,7 @@ function cancelButtonShapeInteraction(event) {
 watch(() => [props.conversationUuid, props.running, Boolean(props.draft.trim()), props.canSend], () => cancelButtonShapeInteraction());
 
 function focusInteraction(interactionId) {
-	const pending = props.pendingConfirmations.find(item => item.confirmationId === interactionId);
-	if (!pending || interactionExpired(pending)) return false;
-	const card = Array.from(composerShell.value?.querySelectorAll("[data-interaction-id]") || [])
-		.find(element => element.dataset.interactionId === interactionId);
-	if (!card) return false;
-	card.scrollIntoView({block: "nearest", inline: "nearest"});
-	// Focus the card, not an input: navigation must not summon the phone keyboard
-	// or activate any confirmation/submit button.
-	card.focus({preventScroll: true});
-	return true;
+	return Boolean(interactionSheet.value?.focusInteraction?.(interactionId));
 }
 
 function getReferenceOrder() { return composerTextarea.value?.getReferenceOrder?.() || []; }
@@ -860,7 +622,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 </script>
 
 <template>
-	<footer ref="composerShell" class="composer-shell shrink-0 pb-3 pt-5">
+	<footer ref="composerShell" class="composer-shell shrink-0 pb-3 pt-5" :class="{'is-compact': props.compact}">
 		<div class="composer-content pointer-events-auto relative mx-auto">
 			<div v-if="props.pendingSteering.length" class="steering-queue-card">
 				<div class="steering-queue-title">
@@ -873,160 +635,15 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 				</div>
 			</div>
 
-			<div v-if="props.pendingConfirmations.length" class="web-confirm-stack" :class="{'has-multiple': props.pendingConfirmations.length > 1}">
-				<div v-for="item in props.pendingConfirmations" :key="item.confirmationId" class="web-confirm-card"
-				     :class="{'questionnaire-card': interactionAction(item) === 'questionnaire', 'group-proposal-card': interactionAction(item) === 'group_proposal', 'is-expired': interactionExpired(item)}"
-				     :data-questionnaire-id="interactionAction(item) === 'questionnaire' ? item.confirmationId : undefined"
-				     :data-interaction-id="item.confirmationId" tabindex="-1" role="region" :aria-label="item.title || '待处理交互'">
-					<div class="web-confirm-title" :class="{'questionnaire-title': interactionAction(item) === 'questionnaire'}">
-						<Warning/>
-						<div>
-							<strong>{{ item.title || (interactionAction(item) === 'questionnaire' ? '需要你补充一些信息' : '请确认') }}</strong>
-							<span v-if="interactionAction(item) === 'questionnaire'" class="interaction-title-description">请按实际情况回答；选择题也可以直接填写自己的答案。</span>
-							<span class="interaction-card-meta">
-								<span>{{ interactionActionName(item) }}</span>
-								<span v-if="interactionExpiry(item)" class="interaction-expiry" :class="{'is-expired': interactionExpired(item)}">{{ interactionExpiry(item) }}</span>
-								<span v-if="interactionRiskLabel(item)" class="interaction-risk" :class="String(item.type || item.tone || '').toLowerCase()">{{ interactionRiskLabel(item) }}</span>
-							</span>
-						</div>
-					</div>
-					<div v-if="interactionExpired(item)" class="interaction-expired-notice" role="status">此交互已过期，等待同步最新状态。</div>
-
-					<GroupProposalCard v-if="interactionAction(item) === 'group_proposal'" :item="item"
-					                   :disabled="interactionDisabled(item)" :submitting="Boolean(props.confirmationSubmitting[item.confirmationId])"
-					                   :error="interactionError(item)" @answer="answerGroupProposal(item, $event)"/>
-
-					<template v-else-if="interactionAction(item) === 'questionnaire'">
-						<div v-if="item.body" class="web-interaction-content" tabindex="0" role="region" :aria-label="`${item.title || '问卷'}内容`">
-							<InteractionMarkdown class="questionnaire-intro" :text="item.body"/>
-						</div>
-						<div class="questionnaire-questions" :class="{'has-multiple': questionnaireQuestions(item).length > 1}">
-							<fieldset v-for="(question, questionIndex) in questionnaireQuestions(item)"
-							          :key="questionnaireQuestionId(question) || questionIndex"
-							          class="questionnaire-question"
-							          :class="{'has-error': questionnaireError(item, question)}"
-							          :data-question-error="questionnaireError(item, question) ? 'true' : 'false'"
-							          :aria-describedby="`${questionnaireFieldId(item, question, questionIndex)}-hint ${questionnaireFieldId(item, question, questionIndex)}-error`">
-								<legend>
-									<span class="question-number">{{ questionIndex + 1 }}</span>
-									<span>{{ questionnaireQuestionText(question, questionIndex) }}</span>
-									<span v-if="question.required" class="required-mark">必填</span>
-									<span v-else class="optional-mark">选填</span>
-								</legend>
-								<InteractionMarkdown v-if="question.description" class="question-description" :text="question.description"/>
-								<template v-if="question.type === 'choice'">
-									<div class="question-choice-list">
-										<label v-for="(option, optionIndex) in question.options || []"
-										       :key="`${questionnaireQuestionId(question)}-${optionIndex}`"
-										       class="question-choice-option"
-										       :class="{'is-selected': questionnaireChoiceSelected(item, question, option)}">
-											<input :type="question.multiple ? 'checkbox' : 'radio'"
-											       :name="`question-${item.confirmationId}-${questionnaireQuestionId(question)}`"
-											       :checked="questionnaireChoiceSelected(item, question, option)"
-											       :disabled="interactionDisabled(item)"
-											       @change="toggleQuestionnaireChoice(item, question, option)"/>
-											<span class="question-choice-copy">
-												<span class="question-choice-label">
-													{{ optionLabel(option) }}
-													<small v-if="isRecommendedOption(question, option)" class="recommendation-badge">推荐</small>
-												</span>
-												<small v-if="questionnaireOptionDescription(option)">{{ questionnaireOptionDescription(option) }}</small>
-											</span>
-										</label>
-									</div>
-									<div v-if="question.recommendation?.reason" class="recommendation-reason">
-										<strong>推荐理由</strong>{{ question.recommendation.reason }}
-									</div>
-									<button v-if="!question.multiple && questionnaireAnswer(item, question).selectedValues.length"
-									        type="button" class="clear-question-choice"
-									        :disabled="interactionDisabled(item)"
-									        @click="clearQuestionnaireSelection(item, question)">清除选择</button>
-									<label class="question-free-text" :for="`${questionnaireFieldId(item, question, questionIndex)}-text`">
-										<span>{{ questionnaireAnswer(item, question).selectedValues.length ? '补充、限制或修正以上选择' : '也可以不选，直接填写自己的答案' }}</span>
-										<textarea :id="`${questionnaireFieldId(item, question, questionIndex)}-text`"
-										          :value="questionnaireAnswer(item, question).text" rows="2"
-										          :disabled="interactionDisabled(item)"
-										          placeholder="写下更符合你需要的答案"
-										          @input="setQuestionnaireText(item, question, $event.target.value)"></textarea>
-									</label>
-								</template>
-								<label v-else class="question-free-text open-answer" :for="`${questionnaireFieldId(item, question, questionIndex)}-text`">
-									<span>你的回答</span>
-									<textarea :id="`${questionnaireFieldId(item, question, questionIndex)}-text`"
-									          :value="questionnaireAnswer(item, question).text" rows="3"
-									          :disabled="interactionDisabled(item)"
-									          placeholder="请输入你的回答"
-									          @input="setQuestionnaireText(item, question, $event.target.value)"></textarea>
-								</label>
-								<div :id="`${questionnaireFieldId(item, question, questionIndex)}-hint`" class="question-hint">
-									{{ question.required ? (question.type === 'choice' ? '必填：至少选择一项或填写文字。' : '必填：请填写文字。') : '选填：留空也可以提交。' }}
-								</div>
-								<div :id="`${questionnaireFieldId(item, question, questionIndex)}-error`" class="question-error" role="alert">
-									{{ questionnaireError(item, question) }}
-								</div>
-							</fieldset>
-						</div>
-						<div v-if="interactionError(item)" class="interaction-submit-error" role="alert">{{ interactionError(item) }}</div>
-						<div class="web-confirm-actions questionnaire-actions">
-							<button type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)" @click="cancelQuestionnaire(item)">暂不回答</button>
-							<button type="button" class="web-confirm-btn confirm" :disabled="interactionDisabled(item)"
-							        :aria-busy="props.confirmationSubmitting[item.confirmationId] ? 'true' : 'false'"
-							        @click="submitQuestionnaire(item)">{{ props.confirmationSubmitting[item.confirmationId] ? '提交中…' : '提交回答' }}</button>
-						</div>
-					</template>
-
-					<template v-else>
-						<div v-if="item.body" class="web-interaction-content" tabindex="0" role="region" :aria-label="`${item.title || '交互'}内容`">
-							<InteractionMarkdown class="web-confirm-body" :text="item.body"/>
-						</div>
-						<template v-if="interactionAction(item) === 'select'">
-							<div class="web-interaction-options">
-								<label v-for="(option, idx) in item.options || []" :key="`${item.confirmationId}-${idx}`"
-								       class="web-interaction-option" :class="{'is-selected': optionChecked(item, idx), 'is-disabled': interactionDisabled(item)}">
-									<input :type="item.multiple ? 'checkbox' : 'radio'" :name="`interaction-${item.confirmationId}`"
-									       :checked="optionChecked(item, idx)" :disabled="interactionDisabled(item)" @change="toggleOption(item, idx)"/>
-									<span class="web-interaction-option-copy"><strong>{{ optionLabel(option) }}</strong><small v-if="option?.description">{{ option.description }}</small></span>
-								</label>
-							</div>
-							<button v-if="!item.multiple && ensureInteractionDraft(item).selectedIndexes.length" type="button"
-							        class="clear-question-choice" :disabled="interactionDisabled(item)" @click="clearSelectChoice(item)">清除选择</button>
-							<label class="web-interaction-input">
-								<span>{{ ensureInteractionDraft(item).selectedIndexes.length ? '补充、限制或修正以上选择' : '也可以不选，直接填写自己的答案' }}</span>
-								<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
-								          placeholder="写下更符合你需要的答案" @input="setInteractionText(item, $event.target.value)"></textarea>
-								<small v-if="item.requiresAuthorization">可按补充内容确认执行，也可仅提交意见。附言授权仅限本次操作。</small>
-							</label>
-						</template>
-						<label v-else-if="interactionAction(item) === 'prompt'" class="web-interaction-input">
-							<span>你的回答</span>
-							<textarea :value="ensureInteractionDraft(item).value" :placeholder="item.sensitive ? '输入内容' : '请输入内容'"
-							          rows="3" :disabled="interactionDisabled(item)" @input="setPromptValue(item, $event.target.value)"></textarea>
-							<small v-if="item.sensitive">此输入会原样提交给当前任务，不会显示在公开历史中。</small>
-						</label>
-						<label v-else class="web-interaction-input confirm-feedback-input">
-							<span>补充或修改（可选）</span>
-							<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
-							          placeholder="如需调整原操作，请在这里说明" @input="setInteractionText(item, $event.target.value)"></textarea>
-							<small>确认时将按补充内容执行；如尚未决定，请选择“仅提交意见”。</small>
-						</label>
-						<div v-if="interactionError(item)" class="interaction-submit-error" role="alert">{{ interactionError(item) }}</div>
-						<div class="web-confirm-actions">
-							<button type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)"
-							        @click="answerInteraction(item, 'cancel')">{{ item.cancelText || '暂不回答' }}</button>
-							<button v-if="interactionAction(item) === 'confirm'" type="button" class="web-confirm-btn reject"
-							        :disabled="interactionDisabled(item)" @click="answerInteraction(item, 'reject')">{{ confirmRejectLabel(item) }}</button>
-							<button v-if="(interactionAction(item) === 'confirm' || (item.requiresAuthorization && ensureInteractionDraft(item).selectedIndexes.length)) && ensureInteractionDraft(item).text.trim()"
-							        type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)"
-							        @click="answerInteraction(item, 'feedback')">仅提交意见，暂不执行</button>
-							<button type="button" class="web-confirm-btn confirm" :disabled="interactionDisabled(item)"
-							        :aria-busy="props.confirmationSubmitting[item.confirmationId] ? 'true' : 'false'"
-							        @click="answerInteraction(item, 'confirm')">
-								{{ primaryActionLabel(item) }}
-							</button>
-						</div>
-					</template>
-				</div>
-			</div>
+			<PendingInteractionSheet
+				ref="interactionSheet"
+				:items="props.pendingConfirmations"
+				:submitting="props.confirmationSubmitting"
+				:errors="props.confirmationErrors"
+				:phone="phone"
+				:compact="props.compact"
+				@answer="onAnswerConfirmation"
+			/>
 
 			<RunStatusLine v-if="props.running" :started-at="props.runStartedAt" :stats="props.runStats"/>
 
@@ -1111,7 +728,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								</el-tooltip>
 							</template>
 						</ExtensionsMenu>
-						<PersonaMenu ref="personaMenu" :value="props.promptTemplate" :locked="props.promptTemplateLocked" :missing="props.promptTemplateMissing" :saving="props.promptTemplateSaving"
+						<PersonaMenu v-if="props.personaAvailable" ref="personaMenu" :value="props.promptTemplate" :locked="props.promptTemplateLocked" :missing="props.promptTemplateMissing" :saving="props.promptTemplateSaving"
 						             :draft="String(props.conversationUuid || '').startsWith('local:')" :conversation-uuid="props.conversationUuid"
 						             @change="emit('update-prompt-template', $event)">
 							<template #trigger="{label, open, on, attention}">
@@ -1127,7 +744,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 						<el-tooltip v-if="!phone && props.contextStrategy === 'model_summary'" :content="props.compacting ? '正在压缩上下文…' : '手动压缩上下文'" placement="top" :show-after="260">
 							<button type="button" class="tool-btn" aria-label="手动压缩上下文" :disabled="!props.canCompact || props.compacting" @click="emit('compact')"><ContextCompactionIcon :class="{'context-compacting-icon': props.compacting}" /></button>
 						</el-tooltip>
-						<el-tooltip v-if="!phone" content="清空草稿" placement="top" :show-after="260">
+						<el-tooltip v-if="!phone && !props.compact" content="清空草稿" placement="top" :show-after="260">
 							<button type="button" class="tool-btn composer-clear" aria-label="清空草稿"
 							        :disabled="props.running || (!props.draft && !props.pendingAttachments.length)"
 							        @click="clearDraft">
@@ -1286,8 +903,6 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 </template>
 
 <style scoped>
-@import "./userInteractionTokens.css";
-
 .context-compacting-icon { animation: context-compress-spin 1.5s linear infinite; }
 @keyframes context-compress-spin { to { transform: rotate(360deg); } }
 
@@ -1365,556 +980,6 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 	margin-top: 0.25rem;
 	color: var(--ob-text-subtle);
 	font-size: 0.74rem;
-}
-
-.web-confirm-stack {
-	display: grid;
-	gap: 0.6rem;
-	margin-bottom: 0.75rem;
-}
-
-/* A single card owns its content scroll; only stacked cards need an outer rail. */
-.web-confirm-stack.has-multiple {
-	grid-auto-rows: max-content;
-	max-height: min(58vh, 36rem);
-	max-height: min(58dvh, 36rem);
-	overflow: auto;
-	overscroll-behavior: contain;
-	scrollbar-width: thin;
-}
-
-.web-interaction-content {
-	max-height: min(24vh, 14rem);
-	max-height: min(24dvh, 14rem);
-	min-width: 0;
-	min-height: 0;
-	overflow: auto;
-	overscroll-behavior: contain;
-	scrollbar-width: thin;
-	scrollbar-color: var(--ob-interaction-border-strong) transparent;
-	/* Leave room for input focus rings without moving the card edges. */
-	padding: 0 0.2rem 0.2rem;
-	margin: 0 -0.2rem;
-}
-
-.web-interaction-content:focus-visible {
-	outline: 2px solid var(--ob-interaction-border-strong);
-	outline-offset: -2px;
-}
-
-.web-confirm-card {
-	display: flex;
-	flex-direction: column;
-	box-sizing: border-box;
-	min-width: 0;
-	position: relative;
-	z-index: 45;
-	border: 1px solid var(--ob-interaction-border);
-	border-radius: 1rem;
-	background: var(--ob-interaction-surface);
-	box-shadow: var(--ob-interaction-shadow);
-	padding: 0.85rem;
-	color: var(--ob-interaction-ink);
-}
-
-.web-confirm-card:focus { outline: 2px solid var(--ob-interaction-border-strong); outline-offset: 2px; }
-
-.web-confirm-card.is-expired {
-	box-shadow: none;
-	opacity: 0.82;
-}
-
-/* A proposal can be long; it scrolls inside the card, above the composer. */
-.web-confirm-card.group-proposal-card {
-	max-height: min(58vh, 36rem);
-	max-height: min(58dvh, 36rem);
-	overflow: auto;
-	overscroll-behavior: contain;
-	scrollbar-width: thin;
-}
-
-.web-confirm-title {
-	flex: 0 0 auto;
-	overflow-wrap: anywhere;
-	display: flex;
-	align-items: flex-start;
-	gap: 0.52rem;
-	font-size: 0.82rem;
-	font-weight: 700;
-	color: var(--ob-interaction-accent-strong);
-}
-
-.web-confirm-title > svg {
-	width: 1.05rem;
-	height: 1.05rem;
-	flex: 0 0 auto;
-	margin-top: 0.08rem;
-}
-
-.web-confirm-title > div {
-	display: grid;
-	min-width: 0;
-	gap: 0.16rem;
-}
-
-.web-confirm-title strong {
-	font-size: 0.9rem;
-	line-height: 1.4;
-}
-
-.interaction-title-description {
-	font-size: 0.75rem;
-	font-weight: 400;
-	line-height: 1.5;
-	color: var(--ob-interaction-muted);
-}
-
-.interaction-card-meta {
-	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
-	gap: 0.35rem;
-	font-size: 0.67rem;
-	font-weight: 650;
-	line-height: 1.35;
-	color: var(--ob-interaction-muted);
-}
-
-.interaction-card-meta > span + span::before {
-	margin-right: 0.35rem;
-	color: var(--ob-text-muted);
-	content: "·";
-}
-
-.interaction-expiry.is-expired {
-	font-weight: 750;
-	color: var(--ob-danger);
-}
-
-.interaction-risk {
-	font-weight: 750;
-}
-
-.interaction-risk.warning {
-	color: var(--ob-warning);
-}
-
-.interaction-risk.danger {
-	color: var(--ob-danger);
-}
-
-.interaction-expired-notice,
-.interaction-submit-error {
-	margin-top: 0.65rem;
-	border: 1px solid rgb(var(--ob-danger-rgb) / 0.23);
-	border-radius: 0.7rem;
-	background: var(--ob-danger-soft);
-	padding: 0.55rem 0.65rem;
-	font-size: 0.74rem;
-	line-height: 1.45;
-	color: var(--ob-danger);
-}
-
-.web-confirm-body {
-	margin: 0.55rem 0 0;
-	white-space: normal;
-	font-family: inherit;
-	font-size: 0.76rem;
-	line-height: 1.5;
-	color: var(--ob-interaction-muted);
-}
-
-.web-interaction-options {
-	max-height: min(20vh, 12rem);
-	max-height: min(20dvh, 12rem);
-	overflow: auto;
-	scrollbar-width: thin;
-	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 0.45rem;
-	margin-top: 0.7rem;
-}
-
-.web-interaction-option {
-	display: flex;
-	min-width: 0;
-	align-items: flex-start;
-	gap: 0.5rem;
-	border: 1px solid var(--ob-interaction-border);
-	border-radius: 0.72rem;
-	background: var(--ob-interaction-surface-strong);
-	padding: 0.55rem 0.62rem;
-	font-size: 0.78rem;
-	color: var(--ob-interaction-ink);
-	cursor: pointer;
-}
-
-.web-interaction-option.is-selected {
-	border-color: var(--ob-interaction-border-strong);
-	background: var(--ob-interaction-surface-selected);
-}
-
-.web-interaction-option input {
-	flex: 0 0 auto;
-	margin-top: 0.17rem;
-	accent-color: var(--ob-interaction-accent);
-}
-
-.web-interaction-option-copy {
-	display: grid;
-	min-width: 0;
-	gap: 0.15rem;
-	line-height: 1.4;
-}
-
-.web-interaction-option-copy small {
-	font-size: 0.7rem;
-	font-weight: 400;
-	color: var(--ob-interaction-muted);
-}
-
-.web-interaction-input {
-	display: grid;
-	gap: 0.32rem;
-	margin-top: 0.62rem;
-	font-size: 0.72rem;
-	font-weight: 650;
-	color: var(--ob-text);
-}
-
-.web-interaction-input textarea {
-	width: 100%;
-	resize: vertical;
-	border: 1px solid var(--ob-border);
-	border-radius: 0.68rem;
-	background: var(--ob-interaction-surface-strong);
-	padding: 0.58rem 0.65rem;
-	font: inherit;
-	font-size: 0.78rem;
-	font-weight: 400;
-	line-height: 1.5;
-	color: var(--ob-interaction-ink);
-	outline: none;
-}
-
-.web-interaction-input textarea:focus {
-	border-color: var(--ob-interaction-border-strong);
-	box-shadow: 0 0 0 3px var(--ob-interaction-focus);
-}
-
-.web-interaction-input small {
-	font-size: 0.69rem;
-	font-weight: 400;
-	line-height: 1.45;
-	color: var(--ob-interaction-muted);
-}
-
-.web-confirm-actions {
-	flex: 0 0 auto;
-	display: flex;
-	flex-wrap: wrap;
-	justify-content: flex-end;
-	gap: 0.5rem;
-	margin-top: 0.7rem;
-}
-
-.web-confirm-btn {
-	min-height: 2rem;
-	border: 1px solid transparent;
-	border-radius: 999px;
-	padding: 0.42rem 0.8rem;
-	font-size: 0.76rem;
-	font-weight: 700;
-	line-height: 1.25;
-	cursor: pointer;
-}
-
-.web-confirm-btn.cancel {
-	border-color: var(--ob-interaction-border);
-	background: var(--ob-interaction-surface-strong);
-	color: var(--ob-interaction-muted);
-}
-
-.web-confirm-btn.reject {
-	border-color: var(--ob-border);
-	background: var(--ob-surface-soft);
-	color: var(--ob-text);
-}
-
-.web-confirm-btn.confirm {
-	background: var(--ob-interaction-accent);
-	color: var(--ob-text-inverse);
-}
-
-.web-confirm-btn:disabled,
-.web-interaction-option.is-disabled,
-.clear-question-choice:disabled {
-	opacity: 0.58;
-	cursor: not-allowed;
-}
-
-.questionnaire-intro,
-.question-description {
-	font-size: 0.75rem;
-	font-weight: 400;
-	line-height: 1.5;
-	color: var(--ob-interaction-muted);
-	white-space: normal;
-}
-
-.questionnaire-intro {
-	margin: 0.65rem 0 0;
-}
-
-.questionnaire-card > .web-interaction-content {
-	max-height: min(14vh, 8rem);
-	max-height: min(14dvh, 8rem);
-}
-
-.questionnaire-questions.has-multiple {
-	max-height: min(32vh, 20rem);
-	max-height: min(32dvh, 20rem);
-	overflow: auto;
-	overscroll-behavior: contain;
-	scrollbar-width: thin;
-}
-
-.questionnaire-questions {
-	display: grid;
-	gap: 0.7rem;
-	margin-top: 0.75rem;
-}
-
-.questionnaire-question {
-	min-width: 0;
-	margin: 0;
-	border: 1px solid var(--ob-border);
-	border-radius: 0.85rem;
-	background: rgb(var(--ob-surface-rgb) / 0.9);
-	padding: 0.72rem;
-}
-
-.questionnaire-question.has-error {
-	border-color: var(--ob-danger);
-}
-
-.questionnaire-question legend {
-	display: flex;
-	max-width: 100%;
-	align-items: center;
-	gap: 0.42rem;
-	padding: 0 0.2rem;
-	font-size: 0.82rem;
-	font-weight: 750;
-	line-height: 1.45;
-	color: var(--ob-text);
-}
-
-.question-number {
-	display: inline-grid;
-	flex: 0 0 auto;
-	width: 1.35rem;
-	height: 1.35rem;
-	place-items: center;
-	border-radius: 50%;
-	background: var(--ob-blue-soft);
-	font-size: 0.7rem;
-	color: var(--ob-text);
-}
-
-.required-mark,
-.optional-mark,
-.recommendation-badge {
-	flex: 0 0 auto;
-	border-radius: 999px;
-	padding: 0.1rem 0.38rem;
-	font-size: 0.64rem;
-	font-weight: 750;
-}
-
-.required-mark {
-	background: var(--ob-danger-soft);
-	color: var(--ob-danger);
-}
-
-.optional-mark {
-	background: var(--ob-surface-soft);
-	color: var(--ob-text-subtle);
-}
-
-.question-description {
-	max-height: min(12vh, 7rem);
-	max-height: min(12dvh, 7rem);
-	overflow: auto;
-	overscroll-behavior: contain;
-	scrollbar-width: thin;
-	margin: 0.25rem 0 0.55rem;
-}
-
-.question-choice-list {
-	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 0.45rem;
-	margin-top: 0.4rem;
-}
-
-.question-choice-option {
-	display: flex;
-	min-width: 0;
-	align-items: flex-start;
-	gap: 0.5rem;
-	border: 1px solid var(--ob-border);
-	border-radius: 0.72rem;
-	background: var(--ob-surface);
-	padding: 0.55rem 0.62rem;
-	cursor: pointer;
-}
-
-.question-choice-option.is-selected {
-	border-color: var(--ob-blue);
-	background: var(--ob-blue-soft);
-}
-
-.question-choice-option input {
-	flex: 0 0 auto;
-	margin-top: 0.17rem;
-	accent-color: var(--ob-blue);
-}
-
-.question-choice-copy {
-	display: grid;
-	min-width: 0;
-	gap: 0.15rem;
-	font-size: 0.78rem;
-	line-height: 1.4;
-	color: var(--ob-text);
-}
-
-.question-choice-copy > small {
-	font-size: 0.7rem;
-	font-weight: 400;
-	line-height: 1.4;
-	color: var(--ob-text-subtle);
-	white-space: normal;
-}
-
-.question-choice-label {
-	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
-	gap: 0.3rem;
-}
-
-.recommendation-badge {
-	border: 1px solid rgb(var(--ob-blue-rgb) / 0.23);
-	background: var(--ob-blue-soft);
-	color: var(--ob-blue);
-}
-
-.recommendation-reason {
-	margin-top: 0.45rem;
-	border-left: 2px solid var(--ob-blue);
-	padding-left: 0.55rem;
-	font-size: 0.71rem;
-	line-height: 1.45;
-	color: var(--ob-text-subtle);
-	white-space: pre-wrap;
-}
-
-.recommendation-reason strong {
-	margin-right: 0.35rem;
-	color: var(--ob-blue);
-}
-
-.clear-question-choice {
-	margin-top: 0.42rem;
-	border: 0;
-	background: transparent;
-	padding: 0.15rem 0;
-	font-size: 0.7rem;
-	color: var(--ob-blue);
-	text-decoration: underline;
-	text-underline-offset: 2px;
-	cursor: pointer;
-}
-
-.question-free-text {
-	display: grid;
-	gap: 0.32rem;
-	margin-top: 0.55rem;
-	font-size: 0.72rem;
-	font-weight: 650;
-	color: var(--ob-text);
-}
-
-.question-free-text textarea {
-	width: 100%;
-	resize: vertical;
-	border: 1px solid var(--ob-border);
-	border-radius: 0.68rem;
-	background: var(--ob-surface);
-	padding: 0.55rem 0.62rem;
-	font: inherit;
-	font-size: 0.78rem;
-	font-weight: 400;
-	line-height: 1.45;
-	color: var(--ob-text);
-	outline: none;
-}
-
-.question-free-text textarea:focus {
-	border-color: var(--ob-blue);
-	box-shadow: 0 0 0 3px rgb(var(--ob-blue-rgb) / 0.12);
-}
-
-.question-hint {
-	margin-top: 0.35rem;
-	font-size: 0.68rem;
-	line-height: 1.4;
-	color: var(--ob-text-subtle);
-}
-
-.question-error {
-	min-height: 0;
-	margin-top: 0.22rem;
-	font-size: 0.7rem;
-	font-weight: 650;
-	color: var(--ob-danger);
-}
-
-.question-error:empty {
-	display: none;
-}
-
-.questionnaire-actions {
-	margin: 0.75rem -0.85rem -0.85rem;
-	border-top: 1px solid var(--ob-border);
-	background: rgb(var(--ob-surface-rgb) / 0.97);
-	padding: 0.65rem 0.85rem;
-}
-
-/* On a short viewport, reserve space for answers rather than scrolling them away. */
-@media (max-height: 600px) {
-	.questionnaire-card > .web-interaction-content {
-		max-height: 8vh;
-		max-height: 8dvh;
-	}
-	.questionnaire-card .question-description {
-		max-height: 6vh;
-		max-height: 6dvh;
-	}
-}
-
-@media (max-width: 640px) {
-	.question-choice-list,
-	.web-interaction-options {
-		grid-template-columns: minmax(0, 1fr);
-	}
-
-	.questionnaire-question legend {
-		align-items: flex-start;
-		flex-wrap: wrap;
-	}
 }
 
 .composer-box {
@@ -2656,6 +1721,15 @@ button.status-chip:hover, .status-chip-active {
 	background: var(--ob-text-disabled);
 	cursor: not-allowed;
 }
+
+/* The page assistant's panel is narrow on any screen. */
+.composer-shell.is-compact { padding: .4rem .6rem .5rem; }
+.is-compact .composer-toolbar { grid-template-columns: auto minmax(0, 1fr); gap: .25rem; }
+.is-compact .composer-actions { gap: 0; }
+.is-compact .composer-status { justify-content: flex-end; }
+.is-compact .run-config-chip { max-width: 100%; }
+.is-compact .run-config-chip-meta { display: none; }
+.is-compact .run-config-chip-status { display: inline-flex; }
 
 /* Desktop keeps context in run configuration and totals in the header. */
 .composer-usage-summary { display: none; }

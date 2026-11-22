@@ -56,6 +56,9 @@ const ERROR_LABELS = {
 const TOOL_LABELS = {
   Bash: "执行脚本", Read: "读取文件", Write: "写入文件", Edit: "编辑文件", EditBatch: "批量编辑文件",
   Process: "管理进程", Memory: "全局记忆", TaskMemory: "会话记忆", History: "查询历史", UserInteraction: "用户交互",
+  WorkItem: "任务面板", RequestExtension: "申请扩展", Browser: "浏览器", Servers: "服务器", InstanceControl: "实例管理",
+  Cron: "定时任务", Webhook: "触发器", ConversationRequest: "会话请求", ConversationGroup: "协作小组",
+  Page: "页面操作", Notes: "笔记", SystemConfig: "系统配置",
   Agent: "启动 Agent", AgentContinue: "继续 Agent", AgentMessage: "指导 Agent", AgentInfo: "查看 Agent", AgentWait: "等待 Agent",
   AgentStop: "停止 Agent", AgentPlanDecision: "Agent 计划决策", OpenBearControl: "控制 OpenBear", WebSearch: "搜索网页",
   WebExtract: "提取网页", BashStatus: "查看脚本状态",

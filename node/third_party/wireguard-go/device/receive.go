@@ -275,6 +275,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				bufsArrs[i] = next
 				bufs[i] = bufsArrs[i].Data
 			default:
+				device.handshakes.queueFull.Add(1)
 				device.PutMessageBuffer(next)
 			}
 		}
@@ -353,6 +354,9 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
 				if !peer.cookieGenerator.ConsumeReply(&reply) {
 					device.log.Verbosef("Could not decrypt invalid cookie response")
+				} else {
+					device.handshakes.cookiesReceived.Add(1)
+					peer.retryAfterCookie()
 				}
 			}
 
@@ -374,6 +378,7 @@ func (device *Device) RoutineHandshake(id int) {
 				// verify MAC2 field
 
 				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
+					device.handshakes.cookiesSent.Add(1)
 					device.SendHandshakeCookie(&elem)
 					goto skip
 				}
@@ -381,6 +386,7 @@ func (device *Device) RoutineHandshake(id int) {
 				// check ratelimiter
 
 				if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
+					device.handshakes.rateLimited.Add(1)
 					goto skip
 				}
 			}

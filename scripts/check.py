@@ -7,7 +7,9 @@ importing them. What passed is not run again until something it depends on chang
 A failing test is rerun on a clean checkout of HEAD, to tell a failure this change made
 from one that was already there.
 
-Full suites are scripts/release.py's job; --full runs them here only when asked for.
+Full suites are scripts/release.py's job; --full runs them here only when asked for. A full
+round takes several runs: each --full run continues where the last one stopped, as long as
+the files have not changed, and the last one reports the whole round.
 
     .venv/bin/python scripts/check.py           # test the changes
     .venv/bin/python scripts/check.py --list    # show what would run
@@ -52,6 +54,7 @@ VERSIONED = ("web/package.json", "web/package-lock.json", *sorted(PY_DEPENDENCIE
 NODE_BUILD = ("node_binary", "newer_build", "_build_node", "./cmd/openbear-node")
 WEB_TEST = re.compile(r"(?:^|/)(?:[^/]*[.\-_]test|test-[^/]*|test)\.[cm]?js$")
 KEEP_LOGS = 15
+FULL_ROUND = "full_round"  # state key: what a --full round has finished, for the content it ran on
 
 IMPORTS = (
     re.compile(r"""\b(?:import|export)\b[^'"`;()]*?\bfrom\s*(['"])([^'"\n]+)\1"""),
@@ -319,6 +322,8 @@ class Plan:
     extra: dict[str, str] = field(default_factory=dict)      # python test file -> why
     web: dict[str, str] = field(default_factory=dict)        # web test -> why
     web_done: int = 0                                         # reached, but already passed as things are
+    full: bool = False
+    full_done: int = 0                                        # --full: files earlier runs of this round finished
     go: dict[str, list[str]] = field(default_factory=dict)   # module -> import paths
     uncovered: list[str] = field(default_factory=list)
     data_tests: dict[str, list[str]] = field(default_factory=dict)
@@ -339,6 +344,7 @@ def make_plan(args, state: dict, current: dict[str, str], web: WebGraph, py: PyI
     plan.python = bool(args.full or by_kind["py"] or changed & PY_DEPENDENCIES or plan.testmon_new)
 
     if args.full:
+        plan.full = True
         plan.web = {t: "--full" for t in web.tests}
         for module in GO_MODULES:
             if (ROOT / module / "go.mod").is_file():
@@ -417,6 +423,71 @@ class Lane:
     stuck: list[str] = field(default_factory=list)        # "test（phase）" whose process was ended
     done: int = 0                                         # tests finished, of total, when the deadline ended the run
     total: int = 0
+
+
+# ---------------------------------------------------------------- a --full round over several runs
+
+_LANE_SETS = ("units", "failed_units", "alone")
+
+
+def lane_record(lane: Lane) -> dict:
+    """What a full round keeps of a lane: counts, failures with their verdicts, times; not every passed id."""
+    return {"name": lane.name, "passed": lane.passed, "skipped": lane.skipped, "seconds": lane.seconds, "note": lane.note,
+            "total": lane.total, "stuck": lane.stuck, "unit_seconds": lane.unit_seconds,
+            "failures": [vars(f) for f in lane.failures], **{k: sorted(getattr(lane, k)) for k in _LANE_SETS}}
+
+
+def lane_from_record(data: dict) -> Lane:
+    lane = Lane(data["name"], passed=data["passed"], skipped=data["skipped"], seconds=data["seconds"], note=data["note"],
+                total=data["total"], stuck=list(data["stuck"]), unit_seconds=dict(data["unit_seconds"]),
+                failures=[Failure(**f) for f in data["failures"]])
+    for k in _LANE_SETS:
+        setattr(lane, k, set(data[k]))
+    return lane
+
+
+def content_key(current: dict[str, str]) -> str:
+    return hashlib.sha1(json.dumps(sorted(current.items())).encode()).hexdigest()
+
+
+def resume_full(plan: Plan, state: dict, current: dict[str, str]) -> tuple[dict, dict[str, Lane]]:
+    """Leave out of a --full plan what an earlier run of this round finished on the same content."""
+    key = content_key(current)
+    kept = state.get(FULL_ROUND)
+    round_ = kept if isinstance(kept, dict) and kept.get("content") == key else {"content": key, "lanes": {}}
+    carried = {name: lane_from_record(data) for name, data in round_["lanes"].items()}
+    if "python" in carried:
+        plan.python = False
+    for module in GO_MODULES:
+        if f"go:{module}" in carried:
+            plan.go[module] = []
+    if "web" in carried:
+        plan.web = {t: why for t, why in plan.web.items() if t not in carried["web"].units}
+        plan.full_done = len(carried["web"].units)
+    return round_, carried
+
+
+def keep_round(state: dict, round_: dict, lanes: dict[str, Lane]) -> None:
+    """Record what this run of the round finished; a finished round is dropped, so the next --full starts over."""
+    for name, lane in lanes.items():
+        if name == "web" or (lane.complete and not lane.error):
+            round_["lanes"][name] = lane_record(lane)
+    if all(lane.complete and not lane.error and not lane.left for lane in lanes.values()):
+        state.pop(FULL_ROUND, None)
+    else:
+        state[FULL_ROUND] = round_
+
+
+def merge_web(before: Lane, now: Lane | None) -> Lane:
+    if now is None:
+        return before
+    merged = Lane("web", complete=now.complete, error=now.error, left=now.left, passed=before.passed + now.passed,
+                  skipped=before.skipped + now.skipped, seconds=before.seconds + now.seconds,
+                  failures=before.failures + now.failures, stuck=before.stuck + now.stuck,
+                  unit_seconds={**before.unit_seconds, **now.unit_seconds})
+    for k in _LANE_SETS:
+        setattr(merged, k, getattr(before, k) | getattr(now, k))
+    return merged
 
 
 def run(cmd: list[str], cwd: Path, env: dict, log: Path, deadline: float, stdout: Path | None = None,
@@ -715,11 +786,14 @@ def run_go(module: str, packages: list[str], logs: Path, deadline: float, root: 
 # ---------------------------------------------------------------- telling failures apart
 
 def rerun_alone(lanes: list[Lane], logs: Path, deadline: float) -> str:
-    """A failure that passes when its test runs by itself came from load, not from the change."""
-    failing = [lane for lane in lanes if lane.failures]
+    """A failure that passes when its test runs by itself came from load, not from the change.
+
+    Failures an earlier run of a --full round already judged keep their verdict."""
+    open_units = {lane.name: {f.unit for f in lane.failures if not f.verdict} for lane in lanes}
+    failing = [lane for lane in lanes if open_units[lane.name]]
     if not failing:
         return ""
-    estimate = 10.0 + sum(min(lane.unit_seconds.get(u, 10.0), 300.0) for lane in failing for u in lane.failed_units)
+    estimate = 10.0 + sum(min(lane.unit_seconds.get(u, 10.0), 300.0) for lane in failing for u in open_units[lane.name])
     if time.monotonic() + estimate > deadline:
         return f"剩余时间不够（估计要 {short(estimate)}），失败的测试没有单独重跑"
     out = logs / "alone"
@@ -727,33 +801,33 @@ def rerun_alone(lanes: list[Lane], logs: Path, deadline: float) -> str:
     for lane in failing:
         if lane.name.startswith("python"):
             again = Lane("alone")
-            ids = sorted({f.key for f in lane.failures})
+            ids = sorted({f.key for f in lane.failures if not f.verdict})
             run([str(PYTHON), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={out / (lane.name + '.xml')}", *ids],
                 ROOT, base_env(), out / f"{lane.name}.log", deadline)
             read_junit(out / f"{lane.name}.xml", again)
             for f in lane.failures:
                 f.verdict = "flaky" if f.key in again.passed_keys else f.verdict
         elif lane.name == "web":
-            again = run_web(sorted(lane.failed_units), out, deadline, 1)
+            again = run_web(sorted(open_units[lane.name]), out, deadline, 1)
             fine = again.units - again.failed_units
-            lane.alone = fine
+            lane.alone |= fine
             for f in lane.failures:
                 f.verdict = "flaky" if f.unit in fine else f.verdict
         else:
             module = lane.name.split(":", 1)[1]
-            again = run_go(module, sorted(lane.failed_units), out, deadline, flags=("-count=1", "-p=1"))
+            again = run_go(module, sorted(open_units[lane.name]), out, deadline, flags=("-count=1", "-p=1"))
             for f in lane.failures:
                 f.verdict = "flaky" if f.key in again.passed_keys or (f.unit in again.units - again.failed_units) else f.verdict
     return ""
 
 
 def compare_with_head(lanes: list[Lane], ref: str, logs: Path, deadline: float) -> str:
-    failures = [f for lane in lanes for f in lane.failures if f.verdict != "flaky"]
+    failures = [f for lane in lanes for f in lane.failures if not f.verdict]
     if not failures:
         return ""
     estimate = 20.0
     for lane in lanes:
-        units = {f.unit for f in lane.failures if f.verdict != "flaky"}
+        units = {f.unit for f in lane.failures if not f.verdict}
         estimate += sum(min(lane.unit_seconds.get(u, 10.0), 300.0) for u in units) * 1.3
     if time.monotonic() + estimate > deadline:
         return f"剩余时间不够（估计要 {short(estimate)}），没和 {ref} 对比"
@@ -867,9 +941,10 @@ def report(plan: Plan, lanes: dict[str, Lane], notes: list[str], logs: Path, ref
         reasons = "；".join(sorted(set(plan.extra.values())))
         line("Python", lanes["python-extra"], f"另跑 {len(plan.extra)} 个文件（{reasons[:120]}）")
     for module in GO_MODULES:
-        line("Go", lanes.get(f"go:{module}"), f"{module} {len(plan.go.get(module, []))} 个包")
+        line("Go", lanes.get(f"go:{module}"), f"{module} {len(plan.go.get(module) or (['./...'] if plan.full else []))} 个包")
     if lanes.get("web"):
         done = f"，另有 {plan.web_done} 个已在当前内容下通过过" if plan.web_done else ""
+        done += f"，这一轮前面已跑完 {plan.full_done} 个" if plan.full_done else ""
         line("前端", lanes["web"], f"选中 {len(plan.web)} 个文件{done}")
         for test, why in sorted(plan.web.items())[:6]:
             out.append(f"          {Path(test).name} ← {why}")
@@ -895,7 +970,7 @@ def report(plan: Plan, lanes: dict[str, Lane], notes: list[str], logs: Path, ref
     elif any(lane.error for lane in lanes.values()):
         verdict, code = "结论：测试没能正常运行，见上面的报错", 2
     elif any(not lane.complete for lane in lanes.values()):
-        verdict, code = "结论：时间用完，结果不完整；再运行一次会接着跑没跑到的", 3
+        verdict, code = "结论：时间用完，结果不完整；再运行一次" + (" --full" if plan.full else "") + " 会接着跑没跑到的", 3
     elif failures:
         verdict, code = "结论：没有这次改出来的失败（失败的都是负载下不稳定或 HEAD 上原本就失败的）", 0
     else:
@@ -938,8 +1013,11 @@ def main(argv: list[str] | None = None) -> int:
         current = {f: digest(f) for f in files}
         web, py = WebGraph(files, current), PyIndex()
         plan = make_plan(args, state, current, web, py)
+        round_, carried = resume_full(plan, state, current) if args.full else (None, {})
 
         if args.list:
+            if carried:
+                print("--full：这一轮前面已跑完 " + "、".join(sorted(carried)) + "，接着跑剩下的")
             print(f"改动 {len(plan.changed)} 个文件" + (f"（相对 {args.base}，首次运行）" if plan.first else "（自上次通过）"))
             if plan.python:
                 print("Python：testmon 运行时按执行过的代码挑选" + ("（还没有依赖记录，会完整跑一遍）" if plan.testmon_new else ""))
@@ -959,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # A test keeps the last few states it passed in, so changing a file back needs no rerun.
         passed = {t: [h] if isinstance(h, str) else h for t, h in state.get("web_passed", {}).items() if t in set(web.tests)}
-        if plan.empty():
+        if plan.empty() and not args.full:
             print(("自上次通过后没有改动" if not plan.changed else "改动碰到的测试都已在当前内容下通过过") + "，不需要跑测试")
             if plan.uncovered:
                 print("没有测试覆盖到：" + "、".join(plan.uncovered))
@@ -995,6 +1073,12 @@ def main(argv: list[str] | None = None) -> int:
                     lanes[name].left = len(plan.web)
                 continue
             lanes[name] = step()
+        for name, lane in carried.items():
+            if name == "web":
+                lanes["web"] = merge_web(lane, lanes.get("web"))
+            elif name not in lanes:
+                lane.note = "这一轮前面已跑完，这次没有重跑"
+                lanes[name] = lane
 
         notes = []
         if not args.no_baseline:
@@ -1011,6 +1095,8 @@ def main(argv: list[str] | None = None) -> int:
         previous = state.get("snapshot") or {}
         snapshot = {f: sha for f, sha in current.items() if f not in plan.changed or f in settled}
         snapshot.update({f: previous.get(f, "?") for f in plan.changed - settled})
+        if round_ is not None:
+            keep_round(state, round_, lanes)
         save_state({**state, "snapshot": snapshot, "web_passed": passed})
         return report(plan, lanes, notes, logs, args.base)
 

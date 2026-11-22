@@ -15,6 +15,7 @@ import {normalizeImageOneTurn} from "./imageOneTurn.js";
 import {normalizePromptTemplate} from "./promptTemplate.js";
 import {referenceErrorText, referenceDisplayText, referencesInText} from "../../references/codec.js";
 import {referenceCatalog, acceptActivityReadReceipt} from "../../references/catalog.js";
+import {usePageSubject} from "../../assistant/pageRegistry.js";
 import {createActivityReadTracker, withActivityReadVersion} from "../../conversationActivity.js";
 import {initialConversationTitle} from "../../conversationTitle.js";
 import ConsoleHeader from "./ConsoleHeader.vue";
@@ -164,7 +165,21 @@ const props = defineProps({
 	// an explicit reassignment confirmation; persisted conversations use it as the
 	// target for cross-family "new conversation" creation.
 	folderId: {type: String, default: ""},
+	// "assistant": the page assistant panel. It hides page-level chrome, uses its own
+	// local draft identity, sends pageContext() with each message and answers Page
+	// tool requests through pageHost(request).
+	variant: {type: String, default: "console"},
+	pageContext: {type: Function, default: null},
+	pageHost: {type: Function, default: null},
+	// (localDraftUuid) => fields added when that draft becomes a conversation, e.g. the assistant's scope.
+	createExtras: {type: Function, default: null},
 });
+const isAssistant = computed(() => props.variant === "assistant");
+const localDraftUuid = computed(() => isAssistant.value ? "local:assistant" : "local:new");
+if (!isAssistant.value) {
+	usePageSubject(() => isLocalConversation.value || !activeConversationUuid.value ? null
+		: {kind: "chat", id: activeConversationUuid.value, label: conversationTitle.value || "当前会话", role: "主对话"});
+}
 const emit = defineEmits(["conversation-created", "conversations-refresh"]);
 
 const loading = ref(false);
@@ -769,7 +784,7 @@ async function persistForProperties() {
 		if (props.conversationUuid !== sourceUuid || outboundSends.current) throw new Error('草稿状态已变化，请重试');
 		const extensions = extensionDraft(sourceUuid);
 		const submittedRunConfig = completeLocalRunConfig();
-		const created = await Api.createConversation({title:'新会话',runConfig:submittedRunConfig,folderId:props.folderId || '',...(extensions ? {extensions} : {})});
+		const created = await Api.createConversation({title:'新会话',runConfig:submittedRunConfig,folderId:props.folderId || '',...(extensions ? {extensions} : {}),...(props.createExtras?.(sourceUuid) || {})});
 		const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid;
 		if (!uuid) throw new Error('conversation_create_failed');
 		forgetLocalDraftChoices();
@@ -784,7 +799,7 @@ async function persistForProperties() {
 	})().finally(() => { propertyPersistence = null; propertyPersisting.value = false; finishMutation(); });
 	return propertyPersistence;
 }
-defineExpose({discardConversationDraft, focusPendingInteraction, captureMobileViewportAnchor, restoreMobileViewportAnchor, savePropertyRunConfig, persistForProperties});
+defineExpose({discardConversationDraft, focusPendingInteraction, captureMobileViewportAnchor, restoreMobileViewportAnchor, savePropertyRunConfig, persistForProperties, applyQuickPrompt, focusComposer: () => focusComposer()});
 
 function primaryModelInfo() {
 	const preferred = currentPrimaryModelKey.value || primaryModelKey.value;
@@ -3876,6 +3891,13 @@ function handleWsMessage(raw, source = {}) {
 	} catch {
 		return;
 	}
+	if (data.type === "page_request") {
+		const socket = source.socket || ws;
+		if (!props.pageHost || !socket) return;
+		Promise.resolve().then(() => props.pageHost(data)).catch((error) => ({ok: false, error: "page_action_failed", message: String(error?.message || error)}))
+			.then((result) => { if (socket.readyState === 1) socket.send(JSON.stringify({type: "page_result", requestId: data.requestId, result})); });
+		return;
+	}
 	if (data.type === "task_memory.changed") {
 		const event = taskMemoryChangedTransportEvent(data, {
 			activeConversationUuid: activeConversationUuid.value,
@@ -4030,6 +4052,7 @@ async function connectWs(conversationUuid = props.conversationUuid) {
 	// transport now bootstraps incrementally instead of sending a second state.
 	socket.onopen = () => {
 		if (ws !== socket || wsConversationUuid !== uuid || !componentMounted) return;
+		if (props.pageHost) socket.send(JSON.stringify({type: "page_host"}));
 		status.value = running.value ? status.value : "已连接";
 		if (operationFrameBuffer.blocked) scheduleOperationStateResync({requiresFullState: true});
 	};
@@ -4100,7 +4123,8 @@ async function ensureServerConversationForSend(firstText, pending) {
 	const title = initialConversationTitle(referenceDisplayText(firstText || "新会话"));
 	const extensions = extensionDraft(pending.conversationUuid);
 	const submittedRunConfig = pending.localRunConfig || completeLocalRunConfig();
-	const created = await Api.createConversation({title, runConfig: submittedRunConfig, folderId: pending.localFolderId, ...(extensions ? {extensions} : {})});
+	const created = await Api.createConversation({title, runConfig: submittedRunConfig, folderId: pending.localFolderId, ...(extensions ? {extensions} : {}),
+		...(props.createExtras?.(pending.conversationUuid) || {})});
 	if (!outboundSends.isCurrent(pending)) return "";
 	const uuid = created.conversation?.conversationUuid || created.state?.conversationUuid || "";
 	if (!uuid) throw new Error("conversation_create_failed");
@@ -4443,6 +4467,9 @@ async function send({text: composed = null} = {}) {
 	// The server clears them when the run starts; hide them now so they do not flash back.
 	updatePromptSuggestions(null);
 	const requestId = globalThis.crypto?.randomUUID?.() || `send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	// Taken before any await: it describes the screen the user was looking at when sending.
+	let pageContext = null;
+	try { pageContext = props.pageContext?.() || null; } catch { pageContext = null; }
 	const attachments = isComposed ? [] : [...pendingAttachments.value];
 	const files = attachments.map((item) => item.file);
 	const sentPreviewUrls = Object.values(attachmentPreviews.value).filter(Boolean);
@@ -4480,6 +4507,7 @@ async function send({text: composed = null} = {}) {
 			role: "user",
 			content: finalText,
 			attachments: optimisticAttachments,
+			...(pageContext?.label ? {pageContextLabel: pageContext.label} : {}),
 			createdAt: Math.floor(Date.now() / 1000)
 		});
 		noteVisibleOutput(messages.value, {force: true});
@@ -4540,7 +4568,7 @@ async function send({text: composed = null} = {}) {
 			const ownDraft = conversationUuid === activeConversationUuid.value ? draft.value : pending.editorDraft;
 			setDraftForConversation(conversationUuid, ownDraft);
 		}
-		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles, referenceOrder}));
+		sock.send(JSON.stringify({type: "send", requestId, text, files: uploadedFiles, referenceOrder, ...(pageContext ? {pageContext} : {})}));
 		outboundSends.markSent(pending);
 		emit("conversations-refresh");
 		return true;
@@ -4593,11 +4621,12 @@ async function stop() {
 async function newSession() {
 	await loadOptions();
 	applyDefaultLocalModel();
-	emit("conversation-created", "local:new");
+	const local = localDraftUuid.value;
+	emit("conversation-created", local);
 	await nextTick();
-	await loadLocalRunDefaults("local:new");
-	resetLocalConversationState("local:new");
-	restoreDraftForConversation("local:new");
+	await loadLocalRunDefaults(local);
+	resetLocalConversationState(local);
+	restoreDraftForConversation(local);
 	resetTransientThinking();
 	ElMessage.success(isLocalConversation.value ? "已聚焦未发送的新会话" : "已开启新会话");
 	await focusComposer();
@@ -4812,9 +4841,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-	<section class="console-page h-full min-h-0 flex bg-ob-bg text-ob-text" :class="{'visibility-overlay-active': messageVisibility.selecting.value || messageVisibility.undoIds.value.length}" :style="{'--console-composer-height': `${composerHeight}px`}" @click="onConsoleClick">
+	<section class="console-page h-full min-h-0 flex bg-ob-bg text-ob-text" :class="{'visibility-overlay-active': messageVisibility.selecting.value || messageVisibility.undoIds.value.length, 'is-assistant-console': isAssistant}" :style="{'--console-composer-height': `${composerHeight}px`}" @click="onConsoleClick">
 		<div class="console-main min-w-0 flex flex-1 flex-col">
 			<ConsoleHeader
+				v-if="!isAssistant"
 				:title="conversationTitle"
 				:title-identity="activeConversationUuid"
 				:conversation-path="props.conversationPath"
@@ -4898,6 +4928,9 @@ onBeforeUnmount(() => {
 					正在读取会话…
 				</div>
 				
+				<div v-else-if="!turns.length && isAssistant" class="assistant-empty">
+					<slot name="assistant-empty"/>
+				</div>
 				<div v-else-if="!turns.length"
 				     class="mx-auto flex h-full max-w-3xl flex-col items-center justify-center px-6 text-center">
 					<div class="empty-mark">
@@ -4951,7 +4984,7 @@ onBeforeUnmount(() => {
 			<ConversationNotesSelection v-if="!contextEditorOpen" :scroller="scroller"/>
 			<ConversationSearch :conversation-uuid="activeConversationUuid" v-model:open="searchOpen" @locate="locateSearchResult"/>
 			<ContextEditor v-if="!isLocalConversation" ref="contextEditor" :conversation-uuid="activeConversationUuid" :busy="running" @open-change="contextEditorOpen = $event" @created="emit('conversation-created', $event.conversationUuid)" @saved="load(); emit('conversations-refresh')"/>
-			<aside class="console-controls" v-show="!contextEditorOpen" :inert="contextEditorOpen" aria-label="会话工具与导航">
+			<aside class="console-controls" v-show="!contextEditorOpen" :inert="contextEditorOpen" v-if="!isAssistant" aria-label="会话工具与导航">
 				<ConversationNotes @locate="locateFromNotes" @insert-text="insertNoteTextToDraft"/>
 				<el-tooltip v-if="!isLocalConversation" :content="hiddenMessageCount ? `隐藏内容 · ${hiddenMessageCount} 条` : '隐藏内容'" placement="left" :show-after="260">
 					<button type="button" class="hidden-content-toggle" :class="{populated: hiddenMessageCount > 0}" :aria-label="`管理隐藏内容，${hiddenMessageCount} 条`" @click="messageVisibility.managing.value = true">
@@ -4995,6 +5028,8 @@ onBeforeUnmount(() => {
 				v-model:draft="draft"
 				:conversation-uuid="activeConversationUuid"
 				:folder-id="props.folderId || ''"
+				:persona-available="!isAssistant"
+				:compact="isAssistant"
 				v-model:model-query="modelQuery"
 				:pending-attachments="pendingAttachments"
 				:attachment-previews="attachmentPreviews"
@@ -5311,6 +5346,16 @@ onBeforeUnmount(() => {
 	   without rewrapping messages when selection mode starts. */
 	.conversation-timeline-shell { width: min(var(--console-content-max-width), calc(100% - max(2rem, var(--console-content-gutter)) - max(2rem, var(--console-content-gutter)))); }
 }
+
+/* The page assistant panel has no page header and little width. */
+.console-page.is-assistant-console { --console-header-height: 0px; }
+.is-assistant-console .conversation-timeline-shell { width: calc(100% - 1.5rem); }
+/* A narrow panel: a smaller "back to latest" at the right edge, clear of the messages' own actions. */
+.is-assistant-console .scroll-bottom-dock { left: auto; right: 12px; bottom: calc(var(--console-composer-height, 135px) + 8px); transform: none; }
+.is-assistant-console .scroll-bottom-button { width: 30px; height: 30px; }
+.is-assistant-console .scroll-bottom-button svg { width: 15px; height: 15px; }
+/* No gutter for the hover time beside a message; the reply footer still shows it. */
+.is-assistant-console :deep(.time-float) { display: none; }
 
 @media (max-width: 760px) {
 	.console-page { --console-header-height: calc(60px + env(safe-area-inset-top, 0px)); --console-content-gutter: 1rem; }

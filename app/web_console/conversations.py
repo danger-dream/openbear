@@ -9,6 +9,7 @@ from app.conversation_titles import (
     render_naming_transcript,
     select_naming_turns,
 )
+from app.assistant import conversations as assistant_conversations
 from app.context import image_one_turn, prompt_template
 from app.extensions import split_usage
 from app.lifecycle import wait_for_startup
@@ -212,6 +213,8 @@ class WebAdminConversationsMixin:
 
     async def _extensions_for_new(self, owner_chat_id: int, folder_uuid: str) -> dict[str, Any] | None:
         service = getattr(self, "extensions", None)
+        if service is not None and folder_uuid == assistant_conversations.FOLDER:
+            return assistant_conversations.extensions(self.config, {e.key for e in service.catalog()})
         return await service.for_new(owner_chat_id, folder_uuid) if service is not None else None
 
     async def _extensions_for_unattended(self, owner_chat_id: int, folder_uuid: str, declared: list[str] | None) -> dict[str, Any] | None:
@@ -250,6 +253,8 @@ class WebAdminConversationsMixin:
         origin_kind: str = "user",
         origin_ref: str = "",
         extensions: dict[str, Any] | None = None,
+        assistant: bool = False,
+        assistant_scope: str = "",
     ) -> dict[str, Any]:
         conv_uuid = conversation_uuid or str(uuid.uuid4())
         config = run_config if isinstance(run_config, dict) else {}
@@ -291,14 +296,16 @@ class WebAdminConversationsMixin:
                               conversation_uuid, owner_chat_id, internal_chat_id, title, model,
                               agent_model, agent_think_level, agent_fast_mode,
                               status, current_status, created_at, updated_at, display_order, folder_uuid, context_strategy,
-                              image_one_turn, prompt_template, last_interaction_at_ms, last_conversation_at, origin_kind, origin_ref
-                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              image_one_turn, prompt_template, last_interaction_at_ms, last_conversation_at, origin_kind, origin_ref,
+                              assistant, assistant_scope
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 conv_uuid, owner_chat_id, internal, title or "新对话", model_label,
                                 agent_model, agent_thinking, agent_fast,
                                 "idle", "就绪", ts, ts, display_order, str(folder_uuid or ""), context_strategy,
                                 image_setting, template_setting, 0, 0, str(origin_kind or "user"), str(origin_ref or ""),
+                                1 if assistant else 0, str(assistant_scope or "") if assistant else "",
                             ),
                         )
                         await conn.execute(

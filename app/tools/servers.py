@@ -813,7 +813,7 @@ def _mesh_trend(series):
     result = {'ok': True, 'range': series['range'], 'points': len(points), 'rtt': series.get('rtt'),
               'units': {'rttMs': 'ms', 'timeoutRate': '0-1', 'cpuPercent': 'percent', 'rssBytes': 'bytes', 'rxBytes/txBytes': 'bytes per step'},
               'summary': {**{k: _summary([p[k] for p in points]) for k in ('rttMs', 'timeoutRate', 'cpuPercent', 'rssBytes')},
-                          **{k: sum(p[k] for p in points) for k in ('switches', 'reconnects', 'rxBytes', 'txBytes')}},
+                          **{k: sum(p.get(k) or 0 for p in points) for k in ('switches', 'routeSwitches', 'routeFlips', 'reconnects', 'rxBytes', 'txBytes', 'tcpPressures')}},
               'series': points}
 
     def thin(r):
@@ -957,13 +957,14 @@ MESH_CONTRACTS = {
                     '(defaults for new members), health {activeIntervalMs, standbyIntervalMs, coldRetryMs, initialTimeoutMs, '
                     'minTimeoutMs, maxTimeoutMs, consecutiveFailures, readySuccesses, handshakeGraceMs, returnHealthyMs, minResidenceMs, leaseMs, '
                     'leaseRefreshMs}, reachability {stun ["host:port", <=8]: extra STUN servers every node checks its NAT with}, '
-                    'routing {switchMs (default 5: a working route moves to a path costing at least this much less), switchPct (0: and more '
-                    'than this % less), shorterMs 3, shorterPct 0 (the same for a path through fewer relays, held holdS), advertMs 2, advertPct 0 '
-                    '(a link\'s routed cost follows the measured one once they differ by more), holdS 5, jitterWeight 2, lossWeight 1000 (link '
-                    'cost = rtt + jitterWeight*jitter + lossWeight*loss(0-1) + bias ms, plus 50 while a UDP link carries less than the network MTU '
-                    '(event link.mtu, peers[].pathMtu), the larger of the two ends\'), flapHoldS 60, flapHoldMaxS '
-                    '480 (after a route went back and forth within 10 minutes a move waits flapHoldS, doubled per further flap, up to flapHoldMaxS)}; '
-                    'warning mesh_tuning_outdated names routing nodes that keep the former fixed thresholds (20 % and 10 ms) until updated',
+                    'routing {smoothHalfLifeS (default 60, 1..300: half-life in seconds for per-neighbor smoothed path cost), '
+                    'switchPct (5, 0..50: cheaper by at least this % in both real and smoothed cost to move a working route), '
+                    'switchMinMs (2, 0..100: and at least this many ms cheaper), hopCostMs (2, 0..50: fixed ms added per up link to prefer fewer hops), '
+                    'startPenaltyMs (150, 0..5000: initial smoothed cost penalty when a neighbor becomes usable, times 1 + the link\'s '
+                    'flap penalty / 1000, so a link back from one outage returns within a minute or two and one flapping draws no routes), '
+                    'jitterWeight 2 (0..10), lossWeight 1000 (0..10000; link cost = rtt + jitterWeight*jitter + lossWeight*loss(0-1) + bias + hopCostMs ms, '
+                    'plus 50 while a UDP link carries less than the network MTU (event link.mtu, peers[].pathMtu), the larger of the two ends)}; '
+                    'warning mesh_tuning_outdated names routing nodes that keep legacy tuning until updated to support smoothed routing',
         'returns': 'the overview as in mesh. A draft that fails its checks is not saved: ok false, error mesh_invalid, errors [{path (e.g. '
                    'members[2].entry.candidates[0], relayLinks.pairs[1]), error (code), message (Chinese)}]; fix those and save again. '
                    'Saving changes no machine: mesh_apply does. Warning mesh_udp_port_shared (path members[i].listen.udp): two members '
@@ -1029,15 +1030,20 @@ MESH_CONTRACTS = {
                     'include': 'optional subset of [member, node, status, events, config] to return only those parts',
                     'fields|statusFields|configFields': 'optional field projections on member, status (e.g. ["entry","peers","routing"]) or config (e.g. ["peers","routes","proxy"])',
                     'offset|limit': 'optional pagination for sub-collections (or peersOffset/peersLimit, eventsOffset/eventsLimit, routesOffset/routesLimit); returns pages.{peers,events,routes,configPeers}.nextOffset',
+                    'eventsBefore|eventsBeforeSeq': 'optional: events from the stored history (30 days) instead of the latest 100 held in memory, newest first: '
+                                                    'those before eventsBefore (unix ms, or "now"), and at that same ms before eventsBeforeSeq; eventsLimit '
+                                                    'up to 500 (default 100); raw, not folded; pages.events gives {more, eventsBefore, eventsBeforeSeq} for the next page',
                     'returns': 'member (draft view), node (as in mesh.nodes), status (the node\'s latest full report: peers, '
-                               'entry with candidates, owners, routing links (cost measured, advertised what routes go by) and routes (best, bestCost, '
-                               'held, until while one stays though another next hop is shortest), reachability with observers, '
+                               'entry with candidates, owners, routing links (cost measured, advertised what routes go by) and routes (smoothed, flips, best, bestCost, '
+                               'bestSmoothed, held while one stays though another next hop is cheaper), reachability with observers, '
                                'resources, counters), events (newest first; {seq, at, kind, detail}, a run of the same kind and detail folded into one '
                                'with firstAt = its first time, at = its latest, repeat = how many times), config (the config delivered to it); cut to fit '
                                'when large, named in truncated'},
     'mesh_trend': {'serverId': 'required', 'range': f'{" | ".join(TREND_RANGES)}, default 1h',
-                   'returns': 'summary (rttMs, timeoutRate, cpuPercent, rssBytes: avg/min/max/last; switches, reconnects, rxBytes, txBytes: totals) '
-                              'and series of points {at, rttMs, timeoutRate, switches, reconnects, rssBytes, cpuPercent, rxBytes, txBytes}; '
+                   'returns': 'summary (rttMs, timeoutRate, cpuPercent, rssBytes: avg/min/max/last; switches, routeSwitches, routeFlips, reconnects, rxBytes, '
+                              'txBytes, tcpPressures: totals) and series of points {at, rttMs, timeoutRate, switches, routeSwitches, routeFlips, reconnects, '
+                              'rssBytes, cpuPercent, rxBytes, txBytes, tcpPressures}; switches: of its entry, routeSwitches: of its routes\' next '
+                              'hops (relays and leaves), routeFlips: voluntary moves back to a next hop left within 5 minutes, tcpPressures: times the machine\'s kernel entered TCP memory pressure; '
                               'rtt {kind entry|links, peers [serverIds]}: what rttMs is the round trip to over the range, for a member the '
                               'entry relays it used, for a relay the average of its links to these relays (not the members it carries)'},
     'mesh_line_trend': {'lineId': 'required: a line id as in mesh lines: relay:<a>|<b> (a < b), entry:<member>|<relay>|<transport>, direct:<a>|<b>',
@@ -1061,8 +1067,8 @@ MESH_CONTRACTS = {
                            'kept a minute), or why not (how none, why); segments [{a, b, exists, rttMs, loss, how, why?}], rttMs (null while one has none)',
                   'returns': 'with dst: the path traffic takes now from the latest reports: hops [{node, via (from the hop before: "" for src, '
                              'direct, lan, entry, relay), rttMs}], rttMs total, stale (a report is missing or old, or a segment has no rtt; rttMs '
-                             'is then null and hops may stop where the path is unknown), decision {node, dest, cost, best?, bestCost?, held? '
-                             '(margin: cheaper by less than the threshold, hold or damped until until, loop, penalty, transit)}: the relay that chose '
+                             'is then null and hops may stop where the path is unknown), decision {node, dest, cost, smoothed?, best?, bestCost?, bestSmoothed?, held? '
+                             '(margin: real cost not cheaper enough, settling: real cost beats margin while smoothed cost is catching up, or a move off no-transit relays waits its half second, loop, transit)}: the relay that chose '
                              'the route and, while it stays though another next hop is shortest, that one and why, tuning (settings.routing applied). '
                              'Without dst (as GET /mesh/routes): routes [{dst, hops, '
                              'rttMs, stale}] to every other applied member, and subnets [{subnet, gateway, hops, rttMs, stale}] for each gateway '
@@ -2933,6 +2939,18 @@ class ServersTool:
                 routes_off, routes_lim, routes_exp = gen_off, gen_lim, True
             elif include != ['config']:
                 peers_off, peers_lim, peers_exp = gen_off, gen_lim, True
+        if params.get('eventsBefore') is not None and 'events' in detail:
+            before, before_seq = params['eventsBefore'], params.get('eventsBeforeSeq')
+            if before == 'now':
+                before = None
+            if (before is not None and (not isinstance(before, int) or isinstance(before, bool))) or \
+                    (before_seq is not None and (not isinstance(before_seq, int) or isinstance(before_seq, bool))):
+                raise InstanceError('invalid_parameters')
+            got = await self.service.mesh.events(owner, sid, before, before_seq, events_lim if events_exp else None)
+            detail['events'] = got['events']
+            last = got['events'][-1] if got['events'] else None
+            pages['events'] = {'more': got['more'], **({'eventsBefore': last['at'], 'eventsBeforeSeq': last['seq']} if got['more'] and last else {})}
+            events_exp = False
         st = detail.get('status')
         if peers_exp and isinstance(st, dict) and isinstance(st.get('peers'), list):
             sl, pg = _paginate_items(st['peers'], peers_off, peers_lim, 'status.peers', budget=max(1000, budget - 1500),

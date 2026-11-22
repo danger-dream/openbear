@@ -19,12 +19,12 @@ export const member = (serverId, name, role, extra = {}) => ({serverId, name, pl
 // A small stand-in for the controller's mesh API: a draft, validation with
 // paths, installs that take a moment, a board layout, trends, and a rollout
 // that advances one step per GET. `old` leaves out what newer controllers add.
-export function fakeMesh({failing = '', upgrades = false, old = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, v3 = false} = {}) {
+export function fakeMesh({failing = '', upgrades = false, old = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, v3 = false, prepareMs = 0} = {}) {
   if (routes) reach = true;
   const doc = {
     settings: {prefix: '100.96.0.0/16', mtu: 1400, ports: {udp: 51999, tcp: 52000, tls: 52001}, health: {},
-      ...(v3 ? {autoLinks: {enabled: true, perNode: 2, gainRatio: 0.25, gainMs: 25, holdRounds: 3, dropAfterS: 1800},
-        routing: {switchMs: 5, switchPct: 0, shorterMs: 3, shorterPct: 0, advertMs: 2, advertPct: 0, holdS: 5, jitterWeight: 2, lossWeight: 1000, flapHoldS: 60, flapHoldMaxS: 480}} : {})},
+      ...(v3 ? {autoLinks: {enabled: true, perNode: 2, buildMs: 25, buildRatio: 0.25, keepMs: 10, holdS: 1800, dropAfterS: 1800},
+        routing: {smoothHalfLifeS: 60, switchPct: 5, switchMinMs: 2, hopCostMs: 2, startPenaltyMs: 150, jitterWeight: 2, lossWeight: 1000}} : {})},
     members: [member('berlin', 'Berlin', 'relay', {address: '100.96.0.1'}), member('lax', 'LAX', 'relay', {address: '100.96.0.2', listen: {udp: 51999, tcp: 52000, tls: 0}}),
       member('home', 'Home', 'member', {address: '100.96.0.3', tags: ['家'], ...(v3 ? {direct: true} : {}),
         entry: {mode: v3 ? 'upstreams' : 'failover', autoReturn: true, candidates: [{id: 'c1', relay: 'berlin', transport: 'udp'},
@@ -163,6 +163,8 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
       {seq: 42, at: now - 10 * 60000, kind: 'route.changed', detail: 'toy: sg -> toy (better)'});
   }
   let applied = JSON.parse(JSON.stringify(doc)), revision = 12, rollout = null, installing = [];
+  // What an apply is checking before its rollout starts (prepareMs: how long it takes), as the controller shows it.
+  let preparing = null;
   const layout = old ? null : reach ? {sg: {x: 130, y: 0}, lax: {x: 560, y: 0}, home: {x: 0, y: 210}, toy: {x: 430, y: 210}, mac: {x: 250, y: 430}, win: {x: 600, y: 430}, lab: {x: 860, y: 210}} : punch ? {berlin: {x: 60, y: 0}, lax: {x: 360, y: 0}, home: {x: -90, y: 230}, office: {x: 510, y: 230}, cafe: {x: 210, y: 420}, nas: {x: -90, y: 420}}
     : {berlin: {x: 0, y: 0}, lax: {x: 300, y: 0}, home: {x: 150, y: 220}};
   const nodes = {berlin: {state: 'ready', appliedRevision: 12, error: '', summary: {entry: {}, ready: true, peers: 2, rttMs: null}},
@@ -402,14 +404,18 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
     if (!rollout.progress.some(x => x.state === 'pending' || x.state === 'applying')) rollout.running = false;
   }
   const view = () => ({ok: true, draftVersion: draftVersion(), ...JSON.parse(JSON.stringify(doc)), applied: {revision, at: Date.now()}, draft: {dirty: JSON.stringify(doc) !== JSON.stringify(applied), changes: changes()},
-    nodes, eligible: eligible(), apply: rollout ? JSON.parse(JSON.stringify(rollout)) : {running: false, revision, progress: []}, errors: [], ...(reach ? {warnings: warnings()} : {}), ...(routes && !oldRoutes ? {exports: exportsNow()} : {}), ...(lines ? {lines: LINES} : {}),
+    nodes, eligible: eligible(), apply: {...(rollout ? JSON.parse(JSON.stringify(rollout)) : {running: false, revision, progress: []}), ...(preparing ? {preparing: {...preparing}} : {})}, errors: [], ...(reach ? {warnings: warnings()} : {}), ...(routes && !oldRoutes ? {exports: exportsNow()} : {}), ...(lines ? {lines: LINES} : {}),
     // The gateway on Berlin reaching an instance on Home's mesh address, as the controller adds it.
     ...(firewall ? {autoRules: [{kind: 'instance', proto: 'tcp', serverId: 'home', gateway: 'berlin', instanceId: 'i-edge', name: 'Edge-Fra', port: 18970, src: '100.96.0.1/32', dst: '100.96.0.3/32'}]} : {}),
     ...(old ? {} : {layout: JSON.parse(JSON.stringify(layout)), installing: JSON.parse(JSON.stringify(installing))}),
     ...(v3 ? {auto: autoNow(), pathsView: buildPathsView(doc), forwardGeo, autoLinks: {suggestions: [], lastChange: {at: Date.now() - 300000, text: '为 Home 新增上游 LAX（实测快 42 ms）'}}} : {})});
   const trend = range => Array.from({length: 30}, (_, i) => ({at: Date.now() - (30 - i) * 120000, rttMs: i === 20 ? null : 140 + (i % 7) * 6, timeoutRate: i === 20 ? 1 : 0, switches: i === 20 ? 1 : 0,
-    reconnects: i === 12 ? 1 : 0, rssBytes: 200e6 + i * 1e6, cpuPercent: 2 + (i % 5) * 0.4, rxBytes: 1e6 * i, txBytes: 5e5 * i, range}));
+    reconnects: i === 12 ? 1 : 0, rssBytes: 200e6 + i * 1e6, cpuPercent: 2 + (i % 5) * 0.4, rxBytes: 1e6 * i, txBytes: 5e5 * i, routeSwitches: i % 8 === 0 ? 1 : 0, routeFlips: i === 16 ? 1 : 0, range}));
   const extra = {peers: [], events: [], status: {}};
+  // Home's stored events, newest first: two newer than the ones its detail holds (as when the history
+  // began after them), then 320 older, alternating so no two read the same.
+  const history = {home: [{seq: 20, at: now - 10000, kind: 'peer.up', detail: 'berlin'}, {seq: 19, at: now - 20000, kind: 'path.ready', detail: 'c1'},
+    ...Array.from({length: 320}, (_, i) => ({seq: 1000 - i, at: now - 3 * 3600000 - i * 60000, ...(i % 2 ? {kind: 'path.ready', detail: 'c1'} : {kind: 'peer.reconnect', detail: 'lax'})}))]};
   return {
     // extra: more peers and events for Home's detail, and fields replacing those of its status, set by a test.
     doc, nodes, layout, rollbacks, extra, failing: id => { failing = id; }, setPath: fn => { pathOf = fn; }, setPathsView: fn => { customPathsView = fn; }, setBest: fn => { bestOf = fn; }, setReinstall: outcome => { reinstallOutcome = outcome; },
@@ -533,6 +539,14 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
       }
       if (method === 'DELETE' && path.startsWith('/members/')) { doc.members.find(m => m.serverId === path.split('/').pop()).removing = true; return [200, view()]; }
       if (method === 'POST' && path === '/apply') {
+        if (preparing || rollout?.running) return [409, {ok: false, error: 'mesh_apply_running'}];
+        if (prepareMs) {
+          for (const phase of ['facts', 'tls', 'build']) {
+            preparing = {phase};
+            await new Promise(resolve => setTimeout(resolve, prepareMs / 3));
+          }
+          preparing = null;
+        }
         revision++;
         applied = JSON.parse(JSON.stringify(doc));
         rollout = {running: true, revision, progress: doc.members.map(m => ({serverId: m.serverId, state: 'pending', error: ''}))};
@@ -549,6 +563,11 @@ export function fakeMesh({failing = '', upgrades = false, old = false, punch = f
         if (!lines) return [404, {ok: false, error: 'not_found'}];
         const id = decodeURIComponent(path.split('/')[2]);
         return LINES.some(l => l.id === id) ? [200, lineTrend(id, new URLSearchParams(query).get('range'))] : [404, {ok: false, error: 'mesh_line_not_found'}];
+      }
+      if (method === 'GET' && /^\/members\/[\w-]+\/events$/.test(path)) {
+        const q = new URLSearchParams(query), before = q.get('before'), beforeSeq = q.get('beforeSeq'), limit = Number(q.get('limit') || 100);
+        const older = (history[path.split('/')[2]] || []).filter(e => before == null || e.at < Number(before) || (beforeSeq != null && e.at === Number(before) && e.seq < Number(beforeSeq)));
+        return [200, {ok: true, events: older.slice(0, limit), more: older.length > limit}];
       }
       if (method === 'GET' && path.startsWith('/members/')) {
         const id = path.split('/').pop();

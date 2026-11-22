@@ -311,12 +311,12 @@ async def test_a_delivery_that_cuts_its_connection_waits_for_the_node(env, monke
     revision = await one(e.db.conn, 'SELECT status FROM mesh_revisions WHERE owner=? AND revision=2', (OWNER,))
     assert revision['status'] == 'applied'
 
-    # Back, but on the old revision when the wait runs out: failed, the rest not reached.
+    # Back, but on the old revision when the wait runs out: failed. m2, sent alongside it, has the revision.
     monkeypatch.setattr(mesh_module, 'RECONNECT_WAIT', 0.6)
     fake.drops[(m1, 'mesh.apply')] = 'stale'
     state = await reissue()
     progress = {p['serverId']: p for p in state['apply']['progress']}
-    assert progress[m2]['error'] == 'stopped'
+    assert progress[m2]['state'] == 'done'
     assert await notifications(e) == [*before, f'mesh-apply:{OWNER}:3:{m1}']
     assert (await one(e.db.conn, 'SELECT text FROM server_notifications WHERE id=?', (f'mesh-apply:{OWNER}:3:{m1}',)))['text'].endswith('「mesh_not_applied」。')
     revision = await one(e.db.conn, 'SELECT status FROM mesh_revisions WHERE owner=? AND revision=3', (OWNER,))

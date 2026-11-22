@@ -21,6 +21,7 @@ import ContextCompactionIcon from "./legacy/ContextCompactionIcon.vue";
 import {plainText} from "./markdown.js";
 import {contextCompactionView} from "./agentPlanPresentation.js";
 import {toolArgumentsSummary} from "./toolArgumentsPresentation.js";
+import {settingNamesVersion} from "./settingNames.js";
 
 const TOOL_ARGUMENT_PREVIEW_CHARS = 5000;
 const TOOL_RESULT_PREVIEW_CHARS = 8000;
@@ -321,6 +322,7 @@ function toolPreviewFromCall(call, rawResult = "") {
 	const resultText = String(rawResult || call.resultDigest || "");
 	const sourceArguments = argsText || previewArguments;
 	const toolName = callName(call);
+	const nameVersion = toolName === "SystemConfig" ? settingNamesVersion.value : 0;
 	const cached = toolCallPreviewMemo.get(call);
 	if (
 		cached
@@ -328,13 +330,14 @@ function toolPreviewFromCall(call, rawResult = "") {
 		&& cached.previewArguments === previewArguments
 		&& cached.summaryPreview === summaryPreview
 		&& cached.resultText === resultText
+		&& cached.nameVersion === nameVersion
 	) return cached.value;
 	const value = toolName === "ContextCompaction" && summaryPreview
 		? shortText(rendererLineContent(summaryPreview, toolName), 110)
 		: sourceArguments
 			? (toolArgumentsSummary(toolName, sourceArguments, resultText) || toolPreviewFromArgs(sourceArguments))
 			: shortText(rendererLineContent(summaryPreview, toolName), 110);
-	toolCallPreviewMemo.set(call, {argsText, previewArguments, summaryPreview, resultText, value});
+	toolCallPreviewMemo.set(call, {argsText, previewArguments, summaryPreview, resultText, nameVersion, value});
 	return value;
 }
 

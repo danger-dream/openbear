@@ -1585,6 +1585,15 @@ onBeforeUnmount(() => {
 defineExpose({
   focusTitle: () => titleInputRef.value?.focus(),
   focusBody: () => editor.value?.commands.focus('end'),
+  // The page assistant inserts here like a paste: the user sees it at once and can undo it.
+  insertMarkdown: (markdown, at = 'cursor') => {
+    const instance = editor.value;
+    if (!instance || isReadonly.value) return false;
+    const parsed = markdownToDoc(String(markdown || ''));
+    if (!parsed.content?.length) return false;
+    instance.chain().focus(at === 'end' ? 'end' : at === 'start' ? 'start' : undefined).insertContent(parsed.content).run();
+    return true;
+  },
 });
 </script>
 

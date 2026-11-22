@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import { authMode } from '../authMode.js';
 import { defineLazyView } from "../lazyView.js";
+import { usePageSubject } from "../assistant/pageRegistry.js";
 import "./settings-ui.css";
 
 const TemplateView = defineLazyView(() => import("./TemplateView.vue"), "提示词模板");
@@ -37,6 +38,7 @@ function normalizeSection(value) {
 const activeSection = ref(normalizeSection(props.section));
 const activeInfo = computed(() => sections.find((item) => item.key === activeSection.value) || sections[0]);
 const activeComponent = computed(() => activeInfo.value.component);
+usePageSubject(() => ({kind: "settings-tab", id: activeInfo.value.key, label: activeInfo.value.label, main: true, details: {hint: activeInfo.value.hint}}));
 
 const restarting = ref(false);
 

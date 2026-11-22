@@ -29,11 +29,11 @@ export async function startMeshBrowser(t) {
   browser = await chromium.launch({executablePath: process.env.OPENBEAR_CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox']});
   if (shots) mkdirSync(shots, {recursive: true});
 
-  async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false, v3 = false} = {}) {
+  async function setup(t, {width = 1440, height = 900, dark = false, tabs = [], active = 'mesh', failing = '', upgrades = false, old = false, missing = false, punch = false, legacyDirect = false, reach = false, noPath = false, routes = false, oldRoutes = false, noisy = false, gone = '', lines = false, allSubnets = false, secure = false, firewall = false, init = null, keepAlive = false, v3 = false, prepareMs = 0} = {}) {
     if (routes) reach = true;
     const context = await browser.newContext({viewport: {width, height}, deviceScaleFactor: 1, colorScheme: dark ? 'dark' : 'light', hasTouch: width < 760, isMobile: width < 760});
     t.after(() => context.close());
-    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall, v3}), items = SERVERS();
+    const page = await context.newPage(), calls = [], errors = [], mesh = fakeMesh({failing, upgrades, old, punch, legacyDirect, reach, noPath, routes, oldRoutes, noisy, gone, lines, allSubnets, secure, firewall, v3, prepareMs}), items = SERVERS();
     if (punch) items.push(server('office', 'Office', {region: 'CN'}), server('cafe', 'Cafe', {region: 'SG'}), server('nas', 'NAS', {region: 'CN'}));
     if (reach) items.push(server('sg', 'SG', {region: 'SG'}), server('toy', 'TOY', {region: 'CN'}), server('lab', 'Lab', {region: 'CN'}));
     page.on('pageerror', error => errors.push(error.message));

@@ -5,7 +5,7 @@ import copy
 
 from app.servers import compat
 from app.servers import mesh_model as model
-from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build, default_routing
+from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, SMOOTH_FEATURE, build, default_routing
 
 
 KEYS = {sid: (f'{sid}wg'.ljust(43, 'A') + '=', f'{sid}ctl'.ljust(43, 'B') + '=', f'{sid}sig'.ljust(43, 'C') + '=', f'{sid}e2e'.ljust(43, 'D') + '=')
@@ -31,7 +31,7 @@ def _facts(featured=()):
     return {sid: {'name': sid.upper(), 'platform': 'linux', 'ipv4': f'203.0.113.{i + 1}',
                   'publicKey': KEYS[sid][0], 'controlKey': KEYS[sid][1], 'signKey': KEYS[sid][2], 'e2eKey': KEYS[sid][3],
                   'localPrefixes': [], 'configSchemas': compat.CONFIG_SCHEMA,
-                  'features': [MEMBERS_ROUTING_FEATURE] if sid in featured else []}
+                  'features': [MEMBERS_ROUTING_FEATURE, SMOOTH_FEATURE] if sid in featured else []}
             for i, sid in enumerate(KEYS)}
 
 

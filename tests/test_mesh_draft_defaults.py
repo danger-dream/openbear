@@ -109,7 +109,7 @@ async def test_auto_revision_refreshes_member_caches_and_keeps_draft_edits(env, 
     await mesh._save_draft(OWNER, draft, auto_base=[{'version': 'old', 'applied': old}])
     prior_version = (await mesh._load(OWNER, 'draft', with_version=True))[1]
 
-    def optimize(doc, facts, statuses, *, state, now_ms):
+    def optimize(doc, facts, statuses, *, state, now_ms, **_):
         return {'changed': True, 'doc': copy.deepcopy(doc), 'state': state,
                 'revisionReason': '自动：更新线路', 'dropped': []}
 

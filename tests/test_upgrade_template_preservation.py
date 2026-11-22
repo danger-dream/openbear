@@ -35,7 +35,12 @@ async def test_bootstrap_and_request_view_preserve_old_and_custom_versions(db, s
         cur = await db.conn.execute("SELECT * FROM memory_templates ORDER BY id")
         return [dict(row) for row in await cur.fetchall()]
 
+    original = await rows()
+    await BuiltinMemoryClient(db)._bootstrap()
     before = await rows()
+    # The first startup with the page assistant adds its built-in template and changes nothing else.
+    assert before[:len(original)] == original
+    assert [(row["name"].startswith("内置页面助手模板"), row["is_assistant_active"]) for row in before[len(original):]] == [(True, 1)]
     for _ in range(2):
         # A new client represents another startup, not merely the fast-path flag.
         await BuiltinMemoryClient(db)._bootstrap()

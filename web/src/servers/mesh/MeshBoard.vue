@@ -246,7 +246,7 @@ const edgeRaw = computed(() => {
       // Standbys carry nothing: drawn quiet, back to normal while the line (or one of its ends) is in focus.
       const quiet = entryQuiet(look, line) && id !== selId;
       push(id, m.serverId, c.relay, {kind: 'entry', look: look.look, quiet, arrow: 'end', label: [`${i + 1}`, how, look.failing].filter(Boolean).join(' · '), flash: flash.value === id, rttMs: line?.rttMs ?? null,
-        title: look.problem || (look.failing ? `${relayName} ${look.role}：${look.failing}` : [look.opened ? `${look.role}，经${look.via || '打洞'}接入` : LOOK_TITLES[look.look], look.standby ? standbyNote(look) : ''].filter(Boolean).join('；')),
+        title: look.problem || (look.failing ? `${relayName} ${look.role}：${look.failing}` : [look.lan ? `${look.role}，经局域网接入` : look.opened ? `${look.role}，经${look.via || '打洞'}接入` : LOOK_TITLES[look.look], look.standby ? standbyNote(look) : ''].filter(Boolean).join('；')),
         aria: `${m.name} 的第 ${i + 1} 个入口：${relayName} · ${how}，${look.problem || (look.failing ? `${look.role}，${look.failing}` : look.role)}${look.standby ? `，${standbyNote(look)}` : ''}`});
     });
   }

@@ -27,9 +27,30 @@ const depsCacheRoot = fileURLToPath(new URL('../node_modules/.cache/openbear-bro
 // OPENBEAR_BROWSER_DEPS_CACHE=0 turns this off.
 const depsCacheOn = process.env.OPENBEAR_BROWSER_DEPS_CACHE !== '0';
 async function depsSlot(name, pluginNames) {
-  const lock = await readFile(join(root, 'package-lock.json')).catch(() => '');
+  const lock = withoutOwnVersion(await readFile(join(root, 'package-lock.json'), 'utf8').catch(() => ''));
   const key = createHash('sha256').update(JSON.stringify([pluginNames, viteVersion])).update(lock).digest('hex').slice(0, 16);
   return join(depsCacheRoot, `${name.replace(/[^\w.-]/g, '_')}-${key}`);
+}
+// Every frontend build raises the app's own version in package-lock.json; that is not a
+// dependency change and must not start a new slot (Vite itself checks node_modules).
+function withoutOwnVersion(lock) {
+  try {
+    const data = JSON.parse(lock);
+    delete data.version;
+    if (data.packages?.['']) delete data.packages[''].version;
+    return JSON.stringify(data);
+  } catch { return lock; }
+}
+// The scripts behind the `?worker` imports Vite has transformed so far: each wrapper module
+// starts its worker from a URL of its own (`new Worker("/src/x.js?worker_file&type=module")`).
+function workerScripts(server) {
+  const graph = server.environments?.client?.moduleGraph || server.moduleGraph;
+  const urls = new Set();
+  for (const mod of graph.urlToModuleMap.values()) {
+    if (!/[?&]worker(?:&|$)/.test(mod.url)) continue;
+    for (const match of String(mod.transformResult?.code || '').matchAll(/new\s+Worker\(\s*["'`]([^"'`]+)["'`]/g)) urls.add(match[1]);
+  }
+  return [...urls];
 }
 // Every file the metadata names is present (a copy is never used half-made).
 async function depsComplete(dir) {
@@ -180,6 +201,13 @@ export async function startBrowserTestServer(t, {name, plugins, entries, authMod
         (async () => {
           await Promise.all(entries.map(entry => server.transformRequest(entry)));
           await server.waitForRequestsIdle();
+          // A Web Worker's script is fetched only when a page starts the worker, so Vite would
+          // find its dependencies then, bundle them again and reload the page under test.
+          const workers = workerScripts(server);
+          if (workers.length) {
+            await Promise.all(workers.map(url => server.transformRequest(url)));
+            await server.waitForRequestsIdle();
+          }
         })(),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${name}: Vite entry warmup exceeded ${warmupTimeoutMs / 1000}s`)), warmupTimeoutMs); }),
       ]);

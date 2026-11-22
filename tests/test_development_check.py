@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -88,3 +89,59 @@ def test_a_run_ended_by_the_deadline_reports_what_it_finished(tmp_path):
     # pytest -q under xdist, killed in the middle of a progress line.
     log.write_text('8 workers [150 items]\n\n' + '.' * 72 + ' [ 50%]\n.F.')
     assert check._counted(log) == (75, 150)
+
+
+def _full_plan(web_tests):
+    plan = check.Plan(first=False, changed=set(), python=True, full=True)
+    plan.web = {t: '--full' for t in web_tests}
+    plan.go = {m: ['./...'] for m in check.GO_MODULES}
+    return plan
+
+
+def test_a_full_round_continues_where_the_last_run_stopped_and_ends_with_the_whole_result():
+    current, state = {'app/a.py': '1', 'web/src/a.test.mjs': '2'}, {}
+    tests = ['web/src/a.test.mjs', 'web/src/b.test.mjs', 'web/src/c.test.mjs']
+
+    # First run: Python and Go finish, the frontend stops after one file with a judged failure.
+    plan = _full_plan(tests)
+    round_, carried = check.resume_full(plan, state, current)
+    assert not carried and plan.python and len(plan.web) == 3
+    py = check.Lane('python', passed=6700, skipped=15, total=6715, failures=[check.Failure('py', 't::x', 't::x', 'boom', 'tests/t.py', 'flaky')])
+    web = check.Lane('web', complete=False, left=2, passed=3, units={'web/src/a.test.mjs'})
+    lanes = {'python': py, 'go:node': check.Lane('go:node', passed=1083), 'go:gateway': check.Lane('go:gateway', passed=94), 'web': web}
+    check.keep_round(state, round_, lanes)
+    assert state[check.FULL_ROUND]['content'] == check.content_key(current)
+
+    # Second run on the same content: only the two frontend files left.
+    plan = _full_plan(tests)
+    round_, carried = check.resume_full(plan, state, current)
+    assert not plan.python and plan.go == {'node': [], 'gateway': []}
+    assert sorted(plan.web) == ['web/src/b.test.mjs', 'web/src/c.test.mjs'] and plan.full_done == 1
+    assert carried['python'].failures[0].verdict == 'flaky' and carried['python'].total == 6715
+    now = check.Lane('web', passed=5, units={'web/src/b.test.mjs', 'web/src/c.test.mjs'})
+    merged = check.merge_web(carried['web'], now)
+    assert (merged.passed, merged.complete, merged.left, len(merged.units)) == (8, True, 0, 3)
+    check.keep_round(state, round_, {**carried, 'web': merged})
+    assert check.FULL_ROUND not in state
+
+    # The next --full starts a new round.
+    plan = _full_plan(tests)
+    assert not check.resume_full(plan, state, current)[1] and plan.python and len(plan.web) == 3
+
+
+def test_a_full_round_is_dropped_when_the_files_change():
+    state, current = {}, {'app/a.py': '1'}
+    round_, _ = check.resume_full(_full_plan([]), state, current)
+    check.keep_round(state, round_, {'python': check.Lane('python', passed=1), 'web': check.Lane('web', complete=False, left=1)})
+    plan = _full_plan(['web/src/a.test.mjs'])
+    _, carried = check.resume_full(plan, state, {'app/a.py': '2'})
+    assert not carried and plan.python and plan.web
+
+
+def test_failures_judged_by_an_earlier_run_are_not_run_again(monkeypatch, tmp_path):
+    monkeypatch.setattr(check, 'run', lambda *a, **k: pytest.fail('ran a judged failure again'))
+    monkeypatch.setattr(check, 'run_web', lambda *a, **k: pytest.fail('ran a judged failure again'))
+    lane = check.Lane('web', failures=[check.Failure('web', 'a › x', 'a › x', '', 'web/src/a.test.mjs', 'flaky'),
+                                       check.Failure('web', 'b › y', 'b › y', '', 'web/src/b.test.mjs', 'old')])
+    assert check.rerun_alone([lane], tmp_path, time.monotonic() + 60) == ''
+    assert check.compare_with_head([lane], 'HEAD', tmp_path, time.monotonic() + 60) == ''

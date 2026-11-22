@@ -52,7 +52,7 @@ def pending_items(chat_id: int) -> list[dict[str, Any]]:
 
 def public(item: dict[str, Any]) -> dict[str, Any]:
     """An item as the composer shows it: its attachments by their public card, without paths or extracted text."""
-    return {k: v for k, v in item.items() if k != "media"}
+    return {k: v for k, v in item.items() if k not in {"media", "pageContext"}}
 
 
 def public_pending_items(chat_id: int) -> list[dict[str, Any]]:

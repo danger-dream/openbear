@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/netip"
 	"slices"
@@ -68,8 +69,8 @@ func (b *offerBackend) ReflectSeen(id [8]byte) (netip.AddrPort, bool) {
 	a, ok := b.seen[id]
 	return a, ok
 }
-func (b *offerBackend) RecentlyFrom(netip.Addr, time.Duration) bool { return b.recent }
-func (b *offerBackend) Remote(Path) (netip.AddrPort, bool)          { return b.remote, b.remote.IsValid() }
+func (b *offerBackend) RecentlyFrom(netip.AddrPort, time.Duration) bool { return b.recent }
+func (b *offerBackend) Remote(Path) (netip.AddrPort, bool)              { return b.remote, b.remote.IsValid() }
 func (b *offerBackend) SendTest(target netip.AddrPort, _ [8]byte, _ byte) error {
 	b.tests = append(b.tests, target)
 	return nil
@@ -95,7 +96,7 @@ func offerManager(t *testing.T, cfg Config, allowed map[string][]string, relays 
 	cfg = withKeys(cfg)
 	b := &offerBackend{seen: map[[8]byte]netip.AddrPort{}}
 	m := &Manager{cfg: cfg, signKeys: keysOf(cfg), backend: b, store: s, owners: newOwners(s, cfg.Parameters.Lease), candidates: map[string]*candidateState{}, links: map[string]*candidateState{}, inbound: map[Path]*inbound{}, changes: make(chan struct{}, 1), notices: map[string]outboundNotice{}, lastRefresh: map[string]time.Time{},
-		directs: map[string]*directState{}, session: nonce(), offerRates: map[string]offerRate{}, reach: newReach(), ctx: context.Background()}
+		directs: map[string]*directState{}, session: nonce(), offerRates: map[string]offerRate{}, reach: newReach(nil), ctx: context.Background()}
 	if _, err = m.owners.configure(cfg.Revision, allowed, relays, cfg.Network, m.signKeys); err != nil {
 		t.Fatal(err)
 	}
@@ -837,6 +838,76 @@ func TestReachTestsAreBounded(t *testing.T) {
 	}
 }
 
+// The relay testing a node asks relays the node is not linked to: its
+// listener talks to those all the time and they hold their tests back, and
+// where the relays a tester dials were the node's own links too no test came
+// (Aws-us, 11-22: Misaka-LAX asked VMISS-LA and Zgo.LAX, both linked).
+func TestReachAsksRelaysTheNodeIsNotLinkedTo(t *testing.T) {
+	nodes := []Node{{ID: "B", Role: "relay"}, {ID: "C", Role: "relay"}, {ID: "D", Role: "relay"}, {ID: "T", Role: "relay"}}
+	m, b := offerManager(t, Config{Network: "n", Self: "A", Role: "relay", Revision: 1, Nodes: nodes,
+		Links: []Link{{Peer: "B", Endpoint: "udp://192.0.2.2:1"}, {Peer: "C", Endpoint: "udp://192.0.2.3:1"}, {Peer: "D"}, {Peer: "T"}}},
+		map[string][]string{}, map[string]bool{"B": true, "C": true, "D": true, "T": true})
+	for _, s := range []string{"B", "C", "D", "T"} {
+		m.links[s] = &candidateState{config: Candidate{ID: "link:" + s, Peer: s}, ready: true, path: Path{ID: s, Generation: 1}}
+	}
+	id := randomID()
+	r := Reach{ID: encodeID(id), Linked: []string{"B", "X"}}
+	m.receive(signal(t, "T", "A", "reach", message{Reach: &r}))
+	b.seen[id] = netip.MustParseAddrPort("203.0.113.5:51999")
+	m.reachServe(time.Now())
+	if got := b.types(); !slices.Equal(got, []string{"C:reach-relay", "D:reach-relay", "T:reach-ack"}) {
+		t.Fatalf("sent %v, want C and D asked, not B", got)
+	}
+
+	// The node's side: its relay links and candidates but the relay asked,
+	// as many as fit.
+	n, _ := offerManager(t, Config{Network: "n", Self: "M", Role: "relay", Revision: 1, Nodes: nodes,
+		Links: []Link{{Peer: "T"}, {Peer: "B"}, {Peer: "X"}}, Candidates: []Candidate{{ID: "c", Peer: "C"}, {ID: "b", Peer: "B"}}},
+		map[string][]string{}, map[string]bool{"B": true, "C": true, "D": true, "T": true})
+	if got := n.reachLinked("T"); !slices.Equal(got, []string{"B", "C"}) {
+		t.Fatalf("linked %v, want B and C", got)
+	}
+	var many []Link
+	relays := map[string]bool{}
+	for i := range 40 {
+		id := fmt.Sprintf("%036d", i)
+		many, relays[id] = append(many, Link{Peer: id}), true
+	}
+	n.cfg.Links = many
+	n.owners.relays = relays
+	got := n.reachLinked("T")
+	if len(got) != maxReachLinked/39 {
+		t.Fatalf("%d linked named, want %d within %d bytes", len(got), maxReachLinked/39, maxReachLinked)
+	}
+	raw, err := json.Marshal(message{Type: "reach", Version: 99, Min: 99, Max: 99, LargeFrames: true, Network: strings.Repeat("n", 36), Revision: 1 << 50,
+		From: many[0].Peer, To: many[1].Peer, Reach: &Reach{ID: encodeID(id), Linked: got}})
+	if err != nil || len(raw) > maxMessage {
+		t.Fatalf("a request naming them takes %d bytes, over %d", len(raw), maxMessage)
+	}
+}
+
+// A relay's linked reflectors test it in turn: the first may have no relay
+// but the node's own links to ask (Po0-HK, 11-22: SoftShellWeb-TW every
+// round). A relay that is no reflector is not taken while one is.
+func TestReachRelaysTakeTurnsTesting(t *testing.T) {
+	nodes := []Node{{ID: "B", Role: "relay"}, {ID: "C", Role: "relay"}, {ID: "D", Role: "relay"}}
+	m, _ := offerManager(t, Config{Network: "n", Self: "A", Role: "relay", Revision: 1, Nodes: nodes,
+		Links:      []Link{{Peer: "B", Endpoint: "udp://192.0.2.2:51999"}, {Peer: "C", Endpoint: "udp://192.0.2.3:51999"}, {Peer: "D", Endpoint: "udp://192.0.2.4:51999"}},
+		Reflectors: []string{"192.0.2.2:51999", "192.0.2.4:51999"}},
+		map[string][]string{}, map[string]bool{"B": true, "C": true, "D": true})
+	for _, s := range []string{"B", "C", "D"} {
+		m.links[s] = &candidateState{config: Candidate{ID: "link:" + s, Peer: s}, ready: true, path: Path{ID: s, Generation: 1}}
+	}
+	var got []string
+	for range 4 {
+		relay, _, _ := m.reachRelay()
+		got = append(got, relay)
+	}
+	if !slices.Equal(got, []string{"B", "D", "D", "B"}) {
+		t.Fatalf("tested through %v, want B, D, D, B", got)
+	}
+}
+
 func encodeID(id [8]byte) string {
 	const hexdigits = "0123456789abcdef"
 	var s strings.Builder
@@ -931,6 +1002,53 @@ func TestReachKeepsWhatItMeasured(t *testing.T) {
 		s := judge(c.obs, c.filtering)
 		if s.Verdict != c.verdict || s.Mapping != c.mapping || s.Filtering != c.filtered {
 			t.Fatalf("round %d: %s/%s/%s, want %s/%s/%s", i+1, s.Verdict, s.Mapping, s.Filtering, c.verdict, c.mapping, c.filtered)
+		}
+	}
+}
+
+// A data plane started again keeps what another relay's test proved while
+// its addresses are the same: after Aws-SG restarted (11-22) every round had
+// the asked relay's own test only, and it was taken behind NAT though anyone
+// could reach it. A port result, its own test filtered too, takes it back.
+func TestReachKeepsOpenAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	pub := netip.MustParseAddrPort("198.51.100.7:51999")
+	local := []netip.Addr{netip.MustParseAddr("172.31.6.110")}
+	start := func() *Manager {
+		s, err := openStore(dir, "n", "AWS")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, _ := offerManager(t, Config{Network: "n", Self: "AWS", Role: "relay", Revision: 1, Port: 51999}, map[string][]string{}, map[string]bool{})
+		m.store, m.reach = s, newReach(s.state.Reach)
+		return m
+	}
+	round := func(m *Manager, filtering string) string {
+		ok := func(id string) Observer { return Observer{ID: id, Kind: "relay", Addr: pub, OK: true} }
+		m.reach.running, m.reach.id = true, [8]byte{7}
+		m.reachDone(reachResult{id: [8]byte{7}, observers: []Observer{ok("SG"), ok("LAX")}, filtering: filtering, local: local}, time.Now())
+		if err := m.store.flush(); err != nil {
+			t.Fatal(err)
+		}
+		return m.reach.status.Verdict
+	}
+	var m *Manager
+	for i, c := range []struct {
+		restart         bool
+		filtering, want string
+	}{
+		{true, "address", "punchable"}, // nothing proved yet
+		{false, "open", "public"},
+		{true, "address", "public"},
+		{true, "unknown", "public"},
+		{false, "port", "punchable"},
+		{true, "address", "punchable"},
+	} {
+		if c.restart || m == nil {
+			m = start()
+		}
+		if got := round(m, c.filtering); got != c.want {
+			t.Fatalf("round %d (%s): %s, want %s", i+1, c.filtering, got, c.want)
 		}
 	}
 }

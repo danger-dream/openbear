@@ -111,6 +111,7 @@ const loading = ref(false);
 const activeCount = ref(0);
 const archivedCount = ref(0);
 const temporaryCount = ref(0);
+const assistantCount = ref(0);
 const initialized = ref(false);
 const listRef = ref(null);
 const query = ref("");
@@ -315,6 +316,16 @@ const visibleRows = computed(() => {
     else if ((branch.loaded || branch.pages > 0) && !withDraft(branch.items, "").length) output.push({ kind: "empty", id: "empty:temporary", depth: 1, systemNode: "temporary" });
     if (branch.hasMore) output.push({ kind: "more", id: "more:temporary", depth: 1, systemNode: "temporary", cursor: branch.nextCursor });
   }
+  if (assistantCount.value || isExpanded("__assistant")) {
+    output.push({ kind: "system", systemNode: "assistant", id: "__assistant", name: "页面助手", count: assistantCount.value, depth: 0 });
+    if (isExpanded("__assistant")) {
+      const branch = stateFor("", "assistant");
+      for (const row of branch.items || []) appendConversationRow(output, { ...row, parentId: "__assistant" }, 1);
+      if (branch.error) output.push({ kind: "error", id: "error:assistant", depth: 1, systemNode: "assistant", message: branch.error });
+      else if ((branch.loaded || branch.pages > 0) && !branch.items.length) output.push({ kind: "empty", id: "empty:assistant", depth: 1, systemNode: "assistant" });
+      if (branch.hasMore) output.push({ kind: "more", id: "more:assistant", depth: 1, systemNode: "assistant", cursor: branch.nextCursor });
+    }
+  }
   const archive = { kind: "system", systemNode: "archive", id: "__archive", name: "已归档", count: archivedCount.value, depth: 0 };
   output.push(archive);
   if (isExpanded("__archive")) {
@@ -470,8 +481,8 @@ function cacheLocatedConversation(raw) {
   if (!raw?.conversationUuid || (raw.origin === "collab" && !raw.archived)) return;
   const row = statusAdjustedRow(raw);
   const parentId = String(row.folderId || "");
-  const system = row.archived ? "archive" : parentId ? "" : "temporary";
-  const branch = stateFor(parentId, system);
+  const system = row.archived ? "archive" : row.assistant ? "assistant" : parentId ? "" : "temporary";
+  const branch = stateFor(system === "assistant" ? "" : parentId, system);
   branch.items = mergeTreeRows(branch.items, [row]);
 }
 function mapKnownRows(transform) {
@@ -571,7 +582,7 @@ function rebaseStatusFolderPaths(original, newFolderIds) {
     for (const [uuid, item] of map) map.set(uuid, rebase(item));
   }
   activityItems.value = activityItems.value.map(rebase);
-  folderActivity.value = folderActivityCounts([...(latestStatusState.raw?.items || []).map(withLocalRead), ...activityItems.value]);
+  folderActivity.value = folderActivityCounts([...(latestStatusState.raw?.items || []).filter(item => !item.assistant).map(withLocalRead), ...activityItems.value]);
 }
 function adjustRunningFolderCounts(ids, delta) {
   if (!latestStatusState || !delta) return;
@@ -756,6 +767,7 @@ async function refreshTree({
     activeCount.value = Number(data.activeCount || 0);
     archivedCount.value = Number(data.archivedCount || 0);
     temporaryCount.value = Number(data.temporaryCount || 0);
+    assistantCount.value = Number(data.assistantCount || 0);
     // A successfully returned bootstrap becomes the newest status calibration and
     // invalidates any poll that began against an older tree snapshot.
     statusRequestGeneration += 1;
@@ -826,14 +838,15 @@ function applyStatus(data = {}) {
   if (revision) statusServerRevision = Math.max(statusServerRevision, revision);
   const adjust = withLocalRead;
   hiddenConversationIds.value = data.hiddenConversationIds || [];
-  activityItems.value = (data.activityItems || data.items || []).map(adjust).filter(item => !item.archived && (item.running || item.activityUnread || isActivityWaiting(item)));
+  // Page assistant conversations live in their own group and panel, not in these lists.
+  activityItems.value = (data.activityItems || data.items || []).map(adjust).filter(item => !item.archived && !item.assistant && (item.running || item.activityUnread || isActivityWaiting(item)));
   // Every running conversation, including automatic ones, plus user-visible unread results.
-  folderActivity.value = folderActivityCounts([...(data.items || []).map(adjust), ...activityItems.value]);
+  folderActivity.value = folderActivityCounts([...(data.items || []).filter(item => !item.assistant).map(adjust), ...activityItems.value]);
   pendingRows.value = pendingConversationRows(data);
   emit('activity-status', data);
   // Recency is independent of completion/read state; server supplies the newest
   // fifteen actual interactions, including rows absent from the loaded tree pages.
-  recentItems.value = (data.recentItems || []).map(adjust).filter(item => !item.archived && !item.local).slice(0, 15);
+  recentItems.value = (data.recentItems || []).map(adjust).filter(item => !item.archived && !item.local && !item.assistant).slice(0, 15);
   collabGroups.value = data.collabGroups || {};
   latestStatusState = {
     raw: data,
@@ -1915,7 +1928,7 @@ onBeforeUnmount(() => {
           :role="isDirectoryView ? 'treeitem' : 'listitem'" :aria-level="isDirectoryView ? Number(row.depth || 0) + 1 : undefined" :aria-busy="rowLoading(row) || isTitleGenerating(row)"
           :aria-expanded="['folder','system'].includes(row.kind) ? String(isExpanded(row.kind === 'system' ? row.id : row.folderId)) : !row.recentAlias && row.expandId ? String(isExpanded(row.expandId)) : undefined"
           :tabindex="['folder','conversation','system','group'].includes(row.kind) ? 0 : -1"
-          :draggable="!selecting && !row.local && !moveInFlight && !row.groupMember && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
+          :draggable="!selecting && !row.local && !moveInFlight && !row.groupMember && !row.assistant && (row.kind === 'conversation' || (row.kind === 'folder' && !query && !row.archived))"
           @keydown="rowKeydown($event, row)" @contextmenu="openMenu($event, row)"
           @pointerenter="enterOverview($event, row)" @pointerleave="leaveOverview"
           @dragstart="dragStart($event, row)" @dragover="dragOver($event, row)" @drop="drop($event, row)" @dragend="clearDrag"
@@ -1925,7 +1938,7 @@ onBeforeUnmount(() => {
               <el-icon><component :is="isExpanded(row.kind === 'system' ? row.id : row.folderId) ? ArrowDown : ArrowRight" /></el-icon>
             </button>
             <button class="tree-node-main" type="button" :class="{ 'is-folder-target': (row.kind === 'folder' && selectedFolderId === row.folderId) || (row.kind === 'system' && row.systemNode === 'temporary' && selectedFolderId === '') }" :title="row.path || row.name" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
-              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) }"><component :is="rowLoading(row) ? Loading : row.kind === 'system' ? (row.systemNode === 'archive' ? Box : ChatLineRound) : (isExpanded(row.folderId) ? FolderOpened : Folder)" /></el-icon>
+              <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) }"><component :is="rowLoading(row) ? Loading : row.kind === 'system' ? (row.systemNode === 'archive' ? Box : row.systemNode === 'assistant' ? MagicStick : ChatLineRound) : (isExpanded(row.folderId) ? FolderOpened : Folder)" /></el-icon>
               <span class="node-label">{{ row.name }}</span>
               <span v-if="row.pinned" class="node-star" title="同级置顶"><el-icon><StarFilled /></el-icon></span>
               <span v-if="folderWaitingCount(row)" class="tree-waiting-state" :aria-label="`${folderWaitingCount(row)} 个会话待处理`">待处理 {{ folderWaitingCount(row) }}</span>
@@ -2027,7 +2040,7 @@ onBeforeUnmount(() => {
             <hr />
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('select')"><el-icon><Finished /></el-icon><span>多选</span></button>
             <button v-if="menu.recent" role="menuitem" :disabled="locatingConversation" @click="runMenuAction('locate')"><el-icon><Aim /></el-icon><span>在目录中定位</span></button>
-            <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('move')"><el-icon><FolderOpened /></el-icon><span>移动到…</span></button>
+            <button v-if="!menu.row?.assistant" role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('move')"><el-icon><FolderOpened /></el-icon><span>移动到…</span></button>
             <button role="menuitem" :disabled="menu.row?.local || running(menu.row)" @click="runMenuAction('refresh-prompt')"><el-icon><Refresh /></el-icon><span>更新系统提示词…</span></button>
             <button role="menuitem" :disabled="menu.row?.local" @click="runMenuAction('archive')"><el-icon><component :is="menu.row?.archived ? RefreshLeft : Box" /></el-icon><span>{{ menu.row?.archived ? '取消归档' : '归档' }}</span></button>
             <button role="menuitem" @click="runMenuAction('conversation-properties')"><el-icon><InfoFilled /></el-icon><span>会话属性</span></button>

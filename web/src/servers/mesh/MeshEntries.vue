@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount } from 'vue';
 import draggable from 'vuedraggable';
 import { dragEdgeScroll } from '../dragEdgeScroll.js';
 import { mesh, save } from './meshStore.js';
-import { candParts, CAND_STATES, codeText, errorsAt, errorsUnder, isRelay, isSite, listens, move, publicAddress, TRANSPORTS, transportLabel, uid } from './meshHelpers.js';
+import { candParts, CAND_STATES, codeText, entryLan, errorsAt, errorsUnder, isRelay, isSite, listens, move, publicAddress, TRANSPORTS, transportLabel, uid } from './meshHelpers.js';
 
 // A member's ordered entry candidates, one card each: the relay on the first line with the
 // order and delete buttons, how it connects and how it is doing on the second. On phones the
@@ -19,6 +19,8 @@ const entry = computed(() => props.member.entry);
 const base = computed(() => `members[${props.index}].entry`);
 const errorsOf = i => errorsUnder(mesh.errors, `${base.value}.candidates[${i}]`).map(e => e.message || e.text || e.error || '这个入口的设置不正确');
 const MODES = [['fixed', '固定', '只用第一个入口；它连不上时不会自动换。'], ['failover', '自动切换', '第一个连不上时，按顺序换到下一个。']];
+const lan = c => entryLan(mesh.data, props.member.serverId, c.relay, c.transport, props.health[c.id]);
+const LAN_TITLE = '和这台中转在同一局域网，直接连它的局域网地址';
 // What a candidate is to the member, before it reports: the first one is the one it starts with.
 const role = (i) => i === 0 ? '首选' : entry.value.mode === 'failover' ? '备用' : '不使用';
 
@@ -87,10 +89,13 @@ onBeforeUnmount(() => stopEdgeScroll());
             </div>
           </div>
           <div class="mesh-cand-sub">
-            <span v-if="isSite(relayOf(c.relay)) && c.transport === 'udp'" class="mesh-cand-transport mesh-cand-punch" title="站点中转：先经其他入口交换地址，再打洞连接；同一局域网时走局域网">打洞</span>
-            <div v-else class="sv-ranges mesh-cand-transport" role="radiogroup" :aria-label="`第 ${i + 1} 个入口的传输方式`">
-              <button v-for="[value, label] in TRANSPORTS" :key="value" type="button" role="radio" :aria-checked="c.transport === value" :aria-selected="c.transport === value" @click="setTransport(c, value)">{{ label }}</button>
-            </div>
+            <span v-if="isSite(relayOf(c.relay)) && c.transport === 'udp'" class="mesh-cand-transport mesh-cand-punch" :title="lan(c) ? LAN_TITLE : '站点中转：先经其他入口交换地址，再打洞连接；同一局域网时走局域网'">{{ lan(c) ? '局域网 · UDP' : '打洞' }}</span>
+            <template v-else>
+              <span v-if="lan(c)" class="mesh-cand-punch" :title="LAN_TITLE">局域网</span>
+              <div class="sv-ranges mesh-cand-transport" role="radiogroup" :aria-label="`第 ${i + 1} 个入口的传输方式`">
+                <button v-for="[value, label] in TRANSPORTS" :key="value" type="button" role="radio" :aria-checked="c.transport === value" :aria-selected="c.transport === value" @click="setTransport(c, value)">{{ label }}</button>
+              </div>
+            </template>
             <div v-if="phone" class="so-actions mesh-cand-actions mesh-cand-move">
               <button type="button" :disabled="i === 0" :aria-label="`上移第 ${i + 1} 个入口`" title="上移" @click="shift(i, -1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
               <button type="button" :disabled="i === entry.candidates.length - 1" :aria-label="`下移第 ${i + 1} 个入口`" title="下移" @click="shift(i, 1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6"/></svg></button>

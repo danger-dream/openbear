@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/netip"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -139,44 +138,20 @@ type peerState struct {
 	keepalive     int
 }
 
+// deviceState is the listen port and the peers by public key in hex. A
+// handshake under a second after the epoch reads as none, as IpcGet's
+// whole seconds do.
 func deviceState(dev *device.Device) (listenPort int, peers map[string]*peerState) {
-	peers = map[string]*peerState{}
-	text, err := dev.IpcGet()
-	if err != nil {
-		return 0, peers
-	}
-	var cur *peerState
-	var sec int64
-	for _, line := range strings.Split(text, "\n") {
-		k, v, _ := strings.Cut(line, "=")
-		switch k {
-		case "listen_port":
-			listenPort, _ = strconv.Atoi(v)
-		case "public_key":
-			cur = &peerState{}
-			peers[v] = cur
-		case "endpoint":
-			cur.endpoint = v
-		case "last_handshake_time_sec":
-			sec, _ = strconv.ParseInt(v, 10, 64)
-		case "last_handshake_time_nsec":
-			n, _ := strconv.ParseInt(v, 10, 64)
-			if sec > 0 {
-				cur.handshakeNano = sec*1e9 + n
-			}
-		case "rx_bytes":
-			cur.rx, _ = strconv.ParseUint(v, 10, 64)
-		case "tx_bytes":
-			cur.tx, _ = strconv.ParseUint(v, 10, 64)
-		case "persistent_keepalive_interval":
-			cur.keepalive, _ = strconv.Atoi(v)
-		case "allowed_ip":
-			if p, err := netip.ParsePrefix(v); err == nil {
-				cur.allowed = append(cur.allowed, p)
-			}
+	port, stats := dev.Stats()
+	peers = make(map[string]*peerState, len(stats))
+	for _, s := range stats {
+		p := &peerState{endpoint: s.Endpoint, rx: s.RxBytes, tx: s.TxBytes, allowed: s.AllowedIPs, keepalive: int(s.Keepalive)}
+		if s.HandshakeNano >= int64(time.Second) {
+			p.handshakeNano = s.HandshakeNano
 		}
+		peers[hex.EncodeToString(s.PublicKey[:])] = p
 	}
-	return listenPort, peers
+	return int(port), peers
 }
 
 // kick starts a handshake now instead of on the first packet or keepalive.

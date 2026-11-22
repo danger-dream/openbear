@@ -21,9 +21,10 @@ func TestRelayRoutingFollowsAdvertisements(t *testing.T) {
 	// make a two-hop path win now and then, and it would stay: the direct
 	// one is not 10 ms cheaper. 20 ms a link makes paths direct.
 	bias := map[string]map[string]float64{"A": {"B": 20, "C": 20}, "B": {"A": 20, "C": 20}, "C": {"A": 20, "B": 20}}
+	hl, pen := 2.0, 10.0
 	l.edit = func(name string, c *Config) {
 		keys(name, c)
-		c.Routing = &Routing{Mode: "dynamic", Bias: bias[name]}
+		c.Routing = &Routing{Mode: "dynamic", Bias: bias[name], Tuning: &RoutingTuning{SmoothHalfLifeS: &hl, StartPenaltyMs: &pen}}
 	}
 	nodes := map[string]*running{}
 	for _, id := range []string{"A", "B", "C"} {

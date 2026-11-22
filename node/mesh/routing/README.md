@@ -1,282 +1,236 @@
 # Relay routing
 
 Relays choose their next hop toward every other relay from link costs they
-measure and share (contract, third batch, section 4). Package `routing` is
-the logic, with an injectable clock; `health/routing.go` feeds it probes and
-carries its advertisements; the engine turns its next hops into AllowedIPs.
-Only relays route; members are unaffected.
+measure and share. Package `routing` holds the logic on an injectable clock;
+`health/routing.go` feeds it probes and carries its advertisements; the engine
+turns its next hops into AllowedIPs. Both relays and routed members (leaves)
+use it.
 
 ## Parameters
 
 `routing.tuning` in the config sets them (`Tuning`, the controller's
-settings.routing); without it, the defaults. The tests written for the
-former fixed values (`legacyTuning`: 20 % and more than 10 ms to move, 20 %
-and 10 ms to advertise, shorter 5 % and 3 ms) keep them.
+`settings.routing`); without it, the defaults. Nodes advertising feature
+`mesh.routing.smooth` receive the smoothed tuning; older N-1 nodes keep legacy
+tuning while mixed versions run together.
 
-| | default | |
-|---|---|---|
-| switchMs, switchPct | 5, 0 | a working route moves to one at least this cheaper (ms), and with a share more than this % cheaper |
-| shorterMs, shorterPct | 3, 0 | the same for a path through fewer relays, held `holdS` |
-| advertMs, advertPct | 2, 0 | a link's advertised cost follows the measured one once they differ by more than this (ms, % of the larger) |
-| holdS | 5 | how long an advertised cost change and the shorter rule must hold |
-| jitterWeight, lossWeight | 2, 1000 | ms of cost per ms of jitter, for a link losing every probe |
-| flapHoldS, flapHoldMaxS | 60, 480 | flap damping's first wait and its cap |
+| | default | range | |
+|---|---|---|---|
+| `smoothHalfLifeS` | 60 | 1..300 | half-life (s) of per-neighbor smoothed path cost |
+| `switchPct` | 5 | 0..50 | cheaper by at least this % in both real and smoothed cost to move a working route |
+| `switchMinMs` | 2 | 0..100 | and at least this many ms cheaper |
+| `hopCostMs` | 2 | 0..50 | fixed ms added per up link so equal-cost paths prefer fewer hops |
+| `startPenaltyMs` | 150 | 0..5000 | initial smoothed-cost penalty when a neighbor becomes usable, times 1 + the link's flap penalty / 1000 |
+| `jitterWeight` | 2 | 0..10 | ms of cost per ms of jitter |
+| `lossWeight` | 1000 | 0..10000 | ms of cost at 100% loss |
 
-`TestReplayWithDefaults`: with the defaults sim.py's scenarios come out as
-before (no switch without a fault, outage and degradation away and back
-once) but for the flapping link, which costs a second detour (4 switches, 6
-s lost against 2 and 3); `TestLossNoiseWithDefaults`: 3 % random loss on a
-link 75 ms shorter than the detour moves once away and back in ten minutes.
+Legacy tuning payloads (pre-smoothing keys such as `switchMs`, `shorterMs`,
+`advertMs`, `holdS`, `flapHoldS`, `flapHoldMaxS`) are ignored silently when
+read and cleared on the next save.
 
 ## Link metrics
 
-Every relay measures each relay it has a link with, dialed or punched, from
-the health probes on that link, sent every `activeIntervalMs` (1 s).
+Every relay measures each link it carries from the health probes sent every
+`activeIntervalMs` (1 s).
 
 | | |
 |---|---|
-| rtt | median of the last 5 answered probes' round trips |
-| jitter | median of the last 5 distances of an answer from the rtt it made |
-| loss | the lower of the lost shares of the last 10 and of the last 30 probes |
-| down | 3 probes in a row lost, or the link's path gone (at once) |
-| penalty | +1000 on every entry into down, capped at 4000, half-life 30 s |
-| suppressed | penalty ≥ 2000; reused once below 750 |
-| held | a link between relays back from down: down for 30 s, twice as long for each further down within 10 minutes, at most 8 minutes; let up at once while its peer is reachable no other way |
-| kept | a suppressed link still in use while no other way to a member works: the member keeps its cheapest; of the relays whose link to it is suppressed, the first by name keeps its own while no relay advertises one up |
-| cost | `rtt + jitterWeight*jitter + lossWeight*loss + bias + narrow` ms, at least 0.1; infinite unless up |
+| `rtt` | median of the last 5 answered probes' round trips |
+| `jitter` | median of the last 5 distances of an answer from the rtt it made |
+| `loss` | `max(longLoss, burstLoss, slowLoss)` where `longLoss = max(0, lost100 - 1) / 100` (100-probe window ignoring a single stray loss), `burstLoss = lost10 / 10` when `lost10 >= 3` else `0` (fast reaction to real degradation), and `slowLoss` every lost probe averaged with a 15-minute half-life, an outage's probes and time left out (memory of a link that loses packets now and then) |
+| `down` | 3 probes in a row lost, or the link's path gone (at once) |
+| `penalty` | +1000 on every entry into down, capped at 4000, half-life 30 s |
+| `suppressed` | penalty ≥ 2000; reused once below 750 |
+| `kept` | a suppressed link still in use while no other way to a member works: the member keeps its cheapest; of the relays whose link to it is suppressed, the first by name keeps its own while no relay advertises one up |
+| `cost` | `rtt + jitterWeight*jitter + lossWeight*loss + bias + narrow + hopCostMs` ms, at least 0.1; infinite unless up |
 
-- A new link is up after 3 answered probes; until then its rtt is the fastest of them, so a slow first answer
-  while the path warms up does not weigh on it for half a minute.
-- Held: RFCHost-JP2 (2026-11-16) answered again on its links for seconds at a
-  time, drew the other relays' routes and went down again; the penalty let a
-  link back within a minute, and every relay moved its routes to it and away
-  again. A link held is advertised down and status shows `heldMs`, what is
-  left of the hold (`link.held <peer>: back after N downs in 10m0s, held for
-  D`). It is let up when the peer is reachable no other way (`link.released
-  <peer>: not reachable another way`): a relay that restarted comes back on
-  every link at once, and each neighbor has others. A link to a member, and
-  a member's own links, have no hold: `kept` keeps a member on the mesh
-  (`TestALinkBackFromDownIsHeldLongerEachTime`, `TestARouteTakesALinkBackOnlyAfterItsHold`,
-  `TestNoProbationOnAMembersLinks`).
-- Medians, not averages: on a TCP link a lost segment holds the probes
-  behind it for a retransmission timeout. With `ewma = 0.7*ewma + 0.3*rtt`
-  and jitter averaged the same way, one such late answer raised a 159 ms
-  link's cost to about 270 ms for longer than 5 s, and the relays' routes
-  over their long TCP links went through a neighbor and back many times an
-  hour (`TestLateAnswersDoNotFlap`, `TestRoutingNetnsTCPNoise`). Up to two
-  late answers in any five now leave rtt and jitter as they were; a lasting
-  change shows from its third probe, round trips that vary all the time
-  still show as jitter.
-- Who measures: the dialing end, and both ends of a punched link, time their
-  own probes (lost after `max(1 s, min(maxTimeout, 3*srtt))`). The accepting
-  end of a dialed link times its pong to the prober's `seen` (one round
-  trip); a pong not seen in time, or a ping not arriving 1.5 intervals after
-  the last, is a lost probe there. So both ends have a cost for every link.
-- Loss: with the last 10 probes alone, two losses close together on a link
-  that loses 3 % at random (+200 ms) sent a 180 ms link's routes over a
-  255 ms detour and back about four times in ten minutes. Taking the lower
-  share of the last 10 and 30 weighs such a pair by 30 probes (+67 ms) until
-  losses persist; sustained loss raises both shares, and 10 good probes
-  clear it, so sim.py's outage, flapping and degradation results are
-  unchanged (`TestReplayMatchesSimulation`). Over 100 random ten-minute runs
-  of that link the routes moved 0.13 times on average; 5 runs had two
-  changes: five losses within 30 s, or three in a row (down by rule).
-- `bias` is `routing.bias[<relay>]` from the config, -10000..10000 ms,
-  default 0. The controller writes a link's preference into both ends.
-- `narrow` is 50 ms while the link carries less than the network MTU from
-  this end (`../linkmtu.go`, `SetNarrow`), else 0. It is advertised at once;
-  as routes take the larger of the two ends' costs, the link costs it both
-  ways.
-
-## Advertised cost (damping)
-
-A link's advertised cost moves only when the measured cost differs from it
-by more than `advertMs` (and, with `advertPct`, more than that share of the
-larger), continuously for `holdS`. A change of state (up, down,
-suppressed) is advertised at once. Routes are computed only from advertised
-costs, this relay's own links included, and a link costs the larger of what
-its two ends advertise. So every relay sees the same costs and the same
-shortest paths, and short spikes move nothing.
+- A new link is up after 3 answered probes; until then its rtt is the fastest
+  of them, so a slow first answer while the path warms up does not weigh on it.
+- Medians, not averages: on a TCP link a lost segment holds probes behind it
+  for a retransmission timeout. Up to two late answers in any five leave rtt
+  and jitter unchanged; sustained change shows from the third probe, and steady
+  jitter still shows as jitter.
+- Windowed loss: 3% random loss averages ~2% penalty with minimal variance;
+  a real 20–30% degradation triggers the 10-probe burst window within
+  seconds.
+- Slow loss: a single stray loss costs under 1 ms and halves every 15
+  minutes, below the switch margin; a link losing probes in runs a minute or
+  two apart, which the windows forget between runs, keeps its average rate
+  (0.8% ≈ 8 ms) through its clean spells instead of drawing routes back in
+  each. When a link goes down, the run of losses that made it down leaves
+  slowLoss, and the outage's probes and time count for nothing.
+- The probes a link lost while down (the run before its first answer) leave
+  both windows when it answers again: an outage weighs on the link through
+  its flap `penalty` and the start penalty below, not as loss. Counted as
+  loss, a 20 s outage held the link at about +1000 ms for 10 s and +190 ms for
+  100 s after it came back, and routes returned after 3.5 minutes
+  (`TestSmoothFailoverRecoveryReturn`).
+- `bias` is `routing.bias[<peer>]` from the config, -10000..10000 ms, default 0.
+- `narrow` is 50 ms while a UDP link carries less than the network MTU from
+  this end (`../linkmtu.go`, `SetNarrow`), else 0.
+- There is no per-link `probation` / `held` state: flapping links are kept from
+  attracting traffic by `penalty`/`suppressed` and by the start penalty, which
+  grows with the link's `penalty` (`TestSmoothFlappingLinkAttractsNoTraffic`:
+  20 s up and 20 s down, and 60 s up and 20 s down, a path 80 ms shorter).
 
 ## Advertisements
 
-An advertisement is a relay's link state and next hops: origin, seq, its
-links as (peer, cost, up | down | suppressed) and `r`, its next hop per
-destination, used for the loop-free check. Two wire forms:
+An advertisement is a node's link state and next hops: origin, seq, its links
+as `(peer, cost, up | down | suppressed)` and `r`, its next hop per destination
+used for the loop-free check, members (leaves) included. A held route is not
+always its node's shortest path, so the others follow the next hops it gives;
+one that gives none to a member (a node before 1.4.1, or left out to fit) is
+taken to use its shortest path to it. Before 1.4.1 every relay was taken so for
+members, and relays restarted one after the other looped traffic to one for
+minutes (`TestMemberRoutesRollingRestart`). Over the 1024-byte budget the next
+hops to members are left out first, then every next hop. Every data plane
+with members in routing (feature `mesh.routing.members`, which the controller
+waits for on every relay) reads next hops to members.
 
-- **JSON**, in the control message's `advert` field, which every version
-  reads: `{"o": origin, "s": seq, "l": [[peer, cost, "u"|"d"|"s"]...], "r":
-  [[dest] | [dest, nextHop]...]}`. With 36-character ids one control
-  message holds `r` only for about 6 relays and the links of about 15.
-- **Compact**, in the field `ac`, read by this version and later: unpadded
-  standard base64 of version byte 2, then unsigned varints: origin, seq,
-  link count, per link (peer, state byte 0 down / 1 up / 2 suppressed, cost
-  in tenths of a ms when up), a byte saying whether `r` follows, route
-  count, per route (destination, next hop or 0 for the destination itself).
-  Relays are named by their control address's host number (control address
-  minus `network.controlPrefix`), the same in every relay's config. 32
-  relays, each linked to all others, with `r` take 516 bytes; full
-  advertisements fit up to 50 such relays in one control message.
-  `TestCompactAdvertHolds32Relays` checks it. Without a distinct number for
-  every relay a router sends and accepts JSON only.
+Advertised cost is the link's measured cost directly (no per-link hold timer).
+Routes take the larger of what a link's two ends advertise.
 
 Sending:
-- Sent every 5 s, and on a state change or an advertised-cost change after a
-  gap of at least 100 ms (a burst of changes goes out as one).
-- To every linked relay in compact form, and in JSON as well to one that has
-  sent no compact advertisement within 30 s: a relay of the version before
-  ignores `ac` (it finds no `advert`) and still gets everything, each
-  origin's advertisement re-encoded in JSON when forwarded to it. When a link
-  comes up, its neighbor gets both again until it speaks compact, as it may
-  have restarted as another version.
-- `r` is left out of an advertisement that would not fit; receivers then
-  assume the origin's shortest path. A relay of the version before receives
-  JSON and so may lack `r` of large meshes, as before; mixed versions route
-  the same as either alone (`TestRollingUpgrade`).
-- `seq` is `max(last+1, unix µs)`, so a restarted relay's advertisements are
-  newer than before. A receiver stores an advertisement with a higher seq
-  than the one it holds, or the same seq bringing the `r` the held one left
-  out, and forwards it to its other relay neighbors (not back, not to the
-  origin); an older or repeated one is dropped silently. One not refreshed
-  for 30 s is deleted. A forwarded advertisement keeps all of its `r`,
-  the route to the forwarding relay included (before, that one was left
-  out, and its neighbors took the origin for not routing to it:
-  `TestForwardedAdvertKeepsRoutes`).
-- When a link comes up, each end sends the other everything it holds, so the
-  new neighbor need not wait for refreshes.
-- Message type `route-advert` over the relay control channel (`health`):
-  relays only, over a configured relay link, from a linked relay, on the
-  authenticated control channel like every control message. Limits: one
-  control message (1024 bytes) per advertisement, never fragmented; origin,
-  every link peer and every route must be configured relays, no more entries
-  than there are relays, each at most once, costs 0..10⁶; per neighbor 50 a
-  second (burst 100) in all; per origin 20 new ones a second (burst 40).
-  Rejections give one `routing.error` event a minute per neighbor.
+- Periodic refresh every 5 s.
+- State change (`up` / `down` / `suppressed`) or next-hop change: coalesced for
+  100 ms and sent immediately so failover and loop-free convergence stay fast.
+- Pure cost change (no state or route change): advertised when
+  `|measured - lastAdvertised| >= max(2% * lastAdvertised, 2 ms)` and at least
+  2 s have elapsed since the previous pure-cost advertisement from this node.
+- Two wire forms (**JSON** `advert` and **Compact** `ac`, version byte 2) remain
+  unchanged for rolling-upgrade compatibility (`TestRollingUpgrade`).
+- `seq` is `max(last+1, unix µs)`. Entries not refreshed for 30 s expire.
+- Limits: one 1024-byte control message per advertisement; per origin 20 new
+  ones/s (burst 40); per neighbor 50 invalid ones/s (burst 100), those that
+  do not decode or verify, past which its messages are dropped unread until
+  the bucket refills. Sound advertisements, forwarded or repeated, cost a
+  neighbor nothing: when a link goes down every relay advertises at once and
+  each neighbor forwards them all, which a limit on every message cut off
+  just when routes needed them. `Status().Drops` counts what was turned away,
+  by why (`advertDrops` in status.json).
 
-## Choosing a next hop
+## Choosing a next hop (smoothed path cost)
 
-Shortest paths by Dijkstra over the advertised links that neither end
-reports down or suppressed; ties broken by a hash of each link's two ends, the same on every
-relay. For each destination:
+For each destination `D`, the router evaluates every direct up neighbor `N`
+that can reach `D` (by Dijkstra over the advertised graph from `N` without
+passing back through self). Each neighbor `N` gives a real path cost
+`M(D, N) = linkCost(self, N) + dist(N, D)` and a toll count (number of
+`noTransit` relays transited).
 
-1. **Loop-free condition.** Neighbor N may be the next hop only if the path
-   N advertises (following each relay's advertised next hop from N) reaches
-   the destination without coming back here, over links that are up, at a
-   cost strictly below this relay's cost through its current next hop
-   (infinite when that route broke; see the convergence exception below). This also holds for the next hop in use:
-   once its advertised path loops back or breaks, the route moves at once
-   (reason `loop` or `down`).
-2. **Damping.** While the route in use works, the shortest path's next hop is
-   taken only when its path costs at least `switchMs` less (and, with
-   `switchPct`, more than that share less; reason `better`). The
-   persistence comes from the advertised costs, which change only after
-   `holdS`.
-3. **Fewer relays.** While the route in use works, a shortest path through
-   strictly fewer relays (counted on the advertised paths) is taken when it
-   costs at least `shorterMs` less (and `shorterPct`), and that held for
-   `holdS` on end (reason `shorter`), so a link that comes back after a
-   detour is used again. Not while the first link's flap penalty is above
-   750, else a flapping link would be taken back every time it is up.
-4. **Current path unusable.** Switch at once to the shortest path's next hop
-   if it is loop-free, otherwise to the cheapest loop-free neighbor, or to
-   none until advertisements catch up (reason `down`).
-5. **Flap damping.** A route that goes back, by `better` or `shorter`, to
-   the next hop it left by `better` or `shorter` less than 10 minutes
-   before has flapped (not within 30 s of its first advertised route, while
-   it converges). For 10 minutes after a flap, a move by `better` or
-   `shorter` waits until its rule has held for `flapHoldS` on end, doubled
-   with each further flap in those 10 minutes, at most `flapHoldMaxS`. Moves by
-   `down` and `loop` never wait, nor does the move back to the next hop a
-   route left by `down` once the link is usable again: an outage is still
-   bypassed within seconds and its end used as before. Spikes shorter than
-   the wait move a flapped route no more (`TestFlapDamping`).
+1. **Loop-free condition.** Neighbor `N` is loop-free if following advertised
+   next hops from `N` reaches `D` over up links without revisiting self and at
+   a real cost strictly below this router's cost through its current next hop
+   (infinite if the current path broke). If the current next hop loops back or
+   breaks, the route moves immediately (`loop` or `down`).
+2. **Per-neighbor smoothed cost `S(D, N)`.** For every usable neighbor `N`,
+   the router maintains an exponential moving average of `M(D, N)` updated on
+   each tick (`dt`) with half-life `smoothHalfLifeS`:
+   `S(D, N) += (M(D, N) - S(D, N)) * (1 - 2^(-dt / smoothHalfLifeS))`.
+   - When `N` first becomes usable for `D` (initial appearance or recovery
+     after being unreachable), `S(D, N)` starts at
+     `M(D, N) + startPenaltyMs * (1 + penalty / 1000)`, `penalty` the flap
+     penalty of the link to `N`: a link back from one outage pays about 1.6
+     times `startPenaltyMs` and is taken again within a minute or two when much
+     the better (87 s for a path 40% cheaper after a 20 s outage); one going
+     down again and again starts too high to draw routes before it goes.
+   - `S(D, N)` never gets further above `M(D, N)` than it started: one
+     started on a passing spike (a link's first probes, a round trip that just
+     fell) does not hold a much cheaper path off for minutes. A recovered link
+     keeps the pace above, the cap only meets a real cost that fell.
+   - Each `S(D, N)` draws its rate when it starts, 0.75 to 1.25 times the
+     half-life's, and keeps it: relays and routes seeing the same change do not
+     move together (babeld randomises its smoothing for the same reason).
+   - When `N` becomes unreachable, `S(D, N)` is deleted so re-appearance pays
+     the start penalty again.
+3. **Switching rule.** While the current next hop `cur` is up and loop-free:
+   - A loop-free neighbor `N` with strictly fewer `noTransit` tolls replaces
+     `cur` (`better`) once that has held for half a second (`transitWait`),
+     checked again against the latest advertisements at every step.
+   - Among loop-free neighbors with the same toll count, with
+     `margin(x) = max(x * switchPct / 100, switchMinMs)`, `N` replaces `cur`
+     (`better`) only when **both** real cost and smoothed cost clear it:
+     `M(D, N) <= M(D, cur) - margin(M(D, cur))` **and**
+     `S(D, N) <= S(D, cur) - margin(S(D, cur))`.
+   - If multiple neighbors qualify, the one with the lowest `S(D, N)` (then
+     `M(D, N)`, then deterministic tie-breaker) wins.
+4. **Current path unusable** (and at the start, with no route yet). Switch
+   immediately to the loop-free neighbor with the fewest tolls and the lowest
+   real cost `M`, or to none until advertisements catch up (`down`). Smoothing
+   does not delay this.
 
-These conditions use each relay's current view, not an atomic view of the
-whole network. With converged advertisements, the next hops decrease cost
-and are loop-free. During simultaneous failures, two neighboring relays
-can lose their links to the same destination before receiving each other's
-new advertisement. Rule 4 can then select each other using the old view,
-forming a transient forwarding loop even while the destination is online
-and reachable through another relay.
+This replaces the earlier five separate mechanisms (advert hold, shorter-hop
+rule, per-link probation, post-hoc flap damping, and fixed switch hysteresis)
+with a single continuous smoothed-cost rule.
 
-The loop clears when a fresh advertisement reaches either relay, directly
-or by flooding over another path. With delivery, its duration includes the
-control-path delay, advertisement scheduling and route-application ticks;
-the simulation covers delayed delivery and loss on the direct link. These
-are not a wall-clock upper bound under sustained advertisement loss or
-shared-link congestion, whose load effects have not been measured here.
-The packet TTL (64, `droppedTtl`) bounds each packet's forwarding, not the
-loop's duration. Immediate failover is retained rather than delaying every
-single-link failure while waiting for a new distributed view.
+Transient loops during simultaneous failures still clear as soon as a fresh
+advertisement arrives directly or via flooding; packet TTL (64, `droppedTtl`)
+bounds forwarding while advertisements are in flight. Loop-freedom is checked
+on what each relay has heard, so two neighbors moving within one
+advertisement's flight of each other can still point at each other for that
+long; the half second a move off no-transit relays waits keeps the case that
+caused such loops in the 11-21 replay, a path through one coming back to life
+and the relays on it all leaving it at once, from happening at all.
 
 ## No-transit relays
 
-`routing.noTransit` lists relays (a home or office router with little
-upload) that forward between two other relays only when no other path is
-left. A path's cost is ordered first by its tolls, the times it goes on
-through such a relay from a relay to a relay, then by cost and tie-breaker.
-No toll is paid where the path starts (the relay's own traffic, its subnets'
-and its members'), where it ends, toward a member (the relays a member
-enters by carry it as their own), or by a member at the relay it enters by.
-
-- A route through fewer tolls is taken at once by `better`, whatever it
-  costs and without flap damping: once the way around is up again, the
-  relay is left. Between paths with as many tolls the rules above hold on
-  their costs alone.
-- Status `cost` stays the paths' cost in ms; tolls do not show in it.
-- Older nodes ignore the list and may still route through such a relay; the
-  loop-free condition keeps mixed versions from looping.
+`routing.noTransit` lists relays that forward between two other relays only
+when no other path exists. Paths are ordered first by toll count, then by cost.
+A loop-free path with fewer tolls is taken (`better`) regardless of cost or
+smoothing, half a second after it first could be while the route in use still
+works (`held: "settling"` meanwhile), at once when that route breaks; paths with
+more tolls are never preferred while a lower-toll route works
+(`held: "transit"`).
 
 ## Static mode and fallback
 
-- `routing.mode` is `dynamic` (default) or `static`. Static uses
-  `nextHops` and nothing else; the relay still measures and advertises.
-- Until any advertisement has arrived, and again after all expired, a
-  destination uses its configured `nextHops`. Once advertisements gave a
-  destination a route, losing it means no route (never a stale static one).
-- A next hop change rewrites AllowedIPs through the engine's reroute hook;
-  sessions are kept. Nothing depends on the controller being online.
+- `routing.mode` is `dynamic` (default) or `static`. Static uses `nextHops` and
+  nothing else; the relay still measures and advertises.
+- Until any advertisement arrives, and after all expire, a destination uses
+  configured `nextHops`. Once dynamic routes exist, losing all paths yields no
+  route rather than a stale static one.
 
 ## Status and events
 
 `status.routing`: `{mode, links: [{peer, state, rttMs, jitterMs, loss, cost,
-penalty, advertised, heldMs?}], routes: [{dest, nextHop, cost, path, since, switches,
-best?, bestCost?, held?, until?}]}`. `cost` is the measured cost and
-`advertised` the one routes go by, `null` where infinite (link down or
-suppressed, no route); `path` is the path as the relays on the way advertise
-it, `[]` without a route; `since` is Unix ms; `switches` counts next hop
-changes after the first. While a route stays on its next hop and the
-shortest path's is another, `best` is that one, `bestCost` its cost along
-the next hops advertised, `held` why: `margin` (cheaper by less than the
-threshold), `hold` (the rule is met, until `until`), `damped` (flap damping,
-until `until`), `loop` (not loop-free yet), `penalty` (a shorter path over a
-link that went down lately), `transit` (through more no-transit relays).
+penalty, advertised}], routes: [{dest, nextHop, cost, smoothed?, path, since,
+switches, flips, best?, bestCost?, bestSmoothed?, held?}]}`.
 
-Events: `route.changed` (`<dest>: <old> -> <new> (<down|better|shorter|loop>)`, `none`
+- `cost` is the current route's real advertised cost and `smoothed` its
+  smoothed cost `S(D, cur)` (`null` / omitted when infinite).
+- `switches` counts next-hop changes after the first; `flips` counts voluntary
+  (`better`) moves back to a next hop left voluntarily within the last 5
+  minutes.
+- While a route stays on `cur` though another neighbor has a lower real cost
+  (or fewer tolls), `best` is that neighbor, `bestCost` its real cost,
+  `bestSmoothed` its smoothed cost, and `held` is one of:
+  - `margin`: the real costs, or the smoothed ones near them, differ by less
+    than the margin; nothing moves while the costs stay as they are
+  - `settling`: the real cost clears the margin and a smoothed cost is still
+    on its way, more than a margin from its real cost (a start penalty, or a
+    change the smoothing is catching up with); or a move off `noTransit`
+    relays waits its half second
+  - `loop`: not loop-free yet
+  - `transit`: crosses more `noTransit` relays
+
+Events: `route.changed` (`<dest>: <old> -> <new> (<down|better|loop>)`, `none`
 for no next hop), `link.suppressed` and `link.reused` (`<peer>: penalty N`),
-`link.held` and `link.released` (see Link metrics), `routing.error`.
+`routing.error`.
 
 ## Tests
 
 ```sh
 cd node && export HOME=/root GOTOOLCHAIN=local
-go test -race ./mesh/routing                      # rules on a fixed clock, sim.py replay
+go test -race ./mesh/routing
 go test -race -run 'TestRelayRouting|TestValidateRouting' ./mesh
+OBLAB_REAL_REPLAY=1 go test -v -run TestRealDataReplay -timeout 15m ./mesh/routing
 OBLAB_NETNS=1 OBLAB_ROUTING=1 OBLAB_OLD_NODE=/tmp/old-node go test -run 'TestRoutingNetns' -v -timeout 20m ./mesh   # root
 ```
 
-`TestRoutingNetnsTCPNoise` (`OBLAB_NOISE_MINUTES`, default 10) runs T, H, B
-with B 159 and 175 ms away over TCP links losing 1 %: no route may move
-more than twice, and a cut of T-B must still be bypassed within 5 s.
-`TestReplayMatchesSimulation` feeds the per-second probes behind `sim.py`
-(`testdata/sim-links.json`) to four routers. `TestRoutingNetnsFaults` runs
-H, T, S, L as real data planes in `oblab-rt-*` namespaces with sim.py's round
-trips and breaks H-T with netem (outage, flap, degrade), measuring the path
-of pings H→T by round trip and TTL. `TestRoutingNetnsNoLoops` runs four
-relays in a ring with a diagonal through cuts, flapping and partial
-isolation with pings in both diagonals at an IP TTL of 6, and checks
-`droppedTtl` stays 0. `TestRoutingNetnsRollingUpgrade` starts three relays as
-the version before (`OBLAB_OLD_NODE`, e.g. a copy of `node/bin`'s
-`openbear-node-linux-amd64` built before compact advertisements) and
-restarts them one by one as this version while all ping each other, checking
-that pings are lost only around a restart.
+- `TestRealDataReplay` replays real recorded relay link metrics from
+  `testdata/replay-real.json.gz` (5 min smoke by default; `OBLAB_REAL_REPLAY=1`
+  for 6 h slice; `OBLAB_REPLAY=1` for the full 48.3 h dataset) comparing
+  `legacy` against smoothed routing across `smoothHalfLifeS ∈ {8, 15, 30, 60}s`,
+  outputting a Markdown report and JSON summary to
+  `workspace/artifacts/mesh-replay/`.
+- `TestRoutingNetnsFaults`, `TestRoutingNetnsNoLoops`,
+  `TestRoutingNetnsTCPNoise` and `TestRoutingNetnsRollingUpgrade` run real data
+  planes in Linux network namespaces with `tc netem`.

@@ -50,18 +50,19 @@ func TestLinkMetrics(t *testing.T) {
 	l := link(t, r, "B")
 	near(t, "rtt", l.RTTMs, 10)
 	near(t, "jitter", l.JitterMs, 0)
-	near(t, "cost", l.Cost, 15) // 10 + bias 5
+	near(t, "cost", l.Cost, 10+5+DefaultTuning.HopCostMs) // rtt 10 + bias 5 + hopCost 2
 	r.Probe("B", ms(20))
 	// Medians: of the round trips 12, 10, 11, 20 the upper middle 12; of
 	// the distances from it, |20-12| alone so far.
 	l = link(t, r, "B")
 	near(t, "rtt", l.RTTMs, 12)
 	near(t, "jitter", l.JitterMs, 8)
-	near(t, "cost", l.Cost, 12+2*8+5)
+	near(t, "cost", l.Cost, 12+2*8+5+DefaultTuning.HopCostMs)
 	r.Lost("B")
 	l = link(t, r, "B")
-	near(t, "loss", l.Loss, 1.0/5)
-	near(t, "cost", l.Cost, 12+2*8+1000.0/5+5)
+	// First single loss in 100 probes is ignored.
+	near(t, "loss", l.Loss, 0)
+	near(t, "cost", l.Cost, 12+2*8+5+DefaultTuning.HopCostMs)
 	if l.State != StateUp {
 		t.Fatal("one lost probe is not down")
 	}
@@ -79,13 +80,26 @@ func TestLinkMetrics(t *testing.T) {
 		t.Fatal("staying down added to the penalty")
 	}
 	r.Probe("B", ms(13))
-	if l := link(t, r, "B"); l.State != StateUp || math.Abs(l.Loss-4.0/9) > 1e-9 {
+	// The four probes lost in the outage leave the loss rate once it answers:
+	// the outage costs through the penalty, not as loss.
+	if l := link(t, r, "B"); l.State != StateUp || l.Loss != 0 {
 		t.Fatalf("back up: %+v", l)
 	}
+	// Losses before the outage stay: one stray, then three more scattered.
+	for _, lost := range []bool{true, false, true, false, true, false, true, false} {
+		if lost {
+			r.Lost("B")
+		} else {
+			r.Probe("B", ms(13))
+		}
+	}
+	// 4 of the last 10 lost -> short window (0.4).
+	near(t, "loss of scattered losses", link(t, r, "B").Loss, 0.4)
 	for i := 0; i < 10; i++ {
 		r.Probe("B", ms(13))
 	}
-	near(t, "loss after ten probes", link(t, r, "B").Loss, 0)
+	// Short window cleared; 4 losses still in 100 -> (4-1)/100 = 0.03.
+	near(t, "loss after ten good probes", link(t, r, "B").Loss, 0.03)
 	now = now.Add(30 * time.Second)
 	r.Tick()
 	near(t, "penalty after a half-life", link(t, r, "B").Penalty, 500)
@@ -139,64 +153,56 @@ func TestLinkMetrics(t *testing.T) {
 	}
 }
 
-// legacyTuning is what the parameters were before the config set them: a
-// route moved for 20 % and more than 10 ms, a link's cost was advertised
-// again once it moved by 20 % and 10 ms. The tests of the dynamics written
-// for them, and the replay of the simulation, keep them. A route moved for
-// more than 10 ms: costs are in tenths, so at least 10.1.
-var legacyTuning = Tuning{SwitchMs: 10.1, SwitchPct: 20, ShorterMs: 3, ShorterPct: 5, AdvertMs: 10, AdvertPct: 20, Hold: 5 * time.Second,
-	JitterWeight: 2, LossWeight: 1000, FlapHold: time.Minute, FlapHoldMax: 8 * time.Minute}
-
-// TestAdvertisedCostThreshold: the cost a link is routed by changes only
-// when the measured cost has differed by more than AdvertMs (2 ms by
-// default; 10 ms and 20 % with legacyTuning) for Hold.
+// TestAdvertisedCostThreshold: the cost a link advertises updates once the
+// measured cost moves by at least max(2% of the larger, 2 ms), with no 5s
+// hold; state changes go out after advertGap (100 ms), while pure cost changes
+// are rate-limited to once every 2 seconds per origin.
 func TestAdvertisedCostThreshold(t *testing.T) {
 	for _, c := range []struct {
-		tune                 *Tuning
 		measured, advertised float64
 		want                 bool
 	}{
-		{&legacyTuning, 100, 100, false}, {&legacyTuning, 85, 100, false}, {&legacyTuning, 79, 100, true}, {&legacyTuning, 125.1, 100, true},
-		{&legacyTuning, 124, 100, false}, {&legacyTuning, 2, 10, false}, {&legacyTuning, 21, 10, true}, {&legacyTuning, 19.9, 10, false},
-		{&legacyTuning, 3, 14, true},
-		{&DefaultTuning, 25, 31.4, true}, {&DefaultTuning, 30, 31.4, false}, {&DefaultTuning, 102, 100, false}, {&DefaultTuning, 102.1, 100, true},
+		{100, 100, false},
+		{101.9, 100, false},
+		{102.1, 100, true},
+		{98.1, 100, false},
+		{98.0, 100, true},
+		{11.9, 10, false},
+		{12.0, 10, true},
+		{8.1, 10, false},
+		{8.0, 10, true},
 	} {
-		if got := c.tune.differs(c.measured, c.advertised); got != c.want {
-			t.Errorf("differs(%v, %v) with %+v = %v", c.measured, c.advertised, *c.tune, got)
+		if got := costDiffers(c.measured, c.advertised); got != c.want {
+			t.Errorf("costDiffers(%v, %v) = %v, want %v", c.measured, c.advertised, got, c.want)
 		}
 	}
-	now := time.Unix(0, 0)
-	m := newMetric(0, &legacyTuning)
-	for i := 0; i < warmSamples; i++ {
-		m.sample(10*time.Millisecond, false, now)
+	now := time.Unix(1_800_000_000, 0)
+	r := New(signed(Config{Self: "A", Relays: []string{"B"}, Links: []string{"B"}}), func() time.Time { return now }, nil)
+	for range warmSamples {
+		r.Probe("B", 10*time.Millisecond)
 	}
-	if !m.settle(now) || m.advState != StateUp || m.advCost != 10 {
-		t.Fatalf("warmed up: %+v", m)
+	if msgs := r.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"}); len(msgs) != 1 {
+		t.Fatalf("initial advert: %d", len(msgs))
 	}
-	m.rtt = 40
-	for d := time.Duration(0); d < legacyTuning.Hold; d += 100 * time.Millisecond {
-		if m.settle(now.Add(d)) {
-			t.Fatalf("advertised after %v", d)
-		}
+	// Pure cost change: not sent before costAdvertGap (2s), sent at 2s.
+	for range 5 {
+		r.Probe("B", 40*time.Millisecond)
 	}
-	if !m.settle(now.Add(legacyTuning.Hold)) || m.advCost != 40 {
-		t.Fatalf("not advertised after %v: %+v", legacyTuning.Hold, m)
+	now = now.Add(time.Second)
+	if msgs := r.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"}); len(msgs) != 0 {
+		t.Fatalf("pure cost advert sent after 1s")
 	}
-	// An interruption starts the 5 s again.
-	m.rtt = 100
-	m.settle(now.Add(10 * time.Second))
-	m.rtt = 45
-	m.settle(now.Add(12 * time.Second))
-	m.rtt = 100
-	if m.settle(now.Add(15*time.Second)) || m.settle(now.Add(19900*time.Millisecond)) || !m.settle(now.Add(20*time.Second)) {
-		t.Fatal("the interruption did not restart the hold")
+	now = now.Add(time.Second)
+	if msgs := r.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"}); len(msgs) != 1 {
+		t.Fatalf("pure cost advert not sent after 2s")
 	}
-	// A state change is advertised at once.
-	m.sample(0, true, now.Add(18*time.Second))
-	m.sample(0, true, now.Add(18*time.Second))
-	m.sample(0, true, now.Add(18*time.Second))
-	if !m.settle(now.Add(18*time.Second)) || m.advState != StateDown {
-		t.Fatal("down was not advertised at once")
+	// State change (down) goes out after advertGap (100ms), not waiting 1s.
+	r.Lost("B")
+	r.Lost("B")
+	r.Lost("B")
+	now = now.Add(advertGap)
+	if msgs := r.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"}); len(msgs) != 1 {
+		t.Fatalf("state change advert not sent after advertGap")
 	}
 }
 
@@ -215,30 +221,31 @@ func triangle(t *testing.T) *testNet {
 	return n
 }
 
-// TestBetterPathNeedsFiveSeconds: a sustained increase of A-B moves A↔B
-// to C 5 s after it shows in the medians, at its third probe, both ways
-// at once; a change within the threshold moves nothing.
-func TestBetterPathNeedsFiveSeconds(t *testing.T) {
+// TestBetterPathSmoothSwitch: small noise does not move the route; a sustained
+// large increase of A-B moves A<->B to C once smoothed costs cross the margin.
+func TestBetterPathSmoothSwitch(t *testing.T) {
 	n := triangle(t)
 	second := func(ab float64) {
 		n.probe("A", "B", ab)
 		n.probe("A", "C", 10)
 		n.probe("B", "C", 10)
 	}
-	// 19 ms is above C's 20 ms path minus nothing: within 10 ms of 10, never advertised.
+	// Settle initial start penalty on both paths.
+	for i := 0; i < 400; i++ {
+		second(10)
+		n.run(time.Second, nil)
+	}
+	// Small increase (15 ms direct vs 24 ms via C): still cheaper, no switch.
 	for i := 0; i < 20; i++ {
 		second(15)
 		n.run(time.Second, nil)
 	}
 	if n.hop("A", "B") != "B" {
-		t.Fatal("a change within the threshold moved the route")
+		t.Fatal("a small increase moved the route")
 	}
 	start := n.now
-	// The third 60 makes the median: cost 60, differs from 15.
-	second(60)
 	var moved, back time.Duration
-	n.run(time.Second, nil)
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 60; i++ {
 		second(60)
 		n.run(time.Second, func() {
 			if moved == 0 && n.hop("A", "B") == "C" {
@@ -249,8 +256,8 @@ func TestBetterPathNeedsFiveSeconds(t *testing.T) {
 			}
 		})
 	}
-	if want := 2*time.Second + DefaultTuning.Hold; moved < want || moved > want+20*time.Millisecond || back-moved > 20*time.Millisecond {
-		t.Fatalf("A moved after %v, B after %v; want %v", moved, back, want)
+	if moved == 0 || moved > 45*time.Second || back == 0 || back > 45*time.Second {
+		t.Fatalf("A moved after %v, B after %v; want within 45s", moved, back)
 	}
 	if e := n.eventsOf("A", "route.changed"); !slices.Contains(e, "B: B -> C (better)") {
 		t.Fatal(e)
@@ -297,13 +304,26 @@ type solo struct {
 }
 
 func newSolo(t *testing.T, relays, links []string, hops map[string]string) *solo {
-	return newSoloTuned(t, relays, links, hops, &legacyTuning)
+	return newSoloTuned(t, relays, links, hops, &DefaultTuning)
 }
 
 func newSoloTuned(t *testing.T, relays, links []string, hops map[string]string, tune *Tuning) *solo {
 	s := &solo{t: t, now: time.Unix(1_800_000_000, 0), seq: map[string]uint64{}}
 	s.r = New(signed(Config{Self: "A", Relays: relays, Links: links, NextHops: hops, Tuning: tune}), func() time.Time { return s.now }, func(k, d string) { s.ev = append(s.ev, k+" "+d) })
+	s.r.setRandSeed(0x123456789abcdef0, 0xfedcba9876543210)
 	return s
+}
+
+func (s *solo) advance(d time.Duration) {
+	steps := int(d / time.Second)
+	for range steps {
+		s.now = s.now.Add(time.Second)
+		s.r.Tick()
+	}
+	if rem := d - time.Duration(steps)*time.Second; rem > 0 {
+		s.now = s.now.Add(rem)
+		s.r.Tick()
+	}
 }
 
 // advert sends origin's advertisement through from: links are peer:cost
@@ -387,6 +407,13 @@ func (s *solo) hop(d string) string {
 // routing back through this relay, the route moves at once.
 func TestRetainedNextHopMustStayLoopFree(t *testing.T) {
 	s := diamond(t)
+	// Let both paths settle their initial start penalty before the fault.
+	for range 60 {
+		s.advance(10 * time.Second)
+		s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "D"})
+		s.advert("C", "C", map[string]float64{"A": 10, "D": 30}, map[string]string{"B": "A", "D": "D"})
+		s.advert("B", "D", map[string]float64{"B": 10, "C": 30}, map[string]string{"B": "B", "C": "C"})
+	}
 	// B now says it reaches D through A, while its link to D still shows up.
 	s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "A"})
 	if s.hop("D") != "C" {
@@ -395,16 +422,30 @@ func TestRetainedNextHopMustStayLoopFree(t *testing.T) {
 	if !slices.Contains(s.ev, "route.changed D: B -> C (loop)") {
 		t.Fatal(s.ev)
 	}
-	// B's path is loop-free again and shorter: back to it, as better.
+	// B's path is loop-free again and cheaper: because it was loop-unsafe,
+	// it starts with StartPenaltyMs and settles back to B.
 	s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "D"})
+	if s.hop("D") != "C" {
+		t.Fatalf("A jumped back to B immediately despite start penalty: %s", s.hop("D"))
+	}
+	if st := routeTo(s.r, "D"); st.Held != HeldSettling || st.Best != "B" {
+		t.Fatalf("want B settling, got %+v", st)
+	}
+	// Refresh adverts periodically while smoothing settles so lsdb does not expire.
+	for range 50 {
+		s.advance(10 * time.Second)
+		s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "D"})
+		s.advert("C", "C", map[string]float64{"A": 10, "D": 30}, map[string]string{"B": "A", "D": "D"})
+		s.advert("B", "D", map[string]float64{"B": 10, "C": 30}, map[string]string{"B": "B", "C": "C"})
+	}
 	if s.hop("D") != "B" || !slices.Contains(s.ev, "route.changed D: C -> B (better)") {
 		t.Fatal(s.hop("D"), s.ev)
 	}
 }
 
-// TestNextHopWaitsForLoopFreePath: the shortest path's next hop is taken
-// only once its own advertised path no longer comes back here and is
-// cheaper than the route in use; until then the route in use stays.
+// TestNextHopWaitsForLoopFreePath: the cheaper next hop is taken only once its
+// own advertised path no longer comes back here and its smoothed cost catches
+// up; until then the route in use stays.
 func TestNextHopWaitsForLoopFreePath(t *testing.T) {
 	s := diamond(t)
 	// B-D goes down: A moves to C, and B, until it hears of it, still says D through D.
@@ -419,10 +460,16 @@ func TestNextHopWaitsForLoopFreePath(t *testing.T) {
 	if s.hop("D") != "C" {
 		t.Fatalf("A moved to %s while B routes through A", s.hop("D"))
 	}
-	// B advertises D direct but on a path costing as much as A's route: still wait.
+	// B advertises D direct: loop-free again, settles back to B.
 	s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "D"})
+	for range 50 {
+		s.advance(10 * time.Second)
+		s.advert("B", "B", map[string]float64{"A": 10, "D": 10}, map[string]string{"C": "A", "D": "D"})
+		s.advert("C", "C", map[string]float64{"A": 10, "D": 30}, map[string]string{"B": "A", "D": "D"})
+		s.advert("B", "D", map[string]float64{"B": 10, "C": 30}, map[string]string{"B": "B", "C": "C"})
+	}
 	if s.hop("D") != "B" {
-		t.Fatalf("A to D through %s once B's path is loop-free", s.hop("D"))
+		t.Fatalf("A to D through %s once B's path is loop-free and settled", s.hop("D"))
 	}
 }
 
@@ -434,48 +481,56 @@ func TestCurrentCostBoundsTheNewNextHop(t *testing.T) {
 	s.advert("C", "D", map[string]float64{"B": 10, "C": 1}, map[string]string{"B": "B", "C": "C"})
 	s.advert("C", "C", map[string]float64{"A": 10, "D": 1}, map[string]string{"B": "A", "D": "B"})
 	s.advert("C", "B", map[string]float64{"A": 10, "D": 10, "C": 40}, map[string]string{"C": "C", "D": "D"})
-	// Shortest: A-C-D 11; C's own path C-B-D costs 50, above A's 20.
+	// Shortest: A-C-D; C's own path C-B-D costs 50, above A's 22.
 	if s.hop("D") != "B" {
 		t.Fatalf("A took %s", s.hop("D"))
 	}
-	// C's path is loop-free and cheaper, but only by 9 ms: below the switch
-	// margin, A keeps B.
+	// C's path is now loop-free and cheaper (13 vs 22): settles and switches to C.
 	s.advert("C", "C", map[string]float64{"A": 10, "D": 1}, map[string]string{"B": "A", "D": "D"})
-	if s.hop("D") != "B" {
-		t.Fatalf("A moved to %s for 9 ms", s.hop("D"))
+	for range 50 {
+		s.advance(10 * time.Second)
+		s.advert("C", "D", map[string]float64{"B": 10, "C": 1}, map[string]string{"B": "B", "C": "C"})
+		s.advert("C", "C", map[string]float64{"A": 10, "D": 1}, map[string]string{"B": "A", "D": "D"})
+		s.advert("C", "B", map[string]float64{"A": 10, "D": 10, "C": 40}, map[string]string{"C": "C", "D": "D"})
 	}
-	// B-D costs 20: A through B 30, through C 11, below 0.8 of it and 19 ms less.
-	s.advert("C", "B", map[string]float64{"A": 10, "D": 20, "C": 40}, map[string]string{"C": "C", "D": "D"})
 	if s.hop("D") != "C" || !slices.Contains(s.ev, "route.changed D: B -> C (better)") {
 		t.Fatalf("A to D through %s: %v", s.hop("D"), s.ev)
 	}
 }
 
 // TestPathSwitchThreshold: with the route in use working, a cheaper path
-// is taken only below 0.8 of its cost and more than 10 ms cheaper.
+// moves only when both real and smoothed costs beat max(SwitchPct% * cur, SwitchMinMs).
 func TestPathSwitchThreshold(t *testing.T) {
-	// A-B and A-C cost 10; A reaches D through B for 10 + bd, through C
-	// for 10 + cd.
+	// A-B and A-C cost 12 (rtt 10 + hopCost 2); A reaches D through B for 12 + bd,
+	// through C for 12 + cd. With defaults 5% / 2ms:
 	cases := []struct {
 		cd, bd float64
 		want   string
 	}{
-		{1, 10, "B"},  // 11 against 20: 9 ms cheaper
-		{38, 50, "B"}, // 48 against 60: exactly 0.8
-		{37, 50, "C"}, // 47 against 60: below 0.8, 13 ms cheaper
-		{45, 50, "B"}, // 55 against 60
-		{100, 200, "C"},
+		{47.5, 50, "B"}, // 59.5 vs 62: 2.5 ms < max(5%=3.1, 2ms)=3.1ms
+		{46, 50, "C"},   // 58 vs 62: 4 ms >= 3.1ms
+		{188, 200, "C"}, // 200 vs 212: 12 ms >= max(5%=10.6, 5ms)=10.6ms
+		{192, 200, "B"}, // 204 vs 212: 8 ms < 10.6ms
 	}
 	for _, c := range cases {
 		s := newSolo(t, []string{"B", "C", "D"}, []string{"B", "C"}, map[string]string{"D": "B"})
 		s.up("B", 10)
 		s.up("C", 10)
-		s.advert("B", "B", map[string]float64{"A": 10, "D": c.bd}, map[string]string{"C": "A", "D": "D"})
+		refresh := func() {
+			s.advert("B", "B", map[string]float64{"A": 12, "D": c.bd}, map[string]string{"C": "A", "D": "D"})
+			s.advert("B", "D", map[string]float64{"B": c.bd, "C": c.cd}, map[string]string{"B": "B", "C": "C"})
+			s.advert("C", "C", map[string]float64{"A": 12, "D": c.cd}, map[string]string{"B": "A", "D": "D"})
+		}
+		// Start with B alone so B is current, then bring C up and let smoothing settle.
+		s.advert("B", "B", map[string]float64{"A": 12, "D": c.bd}, map[string]string{"C": "A", "D": "D"})
 		s.advert("B", "D", map[string]float64{"B": c.bd, "C": c.cd}, map[string]string{"B": "B", "C": "C"})
 		if s.hop("D") != "B" {
 			t.Fatalf("%+v: A to D through %s before C's advertisement", c, s.hop("D"))
 		}
-		s.advert("C", "C", map[string]float64{"A": 10, "D": c.cd}, map[string]string{"B": "A", "D": "D"})
+		for range 80 {
+			refresh()
+			s.advance(10 * time.Second)
+		}
 		if s.hop("D") != c.want {
 			t.Errorf("%+v: A to D through %s, want %s", c, s.hop("D"), c.want)
 		}
@@ -555,7 +610,7 @@ func TestStaticAndFallback(t *testing.T) {
 		t.Fatal("static mode: A to C through", s.hop("C"))
 	}
 	// Static mode still advertises its links and the hops it uses.
-	if raw := string(s.ownJSON(1000)); !strings.Contains(raw, `["C",10,"u"]`) || !strings.Contains(raw, `["C","B"]`) {
+	if raw := string(s.ownJSON(1000)); !strings.Contains(raw, `["C",12,"u"]`) || !strings.Contains(raw, `["C","B"]`) {
 		t.Fatal(raw)
 	}
 }
@@ -598,16 +653,38 @@ func TestAdvertLimits(t *testing.T) {
 	if _, err := s.advert("B", "C", map[string]float64{"B": 1}, nil); err != nil {
 		t.Fatal("refused after a second:", err)
 	}
-	// One neighbor: 100 messages at once, then 50 a second.
+	// One neighbor: sound messages, an old one again included, cost it
+	// nothing; 100 invalid ones at once, then 50 a second, are read, and past
+	// them its messages are dropped unread, a sound one too.
 	s.now = s.now.Add(time.Minute)
-	n := 0
 	for i := 0; i < 200; i++ {
-		if _, _, err := s.recv("B", []byte(`{"o":"C","s":1,"l":[]}`)); err != errRate {
-			n++
+		if _, _, err := s.recv("B", []byte(`{"o":"C","s":1,"l":[]}`)); err != nil {
+			t.Fatalf("an old advertisement again, %d: %v", i, err)
 		}
 	}
-	if n != senderBurst {
-		t.Fatalf("neighbor sent %d of 200 at once", n)
+	verified := s.r.Verified()
+	forged := []byte(`{"o":"C","s":999,"l":[]}`)
+	n := 0
+	for i := 0; i < 200; i++ {
+		_, _, err := s.r.Receive("B", Message{Format: FormatJSON, Raw: forged, Sig: advertInput("n", FormatJSON, forged).Sign(testKey("B"))}, Budget{1000, 1000})
+		if err == ErrSignature {
+			n++
+		} else if err != errThrottled {
+			t.Fatalf("forged %d: %v", i, err)
+		}
+	}
+	if n != senderBurst || s.r.Verified() != verified {
+		t.Fatalf("read %d of 200 forged at once, want %.0f; verified %d", n, senderBurst, s.r.Verified()-verified)
+	}
+	if _, err := s.advert("B", "C", map[string]float64{"B": 1}, nil); err != errThrottled {
+		t.Fatalf("a sound one while throttled: %v", err)
+	}
+	s.now = s.now.Add(time.Second)
+	if _, err := s.advert("B", "C", map[string]float64{"B": 1}, nil); err != nil {
+		t.Fatal("refused after a second:", err)
+	}
+	if d := s.r.Status().Drops; d.Signature != senderBurst || d.Throttled != 101 || d.Unlinked != 1 || d.OriginRate != 20 || d.Malformed != uint64(len(bad)) {
+		t.Fatalf("drops %+v", d)
 	}
 	// This relay's own advertisements: at once when something changed, but
 	// at most every 100 ms; otherwise every 5 s.
@@ -717,8 +794,14 @@ func TestFourRelaysNoLoops(t *testing.T) {
 			second()
 		}
 		down[f.link] = false
-		for i := 0; i < 120; i++ { // past suppression
-			second()
+		for i := 0; i < 900; i++ { // past 100-probe loss window, suppression, and cascaded 60s smoothing
+			for l, v := range rtt {
+				a, b, _ := strings.Cut(l, "-")
+				n.cut(a, b, false)
+				n.probe(a, b, v)
+			}
+			n.runFastSecond()
+			check()
 		}
 		settled(f.link + " back")
 	}
@@ -761,8 +844,21 @@ func TestNoMicroloopWhileConverging(t *testing.T) {
 		}
 		n.run(time.Second, check)
 	}
-	for i := 0; i < 5; i++ {
-		second()
+	for i := 0; i < 400; i++ {
+		for l, v := range rtt {
+			a, b, _ := strings.Cut(l, "-")
+			n.cut(a, b, false)
+			n.probe(a, b, v)
+		}
+		if i < 5 {
+			n.run(time.Second, check)
+		} else {
+			n.runFastSecond()
+			check()
+		}
+		if p, _ := n.path("C", "D"); slices.Equal(p, []string{"C", "A", "B", "D"}) {
+			break
+		}
 	}
 	if p, _ := n.path("C", "D"); !slices.Equal(p, []string{"C", "A", "B", "D"}) {
 		t.Fatal("C to D along", p)
@@ -892,21 +988,27 @@ func TestLeafRouting(t *testing.T) {
 	if nh, ok := rA.NextHop("N"); !ok || nh != "N" {
 		t.Fatalf("rA NextHop(N) = %q, %v; want N", nh, ok)
 	}
-	// Make A-B 20ms so A-B-N is 20+10=30ms < 80ms.
-	now = now.Add(10 * time.Second)
-	for i := 0; i < rttMedian*2; i++ {
+	// Make A-B 20ms so A-B-N is 20+10 < 80ms; advance time so smoothed costs settle.
+	for range 360 {
+		now = now.Add(time.Second)
 		rA.Probe("B", ms(20))
 		rB.Probe("A", ms(20))
+		rA.Probe("N", ms(80))
+		rA.Probe("M", ms(5))
+		rB.Probe("N", ms(10))
+		rB.Probe("M", ms(5))
+		rA.Tick()
+		rB.Tick()
+		rM.Tick()
+		for _, m := range rA.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"}) {
+			rB.Receive("A", m, Budget{JSON: 1000, Compact: 1000})
+			rM.Receive("A", m, Budget{JSON: 1000, Compact: 1000})
+		}
+		for _, m := range rB.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"A"}) {
+			rA.Receive("B", m, Budget{JSON: 1000, Compact: 1000})
+			rM.Receive("B", m, Budget{JSON: 1000, Compact: 1000})
+		}
 	}
-	now = now.Add(DefaultTuning.Hold + time.Second)
-	rA.Tick()
-	rB.Tick()
-	advA = rA.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"B"})
-	advB = rB.Advert(Budget{JSON: 1000, Compact: 1000}, []string{"A"})
-	rB.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000})
-	rA.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000})
-	rM.Receive("A", advA[0], Budget{JSON: 1000, Compact: 1000})
-	rM.Receive("B", advB[0], Budget{JSON: 1000, Compact: 1000})
 
 	// Now A->N should route via B (20+10=30ms vs 80ms).
 	if nh, ok := rA.NextHop("N"); !ok || nh != "B" {
@@ -921,5 +1023,40 @@ func TestLeafRouting(t *testing.T) {
 	}
 	if nh, ok := rM.NextHop("B"); !ok || nh != "B" {
 		t.Fatalf("rM NextHop(B) = %q, %v; want B", nh, ok)
+	}
+}
+
+// TestAdvertBurstOfAllRelays: a link going down has every relay advertise
+// at once, as often as advertGap lets it, and each neighbor forwards them
+// all. Forty origins for three seconds, each advertisement through both of
+// A's neighbors: A takes each the first time, drops none, and ends on every
+// origin's last.
+func TestAdvertBurstOfAllRelays(t *testing.T) {
+	relays := []string{"B", "D"}
+	for i := 0; i < 40; i++ {
+		relays = append(relays, fmt.Sprintf("O%02d", i))
+	}
+	s := newSolo(t, relays, []string{"B", "D"}, nil)
+	s.up("B", 10)
+	s.up("D", 10)
+	for step := 0; step < 30; step++ {
+		for _, o := range relays[2:] {
+			s.seq[o]++
+			raw := []byte(fmt.Sprintf(`{"o":%q,"s":%d,"l":[["B",%d,"u"]]}`, o, s.seq[o], 10+step))
+			for _, from := range []string{"B", "D"} {
+				if _, _, err := s.recv(from, raw); err != nil {
+					t.Fatalf("step %d, %s through %s: %v", step, o, from, err)
+				}
+			}
+		}
+		s.now = s.now.Add(advertGap)
+	}
+	if d := s.r.Status().Drops; d != (AdvertDrops{}) {
+		t.Fatalf("drops %+v", d)
+	}
+	for _, o := range relays[2:] {
+		if a := s.r.lsdb[o]; a == nil || a.seq != s.seq[o] {
+			t.Fatalf("%s holds %v, want seq %d", o, a, s.seq[o])
+		}
 	}
 }

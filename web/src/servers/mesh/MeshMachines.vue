@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue';
 import { flag, regionName } from '../serverHelpers.js';
 import { mesh } from './meshStore.js';
-import { errorMessage, errorsUnder, ipKey, isRelay, isSite, msText, nameOf, nodeAlerts, nodeState, PROGRESS, progressOf, transportLabel, warningItems, WARNINGS_TO_FIX } from './meshHelpers.js';
+import { entryVia, errorMessage, errorsUnder, ipKey, isRelay, isSite, msText, nameOf, nodeAlerts, nodeState, PROGRESS, progressOf, warningItems, WARNINGS_TO_FIX } from './meshHelpers.js';
 import { containerOf } from './meshGroups.js';
 
 // Every node in the mesh by its mesh address, one row each: what it is, what it does, how it is connected and how it
@@ -29,7 +29,7 @@ function connection(m) {
   if (!c) return (m.entry?.candidates || []).length ? '接入的中转不在组网里' : '还没有设置怎么连进组网';
   const l = lineOf('entry', id, c.relay);
   const more = m.entry?.mode === 'upstreams' ? (m.entry.candidates || []).filter(x => x.relay !== c.relay && relaySet.value.has(x.relay)).length : 0;
-  return [`经 ${nameOf(members.value, c.relay)}${more > 0 ? ` +${more}` : ''}`, transportLabel(l?.transport || m.entry.candidates.find(x => x.relay === c.relay)?.transport), Number.isFinite(l?.rttMs) ? msText(l.rttMs) : ''].filter(Boolean).join(' · ');
+  return [`经 ${nameOf(members.value, c.relay)}${more > 0 ? ` +${more}` : ''}`, entryVia(l?.lan, l?.transport || m.entry.candidates.find(x => x.relay === c.relay)?.transport), Number.isFinite(l?.rttMs) ? msText(l.rttMs) : ''].filter(Boolean).join(' · ');
 }
 function features(m) {
   const out = [];

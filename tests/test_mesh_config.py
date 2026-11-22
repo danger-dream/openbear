@@ -11,7 +11,7 @@ import pytest
 from app.notice_names import telegram_html
 from app.servers import compat, mesh_config, mesh_status
 from app.servers import mesh_model as model
-from app.servers.mesh_config import build, config_hash, instance_access, next_hops, relay_pairs
+from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build, config_hash, instance_access, next_hops, relay_pairs
 from app.servers.mesh_path import find
 
 # Base64 of 32 bytes, as nodes report them: the configs leave out a member whose keys are not.
@@ -116,7 +116,7 @@ def test_no_transit_warns_of_relays_left_with_no_way_around_and_of_old_data_plan
     d = doc(shy('r1'), shy('r2'), member('r3', 'relay'), relay_links=links)
     f = facts()
     for sid in f:
-        f[sid]['features'] = frozenset({mesh_config.NO_TRANSIT_FEATURE, mesh_config.TUNING_FEATURE})
+        f[sid]['features'] = frozenset({mesh_config.NO_TRANSIT_FEATURE, mesh_config.TUNING_FEATURE, mesh_config.SMOOTH_FEATURE})
     hints = {(h['path'], h['error']): h['message'] for h in model.hints(d, f)}
     assert set(hints) == {('members[0].noTransit', 'mesh_no_transit_only_way')}
     assert hints[('members[0].noTransit', 'mesh_no_transit_only_way')] == 'R1 只和同样不中转的 R2 相连，它的流量也要借道它们。'
@@ -125,7 +125,7 @@ def test_no_transit_warns_of_relays_left_with_no_way_around_and_of_old_data_plan
     assert hints == {('members[2]', 'mesh_no_transit_only_way'): 'R3 和其余中转之间只能经不中转的 R2 相连，这部分流量会一直借道它们；给它们加一条到其他中转的线路就能避开。'}
     links['pairs'].append(pair('r1', 'r3'))
     assert not model.hints(d, f)
-    f['r3']['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE})
+    f['r3']['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE, mesh_config.SMOOTH_FEATURE})
     assert [(h['path'], h['error']) for h in model.hints(d, f)] == [('members[1].noTransit', 'mesh_no_transit_outdated')]
     # Offline, what it reads is not known: nothing said.
     f['r3']['features'] = frozenset()
@@ -135,29 +135,41 @@ def test_no_transit_warns_of_relays_left_with_no_way_around_and_of_old_data_plan
 def test_routing_settings_default_are_checked_and_sent_with_a_warning_for_old_data_planes():
     d = doc(member('r1', 'relay'), member('r2', 'relay'), member('m1'))
     assert d['settings']['routing'] == mesh_config.default_routing() == {
-        'switchMs': 5, 'switchPct': 0, 'shorterMs': 3, 'shorterPct': 0, 'advertMs': 2, 'advertPct': 0, 'holdS': 5, 'jitterWeight': 2,
-        'lossWeight': 1000, 'flapHoldS': 60, 'flapHoldMaxS': 480}
+        'smoothHalfLifeS': 60, 'switchPct': 5, 'switchMinMs': 2, 'hopCostMs': 2,
+        'startPenaltyMs': 150, 'jitterWeight': 2, 'lossWeight': 1000}
     # A document stored before the setting takes the defaults.
     old = copy.deepcopy(d)
     del old['settings']['routing']
     assert model.upgrade(old)['settings']['routing'] == mesh_config.default_routing()
-    on = model.clean_doc({'settings': {'routing': {'switchMs': 3, 'switchPct': 10, 'holdS': 2.5}}}, d)
-    assert on['settings']['routing'] == {**mesh_config.default_routing(), 'switchMs': 3, 'switchPct': 10, 'holdS': 2.5}
-    configs = build(on, facts(), 'net', 1)
+    # A document with legacy tuning keys drops them silently and adopts the new defaults.
+    legacy = copy.deepcopy(d)
+    legacy['settings']['routing'] = dict(mesh_config.LEGACY_TUNING, switchMs=12)
+    assert model.upgrade(legacy)['settings']['routing'] == mesh_config.default_routing()
+    on = model.clean_doc({'settings': {'routing': {'smoothHalfLifeS': 30, 'switchPct': 10, 'switchMinMs': 3}}}, d)
+    assert on['settings']['routing'] == {**mesh_config.default_routing(), 'smoothHalfLifeS': 30, 'switchPct': 10, 'switchMinMs': 3}
+    f = facts()
+    for sid in f:
+        f[sid]['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE, mesh_config.SMOOTH_FEATURE})
+    configs = build(on, f, 'net', 1)
     assert configs['r1']['routing']['tuning'] == configs['r2']['routing']['tuning'] == on['settings']['routing']
     # Partial changes keep the rest.
-    assert model.clean_doc({'settings': {'routing': {'lossWeight': 0}}}, on)['settings']['routing']['switchMs'] == 3
-    for bad, path in (({'switchMs': -1}, 'settings.routing.switchMs'), ({'switchPct': 95}, 'settings.routing.switchPct'), ({'holdS': True}, 'settings.routing.holdS'),
-                      ({'flapHoldS': 600, 'flapHoldMaxS': 300}, 'settings.routing.flapHoldMaxS'), ({'other': 1}, 'settings.routing')):
+    assert model.clean_doc({'settings': {'routing': {'lossWeight': 0}}}, on)['settings']['routing']['smoothHalfLifeS'] == 30
+    for bad, path in (({'smoothHalfLifeS': 0}, 'settings.routing.smoothHalfLifeS'), ({'switchPct': 95}, 'settings.routing.switchPct'),
+                      ({'switchMinMs': True}, 'settings.routing.switchMinMs'), ({'other': 1}, 'settings.routing')):
         with pytest.raises(model.MeshInvalid) as raised:
             model.clean_doc({'settings': {'routing': bad}}, d)
         assert [e['path'] for e in raised.value.errors] == [path], bad
-    f = facts()
-    for sid in f:
-        f[sid]['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE})
     assert not model.hints(d, f)
-    f['r2']['features'] = frozenset({'mesh'})
+    # A node lacking SMOOTH_FEATURE gets LEGACY_TUNING and triggers mesh_tuning_outdated.
+    f['r2']['features'] = frozenset({'mesh', mesh_config.TUNING_FEATURE})
     assert [(h['path'], h['error']) for h in model.hints(d, f)] == [('settings.routing', 'mesh_tuning_outdated')]
+    mixed = build(on, f, 'net', 1)
+    assert mixed['r1']['routing']['tuning'] == on['settings']['routing']
+    assert mixed['r2']['routing']['tuning'] == mesh_config.LEGACY_TUNING
+    # One that has declared nothing gets them too: a data plane of the version before reads the new
+    # fields' absence as zeros (switchMs 0, lossWeight 0).
+    f['r2']['features'] = frozenset()
+    assert build(on, f, 'net', 1)['r2']['routing']['tuning'] == mesh_config.LEGACY_TUNING
 
 def test_a_relay_without_a_path_is_unreachable_and_refused():
     links = {'mode': 'custom', 'pairs': [pair('r1', 'r2')]}
@@ -400,6 +412,52 @@ def test_a_member_on_its_site_relays_network_enters_it_at_the_lan_address():
     assert all('endpoint' not in link for link in build(d, f, 'net', 1)['gw']['links'] if link['peer'] == 'r3')
 
 
+OFFICE = {'m1': ['10.20.20.3/24'], 'r1': ['10.20.20.2/24'], 'r2': ['10.20.20.5/24']}
+OFFICE_IP = {'r1': '112.115.144.236', 'r2': '112.115.144.236', 'm1': '112.115.144.236'}
+
+
+def office(addresses=OFFICE, ipv4=OFFICE_IP, features=(), change=None):
+    d = sample()
+    if change:
+        change(d)
+    f = facts(ipv4=ipv4, tls=TLS)
+    for sid, values in addresses.items():
+        f[sid]['localAddresses'] = values
+    for sid in f:
+        f[sid]['features'] = list(features)
+    return build(d, f, 'net', 1)
+
+
+def office_entry(**kw):
+    return {c['id']: c['endpoint'] for c in office(**kw)['m1']['entry']['candidates']}
+
+
+def test_a_member_on_a_public_relays_lan_dials_it_there():
+    """The office's PCs reach the office router, a public relay behind a port mapping, at its LAN
+    address, not at the office's public IP and back in through the gateway."""
+    assert office_entry() == {'c1': 'tcp://10.20.20.2:52000', 'c2': 'tls://10.20.20.5:52001'}
+    assert office()['m1']['entry']['candidates'][1]['tlsPins'] == ['aa' * 32, 'bb' * 32]
+
+    # The port it listens on, not the one mapped outside.
+    def mapped(d):
+        d['members'][0]['publicPorts'] = {'tcp': 40000}
+    assert office_entry(change=mapped)['c1'] == 'tcp://10.20.20.2:52000'
+    # The public IP the relay was entered at counts as its own.
+    def entered(d):
+        d['members'][0]['publicEndpoint'] = '112.115.144.236'
+    assert office_entry(ipv4={**OFFICE_IP, 'r1': '198.51.100.9'}, change=entered)['c1'] == 'tcp://10.20.20.2:52000'
+    # Two sites numbered alike go out at different IPs: the public address.
+    assert office_entry(ipv4={**OFFICE_IP, 'm1': '198.51.100.7'}) == {'c1': 'tcp://berlin.example.net:52000', 'c2': 'tls://112.115.144.236:52001'}
+    assert office_entry(ipv4={**OFFICE_IP, 'm1': ''}) == {'c1': 'tcp://berlin.example.net:52000', 'c2': 'tls://112.115.144.236:52001'}
+    # Same IP, another network: the public address too.
+    assert office_entry(addresses={**OFFICE, 'm1': ['192.168.9.3/24']})['c1'] == 'tcp://berlin.example.net:52000'
+    # A member routing as a leaf dials its upstreams the same way.
+    def upstreams(d):
+        d['members'][2]['entry']['mode'] = 'upstreams'
+    links = {link['peer']: link['endpoint'] for link in office(features=[MEMBERS_ROUTING_FEATURE], change=upstreams)['m1']['links']}
+    assert links == {'r1': 'tcp://10.20.20.2:52000', 'r2': 'tls://10.20.20.5:52001'}
+
+
 # ----- addresses -----
 def test_addresses_are_allocated_and_reallocated_with_a_new_prefix():
     d = doc(member('r1', 'relay'), member('m1'), member('m2', address='100.96.0.2'))
@@ -587,13 +645,22 @@ def test_new_status_fields_are_cleaned_and_default_for_an_older_data_plane():
 def test_end_to_end_and_signature_status_is_cleaned():
     status = mesh_status.clean_status({
         'counters': {'droppedPlain': 3},
+        'handshakes': {'cookiesSent': 2, 'retries': 'x', 'other': 9},
         'e2e': {'sessions': 7, 'limit': 64, 'innerMtu': 1348, 'created': 9, 'evicted': 2, 'sent': 100, 'received': 90, 'droppedExhausted': 4,
-                'droppedQueue': 1, 'droppedSource': 'x', 'droppedBad': -1, 'peers': [{'id': 'm2'}]},
+                'droppedQueue': 1, 'droppedSource': 'x', 'droppedBad': -1, 'rekeyed': 12, 'staleKey': 1,
+                'handshakes': {'retries': 3, 'queueFull': 1}, 'peers': [{'id': 'm2'}]},
         'security': {'signing': {'verified': 120, 'rejected': 5, 'byHop': {'r1': 5, 'r2': 0, 'r3': 'x', **{f'h{i}': 1 for i in range(80)}}},
                      'claims': {'expired': 2}, 'mode': 'enforce'}})
     assert status['counters']['droppedPlain'] == 3
+    assert status['handshakes'] == {'cookiesSent': 2, 'cookiesReceived': 0, 'queueFull': 0, 'rateLimited': 0, 'retries': 0}
+    routing = mesh_status.clean_status({'routing': {'mode': 'dynamic', 'links': [], 'routes': [],
+                                                    'advertDrops': {'originRate': 4, 'throttled': 'x', 'signature': 2, 'other': 9}}})['routing']
+    assert routing['advertDrops'] == {'originRate': 4, 'throttled': 0, 'signature': 2, 'malformed': 0, 'unlinked': 0}
+    # A data plane from before the counts reports none: all zero.
+    assert mesh_status.clean_status({'routing': {'mode': 'dynamic'}})['routing']['advertDrops'] == dict.fromkeys(mesh_status.ADVERT_DROPS, 0)
     assert status['e2e'] == {'sessions': 7, 'limit': 64, 'innerMtu': 1348, 'created': 9, 'evicted': 2, 'sent': 100, 'received': 90,
-                             'droppedExhausted': 4, 'droppedQueue': 1, 'droppedSource': 0, 'droppedBad': 0}
+                             'droppedExhausted': 4, 'droppedQueue': 1, 'droppedSource': 0, 'droppedBad': 0, 'rekeyed': 12, 'staleKey': 1,
+                             'handshakes': {'cookiesSent': 0, 'cookiesReceived': 0, 'queueFull': 1, 'rateLimited': 0, 'retries': 3}}
     # Counts of zero or not numbers are left out; at most 64 peers are read.
     by_hop = status['security']['signing']['byHop']
     assert by_hop['r1'] == 5 and 'r2' not in by_hop and 'r3' not in by_hop and len(by_hop) == 64 - 3 + 1
@@ -996,8 +1063,8 @@ def test_reachability_entry_health_and_routing_are_cleaned_and_summarised():
                     'links': [{'peer': 'gw', 'state': 'up', 'rttMs': 2.54, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0, 'advertised': 3.04},
                               {'peer': 'r1', 'state': 'down', 'rttMs': None, 'jitterMs': -1, 'loss': 3, 'cost': None, 'penalty': 1000},
                               {'peer': 'r2', 'state': 'flapping'}],
-                    'routes': [{'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1,
-                                'best': 'r1', 'bestCost': 2.05, 'held': 'damped', 'until': 1793000060000},
+                    'routes': [{'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'smoothed': 3.14, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1, 'flips': 2,
+                                'best': 'r1', 'bestCost': 2.05, 'bestSmoothed': 2.86, 'held': 'settling'},
                                {'dest': 'r1', 'nextHop': 'gw', 'cost': 'inf', 'path': 'r3', 'since': 0, 'switches': 0, 'held': 'margin'}]},
         'peers': [{'id': 'gw', 'kind': 'relay', 'active': True, 'rttMs': 2.5,
                    'direct': {'state': 'direct', 'via': 'public', 'since': 3, 'attempts': 2, 'lastError': ''}}],
@@ -1017,9 +1084,10 @@ def test_reachability_entry_health_and_routing_are_cleaned_and_summarised():
     assert status['routing'] == {'mode': 'dynamic', 'links': [
         {'peer': 'gw', 'state': 'up', 'rttMs': 2.5, 'jitterMs': 0.2, 'loss': 0.0, 'cost': -2.1, 'penalty': 0, 'advertised': 3.0},
         {'peer': 'r1', 'state': 'down', 'rttMs': None, 'jitterMs': 0.0, 'loss': 0.0, 'cost': None, 'penalty': 1000, 'advertised': None}], 'routes': [
-        {'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1,
-         'best': 'r1', 'bestCost': 2.0, 'held': 'damped', 'until': 1793000060000},
-        {'dest': 'r1', 'nextHop': 'gw', 'cost': None, 'path': [], 'since': 0, 'switches': 0}]}
+        {'dest': 'gw', 'nextHop': 'gw', 'cost': 2.9, 'smoothed': 3.1, 'path': ['r3', 'gw'], 'since': 1793000000000, 'switches': 1, 'flips': 2,
+         'best': 'r1', 'bestCost': 2.0, 'bestSmoothed': 2.9, 'held': 'settling'},
+        {'dest': 'r1', 'nextHop': 'gw', 'cost': None, 'path': [], 'since': 0, 'switches': 0, 'flips': 0}],
+        'advertDrops': dict.fromkeys(mesh_status.ADVERT_DROPS, 0)}
     # A punched relay link's state comes through like a direct link's.
     assert status['peers'][0]['direct'] == {'state': 'direct', 'via': 'public', 'since': 3, 'attempts': 2, 'lastError': ''}
     assert mesh_status.clean_status(status) == status

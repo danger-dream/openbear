@@ -7,8 +7,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.assistant import changes
 from app.memory.client import MemoryClient
 from app.tools.base import ToolRegistry
+
+_CHANGE_KINDS = {"entry": "mem", "doc": "doc", "secret": "secret"}
 
 _RESOURCE_TO_ENDPOINT = {
     "identity": "identities",
@@ -37,11 +40,20 @@ def register_memory_tools(reg: ToolRegistry, mem: MemoryClient) -> None:
         if endpoint == "identities" and action != "list":
             return "error: Memory resource identity only supports action=list"
         payload = {k: v for k, v in args.items() if k not in {"resource", "kind"}}
-        return _fmt(await mem.tool_call(endpoint, payload))
+        result = await mem.tool_call(endpoint, payload)
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        if result.get("ok") and endpoint == "secret" and action == "get" and item.get("id") and hasattr(mem, "touch_secret"):
+            await mem.touch_secret(int(item["id"]))
+        if result.get("ok") and endpoint in _CHANGE_KINDS and action in {"set", "del"}:
+            ident = item.get("ref") or item.get("name") or item.get("id") or result.get("id") or args.get("ref") or args.get("name") or args.get("id")
+            await changes.publish(_CHANGE_KINDS[endpoint], ident, "delete" if action == "del" else "update",
+                                  itemId=str(item.get("id") or result.get("id") or ""))
+        return _fmt(result)
 
     reg.add(
         "Memory",
-        "Read and write OpenBear memory. resource=identity|secret|entry|doc. identity supports list. secret/entry/doc support list|get|set|del using the same fields as the memory API.",
+        "Read and write OpenBear memory. resource=identity|secret|entry|doc. identity supports list. secret/entry/doc support list|get|set|del using the same fields as the memory API. "
+        "A secret has comma-separated tags (set replaces them); secret list returns tags and last_used_at (unix seconds when the model last read its values, 0 = no record) and keeps only secrets carrying every tag given in tags.",
         {"type": "object", "properties": {
             "resource": {"type": "string", "enum": ["identity", "secret", "entry", "doc"], "description": "Memory resource"},
             "action": {"type": "string", "description": "list|get|set|del"},

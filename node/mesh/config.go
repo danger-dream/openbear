@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	meshfast "openbear/node/mesh/fast"
 	meshproxy "openbear/node/mesh/proxy"
@@ -120,28 +119,71 @@ type Routing struct {
 }
 
 // RoutingTuning is meshrouting.Tuning in ms, percent and seconds.
+// Pointer fields distinguish omitted keys (filled from DefaultTuning) from
+// explicit values (checked against bounds). Legacy tuning JSON (containing
+// legacy keys without any of the new smoothing keys) is accepted and falls
+// back to DefaultTuning.
 type RoutingTuning struct {
-	SwitchMs     float64 `json:"switchMs"`
-	SwitchPct    float64 `json:"switchPct"`
-	ShorterMs    float64 `json:"shorterMs"`
-	ShorterPct   float64 `json:"shorterPct"`
-	AdvertMs     float64 `json:"advertMs"`
-	AdvertPct    float64 `json:"advertPct"`
-	HoldS        float64 `json:"holdS"`
-	JitterWeight float64 `json:"jitterWeight"`
-	LossWeight   float64 `json:"lossWeight"`
-	FlapHoldS    float64 `json:"flapHoldS"`
-	FlapHoldMaxS float64 `json:"flapHoldMaxS"`
+	SmoothHalfLifeS *float64 `json:"smoothHalfLifeS,omitempty"`
+	SwitchPct       *float64 `json:"switchPct,omitempty"`
+	SwitchMinMs     *float64 `json:"switchMinMs,omitempty"`
+	HopCostMs       *float64 `json:"hopCostMs,omitempty"`
+	StartPenaltyMs  *float64 `json:"startPenaltyMs,omitempty"`
+	JitterWeight    *float64 `json:"jitterWeight,omitempty"`
+	LossWeight      *float64 `json:"lossWeight,omitempty"`
+}
+
+func (t *RoutingTuning) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	hasNew := false
+	for _, k := range []string{"smoothHalfLifeS", "switchMinMs", "hopCostMs", "startPenaltyMs"} {
+		if _, ok := raw[k]; ok {
+			hasNew = true
+			break
+		}
+	}
+	hasLegacy := false
+	for _, k := range []string{"switchMs", "shorterMs", "shorterPct", "advertMs", "advertPct", "holdS", "flapHoldS", "flapHoldMaxS"} {
+		if _, ok := raw[k]; ok {
+			hasLegacy = true
+			break
+		}
+	}
+	if hasLegacy && !hasNew {
+		*t = RoutingTuning{}
+		return nil
+	}
+	type alias RoutingTuning
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*t = RoutingTuning(a)
+	return nil
 }
 
 func (t *RoutingTuning) check() error {
 	for _, f := range []struct {
-		name      string
-		v, lo, hi float64
-	}{{"switchMs", t.SwitchMs, 0, 1000}, {"switchPct", t.SwitchPct, 0, 90}, {"shorterMs", t.ShorterMs, 0, 1000}, {"shorterPct", t.ShorterPct, 0, 90},
-		{"advertMs", t.AdvertMs, 0, 1000}, {"advertPct", t.AdvertPct, 0, 90}, {"holdS", t.HoldS, 0, 60}, {"jitterWeight", t.JitterWeight, 0, 10},
-		{"lossWeight", t.LossWeight, 0, 10000}, {"flapHoldS", t.FlapHoldS, 0, 3600}, {"flapHoldMaxS", t.FlapHoldMaxS, t.FlapHoldS, 3600}} {
-		if math.IsNaN(f.v) || f.v < f.lo || f.v > f.hi {
+		name   string
+		v      *float64
+		lo, hi float64
+	}{
+		{"smoothHalfLifeS", t.SmoothHalfLifeS, 1, 300},
+		{"switchPct", t.SwitchPct, 0, 50},
+		{"switchMinMs", t.SwitchMinMs, 0, 100},
+		{"hopCostMs", t.HopCostMs, 0, 50},
+		{"startPenaltyMs", t.StartPenaltyMs, 0, 5000},
+		{"jitterWeight", t.JitterWeight, 0, 10},
+		{"lossWeight", t.LossWeight, 0, 10000},
+	} {
+		if f.v == nil {
+			continue
+		}
+		v := *f.v
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < f.lo || v > f.hi {
 			return fmt.Errorf("routing.tuning.%s must be between %g and %g", f.name, f.lo, f.hi)
 		}
 	}
@@ -149,10 +191,29 @@ func (t *RoutingTuning) check() error {
 }
 
 func (t *RoutingTuning) router() *meshrouting.Tuning {
-	sec := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
-	return &meshrouting.Tuning{SwitchMs: t.SwitchMs, SwitchPct: t.SwitchPct, ShorterMs: t.ShorterMs, ShorterPct: t.ShorterPct, AdvertMs: t.AdvertMs,
-		AdvertPct: t.AdvertPct, Hold: sec(t.HoldS), JitterWeight: t.JitterWeight, LossWeight: t.LossWeight, FlapHold: sec(t.FlapHoldS),
-		FlapHoldMax: sec(t.FlapHoldMaxS)}
+	out := meshrouting.DefaultTuning
+	if t.SmoothHalfLifeS != nil {
+		out.SmoothHalfLifeS = *t.SmoothHalfLifeS
+	}
+	if t.SwitchPct != nil {
+		out.SwitchPct = *t.SwitchPct
+	}
+	if t.SwitchMinMs != nil {
+		out.SwitchMinMs = *t.SwitchMinMs
+	}
+	if t.HopCostMs != nil {
+		out.HopCostMs = *t.HopCostMs
+	}
+	if t.StartPenaltyMs != nil {
+		out.StartPenaltyMs = *t.StartPenaltyMs
+	}
+	if t.JitterWeight != nil {
+		out.JitterWeight = *t.JitterWeight
+	}
+	if t.LossWeight != nil {
+		out.LossWeight = *t.LossWeight
+	}
+	return &out
 }
 
 // Reachability lists STUN servers, host:port, asked besides the reflectors.

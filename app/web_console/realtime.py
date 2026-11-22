@@ -226,6 +226,11 @@ class GlobalRealtime:
             queue.put_nowait({"type": "reconnect"})
         self.clients.clear()
 
+    def broadcast(self, value: dict):
+        """Metadata every open console page receives, such as which object a tool changed."""
+        for queue in tuple(self.clients):
+            self.put(queue, value)
+
     def put(self, queue: asyncio.Queue, value: dict):
         if queue.full():
             while not queue.empty():

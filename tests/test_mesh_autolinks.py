@@ -196,23 +196,23 @@ def test_remote_member_with_only_distant_upstream_gets_nearby_sg_relay():
     before_ks_jc = t_before[('App-SG', 'App-ES')][0]
     assert before_ks_jc > 260.0
 
-    # Hold rounds = 3: first two rounds only build streak, 3rd round applies.
+    # Held 30 minutes (holdS): watched from 5 minutes on, still waiting at 20, built at 35.
     state = None
-    for round_no in (1, 2):
-        res = mesh_autolinks.optimize(d, f, statuses, state=state, now_ms=round_no * 300_000)
+    for t in (300_000, 1_200_000):
+        res = mesh_autolinks.optimize(d, f, statuses, state=state, now_ms=t)
         assert not res['changed']
-        assert res['suggestions'] and res['suggestions'][0]['rounds'] == round_no
+        assert res['suggestions'] and res['suggestions'][0]['heldMs'] == t - 300_000 and not res['suggestions'][0]['ready']
         state = res['state']
 
-    res = mesh_autolinks.optimize(d, f, statuses, state=state, now_ms=3 * 300_000)
+    res = mesh_autolinks.optimize(d, f, statuses, state=state, now_ms=2_100_000)
     assert res['changed']
     new_doc = res['doc']
     jc_after = next(m for m in new_doc['members'] if m['serverId'] == 'App-ES')
     auto_cands = [c for c in jc_after['entry']['candidates'] if c.get('origin') == 'auto']
     assert any(c['relay'] in ('Relay-SG1', 'Relay-SG2') for c in auto_cands)
     for c in auto_cands:
-        assert 'App-ES' in c['reason'] and 'ms' in c['reason']
-        assert c['since'] == 3 * 300_000
+        assert 'App-ES' in c['reason'] and '新建门槛' in c['reason']
+        assert c['since'] == 2_100_000
 
     g_after = mesh_autolinks.build_graph(new_doc, f, real_costs, probe_costs)
     t_after = mesh_autolinks.shortest_table(g_after, set(relays))
@@ -231,17 +231,17 @@ def test_remote_member_with_only_distant_upstream_gets_nearby_sg_relay():
         assert item['reason'].endswith(f'等 {item["count"]} 对') if item['count'] > 1 else '等' not in item['reason']
     # The next round records what each automatic link gives; the lines page reads that until the round after,
     # whatever the measurements do in between.
-    nxt = mesh_autolinks.optimize(new_doc, f, statuses, state=res['state'], now_ms=4 * 300_000)
+    nxt = mesh_autolinks.optimize(new_doc, f, statuses, state=res['state'], now_ms=2_400_000)
     stored = copy.deepcopy(nxt['doc'])
     stored['_autoLinksState'] = nxt['state']
-    view = mesh_autolinks.view_of(stored, f, statuses, now_ms=4 * 300_000 + 1000)
+    view = mesh_autolinks.view_of(stored, f, statuses, now_ms=2_400_000 + 1000)
     jc_gain = view['benefits'][mesh_autolinks.pair_key('App-ES', auto_cands[0]['relay'])]
     assert jc_gain['kind'] == 'entry' and jc_gain['count'] >= 1
     assert all('App-ES' in (g['src'], g['dst']) for g in jc_gain['pairs'])
     assert set(view['benefits']) == {mesh_autolinks.pair_key(x['a'], x['b']) for x in res['lastChange']['added']}
-    assert (view['idleSince'], view['measuredAt'], view['holdRounds'], view['dropAfterS']) == ({}, 4 * 300_000, 3, 3600)
+    assert (view['idleSince'], view['measuredAt'], view['holdS'], view['dropAfterS'], view['keepMs'], view['buildMs']) == ({}, 2_400_000, 1800, 21600, 10, 15)
     assert view['suggestions'] == nxt['suggestions']
-    assert mesh_autolinks.view_of(stored, f, matrix_probes(relays), now_ms=4 * 300_000 + 5000) == view
+    assert mesh_autolinks.view_of(stored, f, matrix_probes(relays), now_ms=2_400_000 + 5000) == view
 
 
 # ----- 2. Connection limits, fronts, site relays and member.direct=False -----
@@ -270,7 +270,7 @@ def test_connection_limits_and_front_rules_never_violated():
     ]
     d = make_doc(r_hk, r_sg, r_de, jc, mode='custom',
                  pairs=base_pairs,
-                 limits=[limit_manual], auto_links={'holdRounds': 1})
+                 limits=[limit_manual], auto_links={'holdS': 0})
     res = mesh_autolinks.optimize(d, f, statuses, now_ms=1000)
     for item in res['added']:
         assert 'Relay-HK' not in (item['a'], item['b'])
@@ -284,7 +284,7 @@ def test_connection_limits_and_front_rules_never_violated():
     }
     d2 = make_doc(r_hk, r_sg, r_de, jc, mode='custom',
                   pairs=base_pairs,
-                  limits=[limit_manual, limit_tcp], auto_links={'holdRounds': 1})
+                  limits=[limit_manual, limit_tcp], auto_links={'holdS': 0})
     res2 = mesh_autolinks.optimize(d2, f, statuses, now_ms=2000)
     assert res2['changed']
     jc_cands = next(m for m in res2['doc']['members'] if m['serverId'] == 'App-ES')['entry']['candidates']
@@ -298,7 +298,7 @@ def test_connection_limits_and_front_rules_never_violated():
     jc_nodirect['direct'] = False
     d3 = make_doc(r_hk, r_sg, r_de, jc_nodirect, mode='custom',
                   pairs=[{'a': 'Relay-SG1', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}],
-                  auto_links={'holdRounds': 1})
+                  auto_links={'holdS': 0})
     assert mesh_autolinks.candidate_spec('Relay-HK', 'Relay-DE', d3, {m['serverId']: m for m in d3['members']}, f_front) is None
     assert mesh_autolinks.candidate_spec('App-ES', 'Relay-SG1', d3, {m['serverId']: m for m in d3['members']}, f_front) is None
 
@@ -320,7 +320,7 @@ def test_per_node_budget_caps_auto_links_on_each_node():
         {'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp'},
     ], 'autoReturn': True})
     d = make_doc(*(make_member(r, 'relay') for r in relays), jc, mode='custom', pairs=pairs,
-                 auto_links={'perNode': 1, 'holdRounds': 1})
+                 auto_links={'perNode': 1, 'holdS': 0})
     res = mesh_autolinks.optimize(d, f, statuses, now_ms=1000)
     assert res['changed']
     auto_count = {}
@@ -338,85 +338,181 @@ def test_per_node_budget_caps_auto_links_on_each_node():
     assert auto_count.get('App-ES', 0) == 1
 
 
-# ----- 4. Damping: threshold jitter (acceptance case 5), disappointment (24h), drop after 1h, manual kept -----
-def test_damping_near_threshold_disappointment_and_drop_after_hour():
-    nodes = ['Relay-SG1', 'Relay-DE', 'App-ES']
-    f = matrix_facts(nodes)
+# ----- 4. Damping: threshold jitter, held 30 minutes, measured worse than probed (24h), idle 6 hours, manual kept -----
+def _sg_de_es():
+    """Relay-SG1 <-> Relay-DE (manual) and App-ES entering at Relay-DE: (doc, facts)."""
     jc = make_member('App-ES', 'member', entry={'mode': 'upstreams', 'candidates': [
         {'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp'},
     ], 'autoReturn': True})
     pairs = [{'a': 'Relay-SG1', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}]
-    d = make_doc(make_member('Relay-SG1', 'relay'), make_member('Relay-DE', 'relay'), jc, mode='custom', pairs=pairs)
+    doc = make_doc(make_member('Relay-SG1', 'relay'), make_member('Relay-DE', 'relay'), jc, mode='custom', pairs=pairs)
+    return doc, matrix_facts(['Relay-SG1', 'Relay-DE', 'App-ES'])
 
-    # Baseline Relay-SG1 -> App-ES via Relay-DE is 200ms (100 + 100).
-    # 85% of 200ms is 170ms (30ms improvement). Probe fluctuates between 165ms (good) and 175ms (not enough: >170ms).
-    def status_with(probe_rtt, real_rtt=None):
-        st = {
-            'Relay-SG1': {'status': {'probes': [{'peer': 'App-ES', 'rttMs': probe_rtt, 'jitterMs': 0.0, 'loss': 0.0, 'method': 'udp', 'at': 1}],
-                                     'routing': {'mode': 'dynamic', 'links': [{'peer': 'Relay-DE', 'state': 'up', 'rttMs': 100.0, 'jitterMs': 0.0, 'loss': 0.0, 'cost': 100.0, 'penalty': 0}], 'routes': []}}},
-            'Relay-DE': {'status': {'probes': [], 'routing': {'mode': 'dynamic', 'links': [{'peer': 'Relay-SG1', 'state': 'up', 'rttMs': 100.0, 'jitterMs': 0.0, 'loss': 0.0, 'cost': 100.0, 'penalty': 0}], 'routes': []}}},
-            'App-ES': {'status': {'probes': [{'peer': 'Relay-SG1', 'rttMs': probe_rtt, 'jitterMs': 0.0, 'loss': 0.0, 'method': 'udp', 'at': 1}],
-                                  'entry': {'candidate': 'c1', 'relay': 'Relay-DE', 'transport': 'udp', 'since': 1, 'switches': 0,
-                                            'candidates': [{'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp', 'state': 'active', 'rttMs': 100.0, 'timeoutRate': 0.0}]
-                                            + ([{'id': 'c2', 'relay': 'Relay-SG1', 'transport': 'udp', 'state': 'ready', 'rttMs': real_rtt, 'timeoutRate': 0.0}] if real_rtt is not None else [])}}},
-        }
-        return st
 
-    # Fluctuating 165, 165, 175, 165, 165, 175 must never build the link (streak resets on 175).
+def _sg_de_es_status(probe_rtt, real_rtt=None, line_rtt=100.0, started=None):
+    """Relay-SG1 -> App-ES costs 2 x line_rtt through Relay-DE; probe_rtt is what the two probe of each
+    other, real_rtt what App-ES measures over an auto entry at Relay-SG1. started: App-ES's startedAt."""
+    line = {'state': 'up', 'rttMs': line_rtt, 'jitterMs': 0.0, 'loss': 0.0, 'cost': line_rtt, 'penalty': 0}
+    return {
+        'Relay-SG1': {'status': {'probes': [{'peer': 'App-ES', 'rttMs': probe_rtt, 'jitterMs': 0.0, 'loss': 0.0, 'method': 'udp', 'at': 1}],
+                                 'routing': {'mode': 'dynamic', 'links': [{'peer': 'Relay-DE', **line}], 'routes': []}}},
+        'Relay-DE': {'status': {'probes': [], 'routing': {'mode': 'dynamic', 'links': [{'peer': 'Relay-SG1', **line}], 'routes': []}}},
+        'App-ES': {'status': {**({'startedAt': started} if started else {}),
+                              'probes': [{'peer': 'Relay-SG1', 'rttMs': probe_rtt, 'jitterMs': 0.0, 'loss': 0.0, 'method': 'udp', 'at': 1}],
+                              'entry': {'candidate': 'c1', 'relay': 'Relay-DE', 'transport': 'udp', 'since': 1, 'switches': 0,
+                                        'candidates': [{'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp', 'state': 'active', 'rttMs': line_rtt, 'timeoutRate': 0.0}]
+                                        + ([{'id': 'c2', 'relay': 'Relay-SG1', 'transport': 'udp', 'state': 'ready', 'rttMs': real_rtt, 'timeoutRate': 0.0}] if real_rtt is not None else [])}}},
+    }
+
+
+def test_damping_near_threshold_disappointment_and_drop_after_six_hours():
+    d, f = _sg_de_es()
+    minute = 60_000
+    # Baseline Relay-SG1 -> App-ES via Relay-DE is 200ms (100 + 100). A probe of 180ms cuts 20ms (builds: 15ms);
+    # 187ms cuts 13ms, 6.5% (neither 15ms nor 10%).
+    status_with = _sg_de_es_status
+
+    # 180 and 187 by turns every 10 minutes never hold 30 minutes: never built.
     state = None
-    for i, rtt in enumerate([165.0, 165.0, 175.0, 165.0, 165.0, 175.0]):
-        res = mesh_autolinks.optimize(d, f, status_with(rtt), state=state, now_ms=(i + 1) * 60_000)
+    for i, rtt in enumerate([180.0, 180.0, 187.0, 180.0, 180.0, 187.0]):
+        res = mesh_autolinks.optimize(d, f, status_with(rtt), state=state, now_ms=(i + 1) * 10 * minute)
         assert not res['changed']
         state = res['state']
 
-    # Now 3 consecutive good rounds (165ms) -> link is built on the 3rd round.
-    for i in range(3):
-        res = mesh_autolinks.optimize(d, f, status_with(165.0), state=state, now_ms=(10 + i) * 60_000)
+    # 180 from 70 minutes on: built at 100, once it has held 30 minutes.
+    for t in (70, 80, 90):
+        res = mesh_autolinks.optimize(d, f, status_with(180.0), state=state, now_ms=t * minute)
+        assert not res['changed']
         state = res['state']
-    assert res['changed']
-    built_doc = res['doc']
+    res = mesh_autolinks.optimize(d, f, status_with(180.0), state=state, now_ms=100 * minute)
+    assert res['changed'] and '快 20ms，新建门槛 15ms' in res['added'][0]['reason']
+    state, built_doc = res['state'], res['doc']
 
-    # Once built, real measurement reports 190ms (worse than 85% threshold) while probe still says 165ms:
-    # marked disappointed for 24h and dropped immediately.
-    dis_res = mesh_autolinks.optimize(built_doc, f, status_with(165.0, real_rtt=190.0), state=state, now_ms=20 * 60_000)
-    assert dis_res['changed']
-    assert dis_res['dropped'][0]['why'] == '实测不划算'
+    # Built, the link measures 195ms (5ms off) while the probe still says 180ms: after 30 minutes of it,
+    # measured worse than probed, gone and kept out 24h.
+    for t in (110, 125):
+        res = mesh_autolinks.optimize(built_doc, f, status_with(180.0, real_rtt=195.0), state=state, now_ms=t * minute)
+        assert not res['changed']
+        state = res['state']
+    dis_res = mesh_autolinks.optimize(built_doc, f, status_with(180.0, real_rtt=195.0), state=state, now_ms=140 * minute)
+    assert dis_res['changed'] and dis_res['dropped'][0]['code'] == 'disappointing'
+    assert '实测最好只快 5ms' in dis_res['dropped'][0]['why'] and '保留门槛 10ms' in dis_res['dropped'][0]['why']
     state = dis_res['state']
-    # Within 24h, even 3 good probe rounds do not rebuild it.
-    for i in range(3):
-        retry = mesh_autolinks.optimize(dis_res['doc'], f, status_with(120.0), state=state, now_ms=30 * 60_000 + i * 60_000)
+    for i in range(4):
+        retry = mesh_autolinks.optimize(dis_res['doc'], f, status_with(120.0), state=state, now_ms=(150 + 10 * i) * minute)
         assert not retry['changed']
         state = retry['state']
 
-    # Test 1-hour idle drop & manual links never dropped:
-    # Build again after 24h + 1ms.
-    after_24h = 20 * 60_000 + mesh_autolinks.DISAPPOINT_TTL_MS + 1000
-    for i in range(3):
-        res2 = mesh_autolinks.optimize(dis_res['doc'], f, status_with(120.0), state=state, now_ms=after_24h + i * 60_000)
+    # After 24h it holds 30 minutes again and is built.
+    after_24h = 140 * minute + mesh_autolinks.DISAPPOINT_TTL_MS + 1000
+    for i in range(4):
+        res2 = mesh_autolinks.optimize(dis_res['doc'], f, status_with(120.0), state=state, now_ms=after_24h + i * 10 * minute)
         state = res2['state']
     assert res2['changed']
     doc_with_auto = res2['doc']
 
-    # Real measurement is 120ms, and suppose direct baseline also becomes 125ms so auto link has 0 gain (both probe & real say 120ms vs 125ms):
-    def status_no_gain(t_ms):
+    # The direct baseline falls to 125ms and the auto link measures 120ms: 5ms, under the 10ms it keeps for.
+    def status_no_gain():
         st = status_with(120.0, real_rtt=120.0)
         for sid in ('Relay-SG1', 'Relay-DE'):
             st[sid]['status']['routing']['links'][0].update(rttMs=25.0, cost=25.0)
         return st
 
-    t0 = after_24h + 10 * 60_000
-    # At t0 and t0 + 30 min (< 3600s): not dropped yet.
-    r_early = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(t0), state=state, now_ms=t0)
+    t0 = after_24h + 60 * minute
+    r_early = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(), state=state, now_ms=t0)
     assert not r_early['changed']
-    r_mid = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(t0 + 1800_000), state=r_early['state'], now_ms=t0 + 1800_000)
-    assert not r_mid['changed']
-    # At t0 + 3600s: auto link is dropped, while manual relay link Relay-SG1 <-> Relay-DE and manual upstream Relay-DE stay.
-    r_drop = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(t0 + 3600_000), state=r_mid['state'], now_ms=t0 + 3600_000)
-    assert r_drop['changed']
-    assert r_drop['dropped'][0]['why'] == '连续无改善'
+    r_mid = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(), state=r_early['state'], now_ms=t0 + 3 * 3600_000)
+    assert not r_mid['changed'] and r_mid['state']['idleBest'][mesh_autolinks.pair_key('App-ES', 'Relay-SG1')] == 5.0
+    # 6 hours: the auto link goes, while manual relay link Relay-SG1 <-> Relay-DE and manual upstream Relay-DE stay.
+    r_drop = mesh_autolinks.optimize(doc_with_auto, f, status_no_gain(), state=r_mid['state'], now_ms=t0 + 6 * 3600_000)
+    assert r_drop['changed'] and r_drop['dropped'][0]['code'] == 'idle'
+    assert r_drop['dropped'][0]['why'] == '连续 6 小时最好只快 5ms，不到保留门槛 10ms'
     assert len(r_drop['doc']['relayLinks']['pairs']) == 1
     jc_cands = next(m for m in r_drop['doc']['members'] if m['serverId'] == 'App-ES')['entry']['candidates']
     assert [c['relay'] for c in jc_cands] == ['Relay-DE']
+
+
+# ----- 4a. Settings of the older rules, smoothed costs, and the mesh settling -----
+def test_settings_of_the_older_rules_move_to_the_new_thresholds():
+    legacy = {'enabled': True, 'perNode': 3, 'gainRatio': 0.85, 'gainMs': 20, 'holdRounds': 3, 'dropAfterS': 3600}
+    want = {**mesh_autolinks.DEFAULT_SETTINGS, 'perNode': 3}
+    assert mesh_autolinks.settings_of({'settings': {'autoLinks': legacy}}) == want
+    errors = model.Errors()
+    assert mesh_autolinks.clean_settings(legacy, legacy, errors) == want and not errors
+    # A drop time of its own stays; the new keys are taken as given.
+    assert mesh_autolinks.clean_settings({**legacy, 'dropAfterS': 7200}, legacy, errors)['dropAfterS'] == 7200
+    given = {'buildMs': 25, 'buildRatio': 0.2, 'keepMs': 12.5, 'holdS': 600, 'dropAfterS': 3600}
+    assert mesh_autolinks.clean_settings(given, None, errors) == {**mesh_autolinks.DEFAULT_SETTINGS, **given} and not errors
+    for bad in ({'keepMs': 20}, {'buildRatio': 1.5}, {'holdS': -1}, {'buildMs': 0}):
+        errors = model.Errors()
+        mesh_autolinks.clean_settings(bad, None, errors)
+        assert errors, bad
+
+
+def test_history_takes_the_median_and_keeps_a_line_down_a_few_rounds():
+    h = mesh_autolinks.History()
+    line, flaky = frozenset(('a', 'b')), frozenset(('a', 'c'))
+    for i in range(30):
+        real = {}
+        if i not in (7, 8, 9):
+            real[line] = 300.0 if i == 12 else 100.0 + i % 3
+        if i % 3 == 0:
+            real[flaky] = 50.0
+        h.record(i * 60_000, real, {}, {line, flaky}, {}, {})
+    # Down 3 rounds of 30 and once 300ms: in, at its median; up 10 of 30: out.
+    assert h.smoothed('real') == {line: 101.0}
+    h.record(29 * 60_000 + mesh_autolinks.SMOOTH_S * 1000, {}, {}, {line}, {}, {})
+    assert h.smoothed('real') == {}
+
+    live = {'a': {}, 'b': {}, 'c': {}}
+    def links(state):
+        return {'a': {'status': {'routing': {'links': [{'peer': 'b', 'state': state}]}}}}
+    t = 10_000_000
+    h.record(t, {}, {}, set(), links('up'), live)
+    assert mesh_autolinks.settling(links('up'), live, t, h) == set()
+    h.record(t + 60_000, {}, {}, set(), links('down'), live)
+    assert mesh_autolinks.settling(links('down'), live, t + 60_000, h) == {'a', 'b'}
+    assert mesh_autolinks.settling(links('down'), live, t + 60_000 + mesh_autolinks.SETTLE_S * 1000, h) == set()
+
+
+def test_a_settling_end_or_a_new_revision_stops_the_clocks():
+    d, f = _sg_de_es()
+    minute = 60_000
+    key = mesh_autolinks.pair_key('App-ES', 'Relay-SG1')
+    state = None
+
+    def step(t, status, doc=d, applied_ms=0):
+        nonlocal state
+        res = mesh_autolinks.optimize(doc, f, status, state=state, now_ms=t * minute, applied_ms=applied_ms * minute)
+        state = res['state']
+        return res
+
+    # Watched from 10 minutes; App-ES restarts at 15, so the round at 20 stops the clock for those 10 minutes.
+    assert step(10, _sg_de_es_status(180.0))['suggestions'][0]['heldMs'] == 0
+    res = step(20, _sg_de_es_status(180.0, started=15 * minute))
+    assert [(x['key'], x['heldMs'], x['paused']) for x in res['suggestions']] == [(key, 0, True)]
+    assert step(30, _sg_de_es_status(180.0, started=15 * minute))['suggestions'][0]['heldMs'] == 10 * minute
+    assert not step(40, _sg_de_es_status(180.0, started=15 * minute))['changed']
+    # A revision applied at 45: the whole mesh settles until 55, the round at 50 builds nothing.
+    res = step(50, _sg_de_es_status(180.0, started=15 * minute), applied_ms=45)
+    assert res['paused'] and not res['changed'] and res['state']['paused']
+    res = step(60, _sg_de_es_status(180.0, started=15 * minute), applied_ms=45)
+    assert res['changed'] and res['added'][0]['key'] == key
+    built = res['doc']
+
+    # Built, it keeps no pair 10ms faster: idle from 70. App-ES restarting at 125 stops that clock for the round at
+    # 130 (the hour since the last round), so it goes at 70 + 6h + 1h, not 70 + 6h.
+    def no_gain(started=None):
+        st = _sg_de_es_status(120.0, real_rtt=120.0, started=started)
+        for sid in ('Relay-SG1', 'Relay-DE'):
+            st[sid]['status']['routing']['links'][0].update(rttMs=25.0, cost=25.0)
+        return st
+
+    assert not step(70, no_gain(), built)['changed'] and state['idleSince'][key] == 70 * minute
+    assert not step(130, no_gain(started=125 * minute), built)['changed'] and state['idleSince'][key] == 130 * minute
+    assert not step(70 + 6 * 60, no_gain(), built)['changed']
+    res = step(70 + 7 * 60, no_gain(), built)
+    assert res['changed'] and res['dropped'][0]['code'] == 'idle' and res['dropped'][0]['why'].startswith('连续 6 小时最好只快 5ms')
 
 
 # ----- 4b. A link down most rounds (RFCHost-JP2, 2026-11-16): gone in ten rounds, kept out 24h, then 72h -----
@@ -431,7 +527,7 @@ def _link_state(statuses, a, b, state, rtt=60.0):
 
 def test_an_auto_link_down_most_rounds_goes_and_stays_out_longer_each_time():
     names = ['R1', 'R2', 'JP']
-    d = make_doc(*(make_member(n, 'relay') for n in names), pairs=[_link('R1', 'R2'), _link('R2', 'JP')], auto_links={'holdRounds': 1})
+    d = make_doc(*(make_member(n, 'relay') for n in names), pairs=[_link('R1', 'R2'), _link('R2', 'JP')], auto_links={'holdS': 0})
     f = matrix_facts(names)
     key = mesh_autolinks.pair_key('R1', 'JP')
 
@@ -491,7 +587,7 @@ def test_a_relay_mostly_down_is_no_end_of_a_new_auto_link_until_it_holds_an_hour
     names = ['R1', 'R2', 'R3', 'R4', 'JP']
     d = make_doc(*(make_member(n, 'relay') for n in names),
                  pairs=[_link('R1', 'R2'), _link('R2', 'R3'), _link('R2', 'R4'), _link('R2', 'JP'), _link('R3', 'JP'), _link('R4', 'JP')],
-                 auto_links={'holdRounds': 100})
+                 auto_links={'holdS': 86400})
     f = matrix_facts(names)
     key = mesh_autolinks.pair_key('R1', 'JP')
 
@@ -543,7 +639,7 @@ def test_user_deleted_auto_link_suppressed_for_7_days_and_disabled_mode():
         {'a': 'Relay-SG1', 'b': 'Relay-HK', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0},
     ]
     d = make_doc(make_member('Relay-HK', 'relay'), make_member('Relay-SG1', 'relay'), make_member('Relay-DE', 'relay'),
-                 ks, jc, mode='custom', pairs=pairs, auto_links={'holdRounds': 1})
+                 ks, jc, mode='custom', pairs=pairs, auto_links={'holdS': 0})
 
     # enabled=False: calculates suggestions, does not modify doc.
     d_disabled = copy.deepcopy(d)
@@ -589,7 +685,7 @@ def test_works_in_full_custom_and_auto_modes_and_generates_probe_targets():
         ], 'autoReturn': True})
         pairs = [{'a': 'Relay-SG1', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}] if mode == 'custom' else []
         d = make_doc(make_member('Relay-SG1', 'relay'), make_member('Relay-DE', 'relay'), jc,
-                     mode=mode, pairs=pairs, auto_links={'holdRounds': 1})
+                     mode=mode, pairs=pairs, auto_links={'holdS': 0})
         targets = mesh_autolinks.probe_targets(d, f)
         assert any(t['peer'] == 'Relay-SG1' for t in targets['App-ES']['targets'])
         res = mesh_autolinks.optimize(d, f, statuses, now_ms=5000)
@@ -614,7 +710,7 @@ async def test_auto_revision_does_not_leak_draft_preserves_dirty_draft_and_rate_
             {'a': ids['r1'], 'b': ids['r3'], 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0},
         ],
     }
-    doc['settings']['autoLinks'] = {'enabled': True, 'perNode': 4, 'gainRatio': 0.85, 'gainMs': 20, 'holdRounds': 1, 'dropAfterS': 3600}
+    doc['settings']['autoLinks'] = {'enabled': True, 'perNode': 4, 'buildMs': 15, 'buildRatio': 0.1, 'keepMs': 10, 'holdS': 0, 'dropAfterS': 21600}
     for m in doc['members']:
         if m['serverId'] in (ids['r1'], ids['r2'], ids['r3']):
             m['role'] = 'relay'
@@ -739,7 +835,7 @@ def test_a_stored_mesh_keeps_its_links_its_entries_and_its_configs():
     jc = make_member('App-ES', 'member', entry={'mode': 'upstreams', 'candidates': [
         {'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp'}], 'autoReturn': True})
     d = make_doc(make_member('Relay-SG1', 'relay'), make_member('Relay-DE', 'relay'), jc,
-                 pairs=[{'a': 'Relay-SG1', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}], auto_links={'holdRounds': 1})
+                 pairs=[{'a': 'Relay-SG1', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0}], auto_links={'holdS': 0})
     stored = copy.deepcopy(d)
     del stored['settings']['autoLinks']
     stored = model.upgrade(stored)
@@ -795,3 +891,106 @@ async def test_auto_links_off_takes_no_round_and_writes_nothing(env):  # noqa: F
     rev_before = (await api(e, 'GET', '/api/servers/mesh/revisions'))['revisions']
     assert await mesh.check_auto_links(OWNER, now=1_000_000) is None
     assert (await api(e, 'GET', '/api/servers/mesh/revisions'))['revisions'] == rev_before
+
+
+def test_added_edge_score_matches_full_dijkstra():
+    names = ['App-SG', 'Relay-SG1', 'Relay-HK', 'Relay-DE', 'App-ES']
+    r_sg1 = make_member('Relay-SG1', 'relay')
+    r_hk = make_member('Relay-HK', 'relay')
+    r_de = make_member('Relay-DE', 'relay')
+    m_sg = make_member('App-SG', 'member', entry={'mode': 'upstreams', 'candidates': [{'id': 'c1', 'relay': 'Relay-SG1', 'transport': 'udp'}], 'autoReturn': True})
+    m_es = make_member('App-ES', 'member', entry={'mode': 'upstreams', 'candidates': [{'id': 'c1', 'relay': 'Relay-DE', 'transport': 'udp'}], 'autoReturn': True})
+    doc = make_doc(r_sg1, r_hk, r_de, m_sg, m_es, mode='custom', pairs=[
+        {'a': 'Relay-SG1', 'b': 'Relay-HK', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0},
+        {'a': 'Relay-HK', 'b': 'Relay-DE', 'transport': 'udp', 'cost': 1, 'dialer': 'a', 'bias': 0},
+    ])
+    facts = matrix_facts(names)
+    statuses = matrix_probes(names)
+    real_c, probe_c = mesh_autolinks.collect_measurements(doc, facts, statuses)
+    relays = {'Relay-SG1', 'Relay-HK', 'Relay-DE'}
+    base_g = mesh_autolinks.build_graph(doc, facts, real_c, probe_c)
+    base_tbl = mesh_autolinks.shortest_table(base_g, relays)
+    base_dists = mesh_autolinks._shortest_dists(base_g, relays)
+
+    for a, b in (('Relay-SG1', 'Relay-DE'), ('App-ES', 'Relay-SG1'), ('App-SG', 'Relay-HK')):
+        cst, _ = mesh_autolinks.edge_cost(a, b, doc, facts, real_c, probe_c)
+        assert cst is not None
+        trial_g = mesh_autolinks.build_graph(doc, facts, real_c, probe_c, extra=[(a, b)])
+        for building in (True, False):
+            meet = mesh_autolinks.meets(mesh_autolinks.DEFAULT_SETTINGS, building)
+            expected, _ = mesh_autolinks.evaluate_gains(base_tbl, mesh_autolinks.shortest_table(trial_g, relays), meet)
+            got = mesh_autolinks._added_edge_score(base_dists, relays, a, b, cst, meet)
+            assert abs(got - expected) < 1e-9, (a, b, building, got, expected)
+
+
+async def test_no_change_autolinks_updates_settings_only_and_routine_events_and_batched_refresh(env, monkeypatch):  # noqa: F811
+    import asyncio
+    e = env
+    nodes, ids = await mesh_setup(e)
+    await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
+    await api(e, 'POST', '/api/servers/mesh/apply', {})
+    await settled(e)
+    mesh = e.servers.mesh
+
+    # 1. check_auto_links with no changes updates only applied mesh_settings (never calls _save to rewrite members/links/rules).
+    draft = await mesh._load(OWNER, 'draft')
+    stale = (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']
+    await mesh._save_draft(OWNER, draft, auto_base=[{'version': stale, 'applied': mesh._doc_without_internal(await mesh._load(OWNER, 'applied'))}])
+    draft_before = await many(mesh.db.conn, "SELECT settings_json FROM mesh_settings WHERE owner=? AND stage='draft'", (OWNER,))
+
+    full_saves = []
+    orig_save = mesh._save
+
+    async def spy_save(conn, owner, stage, doc, **kw):
+        full_saves.append(stage)
+        return await orig_save(conn, owner, stage, doc, **kw)
+
+    to_thread_calls = []
+    orig_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(fn, *args, **kw):
+        to_thread_calls.append(fn)
+        return await orig_to_thread(fn, *args, **kw)
+
+    monkeypatch.setattr(mesh, '_save', spy_save)
+    monkeypatch.setattr(asyncio, 'to_thread', spy_to_thread)
+    res = await mesh.check_auto_links(OWNER, now=2_000_000)
+    assert res and res['changed'] is False
+    assert mesh_autolinks.optimize in to_thread_calls
+    assert full_saves == []
+    assert (await mesh._load(OWNER, 'applied'))['_autoLinksState']['measuredAt'] == 2_000_000
+    draft_after = await many(mesh.db.conn, "SELECT settings_json FROM mesh_settings WHERE owner=? AND stage='draft'", (OWNER,))
+    assert draft_after == draft_before
+
+    # 2. Routine route.changed events stay in memory immediately without setting dirty for 10s fast save.
+    sid = ids['r1']
+    base_status = {'ready': True, 'appliedRevision': 1, 'startedAt': 1000, 'error': '', 'peers': [], 'events': []}
+    await mesh.report(sid, base_status)
+    mesh.status[sid]['saved'] = 10_000_000_000_000
+    mesh.status[sid]['dirty'] = False
+    await mesh.report(sid, {**base_status, 'events': [{'seq': 1, 'at': 1001, 'kind': 'route.changed', 'detail': 'a -> b (better)'}]})
+    assert mesh.status[sid]['dirty'] is False
+    assert any(ev['kind'] == 'route.changed' for ev in mesh.status[sid]['events'])
+    await mesh.report(sid, {**base_status, 'events': [{'seq': 2, 'at': 1002, 'kind': 'entry.switch', 'detail': 'r1 -> r2'}]})
+    assert mesh.status[sid]['dirty'] is True
+
+    # 3. _refresh_facts batches multiple node updates into one DB write transaction.
+    labels = []
+    orig_tx = mesh.db.write_transaction
+
+    def spy_tx(*args, **kw):
+        labels.append(kw.get('label'))
+        return orig_tx(*args, **kw)
+
+    monkeypatch.setattr(mesh.db, 'write_transaction', spy_tx)
+    await mesh._refresh_facts(OWNER)
+    assert labels.count('mesh-nodes-refresh') == 1
+    assert 'mesh-node' not in labels
+
+    # 4. align_draft treats a draft differing only in _autoLinksState as unmodified and returns after_applied cleanly.
+    applied_doc = await mesh._load(OWNER, 'applied')
+    draft_stale_state = copy.deepcopy(applied_doc)
+    draft_stale_state['_autoLinksState'] = {'measuredAt': 1}
+    after_doc = copy.deepcopy(applied_doc)
+    after_doc['_autoLinksState'] = {'measuredAt': 999}
+    assert mesh_autolinks.align_draft(draft_stale_state, applied_doc, after_doc) == after_doc

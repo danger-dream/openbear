@@ -121,22 +121,36 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 }
 
 func (peer *Peer) SendHandshakeInitiationTo(isRetry bool, endpoint conn.Endpoint) error {
+	return peer.sendHandshakeInitiation(isRetry, endpoint, false)
+}
+
+func (peer *Peer) sendHandshakeInitiation(isRetry bool, endpoint conn.Endpoint, afterCookie bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
 	}
 
 	peer.handshake.mutex.Lock()
-	throttled := time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout
-	// A throttled call only redirects a handshake still in flight: kept
-	// with none, it would take the next one, long after its path is gone.
-	if endpoint != nil && (!throttled || peer.timers.retransmitHandshake.IsPending()) {
-		peer.handshakeEndpoint = endpoint
+	if afterCookie {
+		if peer.handshake.cookieRetried || !peer.timers.retransmitHandshake.IsPending() {
+			peer.handshake.mutex.Unlock()
+			return nil
+		}
+		peer.handshake.lastSentHandshake = time.Now()
+		peer.handshake.cookieRetried = true
+	} else {
+		throttled := time.Since(peer.handshake.lastSentHandshake) < peer.device.handshakeRetry()
+		// A throttled call only redirects a handshake still in flight: kept
+		// with none, it would take the next one, long after its path is gone.
+		if endpoint != nil && (!throttled || peer.timers.retransmitHandshake.IsPending()) {
+			peer.handshakeEndpoint = endpoint
+		}
+		if throttled {
+			peer.handshake.mutex.Unlock()
+			return nil
+		}
+		peer.handshake.lastSentHandshake = time.Now()
+		peer.handshake.cookieRetried = false
 	}
-	if throttled {
-		peer.handshake.mutex.Unlock()
-		return nil
-	}
-	peer.handshake.lastSentHandshake = time.Now()
 	stored := endpoint == nil
 	endpoint = peer.handshakeEndpoint
 	peer.handshake.mutex.Unlock()

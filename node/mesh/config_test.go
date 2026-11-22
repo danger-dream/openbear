@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	meshrouting "openbear/node/mesh/routing"
 )
@@ -295,14 +294,30 @@ func TestRouterConfigNoTransit(t *testing.T) {
 }
 
 func TestRouterConfigTuning(t *testing.T) {
+	f64 := func(v float64) *float64 { return &v }
 	l := newLab(t, spec{relays: []string{"R1", "R2"}})
 	c := l.config("R1")
 	if routerConfig(c).Tuning != nil {
 		t.Fatal("tuning without one in the config")
 	}
-	c.Routing = &Routing{Tuning: &RoutingTuning{SwitchMs: 5, ShorterMs: 3, AdvertMs: 2, HoldS: 2.5, JitterWeight: 1, LossWeight: 500, FlapHoldS: 30, FlapHoldMaxS: 240}}
-	want := meshrouting.Tuning{SwitchMs: 5, ShorterMs: 3, AdvertMs: 2, Hold: 2500 * time.Millisecond, JitterWeight: 1, LossWeight: 500, FlapHold: 30 * time.Second,
-		FlapHoldMax: 4 * time.Minute}
+	c.Routing = &Routing{Tuning: &RoutingTuning{
+		SmoothHalfLifeS: f64(30),
+		SwitchPct:       f64(2),
+		SwitchMinMs:     f64(1.5),
+		HopCostMs:       f64(3),
+		StartPenaltyMs:  f64(400),
+		JitterWeight:    f64(1),
+		LossWeight:      f64(500),
+	}}
+	want := meshrouting.Tuning{
+		SmoothHalfLifeS: 30,
+		SwitchPct:       2,
+		SwitchMinMs:     1.5,
+		HopCostMs:       3,
+		StartPenaltyMs:  400,
+		JitterWeight:    1,
+		LossWeight:      500,
+	}
 	if got := routerConfig(c).Tuning; got == nil || *got != want {
 		t.Fatalf("tuning %+v, want %+v", got, want)
 	}
@@ -310,9 +325,38 @@ func TestRouterConfigTuning(t *testing.T) {
 	if err := Validate(raw); err != nil {
 		t.Fatal(err)
 	}
+	// Legacy tuning JSON (no new fields) is accepted and falls back to DefaultTuning.
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["routing"] = map[string]any{"tuning": map[string]any{
+		"switchMs": 5, "switchPct": 0, "shorterMs": 3, "shorterPct": 0,
+		"advertMs": 2, "advertPct": 0, "holdS": 5, "jitterWeight": 2,
+		"lossWeight": 1000, "flapHoldS": 60, "flapHoldMaxS": 480,
+	}}
+	legacyRaw, _ := json.Marshal(obj)
+	if err := Validate(legacyRaw); err != nil {
+		t.Fatalf("legacy tuning rejected: %v", err)
+	}
+	var legacyCfg Config
+	if err := json.Unmarshal(legacyRaw, &legacyCfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := routerConfig(&legacyCfg).Tuning; got == nil || *got != meshrouting.DefaultTuning {
+		t.Fatalf("legacy tuning gave %+v, want DefaultTuning %+v", got, meshrouting.DefaultTuning)
+	}
+
+	// Out-of-range new fields are rejected.
 	for _, bad := range []func(*RoutingTuning){
-		func(x *RoutingTuning) { x.SwitchPct = 95 }, func(x *RoutingTuning) { x.SwitchMs = -1 }, func(x *RoutingTuning) { x.FlapHoldMaxS = 10 },
-		func(x *RoutingTuning) { x.HoldS = 61 },
+		func(x *RoutingTuning) { x.SmoothHalfLifeS = f64(0.5) },
+		func(x *RoutingTuning) { x.SmoothHalfLifeS = f64(301) },
+		func(x *RoutingTuning) { x.SwitchPct = f64(55) },
+		func(x *RoutingTuning) { x.SwitchMinMs = f64(-1) },
+		func(x *RoutingTuning) { x.HopCostMs = f64(60) },
+		func(x *RoutingTuning) { x.StartPenaltyMs = f64(6000) },
+		func(x *RoutingTuning) { x.JitterWeight = f64(11) },
+		func(x *RoutingTuning) { x.LossWeight = f64(-1) },
 	} {
 		tune := *c.Routing.Tuning
 		bad(&tune)

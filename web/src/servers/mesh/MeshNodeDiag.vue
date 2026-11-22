@@ -4,7 +4,7 @@ import { relativeTime, timeLabel } from '../../instances/instanceHelpers.js';
 import { bytes, flag } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { mesh, meshError } from './meshStore.js';
-import { directLine, entryHealth, eventRows, isRelay, msText, nameOf, peerKeys, routeRows, routineEvent, transportLabel } from './meshHelpers.js';
+import { directLine, entryHealth, eventRows, isRelay, mergeEvents, msText, nameOf, peerKeys, routeRows, routineEvent, transportLabel } from './meshHelpers.js';
 import { canPinRoute, fixedRouteInfo } from './meshAuto.js';
 import { usePoll } from './usePoll.js';
 import MeshNodeName from './MeshNodeName.vue';
@@ -47,8 +47,26 @@ const peers = computed(() => (status.value.peers || []).map((p, i) => ({p, i})).
   || Number(b.p.active !== false) - Number(a.p.active !== false) || a.i - b.i).map(({p}) => ({...p, key: `${p.kind}:${p.id}`,
   note: [coldPeer(p) ? `冷备，定时试连${p.reconnects ? ` ${p.reconnects} 次` : ''}` : p.reconnects ? `重连 ${p.reconnects} 次` : '', directLine(p.direct)].filter(Boolean).join(' · ')})));
 
-// ---- events ----
-const allEvents = computed(() => (props.detail?.events || status.value.events || []).map((e, i) => ({...e, key: `${e.seq ?? ''}-${e.kind || ''}-${e.at ?? ''}-${i}`})));
+// ---- events: the latest the controller holds; once earlier ones are asked for, the stored history (30 days) page by page ----
+const liveEvents = computed(() => props.detail?.events || status.value.events || []);
+const history = ref([]), historyMore = ref(true), historyState = ref('');
+const allEvents = computed(() => mergeEvents(liveEvents.value, history.value).map((e, i) => ({...e, key: `${e.seq ?? ''}-${e.kind || ''}-${e.at ?? ''}-${i}`})));
+async function loadEarlier() {
+  if (historyState.value === 'loading') return;
+  const sid = id.value, last = history.value.at(-1), shownOldest = eventList.value.at(-1)?.at;
+  historyState.value = 'loading';
+  try {
+    const reply = await MeshApi.events(sid, last ? {before: last.at, beforeSeq: last.seq, limit: 200} : {limit: 300});
+    if (sid !== id.value) return;
+    history.value = [...history.value, ...(reply.events || [])];
+    historyMore.value = Boolean(reply.more);
+    historyState.value = '';
+    // On to the page with the first row older than what was shown.
+    const first = shownOldest == null ? -1 : eventList.value.findIndex(r => r.at < shownOldest);
+    if (first >= 0) eventPage.value = Math.floor(first / PAGE) + 1;
+  }
+  catch (e) { if (sid === id.value) historyState.value = meshError(e) || '读取失败'; }
+}
 const showRoutine = ref(false);
 const routine = computed(() => allEvents.value.filter(e => routineEvent(e, m.value, health.value)));
 const routineCount = computed(() => routine.value.reduce((n, e) => n + (Number(e.repeat) > 1 ? Number(e.repeat) : 1), 0));
@@ -93,6 +111,7 @@ const routePoll = usePoll(async current => {
   }
 }, {interval: () => routesState.value === 'unsupported' ? 0 : 10000});
 watch(id, () => {
+  history.value = []; historyMore.value = true; historyState.value = ''; eventPage.value = 1;
   routePoll.stop();
   routes.value = null; routesError.value = ''; routesState.value = 'loading'; routePage.value = 1;
   if (tab.value === 'routes') void routePoll.run();
@@ -151,6 +170,11 @@ watch(id, () => {
         </ul>
         <el-pagination v-model:current-page="eventPage" class="m3-pager" size="small" layout="total, prev, pager, next" :pager-count="5" :page-size="PAGE" :total="eventList.length" hide-on-single-page />
       </template>
+      <p v-if="detail" class="m3-faint" role="status">
+        <button v-if="historyMore" type="button" class="ix-text-button" :disabled="historyState === 'loading'" @click="loadEarlier">{{ historyState === 'loading' ? '正在读取…' : '加载更早的事件' }}</button>
+        <template v-else>没有更早的了（保留 30 天）</template>
+        <span v-if="historyState && historyState !== 'loading'" class="ob-warn"> 读不到：{{ historyState }}</span>
+      </p>
     </template>
 
     <template v-else-if="tab === 'routes'">

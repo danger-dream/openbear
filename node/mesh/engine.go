@@ -243,11 +243,27 @@ func startEngine(dir string, c *Config, privateKey string, dev tun.Device, host 
 		go e.watchLarge()
 	}
 	go e.watchLinks()
+	go e.keepE2EKeyed()
 	if e.health != nil && !c.isRelay() {
 		go e.probeEntry()
 	}
 	e.events.add("start", fmt.Sprintf("%s up, revision %d, %d peers, %d learned addresses restored", name, c.Revision, len(e.peers), len(restored)))
 	return e, nil
+}
+
+// keepE2EKeyed renews the keys of warm end-to-end sessions before they run
+// out (e2eSessions.keepKeyed).
+func (e *engine) keepE2EKeyed() {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-e.done:
+			return
+		case <-tick.C:
+		}
+		e.e2e.keepKeyed()
+	}
 }
 
 // watchStreams starts a handshake when a dialed TCP or TLS path has a new

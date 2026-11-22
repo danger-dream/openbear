@@ -282,23 +282,26 @@ func (m *Manager) sendAdvert(msg routing.Message) {
 	m.send(msg.Peer, path, v, 0)
 }
 
-// advertBudget is the largest advertisement, in each format, a control
-// message between any two relays holds: relays forward advertisements as
-// their origin signed them, so the longest relay ids are both ends, with
-// room for the revision to grow to 19 digits.
-func (m *Manager) advertBudget() routing.Budget {
-	longest := m.cfg.Self
-	for _, n := range m.cfg.Nodes {
+// advertBudget is budgetOf the config, worked out when it was set.
+func (m *Manager) advertBudget() routing.Budget { return m.budget }
+
+// budgetOf is the largest advertisement, in each format, a control message
+// between any two relays of c holds: relays forward advertisements as their
+// origin signed them, so the longest relay ids are both ends, with room for
+// the revision to grow to 19 digits.
+func budgetOf(c Config) routing.Budget {
+	longest := c.Self
+	for _, n := range c.Nodes {
 		if n.Role == "relay" && len(n.ID) > len(longest) {
 			longest = n.ID
 		}
 	}
-	for _, l := range m.cfg.Links {
+	for _, l := range c.Links {
 		if len(l.Peer) > len(longest) {
 			longest = l.Peer
 		}
 	}
-	envelope := message{Version: m.cfg.Protocol.Or().Max, Network: m.cfg.Network, Revision: 1e18, From: longest, To: longest, Type: msgAdvert,
+	envelope := message{Version: c.Protocol.Or().Max, Network: c.Network, Revision: 1e18, From: longest, To: longest, Type: msgAdvert,
 		AdvertSig: make([]byte, sign.Size)}
 	plain, compact := envelope, envelope
 	plain.Advert = json.RawMessage(`{}`)

@@ -1,4 +1,5 @@
 import {serverName} from './serverNames.js';
+import {settingName} from './settingNames.js';
 
 // Collapsed tool rows describe the requested action, never claim it succeeded.
 // Keep identifiers/payloads untouched in the expanded detail. Unknown tools and
@@ -18,10 +19,12 @@ const TOOL_LABELS = {
 	InstanceControl: '实例管理', Servers: '服务器',
 	ConversationRequest: '会话请求', ConversationGroup: '小组',
 	RequestExtension: '扩展', AgentPlan: '计划',
+	Cron: '定时任务', Webhook: '触发器',
+	Page: '页面', Notes: '笔记', SystemConfig: '系统配置',
 };
 // Built-in extension keys; an MCP server's key is mcp:<server>.
 const EXTENSION_LABELS = {workitems: '任务面板', agents: 'Agent 协作', conversations: '会话协作', browser: '浏览器',
-	servers: '服务器', instances: '实例', automation: '自动化'};
+	servers: '服务器', instances: '实例', automation: '自动化', notes: '笔记', system: '系统配置'};
 export function extensionLabel(key) {
 	const value = String(key || '');
 	return EXTENSION_LABELS[value] || (value.startsWith('mcp:') ? value.slice(4) : value);
@@ -472,6 +475,80 @@ function serversSummary(data) {
 	}
 }
 
+const TEMPLATE_ROLES = {main: '主提示词', agent: 'Agent 提示词', assistant: '页面助手提示词', persona: '人设'};
+
+function pageSummary(data) {
+	switch (data.action) {
+		case 'read':
+			return data.region === 'overlay' ? '读取当前弹窗' : data.region === 'page' ? '读取当前页面' : '读取页面内容';
+		case 'locate': return join('定位页面元素', quoted(data.target));
+		case 'fill': return join('填写表单', quoted(data.label));
+		case 'invoke': {
+			const name = text(data.name);
+			const args = object(data.args);
+			if (name === 'note.insert') return '向当前笔记插入内容';
+			if (name === 'terminal.run') return join('在终端执行', text(String(args.command || '').split(/\r?\n/, 1)[0], 80));
+			if (name === 'terminal.read') return '读取当前终端屏幕';
+			return join('执行页面动作', name);
+		}
+		default: return text(data.action);
+	}
+}
+
+function notesSummary(data) {
+	const who = quoted(data.title) || text(data.id, 36);
+	switch (data.action) {
+		case 'list': return '列出笔记';
+		case 'search': return join('搜索笔记', quoted(data.query));
+		case 'get': return join('读取笔记', who);
+		case 'create': return join('新建笔记', quoted(data.title));
+		case 'update':
+			if (data.find) return join('替换笔记内容', who);
+			if (data.mode === 'append') return join('追加笔记内容', who);
+			if (data.mode === 'prepend') return join('在笔记开头插入内容', who);
+			return join('修改笔记', who);
+		default: return text(data.action);
+	}
+}
+
+function systemConfigSummary(data) {
+	const resource = text(data.resource);
+	const action = text(data.action);
+	if (resource === 'setting') {
+		const labelOf = p => settingName(p) || text(p, 60);
+		if (action === 'list') return data.query ? join('查找系统设置', quoted(data.query)) : '列出系统设置';
+		if (action === 'get') {
+			const paths = Array.isArray(data.paths) ? data.paths.map(labelOf).filter(Boolean) : [];
+			const shown = paths.length > 3 ? `${paths.slice(0, 3).join('、')} 等 ${paths.length} 项` : paths.join('、');
+			return join('查看系统设置', shown || labelOf(data.path));
+		}
+		if (action === 'set') return join('修改系统设置', labelOf(data.path));
+		return join(action, '系统设置');
+	}
+	if (resource === 'template') {
+		const who = quoted(data.name) || (data.id ? `#${text(data.id)}` : '');
+		if (action === 'list') return '列出提示词模板';
+		if (action === 'get') return join('读取提示词模板', data.id ? `#${text(data.id)}` : (TEMPLATE_ROLES[data.role] || text(data.role)));
+		if (action === 'create') return join('新建提示词模板', quoted(data.name));
+		if (action === 'update') return join(data.find ? '替换提示词模板内容' : '修改提示词模板', who);
+		if (action === 'activate') {
+			if (data.role === 'persona') return join(data.on === false ? '取消人设模板' : '设为人设模板', data.id ? `#${text(data.id)}` : '');
+			return join(`设为${TEMPLATE_ROLES[data.role] || text(data.role) || '激活'}`, data.id ? `#${text(data.id)}` : '');
+		}
+		return join(action, '提示词模板');
+	}
+	if (resource === 'model') {
+		const modelId = action === 'add' ? text(object(data.model).id) : text(data.id);
+		const target = data.provider && modelId ? `${text(data.provider)}/${modelId}` : (modelId || text(data.provider));
+		if (action === 'list') return '列出模型渠道';
+		if (action === 'add') return join('添加模型', target);
+		if (action === 'update') return join('修改模型配置', target);
+		if (action === 'sync_metadata') return join('同步模型元信息', target);
+		return join(action, '模型渠道');
+	}
+	return join(action, resource);
+}
+
 // Returns an empty string when a tool has no parameter-aware translator yet.
 export function toolActionSummary(name, value) {
 	const data = object(value);
@@ -496,6 +573,9 @@ export function toolActionSummary(name, value) {
 	else if (name === 'Servers') summary = serversSummary(data);
 	else if (name === 'ConversationRequest') summary = conversationRequestSummary(data);
 	else if (name === 'ConversationGroup') summary = conversationGroupSummary(data);
+	else if (name === 'Page') summary = pageSummary(data);
+	else if (name === 'Notes') summary = notesSummary(data);
+	else if (name === 'SystemConfig') summary = systemConfigSummary(data);
 	else if (name === 'mcp__parrot__video_status') summary = join('查询视频生成进度', text(data.request_id, 36));
 	else if (name === 'RequestExtension') summary = join(`申请开启扩展：${extensionLabel(data.extension) || '未指定'}`, text(data.reason, 80));
 	return text(summary, 160);

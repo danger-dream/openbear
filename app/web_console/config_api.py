@@ -62,6 +62,33 @@ class WebAdminSettingsChannelsMixin:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         return web.json_response({"ok": True, "path": path, "rendered": rendered})
 
+    async def _store_setting(self, path: str, raw_value: Any) -> bool:
+        """Validate one setting value, store and apply it; False when a sensitive value only echoes the current one."""
+        current_value = settings_admin.value_at(self.config.model_dump(by_alias=True), path)
+        if settings_admin.sensitive_value_is_noop(path, raw_value, current_value):
+            return False
+        value = settings_admin.parse_setting_value(path, raw_value)
+        if path in {"models.compressionModels", "models.namingModels", "models.suggestionModels"}:
+            existing, label_name = {
+                "models.compressionModels": (self.config.models.compression_models, "摘要模型"),
+                "models.namingModels": (self.config.models.naming_models, "命名模型"),
+                "models.suggestionModels": (self.config.models.suggestion_models, "推荐模型"),
+            }[path]
+            for label in value:
+                if not self.config.models.resolve(label) and label not in existing:
+                    raise ValueError(f"{label_name}不可用：{label}")
+        elif path == "assistant.model" and value and not self.config.models.resolve(value):
+            raise ValueError(f"模型不可用：{value}")
+        elif path == "assistant.thinkingLevel" and value not in {v for v, _label in settings_admin.get_spec(path).choices}:
+            raise ValueError(f"不支持的思考强度：{value}")
+        elif path == "assistant.extensions" and getattr(self, "extensions", None) is not None:
+            known = {e.key for e in self.extensions.catalog()}
+            unknown = [key for key in value if key not in known and key not in self.config.assistant.extensions]
+            if unknown:
+                raise ValueError(f"未知扩展：{', '.join(unknown)}")
+        self._apply_runtime_config(await self.config_store.update_path(path, value))
+        return True
+
     async def handle_api_settings_patch(self, request: web.Request) -> web.Response:
         if not self._config_writer_available():
             return web.json_response({"ok": False, "error": "config_store_unavailable"}, status=503)
@@ -71,27 +98,9 @@ class WebAdminSettingsChannelsMixin:
         if "value" not in body:
             return web.json_response({"ok": False, "error": "value_required"}, status=400)
         try:
-            current_data = self.config.model_dump(by_alias=True)
-            current_value = settings_admin.value_at(current_data, path)
-            secret_noop = settings_admin.sensitive_value_is_noop(path, body.get("value"), current_value)
-            if secret_noop:
-                new_cfg = self.config
-            else:
-                value = settings_admin.parse_setting_value(path, body.get("value"))
-                if path in {"models.compressionModels", "models.namingModels", "models.suggestionModels"}:
-                    existing, label_name = {
-                        "models.compressionModels": (self.config.models.compression_models, "摘要模型"),
-                        "models.namingModels": (self.config.models.naming_models, "命名模型"),
-                        "models.suggestionModels": (self.config.models.suggestion_models, "推荐模型"),
-                    }[path]
-                    for label in value:
-                        if not self.config.models.resolve(label) and label not in existing:
-                            raise ValueError(f"{label_name}不可用：{label}")
-                new_cfg = await self.config_store.update_path(path, value)
+            secret_noop = not await self._store_setting(path, body.get("value"))
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        if not secret_noop:
-            self._apply_runtime_config(new_cfg)
         await self.audit(
             "settings.update",
             actor="web",

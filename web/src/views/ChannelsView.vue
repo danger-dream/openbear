@@ -7,6 +7,8 @@ import { userStorage } from '../sessionBoundary.js';
 import { copyTextToClipboard } from "../utils/clipboard.js";
 import { mobileSelectOptions } from "../mobileSelect.js";
 import { scrollModelListAbove } from "../components/modelDragAutoScroll.js";
+import { usePageSubject } from "../assistant/pageRegistry.js";
+import { useResourceChanges } from "../assistant/resourceChanges.js";
 
 const loading = ref(false);
 const detailLoading = ref(false);
@@ -187,6 +189,14 @@ const modelForm = reactive({
 });
 
 const selectedProvider = computed(() => detail.value?.provider || null);
+usePageSubject(() => [
+  ...(modelDialog.value ? [{kind: modelMode.value === "create" ? "model-draft" : "model", id: modelMode.value === "create" ? "" : `${selectedName.value}/${modelForm.oldId || modelForm.id}`,
+    label: modelMode.value === "create" ? `添加模型到 ${selectedName.value}` : (modelForm.name || modelForm.id), role: modelMode.value === "create" ? "添加模型对话框" : "编辑模型对话框",
+    details: {provider: selectedName.value, id: modelForm.id, contextWindow: modelForm.contextWindow, maxTokens: modelForm.maxTokens}}] : []),
+  ...(selectedProvider.value ? [{kind: "provider", id: selectedName.value, label: selectedName.value, role: "当前渠道",
+    details: {protocol: selectedProvider.value.protocol, models: (selectedProvider.value.models || []).map((m) => m.id).slice(0, 60), primary: primaryModel.value}}] : []),
+]);
+useResourceChanges(["model"], () => loadList(selectedName.value), {keys: (detail) => [`model:${detail.id}`]});
 const totalModels = computed(() => providers.value.reduce((sum, p) => sum + Number(p.modelCount || 0), 0));
 const overviewStats = computed(() => overview.value?.stats || {});
 const overviewCards = computed(() => {
@@ -1548,7 +1558,7 @@ onBeforeUnmount(() => {
               @end="endModelScroll"
             >
               <template #item="{ element: row }">
-                <article class="model-card" :class="{ 'is-primary-card': row.primary }">
+                <article class="model-card" :data-ob-key="'model:' + (row.fullname || `${selectedName}/${row.id}`)" :class="{ 'is-primary-card': row.primary }">
                   <!-- 1. 头部：把手 + 显示名与ID同行 + 状态药丸 -->
                   <div class="model-head">
                     <button type="button" class="model-drag" :disabled="Boolean(modelSearchQuery)" :aria-label="`拖动排序：${modelDisplayName(row)}`" :title="modelSearchQuery ? '搜索状态下暂停拖动' : '拖动排序'"><span class="model-drag-desktop">⋮⋮</span><svg class="model-drag-grip mobile-channel-only" viewBox="0 0 16 20" aria-hidden="true"><circle cx="5" cy="4" r="1.3"/><circle cx="11" cy="4" r="1.3"/><circle cx="5" cy="10" r="1.3"/><circle cx="11" cy="10" r="1.3"/><circle cx="5" cy="16" r="1.3"/><circle cx="11" cy="16" r="1.3"/></svg></button>

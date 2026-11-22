@@ -11,6 +11,9 @@ from typing import Any
 from aiogram import Bot
 from aiohttp import web
 
+from app.assistant import changes as assistant_changes
+from app.assistant import conversations as assistant_conversations
+from app.assistant.page import PageBridge, page_registry
 from app.config import Config
 from app.control_actions import schedule_openbear_restart
 from app.db.engine import DB
@@ -231,6 +234,11 @@ class WebAdminServer(
             self.interaction_telegram = InteractionTelegram(config, db, bot, self.interactions)
             self.interactions.add_listener(self.interaction_telegram.on_interaction)
         self.update_service = None
+        self.page_bridge = PageBridge(lambda: self.config.assistant.page_action_timeout_s,
+                                      lambda conversation_uuid: assistant_conversations.scope_by_uuid(self.db, conversation_uuid))
+        self.page_tools = page_registry(self.page_bridge)
+        self._secret_usage_task: asyncio.Task[Any] | None = None
+        self._resource_change_unsubscribe: Callable[[], None] | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
 
@@ -322,7 +330,26 @@ class WebAdminServer(
             self._conversation_retention_loop(),
             name="web-conversation-retention",
         )
+
+        async def _secret_usage_backfill() -> None:
+            from app.lifecycle import wait_for_startup
+            from app.memory import secret_usage
+            await wait_for_startup(self)
+            try:
+                await secret_usage.backfill(self.db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("回填凭证最近使用时间失败")
+
+        self._secret_usage_task = asyncio.create_task(_secret_usage_backfill(), name="secret-usage-backfill")
+        self._resource_change_unsubscribe = assistant_changes.on_change(self._broadcast_resource_change)
         log.info("Web 管理服务已启动", host=self.config.web.host, port=self.config.web.port)
+
+    async def _broadcast_resource_change(self, packet: dict[str, Any]) -> None:
+        hub = getattr(self, "global_realtime", None)
+        if hub is not None:
+            hub.broadcast(packet)
 
     async def stop(self) -> None:
         # Close admission before any await: controller done callbacks can run
@@ -350,6 +377,14 @@ class WebAdminServer(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._conversation_retention_task
             self._conversation_retention_task = None
+        if self._secret_usage_task is not None:
+            self._secret_usage_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._secret_usage_task
+            self._secret_usage_task = None
+        if self._resource_change_unsubscribe is not None:
+            self._resource_change_unsubscribe()
+            self._resource_change_unsubscribe = None
         # Stop accepting browser work first, then let every registered controller
         # unwind while SQLite and the live operation sink are still available.
         # Closing DB before these tasks receive CancelledError leaves active Web

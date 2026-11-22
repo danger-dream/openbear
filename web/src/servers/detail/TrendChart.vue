@@ -94,13 +94,15 @@ const byTime = computed(() => props.kind !== 'bar' || props.timed);
 const slot = computed(() => byTime.value ? W / (Math.round(span.value.width / props.step) + 1) : W / Math.max(n.value, 1));
 const x = i => byTime.value ? (props.t[i] - span.value.first) / span.value.width * W : slot.value * (i + 0.5);
 
+// Live 3s charts allow one interval of transport jitter before breaking the line; coarser spans keep 1.5x.
+const gapLimit = computed(() => props.step < 60 ? Math.max(props.step * 1.5, props.step + 3) : props.step * 1.5);
 // Runs of points with a value and no gap between them, as [[index, value], ...].
 function runs(values) {
   const out = [];
   let run = [];
   for (let i = 0; i < n.value; i++) {
     const v = values[i];
-    const gap = i > 0 && props.t[i] - props.t[i - 1] > props.step * 1.5;
+    const gap = i > 0 && props.t[i] - props.t[i - 1] > gapLimit.value;
     if (v == null || gap) { if (run.length) out.push(run); run = []; }
     if (v != null) run.push([x(i), y(v)]);
   }

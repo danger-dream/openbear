@@ -21,6 +21,7 @@ import BgpSection from '../servers/detail/BgpSection.vue';
 import { loadRates, storedRates } from '../servers/fxRates.js';
 import { ensureFlagFont, flag, platformOf, safeError, setServerZone } from '../servers/serverHelpers.js';
 import { ddnsRequest } from '../ddns/ddnsLink.js';
+import { openRequest, takeOpenRequest } from '../assistant/openScope.js';
 import '../instances/instances.css';
 import '../servers/servers.css';
 
@@ -47,7 +48,7 @@ const spark = ref({}), batchTargets = ref([]), filesFor = ref(''), phone = ref(f
 const pings = ref({});
 // The page is on screen (KeepAlive puts it away while another one is shown).
 const visible = ref(true);
-let alive = true, livePoll, listPoll, pingPoll, clock, media;
+let alive = true, pingGen = 0, livePoll, listPoll, pingPoll, clock, media;
 
 function restore() {
   try {
@@ -108,15 +109,27 @@ async function refreshLive() {
 }
 
 async function refreshPings() {
+  const gen = ++pingGen;
   if (!settings.value.latency?.enabled) { pings.value = {}; return; }
-  try { pings.value = ok(await Api.serversLatency()).items || {}; } catch { /* the next minute retries */ }
+  try {
+    const items = ok(await Api.serversLatency()).items || {};
+    if (alive && gen === pingGen) pings.value = items;
+  } catch { /* the next minute retries */ }
 }
-watch(() => settings.value.latency?.enabled, () => { void refreshPings(); });
+watch(() => settings.value.latency?.enabled, () => {
+  if (!settings.value.latency?.enabled || (visible.value && active.value === 'probe')) void refreshPings();
+});
+watch(active, value => { if (value === 'probe' && visible.value) void refreshPings(); });
 
 function openServer(item) {
   if (!tabs.value.includes(item.id)) tabs.value.push(item.id);
   active.value = item.id;
 }
+// The page assistant takes the user back to a server's detail; the list may still be loading.
+watch([openRequest, items], () => {
+  const item = openRequest.value?.kind === 'server' && itemOf(openRequest.value.id);
+  if (item && takeOpenRequest('server')) openServer(item);
+}, {immediate: true});
 function closeTab(id) {
   const index = tabs.value.indexOf(id);
   if (index < 0) return;
@@ -168,12 +181,18 @@ function removed(id) { closeTab(id); void load(true); }
 function openBatch(ids = []) { batchTargets.value = ids; dialog.value = 'batch'; }
 function openFiles(id) { filesFor.value = id; }
 function syncPhone() { phone.value = media.matches; }
+function syncVisibility() {
+  if (document.hidden || !visible.value) return;
+  now.value = Date.now();
+  if (active.value === 'probe') void refreshPings();
+}
 
 onMounted(() => {
   ensureFlagFont();
   media = window.matchMedia(MOBILE_VIEWPORT_QUERY);
   syncPhone();
   media.addEventListener?.('change', syncPhone);
+  document.addEventListener('visibilitychange', syncVisibility);
   void load().then(refreshLive);
   void loadRates().then(value => { if (value) fx.value = value; });
   startPolls();
@@ -192,11 +211,19 @@ let shownBefore = false;
 onActivated(() => {
   visible.value = true;
   startPolls();
-  if (shownBefore) { now.value = Date.now(); void load(true).then(refreshLive); }
+  if (shownBefore) {
+    now.value = Date.now();
+    const before = pingGen;
+    void load(true).then(() => {
+      if (!alive || !visible.value) return;
+      void refreshLive();
+      if (active.value === 'probe' && pingGen === before) void refreshPings();
+    });
+  }
   shownBefore = true;
 });
 onDeactivated(() => { visible.value = false; stopPolls(); });
-onBeforeUnmount(() => { alive = false; stopPolls(); media?.removeEventListener?.('change', syncPhone); emit('mobile-header-ready', false); document.removeEventListener('keydown', escBgp); document.removeEventListener('pointerdown', pressBgp, true); });
+onBeforeUnmount(() => { alive = false; stopPolls(); media?.removeEventListener?.('change', syncPhone); document.removeEventListener('visibilitychange', syncVisibility); emit('mobile-header-ready', false); document.removeEventListener('keydown', escBgp); document.removeEventListener('pointerdown', pressBgp, true); });
 
 // BGP 上游 from a card's network line: one popover for the whole board, by the line tapped; a bottom sheet on a phone.
 // The page alone opens and closes it (Element Plus would also toggle it from the line once it had been opened

@@ -1,6 +1,6 @@
 // The board's model: which links two nodes can have, where nodes go when there
 // is no saved layout, and which members a rule connects. No requests here.
-import { ALL_MEMBERS, candErrorText, CAND_STATES, entryHealth, errorsUnder, isRelay, isSite, listens, mutualRule, protoText, sideParts, TRANSPORTS, transportLabel, uid } from './meshHelpers.js';
+import { ALL_MEMBERS, candErrorText, CAND_STATES, entryHealth, entryLan, entryVia, errorsUnder, isRelay, isSite, listens, mutualRule, protoText, sideParts, TRANSPORTS, transportLabel, uid } from './meshHelpers.js';
 
 export const TOOLS = [
   ['select', '选择', '拖动节点，点选查看属性；从节点边上的圆点拖到另一台，按两端角色自动连线'],
@@ -299,13 +299,15 @@ export function entryLook(work, data, errors, member, index, status = null) {
   const anyInUse = (member.entry.candidates || []).some(x => entryHealth(data, member.serverId, status)[x.id]?.state === 'active') || Boolean(summary?.candidate);
   const standby = !problem && !inUse && anyInUse;
   // A hot standby is kept connected; a cold one (untested) is only tried now and then.
-  return {look, problem, role, health, failing, punched, opened, via: opened ? ENTRY_VIA[health.via] || '' : '', standby, cold: standby && health?.state === 'untested'};
+  const lan = !problem && entryLan(data, member.serverId, c.relay, c.transport, health);
+  return {look, problem, role, health, failing, punched, opened, lan, via: opened ? ENTRY_VIA[health.via] || '' : '', standby, cold: standby && health?.state === 'untested'};
 }
 export const standbyNote = look => look.cold ? '冷备，平时不连，只定时试连' : '热备，平时不走流量';
 export const standbyDetail = look => look.cold ? '冷备：平时不保持连接，只定时试连；前面的入口都不可用时才切过来' : '热备：保持连接、平时不走流量，在用的入口断开时切过来';
 // Entries reached by punching say how they got through: LAN or internet once open, punching until then.
 export const ENTRY_VIA = {lan: '局域网', public: '公网', configured: '指定地址', routed: '内网转发'};
 export function entryHow(look, transport) {
+  if (look.lan) return entryVia(true, transport);
   if (!look.punched) return transportLabel(transport);
   if (look.opened) return look.via || '打洞';
   // Without a report (an older controller) it only says that it punches.

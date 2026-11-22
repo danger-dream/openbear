@@ -2484,3 +2484,31 @@ async def test_a_node_and_controller_work_together_only_when_their_protocols_ove
 
 async def _is(value):
     return value
+
+
+async def test_recent_rounds_sample_timestamp_and_list_can_skip_checks(env, monkeypatch):  # noqa: F811
+    from app.servers import hub as hub_mod
+    e = env
+    created = await api(e, 'POST', '/api/servers', {'name': 'RoundBox', 'profile': {'region': 'US'}})
+    sid = created['item']['id']
+    # Save a node record containing route & unlock payloads to verify include_checks=False skips them.
+    async with e.db.write_transaction(label='test-node') as conn:
+        info = json.dumps({'info': {'platform': 'linux'}, 'route': {'at': 1, 'targets': [{'id': 't1', 'tier': '163'}]}, 'unlock': {'at': 1, 'items': []}})
+        await conn.execute('INSERT INTO server_nodes(server_id,owner,public_key,enrolled_ms,seen_ms,info_json) VALUES(?,?,?,?,?,?)',
+                           (sid, 123, 'k', 1, 1, info))
+    full = await e.servers.list(123)
+    lite = await e.servers.list(123, include_checks=False)
+    full_item = next(i for i in full['items'] if i['id'] == sid)
+    lite_item = next(i for i in lite['items'] if i['id'] == sid)
+    assert full_item['node']['route'] is not None and full_item['node']['unlock'] is not None
+    assert lite_item['node']['route'] is None and lite_item['node']['unlock'] is None
+    assert 'latencyCatalog' not in lite['settings'] and 'ipIntel' not in lite['settings']
+
+    # Rounded timestamps avoid floor-truncation turning a 3.1s boundary arrival into a 4s/5s jump.
+    sess = hub_mod.Session(sid, None, None, '127.0.0.1')
+    times = iter([1_700_000_950, 1_700_004_050])
+    monkeypatch.setattr(hub_mod, 'now_ms', lambda: next(times))
+    await e.servers.hub._message(sess, {'t': 'report', 'm': {'cpu': 10}})
+    await e.servers.hub._message(sess, {'t': 'report', 'm': {'cpu': 11}})
+    ts = [t for t, _ in sess.recent]
+    assert ts == [1_700_001, 1_700_004]

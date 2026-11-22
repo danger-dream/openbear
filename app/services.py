@@ -46,6 +46,8 @@ from app.tools.files import register_file_tools
 from app.tools.history import register_history_tools
 from app.tools.mcp import register_mcp_tools
 from app.tools.memory import register_memory_tools
+from app.tools.notes import register_notes_tool
+from app.tools.system_config import register_system_config_tool
 from app.tools.openbear_control import register_openbear_control_tool
 from app.tools.extensions import register_extension_tool
 from app.extensions import ExtensionService
@@ -212,6 +214,8 @@ class Services:
         register_cron_tool(self.tools, self.cron)
         register_collab_tools(self.tools, self.collab, self.collab_groups)
         register_browser_tool(self.tools, self.browser)
+        register_notes_tool(self.tools, self.db)
+        register_system_config_tool(self.tools, self.web_admin)
         register_agent_tools(
             self.tools,
             config=config,
@@ -814,6 +818,8 @@ class Services:
         register_cron_tool(self.tools, self.cron)
         register_collab_tools(self.tools, self.collab, self.collab_groups)
         register_browser_tool(self.tools, self.browser)
+        register_notes_tool(self.tools, self.db)
+        register_system_config_tool(self.tools, self.web_admin)
         register_agent_tools(
             self.tools,
             config=config,

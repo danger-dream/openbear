@@ -9,7 +9,7 @@ const source = fs.readFileSync(new URL('./SettingsView.vue', import.meta.url), '
 function runtime(probe) {
   const script = parse(source).descriptor.scriptSetup.content.replace(/^import .*;\n/gm, '');
   const calls = [];
-  const ctx = vm.createContext({...Vue, onMounted() {},
+  const ctx = vm.createContext({usePageSubject:()=>{}, usePageAction:()=>{}, useResourceChanges:()=>{}, ...Vue, onMounted() {},
     Api: {testBrowserConnection: async endpoint => {calls.push(endpoint); return probe(endpoint);},
       updateSetting() {assert.fail('a connection test must not save or enable');}},
     apiError: error => error.message,

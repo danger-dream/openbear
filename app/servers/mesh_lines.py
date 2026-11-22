@@ -15,9 +15,10 @@ link by its ends' peer records. One end samples a line, so nothing is counted tw
 for its entries, else the smaller id while its reports are fresh, the other end otherwise."""
 from __future__ import annotations
 
+import ipaddress
 import re
 
-from app.servers.mesh_config import node_entry_mode
+from app.servers.mesh_config import is_lan, node_entry_mode
 from app.servers.mesh_status import direct_up, entry_rtt, fresh_status, records
 
 MINUTE_RETENTION = 2 * 86400
@@ -87,12 +88,24 @@ def _strip(endpoint):
     return (endpoint or '').partition('://')[2] or (endpoint or '')
 
 
+def _lan(endpoint, relay):
+    """Whether a member dials its relay at the relay's LAN address: a private one, not what the
+    user entered as the relay's address."""
+    host = _strip(endpoint).rpartition(':')[0].strip('[]')
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return is_lan(ip) and host != relay.get('publicEndpoint')
+
+
 # ----- which lines there are -----
 def catalogue(doc, configs):
     """[line] of the applied document as its configs run it, in a stable order: relay links,
     then each member's entry candidates in its order, then direct links. A line is {id, kind,
     a, b, transport, punch, dial {a, b}, endpoint {a, b}: what each end dials ('' when it
-    waits)}; an entry also has candidate (its id now), mode and order (its place)."""
+    waits)}; an entry also has candidate (its id now), mode, order (its place) and lan (the member
+    dials the relay's LAN address)."""
     live = {m['serverId']: m for m in doc['members'] if not m['removing']}
     out = {}
 
@@ -131,15 +144,19 @@ def catalogue(doc, configs):
                     continue
                 config = configs.get(m['serverId']) or {}
                 written = {c['id']: c for c in (config.get('entry') or {}).get('candidates', [])}
+                # A member on upstreams dials its relays as links.
+                upstreams = {link['peer']: link for link in config.get('links', []) if link.get('kind') == 'relay'}
                 for order, c in enumerate(m['entry']['candidates']):
                     if live.get(c['relay'], {}).get('role') != 'relay':
                         continue
                     line_id = f"entry:{m['serverId']}|{c['relay']}|{c['transport']}"
                     sent = written.get(c['id']) or {}
+                    dialed = (sent or upstreams.get(c['relay']) or {}).get('endpoint', '')
                     out.setdefault(line_id, {'id': line_id, 'kind': 'entry', 'a': m['serverId'], 'b': c['relay'], 'transport': c['transport'],
                                              'punch': bool(sent.get('punch')), 'dial': {'a': True, 'b': False},
-                                             'endpoint': {'a': _strip(sent.get('endpoint', '')), 'b': ''},
-                                             'candidate': c['id'], 'mode': node_entry_mode(m)[0], 'order': order})
+                                             'endpoint': {'a': _strip(dialed), 'b': ''},
+                                             'candidate': c['id'], 'mode': node_entry_mode(m)[0], 'order': order,
+                                             'lan': _lan(dialed, live[c['relay']])})
     return list(out.values())
 
 
@@ -261,7 +278,7 @@ def _end(line, end, statuses, now, role):
 
 def view(lines, statuses, now):
     """The lines as GET /mesh lists them: {id, kind, a, b, transport, punch, state up|down|standby|cold|unused|unknown,
-    role, rttMs, lossRate, ends {a, b}}."""
+    role, rttMs, lossRate, ends {a, b}}, and lan true on an entry the member dials at the relay's LAN address."""
     out = []
     by_member = {}
     for line in lines:
@@ -287,7 +304,8 @@ def view(lines, statuses, now):
         out.append({'id': line['id'], 'kind': line['kind'], 'a': line['a'], 'b': line['b'], 'transport': line['transport'],
                     'punch': line['punch'], 'state': state, 'role': role if line['kind'] == 'entry' else 'active',
                     'rttMs': sample['rttMs'] if sample else None, 'lossRate': sample['lossRate'] if sample else None,
-                    'ends': {end: _end(line, end, statuses, now, role) for end in ('a', 'b')}})
+                    'ends': {end: _end(line, end, statuses, now, role) for end in ('a', 'b')},
+                    **({'lan': True} if line.get('lan') else {})})
     return out
 
 

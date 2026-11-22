@@ -761,6 +761,22 @@ class UpdatesConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
 
+class AssistantConfig(BaseModel):
+    """The page assistant: the floating chat panel of the Web console and the defaults of its conversations."""
+
+    enabled: bool = True
+    # Empty: the conversation defaults' main model.
+    model: str = ""
+    thinking_level: str = Field(default="", alias="thinkingLevel")
+    fast_mode: bool = Field(default=False, alias="fastMode")
+    # Notes and SystemConfig are opt-in extensions: off until the user picks them.
+    extensions: list[str] = Field(default_factory=lambda: ["servers"])
+    context_chars: int = Field(default=4000, alias="contextChars", ge=500, le=20_000)
+    page_action_timeout_s: float = Field(default=15.0, alias="pageActionTimeoutS", ge=3, le=120)
+
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+
 from app.webhooks.contracts import WebhooksConfig
 
 
@@ -785,6 +801,7 @@ class Config(BaseModel):
     media: MediaConfig = Field(default_factory=MediaConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    assistant: AssistantConfig = Field(default_factory=AssistantConfig)
     log_level: str = Field(default="INFO", alias="logLevel")
 
     model_config = {"populate_by_name": True}

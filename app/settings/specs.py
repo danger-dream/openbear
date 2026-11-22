@@ -91,7 +91,7 @@ class SettingSpec:
             item = str(value or "").strip()
             if not item:
                 continue
-            if item not in allowed and self.path not in {"models.compressionModels", "models.namingModels", "models.suggestionModels"}:
+            if item not in allowed and self.path not in {"models.compressionModels", "models.namingModels", "models.suggestionModels", "assistant.extensions"}:
                 raise ValueError(f"不支持的选项：{item}")
             if item not in out:
                 out.append(item)
@@ -959,6 +959,46 @@ SPECS: dict[str, SettingSpec] = {
     ),
 }
 
+SPECS.update({
+    "assistant.enabled": _s(
+        "assistant.enabled", "启用页面助手",
+        "在各页面显示可拖动的助手图标，点开后可以就当前页面提问，或让它代办操作。关闭后不再显示入口，已有的助手会话保留在会话列表的“页面助手”分组。",
+        "bool", "page_assistant", "立即生效",
+    ),
+    "assistant.model": _s(
+        "assistant.model", "默认模型",
+        "新建助手会话使用的主模型；留空跟随新会话的默认模型。面板里可以随时为当前助手会话换模型。",
+        "str", "page_assistant", "立即生效",
+    ),
+    "assistant.thinkingLevel": _s(
+        "assistant.thinkingLevel", "默认思考强度",
+        "新建助手会话的思考强度。留空时：设置了默认模型就用该模型的默认强度，否则跟随新会话的默认；所选模型不支持这一档时，用模型的默认强度。",
+        "str", "page_assistant", "立即生效",
+        choices=(("", "默认"), ("off", "关闭"), ("minimal", "最低"), ("low", "低"), ("medium", "中"),
+                 ("high", "高"), ("xhigh", "超高"), ("max", "最大")),
+    ),
+    "assistant.fastMode": _s(
+        "assistant.fastMode", "默认开启 Fast",
+        "新建助手会话默认开启 Fast；所选模型不支持 Fast 时不生效。",
+        "bool", "page_assistant", "立即生效",
+    ),
+    "assistant.extensions": _s(
+        "assistant.extensions", "默认扩展",
+        "新建助手会话默认开启的扩展；开得越多，每次请求带的工具说明越多。面板里可以为当前会话再开关。",
+        "multi", "page_assistant", "立即生效",
+    ),
+    "assistant.contextChars": _s(
+        "assistant.contextChars", "页面内容摘录上限",
+        "每条消息附带的页面可见文字最多多少字符。越大助手越容易看懂页面，也越费 tokens；不够时助手会自己再读。",
+        "int", "page_assistant", "立即生效", min_value=500, max_value=20_000, unit="字符",
+    ),
+    "assistant.pageActionTimeoutS": _s(
+        "assistant.pageActionTimeoutS", "页面操作等待时间",
+        "助手在页面上读取、定位、填写或调用页面动作时，最多等浏览器多久回应；超时会告诉助手页面没有响应。",
+        "float", "page_assistant", "立即生效", min_value=3, max_value=120, unit="秒",
+    ),
+})
+
 SPECS.update(_browser_specs(_s))
 from app.webhooks.settings import build_specs as _webhook_specs, GROUP_TITLES as _WEBHOOK_GROUPS
 SPECS.update(_webhook_specs(_s))
@@ -999,6 +1039,18 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
     "user_message_template": (
         "用户消息尾部模板",
         ["userMessageTemplate.enabled", "userMessageTemplate.template"],
+    ),
+    "page_assistant": (
+        "页面助手",
+        [
+        "assistant.enabled",
+        "assistant.model",
+        "assistant.thinkingLevel",
+        "assistant.fastMode",
+        "assistant.extensions",
+        "assistant.contextChars",
+        "assistant.pageActionTimeoutS",
+        ],
     ),
     "retry": (
         "模型失败恢复",
@@ -1204,6 +1256,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
         ],
     ),
     "work_items": ("任务", "会话任务记录的长度、条数和模型看到的内容", ["work_items"]),
+    "assistant": ("页面助手", "悬浮助手的开关、默认模型、思考强度与扩展", ["page_assistant"]),
     "features": ("可选功能", "实例、主机等按需开启的菜单和工具", ["features"]),
     "updates": ("版本更新", "是否接收测试版，以及服务器节点的自动更新", ["updates"]),
     "browser": ("浏览器", "网页操作、等待时间与文件大小", ["browser_connection", "browser_limits", "browser_recovery"]),

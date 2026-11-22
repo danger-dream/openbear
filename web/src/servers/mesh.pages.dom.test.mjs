@@ -538,12 +538,12 @@ test('lines page: the last automatic change a line each with its node pairs, wha
   assert.match(plain([await log.locator('.m3-auto-h').innerText()])[0], /新建 1 条 · 拆除 1 条/);
   const [added, dropped] = plain(await texts(log.locator('.m3-auto-item')));
   assert.match(added, /^新建 Berlin ⇄ ?LAX 中转线路 让 2 对节点变快，最多： ?Home → ?R2 300 → 200 ms 查看 2 对$/);
-  assert.match(dropped, /^拆除 LAX ⇄ ?R5 中转线路 连续无改善$/);
+  assert.match(dropped, /^拆除 LAX ⇄ ?R5 中转线路 连续 6 小时最好只快 5ms，不到保留门槛 10ms$/);
   assert.equal(await log.locator('.m3-auto-item').first().locator('.sv-flag').count(), 4);
   await log.getByRole('button', {name: '查看 2 对'}).click();
   assert.deepEqual(plain(await texts(log.locator('.m3-gains li'))).map(s => s.replace(/\s+/g, ' ')), ['Home → R2 300 → 200 ms −100 ms', 'Home → R3 280 → 230 ms −50 ms']);
-  // What it watches: an upstream reads member → relay, with its rounds.
-  assert.match(plain([await watch.innerText()])[0].replace(/\s+/g, ' '), /2\/3 轮 Home → ?R1 入口中转 预计让 1 对节点变快/);
+  // What it watches: an upstream reads member → relay, with how long it has held of the 30 minutes.
+  assert.match(plain([await watch.innerText()])[0].replace(/\s+/g, ' '), /持续 30 分钟都更快才新建 20\/30 分钟 Home → ?R1 入口中转 预计让 1 对节点变快/);
 
   // Lines by what they want: the automatic one open, the 20 others folded under their count, the whole head the switch.
   assert.deepEqual((await texts(page.locator('.m3-rows-group b'))), ['自动建立', '其余线路']);
@@ -611,14 +611,14 @@ test('a member on one entry keeps it until moved: on its page any way and back, 
 test('routing: why a route stays, the best ten against the route in use, the thresholds in the settings', async t => {
   const h = await setup(t, {v3: true});
   const {page} = h;
-  const tuning = {switchMs: 20, switchPct: 0};
+  const tuning = {switchMinMs: 20, switchPct: 0};
   h.mesh.setPath((src, dst) => ({hops: [{node: src, via: ''}, {node: 'berlin', via: 'entry', rttMs: 12}, {node: dst, via: 'relay', rttMs: 140}], rttMs: 152, stale: false,
-    decision: {node: 'berlin', dest: dst, cost: 190.4, best: 'lax', bestCost: 176, held: 'margin'}, tuning}));
+    decision: {node: 'berlin', dest: dst, cost: 190.4, smoothed: 192, best: 'lax', bestCost: 176, bestSmoothed: 185, held: 'margin'}, tuning}));
   await tab(page, '节点').click();
   await page.locator('.m3-row', {hasText: 'Home'}).click();
   const why = page.locator('.m3-rt-why');
   await why.waitFor();
-  assert.equal(await why.innerText(), 'Berlin 选的路线，代价 190.4；改走 LAX 代价 176，便宜 14.4 ms，没换：便宜得不够，没到切换门槛（门槛：至少便宜 20 ms）。');
+  assert.equal(await why.innerText(), 'Berlin 选的路线，代价 190.4（平滑 192）；改走 LAX 代价 176（平滑 185），便宜 14.4 ms，没换：便宜得不够，没到切换门槛（门槛：至少便宜 20 ms）。');
   // The best ten, each against the route in use.
   const seg = (a, b, rttMs) => ({a, b, exists: true, rttMs});
   h.mesh.setBest(() => ({routes: [{nodes: ['home', 'lax'], segments: [seg('home', 'lax', 150)], rttMs: 150, cost: 176, own: null},
@@ -637,17 +637,16 @@ test('routing: why a route stays, the best ten against the route in use, the thr
   assert.match(await routing.innerText(), /链路代价 = 延迟/);
   await routing.getByRole('spinbutton', {name: '切换门槛 且超过 %'}).fill('95');
   await page.getByRole('button', {name: '保存到草稿'}).click();
-  await routing.getByText('在 0～90 之间').waitFor();
-  await routing.getByRole('spinbutton', {name: '切换门槛 且超过 %'}).fill('0');
+  await routing.getByText('在 0～50 之间').waitFor();
+  await routing.getByRole('spinbutton', {name: '切换门槛 且超过 %'}).fill('3');
   await routing.getByRole('spinbutton', {name: '切换门槛 至少便宜 ms'}).fill('3');
   await routing.getByRole('spinbutton', {name: '丢包权重 ms（全丢时）'}).fill('500');
   await page.getByRole('button', {name: '保存到草稿'}).click();
-  const saved = await h.saved(d => d.settings.routing?.switchMs === 3, 'the thresholds saved');
-  assert.deepEqual(saved.settings.routing, {switchMs: 3, switchPct: 0, shorterMs: 3, shorterPct: 0, advertMs: 2, advertPct: 0, holdS: 5, jitterWeight: 2, lossWeight: 500,
-    flapHoldS: 60, flapHoldMaxS: 480});
+  const saved = await h.saved(d => d.settings.routing?.switchMinMs === 3, 'the thresholds saved');
+  assert.deepEqual(saved.settings.routing, {smoothHalfLifeS: 60, switchPct: 3, switchMinMs: 3, hopCostMs: 2, startPenaltyMs: 150, jitterWeight: 2, lossWeight: 500});
   await routing.getByRole('button', {name: '全部恢复默认'}).click();
   await page.getByRole('button', {name: '保存到草稿'}).click();
-  await h.saved(d => d.settings.routing?.switchMs === 5 && d.settings.routing.lossWeight === 1000, 'back to the defaults');
+  await h.saved(d => d.settings.routing?.switchMinMs === 2 && d.settings.routing.lossWeight === 1000, 'back to the defaults');
   await h.close();
 });
 
@@ -661,7 +660,7 @@ test('settings: the mesh notifications switched by type, saved at once into the 
   const standby = alerts.getByRole('switch', {name: '备用入口都连不上提醒'});
   await until(page, async () => await standby.isEnabled(), 'the switches loaded');
   assert.equal(await standby.getAttribute('aria-checked'), 'true');
-  assert.equal(await alerts.getByRole('switch').count(), 9);
+  assert.equal(await alerts.getByRole('switch').count(), 10);
   await standby.click();
   await until(page, async () => await standby.getAttribute('aria-checked') === 'false' && await standby.isEnabled(), 'switched off');
   assert.equal(await standby.innerText(), '不推送');

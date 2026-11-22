@@ -35,6 +35,8 @@ import SiyuanLikeEditor from '../notes/SiyuanLikeEditor.vue';
 import NoteImportDialog from '../notes/NoteImportDialog.vue';
 import NoteMoveDialog from '../notes/NoteMoveDialog.vue';
 import { extractOutlineFromMarkdown } from '../notes/markdownCodec.js';
+import { usePageAction, usePageSubject } from '../assistant/pageRegistry.js';
+import { useResourceChanges } from '../assistant/resourceChanges.js';
 
 const TREE_EMOJIS = [
   '🏠', '👷', '🔑', '📁', '📝', '💡',
@@ -179,6 +181,23 @@ const openTabs = computed(() =>
 );
 
 const activeNote = computed(() => (activeNoteUuid.value ? noteDetails[activeNoteUuid.value] || null : null));
+usePageSubject(() => activeNote.value ? {kind: 'note', id: activeNote.value.noteUuid, label: activeNote.value.title || '未命名笔记', main: true, role: '正在编辑',
+  details: {path: activeNote.value.path || '', revision: activeNote.value.revision, readonly: Boolean(activeNote.value.isReadonly),
+    unsaved: hasUnsavedChanges(activeNote.value.noteUuid)}} : null);
+usePageAction('note.insert', {
+  description: '把 Markdown 插入到用户正在编辑的这篇笔记里（光标处、开头或末尾），用户马上能看到也能撤销，随后按笔记的自动保存保存。',
+  params: {markdown: 'Markdown 文本', at: 'cursor | start | end，默认 cursor'},
+  run: ({markdown, at = 'cursor'} = {}) => {
+    if (activeNote.value?.isReadonly) return {ok: false, error: 'note_readonly', message: '笔记已锁定为只读'};
+    return editorRef.value?.insertMarkdown?.(markdown, at) ? {inserted: true, at} : {ok: false, error: 'insert_failed'};
+  },
+}, {when: () => Boolean(activeNote.value && editorRef.value)});
+useResourceChanges(['note'], async (detail) => {
+  await loadTree({ selectFirstIfEmpty: false });
+  if (detail.id !== activeNoteUuid.value) return;
+  if (hasUnsavedChanges(detail.id)) ElMessage.warning('助手刚修改了这篇笔记；你这里还有未保存的修改，保存时会提示冲突');
+  else await openNote(detail.id, { enterMobileEditor: false });
+}, {keys: (detail) => [`note:${detail.id}`]});
 const mobileOutlineItems = computed(() => extractOutlineFromMarkdown(activeNote.value?.content || ''));
 
 function hasTabCustomIcon(item) {
@@ -1037,6 +1056,7 @@ onBeforeUnmount(() => {
             v-for="row in visibleTreeRows"
             :key="row.noteUuid"
             :data-note-uuid="row.noteUuid"
+            :data-ob-key="'note:' + row.noteUuid"
             class="kb-tree-row"
             :class="{
               'is-active': activeNoteUuid === row.noteUuid,

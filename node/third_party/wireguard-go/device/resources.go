@@ -270,11 +270,40 @@ func (device *Device) newKeepaliveElement() *QueueOutboundElement {
 }
 
 // handshakeLoad is the handshake queue length from which the device counts
-// as under load: an eighth of the queue, as upstream's 128 of 1024, and at
-// least one waiting, so that the few slots of fixed resource mode still
-// turn on cookies and the per-IP limit.
+// as under load: an eighth of the queue, as upstream's 128 of 1024, and half
+// of the few slots of fixed resource mode. An eighth of those was one or
+// four waiting: a few sessions starting at once, as a router's own traffic
+// and its probes do, sent cookies, and each of their handshakes went again
+// only on its retransmit timer, the packets waiting for it lost meanwhile.
 func (device *Device) handshakeLoad() int {
+	if device.resources != nil {
+		return max(1, cap(device.queue.handshake.c)/2)
+	}
 	return max(1, cap(device.queue.handshake.c)/8)
+}
+
+// handshakeRetry is how long an initiation waits for its response before
+// it goes again: the limits' HandshakeRetry, or RekeyTimeout.
+func (device *Device) handshakeRetry() time.Duration {
+	if device.resources != nil && device.resources.limits.HandshakeRetry > 0 {
+		return device.resources.limits.HandshakeRetry
+	}
+	return RekeyTimeout
+}
+
+// HandshakeStats count what slows a handshake down. CookiesSent: messages
+// answered with a cookie under load; CookiesReceived: cookies consumed, each
+// followed at once by the initiation again; QueueFull: handshake messages
+// dropped with the handshake queue full; RateLimited: dropped under load by
+// the per-IP limit; Retries: initiations sent again on their timer.
+type HandshakeStats struct {
+	CookiesSent, CookiesReceived, QueueFull, RateLimited, Retries uint64
+}
+
+func (device *Device) HandshakeStats() HandshakeStats {
+	h := &device.handshakes
+	return HandshakeStats{CookiesSent: h.cookiesSent.Load(), CookiesReceived: h.cookiesReceived.Load(), QueueFull: h.queueFull.Load(),
+		RateLimited: h.rateLimited.Load(), Retries: h.retries.Load()}
 }
 
 // outboundStallWait bounds how long, in fixed resource mode, a packet waits

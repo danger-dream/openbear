@@ -6,7 +6,7 @@ import { mesh, meshError } from './meshStore.js';
 import { trendRttText } from './meshHelpers.js';
 import { usePoll } from './usePoll.js';
 
-// Small trend charts for one member: latency, timeouts, memory and CPU.
+// Small trend charts for one member: latency, timeouts, memory, CPU and, for one that routes, route changes.
 const props = defineProps({serverId: {type: String, required: true}});
 const RANGES = [['1h', '1 小时'], ['24h', '24 小时'], ['7d', '7 天']];
 const range = ref('1h'), points = ref(null), error = ref(''), missing = ref(false), rtt = ref(null);
@@ -33,10 +33,14 @@ const SERIES = [
   ['timeoutRate', '探测超时', v => pct(v * 100), 'bad'],
   ['rssBytes', '内存', v => bytes(v)],
   ['cpuPercent', 'CPU', v => pct(v)],
+  ['routeSwitches', '换路', v => `${Math.round(v)} 次`],
 ];
 const W = 120, H = 28;
+const sum = key => (points.value || []).reduce((n, p) => n + (num(p[key]) || 0), 0);
+// Route changes only for one that changed a route in the range: members on an entry route nothing.
+const shown = computed(() => SERIES.filter(([key]) => key !== 'routeSwitches' || sum(key) > 0));
 // Points without a value (latency while every probe timed out) break the line.
-const charts = computed(() => (points.value || []).length ? SERIES.map(([key, label, fmt, tone]) => {
+const charts = computed(() => (points.value || []).length ? shown.value.map(([key, label, fmt, tone]) => {
   const all = points.value.map(p => ({at: Number(p.at), v: num(p[key])})).filter(p => Number.isFinite(p.at)).sort((a, b) => a.at - b.at);
   const list = all.filter(p => p.v !== null);
   if (!list.length) return {key, label, empty: true};
@@ -52,8 +56,9 @@ const charts = computed(() => (points.value || []).length ? SERIES.map(([key, la
 }) : []);
 const rttNote = computed(() => trendRttText(rtt.value, mesh.work?.members || []));
 const counts = computed(() => {
-  const sum = key => (points.value || []).reduce((n, p) => n + (num(p[key]) || 0), 0);
-  return (points.value || []).length ? `切换 ${sum('switches')} 次 · 重连 ${sum('reconnects')} 次` : '';
+  if (!(points.value || []).length) return '';
+  const routes = sum('routeSwitches'), flips = sum('routeFlips');
+  return `切换 ${sum('switches')} 次 · 重连 ${sum('reconnects')} 次${routes ? ` · 换路 ${routes} 次` : ''}${flips ? ` · 来回 ${flips} 次` : ''}`;
 });
 </script>
 <template>

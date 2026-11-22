@@ -358,4 +358,28 @@ test("an extension request names the extension and how it came out", () => {
 	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "servers"}), JSON.stringify({ok: true, status: "enabled", approvedBy: "auto_allow"})), "申请开启扩展：服务器 · 自动允许");
 	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "mcp:parrot"}), JSON.stringify({ok: false, status: "declined"})), "申请开启扩展：parrot · 未同意");
 	assert.equal(toolArgumentsSummary("RequestExtension", args, JSON.stringify({ok: false, error: "user_confirmation_unavailable"})), "申请开启扩展：浏览器 · 无人确认");
+	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "notes"}), JSON.stringify({ok: true, status: "enabled", approvedBy: "user"})), "申请开启扩展：笔记 · 已同意");
+	assert.equal(toolArgumentsSummary("RequestExtension", JSON.stringify({extension: "system"}), JSON.stringify({ok: true, status: "enabled", approvedBy: "user"})), "申请开启扩展：系统配置 · 已同意");
+});
+
+test("Page, Notes and SystemConfig provide structured Chinese argument views and mask sensitive settings", () => {
+	assert.equal(isStructuredToolArguments("Page"), true);
+	assert.equal(isStructuredToolArguments("Notes"), true);
+	assert.equal(isStructuredToolArguments("SystemConfig"), true);
+
+	const page = buildToolArgumentsView("Page", {action: "fill", label: "名称", value: "demo"});
+	assert.equal(tag(page, "页面动作"), "填写表单");
+	assert.equal(page.rows[0].label, "表单项");
+	assert.equal(block(page, "填写内容").content, "demo");
+
+	const note = buildToolArgumentsView("Notes", {action: "update", id: "n-1", find: "旧文本", replace: "新文本", revision: 3});
+	assert.equal(tag(note, "操作"), "修改笔记");
+	assert.equal(tag(note, "版本"), "#3");
+	assert.equal(block(note, "查找原文").role, "old");
+	assert.equal(block(note, "替换为").role, "new");
+
+	const secretSetting = buildToolArgumentsView("SystemConfig", {resource: "setting", action: "set", path: "memory.accessKey", value: "super-secret-key"});
+	assert.equal(tag(secretSetting, "配置类别"), "系统设置");
+	assert.equal(tag(secretSetting, "操作"), "修改");
+	assert.equal(block(secretSetting, "新值").content, "[已隐藏]");
 });

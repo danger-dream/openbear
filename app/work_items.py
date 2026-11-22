@@ -1123,8 +1123,14 @@ def interaction_quote_text(data: dict[str, Any]) -> str:
             return "\n".join(str(value or "") for value in (payload.get("title"), payload.get("body"), text))
         return text
     answers = result.get("answers") or [result]
-    return "\n".join(str(value) for answer in answers if isinstance(answer, dict)
-                     for value in [*(answer.get("selectedLabels") or []), answer.get("text") or answer.get("value") or ""])
+    parts = [
+        str(value)
+        for answer in answers if isinstance(answer, dict)
+        for value in [*(answer.get("selectedLabels") or []), answer.get("text") or answer.get("value") or ""]
+    ]
+    if action == "questionnaire" and result.get("text"):
+        parts.append(str(result.get("text")))
+    return "\n".join(parts)
 
 
 def interaction_decision(data: dict[str, Any], question_ids: list[str] | None = None) -> dict[str, Any]:

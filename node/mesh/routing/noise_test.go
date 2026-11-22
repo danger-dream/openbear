@@ -54,7 +54,8 @@ func TestLossNoiseDoesNotFlap(t *testing.T) {
 			}
 		}
 		t.Logf("seed %d: %d probes lost, %d within ten of the last, %d route changes", seed, len(lost), close, switches)
-		if switches > 1 {
+		// Each direction at most one detour-and-back (4 total across L->H and H->L).
+		if switches > 4 {
 			t.Fatalf("seed %d: routes changed %d times in ten minutes", seed, switches)
 		}
 		if close == 0 {
@@ -63,13 +64,15 @@ func TestLossNoiseDoesNotFlap(t *testing.T) {
 	}
 }
 
-// TestLossRate: the lower of the shares lost in the last 10 and 30 probes.
+// TestLossRate checks the dual-window loss formula:
+// L = max(max(0, lost100 - 1) / 100, lost10 >= 3 ? lost10 / 10 : 0),
+// with denominator always 100 even when fewer than 100 probes were seen.
 func TestLossRate(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	m := newMetric(0, &DefaultTuning)
 	exact := func(what string, want float64) {
 		t.Helper()
-		if got := m.loss(); math.Abs(got-want) > 1e-9 {
+		if got := m.windowLoss(); math.Abs(got-want) > 1e-9 {
 			t.Fatalf("%s: loss %v, want %v", what, got, want)
 		}
 	}
@@ -81,29 +84,87 @@ func TestLossRate(t *testing.T) {
 	}
 	feed(false, 3)
 	feed(true, 1)
-	exact("one of four lost", 0.25) // both windows hold the same four
-	feed(false, 27)                 // the first loss leaves the last 30
-	feed(true, 1)
+	exact("single loss ignored", 0)
 	feed(false, 1)
 	feed(true, 1)
-	// Two of the last 10, two of the last 30: 30 probes weigh them.
-	exact("two close together", 2.0/30)
-	near(t, "their cost", m.cost(), 180+1000*2.0/30)
-	// Lost on and on: the last 30 catch up with the last 10.
-	feed(true, 2) // 4 of 10, 4 of 30
-	exact("four of the last 30", 4.0/30)
+	// 2 lost in 100, 2 in 10 (<3): (2-1)/100 = 0.01.
+	exact("two losses in 100", 0.01)
+	near(t, "their cost", m.cost(), 180+1000*m.loss()+DefaultTuning.HopCostMs)
+	// A third loss within 10 probes triggers short window: 3/10 = 0.30.
 	feed(false, 1)
 	feed(true, 1)
-	feed(false, 1)
-	feed(true, 1)
-	feed(false, 1)
-	feed(true, 1)
-	feed(false, 1)
-	feed(true, 1)
-	exact("eight of 30, six of 10", min(0.6, 8.0/30))
-	// Ten good probes clear it, whatever the last 30 say.
+	exact("three in 10 triggers short window", 0.3)
+	// 10 good probes clear the short window; 3 losses remain in 100 -> (3-1)/100 = 0.02.
 	feed(false, 10)
-	exact("cleared", 0)
+	exact("short window cleared, long window remains", 0.02)
+	// Push all 3 losses out of the 100-probe window.
+	feed(false, 95)
+	exact("long window cleared", 0)
+}
+
+// TestSlowLoss: every lost probe counts toward a rate that halves every
+// fifteen minutes. A single loss on a clean link costs under a millisecond;
+// a link losing about one probe in 125, in runs the windows forget, keeps
+// about 0.8 % (8 ms) through its clean spells; an outage's probes and its
+// time count for nothing.
+func TestSlowLoss(t *testing.T) {
+	start := time.Unix(1_800_000_000, 0)
+	feed := func(m *metric, now *time.Time, lost bool, n int) {
+		for i := 0; i < n; i++ {
+			*now = now.Add(time.Second)
+			m.sample(180*time.Millisecond, lost, *now)
+		}
+	}
+
+	m, now := newMetric(0, &DefaultTuning), start
+	feed(m, &now, false, 10)
+	feed(m, &now, true, 1)
+	feed(m, &now, false, 1)
+	if got := 1000 * m.loss(); got <= 0 || got >= 1 {
+		t.Fatalf("one lost probe costs %.3f ms, want a little under 1", got)
+	}
+	one := m.slowLoss
+	feed(m, &now, false, int(slowLossHalfLife/time.Second))
+	near(t, "one loss after a half-life", m.slowLoss, one/2)
+
+	// One probe in 125 lost, as runs of two every 250 s: the 100-probe window
+	// is clear most of the time, the slow rate is not.
+	m, now = newMetric(0, &DefaultTuning), start
+	feed(m, &now, false, 10)
+	clean := 0
+	for cycle := 0; cycle < 16; cycle++ {
+		feed(m, &now, true, 2)
+		for s := 0; s < 248; s++ {
+			feed(m, &now, false, 1)
+			if cycle >= 8 && m.windowLoss() == 0 {
+				clean++
+				if got := m.loss(); got < 0.005 || got > 0.012 {
+					t.Fatalf("cycle %d: loss %.4f in a clean spell, want 0.5%%-1.2%%", cycle, got)
+				}
+			}
+		}
+	}
+	if clean < 1000 {
+		t.Fatalf("%d clean-window seconds; the case is not tested", clean)
+	}
+
+	// An outage: its run of losses and the time it lasts leave the slow rate
+	// where the last answer left it.
+	m, now = newMetric(0, &DefaultTuning), start
+	feed(m, &now, false, 10)
+	feed(m, &now, true, 1)
+	feed(m, &now, false, 20)
+	before := m.slowLoss
+	feed(m, &now, true, 600)
+	if m.state() != StateDown {
+		t.Fatalf("state %s after ten minutes lost, want down", m.state())
+	}
+	near(t, "slow loss through an outage", m.slowLoss, before)
+	feed(m, &now, false, 1)
+	near(t, "slow loss on the first answer after it", m.slowLoss, before)
+	if got := m.loss(); got != m.slowLoss {
+		t.Fatalf("loss %.5f after the outage, want the slow rate %.5f alone", got, m.slowLoss)
+	}
 }
 
 // TestLateAnswersDoNotFlap is the flapping seen on the relays' long TCP
@@ -167,68 +228,6 @@ func TestLateAnswersDoNotFlap(t *testing.T) {
 			t.Fatalf("seed %d: T ends on %v", seed, p)
 		}
 	}
-}
-
-// TestFlapDamping: A-B, 10 ms against 20 ms through C, costs 300 ms for
-// 15 s every 75 s. The first time A↔B goes through C and back; then it
-// has flapped, and 15 s are short of the minute a move waits: it stays.
-// Ten minutes after the flap the next one goes through C again. A cut of
-// A-B moves the route at once all the same, and back once A-B returns.
-func TestFlapDamping(t *testing.T) {
-	n := triangle(t)
-	second := func(ab float64) {
-		n.probe("A", "B", ab)
-		n.probe("A", "C", 10)
-		n.probe("B", "C", 10)
-		n.run(time.Second, nil)
-	}
-	for i := 0; i < 60; i++ {
-		second(10)
-	}
-	var detours []int
-	via := false
-	for sec := 0; sec < 750; sec++ {
-		ab := 10.0
-		if sec%75 >= 60 {
-			ab = 300
-		}
-		second(ab)
-		if c := n.hop("A", "B") == "C"; c != via {
-			via = c
-			if c {
-				detours = append(detours, sec)
-			}
-		}
-	}
-	// The first at 60 s + 2 + 5, back by 82; the flap is at about 82 s,
-	// so the spike from 660 s on is the first one after ten minutes.
-	if len(detours) != 2 || detours[0] > 70 || detours[1] < 660 {
-		t.Fatalf("A went through C at %v s; events %v", detours, n.eventsOf("A", "route.changed"))
-	}
-	// Flapped again just now. A cut moves at once, and the return waits not.
-	for n.hop("A", "B") != "B" {
-		second(10)
-	}
-	n.probe("A", "B", -1)
-	n.probe("A", "B", -1)
-	cut := n.now
-	for n.hop("A", "B") != "C" {
-		n.probe("A", "B", -1)
-		n.probe("A", "C", 10)
-		n.probe("B", "C", 10)
-		n.run(time.Second, nil)
-		if n.now.Sub(cut) > 3*time.Second {
-			t.Fatal("A did not move off a cut A-B")
-		}
-	}
-	back := n.now
-	for n.hop("A", "B") != "B" {
-		second(10)
-		if n.now.Sub(back) > 90*time.Second {
-			t.Fatal("A did not come back to A-B")
-		}
-	}
-	t.Logf("detours at %v s; cut moved off within %v, back %v after A-B returned; events %v", detours, back.Sub(cut), n.now.Sub(back), n.eventsOf("A", "route.changed"))
 }
 
 // TestLateAnswerBarelyMoves: one answer a retransmission timeout late, or

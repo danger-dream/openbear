@@ -6,6 +6,7 @@ import inspect
 
 from app.agents import live_state as agent_live_state
 from app.agents.controller_projection import project_history_message_for_controller
+from app.assistant import conversations as assistant_conversations
 from app.context import image_one_turn, prompt_template
 from app.context.window import capped_trigger_tokens
 from app.interaction_data import normalize_questionnaire as _normalize_web_questionnaire
@@ -738,6 +739,17 @@ class WebAdminChatStateMixin:
                     params, template_content=selected['text'], template_name='Conversation custom system', source='conversation')
                 if not prompt.strip() or '[[ERROR:' in prompt:
                     raise ValueError('invalid custom system template')
+                return prompt
+            if self.config.memory.provider == "builtin" and await assistant_conversations.is_assistant(self.db, conversation_uuid):
+                page = self.page_tools.summaries(scope="main")
+                params = {**params,
+                          "toolNames": [*params.get("toolNames", []), *page],
+                          "builtinToolNames": [*params.get("builtinToolNames", []), *page],
+                          "toolSummaries": {**params.get("toolSummaries", {}), **page},
+                          "builtinToolSummaries": {**params.get("builtinToolSummaries", {}), **page}}
+                prompt = await BuiltinMemoryClient(self.db, identity=self.config.memory.identity).render_assistant_system_prompt(params)
+                if not str(prompt or "").strip() or "[[ERROR:" in prompt:
+                    raise ValueError("invalid page assistant system prompt")
                 return prompt
             template_id = await prompt_template.conversation_prompt_template(self.db, conversation_uuid)
             if self.config.memory.provider == "builtin" and template_id:

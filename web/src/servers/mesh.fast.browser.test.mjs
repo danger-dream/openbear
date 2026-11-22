@@ -78,12 +78,16 @@ test('mesh fast ports: declare, who uses them and how, settings, node section, p
 
     // Home's page: its channel, how it takes connections (no nft here), no switch or fast address of the old kind.
     mesh.extra.status = {fast: homeFast({tcpMem: {pageBytes: 4096, original: [9500, 12600, 19000], current: [9500, 12600, 19000], originalBytes: [38912000, 51609600, 77824000],
-      currentBytes: [38912000, 51609600, 77824000], changed: false, limited: true, readOnly: true, container: true, pressures: 2, error: 'permission denied'}})};
+      currentBytes: [38912000, 51609600, 77824000], changed: false, limited: true, readOnly: true, container: true, pressuresSinceBoot: 1457, pressures24h: 2,
+      error: 'permission denied'}})};
     await tab(page, '节点').click();
     await page.locator('.m3-rows li', {hasText: 'Home'}).click();
     const fastSec = page.locator('#m3-sec-fast');
     await fastSec.getByText('本机没有 nft 命令，访问快速端口的连接走加密组网；装上 nftables 后自动接管').waitFor();
     await fastSec.getByText('TCP 内存偏小，速度和并发受限').waitFor();
+    // The kernel's count since boot is no measure of now: the last day's comes first.
+    await fastSec.getByText('最近 24 小时 2 次').waitFor();
+    await fastSec.getByText('（开机以来 1457 次）').waitFor();
     await fastSec.getByRole('button', {name: /到 LAX/}).click();
     await fastSec.locator('.m3-fast-path', {hasText: '在用'}).getByText('Home → Berlin → LAX').waitFor();
     await fastSec.getByText('走组网').waitFor();

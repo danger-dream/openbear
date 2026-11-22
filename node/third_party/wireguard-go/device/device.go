@@ -94,6 +94,9 @@ type Device struct {
 	rxDrops   struct {
 		noBuffer, noLargeBuffer, decrypt, replay, staleKey atomic.Uint64
 	}
+	handshakes struct {
+		cookiesSent, cookiesReceived, queueFull, rateLimited, retries atomic.Uint64
+	}
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger

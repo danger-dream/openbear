@@ -29,6 +29,8 @@ class Extension:
     about: str  # for the model's catalog
     tools: tuple[str, ...]
     hint: str = ""  # for the user's panel
+    # Off in a conversation without a stored state, which otherwise has every extension on.
+    opt_in: bool = False
 
 
 BUILTIN = (
@@ -47,7 +49,12 @@ BUILTIN = (
               "部署和维护 OpenBear 实例"),
     Extension("automation", "自动化", "scheduled tasks (Cron) and external event triggers (Webhook)", ("Cron", "Webhook"),
               "定时任务和外部事件触发（Webhook）"),
+    Extension("notes", "笔记", "the user's knowledge-base notes: list, search, read, create and edit", ("Notes",),
+              "列出、搜索、阅读、新建和修改笔记", opt_in=True),
+    Extension("system", "系统配置", "OpenBear system settings, prompt templates and models: explain, read and change", ("SystemConfig",),
+              "说明、读取和修改系统设置、提示词模板与模型", opt_in=True),
 )
+OPT_IN = frozenset(e.key for e in BUILTIN if e.opt_in)
 
 
 # An extension whose tools only work with another one: on together, and off together with it.
@@ -153,7 +160,7 @@ def _described(schema: dict[str, Any], extra: str) -> dict[str, Any]:
 
 def hidden_tools(names, state: State | None) -> set[str]:
     if state is None:
-        return set()
+        return {tool for e in catalog(names) if e.key in OPT_IN for tool in e.tools}
     return {tool for e in catalog(names) if e.key not in state.enabled for tool in e.tools}
 
 
@@ -198,7 +205,7 @@ class ExtensionService:
 
     def effective(self, state: State | None) -> list[str]:
         keys = [e.key for e in self.catalog()]
-        return keys if state is None else [k for k in keys if k in state.enabled]
+        return [k for k in keys if k not in OPT_IN] if state is None else [k for k in keys if k in state.enabled]
 
     async def describe(self, conversation_uuid: str) -> dict[str, Any]:
         """The panel's view: every extension, whether it is on, and about how many tokens it adds to each request."""

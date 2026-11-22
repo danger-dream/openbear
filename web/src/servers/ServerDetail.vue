@@ -36,6 +36,7 @@ import { METRIC_RANGES, rangeName } from './detail/detailHelpers.js';
 import { every } from './detail/useVisible.js';
 import './detail/detail.css';
 import { incompatibleText, nodeBuildLine, nodeUpdateText, updateResultText } from './nodeVersions.js';
+import { usePageSubject } from '../assistant/pageRegistry.js';
 import { addressNetworks, asnText, bytes, canDesktop as checkDesktop, flag, googleRegionText, hasDesktop as checkHasDesktop, noAutofill, platformOf,
   regionName, ROUTE_CARRIERS, ROUTE_CITIES, routeView, safeError, terminalReason, unlockServices, uptime } from './serverHelpers.js';
 
@@ -57,6 +58,9 @@ const live = computed(() => s.value.live?.m || null);
 const platform = computed(() => platformOf(s.value));
 const has = computed(() => ({load: platform.value !== 'windows', io: platform.value !== 'darwin', wait: platform.value === 'linux'}));
 const address = computed(() => s.value.node?.info?.ipv4 || s.value.node?.info?.ipv6 || s.value.ssh?.host || '');
+usePageSubject(() => props.active ? {kind: 'server', id: s.value.id, label: s.value.name, main: true, role: '服务器详情',
+  details: {state: stateLabel[state.value], platform: platform.value, address: address.value, group: s.value.profile?.group || '',
+    tab: tab.value, live: live.value}} : null);
 const caps = computed(() => s.value.node?.caps || {});
 const canTerminal = computed(() => state.value === 'online' && caps.value.terminal !== false);
 const showDesktop = computed(() => checkHasDesktop(s.value));

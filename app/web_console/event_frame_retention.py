@@ -200,7 +200,7 @@ async def prune_event_frames(
                     candidates, latest = await _candidates(owner.db.conn, rows, state.latest, cutoff, keep)
                 count = 0
                 if candidates:
-                    async with asyncio.timeout_at(min(deadline, time.monotonic() + 0.1)):
+                    async with asyncio.timeout_at(min(deadline, time.monotonic() + 0.1)) as bound:
                         async with owner.db.write_transaction(
                             label="web-event-frame-retention", wait_timeout_s=0.01,
                             sqlite_busy_timeout_ms=10,
@@ -210,6 +210,9 @@ async def prune_event_frames(
                             await cur.close()
                             changes = await _rows(writer, "SELECT changes()")
                             count = int(changes[0][0])
+                            # SQLite completes a commit even if its waiter is cancelled; a
+                            # cancelled one would delete these rows without counting them.
+                            bound.reschedule(None)
                 # Only publish progress after commit. Timeout/cancellation/busy
                 # retries this page, rather than silently losing candidates.
                 deleted += count

@@ -20,8 +20,8 @@ import (
 // reflector saw, once from another port of its own and, through its relay
 // links, from other relays. Filtering is measured first in a round, before
 // this node sends to the other relays, and a relay that heard from the
-// address recently does not send: either would let the NAT pass the test
-// packet for the wrong reason.
+// address and port recently does not send: either would let the NAT pass
+// the test packet for the wrong reason.
 
 const (
 	reachEvery   = 10 * time.Minute
@@ -36,6 +36,9 @@ const (
 	maxReachWait = 32
 	maxReachTo   = 1024
 	maxReachFrom = 2 // other relays asked per test
+	// maxReachLinked bounds the bytes of the relays a request names as
+	// linked, so that it stays within maxMessage.
+	maxReachLinked = 600
 )
 
 type reachState struct {
@@ -59,6 +62,9 @@ type reachState struct {
 	// No relay to test through is a reflector: only a reflector saw the
 	// address to send the tests to.
 	untested bool
+	// turn: the rounds started, for a relay's linked relays to take turns
+	// testing it (reachRelay).
+	turn int
 
 	// on a relay
 	pending map[[8]byte]reachRequest
@@ -76,10 +82,19 @@ type reachHeld struct {
 	mapping   string
 }
 
+// reachProof is an open filtering held, as the store keeps it.
+type reachProof struct {
+	Addr    string `json:"addr"`
+	Local   string `json:"local"`
+	Mapping string `json:"mapping,omitempty"`
+}
+
 type reachRequest struct {
 	peer  string
 	path  Path
 	until time.Time
+	// linked: the relays the asking node said it is linked to (Reach.Linked).
+	linked map[string]bool
 }
 
 type reachResult struct {
@@ -91,9 +106,25 @@ type reachResult struct {
 	local     []netip.Addr
 }
 
-func newReach() reachState {
-	return reachState{status: ReachStatus{Verdict: "unknown", Mapping: "unknown", Filtering: "unknown", Consistent: true},
+// newReach starts with proof, when stored, held: the rounds after a restart
+// may have no other relay free to test.
+func newReach(proof *reachProof) reachState {
+	r := reachState{status: ReachStatus{Verdict: "unknown", Mapping: "unknown", Filtering: "unknown", Consistent: true},
 		pending: map[[8]byte]reachRequest{}, rates: map[string]offerRate{}, targets: map[netip.Addr]time.Time{}}
+	if proof != nil {
+		if a, err := netip.ParseAddrPort(proof.Addr); err == nil {
+			r.held = reachHeld{addr: a, local: proof.Local, filtering: "open", mapping: proof.Mapping}
+		}
+	}
+	return r
+}
+
+// proof is the open filtering held, nil without one.
+func (r *reachState) proof() *reachProof {
+	if r.held.filtering != "open" || !r.held.addr.IsValid() {
+		return nil
+	}
+	return &reachProof{Addr: r.held.addr.String(), Local: r.held.local, Mapping: r.held.mapping}
 }
 
 // reachVerdict judges a round. A consistent public address and open
@@ -167,6 +198,14 @@ func (m *Manager) reachRelay() (string, Path, bool) {
 				peers = append(peers, l.Peer)
 			}
 		}
+		// They take turns: one whose relays are all linked to this one has
+		// none to send a test from elsewhere (Po0-HK, 11-22: SoftShellWeb-TW
+		// every round), and an open filtering one round proves is held.
+		if n := len(peers); n > 1 {
+			k := m.reach.turn % n
+			peers = slices.Concat(peers[k:], peers[:k])
+		}
+		m.reach.turn++
 	} else {
 		if p := m.candidates[m.active]; p != nil {
 			peers = append(peers, p.config.Peer)
@@ -222,7 +261,7 @@ func (m *Manager) reachTick(now time.Time) {
 	testing := reflects && m.backend.WatchTests(r.id)
 	if testing {
 		r.relay = relay
-		m.send(relay, path, message{Type: "reach", Reach: &Reach{ID: hex.EncodeToString(r.id[:])}}, 0)
+		m.send(relay, path, message{Type: "reach", Reach: &Reach{ID: hex.EncodeToString(r.id[:]), Linked: m.reachLinked(relay)}}, 0)
 	}
 	// The relay that tests sees this round's request first.
 	reflectors := slices.Clone(m.cfg.Reflectors)
@@ -239,6 +278,35 @@ func (m *Manager) reachTick(now time.Time) {
 		}
 	}
 	go m.reachRound(r.id, testing, reflectors, first, slices.Clone(m.cfg.STUN), r.ack, m.cfg.Prefix)
+}
+
+// reachLinked are the relays this node is linked to or has as entry
+// candidates, besides relay, as many as fit maxReachLinked: their UDP paths
+// hold its NAT open toward them, and the relay testing it asks others.
+func (m *Manager) reachLinked(relay string) []string {
+	var out []string
+	size := 0
+	add := func(peer string) bool {
+		if peer == relay || !m.owners.relays[peer] || slices.Contains(out, peer) {
+			return true
+		}
+		if size += len(peer) + 3; size > maxReachLinked {
+			return false
+		}
+		out = append(out, peer)
+		return true
+	}
+	for _, l := range m.cfg.Links {
+		if !add(l.Peer) {
+			return out
+		}
+	}
+	for _, c := range m.cfg.Candidates {
+		if !add(c.Peer) {
+			return out
+		}
+	}
+	return out
 }
 
 // reachRound asks the observers from outside the manager's lock. When a
@@ -377,6 +445,11 @@ func (m *Manager) reachDone(v reachResult, now time.Time) {
 		r.next = maxTime(now, minTime(r.next, r.last.Add(reachAgain)))
 	}
 	v.filtering = r.hold(v)
+	if p, stored := r.proof(), m.store.state.Reach; (p == nil) != (stored == nil) || p != nil && *p != *stored {
+		s := m.store.copy()
+		s.Reach = p
+		m.store.stage(s)
+	}
 	r.observers, r.filtering, r.noSocket = v.observers, v.filtering, v.noSocket
 	for _, o := range v.observers {
 		if o.OK && o.Kind == "relay" {
@@ -588,7 +661,11 @@ func (m *Manager) receiveReach(r Received, v message, now time.Time) {
 		if m.cfg.Role != "relay" || !m.authorizedPeer(r.Peer) || len(m.reach.pending) >= maxReachWait || !takeToken(m.reach.rates, r.Peer, 3, 1.0/20, now) {
 			return
 		}
-		m.reach.pending[id] = reachRequest{r.Peer, r.Path, now.Add(reachPending)}
+		linked := map[string]bool{}
+		for _, p := range v.Reach.Linked {
+			linked[p] = true
+		}
+		m.reach.pending[id] = reachRequest{r.Peer, r.Path, now.Add(reachPending), linked}
 	case "reach-relay":
 		target, err := netip.ParseAddrPort(v.Reach.Target)
 		if m.cfg.Role != "relay" || err != nil || !m.owners.relays[r.Peer] || !m.linked(r.Peer) || !takeToken(m.reach.rates, "relay "+r.Peer, 10, 2, now) {
@@ -615,7 +692,7 @@ func (m *Manager) receiveReach(r Received, v message, now time.Time) {
 			}
 		}
 		m.reach.targets[ip] = now
-		if !m.backend.RecentlyFrom(ip, reachRecent) {
+		if !m.backend.RecentlyFrom(netip.AddrPortFrom(ip, target.Port()), reachRecent) {
 			m.backend.SendTest(target, id, transport.TestOther)
 		}
 	case "reach-ack":
@@ -656,7 +733,7 @@ func (m *Manager) reachServe(now time.Time) {
 				if reply.Others == maxReachFrom {
 					break
 				}
-				if !m.owners.relays[l.Peer] || l.Peer == q.peer {
+				if !m.owners.relays[l.Peer] || l.Peer == q.peer || q.linked[l.Peer] {
 					continue
 				}
 				if path, ok := m.peerPath(l.Peer); ok {

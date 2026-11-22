@@ -2,6 +2,7 @@
 import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
 import { Api } from '../api.js';
 import { bytes, rate, safeError } from './serverHelpers.js';
+import { usePageSubject } from '../assistant/pageRegistry.js';
 
 // The busiest processes by one figure, asked of the node while this is open and every 3 seconds; not while the
 // browser tab is in the background or the page kept alive behind another one, and once more on coming back.
@@ -24,6 +25,10 @@ const busyNics = computed(() => (data.value?.interfaces || []).filter(n => n.rxR
 const quietNics = computed(() => (data.value?.interfaces || []).length - busyNics.value.length);
 const busyNetns = computed(() => (data.value?.netns || []).filter(n => n.rxRate || n.txRate));
 let timer = 0, generation = 0, alive = true, away = false;
+
+usePageSubject(() => ({kind: 'processes', id: props.server.id, label: TITLES[current.value], role: props.server.name,
+  details: {serverId: props.server.id, server: props.server.name, sort: current.value,
+    processes: rows.value.slice(0, 15).map(p => ({pid: p.pid, name: p.name, user: p.user, command: p.command, cpu: p.cpu, rss: p.rss, conns: p.conns}))}}));
 
 async function load() {
   const mine = ++generation, server = props.server.id;

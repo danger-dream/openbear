@@ -115,6 +115,7 @@ class WebAdminAppMixin:
             web.get("/api/conversation-tree/search", self.handle_api_conversation_tree_search),
             web.get("/api/conversation-tree/status", self.handle_api_conversation_tree_status),
             web.post("/api/conversation-tree/read", self.handle_api_conversation_activity_read),
+            web.get("/api/assistant/conversations", self.handle_api_assistant_conversations),
             web.get("/api/conversation-tree/folders", self.handle_api_conversation_tree_folders),
             web.get("/api/conversation-tree/locate-folder/{folder_uuid}", self.handle_api_conversation_tree_folder_locate),
             web.get("/api/conversation-tree/locate/{conversation_uuid}", self.handle_api_conversation_tree_locate),

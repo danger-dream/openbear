@@ -357,3 +357,66 @@ test('Servers calls read as what they do on which server, without passwords', as
   }
   assert.match(toolArgumentsRawPayload('Memory', '{"name":"gh","kvJson":"{\\"token\\":\\"x\\"}","resou').content, /"name":"gh"/);
 });
+
+test('Page, Notes, SystemConfig and their extensions translate labels and actions cleanly', () => {
+  assert.equal(toolDisplayLabel('Page'), '页面');
+  assert.equal(toolDisplayLabel('Notes'), '笔记');
+  assert.equal(toolDisplayLabel('SystemConfig'), '系统配置');
+  assert.equal(toolDisplayLabel('Cron'), '定时任务');
+  assert.equal(toolDisplayLabel('Webhook'), '触发器');
+  const samples = [
+    ['Page', {action: 'read'}, '读取页面内容'],
+    ['Page', {action: 'read', region: 'overlay'}, '读取当前弹窗'],
+    ['Page', {action: 'read', region: 'page'}, '读取当前页面'],
+    ['Page', {action: 'locate', target: '保存'}, '定位页面元素 · “保存”'],
+    ['Page', {action: 'fill', label: '备注', value: 'sensitive-value'}, '填写表单 · “备注”'],
+    ['Page', {action: 'invoke', name: 'note.insert', args: {markdown: 'hello'}}, '向当前笔记插入内容'],
+    ['Page', {action: 'invoke', name: 'terminal.run', args: {command: 'df -h\nls'}}, '在终端执行 · df -h'],
+    ['Page', {action: 'invoke', name: 'terminal.read', args: {lines: 80}}, '读取当前终端屏幕'],
+    ['Notes', {action: 'list'}, '列出笔记'],
+    ['Notes', {action: 'search', query: '部署 方案'}, '搜索笔记 · “部署 方案”'],
+    ['Notes', {action: 'get', id: 'n-123'}, '读取笔记 · n-123'],
+    ['Notes', {action: 'create', title: '周报', content: 'body'}, '新建笔记 · “周报”'],
+    ['Notes', {action: 'update', id: 'n-123', find: '旧', replace: '新'}, '替换笔记内容 · n-123'],
+    ['Notes', {action: 'update', id: 'n-123', mode: 'append', content: '补充'}, '追加笔记内容 · n-123'],
+    ['Notes', {action: 'update', id: 'n-123', mode: 'prepend', content: '开头'}, '在笔记开头插入内容 · n-123'],
+    ['SystemConfig', {resource: 'setting', action: 'list'}, '列出系统设置'],
+    ['SystemConfig', {resource: 'setting', action: 'list', query: '页面助手'}, '查找系统设置 · “页面助手”'],
+    ['SystemConfig', {resource: 'setting', action: 'get', paths: ['assistant.enabled', 'assistant.model']}, '查看系统设置 · assistant.enabled、assistant.model'],
+    ['SystemConfig', {resource: 'setting', action: 'set', path: 'memory.accessKey', value: 'top-secret'}, '修改系统设置 · memory.accessKey'],
+    ['SystemConfig', {resource: 'template', action: 'list'}, '列出提示词模板'],
+    ['SystemConfig', {resource: 'template', action: 'get', role: 'assistant'}, '读取提示词模板 · 页面助手提示词'],
+    ['SystemConfig', {resource: 'template', action: 'create', name: '新模板', content: 'hi'}, '新建提示词模板 · “新模板”'],
+    ['SystemConfig', {resource: 'template', action: 'update', id: '7', find: 'a', replace: 'b'}, '替换提示词模板内容 · #7'],
+    ['SystemConfig', {resource: 'template', action: 'activate', id: '7', role: 'assistant'}, '设为页面助手提示词 · #7'],
+    ['SystemConfig', {resource: 'template', action: 'activate', id: '7', role: 'persona', on: false}, '取消人设模板 · #7'],
+    ['SystemConfig', {resource: 'model', action: 'list'}, '列出模型渠道'],
+    ['SystemConfig', {resource: 'model', action: 'add', provider: 'OpenAI', model: {id: 'gpt-5'}}, '添加模型 · OpenAI/gpt-5'],
+    ['SystemConfig', {resource: 'model', action: 'update', provider: 'OpenAI', id: 'gpt-5', model: {supportsFast: true}}, '修改模型配置 · OpenAI/gpt-5'],
+    ['SystemConfig', {resource: 'model', action: 'sync_metadata', provider: 'OpenAI', id: 'gpt-5'}, '同步模型元信息 · OpenAI/gpt-5'],
+    ['RequestExtension', {extension: 'notes', reason: '编辑笔记'}, '申请开启扩展：笔记'],
+    ['RequestExtension', {extension: 'system', reason: '修改设置'}, '申请开启扩展：系统配置'],
+  ];
+  for (const [name, args, expected] of samples) {
+    assert.equal(toolArgumentsSummary(name, args), expected);
+  }
+  // Setting paths resolve to their Chinese titles once specs or results arrive; Notes/template ids use titles from results.
+  assert.equal(
+    toolArgumentsSummary('SystemConfig', {resource: 'setting', action: 'get', paths: ['assistant.enabled', 'assistant.model']},
+      JSON.stringify({ok: true, items: [{path: 'assistant.enabled', title: '启用页面助手'}, {path: 'assistant.model', title: '默认模型'}]})),
+    '查看系统设置 · 启用页面助手、默认模型',
+  );
+  assert.equal(
+    toolArgumentsSummary('SystemConfig', {resource: 'setting', action: 'set', path: 'assistant.enabled', value: '开'}),
+    '修改系统设置 · 启用页面助手',
+  );
+  assert.equal(
+    toolArgumentsSummary('Notes', {action: 'get', id: 'uuid-1'}, JSON.stringify({ok: true, note: {title: '1Panel升级'}})),
+    '读取笔记 · “1Panel升级”',
+  );
+  assert.equal(
+    toolArgumentsSummary('SystemConfig', {resource: 'template', action: 'update', id: '64', find: 'a', replace: 'b'},
+      JSON.stringify({ok: true, template: {id: 64, name: '内置页面助手模板'}})),
+    '替换提示词模板内容 · “内置页面助手模板”',
+  );
+});

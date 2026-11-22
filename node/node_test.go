@@ -450,7 +450,14 @@ func TestBackupAddressTakesOverAndPrimaryWinsBack(t *testing.T) {
 			return
 		}
 		hellos <- next(t, ch, "hello")
-		ch.conn.Read() // stays connected until the node leaves
+		// Stays connected until the node leaves, whatever it sends: it says hello
+		// again once it knows its public address, and a session closed then
+		// took the probe of the primary with it.
+		for {
+			if _, _, err := ch.conn.Read(); err != nil {
+				return
+			}
+		}
 	}
 	backup := f.serve(t, session)
 	defer backup.Close()

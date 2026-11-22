@@ -43,8 +43,8 @@ async def test_sync_actual_resources_auth_idempotent_nonactivating(web_env):
     results = [await response.json() for response in responses]
     assert sorted(result["created"] for result in results) == [0, 4]
     rows = await _rows(db)
-    assert rows[:2] == originals
-    by_name = {row["name"]: row for row in rows[2:]}
+    assert rows[:len(originals)] == originals
+    by_name = {row["name"]: row for row in rows[len(originals):]}
     for spec in personas.bundled_personas():
         row = by_name[spec.name]
         assert row["content"] == spec.content

@@ -2,6 +2,7 @@ import {contextCompactionSourceLabel} from "./agentPlanPresentation.js";
 import {taskMemoryToolPreview} from "./taskMemoryPresentation.js";
 import {workItemToolPreview} from "./workItemsPresentation.js";
 import {BENCH_STATES, BENCH_TESTS, toolActionSummary} from "./toolCallPresentation.js";
+import {rememberSettingNames, settingName} from "./settingNames.js";
 
 const HAS = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
 
@@ -667,6 +668,109 @@ function planProgressView(toolName, data) {
 	return view.finish([actionLabel(action), stepId].filter(Boolean).join(" · "));
 }
 
+const PAGE_ACTION_LABELS = {read: "读取页面", locate: "定位元素", fill: "填写表单", invoke: "执行动作"};
+const PAGE_REGION_LABELS = {overlay: "当前弹窗", page: "页面主体"};
+
+function pageView(toolName, data) {
+	const view = new ViewBuilder(toolName, data);
+	const action = view.take("action");
+	const region = view.take("region");
+	const target = view.take("target");
+	const label = view.take("label");
+	const value = view.take("value");
+	const name = view.take("name");
+	const args = view.take("args");
+	view.addTag("页面动作", PAGE_ACTION_LABELS[String(action || "")] || action, {primary: true});
+	if (region) view.addTag("范围", PAGE_REGION_LABELS[String(region)] || region);
+	view.addRow("目标元素", target, {primary: true});
+	view.addRow("表单项", label, {primary: true});
+	view.addRow("动作名", name, {mono: true, primary: true});
+	if (value !== undefined) view.addBlock("填写内容", value, "", {allowEmpty: true});
+	if (hasDisplayContent(args)) view.addBlock("动作参数", prettyJson(args), "json");
+	return view.finish(toolActionSummary(toolName, data));
+}
+
+const NOTES_ACTION_LABELS = {list: "列出笔记", search: "搜索笔记", get: "读取笔记", create: "新建笔记", update: "修改笔记"};
+const NOTES_MODE_LABELS = {replace: "替换全文", append: "末尾追加", prepend: "开头插入"};
+
+function notesView(toolName, data) {
+	const view = new ViewBuilder(toolName, data);
+	const action = view.take("action");
+	const id = view.take("id");
+	const query = view.take("query");
+	const title = view.take("title");
+	const parent = view.take("parent");
+	const mode = view.take("mode");
+	const revision = view.take("revision");
+	const find = view.take("find");
+	const replace = view.take("replace");
+	const content = view.take("content");
+	view.addTag("操作", NOTES_ACTION_LABELS[String(action || "")] || action, {primary: true});
+	view.addTag("笔记 ID", id, {mono: true, wide: true});
+	view.addTag("上级笔记", parent, {mono: true, wide: true});
+	if (mode) view.addTag("写入方式", NOTES_MODE_LABELS[String(mode)] || mode);
+	if (revision !== undefined && revision !== null && revision !== "") view.addTag("版本", `#${revision}`);
+	view.addRow("标题", title, {primary: true});
+	view.addRow("搜索词", query, {primary: true});
+	view.addBlock("查找原文", find, "markdown", {role: "old"});
+	if (replace !== undefined) view.addBlock("替换为", replace, "markdown", {role: "new", allowEmpty: true});
+	if (content !== undefined) view.addBlock("笔记内容", content, "markdown", {allowEmpty: true});
+	return view.finish(toolActionSummary(toolName, data));
+}
+
+const SYS_RESOURCE_LABELS = {setting: "系统设置", template: "提示词模板", model: "模型渠道"};
+const SYS_ACTION_LABELS = {
+	list: "列出", get: "查看", set: "修改", create: "新建", update: "更新",
+	activate: "切换角色", add: "添加模型", sync_metadata: "同步元信息",
+};
+const SYS_ROLE_LABELS = {main: "主提示词", agent: "Agent 提示词", assistant: "页面助手提示词", persona: "人设"};
+const SENSITIVE_SETTING_RE = /(?:apiKey|accessKey|token|password|secret|key)$/i;
+
+function systemConfigView(toolName, data) {
+	const view = new ViewBuilder(toolName, data);
+	const resource = view.take("resource");
+	const action = view.take("action");
+	const query = view.take("query");
+	const paths = view.take("paths");
+	const path = view.take("path");
+	const value = view.take("value");
+	const id = view.take("id");
+	const role = view.take("role");
+	const on = view.take("on");
+	const name = view.take("name");
+	const provider = view.take("provider");
+	const model = view.take("model");
+	const find = view.take("find");
+	const replace = view.take("replace");
+	const content = view.take("content");
+	view.addTag("配置类别", SYS_RESOURCE_LABELS[String(resource || "")] || resource, {primary: true});
+	view.addTag("操作", SYS_ACTION_LABELS[String(action || "")] || action, {primary: true});
+	if (role) view.addTag("角色", SYS_ROLE_LABELS[String(role)] || role, {primary: true});
+	if (on !== undefined) view.addTag("状态", boolLabel(on));
+	view.addTag("渠道", provider, {mono: true, wide: true});
+	view.addTag("ID", id, {mono: true, wide: true});
+	view.addRow("名称", name, {primary: true});
+	view.addRow("搜索词", query, {primary: true});
+	if (typeof path === "string" && path) {
+		const title = settingName(path);
+		if (title) view.addRow("配置项", title, {primary: true});
+		view.addRow(title ? "配置键" : "配置项", path, {mono: true, primary: !title});
+	}
+	if (Array.isArray(paths) && paths.length) {
+		const labels = paths.map(p => settingName(p) || p).filter(Boolean);
+		view.addRow("配置项", labels.join("、"), {mono: labels.every((l, i) => l === paths[i]), primary: true});
+	}
+	if (value !== undefined) {
+		const sensitive = typeof path === "string" && SENSITIVE_SETTING_RE.test(path.split(".").pop() || "");
+		view.addBlock("新值", sensitive ? "[已隐藏]" : value, "", {allowEmpty: true});
+	}
+	view.addBlock("查找原文", find, "markdown", {role: "old"});
+	if (replace !== undefined) view.addBlock("替换为", replace, "markdown", {role: "new", allowEmpty: true});
+	if (content !== undefined) view.addBlock("模板正文", content, "markdown", {allowEmpty: true});
+	if (hasDisplayContent(model)) view.addBlock("模型配置", prettyJson(model), "json");
+	return view.finish(toolActionSummary(toolName, data));
+}
+
 const PRESENTERS = {
 	AgentContinue: agentContinueView,
 	AgentInfo: agentInfoView,
@@ -678,9 +782,12 @@ const PRESENTERS = {
 	Edit: editView,
 	History: historyView,
 	Memory: memoryView,
+	Notes: notesView,
 	OpenBearControl: controlView,
+	Page: pageView,
 	Process: processView,
 	Read: readView,
+	SystemConfig: systemConfigView,
 	UserInteraction: interactionView,
 	WebExtract: webExtractView,
 	WebSearch: webSearchView,
@@ -869,6 +976,29 @@ export function toolArgumentsSummary(toolName, rawArguments, rawResult = "") {
 		const summary = toolActionSummary("RequestExtension", {extension: data?.extension});
 		const suffix = extensionResultSuffix(rawResult);
 		if (summary) return suffix ? `${summary} · ${suffix}` : summary;
+	}
+	if (String(toolName || "") === "SystemConfig") {
+		const {data} = parseArguments(rawArguments);
+		const result = rawResult ? parseArguments(rawResult).data : null;
+		if (result && typeof result === "object") {
+			if (Array.isArray(result.items)) rememberSettingNames(result.items);
+			if (result.setting && typeof result.setting === "object") rememberSettingNames([result.setting]);
+			if (data?.resource === "template" && !data?.name && typeof result.template?.name === "string" && result.template.name) {
+				const summary = toolActionSummary("SystemConfig", {...data, name: result.template.name});
+				if (summary) return summary;
+			}
+		}
+		const summary = toolActionSummary("SystemConfig", data);
+		if (summary) return summary;
+	}
+	if (String(toolName || "") === "Notes") {
+		const {data} = parseArguments(rawArguments);
+		const result = rawResult ? parseArguments(rawResult).data : null;
+		const title = typeof result?.note?.title === "string" ? result.note.title : "";
+		if (title && data && !data.title && ["get", "update"].includes(data.action)) {
+			const summary = toolActionSummary("Notes", {...data, title});
+			if (summary) return summary;
+		}
 	}
 	const {data} = parseArguments(rawArguments);
 	return toolActionSummary(String(toolName || ""), data) || buildToolArgumentsView(toolName, rawArguments).summary;

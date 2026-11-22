@@ -104,7 +104,7 @@ class Nodes:
         return [sid for sid, m, _ in self.calls if m == method]
 
 
-async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('mesh', config_module.TUNING_FEATURE), online=True):
+async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('mesh', config_module.TUNING_FEATURE, config_module.SMOOTH_FEATURE), online=True):
     sid = (await api(e, 'POST', '/api/servers', {'name': name}))['item']['id']
     info = {'platform': platform, 'ipv4': ipv4}
     async with e.db.write_transaction(label='test') as conn:
@@ -115,7 +115,7 @@ async def server(e, name, *, platform='linux', ipv4='', exec_=True, features=('m
     return sid
 
 
-async def connect(e, sid, info=None, *, exec_=True, features=('mesh', config_module.TUNING_FEATURE), build=''):
+async def connect(e, sid, info=None, *, exec_=True, features=('mesh', config_module.TUNING_FEATURE, config_module.SMOOTH_FEATURE), build=''):
     row = await one(e.db.conn, 'SELECT info_json FROM server_nodes WHERE server_id=?', (sid,))
     info = info or json.loads(row['info_json'])['info']
     session = hub_module.Session(sid, FakeWS(), None, '127.0.0.1')
@@ -139,14 +139,14 @@ async def notifications(e):
     return [r['id'] for r in await many(e.db.conn, "SELECT id FROM server_notifications WHERE kind='mesh' ORDER BY created_ms")]
 
 
-async def mesh_setup(e):
+async def mesh_setup(e, *, features=('mesh', config_module.TUNING_FEATURE, config_module.SMOOTH_FEATURE)):
     nodes = Nodes(e)
     e.servers.hub.call = nodes.call
     ids = {
-        'r1': await server(e, 'Berlin', ipv4='45.32.100.1'),
-        'r2': await server(e, 'LAX', ipv4='45.32.100.2'),
-        'm1': await server(e, '公司-Win', platform='windows', ipv4='45.32.100.3'),
-        'm2': await server(e, '家-Mac', platform='darwin', ipv4='45.32.100.4'),
+        'r1': await server(e, 'Berlin', ipv4='45.32.100.1', features=features),
+        'r2': await server(e, 'LAX', ipv4='45.32.100.2', features=features),
+        'm1': await server(e, '公司-Win', platform='windows', ipv4='45.32.100.3', features=features),
+        'm2': await server(e, '家-Mac', platform='darwin', ipv4='45.32.100.4', features=features),
     }
     return nodes, ids
 
@@ -337,11 +337,13 @@ async def test_failure_stops_the_rollout_and_retry_and_rollback(env):  # noqa: F
     state = await settled(e)
     assert state['apply']['progress'][0] == {'serverId': ids['m1'], 'state': 'failed', 'error': reason}
     assert state['nodes'][ids['m1']] == {**state['nodes'][ids['m1']], 'state': 'failed', 'error': reason}
+    # m2 is in m1's wave: sent at the same time, so it has the revision although m1 refused it.
+    assert state['apply']['progress'][1]['state'] == 'done' and nodes.configs[ids['m2']]['revision'] == state['apply']['revision']
     del nodes.refuse[ids['m1']]
     nodes.fail[ids['m1']] = 'apply_timeout'
     await api(e, 'POST', '/api/servers/mesh/apply')
     state = await settled(e)
-    assert state['apply']['progress'][0]['error'] == 'apply_timeout' and state['apply']['progress'][1]['error'] == 'stopped'
+    assert [(p['serverId'], p['error']) for p in state['apply']['progress']] == [(ids['m1'], 'apply_timeout')]
     # Owners not yet acknowledged: with the revision not running it is a failure; running it, it is delivered.
     pending = 'ownership propagation pending: 4 acknowledgements'
     nodes.fail[ids['m1']] = f'apply_timeout: {pending}'
@@ -553,6 +555,161 @@ async def test_a_data_plane_restarting_keeps_what_its_last_reachability_check_fo
     assert '45.32.100.2:51999' in nodes.configs[ids['m1']]['reflectors']
 
 
+async def test_a_relay_turns_site_only_once_its_checks_held_behind_nat(env, monkeypatch):  # noqa: F811
+    """One round behind NAT (its observers restarting) left a public relay site for hours: a relay left
+    to the mesh turns site after three checks in a row over half an hour, public again after two, and
+    the turn is an event and a reminder. What it keeps survives the controller restarting."""
+    e = env
+    monkeypatch.setattr(mesh_module, 'PUBLIC_ADDR_SETTLE_S', 0.3)
+    ahead, real_now = [0], mesh_module.now_ms
+    monkeypatch.setattr(mesh_module, 'now_ms', lambda: real_now() + ahead[0])
+    nodes, ids = await mesh_setup(e)
+    added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
+    members = added['members']
+    members[0]['role'] = members[1]['role'] = 'relay'
+    members[2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    await settled(e)
+
+    async def check(verdict):
+        ahead[0] += 10 * 60_000
+        await e.servers.mesh.report(ids['r2'], {'startedAt': 1, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA),
+                                                'reachability': {'verdict': verdict, 'publicAddr': '45.32.100.2:51999', 'consistent': True,
+                                                                 'checkedAt': mesh_module.now_ms()}})
+        return await settled(e)
+
+    def public():
+        return '45.32.100.2:51999' in nodes.configs[ids['m1']]['reflectors']
+    revision = (await check('public'))['applied']['revision']
+    assert public()
+    for _ in range(3):
+        state = await check('punchable')
+        assert public() and state['applied']['revision'] == revision
+    assert '要连续 3 次且满 30 分钟才改' in state['auto']['relayMode'][ids['r2']]['reason']
+    await check('punchable')
+    assert not public()
+    assert e.servers.mesh.status[ids['r2']]['events'][-1]['kind'] == 'relay.mode'
+    reminder = await one(e.db.conn, "SELECT text FROM server_notifications WHERE id LIKE 'mesh-relay-mode:%'")
+    assert '自动改成站点中转：可达性检测连续 4 次在 NAT 后（30 分钟）' in reminder['text']
+
+    await check('public')
+    assert not public()
+    # The controller restarts: the checks kept carry on.
+    row = await one(e.db.conn, 'SELECT reach_json FROM mesh_nodes WHERE server_id=?', (ids['r2'],))
+    e.servers.mesh.reach.clear()
+    e.servers.mesh.reach[ids['r2']] = json.loads(row['reach_json'])
+    await check('public')
+    assert public()
+
+
+async def test_a_relay_proven_open_stays_public_on_address_filtering(env, monkeypatch):  # noqa: F811
+    """Aws-SG (11-22 01:24): after its data plane restarted no other relay's test reached it, every round
+    said address filtering, and it turned site though anyone could reach it. Where another relay's test
+    once came through, address filtering does not count; port filtering, the asked relay's own test
+    filtered too, does, and so does any of them at another address."""
+    e = env
+    monkeypatch.setattr(mesh_module, 'PUBLIC_ADDR_SETTLE_S', 0.3)
+    ahead, real_now = [0], mesh_module.now_ms
+    monkeypatch.setattr(mesh_module, 'now_ms', lambda: real_now() + ahead[0])
+    nodes, ids = await mesh_setup(e)
+    added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
+    members = added['members']
+    members[0]['role'] = members[1]['role'] = 'relay'
+    members[2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    await settled(e)
+
+    async def check(verdict, filtering, addr='45.32.100.2:51999'):
+        ahead[0] += 10 * 60_000
+        await e.servers.mesh.report(ids['r2'], {'startedAt': 1, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA),
+                                                'reachability': {'verdict': verdict, 'publicAddr': addr, 'consistent': True, 'mapping': 'stable',
+                                                                 'filtering': filtering, 'checkedAt': mesh_module.now_ms()}})
+        return await settled(e)
+
+    def public():
+        return '45.32.100.2:51999' in nodes.configs[ids['m1']]['reflectors']
+    await check('public', 'open')
+    for _ in range(6):
+        await check('punchable', 'address')
+    assert public() and e.servers.mesh.reach[ids['r2']]['confirmed'] == 'public'
+    # The asked relay's own test filtered too: behind NAT after all.
+    for _ in range(4):
+        await check('punchable', 'port')
+    assert not public()
+    # Proven open at one address says nothing of another.
+    await check('public', 'open')
+    await check('public', 'open')
+    assert public()
+    for _ in range(4):
+        await check('punchable', 'address', addr='45.32.100.9:51999')
+    assert e.servers.mesh.reach[ids['r2']]['confirmed'] == 'punchable'
+
+
+async def test_first_early_reach_report_does_not_lock_confirmed_and_empty_addr_is_not_open(env, monkeypatch):  # noqa: F811
+    e = env
+    monkeypatch.setattr(mesh_module, 'PUBLIC_ADDR_SETTLE_S', 0.3)
+    ahead, real_now = [0], mesh_module.now_ms
+    monkeypatch.setattr(mesh_module, 'now_ms', lambda: real_now() + ahead[0])
+    nodes, ids = await mesh_setup(e)
+    added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
+    members = added['members']
+    members[0]['role'] = members[1]['role'] = 'relay'
+    members[2]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
+    await api(e, 'PUT', '/api/servers/mesh/draft', {'members': members, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    await api(e, 'POST', '/api/servers/mesh/apply')
+    await settled(e)
+
+    started = mesh_module.now_ms()
+    # First report arrives 30s after data-plane start (early): must not lock confirmed='punchable'.
+    ahead[0] += 30_000
+    await e.servers.mesh.report(ids['r2'], {'startedAt': started, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA),
+                                            'reachability': {'verdict': 'punchable', 'publicAddr': '45.32.100.2:51999', 'consistent': True,
+                                                             'checkedAt': started + 30_000}})
+    assert e.servers.mesh.reach[ids['r2']]['confirmed'] == ''
+    # First non-early check (public) confirms immediately in one check, not two.
+    ahead[0] += 11 * 60_000
+    await e.servers.mesh.report(ids['r2'], {'startedAt': started, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA),
+                                            'reachability': {'verdict': 'public', 'publicAddr': '', 'consistent': True,
+                                                             'checkedAt': mesh_module.now_ms()}})
+    assert e.servers.mesh.reach[ids['r2']]['confirmed'] == 'public'
+    assert 'open' not in e.servers.mesh.reach[ids['r2']]
+    # Empty publicAddr on a subsequent punchable/address report is not held as matching open=''.
+    ahead[0] += 10 * 60_000
+    await e.servers.mesh.report(ids['r2'], {'startedAt': started, 'ready': True, 'appliedRevision': 0, 'configSchemas': list(compat.CONFIG_SCHEMA),
+                                            'reachability': {'verdict': 'punchable', 'publicAddr': '', 'filtering': 'address', 'consistent': True,
+                                                             'checkedAt': mesh_module.now_ms()}})
+    assert e.servers.mesh.reach[ids['r2']]['checks'][-1]['held'] is False
+
+
+async def test_mesh_trend_prunes_old_pressure_minutes_on_write(tmp_path):
+    from app.servers.mesh_status import clean_status
+    from app.servers.mesh_trend import MeshTrend, PRESSURE_SPAN_S
+    from app.servers.metrics import MetricsStore
+
+    metrics = MetricsStore(tmp_path / 'metrics.db')
+    await metrics.start()
+    trend = MeshTrend(metrics)
+    await trend.start()
+    base_s = 1_793_000_000
+
+    def st(pressures):
+        return clean_status({'startedAt': 1, 'ready': True, 'peers': [], 'resources': {},
+                             'fast': {'tcpMem': {'pressuresSinceBoot': pressures}}})
+
+    await trend.observe('s1', st(0), 'member', base_s * 1000)
+    await trend.observe('s1', st(3), 'member', (base_s + 10) * 1000)
+    await trend.observe('s1', st(3), 'member', (base_s + 60) * 1000)
+    assert list(trend.pressure_minutes['s1']) == [(base_s // 60 * 60, 3)]
+    # More than 24h later without calling pressures_24h: old entry is pruned on write.
+    later_s = base_s + PRESSURE_SPAN_S + 300
+    await trend.observe('s1', st(5), 'member', later_s * 1000)
+    await trend.observe('s1', st(5), 'member', (later_s + 60) * 1000)
+    assert list(trend.pressure_minutes['s1']) == [(later_s // 60 * 60, 2)]
+    await metrics.close()
+
+
 async def test_a_public_address_flipping_between_hellos_reissues_nothing_until_one_holds(env, monkeypatch):  # noqa: F811
     """A hello reissues with the facts it reads: the public address read there must have held too,
     or one switched back and forth between hellos reissues to those punching towards it each time."""
@@ -717,7 +874,7 @@ async def ready_after_upgrade(e, sid):
 
 
 async def upgrade_setup(e):
-    nodes, ids = await mesh_setup(e)
+    nodes, ids = await mesh_setup(e, features=('mesh', config_module.TUNING_FEATURE))
     added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['r2'], ids['m1']]})
     draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
     draft['members'][0]['role'] = draft['members'][1]['role'] = 'relay'
@@ -777,7 +934,7 @@ async def test_batch_node_update_holds_leaf_configs_until_every_data_plane_upgra
     assert draft['members'][2]['entry']['mode'] == 'upstreams'
     assert nodes.configs[ids['m1']]['entry'] is not None and not nodes.configs[ids['m1']]['self'].get('leaf')
     relays = {ids['r1'], ids['r2']}
-    new_features = ('mesh', mesh_module.MEMBERS_ROUTING_FEATURE)
+    new_features = ('mesh', config_module.SMOOTH_FEATURE, mesh_module.MEMBERS_ROUTING_FEATURE)
     for key in ('r1', 'r2', 'm1'):
         await connect(e, ids[key], features=new_features, build=NEW)
     await until(lambda: any(s == 'end' and sid in relays for s, sid in nodes.upgrades))
@@ -869,7 +1026,7 @@ async def test_a_data_plane_build_not_known_reads_nothing_new(env, monkeypatch):
     e = env
     monkeypatch.setattr(mesh_module, 'MEMBER_UPGRADE_SETTLE', 0.05)
     nodes, ids, _ = await upgrade_setup(e)
-    features = ('mesh', mesh_module.MEMBERS_ROUTING_FEATURE)
+    features = ('mesh', config_module.SMOOTH_FEATURE, mesh_module.MEMBERS_ROUTING_FEATURE)
     # Their data planes stay where they are.
     nodes.upgrade_errors = {ids[k]: 'service_failed: test' for k in ('r1', 'r2', 'm1')}
     for key in ('r1', 'r2', 'm1'):
@@ -987,9 +1144,9 @@ async def test_trend_samples_each_minute_and_answers_three_ranges(env, monkeypat
     await report(7200, started=9, reconnects=1, rx=100, tx=50, switches=0)       # data plane restarted: counted from zero
     await report(7260, started=9, reconnects=1, rx=100, tx=50, switches=0)
     minute0 = {'at': hour * 1000, 'rttMs': 110.0, 'timeoutRate': 0.0, 'switches': 1, 'reconnects': 1, 'rssBytes': 50 * 1024 ** 2,
-               'cpuPercent': 2.0, 'rxBytes': 2000, 'txBytes': 1000}
+               'cpuPercent': 2.0, 'rxBytes': 2000, 'txBytes': 1000, 'routeSwitches': 0, 'routeFlips': 0, 'tcpPressures': 0}
     later = {'at': (hour + 7200) * 1000, 'rttMs': 100.0, 'timeoutRate': 0.0, 'switches': 0, 'reconnects': 1, 'rssBytes': 50 * 1024 ** 2,
-             'cpuPercent': 1.5, 'rxBytes': 100, 'txBytes': 50}
+             'cpuPercent': 1.5, 'rxBytes': 100, 'txBytes': 50, 'routeSwitches': 0, 'routeFlips': 0, 'tcpPressures': 0}
     # The first two minutes in one 12-minute (24h) or 2-hour (7d) point: rtt from the samples that had one, the timeout rate from all.
     merged = {**minute0, 'timeoutRate': 0.333, 'cpuPercent': 1.8}
     clock[0] = (hour + 7300) * 1000
@@ -1004,13 +1161,22 @@ async def test_trend_samples_each_minute_and_answers_three_ranges(env, monkeypat
     assert (await api(e, 'GET', path + '?range=7d'))['points'] == []
 
     # A relay is measured by its active links to other relays, not by the members it carries (they report 0 or nothing).
-    for at in (0, 60):
+    # Its routes' switches and its machine's TCP memory pressures count as they grow; the kernel's count goes on
+    # through a data plane restart and starts again when the machine boots.
+    for at, started, switches, flips, pressures in ((0, 3, 4, 1, 1450), (20, 3, 6, 3, 1453), (40, 4, 1, 1, 1455), (50, 4, 1, 1, 2), (60, 4, 1, 1, 2)):
         clock[0] = (hour + at) * 1000
-        await e.servers.mesh.report(ids['r1'], {'startedAt': 3, 'peers': [{'id': ids['r2'], 'kind': 'relay', 'active': True, 'rttMs': 10.0},
-                                                                          {'id': ids['m1'], 'kind': 'member', 'active': True, 'rttMs': 30.0}]})
+        await e.servers.mesh.report(ids['r1'], {'startedAt': started, 'peers': [{'id': ids['r2'], 'kind': 'relay', 'active': True, 'rttMs': 10.0},
+                                                                                {'id': ids['m1'], 'kind': 'member', 'active': True, 'rttMs': 30.0}],
+                                                'routing': {'mode': 'dynamic', 'routes': [{'dest': ids['r2'], 'nextHop': ids['r2'], 'switches': switches, 'flips': flips}]},
+                                                'fast': {'tcpMem': {'pressures': pressures}}})
     clock[0] = (hour + 120) * 1000
     relay = await api(e, 'GET', f"/api/servers/mesh/members/{ids['r1']}/trend")
     assert [p['rttMs'] for p in relay['points']] == [10.0] and relay['rtt'] == {'kind': 'links', 'peers': [ids['r2']]}
+    assert [(p['routeSwitches'], p['routeFlips'], p['tcpPressures']) for p in relay['points']] == [(2 + 1, 2 + 1, 3 + 2 + 2)]
+    tcp_mem = (await e.servers.mesh.member(OWNER, ids['r1']))['status']['fast']['tcpMem']
+    assert (tcp_mem['pressuresSinceBoot'], tcp_mem['pressures24h']) == (2, 7)
+    clock[0] = (hour + 86400 + 60) * 1000
+    assert e.servers.mesh.trend_store.pressures_24h(ids['r1'], clock[0] // 1000) == 0
 
     assert (await api(e, 'GET', path + '?range=30d', status=400))['error'] == 'invalid_range'
     assert (await api(e, 'GET', f"/api/servers/mesh/members/{ids['m2']}/trend", status=404))['error'] == 'mesh_member_not_found'
@@ -2237,7 +2403,7 @@ async def test_node_rows_are_read_without_the_reports_kept_for_restarts(env):  #
     Every other column is still read, a column added later among them."""
     e = env
     columns = {r['name'] for r in await many(e.db.conn, 'PRAGMA table_info(mesh_nodes)')}
-    assert set(mesh_module.NODE_COLUMNS.split(',')) == columns - {'status_json', 'events_json'}
+    assert set(mesh_module.NODE_COLUMNS.split(',')) == columns - {'status_json', 'events_json', 'reach_json'}
 
 
 async def test_removing_a_member_never_applied_takes_it_out_of_the_draft(env):  # noqa: F811
@@ -2449,3 +2615,40 @@ async def test_a_node_reconnecting_goes_by_what_it_said_last_until_its_hello(env
     assert facts['caps'] == {'exec': True, 'terminal': True, 'browser': False}
     assert hub_module.recalled('not json') == (frozenset(), {'exec': False, 'terminal': False, 'browser': False})
     assert hub_module.recalled(json.dumps({'features': 'mesh'}))[0] == frozenset()
+
+
+async def test_an_apply_shows_what_it_is_preparing_and_clears_it(env):  # noqa: F811
+    e = env
+    nodes, ids = await mesh_setup(e)
+    added = await api(e, 'POST', '/api/servers/mesh/members', {'serverIds': [ids['r1'], ids['m1']]})
+    draft = {k: added[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
+    draft['members'][0]['role'] = 'relay'
+    draft['members'][1]['entry']['candidates'] = [{'relay': ids['r1'], 'transport': 'udp'}]
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+    assert 'preparing' not in (await api(e, 'GET', '/api/servers/mesh'))['apply']
+
+    # The nodes' status is being read: the page sees that step, and a second apply is refused.
+    gate = nodes.status_gates[ids['m1']] = asyncio.Event()
+    applying = asyncio.create_task(api(e, 'POST', '/api/servers/mesh/apply'))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if (await api(e, 'GET', '/api/servers/mesh'))['apply'].get('preparing'):
+            break
+    assert (await api(e, 'GET', '/api/servers/mesh'))['apply']['preparing'] == {'phase': 'facts'}
+    assert (await api(e, 'POST', '/api/servers/mesh/apply', status=409))['error'] == 'mesh_apply_running'
+    gate.set()
+    assert 'preparing' not in (await applying)['apply']
+    state = await settled(e)
+    assert 'preparing' not in state['apply'] and {p['state'] for p in state['apply']['progress']} == {'done'}
+
+    # One that fails before its rollout leaves nothing behind either.
+    del nodes.status_gates[ids['m1']]
+    draft = {k: state[k] for k in ('settings', 'members', 'relayLinks', 'directLinks', 'rules')}
+    draft['members'][1]['uploadLimitMbps'] = 20
+    await api(e, 'PUT', '/api/servers/mesh/draft', {**draft, 'draftVersion': (await api(e, 'GET', '/api/servers/mesh'))['draftVersion']})
+
+    async def broken(*a, **kw):
+        raise InstanceError('mesh_test_broken', 500)
+    e.servers.mesh._issue = broken
+    await api(e, 'POST', '/api/servers/mesh/apply', status=500)
+    assert 'preparing' not in (await api(e, 'GET', '/api/servers/mesh'))['apply'] and not e.servers.mesh.applying

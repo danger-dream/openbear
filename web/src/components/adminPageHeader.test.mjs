@@ -45,7 +45,9 @@ function runtime(phone = true, inlineActions = false) {
 async function render(markup, scope, components = {}) {
   const compiled = Vue.compile(markup); let tree;
   const instance = Vue.createSSRApp({render() { tree = compiled.call(this, scope, []); return tree; }});
-  for (const [name, component] of Object.entries({ElButton, ElCheckbox, ElSwitch, Plus, Refresh, InfoFilled, ...components})) instance.component(name, component);
+  // The filters' selects need Element Plus's id and z-index providers under SSR; their markup is not under test here.
+  const ElSelect = {render() { return Vue.h('select', this.$slots.default?.()); }}, ElOption = {render() { return Vue.h('option'); }};
+  for (const [name, component] of Object.entries({ElButton, ElCheckbox, ElOption, ElSelect, ElSwitch, Plus, Refresh, InfoFilled, ...components})) instance.component(name, component);
   instance.config.warnHandler = message => assert.fail(message);
   const html = await renderToString(instance);
   return {html, tree, nodes: walk([tree])};
@@ -119,7 +121,7 @@ test('all five pages forward navigation/readiness and retain existing primary, r
   for (const name of names) {
     const node = ast(pages[name]).find(n => n.tag === 'AdminPageHeader'); assert.ok(node, name);
     const called = [], scope = Vue.reactive({
-      isAdminPhone:false, showArchived:false, showSecretValues:false, archivedCount:7, enabledCount:12, expandedEntries:[{},{}], expandedTokens:107, totalTokens:4096,
+      isAdminPhone:false, showArchived:false, showSecretValues:false, tagFilter:[], tagNames:['生产'], usageFilter:'', STALE_DAYS:90, mobileSelectOptions:() => ({}), archivedCount:7, enabledCount:12, expandedEntries:[{},{}], expandedTokens:107, totalTokens:4096,
       summary:{enabled:true}, mcpToggling:false, settingsEntryAvailable:true, settingsHref:'/settings?section=system-settings&setting=mcp.installDir', mcpSettingPaths:['mcp.installDir'], loading:false, reloading:false, installOpen:false,
       emit:(...args) => called.push(args), openEdit:row => called.push(['edit', row]), refresh:() => called.push(['refresh']), load:() => called.push(['load']), clearSelection:() => called.push(['clear']), reloadSkills:() => called.push(['reloadSkills']), reloadMcp:() => called.push(['reloadMcp']), setMcpEnabled:value => called.push(['setMcpEnabled', value]),
       $slots:{'mobile-navigation':() => [Vue.h('button', {'aria-label':'打开导航'}, '导航')]},

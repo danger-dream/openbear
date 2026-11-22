@@ -37,6 +37,9 @@ export const MeshApi = {
   // A server about to join measures every relay: {results: [{relay, rttMs, loss, udp, tcp, tls}]}, each ok|timeout|refused|closed|punch|unknown.
   probe: serverId => call('POST', '/probe', {serverId}, 40000),
   member: id => call('GET', `/members/${encodeURIComponent(id)}`),
+  // A node's stored events (30 days), newest first, those before {before, beforeSeq} when given: {events: [{seq, at, kind, detail}], more}.
+  events: (id, {before, beforeSeq, limit} = {}) => call('GET', `/members/${encodeURIComponent(id)}/events?${new URLSearchParams(Object.entries({before, beforeSeq, limit})
+    .filter(([, v]) => v != null).map(([k, v]) => [k, String(v)]))}`),
   // Where nodes sit on the board; not part of the draft. null removes a position.
   saveLayout: positions => call('PUT', '/layout', {positions}),
   trend: (id, range) => call('GET', `/members/${encodeURIComponent(id)}/trend?range=${encodeURIComponent(range)}`),

@@ -112,6 +112,9 @@ function outcome(action, status, result, sensitive, summary = {}) {
 	if ([result, summary].some((source) => source.decision === "confirm_with_changes")) {
 		return {key: "confirmed_with_changes", label: "已授权 · 按补充内容执行", tone: "success"};
 	}
+	if ([result, summary].some((source) => text(source.decision).trim().toLowerCase() === "feedback")) {
+		return {key: "feedback", label: "已反馈", tone: "info"};
+	}
 	if (action === "confirm") {
 		const decision = confirmDecision(result, summary);
 		if (decision === "feedback") return {key: "feedback", label: "已反馈", tone: "info"};
@@ -133,7 +136,10 @@ function introFor(action, outcomeValue) {
 	if (outcomeValue.key === "timeout") return `本次${ACTION_META[action].name}未在限定时间内完成`;
 	if (outcomeValue.key === "interrupted") return `本次${ACTION_META[action].name}因运行中断未完成`;
 	if (["cancelled", "rejected"].includes(outcomeValue.key)) return `用户未继续本次${ACTION_META[action].name}`;
-	if (outcomeValue.key === "feedback") return "用户已提交意见，未授权执行原操作";
+	if (outcomeValue.key === "feedback") {
+		if (action === "questionnaire") return "用户已提交意见，暂未完成本次问卷";
+		return "用户已提交意见，未授权执行原操作";
+	}
 	if (outcomeValue.key === "confirmed_with_changes") return "用户已授权按补充内容修订后执行";
 	if (outcomeValue.key === "error") return `本次${ACTION_META[action].name}未能完成`;
 	return `用户已完成本次${ACTION_META[action].name}`;
@@ -241,6 +247,7 @@ export function buildUserInteractionView(input = {}) {
 		selectedDecisionLabel: selectedDecision === "confirm_with_changes" ? "按补充内容确认执行" : selectedDecision === "confirm" ? "确认执行" : (selectedDecision === "reject" ? "拒绝" : ""),
 		promptValue: action === "prompt" && !sensitive ? text(result.value) : "",
 		selectText: action === "select" && !sensitive ? text(result.text) : "",
+		questionnaireText: action === "questionnaire" && !sensitive ? text(result.text) : "",
 		answerMode: action === "select" && !sensitive ? text(result.answerMode) : "",
 		options: action === "select" ? selectPresentation(args, result, sensitive) : [],
 		questions: action === "questionnaire" && !sensitive ? questionnairePresentation(args, result, false) : [],

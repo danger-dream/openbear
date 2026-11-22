@@ -41,6 +41,17 @@ test('pending work entry and panel layout on desktop and phone', {skip:!chromium
     const phone=width<761;
     if(phone){
       assert.ok(await page.locator('.composer-shell').evaluate(el=>el.getBoundingClientRect().bottom<=innerHeight+1),'pending strip must not push the composer below the viewport');
+      const headerGap = await page.evaluate(()=>{
+        const strip=document.querySelector('.mobile-pending-entry')?.getBoundingClientRect();
+        const header=document.querySelector('.console-header');
+        const rect=header?.getBoundingClientRect();
+        return {
+          gap: strip && rect ? Math.abs(rect.top - strip.bottom) : -1,
+          headerPadTop: header ? parseFloat(getComputedStyle(header).paddingTop) : -1,
+        };
+      });
+      assert.ok(headerGap.gap >= 0 && headerGap.gap <= 1, 'console header sits flush below the mobile pending strip without duplicate safe-area offset');
+      assert.equal(headerGap.headerPadTop, 0, 'console header must not add a second top safe-area padding below the pending strip');
       await page.locator('.mobile-pending-entry').click();
     }else{
       assert.equal(await page.locator('.mobile-pending-entry').isVisible(),false);

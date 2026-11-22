@@ -396,22 +396,12 @@ func (c *Control) Redial(ctx context.Context, peer string, path Path) (string, s
 	return got.From, got.To, nil
 }
 func (c *Control) Retire(path Path) { c.bind.Retire(transport.PathRef(path)) }
+
+// dataHandshaken says whether the data device completed a handshake with
+// key at all: a last handshake of a whole second or more, as IpcGet counts.
 func (c *Control) dataHandshaken(key [32]byte) bool {
-	raw, err := c.data.IpcGet()
-	if err != nil {
-		return false
-	}
-	match := false
-	for _, line := range strings.Split(raw, "\n") {
-		k, v, _ := strings.Cut(line, "=")
-		if k == "public_key" {
-			match = v == hex.EncodeToString(key[:])
-		}
-		if match && k == "last_handshake_time_sec" && v != "0" {
-			return true
-		}
-	}
-	return false
+	p := c.data.LookupPeer(device.NoisePublicKey(key))
+	return p != nil && p.LastHandshakeNano() >= int64(time.Second)
 }
 
 func (c *Control) DataReady(peer string, path Path) bool {
@@ -570,8 +560,8 @@ func (c *Control) Prime(addrs []netip.AddrPort, ttl int) error { return c.bind.P
 func (c *Control) ReflectSeen(id [8]byte) (netip.AddrPort, bool) {
 	return c.bind.ReflectSeen(id)
 }
-func (c *Control) RecentlyFrom(ip netip.Addr, within time.Duration) bool {
-	return c.bind.RecentlyFrom(ip, within)
+func (c *Control) RecentlyFrom(target netip.AddrPort, within time.Duration) bool {
+	return c.bind.RecentlyFrom(target, within)
 }
 func (c *Control) SendTest(target netip.AddrPort, id [8]byte, sender byte) error {
 	return c.bind.SendTest(target, id, sender)

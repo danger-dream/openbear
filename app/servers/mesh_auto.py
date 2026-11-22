@@ -29,6 +29,13 @@ SELECTOR_KINDS = ('any', 'region', 'tag', 'machines')
 MAX_LINE_RULES = 50
 BIAS_SPAN = 10000
 AUTO_LINKS = 3  # relays each relay links to in auto mode
+# A relay is taken behind NAT (its relay mode, who dials it) once REACH_TO_NAT checks in a row over
+# REACH_TO_NAT_MS said so, and public again after REACH_TO_PUBLIC in a row: one round whose observers
+# were restarting must not turn a public relay into a site relay for the whole mesh. Checks within
+# REACH_START_MS of its data plane starting do not count.
+NAT_VERDICTS = ('punchable', 'symmetric', 'no_udp')
+REACH_TO_NAT, REACH_TO_NAT_MS, REACH_TO_PUBLIC = 3, 30 * 60_000, 2
+REACH_START_MS = 10 * 60_000
 _ID = re.compile(r'[A-Za-z0-9_-]{1,32}')
 _REGION = re.compile(r'[A-Z]{2}')
 NAMES = {'udp': 'UDP', 'tcp': 'TCP', 'tls': 'TLS'}
@@ -176,17 +183,66 @@ def _name(m, facts):
     return (facts.get(m['serverId']) or {}).get('name') or m['serverId']
 
 
+def reach_side(verdict):
+    return 'public' if verdict == 'public' else 'nat' if verdict in NAT_VERDICTS else ''
+
+
+def _counts(c):
+    """Whether a check counts: it says a side, came after the data plane's first REACH_START_MS, and is
+    not held (address filtering where another relay's test once came through at that address)."""
+    return reach_side(c['verdict']) and not c.get('early') and not c.get('held')
+
+
+def reach_run(checks):
+    """(side, count, since) of the latest checks that count and agree on a side, oldest first in
+    checks; ('', 0, 0) when none counts."""
+    counted = [c for c in checks if _counts(c)]
+    if not counted:
+        return '', 0, 0
+    side = reach_side(counted[-1]['verdict'])
+    run = list(itertools.takewhile(lambda c: reach_side(c['verdict']) == side, reversed(counted)))
+    return side, len(run), run[-1]['at']
+
+
+def confirm_reach(confirmed, checks, now):
+    """(verdict, pending): the verdict a relay is taken at, from the one it was taken at ('' while none:
+    its latest check that counts is taken at once) and its checks [{at, verdict, early}] oldest first
+    (at: ms the controller saw it, early: within REACH_START_MS of its data plane starting). pending
+    {verdict, checks, since} while the latest checks say the other side and have not held enough.
+    A held check (held: address filtering at an address where another relay's test once came through)
+    does not count: no other relay sent a test that round, which does not make a NAT."""
+    side, count, since = reach_run(checks)
+    if not side:
+        return confirmed, None
+    latest = next(c['verdict'] for c in reversed(checks) if _counts(c) and reach_side(c['verdict']) == side)
+    if not reach_side(confirmed) or side == reach_side(confirmed):
+        return latest, None
+    if count >= REACH_TO_NAT and now - since >= REACH_TO_NAT_MS if side == 'nat' else count >= REACH_TO_PUBLIC:
+        return latest, None
+    return confirmed, {'verdict': latest, 'checks': count, 'since': since}
+
+
 # ----- defaults, each with its reason -----
+def _held(f):
+    pending = f.get('reachPending')
+    if not pending:
+        return ''
+    if reach_side(pending['verdict']) == 'nat':
+        return f'（最近 {pending["checks"]} 次检测在 NAT 后，要连续 {REACH_TO_NAT} 次且满 {REACH_TO_NAT_MS // 60_000} 分钟才改）'
+    return f'（最近 {pending["checks"]} 次检测公网可达，要连续 {REACH_TO_PUBLIC} 次才改）'
+
+
 def relay_mode_default(m, facts):
-    verdict = (facts.get(m['serverId']) or {}).get('verdict', '')
+    f = facts.get(m['serverId']) or {}
+    verdict = f.get('verdict', '')
     if _front(m, facts):
         return 'public', '前置机'
     if m.get('publicEndpoint'):
         return 'public', '填了对外地址'
     if verdict == 'public':
-        return 'public', '可达性检测：公网可达'
-    if verdict in ('punchable', 'symmetric', 'no_udp'):
-        return 'site', '可达性检测：在 NAT 后面'
+        return 'public', '可达性检测：公网可达' + _held(f)
+    if verdict in NAT_VERDICTS:
+        return 'site', '可达性检测：在 NAT 后面' + _held(f)
     return m.get('relayMode') or 'public', '还没有可达性检测结果，保持现在的'
 
 

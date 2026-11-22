@@ -460,6 +460,9 @@ def normalize(run: Run):
         text = re.sub(r"\bs[0-9a-f]{8}\b", "S", text)
         text = re.sub(r'"loaderId": "[0-9A-F]+"', '"loaderId": "L"', text)
         text = re.sub(r'"documentId": "[0-9a-f]{32}"', '"documentId": "D"', text)
+        # Chrome hands focus to the cross-origin frame (refs f2…) asynchronously, so whether an
+        # element there reads as [active] depends on timing, not on the engine. Main frame: f1.
+        text = re.sub(r" \[active\](?= \[ref=S:f(?!1e)\d+e\d+\])", "", text)
         record = json.loads(text)
         result = record.get("result")
         if isinstance(result, dict):

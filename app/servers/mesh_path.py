@@ -23,7 +23,7 @@ def find(src, dst, roles, statuses, configs, now):
     rttMs is then null. A path that cannot be followed to the end stops where it breaks.
     fixed, when the source reports a fixed path for this pair: its id, nodes and state; while
     it is pinned the hops are its nodes. decision: the relay (or routed member) that chose the
-    route for its next hops, as it reports it: {node, dest, cost, best?, bestCost?, held?, until?}."""
+    route for its next hops, as it reports it: {node, dest, cost, smoothed?, best?, bestCost?, bestSmoothed?, held?}."""
     stale = False
     decision = {}
 
@@ -31,7 +31,8 @@ def find(src, dst, roles, statuses, configs, now):
         routing = (fresh(node) or {}).get('routing') or {}
         route = next((r for r in routing.get('routes') or [] if r.get('dest') == target), None)
         if route:
-            decision.update(node=node, dest=target, cost=route.get('cost'), **{k: route[k] for k in ('best', 'bestCost', 'held', 'until') if k in route})
+            decision.update(node=node, dest=target, cost=route.get('cost'),
+                            **{k: route[k] for k in ('smoothed', 'best', 'bestCost', 'bestSmoothed', 'held') if k in route})
 
     def fresh(sid):
         return fresh_status(statuses, sid, now, FRESH_MS)

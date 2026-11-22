@@ -105,8 +105,8 @@ const costMath = computed(() => {
   const m = metric.value;
   if (!m || m.state !== 'up' || !Number.isFinite(m.rttMs)) return '';
   const t = {...ROUTING_DEFAULTS, ...(work.value?.settings?.routing || {})}, r1 = v => Math.round((Number(v) || 0) * 10) / 10;
-  return `实测代价 = 延迟 ${r1(m.rttMs)} + 抖动 ${r1(m.jitterMs)} × ${t.jitterWeight} + 丢包率 ${lossText(m.loss) || '0%'} × ${t.lossWeight}${bias.value ? ` + 偏好 ${bias.value}` : ''} ≈ ${costText(m)}。`
-    + `选路用两端已通告代价里较大的那个；实测和已通告的差超过 ${t.advertMs} ms（设置的「选路」里的通告门槛）并持续 ${t.holdS} 秒才更新。`;
+  return `实测代价 = 延迟 ${r1(m.rttMs)} + 抖动 ${r1(m.jitterMs)} × ${t.jitterWeight} + 丢包率 ${lossText(m.loss) || '0%'} × ${t.lossWeight}${bias.value ? ` + 偏好 ${bias.value}` : ''} + 每跳 ${t.hopCostMs} ≈ ${costText(m)}。`
+    + '选路用两端已通告代价里较大的那个，并结合各邻居平滑代价判断切换；变化达到 2% 且至少 2 ms 时更新通告（最多每 2 秒一次，断线立即通告）。';
 });
 const metricNote = computed(() => {
   const m = metric.value;
@@ -250,7 +250,8 @@ function setFull(on) {
     <section v-if="link.kind === 'entry'" class="mesh-link-group" aria-label="状态">
       <p v-if="look.problem && !notes.some(n => n.text === look.problem)" class="mesh-link-text ob-bad">{{ look.problem }}</p>
       <p v-if="look.health" class="mesh-link-text" :class="look.health.state === 'failing' ? 'ob-bad' : ''">{{ candLine(look.health) }}</p>
-      <p v-if="look.punched" class="mesh-link-text instance-muted">{{ look.opened && look.via ? `已打通，经${look.via}` : '打洞：先经其他入口交换地址，在同一局域网时直接走局域网' }}</p>
+      <p v-if="look.lan" class="mesh-link-text instance-muted">和这台中转在同一局域网，直接连它的局域网地址</p>
+      <p v-else-if="look.punched" class="mesh-link-text instance-muted">{{ look.opened && look.via ? `已打通，经${look.via}` : '打洞：先经其他入口交换地址，在同一局域网时直接走局域网' }}</p>
       <p v-if="look.standby" class="mesh-link-text instance-muted">{{ standbyDetail(look) }}</p>
     </section>
     <section v-else-if="link.kind === 'relay'" class="mesh-link-group mesh-relay-metric" aria-label="实测">

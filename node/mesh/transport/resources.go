@@ -2,6 +2,8 @@ package transport
 
 import (
 	"errors"
+	"time"
+
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -65,7 +67,12 @@ const spareFrameMin = 8192
 func (b *Bind) deviceLimits(plane uint8) conn.DeviceLimits {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	l := conn.DeviceLimits{MaxPeers: b.opt.limits().paths, Workers: 2, BatchSize: 8, QueueDepth: 4, TxBuffers: 32, RxBuffers: 64, KeepaliveBuffers: 4}
+	// A handshake queue of 16, under load from 8 waiting: one of QueueDepth
+	// was under load from one, and a few links or members starting sessions
+	// at once got cookies, each handshake then waiting for its timer. A
+	// handshake missing goes again after 2 s, not 5.
+	l := conn.DeviceLimits{MaxPeers: b.opt.limits().paths, Workers: 2, BatchSize: 8, QueueDepth: 4, TxBuffers: 32, RxBuffers: 64, KeepaliveBuffers: 4,
+		HandshakeQueueDepth: 16, HandshakeRetry: 2 * time.Second}
 	if plane == 0 && b.opt.MTU <= receiveMTU {
 		// Every data message of a network MTU up to receiveMTU fits 2048
 		// bytes: six to seven times as many buffers as the full-size ones

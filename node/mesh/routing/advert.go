@@ -17,11 +17,18 @@ const (
 	advertEvery  = 5 * time.Second
 	advertExpiry = 30 * time.Second
 	// advertGap is the shortest time between two of this relay's own
-	// advertisements, so a burst of changes goes out as one.
+	// advertisements, so a burst of state changes goes out as one.
 	advertGap = 100 * time.Millisecond
+	// costAdvertGap limits pure cost-only advertisements per origin to at most
+	// once every 2 seconds; state changes still go out after advertGap.
+	costAdvertGap = 2 * time.Second
 	// Each origin's new advertisements are accepted at originRate a second
-	// with bursts of originBurst, twice what advertGap lets it send; each
-	// neighbor may send senderRate a second in all, forwarded ones included.
+	// with bursts of originBurst, twice what advertGap lets it send. A
+	// neighbor's messages that do not decode or verify are taken at
+	// senderRate a second with bursts of senderBurst; past them its messages
+	// are dropped unread until the bucket refills. Sound ones, forwarded or
+	// repeated, cost it nothing: when a link goes down every relay advertises
+	// at once, and a neighbor forwards them all.
 	originRate, originBurst = 20.0, 40.0
 	senderRate, senderBurst = 50.0, 100.0
 	maxAdvertCost           = 1e6
@@ -62,7 +69,11 @@ type advert struct {
 	links   map[string]advLink
 	members map[string]advLink
 	routes  map[string]string // destination -> next hop
-	at      time.Time         // received
+	// linksByID / routesByID cache links and routes indexed by Router.topoIndex
+	// for allocation-free, map-free graph builds and path walks.
+	linksByID  []advLink
+	routesByID []int32
+	at         time.Time // received
 	// format, raw and sig: as the origin wrote and signed it, which is
 	// what is forwarded.
 	format Format
@@ -380,6 +391,34 @@ var errCompact = errors.New("compact advert is malformed")
 // ignored, not an error.
 var errNewerFormat = errors.New("compact advert of a later version")
 
+// peekCompactHeader reads version, origin and seq from a FormatCompact payload
+// without decoding links or routes, allowing callers to skip already-seen
+// advertisements cheaply during flooding.
+func peekCompactHeader(raw []byte, ids map[uint32]string, known map[string]bool) (origin string, seq uint64, ok bool) {
+	// At most 1 version byte + 2 uvarints (max 10 bytes each) = 21 decoded bytes -> 28 base64 chars.
+	encLen := min(len(raw), 32)
+	var buf [24]byte
+	n, err := base64.RawStdEncoding.Decode(buf[:], raw[:encLen])
+	if err != nil || n == 0 || buf[0] != compactVersion {
+		return "", 0, false
+	}
+	data := buf[1:n]
+	v, k := binary.Uvarint(data)
+	if k <= 0 || v > math.MaxUint32 {
+		return "", 0, false
+	}
+	data = data[k:]
+	id, has := ids[uint32(v)]
+	if !has || !known[id] {
+		return "", 0, false
+	}
+	seq, k = binary.Uvarint(data)
+	if k <= 0 || seq == 0 {
+		return "", 0, false
+	}
+	return id, seq, true
+}
+
 // decodeCompact parses and checks a FormatCompact advertisement; ids maps
 // control host numbers to the relays this one knows.
 func decodeCompact(raw []byte, ids map[uint32]string, known, leaves map[string]bool) (*advert, error) {
@@ -514,15 +553,20 @@ type bucket struct {
 }
 
 func (b *bucket) take(now time.Time, rate, burst float64) bool {
+	if !b.ready(now, rate, burst) {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// ready refills b and says whether it holds a token, taking none.
+func (b *bucket) ready(now time.Time, rate, burst float64) bool {
 	if b.at.IsZero() {
 		b.tokens = burst
 	} else if now.After(b.at) {
 		b.tokens = min(burst, b.tokens+now.Sub(b.at).Seconds()*rate)
 	}
 	b.at = now
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
+	return b.tokens >= 1
 }

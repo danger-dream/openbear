@@ -378,3 +378,114 @@ func TestE2ETrialsCannotTakeProvenSessions(t *testing.T) {
 		t.Fatalf("H's session %v proven %v", in, ok)
 	}
 }
+
+// TestE2EKeepKeyedRenewsWarmSessions: a session that carried data within
+// e2eWarm gets new keys once its own are e2eRekeyAfter old (or e2eRekeyLate
+// more, from the end of higher address), with no packet waiting for them; a
+// fresh one or one idle past e2eWarm is left alone.
+func TestE2EKeepKeyedRenewsWarmSessions(t *testing.T) {
+	x := newE2ELab(t, spec{relays: []string{"R"}, members: map[string][]string{"A": {"R"}, "B": {"R"}}}, nil)
+	A, B := x.l.addr("A"), x.l.addr("B")
+	a := x.sessions["A"]
+	ping := packet(A, B, protoICMP, 64, 1, 0, false, icmp(8, 1, nil))
+	x.send("A", "B", ping)
+	x.expect("B", ping, "A to B")
+	first := a.handshake("B")
+	if first == 0 {
+		t.Fatal("no handshake with B")
+	}
+	at := func(d time.Duration) {
+		now := time.Now().Add(d)
+		a.mu.Lock()
+		a.now = func() time.Time { return now }
+		a.mu.Unlock()
+	}
+	unchanged := func(what string) {
+		t.Helper()
+		a.keepKeyed()
+		time.Sleep(300 * time.Millisecond)
+		if h := a.handshake("B"); h != first || a.status().Rekeyed != 0 {
+			t.Fatalf("%s: handshake %d -> %d, rekeyed %d", what, first, h, a.status().Rekeyed)
+		}
+	}
+	unchanged("keys just made")
+	at(e2eWarm + time.Minute)
+	unchanged("idle past e2eWarm")
+
+	// WireGuard sends no initiation within its retry of the last one, on the
+	// real clock.
+	time.Sleep(time.Until(time.Unix(0, first).Add(e2eHandshakeRetry + 100*time.Millisecond)))
+	at(e2eRekeyAfter + e2eRekeyLate + time.Second)
+	a.keepKeyed()
+	deadline := time.Now().Add(2 * time.Second)
+	for a.handshake("B") == first && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h := a.handshake("B"); h == first || a.status().Rekeyed != 1 {
+		t.Fatalf("warm session past e2eRekeyAfter: handshake %d -> %d, rekeyed %d", first, h, a.status().Rekeyed)
+	}
+	again := packet(A, B, protoICMP, 64, 2, 0, false, icmp(8, 2, nil))
+	x.send("A", "B", again)
+	x.expect("B", again, "A to B on the new keys")
+}
+
+// TestE2EKeepKeyedKicksOncePerHandshakeWhenOffline: when a warm peer stops
+// answering, keepKeyed kicks its stale handshake once instead of resetting
+// WireGuard's retry attempts and inflating Rekeyed on every tick; once the
+// peer comes back and completes a new handshake, the next rotation runs.
+func TestE2EKeepKeyedKicksOncePerHandshakeWhenOffline(t *testing.T) {
+	x := newE2ELab(t, spec{relays: []string{"R"}, members: map[string][]string{"A": {"R"}, "B": {"R"}}}, nil)
+	A, B := x.l.addr("A"), x.l.addr("B")
+	a := x.sessions["A"]
+	ping := packet(A, B, protoICMP, 64, 1, 0, false, icmp(8, 1, nil))
+	x.send("A", "B", ping)
+	x.expect("B", ping, "A to B")
+	first := a.handshake("B")
+	if first == 0 {
+		t.Fatal("no handshake with B")
+	}
+	// Cut packets between A and B so the rekey initiation cannot complete.
+	x.mu.Lock()
+	x.tamper = func([]byte) bool { return false }
+	x.mu.Unlock()
+	at := func(d time.Duration) {
+		now := time.Now().Add(d)
+		a.mu.Lock()
+		a.now = func() time.Time { return now }
+		a.mu.Unlock()
+	}
+	time.Sleep(time.Until(time.Unix(0, first).Add(e2eHandshakeRetry + 100*time.Millisecond)))
+	at(e2eRekeyAfter + e2eRekeyLate + time.Second)
+	for range 5 {
+		a.keepKeyed()
+	}
+	if got := a.status().Rekeyed; got != 1 {
+		t.Fatalf("offline peer rekeyed %d times across 5 ticks, want 1", got)
+	}
+	// Restore the link: WireGuard's own retransmit timer completes the pending
+	// handshake without keepKeyed kicking again, and after another rotation
+	// interval keepKeyed kicks for the new handshake generation.
+	x.mu.Lock()
+	x.tamper = nil
+	x.mu.Unlock()
+	deadline := time.Now().Add(e2eHandshakeRetry + 2*time.Second)
+	for a.handshake("B") == first && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	second := a.handshake("B")
+	if second == first {
+		t.Fatalf("handshake did not advance after recovery: %d", second)
+	}
+	if got := a.status().Rekeyed; got != 1 {
+		t.Fatalf("rekeyed changed to %d during recovery, want 1", got)
+	}
+	ping2 := packet(A, B, protoICMP, 64, 2, 0, false, icmp(8, 2, nil))
+	x.send("A", "B", ping2)
+	x.expect("B", ping2, "A to B after link returns")
+	time.Sleep(time.Until(time.Unix(0, second).Add(e2eHandshakeRetry + 100*time.Millisecond)))
+	at(2*(e2eRekeyAfter+e2eRekeyLate) + 2*time.Second)
+	a.keepKeyed()
+	if got := a.status().Rekeyed; got != 2 {
+		t.Fatalf("after recovery rekeyed %d times, want 2", got)
+	}
+}

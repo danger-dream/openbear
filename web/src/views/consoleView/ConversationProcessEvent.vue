@@ -1,6 +1,6 @@
 <script setup>
 import {computed, inject, ref, watch} from 'vue';
-import {Brain, SquareTerminal, Search, FileText, FilePenLine, PencilLine, Globe, History, BookOpen, Wrench, ChevronRight, ChevronUp, ListChecks, MessagesSquare, FilePlus, MessageSquareReply, Eye} from '@lucide/vue';
+import {Brain, SquareTerminal, Search, FileText, FilePenLine, PencilLine, Globe, History, BookOpen, Wrench, ChevronRight, ChevronUp, ListChecks, MessagesSquare, FilePlus, MessageSquareReply, Eye, AppWindow, NotebookPen, SlidersHorizontal} from '@lucide/vue';
 import ConsoleToolEvent from './ConsoleToolEvent.vue';
 import WorkDisclosure from './WorkDisclosure.vue';
 import {eventPrimaryToolName, toolDisplayState, toolPreview as argumentToolPreview, toolStatus} from './display.js';
@@ -120,6 +120,7 @@ function respondRow(call) {
 const processIcon = computed(() => isReasoning.value ? Brain : collab.value?.respond ? MessageSquareReply : collab.value ? (collab.value.supply ? FilePlus : MessagesSquare) : groupEvents.value.length ? ListChecks : ({
 	Bash: SquareTerminal, Read: FileText, Write: FilePenLine, Edit: PencilLine, EditBatch: PencilLine,
 	Browser: Globe, History, Memory: BookOpen, TaskMemory: BookOpen, WorkItem: ListChecks,
+	Page: AppWindow, Notes: NotebookPen, SystemConfig: SlidersHorizontal,
 	mcp__parrot__web_search: Search, mcp__parrot__web_fetch: Globe,
 })[toolName.value] || Wrench);
 

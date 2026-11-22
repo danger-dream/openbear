@@ -14,12 +14,13 @@ func TestNarrowLinkCost(t *testing.T) {
 		r.Probe("B", 10*time.Millisecond)
 		r.Probe("C", 10*time.Millisecond)
 	}
-	near(t, "cost", link(t, r, "B").Cost, 10)
+	base := 10 + DefaultTuning.HopCostMs
+	near(t, "cost", link(t, r, "B").Cost, base)
 	r.SetNarrow(map[string]bool{"B": true})
 	l := link(t, r, "B")
-	near(t, "cost", l.Cost, 10+narrowCost)
-	near(t, "advertised", l.Advertised, 10+narrowCost)
-	near(t, "the other link", link(t, r, "C").Advertised, 10)
+	near(t, "cost", l.Cost, base+narrowCost)
+	near(t, "advertised", l.Advertised, base+narrowCost)
+	near(t, "the other link", link(t, r, "C").Advertised, base)
 	r.SetNarrow(nil)
-	near(t, "advertised", link(t, r, "B").Advertised, 10)
+	near(t, "advertised", link(t, r, "B").Advertised, base)
 }

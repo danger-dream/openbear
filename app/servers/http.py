@@ -166,6 +166,11 @@ def install(app, host, service):
     async def mesh_revisions(r, o): return await service.mesh.revisions(o)
     async def mesh_probe(r, o): return await service.mesh.probe(o, await body(r))
     async def mesh_member(r, o): return await service.mesh.member(o, r.match_info['sid'])
+    async def mesh_events(r, o):
+        def number(key):
+            v = r.query.get(key, '')
+            return int(v) if v.lstrip('-').isdigit() else None
+        return await service.mesh.events(o, r.match_info['sid'], number('before'), number('beforeSeq'), number('limit'))
     async def mesh_trend(r, o): return await service.mesh.trend(o, r.match_info['sid'], r.query.get('range', '1h'))
     async def mesh_line_trend(r, o): return await service.mesh.line_trend(o, r.match_info['line'], r.query.get('range', '24h'))
     async def mesh_layout(r, o): return await service.mesh.save_layout(o, await body(r))
@@ -208,7 +213,7 @@ def install(app, host, service):
         ('GET', '/node-release', node_release), ('POST', '/node-release/check', check_node_release),
         ('GET', '/mesh', mesh), ('PUT', '/mesh/draft', mesh_draft), ('POST', '/mesh/members', mesh_add), ('DELETE', '/mesh/members/{sid}', mesh_remove),
         ('POST', '/mesh/apply', mesh_apply), ('POST', '/mesh/discard', mesh_discard), ('POST', '/mesh/rollback', mesh_rollback),
-        ('POST', '/mesh/members/{sid}/reinstall', mesh_reinstall), ('GET', '/mesh/members/{sid}', mesh_member), ('GET', '/mesh/members/{sid}/trend', mesh_trend),
+        ('POST', '/mesh/members/{sid}/reinstall', mesh_reinstall), ('GET', '/mesh/members/{sid}', mesh_member), ('GET', '/mesh/members/{sid}/events', mesh_events), ('GET', '/mesh/members/{sid}/trend', mesh_trend),
         ('GET', '/mesh/lines/{line}/trend', mesh_line_trend), ('PUT', '/mesh/layout', mesh_layout),
         ('GET', '/mesh/path', mesh_path), ('GET', '/mesh/path/options', mesh_path_options), ('POST', '/mesh/path/measure', mesh_path_measure), ('GET', '/mesh/routes', mesh_routes), ('GET', '/mesh/revisions', mesh_revisions),
         ('POST', '/mesh/probe', mesh_probe),

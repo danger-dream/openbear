@@ -1,5 +1,6 @@
 /* One semantic palette for pending and historical interactions. */
 .web-confirm-stack,
+.pi-sheet,
 .interaction-event {
 	--ob-interaction-surface: var(--ob-surface);
 	--ob-interaction-surface-strong: var(--ob-surface);

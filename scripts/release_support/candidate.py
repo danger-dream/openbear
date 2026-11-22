@@ -21,7 +21,8 @@ PUBLIC_ROOTS = {".githooks", ".gitignore", ".gitattributes", ".dockerignore", "D
 # the modules it vendors under third_party; binaries and local build output
 # (node/bin, openbear-node-*) are never public source.
 NODE_FILES = {"node/go.mod", "node/go.sum", "node/VERSION", "node/LICENSE",
-              "node/mesh/routing/testdata/sim-links.json", "node/mesh/testdata/contract_configs.py", "node/mesh/testdata/hostfw_container.sh",
+              "node/mesh/routing/testdata/sim-links.json", "node/mesh/routing/testdata/replay-real.json.gz",
+              "node/mesh/testdata/contract_configs.py", "node/mesh/testdata/hostfw_container.sh",
               "node/third_party/wireguard-go/.gitignore", "node/third_party/wireguard-go/Makefile", "node/third_party/wireguard-go/tests/netns.sh",
               "node/third_party/wireguard-go/tun/LICENSE.checksum-upstream", "node/third_party/wireguard-go/tun/checksum_fast_generated_amd64.s"}
 NODE_RESOURCES = ("node/browser/resources/", "node/mesh/wintun/")

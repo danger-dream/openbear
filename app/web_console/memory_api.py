@@ -512,7 +512,7 @@ class WebAdminMemoryMixin:
 
     async def handle_api_memory_templates(self, request: web.Request) -> web.Response:
         await BuiltinMemoryClient(self.db, identity=self.config.memory.identity)._bootstrap()
-        cur = await self.db.conn.execute("SELECT id, name, content, is_active, is_agent_active, is_persona, updated_at FROM memory_templates ORDER BY id")
+        cur = await self.db.conn.execute("SELECT id, name, content, is_active, is_agent_active, is_persona, is_assistant_active, updated_at FROM memory_templates ORDER BY id")
         return web.json_response({
             "ok": True,
             "items": [{k: r[k] for k in r.keys()} for r in await cur.fetchall()],
@@ -527,6 +527,7 @@ class WebAdminMemoryMixin:
         is_active = 1 if data.get("is_active") or data.get("isActive") else 0
         is_agent_active = 1 if data.get("is_agent_active") or data.get("isAgentActive") else 0
         is_persona = 1 if data.get("is_persona") or data.get("isPersona") else 0
+        is_assistant_active = 1 if data.get("is_assistant_active") or data.get("isAssistantActive") else 0
         validation_error = await self._validate_memory_template(content, name or "new template", agent_active=bool(is_agent_active and not is_active))
         if validation_error:
             return web.json_response({"ok": False, "error": validation_error}, status=400)
@@ -534,10 +535,12 @@ class WebAdminMemoryMixin:
             await self.db.conn.execute("UPDATE memory_templates SET is_active=0")
         if is_agent_active:
             await self.db.conn.execute("UPDATE memory_templates SET is_agent_active=0")
-        cur = await self.db.conn.execute("INSERT INTO memory_templates (name, content, is_active, is_agent_active, is_persona, updated_at) VALUES (?,?,?,?,?,?)", (name, content, is_active, is_agent_active, is_persona, now_ts()))
+        if is_assistant_active:
+            await self.db.conn.execute("UPDATE memory_templates SET is_assistant_active=0")
+        cur = await self.db.conn.execute("INSERT INTO memory_templates (name, content, is_active, is_agent_active, is_persona, is_assistant_active, updated_at) VALUES (?,?,?,?,?,?,?)", (name, content, is_active, is_agent_active, is_persona, is_assistant_active, now_ts()))
         await self.db.conn.commit()
         item_id = int(cur.lastrowid or 0)
-        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "contentLength": len(content)})
+        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "isAssistantActive": bool(is_assistant_active), "contentLength": len(content)})
         return web.json_response({"ok": True, "id": item_id})
 
     async def handle_api_memory_template_import_builtin(self, request: web.Request) -> web.Response:
@@ -557,7 +560,7 @@ class WebAdminMemoryMixin:
 
             kinds: list[str] = []
             for raw_kind in raw_kinds:
-                if not isinstance(raw_kind, str) or raw_kind not in {"main", "agent"}:
+                if not isinstance(raw_kind, str) or raw_kind not in {"main", "agent", "assistant"}:
                     return web.json_response({
                         "ok": False,
                         "error": "unsupported_builtin_template_kind",
@@ -699,10 +702,11 @@ class WebAdminMemoryMixin:
         await self._require_memory_write_allowed()
         data = await self._json_body(request)
         item_id = int(request.match_info["item_id"])
-        cur = await self.db.conn.execute("SELECT name, content, is_active, is_agent_active, is_persona FROM memory_templates WHERE id=?", (item_id,))
+        cur = await self.db.conn.execute("SELECT name, content, is_active, is_agent_active, is_persona, is_assistant_active FROM memory_templates WHERE id=?", (item_id,))
         existing = await cur.fetchone()
         if not existing:
             return web.json_response({"ok": False, "error": "template_not_found"}, status=404)
+        is_assistant_active = 1 if (data.get("is_assistant_active") if "is_assistant_active" in data else data.get("isAssistantActive") if "isAssistantActive" in data else existing["is_assistant_active"]) else 0
         name = str(data.get("name") if "name" in data else existing["name"] or "")
         content = str(data.get("content") if "content" in data else existing["content"] or "")
         is_active = 1 if (data.get("is_active") if "is_active" in data else data.get("isActive") if "isActive" in data else existing["is_active"]) else 0
@@ -715,9 +719,11 @@ class WebAdminMemoryMixin:
             await self.db.conn.execute("UPDATE memory_templates SET is_active=0")
         if is_agent_active:
             await self.db.conn.execute("UPDATE memory_templates SET is_agent_active=0")
-        await self.db.conn.execute("UPDATE memory_templates SET name=?, content=?, is_active=?, is_agent_active=?, is_persona=?, updated_at=? WHERE id=?", (name, content, is_active, is_agent_active, is_persona, now_ts(), item_id))
+        if is_assistant_active:
+            await self.db.conn.execute("UPDATE memory_templates SET is_assistant_active=0")
+        await self.db.conn.execute("UPDATE memory_templates SET name=?, content=?, is_active=?, is_agent_active=?, is_persona=?, is_assistant_active=?, updated_at=? WHERE id=?", (name, content, is_active, is_agent_active, is_persona, is_assistant_active, now_ts(), item_id))
         await self.db.conn.commit()
-        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "contentLength": len(content)})
+        await self._audit_memory(request, "memory_template.save", {"id": item_id, "name": name, "isActive": bool(is_active), "isAgentActive": bool(is_agent_active), "isPersona": bool(is_persona), "isAssistantActive": bool(is_assistant_active), "contentLength": len(content)})
         return web.json_response({"ok": True, "id": item_id})
 
     async def handle_api_prompt_template_choices(self, request: web.Request) -> web.Response:

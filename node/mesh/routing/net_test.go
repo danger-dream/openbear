@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"hash/fnv"
 	"sort"
 	"strings"
 	"testing"
@@ -20,8 +21,7 @@ type testNet struct {
 	budget Budget
 	onSend func(from string, m Message)
 	hops   map[string]map[string]string
-	// tune is every router's tuning: legacyTuning, which the tests on this
-	// net were written for, unless a test sets another.
+	// tune is every router's tuning: DefaultTuning unless a test sets another.
 	tune *Tuning
 }
 
@@ -40,7 +40,7 @@ type delivery struct {
 // nextHops are each relay's configured next hops, "A>C": "B".
 func newNet(t *testing.T, links map[string]time.Duration, nextHops map[string]string) *testNet {
 	n := &testNet{t: t, now: time.Unix(1_800_000_000, 0), r: map[string]*Router{}, links: map[[2]string]*testLink{}, events: map[string][]string{}, budget: Budget{JSON: 1000, Compact: 1000},
-		tune: &legacyTuning}
+		tune: &DefaultTuning}
 	neighbors := map[string][]string{}
 	for l, d := range links {
 		a, b, _ := strings.Cut(l, "-")
@@ -60,11 +60,15 @@ func newNet(t *testing.T, links map[string]time.Duration, nextHops map[string]st
 		}
 		n.hops[from][to] = v
 	}
-	for _, name := range n.names {
+	for i, name := range n.names {
 		name := name
-		n.r[name] = New(n.config(name, nil), func() time.Time { return n.now }, func(kind, detail string) {
+		r := New(n.config(name, nil), func() time.Time { return n.now }, func(kind, detail string) {
 			n.events[name] = append(n.events[name], kind+" "+detail)
 		})
+		h := fnv.New64a()
+		h.Write([]byte(name))
+		r.setRandSeed(h.Sum64(), uint64(i+1)*0x9e3779b97f4a7c15)
+		n.r[name] = r
 	}
 	return n
 }

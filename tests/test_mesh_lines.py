@@ -11,7 +11,7 @@ from app.servers import compat, mesh_lines, mesh_path, mesh_status
 from app.servers import mesh as mesh_module
 from app.servers.mesh_config import MEMBERS_ROUTING_FEATURE, build
 from app.servers.metrics import MetricsStore
-from tests.test_mesh_config import doc, facts, member
+from tests.test_mesh_config import OFFICE, OFFICE_IP, TLS, doc, facts, member, sample
 from tests.test_mesh_service import mesh_setup, settled
 from tests.test_servers import api, env, shipped  # noqa: F401
 from tests.test_webhooks_backend import env as base_env  # noqa: F401
@@ -65,6 +65,32 @@ def test_a_member_on_upstreams_has_its_entry_lines_and_no_relay_lines():
     lines = mesh_lines.catalogue(d, configs)
     assert sorted(line['id'] for line in lines if 'm1' in (line['a'], line['b'])) == ['entry:m1|r1|udp', 'entry:m1|r2|udp']
     assert [(line['a'], line['b']) for line in lines if line['kind'] == 'relay'] == [('r1', 'r2')]
+
+
+def test_an_entry_dialed_at_the_relays_lan_address_says_so():
+    d = sample()
+    lan = {line['id']: line['lan'] for line in mesh_lines.catalogue(d, office_configs(d)) if line['kind'] == 'entry'}
+    assert lan == {'entry:m1|r1|tcp': True, 'entry:m1|r2|tls': True, 'entry:gw|r1|udp': False}
+    view = by_id(mesh_lines.view(mesh_lines.catalogue(d, office_configs(d)), {}, NOW))
+    assert view['entry:m1|r1|tcp']['lan'] is True and 'lan' not in view['entry:gw|r1|udp']
+    # Its public address, even a private one the user entered, is not its LAN address.
+    assert not any(line.get('lan') for line in mesh_lines.catalogue(d, office_configs(d, ipv4={**OFFICE_IP, 'm1': '198.51.100.7'})))
+    d['members'][0]['publicEndpoint'] = '10.20.20.2'
+    assert not mesh_lines._lan('tcp://10.20.20.2:52000', d['members'][0])
+    # A member on upstreams: its links.
+    d = sample()
+    d['members'][2]['entry']['mode'] = 'upstreams'
+    lines = mesh_lines.catalogue(d, office_configs(d, features=[MEMBERS_ROUTING_FEATURE]))
+    assert {line['id'] for line in lines if line.get('lan')} == {'entry:m1|r1|tcp', 'entry:m1|r2|tls'}
+
+
+def office_configs(d, ipv4=None, features=()):
+    f = facts(ipv4=ipv4 or OFFICE_IP, tls=TLS)
+    for sid, values in OFFICE.items():
+        f[sid]['localAddresses'] = values
+    for sid in f:
+        f[sid]['features'] = list(features)
+    return build(d, f, 'net', 1)
 
 
 def test_a_line_end_shows_the_path_mtu_it_reports():
@@ -476,3 +502,22 @@ def test_a_dialed_tcp_direct_link_shows_up_and_paths_take_it():
     # Not in use: down, and the path goes through the relay again.
     statuses[a]['status']['peers'][0]['active'] = statuses[b]['status']['peers'][0]['active'] = False
     assert mesh_lines.view(lines, statuses, now)[0]['state'] == 'down'
+
+
+def test_upstreams_entry_catalogue_records_dialed_endpoint():
+    doc = {
+        'members': [
+            {'serverId': 'r1', 'role': 'relay', 'removing': False, 'relayMode': 'public', 'publicEndpoint': '1.2.3.4',
+             'entry': {'mode': 'upstreams', 'candidates': []}},
+            {'serverId': 'm1', 'role': 'member', 'removing': False,
+             'entry': {'mode': 'upstreams', 'candidates': [{'id': 'c1', 'relay': 'r1', 'transport': 'udp'}]}},
+        ],
+        'directLinks': [],
+    }
+    configs = {
+        'r1': {'links': [{'peer': 'm1', 'kind': 'member', 'dial': False}]},
+        'm1': {'links': [{'peer': 'r1', 'kind': 'relay', 'dial': True, 'endpoint': 'udp://10.0.0.2:51820'}]},
+    }
+    [line] = mesh_lines.catalogue(doc, configs)
+    assert line['endpoint'] == {'a': '10.0.0.2:51820', 'b': ''}
+    assert line['lan'] is True

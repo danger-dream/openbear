@@ -7,6 +7,7 @@ import FileBrowser from './FileBrowser.vue';
 import PlatformMark from './PlatformMark.vue';
 import CommandPanel from './CommandPanel.vue';
 import { canDesktop, flag, hasDesktop, noAutofill, platformOf } from './serverHelpers.js';
+import { usePageSubject } from '../assistant/pageRegistry.js';
 
 const DesktopPane = defineAsyncComponent(() => import('./DesktopPane.vue'));
 
@@ -58,6 +59,11 @@ const servers = computed(() => {
   return props.items.filter(i => i.node && (!q || [i.name, i.profile.group, i.node.info?.ipv4].some(v => String(v || '').toLowerCase().includes(q))));
 });
 const current = computed(() => sessions.value.find(s => s.key === active.value) || null);
+usePageSubject(() => {
+  const server = current.value && serverOf(current.value.serverId);
+  return server ? {kind: 'server', id: server.id, label: server.name, main: true, role: current.value.kind === 'desktop' ? '远程桌面所在服务器' : '终端所在服务器',
+    details: {platform: platformOf(server), address: server.node?.info?.ipv4 || server.ssh?.host || '', online: Boolean(server.live)}} : null;
+});
 const serverOf = id => props.items.find(i => i.id === id);
 const nameOf = id => serverOf(id)?.name || '已删除的服务器';
 const currentServerCanDesktop = computed(() => Boolean(current.value && canDesktop(serverOf(current.value.serverId))));

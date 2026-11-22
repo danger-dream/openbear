@@ -20,12 +20,15 @@ FLAP_QUIET_MS = 30 * 60_000
 ALERT_COOLDOWN_MS = 30 * 60_000
 # The type of a mesh alert by its key's first part: what the reminder settings turn on or off (reminders.MESH_ALERTS).
 ALERT_TYPES = {'mesh_standby_unhealthy': 'standby', 'mesh-entry': 'entry', 'mesh-flap': 'flap', 'mesh_exit_inconsistent': 'exit',
-               'mesh-memory': 'memory', 'mesh-apply': 'apply', 'mesh-upgrade': 'upgrade', 'mesh-missing': 'missing', 'mesh-key-in-use': 'keys'}
+               'mesh-memory': 'memory', 'mesh-apply': 'apply', 'mesh-upgrade': 'upgrade', 'mesh-missing': 'missing', 'mesh-key-in-use': 'keys',
+               'mesh-relay-mode': 'relaymode'}
 PEER_KINDS = ('entry', 'relay', 'direct', 'member')
 COUNTERS = ('delivered', 'forwarded', 'droppedAcl', 'droppedNotRelay', 'droppedTtl', 'droppedNoRoute', 'droppedQueue', 'droppedBad', 'droppedPlain',
             'droppedTooBig')
 # A node's end-to-end sessions: what it counts besides the sessions in use and their limit.
-E2E_COUNTS = ('created', 'evicted', 'sent', 'received', 'droppedExhausted', 'droppedQueue', 'droppedSource', 'droppedBad')
+E2E_COUNTS = ('created', 'evicted', 'sent', 'received', 'droppedExhausted', 'droppedQueue', 'droppedSource', 'droppedBad', 'rekeyed', 'staleKey')
+# What slowed a WireGuard handshake down, of the outer device and of the end-to-end one.
+HANDSHAKE_COUNTS = ('cookiesSent', 'cookiesReceived', 'queueFull', 'rateLimited', 'retries')
 HOPS_KEPT = 64
 RESOURCES = ('rssBytes', 'limitBytes', 'heapBytes', 'queueBytes', 'conns', 'goroutines')
 ROUTES_KEPT = 64
@@ -41,8 +44,10 @@ CANDIDATES_KEPT = 16
 LINE_ROLES = ('active', 'standby', 'cold')
 ROUTING_MODES = ('dynamic', 'static')
 LINK_STATES = ('up', 'down', 'suppressed')
-# Why a route stays while the shortest path's next hop is another (node/mesh/routing README, "Status and events").
-ROUTE_HELD = ('margin', 'hold', 'damped', 'loop', 'penalty', 'transit')
+# Why a route stays while another path is cheaper (node/mesh/routing README, "Status and events").
+ROUTE_HELD = ('margin', 'settling', 'loop', 'transit')
+# The routing advertisements a relay turned away, by why.
+ADVERT_DROPS = ('originRate', 'throttled', 'signature', 'malformed', 'unlinked')
 PATH_KEPT = 16
 ERRORS_TEXT = {'timeout': '超时', 'refused': '被拒绝', 'tls pin mismatch': 'TLS 证书不匹配', 'no handshake': '握手无响应',
                'unreachable': '不可达', 'punch timeout': '打洞超时'}
@@ -241,19 +246,24 @@ def _routing(raw):
                           'jitterMs': round(float(_num(link.get('jitterMs'), 1e7)), 1), 'loss': round(float(_num(link.get('loss'), 1.000001)), 3),
                           'cost': _signed(link.get('cost')), 'penalty': int(_num(link.get('penalty'), 1e6)),
                           'advertised': _signed(link.get('advertised'))})
-            if held := int(_num(link.get('heldMs'), 1e7)):
-                links[-1]['heldMs'] = held
     for route in (raw.get('routes') if isinstance(raw.get('routes'), list) else [])[:300]:
         if isinstance(route, dict):
             path = route.get('path') if isinstance(route.get('path'), list) else []
-            routes.append({'dest': _text(route.get('dest'), 128), 'nextHop': _text(route.get('nextHop'), 128), 'cost': _signed(route.get('cost')),
-                           'path': [_text(n, 128) for n in path[:PATH_KEPT]], 'since': int(_num(route.get('since'))),
-                           'switches': int(_num(route.get('switches')))})
+            item = {'dest': _text(route.get('dest'), 128), 'nextHop': _text(route.get('nextHop'), 128), 'cost': _signed(route.get('cost')),
+                    'path': [_text(n, 128) for n in path[:PATH_KEPT]], 'since': int(_num(route.get('since'))),
+                    'switches': int(_num(route.get('switches'))), 'flips': int(_num(route.get('flips')))}
+            if (smoothed := _signed(route.get('smoothed'))) is not None:
+                item['smoothed'] = smoothed
             best = _text(route.get('best'), 128)
             if best:
-                routes[-1].update(best=best, bestCost=_signed(route.get('bestCost')), held=route.get('held') if route.get('held') in ROUTE_HELD else '',
-                                  until=int(_num(route.get('until'))))
-    return {'mode': raw.get('mode') if raw.get('mode') in ROUTING_MODES else '', 'links': links, 'routes': routes}
+                item.update(best=best, bestCost=_signed(route.get('bestCost')),
+                            held=route.get('held') if route.get('held') in ROUTE_HELD else '')
+                if (best_smoothed := _signed(route.get('bestSmoothed'))) is not None:
+                    item['bestSmoothed'] = best_smoothed
+            routes.append(item)
+    drops = raw.get('advertDrops') if isinstance(raw.get('advertDrops'), dict) else {}
+    return {'mode': raw.get('mode') if raw.get('mode') in ROUTING_MODES else '', 'links': links, 'routes': routes,
+            'advertDrops': {k: int(_num(drops.get(k))) for k in ADVERT_DROPS}}
 
 
 def _e2e(raw):
@@ -261,7 +271,12 @@ def _e2e(raw):
     if not isinstance(raw, dict):
         return None
     return {'sessions': int(_num(raw.get('sessions'), 1e6)), 'limit': int(_num(raw.get('limit'), 1e6)), 'innerMtu': int(_num(raw.get('innerMtu'), 1e5)),
-            **{k: int(_num(raw.get(k))) for k in E2E_COUNTS}}
+            **{k: int(_num(raw.get(k))) for k in E2E_COUNTS}, 'handshakes': _handshakes(raw.get('handshakes'))}
+
+
+def _handshakes(raw):
+    d = raw if isinstance(raw, dict) else {}
+    return {k: int(_num(d.get(k))) for k in HANDSHAKE_COUNTS}
 
 
 FIREWALL_KINDS = ('ufw', 'iptables', 'docker', 'firewalld', 'nftables')
@@ -391,7 +406,7 @@ def clean_status(raw):
             'startedAt': int(_num(raw.get('startedAt'))), 'configRevision': int(_num(raw.get('configRevision'))),
             'appliedRevision': int(_num(raw.get('appliedRevision'))), 'error': _text(raw.get('error'), 500), 'ready': raw.get('ready') is True,
             'iface': _text(raw.get('iface'), 32), 'peers': peers, 'entry': entry, 'owners': owners,
-            'counters': {k: int(_num(counters.get(k))) for k in COUNTERS},
+            'counters': {k: int(_num(counters.get(k))) for k in COUNTERS}, 'handshakes': _handshakes(raw.get('handshakes')),
             'resources': {**{k: int(_num(resources.get(k))) for k in RESOURCES}, 'cpuPercent': round(float(_num(resources.get('cpuPercent'), 1e5)), 1)},
             'skippedRoutes': _prefixes(raw.get('skippedRoutes')), 'hostFirewall': _host_firewall(raw.get('hostFirewall')),
             'hostFirewallIssues': _firewall_issues(raw.get('hostFirewallIssues')),
@@ -480,7 +495,8 @@ def _fast(raw):
             'limited': tm.get('limited') is True,
             'readOnly': tm.get('readOnly') is True,
             'container': tm.get('container') is True,
-            'pressures': int(_num(tm.get('pressures'))),
+            # The kernel's count since the machine booted (the node says pressures); the controller adds pressures24h.
+            'pressuresSinceBoot': int(_num(tm.get('pressuresSinceBoot', tm.get('pressures')))),
             'error': _text(tm.get('error'), 300),
         }
     return out
@@ -647,7 +663,8 @@ def summary(status, role='member'):
     return {'entry': entry, 'ready': status['ready'], 'peers': len(active), 'rttMs': rtt, 'memory': memory(status, role), 'direct': direct,
             'reachability': {k: reach[k] for k in ('verdict', 'publicAddr', 'consistent', 'filtering', 'checkedAt')} if reach else None,
             'entryHealth': list((status['entry'] or {}).get('candidates', [])) if role != 'relay' else [],
-            'routing': {k: routing[k] for k in ('mode', 'links', 'routes')} if routing and (role == 'relay' or not status.get('entry')) else None,
+            'routing': {k: routing[k] for k in ('mode', 'links', 'routes', 'advertDrops') if k in routing}
+            if routing and (role == 'relay' or not status.get('entry')) else None,
             **({'proxy': status['proxy']} if status.get('proxy') else {}),
             **({'fast': status['fast']} if status.get('fast') else {}),
             **({'forward': status['forward']} if status.get('forward') else {})}

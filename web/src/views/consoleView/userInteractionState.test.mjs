@@ -107,3 +107,17 @@ test("revision, expiry and terminal response compatibility are deterministic", (
 	}
 	assert.equal(isTerminalInteractionError({response: {status: 400, data: {error: "invalid_answer"}}}), false);
 });
+
+test("ordinary select supports explicit feedback intent with non-empty text", () => {
+	const draft = createInteractionDraft(selectItem);
+	assert.match(validateInteractionDraft(selectItem, draft, "feedback"), /请填写/);
+	draft.text = "先再补充下性能数据";
+	assert.equal(validateInteractionDraft(selectItem, draft, "feedback"), "");
+	assert.deepEqual(buildInteractionAnswer(selectItem, draft, "feedback"), {
+		cancelled: false,
+		selectedIndexes: [],
+		selectedValues: [],
+		text: "先再补充下性能数据",
+		decision: "feedback",
+	});
+});

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Api, apiError } from "../api";
 import { mobileSelectOptions } from "../mobileSelect.js";
@@ -10,6 +10,8 @@ import AdminPageHeader from "../components/AdminPageHeader.vue";
 import MobileAssetRow from "../components/MobileAssetRow.vue";
 import MobileAssetSheet from "../components/MobileAssetSheet.vue";
 import { useMobileAssets } from "../components/useMobileAssets";
+import { usePageSubject } from "../assistant/pageRegistry.js";
+import { useResourceChanges } from "../assistant/resourceChanges.js";
 
 const emit = defineEmits(["mobile-header-ready"]);
 
@@ -28,6 +30,22 @@ const selectedIds = ref([]);
 const groups = ref([]);
 const scrollContainer = ref(null);
 const dragging = ref(false);
+const tagFilter = ref([]);
+const usageFilter = ref("");
+const STALE_DAYS = 90;
+
+function tagsOf(s) { return String(s?.tags || "").split(/[,，]/).map((t) => t.trim()).filter(Boolean); }
+function lastUsedText(s) {
+  const ts = Number(s?.last_used_at || 0);
+  return ts ? `最近使用 ${formatAssetTime(ts)}` : "无使用记录";
+}
+function usageMatches(s) {
+  const ts = Number(s?.last_used_at || 0);
+  if (usageFilter.value === "never") return !ts;
+  if (usageFilter.value === "stale") return !ts || ts < Date.now() / 1000 - STALE_DAYS * 86400;
+  return true;
+}
+const filtering = computed(() => Boolean(tagFilter.value.length || usageFilter.value));
 
 async function load() {
   const generation = ++loadGeneration, archived = showArchived.value;
@@ -52,7 +70,10 @@ async function load() {
 }
 async function refresh() { if (!await load()) return; clearSelection(); ElMessage.success("已刷新"); }
 onMounted(load);
-const shownSecrets = computed(() => secrets.value.filter((s) => showArchived.value || !s.archived));
+const shownSecrets = computed(() => secrets.value.filter((s) => (showArchived.value || !s.archived)
+  && tagFilter.value.every((tag) => tagsOf(s).includes(tag)) && usageMatches(s)));
+const tagNames = computed(() => [...new Set(secrets.value.flatMap(tagsOf))].sort((a, b) => a.localeCompare(b, "zh")));
+watch([tagFilter, usageFilter], () => { rebuildGroups(); clearSelection(); });
 const selectedSecrets = computed(() => shownSecrets.value.filter((s) => selectedIds.value.includes(s.id)));
 const allShownSelected = computed(() => shownSecrets.value.length > 0 && shownSecrets.value.every((s) => selectedIds.value.includes(s.id)));
 const groupNames = computed(() => [...new Set(secrets.value.map((s) => s.grp).filter(Boolean))]);
@@ -86,6 +107,7 @@ function editSnapshot(s) {
     name: s.name || "",
     note: s.note || "",
     grp: s.grp || "",
+    tags: Array.isArray(s.tagList) ? s.tagList.join(",") : String(s.tags || ""),
     kv: Array.isArray(s.kv) ? s.kv.map((x) => ({ key: x.key || "", value: x.value || "" })) : [],
     enabled: boolInt(s.enabled),
     archived: boolInt(s.archived),
@@ -106,6 +128,7 @@ async function openEdit(s) {
       return;
     }
   }
+  row.tagList = tagsOf(row);
   editing.value = row;
   if (!editing.value.kv?.length) editing.value.kv = [{ key: "", value: "" }];
   editing.value.grp = editing.value.grp || "";
@@ -125,7 +148,8 @@ async function save() {
   target.kv = target.kv.filter((x) => String(x.key || "").trim());
   const submitted = JSON.parse(JSON.stringify(target));
   const snapshot = editSnapshot(submitted);
-  const payload = { ...submitted, kvJson: JSON.stringify(submitted.kv || [], null, 2) };
+  const { tagList, ...rest } = submitted;
+  const payload = { ...rest, tags: (tagList || []).join(","), kvJson: JSON.stringify(submitted.kv || [], null, 2) };
   saving.value = true;
   let committed = false;
   try {
@@ -218,6 +242,22 @@ const { isAdminPhone, mobileMode, mobileOpen, mobileView, mobileItem, mobileDeta
   actions: { edit: openEdit, enabled: toggleEnabled, archive: toggleArchived, remove },
 });
 const mobileEnabledCount = computed(() => shownSecrets.value.filter(row => row.enabled && !row.archived).length);
+
+usePageSubject(() => {
+  if (dialogOpen.value && editing.value) {
+    return editing.value.id
+      ? {kind: "secret", id: editing.value.id, label: editing.value.name, role: "正在编辑", details: {tags: editing.value.tagList || [], lastUsedAt: editing.value.last_used_at || 0}}
+      : {kind: "secret-draft", label: "新建凭证（未保存）"};
+  }
+  return selectedSecrets.value.slice(0, 10).map((s) => ({kind: "secret", id: s.id, label: s.name, role: "已选中", details: {tags: tagsOf(s), lastUsedAt: s.last_used_at || 0}}));
+});
+useResourceChanges(["secret"], async (detail) => {
+  await load();
+  if (!dialogOpen.value || !editing.value?.id || String(editing.value.id) !== String(detail.itemId)) return;
+  if (detail.action === "delete") ElMessage.warning("助手删除了正在编辑的这条凭证");
+  else if (dirty()) ElMessage.warning("助手刚修改了这条凭证；编辑框里是修改前的内容，保存会覆盖它");
+  else await openEdit({id: editing.value.id});
+}, {keys: (detail) => [`secret:${detail.itemId}`]});
 function mobileUpdated(row) {
   const value = row.updatedAt ?? row.updated_at;
   return value ? formatAssetTime(value).slice(5, 10) + " 更新" : "时间未知";
@@ -238,6 +278,15 @@ function mobileUpdated(row) {
           <el-button :icon="'Select'" @click="setMobileMode('select')">选择条目</el-button>
           <el-button :icon="'Rank'" @click="setMobileMode('sort')">整理顺序</el-button>
         </template>
+        <el-select v-model="tagFilter" multiple collapse-tags collapse-tags-tooltip clearable filterable size="small" placeholder="按标签筛选"
+          class="secret-tag-filter" :popper-options="mobileSelectOptions()" aria-label="按标签筛选">
+          <el-option v-for="tag in tagNames" :key="tag" :label="tag" :value="tag" />
+        </el-select>
+        <el-select v-model="usageFilter" size="small" placeholder="全部使用情况" class="secret-usage-filter" :popper-options="mobileSelectOptions()" aria-label="按使用情况筛选">
+          <el-option label="全部使用情况" value="" />
+          <el-option :label="`${STALE_DAYS} 天内没用过`" value="stale" />
+          <el-option label="无使用记录" value="never" />
+        </el-select>
         <el-checkbox v-model="showArchived" size="small" @change="load(); clearSelection()">显示归档</el-checkbox>
         <el-switch v-model="showSecretValues" size="small" active-text="显示明文" inactive-text="隐藏明文" />
         <el-button :icon="'Refresh'" @click="refresh" title="刷新">刷新</el-button>
@@ -268,7 +317,7 @@ function mobileUpdated(row) {
       </div>
       <div v-else-if="!shownSecrets.length" class="text-center text-macsub py-16 text-sm">暂无凭证</div>
       <draggable v-model="groups" item-key="name" handle=".group-handle" :animation="180"
-        v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
+        v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="filtering || (isAdminPhone && mobileMode !== 'sort')"
         @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag">
         <template #item="{ element: g }">
           <section class="asset-group-section mb-5">
@@ -278,14 +327,14 @@ function mobileUpdated(row) {
               <span class="opacity-50">({{ g.items.length }})</span>
             </div>
             <draggable v-model="g.items" item-key="id" handle=".drag-handle" :animation="180"
-              v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
+              v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="filtering || (isAdminPhone && mobileMode !== 'sort')"
               :group="{ name: 'secret-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag"
               class="mobile-asset-group grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3 min-h-6">
               <template #item="{ element: s }">
-                <MobileAssetRow v-if="isAdminPhone && (showArchived || !s.archived)" :title="s.name" :summary="`${(s.kv || []).length} 个字段${s.note ? ' · ' + s.note : ''}`" :reference="'@secret/' + s.name" :meta="mobileUpdated(s)"
+                <MobileAssetRow v-if="isAdminPhone && (showArchived || !s.archived)" :data-ob-key="'secret:' + s.id" :title="s.name" :summary="`${(s.kv || []).length} 个字段${tagsOf(s).length ? ' · ' + tagsOf(s).join('、') : ''}${s.note ? ' · ' + s.note : ''}`" :reference="'@secret/' + s.name" :meta="mobileUpdated(s)"
                   :enabled="!!s.enabled" :archived="!!s.archived" :selected="isSelected(s.id)" :mode="mobileMode"
                   @select="setSelected(s.id, $event)" @open="openMobileAsset(s)" @more="openMobileAsset(s, 'actions')" />
-                <div v-else-if="!isAdminPhone && (showArchived || !s.archived)" @click="openEdit(s)"
+                <div v-else-if="!isAdminPhone && (showArchived || !s.archived)" :data-ob-key="'secret:' + s.id" @click="openEdit(s)"
             class="secret-card mac-panel mac-shadow p-4 flex flex-col gap-2 cursor-pointer hover:border-macblue/50 transition-colors"
             :class="{ 'opacity-50 border-dashed': s.archived || !s.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(s.id) }">
             <div class="flex items-center justify-between gap-2">
@@ -299,6 +348,9 @@ function mobileUpdated(row) {
                     <el-tag v-if="!s.enabled && !s.archived" size="small" type="warning" effect="plain">未注入</el-tag>
                   </div>
                   <div v-if="s.note" class="text-xs text-macsub mt-0.5 truncate">{{ s.note }}</div>
+                  <div v-if="tagsOf(s).length" class="secret-tags">
+                    <el-tag v-for="tag in tagsOf(s)" :key="tag" size="small" effect="plain" round @click.stop="tagFilter = [tag]">{{ tag }}</el-tag>
+                  </div>
                 </div>
               </div>
               <div class="asset-actions flex items-center gap-1" @click.stop>
@@ -313,7 +365,7 @@ function mobileUpdated(row) {
                       <span class="font-mono break-all whitespace-pre-wrap text-mactext">{{ showSecretValues ? kv.value : maskValue(kv.value) }}</span>
                     </div>
                   </div>
-                  <div class="text-[10px] text-macsub/75 tabular-nums">{{ assetTimeLine(s) }}</div>
+                  <div class="text-[10px] text-macsub/75 tabular-nums">{{ assetTimeLine(s) }} · {{ lastUsedText(s) }}</div>
                 </div>
               </template>
             </draggable>
@@ -338,6 +390,13 @@ function mobileUpdated(row) {
           <div><label class="text-xs text-macsub mb-1 block">序号</label><el-input-number v-model="editing.sort" :min="0" :step="10" class="!w-full" /></div>
         </div>
         <div><label class="text-xs text-macsub mb-1 block">备注</label><el-input v-model="editing.note" /></div>
+        <div>
+          <label class="text-xs text-macsub mb-1 block">标签</label>
+          <el-select v-model="editing.tagList" multiple filterable allow-create default-first-option :reserve-keyword="false" placeholder="输入后回车添加" class="w-full" :popper-options="mobileSelectOptions()" aria-label="标签">
+            <el-option v-for="tag in tagNames" :key="tag" :label="tag" :value="tag" />
+          </el-select>
+          <div v-if="editing.id" class="text-[11px] text-macsub mt-1">{{ lastUsedText(editing) }}</div>
+        </div>
         <div class="asset-form-toggles flex items-center gap-4">
           <el-switch v-model="editing.enabled" :active-value="1" :inactive-value="0" :disabled="!!editing.archived" active-text="注入提示词" inactive-text="不注入" />
           <el-switch v-model="editing.archived" :active-value="1" :inactive-value="0" @change="(v) => { if (v) editing.enabled = 0 }" active-text="归档" inactive-text="未归档" />
@@ -376,3 +435,13 @@ function mobileUpdated(row) {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.secret-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.secret-tags :deep(.el-tag) { cursor: pointer; }
+.secret-tag-filter { width: 180px; }
+.secret-usage-filter { width: 150px; }
+@media (max-width: 760px) {
+  .secret-tag-filter, .secret-usage-filter { width: 100%; }
+}
+</style>

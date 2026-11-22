@@ -18,6 +18,7 @@ const ALERTS = [
   ['upgrade', '组网服务升级失败', '节点的组网服务升级后没起来，已回退。'],
   ['missing', '组网服务不见了', '节点上的组网服务被卸载或重装过。'],
   ['keys', '密钥和别的机器相同', '加入组网时上报的密钥和已有机器的一样，没有安装。'],
+  ['relaymode', '中转类型自动改判', '中转的可达性检测连续多次变了，自动在公网中转和站点中转之间改判。'],
 ];
 const state = reactive(Object.fromEntries(ALERTS.map(([key]) => [key, true])));
 const loaded = ref(false), busy = ref('');

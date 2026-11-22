@@ -105,6 +105,10 @@ type Reach struct {
 	Target string `json:"target,omitempty"`
 	Seen   bool   `json:"seen,omitempty"`
 	Others int    `json:"others,omitempty"`
+	// Linked: on a request, the relays the asking node is linked to besides
+	// the one asked. Its listener talks to them, so a test from one says
+	// nothing; the relay asked picks others.
+	Linked []string `json:"linked,omitempty"`
 }
 
 func nonce() string {

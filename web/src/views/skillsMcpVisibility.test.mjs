@@ -11,7 +11,7 @@ function page(name, api = {}, search = '') {
   const source = descriptor.scriptSetup.content;
   const ast = parseJs(source, { sourceType: 'module' });
   const code = ast.program.body.filter(n => n.type !== 'ImportDeclaration').map(n => source.slice(n.start, n.end)).join('\n');
-  const context = vm.createContext({ ...Vue, authMode: Vue.ref('controller'), onMounted: () => {}, defineEmits: () => () => {}, Api: api, apiError: e => e.message,
+  const context = vm.createContext({usePageSubject:()=>{}, usePageAction:()=>{}, useResourceChanges:()=>{},  ...Vue, authMode: Vue.ref('controller'), onMounted: () => {}, defineEmits: () => () => {}, Api: api, apiError: e => e.message,
     ElMessage: { error: () => {}, success: () => {} }, ElMessageBox: {},
     window: { location: { search } }, URLSearchParams });
   vm.runInContext(code, context);

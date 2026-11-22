@@ -121,6 +121,10 @@ type persistent struct {
 	Claims     map[string]claim    `json:"claims"`
 	Revoked    map[string]int64    `json:"revoked"`
 	Authorized map[string][]string `json:"authorized"`
+	// Reach is where another relay's unsolicited test came through (reach.go,
+	// hold): a data plane started again keeps it while its public address and
+	// its own addresses are the same.
+	Reach *reachProof `json:"reach,omitempty"`
 }
 
 type store struct {
@@ -216,6 +220,10 @@ func (s *store) copy() persistent {
 	p.Authorized = make(map[string][]string, len(s.state.Authorized))
 	for k, v := range s.state.Authorized {
 		p.Authorized[k] = append([]string(nil), v...)
+	}
+	if s.state.Reach != nil {
+		r := *s.state.Reach
+		p.Reach = &r
 	}
 	return p
 }

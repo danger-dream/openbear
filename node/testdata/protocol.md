@@ -84,7 +84,7 @@ The node's first sealed message, and again when its addresses or browser change.
 ```json
 {"t": "hello", "info": "<ref:info>", "caps": {"exec": "<bool>", "terminal": "<bool>", "browser": "<bool>"},
  "version": "<string>", "build": "<hex64>", "endpoint": "<string>", "backup": "<bool>",
- "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "fs.write.noReplace", "host", "host.processIdentity", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe", "mesh.routing.noTransit", "mesh.routing.tuning", "mesh.fastPorts", "mesh.forwards"],
+ "features": ["fs.edit", "jobs", "exec.shell", "mesh", "net", "access.mesh", "net.ports", "ddns", "http.local", "mesh.confirmed", "fs.transfer", "fs.write.noReplace", "host", "host.processIdentity", "net.http", "front", "latency", "latency.http", "mesh.standby", "browser.update", "mesh.proxy.entries", "mesh.routing.members", "mesh.routing.paths", "mesh.routing.paths.backup", "mesh.routing.paths.probe", "mesh.routing.noTransit", "mesh.routing.tuning", "mesh.routing.smooth", "mesh.fastPorts", "mesh.forwards"],
  "protocol": 1, "protocolMin": 1, "front?": "<bool>", "frontAccess?": "<ref:frontAccess>"}
 ```
 

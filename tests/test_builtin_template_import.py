@@ -123,7 +123,8 @@ async def test_builtin_template_import_is_authenticated_validated_idempotent_and
         "SELECT id, name, content, is_active, is_agent_active FROM memory_templates ORDER BY id",
     )
     rows = [dict(row) for row in await cur.fetchall()]
-    assert len(rows) == 4
+    # Two of the user's, the page assistant's built-in seeded at startup, and the two imported.
+    assert len(rows) == 5
     by_name = {row["name"]: row for row in rows}
     assert (by_name["我的主控模板"]["is_active"], by_name["我的主控模板"]["is_agent_active"]) == (1, 0)
     assert (by_name["我的 Agent 模板"]["is_active"], by_name["我的 Agent 模板"]["is_agent_active"]) == (0, 1)
@@ -139,7 +140,7 @@ async def test_builtin_template_import_is_authenticated_validated_idempotent_and
     repeated_data = await repeated.json()
     assert (repeated_data["created"], repeated_data["reused"]) == (0, 2)
     cur = await web_env.db.conn.execute("SELECT COUNT(*) AS n FROM memory_templates")
-    assert int((await cur.fetchone())["n"]) == 4
+    assert int((await cur.fetchone())["n"]) == 5
 
     cur = await web_env.db.conn.execute(
         "SELECT kind, actor, chat_id, detail_json FROM audit_logs WHERE kind IN (?, ?) ORDER BY id",
@@ -200,4 +201,5 @@ async def test_empty_database_template_names_follow_the_installed_version_source
     assert rows == [
         {"name": "内置主控模板 · OpenBear source-version-for-test", "is_active": 1, "is_agent_active": 0},
         {"name": "内置 Agent 模板 · OpenBear source-version-for-test", "is_active": 0, "is_agent_active": 1},
+        {"name": "内置页面助手模板 · OpenBear source-version-for-test", "is_active": 0, "is_agent_active": 0},
     ]

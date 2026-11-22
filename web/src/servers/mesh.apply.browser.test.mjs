@@ -29,4 +29,30 @@ test('mesh board layout: apply and rollback', {skip: !chromium, timeout: 300000}
     await page.waitForFunction(() => !document.querySelector('.mesh-stage .mesh-bar'), null, {timeout: 20000});
     await h.close();
   });
+
+  await t.test('apply: shows what it prepares at once, takes one click, then the nodes under way and the time it took', {timeout: 90000}, async t => {
+    const h = await setup(t, {prepareMs: 2400});
+    const {page} = h;
+    await node(page, 'berlin').click();
+    await inspector(page).getByRole('tab', {name: '配置'}).click();
+    await inspector(page).getByRole('checkbox', {name: '监听 TCP'}).check();
+    await h.saved(d => memberOf(d, 'berlin').listen.tcp === 52000, 'listen');
+    const bar = page.locator('.mesh-stage .mesh-bar');
+    const apply = bar.getByRole('button', {name: '应用'});
+    await apply.click();
+    // At once, before the controller answers: the bar says so and nothing can be applied again.
+    await bar.locator('strong', {hasText: '正在准备应用'}).waitFor({timeout: 500});
+    assert.equal(await bar.getByRole('button', {name: /应用中/}).isDisabled(), true);
+    await bar.locator('.mesh-bar-summary', {hasText: /正在(读取各节点的最新状态|检查中继的 TLS 证书)/}).waitFor({timeout: 3000});
+    await bar.locator('.mesh-bar-summary', {hasText: /已用 \d+ 秒/}).waitFor({timeout: 3000});
+    await shot(page, 'desktop-apply-preparing');
+    await bar.getByRole('button', {name: /应用中/}).click({force: true}).catch(() => {});
+    await bar.locator('strong', {hasText: /正在应用/}).waitFor({timeout: 6000});
+    assert.equal(h.calls.filter(c => c.method === 'POST' && c.path === '/api/servers/mesh/apply').length, 1, 'one apply');
+    await bar.getByRole('button', {name: '查看进度'}).click();
+    await bar.locator('.mesh-bar-list li').first().waitFor();
+    await shot(page, 'desktop-apply-progress');
+    await page.locator('.el-message', {hasText: /已应用到 \d+ 台，用时 \d+ 秒/}).waitFor({timeout: 20000});
+    await h.close();
+  });
 });

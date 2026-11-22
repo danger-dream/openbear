@@ -53,15 +53,15 @@ func (b *policyBackend) Reflect(context.Context, netip.AddrPort, [8]byte) (netip
 func (b *policyBackend) STUN(context.Context, netip.AddrPort) (netip.AddrPort, error) {
 	return netip.AddrPort{}, context.DeadlineExceeded
 }
-func (b *policyBackend) Remote(Path) (netip.AddrPort, bool)           { return netip.AddrPort{}, false }
-func (b *policyBackend) Prime([]netip.AddrPort, int) error            { return nil }
-func (b *policyBackend) UDPPort() int                                 { return 0 }
-func (b *policyBackend) ReflectSeen([8]byte) (netip.AddrPort, bool)   { return netip.AddrPort{}, false }
-func (b *policyBackend) RecentlyFrom(netip.Addr, time.Duration) bool  { return false }
-func (b *policyBackend) SendTest(netip.AddrPort, [8]byte, byte) error { return nil }
-func (b *policyBackend) WatchTests([8]byte) bool                      { return false }
-func (b *policyBackend) TestsSeen([8]byte) byte                       { return 0 }
-func (b *policyBackend) StopTests([8]byte)                            {}
+func (b *policyBackend) Remote(Path) (netip.AddrPort, bool)              { return netip.AddrPort{}, false }
+func (b *policyBackend) Prime([]netip.AddrPort, int) error               { return nil }
+func (b *policyBackend) UDPPort() int                                    { return 0 }
+func (b *policyBackend) ReflectSeen([8]byte) (netip.AddrPort, bool)      { return netip.AddrPort{}, false }
+func (b *policyBackend) RecentlyFrom(netip.AddrPort, time.Duration) bool { return false }
+func (b *policyBackend) SendTest(netip.AddrPort, [8]byte, byte) error    { return nil }
+func (b *policyBackend) WatchTests([8]byte) bool                         { return false }
+func (b *policyBackend) TestsSeen([8]byte) byte                          { return 0 }
+func (b *policyBackend) StopTests([8]byte)                               {}
 func policyManager(t *testing.T) (*Manager, *policyBackend, time.Time) {
 	t.Helper()
 	now := time.Now()

@@ -29,13 +29,12 @@ const formOf = s => ({prefix: s.prefix || '', fastPaths: s.fast?.paths ?? FAST_D
   routing: {...ROUTING_DEFAULTS, ...(s.routing || {})}});
 // The routing parameters, a row each: [key, before the box, after it].
 const ROUTING_ROWS = [
-  {label: '切换门槛', hint: '路线没断时，另一条的代价至少低这么多才换过去；百分比填 0 表示不要求。', fields: [['switchMs', '至少便宜', 'ms'], ['switchPct', '且超过', '%']]},
-  {label: '中转更少时', hint: '经过的中转更少的路线，便宜这么多、并持续下面的“持续时间”，就换过去。', fields: [['shorterMs', '至少便宜', 'ms'], ['shorterPct', '且超过', '%']]},
-  {label: '通告门槛', hint: '链路实测代价和已通告的差这么多、并持续“持续时间”，才重新通告；各节点按已通告的代价选路。', fields: [['advertMs', '差超过', 'ms'], ['advertPct', '且超过', '%']]},
-  {label: '持续时间', hint: '通告门槛和“中转更少时”要持续这么久才算数，短暂的波动不动路线。', fields: [['holdS', '', '秒']]},
+  {label: '平滑半衰期', hint: '每条备选路的平滑代价追上实时代价的速度：越大越稳、越不容易受慢波动影响，断线仍立即切。', fields: [['smoothHalfLifeS', '', '秒']]},
+  {label: '切换门槛', hint: '路线没断时，另一条的实时代价和平滑代价都要至少便宜这么多才换过去。', fields: [['switchMinMs', '至少便宜', 'ms'], ['switchPct', '且超过', '%']]},
+  {label: '每跳代价', hint: '每经过一条中转链路附加的固定代价，自然偏好跳数更少的路线。', fields: [['hopCostMs', '', 'ms']]},
+  {label: '起步惩罚', hint: '新出现或刚恢复的线路平滑代价从“实时代价 + 起步惩罚”起步；这条链路最近断得越多，起步越高，反复断线的线路吸不走流量，只断过一次的一两分钟内就能用回。', fields: [['startPenaltyMs', '', 'ms']]},
   {label: '抖动权重', hint: '每 1 ms 抖动在代价里算几 ms。', fields: [['jitterWeight', '×', '']]},
   {label: '丢包权重', hint: '丢包率乘以这个数加到代价上：1000 时丢 1% 约加 10 ms。', fields: [['lossWeight', '', 'ms（全丢时）']]},
-  {label: '来回切后等待', hint: '10 分钟内来回切过的路线，再因为更便宜而切换前要先等这么久，每多切一次翻倍，最多到上限；线路断了照样立即切。', fields: [['flapHoldS', '先等', '秒'], ['flapHoldMaxS', '最长', '秒']]},
 ];
 const rowDefault = row => row.fields.map(([k, , unit]) => `${ROUTING_DEFAULTS[k]}${unit ? ` ${unit.replace(/（.*/, '')}` : ''}`).join(' · ');
 const rowChanged = row => row.fields.some(([k]) => Number(form.routing[k]) !== ROUTING_DEFAULTS[k]);
@@ -80,7 +79,6 @@ function check() {
     const v = Number(form.routing[key]);
     if (form.routing[key] === '' || !Number.isFinite(v) || v < lo || v > hi) problems[`routing.${key}`] = `在 ${lo}～${hi} 之间`;
   }
-  if (!problems['routing.flapHoldMaxS'] && Number(form.routing.flapHoldMaxS) < Number(form.routing.flapHoldS)) problems['routing.flapHoldMaxS'] = '最长等待不能少于先等的时间';
   local.value = problems;
   return !Object.keys(problems).length;
 }

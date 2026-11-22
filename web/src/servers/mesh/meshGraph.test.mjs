@@ -63,7 +63,7 @@ test('only rules that name machines become arrows; phones lay out top-down', () 
   assert.deepEqual(p, {r1: {x: 0, y: 0}, r2: {x: 170, y: 0}, a: {x: 0, y: 156}, b: {x: 170, y: 156}, c: {x: 85, y: 288}});
 });
 
-test('entries: LAN or internet once a punched entry is through, punching until then; standbys while another is in use', async () => {
+test('entries: LAN or internet once a punched entry is through, punching until then; LAN when dialed there; standbys while another is in use', async () => {
   const { entryHow, entryLook } = await import('./meshGraph.js');
   const relay = (serverId, mode) => m(serverId, 'relay', {relayMode: mode, listen: {udp: 1, tcp: 1, tls: 0}});
   const mac = m('mac', 'member', {entry: {mode: 'failover', candidates: [{id: 'c1', relay: 'toy', transport: 'udp'}, {id: 'c2', relay: 'sg', transport: 'tcp'}]}});
@@ -71,13 +71,24 @@ test('entries: LAN or internet once a punched entry is through, punching until t
   const data = health => ({nodes: {mac: {summary: {entry: {candidate: health[0].state === 'active' ? 'c1' : ''}, entryHealth: health}}}});
   const look = (health, i) => entryLook(w, data(health), [], mac, i);
   const lan = [{id: 'c1', state: 'active', via: 'lan'}, {id: 'c2', state: 'ready', via: ''}];
-  assert.equal(entryHow(look(lan, 0), 'udp'), '局域网');
+  assert.equal(entryHow(look(lan, 0), 'udp'), '局域网 · UDP');
+  assert.equal(look(lan, 0).lan, true);
   assert.equal(entryHow(look([{...lan[0], via: 'public'}, lan[1]], 0), 'udp'), '公网');
   assert.equal(entryHow(look([{id: 'c1', state: 'punching', via: ''}, {id: 'c2', state: 'active', via: ''}], 0), 'udp'), '打洞中');
   // Ordinary candidates keep their transport; without any report a punched one only says it punches.
   assert.equal(entryHow(look(lan, 1), 'tcp'), 'TCP');
   assert.equal(entryHow(entryLook(w, {nodes: {}}, [], mac, 0), 'udp'), '打洞');
   assert.deepEqual([look(lan, 0).standby, look(lan, 1).standby], [false, true]);
+  // The controller dials a public relay on the member's LAN at its LAN address: the applied line says so.
+  const lines = [{id: 'entry:mac|sg|tcp', kind: 'entry', a: 'mac', b: 'sg', transport: 'tcp', lan: true}];
+  assert.equal(entryHow(entryLook(w, {...data(lan), lines}, [], mac, 1), 'tcp'), '局域网 · TCP');
+  // A punched one before it is through, dialed at the LAN address.
+  const site = [{id: 'entry:mac|toy|udp', kind: 'entry', a: 'mac', b: 'toy', transport: 'udp', punch: true, lan: true}];
+  assert.equal(entryHow(entryLook(w, {nodes: {}, lines: site}, [], mac, 0), 'udp'), '局域网 · UDP');
+  // Once through, the member's own word wins.
+  assert.equal(entryHow(entryLook(w, {...data([{...lan[0], via: 'public'}, lan[1]]), lines: site}, [], mac, 0), 'udp'), '公网');
+  // Another transport in the draft is not the applied line.
+  assert.equal(entryHow(entryLook(w, {...data(lan), lines}, [], {...mac, entry: {...mac.entry, candidates: [mac.entry.candidates[0], {id: 'c2', relay: 'sg', transport: 'udp'}]}}, 1), 'udp'), 'UDP');
   assert.equal(entryLook(w, {nodes: {}}, [], mac, 1).standby, false, 'nothing known in use: no standby');
 });
 

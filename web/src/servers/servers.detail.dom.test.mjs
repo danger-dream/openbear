@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setup, showTab, tab} from './testing/serversDom.mjs';
 import {window} from '../domTestEnv.mjs';
+import {network} from '../testing/fakeNetwork.mjs';
 import {sleep} from '../testing/domPage.mjs';
 import {DETAILS} from './testing/serversBackend.mjs';
 
@@ -707,5 +708,49 @@ test('网络设备: interfaces without their counters show none, not 0 B', async
   assert.match(await section.locator('.dt-nics h4').innerText(), /节点没有提供各网卡的流量/);
   assert.equal(await section.locator('.dt-nic-bytes').count(), 0);
   assert.doesNotMatch(await section.locator('.dt-nic-list').innerText(), /0 B/);
+  await h.close();
+});
+
+test('走势: live chart tolerates up to 6s jitter without splitting, breaks on >6s gaps, and keeps 1.5x for 1h', async t => {
+  const h = await setup(t);
+  const orig = network.handler;
+  const makeSeries = (tArr, step, range) => ({
+    ok: true, range, step,
+    points: {
+      t: tArr,
+      cpu: tArr.map(() => 20), steal: tArr.map(() => 0.5), iowait: tArr.map(() => 0.1),
+      mem: tArr.map(() => 30), swap: tArr.map(() => 0), disk: tArr.map(() => 15),
+      load: tArr.map(() => 0.2), rxRate: tArr.map(() => 1024), txRate: tArr.map(() => 512),
+      ioRead: tArr.map(() => 0), ioWrite: tArr.map(() => 0), tcp: tArr.map(() => 10), udp: tArr.map(() => 2), proc: tArr.map(() => 50),
+    },
+  });
+  let got1h = false;
+  network.handler = async req => {
+    if (req.path === '/api/servers/srv-delta/metrics') {
+      const range = req.query.range;
+      if (range === 'live') {
+        if (Number(req.query.after || 0)) return {status: 200, json: makeSeries([], 3, 'live')};
+        // +3, +5, +6 stay joined; +8 splits into a second segment.
+        return {status: 200, json: makeSeries([1000, 1003, 1008, 1014, 1022, 1025], 3, 'live')};
+      }
+      if (range === '1h') {
+        got1h = true;
+        // +60 joined; +120 (> 60 * 1.5) splits into two segments.
+        return {status: 200, json: makeSeries([1000, 1060, 1180, 1240], 60, '1h')};
+      }
+    }
+    return orig(req);
+  };
+  const detail = await open(h, 'Delta-JP');
+  const trends = detail.locator('[data-jump=trends]');
+  const cpuLine = trends.locator('[data-chart=load] .tc-line').first();
+  await cpuLine.waitFor();
+  const liveD = await cpuLine.getAttribute('d');
+  assert.equal((liveD.match(/M/g) || []).length, 2, `live path should split only once at +8s, not +5s/+6s: ${liveD}`);
+  await trends.getByRole('tab', {name: '1 小时'}).click();
+  assert.ok(await until(() => got1h));
+  await cpuLine.waitFor();
+  const hourD = await cpuLine.getAttribute('d');
+  assert.equal((hourD.match(/M/g) || []).length, 2, `1h path should still split at 120s > 90s: ${hourD}`);
   await h.close();
 });

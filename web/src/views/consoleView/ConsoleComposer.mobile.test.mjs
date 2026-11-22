@@ -80,7 +80,7 @@ test('actual composer paste and file chooser retain files, mixed text and focus 
   const emitted = [], inserts = [], focuses = [], warnings = [], props = { draft: 'draft', running: false, pendingAttachments: [], attachmentPreviews: {} };
   let picked = 0;
   const c = vm.createContext({ props, nextTick, File, ElMessage: {warning: text => warnings.push(text)}, emit: (...args) => emitted.push(args), fileInput: ref({ click() { picked++; } }), composerTextarea: ref({ insertText: text => inserts.push(text), adjustHeight() {}, focus: options => focuses.push(options), value: 'draft', setSelectionRange() {} }) });
-  vm.runInContext(between(source, 'function openFilePicker()', 'function interactionAction('), c);
+  vm.runInContext(between(source, 'function openFilePicker()', 'function onAnswerConfirmation('), c);
   vm.runInContext('openFilePicker()', c); assert.equal(picked, 1);
   const file = new File(['image'], 'image.png', { type: 'image/png' }); let prevented = 0;
   c.event = { clipboardData: { items: [{ kind: 'file', getAsFile: () => file }], getData: () => 'pasted text' }, preventDefault() { prevented++; } };

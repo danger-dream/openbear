@@ -22,7 +22,7 @@ OWNER = 1
 IDS = ('r1', 'r2', 'r3', 'm1')
 LEGACY = frozenset({mesh_config.STANDBY_FEATURE, mesh_proxy.ENTRIES_FEATURE, mesh_config.MEMBERS_ROUTING_FEATURE,
                     mesh_config.PATHS_FEATURE, mesh_config.PATHS_BACKUP_FEATURE, 'mesh.routing.paths.probe'})
-ADDED = frozenset({mesh_config.NO_TRANSIT_FEATURE, mesh_config.TUNING_FEATURE, mesh_fast.FAST_FEATURE, mesh_forward.FEATURE})
+ADDED = frozenset({mesh_config.NO_TRANSIT_FEATURE, mesh_config.TUNING_FEATURE, mesh_config.SMOOTH_FEATURE, mesh_fast.FAST_FEATURE, mesh_forward.FEATURE})
 WARNINGS = {'mesh_no_transit_outdated', 'mesh_tuning_outdated'}
 PORT_ERRORS = {'fast_member_needs_update', 'forward_member_needs_update'}
 
@@ -64,7 +64,7 @@ def intent():
             m['entry']['candidates'] = [{'id': sid, 'relay': sid, 'transport': 'udp'} for sid in ('r1', 'r3')]
         d['members'].append(m)
     d['members'][1]['noTransit'] = True
-    d['settings']['routing']['switchMs'] = 50
+    d['settings']['routing']['smoothHalfLifeS'] = 30
     d['paths'] = [{'id': f'path-{r}', 'on': True, 'from': 'm1', 'to': 'r2', 'via': [r]} for r in ('r1', 'r3')]
     # An existing, unrelated user grant must survive both capability filtering and recovery.
     d['rules'] = [{'id': 'keep-access', 'src': {'all': False, 'allSubnets': False, 'members': ['r1'], 'tags': [], 'prefixes': []},
@@ -88,13 +88,16 @@ def warning_map(d, facts):
     return {h['error']: h['message'] for h in model.hints(d, facts) if h['error'] in WARNINGS}
 
 
-def assert_routes_kept(configs):
+def assert_routes_kept(configs, *, smooth_ids=None):
     assert configs['m1']['self']['leaf'] is True and configs['m1']['entry'] is None
     assert {p['id'] for p in configs['m1']['paths']} == {'path-r1', 'path-r3'}
     assert {p['id'] for p in configs['r2']['paths']} == {'path-r1~back', 'path-r3~back'}
     for sid in IDS:
         assert configs[sid]['routing']['noTransit'] == ['r2']
-        assert configs[sid]['routing']['tuning']['switchMs'] == 50
+        if smooth_ids is None or sid in smooth_ids:
+            assert configs[sid]['routing']['tuning']['smoothHalfLifeS'] == 30
+        else:
+            assert configs[sid]['routing']['tuning'] == mesh_config.LEGACY_TUNING
     for sid in ('r1', 'r3'):
         assert any(link['peer'] == 'm1' and link['kind'] == 'member' for link in configs[sid]['links'])
 
@@ -150,14 +153,14 @@ async def test_upgrade_capability_matrix_uses_running_plane_without_erasing_inte
         assert '设置会保留' in text and '确认支持后自动生效' in text
         assert '的节点版本还不' not in text  # The management node may already be up to date.
     configs = mesh_config.build(d, facts, 'net', 4)
-    assert_routes_kept(configs)
+    assert_routes_kept(configs, smooth_ids=IDS if supported else ())
     assert all('fast' not in c and 'forward' not in c for c in configs.values())
 
     services = with_ports(d)
     original_services = copy.deepcopy(services)
     errors = {e['error'] for e in model.validate(services, facts, applying=True)}
     wired = mesh_config.build(services, facts, 'net', 4)
-    assert_routes_kept(wired)
+    assert_routes_kept(wired, smooth_ids=IDS if supported else ())
     if supported:
         assert not errors
         assert wired['m1']['forward']['forwards'][0]['allow'] == ['198.51.100.0/24']
@@ -191,7 +194,7 @@ async def test_confirmed_plane_automatically_reconciles_preserved_intent(monkeyp
     assert [(e['path'], e['error']) for e in errors] == [('forwards[0]', 'forward_member_needs_update')]
     assert 'M1' in errors[0]['message']
     assert ADDED <= before_facts['r2']['features'] and not (ADDED & before_facts['m1']['features'])
-    assert_routes_kept(before)
+    assert_routes_kept(before, smooth_ids=('r1', 'r2', 'r3'))
     assert all('forward' not in c for c in before.values()) and 'fast' not in before['m1']
     baseline = mesh_config.build(intent(), before_facts, 'net', 4)
     assert_service_acl(d, baseline, before, fast_members=('r1', 'r2', 'r3'))

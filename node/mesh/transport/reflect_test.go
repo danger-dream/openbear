@@ -88,8 +88,15 @@ func TestReflectorRepliesNoLargerAndLimitsEachSource(t *testing.T) {
 	if kept, ok := relay.ReflectSeen(id); !ok || kept != seen {
 		t.Fatalf("the relay kept %v %v for the request, the member is %v", kept, ok, seen)
 	}
-	if !relay.RecentlyFrom(seen.Addr(), time.Minute) || relay.RecentlyFrom(netip.MustParseAddr("192.0.2.1"), time.Minute) {
+	if !relay.RecentlyFrom(seen, time.Minute) || relay.RecentlyFrom(netip.MustParseAddrPort("192.0.2.1:51820"), time.Minute) {
 		t.Fatal("RecentlyFrom does not follow the requests answered")
+	}
+	// Another port of an address holds state of its own: requests from a
+	// socket of their own (ProbeUDP, as relays measure each other; Aws-SG,
+	// 11-22) leave a test to the listener telling.
+	other := netip.AddrPortFrom(self.Addr(), uint16(freePort(t, "udp")))
+	if !relay.RecentlyFrom(self, time.Minute) || other == self || relay.RecentlyFrom(other, time.Minute) {
+		t.Fatal("RecentlyFrom goes by the address alone")
 	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel2()

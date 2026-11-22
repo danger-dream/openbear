@@ -3,7 +3,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { MeshApi } from './meshApi.js';
 import { mesh, meshError, revert, save } from './meshStore.js';
-import { errorMessage, HELD_TEXT, isRelay, msText, nameOf, ROUTING_DEFAULTS, switchesTo, transportLabel } from './meshHelpers.js';
+import { entryVia, errorMessage, HELD_TEXT, isRelay, msText, nameOf, ROUTING_DEFAULTS, switchesTo, transportLabel } from './meshHelpers.js';
 import { fixedRouteInfo } from './meshAuto.js';
 import { addRoute, changeRoute, gapsOf, MAX_PER_PAIR, MAX_VIA, moveInPair, nodesFrom, pairRoutes, pairsOf, routeRtt, routeState, sameRoute } from './meshRoutes.js';
 import { usePoll } from './usePoll.js';
@@ -75,23 +75,24 @@ const pathPoll = usePoll(() => loadPath(true), {interval: () => livePath.value ?
 watch(livePath, on => { if (on) void pathPoll.run(); });
 const hops = computed(() => (path.value?.hops || []).map((h, i, all) => {
   const l = i ? lineOf(all[i - 1].node, h.node) : null;
-  return {node: h.node, transport: l ? transportLabel(l.transport) : h.via === 'lan' ? '局域网' : '', rtt: i ? h.rttMs : null};
+  return {node: h.node, transport: l ? entryVia(l.lan, l.transport) : h.via === 'lan' ? '局域网' : '', rtt: i ? h.rttMs : null};
 }));
 const pathFixed = computed(() => fixedRouteInfo(path.value?.fixed));
 const costText = v => Number.isFinite(v) ? `${Math.round(v * 10) / 10}` : '—';
-const thresholdText = t => `至少便宜 ${t.switchMs} ms${t.switchPct ? ` 且超过 ${t.switchPct}%` : ''}`;
-// What the relay that chose the route says: its cost, and the cheaper next hop it does not take and why.
+const thresholdText = t => `至少便宜 ${t.switchMinMs} ms${t.switchPct ? ` 且超过 ${t.switchPct}%` : ''}`;
+// What the relay that chose the route says: its cost, smoothed cost, and the cheaper next hop it does not take and why.
 const decision = computed(() => {
   const d = path.value?.decision;
   if (!d || pathFixed.value) return null;
   const t = {...ROUTING_DEFAULTS, ...(path.value.tuning || {})};
-  const who = `${nm(d.node)} 选的路线，代价 ${costText(d.cost)}`;
+  const sm = Number.isFinite(d.smoothed) ? `（平滑 ${costText(d.smoothed)}）` : '';
+  const who = `${nm(d.node)} 选的路线，代价 ${costText(d.cost)}${sm}`;
   if (!d.best) return {text: `${who}；它看来这已是最便宜的。`, tone: ''};
   const saved = Number.isFinite(d.cost) && Number.isFinite(d.bestCost) ? Math.round((d.cost - d.bestCost) * 10) / 10 : null;
-  const left = d.until ? Math.max(0, Math.ceil((d.until - Date.now()) / 1000)) : 0;
+  const bsm = Number.isFinite(d.bestSmoothed) ? `（平滑 ${costText(d.bestSmoothed)}）` : '';
   const why = HELD_TEXT[d.held] || '';
-  return {tone: 'warn', text: `${who}；改走 ${nm(d.best)} 代价 ${costText(d.bestCost)}${saved != null ? `，便宜 ${saved} ms` : ''}，没换：${why}`
-    + (d.held === 'margin' ? `（门槛：${thresholdText(t)}）` : '') + (left ? `，约 ${left} 秒后再看` : '') + '。'};
+  return {tone: 'warn', text: `${who}；改走 ${nm(d.best)} 代价 ${costText(d.bestCost)}${bsm}${saved != null ? `，便宜 ${saved} ms` : ''}，没换：${why}`
+    + (d.held === 'margin' ? `（门槛：${thresholdText(t)}）` : '') + '。'};
 });
 const nowNodes = computed(() => hops.value.at(-1)?.node === ends.value[1] ? hops.value.map(h => h.node) : []);
 function showPathOnBoard() {
@@ -180,7 +181,7 @@ function bSeg(i) {
   if (g?.error) return {tone: 'bad', text: g.text};
   const a = bNodes.value[i], b = bNodes.value[i + 1], l = lineOf(a, b), m = bMeasured.value.get(`${a}>${b}`) || bMeasured.value.get(`${b}>${a}`);
   const up = m ? m.how === 'report' : l?.state === 'up';
-  const how = g ? `保存后：${g.text}` : up ? ['已连通', l && transportLabel(l.transport)].filter(Boolean).join(' · ') : '已在草稿里，应用后连上';
+  const how = g ? `保存后：${g.text}` : up ? ['已连通', l && entryVia(l.lan, l.transport)].filter(Boolean).join(' · ') : '已在草稿里，应用后连上';
   const ms = !m ? (bMeasuring.value ? '测量中…' : '') : Number.isFinite(m.rttMs) ? `${up ? '' : '直测 '}${msText(m.rttMs)}${lossText(m.loss)}` : `测不到：${m.why || '没有结果'}`;
   return {tone: g || !up ? 'warn' : m?.loss > 0.02 ? 'warn' : 'ok', text: [how, ms].filter(Boolean).join(' · ')};
 }

@@ -151,6 +151,17 @@ def test_config_listening_targets_sources_direct_dials_and_fronts():
     assert 'r1' not in cfgs_front['r2']['fast'].get('next', {})
     assert ['r1', 'r2'] in cfgs_front['r1']['fast']['dial'] and ['r2', 'r1'] not in cfgs_front['r1']['fast']['dial']
 
+    # Without a front, a manual-only border lets the side dialing the manual link dial directly too;
+    # the other side reaches it over the mesh.
+    f_border = copy.deepcopy(f_front)
+    f_border['r1'].pop('front')
+    d_border = copy.deepcopy(d_front)
+    d_border['relayLinks'] = {'mode': 'custom', 'pairs': [pair('r1', 'r2', transport='tcp', dialer='a')]}
+    cfgs_border = build(d_border, f_border, 'net', 1)
+    assert cfgs_border['r1']['fast']['next']['r2'] == f"{f['r2']['ipv4']}:62003"
+    assert 'r1' not in cfgs_border['r2']['fast'].get('next', {})
+    assert ['r1', 'r2'] in cfgs_border['r1']['fast']['dial'] and ['r2', 'r1'] not in cfgs_border['r1']['fast']['dial']
+
 
 def test_older_nodes_passed_over_and_flagged_at_apply():
     d = _fast_doc()
@@ -197,7 +208,9 @@ def test_clean_status_keeps_capture_and_channels():
     ch = fast['channels'][0]
     assert ch['dest'] == 'r2' and ch['ready'] and ch['using'] == 1 and ch['streams'] == 5 and ch['fallbacks'] == 1
     assert ch['paths'][0]['state'] == 'down' and ch['paths'][1] == {'hops': ['r2'], 'fixed': 'p1', 'state': 'ready', 'since': 4, 'rttMs': 12.4, 'error': ''}
-    assert fast['tcpMem']['pressures'] == 3 and fast['peers'][0]['rttMs'] == 12.4
+    assert fast['tcpMem']['pressuresSinceBoot'] == 3 and fast['peers'][0]['rttMs'] == 12.4
+    # A status saved and read back on a restart keeps it.
+    assert mesh_status.clean_status(cleaned)['fast']['tcpMem']['pressuresSinceBoot'] == 3
     assert 'address' not in fast and 'transparent' not in fast
     summ = mesh_status.summary(cleaned, 'relay')
     assert summ['fast']['channels'][0]['dest'] == 'r2'

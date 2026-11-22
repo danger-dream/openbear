@@ -28,11 +28,12 @@ async def choices(db: Any) -> dict[str, Any]:
     The Agent prompt is never a choice; the active template appears once, as the default.
     """
     cur = await db.conn.execute(
-        "SELECT id, name, is_active, is_agent_active, is_persona, length(content) AS chars, updated_at"
+        "SELECT id, name, is_active, is_agent_active, is_persona, is_assistant_active, length(content) AS chars, updated_at"
         " FROM memory_templates ORDER BY id")
     rows = [dict(row) for row in await cur.fetchall()]
     active = next((row for row in reversed(rows) if row["is_active"]), None)
-    items = [_choice(row) for row in rows if row["is_persona"] and not row["is_active"] and not row["is_agent_active"]]
+    items = [_choice(row) for row in rows if row["is_persona"] and not row["is_active"] and not row["is_agent_active"]
+             and not row["is_assistant_active"]]
     return {"active": _choice(active) if active else {"id": "", "name": "", "chars": 0, "updatedAt": 0}, "items": items, "existingIds": [str(row["id"]) for row in rows]}
 
 

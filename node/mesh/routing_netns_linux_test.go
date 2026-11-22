@@ -455,7 +455,7 @@ func TestRoutingNetnsFaults(t *testing.T) {
 			time.Sleep(time.Until(start.Add(30 * time.Second)))
 			l.netem(k, "")
 			return time.Now()
-		}, 55 * time.Second},
+		}, 250 * time.Second},
 		{"flap", func(l *rtLab, k *rtLink, start time.Time) time.Time {
 			for i := 0; i < 30; i += 4 {
 				if (i/4)%2 == 0 {
@@ -542,9 +542,9 @@ func TestRoutingNetnsFaults(t *testing.T) {
 			// minutes): later back than sim.py's result.txt.
 			switch c.name {
 			case "outage":
-				// result.txt: 2 switches, 3 s lost, away at +3 s, back at +13 s;
-				// here back at about +35 s, its hold and the 5 s rule.
-				if !back || switches != 2 || r.detour < 0 || r.detour > 5*time.Second || r.lost > 5*time.Second || r.back > 45*time.Second {
+				// 30s outage leaves 30 losses in the 100-probe window plus 60s smoothing
+				// half-life; detour must still happen within 5s and return within 240s.
+				if !back || switches != 2 || r.detour < 0 || r.detour > 5*time.Second || r.lost > 5*time.Second || r.back > 240*time.Second {
 					t.Fatalf("outage: on %v, %d switches, %s", after.Path, switches, r)
 				}
 			case "flap":
@@ -575,7 +575,7 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 		[]string{"A-B:4", "B-C:8", "C-D:16", "A-D:32", "A-C:100"},
 		map[string]string{"A>B": "B", "A>C": "B", "A>D": "D", "B>A": "A", "B>C": "C", "B>D": "C", "C>A": "B", "C>B": "B", "C>D": "D", "D>A": "A", "D>B": "C", "D>C": "C"})
 	l.start()
-	l.paths(60*time.Second, "A>B>C", "C>B>A", "B>C>D", "D>C>B")
+	l.paths(180*time.Second, "A>B>C", "C>B>A", "B>C>D", "D>C>B")
 	rtt := map[string]float64{}
 	for _, k := range l.links {
 		rtt[k.a+k.b], rtt[k.b+k.a] = k.rttMs, k.rttMs
@@ -615,7 +615,7 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 	l.netem(l.link("B", "C"), "loss 100%")
 	phase("B-C cut", 20*time.Second)
 	l.netem(l.link("B", "C"), "")
-	phase("B-C back", 40*time.Second)
+	phase("B-C back", 15*time.Second)
 	for i := 0; i < 8; i++ {
 		if i%2 == 0 {
 			l.netem(l.link("C", "D"), "loss 100%")
@@ -637,7 +637,7 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 		}
 		for _, k := range s.Routing.Links {
 			if k.Peer == b {
-				return k.State == "up" || k.HeldMs > 0 && k.State == "down"
+				return k.State == "up"
 			}
 		}
 		return false
@@ -651,8 +651,8 @@ func TestRoutingNetnsNoLoops(t *testing.T) {
 	phase("A routed through D", 15*time.Second)
 	l.netem(l.link("A", "B"), "")
 	l.netem(l.link("A", "C"), "")
-	phase("A-B and A-C back", 60*time.Second)
-	l.paths(30*time.Second, "A>B>C", "C>B>A", "B>C>D", "D>C>B")
+	phase("A-B and A-C back", 0)
+	l.paths(480*time.Second, "A>B>C", "C>B>A", "B>C>D", "D>C>B")
 
 	for _, f := range flows {
 		var paths [][]string
@@ -785,11 +785,11 @@ func TestRoutingNetnsTCPNoise(t *testing.T) {
 	}
 	t.Logf("%.0f min of 1%% loss on the TCP links: routes moved %d times; the TCP links' measured cost peaked at %.1f, jitter at %.1f, loss at %.3f; %s",
 		minutes, moved, peakCost, peakJitter, peakLoss, strings.Join(changes, "; "))
-	if most > 2 {
+	if most > 1 {
 		for _, id := range l.ids {
 			t.Logf("%s:\n%s", id, strings.Join(snap[id], "\n"))
 		}
-		t.Errorf("a route moved %d times on noise alone", most)
+		t.Errorf("a route moved %d times on noise alone (want <= 1)", most)
 	}
 
 	// An outage still detours at once and returns.
@@ -804,6 +804,8 @@ func TestRoutingNetnsTCPNoise(t *testing.T) {
 	time.Sleep(time.Until(cut.Add(30 * time.Second)))
 	l.netem(k, "loss 1%")
 	restored := time.Now()
-	l.paths(60*time.Second, "T>B", "B>T")
+	// With 60s half-life and 500ms start penalty, a ~21ms advantage over the
+	// detour (margin ~9ms) takes ~5.5 min plus TCP reconnect to settle back.
+	l.paths(480*time.Second, "T>B", "B>T")
 	t.Logf("T back on T-B %.1fs after it was restored", time.Since(restored).Seconds())
 }

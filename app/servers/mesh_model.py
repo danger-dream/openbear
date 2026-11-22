@@ -111,8 +111,12 @@ def upgrade(doc):
     doc['settings'].setdefault('proxy', mesh_proxy.default_settings())
     # A mesh from before auto links keeps the links it has until the user turns them on.
     doc['settings'].setdefault('autoLinks', {**mesh_autolinks.default_settings(), 'enabled': False})
-    # Before the routing parameters were settings the data plane had fixed ones; a mesh takes the defaults.
-    doc['settings'].setdefault('routing', mesh_config.default_routing())
+    # Before the routing parameters were settings, or before smoothed routing, a mesh takes the new defaults.
+    raw_routing = doc['settings'].get('routing')
+    if not isinstance(raw_routing, dict) or not any(k in raw_routing for k in ('smoothHalfLifeS', 'switchMinMs', 'hopCostMs', 'startPenaltyMs')):
+        doc['settings']['routing'] = mesh_config.default_routing()
+    else:
+        doc['settings']['routing'] = {**mesh_config.default_routing(), **{k: v for k, v in raw_routing.items() if k in mesh_config.ROUTING_TUNING}}
     doc.setdefault('lineRules', [])
     doc.setdefault('limits', [])
     doc.setdefault('paths', [])
@@ -254,25 +258,34 @@ def _settings(raw, prior, errors):
         out['autoLinks'] = mesh_autolinks.clean_settings(raw['autoLinks'], out.get('autoLinks') or mesh_autolinks.default_settings(), errors)
     else:
         out.setdefault('autoLinks', mesh_autolinks.default_settings())
-    out['routing'] = {**mesh_config.default_routing(), **(out.get('routing') or {})}
+    prior_routing = out.get('routing') if isinstance(out.get('routing'), dict) else {}
+    has_new_prior = any(k in prior_routing for k in ('smoothHalfLifeS', 'switchMinMs', 'hopCostMs', 'startPenaltyMs'))
+    kept_prior = {k: v for k, v in prior_routing.items() if k in mesh_config.ROUTING_TUNING} if has_new_prior else {}
+    out['routing'] = {**mesh_config.default_routing(), **kept_prior}
     if 'routing' in raw:
         _routing_settings(raw['routing'], out['routing'], errors)
     return out
 
 
 def _routing_settings(raw, out, errors):
-    """settings.routing merged into out: each a number within its range (mesh_config.ROUTING_TUNING)."""
-    if not isinstance(raw, dict) or set(raw) - set(mesh_config.ROUTING_TUNING):
+    """settings.routing merged into out: each a number within its range (mesh_config.ROUTING_TUNING).
+    Legacy keys (LEGACY_TUNING) are silently dropped on read and cleared on next save."""
+    legacy_only_keys = set(mesh_config.LEGACY_TUNING) - set(mesh_config.ROUTING_TUNING)
+    allowed = set(mesh_config.ROUTING_TUNING) | legacy_only_keys
+    if not isinstance(raw, dict) or set(raw) - allowed:
         errors.add('settings.routing', 'invalid_routing', '选路参数格式不正确')
         return
+    # Pure legacy payload (has legacy keys and none of the new smoothing keys): ignore legacy values, keep defaults.
+    if (set(raw) & legacy_only_keys) and not (set(raw) & {'smoothHalfLifeS', 'switchMinMs', 'hopCostMs', 'startPenaltyMs'}):
+        return
     for key, value in raw.items():
+        if key not in mesh_config.ROUTING_TUNING:
+            continue
         _, lo, hi = mesh_config.ROUTING_TUNING[key]
         if type(value) not in (int, float) or value != value or not lo <= value <= hi:
             errors.add(f'settings.routing.{key}', 'invalid_routing', f'须在 {lo}～{hi} 之间')
         else:
             out[key] = value
-    if out['flapHoldMaxS'] < out['flapHoldS']:
-        errors.add('settings.routing.flapHoldMaxS', 'invalid_routing', '最长等待不能少于第一次等待')
 
 
 def _host_port(value):
@@ -1098,13 +1111,13 @@ def _lacks(facts, sid, feature):
 
 
 def _tuning_hints(facts, live, index, name, out):
-    """Routing nodes whose data plane does not take settings.routing yet: they keep the fixed thresholds."""
+    """Routing nodes whose data plane does not support smoothed routing yet: they keep legacy tuning until updated."""
     old = sorted((sid for sid, m in live.items() if (m['role'] == 'relay' or mesh_config.routed_member(m, live, facts))
-                  and _lacks(facts, sid, mesh_config.TUNING_FEATURE)), key=index.get)
+                  and _lacks(facts, sid, mesh_config.SMOOTH_FEATURE)), key=index.get)
     if old:
         names = '、'.join(name(x) for x in old[:3]) + (f' 等 {len(old)} 台' if len(old) > 3 else '')
         out.add('settings.routing', 'mesh_tuning_outdated',
-                f'{names} 的组网数据面尚未确认支持选路参数（旧数据面按便宜 20% 且超过 10 ms 才切换）。'
+                f'{names} 的组网数据面尚未确认支持平滑选路（目前继续按旧版选路参数运行）。'
                 '请查看组网服务升级状态；节点尚未更新的先在服务器页更新。设置会保留，数据面确认支持后自动生效。')
 
 

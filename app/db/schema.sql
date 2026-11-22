@@ -187,7 +187,11 @@ CREATE TABLE IF NOT EXISTS web_conversations (
   origin_kind           TEXT NOT NULL DEFAULT '',
   origin_ref            TEXT NOT NULL DEFAULT '',
   -- 最近一轮结束后生成的下一句推荐 {turnUuid, items, createdAtMs}；新一轮开始或用户关闭时清空。
-  prompt_suggestions_json TEXT NOT NULL DEFAULT '{}'
+  prompt_suggestions_json TEXT NOT NULL DEFAULT '{}',
+  -- 页面助手会话：用页面助手模板，只在会话树的“页面助手”分组里出现。
+  assistant             INTEGER NOT NULL DEFAULT 0,
+  -- 页面助手会话所属的页面和对象：JSON {key, label, path}。
+  assistant_scope       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_web_conversations_owner_time
   ON web_conversations(owner_chat_id, archived_at, pinned_at DESC, updated_at DESC, id DESC);
@@ -762,11 +766,15 @@ CREATE TABLE IF NOT EXISTS memory_secrets (
   note        TEXT DEFAULT '',
   kv_json     TEXT NOT NULL DEFAULT '[]',
   grp         TEXT DEFAULT '',
+  -- 逗号分隔的标签。
+  tags        TEXT NOT NULL DEFAULT '',
   enabled     INTEGER DEFAULT 1,
   archived    INTEGER DEFAULT 0,
   sort        INTEGER DEFAULT 0,
   created_at  INTEGER DEFAULT 0,
-  updated_at  INTEGER DEFAULT 0
+  updated_at  INTEGER DEFAULT 0,
+  -- 模型读取或引用展开正文的最近时间；0 表示没有记录。
+  last_used_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_secrets_sort
   ON memory_secrets(archived, enabled, sort, id);
@@ -801,6 +809,7 @@ CREATE TABLE IF NOT EXISTS memory_templates (
   is_active   INTEGER DEFAULT 0,
   is_agent_active INTEGER DEFAULT 0,
   is_persona  INTEGER NOT NULL DEFAULT 0,
+  is_assistant_active INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_templates_active

@@ -8,6 +8,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { terminalReason } from './serverHelpers.js';
 import { addressParts, linkInfo } from './terminalLinks.js';
+import { usePageAction, usePageSelection, usePageSubject } from '../assistant/pageRegistry.js';
 
 // One shell per pane. The shell lives exactly as long as this socket: a closed
 // session is reopened only when the user presses Enter, never automatically.
@@ -71,6 +72,35 @@ function input(data) {
 }
 // Commands from the panel run as typed; multi-line text keeps its order.
 function run(text) { send(text.replace(/\r?\n/g, '\r').replace(/\r?$/, '\r')); term?.focus(); }
+// The last lines of the screen up to the cursor, as the user sees them.
+function screenText(lines = 40) {
+  const buffer = term?.buffer?.active;
+  if (!buffer) return '';
+  const end = buffer.baseY + buffer.cursorY;
+  const out = [];
+  for (let i = Math.max(0, end - lines + 1); i <= end; i++) out.push(buffer.getLine(i)?.translateToString(true) ?? '');
+  return out.join('\n').replace(/\s+$/, '');
+}
+const current = () => Boolean(props.active && term);
+usePageSelection(() => term?.getSelection() || '', {el: host, source: 'terminal', when: current});
+usePageSubject(() => current() ? {kind: 'terminal', id: props.serverId, label: '终端', role: '当前终端',
+  details: {serverId: props.serverId, connection: state, screen: screenText()}} : null, {el: host});
+usePageAction('terminal.run', {
+  description: '在用户正在看的这个终端里输入命令并回车执行，用户看着它运行；输出不会返回，需要读结果时用 Servers exec。',
+  params: {command: '要执行的命令'},
+  run: ({command} = {}) => {
+    const text = String(command || '').trim();
+    if (!text) return {ok: false, error: 'command_required'};
+    if (state !== 'open') return {ok: false, error: 'terminal_not_connected', message: '终端未连接'};
+    run(text);
+    return {typed: text};
+  },
+}, {el: host, when: current});
+usePageAction('terminal.read', {
+  description: '读取这个终端屏幕上最近的输出（默认 80 行，最多 400 行）。',
+  params: {lines: '行数'},
+  run: ({lines = 80} = {}) => ({screen: screenText(Math.min(400, Math.max(1, Number(lines) || 80)))}),
+}, {el: host, when: current});
 function key(sequence) { if (sequence === 'ctrl') ctrl = true; else send(sequence); term?.focus(); }
 function focus() { term?.focus(); }
 function search(text, backwards = false) {

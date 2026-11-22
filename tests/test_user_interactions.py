@@ -201,3 +201,51 @@ def test_shared_gate_and_redaction_cover_text_fields():
     assert explicit_authorization({"confirmed": True})
     result = redact_result({"text": "secret", "value": "secret", "selectedLabels": ["secret"], "answers": [{"questionId": "q", "text": "secret", "selectedValues": ["secret"]}]})
     assert "secret" not in json.dumps(result)
+
+
+async def test_questionnaire_feedback_skips_required_questions_and_preserves_text(interactions):
+    questions = [
+        {"id": "q1", "type": "choice", "question": "方向", "required": True, "options": [{"label": "A", "value": "a"}]},
+        {"id": "q2", "type": "open", "question": "细节", "required": True},
+    ]
+    item, waiter = await pending(interactions, "questionnaire", questions=questions)
+    cid = item["interactionId"]
+    # feedback without text must fail and keep interaction pending
+    empty_resp = await interactions.submit(cid, 123, {"decision": "feedback", "text": "   "})
+    assert empty_resp["statusCode"] == 400
+    assert not waiter.done()
+    # feedback with overall text succeeds without answering any required question
+    ok_resp = await interactions.submit(cid, 123, {"decision": "feedback", "text": "先聊聊方案第 2 点，暂时不定"})
+    assert ok_resp["ok"]
+    result = await waiter
+    assert result["status"] == "answered"
+    assert result["cancelled"] is False
+    assert result["decision"] == "feedback"
+    assert result["text"] == "先聊聊方案第 2 点，暂时不定"
+    assert result["answers"] == []
+
+
+async def test_questionnaire_submit_with_overall_text_and_select_feedback(interactions):
+    questions = [
+        {"id": "q1", "type": "choice", "question": "方向", "required": True, "options": [{"label": "A", "value": "a"}]},
+    ]
+    item, waiter = await pending(interactions, "questionnaire", questions=questions)
+    resp = await interactions.submit(
+        item["interactionId"],
+        123,
+        {"answers": [{"questionId": "q1", "selectedValues": ["a"], "text": ""}], "text": "整体按保守参数来"},
+    )
+    assert resp["ok"]
+    result = await waiter
+    assert result["answers"][0]["selectedValues"] == ["a"]
+    assert result["text"] == "整体按保守参数来"
+
+    s_item, s_waiter = await pending(interactions, "select")
+    s_bad = await interactions.submit(s_item["interactionId"], 123, {"decision": "feedback", "text": ""})
+    assert s_bad["statusCode"] == 400
+    s_ok = await interactions.submit(s_item["interactionId"], 123, {"decision": "feedback", "text": "先再比较一下两个方案"})
+    assert s_ok["ok"]
+    s_result = await s_waiter
+    assert s_result["decision"] == "feedback"
+    assert s_result["selectedValues"] == []
+    assert s_result["text"] == "先再比较一下两个方案"

@@ -556,6 +556,10 @@ class ReferenceMaterials:
                 int(time.time()),
             ),
         )
+        # The model receives a credential's values with this bundle: that counts as using it.
+        used = [int(m["reference"]["id"]) for m in protected if m["reference"].get("kind") == "secret" and str(m["reference"].get("id") or "").isdigit()]
+        if used:
+            await self.db.conn.executemany("UPDATE memory_secrets SET last_used_at=? WHERE id=?", [(int(time.time()), i) for i in used])
         await self.db.conn.commit()
         return bundle_id
 

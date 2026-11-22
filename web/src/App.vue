@@ -38,6 +38,8 @@ import SidebarDesktopNav from "./components/SidebarDesktopNav.vue";
 import ReferenceInspector from "./references/ReferenceInspector.vue";
 import ArtifactPreview from "./artifacts/ArtifactPreview.vue";
 import NoteCaptureDialog from "./notes/NoteCaptureDialog.vue";
+import AssistantDock from "./assistant/AssistantDock.vue";
+import { setPageInfo } from "./assistant/pageRegistry.js";
 import { referenceCatalog, referenceItem, startReferenceCatalog, stopReferenceCatalog } from "./references/catalog.js";
 
 const THEME_OPTIONS = [
@@ -128,6 +130,10 @@ function openFeatureSettings(path) {
 }
 const desktopNav = computed(() => listedNav.value.filter((n) => n.key !== "settings" && !n.headerOnly));
 const active = ref("console");
+setPageInfo(() => {
+  const item = allNav.find((x) => x.key === active.value);
+  return {key: active.value, label: active.value === "console" ? "对话" : item?.label || active.value};
+});
 const referenceShelf = shallowRef({open:false,kind:'',anchor:null});
 let referenceShelfTimer = null;
 function closeReferenceShelf(){window.clearTimeout(referenceShelfTimer);referenceShelf.value={...referenceShelf.value,open:false};}
@@ -192,6 +198,17 @@ function handleOpenKbNote(event) {
   const noteUuid = String(event?.detail?.noteUuid || event?.detail?.id || '');
   if (noteUuid) window.__openbearPendingKbNoteUuid = noteUuid;
   selectNav('notes');
+}
+// Another part of the app sends the user to a page by its path (the page assistant's "back to that page").
+function handleOpenPage(event) {
+  const path = String(event?.detail?.path || '');
+  if (!path.startsWith('/') || path.startsWith('//')) return;
+  return navigateFromCron(() => {
+    closeSidebar();
+    if (`${window.location.pathname}${window.location.search}` !== path) writeRoute(path);
+    applyRouteFromLocation();
+    return true;
+  });
 }
 function handleLocateConversation(event) {
   const detail = event?.detail || {};
@@ -1179,6 +1196,7 @@ onMounted(() => {
   window.addEventListener('openbear:open-ddns', handleOpenDdns);
   window.addEventListener('openbear:open-conversation', handleOpenConversation);
   window.addEventListener('openbear:open-kb-note', handleOpenKbNote);
+  window.addEventListener('openbear:open-page', handleOpenPage);
   window.addEventListener('openbear:locate-conversation', handleLocateConversation);
   window.addEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.addEventListener("click", closeConversationMenu);
@@ -1208,6 +1226,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('openbear:open-ddns', handleOpenDdns);
   window.removeEventListener('openbear:open-conversation', handleOpenConversation);
   window.removeEventListener('openbear:open-kb-note', handleOpenKbNote);
+  window.removeEventListener('openbear:open-page', handleOpenPage);
   window.removeEventListener('openbear:locate-conversation', handleLocateConversation);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.removeEventListener("click", closeConversationMenu);
@@ -1571,7 +1590,7 @@ onBeforeUnmount(() => {
       </div>
     </Teleport>
 
-    <main class="app-main flex-1 min-w-0 flex flex-col bg-macbg text-mactext">
+    <main class="app-main flex-1 min-w-0 flex flex-col bg-macbg text-mactext" :class="{'has-mobile-pending': pendingConversations.length > 0}">
       <PendingConversations v-model:open="pendingConversationsOpen" :items="pendingConversations" :active-conversation-uuid="activeConversationUuid" @open-conversation="openPendingConversation" />
       <el-alert v-if="frontendRefreshRequired" type="info" :closable="false" show-icon class="shrink-0" data-testid="frontend-refresh-required">
         <template #title>
@@ -1661,6 +1680,7 @@ onBeforeUnmount(() => {
       </component>
       </KeepAlive>
     </main>
+    <AssistantDock :page="active" />
 
     <ConversationPropertiesDialog ref="conversationPropertiesRef" v-model="conversationPropertiesOpen" :conversation="conversationPropertiesRow" :initial-tab="conversationPropertiesTab" @persist="persistPropertyConversation" />
     <NoteCaptureDialog />
@@ -2412,6 +2432,31 @@ onBeforeUnmount(() => {
 .version-btn:disabled {
   opacity: .55;
   cursor: default;
+}
+
+@media (max-width: 760px) {
+  /* When the top pending strip occupies the very top of a self-headed mobile page,
+     it owns the status-bar safe area and the page header below must not add it a second time. */
+  .app-shell.is-console .app-main.has-mobile-pending .mobile-pending-entry,
+  .app-shell.is-settings .app-main.has-mobile-pending .mobile-pending-entry,
+  .app-shell.is-admin .app-main.has-mobile-pending .mobile-pending-entry {
+    box-sizing: border-box;
+    min-height: calc(38px + env(safe-area-inset-top, 0px));
+    padding: calc(5px + env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px)) 5px max(14px, env(safe-area-inset-left, 0px));
+  }
+  .app-shell.is-console .app-main.has-mobile-pending .console-page {
+    --console-header-height: 60px;
+  }
+  .app-shell.is-console .app-main.has-mobile-pending .console-header {
+    height: 60px;
+    min-height: 60px;
+    padding-top: 0;
+  }
+  .app-shell.is-settings .app-main.has-mobile-pending .admin-page-header,
+  .app-shell.is-admin .app-main.has-mobile-pending .admin-page-header {
+    height: 60px;
+    padding-top: 0;
+  }
 }
 
 </style>

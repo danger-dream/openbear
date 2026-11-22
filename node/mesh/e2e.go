@@ -36,6 +36,18 @@ const (
 	protoE2E = 254
 	// e2eIdle: a session unused this long may make room for another.
 	e2eIdle = 30 * time.Second
+	// e2eHandshakeRetry: an initiation goes again after this without its
+	// response, not after WireGuard's 5 s; mesh paths answer well within it.
+	e2eHandshakeRetry = 2 * time.Second
+	// A session that carried data within e2eWarm gets new keys from
+	// e2eRekeyAfter, the one end of lower address first and the other
+	// e2eRekeyLate later, before WireGuard drops them at 180 s. WireGuard
+	// itself renews them only on a packet sent after 120 s: traffic every few
+	// minutes, as a proxy's health check, found its keys gone each time and
+	// waited for a handshake, and one delayed cost it seconds.
+	e2eWarm       = 10 * time.Minute
+	e2eRekeyAfter = 120 * time.Second
+	e2eRekeyLate  = 15 * time.Second
 )
 
 // e2eNode is another node as its inner peer has it.
@@ -113,10 +125,10 @@ type e2eLimits struct {
 func e2eLimitsFor(c *Config) e2eLimits {
 	if resourceProfile(c) == roleRelay {
 		return e2eLimits{device: conn.DeviceLimits{MaxPeers: 128, Workers: 2, BatchSize: 1, QueueDepth: 4, HandshakeQueueDepth: 32, StagedDepth: 4,
-			TxBuffers: 96, RxBuffers: 64, KeepaliveBuffers: 4}, rate: 32, burst: 64, queue: 1024, idle: e2eIdle}
+			TxBuffers: 96, RxBuffers: 64, KeepaliveBuffers: 4, HandshakeRetry: e2eHandshakeRetry}, rate: 32, burst: 64, queue: 1024, idle: e2eIdle}
 	}
 	return e2eLimits{device: conn.DeviceLimits{MaxPeers: 64, Workers: 1, BatchSize: 1, QueueDepth: 4, HandshakeQueueDepth: 32, StagedDepth: 4,
-		TxBuffers: 48, RxBuffers: 32, KeepaliveBuffers: 4}, rate: 16, burst: 32, queue: 256, idle: e2eIdle}
+		TxBuffers: 48, RxBuffers: 32, KeepaliveBuffers: 4, HandshakeRetry: e2eHandshakeRetry}, rate: 16, burst: 32, queue: 256, idle: e2eIdle}
 }
 
 // e2eStats are kept apart from the outer counters.
@@ -125,6 +137,7 @@ type e2eStats struct {
 	DroppedQueue, DroppedExhausted atomic.Uint64
 	DroppedSource, DroppedBad      atomic.Uint64
 	Created, Evicted               atomic.Uint64
+	Rekeyed                        atomic.Uint64
 }
 
 // e2eSessions is the inner device and its peers, made on demand within the
@@ -159,9 +172,10 @@ type e2ePeer struct {
 	// sent to it. Until then the session is a trial: any relay or entry can
 	// send a packet that claims to be from a node, so trials get a budget of
 	// their own (e2eTrials), and what they receive keeps no session in use.
-	proven  bool
-	created time.Time
-	raw     [32]byte // the node's key
+	proven     bool
+	created    time.Time
+	raw        [32]byte // the node's key
+	rekeyedFor int64    // handshakeNano keepKeyed already started a rekey for
 }
 
 // e2eTrials: trials at once, out of MaxPeers; a trial older than
@@ -473,6 +487,11 @@ type E2EStatus struct {
 	DroppedSource uint64 `json:"droppedSource"`
 	DroppedBad    uint64 `json:"droppedBad"`
 	InnerMTU      int    `json:"innerMtu"`
+	// Rekeyed: handshakes keepKeyed started for warm sessions ahead of their
+	// keys' expiry; StaleKey: packets received under keys already dropped.
+	Rekeyed    uint64          `json:"rekeyed"`
+	StaleKey   uint64          `json:"staleKey"`
+	Handshakes HandshakeStatus `json:"handshakes"`
 	// Peers are the sessions, by node.
 	Peers []E2EPeerStatus `json:"peers,omitempty"`
 }
@@ -514,7 +533,60 @@ func (s *e2eSessions) status() *E2EStatus {
 	return &E2EStatus{Peers: peers, Sessions: n, Limit: s.limits.device.MaxPeers, Created: s.stats.Created.Load(), Evicted: s.stats.Evicted.Load(),
 		Sent: s.stats.Sent.Load(), Received: s.stats.Received.Load(), DroppedExhausted: s.stats.DroppedExhausted.Load(),
 		DroppedQueue: s.stats.DroppedQueue.Load(), DroppedSource: s.stats.DroppedSource.Load(), DroppedBad: s.stats.DroppedBad.Load(),
-		InnerMTU: int(s.tun.mtu.Load())}
+		InnerMTU: int(s.tun.mtu.Load()), Rekeyed: s.stats.Rekeyed.Load(), StaleKey: s.dev.ReceiveDrops().StaleKey,
+		Handshakes: handshakeStatus(s.dev.HandshakeStats())}
+}
+
+// keepKeyed starts a handshake with each node whose session carried data
+// within e2eWarm and whose keys are e2eRekeyAfter old, from the end of lower
+// mesh address; the other end waits e2eRekeyLate longer, so that the two do
+// not start one each at once. Each handshake generation is kicked once, so an
+// unreachable peer still hits WireGuard's retry limit instead of being reset
+// every tick.
+func (s *e2eSessions) keepKeyed() {
+	type candidate struct {
+		id, key    string
+		after      time.Duration
+		rekeyedFor int64
+	}
+	s.mu.Lock()
+	now := s.now()
+	s.applyProofs(now)
+	var cands []candidate
+	for id, p := range s.peers {
+		if !p.proven || now.Sub(time.Unix(0, p.used.Load())) >= e2eWarm {
+			continue
+		}
+		after := e2eRekeyAfter
+		if s.table == nil || !s.table.self.Less(p.node.addr) {
+			after += e2eRekeyLate
+		}
+		cands = append(cands, candidate{id: id, key: p.node.key, after: after, rekeyedFor: p.rekeyedFor})
+	}
+	s.mu.Unlock()
+	if len(cands) == 0 {
+		return
+	}
+	_, states := deviceState(s.dev)
+	var kickKeys []string
+	s.mu.Lock()
+	for _, c := range cands {
+		st := states[c.key]
+		if st == nil || st.handshakeNano == 0 || st.handshakeNano == c.rekeyedFor || now.Sub(time.Unix(0, st.handshakeNano)) < c.after {
+			continue
+		}
+		p := s.peers[c.id]
+		if p == nil || p.node.key != c.key || p.rekeyedFor == st.handshakeNano {
+			continue
+		}
+		p.rekeyedFor = st.handshakeNano
+		kickKeys = append(kickKeys, c.key)
+	}
+	s.mu.Unlock()
+	for _, key := range kickKeys {
+		s.stats.Rekeyed.Add(1)
+		kick(s.dev, key)
+	}
 }
 
 // inUse are the nodes whose sessions carried data within d.

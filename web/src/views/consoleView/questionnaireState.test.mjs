@@ -5,7 +5,9 @@ import {
   buildQuestionnaireAnswer,
   clearQuestionChoice,
   createQuestionnaireDraft,
+  hasLongQuestionnaireBody,
   isQuestionChoiceSelected,
+  questionnaireProgress,
   toggleQuestionChoice,
   validateQuestionnaire,
 } from "./questionnaireState.js";
@@ -86,4 +88,40 @@ test("cancel payload contains no draft answers", () => {
   const draft = createQuestionnaireDraft(questions);
   draft.answers.direction.text = "不得外发的草稿";
   assert.deepEqual(buildQuestionnaireAnswer(questions, draft, true), {cancelled: true});
+});
+
+test("overall feedback bypasses required questions and optional overall text attaches to normal submit", () => {
+  const draft = createQuestionnaireDraft(questions);
+  assert.deepEqual(questionnaireProgress(questions, draft), {
+    total: 2,
+    answered: 0,
+    requiredMissing: 1,
+    missingQuestionIds: ["direction"],
+  });
+  const feedback = buildQuestionnaireAnswer(questions, draft, false, {
+    intent: "feedback",
+    overallText: "先讨论方案再选",
+  });
+  assert.deepEqual(feedback, {
+    cancelled: false,
+    decision: "feedback",
+    text: "先讨论方案再选",
+  });
+  toggleQuestionChoice(draft, questions[0], "a");
+  assert.deepEqual(questionnaireProgress(questions, draft), {
+    total: 2,
+    answered: 1,
+    requiredMissing: 0,
+    missingQuestionIds: [],
+  });
+  const withOverall = buildQuestionnaireAnswer(questions, draft, false, {overallText: "整体偏保守"});
+  assert.equal(withOverall.text, "整体偏保守");
+  assert.equal(withOverall.answers[0].selectedValues[0], "a");
+});
+
+test("long questionnaire body detector flags headings, lists, multi-paragraph and long proposals", () => {
+  assert.equal(hasLongQuestionnaireBody(""), false);
+  assert.equal(hasLongQuestionnaireBody("选定后我立即开始实现。"), false);
+  assert.equal(hasLongQuestionnaireBody("### 方案概述\n- 第一点\n- 第二点"), true);
+  assert.equal(hasLongQuestionnaireBody("一".repeat(150)), true);
 });

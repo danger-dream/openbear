@@ -123,6 +123,8 @@ const refused = computed(() => {
             <template v-if="tcpMem.changed">{{ memTriplet(tcpMem.originalBytes) }} → {{ memTriplet(tcpMem.currentBytes) }}</template>
             <template v-else>{{ memTriplet(tcpMem.currentBytes) || '—' }}<small class="m3-faint">{{ tcpMem.readOnly ? '（只读）' : '（原值已满足）' }}</small></template>
           </dd></div>
+        <div v-if="Number.isFinite(tcpMem?.pressures24h)"><dt>TCP 内存告急</dt>
+          <dd :class="tcpMem.pressures24h ? 'ob-warn' : ''">最近 24 小时 {{ tcpMem.pressures24h }} 次<small class="m3-faint">（开机以来 {{ tcpMem.pressuresSinceBoot }} 次）</small></dd></div>
         <div v-if="refused.length"><dt>拦截统计</dt><dd>{{ refused.join(' · ') }}</dd></div>
       </dl>
 

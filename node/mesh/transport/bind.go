@@ -113,7 +113,7 @@ type Bind struct {
 	reflectLimit  reflectLimiter
 	reflectWait   map[[8]byte]*reflectWaiter
 	reflectIDs    map[[8]byte]reflectSeen
-	reflectFrom   map[netip.Addr]time.Time
+	reflectFrom   map[netip.AddrPort]time.Time
 	tests         map[[8]byte]byte
 	stunWait      map[[12]byte]*stunWaiter
 	rxDrops       struct{ queue, tooLong, stale atomic.Uint64 }
@@ -220,7 +220,7 @@ func New(opt Options) (*Bind, error) {
 		return nil, err
 	}
 	return &Bind{opt: opt, paths: map[string]*endpoint{}, pins: map[string]pinSet{}, peers: map[string]*peerPaths{}, ids: map[string]*endpoint{}, events: make(chan PathEvent, 256), largeCh: make(chan struct{}, 1), reflectWait: map[[8]byte]*reflectWaiter{},
-		reflectIDs: map[[8]byte]reflectSeen{}, reflectFrom: map[netip.Addr]time.Time{}, tests: map[[8]byte]byte{}, stunWait: map[[12]byte]*stunWaiter{}}, nil
+		reflectIDs: map[[8]byte]reflectSeen{}, reflectFrom: map[netip.AddrPort]time.Time{}, tests: map[[8]byte]byte{}, stunWait: map[[12]byte]*stunWaiter{}}, nil
 }
 
 func endpointKey(s string) (string, string, string, error) {

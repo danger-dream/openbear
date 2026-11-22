@@ -304,8 +304,22 @@ def canonical_answer(item: dict[str, Any], body: Any, *, source: str) -> tuple[d
     }
     text = ""
     if action == "questionnaire":
-        result["answers"], answer_errors = canonical_questionnaire_answers(item["questions"], body.get("answers"))
-        errors.extend(answer_errors)
+        decision = body.get("decision")
+        text = _text(body, "text", errors)
+        if decision is not None and (not isinstance(decision, str) or decision not in {"answer", "confirm", "feedback"}):
+            errors.append({"path": "decision", "message": "invalid questionnaire decision"})
+            decision = None
+        if decision == "feedback":
+            if not text:
+                errors.append({"path": "text", "message": "请填写你的意见。"})
+            result["decision"] = "feedback"
+            result["text"] = text
+            result["answers"] = []
+        else:
+            result["answers"], answer_errors = canonical_questionnaire_answers(item["questions"], body.get("answers"))
+            errors.extend(answer_errors)
+            if text:
+                result["text"] = text
     elif action == "group_proposal":
         decision = body.get("decision")
         text = _text(body, "text", errors)
@@ -360,6 +374,14 @@ def canonical_answer(item: dict[str, Any], body: Any, *, source: str) -> tuple[d
             if decision == "confirm_with_changes" and (not text or not selected):
                 errors.append({"path": "text", "message": "请选择授权选项并填写补充内容。"})
             result["decision"] = decision if decision == "confirm_with_changes" else "feedback" if text else decision
+        elif "decision" in body and body.get("decision") is not None:
+            decision = body.get("decision")
+            if not isinstance(decision, str) or decision not in {"confirm", "feedback"}:
+                errors.append({"path": "decision", "message": "invalid select decision"})
+            elif decision == "feedback":
+                if not text:
+                    errors.append({"path": "text", "message": "请填写你的意见。"})
+                result["decision"] = "feedback"
     else:
         text = _text(body, "text", errors)
         if "confirmed" in body and not isinstance(body["confirmed"], bool):

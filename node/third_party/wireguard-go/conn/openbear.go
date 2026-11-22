@@ -1,5 +1,7 @@
 package conn
 
+import "time"
+
 // ReceiveMetadata is local provenance, never a field received from the network.
 // MessageTransportType notifications follow AEAD and replay validation.
 type ReceiveMetadata struct {
@@ -36,6 +38,11 @@ type SendMetadata struct {
 // apart from the others, for messages longer than those hold: the reader
 // of a TUN's LargeReader takes its buffers from it, LargeBatchSize at a
 // time, and so does the receive function a LargeReceiver names.
+//
+// HandshakeRetry, when set, is how long a handshake initiation waits for
+// its response before it is sent again, in place of RekeyTimeout (5 s): a
+// device whose sessions start on a packet waiting for them, over paths of
+// known round trips, loses that long to any handshake that goes missing.
 type DeviceLimits struct {
 	MaxPeers, Workers, BatchSize, QueueDepth int
 	TxBuffers, RxBuffers, KeepaliveBuffers   int
@@ -44,6 +51,7 @@ type DeviceLimits struct {
 	PriorityRxBuffers                        int
 	LargeBufferSize, LargeBatchSize          int
 	LargeTxBuffers, LargeRxBuffers           int
+	HandshakeRetry                           time.Duration
 }
 
 type ResourceBound interface {

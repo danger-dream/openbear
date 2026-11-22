@@ -30,10 +30,16 @@ PATHS_BACKUP_FEATURE = 'mesh.routing.paths.backup'
 NO_TRANSIT_FEATURE = 'mesh.routing.noTransit'
 # The data plane takes routing.tuning; one without it keeps its fixed thresholds (20 % and 10 ms).
 TUNING_FEATURE = 'mesh.routing.tuning'
-# settings.routing, sent as routing.tuning (node/mesh/routing README, "Parameters"): default, lowest, highest.
-ROUTING_TUNING = {'switchMs': (5, 0, 1000), 'switchPct': (0, 0, 90), 'shorterMs': (3, 0, 1000), 'shorterPct': (0, 0, 90),
-                  'advertMs': (2, 0, 1000), 'advertPct': (0, 0, 90), 'holdS': (5, 0, 60), 'jitterWeight': (2, 0, 10),
-                  'lossWeight': (1000, 0, 10000), 'flapHoldS': (60, 0, 3600), 'flapHoldMaxS': (480, 0, 3600)}
+# The data plane takes smoothed routing.tuning parameters (Babel-style smoothed cost).
+SMOOTH_FEATURE = 'mesh.routing.smooth'
+# Pre-smoothing tuning sent to N-1 nodes that lack SMOOTH_FEATURE.
+LEGACY_TUNING = {'switchMs': 5, 'switchPct': 0, 'shorterMs': 3, 'shorterPct': 0,
+                 'advertMs': 2, 'advertPct': 0, 'holdS': 5, 'jitterWeight': 2,
+                 'lossWeight': 1000, 'flapHoldS': 60, 'flapHoldMaxS': 480}
+# settings.routing, sent as routing.tuning to nodes with SMOOTH_FEATURE (node/mesh/routing README, "Parameters"): default, lowest, highest.
+ROUTING_TUNING = {'smoothHalfLifeS': (60, 1, 300), 'switchPct': (5, 0, 50), 'switchMinMs': (2, 0, 100),
+                  'hopCostMs': (2, 0, 50), 'startPenaltyMs': (150, 0, 5000),
+                  'jitterWeight': (2, 0, 10), 'lossWeight': (1000, 0, 10000)}
 
 
 def default_routing():
@@ -553,7 +559,7 @@ def exports(doc, routes=None):
     return out
 
 
-# ----- a member next to its site relay: the relay's LAN address -----
+# ----- a member next to its relay: the relay's LAN address -----
 def _lan_addresses(facts, sid):
     out = []
     for raw in (facts.get(sid) or {}).get('localAddresses') or []:
@@ -566,17 +572,52 @@ def _lan_addresses(facts, sid):
     return out
 
 
+def _lan_host(member, relay, facts):
+    """The relay's first address, in the order it reported them, on a network the member has an
+    address on; '' when there is none."""
+    mine = _lan_addresses(facts, member['serverId'])
+    for theirs in _lan_addresses(facts, relay['serverId']) if mine else ():
+        if any(m.ip != theirs.ip and m.network.overlaps(theirs.network) for m in mine):
+            return str(theirs.ip)
+    return ''
+
+
 def lan_endpoint(member, relay, facts):
     """udp://<relay's LAN address>:<its listen.udp> when the member has an address on one of
-    the relay's networks; the relay's first such address in the order it reported them."""
+    the relay's networks."""
     port = relay['listen']['udp']
-    mine = _lan_addresses(facts, member['serverId'])
-    if not port or not mine:
-        return ''
-    for theirs in _lan_addresses(facts, relay['serverId']):
-        if any(m.ip != theirs.ip and m.network.overlaps(theirs.network) for m in mine):
-            return endpoint('udp', str(theirs.ip), port)
-    return ''
+    host = _lan_host(member, relay, facts) if port else ''
+    return endpoint('udp', host, port) if host else ''
+
+
+def _exit_ips(member, facts):
+    ips = {(facts.get(member['serverId']) or {}).get('ipv4') or ''}
+    if member['role'] == 'relay':
+        ips.add(member['publicEndpoint'])
+    return {ip for ip in ips if ip and _is_ip(ip)}
+
+
+def _is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def lan_dial(member, relay, transport, facts):
+    """(endpoint, tlsPins) to dial a public relay over transport at its LAN address and the port
+    it listens on, from a member on one of its networks that goes out at the same public IP; None
+    otherwise. Two sites numbered alike go out at different IPs: the address would be another
+    machine there, and the member dials the relay's public address instead."""
+    port = relay['listen'][transport]
+    if is_site(relay) or not port or not _exit_ips(member, facts) & _exit_ips(relay, facts):
+        return None
+    host = _lan_host(member, relay, facts)
+    pins = tls_pins(facts, relay['serverId']) if transport == 'tls' else []
+    if not host or transport == 'tls' and not pins:
+        return None
+    return endpoint(transport, host, port), pins
 
 
 def punched(pair, kind):
@@ -697,7 +738,8 @@ def _build(doc, facts, network_id, revision):
             if target_endpoint:
                 link['endpoint'] = target_endpoint
             return link
-        dialed = dial_target(target, c['transport'], facts, front_exits(facts, m['serverId']).get(c['relay'], ''))
+        front = front_exits(facts, m['serverId']).get(c['relay'], '')
+        dialed = (not front and lan_dial(m, target, c['transport'], facts)) or dial_target(target, c['transport'], facts, front)
         if dialed:
             link['endpoint'] = dialed[0]
             if c['transport'] == 'tls':
@@ -798,7 +840,8 @@ def _build(doc, facts, network_id, revision):
                         candidate['endpoint'] = target_endpoint
                     candidates.append(candidate)
                     continue
-                dialed = dial_target(target, c['transport'], facts, front_exits(facts, sid).get(c['relay'], ''))
+                front = front_exits(facts, sid).get(c['relay'], '')
+                dialed = (not front and lan_dial(m, target, c['transport'], facts)) or dial_target(target, c['transport'], facts, front)
                 if not dialed:
                     # Left out until a reissue with the address; the member's other candidates stay.
                     continue
@@ -847,8 +890,15 @@ def _build(doc, facts, network_id, revision):
             configs[sid]['probe'] = probes_by_node[sid]
         if relay or leaf:
             # nextHops stay the start and the static mode; bias shifts the measured cost of each link.
+            # A data plane not known to read the smoothed fields (one that has said nothing
+            # included) gets the legacy ones: it would read their absence as zeros.
+            node_features = (facts.get(sid) or {}).get('features')
+            if node_features is not None and SMOOTH_FEATURE not in node_features:
+                tuning = dict(LEGACY_TUNING)
+            else:
+                tuning = {**default_routing(), **{k: v for k, v in (s.get('routing') or {}).items() if k in ROUTING_TUNING}}
             configs[sid]['routing'] = {'mode': 'dynamic', 'bias': dict(sorted(bias.items())), **({'noTransit': no_transit} if no_transit else {}),
-                                       'tuning': {**default_routing(), **(s.get('routing') or {})}}
+                                       'tuning': tuning}
             configs[sid]['relayLinks'] = [list(p) for p in relay_links]
             if member_links:
                 configs[sid]['memberLinks'] = [list(p) for p in member_links]

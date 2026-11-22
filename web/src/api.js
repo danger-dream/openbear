@@ -184,6 +184,7 @@ export const Api = {
   conversationTreeSearch: (params = {}) => api.get("/conversation-tree/search", { params }).then(unwrap),
   conversationTreeStatus: () => api.get("/conversation-tree/status").then(unwrap),
   readConversationActivity: (items) => api.post("/conversation-tree/read", {items}).then(unwrap),
+  assistantConversations: (params = {}) => api.get("/assistant/conversations", { params }).then(unwrap),
   conversationTreeFolders: (params = {}) => api.get("/conversation-tree/folders", { params }).then(unwrap),
   locateConversationFolderInTree: (uuid) => api.get(`/conversation-tree/locate-folder/${encodeURIComponent(uuid)}`).then(unwrap),
   locateConversationInTree: (uuid) => api.get(`/conversation-tree/locate/${encodeURIComponent(uuid)}`).then(unwrap),

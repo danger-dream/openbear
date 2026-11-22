@@ -294,7 +294,7 @@ def _direct_fast_target(src_member, dst_member, doc, facts, *, is_pair_dialer=Tr
         return address(lan, listen_port(dst_member, s, doc, facts))
     limits = doc.get('limits') or []
     if limits:
-        if 'tcp' not in mesh_limits.transports_for(limits, src_member, dst_member, facts):
+        if 'tcp' not in mesh_limits.transports_for(limits, src_member, dst_member, facts, automatic=False):
             return ''
         if not is_pair_dialer and any(k.get('manualOnly') for k in mesh_limits.crossing(limits, src_member, dst_member, facts)):
             return ''

@@ -112,7 +112,7 @@ test('actual sheet shows full document metadata/text, defaults credential fields
 function page(name,phone=true){
   const sfc=sfcs[`../views/${name}View.vue`],script=compileScript(sfc,{id:name}),calls=[];
   const api=new Proxy({}, {get:(_,method)=>(...args)=>{calls.push({method,args});return Promise.resolve({ok:true,item:{...sample[0],content:'全文'},items:[]});}});
-  const ctx=vm.createContext({...Vue,mobileSelectOptions,onMounted:()=>{},onBeforeUnmount:()=>{},defineProps:()=>({activeType:'memory'}),defineEmits:()=>()=>{},Api:api,apiError:e=>e.message,ElMessage:{success(){},warning(){},error(){}},ElMessageBox:{confirm:async()=>{}},encode:text=>[...text],pinyin:text=>[text],assetTimeLine,formatAssetTime,useMobileAssets:mobileAssetsRuntime({phone}).useMobileAssets});
+  const ctx=vm.createContext({usePageSubject:()=>{}, usePageAction:()=>{}, useResourceChanges:()=>{}, ...Vue,mobileSelectOptions,onMounted:()=>{},onBeforeUnmount:()=>{},defineProps:()=>({activeType:'memory'}),defineEmits:()=>()=>{},Api:api,apiError:e=>e.message,ElMessage:{success(){},warning(){},error(){}},ElMessageBox:{confirm:async()=>{}},encode:text=>[...text],pinyin:text=>[text],assetTimeLine,formatAssetTime,useMobileAssets:mobileAssetsRuntime({phone}).useMobileAssets});
   vm.runInContext(clean(sfc.scriptSetup.content),ctx);
   const key={Memory:'entries',Secrets:'secrets',Docs:'docs'}[name];ctx.fixtures=structuredClone(sample);vm.runInContext(`${key}.value=fixtures;rebuildGroups()`,ctx);
   const imports=new Set(['Api','apiError','draggable','MdEditor','AdminPageHeader','MobileAssetRow','MobileAssetSheet','MobileAdminSummary','encode','pinyin','dragAutoScrollOptions','useMobileAssets']);

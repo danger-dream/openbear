@@ -312,3 +312,22 @@ test("sensitive and redacted payloads are fail-closed in presentation", () => {
 		assert.equal(model.redactedText, "[敏感内容已隐藏]");
 	}
 });
+
+test("questionnaire feedback and overall text render cleanly in history presentation", () => {
+	const fb = view("questionnaire", "answered", {questions: [{id: "q1", type: "open", question: "问题"}]}, {
+		decision: "feedback",
+		text: "方案先再讨论一下",
+		answers: [],
+	});
+	assert.equal(fb.statusKey, "feedback");
+	assert.equal(fb.statusLabel, "已反馈");
+	assert.equal(fb.intro, "用户已提交意见，暂未完成本次问卷");
+	assert.equal(fb.questionnaireText, "方案先再讨论一下");
+
+	const answeredWithText = view("questionnaire", "answered", {questions: [{id: "q1", type: "open", question: "问题"}]}, {
+		text: "整体约束：保留旧接口",
+		answers: [{questionId: "q1", text: "同意"}],
+	});
+	assert.equal(answeredWithText.statusKey, "answered");
+	assert.equal(answeredWithText.questionnaireText, "整体约束：保留旧接口");
+});

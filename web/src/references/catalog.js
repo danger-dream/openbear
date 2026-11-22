@@ -183,6 +183,7 @@ function connect() {
     let packet;try{packet=JSON.parse(event.data);}catch{return;}
     if(packet.type==='conversation-overview'){applyConversationOverviewPacket(packet);return;}
     if(packet.type==='ping'){current.send(JSON.stringify({type:'ping'}));return;}
+    if(packet.type==='resource-changed'){window.dispatchEvent(new CustomEvent('openbear:resource-changed',{detail:packet}));return;}
     if(packet.type==='resync'||packet.type==='stale'){referenceCatalog.stale=true;sendScope();return;}
     if(packet.type==='snapshot') {
       // Only the response for the pending scope releases its single-flight gate.

@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS mesh_nodes (
  data_build TEXT NOT NULL DEFAULT '', upgrade_failed_build TEXT NOT NULL DEFAULT '', upgrade_error TEXT NOT NULL DEFAULT '',
  upgrade_ms INTEGER NOT NULL DEFAULT 0, addresses_json TEXT NOT NULL DEFAULT '[]', config_schemas TEXT NOT NULL DEFAULT '',
  sign_key TEXT NOT NULL DEFAULT '', e2e_key TEXT NOT NULL DEFAULT '', routes_json TEXT NOT NULL DEFAULT '',
- data_features TEXT NOT NULL DEFAULT ''
+ data_features TEXT NOT NULL DEFAULT '', reach_json TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS mesh_layout (
  owner INTEGER NOT NULL, server_id TEXT NOT NULL, x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY(owner, server_id)
@@ -121,7 +121,9 @@ ADDED = {'mesh_nodes': {'data_build': "TEXT NOT NULL DEFAULT ''", 'upgrade_faile
                         # The machine's own routes ([{net, dev}]) as JSON; '' until the node says.
                         'routes_json': "TEXT NOT NULL DEFAULT ''",
                         # The config features data_build's data plane reads, as JSON; '' while not known.
-                        'data_features': "TEXT NOT NULL DEFAULT ''"},
+                        'data_features': "TEXT NOT NULL DEFAULT ''",
+                        # A relay's recent reachability checks and the verdict they confirmed, as JSON; '' for none.
+                        'reach_json': "TEXT NOT NULL DEFAULT ''"},
          # Line rules and exit groups as JSON; '' for a stage stored before them (exit groups are then made from the members' exits).
          'mesh_settings': {'line_rules_json': "TEXT NOT NULL DEFAULT ''", 'exit_groups_json': "TEXT NOT NULL DEFAULT ''"},
          # Runs again after its package was found damaged on the node and pushed anew (once).

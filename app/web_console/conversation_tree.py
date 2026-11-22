@@ -16,6 +16,7 @@ from typing import Any
 
 from aiohttp import web
 
+from app.assistant import conversations as assistant_conversations
 from app.db.engine import now_ts
 from app.context import prompt_template
 from app.context.prompt_policy import folder_policy, policy, read_json, snapshot_key, write_json
@@ -178,6 +179,8 @@ class WebAdminConversationTreeMixin:
         return {str(row["folder_uuid"]): dict(row) for row in await cur.fetchall()}
 
     async def _tree_folder_run_defaults(self, owner_chat_id: int, folder_uuid: str) -> dict[str, Any]:
+        if folder_uuid == assistant_conversations.FOLDER:
+            return assistant_conversations.run_defaults(self.config)
         if not folder_uuid:
             return self._tree_local_run_defaults(await self._tree_temporary_properties(owner_chat_id))
         folders = await self._tree_run_default_folders(owner_chat_id)
@@ -407,7 +410,7 @@ class WebAdminConversationTreeMixin:
             SELECT conversation_uuid, internal_chat_id, folder_uuid, title, pinned_at,
                    display_order, created_at, updated_at, status, current_status, last_error,
                    activity_version, activity_read_version, activity_result_json, origin_kind,
-                   last_interaction_at_ms
+                   last_interaction_at_ms, assistant, assistant_scope
             FROM web_conversations
             WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
             """,
@@ -429,7 +432,7 @@ class WebAdminConversationTreeMixin:
             )
             SELECT conversation_uuid,last_interaction_at_ms
             FROM web_conversations
-            WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
+            WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0 AND COALESCE(assistant,0)=0
               AND COALESCE(folder_uuid,'') NOT IN (SELECT folder_uuid FROM hidden)
               AND last_interaction_at_ms>0
             ORDER BY last_interaction_at_ms DESC,conversation_uuid ASC
@@ -522,7 +525,7 @@ class WebAdminConversationTreeMixin:
         member_uuids = {str(r["conversation_uuid"]) for r in await (await self.db.conn.execute("SELECT conversation_uuid FROM collab_members")).fetchall()}
         for row in rows:
             folder_id = str(row.get("folder_uuid") or "")
-            if str(row.get("conversation_uuid") or "") not in member_uuids:
+            if str(row.get("conversation_uuid") or "") not in member_uuids and not int(row.get("assistant") or 0):
                 direct_conversation_counts[folder_id] = direct_conversation_counts.get(folder_id, 0) + 1
             conv_uuid = str(row.get("conversation_uuid") or "")
             chat_id = int(row.get("internal_chat_id") or 0)
@@ -557,7 +560,10 @@ class WebAdminConversationTreeMixin:
                 "activityPending": pending,
                 "activityState": ("waiting" if needs_attention else "running") if running else str(activity["activityResult"].get("status") or ("completed" if activity["activityUnread"] else "idle")),
                 "activityAtMs": (int(facts.get("activeStartedAtMs") or 0) or rath_started.get(chat_id, 0) or int(row.get("created_at") or 0) * 1000) if running else int(activity["activityResult"].get("atMs") or 0),
-                "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话",
+                "path": assistant_conversations.GROUP_LABEL if int(row.get("assistant") or 0) else (
+                    self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话"),
+                "assistant": bool(int(row.get("assistant") or 0)),
+                **({"assistantScope": assistant_conversations.scope_of(row)} if int(row.get("assistant") or 0) else {}),
                 "kind": "conversation",
                 "id": conv_uuid,
                 "conversationUuid": conv_uuid,
@@ -604,6 +610,31 @@ class WebAdminConversationTreeMixin:
             "collabGroups": collab_groups,
             "revision": int(time.time() * 1000),
         }
+
+    async def handle_api_assistant_conversations(self, request: web.Request) -> web.Response:
+        """The page assistant's tasks, newest first, with run and unread state; with scope, also that scope's latest."""
+        owner = int(request[_WEB_SESSION_KEY].chat_id)
+        scope = str(request.query.get("scope") or "")
+        cur = await self.db.conn.execute(
+            """SELECT conversation_uuid, title, created_at, last_interaction_at_ms, activity_version,
+                      activity_read_version, activity_result_json, assistant_scope
+               FROM web_conversations WHERE owner_chat_id=? AND assistant=1 AND COALESCE(archived_at,0)=0
+               ORDER BY MAX(COALESCE(last_interaction_at_ms,0), COALESCE(created_at,0)*1000) DESC, id DESC LIMIT 40""",
+            (owner,),
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+        running = {item["conversationUuid"]: item for item in (await self._tree_running_state(owner)).get("items", [])}
+        items = [{
+            **activity_fields(row),
+            "conversationUuid": row["conversation_uuid"],
+            "title": str(row.get("title") or "新对话"),
+            "assistantScope": assistant_conversations.scope_of(row),
+            "running": row["conversation_uuid"] in running,
+            "activityState": str((running.get(row["conversation_uuid"]) or {}).get("activityState") or ""),
+            "atMs": max(int(row.get("last_interaction_at_ms") or 0), int(row.get("created_at") or 0) * 1000),
+        } for row in rows]
+        latest = await assistant_conversations.latest_in_scope(self.db, owner, scope) if scope else ""
+        return web.json_response({"ok": True, "items": items, "latest": latest})
 
     async def handle_api_conversation_activity_read(self, request: web.Request) -> web.Response:
         owner = int(request[_WEB_SESSION_KEY].chat_id)
@@ -669,7 +700,7 @@ class WebAdminConversationTreeMixin:
             SELECT folder_uuid,
                    SUM(CASE WHEN COALESCE(archived_at,0)=0 THEN 1 ELSE 0 END) AS active_count,
                    SUM(CASE WHEN COALESCE(archived_at,0)>0 THEN 1 ELSE 0 END) AS archived_count
-            FROM web_conversations WHERE owner_chat_id=?
+            FROM web_conversations WHERE owner_chat_id=? AND COALESCE(assistant,0)=0
               AND conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members WHERE status='active')
             GROUP BY folder_uuid
             """,
@@ -721,8 +752,11 @@ class WebAdminConversationTreeMixin:
     ) -> dict[str, Any]:
         conv_uuid = str(row.get("conversation_uuid") or "")
         running = running_lookup.get(conv_uuid) or {}
+        assistant = bool(int(row.get("assistant") or 0))
         return {
             **activity_fields(row),
+            "assistant": assistant,
+            **({"assistantScope": assistant_conversations.scope_of(row)} if assistant else {}),
             "activityState": str(running.get("activityState") or ""),
             "activityPending": list(running.get("activityPending") or []),
             "kind": "conversation",
@@ -742,7 +776,8 @@ class WebAdminConversationTreeMixin:
             "running": bool(running),
             "status": "running" if running else "idle",
             "currentStatus": str(running.get("currentStatus") or row.get("current_status") or "就绪"),
-            "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话",
+            "path": assistant_conversations.GROUP_LABEL if assistant else (
+                self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders) or "临时会话"),
         }
 
     async def _tree_direct_folder_nodes(
@@ -838,7 +873,7 @@ class WebAdminConversationTreeMixin:
                 SELECT wc.conversation_uuid
                 FROM web_conversations wc
                 WHERE wc.owner_chat_id=? AND COALESCE(wc.archived_at,0)=0
-                  AND wc.origin_kind IN ('','user')
+                  AND wc.origin_kind IN ('','user') AND COALESCE(wc.assistant,0)=0
                 ORDER BY wc.last_conversation_at DESC,
                          COALESCE(wc.created_at,0) DESC, wc.id DESC
                 LIMIT 1
@@ -852,7 +887,7 @@ class WebAdminConversationTreeMixin:
                 )
         cur = await self.db.conn.execute(
             """SELECT
-                 SUM(CASE WHEN COALESCE(archived_at,0)=0 THEN 1 ELSE 0 END) AS active_count,
+                 SUM(CASE WHEN COALESCE(archived_at,0)=0 AND COALESCE(assistant,0)=0 THEN 1 ELSE 0 END) AS active_count,
                  SUM(CASE WHEN COALESCE(archived_at,0)>0 THEN 1 ELSE 0 END) AS archived_count
                FROM web_conversations WHERE owner_chat_id=?""",
             (owner,),
@@ -885,7 +920,11 @@ class WebAdminConversationTreeMixin:
             "archivedCount": int((count_row or {}).get("archived_count") or 0),
             "temporaryCount": int(await self._tree_scalar(
                 "SELECT COUNT(*) FROM web_conversations WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0 AND COALESCE(folder_uuid,'')=''"
-                " AND conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members)",
+                " AND COALESCE(assistant,0)=0 AND conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members)",
+                (owner,),
+            )),
+            "assistantCount": int(await self._tree_scalar(
+                "SELECT COUNT(*) FROM web_conversations WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0 AND COALESCE(assistant,0)=1",
                 (owner,),
             )),
         })
@@ -910,7 +949,7 @@ class WebAdminConversationTreeMixin:
             tracked_folder_ids.insert(0, include_folder_id)
         if parent and not await self._tree_folder_owned(owner, parent):
             return web.json_response({"ok": False, "error": "folder_not_found"}, status=404)
-        if system_node not in {"", "temporary", "archive"}:
+        if system_node not in {"", "temporary", "archive", "assistant"}:
             return web.json_response({"ok": False, "error": "invalid_system_node"}, status=400)
         try:
             limit = max(1, min(100, int(request.query.get("limit") or _TREE_PAGE_SIZE)))
@@ -932,8 +971,13 @@ class WebAdminConversationTreeMixin:
                 owner, parent, folders=folders, status=status
             ))
         archive_clause = "COALESCE(wc.archived_at,0)>0" if system_node == "archive" else "COALESCE(wc.archived_at,0)=0"
-        folder_clause = "" if system_node == "archive" else "AND COALESCE(wc.folder_uuid,'')=?"
-        params: tuple[Any, ...] = (owner,) if system_node == "archive" else (owner, parent)
+        if system_node == "archive":
+            folder_clause = ""
+        elif system_node == "assistant":
+            folder_clause = "AND COALESCE(wc.assistant,0)=1"
+        else:
+            folder_clause = "AND COALESCE(wc.folder_uuid,'')=? AND COALESCE(wc.assistant,0)=0"
+        params: tuple[Any, ...] = (owner,) if system_node in {"archive", "assistant"} else (owner, parent)
         # Group members are listed under their lead's group, not as siblings.
         member_clause = "" if system_node == "archive" else "AND wc.conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members)"
         conv_where = f"wc.owner_chat_id=? AND {archive_clause} {folder_clause} {member_clause}"
@@ -1472,6 +1516,8 @@ class WebAdminConversationTreeMixin:
             return row, folders
         if kind == "conversation":
             row = await self._conversation_row(owner, item_id, require=True)
+            if int(row.get("assistant") or 0) and target_folder:
+                raise web.HTTPBadRequest(text="assistant_conversation_cannot_move_to_folder")
             return row, folders  # type: ignore[return-value]
         raise web.HTTPBadRequest(text="invalid_tree_item_kind")
 
@@ -1551,17 +1597,18 @@ class WebAdminConversationTreeMixin:
         """Find the next visible sibling (or previous at the end), across pages."""
         current = await self._conversation_row(owner, item_id, require=True)
         parent = str(current.get("folder_uuid") or "")
+        is_assistant = int(current.get("assistant") or 0)
         cur = await self.db.conn.execute(
             """SELECT conversation_uuid, title, folder_uuid
                FROM web_conversations
-               WHERE owner_chat_id=? AND COALESCE(folder_uuid,'')=?
+               WHERE owner_chat_id=? AND COALESCE(folder_uuid,'')=? AND COALESCE(assistant,0)=?
                  AND ((COALESCE(archived_at,0)=0
                        AND conversation_uuid NOT IN (SELECT conversation_uuid FROM collab_members))
                       OR conversation_uuid=?)
                ORDER BY CASE WHEN COALESCE(pinned_at,0)>0 THEN 0 ELSE 1 END,
                         CASE WHEN display_order IS NULL THEN 1 ELSE 0 END,
                         display_order ASC, COALESCE(created_at,0) DESC, id DESC""",
-            (owner, parent, item_id),
+            (owner, parent, is_assistant, item_id),
         )
         rows = [dict(row) for row in await cur.fetchall()]
         index = next((i for i, row in enumerate(rows) if row["conversation_uuid"] == item_id), -1)

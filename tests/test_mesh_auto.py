@@ -314,3 +314,50 @@ def test_the_draft_takes_a_lan_name_and_backup():
     with pytest.raises(model.MeshInvalid) as bad:
         model.clean_doc({'members': [{**d['members'][0], 'gateway': {'subnets': LAN, 'name': 'x' * 41}}]}, d)
     assert [e['path'] for e in bad.value.errors] == ['members[0].gateway.name']
+
+
+# ----- a relay's reachability, confirmed over several checks -----
+MIN = 60_000
+
+
+def check(at, verdict, early=False, held=False):
+    return {'at': at * MIN, 'verdict': verdict, 'early': early, 'held': held}
+
+
+def test_a_public_relay_is_taken_behind_nat_only_after_three_checks_over_half_an_hour():
+    """GCP-SG turned site on one round whose observers were restarting (11-20 09:48)."""
+    checks = [check(0, 'public'), check(10, 'punchable')]
+    assert mesh_auto.confirm_reach('public', checks, 10 * MIN) == ('public', {'verdict': 'punchable', 'checks': 1, 'since': 10 * MIN})
+    checks += [check(20, 'no_udp'), check(30, 'punchable')]
+    # Three in a row, but over 20 minutes.
+    assert mesh_auto.confirm_reach('public', checks, 30 * MIN)[0] == 'public'
+    checks.append(check(40, 'punchable'))
+    assert mesh_auto.confirm_reach('public', checks, 40 * MIN) == ('punchable', None)
+    # A public round in between starts the count again.
+    broken = [check(10, 'punchable'), check(20, 'punchable'), check(30, 'public'), check(40, 'punchable'), check(50, 'punchable')]
+    assert mesh_auto.confirm_reach('public', broken, 50 * MIN)[0] == 'public'
+
+
+def test_a_site_relay_is_public_again_after_two_checks_and_unknown_or_early_ones_do_not_count():
+    assert mesh_auto.confirm_reach('punchable', [check(0, 'public')], 0)[0] == 'punchable'
+    assert mesh_auto.confirm_reach('punchable', [check(0, 'public'), check(10, 'unknown'), check(20, 'public')], 20 * MIN) == ('public', None)
+    # Within ten minutes of its data plane starting: the relays observing it may be restarting too.
+    early = [check(0, 'public'), check(10, 'no_udp', early=True), check(12, 'no_udp', early=True), check(14, 'no_udp', early=True),
+             check(50, 'no_udp')]
+    assert mesh_auto.confirm_reach('public', early, 50 * MIN) == ('public', {'verdict': 'no_udp', 'checks': 1, 'since': 50 * MIN})
+    # Address filtering where another relay's test once came through: no other relay tested, which is no NAT.
+    held = [check(0, 'public')] + [check(10 * i, 'punchable', held=True) for i in range(1, 7)]
+    assert mesh_auto.confirm_reach('public', held, 60 * MIN) == ('public', None)
+    assert mesh_auto.confirm_reach('public', held + [check(70, 'punchable')], 70 * MIN) == ('public', {'verdict': 'punchable', 'checks': 1, 'since': 70 * MIN})
+    # On the same side a new verdict is taken at once, and with none confirmed yet the latest is.
+    assert mesh_auto.confirm_reach('punchable', [check(0, 'symmetric')], 0) == ('symmetric', None)
+    assert mesh_auto.confirm_reach('', [check(0, 'no_udp')], 0) == ('no_udp', None)
+    assert mesh_auto.confirm_reach('', [check(0, 'no_udp', early=True)], 0) == ('', None)
+
+
+def test_a_relay_held_public_says_why_its_mode_has_not_changed():
+    m = auto(member('r1', role='relay'))
+    held = {'r1': {'verdict': 'public', 'reachPending': {'verdict': 'punchable', 'checks': 2, 'since': 0}}}
+    assert mesh_auto.relay_mode_default(m, held) == ('public', '可达性检测：公网可达（最近 2 次检测在 NAT 后，要连续 3 次且满 30 分钟才改）')
+    back = {'r1': {'verdict': 'punchable', 'reachPending': {'verdict': 'public', 'checks': 1, 'since': 0}}}
+    assert mesh_auto.relay_mode_default(m, back) == ('site', '可达性检测：在 NAT 后面（最近 1 次检测公网可达，要连续 2 次才改）')

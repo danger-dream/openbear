@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { ElMessageBox } from 'element-plus';
 import { MeshApi } from './meshApi.js';
 import { act, applyBlocked, mesh, meshErrorText, revert, unsaved } from './meshStore.js';
@@ -10,7 +10,7 @@ import MeshNodeName from './MeshNodeName.vue';
 // As `panel` (nothing selected): always shown, with the whole list.
 const props = defineProps({panel: Boolean});
 const emit = defineEmits(['apply', 'member']);
-const expanded = ref(false), busy = ref('');
+const expanded = ref(false), busy = ref(''), showProgress = ref(false);
 const data = computed(() => mesh.data);
 const members = computed(() => mesh.work?.members || []);
 const progress = computed(() => data.value?.apply?.progress || []);
@@ -24,20 +24,41 @@ const dirty = computed(() => Boolean(data.value?.draft?.dirty));
 const local = computed(() => mesh.rejected || unsaved());
 const recovery = computed(() => data.value?.apply?.recovery || '');
 const recoveryText = computed(() => recovery.value === 'restoring' ? '正在恢复旧网络，等待节点重连确认；草稿已保留。' : recovery.value === 'restored' ? '这次变更未提交，已恢复旧网络；草稿已保留，可调整后重试。' : '');
-const kind = computed(() => running.value ? 'running' : failed.value.length && !dirty.value && !local.value && !recovery.value ? 'failed'
+const preparing = computed(() => mesh.applying || Boolean(data.value?.apply?.preparing));
+const kind = computed(() => running.value ? 'running' : preparing.value ? 'preparing' : failed.value.length && !dirty.value && !local.value && !recovery.value ? 'failed'
   : dirty.value || (local.value && (!mesh.conflict || props.panel)) || recovery.value === 'restoring' ? 'dirty' : missing.value.length ? 'missing' : offline.value.length ? 'offline' : '');
 const done = computed(() => progress.value.filter(p => FINISHED.has(p.state)).length);
-const applying = computed(() => progress.value.find(p => p.state === 'applying'));
+const applying = computed(() => progress.value.filter(p => p.state === 'applying'));
+// What the controller is doing before the rollout starts, as the last poll saw it.
+const PHASES = {waiting: '正在等待其他组网操作完成', facts: '正在读取各节点的最新状态', tls: '正在检查中继的 TLS 证书',
+  check: '正在校验设置和端口', build: '正在生成新配置'};
+const now = ref(Date.now());
+let clock = null;
+watch(() => ['preparing', 'running'].includes(kind.value), on => {
+  clearInterval(clock);
+  clock = on ? setInterval(() => { now.value = Date.now(); }, 1000) : null;
+  now.value = Date.now();
+  if (!on) showProgress.value = false;
+}, {immediate: true});
+onBeforeUnmount(() => clearInterval(clock));
+// Known only for an apply started on this page.
+const elapsed = computed(() => mesh.applyStartedAt ? `已用 ${Math.max(0, Math.round((now.value - mesh.applyStartedAt) / 1000))} 秒` : '');
+const withElapsed = text => [text, elapsed.value].filter(Boolean).join(' · ');
 const list = (items, n = 2) => items.slice(0, n).join('；') + (items.length > n ? ` 等 ${items.length} 项` : '');
 const title = computed(() => ({
   running: `正在应用 ${done.value}/${progress.value.length}`,
+  preparing: '正在准备应用',
   failed: `${failed.value.length} 台失败`,
   dirty: changes.value.length ? `有 ${changes.value.length} 项更改未应用` : local.value ? '有修改还没保存' : '有更改未应用',
   offline: `${offline.value.length} 台离线，连上后自动补发`,
   missing: `${missing.value.length} 台的组网服务不见了`,
 })[kind.value]);
 const summary = computed(() => {
-  if (kind.value === 'running') return applying.value ? `正在下发到 ${nameOf(members.value, applying.value.serverId)}` : '';
+  if (kind.value === 'running') {
+    const names = applying.value.map(p => nameOf(members.value, p.serverId));
+    return withElapsed(names.length ? `正在下发到 ${names.slice(0, 2).join('、')}${names.length > 2 ? ` 等 ${names.length} 台` : ''}` : '');
+  }
+  if (kind.value === 'preparing') return withElapsed(PHASES[data.value?.apply?.preparing?.phase] || '正在检查各节点、生成新配置，完成后开始下发');
   if (kind.value === 'failed') return list(failed.value.map(p => `${nameOf(members.value, p.serverId)}：${meshErrorText(p.error) || '原因未知'}`));
   if (kind.value === 'offline') return offline.value.map(p => nameOf(members.value, p.serverId)).join('、');
   if (kind.value === 'missing') {
@@ -128,7 +149,13 @@ function apply() { expanded.value = false; emit('apply'); }
         <span v-if="mesh.errors.length" class="mesh-bar-problem mesh-bar-note">{{ mesh.errors.length }} 处设置需要修改，{{ mesh.rejected ? '改好之前不会保存' : '改好之前不能应用' }}</span>
         <span v-else-if="mesh.saving" class="mesh-bar-summary mesh-bar-note">正在保存…</span>
       </div>
-      <div v-if="kind === 'running'" class="mesh-bar-actions"><i class="sv-bar" :style="{'--v': pct + '%'}" aria-hidden="true"></i></div>
+      <div v-if="kind === 'running'" class="mesh-bar-actions">
+        <i class="sv-bar" :style="{'--v': pct + '%'}" aria-hidden="true"></i>
+        <el-button :aria-expanded="showProgress" @click="showProgress = !showProgress">{{ showProgress ? '收起' : '查看进度' }}</el-button>
+      </div>
+      <div v-else-if="kind === 'preparing'" class="mesh-bar-actions">
+        <el-button type="primary" loading disabled>应用中</el-button>
+      </div>
       <div v-else-if="kind === 'failed'" class="mesh-bar-actions">
         <el-button :loading="busy === 'rollback'" :disabled="Boolean(busy)" @click="rollback">回退到上一版</el-button>
         <el-button type="primary" :disabled="Boolean(busy)" @click="emit('apply')">重试</el-button>
@@ -142,6 +169,11 @@ function apply() { expanded.value = false; emit('apply'); }
         <el-button type="primary" :disabled="!canApply" @click="apply">应用</el-button>
       </div>
     </div>
+    <ul v-if="showProgress && kind === 'running'" class="mesh-bar-list">
+      <li v-for="p in progress" :key="p.serverId" :data-tone="p.state === 'failed' ? 'bad' : undefined">
+        <button type="button" class="ix-text-button" @click="emit('member', p.serverId)"><MeshNodeName :id="p.serverId" plain /></button>：{{ p.state === 'failed' ? meshErrorText(p.error) || '原因未知' : PROGRESS[p.state]?.[1] || p.state }}
+      </li>
+    </ul>
     <ul v-if="expanded && kind === 'dirty' && hasDetails" class="mesh-bar-list">
       <li v-for="(p, i) in problems" :key="'e' + i" data-tone="bad">
         <button v-if="p.member" type="button" class="ix-text-button" @click="emit('member', p.member)">{{ p.text }}</button><span v-else>{{ p.text }}</span>：{{ p.message }}

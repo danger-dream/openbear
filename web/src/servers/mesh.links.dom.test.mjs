@@ -138,7 +138,7 @@ test('site relays and relay links: relay mode and its recommendation, punched li
   assert.match(await panel.locator('.mesh-relay-facts').innerText(), /连接方式\s*打洞：两台都是站点中转/);
   assert.match(await panel.locator('.mesh-relay-metric').innerText(), /线路\s*正常[\s\S]*延迟\s*2\.6 ms[\s\S]*抖动\s*0\.2 ms[\s\S]*丢包\s*0%[\s\S]*实测代价\s*3[\s\S]*选路用\s*3\.4/);
   // Routes go by the larger of what the two ends advertised; the measured cost worked out with this link's figures.
-  assert.match(await panel.locator('.mesh-cost-math').innerText(), /^实测代价 = 延迟 2\.6 \+ 抖动 0\.2 × 2 \+ 丢包率 0% × 1000 ≈ 3。选路用两端已通告代价里较大的那个/);
+  assert.match(await panel.locator('.mesh-cost-math').innerText(), /^实测代价 = 延迟 2\.6 \+ 抖动 0\.2 × 2 \+ 丢包率 0% × 1000 \+ 每跳 2 ≈ 3。选路用两端已通告代价里较大的那个/);
   await page.waitForFunction(() => /持续/.test(document.querySelector('.mesh-direct-live .mesh-stats')?.innerText || ''));
   const live = await panel.locator('.mesh-direct-live .mesh-stats').innerText();
   for (const want of [/打洞\s*直连中/, /经由\s*公网/, /持续\s*42 分钟/, /尝试次数\s*2 次/, /最近错误\s*无/]) assert.match(live, want);
@@ -219,9 +219,9 @@ test('routes: standby entries drawn faint, LAN or internet on punched entries, t
     assert.equal(await standby(id), null, `${id} is in use`);
   }
   // Punched entries say how they got through: both office machines reach TOY over the LAN.
-  assert.equal(await label(page, '1 · 局域网').count(), 2);
+  assert.equal(await label(page, '1 · 局域网 · UDP').count(), 2);
   assert.equal(await page.locator('.mesh-edge-label[data-kind=entry]', {hasText: '打洞'}).count(), 0);
-  assert.match(await label(page, '1 · 局域网').first().getAttribute('title'), /经局域网接入/);
+  assert.match(await label(page, '1 · 局域网 · UDP').first().getAttribute('title'), /经局域网接入/);
   assert.match(await label(page, '2 · TCP · 超时').getAttribute('aria-label'), /热备，平时不走流量/);
   // Win's standby is quiet: its label stays away until Win is selected.
   assert.equal(await label(page, '2 · TCP').count(), 0);

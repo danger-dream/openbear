@@ -115,7 +115,7 @@ type Backend interface {
 	UDPPort() int
 	// For reachability tests; see the transport package.
 	ReflectSeen(id [8]byte) (netip.AddrPort, bool)
-	RecentlyFrom(ip netip.Addr, within time.Duration) bool
+	RecentlyFrom(target netip.AddrPort, within time.Duration) bool
 	SendTest(target netip.AddrPort, id [8]byte, sender byte) error
 	WatchTests(id [8]byte) bool
 	TestsSeen(id [8]byte) byte

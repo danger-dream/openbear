@@ -7,7 +7,7 @@ import { bytes, flag, noAutofill, regionName } from '../serverHelpers.js';
 import { MeshApi } from './meshApi.js';
 import { applyBlocked, keepPeers, mesh, meshError, meshErrorText, reinstallMesh, reinstalling, removeFromMesh, save } from './meshStore.js';
 import { addressProblem, codeText, errorMessage, errorsAt, errorsUnder, FILTERINGS, firewallIssue, firewallKinds, isRelay, isSite, listens, listenWarnings, MAPPINGS,
-  MISSING_TEXT, msText, nameOf, NO_TRANSIT_HINT, nodeAlerts, nodeState, portProblem, progressOf, PROGRESS, reachOf, recommendedMode, rowButton, ruleWords, securityStats, TRANSPORTS, transportLabel,
+  entryVia, MISSING_TEXT, msText, nameOf, NO_TRANSIT_HINT, nodeAlerts, nodeState, portProblem, progressOf, PROGRESS, reachOf, recommendedMode, rowButton, ruleWords, securityStats, TRANSPORTS, transportLabel,
   uid, upgradeLabel, VERDICT_NOTES, verdictBadge, warningItems, warningsUnder, WARNINGS_TO_FIX } from './meshHelpers.js';
 import { changeRole } from './meshGraph.js';
 import { directEdgeId, relayEdgeId } from './meshEdit.js';
@@ -139,11 +139,11 @@ const connText = computed(() => {
     if (!up.length) return offline.value ? '离线' : `${all.length} 个中转都没连上`;
     const best = [...up].sort((a, b) => (a.rttMs ?? Infinity) - (b.rttMs ?? Infinity))[0];
     return [`同时连上 ${up.length === all.length ? '' : `${up.length}/`}${all.length} 个中转`, `最快经 ${nm(best.peer)}`,
-      transportLabel(lineOf('entry', props.id, best.peer)?.transport), msText(best.rttMs)].filter(Boolean).join(' · ');
+      entryVia(lineOf('entry', props.id, best.peer)?.lan, lineOf('entry', props.id, best.peer)?.transport), msText(best.rttMs)].filter(Boolean).join(' · ');
   }
   if (!e) return (m.value.entry?.candidates || []).length ? (offline.value ? '离线' : '还没连上') : '还没有设置接入的中转';
   const l = lineOf('entry', props.id, e.relay);
-  return [`经 ${nm(e.relay)}`, transportLabel(e.transport || l?.transport), msText(l?.rttMs)].filter(Boolean).join(' · ');
+  return [`经 ${nm(e.relay)}`, entryVia(l?.lan, e.transport || l?.transport), msText(l?.rttMs)].filter(Boolean).join(' · ');
 });
 
 // ---- overview ----
@@ -293,11 +293,12 @@ const isUpstreams = computed(() => (m.value?.entry?.mode || 'upstreams') === 'up
 const candRows = computed(() => (m.value?.entry?.candidates || []).map((c, i) => {
   const r = relayOf(c.relay), l = lineOf('entry', props.id, c.relay), a = candAuto(c), autoOn = isAuto(c, 'transport');
   const errs = errorsUnder(mesh.errors, `members[${index.value}].entry.candidates[${i}]`).map(errorMessage);
-  return {c, i, name: nm(c.relay), flag: flagOf(c.relay), inUse: nowEntry.value?.relay === c.relay, site: isSite(r),
+  return {c, i, name: nm(c.relay), flag: flagOf(c.relay), inUse: nowEntry.value?.relay === c.relay, site: isSite(r), lan: Boolean(l?.lan),
     measured: Number.isFinite(l?.rttMs) ? `实测 ${msText(l.rttMs)}` : fresh.value ? '应用后实测' : '还没有实测',
     autoText: a && (autoOn || a.value === c.transport) ? `自动：${a.reason}` : '', changed: !autoOn && a && a.value !== c.transport ? a : null,
     errors: errs, allowed: t => !r || listens(r, t)};
 }));
+const LAN_TITLE = '和这台中转在同一局域网，直接连它的局域网地址';
 function setCandTransport(c, t) { c.transport = t; c.auto = (c.auto || []).filter(f => f !== 'transport'); void save(); }
 function moveCand(i) { const list = m.value.entry.candidates; list.splice(i - 1, 0, list.splice(i, 1)[0]); void save(); }
 function dropCand(i) { m.value.entry.candidates.splice(i, 1); void save(); }
@@ -426,7 +427,7 @@ const joined = computed(() => {
   if (!m.value) return [];
   const list = relay.value
     ? linkRows.value.map(x => ({id: x.o, rtt: x.rttValue, t: x.transport, kind: 'line'}))
-    : [...(m.value.entry?.candidates || []).map((c, i) => ({id: c.relay, rtt: lineOf('entry', props.id, c.relay)?.rttMs, t: c.transport, kind: i && !isUpstreams.value ? 'backup' : 'entry'})),
+    : [...(m.value.entry?.candidates || []).map((c, i) => ({id: c.relay, rtt: lineOf('entry', props.id, c.relay)?.rttMs, t: c.transport, lan: lineOf('entry', props.id, c.relay)?.lan, kind: i && !isUpstreams.value ? 'backup' : 'entry'})),
       ...directs.value.map(d => ({id: d.other, rtt: lineOf('direct', props.id, d.other)?.rttMs, t: d.d.transport, kind: 'direct'}))];
   return list.map((x, i) => ({...x, y: 17 + i * 24, tone: x.kind === 'backup' ? 'ride' : !Number.isFinite(x.rtt) || x.rtt >= 1e9 ? 'ride' : x.rtt < 50 ? 'good' : x.rtt < 130 ? 'mid' : 'far'}));
 });
@@ -531,10 +532,10 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
                     <span v-if="r.c.origin === 'auto'" class="m3-tag">自动加的</span>
                     <template v-if="!isUpstreams && r.i"><span class="m3-faint"> {{ entryMode === 'fixed' ? '不用' : '备用' }}</span></template>
                     <span v-else-if="!isUpstreams && r.inUse" class="m3-tag" data-kind="lan">使用中</span>
-                    <small>{{ r.measured }}<template v-if="r.c.origin === 'auto' && r.c.reason"> · <span :title="r.c.reason">{{ r.c.reason }}</span></template></small>
+                    <small>{{ r.measured }}<template v-if="r.lan && !r.site"> · <span :title="LAN_TITLE">局域网</span></template><template v-if="r.c.origin === 'auto' && r.c.reason"> · <span :title="r.c.reason">{{ r.c.reason }}</span></template></small>
                     <small v-for="e in r.errors" :key="e" class="ob-bad">{{ e }}</small></span>
                   <button v-if="r.c.origin === 'auto'" type="button" class="ix-text-button" @click="toManual(r.c)">转成手动</button>
-                  <span v-if="r.site" class="m3-tag">UDP 打洞</span>
+                  <span v-if="r.site" class="m3-tag" :title="r.lan ? LAN_TITLE : ''">{{ r.lan ? '局域网 · UDP' : 'UDP 打洞' }}</span>
                   <div v-else class="m3-seg" role="radiogroup" :aria-label="`经 ${r.name} 用什么协议`">
                     <button v-for="[t, l] in TRANSPORTS" :key="t" type="button" role="radio" :aria-checked="r.c.transport === t" :disabled="!r.allowed(t)" :title="r.allowed(t) ? TRANSPORT_TIPS[t] : '那台中转没开这个协议'" @click="setCandTransport(r.c, t)">{{ l }}</button>
                   </div>
@@ -590,7 +591,7 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
               <template v-if="riders.length">
                 <button v-for="r in riders" :key="r.serverId" type="button" class="m3-rel" @click="emit('open', r.serverId)">
                   <span class="ob-grow"><span v-if="flagOf(r.serverId)" class="sv-flag" aria-hidden="true">{{ flagOf(r.serverId) }}</span>{{ r.name }}</span>
-                  <span class="m3-faint">{{ transportLabel(r.entry.candidates.find(c => c.relay === id)?.transport) }}</span><span class="m3-chev">›</span>
+                  <span class="m3-faint">{{ entryVia(lineOf('entry', r.serverId, id)?.lan, r.entry.candidates.find(c => c.relay === id)?.transport) }}</span><span class="m3-chev">›</span>
                 </button>
               </template>
               <span v-else class="m3-faint">没有成员经它接入</span>
@@ -680,7 +681,7 @@ const changes = computed(() => (data.value?.draft?.changes || []).filter(c => c.
               <path :class="n.tone" :d="`M28,${mapH / 2} C58,${mapH / 2} 52,${n.y} 80,${n.y}`" fill="none" />
               <g class="m3-relmap-node" role="button" tabindex="0" :aria-label="`打开 ${nm(n.id)}`" @click="emit('open', n.id)" @keydown.enter="emit('open', n.id)">
                 <circle class="n" cx="84" :cy="n.y" r="4.5" />
-                <text x="93" :y="n.y + 4">{{ flagOf(n.id) }} {{ short(nm(n.id)) }}<title>{{ nm(n.id) }}</title><tspan class="ms" dx="6">{{ transportLabel(n.t) }} {{ Number.isFinite(n.rtt) && n.rtt < 1e9 ? msText(n.rtt) : '' }}{{ n.kind === 'backup' ? ' · 备用' : n.kind === 'direct' ? ' · 直连' : '' }}</tspan></text>
+                <text x="93" :y="n.y + 4">{{ flagOf(n.id) }} {{ short(nm(n.id)) }}<title>{{ nm(n.id) }}</title><tspan class="ms" dx="6">{{ entryVia(n.lan, n.t) }} {{ Number.isFinite(n.rtt) && n.rtt < 1e9 ? msText(n.rtt) : '' }}{{ n.kind === 'backup' ? ' · 备用' : n.kind === 'direct' ? ' · 直连' : '' }}</tspan></text>
               </g>
             </g>
             <circle class="c" cx="22" :cy="mapH / 2" r="9" />

@@ -23,6 +23,7 @@ from app.servers import (
     mesh_auto,
     mesh_autolinks,
     mesh_change,
+    mesh_events,
     mesh_fast,
     mesh_forward,
     mesh_geo,
@@ -41,6 +42,7 @@ from app.servers.mesh_config import (
     NO_TRANSIT_FEATURE,
     PATHS_BACKUP_FEATURE,
     PATHS_FEATURE,
+    SMOOTH_FEATURE,
     STANDBY_FEATURE,
     TUNING_FEATURE,
     _key32,
@@ -86,6 +88,7 @@ DATA_PLANE_FEATURES = frozenset({
     PATHS_BACKUP_FEATURE,
     NO_TRANSIT_FEATURE,
     TUNING_FEATURE,
+    SMOOTH_FEATURE,
     mesh_fast.FAST_FEATURE,
     mesh_forward.FEATURE,
     'mesh.routing.paths',
@@ -132,9 +135,15 @@ TLS_REFRESH_MS = 86400000
 STATUS_SAVE_MS = 60000
 # A status that changed is saved at most this often; the one in memory is always the latest.
 STATUS_SAVE_MIN_MS = 10000
+# Routine dynamic route churn stays in memory immediately and persists on the regular STATUS_SAVE_MS cadence.
+ROUTINE_EVENT_KINDS = frozenset({'route.changed'})
 # A member's public address (its reachability check) or its IPv4 must hold this long before the
 # configs of those that punch towards it or dial it follow it: one that flips back and forth costs nothing.
 PUBLIC_ADDR_SETTLE_S = 30
+# A relay's reachability checks kept to confirm its verdict: those of twice mesh_auto.REACH_TO_NAT_MS, at
+# most REACH_KEPT (a round that fails is made again in 2 minutes).
+REACH_KEPT, REACH_KEPT_MS = 40, 2 * mesh_auto.REACH_TO_NAT_MS
+RELAY_MODE_NAMES = {'public': '公网中转', 'site': '站点中转'}
 LAYOUT_KEPT = 500
 LAYOUT_SPAN = 100000
 # Looked up by the node after it connects: until then its hello has none, and the last known ones stand.
@@ -217,7 +226,7 @@ def _running_features(features, reads):
     # Unknown legacy member/path capabilities keep existing routes intact. New routing controls
     # and port services need confirmed data-plane support, not just a newly updated openbear-node.
     missing = DATA_PLANE_FEATURES - reads if reads is not None else {
-        NO_TRANSIT_FEATURE, TUNING_FEATURE, mesh_fast.FAST_FEATURE, mesh_forward.FEATURE}
+        NO_TRANSIT_FEATURE, TUNING_FEATURE, SMOOTH_FEATURE, mesh_fast.FAST_FEATURE, mesh_forward.FEATURE}
     return frozenset(features) - missing
 
 
@@ -411,7 +420,9 @@ class Mesh:
         self.names = {}
         self.trend_store = MeshTrend(service.metrics)
         self.line_store = mesh_lines.LineTrend(service.metrics)
+        self.event_log = mesh_events.EventLog(service.metrics)
         self.applied_cache = {}  # owner -> the applied revision as _applied gives it, until another is issued
+        self.auto_history = {}  # owner -> mesh_autolinks.History its optimizer rounds smooth costs with
         self.applied_issued = {}  # owner -> how many revisions were issued since the start, to drop a load that raced one
         self.port_checks = {}  # (server id, ports asked) -> (ms it holds until, net.ports answer)
         self.port_pending = {}  # (server id, ports asked) -> the check under way, shared by everyone asking
@@ -421,6 +432,7 @@ class Mesh:
         self.relay_upgrades = {}
         self.ready_waits = {}
         self.applying = set()  # owners with an apply or rollback from its start until its rollout ends
+        self.preparing = {}  # owner -> {'phase': ...} while an apply checks and builds, before its rollout starts
         self.change_watching = set()
         self.refused = {}  # server id -> hash of the latest config it refused; its data plane retries that one itself
         self.resending = set()
@@ -433,6 +445,7 @@ class Mesh:
         self.ipv4s = {}  # server id -> (the IPv4 configs use, another it reports, monotonic time since it does)
         self.public_ips = {}  # server id -> the same for the public IP its reachability check verified
         self.verdicts = {}  # server id -> the same for its reachability verdict
+        self.reach = {}  # relay's server id -> {confirmed, pending, checks, started, open?}: its verdict as mesh_auto.confirm_reach confirms it
         self.key_conflicts = {}  # server id -> {signKey|e2eKey: the member whose key it reported}, from its last report of them
         self.alerted = {}  # server id -> {alert kind: ms one last went out}, for alerts not from its reports (mesh_status.Watch)
         self.missing_held = set()  # server ids missing whose alert waits out the cooldown
@@ -484,8 +497,10 @@ class Mesh:
         return reply.get('result') if isinstance(reply.get('result'), dict) else {}
 
     async def start(self):
-        for row in await many(self.db.conn, 'SELECT server_id,owner,status_json,events_json,updated_ms FROM mesh_nodes'):
+        for row in await many(self.db.conn, 'SELECT server_id,owner,status_json,events_json,updated_ms,reach_json FROM mesh_nodes'):
             self.owners[row['server_id']] = row['owner']
+            if row['reach_json']:
+                self.reach[row['server_id']] = json.loads(row['reach_json'])
             if row['status_json']:
                 # Cleaned again: a status saved before a field was added gains its default.
                 self.status[row['server_id']] = {'status': mesh_status.clean_status(json.loads(row['status_json'])), 'at': row['updated_ms'], 'saved': row['updated_ms'],
@@ -500,6 +515,7 @@ class Mesh:
             await conn.execute("UPDATE mesh_revisions SET status='partial' WHERE status='applying'")
         await self.trend_store.start()
         await self.line_store.start()
+        await self.event_log.start()
         await asyncio.to_thread(mesh_geo.install, Path(self.db.path).expanduser().parent / 'mesh-geo')
         self.service.spawn(self._tls_loop())
 
@@ -559,6 +575,20 @@ class Mesh:
         for i, rule in enumerate(doc['rules']):
             await conn.execute('INSERT INTO mesh_rules VALUES(?,?,?,?)', (owner, stage, i, dumps(rule)))
 
+    @staticmethod
+    async def _save_auto_links_state(conn, owner, state, *, stage='applied'):
+        """Update only _autoLinksState in mesh_settings.settings_json without rewriting member/link/rule rows."""
+        row = await one(conn, 'SELECT settings_json FROM mesh_settings WHERE owner=? AND stage=?', (owner, stage))
+        if not row:
+            return False
+        settings = json.loads(row['settings_json'])
+        if state:
+            settings['_autoLinksState'] = state
+        else:
+            settings.pop('_autoLinksState', None)
+        await conn.execute('UPDATE mesh_settings SET settings_json=? WHERE owner=? AND stage=?', (dumps(settings), owner, stage))
+        return True
+
     async def _save_draft(self, owner, doc, *, draft_version=None, auto_base=None):
         async with self.db.write_transaction(label='mesh-draft') as conn:
             await self._save(conn, owner, 'draft', doc, draft_version=draft_version, auto_base=auto_base)
@@ -610,7 +640,7 @@ class Mesh:
 
     async def _rows(self, owner):
         """The owner's mesh_nodes rows by server, without the reports kept for restarts (status_json,
-        events_json): self.status has them, and they are most of each row."""
+        events_json, reach_json): self.status and self.reach have them, and they are most of each row."""
         return {r['server_id']: r for r in await many(self.db.conn, f'SELECT {NODE_COLUMNS} FROM mesh_nodes WHERE owner=?', (owner,))}
 
     async def _facts(self, owner, rows=None):
@@ -683,7 +713,13 @@ class Mesh:
                 if not reach.get('checkedAt'):
                     verdict = self.verdicts.get(sid, (verdict,))[0]
                     public = self.public_ips.get(sid, (public,))[0]
-                verdict = self._settled(self.verdicts, owner, sid, verdict)
+                kept = self.reach.get(sid)
+                if kept and kept['confirmed']:
+                    verdict = kept['confirmed']
+                    if kept.get('pending'):
+                        f['reachPending'] = kept['pending']
+                else:
+                    verdict = self._settled(self.verdicts, owner, sid, verdict)
                 public = self._settled(self.public_ips, owner, sid, public)
             f['verdict'], f['publicIp'] = verdict, public
             # The IP it was seen at, whatever the verdict: nodes seen at one IP share a NAT.
@@ -897,7 +933,8 @@ class Mesh:
                 'routeClashes': route_clashes(conflicts, taken, facts),
                 'eligible': self._eligible(draft, facts),
                 'apply': {**(rollout.view() if rollout else {'running': False, 'revision': net['applied_revision'], 'progress': []}),
-                          **({'recovery': 'restoring'} if pending_change and pending_change['phase'] == 'aborting' else {})},
+                          **({'recovery': 'restoring'} if pending_change and pending_change['phase'] == 'aborting' else {}),
+                          **({'preparing': dict(self.preparing[owner])} if owner in self.preparing else {})},
                 # Each line of the applied mesh as both ends' latest reports show it.
                 'lines': mesh_lines.view(issued['lines'], self.status, now_ms()),
                 'errors': model.validate(draft, facts, applied=applied), 'warnings': warnings}
@@ -1050,7 +1087,8 @@ class Mesh:
         state = mesh_status.node_state(cleanup=row['state'] == 'cleanup', installing=sid in self.installing, online=sid in self.hub.sessions,
                                        configured=bool(row['confirmed_hash']), current=current, failed=failed, status=status, missing=missing)
         return {'state': state, 'appliedRevision': status['appliedRevision'] if status else row['confirmed_revision'],
-                'error': row['error'] if failed or missing else (status or {}).get('error', ''), 'summary': mesh_status.summary(status, role),
+                'error': row['error'] if failed or missing else (status or {}).get('error', ''),
+                'summary': mesh_status.summary(self._shown_status(sid, status), role),
                 'dataVersion': row['data_version'],
                 'upgrade': {'state': self.upgrades.get(sid, ''), 'error': row['upgrade_error'], 'at': row['upgrade_ms']},
                 **({'alerts': list(alerts)} if alerts else {})}
@@ -1192,7 +1230,22 @@ class Mesh:
         role = self._roles(draft, applied).get(server_id)
         hashes = (await self._applied(owner))['hashes']
         return {'ok': True, 'member': self._member_view(m, facts, draft['settings']['prefix']) if m else None, 'node': self._node_view(server_id, row, hashes, role) if row else None,
-                'status': live.get('status'), 'events': list(reversed(live.get('events') or [])), 'config': latest.get(server_id)}
+                'status': self._shown_status(server_id, live.get('status')), 'events': list(reversed(live.get('events') or [])), 'config': latest.get(server_id)}
+
+    async def events(self, owner, server_id, before=None, before_seq=None, limit=None):
+        """A node's events as stored (RETENTION_S), newest first: those before (before, before_seq) when given."""
+        if server_id not in await self._rows(owner):
+            raise InstanceError('mesh_member_not_found', 404)
+        return {'ok': True, **await self.event_log.page(server_id, before, before_seq, limit or mesh_events.PAGE_DEFAULT)}
+
+    def _shown_status(self, sid, status):
+        """A node's status as the page and tools read it: TCP memory pressures over the last day beside
+        the kernel's count since boot."""
+        tcp_mem = ((status or {}).get('fast') or {}).get('tcpMem')
+        if not tcp_mem:
+            return status
+        counted = {**tcp_mem, 'pressures24h': self.trend_store.pressures_24h(sid, now_ms() // 1000)}
+        return {**status, 'fast': {**status['fast'], 'tcpMem': counted}}
 
     async def trend(self, owner, server_id, span):
         if span not in TREND_RANGES:
@@ -1371,12 +1424,11 @@ class Mesh:
                 doc = back
             elif errors := invalid(doc):
                 raise model.MeshInvalid(errors)
-            doc['_autoLinksState'] = mesh_autolinks.record_user_deletions(prior, doc, prior.get('_autoLinksState'), now_ms())
+            doc['_autoLinksState'] = mesh_autolinks.record_user_deletions(prior, doc, applied.get('_autoLinksState') or prior.get('_autoLinksState'), now_ms())
             async with self.db.write_transaction(label='mesh-draft') as conn:
                 await self._save(conn, owner, 'draft', doc)
                 if '_autoLinksState' in applied or doc.get('_autoLinksState'):
-                    applied['_autoLinksState'] = copy.deepcopy(doc['_autoLinksState'])
-                    await self._save(conn, owner, 'applied', applied)
+                    await self._save_auto_links_state(conn, owner, doc.get('_autoLinksState'))
                 await self._drop_removed(conn, owner, undone)
             if _provinces(doc) and mesh_geo.store() and not mesh_geo.store().sets:
                 self.service.spawn(self._geo_check(force=True))
@@ -1785,16 +1837,22 @@ class Mesh:
             raise InstanceError('mesh_apply_running', 409)
         self.applying.add(owner)
 
+    def _phase(self, owner, phase):
+        self.preparing[owner] = {'phase': phase}
+
     async def apply(self, owner, *, reserved=False, preserve_line_rules=False):
         if not reserved:
             self._reserve(owner)
+        self._phase(owner, 'waiting')
         lock = self._lock(owner)
         try:
             await lock.acquire()
         except BaseException:
+            self.preparing.pop(owner, None)
             self.applying.discard(owner)
             raise
         try:
+            self._phase(owner, 'facts')
             await self._refresh_facts(owner)
             async with self._edit(owner):
                 draft, facts, applied = await self._load(owner, 'draft'), await self._facts(owner), await self._load(owner, 'applied')
@@ -1803,7 +1861,9 @@ class Mesh:
                     draft = mesh_auto.for_draft(draft)
                 # What follows the mesh, worked out from the facts as they are now.
                 draft = mesh_auto.resolve(draft, facts)
+                self._phase(owner, 'tls')
                 await self._refresh_tls(owner, draft, facts)
+                self._phase(owner, 'check')
                 errors = model.validate(draft, facts, applying=True, applied=applied)
                 if not errors:
                     # A listen port another program holds would fail the delivery: checked again now, not from the cache.
@@ -1811,13 +1871,16 @@ class Mesh:
                               if w['error'] == 'mesh_port_in_use']
                 if errors:
                     raise model.MeshInvalid(errors)
-                draft['_autoLinksState'] = mesh_autolinks.record_user_deletions(applied, draft, draft.get('_autoLinksState') or applied.get('_autoLinksState'), now_ms())
+                draft['_autoLinksState'] = mesh_autolinks.record_user_deletions(applied, draft, applied.get('_autoLinksState') or draft.get('_autoLinksState'), now_ms())
+                self._phase(owner, 'build')
                 plan = await self._issue(owner, draft, facts, reason='apply', save_draft=True)
         except BaseException:
             lock.release()
+            self.preparing.pop(owner, None)
             self.applying.discard(owner)
             raise
         self.rollouts[owner] = plan['rollout']
+        self.preparing.pop(owner, None)
 
         async def roll():
             try:
@@ -1846,7 +1909,8 @@ class Mesh:
         fresh = not revision or doc != previous or {k: config_hash(v) for k, v in configs.items()} != {k: config_hash(v) for k, v in latest.items()}
         if fresh:
             revision = net['revision'] + 1
-            configs = build(doc, facts, network_id, revision)
+            for cfg in configs.values():
+                cfg['revision'] = revision
         else:
             configs = latest
         cleanup = list(dict.fromkeys([*removed, *sorted(sid for sid, r in rows.items() if r['state'] == 'cleanup')]))
@@ -2031,12 +2095,14 @@ class Mesh:
         if not cursor.rowcount and cleanup_only:
             return
         for cache in (self.owners, self.status, self.watches, self.refused, self.schemas, self.ipv4s, self.public_ips, self.verdicts,
-                      self.key_conflicts, self.alerted):
+                      self.reach, self.key_conflicts, self.alerted):
             cache.pop(sid, None)
         self.missing_held.discard(sid)
         await self.trend_store.forget(sid)
         with contextlib.suppress(Exception):
             await self.line_store.forget(sid)
+        with contextlib.suppress(Exception):
+            await self.event_log.forget(sid)
 
     def node_hello(self, server_id):
         """A node (re)connected: send it what it missed, finish its cleanup, and reissue
@@ -2116,20 +2182,29 @@ class Mesh:
         connects, and they change under it (a WireGuard interface stopped, a container network added):
         configs and route checks would otherwise go by what it had until it reconnects."""
         rows = await self._rows(owner)
-        await asyncio.gather(*(self._refresh_node(owner, sid, timeout=FACTS_REFRESH_TIMEOUT)
-                               for sid, row in rows.items() if sid in self.hub.sessions and row['state'] != 'cleanup'))
+        sids = [sid for sid, row in rows.items() if sid in self.hub.sessions and row['state'] != 'cleanup']
+        fetched = await asyncio.gather(*(self._fetch_node_status(owner, sid, timeout=FACTS_REFRESH_TIMEOUT) for sid in sids))
+        updates = [update for _, _, update in fetched if update is not None]
+        if not updates:
+            return
+        reconcile = False
+        async with self.db.write_transaction(label='mesh-nodes-refresh') as conn:
+            for sid, fields, result in updates:
+                if await self._write_node_refresh(conn, owner, sid, fields, result):
+                    reconcile = True
+        for sid, _, _ in updates:
+            await self._key_conflict(owner, sid)
+        if reconcile:
+            self._reconcile_soon(owner)
 
-    async def _refresh_node(self, owner, sid, *, timeout=STATUS_CALL_TIMEOUT, live_status=False):
-        """mesh.status after a reconnect, and before an apply or when the page opens (_refresh_facts): the
-        interfaces and routes for the prefix and route checks, the build of the data plane's copy, and
-        whether its mesh service is still there."""
+    async def _fetch_node_status(self, owner, sid, *, timeout=STATUS_CALL_TIMEOUT, live_status=False):
         try:
             result = await self._call(owner, sid, 'mesh.status', {}, timeout=timeout)
         except InstanceError as exc:
-            return False, exc.error
+            return False, exc.error, None
         if result.get('installed') is False or result.get('service') == 'absent':
             await self._mark_missing(owner, sid)
-            return False, MISSING_ERROR
+            return False, MISSING_ERROR, None
         await self._found(sid, result)
         if live_status and isinstance(result.get('status'), dict):
             self.owners.setdefault(sid, owner)
@@ -2146,14 +2221,29 @@ class Mesh:
                   'data_version': version[:40] if isinstance(version, str) and version else None,
                   'data_build': data_build if _BUILD.fullmatch(data_build) else None}
         fields = {k: v for k, v in fields.items() if v is not None}
+        update = (sid, fields, result) if (fields or result.get('signKey') or result.get('e2eKey')) else None
+        return True, '', update
+
+    async def _write_node_refresh(self, conn, owner, sid, fields, result):
+        fields = dict(fields)
+        if 'data_build' in fields:
+            await self._store_data_build(conn, sid, fields.pop('data_build'))
+        if fields:
+            await conn.execute(f"UPDATE mesh_nodes SET {','.join(f'{k}=?' for k in fields)} WHERE server_id=?", (*fields.values(), sid))
+        return await self._store_security_keys(conn, owner, sid, result)
+
+    async def _refresh_node(self, owner, sid, *, timeout=STATUS_CALL_TIMEOUT, live_status=False):
+        """mesh.status after a reconnect, and before an apply or when the page opens (_refresh_facts): the
+        interfaces and routes for the prefix and route checks, the build of the data plane's copy, and
+        whether its mesh service is still there."""
+        ok, err, update = await self._fetch_node_status(owner, sid, timeout=timeout, live_status=live_status)
+        if not ok:
+            return False, err
         changed = False
-        if fields or result.get('signKey') or result.get('e2eKey'):
+        if update is not None:
+            _, fields, result = update
             async with self.db.write_transaction(label='mesh-node') as conn:
-                if 'data_build' in fields:
-                    await self._store_data_build(conn, sid, fields.pop('data_build'))
-                if fields:
-                    await conn.execute(f"UPDATE mesh_nodes SET {','.join(f'{k}=?' for k in fields)} WHERE server_id=?", (*fields.values(), sid))
-                changed = await self._store_security_keys(conn, owner, sid, result)
+                changed = await self._write_node_refresh(conn, owner, sid, fields, result)
             await self._key_conflict(owner, sid)
         if changed:
             self._reconcile_soon(owner)
@@ -2379,9 +2469,73 @@ class Mesh:
         event, so the node's next events, compared by seq, still come through."""
         live = self.status.setdefault(sid, {'status': None, 'events': [], 'at': 0, 'saved': 0})
         seq = live['events'][-1]['seq'] if live['events'] else -1
-        live['events'] = mesh_status.merge_events(live['events'], [{'seq': seq, 'at': now_ms(), 'kind': kind, 'detail': detail}])
+        event = {'seq': seq, 'at': now_ms(), 'kind': kind, 'detail': detail}
+        live['events'] = mesh_status.merge_events(live['events'], [event])
         async with self.db.write_transaction(label='mesh-event') as conn:
             await conn.execute('UPDATE mesh_nodes SET events_json=? WHERE server_id=?', (dumps(list(live['events'])), sid))
+        with contextlib.suppress(Exception):
+            await self.event_log.add(sid, [event])
+
+    async def _observe_reach(self, owner, sid, status, restarted, member, now):
+        """A relay's reachability checks, kept to confirm its verdict (mesh_auto.confirm_reach). A
+        confirmed verdict that changed reissues the configs; one that turns the relay's automatic
+        relay mode is recorded as an event and sent as a reminder."""
+        if member['role'] != 'relay':
+            if self.reach.pop(sid, None) is not None:
+                await self._save_reach(sid, None)
+            return
+        reach = status.get('reachability') or {}
+        kept = self.reach.get(sid)
+        if kept is None:
+            # Taken as it stands: what the controller already settled for it before it kept checks.
+            verdict = self.verdicts[sid][0] if sid in self.verdicts else ''
+            kept = self.reach[sid] = {'confirmed': verdict if mesh_auto.reach_side(verdict) else '', 'pending': None, 'checks': [], 'started': 0}
+        if restarted:
+            kept['started'] = now
+        checked, verdict = reach.get('checkedAt') or 0, reach.get('verdict', '')
+        if not checked:
+            return
+        addr, filtering = reach.get('publicAddr', ''), reach.get('filtering', '')
+        # The address another relay's unsolicited test came through at. A round there that only the asked
+        # relay's own test reached (address filtering) had no other relay send one: a data plane that
+        # restarted forgets what it proved, and the relays asked may all have heard from it lately.
+        if verdict == 'public' and addr:
+            kept['open'] = addr
+        elif addr != kept.get('open') or verdict in ('symmetric', 'no_udp') or filtering == 'port':
+            kept.pop('open', None)
+        held = bool(addr) and verdict == 'punchable' and filtering == 'address' and kept.get('open') == addr
+        checks = kept['checks']
+        if checks and checks[-1]['checkedAt'] == checked:
+            if checks[-1]['verdict'] == verdict and checks[-1].get('held', False) == held:
+                return
+            checks[-1].update(verdict=verdict, held=held)  # the same round judged again
+        else:
+            # Early by the controller's clock or the node's own: a node without a clock at boot
+            # reports a start from before it set its time.
+            early = now - kept['started'] < mesh_auto.REACH_START_MS or 0 <= checked - status['startedAt'] < mesh_auto.REACH_START_MS
+            checks.append({'checkedAt': checked, 'at': now, 'verdict': verdict, 'early': early, 'held': held})
+            checks[:] = [c for c in checks if now - c['at'] <= REACH_KEPT_MS][-REACH_KEPT:]
+        before = kept['confirmed']
+        kept['confirmed'], kept['pending'] = mesh_auto.confirm_reach(before, checks, now)
+        await self._save_reach(sid, kept)
+        if kept['confirmed'] == before:
+            return
+        self._reconcile_soon(owner)
+        if not before or mesh_auto.reach_side(before) == mesh_auto.reach_side(kept['confirmed']) or 'relayMode' not in (member.get('auto') or []):
+            return
+        mode = mesh_auto.relay_mode_default(member, await self._facts(owner))[0]
+        if mode == member['relayMode']:
+            return
+        _, count, since = mesh_auto.reach_run(checks)
+        minutes = round((now - since) / 60_000)
+        await self._event(sid, 'relay.mode', f"{member['relayMode']} -> {mode}: {kept['confirmed']} {count} checks over {minutes}m")
+        found = '在 NAT 后' if mode == 'site' else '公网可达'
+        await self._remind(owner, f'mesh-relay-mode:{sid}:{now}', sid,
+                           f"{quoted(self._name(sid))} 自动改成{RELAY_MODE_NAMES[mode]}：可达性检测连续 {count} 次{found}（{minutes} 分钟）。")
+
+    async def _save_reach(self, sid, kept):
+        async with self.db.write_transaction(label='mesh-reach') as conn:
+            await conn.execute('UPDATE mesh_nodes SET reach_json=? WHERE server_id=?', (dumps(kept) if kept else '', sid))
 
     def _reconcile_soon(self, owner):
         """reconcile, once for any number of changes that come while one waits for the lock: it
@@ -2452,18 +2606,22 @@ class Mesh:
 
     # ----- TLS pins -----
     async def _refresh_tls(self, owner, doc, facts, *, stale_only=False):
-        """Ask relays that listen for TLS for their certificates; True when a pin changed."""
-        rows, changed = await self._rows(owner), False
+        """Ask relays that listen for TLS for their certificates, all at once; True when a pin changed."""
+        rows, changed, asked = await self._rows(owner), False, []
         for m in model.active(doc):
             sid = m['serverId']
             if m['role'] != 'relay' or not m['listen']['tls'] or sid not in self.hub.sessions or sid not in rows or rows[sid]['state'] == 'missing':
                 continue
             if stale_only and now_ms() - rows[sid]['tls_checked_ms'] < TLS_REFRESH_MS:
                 continue
+            asked.append(sid)
+
+        async def ask(sid):
             try:
-                tls = clean_tls(await self._call(owner, sid, 'mesh.tls', {}, timeout=TLS_CALL_TIMEOUT))
+                return clean_tls(await self._call(owner, sid, 'mesh.tls', {}, timeout=TLS_CALL_TIMEOUT))
             except InstanceError:
-                continue
+                return None
+        for sid, tls in zip(asked, await asyncio.gather(*(ask(sid) for sid in asked))):
             if tls is None:
                 continue
             changed = changed or tls != facts[sid].get('tls')
@@ -2527,20 +2685,39 @@ class Mesh:
             if not net['applied_revision']:
                 return None
             now = now_ms() if now is None else int(now)
+            applied = await self._load(owner, 'applied')
+            if not mesh_autolinks.enabled(applied):
+                return None
+            facts = await self._facts(owner)
+            applied_state = applied.get('_autoLinksState')
+            if applied_state is None:
+                draft_state = (await self._load(owner, 'draft')).get('_autoLinksState')
+            else:
+                draft_state = None
+            state = mesh_autolinks.clean_state(applied_state or draft_state, now)
+            status_snap = {sid: {'status': rec.get('status')} for sid, rec in self.status.items()}
+            history = self.auto_history.setdefault(owner, mesh_autolinks.History())
+            res = await asyncio.to_thread(mesh_autolinks.optimize, applied, facts, status_snap, state=state, now_ms=now,
+                                          history=history, applied_ms=net['applied_ms'])
             async with self._edit(owner):
-                applied = await self._load(owner, 'applied')
-                if not mesh_autolinks.enabled(applied):
-                    return None
-                (draft, draft_version), facts = await self._load(owner, 'draft', with_version=True), await self._facts(owner)
-                state = mesh_autolinks.clean_state(applied.get('_autoLinksState') or draft.get('_autoLinksState'), now)
-                res = mesh_autolinks.optimize(applied, facts, self.status, state=state, now_ms=now)
+                latest_applied = await self._load(owner, 'applied')
+                latest_state = latest_applied.get('_autoLinksState')
+                if latest_state != applied_state:
+                    # A user draft edit ran while optimize() was in the worker thread: preserve new suppressions.
+                    merged_suppressed = dict(res['state'].get('suppressed') or {})
+                    merged_suppressed.update((latest_state or {}).get('suppressed') or {})
+                    if res['changed'] and any(item['key'] in merged_suppressed for item in res['added']):
+                        return {**res, 'changed': False, 'superseded': True}
+                    res['state']['suppressed'] = merged_suppressed
+                    state['suppressed'] = dict(merged_suppressed)
+                    for k in merged_suppressed:
+                        for part in ('watchSince', 'idleSince', 'idleBest'):
+                            res['state'][part].pop(k, None)
+                            state[part].pop(k, None)
                 if not res['changed']:
-                    if applied.get('_autoLinksState') != res['state']:
-                        applied['_autoLinksState'] = copy.deepcopy(res['state'])
-                        draft['_autoLinksState'] = copy.deepcopy(res['state'])
+                    if latest_state != res['state']:
                         async with self.db.write_transaction(label='mesh-autolinks-state') as conn:
-                            await self._save(conn, owner, 'applied', applied)
-                            await self._save(conn, owner, 'draft', draft, draft_version=draft_version, auto_base=draft.get('_autoBase'))
+                            await self._save_auto_links_state(conn, owner, res['state'])
                     return res
                 last_auto_ms = state.get('lastAutoRevisionMs', 0)
                 if last_auto_ms and now - last_auto_ms < mesh_autolinks.AUTO_REVISION_INTERVAL_MS:
@@ -2549,21 +2726,20 @@ class Mesh:
                     kept_state['lastChange'] = state.get('lastChange')
                     for item in res['dropped']:
                         k = item['key']
-                        if item['why'] == '连续无改善' and k in state.get('idleSince', {}):
+                        if item['code'] == 'idle' and k in state.get('idleSince', {}):
                             kept_state['idleSince'][k] = state['idleSince'][k]
-                        elif item['why'] != '已手动删除':
+                            kept_state['idleBest'][k] = res['state']['idleBest'].get(k, state.get('idleBest', {}).get(k, 0.0))
+                        elif item['code'] != 'deleted':
                             # Judged again once the window passes: one drop counts one strike.
                             for part in ('disappointed', 'strikes'):
                                 if k in state.get(part, {}):
                                     kept_state[part][k] = state[part][k]
                                 else:
                                     kept_state[part].pop(k, None)
-                    applied['_autoLinksState'] = kept_state
-                    draft['_autoLinksState'] = copy.deepcopy(kept_state)
                     async with self.db.write_transaction(label='mesh-autolinks-state') as conn:
-                        await self._save(conn, owner, 'applied', applied)
-                        await self._save(conn, owner, 'draft', draft, draft_version=draft_version, auto_base=draft.get('_autoBase'))
+                        await self._save_auto_links_state(conn, owner, kept_state)
                     return {**res, 'changed': False, 'rateLimited': True}
+                draft, draft_version = await self._load(owner, 'draft', with_version=True)
                 next_doc = mesh_auto.resolve(res['doc'], facts)
                 await self._refresh_tls(owner, next_doc, facts, stale_only=True)
                 errors = model.validate(next_doc, facts, applying=True, applied=applied)
@@ -2575,11 +2751,8 @@ class Mesh:
                         'reason': f'自动版本校验未通过：{errors[0]["message"]}',
                         'errors': errors,
                     }
-                    applied['_autoLinksState'] = bad_state
-                    draft['_autoLinksState'] = copy.deepcopy(bad_state)
                     async with self.db.write_transaction(label='mesh-autolinks-invalid') as conn:
-                        await self._save(conn, owner, 'applied', applied)
-                        await self._save(conn, owner, 'draft', draft, draft_version=draft_version, auto_base=draft.get('_autoBase'))
+                        await self._save_auto_links_state(conn, owner, bad_state)
                     for sid in {m['serverId'] for m in model.active(applied)}:
                         await self._event(sid, 'autolinks.invalid', bad_state['lastChange']['reason'])
                         break
@@ -2650,6 +2823,10 @@ class Mesh:
         new = [e for e in events if e['seq'] > last]
         live['status'], live['at'] = status, now
         live['events'] = mesh_status.merge_events(live['events'], new)
+        if new:
+            with contextlib.suppress(Exception):
+                # A write lost is a gap in the history, not a report lost.
+                await self.event_log.add(server_id, new, status['startedAt'] or None)
         if status['ready'] and server_id in self.ready_waits:
             self.ready_waits[server_id].set()
 
@@ -2657,7 +2834,7 @@ class Mesh:
             return s and (s['ready'], s['appliedRevision'], s['error'], (s['entry'] or {}).get('relay'), (s['entry'] or {}).get('transport'),
                           mesh_status.public_ip(s))
         try:
-            if new or key(before) != key(status):
+            if any(e['kind'] not in ROUTINE_EVENT_KINDS for e in new) or key(before) != key(status):
                 live['dirty'] = True
             # A change is saved soon, not on every report: a node whose state flaps does not write each time.
             if now - live['saved'] >= (STATUS_SAVE_MIN_MS if live.get('dirty') else STATUS_SAVE_MS):
@@ -2696,6 +2873,7 @@ class Mesh:
                                                     bool(member['entry']['candidates']), status, new, self._name,
                                                     punches=mesh_status.needs_public_addr(applied['configs'].get(server_id))):
                 await self._remind(owner, alert_key, server_id, text)
+            await self._observe_reach(owner, server_id, status, restarted, member, now)
         except Exception:
             # A report must never break the node's session; the next one tries again.
             live['saved'] = 0

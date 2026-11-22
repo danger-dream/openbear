@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"openbear/node/mesh/clock"
+	"openbear/node/mesh/routing"
 	"openbear/node/mesh/transport"
 	"openbear/node/mesh/wire"
 	"reflect"
@@ -193,6 +194,7 @@ const linkRetryLimit = 30 * time.Second
 type Manager struct {
 	mu          sync.RWMutex
 	cfg         Config
+	budget      routing.Budget // budgetOf(cfg)
 	backend     Backend
 	hooks       Hooks
 	store       *store
@@ -275,7 +277,7 @@ func New(dir string, c Config, b Backend, h Hooks) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{protocols: map[string]peerProtocol{}, backend: b, hooks: h, store: s, owners: newOwners(s, c.Parameters.Lease), candidates: map[string]*candidateState{}, links: map[string]*candidateState{}, inbound: map[Path]*inbound{}, notices: map[string]outboundNotice{}, lastRefresh: map[string]time.Time{}, changes: make(chan struct{}, 1), input: make(chan any, 256), inbox: newInbox(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		directs: map[string]*directState{}, session: fmt.Sprintf("%d-%s", epoch, nonce()), epochs: map[string]uint64{}, offerRates: map[string]offerRate{}, reach: newReach(), started: time.Now(),
+		directs: map[string]*directState{}, session: fmt.Sprintf("%d-%s", epoch, nonce()), epochs: map[string]uint64{}, offerRates: map[string]offerRate{}, reach: newReach(s.state.Reach), started: time.Now(),
 		redial: currentRedialParams(), baselines: loadBaselines(s.path), baselineSaved: time.Now()}
 	if err = m.configure(c); err != nil {
 		cancel()
@@ -482,7 +484,7 @@ func (m *Manager) configure(c Config) error {
 	}
 	m.configureDirects(c, now)
 	oldNodes := m.cfg.Nodes
-	m.cfg = c
+	m.cfg, m.budget = c, budgetOf(c)
 	m.candidates = keep
 	m.owners.lease = c.Parameters.Lease
 	for _, n := range oldNodes {

@@ -11,6 +11,8 @@ import AdminPageHeader from "../components/AdminPageHeader.vue";
 import MobileAssetRow from "../components/MobileAssetRow.vue";
 import MobileAssetSheet from "../components/MobileAssetSheet.vue";
 import { useMobileAssets } from "../components/useMobileAssets";
+import { usePageSubject } from "../assistant/pageRegistry.js";
+import { useResourceChanges } from "../assistant/resourceChanges.js";
 
 const emit = defineEmits(["mobile-header-ready"]);
 
@@ -59,6 +61,21 @@ async function refresh() { if (!await load()) return; clearSelection(); ElMessag
 onMounted(load);
 const shownDocs = computed(() => docs.value.filter((d) => showArchived.value || !d.archived));
 const selectedDocs = computed(() => shownDocs.value.filter((d) => selectedIds.value.includes(d.id)));
+usePageSubject(() => {
+  if (dialogOpen.value && editing.value) {
+    return editing.value.id
+      ? {kind: "doc", id: editing.value.id, label: editing.value.title || editing.value.name, role: "正在编辑", details: {name: editing.value.name || ""}}
+      : {kind: "doc-draft", label: "新建文档（未保存）"};
+  }
+  return selectedDocs.value.slice(0, 10).map((d) => ({kind: "doc", id: d.id, label: d.title || d.name, role: "已选中", details: {name: d.name}}));
+});
+useResourceChanges(["doc"], async (detail) => {
+  await load();
+  if (!dialogOpen.value || !editing.value?.id || String(editing.value.id) !== String(detail.itemId)) return;
+  if (detail.action === "delete") ElMessage.warning("助手删除了正在编辑的这篇文档");
+  else if (dirty()) ElMessage.warning("助手刚修改了这篇文档；编辑框里是修改前的内容，保存会覆盖它");
+  else await openEdit({id: editing.value.id});
+}, {keys: (detail) => [`doc:${detail.itemId}`]});
 const allShownSelected = computed(() => shownDocs.value.length > 0 && shownDocs.value.every((d) => selectedIds.value.includes(d.id)));
 const projectOptions = computed(() => [...new Set(docs.value.flatMap((d) => splitList(d.project)))].sort());
 const groupNames = computed(() => [...new Set(docs.value.map((d) => d.grp).filter(Boolean))]);
@@ -291,10 +308,10 @@ const mobileEnabledCount = computed(() => shownDocs.value.filter(row => row.enab
               v-bind="dragAutoScrollOptions" :scroll="scrollContainer" :disabled="isAdminPhone && mobileMode !== 'sort'"
               :group="{ name: 'doc-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag" class="mobile-asset-group space-y-2 min-h-6">
               <template #item="{ element: d }">
-                <MobileAssetRow v-if="isAdminPhone" :title="d.title || d.name" :summary="d.summary" :reference="'@doc/' + d.name" :meta="`P${d.importance ?? '—'}${d.project ? ' · ' + splitList(d.project).join(' · ') : ''}`"
+                <MobileAssetRow v-if="isAdminPhone" :data-ob-key="'doc:' + d.id" :title="d.title || d.name" :summary="d.summary" :reference="'@doc/' + d.name" :meta="`P${d.importance ?? '—'}${d.project ? ' · ' + splitList(d.project).join(' · ') : ''}`"
                   :enabled="!!d.enabled" :archived="!!d.archived" :selected="isSelected(d.id)" :mode="mobileMode"
                   @select="setSelected(d.id, $event)" @open="openMobileAsset(d)" @more="openMobileAsset(d, 'actions')" />
-                <div v-else @click="openEdit(d)"
+                <div v-else :data-ob-key="'doc:' + d.id" @click="openEdit(d)"
                   class="doc-card mac-panel mac-shadow p-4 flex items-start gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
           :class="{ 'opacity-50 border-dashed': d.archived || !d.enabled, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(d.id) }">
                   <div class="pt-0.5" @click.stop><el-checkbox :model-value="isSelected(d.id)" @change="(v) => setSelected(d.id, v)" /></div>

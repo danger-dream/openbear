@@ -5,6 +5,8 @@ import dataclasses
 
 from app.agent.native_continuation import validate_model_context
 from app.agents import live_state as agent_live_state
+from app.assistant import context as assistant_context
+from app.assistant import conversations as assistant_conversations
 from app.context import image_one_turn, prompt_template
 from app.context.configuration import CONTEXT_STRATEGIES, normalize_strategy
 from app.interaction_data import canonical_questionnaire_answers as _canonical_questionnaire_answers
@@ -25,7 +27,7 @@ def _confirmation_answer_audit_result(
         return redact_result(result)
     if action == "questionnaire":
         answers = result.get("answers") if isinstance(result.get("answers"), list) else []
-        return {
+        out = {
             "status": str(result.get("status") or ""),
             "cancelled": bool(result.get("cancelled")),
             "interactionId": str(result.get("interactionId") or ""),
@@ -39,6 +41,9 @@ def _confirmation_answer_audit_result(
                 for answer in answers if isinstance(answer, dict)
             ],
         }
+        if result.get("decision"):
+            out["decision"] = str(result.get("decision"))
+        return out
     return result
 
 
@@ -396,15 +401,18 @@ class WebAdminChatHandlersMixin:
                 extensions = self.extensions.chosen(body["extensions"])
             except ExtensionError as exc:
                 return web.json_response(exc.payload, status=400)
+        assistant = folder_uuid == assistant_conversations.FOLDER
         row = await self._create_web_conversation(
             session.chat_id,
             title=title,
             model=normalized["mainModel"],
             run_config=storage,
-            folder_uuid=folder_uuid,
+            folder_uuid="" if assistant else folder_uuid,
             persist_defaults=persist_defaults,
             defaults_seed=self._web_defaults_storage(global_defaults) if folder_defaults else None,
             extensions=extensions,
+            assistant=assistant,
+            assistant_scope=assistant_conversations.scope_json(body.get("assistantScope")) if assistant else "",
         )
         live = self._live_for(row)
         await self.audit("web.conversation.create", actor="web", chat_id=session.chat_id, ip=request.remote or "", detail={"conversationUuid": row["conversation_uuid"], "internalChatId": row["internal_chat_id"]})
@@ -2018,7 +2026,7 @@ class WebAdminChatHandlersMixin:
             row, text, [], self._live_for(row), telegram_submission_id=submission_id,
         )
 
-    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None) -> dict[str, Any]:
+    async def _start_or_steer_web_conversation(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None, page_context: dict[str, Any] | None = None) -> dict[str, Any]:
         internal_chat_id = int(row["internal_chat_id"])
         # Serialize acceptance while preserving the existing steering behavior.
         async with self.operation_locks.chat_unless(internal_chat_id, "web_send", reject_operation="web_manual_compact") as acquired:
@@ -2040,6 +2048,7 @@ class WebAdminChatHandlersMixin:
             row = current
             return await self._start_or_steer_web_conversation_locked(
                 row, text, media, live, telegram_submission_id=telegram_submission_id, reference_order=reference_order,
+                page_context=page_context if int(current.get("assistant") or 0) else None,
             )
 
     async def _web_media_attachments_public(self, row: dict[str, Any], media: list[InboundMedia], *, turn_uuid: str = "", op_id: str = "") -> list[dict[str, Any]]:
@@ -2090,7 +2099,7 @@ class WebAdminChatHandlersMixin:
             out.append(public)
         return out
 
-    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None) -> dict[str, Any]:
+    async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None, page_context: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._web_stopping:
             return {"ok": False, "error": "server_stopping"}
         internal_chat_id = int(row["internal_chat_id"])
@@ -2128,6 +2137,8 @@ class WebAdminChatHandlersMixin:
             text = effective_reference_text(text, reference_manifest)
             visible_user_text = effective_reference_text(visible_user_text, reference_manifest)
             input_metadata.update(referenceBundleId=reference_bundle_id, references=reference_manifest)
+        if page_context and page_context.get("label"):
+            input_metadata["pageContextLabel"] = page_context["label"]
         # While the main controller is alive (including its event-driven wait),
         # interruptions stay in the original root and wake that controller.
         # A detached/waiting Agent alone must not strand input in this queue.
@@ -2161,6 +2172,7 @@ class WebAdminChatHandlersMixin:
             item = steering.enqueue(
                 internal_chat_id,
                 text if (text or "").strip() else visible_user_text,
+                **({"pageContext": page_context} if page_context else {}),
                 visibleText=visible_user_text,
                 turnUuid=root_turn_uuid,
                 rootTurnUuid=root_turn_uuid,
@@ -2234,6 +2246,7 @@ class WebAdminChatHandlersMixin:
                 user_op_id=f"msg:{user_message_uuid}",
                 user_message_source=source,
                 **({"reference_bundle_id": reference_bundle_id} if reference_bundle_id else {}),
+                **({"page_context": page_context} if page_context else {}),
             ))
             if self.runs is not None:
                 self.runs.register(internal_chat_id, task)
@@ -2366,6 +2379,7 @@ class WebAdminChatHandlersMixin:
                     user_op_id=f"msg:{message_uuid}",
                     user_message_source=source,
                     **({"reference_bundle_id": bundle_id} if bundle_id else {}),
+                    **({"page_context": first["pageContext"]} if isinstance(first.get("pageContext"), dict) else {}),
                 ))
                 self.runs.register(internal_chat_id, task)
             finally:
@@ -2674,6 +2688,14 @@ class WebAdminChatHandlersMixin:
                         await _send_json({"type": "pong", "ts": now_ts()})
                     elif kind == "live_resync":
                         await _send_live_snapshot(requested=True)
+                    elif kind == "page_host":
+                        # The page assistant panel answers this conversation's Page tool requests.
+                        if data.get("on") is False:
+                            self.page_bridge.detach(conv_uuid_for_log, ws_id)
+                        else:
+                            self.page_bridge.attach(conv_uuid_for_log, ws_id, _send_json)
+                    elif kind == "page_result":
+                        self.page_bridge.resolve(conv_uuid_for_log, str(data.get("requestId") or ""), data.get("result"))
                     elif kind == "refresh":
                         # A refresh replaces the browser's operation snapshot.
                         # Hold the WS send boundary across materialization and
@@ -2707,6 +2729,9 @@ class WebAdminChatHandlersMixin:
                             continue
                         reference_order = data.get("referenceOrder")
                         reference_kwargs = {"reference_order": [key for key in reference_order if isinstance(key, str)]} if isinstance(reference_order, list) else {}
+                        snapshot = assistant_context.normalize(data.get("pageContext"), visible_chars=self.config.assistant.context_chars)
+                        if snapshot:
+                            reference_kwargs["page_context"] = snapshot
                         result = await self._start_or_steer_web_conversation(row, text, media, live, **reference_kwargs)
                         if not result.get("ok"):
                             await _send_json({"type": "error", "error": result.get("error") or "send_failed", "requestId": request_id, **({"referenceError": result["referenceError"]} if result.get("referenceError") else {})})
@@ -2729,6 +2754,7 @@ class WebAdminChatHandlersMixin:
                 "closeCode": getattr(ws, "close_code", None),
                 "exception": repr(ws.exception()) if ws.exception() else "",
             })
+            self.page_bridge.detach(conv_uuid_for_log, ws_id)
             live.unsubscribe(sub)
             if writer is not None:
                 writer.cancel()

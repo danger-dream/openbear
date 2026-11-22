@@ -20,10 +20,10 @@ export function linesAtWork(mesh) {
       const links = mesh.doc.relayLinks.pairs;
       body.lines = [...(body.lines || []).filter(l => l.kind !== 'relay'), ...links.map((p, i) => ({id: `relay:${p.a}|${p.b}`, kind: 'relay', a: p.a, b: p.b, transport: p.transport, state: 'up', role: 'active', rttMs: 20 + i * 5, lossRate: 0}))];
       body.auto.pairs = Object.fromEntries(links.map(p => [`${p.a}|${p.b}`, {transport: {value: 'udp', reason: '两端都开着 UDP'}, dialer: {value: 'a', reason: ''}, bias: {value: 0, reason: ''}, rules: []}]));
-      body.autoLinks = {holdRounds: 3, dropAfterS: 3600, idleSince: {}, benefits: {'berlin|lax': {kind: 'relay', count: 2, pairs: GAINS}},
+      body.autoLinks = {buildMs: 15, buildRatio: 0.1, keepMs: 10, holdS: 1800, dropAfterS: 21600, idleSince: {}, benefits: {'berlin|lax': {kind: 'relay', count: 2, pairs: GAINS}},
         lastChange: {at: Date.now() - 300000, reason: '自动：新建 Berlin ↔ LAX', added: [{a: 'berlin', b: 'lax', kind: 'relay', transport: 'udp', reason: pairs[0].reason, count: 2, pairs: GAINS}],
-          dropped: [{a: 'lax', b: 'r5', kind: 'relay', why: '连续无改善'}]},
-        suggestions: [{key: 'home|r1', a: 'home', b: 'r1', kind: 'entry', transport: 'udp', reason: '', count: 1, pairs: [{src: 'home', dst: 'r1', before: 250, after: 150}], rounds: 2, ready: false}]};
+          dropped: [{a: 'lax', b: 'r5', kind: 'relay', why: '连续 6 小时最好只快 5ms，不到保留门槛 10ms'}]},
+        suggestions: [{key: 'home|r1', a: 'home', b: 'r1', kind: 'entry', transport: 'udp', reason: '', count: 1, pairs: [{src: 'home', dst: 'r1', before: 250, after: 150}], since: Date.now() - 20 * 60000, heldMs: 20 * 60000, ready: false}]};
     }
     return answer;
   };

@@ -1,6 +1,14 @@
 // Display rules and small editing helpers for the mesh page; no requests here.
 export const TRANSPORTS = [['udp', 'UDP'], ['tcp', 'TCP'], ['tls', 'TLS']];
 export const transportLabel = value => Object.fromEntries(TRANSPORTS)[value] || String(value || '').toUpperCase();
+// An entry's way in for a label: 局域网 · TCP when the member reaches the relay at its LAN address.
+export const entryVia = (lan, transport) => [lan ? '局域网' : '', transportLabel(transport)].filter(Boolean).join(' · ');
+// Whether a member's entry by relay over transport goes over the LAN: a punched one as the member
+// reports it once through, any other (and a punched one until then) as the controller dials it.
+export function entryLan(data, memberId, relayId, transport, h = null) {
+  if (h?.via && ['active', 'ready'].includes(h.state)) return h.via === 'lan';
+  return Boolean(lineOf(data, `entry:${memberId}|${relayId}|${transport}`)?.lan);
+}
 export const PROTOCOLS = [['any', '任意协议'], ['tcp', 'TCP'], ['udp', 'UDP'], ['icmp', 'ICMP（ping）']];
 
 const NODE_STATES = {installing: ['warn', '安装中'], installed: ['warn', '已安装，未就绪'], ready: ['ok', '就绪'], degraded: ['warn', '异常'],
@@ -205,18 +213,21 @@ export const isSite = m => isRelay(m) && m?.relayMode === 'site';
 export const RELAY_MODES = [['public', '公网中转', '有别人能直接连到的地址，成员和其他中转直接连它'],
   ['site', '站点中转', '在 NAT 后，不对外宣告地址：由它拨号连公网中转，和其他站点中转、本地成员之间打洞']];
 // settings.routing (mesh_config.ROUTING_TUNING): [key, default, lowest, highest].
-export const ROUTING_PARAMS = [['switchMs', 5, 0, 1000], ['switchPct', 0, 0, 90], ['shorterMs', 3, 0, 1000], ['shorterPct', 0, 0, 90], ['advertMs', 2, 0, 1000],
-  ['advertPct', 0, 0, 90], ['holdS', 5, 0, 60], ['jitterWeight', 2, 0, 10], ['lossWeight', 1000, 0, 10000], ['flapHoldS', 60, 0, 3600], ['flapHoldMaxS', 480, 0, 3600]];
+export const ROUTING_PARAMS = [['smoothHalfLifeS', 60, 1, 300], ['switchPct', 5, 0, 50], ['switchMinMs', 2, 0, 100],
+  ['hopCostMs', 2, 0, 50], ['startPenaltyMs', 150, 0, 5000], ['jitterWeight', 2, 0, 10], ['lossWeight', 1000, 0, 10000]];
 export const ROUTING_DEFAULTS = Object.fromEntries(ROUTING_PARAMS.map(([k, v]) => [k, v]));
-export const COST_FORMULA = '链路代价 = 延迟（最近 5 次探测的中位数）+ 抖动 × 抖动权重 + 丢包率 × 丢包权重 + 偏好，两端各算一份取较大的；路线代价是沿途各段已通告代价之和。';
+export const COST_FORMULA = '链路代价 = 延迟（最近 5 次探测的中位数）+ 抖动 × 抖动权重 + 丢包率（100 探测长窗忽略首包、10 探测 ≥3 包即触发）× 丢包权重 + 偏好 + 每跳代价，两端各算一份取较大的；选路按各邻居的实时与平滑代价同时超过切换门槛才切换。';
 // Whether a path costing cost replaces the route in use costing cur by the switch threshold (tuning as GET /mesh/path gives it).
 export function switchesTo(cost, cur, tuning) {
   const t = {...ROUTING_DEFAULTS, ...(tuning || {})}, saved = cur - cost;
-  return Number.isFinite(saved) && saved >= t.switchMs && (!t.switchPct || saved > cur * t.switchPct / 100);
+  const minMs = Number.isFinite(Number(t.switchMinMs)) ? Number(t.switchMinMs) : ROUTING_DEFAULTS.switchMinMs;
+  const pct = Number.isFinite(Number(t.switchPct)) ? Number(t.switchPct) : ROUTING_DEFAULTS.switchPct;
+  const margin = Math.max(cur * pct / 100, minMs);
+  return Number.isFinite(saved) && saved >= margin - 1e-9;
 }
-// Why a route stays on its next hop while another is shortest (status routes[].held).
-export const HELD_TEXT = {margin: '便宜得不够，没到切换门槛', hold: '已满足条件，正在确认是否持续', damped: '最近来回切过，按防抖规则等待', loop: '等其他节点的通告跟上，确认不会绕回来',
-  penalty: '那条线路最近断过，等它稳定', transit: '要经过不中转的节点'};
+// Why a route stays on its next hop while another is cheaper (status routes[].held).
+export const HELD_TEXT = {margin: '便宜得不够，没到切换门槛', settling: '更好的路还在观察：平滑代价没追上，或离开不中转的节点前等半秒确认',
+  loop: '等其他节点的通告跟上，确认不会绕回来', transit: '要经过不中转的节点'};
 // A relay with noTransit (routing.noTransit on the nodes).
 export const NO_TRANSIT_HINT = '打开后，它只承载访问它自己、它共享的局域网和经它接入的成员的流量，不再替其他中转之间转发；只有别的路都断了才临时借道，通了马上切回。适合上传很低的家里或公司路由。';
 // What the reachability check suggests; '' before there is a verdict.
@@ -386,7 +397,7 @@ export function hopsOf(raw) {
 export function entrySegment(data, a, b) {
   for (const [m, relay] of [[a, b], [b, a]]) {
     const h = Object.values(entryHealth(data, m)).find(x => x.state === 'active' && x.relay === relay);
-    if (h) return {id: h.id, via: h.via || '', member: m, relay, rttMs: Number.isFinite(data?.nodes?.[m]?.summary?.rttMs) && data.nodes[m].summary.rttMs > 0 ? data.nodes[m].summary.rttMs : null};
+    if (h) return {id: h.id, via: entryLan(data, m, relay, h.transport, h) ? 'lan' : h.via || '', member: m, relay, rttMs: Number.isFinite(data?.nodes?.[m]?.summary?.rttMs) && data.nodes[m].summary.rttMs > 0 ? data.nodes[m].summary.rttMs : null};
   }
   return null;
 }
@@ -594,13 +605,13 @@ const EVENTS = {'entry.switch': '切换入口', 'entry.return': '切回入口', 
   'firewall.restored': '防火墙规则已恢复', 'mtu.own': '本机组网包上限', error: '错误',
   'sign.rejected': '签名校验失败', 'owner.claim_expired': '旧接入记录作废', 'e2e.error': '端到端加密出错', 'e2e.exhausted': '端到端会话已满',
   'entry.suspect': '入口疑似丢包', 'reach.mismatch': '出口地址对不上', 'routing.unknown_link': '通告了不存在的链路', 'routing.clock': '中转时钟不准',
-  'mesh.missing': '组网服务不见了', 'mesh.reinstall': '重新安装组网服务', 'mesh.key_conflict': '上报了其他成员的密钥',
+  'mesh.missing': '组网服务不见了', 'mesh.reinstall': '重新安装组网服务', 'mesh.key_conflict': '上报了其他成员的密钥', 'relay.mode': '中转类型自动改判',
   'gateway.standby': '切换局域网网关'};
 // What a node says on another's behalf, by what a rejected signature was on.
 const SIGNED = {offer: '打洞地址', punch: '打洞状态', commit: '接入声明', 'owner notice': '接入通告', 'routing advertisement': '路由通告'};
 // The events about signatures, end-to-end encryption and relays misbehaving; the latest shows in a member's status.
 export const SECURITY_EVENTS = ['sign.rejected', 'owner.claim_expired', 'e2e.error', 'e2e.exhausted', 'entry.suspect', 'reach.mismatch', 'routing.unknown_link'];
-const ROUTE_REASONS = {down: '原线路断开', better: '新线路更快', shorter: '经过的中转更少', loop: '避免环路'};
+const ROUTE_REASONS = {down: '原线路断开', better: '新线路更快', loop: '避免环路'};
 export const eventLabel = kind => EVENTS[kind] || '其他事件';
 const PATH_REASONS = {'connect timeout': '连接超时', 'connection refused': '连接被拒绝', 'certificate rejected': '证书被拒绝', 'too many paths': '同时尝试的线路太多',
   'connect failed': '连接失败', 'probe timeout': '探测超时', 'relay not ready': '中转还没有就绪', 'commit failed': '切换没有生效', 'punch timeout': '打洞超时'};
@@ -874,6 +885,12 @@ export function eventView(e, member, members, keys = {}) {
   // Recorded by the controller.
   case 'mesh.missing': return out('可能被卸载或重装过，暂停给它下发配置；点「重新安装组网服务」恢复', detail);
   case 'mesh.reinstall': return out('已经装回，其他成员会收到它的新密钥', detail);
+  case 'relay.mode': {
+    // "<mode> -> <mode>: <verdict> <n> checks over <minutes>m"
+    const modes = {public: '公网中转', site: '站点中转'};
+    if (!(r = /^(\w+)\s*->\s*(\w+):\s*(\w+)\s+(\d+) checks over (\d+)m$/.exec(detail))) return out('中转类型自动改了', detail);
+    return out(`${modes[r[1]] || r[1]} → ${modes[r[2]] || r[2]}：可达性检测连续 ${r[4]} 次是「${VERDICTS[r[3]]?.[1] || r[3]}」（${r[5]} 分钟）`);
+  }
   case 'entry.flapping':
     return (r = /at least (\d+) entry switches in (\d+) minutes?/i.exec(detail)) ? out(`${r[2]} 分钟内切换了至少 ${r[1]} 次入口`) : out('入口切换太频繁', detail);
   case 'entry.switch':
@@ -886,6 +903,18 @@ export function eventView(e, member, members, keys = {}) {
   }
 }
 export const eventDetail = (e, member, members, keys = {}) => eventView(e, member, members, keys).text;
+
+// The events the controller holds and those read from the stored history, newest first: each once
+// (a held one of the same time, kind and detail as a stored one is that one), held ones the history
+// lacks kept, as those from before it began or newer than its pages. Not by seq: the controller's own
+// events are held with the node's last seq and stored without one.
+export function mergeEvents(held, stored) {
+  if (!stored?.length) return held || [];
+  const key = e => `${e.at}|${e.kind}|${e.detail}`;
+  const have = new Set(stored.map(key));
+  return [...stored, ...(held || []).filter(e => !have.has(key(e)))]
+    .sort((a, b) => (b.at ?? 0) - (a.at ?? 0) || (b.seq ?? -1) - (a.seq ?? -1));
+}
 export const eventTone = kind => ['owner.changed', 'owner.ack', 'config.applied', 'start', 'stop'].includes(kind) ? 'off'
   : ['direct.up', 'direct.switched', 'link.reused', 'path.ready', 'entry.committed', 'mesh.reinstall'].includes(kind) ? 'ok'
   : /error|fail|down|security|unavailable|unconfirmed|conflict|missing|rejected|exhausted/.test(kind || '') ? 'bad'
@@ -901,6 +930,13 @@ export function securityStats(status, events, member, members, keys = {}) {
     const total = drops.reduce((s, [, n]) => s + n, 0);
     rows.push({label: '端到端会话', value: `${e2e.sessions || 0} / ${e2e.limit}`, cls: e2e.sessions >= e2e.limit ? 'ob-warn' : '',
       note: total ? `丢弃 ${total} 个包：${drops.map(([k, n]) => `${k} ${n}`).join('、')}` : '', noteCls: 'ob-warn', wide: total > 0});
+  }
+  const adverts = status?.routing?.advertDrops;
+  if (adverts) {
+    const drops = [['来源超速', adverts.originRate], ['邻居发无效通告被限流', adverts.throttled], ['签名不对', adverts.signature],
+      ['格式不对', adverts.malformed], ['来自没有线路的中转', adverts.unlinked]].filter(([, n]) => n > 0);
+    const total = drops.reduce((s, [, n]) => s + n, 0);
+    if (total) rows.push({label: '丢弃的路由通告', value: `${total} 条`, cls: 'ob-warn', note: drops.map(([k, n]) => `${k} ${n}`).join('、'), noteCls: 'ob-warn', wide: true});
   }
   if (sec?.signing) {
     const rejected = sec.signing.rejected || 0, hops = Object.entries(sec.signing.byHop || {}).sort((a, b) => b[1] - a[1]);

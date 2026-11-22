@@ -41,7 +41,7 @@ function runtime(f, overrides = {}) {
   const script = sfc[f].scriptSetup.content;
   const names = parseScript(script, {sourceType: 'module'}).program.body.flatMap(n => n.type === 'VariableDeclaration' ? n.declarations.map(d => d.id.name) : n.type === 'FunctionDeclaration' ? [n.id.name] : []);
   const props = Vue.reactive({section: 'channels'}), events = [], mounted = [], unmounted = [];
-  const ctx = vm.createContext({ ...Vue, draggable, scrollModelListAbove, authMode: Vue.ref('controller'),
+  const ctx = vm.createContext({usePageSubject:()=>{}, usePageAction:()=>{}, useResourceChanges:()=>{},  ...Vue, draggable, scrollModelListAbove, authMode: Vue.ref('controller'),
     defineProps: () => props, defineEmits: () => (...args) => events.push(args),
     defineLazyView: (_loader, label) => ({name: label, render: () => Vue.h('div', label)}),
     onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn), mobileSlots: {},

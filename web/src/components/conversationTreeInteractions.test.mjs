@@ -50,9 +50,12 @@ test('empty folder row is a destination; an archive or incompatible row is never
  assert.equal(resolveTreeDrop(first,b,.1,known),null);
  assert.equal(resolveTreeDrop(first,{...second,archived:true},.5,known),null);
 });
-test('local drafts, archived sources, and search targets do not start a move',()=>{
+test('local drafts, archived sources, assistant rows, and search targets do not start or accept a move',()=>{
  assert.equal(resolveTreeDrop({...first,local:true},b,.5,known),null);
  assert.equal(resolveTreeDrop({...first,archived:true},b,.5,known),null);
+ assert.equal(resolveTreeDrop({...first,folderId:'',assistant:true},b,.5,known),null);
+ assert.equal(resolveTreeDrop(first,{...second,folderId:'',assistant:true},.1,known),null);
+ assert.equal(resolveTreeDrop(first,{kind:'system',systemNode:'assistant',id:'__assistant'},.5,known),null);
  assert.equal(resolveTreeDrop(first,{...b,search:true},.5,known),null);
 });
 test('parent identity distinguishes a root folder from its own id and archive virtual parent',()=>{

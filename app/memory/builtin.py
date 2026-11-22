@@ -33,7 +33,20 @@ _INSTALL_META = Path("data/install-meta.json")
 _BUNDLED_PROMPT_FILES = {
     "main": "openbear-system.tpl",
     "agent": "openbear-agent.tpl",
+    "assistant": "openbear-assistant.tpl",
 }
+ASSISTANT_TEMPLATE_PREFIX = "内置页面助手模板"
+
+
+def secret_tags(value: Any) -> list[str]:
+    """Tags from a comma-separated string or a list, trimmed and without repeats, in order."""
+    parts = value if isinstance(value, (list, tuple)) else re.split(r"[,，;；\n]+", str(value or ""))
+    out: list[str] = []
+    for part in parts:
+        tag = str(part or "").strip()[:40]
+        if tag and tag not in out:
+            out.append(tag)
+    return out
 
 
 def builtin_template_name(kind: str) -> str:
@@ -43,6 +56,8 @@ def builtin_template_name(kind: str) -> str:
         return f"内置主控模板 · OpenBear {version}"
     if kind == "agent":
         return f"内置 Agent 模板 · OpenBear {version}"
+    if kind == "assistant":
+        return f"{ASSISTANT_TEMPLATE_PREFIX} · OpenBear {version}"
     raise ValueError(f"unsupported builtin template kind: {kind}")
 
 
@@ -342,6 +357,7 @@ class BuiltinMemoryClient:
                     "INSERT INTO memory_templates (name, content, is_active, is_agent_active, updated_at) VALUES (?,?,0,1,?)",
                     (builtin_template_name("agent"), agent_content, now_ts()),
                 )
+        await self._seed_assistant_template()
         await self._db.conn.commit()
         # Existing template versions, including inactive built-ins, are history.
         # Apply strategy wording only to the in-memory request view; changing a
@@ -353,6 +369,23 @@ class BuiltinMemoryClient:
 
     def _default_agent_template(self) -> str:
         return _read_prompt("prompts", "openbear-agent.tpl", fallback="")
+
+    def _default_assistant_template(self) -> str:
+        return _apply_display_name(_read_prompt("prompts", "openbear-assistant.tpl", fallback=_FALLBACK_TEMPLATE))
+
+    async def _seed_assistant_template(self) -> None:
+        """Give the page assistant an active template once; a built-in copy the user still keeps is not added again."""
+        cur = await self._db.conn.execute(
+            "SELECT 1 FROM memory_templates WHERE is_assistant_active=1 OR name LIKE ? LIMIT 1",
+            (ASSISTANT_TEMPLATE_PREFIX + "%",))
+        if await cur.fetchone() is not None:
+            return
+        content = self._default_assistant_template()
+        if content.strip():
+            await self._db.conn.execute(
+                "INSERT INTO memory_templates (name, content, is_active, is_agent_active, is_assistant_active, updated_at) VALUES (?,?,0,0,1,?)",
+                (builtin_template_name("assistant"), content, now_ts()),
+            )
 
     async def build_system_prompt(self, params: dict[str, Any] | None = None) -> str:
         return await self.render_system_prompt(params or {}, source="runtime")
@@ -373,6 +406,13 @@ class BuiltinMemoryClient:
             template = (await self._template_by_id(template_id) if template_id else None) or await self._active_template()
         ctx = await self._main_template_context(params or {})
         return await self._render_template(template, ctx, source=source, params=params or {})
+
+    async def render_assistant_system_prompt(self, params: dict[str, Any] | None = None) -> str:
+        """Render the page assistant's system prompt: the active assistant template with the main template's context."""
+        await self._bootstrap()
+        template = await self._assistant_active_template()
+        ctx = await self._main_template_context(params or {})
+        return await self._render_template(template, ctx, source="assistant_runtime", params=params or {})
 
     async def render_agent_system_prompt(self, params: dict[str, Any] | None = None) -> str:
         """Render the explicitly selected Rath Agent base system prompt.
@@ -533,6 +573,15 @@ class BuiltinMemoryClient:
         if row:
             return _Template(id=int(row["id"]), name=str(row["name"]), content=str(row["content"]))
         return None
+
+    async def _assistant_active_template(self) -> _Template:
+        cur = await self._db.conn.execute(
+            "SELECT id, name, content FROM memory_templates WHERE is_assistant_active=1 ORDER BY id DESC LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if row:
+            return _Template(id=int(row["id"]), name=str(row["name"]), content=str(row["content"]))
+        return _Template(id=0, name="assistant fallback", content=self._default_assistant_template())
 
     async def _agent_active_template(self) -> _Template | None:
         cur = await self._db.conn.execute(
@@ -865,9 +914,13 @@ class BuiltinMemoryClient:
             include_archived = bool(args.get("includeArchived") or args.get("archived") or args.get("showArchived"))
             where = "" if include_archived else "WHERE archived=0"
             cur = await self._db.conn.execute(
-                f"SELECT id, name, note, grp, enabled, archived, sort, created_at, updated_at FROM memory_secrets {where} ORDER BY sort, id"
+                f"SELECT id, name, note, grp, tags, enabled, archived, sort, created_at, updated_at, last_used_at FROM memory_secrets {where} ORDER BY sort, id"
             )
-            return {"ok": True, "items": [{k: r[k] for k in r.keys()} for r in await cur.fetchall()]}
+            items = [{k: r[k] for k in r.keys()} for r in await cur.fetchall()]
+            wanted = set(secret_tags(args.get("tags") or args.get("tag") or ""))
+            if wanted:
+                items = [item for item in items if wanted <= set(secret_tags(item["tags"]))]
+            return {"ok": True, "items": items}
         if action == "get":
             row = await self._find_secret(args)
             if not row:
@@ -885,6 +938,11 @@ class BuiltinMemoryClient:
             await self._db.conn.commit()
             return {"ok": True, "deleted": True, "id": row["id"]}
         return {"ok": False, "error": f"unsupported action: {action}"}
+
+    async def touch_secret(self, sec_id: int) -> None:
+        """Record that the model used this credential's values."""
+        await self._db.conn.execute("UPDATE memory_secrets SET last_used_at=? WHERE id=?", (now_ts(), int(sec_id)))
+        await self._db.conn.commit()
 
     async def _find_secret(self, args: dict[str, Any]):
         sec_id = int(args.get("id") or 0)
@@ -911,6 +969,7 @@ class BuiltinMemoryClient:
             str(args.get("note") if "note" in args else (existing["note"] if existing else "")),
             json.dumps(kv, ensure_ascii=False),
             str(args.get("grp") if "grp" in args else (existing["grp"] if existing else "")),
+            ",".join(secret_tags(args["tags"])) if "tags" in args else (existing["tags"] if existing else ""),
             int(bool(args.get("enabled", existing["enabled"] if existing else True))),
             int(bool(args.get("archived", existing["archived"] if existing else False))),
             int(args.get("sort") if "sort" in args else (existing["sort"] if existing else 0)),
@@ -918,13 +977,13 @@ class BuiltinMemoryClient:
         )
         if existing:
             await self._db.conn.execute(
-                "UPDATE memory_secrets SET name=?, note=?, kv_json=?, grp=?, enabled=?, archived=?, sort=?, updated_at=? WHERE id=?",
+                "UPDATE memory_secrets SET name=?, note=?, kv_json=?, grp=?, tags=?, enabled=?, archived=?, sort=?, updated_at=? WHERE id=?",
                 (*values, existing["id"]),
             )
             sec_id = int(existing["id"])
         else:
             cur = await self._db.conn.execute(
-                "INSERT INTO memory_secrets (name, note, kv_json, grp, enabled, archived, sort, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO memory_secrets (name, note, kv_json, grp, tags, enabled, archived, sort, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (*values[:-1], values[-1], values[-1]),
             )
             sec_id = int(cur.lastrowid or 0)

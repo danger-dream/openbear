@@ -4,6 +4,8 @@ from __future__ import annotations
 import inspect
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
+from app.assistant import context as assistant_context
+from app.assistant.page import PageToolRegistry
 from app.agents.supervision import (
     POLL_SECONDS, RUNNING_STATUSES, OversightSettings, digest_has_progress, digest_highlights,
     in_long_single_step, progress_digest, requires_assessment, restore_review_state, review_due_at_ms,
@@ -72,6 +74,7 @@ class WebAdminChatRunMixin:
         cron_run_id: str = "",
         collab_request_id: str = "",
         backend_override: Any = None,
+        page_context: dict[str, Any] | None = None,
     ) -> bool:
         messages = MessageDAO(self.db)
         user_saved = False
@@ -145,6 +148,8 @@ class WebAdminChatRunMixin:
             mark_stage("sessionMs")
             edited_context = await branch_settings(self.db, conversation_uuid)
             run_tools = EditedToolRegistry(self.tools, edited_context['tools']) if edited_context else self.tools
+            if int((conversation or {}).get('assistant') or 0) and not edited_context:
+                run_tools = PageToolRegistry(run_tools, self.page_tools)
             from app.collab.store import member_row as collab_member_row
             collab_member = await collab_member_row(self.db.conn, conversation_uuid) if conversation_uuid else None
             if collab_member:
@@ -186,6 +191,9 @@ class WebAdminChatRunMixin:
                 return append_user_message_suffix(content, render_user_message_suffix(template_settings, variables))
 
             def steer_model_text(text, items):
+                snapshots = [item['pageContext'] for item in items if isinstance(item, dict) and isinstance(item.get('pageContext'), dict)]
+                if snapshots:
+                    text = assistant_context.with_context(text, snapshots[-1])
                 # An interjection's attachments reach the model as a new turn's do: summary text plus image blocks.
                 media = [InboundMedia(**m) for item in items if isinstance(item, dict) for m in item.get('media') or []]
                 content = build_llm_content(build_llm_text_with_media(text, media), media) if media else text
@@ -347,7 +355,7 @@ class WebAdminChatRunMixin:
                     await renderer.on_steers_injected([item], injected_texts=[text], restored=True)
 
             visible_user_text = (user_text or "").strip() or ("请根据我发送的附件内容回答。" if media else "")
-            llm_text = build_llm_text_with_media(user_text, media or [])
+            llm_text = assistant_context.with_context(build_llm_text_with_media(user_text, media or []), page_context)
             if instance_binding:
                 visible_user_text = instance_binding['scrub'](visible_user_text)
                 llm_text += ('\n服务端实例绑定：operation=' + instance_binding['id'] + ', revision=' + str(instance_binding['revision'])

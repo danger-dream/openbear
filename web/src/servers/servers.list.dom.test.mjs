@@ -88,3 +88,54 @@ test('a strip on whole device pixels: every minute as wide, the gaps within a pi
   assert.deepEqual(stripPaths(cells, 'loss', [[0, 3], [5, 8], [10, 13]]),
     [{fill: 'rgb(var(--ob-success-rgb) / .55)', d: 'M1 0h3v1h-3zM6 0h3v1h-3z'}, {fill: 'var(--ob-orange)', d: 'M11 0h3v1h-3z'}]);
 });
+
+test('latency summary refreshes at once on KeepAlive activate, switching back to probe, and tab visibility return', async t => {
+  const h = await setup(t, {keepAlive: true});
+  const countLatency = () => h.calls.filter(c => c.path === '/api/servers/latency').length;
+  await card(h, 'Papa-HK.T1').locator('[data-cell=latency]').waitFor();
+  const initial = countLatency();
+  assert.equal(initial, 1);
+
+  // 1. Switching away to another kept-alive page and coming back refreshes latency immediately.
+  window.__showServers(false);
+  await new Promise(r => setTimeout(r, 20));
+  window.__showServers(true);
+  await new Promise(r => setTimeout(r, 40));
+  const afterActivate = countLatency();
+  assert.equal(afterActivate, initial + 1);
+
+  // 2. Switching to a server detail tab and back to 探针 refreshes latency immediately.
+  await card(h, 'Delta-JP').click();
+  await h.page.locator('.sv-detail:visible .dt-tabs').waitFor();
+  assert.equal(countLatency(), afterActivate);
+  await h.page.locator('.sv-tabs [role=tab]').filter({hasText: '探针'}).click();
+  await new Promise(r => setTimeout(r, 40));
+  const afterReturn = countLatency();
+  assert.equal(afterReturn, afterActivate + 1);
+
+  // 3. Browser tab returning from hidden refreshes latency immediately (and stays quiet while deactivated).
+  const setHidden = value => Object.defineProperty(document, 'hidden', {configurable: true, get: () => value});
+  t.after(() => setHidden(false));
+  setHidden(true);
+  document.dispatchEvent(new Event('visibilitychange'));
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(countLatency(), afterReturn);
+  setHidden(false);
+  document.dispatchEvent(new Event('visibilitychange'));
+  await new Promise(r => setTimeout(r, 40));
+  const afterVisible = countLatency();
+  assert.equal(afterVisible, afterReturn + 1);
+
+  // While kept-alive in background (another page shown), visibilitychange does not poll latency.
+  window.__showServers(false);
+  await new Promise(r => setTimeout(r, 20));
+  document.dispatchEvent(new Event('visibilitychange'));
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(countLatency(), afterVisible);
+
+  // After unmount, visibilitychange listener is removed.
+  await h.close();
+  document.dispatchEvent(new Event('visibilitychange'));
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(countLatency(), afterVisible);
+});

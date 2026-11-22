@@ -111,8 +111,8 @@ func TestHandshakeLoadFollowsQueueCapacity(t *testing.T) {
 	t.Cleanup(bounded.Close)
 	plain := NewDevice(tuntest.NewChannelTUN().TUN(), bindtest.NewChannelBinds()[0], NewLogger(LogLevelError, ""))
 	t.Cleanup(plain.Close)
-	if got := bounded.handshakeLoad(); got != 1 {
-		t.Fatalf("a queue of 4 is under load from %d waiting, want 1", got)
+	if got := bounded.handshakeLoad(); got != 2 {
+		t.Fatalf("a queue of 4 is under load from %d waiting, want 2", got)
 	}
 	if got := plain.handshakeLoad(); got != QueueHandshakeSize/8 {
 		t.Fatalf("upstream's queue is under load from %d waiting, want %d", got, QueueHandshakeSize/8)
@@ -133,8 +133,17 @@ func TestSeparateHandshakeAndStagedDepths(t *testing.T) {
 	if got := cap(d.queue.handshake.c); got != 32 {
 		t.Fatalf("handshake queue %d, want 32", got)
 	}
-	if got := d.handshakeLoad(); got != 4 {
-		t.Fatalf("under load from %d waiting, want 4", got)
+	if got := d.handshakeLoad(); got != 16 {
+		t.Fatalf("under load from %d waiting, want 16", got)
+	}
+	if got := d.handshakeRetry(); got != RekeyTimeout {
+		t.Fatalf("handshake retry %v without HandshakeRetry, want RekeyTimeout", got)
+	}
+	limits.HandshakeRetry = 2 * time.Second
+	quick := NewDevice(tuntest.NewChannelTUN().TUN(), resourceTestBind{Bind: bindtest.NewChannelBinds()[0], limits: limits}, NewLogger(LogLevelError, ""))
+	t.Cleanup(quick.Close)
+	if got := quick.handshakeRetry(); got != 2*time.Second {
+		t.Fatalf("handshake retry %v, want HandshakeRetry 2s", got)
 	}
 	if got := cap(d.queue.encryption.c); got != 4 {
 		t.Fatalf("encryption queue %d, want QueueDepth 4", got)

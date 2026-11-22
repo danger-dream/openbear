@@ -26,7 +26,7 @@ export function pendingConversationRows(status = {}) {
   for (const item of [...(status.recentItems || []), ...(status.activityItems || []), ...(status.items || [])]) {
     if (item?.conversationUuid) unique.set(item.conversationUuid, item);
   }
-  return [...unique.values()].filter(item => !item.archived && !item.local && isActivityWaiting(item))
+  return [...unique.values()].filter(item => !item.archived && !item.local && !item.assistant && isActivityWaiting(item))
     .sort((a, b) => Number(a.activityAtMs || 0) - Number(b.activityAtMs || 0) || a.conversationUuid.localeCompare(b.conversationUuid));
 }
 export function pendingFolderCounts(items = [], folders = []) {

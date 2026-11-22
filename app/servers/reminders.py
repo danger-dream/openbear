@@ -16,7 +16,7 @@ from app.webhooks.repository import many, one
 
 # The mesh's alerts by type (mesh_status.ALERT_TYPES), each on or off apart from enabled: one off is
 # recorded as done ('off') and listed, not sent.
-MESH_ALERTS = ('standby', 'entry', 'flap', 'exit', 'memory', 'apply', 'upgrade', 'missing', 'keys')
+MESH_ALERTS = ('standby', 'entry', 'flap', 'exit', 'memory', 'apply', 'upgrade', 'missing', 'keys', 'relaymode')
 DEFAULTS = {'enabled': True, 'time': '10:00', 'expiryDays': [7, 3, 1, 0], 'trafficPercents': [80, 90, 100], 'autoRenew': True,
             'mesh': dict.fromkeys(MESH_ALERTS, True)}
 _TIME = re.compile(r'([01]\d|2[0-3]):[0-5]\d')
@@ -107,7 +107,7 @@ class Reminders:
         for owner in [r['owner'] for r in await many(self.db.conn, owners)]:
             # One listing per owner: this runs every minute, and a lookup per server
             # would read every profile again for each of them.
-            listing = await self.service.list(owner)
+            listing = await self.service.list(owner, include_checks=False)
             for item in listing['items']:
                 if not item['profile']:
                     continue

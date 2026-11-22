@@ -10,6 +10,9 @@ import {mobileSelectOptions} from "../mobileSelect.js";
 import PromptTemplateEditor from "../components/PromptTemplateEditor.vue";
 import MobileAdminSummary from "../components/MobileAdminSummary.vue";
 import LocalPersonaSync from "../components/LocalPersonaSync.vue";
+import {usePageSubject} from "../assistant/pageRegistry.js";
+import {useResourceChanges} from "../assistant/resourceChanges.js";
+import {openRequest, takeOpenRequest} from "../assistant/openScope.js";
 
 const templates = ref([]);
 const activeId = ref(null);
@@ -85,6 +88,12 @@ function sampleParamsNeedRuntimeRefresh() {
 }
 
 const dirty = () => editing.value && JSON.stringify(editing.value) !== original.value;
+usePageSubject(() => editing.value ? {kind: "template", id: editing.value.id, label: editing.value.name, main: true, role: "正在编辑",
+  details: {roles: templateRoles(editing.value), unsaved: Boolean(dirty()), chars: String(editing.value.content || "").length}} : null);
+useResourceChanges(["template"], async (detail) => {
+  if (String(detail.id) === String(activeId.value) && dirty()) ElMessage.warning("助手刚修改了这份模板；编辑器里是修改前的内容，保存会覆盖它");
+  await load(activeId.value, {preserveDirty: true});
+}, {keys: (detail) => [`template:${detail.id}`]});
 const templateChars = computed(() => editing.value?.content?.length || 0);
 const templateTokens = computed(() => tokenCount(editing.value?.content || ""));
 const outputChars = computed(() => previewResult.value.length || 0);
@@ -121,10 +130,13 @@ markdown.renderer.rules.link_open = (tokens, idx, options, _env, self) => {
 const renderedPreview = computed(() => markdown.render(previewResult.value || ""));
 const activeTemplateName = computed(() => templates.value.find((t) => t.is_active)?.name || "未设置");
 const agentActiveTemplateName = computed(() => templates.value.find((t) => t.is_agent_active)?.name || "未设置");
-const templateRoles = (t) => [t?.is_active && "主提示词", t?.is_agent_active && "Agent 提示词", t?.is_persona && !t?.is_agent_active && "人设"].filter(Boolean);
+const assistantActiveTemplateName = computed(() => templates.value.find((t) => t.is_assistant_active)?.name || "未设置");
+const personaBlocked = (t) => Boolean(t?.is_agent_active || t?.is_assistant_active);
+const templateRoles = (t) => [t?.is_active && "主提示词", t?.is_agent_active && "Agent 提示词", t?.is_assistant_active && "页面助手提示词", t?.is_persona && !personaBlocked(t) && "人设"].filter(Boolean);
 const rolesText = computed(() => templateRoles(editing.value).join(" · ") || "未使用");
 const personaHint = computed(() => {
 	if (editing.value?.is_agent_active) return "Agent 提示词不能作为人设";
+	if (editing.value?.is_assistant_active) return "页面助手提示词不能作为人设";
 	if (editing.value?.is_active) return "它是主提示词，人设列表里显示为「系统默认」";
 	return "新建会话、目录和会话属性里可以选这份";
 });
@@ -191,6 +203,12 @@ async function selectById(id) {
 onMounted(async () => {
 	await load();
 });
+// The page assistant takes the user back to the template a task was about.
+watch([openRequest, templates], () => {
+	const id = openRequest.value?.kind === "template" ? Number(openRequest.value.id) : 0;
+	if (!id || !templates.value.some((t) => t.id === id) || !takeOpenRequest("template")) return;
+	if (editing.value?.id !== id) { activeId.value = id; void selectById(id); }
+}, {immediate: true});
 
 async function saveTemplate(patch = {}, message = "已保存") {
 	if (!alive || !editing.value || saving.value || changingTemplate.value) return;
@@ -221,6 +239,7 @@ async function saveTemplate(patch = {}, message = "已保存") {
 function save() { return saveTemplate(); }
 function activate() { return saveTemplate({is_active: 1}, "已设为激活模板"); }
 function activateAgent() { return saveTemplate({is_agent_active: 1}, "已设为 Agent 提示词"); }
+function activateAssistant() { return saveTemplate({is_assistant_active: 1}, "已设为页面助手提示词，新建的助手对话使用这份"); }
 function setPersona(on) { return saveTemplate({is_persona: on ? 1 : 0}, on ? "已设为人设，新建会话时可以选择" : "已取消人设"); }
 
 async function newTpl() {
@@ -382,7 +401,8 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					<div class="template-more-menu" @click="$event.currentTarget.closest('details').open = false">
 						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_active" @click="activate">设为主提示词</button>
 						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_agent_active" @click="activateAgent">设为 Agent 提示词</button>
-						<button type="button" :disabled="saving || changingTemplate || !editing || Boolean(editing.is_agent_active)" @click="setPersona(!editing.is_persona)">{{ editing?.is_persona ? '取消人设' : '设为人设' }}</button>
+						<button type="button" :disabled="saving || changingTemplate || !editing || editing.is_assistant_active" @click="activateAssistant">设为页面助手提示词</button>
+						<button type="button" :disabled="saving || changingTemplate || !editing || personaBlocked(editing)" @click="setPersona(!editing.is_persona)">{{ editing?.is_persona ? '取消人设' : '设为人设' }}</button>
 						<button type="button" @click="showPersonaSync = true">同步本地人设</button>
 						<button type="button" @click="openBuiltinImport">导入随版本模板</button>
 						<button type="button" @click="showHelp = true">语法说明</button>
@@ -425,10 +445,16 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 						<el-button v-else size="small" :disabled="saving || changingTemplate" aria-label="设为 Agent 提示词" @click="activateAgent">设为</el-button>
 					</div>
 					<div class="template-role">
-						<span class="template-role-dot" :class="{'is-on': editing.is_persona && !editing.is_agent_active}" aria-hidden="true"></span>
+						<span class="template-role-dot" :class="{'is-on': editing.is_assistant_active}" aria-hidden="true"></span>
+						<div class="template-role-text"><span>页面助手提示词</span><small>{{ editing.is_assistant_active ? '新建的助手对话使用这份' : `当前是「${assistantActiveTemplateName}」` }}</small></div>
+						<span v-if="editing.is_assistant_active" class="template-role-state">使用中</span>
+						<el-button v-else size="small" :disabled="saving || changingTemplate" aria-label="设为页面助手提示词" @click="activateAssistant">设为</el-button>
+					</div>
+					<div class="template-role">
+						<span class="template-role-dot" :class="{'is-on': editing.is_persona && !personaBlocked(editing)}" aria-hidden="true"></span>
 						<div class="template-role-text"><span>人设</span><small>{{ personaHint }}</small></div>
-						<el-switch :model-value="Boolean(editing.is_persona) && !editing.is_agent_active" size="small" aria-label="作为人设"
-						           :disabled="saving || changingTemplate || Boolean(editing.is_agent_active)" @update:model-value="setPersona"/>
+						<el-switch :model-value="Boolean(editing.is_persona) && !personaBlocked(editing)" size="small" aria-label="作为人设"
+						           :disabled="saving || changingTemplate || personaBlocked(editing)" @update:model-value="setPersona"/>
 					</div>
 				</div>
 			</el-popover>
@@ -442,14 +468,14 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 			</div>
 		</div>
 		
-		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '人设', value: editing.is_agent_active ? '不可用' : editing.is_persona ? '是' : '否' }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-ob-orange">· 未保存</span></MobileAdminSummary>
+		<MobileAdminSummary v-if="editing" :items="[{ label: '主提示词', value: activeTemplateName }, { label: 'Agent 提示词', value: agentActiveTemplateName }, { label: '页面助手提示词', value: assistantActiveTemplateName }, { label: '人设', value: personaBlocked(editing) ? '不可用' : editing.is_persona ? '是' : '否' }, { label: '模板 tokens', value: formatNum(templateTokens) }, { label: '输出 tokens', value: formatNum(outputTokens) }, { label: '膨胀比', value: previewRatio }, { label: '渲染耗时', value: previewMs + 'ms' }]">模板 {{ formatNum(templateChars) }} 字 · 输出 {{ formatNum(outputChars) }} 字 <span v-if="dirty()" class="text-ob-orange">· 未保存</span></MobileAdminSummary>
 		<div v-if="editing" class="admin-mobile-only template-pane-switch" role="group" aria-label="模板工作区">
 			<button type="button" :aria-pressed="mobilePane === 'edit'" aria-controls="template-editor-pane" @click="mobilePane = 'edit'">编辑模板</button>
 			<button type="button" :aria-pressed="mobilePane === 'preview'" aria-controls="template-preview-pane" @click="mobilePane = 'preview'">实时预览</button>
 		</div>
 		<div class="template-workspace flex-1 min-h-0 flex" :class="`mobile-pane-${mobilePane}`">
 			<template v-if="editing">
-				<section id="template-editor-pane" class="template-editor-pane flex-[1.18] min-w-0 flex flex-col p-4 gap-3 border-r border-macborder">
+				<section id="template-editor-pane" :data-ob-key="editing ? 'template:' + editing.id : undefined" class="template-editor-pane flex-[1.18] min-w-0 flex flex-col p-4 gap-3 border-r border-macborder">
 					<div class="flex-1 min-h-0">
 						<PromptTemplateEditor v-model="editing.content"/>
 					</div>
@@ -531,6 +557,10 @@ const SAMPLE = `You are OpenBear, a capable AI assistant operating inside a priv
 					<el-checkbox value="agent" border class="builtin-template-option">
 						<span class="block font-medium text-mactext">Agent 提示词</span>
 						<span class="mt-0.5 block text-xs font-normal text-macsub">当前版本附带的 Agent 基础模板</span>
+					</el-checkbox>
+					<el-checkbox value="assistant" border class="builtin-template-option">
+						<span class="block font-medium text-mactext">页面助手提示词</span>
+						<span class="mt-0.5 block text-xs font-normal text-macsub">当前版本附带的页面助手基础模板</span>
 					</el-checkbox>
 				</el-checkbox-group>
 				<div class="mt-4 rounded-xl border border-ob-border bg-ob-soft px-3 py-2.5 text-xs text-ob-subtle">

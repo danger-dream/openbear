@@ -9,6 +9,9 @@ import DeviceNotifications from "../pwa/DeviceNotifications.vue";
 import SystemExtensionDefaults from "../components/SystemExtensionDefaults.vue";
 import { settingDisplayValue, settingStorageValue, settingRangeLabel } from "./settingsDisplay.js";
 import { applyFeatureSettings } from "../featureToggles.js";
+import { mobileSelectOptions } from "../mobileSelect.js";
+import { usePageSubject } from "../assistant/pageRegistry.js";
+import { useResourceChanges } from "../assistant/resourceChanges.js";
 
 const webhookEnvironment = ref(null);
 const webhookSettingFailures = reactive({});
@@ -51,6 +54,46 @@ const testingBrowser = ref(false);
 const browserProbe = ref(null);
 const browserProbeState = computed(() => browserProbe.value?.endpoint === String(draft['browser.mainEndpoint'] || '').trim() ? browserProbe.value : null);
 const compressionModels = ref([]);
+const extensionOptions = ref([]);
+const newConversationModel = ref("");
+const assistantModelOptions = computed(() => [{value: "", label: "跟随新会话默认模型"},
+  ...compressionModels.value.map((model) => ({value: model.key, label: model.label || model.model || model.key}))]);
+// The model new assistant conversations get: the assistant's own default, else the new-conversation default.
+const assistantModel = computed(() => {
+  const key = draft["assistant.model"] || newConversationModel.value;
+  return compressionModels.value.find((model) => model.key === key) || null;
+});
+function thinkingLabel(level) {
+  return (specs.value?.["assistant.thinkingLevel"]?.choices || []).find((item) => item.value === level)?.label || level;
+}
+const assistantThinkingOptions = computed(() => {
+  const model = assistantModel.value;
+  const levels = model?.thinkingLevels || [];
+  const fallback = model?.defaultThinkingLevel || levels[0] || "";
+  return [{value: "", label: fallback ? `默认（${thinkingLabel(fallback)}）` : "默认"},
+    ...(specs.value?.["assistant.thinkingLevel"]?.choices || []).filter((item) => item.value && levels.includes(item.value))];
+});
+// A stored level or Fast the model cannot use does not apply to new conversations; show what does.
+const assistantThinkingValue = computed(() => {
+  const value = draft["assistant.thinkingLevel"] || "";
+  return assistantThinkingOptions.value.some((item) => item.value === value) ? value : "";
+});
+const assistantFastSupported = computed(() => Boolean(assistantModel.value?.supportsFast));
+// The extension list is saved once its dropdown closes (or a tag is removed), not on every pick.
+function setAssistantExtensions(spec, value) {
+  const picked = new Set(value || []);
+  draft[spec.path] = optionsFor(spec).map((item) => item.value).filter((item) => picked.has(item));
+}
+async function saveAssistantExtensions(spec) {
+  await nextTick();
+  if (isDirty(spec) && !saving[spec.path]) await save(spec);
+}
+async function selectAssistantModel(spec, value) {
+  if (!(await selectOption(spec, value))) return;
+  const levelSpec = specs.value?.["assistant.thinkingLevel"], fastSpec = specs.value?.["assistant.fastMode"];
+  if (levelSpec && draft[levelSpec.path] && assistantThinkingValue.value !== draft[levelSpec.path]) await selectOption(levelSpec, "");
+  if (fastSpec && draft[fastSpec.path] && !assistantFastSupported.value) await toggleBool(fastSpec);
+}
 
 
 const selectOptions = {
@@ -148,6 +191,7 @@ const restartCount = computed(() => Object.values(specs.value || {}).filter(sett
 const dirtyCount = computed(() => Object.values(specs.value || {}).filter(settingAvailable).filter((spec) => isDirty(spec)).length);
 const resultCount = computed(() => visibleSections.value.reduce((total, section) => total + section.specs.length, Number(showDeviceNotifications.value) + Number(showExtensionDefaults.value)));
 function optionsFor(spec) {
+  if (spec?.path === "assistant.extensions") return extensionOptions.value;
   if (Array.isArray(spec?.choices) && spec.choices.length) return spec.choices;
   return selectOptions[spec?.path] || [];
 }
@@ -203,6 +247,23 @@ function displayedValue(spec) {
   if (spec.path === 'contextManagement.toolResultArtifactTokens' && Number(value) === 0) return '关闭（0 token）';
   return `${settingDisplayValue(spec, value)}${spec.unit || ""}`;
 }
+usePageSubject(() => {
+  const editingSpec = specs.value?.[editingPath.value || editingPromptPath.value];
+  const shown = visibleSections.value.flatMap((section) => section.specs.map((spec) => spec.path));
+  return [
+    ...(editingSpec ? [{kind: "setting", id: editingSpec.path, label: editingSpec.title, role: "正在编辑", details: {path: editingSpec.path, desc: editingSpec.desc}}] : []),
+    {kind: "settings-section", id: activeDomainInfo.value?.key || "", label: query.value.trim() ? `搜索「${query.value.trim()}」` : activeDomainInfo.value?.title || "系统设置",
+      details: {paths: shown.slice(0, 40)}},
+  ];
+});
+// A setting the assistant changed: show its stored value; a draft the user is typing elsewhere stays.
+useResourceChanges(["setting"], async (detail) => {
+  const data = await Api.settings();
+  values.value = data.values || values.value;
+  applyFeatureSettings(values.value);
+  const spec = specs.value?.[detail.id];
+  if (spec && editingPath.value !== detail.id && editingPromptPath.value !== detail.id) draft[detail.id] = normalizeDraftValue(spec, values.value[detail.id]);
+}, {keys: (detail) => [`setting:${detail.id}`]});
 function isDirty(spec) {
   if (!spec) return false;
   if (isPromptEditorSpec(spec)) {
@@ -231,8 +292,12 @@ function effectTagType(effect) {
 async function load() {
   loading.value = true;
   try {
-    const [specData, settingsData, modelData] = await Promise.all([Api.settingsSpecs(), Api.settings(), Api.rathOptions().catch(() => ({models: []}))]);
+    const [specData, settingsData, modelData, extensionData] = await Promise.all([Api.settingsSpecs(), Api.settings(), Api.rathOptions().catch(() => ({models: []})),
+      Promise.resolve().then(() => Api.folderExtensions("__system")).catch(() => ({extensions: []}))]);
     compressionModels.value = modelData.models || [];
+    extensionOptions.value = (extensionData.extensions || []).map((item) => ({value: item.key, label: item.label || item.key, tokens: Number(item.tokens || 0)}));
+    Promise.resolve().then(() => Api.conversationDefaults())
+      .then((data) => { newConversationModel.value = data?.defaults?.mainModel || ""; }).catch(() => {});
     okOrThrow(specData); okOrThrow(settingsData);
     const apiDomains = (specData.domains || []).filter((domain) => (domain.sections || []).length > 0);
     domains.value = apiDomains.length
@@ -339,7 +404,7 @@ function onEditorKeydown(event, spec) {
 }
 async function selectOption(spec, value) {
   draft[spec.path] = value;
-  await save(spec);
+  return save(spec);
 }
 async function toggleBool(spec) {
   if (!spec || saving[spec.path]) return;
@@ -513,6 +578,7 @@ onMounted(load);
             <article
               v-for="spec in section.specs"
               :key="spec.path"
+              :data-ob-key="'setting:' + spec.path"
               class="settings-row"
               :class="[
                 isDirty(spec) ? 'is-dirty' : '',
@@ -570,6 +636,16 @@ onMounted(load);
 
                   <div class="setting-control min-w-0">
                     <template v-if="['webhooks.scripts.pythonPath','webhooks.scripts.nodePath'].includes(spec.path)"><span class="value-pill value-pill--readonly" :title="interpreterPath(spec)"><span class="value-pill__label">{{ interpreterPath(spec) }}</span></span></template>
+                    <template v-else-if="spec.path === 'assistant.fastMode'">
+                      <div class="flex items-center justify-end gap-3">
+                        <span class="setting-state-text">{{ !assistantFastSupported ? `${assistantModel?.label || '所选模型'} 不支持` : draft[spec.path] ? '开启' : '关闭' }}</span>
+                        <button type="button" class="mac-toggle" :class="draft[spec.path] && assistantFastSupported ? 'is-on' : ''"
+                                :disabled="saving[spec.path] || (!assistantFastSupported && !draft[spec.path])" :aria-pressed="Boolean(draft[spec.path] && assistantFastSupported)" @click="toggleBool(spec)">
+                          <span class="mac-toggle__knob">{{ saving[spec.path] ? '…' : '' }}</span>
+                          <span class="sr-only">切换 {{ spec.title }}</span>
+                        </button>
+                      </div>
+                    </template>
                     <template v-else-if="spec.kind === 'bool'">
                       <div class="flex items-center justify-end gap-3">
                         <span class="setting-state-text">{{ draft[spec.path] ? '开启' : '关闭' }}</span>
@@ -598,6 +674,27 @@ onMounted(load);
                           <button type="button" class="mac-text-button is-primary" :disabled="saving[spec.path]" @click="save(spec)">{{ saving[spec.path] ? '保存中…' : '保存模型及顺序' }}</button>
                         </div>
                       </div>
+                    </template>
+                    <template v-else-if="spec.path === 'assistant.model'">
+                      <el-select :model-value="draft[spec.path] || ''" filterable size="small" class="assistant-model-select" :disabled="saving[spec.path]" :popper-options="mobileSelectOptions()"
+                                 placeholder="跟随新会话默认模型" :aria-label="spec.title" @update:model-value="selectAssistantModel(spec, $event)">
+                        <el-option v-for="option in assistantModelOptions" :key="option.value" :label="option.label" :value="option.value"/>
+                      </el-select>
+                    </template>
+                    <template v-else-if="spec.path === 'assistant.thinkingLevel'">
+                      <el-select :model-value="assistantThinkingValue" size="small" class="assistant-model-select" :popper-options="mobileSelectOptions()"
+                                 :disabled="saving[spec.path] || assistantThinkingOptions.length < 2" :placeholder="assistantThinkingOptions[0].label" :aria-label="spec.title" @update:model-value="selectOption(spec, $event)">
+                        <el-option v-for="option in assistantThinkingOptions" :key="option.value" :label="option.label" :value="option.value"/>
+                      </el-select>
+                    </template>
+                    <template v-else-if="spec.path === 'assistant.extensions'">
+                      <el-select :model-value="draft[spec.path] || []" multiple collapse-tags collapse-tags-tooltip :max-collapse-tags="3" size="small"
+                                 class="assistant-model-select assistant-extension-select" :popper-options="mobileSelectOptions()" placeholder="不开启扩展" :aria-label="spec.title"
+                                 @update:model-value="setAssistantExtensions(spec, $event)" @visible-change="$event || saveAssistantExtensions(spec)" @remove-tag="saveAssistantExtensions(spec)">
+                        <el-option v-for="option in optionsFor(spec)" :key="option.value" :label="option.label" :value="option.value">
+                          <span class="assistant-extension-option"><span>{{ option.label }}</span><small>≈{{ option.tokens >= 1000 ? `${(option.tokens / 1000).toFixed(1)}K` : option.tokens }} tokens</small></span>
+                        </el-option>
+                      </el-select>
                     </template>
                     <template v-else-if="isMulti(spec)">
                       <div class="event-multi" :class="saving[spec.path] ? 'is-saving' : ''">
@@ -701,6 +798,9 @@ onMounted(load);
 .settings-row.is-context p, .settings-row.is-context .settings-technical, .settings-row.is-context .settings-builtin, .settings-row.is-context .mac-text-button { font-size: 12px; }
 .settings-row.is-context .value-pill__label, .settings-row.is-context .mac-segmented button { font-size: 13px; }
 .summary-model-setting { width: 100%; min-width: 0; }
+.assistant-model-select { width: min(100%, 300px); }
+.assistant-extension-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; }
+.assistant-extension-option small { color: var(--settings-muted); font-size: 11px; }
 .naming-model-plan { margin: 7px 2px 0; color: var(--settings-muted); font-size: 12px; line-height: 1.55; }
 .summary-model-save { display:flex; justify-content:flex-end; gap:8px; margin-top:10px; font-size:12px; }
 .settings-shell {

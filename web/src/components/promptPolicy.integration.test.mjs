@@ -16,7 +16,7 @@ function harness(name, props = {}, api = {}, extra = {}) {
   const inputs = Vue.reactive(props), events = [], mounts = [], cleanup = [], scope = Vue.effectScope();
   const bindings = compileScript(descriptor, {id:'policy-test'}).bindings;
   const components = Object.fromEntries(Object.entries(bindings).filter(([key]) => /^[A-Z]/.test(key)).map(([key]) => [key, shell]));
-  const ctx = vm.createContext({...Vue, ...components, ...policy, ...settingsDisplay, authMode: Vue.ref('controller'), defineAsyncComponent:() => shell,
+  const ctx = vm.createContext({usePageSubject:()=>{}, usePageAction:()=>{}, useResourceChanges:()=>{}, ...Vue, ...components, ...policy, ...settingsDisplay, authMode: Vue.ref('controller'), defineAsyncComponent:() => shell,
     defineProps:() => inputs, defineEmits:() => (name, value) => {events.push([name, value]); if (name === 'update:modelValue') inputs.modelValue = value;},
     defineOptions(){}, onMounted:fn => mounts.push(fn), onBeforeUnmount:fn => cleanup.push(fn),
     Api:api, apiError:e => e?.response?.data?.error || e.message, mobileSelectOptions:() => ({}),

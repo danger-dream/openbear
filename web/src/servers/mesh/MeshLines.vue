@@ -39,8 +39,15 @@ const autoLinks = computed(() => data.value?.autoLinks || {});
 const benefits = computed(() => autoLinks.value.benefits || {});
 // A link the last change made, until the next round measures it: the pairs it was made for.
 const madeWith = computed(() => Object.fromEntries((autoLinks.value.lastChange?.added || []).filter(x => x.pairs?.length).map(x => [pk(x.a, x.b), {kind: x.kind, count: x.count, pairs: x.pairs}])));
-const holdRounds = computed(() => Number(autoLinks.value.holdRounds || work.value?.settings?.autoLinks?.holdRounds) || 3);
-const dropAfterMs = computed(() => (Number(autoLinks.value.dropAfterS || work.value?.settings?.autoLinks?.dropAfterS) || 3600) * 1000);
+const autoSetting = (key, fallback) => {
+  const v = Number(autoLinks.value[key] ?? work.value?.settings?.autoLinks?.[key]);
+  return Number.isFinite(v) ? v : fallback;
+};
+const holdMs = computed(() => autoSetting('holdS', 1800) * 1000);
+const dropAfterMs = computed(() => autoSetting('dropAfterS', 21600) * 1000);
+const keepMs = computed(() => autoSetting('keepMs', 10));
+const buildMs = computed(() => autoSetting('buildMs', 15));
+const buildPct = computed(() => Math.round(autoSetting('buildRatio', 0.1) * 100));
 const LINK_FIELDS = [['transport', '协议'], ['dialer', '主动连的一端'], ['bias', '偏好']];
 const biasText = v => v > 0 ? `少走 +${v} ms` : v < 0 ? `优先 ${v} ms` : '正常';
 function fieldText(field, value, p) {
@@ -64,7 +71,7 @@ const pairs = computed(() => {
     const origin = p?.origin === 'auto' ? 'auto' : 'manual', measured = origin === 'auto' && autoLinksEnabled.value;
     return {...x, key, p, ex, line: l, rtt: l?.rttMs, transport: p?.transport || ex?.transport?.value || l?.transport || 'udp', bias: p?.bias ?? ex?.bias?.value ?? 0, ruled: ex?.rules || [],
       diffs, differs: diffs.length, auto: p ? (p.auto || []).length === 3 : true, origin, reason: p?.reason || '', errors,
-      benefit: measured ? benefits.value[key] || madeWith.value[key] || null : null, idleSince: measured ? Number(autoLinks.value.idleSince?.[key]) || 0 : 0,
+      benefit: measured ? benefits.value[key] || madeWith.value[key] || null : null, idleSince: measured ? Number(autoLinks.value.idleSince?.[key]) || 0 : 0, idleBest: measured ? Number(autoLinks.value.idleBest?.[key]) || 0 : 0,
       edge: relayEdgeId(work.value, x.a, x.b)};
   });
 });
@@ -98,10 +105,11 @@ const durationText = ms => {
   const min = Math.max(1, Math.round(ms / 60000));
   return min < 60 ? `${min} 分钟` : `${Math.floor(min / 60)} 小时${min % 60 ? ` ${min % 60} 分钟` : ''}`;
 };
-const idleText = since => {
+const idleText = (since, best) => {
   const now = Date.now(), left = since + dropAfterMs.value - now;
-  return `已 ${durationText(now - since)}没有让任何节点对变快，${left > 0 ? `约 ${durationText(left)}后` : '下一轮'}自动拆除`;
+  return `已 ${durationText(now - since)}没有让任何节点对快 ${keepMs.value} ms 以上${best > 0 ? `（最好快 ${best} ms）` : ''}，${left > 0 ? `约 ${durationText(left)}后` : '下一轮'}自动拆除`;
 };
+const heldText = x => `${Math.min(Math.floor(x.heldMs / 60000), Math.round(holdMs.value / 60000))}/${Math.round(holdMs.value / 60000)} 分钟`;
 const pairAt = computed(() => new Map(pairs.value.map(p => [pk(p.a, p.b), p])));
 const band = ms => !Number.isFinite(ms) ? '' : ms < 50 ? 'good' : ms < 130 ? 'mid' : 'far';
 
@@ -189,7 +197,7 @@ const lastAutoChange = computed(() => {
   return {text, skipped: Boolean(lc.skipped), at: Number(lc.at || lc.since || 0), items,
     added: items.filter(i => i.op === 'add').length, dropped: items.filter(i => i.op === 'drop').length};
 });
-const watching = computed(() => autoLinksEnabled.value ? (autoLinks.value.suggestions || []).map(x => ({...autoItem(x, 'add'), key: `watch:${pk(x.a, x.b)}`, rounds: Number(x.rounds) || 0, ready: Boolean(x.ready)})) : []);
+const watching = computed(() => autoLinksEnabled.value ? (autoLinks.value.suggestions || []).map(x => ({...autoItem(x, 'add'), key: `watch:${pk(x.a, x.b)}`, heldMs: Number(x.heldMs) || 0, ready: Boolean(x.ready), paused: Boolean(x.paused)})) : []);
 
 // ---- new links ----
 const adding = ref(null);
@@ -283,7 +291,7 @@ const entries = computed(() => (work.value?.members || []).map((m, idx) => ({m, 
       </div>
       <div class="m3-autolinks-bar">
         <button type="button" class="m3-sw" role="switch" :aria-checked="autoLinksEnabled" aria-label="自动调整线路" @click="setAutoLinksEnabled(!autoLinksEnabled)"><i></i><span>自动调整线路</span></button>
-        <span class="instance-muted">{{ autoLinksEnabled ? `按实测自动补更快的中转线路和成员的入口中转，遵守连接限制：连续 ${holdRounds} 轮都更快才新建，${durationText(dropAfterMs)}没有收益就拆除，两次调整至少隔 10 分钟` : '已关闭：不测速，也不自动改线路' }}</span>
+        <span class="instance-muted">{{ autoLinksEnabled ? `按实测自动补更快的中转线路和成员的入口中转，遵守连接限制：有节点对快 ${buildMs} ms（或快 ${buildPct}% 且 ${keepMs} ms）以上、持续 ${durationText(holdMs)}才新建，连续 ${durationText(dropAfterMs)}没有节点对快 ${keepMs} ms 以上才拆除，网络变动时暂停判断，两次调整至少隔 10 分钟` : '已关闭：不测速，也不自动改线路' }}</span>
       </div>
       <div v-if="lastAutoChange" class="m3-auto-log">
         <div class="m3-auto-h"><b>最近一次调整</b><span class="m3-faint"><template v-if="lastAutoChange.at"><time :title="timeLabel(lastAutoChange.at)">{{ relativeTime(lastAutoChange.at, Date.now()) }}</time></template><template v-if="lastAutoChange.added"> · 新建 {{ lastAutoChange.added }} 条</template><template v-if="lastAutoChange.dropped"> · 拆除 {{ lastAutoChange.dropped }} 条</template></span></div>
@@ -303,12 +311,12 @@ const entries = computed(() => (work.value?.members || []).map((m, idx) => ({m, 
         </ul>
       </div>
       <div v-if="autoLinksEnabled" class="m3-auto-log">
-        <div class="m3-auto-h"><b>正在观察</b><span class="m3-faint">每分钟测一轮，连续 {{ holdRounds }} 轮都更快才新建<template v-if="autoLinks.measuredAt"> · 上一轮 <time :title="timeLabel(autoLinks.measuredAt)">{{ clockOf(autoLinks.measuredAt) }}</time></template></span></div>
+        <div class="m3-auto-h"><b>正在观察</b><span class="m3-faint">每分钟测一轮，持续 {{ durationText(holdMs) }}都更快才新建<template v-if="autoLinks.paused"> · 网络正在变动，暂停判断</template><template v-if="autoLinks.measuredAt"> · 上一轮 <time :title="timeLabel(autoLinks.measuredAt)">{{ clockOf(autoLinks.measuredAt) }}</time></template></span></div>
         <p v-if="!watching.length" class="instance-muted">暂时没有更快的候选</p>
         <ul v-else class="m3-auto-list">
           <li v-for="x in watching" :key="x.key">
             <div class="m3-auto-item">
-              <span class="pb-tag" :data-tone="x.ready ? 'ok' : 'info'">{{ x.ready ? '下一轮新建' : `${Math.min(x.rounds, holdRounds)}/${holdRounds} 轮` }}</span>
+              <span class="pb-tag" :data-tone="x.ready ? 'ok' : 'info'">{{ x.ready ? '下一轮新建' : x.paused ? `暂停计时 ${heldText(x)}` : heldText(x) }}</span>
               <span class="m3-auto-who"><MeshNodeName :id="x.a" /><span class="m3-faint">{{ x.kind === 'entry' ? ' → ' : ' ⇄ ' }}</span><MeshNodeName :id="x.b" /><span class="m3-tag">{{ AUTO_KIND[x.kind] || x.kind }}</span></span>
               <span v-if="x.pairs.length" class="m3-auto-what">预计让 {{ x.count }} 对节点变快，最多：<MeshNodeName :id="x.pairs[0].src" /> → <MeshNodeName :id="x.pairs[0].dst" /> {{ Math.round(x.pairs[0].before) }} → {{ Math.round(x.pairs[0].after) }} ms</span>
               <span v-else class="m3-auto-what">{{ x.reason }}</span>
@@ -346,7 +354,7 @@ const entries = computed(() => (work.value?.members || []).map((m, idx) => ({m, 
                   <span>让 {{ p.benefit.count }} 对节点变快，最多：<MeshNodeName :id="p.benefit.pairs[0].src" /> → <MeshNodeName :id="p.benefit.pairs[0].dst" /> {{ Math.round(p.benefit.pairs[0].before) }} → {{ Math.round(p.benefit.pairs[0].after) }} ms</span>
                   <button type="button" class="ix-text-button" :aria-expanded="opened.has(p.key)" @click.stop="toggleOpen(p.key)">{{ opened.has(p.key) ? '收起' : `查看 ${p.benefit.count} 对` }}</button>
                 </small>
-                <small v-else-if="p.origin === 'auto' && p.benefit" class="m3-line-note" data-tone="warn"><span>{{ p.idleSince ? idleText(p.idleSince) : '现在没有让任何节点对变快' }}</span></small>
+                <small v-else-if="p.origin === 'auto' && p.benefit" class="m3-line-note" data-tone="warn"><span>{{ p.idleSince ? idleText(p.idleSince, p.idleBest) : `现在没有让任何节点对快 ${keepMs} ms 以上` }}</span></small>
                 <small v-else-if="p.origin === 'auto' && p.reason" class="m3-line-note"><span :title="p.reason">建立时：{{ p.reason }}</span></small>
                 <small v-for="e in p.errors" :key="e" class="ob-bad m3-line-err">{{ e }}</small>
               </span>

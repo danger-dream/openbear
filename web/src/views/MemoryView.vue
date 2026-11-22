@@ -14,6 +14,8 @@ import { encode } from "gpt-tokenizer";
 import { pinyin } from "pinyin-pro";
 import { assetTimeLine } from "../utils/assetTime";
 import { dragAutoScrollOptions } from "../utils/dragScroll";
+import { usePageSubject } from "../assistant/pageRegistry.js";
+import { useResourceChanges } from "../assistant/resourceChanges.js";
 
 const props = defineProps({ activeType: { type: String, default: "" } });
 const emit = defineEmits(["type-changed", "mobile-header-ready"]);
@@ -151,6 +153,21 @@ function rebuildGroups() {
 const groupNames = computed(() => [...new Set(entries.value.map((e) => e.grp).filter(Boolean))]);
 const hasGroups = computed(() => groups.value.some((g) => !g.expanded && g.name));
 const selectedEntries = computed(() => entries.value.filter((e) => selectedIds.value.includes(e.id)));
+usePageSubject(() => {
+  if (dialogOpen.value && editing.value) {
+    return editing.value.id
+      ? {kind: "mem", id: editing.value.id, label: editing.value.title || editing.value.ref, role: "正在编辑", details: {ref: editing.value.ref || "", category: activeCat.value}}
+      : {kind: "mem-draft", label: "新建记忆（未保存）", details: {category: activeCat.value}};
+  }
+  return selectedEntries.value.slice(0, 10).map((e) => ({kind: "mem", id: e.id, label: e.title || e.ref, role: "已选中", details: {ref: e.ref || ""}}));
+});
+useResourceChanges(["mem"], async (detail) => {
+  await loadEntries();
+  if (!dialogOpen.value || !editing.value?.id || String(editing.value.id) !== String(detail.itemId)) return;
+  if (detail.action === "delete") ElMessage.warning("助手删除了正在编辑的这条记忆");
+  else if (dirty.value) ElMessage.warning("助手刚修改了这条记忆；编辑框里是修改前的内容，保存会覆盖它");
+  else await openEdit({id: editing.value.id});
+}, {keys: (detail) => [`mem:${detail.itemId}`]});
 const allShownSelected = computed(() => entries.value.length > 0 && entries.value.every((e) => selectedIds.value.includes(e.id)));
 const visibleActiveEntries = computed(() => entries.value.filter((e) => !e.archived && e.enabled));
 const totalTokens = computed(() => visibleActiveEntries.value.reduce((s, e) => s + tokenCount(e.body), 0));
@@ -454,10 +471,10 @@ watch(activeCat, () => setMobileMode("browse"));
               :group="{ name: 'memory-entry-groups' }" @choose="dragging = true" @unchoose="dragging = false" @end="finishDrag"
               class="mobile-asset-group space-y-2 min-h-8" :class="g.expanded && !g.items.length ? 'rounded-xl border border-dashed border-ob-warning/30' : ''">
               <template #item="{ element: e }">
-                <MobileAssetRow v-if="isAdminPhone" :title="e.title" :summary="snippet(e.body)" :reference="e.ref ? '@mem/' + e.ref : ''" :meta="`${tokenCount(e.body).toLocaleString()} tk`"
+                <MobileAssetRow v-if="isAdminPhone" :data-ob-key="'mem:' + e.id" :title="e.title" :summary="snippet(e.body)" :reference="e.ref ? '@mem/' + e.ref : ''" :meta="`${tokenCount(e.body).toLocaleString()} tk`"
                   :enabled="!!e.enabled" :archived="!!e.archived" :expanded="!!e.expanded" :selected="isSelected(e.id)" :mode="mobileMode"
                   @select="setSelected(e.id, $event)" @open="openMobileAsset(e)" @more="openMobileAsset(e, 'actions')" />
-                <div v-else @click="openEdit(e)"
+                <div v-else :data-ob-key="'mem:' + e.id" @click="openEdit(e)"
                   class="memory-card mac-panel px-3.5 py-3 grid grid-cols-[28px_20px_40px_minmax(0,1fr)_auto] items-stretch gap-3 cursor-pointer hover:border-macblue/50 transition-colors"
                   :class="{ 'opacity-45': !e.enabled || e.archived, 'border-dashed': e.archived, 'ring-1 ring-macblue/30 bg-macblue/5': isSelected(e.id) }">
                   <div class="self-stretch flex items-center justify-center" @click.stop>

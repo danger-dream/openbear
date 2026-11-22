@@ -149,6 +149,10 @@ watch(() => [props.open, operationId.value, operationRevision.value, operationLi
 				</div>
 
 				<div v-else-if="view.action === 'questionnaire'" class="questionnaire-questions" :class="{'has-multiple': view.questions.length > 1}">
+					<div v-if="view.questionnaireText" class="readonly-text-answer">
+						<span>{{ view.statusKey === 'feedback' ? '整体意见（未提交选项）' : '整体补充说明' }}</span>
+						<div>{{ view.questionnaireText }}</div>
+					</div>
 					<section v-for="question in view.questions" :key="question.id" class="questionnaire-question">
 						<header>
 							<span class="question-number">{{ question.number }}</span>

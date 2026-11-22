@@ -29,10 +29,13 @@ for (const width of [1440, 320]) test(`${width}px: waiting work is listed, opens
   assert.equal(await panel.locator('[data-interaction-id]').count(), 3);
   await panel.locator('[data-interaction-id="choose-two"]').click();
   await page.waitForFunction(() => here().searchParams.get('id') === 'background');
-  await page.waitForFunction(() => document.activeElement?.classList.contains('web-confirm-card') && document.activeElement.dataset.interactionId === 'choose-two');
-  assert.equal(await page.locator('.web-confirm-card').count(), 3);
+  await page.waitForFunction(() => document.activeElement?.classList.contains('pi-sheet') && document.activeElement.dataset.interactionId === 'choose-two');
+  assert.equal(await page.locator('.pi-sheet .pi-queue-idx').textContent(), '2/3');
+  await page.locator('.pi-sheet button[aria-label="下一条交互"]').click();
   const questionnaire = page.locator('[data-questionnaire-id="questionnaire-three"]');
+  await questionnaire.waitFor({state: 'visible'});
   await questionnaire.locator('textarea').fill('未提交的问卷回答');
+  if (phone) await page.locator('.pi-fold-btn').click();
   if (phone) await page.getByRole('button', {name: '打开导航', exact: true}).filter({visible: true}).click();
   if (phone) await page.locator('.sidebar-new-session').click();
   else {
@@ -40,15 +43,16 @@ for (const width of [1440, 320]) test(`${width}px: waiting work is listed, opens
     await page.getByRole('menuitem', {name: '新建临时会话', exact: true}).click();
   }
   await page.waitForFunction(() => here().searchParams.get('id') === 'local:new');
-  await page.waitForFunction(() => document.querySelectorAll('.web-confirm-card').length === 0);
+  await page.waitForFunction(() => document.querySelectorAll('.pi-sheet, .pi-dock-pill').length === 0);
   assert.equal(await page.locator('.recent-waiting-count').textContent(), '待处理 1');
   await (phone ? page.locator('.mobile-pending-entry') : page.locator('.recent-waiting-count')).click();
   await panel.locator('[data-interaction-id="questionnaire-three"]').click();
   await page.waitForFunction(() => here().searchParams.get('id') === 'background');
   await page.waitForFunction(() => document.activeElement?.dataset.interactionId === 'questionnaire-three');
   assert.equal(await questionnaire.locator('textarea').inputValue(), '未提交的问卷回答');
-  assert.equal(await page.locator('.web-confirm-card').count(), 3);
+  assert.equal(await page.locator('.pi-sheet .pi-queue-idx').textContent(), '3/3');
   assert.equal(await page.locator('.recent-waiting-count').textContent(), '待处理 1');
+  if (phone) await page.locator('.pi-fold-btn').click();
   if (phone) await page.getByRole('button', {name: '打开导航', exact: true}).filter({visible: true}).click();
   assert.equal(await page.locator('[data-tree-id="background"] .tree-waiting-state').textContent(), '待确认 · 3项');
   assert.equal(await page.locator('[data-tree-id="background"] .running-leaf').count(), 0);

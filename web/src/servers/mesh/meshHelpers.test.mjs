@@ -326,6 +326,9 @@ test('a member whose mesh service is gone: its state, its rollout step, its even
   assert.equal(gone.raw, '');
   const back = eventView({kind: 'mesh.reinstall', detail: ''}, {serverId: 'a', name: 'EdgeES'}, []);
   assert.deepEqual([back.label, back.tone], ['重新安装组网服务', 'ok']);
+  // A relay's mode turned once its reachability checks held.
+  const turned = eventView({kind: 'relay.mode', detail: 'public -> site: punchable 4 checks over 31m'}, {serverId: 'a', name: 'EdgeES'}, []);
+  assert.deepEqual([turned.label, turned.text], ['中转类型自动改判', '公网中转 → 站点中转：可达性检测连续 4 次是「可打洞」（31 分钟）']);
   // The controller's own words: which member's key it reported, kept whole.
   const copied = eventView({kind: 'mesh.key_conflict', detail: '上报的端到端密钥和「Berlin」的相同，没有采用。多半是从那个节点的系统快照或模板克隆出来的'},
     {serverId: 'a', name: 'EdgeES'}, []);
@@ -471,6 +474,22 @@ test('signature, end-to-end and entry security events read in Chinese with what 
   assert.equal(v('routing.clock', 'odd')[2], 'raw');
 });
 
+test('held events and the stored history merge newest first, each once, none the history lacks lost', async () => {
+  const {mergeEvents} = await import('./meshHelpers.js');
+  const e = (seq, at, kind = 'route.changed', detail = 'd') => ({seq, at, kind, detail});
+  // Held: the latest, a folded run, and two from before the history began.
+  const held = [e(9, 900, 'peer.up', 'r1'), {...e(8, 800), firstAt: 600, repeat: 3}, e(2, 200, 'start', ''), e(1, 100, 'config.applied', 'revision 3')];
+  const stored = [e(8, 800), e(7, 700), e(6, 600), e(5, 500, 'peer.down', 'r1')];
+  assert.deepEqual(mergeEvents(held, stored).map(x => [x.seq, x.at]), [[9, 900], [8, 800], [7, 700], [6, 600], [5, 500], [2, 200], [1, 100]]);
+  // The folded held one is the stored one of its time and seq: the stored, unfolded, stands.
+  assert.equal(mergeEvents(held, stored)[1].repeat, undefined);
+  // The controller's own event: held with the node's last seq, stored without one, shown once.
+  const own = {seq: 9, at: 950, kind: 'relay.mode', detail: 'public -> site: punchable 4 checks over 30m'};
+  assert.deepEqual(mergeEvents([own, ...held], [{...own, seq: null}, ...stored]).filter(x => x.kind === 'relay.mode').length, 1);
+  assert.equal(mergeEvents(held, []), held);
+  assert.deepEqual(mergeEvents(null, stored), stored);
+});
+
 test('a member shows its end-to-end sessions, rejected signatures and latest security event', async () => {
   const {securityStats} = await import('./meshHelpers.js');
   const members = [{serverId: 'r1', name: 'Berlin'}, {serverId: 'm1', name: '公司'}];
@@ -487,6 +506,12 @@ test('a member shows its end-to-end sessions, rejected signatures and latest sec
   assert.deepEqual(quiet.map(s => [s.value, s.note, s.wide]), [['2 / 64', '', false], ['0 次', '', false]]);
   // A node that reports neither shows none.
   assert.deepEqual(securityStats({}, [], members[1], members), []);
+
+  // A relay's turned-away routing advertisements: a row with the reasons, none while there are none.
+  const relay = {routing: {advertDrops: {originRate: 2, throttled: 0, signature: 3, malformed: 0, unlinked: 1}}};
+  assert.deepEqual(securityStats(relay, [], members[0], members).map(s => [s.label, s.value, s.note, s.wide]),
+    [['丢弃的路由通告', '6 条', '来源超速 2、签名不对 3、来自没有线路的中转 1', true]]);
+  assert.deepEqual(securityStats({routing: {advertDrops: {originRate: 0, throttled: 0, signature: 0, malformed: 0, unlinked: 0}}}, [], members[0], members), []);
 });
 
 test('host firewalls a Linux node found, what they may not let through, and the automatic instance rules', async () => {
@@ -594,13 +619,13 @@ test('a member moving between the gateways of a LAN reads in Chinese', async () 
   assert.deepEqual(v('192.168.1.0/24 moved'), ['切换局域网网关', '改经另一个网关访问局域网', '192.168.1.0/24 moved', 'warn']);
 });
 
-test('switchesTo: at least switchMs cheaper, and with switchPct more than that share', () => {
-  assert.equal(switchesTo(176, 190.4), true);
-  assert.equal(switchesTo(186, 190.4), false);
-  assert.equal(switchesTo(185.4, 190.4), true);
-  assert.equal(switchesTo(176, 190.4, {switchMs: 20}), false);
-  assert.equal(switchesTo(176, 190.4, {switchMs: 10, switchPct: 20}), false);
-  assert.equal(switchesTo(150, 190.4, {switchMs: 10, switchPct: 20}), true);
+test('switchesTo: beats max(switchPct% * cur, switchMinMs)', () => {
+  assert.equal(switchesTo(176, 190.4), true); // saved 14.4 >= max(5%=9.52, 5)
+  assert.equal(switchesTo(183, 190.4), false); // saved 7.4 < 9.52
+  assert.equal(switchesTo(180.8, 190.4), true); // saved 9.6 >= 9.52
+  assert.equal(switchesTo(176, 190.4, {switchMinMs: 20, switchPct: 0}), false);
+  assert.equal(switchesTo(176, 190.4, {switchMinMs: 10, switchPct: 20}), false);
+  assert.equal(switchesTo(150, 190.4, {switchMinMs: 10, switchPct: 20}), true);
   assert.equal(switchesTo(NaN, 190.4), false);
 });
 

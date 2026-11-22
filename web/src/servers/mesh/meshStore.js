@@ -15,7 +15,10 @@ export const meshError = e => meshCodeText(e?.response?.data?.error) || safeErro
 // One copy of the mesh for the page and the server cards. `work` is what the
 // user edits; every edit is written to the draft with PUT. A poll never
 // replaces edits that are not saved yet (in flight, or rejected with errors).
-export const mesh = reactive({data: null, work: null, errors: [], rejected: false, conflict: false, saving: false, installing: false, loadError: '', error: '', unavailable: false});
+// applying: an apply sent and not answered yet (the controller checks the nodes and builds the configs first).
+// applyStartedAt: when this page saw the apply begin, for its elapsed time; 0 when none is under way.
+export const mesh = reactive({data: null, work: null, errors: [], rejected: false, conflict: false, saving: false, installing: false, applying: false,
+  applyStartedAt: 0, loadError: '', error: '', unavailable: false});
 let saving = null, again = false, loading = null;
 // The draft as the server last had it (canonical JSON). Reactive: the draft being edited is not swapped for an
 // equal copy, so whatever asks unsaved() must still see a save come back.
@@ -33,7 +36,8 @@ export const ruleHover = reactive({id: ''});
 // What the overview panel has open: kept while the panel comes and goes with the selection.
 export const folds = reactive({rules: false, autoRules: false, proxies: false});
 export const unsaved = () => Boolean(mesh.work) && snapshot() !== synced.value;
-export const applyBlocked = () => unsaved() || mesh.rejected || mesh.conflict || mesh.saving || Boolean(mesh.errors.length);
+export const applyBlocked = () => unsaved() || mesh.rejected || mesh.conflict || mesh.saving || Boolean(mesh.errors.length)
+  || mesh.applying || Boolean(mesh.data?.apply?.running || mesh.data?.apply?.preparing);
 
 function adopt(data, force = false, saved = false) {
   const state = data?.mesh || data;

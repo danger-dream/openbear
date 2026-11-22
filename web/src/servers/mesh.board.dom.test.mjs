@@ -78,8 +78,8 @@ test('node properties: settings saved to the draft, live status with hints, tren
   assert.match(text, /内存\s*230 MB \/ 256 MB/);
   assert.match(text, /CPU\s*3\.4%/);
   assert.match(text, /升级失败，已回退到原版本：组网服务升级后没有就绪/);
-  assert.deepEqual(await panel.locator('.mesh-spark-label').allInnerTexts(), ['延迟', '探测超时', '内存', 'CPU']);
-  assert.match(await panel.locator('.mesh-trend-head').innerText(), /切换 1 次 · 重连 1 次/);
+  assert.deepEqual(await panel.locator('.mesh-spark-label').allInnerTexts(), ['延迟', '探测超时', '内存', 'CPU', '换路']);
+  assert.match(await panel.locator('.mesh-trend-head').innerText(), /切换 1 次 · 重连 1 次 · 换路 4 次/);
   await panel.getByRole('tab', {name: '24 小时'}).click();
   assert.ok(h.calls.some(c => c.path === '/api/servers/mesh/members/home/trend' && c.query === '?range=24h'));
   await panel.getByRole('tab', {name: '事件'}).click();

@@ -109,6 +109,9 @@ test('mesh board layout: joining, links, node properties', {skip: !chromium, tim
     await node(page, 'home').click();
     const panel = inspector(page);
     await panel.locator('.mesh-sparks > li').nth(3).waitFor();
+    // Route changes beside entry switches and reconnects, with a chart of their own.
+    await panel.getByText(/换路 4 次/).waitFor();
+    await panel.locator('.mesh-sparks > li', {hasText: '换路'}).waitFor();
     const text = await panel.innerText();
     // One line per hint, memory first; the explanation opens on a click.
     const hintRows = panel.locator('.mesh-hints summary');
