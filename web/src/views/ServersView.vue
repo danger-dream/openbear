@@ -112,6 +112,7 @@ async function refreshPings() {
   try { pings.value = ok(await Api.serversLatency()).items || {}; } catch { /* the next minute retries */ }
 }
 watch(() => settings.value.latency?.enabled, () => { void refreshPings(); });
+watch(active, value => { if (value === 'probe' && visible.value) void refreshPings(); });
 
 function openServer(item) {
   if (!tabs.value.includes(item.id)) tabs.value.push(item.id);
@@ -168,12 +169,16 @@ function removed(id) { closeTab(id); void load(true); }
 function openBatch(ids = []) { batchTargets.value = ids; dialog.value = 'batch'; }
 function openFiles(id) { filesFor.value = id; }
 function syncPhone() { phone.value = media.matches; }
+function syncVisibility() {
+  if (!document.hidden && visible.value && active.value === 'probe') void refreshPings();
+}
 
 onMounted(() => {
   ensureFlagFont();
   media = window.matchMedia(MOBILE_VIEWPORT_QUERY);
   syncPhone();
   media.addEventListener?.('change', syncPhone);
+  document.addEventListener('visibilitychange', syncVisibility);
   void load().then(refreshLive);
   void loadRates().then(value => { if (value) fx.value = value; });
   startPolls();
@@ -192,11 +197,17 @@ let shownBefore = false;
 onActivated(() => {
   visible.value = true;
   startPolls();
-  if (shownBefore) { now.value = Date.now(); void load(true).then(refreshLive); }
+  if (shownBefore) {
+    now.value = Date.now();
+    void load(true).then(() => {
+      void refreshLive();
+      if (active.value === 'probe') void refreshPings();
+    });
+  }
   shownBefore = true;
 });
 onDeactivated(() => { visible.value = false; stopPolls(); });
-onBeforeUnmount(() => { alive = false; stopPolls(); media?.removeEventListener?.('change', syncPhone); emit('mobile-header-ready', false); document.removeEventListener('keydown', escBgp); document.removeEventListener('pointerdown', pressBgp, true); });
+onBeforeUnmount(() => { alive = false; stopPolls(); media?.removeEventListener?.('change', syncPhone); document.removeEventListener('visibilitychange', syncVisibility); emit('mobile-header-ready', false); document.removeEventListener('keydown', escBgp); document.removeEventListener('pointerdown', pressBgp, true); });
 
 // BGP 上游 from a card's network line: one popover for the whole board, by the line tapped; a bottom sheet on a phone.
 // The page alone opens and closes it (Element Plus would also toggle it from the line once it had been opened
