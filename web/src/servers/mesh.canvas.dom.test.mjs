@@ -199,6 +199,7 @@ test('keyboard and the server card: Delete on a node asks first, Esc clears, the
   const box = page.locator('.el-message-box');
   await box.getByText('应用后「Home」将无法访问网格').waitFor();
   await box.getByRole('button', {name: '移除'}).click();
+  await box.waitFor({state: 'detached'});
   await node(page, 'home').getByText('待移除').waitFor();
   assert.ok(h.calls.some(c => c.method === 'DELETE' && c.path === '/api/servers/mesh/members/home'));
   await page.keyboard.press('Escape');

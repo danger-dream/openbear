@@ -34,6 +34,7 @@ function editor(name, overrides = {}) {
     defineProps: () => ({activeType: 'memory'}), defineEmits: () => () => {},
     useMobileAssets: mobileAssetsRuntime({onBeforeUnmount: fn => unmount.push(fn)}).useMobileAssets,
     usePageSubject: () => () => {}, useResourceChanges: () => {},
+    openRequest: Vue.ref(null), takeOpenRequest: () => null,
     Api: api, apiError: error => error.message || String(error),
     ElMessage: Object.fromEntries(['success', 'warning', 'error', 'info'].map(kind => [kind, text => notices.push({kind, text})])),
     ElMessageBox: {confirm: (...args) => { confirms++; return confirmation(...args); }},
